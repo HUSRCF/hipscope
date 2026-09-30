@@ -1380,6 +1380,7 @@ fn run_gdn_sequence(
                     value_heads,
                     key_dim,
                     value_dim,
+                    position: token,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -3883,7 +3884,7 @@ fn run_quality_candidate(
         &mut gpu,
         2048,
         metadata,
-        QsaKvFormat::F32,
+        hipfire_arch_qwen4::Qwen4StateFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));

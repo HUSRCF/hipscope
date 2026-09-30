@@ -212,6 +212,9 @@ pub struct ScratchState {
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
     pub qsa_select_scores: Option<DeviceBuffer>,
     pub qsa_select_scores_bytes: usize,
+    /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
+    pub gdn_state_f32: Option<DeviceBuffer>,
+    pub gdn_state_f32_bytes: usize,
     pub fp16_x_source_ptr: *mut c_void,
     pub fp8_x_scratch: Option<DeviceBuffer>,
     pub fp8_x_scratch_bytes: usize,

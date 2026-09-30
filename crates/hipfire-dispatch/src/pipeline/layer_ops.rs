@@ -27,7 +27,7 @@ use rdna_compute::tensor_ops::{
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
-    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat, HcActivationFused,
     HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
@@ -1009,7 +1009,7 @@ pub struct GatedDeltaNetOp<'a> {
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
 /// row prefix needs: the recurrent state after the last row (slot `rows - 1`
-/// of `states`, `[rows, value_heads * value_dim * key_dim]` F32, written
+/// of `states`, a `[rows]` ring of states in `recurrent`'s format, written
 /// instead of updating `recurrent`, which stays the pre-forward state), the
 /// convolution input rows (`inputs`, `[rows, qkv]` F32; every reader of the
 /// convolution history rounds it to BF16), and the recurrence inputs a
@@ -1057,10 +1057,19 @@ impl GatedDeltaNetOp<'_> {
             DType::F32,
             "gated delta projection scratch",
         )?;
+        let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
+            DispatchError::Hip(format!("gated delta state: {error}"))
+        })?;
+        if !state_format.supports(self.key_dim, self.value_dim) {
+            return Err(DispatchError::Hip(format!(
+                "gated delta {} state needs 128x128 heads",
+                state_format.name()
+            )));
+        }
         require_tensor(
             self.recurrent,
-            checked_mul(value, self.key_dim, "gated delta state")?,
-            DType::F32,
+            state_format.state_units(self.value_heads, self.key_dim, self.value_dim),
+            state_format.dtype(),
             "gated delta state",
         )?;
         require_tensor(
@@ -1191,6 +1200,7 @@ pub fn execute_gated_delta_net(
         value_heads: op.value_heads,
         key_dim: op.key_dim,
         value_dim: op.value_dim,
+        position: op.start_position,
     };
     let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
     if chunked && capture.is_some() {
@@ -1355,6 +1365,7 @@ pub fn execute_gated_delta_net(
                     value_heads: op.value_heads,
                     key_dim: op.key_dim,
                     value_dim: op.value_dim,
+                    position,
                 },
                 &GatedDeltaGate {
                     recurrent_output: &recurrent_output,

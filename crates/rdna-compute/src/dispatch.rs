@@ -1545,6 +1545,8 @@ impl Gpu {
                 fp16_x_scratch_bytes: 0,
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,
+                gdn_state_f32: None,
+                gdn_state_f32_bytes: 0,
                 fp16_x_source_ptr: std::ptr::null_mut(),
                 fp8_x_scratch: None,
                 fp8_x_scratch_bytes: 0,
@@ -3018,6 +3020,25 @@ impl Gpu {
             )?;
         }
         Ok(self.scratch.qsa_select_scores.as_ref().unwrap().as_ptr())
+    }
+
+    /// The F32 working copy of a Q8 GDN state (the chunked prefill route runs
+    /// on F32 state), at least `bytes`; grows like the other scratch slots.
+    pub(crate) fn gdn_state_f32_scratch(&mut self, bytes: usize) -> HipResult<*mut c_void> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.gdn_state_f32_bytes,
+            self.scratch.gdn_state_f32.is_some(),
+            bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+            crate::scratch::grow_scratch_slot(
+                &self.hip,
+                &mut self.scratch.gdn_state_f32,
+                &mut self.scratch.gdn_state_f32_bytes,
+                bytes,
+            )?;
+        }
+        Ok(self.scratch.gdn_state_f32.as_ref().unwrap().as_ptr())
     }
 
     pub(crate) fn ensure_fp16_x(

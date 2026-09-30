@@ -547,15 +547,17 @@ fn main() -> Result<()> {
     )
     .map_err(err)?;
     let vocab = receipt.config.vocab_size;
-    // The shipped QSA state format for this device (HIPFIRE_KV_MODE; `bf16`
-    // is the exact reference arm).
-    let qsa_format = hipfire_arch_qwen4::resolve_qsa_format(
+    // The shipped state formats for this device (HIPFIRE_KV_MODE /
+    // HIPFIRE_STATE_QUANT; `bf16` + `fp32` is the exact reference arm).
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
         &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
         &gpu,
         &receipt.config,
     )
     .map_err(err)?;
-    eprintln!("state format qsa={}", qsa_format.name());
+    let qsa_format = state_format.qsa;
+    eprintln!("state format qsa={} gdn={}", qsa_format.name(), state_format.gdn.name());
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
         transaction,
@@ -563,7 +565,7 @@ fn main() -> Result<()> {
         &mut gpu,
         n_ctx,
         receipt.ple,
-        qsa_format,
+        state_format,
     )
     .map_err(err)?;
     bundle.attach_forward(&mut gpu, n_ctx).map_err(err)?;
@@ -655,6 +657,7 @@ fn main() -> Result<()> {
         let summary = json!({
             "kind": "logits", "ctx": ctx, "decode_rows": decode,
             "qsa_format": qsa_format.name(),
+            "gdn_format": state_format.gdn.name(),
             "max_abs_diff": max_diff, "kl_prefill_decode": kl,
             "argmax_prefill": argmax(&prefill_logits), "argmax_decode": argmax(&decode_logits),
             "top5_overlap": top5_overlap,

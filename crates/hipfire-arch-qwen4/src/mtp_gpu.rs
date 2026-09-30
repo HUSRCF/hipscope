@@ -1517,7 +1517,7 @@ mod tests {
             return;
         };
         let config = compact_test_config();
-        let mut target = Qwen4State::new(&mut gpu, &config, 8, QsaKvFormat::F32)
+        let mut target = Qwen4State::new(&mut gpu, &config, 8, crate::state::Qwen4StateFormat::F32)
             .expect("compact target state");
         let mut mtp = MtpGpuState::new(&mut gpu, &config, 8).expect("compact MTP state");
         let target_recurrent_size = target.gdn[0].recurrent.byte_size();

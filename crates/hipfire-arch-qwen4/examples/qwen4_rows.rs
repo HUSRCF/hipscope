@@ -52,8 +52,10 @@ fn main() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let vocab = receipt.config.vocab_size;
-    let qsa_format = hipfire_arch_qwen4::resolve_qsa_format(
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
         &hipfire_runtime::config::get().kv_mode,
+        // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
         &gpu,
         &receipt.config,
     )?;
@@ -64,7 +66,7 @@ fn main() -> Result<(), String> {
         &mut gpu,
         n_ctx,
         receipt.ple,
-        qsa_format,
+        state_format,
     )
     .map_err(|e| e.to_string())?;
     bundle

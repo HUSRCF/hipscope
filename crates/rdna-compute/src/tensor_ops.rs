@@ -132,18 +132,83 @@ pub(crate) fn blocks(elements: usize) -> HipResult<u32> {
     )
 }
 
+/// Storage format of a GDN recurrent state (`kernels/src/tensor_ops.hip`,
+/// "Q8 GDN recurrent state"); the launchers read it from the state tensor's
+/// dtype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GdnStateFormat {
+    /// F32 `[value_head][key][value]`: the exact reference.
+    F32,
+    /// Qwen3.5's Q8 DeltaNet state as one Raw byte slot: per value head 128
+    /// rows (value channel) of 128 i8 key-channel codes, then one F32 scale
+    /// per row. 128x128 heads only.
+    Q8,
+}
+
+impl GdnStateFormat {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Q8 => "q8",
+        }
+    }
+
+    pub const fn supports(self, key_dim: usize, value_dim: usize) -> bool {
+        match self {
+            Self::F32 => key_dim > 0 && value_dim > 0,
+            Self::Q8 => key_dim == 128 && value_dim == 128,
+        }
+    }
+
+    pub const fn dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::Q8 => DType::Raw,
+        }
+    }
+
+    /// `dtype` units (F32 elements or bytes) of one state of `value_heads`
+    /// heads of `key_dim x value_dim`.
+    pub const fn state_units(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
+        match self {
+            Self::F32 => value_heads * key_dim * value_dim,
+            Self::Q8 => value_heads * value_dim * (key_dim + 4),
+        }
+    }
+
+    pub const fn state_bytes(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
+        match self {
+            Self::F32 => self.state_units(value_heads, key_dim, value_dim) * 4,
+            Self::Q8 => self.state_units(value_heads, key_dim, value_dim),
+        }
+    }
+
+    /// The format of a state tensor (F32, or a Raw Q8 slot).
+    pub fn of(state: &GpuTensor) -> HipResult<Self> {
+        match state.dtype {
+            DType::F32 => Ok(Self::F32),
+            DType::Raw => Ok(Self::Q8),
+            _ => Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+        }
+    }
+}
+
 pub struct GatedDeltaStep<'a> {
     pub q: &'a GpuTensor,
     pub k: &'a GpuTensor,
     pub v: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
+    /// F32, or a Q8 slot ([`GdnStateFormat`]).
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    /// The token's position: seeds a Q8 state's requantization (declared to
+    /// the recorder, so a replayed decode reseeds per position).
+    pub position: usize,
 }
 
 /// Head-pair arrival counters of the fused GDN step's optional rotation.
@@ -194,26 +259,26 @@ fn gated_delta_step_launch(
     gated: Option<&GatedDeltaGate<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> HipResult<()> {
-    for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.state, p.output] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
     if p.key_heads == 0
         || p.value_heads == 0
         || p.value_heads % p.key_heads != 0
-        || p.key_dim == 0
-        || p.value_dim == 0
+        || !format.supports(p.key_dim, p.value_dim)
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let key_elements = checked_product(p.key_heads, p.key_dim, "GDN key extent")?;
     let value_elements = checked_product(p.value_heads, p.value_dim, "GDN value extent")?;
-    let state_elements = checked_product(value_elements, p.key_dim, "GDN state extent")?;
+    checked_product(value_elements, p.key_dim, "GDN state extent")?;
     if p.q.numel() != key_elements
         || p.k.numel() != key_elements
         || p.v.numel() != value_elements
         || p.gate.numel() != p.value_heads
         || p.beta.numel() != p.value_heads
-        || p.state.numel() != state_elements
+        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || p.output.numel() != value_elements
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -224,11 +289,15 @@ fn gated_delta_step_launch(
     let value_dim = checked_i32(p.value_dim, "GDN value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN value-head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
-    let shared_norm128 =
-        gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
-    let kernel = match (gated, shared_norm128) {
-        (Some(_), true) => "gated_delta_step_gate_norm128_gfx1151",
-        (None, true) => "gated_delta_step_shared_norm128_gfx1151",
+    let q8 = format == GdnStateFormat::Q8;
+    // The Q8 kernels are the 128x128 bodies on the dequantized state.
+    let shared_norm128 = q8
+        || gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
+    let kernel = match (gated, shared_norm128, q8) {
+        (Some(_), _, true) => "gated_delta_step_gate_norm128_q8",
+        (None, _, true) => "gated_delta_step_norm128_q8",
+        (Some(_), true, false) => "gated_delta_step_gate_norm128_gfx1151",
+        (None, true, false) => "gated_delta_step_shared_norm128_gfx1151",
         _ => "gated_delta_step_f32",
     };
     let block_x = if shared_norm128 { 128 } else { 256 };
@@ -279,6 +348,14 @@ fn gated_delta_step_launch(
             args.push_ptr(ptr);
         }
     }
+    let mut frame_binding = None;
+    if q8 {
+        args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
+        frame_binding = Some([crate::replay::ReplayKernargBinding::PositionPlusU32 {
+            offset: args.len() - 4,
+            addend: 0,
+        }]);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -286,7 +363,13 @@ fn gated_delta_step_launch(
         [block_x, 1, 1],
         0,
         args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
+        match &frame_binding {
+            Some(bindings) => crate::dispatch::ReplayLaunchBindings {
+                grid: None,
+                kernargs: bindings,
+            },
+            None => crate::dispatch::ReplayLaunchBindings::NONE,
+        },
     )
 }
 /// Persistent row-batched GDN recurrence for the exact 128x128 geometry.
@@ -298,11 +381,12 @@ pub struct GatedDeltaStepBatched<'a> {
     pub projection: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
+    /// F32, or a Q8 slot ([`GdnStateFormat`]).
     pub state: &'a GpuTensor,
     pub output: &'a GpuTensor,
-    /// Optional `[rows, state]` F32: the recurrent state after the last row
-    /// lands in slot `rows - 1` instead of updating `state` (speculative
-    /// verify; `state` keeps the pre-call value).
+    /// Optional `[rows]` ring of states in `state`'s format: the recurrent
+    /// state after the last row lands in slot `rows - 1` instead of updating
+    /// `state` (speculative verify; `state` keeps the pre-call value).
     pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
@@ -310,10 +394,14 @@ pub struct GatedDeltaStepBatched<'a> {
     pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    /// The first row's position; a Q8 state's requantization is seeded by
+    /// the last row's.
+    pub position: usize,
 }
 
 pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.projection, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
     if p.rows == 0
@@ -335,15 +423,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let rows_qkv = checked_product(p.rows, expected_qkv, "GDN batched projection extent")?;
     let rows_value = checked_product(p.rows, value, "GDN batched output extent")?;
     let rows_heads = checked_product(p.rows, p.value_heads, "GDN batched parameter extent")?;
-    let state_elements = checked_product(value, p.key_dim, "GDN batched state extent")?;
+    let state_units = format.state_units(p.value_heads, p.key_dim, p.value_dim);
     if p.qkv_width != expected_qkv
         || p.projection.numel() != rows_qkv
         || p.gate.numel() != rows_heads
         || p.beta.numel() != rows_heads
-        || p.state.numel() != state_elements
+        || p.state.numel() != state_units
         || p.output.numel() != rows_value
         || p.row_states.is_some_and(|states| {
-            states.dtype != DType::F32 || states.numel() < p.rows * state_elements
+            states.dtype != p.state.dtype || states.numel() < p.rows * state_units
         })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -355,10 +443,11 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    let kernel = if p.row_states.is_some() {
-        "gated_delta_step_halves_state128_persistent256_capture_f32"
-    } else {
-        "gated_delta_step_halves_state128_persistent256_f32"
+    let kernel = match (p.row_states.is_some(), format) {
+        (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+        (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
+        (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -375,6 +464,9 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     args.push_i32(key_dim);
     args.push_i32(value_dim);
     args.push_f32((p.key_dim as f32).sqrt().recip());
+    if format == GdnStateFormat::Q8 {
+        args.push_u32(checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -387,13 +479,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
 }
 
 /// Few-row verify rollback of every GDN layer in one launch (kernel
-/// `gated_delta_rollback_layers_f32`): `table` is `layers` pairs of device
-/// pointers (captured recurrence input, state ring); each layer re-runs its
-/// first `keep` of `rows` captured rows from ring slot `from` and leaves the
-/// last kept row's state in slot `to + keep - 1`. 128-wide heads.
+/// `gated_delta_rollback_layers_{f32,q8}`): `table` is `layers` pairs of
+/// device pointers (captured recurrence input, ring of `format` states);
+/// each layer re-runs its first `keep` of `rows` captured rows from ring
+/// slot `from` and leaves the last kept row's state in slot
+/// `to + keep - 1`. 128-wide heads.
 pub struct GatedDeltaRollbackLayers<'a> {
     pub table: &'a GpuTensor,
     pub discard: &'a GpuTensor,
+    pub format: GdnStateFormat,
     pub layers: usize,
     pub rows: usize,
     pub keep: usize,
@@ -402,6 +496,8 @@ pub struct GatedDeltaRollbackLayers<'a> {
     pub qkv_width: usize,
     pub key_heads: usize,
     pub value_heads: usize,
+    /// Position of the last kept row: seeds a Q8 state's requantization.
+    pub position: usize,
 }
 
 pub fn gated_delta_rollback_layers(
@@ -419,7 +515,10 @@ pub fn gated_delta_rollback_layers(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let kernel = "gated_delta_rollback_layers_f32";
+    let kernel = match p.format {
+        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
+        GdnStateFormat::Q8 => "gated_delta_rollback_layers_q8",
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -436,6 +535,9 @@ pub fn gated_delta_rollback_layers(
         args.push_i32(checked_i32(value, label)?);
     }
     args.push_f32(128f32.sqrt().recip());
+    if p.format == GdnStateFormat::Q8 {
+        args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
+    }
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -480,7 +582,8 @@ pub fn gated_delta_step_gate_wmma(
     if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    for tensor in [p.gate, p.beta, p.state, gate.z] {
+    let format = GdnStateFormat::of(p.state)?;
+    for tensor in [p.gate, p.beta, gate.z] {
         ensure_f32(tensor)?;
     }
     // The gated output is BF16-rounded: stored as BF16 bits or F32.
@@ -494,7 +597,7 @@ pub fn gated_delta_step_gate_wmma(
         || p.projection.numel() < p.rows * p.qkv_width
         || p.gate.numel() < p.rows * p.value_heads
         || p.beta.numel() < p.rows * p.value_heads
-        || p.state.numel() != value * p.key_dim
+        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || gate.rows != p.rows
         || gate.value_heads != p.value_heads
         || gate.value_dim != p.value_dim
@@ -538,11 +641,26 @@ pub fn gated_delta_step_gate_wmma(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
+    // and is requantized from it after the chunk, seeded by the last row.
+    let state = match format {
+        GdnStateFormat::F32 => p.state.buf.as_ptr(),
+        GdnStateFormat::Q8 => {
+            let scratch = gpu.gdn_state_f32_scratch(
+                GdnStateFormat::F32.state_bytes(p.value_heads, p.key_dim, p.value_dim),
+            )?;
+            gdn_state_convert(gpu, "gdn_state_q8_to_f32", p.state.buf.as_ptr(), scratch, p.value_heads, None)?;
+            scratch
+        }
+    };
     let mut args = KernargBlob::new();
     args.push_ptr(p.projection.buf.as_ptr());
     args.push_ptr(qp);
     args.push_ptr(kp);
-    for tensor in [p.gate, p.beta, p.state, gate.z, gate.norm, gate.output] {
+    args.push_ptr(p.gate.buf.as_ptr());
+    args.push_ptr(p.beta.buf.as_ptr());
+    args.push_ptr(state);
+    for tensor in [gate.z, gate.norm, gate.output] {
         args.push_ptr(tensor.buf.as_ptr());
     }
     args.push_i32(rows);
@@ -556,6 +674,41 @@ pub fn gated_delta_step_gate_wmma(
         "gated_delta_chunk_gate_wmma",
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    if format == GdnStateFormat::Q8 {
+        let frame = checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?;
+        gdn_state_convert(gpu, "gdn_state_f32_to_q8", state, p.state.buf.as_ptr(), p.value_heads, Some(frame))?;
+    }
+    Ok(())
+}
+
+/// One of the Q8 GDN state conversions (`gdn_state_q8_to_f32`, or
+/// `gdn_state_f32_to_q8` with its requantization `frame`): grid
+/// `value_heads * 128` value rows, block 128.
+fn gdn_state_convert(
+    gpu: &mut Gpu,
+    kernel: &str,
+    source: *mut std::ffi::c_void,
+    destination: *mut std::ffi::c_void,
+    value_heads: usize,
+    frame: Option<u32>,
+) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(source);
+    args.push_ptr(destination);
+    args.push_i32(checked_i32(value_heads, "GDN state heads")?);
+    if let Some(frame) = frame {
+        args.push_u32(frame);
+    }
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [checked_u32(value_heads * 128, "GDN state row grid")?, 1, 1],
+        [128, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -4399,6 +4552,7 @@ mod tests {
                 value_heads,
                 key_dim: dim,
                 value_dim: dim,
+                position: 0,
             },
         )
         .expect("batched GDN");
@@ -4420,6 +4574,7 @@ mod tests {
                     value_heads,
                     key_dim: dim,
                     value_dim: dim,
+                    position: row,
                 },
             )
             .expect("per-row GDN");
@@ -4536,6 +4691,7 @@ mod tests {
                 value_heads,
                 key_dim: dim,
                 value_dim: dim,
+                position: 0,
             };
             let gated = GatedDeltaGateBatched {
                 recurrent_output: &recurrent,
@@ -4583,6 +4739,372 @@ mod tests {
         assert!(out_rel < 1e-2, "GDN chunk gate output rel L2 {out_rel:.3e}");
         assert!(state_rel < 2e-3, "GDN chunk state rel L2 {state_rel:.3e}");
         for tensor in [proj_gpu, proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// Q8 GDN state (Qwen3.5's DeltaNet Q8 format): every route tracks its
+    /// F32 twin (decode steps, the persistent batch, the chunked prefill),
+    /// the verify capture writes exactly the plain batch's final state into
+    /// its ring slot, and a rollback re-run of the kept rows writes exactly
+    /// the state a plain batch over those rows does. A transposed row, a
+    /// wrong scale or a slot offset lands near 1.
+    #[test]
+    fn gdn_q8_state_tracks_f32_on_every_route() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        // `rows` decode steps; the batch routes run every ragged row count
+        // around the persistent kernel's 16-row unroll and 256-row blocks.
+        let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 24usize);
+        let batch_rows = [2usize, 15, 16, 17, 255, 256, 257];
+        let max_rows = 257usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let slot_bytes = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(1, max_rows * qkv, 1.5);
+        let gate: Vec<f32> =
+            wave(2, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> =
+            wave(3, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(4, value * dim, 0.2);
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), slot0.buf.as_ptr(), value_heads, Some(7))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        let fresh_slot = |gpu: &mut Gpu| -> GpuTensor {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+            slot
+        };
+        let dequant = |gpu: &mut Gpu, slot: &GpuTensor| -> Vec<f32> {
+            let f = gpu.zeros(&[value * dim], DType::F32).expect("f32");
+            gdn_state_convert(gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), f.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let values = gpu.download_f32(&f).expect("download");
+            gpu.free_tensor(f).expect("free");
+            values
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                err += (*x as f64 - *y as f64).powi(2);
+                norm += (*x as f64).powi(2);
+            }
+            assert!(norm > 0.0, "reference is all zero");
+            (err / norm).sqrt()
+        };
+        let q0 = dequant(&mut gpu, &slot0);
+        let round_trip = rel(&state0, &q0);
+        assert!(round_trip < 1e-2, "Q8 state round trip rel L2 {round_trip:.3e}");
+
+        // Decode: one step per row, F32 and Q8 states from the same start.
+        let decode = |gpu: &mut Gpu, state: &GpuTensor| -> Vec<f32> {
+            let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+            for row in 0..rows {
+                gated_delta_step(
+                    gpu,
+                    &GatedDeltaStep {
+                        q: &proj_gpu.sub_offset(row * qkv, qk),
+                        k: &proj_gpu.sub_offset(row * qkv + qk, qk),
+                        v: &proj_gpu.sub_offset(row * qkv + 2 * qk, value),
+                        gate: &gate_gpu.sub_offset(row * value_heads, value_heads),
+                        beta: &beta_gpu.sub_offset(row * value_heads, value_heads),
+                        state,
+                        output: &out.sub_offset(row * value, value),
+                        key_heads,
+                        value_heads,
+                        key_dim: dim,
+                        value_dim: dim,
+                        position: row,
+                    },
+                )
+                .expect("GDN step");
+            }
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        let f32_state = gpu.upload_f32(&q0, &[q0.len()]).expect("state");
+        let f32_out = decode(&mut gpu, &f32_state);
+        let f32_final = gpu.download_f32(&f32_state).expect("download");
+        let q8_state = fresh_slot(&mut gpu);
+        let q8_out = decode(&mut gpu, &q8_state);
+        let q8_final = dequant(&mut gpu, &q8_state);
+        let (out_rel, state_rel) = (rel(&f32_out, &q8_out), rel(&f32_final, &q8_final));
+        eprintln!("Q8 decode: output rel {out_rel:.3e}, state rel {state_rel:.3e}");
+        assert!(out_rel < 3e-2 && state_rel < 3e-2, "Q8 decode drifted: {out_rel:.3e} {state_rel:.3e}");
+
+        // Persistent batch, plain and captured, and the F32 twin.
+        let batch = |gpu: &mut Gpu, state: &GpuTensor, ring: Option<&GpuTensor>, n: usize| -> Vec<f32> {
+            let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+            gated_delta_step_batched(
+                gpu,
+                &GatedDeltaStepBatched {
+                    projection: &proj_gpu.sub_offset(0, n * qkv),
+                    gate: &gate_gpu.sub_offset(0, n * value_heads),
+                    beta: &beta_gpu.sub_offset(0, n * value_heads),
+                    state,
+                    output: &out,
+                    row_states: ring,
+                    rows: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    key_dim: dim,
+                    value_dim: dim,
+                    position: 0,
+                },
+            )
+            .expect("batched GDN");
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        // Digest of every Q8 state this test writes: equal across processes
+        // (the multi-process stress compares it).
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let mut fold = |data: &[u8]| {
+            for byte in data {
+                digest = (digest ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        fold(&bytes(&gpu, &q8_state));
+        for n in batch_rows {
+            let keep = (n / 2).max(1);
+            let f32_batch_state = gpu.upload_f32(&q0, &[q0.len()]).expect("state");
+            let f32_batch_out = batch(&mut gpu, &f32_batch_state, None, n);
+            let f32_batch_final = gpu.download_f32(&f32_batch_state).expect("download");
+            let q8_batch_state = fresh_slot(&mut gpu);
+            let q8_batch_out = batch(&mut gpu, &q8_batch_state, None, n);
+            let q8_batch_final = dequant(&mut gpu, &q8_batch_state);
+            let (out_rel, state_rel) =
+                (rel(&f32_batch_out, &q8_batch_out), rel(&f32_batch_final, &q8_batch_final));
+            eprintln!("Q8 batch {n} rows: output rel {out_rel:.3e}, state rel {state_rel:.3e}");
+            assert!(
+                out_rel < 1e-2 && state_rel < 1e-2,
+                "Q8 batch {n} rows drifted: {out_rel:.3e} {state_rel:.3e}"
+            );
+            fold(&bytes(&gpu, &q8_batch_state));
+
+            let captured_state = fresh_slot(&mut gpu);
+            let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
+            let captured_out = batch(&mut gpu, &captured_state, Some(&ring), n);
+            assert_eq!(captured_out, q8_batch_out, "{n} rows: captured verify output differs");
+            assert_eq!(
+                bytes(&gpu, &captured_state),
+                bytes(&gpu, &slot0),
+                "{n} rows: capture wrote the live state"
+            );
+            assert_eq!(
+                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes)),
+                bytes(&gpu, &q8_batch_state),
+                "{n} rows: captured slot is not the plain batch's final state"
+            );
+
+            // Rollback: `keep` rows re-run from ring slot 0 into slot `n`. Its
+            // input is the rows' projection, then gate, then beta.
+            let recurrence: Vec<f32> = projection[..n * qkv]
+                .iter()
+                .chain(&gate[..n * value_heads])
+                .chain(&beta[..n * value_heads])
+                .copied()
+                .collect();
+            let recurrence_gpu =
+                gpu.upload_f32(&recurrence, &[recurrence.len()]).expect("recurrence");
+            gpu.copy_d2d(&slot0, &ring, slot_bytes).expect("seed ring");
+            let pointers: Vec<u8> = [recurrence_gpu.buf.as_ptr(), ring.buf.as_ptr()]
+                .iter()
+                .flat_map(|p| (*p as u64).to_ne_bytes())
+                .collect();
+            let table = gpu.upload_raw(&pointers, &[pointers.len()]).expect("table");
+            let discard = gpu.zeros(&[n * value], DType::F32).expect("discard");
+            gated_delta_rollback_layers(
+                &mut gpu,
+                &GatedDeltaRollbackLayers {
+                    table: &table,
+                    discard: &discard,
+                    format,
+                    layers: 1,
+                    rows: n,
+                    keep,
+                    from: 0,
+                    to: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    position: keep - 1,
+                },
+            )
+            .expect("rollback");
+            let kept_state = fresh_slot(&mut gpu);
+            batch(&mut gpu, &kept_state, None, keep);
+            assert_eq!(
+                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes)),
+                bytes(&gpu, &kept_state),
+                "{n} rows: rollback slot is not the kept rows' state"
+            );
+            fold(&bytes(&gpu, &kept_state));
+            for tensor in [
+                f32_batch_state, q8_batch_state, captured_state, ring, recurrence_gpu, table,
+                discard, kept_state,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        eprintln!("GDN_Q8_DIGEST {digest:016x}");
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0, f32_state, q8_state] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The chunked F16 WMMA prefill route on a Q8 state (dequantize, chunk,
+    /// requantize) tracks the same route on the F32 state.
+    #[test]
+    fn gdn_q8_state_chunk_route_tracks_f32() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_wmma_w32() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx11 WMMA");
+            return;
+        }
+        let (key_heads, value_heads, dim, rows) = (2usize, 6usize, 128usize, 530usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(1, rows * qkv, 1.5);
+        let gate: Vec<f32> = wave(2, rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> = wave(3, rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(4, value * dim, 0.2);
+        let z = wave(5, rows * value, 2.0);
+        let norm_bytes: Vec<u8> = wave(6, dim, 1.0)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let proj_bytes: Vec<u8> = projection
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        let mut proj_bf16 = gpu.upload_raw(&proj_bytes, &[proj_bytes.len()]).expect("projection");
+        proj_bf16.dtype = DType::BF16;
+        proj_bf16.shape = vec![projection.len()];
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let z_gpu = gpu.upload_f32(&z, &[z.len()]).expect("z");
+        let mut norm_gpu = gpu.upload_raw(&norm_bytes, &[norm_bytes.len()]).expect("norm");
+        norm_gpu.dtype = DType::BF16;
+        norm_gpu.shape = vec![dim];
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), seed_slot.buf.as_ptr(), value_heads, Some(3))
+            .expect("quantize");
+        let run = |gpu: &mut Gpu, state: &GpuTensor, n: usize| -> Vec<f32> {
+            let recurrent = gpu.zeros(&[n * value], DType::F32).expect("recurrent");
+            let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+            let step = GatedDeltaStepBatched {
+                projection: &proj_bf16.sub_offset(0, n * qkv),
+                gate: &gate_gpu.sub_offset(0, n * value_heads),
+                beta: &beta_gpu.sub_offset(0, n * value_heads),
+                state,
+                output: &recurrent,
+                row_states: None,
+                rows: n,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+                position: 0,
+            };
+            let gated = GatedDeltaGateBatched {
+                recurrent_output: &recurrent,
+                z: &z_gpu.sub_offset(0, n * value),
+                norm: &norm_gpu,
+                output: &out,
+                rows: n,
+                value_heads,
+                value_dim: dim,
+            };
+            gated_delta_step_gate_wmma(gpu, &step, &gated).expect("chunked GDN");
+            let values = gpu.download_f32(&out).expect("download");
+            gpu.free_tensor(recurrent).expect("free");
+            gpu.free_tensor(out).expect("free");
+            values
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let (mut err, mut norm) = (0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                err += (*x as f64 - *y as f64).powi(2);
+                norm += (*x as f64).powi(2);
+            }
+            assert!(norm > 0.0, "reference is all zero");
+            (err / norm).sqrt()
+        };
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        // The route's minimum and the 16-row chunk boundary +-1.
+        for n in [512usize, 513, 527, 528, 529, 530] {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&seed_slot, &slot, slot_bytes).expect("copy slot");
+            let f32_state = gpu.zeros(&[value * dim], DType::F32).expect("state");
+            gdn_state_convert(&mut gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), f32_state.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let f32_out = run(&mut gpu, &f32_state, n);
+            let q8_out = run(&mut gpu, &slot, n);
+            let f32_final = gpu.download_f32(&f32_state).expect("download");
+            let q8_final = gpu.zeros(&[value * dim], DType::F32).expect("state");
+            gdn_state_convert(&mut gpu, "gdn_state_q8_to_f32", slot.buf.as_ptr(), q8_final.buf.as_ptr(), value_heads, None)
+                .expect("dequantize");
+            let q8_final_values = gpu.download_f32(&q8_final).expect("download");
+            // The same inputs and dequantized start: the chunk output is
+            // equal; the final state differs by one requantization.
+            assert_eq!(f32_out, q8_out, "{n} rows: Q8 chunk output differs from its F32 twin");
+            let state_rel = rel(&f32_final, &q8_final_values);
+            eprintln!("Q8 chunk {n} rows: state rel {state_rel:.3e}");
+            assert!(state_rel < 1e-2, "{n} rows: Q8 chunk state rel L2 {state_rel:.3e}");
+            let mut slot_bytes_host = vec![0u8; slot_bytes];
+            gpu.hip.memcpy_dtoh(&mut slot_bytes_host, &slot.buf).expect("download");
+            for byte in slot_bytes_host {
+                digest = (digest ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            for tensor in [slot, f32_state, q8_final] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        eprintln!("GDN_Q8_CHUNK_DIGEST {digest:016x}");
+        for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -4787,6 +5309,7 @@ mod tests {
             value_heads: 3,
             key_dim: 2,
             value_dim: 4,
+            position: 0,
         };
 
         let error = gated_delta_step(&mut gpu, &params).expect_err("invalid shape must fail");

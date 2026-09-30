@@ -28,6 +28,50 @@ static __device__ __forceinline__ __hip_bfloat16 bf16_add(
     return bf16_round(bf16_to_f32(lhs) + bf16_to_f32(rhs));
 }
 
+// Q8 GDN recurrent state: Qwen3.5's DeltaNet Q8 state format
+// (gated_delta_net_q8_fast.hip). Per value head, 128 rows of 128 signed
+// bytes (row = value channel, byte = key channel), then, after every head's
+// codes, one F32 scale per row (`value_heads * 128`). A row dequantizes as
+// scale * code. A launch requantizes each row once, after its last token, by
+// the row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
+// + u), u uniform in [0, 1) from an LCG seeded by head, row, key channel and
+// frame), so repeated decay does not bias the stored state.
+static __device__ __forceinline__ signed char* gdn_q8_row(void* slot, int head, int row) {
+    return reinterpret_cast<signed char*>(slot) + ((size_t)head * 128 + row) * 128;
+}
+
+static __device__ __forceinline__ float* gdn_q8_scales(void* slot, int value_heads) {
+    return reinterpret_cast<float*>(
+        reinterpret_cast<signed char*>(slot) + (size_t)value_heads * 128 * 128);
+}
+
+static __device__ __forceinline__ size_t gdn_q8_slot_bytes(int value_heads) {
+    return (size_t)value_heads * 128 * (128 + sizeof(float));
+}
+
+static __device__ __forceinline__ signed char gdn_q8_round(
+    float value, float inv, int head, int row, int column, unsigned int frame) {
+    unsigned int rng = (unsigned int)head * 1664525u + (unsigned int)row * 1013904223u
+        + (unsigned int)column * 214013u + frame * 2531011u;
+    rng = rng * 1664525u + 1013904223u;
+    const float noise = (float)(rng >> 8) * (1.0f / 16777216.0f);
+    return (signed char)fminf(fmaxf(floorf(value * inv + noise), -128.0f), 127.0f);
+}
+
+static __device__ __forceinline__ float gdn_q8_inv(float peak) {
+    return peak > 0.0f ? 127.0f / peak : 0.0f;
+}
+
+static __device__ __forceinline__ float gdn_q8_scale(float peak) {
+    return peak > 0.0f ? peak / 127.0f : 1.0f;
+}
+
+// Code `b` (0..15, a constant after unrolling) of a 16-byte code word.
+static __device__ __forceinline__ float gdn_q8_code(int4 word, int b) {
+    const int lane = b < 4 ? word.x : b < 8 ? word.y : b < 12 ? word.z : word.w;
+    return (float)(signed char)(lane >> ((b & 3) * 8));
+}
+
 
 
 // q/k/v are source BF16 activations promoted to the explicit F32 recurrent
@@ -112,19 +156,23 @@ extern "C" __global__ void gated_delta_step_f32(
 // One decode step of the 128x128 recurrence for block `value_head`; returns
 // false for threads outside the exact shape, else writes the thread's
 // channel output to `*out`. Shared by the step kernel and the fused
-// step + gated-norm kernel below.
+// step + gated-norm kernel below. `kQ8`: `state` is a Q8 GDN state slot
+// (see gdn_q8_row) and `frame` seeds its requantization; else F32
+// [head][key][value] and `frame` is unused.
+template <bool kQ8>
 static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float* q,
     const float* k,
     const float* v,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     int key_heads,
     int value_heads,
     int key_dim,
     int value_dim,
     float query_scale,
+    unsigned int frame,
     float* out_value) {
     const int value_head = (int)blockIdx.x;
     const int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
@@ -200,8 +248,64 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const int key_head = value_head / repeat;
     const float decay = expf(gate[value_head]);
     const float beta_value = beta[value_head];
+    const __hip_bfloat16 v_value = bf16_round(
+        v[value_head * 128 + value_index]);
+    if constexpr (kQ8) {
+        // The thread's value row: 128 key-channel codes, read 16 at a time
+        // (a 16-byte word per step, from cache after the first pass) and
+        // dequantized on use. The update is the F32 route's expression on
+        // the dequantized state; the row is requantized from the updated
+        // values (recomputed, not stored) after the output.
+        int4* row = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, value_index));
+        float* scale_slot = gdn_q8_scales(state, value_heads) + value_head * 128 + value_index;
+        const float scale = *scale_slot;
+        float kv_mem = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = (scale * gdn_q8_code(codes, b)) * decay;
+                kv_mem += decayed * kv;
+            }
+        }
+        const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
+        float out = 0.0f;
+        float peak = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = fmaf(kv, delta, (scale * gdn_q8_code(codes, b)) * decay);
+                peak = fmaxf(peak, fabsf(decayed));
+                float qv = bf16_to_f32(q_norm[kd]);
+                qv *= query_scale;
+                out += decayed * qv;
+            }
+        }
+        const float inv = gdn_q8_inv(peak);
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+            int packed[4] = {0, 0, 0, 0};
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float decayed = fmaf(kv, delta, (scale * gdn_q8_code(codes, b)) * decay);
+                const int code = gdn_q8_round(decayed, inv, value_head, value_index, kd, frame);
+                packed[b >> 2] |= (code & 0xff) << ((b & 3) * 8);
+            }
+            row[word] = make_int4(packed[0], packed[1], packed[2], packed[3]);
+        }
+        *scale_slot = gdn_q8_scale(peak);
+        *out_value = out;
+        return true;
+    }
     const int state_base = value_head * 128 * 128;
-    float* column = state + state_base + value_index;
+    float* column = reinterpret_cast<float*>(state) + state_base + value_index;
     // Two passes over the state column (read; read + write) instead of four
     // reads and two writes: the decayed value is recomputed, not stored, and
     // the update and output share a pass. Same per-element operations.
@@ -211,8 +315,6 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
         const float decayed = column[kd * 128] * decay;
         kv_mem += decayed * kv;
     }
-    const __hip_bfloat16 v_value = bf16_round(
-        v[value_head * 128 + value_index]);
     const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
     float out = 0.0f;
     for (int kd = 0; kd < 128; ++kd) {
@@ -230,23 +332,27 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
 }
 
 extern "C" __global__ void gated_delta_step_shared_norm128_gfx1151(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* gate,
-    const float* beta,
-    float* state,
-    float* output,
-    int key_heads,
-    int value_heads,
-    int key_dim,
-    int value_dim,
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    float* state, float* output, int key_heads, int value_heads, int key_dim, int value_dim,
     float query_scale) {
     float out;
-    if (gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
-                                      key_dim, value_dim, query_scale, &out))
+    if (gated_delta_step_norm128_body<false>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                             key_dim, value_dim, query_scale, 0u, &out))
         output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
 }
+
+// gated_delta_step_shared_norm128_gfx1151 on a Q8 GDN state slot.
+extern "C" __global__ void gated_delta_step_norm128_q8(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, float* output, int key_heads, int value_heads, int key_dim,
+    int value_dim, float query_scale, unsigned int frame) {
+    float out;
+    if (gated_delta_step_norm128_body<true>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                            key_dim, value_dim, query_scale, frame, &out))
+        output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
+}
+
+
 // Workgroup barrier ordering LDS only: every handoff in the persistent GDN
 // step is through LDS, and a full __syncthreads would also wait at each
 // barrier for the row's global stores (outputs, captured states) to land.
@@ -274,21 +380,25 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // pre-verify state stays intact, and a rollback re-runs the kept rows from
 // it); a separate instantiation so the plain route's register allocation is
 // unchanged.
-template <bool kCapture>
+// `kQ8`: `state` and the `row_states` slots are Q8 GDN state slots (see
+// gdn_q8_row) and `frame` seeds the final requantization; the recurrence
+// runs on the dequantized F32 values.
+template <bool kCapture, bool kQ8 = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     float* output,
-    float* row_states,
+    void* row_states,
     int rows,
     int qkv_width,
     int key_heads,
     int value_heads,
     int key_dim,
     int value_dim,
-    float query_scale) {
+    float query_scale,
+    unsigned int frame = 0u) {
     const int value_head = (int)blockIdx.x;
     const int thread = (int)threadIdx.x;
     const int value_index = thread & 127;
@@ -317,10 +427,23 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_out[128];
 
     float state_half[64];
-    #pragma unroll
-    for (int kd = 0; kd < 64; ++kd) {
-        state_half[kd] =
-            state[state_base + (kd_base + kd) * 128 + value_index];
+    if constexpr (kQ8) {
+        const int4* codes4 =
+            reinterpret_cast<const int4*>(gdn_q8_row(state, value_head, value_index) + kd_base);
+        const float scale =
+            gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
+        int4 packed[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) packed[i] = codes4[i];
+        const signed char* codes = reinterpret_cast<const signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) state_half[kd] = scale * (float)codes[kd];
+    } else {
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            state_half[kd] = reinterpret_cast<const float*>(
+                state)[state_base + (kd_base + kd) * 128 + value_index];
+        }
     }
 
     // Half 0 carries q/k channel value_index, half 1 carries v.
@@ -471,8 +594,40 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
         }
     }
 
-    float* const final_state =
-        kCapture ? row_states + (size_t)(rows - 1) * value_heads * 128 * 128 : state;
+    if constexpr (kQ8) {
+        // The row's absmax spans both halves: exchange the half peaks.
+        __shared__ float peak_half[2][128];
+        float peak = 0.0f;
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
+        peak_half[half][value_index] = peak;
+        gdn_lds_barrier();
+        peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+        const float inv = gdn_q8_inv(peak);
+        void* const final_slot = kCapture
+            ? reinterpret_cast<signed char*>(row_states)
+                  + (size_t)(rows - 1) * gdn_q8_slot_bytes(value_heads)
+            : state;
+        int4 packed[4];
+        signed char* codes = reinterpret_cast<signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 64; ++kd) {
+            codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
+                                     kd_base + kd, frame);
+        }
+        int4* dst =
+            reinterpret_cast<int4*>(gdn_q8_row(final_slot, value_head, value_index) + kd_base);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[i] = packed[i];
+        if (half == 0) {
+            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] =
+                gdn_q8_scale(peak);
+        }
+        return;
+    }
+    float* const final_state = kCapture
+        ? reinterpret_cast<float*>(row_states) + (size_t)(rows - 1) * value_heads * 128 * 128
+        : reinterpret_cast<float*>(state);
     #pragma unroll
     for (int kd = 0; kd < 64; ++kd) {
         final_state[state_base + (kd_base + kd) * 128 + value_index] =
@@ -498,6 +653,28 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
         rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
 }
 
+// The two persistent kernels above on Q8 GDN state slots (`row_states`: a
+// ring of slots); `frame` seeds the final requantization.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<false, true>(projection, gate, beta, state, output,
+        nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
+        frame);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_capture_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, signed char* row_states, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<true, true>(projection, gate, beta, state, output,
+        row_states, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
+        frame);
+}
+
 // Few-row verify rollback: re-run the `keep` kept rows of every GDN layer in
 // one launch (blockIdx.y = layer; the layers' recurrences are independent).
 // `table[2 * layer]` is the layer's captured recurrence input (the verify's
@@ -517,6 +694,60 @@ extern "C" __global__ void gated_delta_rollback_layers_f32(
     gated_delta_step_persistent256_body<true>(recurrence, recurrence + gate,
         recurrence + gate + (size_t)rows * value_heads, ring + from * state, discard,
         ring + to * state, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale);
+}
+
+// gated_delta_rollback_layers_f32 over rings of Q8 GDN state slots.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_rollback_layers_q8(
+    const unsigned long long* table, float* discard, int rows, int keep, int from, int to,
+    int qkv_width, int key_heads, int value_heads, float query_scale, unsigned int frame) {
+    const float* recurrence = reinterpret_cast<const float*>(table[2 * blockIdx.y]);
+    signed char* ring = reinterpret_cast<signed char*>(table[2 * blockIdx.y + 1]);
+    const size_t slot = gdn_q8_slot_bytes(value_heads);
+    const size_t gate = (size_t)rows * qkv_width;
+    gated_delta_step_persistent256_body<true, true>(recurrence, recurrence + gate,
+        recurrence + gate + (size_t)rows * value_heads, ring + from * slot, discard,
+        ring + to * slot, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale,
+        frame);
+}
+
+// A Q8 GDN state slot as F32 [head][key][value] (the F32 recurrence's
+// order), for kernels that run on F32 state. Grid value_heads * 128 (one
+// block per value row), block 128 (key channel).
+extern "C" __global__ __launch_bounds__(128) void gdn_state_q8_to_f32(
+    signed char* slot, float* state, int value_heads) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    const float scale = gdn_q8_scales(slot, value_heads)[flat];
+    state[((size_t)head * 128 + column) * 128 + row] =
+        scale * (float)gdn_q8_row(slot, head, row)[column];
+}
+
+// F32 [head][key][value] state requantized into a Q8 GDN state slot, each
+// value row by its absmax (the kernels' own requantization). Grid
+// value_heads * 128, block 128.
+extern "C" __global__ __launch_bounds__(128) void gdn_state_f32_to_q8(
+    const float* state, signed char* slot, int value_heads, unsigned int frame) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    __shared__ float peaks[128];
+    const float value = state[((size_t)head * 128 + column) * 128 + row];
+    peaks[column] = fabsf(value);
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (column < stride) peaks[column] = fmaxf(peaks[column], peaks[column + stride]);
+        __syncthreads();
+    }
+    const float peak = peaks[0];
+    gdn_q8_row(slot, head, row)[column] =
+        gdn_q8_round(value, gdn_q8_inv(peak), head, row, column, frame);
+    if (column == 0) gdn_q8_scales(slot, value_heads)[flat] = gdn_q8_scale(peak);
 }
 
 
@@ -1501,13 +1732,14 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
 // The decode step and its gated RMSNorm in one launch: the head's recurrent
 // output stays in LDS for the norm (same values the separate launches pass
 // through memory, so bitwise equal). The recurrent output is not stored.
-extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
+template <bool kQ8>
+static __device__ __forceinline__ void gated_delta_step_gate_norm128_body(
     const float* q,
     const float* k,
     const float* v,
     const float* gate,
     const float* beta,
-    float* state,
+    void* state,
     const float* z,
     const __hip_bfloat16* norm,
     float* output,
@@ -1519,12 +1751,13 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
     float* rotated,
     const float* signs1,
     const float* signs2,
-    unsigned int* pair_counters) {
+    unsigned int* pair_counters,
+    unsigned int frame) {
     __shared__ float head_values[128];
     __shared__ int rotate_pair;
     float out;
-    if (!gated_delta_step_norm128_body(q, k, v, gate, beta, state, key_heads, value_heads,
-                                       key_dim, value_dim, query_scale, &out))
+    if (!gated_delta_step_norm128_body<kQ8>(q, k, v, gate, beta, state, key_heads, value_heads,
+                                            key_dim, value_dim, query_scale, frame, &out))
         return;
     const int channel = (int)threadIdx.x;
     head_values[channel] = out;
@@ -1554,6 +1787,28 @@ extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
 #pragma unroll
     for (int e = 0; e < 8; ++e) rotated[base + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
     if (threadIdx.x == 0) pair_counters[pair] = 0u;
+}
+
+extern "C" __global__ void gated_delta_step_gate_norm128_gfx1151(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    float* state, const float* z, const __hip_bfloat16* norm, float* output, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale, float* rotated,
+    const float* signs1, const float* signs2, unsigned int* pair_counters) {
+    gated_delta_step_gate_norm128_body<false>(q, k, v, gate, beta, state, z, norm, output,
+        key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
+        pair_counters, 0u);
+}
+
+// gated_delta_step_gate_norm128_gfx1151 on a Q8 GDN state slot.
+extern "C" __global__ void gated_delta_step_gate_norm128_q8(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, const float* z, const __hip_bfloat16* norm, float* output,
+    int key_heads, int value_heads, int key_dim, int value_dim, float query_scale,
+    float* rotated, const float* signs1, const float* signs2, unsigned int* pair_counters,
+    unsigned int frame) {
+    gated_delta_step_gate_norm128_body<true>(q, k, v, gate, beta, state, z, norm, output,
+        key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
+        pair_counters, frame);
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one
