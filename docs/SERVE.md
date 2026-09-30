@@ -7,7 +7,7 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 
 | Field | Default (source) |
 |---|---|
-| Bind host | `serve.host = "0.0.0.0"` |
+| Bind host | `serve.host = "127.0.0.1"` (loopback only) |
 | Port | `serve.port = 11435` |
 | Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
@@ -23,7 +23,8 @@ implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATI
 
 The native handler implements **no authentication and no TLS**.
 Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `0.0.0.0` (all interfaces).
+chat completions. Default bind is `127.0.0.1` (loopback only); set
+`serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
 
 - Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
 - Expose beyond localhost only behind a trusted network or an authenticated
@@ -32,7 +33,7 @@ chat completions. Default bind is `0.0.0.0` (all interfaces).
 ## Start and stop
 
 ```bash
-hipfire serve                         # foreground; Ctrl-C stops (default bind 0.0.0.0)
+hipfire serve                         # foreground; Ctrl-C stops (default bind 127.0.0.1)
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
