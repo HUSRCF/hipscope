@@ -2529,6 +2529,26 @@ pub fn forward_batch_slots_graphed(
             logits_out,
         );
     }
+    // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
+    // model routes it to the CPU (a host sync point) and the graph must not be
+    // used — same rule as the dense AR graph in `qwen35/forward.rs`.
+    if hipfire_dispatch::cpu_offload_active(config.i_gpu_start) {
+        hipfire_dispatch::log_capture_disabled_once();
+        return forward_batch_slots(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            dn_states,
+            k_arenas,
+            v_arenas,
+            desc_staging,
+            pbs,
+            s,
+            logits_out,
+        );
+    }
 
     let physical_cap = pool.descriptors()[0].cap as usize;
     let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
