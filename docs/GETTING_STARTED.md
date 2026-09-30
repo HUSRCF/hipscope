@@ -130,7 +130,11 @@ restore kernels on a machine without hipcc.
 
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev container and
-attaches the assets to the release. To publish from a local toolchain instead:
+attaches the assets to the release. Repository variables choose the image
+(`HIPFIRE_ROCM_IMAGE`, default the Containerfile's `rocm/dev-ubuntu-24.04`) and,
+optionally, a wider admitted range (`HIPFIRE_PACK_ROCM_MIN` and
+`HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To publish from a local toolchain
+instead:
 
 ```bash
 scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
@@ -140,7 +144,8 @@ gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
 no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
-and writes byte-reproducible tarballs.
+and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
+declares a range other than the default; it must contain the build's ROCm.
 
 ### Windows — select a branch, tag, or commit
 

@@ -12,11 +12,12 @@ name: release-kernel-packs
 # arch, check the SHA-256, manifest and every index against the checked-out
 # sources, and fall back to local hipcc compilation when anything differs.
 #
-# The image's ROCm fixes the manifest's toolchain and admitted ROCm range
-# (its major.minor up to the next major). Set the repository variable
-# HIPFIRE_ROCM_IMAGE to build with another ROCm. To publish from a local
-# toolchain instead, run scripts/build-kernel-pack.sh and upload with gh
-# (docs/GETTING_STARTED.md, "Prebuilt kernel packs").
+# The image's ROCm fixes the manifest's toolchain and, by default, the admitted
+# ROCm range (its major.minor up to the next major). Repository variables:
+# HIPFIRE_ROCM_IMAGE builds with another ROCm; HIPFIRE_PACK_ROCM_MIN and
+# HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE (set both) declare a different range. To
+# publish from a local toolchain instead, run scripts/build-kernel-pack.sh and
+# upload with gh (docs/GETTING_STARTED.md, "Prebuilt kernel packs").
 
 on:
   push:
@@ -60,7 +61,15 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build kernel packs (every admitted arch)
-        run: scripts/build-kernel-pack.sh --tag "$TAG" --commit HEAD --out dist
+        env:
+          ROCM_MIN: ${{ vars.HIPFIRE_PACK_ROCM_MIN }}
+          ROCM_MAX: ${{ vars.HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE }}
+        run: |
+          range=()
+          if [ -n "$ROCM_MIN" ] || [ -n "$ROCM_MAX" ]; then
+            range=(--rocm-min "$ROCM_MIN" --rocm-max-exclusive "$ROCM_MAX")
+          fi
+          scripts/build-kernel-pack.sh --tag "$TAG" --commit HEAD --out dist "${range[@]}"
 
       - name: Attach packs to the release
         uses: softprops/action-gh-release@v2
