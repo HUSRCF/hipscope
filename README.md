@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.3.1" src="https://img.shields.io/badge/stable-v0.3.1-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.3.1-f04b24?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.0" src="https://img.shields.io/badge/stable-v0.4.0-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.0-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="82 curated model entries" src="https://img.shields.io/badge/registry-82%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -46,13 +46,14 @@ hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
 only by default; set `serve.host` to listen on other interfaces).
 
-Current stable release: **v0.3.1**, headlined by DFlash prompt-cache
-repair, registry draft sidecars, Ornith 1.5, sealed MoE execution
-contracts, gfx1201 long-context DFlash, tool turns on daemon slots, and
-first-release image generation (FLUX). See [CHANGELOG.md](CHANGELOG.md).
-
-The upcoming [v0.4.0 KV migration](CHANGELOG.md) is documented under Unreleased;
-v0.3.1 remains the latest tagged stable release.
+Current stable release: **[v0.4.0](https://github.com/warpfront/hipfire/releases/tag/v0.4.0)**.
+Headline items: **Qwen3.8 Flash-Next** MoE at full **262K** context on one R9700
+(gfx1201, tp=1, host-mapped experts) and on Strix Halo; **native fp8 KV** as the
+`auto` default on exact gfx1201; **prebuilt kernel packs** in the installer so a
+release-tag install can run without a device compiler; and serve/API hardening
+(loopback bind by default, daemon respawn, SIGTERM drain, typed errors). See
+[CHANGELOG.md](CHANGELOG.md) and the
+[v0.4.0 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.0).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -139,6 +140,7 @@ The registry currently contains 80 curated model entries. Run
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
 | Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (symmetric XT), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
+| Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (canonical); 262K context on one R9700 (gfx1201, tp=1, routed experts host-mapped) and on Strix Halo (gfx1151) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | Ornith 1.5 | `ornith-1.5:35b-a3b` (MQ4 default), `ornith-1.5:35b-a3b-mq4r` / `ornith-1.5:fast` (MQ4R) |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
@@ -252,10 +254,14 @@ curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/in
 ```
 
 RDNA4 requires ROCm 6.4 or newer. gfx1151 requires ROCm 7.2 or newer.
+Release-tag installs (`install.sh` / `install.ps1`, or `hipfire update --tag`)
+download a verified prebuilt kernel pack for the detected arch when it admits;
+otherwise they fall back to local hipcc. See
+[Prebuilt kernel packs](docs/GETTING_STARTED.md#prebuilt-kernel-packs).
 Run `hipfire --version` for a concise build ID or `hipfire version` to compare
 the installed binary, managed source checkout, and daemon. Managed Linux
 installs can switch revisions with `hipfire update @beta`,
-`hipfire update --tag v0.2.1`, or `hipfire update --commit <sha>`.
+`hipfire update --tag v0.4.0`, or `hipfire update --commit <sha>`.
 
 To uninstall a managed Linux install while keeping downloaded models and
 settings:
@@ -393,7 +399,9 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
+See [CONTRIBUTING.md](CONTRIBUTING.md), including
+[Release cadence and PR cutoff](CONTRIBUTING.md#release-cadence-and-pr-cutoff)
+(weekly releases alternating Tuesday/Sunday). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
 `./scripts/no-gpu-ci.sh`; it does not replace the hardware gates.
 **There is no single canonical correctness gate** — the retired
