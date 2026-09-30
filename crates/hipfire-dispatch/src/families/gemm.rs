@@ -40,6 +40,46 @@ fn validate_packed_gemm_dtype(key: KernelKey, dtype: DType) -> Result<(), Dispat
     Ok(())
 }
 
+/// Run a Q8 projection while refreshing the F16 activation conversion on every
+/// invocation. Pointer-keyed conversion caches are unsafe for layer-reused
+/// scratch buffers whose contents change between projections.
+#[inline]
+pub fn run_q8_projection_fresh(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+    x_f16: &GpuTensor,
+    enable_wmma: bool,
+) -> hip_bridge::HipResult<()> {
+    if enable_wmma && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+        gpu.deepseek4_convert_f32_to_f16(x, x_f16, (batch_size * k) as i64)?;
+        gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, batch_size)
+    } else {
+        gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, batch_size)
+    }
+}
+
+/// Select the residual GEMM key for a packed weight container.
+pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        // qt=52 must NEVER alias a uniform key (silent noise at full speed):
+        // Lloyd prefill uses the FP8-LUT launchers directly, never these keys.
+        DType::MQ4G256V2Lloyd => panic!(
+            "residual_gemm_key_for: MQ4G256V2Lloyd (qt=52) has no uniform residual key — route Lloyd prefill through gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::GemmHfq4G256Residual,
+    }
+}
 fn is_gemm_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,
@@ -169,6 +209,14 @@ impl GemmFamily {
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ4G128V2 => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "gemm",
+                    variant: "mq4g128v2_specialized_route_only",
+                    arch: "",
+                    quant: "MQ4G128V2",
+                });
+            }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
             DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
             DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
@@ -229,6 +277,14 @@ impl GemmFamily {
         gpu: &mut Gpu,
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype == DType::MQ4G128V2 {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemm",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            });
+        }
         // Validate the explicit key is registered and arch-admissible. The
         // dispatcher-entry keys used at migrated prefill sites are registered
         // `ArchPredicate::Always`, so this never rejects on a supported build.

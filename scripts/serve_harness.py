@@ -103,13 +103,14 @@ def resolve_kv_mode(explicit, tag, registry_path):
     return kv, source
 
 
-def _tag_load_policy(canonical_tag):
+def _tag_load_policy(canonical_tag, entry=None):
     """Automatic load policy keyed by canonical registry tag.
 
     Mirrors hipfire-registry's generation-only tag policy (not wire fields).
     Context is resolved by loader admission from model metadata and card
     capacity; only an explicit user max_seq reaches the sparse TOML.
-      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920
+      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920, except Qwen3.8
+        entries with arch_id=16 (Qwen4 / Flash-Next), which take no policy
       - DeepSeek V4 Flash targets → max_tokens=393216
       - other tags and draft/dflash sidecars → no policy.
     """
@@ -120,6 +121,8 @@ def _tag_load_policy(canonical_tag):
         return {}
     family = tag.split(":", 1)[0]
     if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
+        if (entry or {}).get("arch_id") == 16:
+            return {}
         return {"max_tokens": 81920}
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return {"max_tokens": 393216}
@@ -169,7 +172,7 @@ def resolve_max_tokens(explicit, tag, registry_path):
         print(f"  [warn] could not resolve max_tokens policy from {registry_path}: {e}",
               file=sys.stderr)
         canonical, entry = tag, {}
-    policy = _tag_load_policy(canonical) if entry else {}
+    policy = _tag_load_policy(canonical, entry) if entry else {}
     if "max_tokens" in policy:
         return policy["max_tokens"], f"tag-policy({canonical})"
     return 2048, "default(2048)"

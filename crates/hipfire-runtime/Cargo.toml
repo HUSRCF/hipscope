@@ -104,7 +104,7 @@ minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_o
 # template which uses these throughout.
 minijinja-contrib = { workspace = true, features = ["pycompat"] }
 tracing = "0.1"
-sha2 = "0.10"
+sha2.workspace = true
 
 # Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -632,6 +632,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "tp4_cross_device_graph_barrier"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_qt53_channel"
 required-features = ["lab"]
 
 [[example]]

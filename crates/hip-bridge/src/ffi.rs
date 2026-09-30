@@ -370,6 +370,7 @@ pub struct HipRuntime {
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
+    fn_memset_d32_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_mem_address_reserve:
         Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
     fn_mem_create: Option<
@@ -395,6 +396,7 @@ pub struct HipRuntime {
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
+    fn_stream_create_with_flags: unsafe extern "C" fn(*mut HipStream, c_uint) -> u32,
     fn_stream_synchronize: unsafe extern "C" fn(HipStream) -> u32,
     fn_stream_destroy: unsafe extern "C" fn(HipStream) -> u32,
 
@@ -643,6 +645,11 @@ impl HipRuntime {
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
                 ),
+                fn_memset_d32_async: load_fn!(
+                    lib,
+                    "hipMemsetD32Async",
+                    unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
+                ),
                 fn_mem_address_reserve: load_optional_fn!(
                     lib,
                     "hipMemAddressReserve",
@@ -701,6 +708,11 @@ impl HipRuntime {
                     lib,
                     "hipStreamCreate",
                     unsafe extern "C" fn(*mut HipStream) -> u32
+                ),
+                fn_stream_create_with_flags: load_fn!(
+                    lib,
+                    "hipStreamCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipStream, c_uint) -> u32
                 ),
                 fn_stream_synchronize: load_fn!(
                     lib,
@@ -1501,6 +1513,21 @@ impl HipRuntime {
         self.check(code, "hipMemset")
     }
 
+    /// Fill `count` 32-bit words of `buf` with `value`, ordered on `stream`
+    /// (the null stream when `None`) without blocking the host.
+    pub fn memset_d32_async(
+        &self,
+        buf: &DeviceBuffer,
+        value: i32,
+        count: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        assert!(count * 4 <= buf.size);
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
+        self.check(code, "hipMemsetD32Async")
+    }
+
     /// Async memset on a specific stream — does NOT block the host.
     /// Caller must ensure stream-ordering downstream work syncs correctly.
     #[track_caller]
@@ -1542,6 +1569,15 @@ impl HipRuntime {
         let mut stream: HipStream = ptr::null_mut();
         let code = unsafe { (self.fn_stream_create)(&mut stream) };
         self.check(code, "hipStreamCreate")?;
+        Ok(Stream(stream))
+    }
+
+    /// A stream that does not synchronize with the legacy null stream
+    /// (`hipStreamNonBlocking`).
+    pub fn stream_create_non_blocking(&self) -> HipResult<Stream> {
+        let mut stream: HipStream = ptr::null_mut();
+        let code = unsafe { (self.fn_stream_create_with_flags)(&mut stream, 0x1) };
+        self.check(code, "hipStreamCreateWithFlags")?;
         Ok(Stream(stream))
     }
 
@@ -1815,6 +1851,22 @@ impl HipRuntime {
             )
         };
         self.check(code, "hipMemcpyAsync H2D")
+    }
+
+    /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
+    /// stay unchanged until the stream reaches the copy.
+    pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        assert!(src.len() <= dst.size);
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst.ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                ptr::null_mut(),
+            )
+        };
+        self.check(code, "hipMemcpyAsync H2D default stream")
     }
 
     pub fn memcpy_dtoh_async(

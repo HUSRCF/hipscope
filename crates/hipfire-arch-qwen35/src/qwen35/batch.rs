@@ -147,6 +147,10 @@ pub struct PrefillBatchScratch {
     // applied. RDNA-only (atomic on GDDR is slow); the wave64/CDNA path
     // stays on the residual_scaled atomic kernel.
     pub moe_down_expanded_batch: Option<GpuTensor>,
+    /// Backup for inactive residual rows around a partial-mask MoE call.
+    /// MoE kernels currently execute fixed-width rows, so the batched EP path
+    /// restores inactive `x_batch` rows after the stateless FFN body.
+    pub moe_inactive_backup: Option<GpuTensor>,
 
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
     // allocated when num_experts > 0; gated at runtime by
@@ -423,6 +427,12 @@ impl PrefillBatchScratch {
             &[max_batch * config.num_experts_per_tok * config.dim],
             DType::F32
         );
+        let i_moe_inactive_backup = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.dim],
+            DType::F32
+        );
+
         // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
         // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
         // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
@@ -580,6 +590,8 @@ impl PrefillBatchScratch {
             moe_up_batch: i_moe_up_batch.map(|i| take!(i)),
             moe_rot_batch: i_moe_rot_batch.map(|i| take!(i)),
             moe_down_expanded_batch: i_moe_down_expanded_batch.map(|i| take!(i)),
+            moe_inactive_backup: i_moe_inactive_backup.map(|i| take!(i)),
+
             moe_expert_token_counts: i_moe_expert_token_counts.map(|i| take!(i)),
             moe_expert_offsets: i_moe_expert_offsets.map(|i| take!(i)),
             moe_sorted_slot_index: i_moe_sorted_slot_index.map(|i| take!(i)),
@@ -663,6 +675,7 @@ impl PrefillBatchScratch {
             self.moe_up_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
+            self.moe_inactive_backup,
             self.moe_expert_token_counts,
             self.moe_expert_offsets,
             self.moe_sorted_slot_index,
@@ -1463,6 +1476,7 @@ impl PrefillBatchScratch {
                 cm(cm(n, config.num_experts_per_tok as u64)?, config.dim as u64)?,
                 4,
             )?;
+            add(cm(n, config.dim as u64)?, 4)?;
             let m_max =
                 moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts)
                     as u64;
@@ -1552,6 +1566,20 @@ pub(crate) fn valid_lane_mask(max_batch: usize) -> HipResult<u64> {
     } else {
         Ok((1u64 << max_batch) - 1)
     }
+}
+
+/// Active-lane mask to honour for a batch, or `None` when every row is live.
+/// Only independent decode batches (at most 64 lanes) carry a mask; sequential
+/// prefill chunks run up to `PREFILL_MAX_BATCH` rows and never build one.
+pub(crate) fn partial_lane_mask(active_mask: Option<u64>, n: usize) -> HipResult<Option<u64>> {
+    let Some(mask) = active_mask else {
+        return Ok(None);
+    };
+    let full = valid_lane_mask(n)?;
+    if mask == 0 || mask & !full != 0 {
+        return Err(HipError::new(0, "active lane mask out of range"));
+    }
+    Ok((mask != full).then_some(mask))
 }
 
 #[inline]

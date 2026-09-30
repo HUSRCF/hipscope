@@ -2072,13 +2072,16 @@ mod tests {
         let dest_path = dest.join(format!("{name}.hsaco"));
 
         // The reader owns its observations locally and returns them through
-        // the scoped join — no shared lock between the threads.
+        // the scoped join — no shared lock between the threads. It samples
+        // until it has seen the writer finish, and the read after that
+        // observation is guaranteed to see the final generation, so the test
+        // does not depend on how the two threads are scheduled.
         let (seen, missings) = std::thread::scope(|scope| {
             let reader = scope.spawn(move || {
                 let mut seen: Vec<Vec<u8>> = Vec::new();
                 let mut missings = 0;
-                let mut samples = 0;
-                while samples < 500 {
+                loop {
+                    let finished = reader_done.load(std::sync::atomic::Ordering::SeqCst);
                     match std::fs::read(&dest_path) {
                         Ok(bytes) => {
                             if !seen.contains(&bytes) {
@@ -2087,8 +2090,7 @@ mod tests {
                         }
                         Err(_) => missings += 1,
                     }
-                    samples += 1;
-                    if reader_done.load(std::sync::atomic::Ordering::SeqCst) && samples >= 100 {
+                    if finished {
                         break;
                     }
                 }

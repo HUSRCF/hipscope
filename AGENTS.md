@@ -648,6 +648,96 @@ The only permitted prompt fixtures for this A3B MoE DFlash thread are:
 Runs using any other prompt are exploratory only and must not be compared
 against the A3B MoE DFlash perfmaxx line.
 
+### Pinned Flash-Next bench fixture
+
+The canonical Flash-Next trunk is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next`, since 2026-09-28):
+
+- HF repo: `hipfire-models/qwen3.8-flash-next`
+- HF / local file: `qwen3.8-flash-next.mq4`
+- File size: `125288540696`
+- SHA-256: `8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`
+- MD5: `001878abd9b68218876ac0ae732e481b`
+- Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
+  (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
+  after `cb566dab9` (qt=54 I64 metadata records).
+- Container revision 2026-09-29: the three I64 PLE metadata records were
+  re-tagged qt=52 -> qt=54 in place; payloads are byte-identical to the
+  2026-09-28 upload (sha256 `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`),
+  so measurements taken on those bytes still apply.
+
+Before reporting Flash-Next results, verify the candidate trunk with
+`sha256sum` and require the digest above.
+
+Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
+`c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
+same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+before it); it differs
+only in its Q8F16 head. The caveats and measurements below were taken on that
+prior pin unless they say otherwise.
+
+Caveats that are part of the fixture, not trivia:
+
+- Loading it needs a build whose qwen4 trunk source contract admits **both**
+  packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
+  Older builds refuse at load; that refusal is correct, not a corrupt file.
+- **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
+  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  window picks its verification route: a batched `(K+1)`-row verify at the
+  draft depth `K` that maximizes expected emitted tokens per window cost
+  (per-depth draft agreement, decayed), or the interleaved route (one target
+  row per draft, stop at the first rejection) when no depth pays.
+  `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
+  interleaved. The few-row (2..8) verify forward is bitwise the single-row
+  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
+  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
+  rolls back without re-running the accepted rows; elsewhere the batched
+  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
+  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
+  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  Teacher-forced prompt and replay steps advance MTP state without computing
+  an unused language-head prediction; prompt target chunks emit only their
+  final logit row while retaining every wide hidden row.
+- **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
+  KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
+  byte-identical committed prompts, median code decode was AR 19.4 versus
+  MTP 20.1 tok/s (end-to-end 17.1 versus 17.2); prose decode was AR 17.9
+  versus MTP 18.0 (end-to-end 15.6 versus 17.1, with large run-to-run
+  spread). Daemon md5 `d09ff1d3220b818c4f4d06a3c60cc85b`; prompt md5s:
+  code `df5dedc8040ce70ba55080c4548e6024`, prose
+  `07a7880965142971dbb3cc7493f8fb94`. All three MTP runs emitted AR's
+  exact 227 code and 256 prose token IDs. Local raw reports:
+  `.codeinsight+research/qwen4/mtp-parity/runs/moe-buffer-fix/perf-v2/`.
+- After fixing routed/shared MoE scratch aliasing, restoring the learned final
+  HC mixer, and reselecting QSA at source-correct boundaries, conditional
+  draft agreement was 0.708/0.532/0.476 for prose and
+  0.922/0.932/0.889 for code at steps 1/2/3. The remaining throughput gap
+  to a claimed 80% gain is verifier/replay cost, not evidence that the
+  trained drafter is defective. Do not extrapolate these fixture-bound
+  measurements to other architectures or prompts.
+- **Later measurement (2026-09-28, same prompts, fixture-bound):** after the
+  few-row verify, rollback and draft-head work in
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md),
+  MTP decode was code ~55 and prose ~37 tok/s against AR ~33 on the same
+  build, with greedy MTP ids equal to AR's. The GPU was shared with external
+  processes; read the checkpoint's method before citing a number.
+- **On `qwen3.8-flash-next.mq4` (2026-09-28, fixture-bound):** with the
+  MQ6G256V2 head's re-score, greedy MTP geomean over nine committed prompts
+  was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
+  with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
+- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
+  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
+  `memory.max_seq` forced to 2048), so it fails closed at load and never
+  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
+  bench-side `max_seq` knob — not an MTP change.
+- Decode numbers are not comparable across instruments: the raw decode probe
+  measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
+  Same model, different measurement; never average or compare them across.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)

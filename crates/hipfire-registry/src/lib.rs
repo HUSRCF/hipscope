@@ -298,8 +298,8 @@ impl ModelEntry {
 /// Policy (static; no registry/v1 wire fields): Qwen3.5/3.6/3.8 and
 /// DeepSeek V4 Flash tags supply generation max_tokens only — never
 /// `memory.max_seq` (resolved at load time) and never a KV backend.
-/// Backend selection is source-independent at admission. Muse Glimmer
-/// tags write neither length.
+/// Backend selection is source-independent at admission. Qwen3.8 entries
+/// with `arch_id=16` (Qwen4) and Muse Glimmer tags write neither length.
 ///
 /// Explicit global/model/one-shot user config remains higher precedence than
 /// this registry layer.
@@ -310,7 +310,9 @@ pub fn config_layer_for_tag(
     let mut layer = entry.config_layer()?;
     let family = tag.split(':').next().unwrap_or(tag);
     let is_sidecar = tag.contains("draft") || tag.contains("dflash");
-    let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8") && !is_sidecar;
+    let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8")
+        && !is_sidecar
+        && entry.arch_id != Some(16);
     if is_qwen_tag_policy {
         layer
             .set("generation.max_tokens", ConfigValue::Integer(81920))
@@ -1304,6 +1306,15 @@ mod tests {
             fast_layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(81920))
         );
+        // Flash-Next carries arch_id=16 inside the qwen3.8 naming family;
+        // do not inherit the ordinary Qwen3.8 VMM/262K policy.
+        let (flash_tag, flash) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(flash.arch_id, Some(16));
+        let flash_layer = config_layer_for_tag(flash_tag, flash)
+            .expect("qwen3.8:flash-next must lower without a family policy");
+        assert!(flash_layer.get("memory.kv_backend").is_none());
+        assert!(flash_layer.get("memory.max_seq").is_none());
+        assert!(flash_layer.get("generation.max_tokens").is_none());
         assert_eq!(
             layer.get("reasoning.effort"),
             Some(&ConfigValue::String("xhigh".into()))

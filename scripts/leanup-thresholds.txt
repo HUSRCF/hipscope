@@ -114,4 +114,6 @@ bypass_slack                == 0
 # visible in this file's diff. Lower it when you bank a migration.
 # RATCHET-RAISE 304 -> 305: the "+1 pending from the SCS port PR series" already
 # recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
-bypass_total                <= 305
+# Banked 305 -> 296 with fold/flash-next: #755's sealed MoE prefill moved into
+# dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
+bypass_total                <= 296

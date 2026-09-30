@@ -25,6 +25,7 @@ mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
+pub mod grouped_ops;
 pub mod kernel_pack;
 pub mod kernel_registry;
 mod kernels;
@@ -47,6 +48,7 @@ pub mod select_regrid;
 pub use scratch::{Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared};
 pub use gemm::F2GdnTargets;
 pub mod slot_pool;
+pub mod tensor_ops;
 pub mod text_encoder;
 pub mod vae;
 
@@ -55,8 +57,8 @@ pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
     GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES,
     LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, MQ2G256V2_GROUP_BYTES,
-    MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES,
-    MQ6G256V2_GROUP_BYTES,
+    MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES,
+    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};

@@ -113,6 +113,7 @@ pub struct RuntimeConfig {
     pub experimental_budget_alert: bool,
     pub max_total_think_tokens: usize,
     pub devices: Option<String>,
+    pub emulate_gpus: Option<usize>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
@@ -222,6 +223,9 @@ impl RuntimeConfig {
                         .collect::<Vec<_>>()
                         .join(",")
                 }),
+            emulate_gpus: value("HIPFIRE_EMULATE_GPUS")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value >= 2),
             allow_mixed_arch: value("HIPFIRE_ALLOW_MIXED_ARCH").as_deref() == Some("1"),
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
@@ -306,6 +310,35 @@ mod tests {
         assert_eq!(config.ngram_loop_threshold, 12);
         assert_eq!(config.devices.as_deref(), Some("0,1"));
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
+    }
+
+    #[test]
+    fn emulate_gpus_parser_requires_at_least_two() {
+        fn parse(raw: Option<&str>) -> Option<usize> {
+            RuntimeConfig::from_lookup(|name| {
+                if name == "HIPFIRE_EMULATE_GPUS" {
+                    raw.map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .emulate_gpus
+        }
+
+        for (raw, expected) in [
+            (None, None),
+            (Some("malformed"), None),
+            (Some("0"), None),
+            (Some("1"), None),
+            (Some("2"), Some(2)),
+            (Some("4"), Some(4)),
+        ] {
+            assert_eq!(
+                parse(raw),
+                expected,
+                "unexpected emulation parse for {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -454,18 +487,30 @@ mod tests {
     #[test]
     fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
         let h2 = "/models/h2.group-alpha-refit.hfq";
-        assert!(retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 1, false
+        ));
         // A drafter keeps the model on its speculative path.
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 1, true));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 1, true
+        ));
         // Pipeline / tensor parallel stay on HIP.
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen3_5", h2, 1, 2, false));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3_5", h2, 1, 2, false
+        ));
         // Exact gfx1201 only; other dense archs and the MoE sibling stay on HIP.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
-            assert!(!retained_redline_default(gpu_arch, "qwen3_5", h2, 1, 1, false));
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen3_5", h2, 1, 1, false
+            ));
         }
         for model_arch in ["qwen3_5_moe", "qwen3", "qwen2", "gemma4"] {
-            assert!(!retained_redline_default("gfx1201", model_arch, h2, 1, 1, false));
+            assert!(!retained_redline_default(
+                "gfx1201", model_arch, h2, 1, 1, false
+            ));
         }
     }
 }

@@ -35,7 +35,10 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is
-    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. Not used by
+    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. For
+    /// `--qwen4-flash-next`, use a local directory/file or the immutable
+    /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
+    /// `main`, tags, and short revisions are rejected. Not used by
     /// `--flux-pipe`, which names its own input.
     #[arg(
         long,
@@ -44,6 +47,18 @@ pub(crate) struct QuantizeArgs {
     )]
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
+
+    /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
+    /// transactional path always includes typed PLE metadata, all PLE shards,
+    /// and native MTP experts; legacy recipe flags are ignored.
+    #[arg(long, conflicts_with = "flux_pipe")]
+    pub qwen4_flash_next: bool,
+    /// Explicit non-production bounded fixture mode for exercising the full
+    /// transactional writer with a compact local component. Production remains
+    /// the default and keeps the pinned checkpoint admission counts.
+    #[arg(long, value_name = "MODE", default_value = "production",
+          value_parser = ["production", "compact-fixture"])]
+    pub qwen4_component_mode: String,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]

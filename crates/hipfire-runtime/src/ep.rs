@@ -10,14 +10,14 @@
 //! [`ForwardBindings::ep_moe_combine_mode`] (all ranks must agree; mixed
 //! modes refuse):
 //!
-//! - **Root-routed partial** (`EpMoeCombineMode::RootRoutedPartial`, Qwen
-//!   plan-bound compact EP): the root seals SoftmaxTopK route production,
-//!   folds owned experts plus the shared expert once into its zeroed partial,
-//!   and returns a sealer-issued route-producer proof; the driver
-//!   broadcasts the root top-k IDs **and** weights device-to-device into each
-//!   rank's existing route buffers, non-roots seal routed contrib against the
-//!   proof (no independent router; zero dummies read 0), then the existing
-//!   all-reduce-sum plus residual add completes the combine.
+//! - **Root-routed slot order** (`EpMoeCombineMode::RootRoutedPartial`, Qwen
+//!   plan-bound compact EP): the root seals SoftmaxTopK route production and
+//!   returns a sealer-issued proof; every rank writes owned expert outputs into
+//!   the global slot layout while zero-dummy experts write zero. The driver
+//!   broadcasts root IDs and weights, synchronizes the root's shared-expert
+//!   residual base to every rank, gathers the slot rows to root, invokes the
+//!   ordinary single-device slot-order combine once, byte-copies the finished
+//!   routed partial to every rank, then adds it to each residual.
 //! - **Rank-partial all-reduce** (`EpMoeCombineMode::RankPartial`, the default
 //!   for DeepSeek4/MiniMax):
 //!
@@ -35,7 +35,7 @@
 //! fail-closed `ForwardBindings` attention-TP hooks; the default remains false,
 //! so Qwen, MiniMax, and every existing EP route retain replicated attention.
 //!
-//! Ordering: every op (zero, root/contrib or `run_moe_ep`, the collective, the
+//! Ordering: every op (zero, root/contrib or `run_moe_ep`, transport, combine,
 //! residual add, and the next layer's ops) is enqueued on each device's
 //! `active_stream`, which is FIFO — so the per-rank sequence is correctly
 //! ordered without host syncs between ops or layers. The decode driver syncs
@@ -52,7 +52,7 @@ use hipfire_dispatch::pipeline::superop::{
     dispatch_super_op, EpMoeCombineMode, ForwardBindings, LayerProgram, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
-use rdna_compute::GpuTensor;
+use rdna_compute::{Gpu, GpuTensor};
 
 fn hip_err(e: HipError) -> DispatchError {
     DispatchError::Hip(e.to_string())
@@ -134,6 +134,488 @@ fn all_reduce_sum_f32_decode(
     } else {
         gpus.all_reduce_sum_f32(refs, count).map_err(hip_err)
     }
+}
+
+/// Reduction transport selected by a sealed root-routed EP schedule.
+///
+/// The two normal modes intentionally retain their existing environment and
+/// lease policy. `PrefillSkipAllReduce` is the explicit diagnostic switch used
+/// by the prefill caller; it is not a fallback and therefore omits both the
+/// reduction and residual completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootRoutedEpReduction {
+    Decode,
+    Prefill,
+    PrefillSkipAllReduce,
+}
+
+/// Borrowed per-rank activation operands consumed by the executable schedule.
+///
+/// The slice is owned by the caller (typically a load-owned scratch pool); the
+/// schedule never allocates or caches mutable resource identity.
+pub struct RootRoutedEpOperands<'a> {
+    pub partials: &'a [GpuTensor],
+    pub partial_bytes: usize,
+    pub reduce_count: usize,
+    pub route_count: usize,
+    pub contribution_count: usize,
+    pub contribution_chunk: usize,
+}
+
+/// Existing route buffers borrowed by one schedule stage.
+#[derive(Clone, Copy)]
+pub struct EpRouteBuffers<'a> {
+    pub ids: &'a DeviceBuffer,
+    pub weights: &'a DeviceBuffer,
+    pub slot_outputs: &'a DeviceBuffer,
+}
+
+/// Checked root-routed execution metadata for one admitted root-routed MoE
+/// layer.
+///
+/// `derive` binds the metadata to the dispatch-owned execution contract and
+/// its actual `moe`/layer/EP all-reduce row. It never infers an axis from the
+/// first row and rejects duplicate or missing rows before the first side
+/// effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootRoutedEpSchedule {
+    contract_id: u64,
+    n_ranks: usize,
+    layer: usize,
+    route_count: usize,
+    partial_bytes: usize,
+    reduce_count: usize,
+    contribution_count: usize,
+    contribution_chunk: usize,
+    reduction: RootRoutedEpReduction,
+}
+
+impl RootRoutedEpSchedule {
+    /// Derive the checked root-routed execution metadata from one load-bound
+    /// execution contract.
+    /// `n_ranks`, route length, and reduction geometry are supplied by the
+    /// architecture adapter, but are checked here and again by the executor.
+    /// The contract remains the only authority for the collective name/axis.
+    pub fn derive(
+        contract: &hipfire_dispatch::pipeline::sealed_moe::ExpertExecutionContract,
+        n_ranks: usize,
+        layer: usize,
+        route_count: usize,
+        partial_bytes: usize,
+        reduce_count: usize,
+        contribution_count: usize,
+        contribution_chunk: usize,
+        reduction: RootRoutedEpReduction,
+    ) -> Result<Self, DispatchError> {
+        if n_ranks == 0 {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule requires at least one rank".into(),
+            ));
+        }
+        if n_ranks > MAX_EP_STACK_RANKS {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP schedule rank count {n_ranks} exceeds host-stack bound {MAX_EP_STACK_RANKS}"
+            )));
+        }
+        if contract.physical_devices().len() != n_ranks {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP schedule mesh has {} contract devices, expected {n_ranks}",
+                contract.physical_devices().len()
+            )));
+        }
+        if contract.layer() != Some(layer) {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP schedule layer {layer} disagrees with contract layer {:?}",
+                contract.layer()
+            )));
+        }
+        if !contract.is_root_routed_ep() {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule requires an admitted root-routed EP contract".into(),
+            ));
+        }
+        // Runtime plans may expose one EP row per manifest source (for
+        // example, Qwen gate/up/down projections) rather than a synthetic
+        // row named "moe". Any EP all-reduce row for this sealed layer
+        // authorizes the root-routed schedule; retain the synthetic-name
+        // duplicate check for older contracts and its focused diagnostics.
+        let mut matched = false;
+        let mut named_moe = false;
+        for row in contract.collective_rows() {
+            if row.layer != layer {
+                continue;
+            }
+            if row.name == "moe" {
+                if named_moe {
+                    return Err(DispatchError::Hip(format!(
+                        "root-routed EP schedule has duplicate moe collective rows for layer {layer}"
+                    )));
+                }
+                named_moe = true;
+            }
+            if matches!(
+                row.hint,
+                hipfire_dispatch::pipeline::sealed_moe::ContractCollectiveHint::AllReduce {
+                    kind: hipfire_dispatch::pipeline::sealed_moe::ContractAxis::Ep
+                }
+            ) {
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP schedule has no moe EP all-reduce row for layer {layer}"
+            )));
+        }
+        if route_count == 0 {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule requires a non-zero route count".into(),
+            ));
+        }
+        if partial_bytes == 0 || partial_bytes % std::mem::size_of::<f32>() != 0 {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule partial byte count is not a non-zero f32 span".into(),
+            ));
+        }
+        if reduce_count == 0 {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule reduction geometry is invalid".into(),
+            ));
+        }
+        if let Some(bytes) = reduce_count.checked_mul(std::mem::size_of::<f32>()) {
+            if bytes > partial_bytes {
+                return Err(DispatchError::Hip(
+                    "root-routed EP schedule reduction geometry is invalid".into(),
+                ));
+            }
+        } else {
+            return Err(DispatchError::Hip(
+                "root-routed EP schedule reduction geometry is invalid".into(),
+            ));
+        }
+        if contribution_count == 0 || contribution_chunk == 0 {
+            return Err(DispatchError::Hip(
+                "root-routed EP contribution geometry is invalid".into(),
+            ));
+        }
+
+        Ok(Self {
+            contract_id: contract.contract_id(),
+            n_ranks,
+            layer,
+            route_count,
+            partial_bytes,
+            reduce_count,
+            contribution_count,
+            contribution_chunk,
+            reduction,
+        })
+    }
+
+    pub fn contract_id(&self) -> u64 {
+        self.contract_id
+    }
+
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub fn rank_count(&self) -> usize {
+        self.n_ranks
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.route_count
+    }
+
+    pub fn partial_bytes(&self) -> usize {
+        self.partial_bytes
+    }
+
+    pub fn reduce_count(&self) -> usize {
+        self.reduce_count
+    }
+
+    pub fn contribution_count(&self) -> usize {
+        self.contribution_count
+    }
+
+    pub fn contribution_chunk(&self) -> usize {
+        self.contribution_chunk
+    }
+}
+
+/// Family operand adapters for one root-routed EP schedule.
+///
+/// Implementations bind a family's weights, scratch, and state to the fixed
+/// stages; [`execute_root_routed_ep`] owns the preflight barrier, stage order,
+/// ascending rank traversal, route transfer, reduction, and stop-on-error.
+pub trait RootRoutedEpBinding {
+    /// Root preflight result handed to every non-root preflight.
+    type Admission: Copy;
+    /// Route-producer proof the root returns and non-roots adopt.
+    type Proof: Copy;
+
+    fn preflight_root(
+        &self,
+        gpu: &Gpu,
+        partial: &GpuTensor,
+    ) -> Result<Self::Admission, DispatchError>;
+    fn preflight_rank(
+        &self,
+        rank: usize,
+        gpu: &Gpu,
+        partial: &GpuTensor,
+        admission: &Self::Admission,
+    ) -> Result<(), DispatchError>;
+    fn root_compute(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+        admission: &Self::Admission,
+    ) -> Result<Self::Proof, DispatchError>;
+    fn route_buffers(&self, rank: usize) -> Result<EpRouteBuffers<'_>, DispatchError>;
+    fn rank_contribute(
+        &mut self,
+        rank: usize,
+        gpu: &mut Gpu,
+        proof: &Self::Proof,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError>;
+    /// Run the family's ordinary single-device slot-order combine once on root.
+    fn finish_combine(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError>;
+    /// Add the broadcast routed partial into this rank's residual stream.
+    fn residual_finish(
+        &mut self,
+        rank: usize,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError>;
+    /// Synchronize a shared-expert residual base after non-root route work.
+    fn sync_shared_residual(
+        &mut self,
+        _gpus: &mut Gpus,
+        _count: usize,
+    ) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    /// Per-rank fix-up of the combined partial before the root broadcast.
+    fn prepare_reduce(
+        &mut self,
+        _rank: usize,
+        _gpu: &mut Gpu,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
+/// Execute one checked root-routed EP schedule through `binding`.
+pub fn execute_root_routed_ep<B: RootRoutedEpBinding>(
+    gpus: &mut Gpus,
+    binding: &mut B,
+    schedule: RootRoutedEpSchedule,
+    operands: RootRoutedEpOperands<'_>,
+    peer_lease: Option<&PeerReduceScratchLease>,
+) -> Result<(), DispatchError> {
+    let n = gpus.devices.len();
+    if n != schedule.n_ranks {
+        return Err(DispatchError::Hip(format!(
+            "root-routed EP schedule mesh has {n} ranks, expected {}",
+            schedule.n_ranks
+        )));
+    }
+    if operands.partials.len() != n {
+        return Err(DispatchError::Hip(format!(
+            "root-routed EP schedule has {} partials, expected {n}",
+            operands.partials.len()
+        )));
+    }
+    if operands.partial_bytes != schedule.partial_bytes
+        || operands.reduce_count != schedule.reduce_count
+        || operands.route_count != schedule.route_count
+        || operands.contribution_count != schedule.contribution_count
+        || operands.contribution_chunk != schedule.contribution_chunk
+    {
+        return Err(DispatchError::Hip(
+            "root-routed EP operands disagree with checked schedule geometry".into(),
+        ));
+    }
+    let route_bytes = schedule
+        .route_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| DispatchError::Hip("root-routed EP route byte count overflow".into()))?;
+    let contribution_bytes = schedule
+        .contribution_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DispatchError::Hip("root-routed EP contribution byte count overflow".into())
+        })?;
+    for rank in 0..n {
+        if gpus.devices[rank].active_stream.is_none() {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP device {rank} has no active_stream"
+            )));
+        }
+        if operands.partials[rank].buf.size() < schedule.partial_bytes {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP rank {rank} partial has {} bytes, needs {}",
+                operands.partials[rank].buf.size(),
+                schedule.partial_bytes
+            )));
+        }
+    }
+
+    // Every callback and route buffer is validated before the first partial
+    // memset. This is the transaction boundary for the whole schedule.
+    let admission = binding.preflight_root(&gpus.devices[0], &operands.partials[0])?;
+    for rank in 1..n {
+        binding.preflight_rank(
+            rank,
+            &gpus.devices[rank],
+            &operands.partials[rank],
+            &admission,
+        )?;
+    }
+    for rank in 0..n {
+        let route = binding.route_buffers(rank)?;
+        if route.ids.size() < route_bytes || route.weights.size() < route_bytes {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP rank {rank} route buffers are smaller than {route_bytes} bytes"
+            )));
+        }
+        if route.slot_outputs.size() < contribution_bytes {
+            return Err(DispatchError::Hip(format!(
+                "root-routed EP rank {rank} slot outputs have {} bytes, need {contribution_bytes}",
+                route.slot_outputs.size()
+            )));
+        }
+    }
+    if let Some(lease) = peer_lease {
+        if schedule.reduction != RootRoutedEpReduction::PrefillSkipAllReduce {
+            let partial_refs: Vec<&DeviceBuffer> = operands
+                .partials
+                .iter()
+                .map(|partial| &partial.buf)
+                .collect();
+            gpus.validate_peer_reduce_scratch_lease(
+                lease,
+                &partial_refs,
+                schedule.contribution_chunk.max(schedule.reduce_count),
+            )
+            .map_err(hip_err)?;
+        }
+    }
+
+    // The fixed order below is intentionally procedural rather than a second
+    // command interpreter: this function is the one root-routed EP sequencer.
+    // The proof is produced exactly once after zeroing and consumed by every
+    // non-root contribution.
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "root-routed EP device {rank} lost its active_stream"
+            ))
+        })?;
+        gpu.hip
+            .memset_async(
+                &operands.partials[rank].buf,
+                0,
+                schedule.partial_bytes,
+                stream,
+            )
+            .map_err(hip_err)?;
+    }
+
+    let proof = {
+        let gpu = &mut gpus.devices[0];
+        gpu.bind_thread().map_err(hip_err)?;
+        binding.root_compute(gpu, &operands.partials[0], &admission)?
+    };
+
+    {
+        let mut staged_routes = [None; MAX_EP_STACK_RANKS];
+        for rank in 0..n {
+            staged_routes[rank] = Some(binding.route_buffers(rank)?);
+        }
+        let root = staged_routes[0].ok_or_else(|| {
+            DispatchError::Hip(
+                "root-routed EP root route buffers disappeared after root compute".into(),
+            )
+        })?;
+        gpus.broadcast_ep_route(
+            root.ids,
+            root.weights,
+            |rank| {
+                let route =
+                    staged_routes[rank].expect("root-routed EP route preflight omitted a rank");
+                (route.ids, route.weights)
+            },
+            schedule.route_count,
+        )
+        .map_err(hip_err)?;
+    }
+
+    for rank in 1..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        binding.rank_contribute(rank, gpu, &proof, &operands.partials[rank])?;
+    }
+
+    if schedule.reduction == RootRoutedEpReduction::PrefillSkipAllReduce {
+        return Ok(());
+    }
+
+    // Qwen root-routed decode keeps the shared expert in the same residual
+    // buffer as the single-device path. Synchronize that base only after all
+    // non-root routed contributions have consumed the original residual.
+    binding.sync_shared_residual(gpus, schedule.reduce_count)?;
+
+    {
+        let mut staged_slots: [&DeviceBuffer; MAX_EP_STACK_RANKS] =
+            [binding.route_buffers(0)?.slot_outputs; MAX_EP_STACK_RANKS];
+        for rank in 1..n {
+            staged_slots[rank] = binding.route_buffers(rank)?.slot_outputs;
+        }
+        gpus.gather_unique_f32_to_root(
+            peer_lease,
+            &staged_slots[..n],
+            schedule.contribution_count,
+            schedule.contribution_chunk,
+        )
+        .map_err(hip_err)?;
+    }
+
+    {
+        let gpu = &mut gpus.devices[0];
+        gpu.bind_thread().map_err(hip_err)?;
+        binding.finish_combine(gpu, &operands.partials[0])?;
+    }
+
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        binding.prepare_reduce(rank, gpu, &operands.partials[rank])?;
+    }
+
+    {
+        let mut staged: [&DeviceBuffer; MAX_EP_STACK_RANKS] =
+            [&operands.partials[0].buf; MAX_EP_STACK_RANKS];
+        for rank in 1..n {
+            staged[rank] = &operands.partials[rank].buf;
+        }
+        gpus.broadcast_f32_from_root(&staged[..n], schedule.reduce_count)
+            .map_err(hip_err)?;
+    }
+
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().map_err(hip_err)?;
+        binding.residual_finish(rank, gpu, &operands.partials[rank])?;
+    }
+    Ok(())
 }
 
 fn tp_peer_hc4_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool {
@@ -395,20 +877,134 @@ const MAX_EP_STACK_RANKS: usize = 64;
 ///    validates its actual seal inputs against it; enqueues NOTHING) —
 ///    still before zeroing ANY partial.
 /// 2. Zero every rank's routed partial on its own stream.
-/// 3. Rank 0 runs [`ForwardBindings::ep_run_moe_root`] (router + owned +
-///    shared exactly once into its zeroed partial) and returns the opaque
-///    [`MoeRouteProducerProof`](hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof).
-/// 4. Re-borrow each rank's resident route buffers via a broadcast closure;
-///    broadcast root top-k IDs **and** weights into them via
-///    [`Gpus::broadcast_ep_route`] (no host D2H/H2D, no new staging, no
-///    per-layer heap allocation).
+/// 3. Rank 0 runs [`ForwardBindings::ep_run_moe_root`] (router + owned slot
+///    outputs + shared exactly once into its residual base) and returns the
+///    opaque route-producer proof.
+/// 4. Re-borrow each rank's resident route buffers and broadcast root top-k
+///    IDs and weights via [`Gpus::broadcast_ep_route`].
 /// 5. Every non-root runs [`ForwardBindings::ep_run_moe_contrib`] against the
-///    proof (owned experts only; no independent router).
-/// 6. Existing `all_reduce_sum_f32_decode` over the partials, then
-///    [`ForwardBindings::ep_add_into_residual`] exactly once per rank.
+///    proof, writing its owned outputs into the same global slot layout.
+/// 6. Synchronize the root shared-residual base after all non-root route work,
+///    gather slot outputs to root without folding slots, run the ordinary
+///    single-device slot-order combine once, byte-copy the finished routed
+///    partial to every rank, then call
+///    [`ForwardBindings::ep_add_into_residual`] once per rank.
 ///
 /// Any error is fail-stop for the token: no retry, no fallback to the
 /// independent-router rank-partial path.
+struct DecodeRootRoutedContext<'a, B: ForwardBindings> {
+    bindings: &'a mut [B],
+    op: &'a hipfire_dispatch::pipeline::superop::OpBinding,
+}
+
+impl<B: ForwardBindings> RootRoutedEpBinding for DecodeRootRoutedContext<'_, B> {
+    type Admission = hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
+    type Proof = hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
+
+    fn preflight_root(
+        &self,
+        gpu: &Gpu,
+        partial: &GpuTensor,
+    ) -> Result<Self::Admission, DispatchError> {
+        self.bindings[0].ep_preflight_moe_root(gpu, &DispatchCtx::new(gpu), self.op, partial)
+    }
+
+    fn preflight_rank(
+        &self,
+        rank: usize,
+        gpu: &Gpu,
+        partial: &GpuTensor,
+        admission: &Self::Admission,
+    ) -> Result<(), DispatchError> {
+        self.bindings[rank].ep_preflight_moe_contrib(
+            gpu,
+            &DispatchCtx::new(gpu),
+            self.op,
+            admission,
+            partial,
+        )
+    }
+
+    fn root_compute(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+        _admission: &Self::Admission,
+    ) -> Result<Self::Proof, DispatchError> {
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        self.bindings[0].ep_run_moe_root(gpu, &dispatch_ctx, self.op, partial)
+    }
+
+    fn route_buffers(&self, rank: usize) -> Result<EpRouteBuffers<'_>, DispatchError> {
+        let view = self.bindings[rank].ep_moe_route_view().ok_or_else(|| {
+            DispatchError::Hip(format!(
+                "run_layer_program_ep: root-routed EP rank {rank} route view unavailable"
+            ))
+        })?;
+        Ok(EpRouteBuffers {
+            ids: &view.topk_ids.buf,
+            weights: &view.topk_weights.buf,
+            slot_outputs: &view.slot_outputs.buf,
+        })
+    }
+
+    fn rank_contribute(
+        &mut self,
+        rank: usize,
+        gpu: &mut Gpu,
+        proof: &Self::Proof,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        self.bindings[rank].ep_run_moe_contrib(gpu, &dispatch_ctx, self.op, proof, partial)
+    }
+
+    fn sync_shared_residual(&mut self, gpus: &mut Gpus, count: usize) -> Result<(), DispatchError> {
+        let bytes = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                DispatchError::Hip(
+                    "run_layer_program_ep: shared residual byte count overflow".into(),
+                )
+            })?;
+        let residuals: Vec<&DeviceBuffer> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(rank, binding)| {
+                let residual = binding.ep_moe_shared_residual().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "run_layer_program_ep: root-routed EP rank {rank} is missing its shared residual"
+                    ))
+                })?;
+                if residual.buf.size() < bytes {
+                    return Err(DispatchError::Hip(format!(
+                        "run_layer_program_ep: root-routed EP rank {rank} shared residual has {} bytes, needs {bytes}",
+                        residual.buf.size()
+                    )));
+                }
+                Ok(&residual.buf)
+            })
+            .collect::<Result<_, DispatchError>>()?;
+        gpus.broadcast_f32_from_root(&residuals, count)
+            .map_err(hip_err)
+    }
+
+    fn finish_combine(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError> {
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        self.bindings[0].ep_finish_moe_slot_order(gpu, &dispatch_ctx, self.op, partial)
+    }
+
+    fn residual_finish(
+        &mut self,
+        rank: usize,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        self.bindings[rank].ep_add_into_residual(gpu, partial)
+    }
+}
+
 fn run_moe_ep_root_routed<B: ForwardBindings>(
     gpus: &mut Gpus,
     bindings: &mut [B],
@@ -418,17 +1014,21 @@ fn run_moe_ep_root_routed<B: ForwardBindings>(
     peer_lease: Option<&PeerReduceScratchLease>,
 ) -> Result<(), DispatchError> {
     let n = gpus.devices.len();
-
-    // Fail-closed rank bound for the host-stack staging in step 6 (and the
-    // per-rank preflight loop in step 1b): checked before ANY work, so no
-    // path below can index past the bounded staging.
-    if n > MAX_EP_STACK_RANKS {
-        return Err(DispatchError::Hip(format!(
-            "run_layer_program_ep: root-routed EP rank count {n} exceeds host-stack bound {MAX_EP_STACK_RANKS}"
-        )));
+    if n == 0 {
+        return Err(DispatchError::Hip(
+            "run_layer_program_ep: root-routed EP mesh has no ranks".into(),
+        ));
     }
-
-    // ── 1. Preflight (no scratch mutation yet) ─────────────────────────────
+    if bindings.len() != n {
+        return Err(DispatchError::Hip(
+            "run_layer_program_ep: root-routed EP binding count disagrees with mesh".into(),
+        ));
+    }
+    if partials.len() != n {
+        return Err(DispatchError::Hip(
+            "run_layer_program_ep: root-routed EP partial count disagrees with mesh".into(),
+        ));
+    }
     let need_bytes = residual_dim
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| {
@@ -436,61 +1036,80 @@ fn run_moe_ep_root_routed<B: ForwardBindings>(
                 "run_layer_program_ep: residual_dim*4 partial byte count overflow".into(),
             )
         })?;
-    for r in 0..n {
-        if partials[r].buf.size() < need_bytes {
-            return Err(DispatchError::Hip(format!(
-                "run_layer_program_ep: root-routed EP rank {r} partial has {} bytes, needs {need_bytes}",
-                partials[r].buf.size()
-            )));
-        }
-    }
 
-    let root_view = bindings[0].ep_moe_route_view().ok_or_else(|| {
-        DispatchError::Hip(
-            "run_layer_program_ep: root-routed EP rank 0 is missing its route view".into(),
-        )
-    })?;
-    let root_contract_id = root_view.contract_id().ok_or_else(|| {
-        DispatchError::Hip(
-            "run_layer_program_ep: root-routed EP root has no execution contract".into(),
-        )
-    })?;
-    if let Some(contract) = root_view.execution_contract() {
-        if !contract.is_root_routed_ep() {
+    let (
+        schedule,
+        root_contract_id,
+        root_layer,
+        root_hidden,
+        root_k,
+        root_n_exp,
+        contribution_count,
+    ) = {
+        let root_view = bindings[0].ep_moe_route_view().ok_or_else(|| {
+            DispatchError::Hip(
+                "run_layer_program_ep: root-routed EP rank 0 is missing its route view".into(),
+            )
+        })?;
+        let contract = root_view.execution_contract().ok_or_else(|| {
+            DispatchError::Hip(
+                "run_layer_program_ep: root-routed EP root has no execution contract".into(),
+            )
+        })?;
+        let contribution_count = root_view.k.checked_mul(root_view.hidden).ok_or_else(|| {
+            DispatchError::Hip(
+                "run_layer_program_ep: root-routed slot contribution count overflow".into(),
+            )
+        })?;
+        let schedule = RootRoutedEpSchedule::derive(
+            contract,
+            n,
+            root_view.layer,
+            root_view.k,
+            need_bytes,
+            residual_dim,
+            contribution_count,
+            root_view.hidden,
+            RootRoutedEpReduction::Decode,
+        )?;
+        if root_view.contract_id() != Some(schedule.contract_id()) {
             return Err(DispatchError::Hip(
-                "run_layer_program_ep: root-routed EP root contract is not root-routed".into(),
+                "run_layer_program_ep: root route view contract identity disagrees with execution contract".into(),
             ));
         }
-    }
-    if root_view.experts.local_rank() != 0 {
-        return Err(DispatchError::Hip(format!(
-            "run_layer_program_ep: root-routed EP rank 0 binding reports local_rank {}",
-            root_view.experts.local_rank()
-        )));
-    }
-    if root_view.experts.rank_count() != n {
-        return Err(DispatchError::Hip(format!(
-            "run_layer_program_ep: root-routed EP root rank_count {} != mesh {n}",
-            root_view.experts.rank_count()
-        )));
-    }
-    if root_view.k == 0 {
-        return Err(DispatchError::Hip(
-            "run_layer_program_ep: root-routed EP requires k > 0".into(),
-        ));
-    }
-    if root_view.hidden != residual_dim {
-        return Err(DispatchError::Hip(format!(
-            "run_layer_program_ep: root-routed EP root hidden {} != residual_dim {residual_dim}",
-            root_view.hidden
-        )));
-    }
-    let root_layer = root_view.layer;
-    let root_hidden = root_view.hidden;
-    let root_k = root_view.k;
-    let root_n_exp = root_view.n_exp;
-    // End the root view borrow before the experts loop (and before re-borrow).
-    drop(root_view);
+        if root_view.experts.local_rank() != 0 {
+            return Err(DispatchError::Hip(format!(
+                "run_layer_program_ep: root-routed EP rank 0 binding reports local_rank {}",
+                root_view.experts.local_rank()
+            )));
+        }
+        if root_view.experts.rank_count() != n {
+            return Err(DispatchError::Hip(format!(
+                "run_layer_program_ep: root-routed EP root rank_count {} != mesh {n}",
+                root_view.experts.rank_count()
+            )));
+        }
+        if root_view.k == 0 {
+            return Err(DispatchError::Hip(
+                "run_layer_program_ep: root-routed EP requires k > 0".into(),
+            ));
+        }
+        if root_view.hidden != residual_dim {
+            return Err(DispatchError::Hip(format!(
+                "run_layer_program_ep: root-routed EP root hidden {} != residual_dim {residual_dim}",
+                root_view.hidden
+            )));
+        }
+        (
+            schedule,
+            schedule.contract_id(),
+            root_view.layer,
+            root_view.hidden,
+            root_view.k,
+            root_view.n_exp,
+            contribution_count,
+        )
+    };
 
     for r in 1..n {
         let view = bindings[r].ep_moe_route_view().ok_or_else(|| {
@@ -498,12 +1117,7 @@ fn run_moe_ep_root_routed<B: ForwardBindings>(
                 "run_layer_program_ep: root-routed EP rank {r} is missing its route view"
             ))
         })?;
-        let contract_id = view.contract_id().ok_or_else(|| {
-            DispatchError::Hip(format!(
-                "run_layer_program_ep: root-routed EP rank {r} has no execution contract"
-            ))
-        })?;
-        if contract_id != root_contract_id
+        if view.contract_id() != Some(root_contract_id)
             || view.layer != root_layer
             || view.hidden != root_hidden
             || view.k != root_k
@@ -527,106 +1141,18 @@ fn run_moe_ep_root_routed<B: ForwardBindings>(
         }
     }
 
-    // ── 1b. Actual binding/params/proof preflight (pure; enqueues nothing) ──
-    // Every rank validates its real MoE seal inputs (bound experts, params,
-    // proof adoption) BEFORE any partial is zeroed, so a bad rank fails
-    // closed without mutating scratch. The proof below is static load-bound
-    // validation metadata only; the authoritative proof still comes from
-    // the root compute in step 3.
-    {
-        let ctx0 = DispatchCtx::new(&gpus.devices[0]);
-        let preflight_proof =
-            bindings[0].ep_preflight_moe_root(&gpus.devices[0], &ctx0, op, &partials[0])?;
-        for r in 1..n {
-            let ctx = DispatchCtx::new(&gpus.devices[r]);
-            bindings[r].ep_preflight_moe_contrib(
-                &gpus.devices[r],
-                &ctx,
-                op,
-                &preflight_proof,
-                &partials[r],
-            )?;
-        }
-    }
-
-    // ── 2. Zero every rank partial ─────────────────────────────────────────
-    for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(hip_err)?;
-        let stream = gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
-            DispatchError::Hip(format!(
-                "run_layer_program_ep: device {r} has no active_stream (call ensure_rank_streams)"
-            ))
-        })?;
-        gpus.devices[r]
-            .hip
-            .memset_async(&partials[r].buf, 0, need_bytes, stream)
-            .map_err(hip_err)?;
-    }
-
-    // ── 3. Root: router + owned + shared exactly once → proof ──────────────
-    gpus.devices[0].bind_thread().map_err(hip_err)?;
-    let ctx0 = DispatchCtx::new(&gpus.devices[0]);
-    let proof = bindings[0].ep_run_moe_root(&mut gpus.devices[0], &ctx0, op, &partials[0])?;
-
-    // ── 4. Broadcast root IDs + weights into existing per-rank route bufs ──
-    // No host ID pack, no extra staging, no per-layer heap allocation: the
-    // broadcast closure re-borrows each rank's resident route buffers
-    // directly from its binding (the `&'a GpuTensor` is copied out of the
-    // view, so the returned `&DeviceBuffer`s outlive the view temporary).
-    // Non-root bindings are untouched by the root compute, but the closure
-    // API is infallible, so re-check every view here to stay fail-stop
-    // (never a fallback); the expect below is unreachable after that
-    // check on this single thread.
-    for r in 1..n {
-        if bindings[r].ep_moe_route_view().is_none() {
-            return Err(DispatchError::Hip(format!(
-                "run_layer_program_ep: root-routed EP rank {r} lost its route view after root"
-            )));
-        }
-    }
-    let root_view = bindings[0].ep_moe_route_view().ok_or_else(|| {
-        DispatchError::Hip(
-            "run_layer_program_ep: root-routed EP rank 0 lost its route view after root".into(),
-        )
-    })?;
-    let root_ids: &GpuTensor = root_view.topk_ids;
-    let root_weights: &GpuTensor = root_view.topk_weights;
-    let root_k = root_view.k;
-    gpus.broadcast_ep_route(
-        &root_ids.buf,
-        &root_weights.buf,
-        |r| {
-            let view = bindings[r].ep_moe_route_view().expect(
-                "run_layer_program_ep: root-routed EP rank lost its route view after re-check",
-            );
-            let ids: &GpuTensor = view.topk_ids;
-            let weights: &GpuTensor = view.topk_weights;
-            (&ids.buf, &weights.buf)
+    execute_root_routed_ep(
+        gpus,
+        &mut DecodeRootRoutedContext { bindings, op },
+        schedule,
+        RootRoutedEpOperands {
+            partials,
+            partial_bytes: need_bytes,
+            reduce_count: residual_dim,
+            route_count: root_k,
+            contribution_count,
+            contribution_chunk: root_hidden,
         },
-        root_k,
+        peer_lease,
     )
-    .map_err(hip_err)?;
-
-    // ── 5. Non-root contrib (proof-bound; no independent router) ───────────
-    for r in 1..n {
-        gpus.devices[r].bind_thread().map_err(hip_err)?;
-        let ctx = DispatchCtx::new(&gpus.devices[r]);
-        bindings[r].ep_run_moe_contrib(&mut gpus.devices[r], &ctx, op, &proof, &partials[r])?;
-    }
-
-    // ── 6. All-reduce partials + residual add, once per rank ───────────────
-    // Host-stack slice of buffer refs: no per-layer heap allocation. The
-    // rank bound was checked fail-closed at the top of this function, so
-    // every staged index below is live and `staged[..n]` is exactly the N
-    // ranks. Stack only (64 refs worst case) — never a GPU allocation.
-    let mut staged: [&DeviceBuffer; MAX_EP_STACK_RANKS] = [&partials[0].buf; MAX_EP_STACK_RANKS];
-    for r in 1..n {
-        staged[r] = &partials[r].buf;
-    }
-    all_reduce_sum_f32_decode(gpus, &staged[..n], residual_dim, peer_lease)?;
-    for r in 0..n {
-        gpus.devices[r].bind_thread().map_err(hip_err)?;
-        bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
-    }
-    Ok(())
 }

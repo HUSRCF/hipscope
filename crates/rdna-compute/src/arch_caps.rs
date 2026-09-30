@@ -58,6 +58,7 @@ pub struct ArchCaps {
     has_wmma: bool,
     has_wmma_w32: bool,
     has_wmma_w32_gfx12: bool,
+    has_gfx11_plus_simt: bool,
     has_dot2_f32_f16: bool,
     has_mmq: bool,
     is_gcn5_wave64: bool,
@@ -143,6 +144,7 @@ impl ArchCaps {
         let has_wmma = is_rdna3 || is_rdna4;
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
+        let has_gfx11_plus_simt = is_rdna3 || is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let has_mmq = is_gfx906 || is_rdna3;
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
@@ -204,6 +206,7 @@ impl ArchCaps {
             has_wmma,
             has_wmma_w32,
             has_wmma_w32_gfx12,
+            has_gfx11_plus_simt,
             has_dot2_f32_f16,
             has_mmq,
             is_gcn5_wave64,
@@ -425,6 +428,13 @@ impl ArchCaps {
     }
     pub fn has_wmma_w32_gfx12(&self) -> bool {
         self.has_wmma_w32_gfx12
+    }
+    /// gfx11-generation wave32 SIMT ISA, shared by gfx12: DPP16 row shifts,
+    /// `permlanex16`, and the gfx11+ buffer-resource descriptor (word3
+    /// `0x31004000`).  Kernels that need only these (no WMMA) compile from one
+    /// source for both generations behind `__GFX11__ || __GFX12__`.
+    pub fn has_gfx11_plus_simt(&self) -> bool {
+        self.has_gfx11_plus_simt
     }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
@@ -737,6 +747,19 @@ mod tests {
                 !make_caps(arch).supports_mq3_lloyd_mb4(),
                 "mq3-lloyd mb4 must NOT admit {arch}"
             );
+        }
+    }
+
+    #[test]
+    fn gfx11_plus_simt_covers_rdna3_and_rdna4_only() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            assert!(make_caps(arch).has_gfx11_plus_simt(), "{arch}");
+        }
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx942"] {
+            assert!(!make_caps(arch).has_gfx11_plus_simt(), "{arch}");
         }
     }
 

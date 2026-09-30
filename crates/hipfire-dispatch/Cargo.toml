@@ -9,6 +9,7 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+smallvec = "1.15.2"
 
 [features]
 default = []
