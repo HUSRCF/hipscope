@@ -9110,6 +9110,11 @@ pub fn dflash_legacy_prefill() -> bool {
 /// after the prompt the target's KV, DeltaNet state and last-token logits are
 /// byte-identical to AR's prefill of the same prompt.
 ///
+/// The ring holds only `max_positions` rows (a windowed draft's ring is W
+/// rows), so an outer chunk wider than the ring runs as ring-sized pieces
+/// ([`SeedPrefill::piece_len`]) whose hidden rows are read back one piece at
+/// a time.
+///
 /// Legacy (`HIPFIRE_DFLASH_LEGACY_PREFILL=1`): 256-row outer chunks.
 struct SeedPrefill {
     ceiling: usize,
@@ -9148,7 +9153,24 @@ impl SeedPrefill {
             .unwrap_or(remaining.min(self.ceiling).max(1))
     }
 
-    /// Prefill one outer chunk at `pos`, extracting hidden rows into the ring.
+    /// Rows of the next forward call inside an outer chunk with `remaining`
+    /// rows left. A chunk the ring can hold runs whole. A wider one runs as
+    /// pieces planned by the widened chunk rule at the ring size rounded down
+    /// to the 512-row commit stride: the pieces keep every boundary AR's own
+    /// chunk planner makes, and each added boundary falls on one of the 512-row
+    /// commits the widened chunk already makes there.
+    fn piece_len(hidden_rb: &HiddenStateRingBuffer, remaining: usize) -> usize {
+        let ring = hidden_rb.max_positions;
+        if remaining <= ring {
+            return remaining;
+        }
+        let stride = qwen35::prefill::WIDENED_COMMIT_ROWS;
+        let cap = if ring >= stride { ring / stride * stride } else { ring };
+        qwen35::prefill::next_exact_prefill_chunk_len(remaining, cap)
+            .unwrap_or(remaining.min(cap))
+    }
+
+    /// Prefill one piece at `pos`, extracting hidden rows into the ring.
     /// `total` is the seed's token count, which bounds the scratch.
     fn forward(
         &mut self,
@@ -9258,11 +9280,14 @@ pub fn seed_target_hidden_from_prompt_abortable(
                 return Ok(true);
             }
             let end = seq_pos + seed.next_len(prompt_tokens.len() - seq_pos);
-            let chunk = &prompt_tokens[seq_pos..end];
-            seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
-            let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
-            target_hidden_host.extend_from_slice(&block);
-            seq_pos = end;
+            while seq_pos < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
+                let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
+                seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
+                let block = download_hidden_block(gpu, hidden_rb, piece)?;
+                target_hidden_host.extend_from_slice(&block);
+                seq_pos += piece;
+            }
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
             }
@@ -9315,10 +9340,12 @@ pub fn seed_target_hidden_suffix_abortable(
                 return Ok(true);
             }
             let end = off + seed.next_len(suffix.len() - off);
-            let chunk = &suffix[off..end];
-            seed.forward(gpu, target, hidden_rb, chunk, pos, suffix.len())?;
-            pos += chunk.len();
-            off = end;
+            while off < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - off);
+                seed.forward(gpu, target, hidden_rb, &suffix[off..off + piece], pos, suffix.len())?;
+                pos += piece;
+                off += piece;
+            }
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
             }

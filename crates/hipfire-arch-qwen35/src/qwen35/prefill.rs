@@ -1961,7 +1961,7 @@ fn ordinary_prefill_chunk_limit_with_cache(
 /// singleton after a full ceiling: shorten that chunk by one row so the
 /// 512-row recurrent segments end in a 511-row partial and the final chunk has
 /// two rows. The same rule maps a final in-ceiling 513 rows to 511 + 2.
-fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+pub(crate) fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining < MIN_BATCH || ceiling < MIN_BATCH {
         return None;
     }
