@@ -3556,6 +3556,19 @@ pub fn generate(
             })
             .unwrap_or(0),
     );
+    let max_tokens = if m.eviction.is_none() {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            m.seq_pos + new_tokens.len() + trailer,
+            m.physical_cap,
+        )
+    } else {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            absolute_pos + new_tokens.len() + trailer,
+            m.max_seq,
+        )
+    };
     if m.eviction.is_none() {
         if m.seq_pos
             .saturating_add(new_tokens.len())

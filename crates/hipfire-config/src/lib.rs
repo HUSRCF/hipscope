@@ -1135,6 +1135,24 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
         "Backoff before the single serve retry; slept outside runtime and admission locks."
     ),
+    process_bool_field!(
+        "serve.allow_request_pull",
+        "allow_request_pull",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_ALLOW_REQUEST_PULL",
+        "Let a chat request that names a registry model not on disk download it. Off: the request gets 404 and the operator runs `hipfire pull`."
+    ),
+    process_bool_field!(
+        "serve.allow_request_paths",
+        "allow_request_paths",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_ALLOW_REQUEST_PATHS",
+        "Let a chat request load any readable file it names. Off: requests may name only installed models (models directory, catalog, pre-warm model)."
+    ),
     field!(
         "experimental.budget_alert",
         "experimental_budget_alert",

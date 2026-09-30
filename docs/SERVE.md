@@ -119,8 +119,13 @@ Agent / Pi custom-provider configuration, see
 
 ### `GET /health`
 
-Always `200` while the HTTP server is up. `model` is the loaded tag/path or
-`null` when idle/unloaded; `loading_model` names an asynchronous pre-warm.
+`200` with `status: "ok"` while the daemon is up. `503` with
+`status: "restarting"` while serve respawns a daemon that exited (crash, panic,
+or a sticky GPU fault, after which the daemon exits 75) and reloads the
+resident model; `503` with `status: "unhealthy"` if respawning failed, after
+which serve exits 1 so a service manager can restart it. `model` is the loaded
+tag/path or `null` when idle/unloaded or after a failed model switch;
+`loading_model` names an asynchronous pre-warm or post-restart reload.
 
 ```bash
 # Loopback example (safe default for local smoke):
@@ -152,7 +157,8 @@ through to per-model / registry / daemon defaults when omitted):
 
 | Field | Notes |
 |---|---|
-| `model` | Tag or path; triggers reload if different from resident model |
+| `model` | Tag or path of an installed model; reloads if different from the resident model. A registry model that is not installed is 404 ("run `hipfire pull`") unless `serve.allow_request_pull = true`; a file outside the models directory, the catalog and the pre-warm model is 404 unless `serve.allow_request_paths = true`. |
+| `max_tokens` / `max_completion_tokens` | Omitted: the configured default (Qwen tags 81920, DeepSeek V4 Flash 393216, else `generation.max_tokens`) is fitted to the context left after the prompt, minus 64. Explicit and at or above the loaded context: 400. Never triggers a reload. |
 | `messages` | OpenAI chat messages (required for useful chat) |
 | `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
