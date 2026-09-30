@@ -203,6 +203,10 @@ name = "bench_moe_expert_gemv"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_qwen4_hc_wmma"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq2g256_lloyd_grouped_gfx12"
 required-features = ["lab"]
 

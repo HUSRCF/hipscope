@@ -31,6 +31,15 @@ pub struct F2GdnTargets<'a> {
 pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
+/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` opts gfx1201 into its gfx12 WMMA
+/// kernels for the F16 WMMA route (the BF16 projections and the HC read).
+/// Default off: the route is not bit-exact and has no Flash-Next KLD
+/// reference yet, so gfx1201 keeps the multirow/SIMT arms it ran before.
+/// Other arches are untouched.  Read once.
+pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", false)
+    });
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
@@ -131,6 +140,47 @@ impl LdsTile {
     /// suffix, matching `WLDS_EPI_SET` in the .hip.
     pub fn entry_epi(&self, suffix: &str) -> String {
         format!("{}{}", self.entry(), suffix)
+    }
+}
+
+/// One tile of the split-K LDS WMMA GEMM
+/// (`kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip`, gfx1201 and gfx1151):
+/// block `bm × bn`, wave `wm × wn`, K staged 64 at a time, optional software
+/// pipelining and a deterministic `split`-way K split.
+/// [`LdsTileSplitK::entry`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LdsTileSplitK {
+    pub bm: usize,
+    pub bn: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub pipe: bool,
+    pub split: usize,
+}
+
+impl LdsTileSplitK {
+    pub const fn new(bm: usize, bn: usize, wm: usize, wn: usize, pipe: bool, split: usize) -> Self {
+        Self {
+            bm,
+            bn,
+            wm,
+            wn,
+            pipe,
+            split,
+        }
+    }
+
+    /// Kernel entry-point name, matching `SK_KERNEL` in the .hip.
+    pub fn entry(&self) -> String {
+        format!(
+            "qwen4_wmma_lds_{}_{}_{}_{}_k64{}{}",
+            self.bm,
+            self.bn,
+            self.wm,
+            self.wn,
+            if self.pipe { "_p" } else { "" },
+            if self.split > 1 { format!("_s{}", self.split) } else { String::new() }
+        )
     }
 }
 
@@ -27817,16 +27867,25 @@ impl Gpu {
     }
 
     /// Whether the Qwen4 F16 WMMA route applies to a `[M × K]` BF16 weight at
-    /// `batch_size` rows: gfx11 WMMA, >= QWEN4_F16_WMMA_MIN_TOKENS rows,
-    /// K % 64 == 0, no recorder/capture active, not opted out.
+    /// `batch_size` rows: gfx11 WMMA or gfx1201 ([`Gpu::qwen4_f16_wmma_gfx1201`]),
+    /// >= QWEN4_F16_WMMA_MIN_TOKENS rows, K % 64 == 0, no recorder/capture
+    /// active, not opted out.
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
-        self.arch_caps.has_wmma_w32()
+        (self.arch_caps.has_wmma_w32() || self.qwen4_f16_wmma_gfx1201())
             && weight.dtype == DType::BF16
             && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS
             && k % 64 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && *QWEN4_F16_WMMA
+    }
+
+    /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
+    /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
+    /// only with `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` (opt-in, default off).
+    /// Exact arch: gfx1200 and every other RDNA4 part stay on the multirow arms.
+    pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
+        self.arch_caps.is_gfx1201() && *QWEN4_F16_WMMA_GFX1201
     }
 
     /// Whether a Qwen4 forward of `rows` tokens keeps its HC residual streams as
@@ -27856,8 +27915,8 @@ impl Gpu {
 
     /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
     /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
-    /// F16.  2.5-5x the BF16 multirow kernel on gfx1151.  Not bit-exact:
-    /// callers are KLD-gated (see [`Gpu::qwen4_f16_wmma_applies`]).
+    /// F16.  2.5-5x the BF16 multirow kernel on gfx1151, 4-30x on gfx1201.
+    /// Not bit-exact: callers are KLD-gated (see [`Gpu::qwen4_f16_wmma_applies`]).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf16_f16_wmma(
         &mut self,
@@ -27875,6 +27934,10 @@ impl Gpu {
             shape: vec![m * k],
             dtype: DType::F16,
         };
+        if self.arch_caps.is_gfx1201() {
+            let tile = Self::qwen4_lds_tile_gfx1201(m, k);
+            return self.gemm_f16_x_f16_wmma_lds_splitk(&w_view, x_f16, y, m, k, batch_size, tile);
+        }
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
         // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
@@ -27904,7 +27967,11 @@ impl Gpu {
     /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X for each `(weight, y, m)`
     /// (all reading the same `[batch_size, k]` X, converted to F16 once) when
     /// the route applies to every weight; returns `false` with nothing
-    /// launched otherwise.
+    /// launched otherwise.  On gfx1201 a projection shorter than one 16-row
+    /// WMMA tile (the M = 4 hyper-write gate, the M = 1 selector) runs the
+    /// exact multirow kernel instead: with the F16 conversion of X paid it
+    /// loses there (4 x 20480 x 1536: 0.432 vs 0.207 ms; 4 x 10240 x 1900:
+    /// 0.255 vs 0.091 ms).
     pub fn gemm_bf16_xf32_f16_wmma_qwen4(
         &mut self,
         projections: &[(&GpuTensor, &GpuTensor, usize)],
@@ -27920,16 +27987,148 @@ impl Gpu {
             return Ok(false);
         }
         self.bind_thread()?;
+        let gfx1201 = self.arch_caps.is_gfx1201();
+        let short = move |m: usize| m < 16 && gfx1201;
+        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
+            self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+        }
+        if projections.iter().all(|&(_, _, m)| short(m)) {
+            return Ok(true);
+        }
         let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
         let x_view = GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
             shape: vec![batch_size * k],
             dtype: DType::F16,
         };
-        for &(weight, y, m) in projections {
+        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
             self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
         }
         Ok(true)
+    }
+
+    /// `Y[b, m] = Σ_k A[m, k]·X[b, k]` (A `[M, K]`, X `[B, K]` F16, Y `[B, M]`
+    /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
+    /// `tile.split > 1` the K-split partials go to the shared deterministic
+    /// K-split scratch (`split·B·M` F32) and are added in ascending split
+    /// order.  gfx1201 and gfx1151 only; `K % (64·split) == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_splitk(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTileSplitK,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151(),
+            "gemm_f16_x_f16_wmma_lds_splitk is gfx1201/gfx1151-only (arch {})",
+            self.arch
+        );
+        assert!(
+            k > 0 && k % (64 * tile.split) == 0,
+            "gemm_f16_x_f16_wmma_lds_splitk: K must be a positive multiple of {} (got {k})",
+            64 * tile.split
+        );
+        assert!(
+            a_f16.numel() >= m * k && x_f16.numel() >= batch_size * k && y_f32.numel() >= batch_size * m,
+            "gemm_f16_x_f16_wmma_lds_splitk: operands too small for [{m} x {k}] x {batch_size}"
+        );
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_wmma_lds_splitk";
+        let entry = tile.entry();
+        self.ensure_kernel(MODULE, kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, &entry)?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = if tile.split > 1 {
+            self.ensure_ksplit_det_partials(tile.split * batch_size * m * 4)?
+        } else {
+            y_f32.buf.as_ptr()
+        };
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+        ];
+        let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
+        let grid = [
+            m.div_ceil(tile.bm) as u32,
+            batch_size.div_ceil(tile.bn) as u32,
+            tile.split as u32,
+        ];
+        self.launch_maybe_blob(&entry, grid, [threads, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b
+        })?;
+        if tile.split == 1 {
+            return Ok(());
+        }
+        const REDUCE: &str = "qwen4_wmma_lds_reduce";
+        self.ensure_kernel(MODULE, kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, REDUCE)?;
+        let pp = yp;
+        let op = y_f32.buf.as_ptr();
+        let ni = (batch_size * m) as i32;
+        let si = tile.split as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            REDUCE,
+            [(batch_size * m).div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(si);
+                b
+            },
+        )
+    }
+
+    /// gfx1201 tile for the Qwen4 BF16 projections, measured on the R9700
+    /// against a 25-tile sweep (event-timed, 10-20 reps;
+    /// `qcal/release-0.4.0/qwen4-hc-wmma/logs/sweep{1,2}.txt`), multirow in
+    /// brackets:
+    ///
+    /// * M < 512 (HC input_mix_down 320, the M = 4 hyper-write gate, M = 1):
+    ///   64 x 128 / 32 x 64 pipelined, 4-way K split when K % 256 == 0.
+    ///   320 x 20480 x 1536 0.340 ms (4.78), 320 x 20480 x 512 0.129 (1.57),
+    ///   320 x 10240 x 1900 0.217 (1.15), 320 x 10240 x 1131 0.133 (0.71).
+    ///   The split also shortens each F32 accumulation chain: max error
+    ///   against an F64 reference falls from 2.3e-5 to 3.7e-6 of max |y| at
+    ///   K = 20480.
+    /// * 512 <= M < 1024: 128 x 128 / 32 x 64, 512 x 2560 x 1900 0.082 (0.52).
+    /// * M >= 1024: 128 x 256 / 32 x 64, 20480 x 2560 x 1536 2.09 ms (64.1),
+    ///   5120 x 2560 x 1536 0.49 (7.88), 2560 x 2560 x 1900 0.33 (2.48).
+    pub fn qwen4_lds_tile_gfx1201(m: usize, k: usize) -> LdsTileSplitK {
+        match m {
+            0..512 if k % 256 == 0 => LdsTileSplitK::new(64, 128, 32, 64, true, 4),
+            0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+            512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+            _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+        }
     }
 
     /// Exact BF16-weight × F32-input multirow GEMM with four- and
@@ -44385,6 +44584,77 @@ mod tests {
         assert!(!g12_iu4_b1_eligible(128, 384, aligned));
         assert!(!g12_iu4_b1_eligible(127, 512, aligned));
         assert!(!g12_iu4_b1_eligible(128, 512, 0x1004usize as *mut c_void));
+    }
+
+    /// The Qwen4 BF16 projection route (F16 weight shadow + LDS WMMA) against
+    /// the exact multirow kernel, across every gfx1201 tile (M < 512 with and
+    /// without the K split, 512 <= M < 1024, M >= 1024), the M < 16 multirow
+    /// fallback, and M / B one either side of the tile edges.  Not bit-exact
+    /// (F16 operands, WMMA summation order); a fragment layout, split or tail
+    /// error is off by O(max |y|).
+    #[test]
+    #[ignore = "requires a GPU and working HIP toolchain"]
+    fn qwen4_bf16_f16_wmma_route_matches_multirow() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("skip: no GPU ({error:?})");
+                return;
+            }
+        };
+        if !(gpu.arch_caps.has_wmma_w32() || gpu.qwen4_f16_wmma_gfx1201()) || !*QWEN4_F16_WMMA {
+            eprintln!("skip: no Qwen4 F16 WMMA route on {}", gpu.arch);
+            return;
+        }
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    // BF16-exact, so the multirow kernel sees the same values.
+                    f32::from_bits((((h as f32 - 4095.0) / 4095.0 * scale).to_bits()) & 0xFFFF_0000)
+                })
+                .collect()
+        };
+        // (M, K, B): split and unsplit short-M tiles, the M = 4 gate, the
+        // mid tile and the wide tile; M and B at tile edges and one either side.
+        for (m, k, b) in [
+            (320, 2560, 600),
+            (4, 2560, 517),
+            (300, 2624, 512),
+            (600, 1280, 530),
+            (1100, 640, 515),
+            (63, 2560, 641),
+            (65, 2560, 639),
+            (511, 1280, 640),
+            (513, 1280, 767),
+            (1023, 640, 769),
+            (1025, 640, 513),
+        ] {
+            let w: Vec<u8> = wave(1, m * k, 0.2)
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut weight = gpu.upload_raw(&w, &[m * k]).expect("weight");
+            weight.dtype = DType::BF16;
+            let x = gpu.upload_f32(&wave(2, b * k, 2.0), &[b * k]).expect("x");
+            let exact = gpu.zeros(&[b * m], DType::F32).expect("exact");
+            let route = gpu.zeros(&[b * m], DType::F32).expect("route");
+            gpu.gemm_bf16_xf32_multirow(&weight, &x, &exact, m, k, b).expect("multirow");
+            assert!(
+                gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &route, m)], &x, k, b)
+                    .expect("wmma route"),
+                "route not admitted for {m} x {k} x {b}"
+            );
+            let exact = gpu.download_f32(&exact).expect("download");
+            let got = gpu.download_f32(&route).expect("download");
+            let scale = exact.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let worst = exact.iter().zip(&got).fold(0f32, |a, (e, g)| a.max((e - g).abs()));
+            assert!(scale > 1.0, "{m} x {k} x {b}: degenerate output");
+            assert!(
+                worst <= 1e-4 * scale,
+                "{m} x {k} x {b}: max |route - multirow| {worst} vs max |y| {scale}"
+            );
+        }
     }
 
     #[test]
