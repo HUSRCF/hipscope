@@ -30,6 +30,9 @@ hipfire serve qwen3.8:27b-mq4-xts -d
 hipfire chat qwen3.8:27b-mq4-xts
 ```
 
+That pulls about 15 GB and wants a 24 GB+ card or Strix Halo. On smaller cards,
+start with `qwen3.5:4b` (or `qwen3.5:9b`) in the same commands.
+
 One-shot inference uses the same model registry and serving stack:
 
 ```bash
@@ -48,10 +51,9 @@ only by default; set `serve.host` to listen on other interfaces).
 
 Current stable release: **[v0.4.0](https://github.com/warpfront/hipfire/releases/tag/v0.4.0)**.
 
-**Flagship: Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (H2 — symmetric MQ4V2 XT with
-per-group AWQ and GPTQ scale refits; sha256 `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae`).
-`hipfire pull qwen3.8:27b-mq4-xts` fetches the target plus its DFlash draft
-sidecar (`qwen38-27b-dflash-mq4.hfq`). On v0.4.0 it gets:
+**Flagship: Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (symmetric MQ4V2 XT with
+per-group AWQ and GPTQ scale refits). `hipfire pull qwen3.8:27b-mq4-xts`
+fetches the target plus its DFlash draft sidecar. On v0.4.0 it gets:
 
 - **Prefill on one R9700 (gfx1201):** pp8192 ≈ 5,120 tok/s with native fp8 KV
   as the `auto` default, and 4,464 / 3,804 / 2,940 tok/s at 32K / 64K / 128K.
@@ -152,7 +154,7 @@ The registry currently contains 80 curated model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
-| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (H2 symmetric XT flagship), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
+| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (symmetric XT, flagship), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
 | Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (canonical); 262K context on one R9700 (gfx1201, tp=1, routed experts host-mapped) and on Strix Halo (gfx1151) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | Ornith 1.5 | `ornith-1.5:35b-a3b` (MQ4 default), `ornith-1.5:35b-a3b-mq4r` / `ornith-1.5:fast` (MQ4R) |
