@@ -327,10 +327,21 @@ struct VerifyGqaKernels {
     tile_fp8: Option<&'static str>,
     rows_q8: Option<&'static str>,
     reduce: &'static str,
-    /// Workgroups the split count aims for: the fixed grid is
-    /// `[row_groups * n_kv_heads, splits]` and each workgroup loops over
-    /// tiles `y, y + splits, ...` of its row group's live range.
-    target_workgroups: usize,
+    /// What the split count aims for; see [`VerifySplitTarget`].
+    split_target: VerifySplitTarget,
+}
+
+/// Split-count target of a VerifyAttn launch: the fixed grid is
+/// `[row_groups * n_kv_heads, splits]` and each workgroup loops over tiles
+/// `y, y + splits, ...` of its row group's live range.
+#[derive(Clone, Copy)]
+enum VerifySplitTarget {
+    /// This many workgroups (all 8 waves of a workgroup run).
+    Workgroups(usize),
+    /// This many active waves: the kernel runs one wave per query row of a
+    /// row group, so a chunk of `rows` rows has `rows * n_kv_heads` waves per
+    /// split.
+    Waves(usize),
 }
 
 const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
@@ -340,7 +351,7 @@ const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
     tile_fp8: Some("attention_verify_gqa_fp8_gfx1201"),
     rows_q8: None,
     reduce: "attention_verify_reduce_gfx1201",
-    target_workgroups: 256,
+    split_target: VerifySplitTarget::Workgroups(256),
 };
 
 const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
@@ -350,7 +361,7 @@ const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
     tile_fp8: None,
     rows_q8: Some("attention_verify_gqa_q8_rows_gfx1100"),
     reduce: "attention_verify_reduce_gfx1100",
-    target_workgroups: 256,
+    split_target: VerifySplitTarget::Waves(2048),
 };
 
 fn verify_gqa_kernels(gpu: &Gpu) -> Option<&'static VerifyGqaKernels> {
@@ -382,13 +393,16 @@ const VERIFY_GQA_MAX_ROWS: usize = 32;
 /// tile count, so a captured verify graph (keyed by batch size) always gets the
 /// capped value. The split count never changes output bytes.
 fn verify_gqa_splits(
-    target_workgroups: usize,
+    target: VerifySplitTarget,
     max_tiles: usize,
-    row_groups: usize,
+    rows: usize,
     n_kv_heads: usize,
 ) -> usize {
-    let per_split = (row_groups * n_kv_heads).max(1);
-    let cap = target_workgroups.div_ceil(per_split).max(1);
+    let (target, per_split) = match target {
+        VerifySplitTarget::Workgroups(n) => (n, rows.div_ceil(VERIFY_GQA_ROWS) * n_kv_heads),
+        VerifySplitTarget::Waves(n) => (n, rows * n_kv_heads),
+    };
+    let cap = target.div_ceil(per_split.max(1)).max(1);
     max_tiles.clamp(1, cap)
 }
 
@@ -7149,7 +7163,7 @@ impl Gpu {
         while offset < batch_size {
             let chunk = (batch_size - offset).min(sub_batch);
             let row_groups = chunk.div_ceil(VERIFY_GQA_ROWS);
-            let splits = verify_gqa_splits(set.target_workgroups, max_tiles, row_groups, n_kv_heads);
+            let splits = verify_gqa_splits(set.split_target, max_tiles, chunk, n_kv_heads);
             {
                 let q_ptr =
                     unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };

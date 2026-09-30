@@ -45,9 +45,10 @@
 // reference lanes r (dims 8r..8r+7) and r+16 (dims 128+8r..), so the xor-16
 // step is in-thread and 8/4/2/1 are DPP row_xmask adds.
 //
-// Every wave owns 6 (row, head) pairs for the whole tile (scores, softmax and
-// PV), so the tile loop has no workgroup barrier; the 8 waves of a workgroup
-// read the same K/V bytes through L0.
+// A row group of R <= 8 rows runs on R waves, each owning 6 (row, head)
+// pairs for the whole tile (scores, softmax and PV), so every dequantized K/V
+// slice serves 6 pairs and the tile loop has no workgroup barrier; the waves
+// of a workgroup read the same K/V bytes through L0.
 #include <hip/hip_runtime.h>
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
@@ -440,6 +441,11 @@ __device__ __forceinline__ void va_verify_gqa(
 
     const int wave = __builtin_amdgcn_readfirstlane((int)threadIdx.x >> 5);
     const int rl = (int)threadIdx.x & 15;
+    // One wave per row of the group: a group of R rows (6R pairs) runs on R
+    // waves of exactly 6 pairs, so each dequantized K/V slice always serves 6
+    // pairs; waves R..7 exit (the host sizes the split grid by active waves).
+    const int n_waves = rows_here;
+    if (wave >= n_waves) return;
 
     const unsigned per_pos = (unsigned)n_kv_heads * (VA_HD / 32) * 34u;
 
@@ -449,61 +455,39 @@ __device__ __forceinline__ void va_verify_gqa(
     // The reference grid covers tiles < max_tiles only; never write past it.
     const int n_tiles = min((group_len + VA_TILE - 1) / VA_TILE, max_tiles);
 
-    // This wave's pairs: p = wave + 8j -> (row p/6, head p%6); valid pairs
-    // (row < rows_here) are the prefix j < np.
-    int np = 0;
+    // This wave's pairs: p = wave + n_waves * j -> (row p/6, head p%6), all
+    // six valid.
     int pair_len[VA_PPW];
     int pair_tiles[VA_PPW];
     size_t pair_base[VA_PPW];
     float qa[VA_PPW][8], qb[VA_PPW][8];
 #pragma unroll
     for (int j = 0; j < VA_PPW; ++j) {
-        const int p = wave + VA_WAVES * j;
+        const int p = wave + n_waves * j;
         const int r = p / VA_GROUP;
         const int head = kv_h * VA_GROUP + (p - r * VA_GROUP);
         pair_base[j] = ((size_t)(row0 + r) * n_heads + head) * max_tiles;
-        pair_len[j] = (r < rows_here) ? positions[batch_offset + row0 + r] + 1 : 0;
+        pair_len[j] = positions[batch_offset + row0 + r] + 1;
         pair_tiles[j] = 0;
-        if (MODE == VA_MODE_ROWS && r < rows_here) {
+        if (MODE == VA_MODE_ROWS) {
             const int g0 = r - r % group_rows;
             const int g1 = min(g0 + group_rows, rows_here);
             int len = 0;
             for (int rr = g0; rr < g1; ++rr) len = max(len, positions[batch_offset + row0 + rr] + 1);
             pair_tiles[j] = min((len + VA_TILE - 1) / VA_TILE, max_tiles);
         }
-        if (r < rows_here) {
-            np = j + 1;
-            const float* qr = q + ((size_t)(row0 + r) * n_heads + head) * VA_HD;
-            const float4 a0 = *(const float4*)(qr + 8 * rl);
-            const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
-            const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
-            const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
-            qa[j][0] = a0.x; qa[j][1] = a0.y; qa[j][2] = a0.z; qa[j][3] = a0.w;
-            qa[j][4] = a1.x; qa[j][5] = a1.y; qa[j][6] = a1.z; qa[j][7] = a1.w;
-            qb[j][0] = b0.x; qb[j][1] = b0.y; qb[j][2] = b0.z; qb[j][3] = b0.w;
-            qb[j][4] = b1.x; qb[j][5] = b1.y; qb[j][6] = b1.z; qb[j][7] = b1.w;
-        } else {
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { qa[j][i] = 0.0f; qb[j][i] = 0.0f; }
-        }
+        const float* qr = q + ((size_t)(row0 + r) * n_heads + head) * VA_HD;
+        const float4 a0 = *(const float4*)(qr + 8 * rl);
+        const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
+        const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
+        const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
+        qa[j][0] = a0.x; qa[j][1] = a0.y; qa[j][2] = a0.z; qa[j][3] = a0.w;
+        qa[j][4] = a1.x; qa[j][5] = a1.y; qa[j][6] = a1.z; qa[j][7] = a1.w;
+        qb[j][0] = b0.x; qb[j][1] = b0.y; qb[j][2] = b0.z; qb[j][3] = b0.w;
+        qb[j][4] = b1.x; qb[j][5] = b1.y; qb[j][6] = b1.z; qb[j][7] = b1.w;
     }
-
-#define VA_TILES(N)                                                                                        \
-    case N:                                                                                                \
-        va_tiles<MODE, N>(k_cache, v_cache, partials, sc_lds[wave], qa, qb, pair_len, pair_tiles, pair_base, \
-                          group_len, n_tiles, kv_h, per_pos, scale_attn);                                  \
-        break;
-    switch (np) {
-        VA_TILES(1)
-        VA_TILES(2)
-        VA_TILES(3)
-        VA_TILES(4)
-        VA_TILES(5)
-        VA_TILES(6)
-        default:
-            break;
-    }
-#undef VA_TILES
+    va_tiles<MODE, VA_PPW>(k_cache, v_cache, partials, sc_lds[wave], qa, qb, pair_len, pair_tiles, pair_base,
+                           group_len, n_tiles, kv_h, per_pos, scale_attn);
 }
 
 // Grid: [ceil(n_rows/8) * n_kv_heads, S], block 256. Workgroup x = kv_h *
