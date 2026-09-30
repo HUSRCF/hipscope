@@ -5,8 +5,8 @@
 //! Routed-expert residency for cards whose VRAM cannot hold every expert.
 //!
 //! Flash-Next's routed experts are ~65 GB, the rest of the model ~5 GB. On a
-//! discrete card the experts of trunk layers at or past
-//! [`EXPERT_VRAM_LAYERS_ENV`] (and the MTP layer's) are fulfilled into pinned,
+//! discrete card the experts of trunk layers at or past the VRAM layer count
+//! ([`EXPERT_VRAM_LAYERS_ENV`]) and the MTP layer's are fulfilled into pinned,
 //! device-mapped host RAM instead of VRAM. The sealed MoE kernels already read
 //! every expert through per-layer pointer tables, so a host-mapped layer is
 //! read over PCIe (zero-copy) with no kernel or dispatch change: a decode
@@ -14,25 +14,91 @@
 
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 
-/// Number of trunk layers (from layer 0) whose routed experts stay in VRAM.
-/// Unset keeps every expert resident; `0` places every routed expert in host
-/// RAM.
+/// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
+/// the largest `N` that fits the card's free VRAM. Unset keeps every expert
+/// resident (the fully resident load).
 pub const EXPERT_VRAM_LAYERS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS";
 
+/// VRAM left free by `auto` beyond the resident non-expert weights: forward
+/// scratch, KV and state for the 2048-token contract plus headroom. Measured
+/// on gfx1201: a load with every routed expert in host RAM used 5.28 GiB
+/// beyond the non-expert weights.
+pub const AUTO_VRAM_RESERVE_BYTES: u64 = 6656 << 20;
+
+/// Host RAM that must remain available after the pinned experts are placed.
+pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
+
+/// Slack `Gpu::upload_raw_host_mapped` adds to every host-mapped tensor.
+pub const HOST_MAPPED_PAD_BYTES: u64 = 1 << 20;
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertVramLayers {
+    Layers(usize),
+    Auto,
+}
+
 /// Parse [`EXPERT_VRAM_LAYERS_ENV`]. `Ok(None)` = unset (fully resident).
-pub fn expert_vram_layers_from_env() -> Result<Option<usize>, String> {
+pub fn expert_vram_layers_from_env() -> Result<Option<ExpertVramLayers>, String> {
     match hipfire_config::developer_var(EXPERT_VRAM_LAYERS_ENV) {
-        Ok(value) => value
-            .trim()
-            .parse::<usize>()
-            .map(Some)
-            .map_err(|_| format!("{EXPERT_VRAM_LAYERS_ENV}={value:?} is not a layer count")),
+        Ok(value) => parse_expert_vram_layers(&value).map(Some),
         Err(_) => Ok(None),
     }
 }
 
+fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
+    let value = value.trim();
+    if value == "auto" {
+        return Ok(ExpertVramLayers::Auto);
+    }
+    value
+        .parse::<usize>()
+        .map(ExpertVramLayers::Layers)
+        .map_err(|_| format!("{EXPERT_VRAM_LAYERS_ENV}={value:?} is neither `auto` nor a layer count"))
+}
+
 fn is_routed_expert(name: &str) -> bool {
     name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+}
+
+/// Resident bytes outside the routed experts, and the routed-expert bytes of
+/// one trunk layer (layer 0), from each entry's payload size.
+pub fn resident_split(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<(u64, u64), String> {
+    let mut non_expert = 0u64;
+    let mut layer_experts = 0u64;
+    for entry in weights {
+        if entry.residency.is_external() {
+            continue;
+        }
+        let bytes = bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        if !is_routed_expert(&entry.name) {
+            non_expert += bytes;
+        } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
+            layer_experts += bytes;
+        }
+    }
+    Ok((non_expert, layer_experts))
+}
+
+/// The largest trunk-layer count whose routed experts fit in `free_vram` after
+/// the non-expert weights and [`AUTO_VRAM_RESERVE_BYTES`].
+pub fn auto_vram_layers(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes: u64,
+    num_layers: usize,
+) -> usize {
+    let budget = free_vram
+        .saturating_sub(non_expert_bytes)
+        .saturating_sub(AUTO_VRAM_RESERVE_BYTES);
+    match budget.checked_div(layer_expert_bytes) {
+        Some(layers) => (layers as usize).min(num_layers),
+        None => num_layers,
+    }
 }
 
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
@@ -52,6 +118,49 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
         }
     }
     moved
+}
+
+/// Pinned host bytes the [`WeightResidency::HostMapped`] entries will take.
+pub fn host_mapped_bytes(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in weights {
+        if entry.residency == WeightResidency::HostMapped {
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            total += bytes + HOST_MAPPED_PAD_BYTES;
+        }
+    }
+    Ok(total)
+}
+
+/// Refuse before any allocation when the pinned experts would not leave
+/// [`HOST_RAM_HEADROOM_BYTES`] of `MemAvailable`. Pinned pages cannot be
+/// reclaimed, so over-committing them starves the rest of the host.
+pub fn check_host_ram(host_bytes: u64, mem_available: Option<u64>) -> Result<(), String> {
+    if host_bytes == 0 {
+        return Ok(());
+    }
+    let Some(available) = mem_available else {
+        return Err(format!(
+            "routed experts need {:.1} GiB of pinned host RAM, but MemAvailable is unreadable",
+            host_bytes as f64 / GIB
+        ));
+    };
+    let needed = host_bytes + HOST_RAM_HEADROOM_BYTES;
+    if available < needed {
+        return Err(format!(
+            "routed experts need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
+             MemAvailable is {:.1} GiB; free host memory or keep more expert layers in VRAM \
+             ({EXPERT_VRAM_LAYERS_ENV})",
+            host_bytes as f64 / GIB,
+            HOST_RAM_HEADROOM_BYTES as f64 / GIB,
+            available as f64 / GIB
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -89,5 +198,34 @@ mod tests {
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
         );
+    }
+
+    #[test]
+    fn auto_fits_the_measured_gfx1201_card() {
+        // R9700 before load: 32548 MiB free; Flash-Next non-expert weights
+        // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
+        let free = 32548u64 << 20;
+        assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48), 16);
+        // A card that holds everything keeps every layer resident.
+        assert_eq!(auto_vram_layers(u64::MAX / 2, 5_364_000_000, 1_336_900_000, 48), 48);
+        // No room past the reserve places every expert in host RAM.
+        assert_eq!(auto_vram_layers(8 << 30, 5_364_000_000, 1_336_900_000, 48), 0);
+    }
+
+    #[test]
+    fn host_ram_check_refuses_below_headroom() {
+        let host = 60u64 << 30;
+        assert!(check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES)).is_ok());
+        let error = check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES - 1)).unwrap_err();
+        assert!(error.contains("MemAvailable"), "{error}");
+        assert!(check_host_ram(host, None).is_err());
+        assert!(check_host_ram(0, None).is_ok());
+    }
+
+    #[test]
+    fn parse_accepts_auto_and_counts_only() {
+        assert_eq!(parse_expert_vram_layers(" auto "), Ok(ExpertVramLayers::Auto));
+        assert_eq!(parse_expert_vram_layers("16"), Ok(ExpertVramLayers::Layers(16)));
+        assert!(parse_expert_vram_layers("16GB").is_err());
     }
 }
