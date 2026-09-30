@@ -6839,6 +6839,22 @@ pub fn kv_slot_desc_paged_source(body: &str, symbol: &str, paged_symbol: &str) -
     )
 }
 
+/// Source of the paged (slot-engine) variant of a descriptor kernel launched
+/// through the givens4/turbo assembler: `func` renamed to `paged_func` by
+/// macro, then the turbo/givens headers and the paged descriptor header in
+/// place of `body`'s includes. Shared by the runtime and the installer
+/// registry so both build the same module bytes.
+pub fn kv_slot_givens4_paged_source(body: &str, func: &str, paged_func: &str) -> String {
+    let stripped = body
+        .replace("#include \"turbo_common.h\"", "")
+        .replace("#include \"givens_common.h\"", "")
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "");
+    format!(
+        "#define {func} {paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_PAGED_H}\n{stripped}"
+    )
+}
+
 /// Sliding-window variant of ATTENTION_Q8_0_KV_SRC. Adds a `window`
 /// parameter: 0 = full causal (identical to the baseline), >0 = attend only
 /// to the last `window` keys ([max(0, seq_len - window), seq_len)). Used by

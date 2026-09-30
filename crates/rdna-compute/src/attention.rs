@@ -8743,18 +8743,7 @@ impl Gpu {
             )
         })?;
         if !self.functions.contains_key(paged_func) {
-            let stripped = body_src
-                .replace("#include \"turbo_common.h\"", "")
-                .replace("#include \"givens_common.h\"", "")
-                .replace("#include \"kv_slot_desc.h\"", "")
-                .replace("#include \"kv_slot_desc_paged.h\"", "");
-            let full_src = format!(
-                "#define {func_name} {paged_func}\n{}\n{}\n{}\n{}",
-                kernels::TURBO_COMMON_H,
-                kernels::GIVENS_COMMON_SRC,
-                kernels::KV_SLOT_DESC_PAGED_H,
-                stripped
-            );
+            let full_src = kernels::kv_slot_givens4_paged_source(body_src, func_name, paged_func);
             self.ensure_kernel(paged_func, &full_src, paged_func)?;
         }
         Ok(paged_func)
