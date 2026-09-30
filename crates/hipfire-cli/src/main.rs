@@ -13252,4 +13252,68 @@ mod tests {
         // The parent closes stdin once it has its response.
         let _ = std::io::stdin().read_line(&mut line);
     }
+
+    /// One `/metrics` sample value, by exact series name.
+    #[cfg(unix)]
+    fn metric(port: u16, name: &str) -> u64 {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from /metrics: {text}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Failed generations and admission rejections reach `/metrics`, each in
+    /// its own counter; successes reach neither.
+    #[cfg(unix)]
+    #[test]
+    fn failures_and_admission_rejections_are_counted() {
+        let harness = Task11HttpHarness::spawn("metrics-counters");
+        let port = harness.port();
+        let failed = "hipfire_requests_failed_total";
+        let rejected = "hipfire_admission_rejected_total";
+
+        // JSON error, stream rejected before commit, stream failing after it.
+        for (tag, stream, status) in [
+            ("t15-class-validation", false, 400),
+            ("t15-class-internal", true, 500),
+            ("t15-visible-token", true, 200),
+            ("t11-stop-text", false, 200),
+            ("t11-stop-text", true, 200),
+        ] {
+            let (got, _, _) = raw_chat_post(port, &harness.base_body(tag, stream));
+            assert_eq!(got, status, "{tag} stream={stream}");
+        }
+        assert_eq!(metric(port, failed), 3);
+        assert_eq!(metric(port, rejected), 0);
+
+        // Hold the only slot and fill the four-deep queue: the next request
+        // is refused by admission.
+        let held = harness.shared.admission.acquire().unwrap();
+        let queued: Vec<_> = (0..4)
+            .map(|_| {
+                let body = harness.base_body("t11-stop-text", false);
+                thread::spawn(move || raw_chat_post(port, &body).0)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 5 {
+            assert!(Instant::now() < deadline, "queue never filled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (status, head, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 503, "{head}");
+        drop(held);
+        for waiter in queued {
+            assert_eq!(waiter.join().unwrap(), 200);
+        }
+        assert_eq!(metric(port, rejected), 1);
+        assert_eq!(metric(port, failed), 3);
+    }
 }

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Serve `/metrics`: `hipfire_requests_failed_total` and `hipfire_admission_rejected_total` now count.** Both counters existed but nothing incremented them, so after three failed requests `/metrics` still read `failed_total 0`. A chat or image request answered with an error, or whose stream ended in an error event, now counts as failed; a request refused by admission (queue full, or queue wait timed out) counts as rejected and not as failed. Oversized or unparseable bodies count in neither.
 - **Serve survives `accept` failures, bounds its connections, and drains requests on SIGTERM.** An `accept` error (for example `EMFILE`: 56 idle connections under `ulimit -n 64` did it) ended the whole server with exit 1 and left `serve.pid` behind. It is now logged and retried with a backoff of 10 ms doubling to 1 s.
   - At most 512 client connections are served at once; further connects wait in the listen backlog.
   - A client must send a complete request head within 30 s of connecting or of its previous response. This also closes idle keep-alive connections, which before stayed open forever.

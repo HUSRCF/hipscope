@@ -12,6 +12,7 @@ use crate::serve::complete::{
     complete_request_cancellable, completion_json, gate_chat_completions_tools,
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
+use crate::serve::metrics::Metrics;
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
@@ -117,7 +118,11 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
         .unwrap_or_else(|_| static_server_error())
 }
 
-pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
+pub(crate) fn admission_error_response(
+    metrics: &Metrics,
+    error: &AdmissionError,
+) -> Response<BoxBody> {
+    metrics.record_admission_rejected();
     let mut resp = openai_error(&error.message, 503);
     if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
         resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
@@ -740,17 +745,17 @@ async fn handle_request(
                     .await
                 {
                     Ok(g) => g,
-                    Err(e) => return admission_error_response(&e),
+                    Err(e) => return admission_error_response(&shared.metrics, &e),
                 }
             } else {
                 match shared.admission.acquire_async(cancel.clone()).await {
                     Ok(g) => g,
-                    Err(e) => return admission_error_response(&e),
+                    Err(e) => return admission_error_response(&shared.metrics, &e),
                 }
             };
 
             if let Err(error) = gate_chat_completions_tools(&body_val) {
-                return openai_error(&error.to_string(), 400);
+                return RequestFailure::new(error.to_string(), 400).respond(&shared.metrics);
             }
 
             let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
@@ -781,9 +786,12 @@ async fn handle_request(
                     return openai_error(&msg, status);
                 }
             };
-            match handle_images_generations(shared, body_val).await {
+            match handle_images_generations(Arc::clone(&shared), body_val).await {
                 Ok(resp) => resp,
-                Err(message) => openai_error(&message, images_error_status(&message)),
+                Err(message) => {
+                    let status = images_error_status(&message);
+                    RequestFailure::new(message, status).respond(&shared.metrics)
+                }
             }
         }
         // OpenAI-shaped reference edit: `multipart/form-data` with one to four
@@ -827,9 +835,12 @@ async fn handle_request(
                 Ok(v) => v,
                 Err(message) => return openai_error(&message, 400),
             };
-            match handle_images_generations(shared, body_val).await {
+            match handle_images_generations(Arc::clone(&shared), body_val).await {
                 Ok(resp) => resp,
-                Err(message) => openai_error(&message, images_error_status(&message)),
+                Err(message) => {
+                    let status = images_error_status(&message);
+                    RequestFailure::new(message, status).respond(&shared.metrics)
+                }
             }
         }
         _ => openai_error("not found", 404),
@@ -1246,10 +1257,11 @@ async fn handle_streaming(
     let mut first = VecDeque::from([ResponseChunk::plain(sse_data(&role))]);
 
     let body_cancelled = Arc::clone(&cancelled);
+    let worker_shared = Arc::clone(&shared);
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             complete_request_cancellable(
-                &shared,
+                &worker_shared,
                 &body,
                 guard,
                 Some((sink.id.clone(), sink.created)),
@@ -1264,7 +1276,7 @@ async fn handle_streaming(
                 panic_message(payload.as_ref())
             ))
         });
-        sink.finish(result);
+        sink.finish(result, &worker_shared.metrics);
     });
 
     // Validation, model load and the daemon's own request checks all run in
@@ -1276,14 +1288,15 @@ async fn handle_streaming(
             Some(chunk) => first.push_back(chunk),
             None => {
                 return match commit_stream(&commit) {
-                    Err(failure) => failure.response(),
-                    Ok(()) => openai_error("generation ended without a response", 500),
+                    Err(failure) => failure.respond(&shared.metrics),
+                    Ok(()) => RequestFailure::new("generation ended without a response", 500)
+                        .respond(&shared.metrics),
                 };
             }
         },
         _ = tokio::time::sleep(SSE_SILENCE_LIMIT) => {
             if let Err(failure) = commit_stream(&commit) {
-                return failure.response();
+                return failure.respond(&shared.metrics);
             }
         }
     }
@@ -1393,8 +1406,10 @@ async fn handle_nonstreaming(
                 .unwrap();
             resp
         }
-        Ok(Err(failure)) => failure.response(),
-        Err(_) => openai_error("generation worker disconnected", 500),
+        Ok(Err(failure)) => failure.respond(&shared.metrics),
+        Err(_) => {
+            RequestFailure::new("generation worker disconnected", 500).respond(&shared.metrics)
+        }
     }
 }
 
@@ -1425,7 +1440,9 @@ impl RequestFailure {
         Self::new(error.to_string(), request_error_status(error))
     }
 
-    fn response(&self) -> Response<BoxBody> {
+    /// The JSON error response ending this request; counts it as failed.
+    fn respond(&self, metrics: &Metrics) -> Response<BoxBody> {
+        metrics.record_failure();
         let mut resp = openai_error(&self.message, self.status);
         if self.status == 503 {
             resp.headers_mut().insert(
@@ -1591,7 +1608,7 @@ impl SseSink {
     /// - Failure after commit: an SSE error event, then `[DONE]`.
     /// - Failure after the acknowledged `[DONE]` (e.g. the daemon commit):
     ///   nothing may follow it, so the body fails and the reader sees it torn.
-    fn finish(self, result: Result<Completion>) {
+    fn finish(self, result: Result<Completion>, metrics: &Metrics) {
         let Err(error) = result else {
             return;
         };
@@ -1606,6 +1623,7 @@ impl SseSink {
             self.id
         );
         if self.terminal_sent.get() {
+            metrics.record_failure();
             let _ = self.tx.try_send(ResponseChunk::fail());
             return;
         }
@@ -1618,6 +1636,7 @@ impl SseSink {
             }
             // The handler committed on its deadline while the worker was silent.
         }
+        metrics.record_failure();
         let _ = self
             .tx
             .blocking_send(ResponseChunk::last(failure.sse_event(), None));
