@@ -1881,7 +1881,7 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
                 {
@@ -2121,7 +2121,7 @@ fn dispatch_attend(
                     && io.head_dim == 256
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {

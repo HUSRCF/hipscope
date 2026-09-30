@@ -3711,6 +3711,31 @@ impl Gpu {
         result
     }
 
+    /// Largest `max_ctx_len` (max(positions)+1) the gfx11 FA2 prefill
+    /// ingresses and launchers accept on this GPU.
+    ///
+    /// Exact gfx1100 and gfx1151 take the model's 262144 positions. The FA2
+    /// bodies (`attention_q8_0_fa2_gqa.gfx11.hip`, `.gfx1151.hip`, and the
+    /// fwht3-K build of the former) never read the context: they walk KT32
+    /// tiles up to `max(positions)+1`, K/V row offsets are 64-bit, LDS is a
+    /// fixed 32 KiB and the grid is `(ceil(batch/16 or 8), 4)`. The former
+    /// 32768 ceiling sent every longer prefill segment to the query-tiled
+    /// `_wmma_slots` kernel. Other gfx11 atoms keep 32768 until measured.
+    pub fn fa2_gfx11_max_ctx(&self) -> usize {
+        if matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            262_144
+        } else {
+            32_768
+        }
+    }
+
+    /// Context admission shared by every gfx11 FA2 prefill ingress (dispatch
+    /// Q8/fwht3 arms, the wide Q8 route, the qwen35 whole-chunk and F2 pair
+    /// envelopes): `64..=`[`Self::fa2_gfx11_max_ctx`].
+    pub fn fa2_gfx11_ctx_admitted(&self, max_ctx_len: usize) -> bool {
+        (64..=self.fa2_gfx11_max_ctx()).contains(&max_ctx_len)
+    }
+
     /// Batch sizes the gfx11 FA2 prefill ingress accepts on this GPU.
     ///
     /// F2 N1024 pair envelope: exactly 1024 is admitted on exact gfx1151
@@ -3773,7 +3798,7 @@ impl Gpu {
             && head_dim == 256
             && (64..=8192).contains(&batch_size)
             && (batch_size <= 512 || batch_size % 512 == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
@@ -3822,7 +3847,7 @@ impl Gpu {
             && n_kv_heads == 4
             && head_dim == 256
             && self.fa2_gfx11_batch_admitted(batch_size)
-            && (64..=32768).contains(&max_ctx_len)
+            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
@@ -5867,11 +5892,12 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
                 ),
             ));
         }
@@ -6130,11 +6156,12 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
                 ),
             ));
         }
