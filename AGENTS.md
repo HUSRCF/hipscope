@@ -171,11 +171,11 @@ works, what to measure, what counts as pass/fail.
   for supported serving workloads. Agents must not treat PFlash as a production
   element, recommendation, acceptance route, or basis for a current
   performance claim.
-- **CASK is retained legacy research, not mainline or production functionality.**
+- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
   CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
-  sidecar-gen`) stays in-tree only for historical reference and reproduction
-  and warns when used. Same rule as PFlash: not a production element,
-  recommendation, acceptance route, or basis for a current performance claim.
+  sidecar-gen`) still loads, warns when used, and is not supported. Do not
+  treat it as a production element, recommendation, acceptance route, or basis
+  for a current performance claim, and do not build on it.
 
 ---
 
@@ -687,10 +687,10 @@ against the A3B MoE DFlash perfmaxx line.
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
 
-**Legacy note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
+**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
 config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
-flags; FlashCASK) is retired legacy research with the same status as PFlash.
-It prints a retirement warning when used, forces legacy contiguous DFlash
+flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
+It prints a deprecation warning when used, forces legacy contiguous DFlash
 (windowed draft disabled), and is not a flag, fix or pitfall workaround to
 reach for.
 

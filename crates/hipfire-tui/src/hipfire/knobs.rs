@@ -244,11 +244,12 @@ pub const KNOBS: &[KnobInfo] = &[
             ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     KnobInfo {
         key: "cask",
-        title: "CASK (retired legacy research)",
-        summary: "Retired legacy research: TriAttention KV-cache eviction, kept only for historical reproduction. Not supported.",
-        effect: "Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached. Loading with CASK prints a retirement warning.",
+        title: "CASK (deprecated, removal in 0.5.0)",
+        summary: "Deprecated since 0.4.0 and removed in 0.5.0: TriAttention KV-cache eviction. Not supported.",
+        effect: "Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached. Loading with CASK prints a deprecation warning.",
         default: "false",
         when: "Leave false. Not a production or recommended setting.",
         note: Some("m-fold eviction + DFlash can produce a repetition attractor; validate together. Eviction needs a sidecar path, not just this toggle."),

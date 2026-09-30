@@ -76,7 +76,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (retired CASK legacy research: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense

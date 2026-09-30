@@ -262,8 +262,8 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 
 Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
 pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
-eviction is retired legacy research — off by default, not supported, and not a
-recommended route to long context.
+eviction is deprecated and will be removed in 0.5.0 — off by default, not
+supported, and not a recommended route to long context.
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 

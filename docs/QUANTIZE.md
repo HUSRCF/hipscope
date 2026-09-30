@@ -262,12 +262,12 @@ not a guarantee):
 
 Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
 
-## Legacy research: CASK sidecar
+## Deprecated: CASK sidecar (removal in 0.5.0)
 
-CASK / TriAttention eviction is retired legacy research, kept only for
-historical reproduction; it is not a post-quantize step and not supported.
-To reproduce old CASK runs, `hipfire sidecar-gen <model> --corpus <file>`
-still writes `<model>.triattn.bin` (with a retirement warning); nothing
+CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
+not a post-quantize step and not supported. Until then,
+`hipfire sidecar-gen <model> --corpus <file>` still writes
+`<model>.triattn.bin` (with a deprecation warning); nothing
 attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
 [CONFIG.md](CONFIG.md).
 

@@ -199,12 +199,12 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority (schema v2; exactly one earned retained-PM4 product row).
 
-### CASK (retired legacy research) / serve / multi-GPU
+### CASK (deprecated, removal in 0.5.0) / serve / multi-GPU
 
-CASK / TriAttention eviction is retired legacy research (same status as
-PFlash): kept for historical reproduction only and not supported.
-`HIPFIRE_CASK_SIDECAR` is the legacy env alias of `memory.cask.sidecar`;
-setting it (or any CASK key) makes the daemon print a retirement warning at
+CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
+not supported. `HIPFIRE_CASK_SIDECAR` is the legacy env alias of
+`memory.cask.sidecar` and goes with it; setting it (or any CASK key) makes the
+daemon print a deprecation warning at
 load. `HIPFIRE_CASK_OFF` is a retired compatibility name that the Rust control
 plane does not consume; CASK is already off unless `memory.cask.sidecar` is
 set or `memory.cask.auto_attach=true`. The old name remains only in developer

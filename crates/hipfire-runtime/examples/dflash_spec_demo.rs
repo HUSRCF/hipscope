@@ -32,9 +32,8 @@
 //! stays byte-identical to the legacy path.
 //!
 //! `--cask-sidecar` / `--cask` / `--cask-budget` / `--cask-beta` /
-//! `--cask-core-frac` / `--cask-fold-m` (FlashCASK) are retired legacy
-//! research, kept only for historical reproduction; using them prints a
-//! one-line warning.
+//! `--cask-core-frac` / `--cask-fold-m` (FlashCASK) are deprecated since
+//! 0.4.0 and will be removed in 0.5.0; using them prints a one-line warning.
 //!
 //! Per-process diagnostics that gate on env vars (`HIPFIRE_PROFILE`,
 //! `HIPFIRE_HOST_TIMING`, `HIPFIRE_DPM_WARMUP_SECS`,
@@ -729,6 +728,7 @@ fn main() {
                 }
                 i += 2;
             }
+            // lifecycle: deprecated since 0.4.0, removal 0.5.0
             "--cask-sidecar" => {
                 cask_sidecar = Some(args[i + 1].clone());
                 i += 2;
@@ -762,7 +762,7 @@ fn main() {
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
     if cask_sidecar.is_some() || use_cask {
-        eprintln!("warning: CASK is retired legacy research; not supported (--cask* flags)");
+        eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (--cask* flags)");
     }
 
     // Build the prompt manifest. Exactly one of --prompt, --prompt-file,

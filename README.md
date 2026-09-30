@@ -233,10 +233,10 @@ roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
 not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
 389 tok/s) and leaves a fourth card free.
 
-PFlash (prefill compression) and CASK / TriAttention KV eviction are retained
-legacy research: off by default, kept only for historical reproduction, and
-neither a supported feature nor a recommended setting. Loading with a CASK
-option prints a retirement warning.
+PFlash (prefill compression) is retained legacy research, off by default.
+CASK / TriAttention KV eviction is deprecated and will be removed in 0.5.0:
+off by default, not supported, and not a recommended setting; loading with a
+CASK option prints a deprecation warning.
 
 ## Install
 

@@ -1225,6 +1225,7 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
         "Verify-path n-gram defense."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.sidecar",
         "cask_sidecar",
@@ -1235,8 +1236,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         Some("HIPFIRE_CASK_SIDECAR"),
-        "Legacy research (retired CASK/TriAttention, unsupported): sidecar path; empty disables eviction."
+        "Deprecated CASK (removal in 0.5.0): TriAttention sidecar path; empty disables eviction."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.enabled",
         "cask",
@@ -1247,8 +1249,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired, unsupported): enable core-aware CASK folding."
+        "Deprecated CASK (removal in 0.5.0): enable core-aware m-folding."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.budget",
         "cask_budget",
@@ -1262,8 +1265,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired CASK, unsupported): active-token target after eviction."
+        "Deprecated CASK (removal in 0.5.0): active-token target after eviction."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.beta",
         "cask_beta",
@@ -1274,8 +1278,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired CASK, unsupported): eviction hysteresis."
+        "Deprecated CASK (removal in 0.5.0): eviction hysteresis."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.handoff_tokens",
         "cask_handoff_tokens",
@@ -1286,8 +1291,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired CASK, unsupported): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
+        "Deprecated CASK (removal in 0.5.0): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.core_fraction",
         "cask_core_frac",
@@ -1302,8 +1308,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired, unsupported): fraction of the CASK budget retained as core."
+        "Deprecated CASK (removal in 0.5.0): fraction of the budget retained as core."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.fold",
         "cask_fold_m",
@@ -1314,8 +1321,9 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired, unsupported): CASK merge factor."
+        "Deprecated CASK (removal in 0.5.0): merge factor."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0
     field!(
         "memory.cask.auto_attach",
         "cask_auto_attach",
@@ -1326,7 +1334,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         None,
-        "Legacy research (retired CASK, unsupported): discover a matching TriAttention sidecar when explicitly enabled."
+        "Deprecated CASK (removal in 0.5.0): discover a matching TriAttention sidecar when explicitly enabled."
     ),
     field!(
         "prompt.normalize",
