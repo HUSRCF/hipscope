@@ -370,7 +370,8 @@ mod tests {
         // The five KV-write modules gained paged-only code behind
         // `#ifdef HIPFIRE_KV_SLOT_PAGED` (fold/scs); their preprocessed source
         // and gfx1100/gfx1151/gfx1201 `.text` are unchanged.
-        const REPINNED_SINCE_P0: [&str; 9] = [
+        const REPINNED_SINCE_P0: [&str; 10] = [
+            "conv1d_silu_split_qknorm_b256",
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
             "fused_silu_mul_mq_rotate_awq",
