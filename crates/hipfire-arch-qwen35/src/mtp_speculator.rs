@@ -17,7 +17,8 @@ use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
     prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
     spec_step_mtp_compressed_serial_with_k,
-    spec_step_mtp_compressed_serial_with_takeover_candidates, MtpSamplingConfig, MtpSpecState,
+    spec_step_mtp_compressed_serial_with_takeover_candidates, MtpPromptRoute, MtpSamplingConfig,
+    MtpSpecState,
 };
 use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
@@ -78,6 +79,9 @@ pub struct Qwen35MtpDrafter {
     /// from [`hipfire_config::mtp_cache_policy`] (config-owned). The repair
     /// path performs no policy reads of its own.
     window_rollback: bool,
+    /// Trunk route for prompt fill, forced advance and terminal-repair replay,
+    /// resolved once at construction from [`hipfire_config::mtp_own_prefill`].
+    prompt_route: MtpPromptRoute,
 }
 
 impl Qwen35MtpDrafter {
@@ -87,6 +91,14 @@ impl Qwen35MtpDrafter {
         // or per-step), mirroring `build_dflash_speculator`'s one-shot
         // resolution for the DFlash ring.
         let policy = hipfire_config::mtp_cache_policy();
+        let prompt_route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+        eprintln!(
+            "  qwen35 MTP prompt fill route: {}",
+            match prompt_route {
+                MtpPromptRoute::ArRoute => "ar (AR prefill route)",
+                MtpPromptRoute::Own => "own (HIPFIRE_MTP_OWN_PREFILL=1)",
+            }
+        );
         Self {
             head,
             state: None,
@@ -106,6 +118,7 @@ impl Qwen35MtpDrafter {
             checkpoint_interval: policy.checkpoint_interval,
             checkpoint_cap: policy.checkpoint_cap,
             window_rollback: policy.window_rollback,
+            prompt_route,
         }
     }
     /// Borrow the live MTP spec state (`None` before the first `mtp_prefill`
@@ -270,6 +283,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             }
         }
         let checkpoint_resume = self.checkpoint_resume;
+        let prompt_route = self.prompt_route;
         let checkpoint_interval = self.checkpoint_interval;
         let checkpoint_cap = self.checkpoint_cap;
         let prefill = prefill_trunk_and_mtp_cache_with_boundary(
@@ -279,6 +293,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             state,
             fill_tokens,
             start_pos,
+            prompt_route,
             |gpu, slot, position| {
                 if checkpoint_resume {
                     take_dn_checkpoint(
@@ -467,7 +482,8 @@ impl MtpDrafter for Qwen35MtpDrafter {
         let slot = Self::slot(target)?;
         self.ensure_state(gpu, slot)?;
         let state = self.state.as_mut().expect("ensure_state set it");
-        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, tokens, start_pos)
+        let route = self.prompt_route;
+        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, tokens, start_pos, route)
             .map_err(|e| format!("qwen35 MTP forced advance: {e}"))?;
         Ok(true)
     }
@@ -505,7 +521,8 @@ impl MtpDrafter for Qwen35MtpDrafter {
         if replay.is_empty() {
             return Ok(true);
         }
-        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, &replay, window_start)
+        let route = self.prompt_route;
+        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, &replay, window_start, route)
             .map_err(|e| format!("qwen35 MTP terminal repair replay: {e}"))?;
         Ok(true)
     }

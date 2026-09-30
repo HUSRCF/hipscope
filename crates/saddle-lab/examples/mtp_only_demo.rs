@@ -431,6 +431,7 @@ fn main() {
             &mut state,
             &prompt_tokens,
             0,
+            mtp_spec::MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill()),
         )
         .expect("prefill trunk + mtp cache");
         trunk_prefill_secs = Some(timings.trunk_prefill_secs);

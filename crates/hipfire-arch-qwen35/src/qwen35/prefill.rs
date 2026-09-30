@@ -2291,7 +2291,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         scratch,
         pbs,
         hidden_rb,
-        per_token_hidden_out.map(|t| (t, 0)),
+        per_token_hidden_out.map(|t| (t, 0, HiddenCapture::Verify)),
         gdn_tape,
         0,
         tree_verify,
@@ -2355,6 +2355,58 @@ pub fn forward_prefill_batch(
     )
 }
 
+/// Ordinary prompt prefill that also writes every row's post-output-norm
+/// hidden state into `hidden_out` (`tokens.len() × dim` f32, row `i` = token
+/// `i`), for a draft head that consumes the prompt's hidden rows (MTP).
+///
+/// Chunk planning, widened admission, the GDN chunk scan and the dispatch
+/// workload are exactly those of [`forward_prefill_batch`] with no capture,
+/// so KV, DeltaNet state and `scratch.logits` (last-token logits) match a
+/// plain AR prefill of the same call. Verify callers that capture hidden
+/// rows keep [`forward_prefill_batch`]'s `per_token_hidden_out`, which
+/// selects the speculative-verify kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capture_hidden(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_out: &GpuTensor,
+) -> HipResult<()> {
+    // Same implicit-cache omission as `forward_prefill_batch`.
+    let widen = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
+        .is_some_and(|c| c > WIDENED_COMMIT_ROWS);
+    let pbs_for_call = match scratch.prefill_batch.as_ref() {
+        Some(_) if widen => None,
+        other => other,
+    };
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        Some(hidden_out),
+        HiddenCapture::PromptFill,
+        None,
+        None,
+        pbs_for_call,
+        None,
+        None,
+        true,
+        None,
+        DflashFusionCtx::Off,
+    )
+}
+
 /// Like [`forward_prefill_batch`], but forces the configured chunk ceiling
 /// through `prefill_max_batch(gpu).min(max_batch_cap)` before owned-PBS
 /// planning and chunking.
@@ -2391,6 +2443,7 @@ pub fn forward_prefill_batch_capped(
         scratch,
         hidden_rb,
         per_token_hidden_out,
+        HiddenCapture::Verify,
         gdn_tape,
         tree_verify,
         scratch.prefill_batch.as_ref(),
@@ -2490,6 +2543,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         scratch,
         hidden_rb,
         per_token_hidden_out,
+        HiddenCapture::Verify,
         gdn_tape,
         tree_verify,
         pbs_in,
@@ -2513,6 +2567,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
+    hidden_capture: HiddenCapture,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
@@ -2999,7 +3054,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     pbs,
                     pbs2,
                     stage,
-                    per_token_hidden_out,
+                    per_token_hidden_out.map(|t| (t, hidden_capture)),
                     mask_override,
                     needs_last_token_logits,
                     fusion,
@@ -3012,7 +3067,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             // The chunk only reads the ring buffer's head/dims to place its
             // writes. We advance the head AFTER the chunk returns, here in
             // the caller, to keep the mutable borrow scope tight.
-            let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start));
+            let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start, hidden_capture));
             // Reborrow the tape for this chunk so we keep the outer mut
             // after the chunk returns.
             let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
@@ -5631,13 +5686,35 @@ pub(crate) fn dump_hidden_localize(
     }
 }
 
+/// Why a batched forward writes per-token post-output-norm hidden rows.
+///
+/// `Verify` is a speculative verify (DFlash, MTP, the MTP probe): it keeps
+/// the `SpeculativeVerify` dispatch workload and the sequential GDN
+/// recurrence. `PromptFill` is an ordinary prompt prefill whose hidden rows
+/// also seed a draft head (MTP prompt fill): it selects exactly the kernels a
+/// plain AR prefill of the same chunk selects, so the capture adds output
+/// rows and changes nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HiddenCapture {
+    Verify,
+    PromptFill,
+}
+
+/// Per-token hidden destination: buffer, first destination row, capture kind.
+pub(crate) type HiddenRowsOut<'a> = (&'a GpuTensor, usize, HiddenCapture);
+
+#[inline]
+fn captures_verify_hidden(per_token_hidden_out: Option<HiddenRowsOut<'_>>) -> bool {
+    per_token_hidden_out.is_some_and(|(_, _, capture)| capture == HiddenCapture::Verify)
+}
+
 #[inline]
 fn prefill_dispatch_workload(
-    captures_per_token_hidden: bool,
+    captures_verify_hidden: bool,
     captures_rollback_tape: bool,
     is_tree_verify: bool,
 ) -> DispatchWorkload {
-    if captures_per_token_hidden || captures_rollback_tape || is_tree_verify {
+    if captures_verify_hidden || captures_rollback_tape || is_tree_verify {
         DispatchWorkload::SpeculativeVerify
     } else {
         DispatchWorkload::Standard
@@ -5655,7 +5732,7 @@ pub(crate) fn forward_prefill_chunk(
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
     hidden_rb: Option<&HiddenStateRingBuffer>,
-    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
@@ -11925,7 +12002,7 @@ fn batch_chunk_final_logits(
     n: usize,
     dim: usize,
     dim_row_bytes: usize,
-    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     needs_last_token_logits: bool,
     do_lm_head: bool,
     ctx: &DispatchCtx,
@@ -11939,7 +12016,7 @@ fn batch_chunk_final_logits(
         // If the caller requested per-token hidden output (DFlash verify path),
         // run rmsnorm over all N rows into their buffer. Otherwise use the
         // legacy last-token-only path.
-        if let Some((dst, offset_rows)) = per_token_hidden_out {
+        if let Some((dst, offset_rows, _)) = per_token_hidden_out {
             let dst_view = dst.sub_offset(offset_rows * dim, n * dim);
             gpu.rmsnorm_batched(
                 &pbs.x_batch,
@@ -12325,7 +12402,7 @@ fn forward_prefill_chunk_pair(
     pbs_c: &PrefillBatchScratch,
     pbs_n: &PrefillBatchScratch,
     stage: &FaPairStage,
-    per_token_hidden_out: Option<&GpuTensor>,
+    per_token_hidden_out: Option<(&GpuTensor, HiddenCapture)>,
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     fusion: DflashFusionCtx,
@@ -12348,7 +12425,11 @@ fn forward_prefill_chunk_pair(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    let dispatch_workload = prefill_dispatch_workload(per_token_hidden_out.is_some(), false, false);
+    let dispatch_workload = prefill_dispatch_workload(
+        per_token_hidden_out.is_some_and(|(_, capture)| capture == HiddenCapture::Verify),
+        false,
+        false,
+    );
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     // Mask slot is call-relative: rebase per half.
@@ -12910,8 +12991,8 @@ fn forward_prefill_chunk_pair(
     // its own rows into the caller's per-token buffer (when present) with
     // its own chunk-relative offset, and the legacy last-token path runs
     // per half in order so `s.logits` ends on the pair's last token.
-    let pth_c = per_token_hidden_out.map(|t| (t, chunk_start_c));
-    let pth_n = per_token_hidden_out.map(|t| (t, chunk_start_c + n));
+    let pth_c = per_token_hidden_out.map(|(t, capture)| (t, chunk_start_c, capture));
+    let pth_n = per_token_hidden_out.map(|(t, capture)| (t, chunk_start_c + n, capture));
     batch_chunk_final_logits(
         gpu,
         weights,
@@ -12956,7 +13037,7 @@ pub(crate) fn forward_batch_chunk_impl(
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
     hidden_rb: Option<&HiddenStateRingBuffer>,
-    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
@@ -12994,7 +13075,7 @@ pub(crate) fn forward_batch_chunk_impl(
         gdn_tape.as_deref(),
     )?;
     let dispatch_workload = prefill_dispatch_workload(
-        per_token_hidden_out.is_some(),
+        captures_verify_hidden(per_token_hidden_out),
         gdn_tape.is_some(),
         tree_verify.is_some(),
     );
@@ -13149,7 +13230,9 @@ pub(crate) fn forward_batch_chunk_impl(
         // prefills exactly like the HIP-graph default.
         && !gpu.replay.is_recording()
         && hidden_rb.is_none()
-        && per_token_hidden_out.is_none()
+        // A prompt fill that hands its hidden rows to a draft head runs the
+        // same scan plain AR prefill runs; verify captures stay sequential.
+        && !captures_verify_hidden(per_token_hidden_out)
         && band.is_none()
         && max_layer.is_none()
         && routed_out.is_none()

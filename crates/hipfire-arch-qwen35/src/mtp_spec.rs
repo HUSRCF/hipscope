@@ -1583,6 +1583,32 @@ fn mtp_shared_verify_accept_rollback(
     })
 }
 
+/// Which trunk prefill route the MTP prompt fill drives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpPromptRoute {
+    /// The trunk prefills exactly like AR's serve prefill (same outer chunk
+    /// plan, widened chunks, GDN chunk scan, standard dispatch workload) and
+    /// hands its hidden rows to the head. KV, DeltaNet state and the
+    /// first-token logits match an AR prefill of the same tokens.
+    #[default]
+    ArRoute,
+    /// Legacy route (`HIPFIRE_MTP_OWN_PREFILL=1`): `prefill_max_batch`-row
+    /// trunk chunks captured as a speculative verify (sequential GDN
+    /// recurrence, `SpeculativeVerify` dispatch workload).
+    Own,
+}
+
+impl MtpPromptRoute {
+    /// Resolve from the config-owned opt-out (`HIPFIRE_MTP_OWN_PREFILL`).
+    pub fn from_own_prefill(own_prefill: bool) -> Self {
+        if own_prefill {
+            Self::Own
+        } else {
+            Self::ArRoute
+        }
+    }
+}
+
 /// DS4-style Qwen MTP prefill fill.
 ///
 /// Runs trunk prefill while capturing post-output-norm hidden for every
@@ -1590,17 +1616,17 @@ fn mtp_shared_verify_accept_rollback(
 /// positions. The MTP layer enters decode with a warm private KV cache instead
 /// of starting at the first generated token.
 ///
-/// Trunk prefill is split into `<= PREFILL_MAX_BATCH` committed chunks so
-/// adaptive-KV (and similar) controllers can run `maybe_downshift` between
-/// chunks at the exact committed trunk position. Without that boundary the
-/// internal `forward_prefill_batch` loop would write past the current-tier
-/// capacity (adaptive start `side_cap`) before any downshift could fire —
-/// post-prefill-only downshift is insufficient when prompt_len > start cap.
+/// The trunk chunk plan follows `route` (see [`MtpPromptRoute`]). The head
+/// fills in `<= prefill_max_batch` slices aligned to the start of the fill on
+/// either route, so a given set of hidden rows yields the same MTP KV.
+/// Callers observe a committed boundary after each trunk chunk. Adaptive KV
+/// never reaches this path (qwen generate refuses speculation under
+/// `kv_adaptive`).
 ///
-/// MTP private-cache offsets stay absolute: each chunk fills MTP KV at
+/// MTP private-cache offsets stay absolute: each slice fills MTP KV at
 /// `start_pos + off + i` (same schedule as the trunk), so multi-chunk prefill
-/// is position-identical to a single whole-prompt fill. Non-adaptive callers
-/// keep the same end state: full trunk KV + full MTP private KV + last-token logits.
+/// is position-identical to a single whole-prompt fill. End state: full trunk
+/// KV + full MTP private KV + last-token logits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrunkSpinePrefillTimings {
     pub trunk_prefill_secs: f64,
@@ -1651,6 +1677,7 @@ pub fn prefill_trunk_and_mtp_cache(
     state: &mut MtpSpecState,
     prompt_tokens: &[u32],
     start_pos: usize,
+    route: MtpPromptRoute,
 ) -> HipResult<TrunkSpinePrefillTimings> {
     // No-op boundary: same final state as the historical single-call path.
     prefill_trunk_and_mtp_cache_with_boundary(
@@ -1660,17 +1687,18 @@ pub fn prefill_trunk_and_mtp_cache(
         state,
         prompt_tokens,
         start_pos,
+        route,
         |_gpu, _target, _committed_pos| Ok(()),
     )
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
-/// after each trunk+MTP chunk commits, with the exclusive end position of the
-/// committed prefix (`start_pos + tokens_written_so_far`).
+/// after each trunk chunk and its MTP fill commit, with the exclusive end
+/// position of the committed prefix (`start_pos + tokens_written_so_far`).
 ///
-/// The callback runs while `target.kv_cache` holds the just-written prefix and
-/// before the next chunk may write past the current-tier capacity. Failures
-/// propagate and abort the remaining prefill (caller must free MTP state).
+/// The callback runs while `target.kv_cache` holds the just-written prefix.
+/// Failures propagate and abort the remaining prefill (caller must free MTP
+/// state).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     gpu: &mut Gpu,
@@ -1679,22 +1707,42 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     state: &mut MtpSpecState,
     prompt_tokens: &[u32],
     start_pos: usize,
+    route: MtpPromptRoute,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
     F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
 {
-    let Some(chunk_max) =
+    let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
     else {
         return Ok(TrunkSpinePrefillTimings::default());
+    };
+    // Trunk outer-chunk ceiling. ArRoute copies AR's serve prefill caller
+    // (`hipfire-generate` `ar.rs`, no-eviction branch) and queries it before
+    // the MTP buffers below take memory, as AR's query sees it.
+    let trunk_chunk_max = match route {
+        MtpPromptRoute::Own => head_rows,
+        MtpPromptRoute::ArRoute => match qwen35::ordinary_prefill_chunk_limit(
+            gpu,
+            &target.weights,
+            &target.config,
+            &target.dn_state,
+            &target.kv_cache,
+            None,
+        ) {
+            Ok(limit) => limit,
+            Err(e) => {
+                eprintln!("mtp prefill: chunk-limit query failed ({e}); keeping legacy ceiling");
+                qwen35::prefill_max_batch(gpu)
+            }
+        },
     };
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
-    // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
-    // also caps at this size; externalizing the loop exposes commit boundaries.
+    // The head fills in `head_rows` slices whatever the trunk chunk size.
     let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
         state.mtp_kv.kv_mode,
         &[
@@ -1705,7 +1753,7 @@ where
         ],
     );
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
-        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, chunk_max) {
+        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, head_rows) {
             Ok(scratch) => Some(scratch),
             Err(error) => {
                 let _ = gpu.free_tensor(prompt_hidden);
@@ -1720,7 +1768,7 @@ where
             .max(head.config.n_ff)
             .max(dim)
             .max(head.config.n_head * head.config.head_dim);
-        match gpu.alloc_tensor(&[chunk_max * widest_k], DType::F32) {
+        match gpu.alloc_tensor(&[head_rows * widest_k], DType::F32) {
             Ok(tensor) => Some(tensor),
             Err(error) => {
                 if let Some(scratch) = mtp_prefill_scratch.take() {
@@ -1739,7 +1787,15 @@ where
         let mut mtp_prompt_fill_secs = 0.0f64;
         let mut off = 0usize;
         while off < prompt_tokens.len() {
-            let end = (off + chunk_max).min(prompt_tokens.len());
+            let remaining = prompt_tokens.len() - off;
+            let outer = match route {
+                MtpPromptRoute::Own => remaining.min(head_rows),
+                MtpPromptRoute::ArRoute => {
+                    qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, trunk_chunk_max)
+                        .unwrap_or(remaining.min(trunk_chunk_max).max(1))
+                }
+            };
+            let end = off + outer;
             let chunk = &prompt_tokens[off..end];
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
@@ -1748,42 +1804,64 @@ where
             let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
-            qwen35::forward_prefill_batch(
-                gpu,
-                &target.weights,
-                &target.config,
-                chunk,
-                chunk_start_pos,
-                &mut target.kv_cache,
-                &mut target.dn_state,
-                &target.scratch,
-                None,
-                Some(&chunk_hidden),
-                None,
-                None,
-            )?;
+            match route {
+                MtpPromptRoute::ArRoute => qwen35::forward_prefill_batch_capture_hidden(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    chunk,
+                    chunk_start_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    &chunk_hidden,
+                )?,
+                MtpPromptRoute::Own => qwen35::forward_prefill_batch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    chunk,
+                    chunk_start_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    None,
+                    Some(&chunk_hidden),
+                    None,
+                    None,
+                )?,
+            }
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
             let t_mtp_fill = Instant::now();
             if let (Some(scratch), Some(rot)) =
                 (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
             {
-                let positions: Vec<i32> = (chunk_start_pos..committed_pos)
-                    .map(|position| position as i32)
-                    .collect();
-                mtp_head::mtp_head_forward_block_batched(
-                    gpu,
-                    head,
-                    scratch,
-                    &mut state.mtp_kv,
-                    chunk,
-                    &chunk_hidden,
-                    &positions,
-                    chunk.len(),
-                    &target.weights,
-                    Some(rot),
-                    true,
-                )?;
+                // Slices end on multiples of `head_rows` from the fill start,
+                // so both routes feed the head identical slices.
+                let mut slice_off = off;
+                while slice_off < end {
+                    let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
+                    let slice = &prompt_tokens[slice_off..slice_end];
+                    let slice_hidden = prompt_hidden.sub_offset(slice_off * dim, slice.len() * dim);
+                    let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
+                        .map(|position| position as i32)
+                        .collect();
+                    mtp_head::mtp_head_forward_block_batched(
+                        gpu,
+                        head,
+                        scratch,
+                        &mut state.mtp_kv,
+                        slice,
+                        &slice_hidden,
+                        &positions,
+                        slice.len(),
+                        &target.weights,
+                        Some(rot),
+                        true,
+                    )?;
+                    slice_off = slice_end;
+                }
             } else {
                 for (i, &token) in chunk.iter().enumerate() {
                     let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
