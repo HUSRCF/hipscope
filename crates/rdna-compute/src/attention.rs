@@ -408,6 +408,89 @@ fn verify_gqa_splits(
     max_tiles.clamp(1, cap)
 }
 
+/// VerifyAttn kernel set of the gfx11 WMMA flash prefill
+/// (`attention_q8_0_flash_prefill_wmma_slots`, legacy single slot), the route
+/// every gfx1151 speculative verify takes: a context-parallel S = Q.K^T launch
+/// (f16 S tiles to scratch) and a per-16-dim-chunk online-softmax + P.V walk
+/// that writes `out` directly. Output is byte-identical to the reference; the
+/// contract is in `kernels/src/attention_verify_wmma.gfx1151.hip`.
+struct VerifyWmmaKernels {
+    module: &'static str,
+    src: &'static str,
+    qk: &'static str,
+    /// P.V walkers, indexed by [`VerifyWmmaPv`].
+    pv: [&'static str; 2],
+}
+
+const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
+    module: "attention_verify_wmma_gfx1151",
+    src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
+    qk: "attention_verify_wmma_qk_gfx1151",
+    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
+};
+
+fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
+    if gpu.arch == "gfx1151" {
+        Some(&VERIFY_WMMA_GFX1151)
+    } else {
+        None
+    }
+}
+
+/// Query rows of one reference WMMA query tile (and of one VerifyAttn row group).
+const VERIFY_WMMA_ROWS: usize = 16;
+/// Keys per reference WMMA key tile (one f16 S tile in scratch).
+const VERIFY_WMMA_KEYS: usize = 16;
+/// f16 S tiles per (row group, kv head): the reference's 6 heads x 16 rows.
+const VERIFY_WMMA_FRAGS: usize = 6;
+
+/// P.V walker of the gfx1151 WMMA VerifyAttn twin (Halo sweep: the two that
+/// win at B 1 / 4 and at B 16, out of 24 chunk-width x softmax-split x
+/// prefetch-depth variants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyWmmaPv {
+    /// One 16-dim chunk per workgroup, each pair's 16-key softmax step split
+    /// across the wave's two 16-lane rows, 4 tiles of loads in flight.
+    Chunk1Split4 = 0,
+    /// Two 16-dim chunks per workgroup, whole softmax step in both rows, 2
+    /// tiles of loads in flight.
+    Chunk2Whole2 = 1,
+}
+
+impl VerifyWmmaPv {
+    pub const ALL: [VerifyWmmaPv; 2] = [VerifyWmmaPv::Chunk1Split4, VerifyWmmaPv::Chunk2Whole2];
+
+    /// 16-dim chunks per workgroup.
+    fn chunks(self) -> usize {
+        match self {
+            VerifyWmmaPv::Chunk1Split4 => 1,
+            VerifyWmmaPv::Chunk2Whole2 => 2,
+        }
+    }
+}
+
+/// Launch geometry of the gfx1151 WMMA VerifyAttn twin. It never changes the
+/// output bytes (the oracle sweeps it); production uses
+/// [`VerifyWmmaGeometry::default`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyWmmaGeometry {
+    /// Pack (head, row) pairs densely into ceil(6*rows/16) WMMA fragments
+    /// instead of the reference's 6 head fragments of 16 rows.
+    pub packed: bool,
+    /// Waves the S = Q.K^T launch aims for; its split count (grid y) is this
+    /// over the waves of one split, capped by the scratch tile stride.
+    pub qk_waves: usize,
+    /// P.V walker; `None` = [`VerifyWmmaPv::Chunk2Whole2`] from 4 fragments
+    /// (row group 0 of 10+ rows) up, [`VerifyWmmaPv::Chunk1Split4`] below.
+    pub pv: Option<VerifyWmmaPv>,
+}
+
+impl Default for VerifyWmmaGeometry {
+    fn default() -> Self {
+        Self { packed: true, qk_waves: 160, pv: None }
+    }
+}
+
 /// Opt-in gate for the WMMA flash-attention prefill path.
 fn is_wmma_fa_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_WMMA_FA", false)
@@ -7254,6 +7337,194 @@ impl Gpu {
                 )?;
             }
             offset += chunk;
+        }
+        Ok(true)
+    }
+
+    /// VerifyAttn on gfx1151: run a `batch_size <= 32` legacy single-slot
+    /// WMMA flash prefill ([`Self::attention_q8_0_flash_prefill_wmma_slots`]
+    /// with no slot descriptors) through the context-parallel twin
+    /// ([`VerifyWmmaKernels`]). `Ok(false)` = not admitted; the caller runs
+    /// the unchanged reference. Output is byte-identical to the reference, so
+    /// the dispatch arm intercepts unconditionally (DFlash / MTP / n-gram
+    /// verify, short prefill tails). `scratch` (the model's flash partials)
+    /// holds the f16 S tiles: `ceil(rows/16) * n_kv_heads * 6 *
+    /// ceil(max_ctx_len/16)` tiles of 512 B. Both grids depend on the context
+    /// only through `max_ctx_len` (the physical cap under graph capture); the
+    /// live key range comes from `positions` on the device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        scratch: &GpuTensor,
+    ) -> HipResult<bool> {
+        self.attention_verify_wmma_with(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            scratch,
+            VerifyWmmaGeometry::default(),
+        )
+    }
+
+    /// [`Self::try_attention_verify_wmma`] with an explicit launch geometry
+    /// (oracle and bench sweeps). Same admission and bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_verify_wmma_with(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        scratch: &GpuTensor,
+        geom: VerifyWmmaGeometry,
+    ) -> HipResult<bool> {
+        if !self.flags.verify_attn || self.replay.is_recording() {
+            return Ok(false);
+        }
+        let Some(set) = verify_wmma_kernels(self) else {
+            return Ok(false);
+        };
+        // The reference module must be the default gfx11 hd256 WMMA body:
+        // split-Q changes its arithmetic, and the dynamic-head_dim build is
+        // not the one this twin was proven against.
+        let dev = |name: &str| hipfire_config::developer_var(name).ok();
+        if dev("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() == Some("1")
+            || dev("HIPFIRE_FLASH_PREFILL_FIXED_HD").as_deref() == Some("0")
+        {
+            return Ok(false);
+        }
+        if head_dim != 256
+            || n_kv_heads == 0
+            || n_heads != 6 * n_kv_heads
+            || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
+            || max_ctx_len == 0
+        {
+            return Ok(false);
+        }
+        let row_groups = batch_size.div_ceil(VERIFY_WMMA_ROWS);
+        let t_stride = max_ctx_len.div_ceil(VERIFY_WMMA_KEYS);
+        let tile_bytes = VERIFY_WMMA_ROWS * VERIFY_WMMA_KEYS * 2;
+        let need = row_groups
+            .checked_mul(n_kv_heads * VERIFY_WMMA_FRAGS)
+            .and_then(|n| n.checked_mul(t_stride))
+            .and_then(|n| n.checked_mul(tile_bytes));
+        if need.is_none_or(|n| n > scratch.buf.size()) || t_stride > i32::MAX as usize {
+            return Ok(false);
+        }
+        // Fragments of row group 0 (the largest) set the block size.
+        let rows0 = batch_size.min(VERIFY_WMMA_ROWS);
+        let pack = if geom.packed { rows0 } else { VERIFY_WMMA_ROWS };
+        let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
+        // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
+        let qk_block = (32 * nf.max(4)) as u32;
+        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
+        let pv_chunks = pv.chunks();
+        // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
+        let pv_block = (32 * nf.max(pv_chunks)) as u32;
+        let pv_func = set.pv[pv as usize];
+
+        self.ensure_kernel(set.module, set.src, set.qk)?;
+        self.ensure_kernel(set.module, set.src, pv_func)?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let s_ptr = scratch.buf.as_ptr();
+        let nr = batch_size as i32;
+        let nkv = n_kv_heads as i32;
+        let ts = t_stride as i32;
+        let pk = i32::from(geom.packed);
+        let grid_x = (row_groups * n_kv_heads) as u32;
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &s_ptr as *const _ as *mut c_void,
+                &nr as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &pk as *const _ as *mut c_void,
+                &scale as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                set.qk,
+                [grid_x, qk_splits as u32, 1],
+                [qk_block, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s_ptr);
+                    b.push_i32(nr);
+                    b.push_i32(nkv);
+                    b.push_i32(ts);
+                    b.push_i32(pk);
+                    b.push_f32(scale);
+                    b
+                },
+            )?;
+        }
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &v_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &s_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nr as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &pk as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                pv_func,
+                [grid_x, (16 / pv_chunks) as u32, 1],
+                [pv_block, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nr);
+                    b.push_i32(nkv);
+                    b.push_i32(ts);
+                    b.push_i32(pk);
+                    b
+                },
+            )?;
         }
         Ok(true)
     }

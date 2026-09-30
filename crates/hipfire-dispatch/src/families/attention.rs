@@ -2223,6 +2223,27 @@ fn dispatch_attend(
                         && io.head_dim % 32 == 0
                         && io.head_dim <= 256;
                     if wmma_ok {
+                        // gfx1151 VerifyAttn: byte-identical context-parallel
+                        // twin of the single-slot WMMA kernel below for
+                        // 1..=32 rows (f16 S tiles in the flash partials).
+                        // Declines (Ok(false)) on every other arch/shape.
+                        if let Some(fp) = io.flash_partials {
+                            if hip!(gpu.try_attention_verify_wmma(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                                fp,
+                            ))? {
+                                return Ok(());
+                            }
+                        }
                         return hip!(gpu.attention_q8_0_flash_prefill_wmma(
                             io.q,
                             io.k_cache,

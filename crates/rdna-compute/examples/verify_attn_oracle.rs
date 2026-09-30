@@ -9,6 +9,11 @@
 // head_dim 256). On gfx1100 (Q8 only) it also checks the multi-row twin
 // (`Gpu::try_attention_verify_gqa_rows`) against the R4/R8 tile + reduce
 // (`attention_flash_q8_0_rows_masked`), the eager Q8 verify route there.
+// On gfx1151 (Q8 only) it checks `Gpu::attention_verify_wmma_with` (the
+// production geometry and the other P.V walkers) against the single-slot WMMA
+// flash prefill it replaces (`attention_q8_0_flash_prefill_wmma_slots`); the
+// reference writes no partials, so the twin's S-tile scratch may hold anything
+// and the partials past it must keep their poison.
 //
 // Every run poisons the whole output and partials allocations (including guard
 // regions around the views the launch receives), and the KV cache past the
@@ -32,9 +37,10 @@
 //   bench                     wall-clock per call, reference vs candidate.
 //   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock
 //                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
+//   sweep                     (gfx1151) candidate wall-clock per launch geometry.
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
-use rdna_compute::attention::VerifyKv;
+use rdna_compute::attention::{VerifyKv, VerifyWmmaGeometry, VerifyWmmaPv};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -179,6 +185,9 @@ struct Case {
     partial_rows: usize,
     /// Reference is the multi-row R4/R8 tile (Q8, b >= 4) instead of tile_batched.
     rows: bool,
+    /// gfx1151: the WMMA twin at this geometry against the WMMA reference
+    /// (Q8 only; `partial_rows` unused, the scratch is exactly the S tiles).
+    wmma: Option<VerifyWmmaGeometry>,
 }
 
 impl Case {
@@ -199,7 +208,15 @@ impl Case {
         self.max_ctx_len().div_ceil(TILE)
     }
     fn partials_len(&self) -> usize {
-        self.partial_rows * NH * self.max_tiles() * STRIDE
+        if self.wmma.is_some() {
+            self.wmma_scratch_bytes() / 4
+        } else {
+            self.partial_rows * NH * self.max_tiles() * STRIDE
+        }
+    }
+    /// f16 S tiles of the gfx1151 twin: row groups x kv heads x 6 x key tiles x 512 B.
+    fn wmma_scratch_bytes(&self) -> usize {
+        self.b.div_ceil(16) * NKV * 6 * self.max_ctx_len().div_ceil(16) * 512
     }
     /// The multi-row reference's rows per block (`flash_rows_per_block`).
     fn group_rows(&self) -> usize {
@@ -210,7 +227,9 @@ impl Case {
         }
     }
     fn ref_name(&self) -> &'static str {
-        if self.rows {
+        if self.wmma.is_some() {
+            "wmma"
+        } else if self.rows {
             "rows"
         } else {
             "tile"
@@ -284,6 +303,22 @@ fn bytes_of(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
 /// One launch of the reference (`candidate == false`) or VerifyAttn.
 fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
     std::sync::Arc::make_mut(&mut gpu.flags).verify_attn = candidate;
+    if let Some(geom) = c.wmma {
+        if candidate {
+            let ran = gpu
+                .attention_verify_wmma_with(
+                    &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, &bf.part, geom,
+                )
+                .expect("verify_attn wmma launch");
+            assert!(ran, "VerifyAttn declined an admitted case: {c:?}");
+        } else {
+            gpu.attention_q8_0_flash_prefill_wmma_slots(
+                &bf.q, &bf.k, &bf.v, &bf.out, &bf.pos, NH, NKV, HD, c.max_ctx_len(), c.b, None, None, None, None,
+            )
+            .expect("reference wmma");
+        }
+        return;
+    }
     if c.rows {
         let ran = if candidate {
             gpu.try_attention_verify_gqa_rows(
@@ -347,8 +382,12 @@ fn out_view(c: &Case, full: &[u8]) -> Vec<f32> {
 
 /// Byte ranges of the partials the reference writes (tiles below each row's
 /// causal bound; for the multi-row reference, below its row group's bound),
-/// in chunk-local rows of the sub-batched launch.
+/// in chunk-local rows of the sub-batched launch. gfx1151: the twin's S-tile
+/// scratch (any content; the reference writes none).
 fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
+    if c.wmma.is_some() {
+        return vec![(0, c.wmma_scratch_bytes())];
+    }
     let mt = c.max_tiles();
     let sub = c.partial_rows.min(c.b);
     let mut r = Vec::new();
@@ -380,7 +419,7 @@ fn oracle_cases(kvs: &[VerifyKv], rows_twin: bool) -> Vec<Case> {
     const CAP: usize = 65536 + 256;
     let mut cases = Vec::new();
     for &kv in kvs {
-        let tile = |b, ctx, capture, cap, partial_rows| Case { kv, b, ctx, capture, cap, partial_rows, rows: false };
+        let tile = |b, ctx, capture, cap, partial_rows| Case { kv, b, ctx, capture, cap, partial_rows, rows: false, wmma: None };
         for &b in &[1usize, 4, 16] {
             for &ctx in &[1usize, 127, 128, 2048, 8192, 16384, 32768, 65536] {
                 for &capture in &[false, true] {
@@ -400,7 +439,7 @@ fn oracle_cases(kvs: &[VerifyKv], rows_twin: bool) -> Vec<Case> {
         if rows_twin && kv == VerifyKv::Q8 {
             // Multi-row reference: `capture` here only sizes max_ctx_len to
             // the cap (the reference itself is eager-only).
-            let rows = |b, ctx, capture, partial_rows| Case { kv, b, ctx, capture, cap: CAP, partial_rows, rows: true };
+            let rows = |b, ctx, capture, partial_rows| Case { kv, b, ctx, capture, cap: CAP, partial_rows, rows: true, wmma: None };
             for &b in &[4usize, 16] {
                 for &ctx in &[1usize, 127, 128, 2048, 4097, 8192, 16384, 32768, 65536] {
                     for &capture in &[false, true] {
@@ -419,6 +458,48 @@ fn oracle_cases(kvs: &[VerifyKv], rows_twin: bool) -> Vec<Case> {
     cases
 }
 
+/// gfx1151: production geometry over the B x ctx x capture grid, odd and
+/// two-row-group batches, the reference fragment layout, both P.V walkers in
+/// both fragment layouts with one-split and many-split S launches, and the
+/// physical-cap capture shape.
+fn wmma_oracle_cases() -> Vec<Case> {
+    const CAP: usize = 65536 + 256;
+    let prod = Some(VerifyWmmaGeometry::default());
+    let mut cases = Vec::new();
+    let mut push = |b: usize, ctx: usize, capture: bool, cap: usize, wmma| {
+        cases.push(Case { kv: VerifyKv::Q8, b, ctx, capture, cap, partial_rows: 16, rows: false, wmma });
+    };
+    for &b in &[1usize, 4, 16] {
+        for &ctx in &[1usize, 127, 128, 2048, 8192, 16384, 32768, 65536] {
+            for &capture in &[false, true] {
+                push(b, ctx, capture, CAP, prod);
+            }
+        }
+    }
+    for &(b, ctx) in &[(2, 129), (3, 17), (5, 2047), (8, 15), (9, 4097), (13, 300), (17, 1000), (24, 2049), (32, 3000)] {
+        push(b, ctx, false, CAP, prod);
+        push(b, ctx, true, CAP, prod);
+    }
+    for &(b, ctx) in &[(1, 127), (4, 8192), (5, 2047), (16, 16384), (32, 3000)] {
+        for &capture in &[false, true] {
+            push(b, ctx, capture, CAP, Some(VerifyWmmaGeometry { packed: false, ..VerifyWmmaGeometry::default() }));
+        }
+    }
+    for &(b, ctx) in &[(4, 4099), (16, 8192), (9, 1025), (1, 300), (32, 3000)] {
+        for (i, &pv) in VerifyWmmaPv::ALL.iter().enumerate() {
+            for (j, &qk_waves) in [1usize, 64, 1_000_000].iter().enumerate() {
+                for packed in [true, false] {
+                    push(b, ctx, (i + j) % 2 == 1, CAP, Some(VerifyWmmaGeometry { packed, qk_waves, pv: Some(pv) }));
+                }
+            }
+        }
+    }
+    for &(b, ctx) in &[(16, 2048), (4, 20000), (16, 9000)] {
+        push(b, ctx, true, 262144, prod);
+    }
+    cases
+}
+
 fn parse_kvs(arg: Option<&str>) -> Vec<VerifyKv> {
     match arg.unwrap_or("both") {
         "fp8" => vec![VerifyKv::Fp8],
@@ -431,12 +512,15 @@ fn oracle(gpu: &mut Gpu, kvs: &[VerifyKv]) -> bool {
     let mut ok = true;
     let mut n = 0;
     let rows_twin = gpu.arch == "gfx1100";
-    for (i, c) in oracle_cases(kvs, rows_twin).iter().enumerate() {
+    let cases = if gpu.arch == "gfx1151" { wmma_oracle_cases() } else { oracle_cases(kvs, rows_twin) };
+    for (i, c) in cases.iter().enumerate() {
         let bf = Bufs::new(gpu, c, 0x5eed_0000 + i as u64);
         let (ro, rp) = run(gpu, c, &bf, false, 0xA5);
         let (co, cp) = run(gpu, c, &bf, true, 0xA5);
         let od = first_diff(&ro, &co);
-        let pd = first_diff(&rp, &cp);
+        // gfx1151: the reference writes no partials; past the S tiles they keep their poison.
+        let skip = if c.wmma.is_some() { c.wmma_scratch_bytes() } else { 0 };
+        let pd = first_diff(&rp[skip..], &cp[skip..]).map(|d| d + skip);
         let rv = out_view(c, &ro);
         let nan = rv.iter().filter(|x| !x.is_finite()).count();
         let pass = od.is_none() && pd.is_none() && nan == 0;
@@ -468,6 +552,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
     let mut launches = 0usize;
     let mut mism = 0usize;
     let rows_twin = gpu.arch == "gfx1100";
+    let wmma = (gpu.arch == "gfx1151").then(VerifyWmmaGeometry::default);
     for &kv in kvs {
         let mut shapes = vec![
             (16usize, 8192usize, true, 65536 + 256, false),
@@ -476,6 +561,9 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
             (1, 127, true, 4096, false),
             (9, 2049, true, 4096, false),
         ];
+        if wmma.is_some() {
+            shapes.push((32, 3000, true, 4096, false));
+        }
         if rows_twin && kv == VerifyKv::Q8 {
             shapes.extend([
                 (16usize, 8192usize, false, 8192 + 256, true),
@@ -485,7 +573,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
             ]);
         }
         for &(b, ctx, capture, cap, rows) in &shapes {
-            let c = Case { kv, b, ctx, capture, cap, partial_rows: 16, rows };
+            let c = Case { kv, b, ctx, capture, cap, partial_rows: 16, rows, wmma };
             let bf = Bufs::new(gpu, &c, 0xC0FFEE ^ (b * 131 + ctx) as u64);
             let (ro, rp) = run(gpu, &c, &bf, false, 0xA5);
             let ref_out = out_view(&c, &ro);
@@ -500,10 +588,13 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                 // Guards keep this launch's poison byte.
                 same &= co[..GUARD * 4].iter().all(|&x| x == byte);
                 same &= co[(GUARD + c.b * QDIM) * 4..].iter().all(|&x| x == byte);
-                // Written partials equal the reference's; the rest keeps the poison.
+                // Written partials equal the reference's (gfx1151: the S-tile
+                // scratch may hold anything); the rest keeps the poison.
                 let mut covered = vec![false; cp.len()];
                 for &(s, e) in &ranges {
-                    same &= cp[s..e] == rp[s..e];
+                    if c.wmma.is_none() {
+                        same &= cp[s..e] == rp[s..e];
+                    }
                     covered[s..e].iter_mut().for_each(|x| *x = true);
                 }
                 same &= cp.iter().zip(&covered).all(|(&x, &cov)| cov || x == byte);
@@ -536,16 +627,22 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
 
 fn soak(gpu: &mut Gpu, secs: u64) -> bool {
     let cap = 32768 + 256;
-    let cases: Vec<Case> = if gpu.arch == "gfx1100" {
+    let prod = Some(VerifyWmmaGeometry::default());
+    let cases: Vec<Case> = if gpu.arch == "gfx1151" {
         vec![
-            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
-            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true },
-            Case { kv: VerifyKv::Q8, b: 4, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true },
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false, wmma: prod },
+            Case { kv: VerifyKv::Q8, b: 4, ctx: 32768, capture: false, cap, partial_rows: 16, rows: false, wmma: prod },
+        ]
+    } else if gpu.arch == "gfx1100" {
+        vec![
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false, wmma: None },
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true, wmma: None },
+            Case { kv: VerifyKv::Q8, b: 4, ctx: 32768, capture: false, cap, partial_rows: 16, rows: true, wmma: None },
         ]
     } else {
         vec![
-            Case { kv: VerifyKv::Fp8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
-            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false },
+            Case { kv: VerifyKv::Fp8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false, wmma: None },
+            Case { kv: VerifyKv::Q8, b: 16, ctx: 32768, capture: true, cap, partial_rows: 16, rows: false, wmma: None },
         ]
     };
     let bufs: Vec<Bufs> = cases.iter().enumerate().map(|(i, c)| Bufs::new(gpu, c, 0x50A4 + i as u64)).collect();
@@ -586,25 +683,17 @@ fn soak(gpu: &mut Gpu, secs: u64) -> bool {
 }
 
 fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
+    let wmma = (gpu.arch == "gfx1151").then(VerifyWmmaGeometry::default);
+    let bs: &[usize] = if wmma.is_some() { &[1, 4, 16] } else { &[4, 16] };
     for &kv in kvs {
-        for &b in &[4usize, 16] {
+        for &b in bs {
             for &ctx in &[2048usize, 8192, 16384, 32768, 65536] {
                 for &(capture, cap) in &[(false, ctx + 64), (true, 262144usize)] {
-                    let c = Case { kv, b, ctx, capture, cap: cap.max(ctx + 64), partial_rows: 16, rows: false };
+                    let c = Case { kv, b, ctx, capture, cap: cap.max(ctx + 64), partial_rows: 16, rows: false, wmma };
                     let bf = Bufs::new(gpu, &c, 0xBE4C);
                     let mut ms = [0f64; 2];
                     for (arm, cand) in [(0usize, false), (1, true)] {
-                        for _ in 0..3 {
-                            launch(gpu, &c, &bf, cand);
-                        }
-                        gpu.hip.device_synchronize().expect("sync");
-                        let iters = 20;
-                        let t = Instant::now();
-                        for _ in 0..iters {
-                            launch(gpu, &c, &bf, cand);
-                        }
-                        gpu.hip.device_synchronize().expect("sync");
-                        ms[arm] = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                        ms[arm] = time_ms(gpu, &c, &bf, cand, 20);
                     }
                     println!(
                         "BENCH kv={} B={} ctx={} capture={} ref_ms={:.4} verify_attn_ms={:.4} speedup={:.2}",
@@ -613,6 +702,52 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
                     bf.free(gpu);
                 }
             }
+        }
+    }
+}
+
+fn time_ms(gpu: &mut Gpu, c: &Case, bf: &Bufs, cand: bool, iters: usize) -> f64 {
+    for _ in 0..3 {
+        launch(gpu, c, bf, cand);
+    }
+    gpu.hip.device_synchronize().expect("sync");
+    let t = Instant::now();
+    for _ in 0..iters {
+        launch(gpu, c, bf, cand);
+    }
+    gpu.hip.device_synchronize().expect("sync");
+    t.elapsed().as_secs_f64() * 1e3 / iters as f64
+}
+
+/// gfx1151: candidate wall-clock per launch geometry around the production
+/// one (S-launch waves, every P.V walker, fragment packing), reference alongside.
+fn sweep(gpu: &mut Gpu) {
+    let d = VerifyWmmaGeometry::default();
+    let mut geoms = vec![d];
+    for qk_waves in [80usize, 320, 640] {
+        geoms.push(VerifyWmmaGeometry { qk_waves, ..d });
+    }
+    for pv in VerifyWmmaPv::ALL {
+        geoms.push(VerifyWmmaGeometry { pv: Some(pv), ..d });
+    }
+    geoms.push(VerifyWmmaGeometry { packed: false, ..d });
+    for &b in &[1usize, 4, 16] {
+        for &ctx in &[2048usize, 8192, 32768] {
+            let base = Case {
+                kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16, rows: false, wmma: Some(d),
+            };
+            let bf = Bufs::new(gpu, &base, 0xBE4C);
+            let ref_ms = time_ms(gpu, &base, &bf, false, 10);
+            for g in &geoms {
+                let c = Case { wmma: Some(*g), ..base };
+                let ms = time_ms(gpu, &c, &bf, true, 20);
+                println!(
+                    "SWEEP B={b} ctx={ctx} packed={} qk_waves={} pv={:?} ref_ms={ref_ms:.4} verify_attn_ms={ms:.4} \
+                     speedup={:.2}",
+                    g.packed, g.qk_waves, g.pv, ref_ms / ms
+                );
+            }
+            bf.free(gpu);
         }
     }
 }
@@ -626,7 +761,7 @@ fn bench_rows(gpu: &mut Gpu) {
     let rows_twin = gpu.arch == "gfx1100";
     for &b in &[4usize, 16] {
         for &ctx in &[4096usize, 8192, 16384, 32768, 65536] {
-            let c = Case { kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16, rows: rows_twin };
+            let c = Case { kv: VerifyKv::Q8, b, ctx, capture: false, cap: ctx + 64, partial_rows: 16, rows: rows_twin, wmma: None };
             let bf = Bufs::new(gpu, &c, 0xBE4C);
             let mut ms = [0f64; 2];
             for arm in 0..2 {
@@ -668,10 +803,11 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
-        matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100"),
-        "VerifyAttn oracle runs on gfx1201 or gfx1100, got {}",
+        matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100" | "gfx1151"),
+        "VerifyAttn oracle runs on gfx1201, gfx1100 or gfx1151, got {}",
         gpu.arch
     );
+    println!("VERIFY_ATTN_ORACLE arch={} mode={mode}", gpu.arch);
     // fp8 KV (and its VerifyAttn twin) is gfx1201-only.
     let kvs = |arg: Option<&String>, gpu: &Gpu| -> Vec<VerifyKv> {
         let mut v = parse_kvs(arg.map(String::as_str));
@@ -696,7 +832,11 @@ fn main() {
             bench(&mut gpu, &k);
             true
         }
-        "bench_rows" => {
+        "sweep" if gpu.arch == "gfx1151" => {
+            sweep(&mut gpu);
+            true
+        }
+        "bench_rows" if gpu.arch != "gfx1151" => {
             bench_rows(&mut gpu);
             true
         }
