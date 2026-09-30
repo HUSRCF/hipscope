@@ -131,10 +131,14 @@ static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 /// under concurrent readers, and the decode-hot path must not pay a getenv
 /// per memcpy/launch/sync). Tests arm the seam through
 /// [`arm_hip_fault`] instead of `set_var`.
-fn fault_spec() -> &'static Option<String> {
-    static SPEC: std::sync::LazyLock<Option<String>> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_FAULT_HIP").ok());
-    &SPEC
+///
+/// The spec is read only from an already-installed process config: a HIP call
+/// that runs before `install_process_config` must not install the local
+/// fallback as a side effect (the daemon's own install would then fail and
+/// its resolved config be dropped). Such a call injects nothing and the next
+/// call re-checks.
+fn fault_spec() -> Option<Option<String>> {
+    hipfire_config::active_process_config().map(|config| config.legacy_value("HIPFIRE_FAULT_HIP"))
 }
 
 /// Arm `count` injected failures for one fault class (`upload`, `launch`,
@@ -162,7 +166,10 @@ fn hip_fault_consume(class_idx: usize, class: &'static str) -> bool {
         // First use: latch the class from the (single) environment read.
         // Absent or unmatched means inert forever — the hot path never
         // consults the environment again.
-        let n = fault_spec()
+        let Some(spec) = fault_spec() else {
+            return false;
+        };
+        let n = spec
             .as_deref()
             .map(|spec| {
                 spec.split(',')

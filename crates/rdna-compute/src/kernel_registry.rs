@@ -352,11 +352,19 @@ mod tests {
         // Deliberate changes that landed after the P0 capture (kernel cache
         // ABI 4). The traces keep the captured bytes and argv; the portable
         // digests above are re-pinned to the current source.
-        const REPINNED_SINCE_P0: [&str; 4] = [
+        // The five KV-write modules gained paged-only code behind
+        // `#ifdef HIPFIRE_KV_SLOT_PAGED` (fold/scs); their preprocessed source
+        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged.
+        const REPINNED_SINCE_P0: [&str; 9] = [
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
             "fused_silu_mul_mq_rotate_awq",
             "gated_delta_net_q8_fast",
+            "kv_cache_write_asym_k_givens3_batched",
+            "kv_cache_write_fp8_e4m3_batched",
+            "kv_cache_write_q8_0_batched",
+            "kv_cache_write_q8_0_independent",
+            "kv_cache_write_q8_0_independent_masked",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
         let mut repins_seen = HashSet::new();

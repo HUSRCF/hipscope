@@ -3200,18 +3200,12 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        if !self.functions.contains_key("attention_q8_0_kv_batched") {
-            let attn_q8_batched_src = {
-                let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                    .replace("#include \"kv_slot_desc.h\"", "");
-                format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-            };
-            self.ensure_kernel(
-                "attention_q8_0_kv_batched",
-                &attn_q8_batched_src,
-                "attention_q8_0_kv_batched",
-            )?;
-        }
+        let func = self.ensure_kv_slot_kernel(
+            "attention_q8_0_kv_batched",
+            "attention_q8_0_kv_batched_paged",
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            slot_descs.is_some(),
+        )?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -3270,7 +3264,7 @@ impl Gpu {
         let desc_raw = desc_ptr; // alias for move into closure
         let rs_raw = rs_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
-            "attention_q8_0_kv_batched",
+            func,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -4070,15 +4064,29 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        if !self.functions.contains_key("attention_q8_0_flash_prefill") {
-            let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
+        // Descriptor launches (the slot engine) compile the paged module, the
+        // kernel renamed to `attention_q8_0_flash_prefill_paged`; the default
+        // module's source and code object are unchanged from before paging.
+        let func = if multi_slot {
+            "attention_q8_0_flash_prefill_paged"
+        } else {
+            "attention_q8_0_flash_prefill"
+        };
+        if !self.functions.contains_key(func) {
             let src = format!(
-                "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}\n{}",
-                kernels::KV_SLOT_DESC_H,
-                stripped
+                "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}",
+                if multi_slot {
+                    kernels::kv_slot_desc_paged_source(
+                        kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC,
+                        "attention_q8_0_flash_prefill",
+                        func,
+                    )
+                } else {
+                    kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
+                }
             );
-            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+            let module = if multi_slot { format!("{module}_paged") } else { module };
+            self.ensure_kernel(&module, &src, func)?;
         }
 
         let bph = head_dim / 32;
@@ -4152,7 +4160,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "attention_q8_0_flash_prefill",
+            func,
             [grid_x, n_heads as u32, 1],
             [NTHREADS as u32, 1, 1],
             lds as u32,
@@ -4454,20 +4462,30 @@ impl Gpu {
         // attention_q8_0_flash_prefill_slots and ensure_givens4_kernel). The
         // module name varies by variant but the loaded function name does
         // not, so gate on that — mirrors the scalar port's guard.
-        if !self
-            .functions
-            .contains_key("attention_q8_0_flash_prefill_wmma")
-        {
-            let stripped = kernel_src.replace("#include \"kv_slot_desc.h\"", "");
+        // Descriptor launches compile the paged module (see the scalar port).
+        let func = if multi_slot {
+            "attention_q8_0_flash_prefill_wmma_paged"
+        } else {
+            "attention_q8_0_flash_prefill_wmma"
+        };
+        if !self.functions.contains_key(func) {
             let src = format!(
-                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}\n{}",
+                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
                 split_q as u32,
                 fixed_hd,
                 prefetch_v as u32,
-                kernels::KV_SLOT_DESC_H,
-                stripped
+                if multi_slot {
+                    kernels::kv_slot_desc_paged_source(
+                        kernel_src,
+                        "attention_q8_0_flash_prefill_wmma",
+                        func,
+                    )
+                } else {
+                    kernels::kv_slot_desc_source(kernel_src, false)
+                }
             );
-            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+            let module = if multi_slot { format!("{module}_paged") } else { module };
+            self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
@@ -4550,7 +4568,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "attention_q8_0_flash_prefill_wmma",
+            func,
             [grid_x, n_heads as u32, 1],
             [32, 1, 1],
             lds as u32,
@@ -8701,6 +8719,47 @@ impl Gpu {
         result
     }
 
+    /// Load the givens4/turbo-family kernel `func_name` for a descriptor-aware
+    /// launch. Descriptor-less launches keep [`Self::ensure_givens4_kernel`]'s
+    /// default module (source and code object unchanged); launches with real
+    /// slot descriptors compile the same body against `kv_slot_desc_paged.h`
+    /// with the kernel renamed to its `*_paged` symbol. Returns the function
+    /// to launch.
+    pub(crate) fn ensure_givens4_kv_slot_kernel(
+        &mut self,
+        name: &str,
+        body_src: &str,
+        func_name: &'static str,
+        paged: bool,
+    ) -> HipResult<&'static str> {
+        if !paged {
+            self.ensure_givens4_kernel(name, body_src, func_name)?;
+            return Ok(func_name);
+        }
+        let paged_func = kv_slot_paged_symbol(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("{func_name} has no paged (multi-slot descriptor) variant"),
+            )
+        })?;
+        if !self.functions.contains_key(paged_func) {
+            let stripped = body_src
+                .replace("#include \"turbo_common.h\"", "")
+                .replace("#include \"givens_common.h\"", "")
+                .replace("#include \"kv_slot_desc.h\"", "")
+                .replace("#include \"kv_slot_desc_paged.h\"", "");
+            let full_src = format!(
+                "#define {func_name} {paged_func}\n{}\n{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                kernels::KV_SLOT_DESC_PAGED_H,
+                stripped
+            );
+            self.ensure_kernel(paged_func, &full_src, paged_func)?;
+        }
+        Ok(paged_func)
+    }
+
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
     pub(crate) fn ensure_givens4_kernel(
         &mut self,
@@ -9193,10 +9252,12 @@ impl Gpu {
              are both-or-neither"
         );
         self.bind_thread()?;
-        self.ensure_givens4_kernel(
+        let paged = slot_descs.is_some();
+        let func = self.ensure_givens4_kv_slot_kernel(
             "kv_cache_write_asym_k_fwht3_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC,
             "kv_cache_write_asym_k_fwht3_batched",
+            paged,
         )?;
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
@@ -9223,14 +9284,16 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
-            &mut desc_ptr as *mut _ as *mut c_void,
-            &mut rs_ptr as *mut _ as *mut c_void,
         ];
+        if paged {
+            params.push(&mut desc_ptr as *mut _ as *mut c_void);
+            params.push(&mut rs_ptr as *mut _ as *mut c_void);
+        }
         let shared_mem = ((head_dim + 32) * 4) as u32;
         let desc_raw = desc_ptr;
         let rs_raw = rs_ptr;
         self.launch_maybe_blob(
-            "kv_cache_write_asym_k_fwht3_batched",
+            func,
             [n_kv_heads as u32, batch_size as u32, 1],
             [32, 1, 1],
             shared_mem,
@@ -9245,8 +9308,10 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
-                b.push_ptr(desc_raw);
-                b.push_ptr(rs_raw);
+                if paged {
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                }
                 b
             },
         )
@@ -9751,7 +9816,9 @@ impl Gpu {
             row_slot.is_some(),
             "launch_asym_k_batched: slot_descs and row_slot are both-or-neither"
         );
-        self.ensure_givens4_kernel(kernel_key, src_const, func_name)?;
+        let paged = slot_descs.is_some();
+        let func_name =
+            self.ensure_givens4_kv_slot_kernel(kernel_key, src_const, func_name, paged)?;
         let mut kdp = k_dst.buf.as_ptr();
         let mut ksp = k_src.buf.as_ptr();
         let mut pp = positions.buf.as_ptr();
@@ -9777,9 +9844,11 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
-            &mut desc_ptr as *mut _ as *mut c_void,
-            &mut rs_ptr as *mut _ as *mut c_void,
         ];
+        if paged {
+            params.push(&mut desc_ptr as *mut _ as *mut c_void);
+            params.push(&mut rs_ptr as *mut _ as *mut c_void);
+        }
         let shared_mem = ((head_dim + 32) * 4) as u32;
         let desc_raw = desc_ptr;
         let rs_raw = rs_ptr;
@@ -9799,8 +9868,10 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
-                b.push_ptr(desc_raw);
-                b.push_ptr(rs_raw);
+                if paged {
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                }
                 b
             },
         )
@@ -9995,7 +10066,14 @@ impl Gpu {
             (tile_key, tile_src, tile_func_name)
         };
 
-        self.ensure_givens4_kernel(eff_tile_key, eff_tile_src, eff_tile_func)?;
+        // Descriptor launches never take the WMMA grid (asserted above), so
+        // eff_tile_* is the scalar tile here and has a paged variant.
+        let eff_tile_func = self.ensure_givens4_kv_slot_kernel(
+            eff_tile_key,
+            eff_tile_src,
+            eff_tile_func,
+            slot_descs.is_some(),
+        )?;
         if v_mode_bits != V_MODE_Q8 {
             self.ensure_givens4_kernel(
                 "attention_flash_lloyd_reduce_batched",
@@ -11319,10 +11397,12 @@ impl Gpu {
             );
         }
         // K: batched 3-bit rotated write.
-        self.ensure_givens4_kernel(
+        let paged = slot_descs.is_some();
+        let func = self.ensure_givens4_kv_slot_kernel(
             "kv_cache_write_asym_k_givens3_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
             "kv_cache_write_asym_k_givens3_batched",
+            paged,
         )?;
         {
             let mut kdp = k_dst.buf.as_ptr();
@@ -11350,14 +11430,16 @@ impl Gpu {
                 &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void,
                 &mut bs as *mut _ as *mut c_void,
-                &mut desc_ptr as *mut _ as *mut c_void,
-                &mut rs_ptr as *mut _ as *mut c_void,
             ];
+            if paged {
+                params.push(&mut desc_ptr as *mut _ as *mut c_void);
+                params.push(&mut rs_ptr as *mut _ as *mut c_void);
+            }
             let shared_mem = ((head_dim + 32) * 4) as u32;
             let desc_raw = desc_ptr;
             let rs_raw = rs_ptr;
             self.launch_maybe_blob(
-                "kv_cache_write_asym_k_givens3_batched",
+                func,
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,
@@ -11372,8 +11454,10 @@ impl Gpu {
                     b.push_i32(nkv);
                     b.push_i32(hd);
                     b.push_i32(bs);
-                    b.push_ptr(desc_raw);
-                    b.push_ptr(rs_raw);
+                    if paged {
+                        b.push_ptr(desc_raw);
+                        b.push_ptr(rs_raw);
+                    }
                     b
                 },
             )?;
@@ -21550,6 +21634,33 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b.push_i32(bs);
     b.push_f32(scale);
     b
+}
+
+
+/// `*_paged` symbol of a descriptor-aware kernel launched through the
+/// givens4/turbo assembler, or `None` when the kernel has no paged variant.
+fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
+    Some(match func {
+        "attention_flash_q8_0_tile_batched" => "attention_flash_q8_0_tile_batched_paged",
+        "attention_flash_bf16_tile_batched" => "attention_flash_bf16_tile_batched_paged",
+        "attention_flash_f16_tile_batched" => "attention_flash_f16_tile_batched_paged",
+        "attention_flash_asym2_tile_batched" => "attention_flash_asym2_tile_batched_paged",
+        "attention_flash_asym3_tile_batched" => "attention_flash_asym3_tile_batched_paged",
+        "attention_flash_asym3_tile_hd512_batched" => {
+            "attention_flash_asym3_tile_hd512_batched_paged"
+        }
+        "attention_flash_asym4_tile_batched" => "attention_flash_asym4_tile_batched_paged",
+        "attention_flash_fwht2_tile_batched" => "attention_flash_fwht2_tile_batched_paged",
+        "attention_flash_fwht3_tile_batched" => "attention_flash_fwht3_tile_batched_paged",
+        "attention_flash_fwht4_tile_batched" => "attention_flash_fwht4_tile_batched_paged",
+        "kv_cache_write_asym_k_fwht2_batched" => "kv_cache_write_asym_k_fwht2_batched_paged",
+        "kv_cache_write_asym_k_fwht3_batched" => "kv_cache_write_asym_k_fwht3_batched_paged",
+        "kv_cache_write_asym_k_fwht4_batched" => "kv_cache_write_asym_k_fwht4_batched_paged",
+        "kv_cache_write_asym_k_givens2_batched" => "kv_cache_write_asym_k_givens2_batched_paged",
+        "kv_cache_write_asym_k_givens3_batched" => "kv_cache_write_asym_k_givens3_batched_paged",
+        "kv_cache_write_asym_k_givens4_batched" => "kv_cache_write_asym_k_givens4_batched_paged",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
