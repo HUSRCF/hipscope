@@ -114,7 +114,7 @@
 - Architectures without an admitted registry remain hipcc JIT-only; installers do not install unindexed objects for them.
 
 
-### v0.4.0 folded PRs — partial GPU offload, serve discovery, decide endpoint, GGUF hybrid ingest
+### v0.4.0 folded PRs — partial GPU offload, serve discovery, speculative UTF-8 streaming, GGUF hybrid ingest
 
 - **Partial GPU offload for single-GPU dense Qwen3.5 (#793, Avery Drouillard; opt-in, default off).** `memory.gpu_layer_budget` (env `HIPFIRE_GPU_LAYER_BUDGET`) keeps that many layers in VRAM and places the weights of the layers before them in pinned host RAM (`hipHostMalloc` mapped), so a model larger than the card still loads; the KV cache stays in VRAM. `memory.offload_exec` (env `HIPFIRE_OFFLOAD_EXEC`) chooses who multiplies a spilled layer: `pcie` (default) runs the GPU kernels against the host-mapped weights over the link; `cpu` runs those layers' decode GEMVs on the host (new `hipfire-cpu` crate, AVX2 row dots for every dense quant format with a scalar fallback). The TUI Settings easy list gains `GPU layers` and `Offload exec` rows.
   - Unset (the default) places every layer in VRAM through the same upload calls as before, and no kernel source changes.
