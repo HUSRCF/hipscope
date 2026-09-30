@@ -31,7 +31,7 @@ use rdna_compute::tensor_ops::{
     indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
     indexed_attention_pool_rope, indexed_attention_select, Bf16Roundtrip, GatedDeltaStep,
     HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
-    IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect,
+    IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -2546,6 +2546,7 @@ fn run_qsa(
                 head_dim,
                 selected_len: capacity,
                 full_capacity: tokens,
+                format: QsaKvFormat::F32,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3433,6 +3434,7 @@ fn run_mtp(
                 head_dim: 4,
                 selected_len: capacity,
                 full_capacity: tokens,
+                format: QsaKvFormat::F32,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3881,6 +3883,7 @@ fn run_quality_candidate(
         &mut gpu,
         2048,
         metadata,
+        QsaKvFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));

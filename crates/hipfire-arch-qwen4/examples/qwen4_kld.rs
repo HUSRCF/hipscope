@@ -87,6 +87,11 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 manifest fulfillment: {e}"))?;
         let vocab = receipt.config.vocab_size;
+        let qsa_format = hipfire_arch_qwen4::resolve_qsa_format(
+            &hipfire_runtime::config::get().kv_mode,
+            &gpu,
+            &receipt.config,
+        )?;
         let mut bundle = Qwen4Bundle::assemble_with_metadata(
             receipt.config,
             transaction,
@@ -94,6 +99,7 @@ impl Model {
             &mut gpu,
             n_ctx,
             receipt.ple,
+            qsa_format,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle

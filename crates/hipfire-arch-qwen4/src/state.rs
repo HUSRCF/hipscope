@@ -11,7 +11,7 @@ use crate::config::{LayerType, Qwen4Config};
 use crate::ple::PleHistory;
 use hipfire_dispatch::pipeline::GdnRowCapture;
 use rdna_compute::tensor_ops::{
-    copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
+    copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -158,8 +158,12 @@ pub struct GdnGpuState {
 }
 
 /// A production QSA block.  Full K/V and raw/indexer buffers are allocated at
-/// max sequence capacity once; `*_len` fields are active append lengths.
+/// max sequence capacity once; `*_len` fields are active append lengths. The
+/// K/V arenas hold `format`'s rows (`full_row_units` tensor units per token)
+/// and the raw/pooled index keys its `index_dtype`.
 pub struct QsaGpuState {
+    pub format: QsaKvFormat,
+    pub full_row_units: usize,
     pub full_keys: GpuTensor,
     pub full_values: GpuTensor,
     pub raw_index_keys: GpuTensor,
@@ -202,6 +206,33 @@ impl QsaGpuState {
             selected: self.selected_capacity,
             position: self.position_capacity,
         }
+    }
+}
+
+/// The QSA state format for a `memory.kv_cache` request on `gpu`
+/// ([`hipfire_runtime::kv_mode::resolve_qwen4`]): `bf16` is the exact
+/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 and a head
+/// geometry its kernels implement (head_dim 256, an even KV-head count).
+/// `auto` is fp8 where both hold and the reference state elsewhere; an
+/// explicit request the device or model cannot serve is refused, never
+/// rewritten.
+pub fn resolve_qsa_format(
+    request: &str,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+) -> Result<QsaKvFormat, String> {
+    use hipfire_runtime::kv_mode::{resolve_qwen4, KvMode};
+    let (kv_heads, head_dim) = (config.num_key_value_heads, config.head_dim);
+    let fp8_geometry = QsaKvFormat::Fp8.supports(kv_heads, head_dim);
+    let auto = matches!(request.trim(), "" | "auto");
+    match resolve_qwen4(request, &gpu.arch)?.mode {
+        KvMode::Fp8 if fp8_geometry => Ok(QsaKvFormat::Fp8),
+        KvMode::Fp8 if auto => Ok(QsaKvFormat::F32),
+        KvMode::Fp8 => Err(format!(
+            "qwen4: fp8 QSA K/V needs head_dim 256 and an even KV-head count \
+             (have {kv_heads} x {head_dim}); use bf16"
+        )),
+        _ => Ok(QsaKvFormat::F32),
     }
 }
 
@@ -289,7 +320,7 @@ impl Qwen4StateSnapshotArena {
                     .checked_mul(raw_width)
                     .ok_or(StateError::DimensionOverflow)?;
                 allocated.push(
-                    gpu.zeros(&[circular_elements], DType::F32)
+                    gpu.zeros(&[circular_elements], layer.raw_index_keys.dtype)
                         .map_err(StateError::Hip)?,
                 );
                 allocated.push(
@@ -440,7 +471,9 @@ impl Qwen4StateSnapshotArena {
                 .partial_capacity
                 .checked_mul(raw_width)
                 .ok_or(StateError::DimensionOverflow)?;
-            if self.qsa_raw_circular[index].numel() != expected_raw {
+            if self.qsa_raw_circular[index].numel() != expected_raw
+                || self.qsa_raw_circular[index].dtype != layer.raw_index_keys.dtype
+            {
                 return Err(StateError::SnapshotShape);
             }
         }
@@ -540,13 +573,23 @@ pub struct Qwen4State {
 
 impl Qwen4State {
     /// Allocate all mutable device buffers once.  QSA full K/V and raw key
-    /// buffers are fixed-capacity arenas; only active lengths are mutable.
+    /// buffers are fixed-capacity arenas in `qsa_format`; only active lengths
+    /// are mutable.
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_seq_len: usize,
+        qsa_format: QsaKvFormat,
     ) -> Result<Self, StateError> {
         config.validate().map_err(StateError::Config)?;
+        if !qsa_format.supports(config.num_key_value_heads, config.head_dim) {
+            return Err(StateError::Config(format!(
+                "QSA {} K/V does not support {} KV heads x {}",
+                qsa_format.name(),
+                config.num_key_value_heads,
+                config.head_dim
+            )));
+        }
         if max_seq_len == 0 || max_seq_len > config.max_position_embeddings {
             return Err(StateError::InvalidCapacity);
         }
@@ -574,6 +617,7 @@ impl Qwen4State {
             .num_key_value_heads
             .checked_mul(config.head_dim)
             .ok_or(StateError::DimensionOverflow)?;
+        let full_row_units = qsa_format.kv_row_units(config.num_key_value_heads, config.head_dim);
         let raw_width = config
             .indexer_kv_heads
             .checked_mul(config.indexer_head_dim)
@@ -599,7 +643,7 @@ impl Qwen4State {
                     }
                     LayerType::FullAttention => {
                         let full_elements = max_seq_len
-                            .checked_mul(full_width)
+                            .checked_mul(full_row_units)
                             .ok_or(StateError::DimensionOverflow)?;
                         let raw_elements = max_seq_len
                             .checked_mul(raw_width)
@@ -619,10 +663,10 @@ impl Qwen4State {
                             .checked_mul(std::mem::size_of::<i32>())
                             .ok_or(StateError::DimensionOverflow)?;
                         for (elements, dtype) in [
-                            (full_elements, DType::F32),
-                            (full_elements, DType::F32),
-                            (raw_elements, DType::F32),
-                            (pooled_elements, DType::F32),
+                            (full_elements, qsa_format.kv_dtype()),
+                            (full_elements, qsa_format.kv_dtype()),
+                            (raw_elements, qsa_format.index_dtype()),
+                            (pooled_elements, qsa_format.index_dtype()),
                             (partial_key_elements, DType::F32),
                             (partial_value_elements, DType::F32),
                             (selected_bytes, DType::Raw),
@@ -702,6 +746,8 @@ impl Qwen4State {
                     let partial_values = next_tensor();
                     let selected_indices = next_tensor();
                     qsa.push(QsaGpuState {
+                        format: qsa_format,
+                        full_row_units,
                         full_keys,
                         full_values,
                         raw_index_keys,
@@ -892,11 +938,11 @@ impl Qwen4State {
                 if rows > 0 {
                     let bytes = rows
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     let source_offset = (layer.raw_len - rows)
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     copies.push(CopyRegion {
                         dst: &arena.qsa_raw_circular[index].buf,
@@ -990,11 +1036,11 @@ impl Qwen4State {
                 if rows > 0 {
                     let bytes = rows
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     let destination_offset = (mark.raw_len - rows)
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     copies.push(CopyRegion {
                         dst: &layer.raw_index_keys.buf,
@@ -1494,7 +1540,7 @@ mod tests {
 
     fn new_compact_state(gpu: &mut Gpu) -> Qwen4State {
         let config = crate::config::compact_test_config();
-        Qwen4State::new(gpu, &config, 8).expect("compact Qwen4 state")
+        Qwen4State::new(gpu, &config, 8, QsaKvFormat::F32).expect("compact Qwen4 state")
     }
 
     #[test]

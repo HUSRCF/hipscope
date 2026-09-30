@@ -47,3 +47,5 @@ pub use ple::{
     PLE_HEAD_VOCAB_SIZES, PLE_MULTIPLIERS, PLE_MULTIPLIER_COUNT, PLE_PADDED_ROWS,
     PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };
+pub use rdna_compute::tensor_ops::QsaKvFormat;
+pub use state::resolve_qsa_format;

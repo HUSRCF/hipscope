@@ -467,12 +467,15 @@ pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
-/// Reserved Qwen4 route: the current KV implementation is BF16 only. Keep
-/// aliases local so an explicit q8/rotated mode cannot be silently rewritten
-/// by the generic fallback resolver.
+/// Qwen4 (Flash-Next) QSA K/V. `bf16` is the exact reference state (F32
+/// K/V arenas, BF16-valued index keys); `fp8` stores K/V as E4M3 with one
+/// f16 scale per head and token (gfx12 kernels) and the index keys as BF16.
+/// Aliases stay local so an explicit q8/rotated mode cannot be silently
+/// rewritten by the generic fallback resolver.
 fn normalize_qwen4(raw: &str) -> Option<KvMode> {
-    match raw {
+    match raw.trim() {
         "" | "auto" | "bf16" => Some(Bf16),
+        "fp8" => Some(Fp8),
         _ => None,
     }
 }
@@ -480,19 +483,36 @@ fn normalize_qwen4(raw: &str) -> Option<KvMode> {
 pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen4",
     normalize_alias: normalize_qwen4,
-    accepted: &[Bf16],
+    accepted: &[Bf16, Fp8],
     default: Bf16,
 };
 
-/// Strict Qwen4 policy resolution. Unsupported explicit modes are refused
-/// before the generic [`resolve`] fallback can rewrite them to BF16.
-pub fn resolve_qwen4(raw: &str, _head_dim: usize) -> Result<ResolveResult, String> {
-    if !raw.is_empty() && normalize_qwen4(raw).is_none() {
-        return Err(format!(
-            "unsupported qwen4 kv mode {raw:?}; explicit mode must be one of: bf16"
-        ));
-    }
-    Ok(resolve(raw, &QWEN4_POLICY))
+/// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201
+/// and bf16 everywhere else; explicit `fp8` is refused off gfx1201, and any
+/// other unsupported explicit mode is refused before the generic [`resolve`]
+/// fallback can rewrite it. The model's head geometry is checked where the
+/// state is built (`hipfire_arch_qwen4::resolve_qsa_format`).
+pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
+    let fp8_arch = arch == "gfx1201";
+    let mode = match raw.trim() {
+        "" | "auto" if fp8_arch => Fp8,
+        "" | "auto" | "bf16" => Bf16,
+        "fp8" if fp8_arch => Fp8,
+        "fp8" => {
+            return Err(format!(
+                "qwen4 kv mode \"fp8\" needs gfx1201 (have {arch}); use bf16 or auto"
+            ))
+        }
+        other => {
+            return Err(format!(
+                "unsupported qwen4 kv mode {other:?}; explicit mode must be one of: auto, bf16, fp8"
+            ))
+        }
+    };
+    Ok(ResolveResult {
+        mode,
+        warning: None,
+    })
 }
 
 /// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
@@ -1112,20 +1132,42 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_is_bf16_only_and_rejects_before_fallback() {
+    fn qwen4_auto_fp8_on_gfx1201_bf16_elsewhere_and_rejects_before_fallback() {
         let p = &QWEN4_POLICY;
-        for raw in ["", "auto", "bf16"] {
-            let resolved = resolve_qwen4(raw, 256).expect("Qwen4 BF16 alias");
-            assert_eq!(resolved.mode, KvMode::Bf16);
+        // (raw, arch) -> mode. The Halo (gfx1151) and the XTX (gfx1100) keep
+        // bf16 under auto; only exact gfx1201 selects fp8 (not gfx1200).
+        for (raw, arch, mode) in [
+            ("", "gfx1201", KvMode::Fp8),
+            ("auto", "gfx1201", KvMode::Fp8),
+            (" auto ", "gfx1201", KvMode::Fp8),
+            ("bf16", "gfx1201", KvMode::Bf16),
+            ("fp8", "gfx1201", KvMode::Fp8),
+            ("", "gfx1151", KvMode::Bf16),
+            ("auto", "gfx1151", KvMode::Bf16),
+            ("bf16", "gfx1151", KvMode::Bf16),
+            ("", "gfx1100", KvMode::Bf16),
+            ("auto", "gfx1100", KvMode::Bf16),
+            ("auto", "gfx1200", KvMode::Bf16),
+        ] {
+            let resolved = resolve_qwen4(raw, arch).expect("supported qwen4 mode");
+            assert_eq!(resolved.mode, mode, "{raw:?} on {arch}");
             assert!(resolved.warning.is_none());
         }
-        for raw in ["q8", "asym3", "garbage"] {
-            let error = match resolve_qwen4(raw, 256) {
-                Ok(_) => panic!("explicit unsupported mode {raw} must be rejected"),
-                Err(error) => error,
+        for arch in ["gfx1151", "gfx1100", "gfx1200"] {
+            let Err(error) = resolve_qwen4("fp8", arch) else {
+                panic!("fp8 off gfx1201 must be refused on {arch}");
             };
-            assert!(error.contains("qwen4"));
-            assert!(error.contains(raw));
+            assert!(error.contains("fp8") && error.contains(arch), "{error}");
+        }
+        for raw in ["q8", "asym3", "f16", "garbage"] {
+            for arch in ["gfx1201", "gfx1151"] {
+                let error = match resolve_qwen4(raw, arch) {
+                    Ok(_) => panic!("explicit unsupported mode {raw} must be rejected"),
+                    Err(error) => error,
+                };
+                assert!(error.contains("qwen4"));
+                assert!(error.contains(raw));
+            }
             assert_eq!(resolve(raw, p).mode, KvMode::Bf16);
             assert!(
                 resolve(raw, p).warning.is_some(),

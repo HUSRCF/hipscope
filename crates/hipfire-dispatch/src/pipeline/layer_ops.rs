@@ -23,6 +23,7 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
+    indexed_attention_index_key_append_batch,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
@@ -30,8 +31,9 @@ use rdna_compute::tensor_ops::{
     GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
     HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
-    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
-    IndexedAttentionReuseSelection, IndexedAttentionSelectBatch, ScaleF32,
+    IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelectBatch, QsaKvFormat, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -1383,8 +1385,10 @@ pub fn execute_gated_delta_net(
 
 /// Borrowed cache tensors plus scalar metadata for one operation.  The
 /// architecture commits these scalar values to persistent state after the
-/// shared step list succeeds.
+/// shared step list succeeds. The K/V caches are `format`'s rows and the raw
+/// and pooled index keys its `index_dtype`.
 pub struct IndexedAttentionState<'a> {
+    pub format: QsaKvFormat,
     pub full_keys: &'a GpuTensor,
     pub full_values: &'a GpuTensor,
     pub raw_index_keys: &'a GpuTensor,
@@ -1583,24 +1587,33 @@ impl IndexedAttentionOp<'_> {
             DType::F32,
             "indexed attention projected output",
         )?;
+        let kv_row_units = self.state.format.kv_row_units(self.kv_heads, self.head_dim);
+        if !self.state.format.supports(self.kv_heads, self.head_dim) {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention {} K/V does not support {} KV heads x {}",
+                self.state.format.name(),
+                self.kv_heads,
+                self.head_dim
+            )));
+        }
         require_tensor(
             self.state.full_keys,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full keys",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full keys",
         )?;
         require_tensor(
             self.state.full_values,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full values",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full values",
         )?;
         require_tensor(
@@ -1610,7 +1623,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention raw keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention raw keys",
         )?;
         require_tensor(
@@ -1620,7 +1633,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention pooled keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention pooled keys",
         )?;
         require_tensor(
@@ -1807,6 +1820,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 position: initial_position,
                 rows: op.rows,
+                format: op.state.format,
             },
         ))?;
     } else {
@@ -1824,32 +1838,49 @@ pub fn execute_indexed_attention(
                 rotary_dim: op.index_dim.min(64),
             },
         ))?;
-        hip(gpu.bf16_round_trip_f32_strided(
-            &index_batch,
-            op.rows,
-            index_q_width,
-            index_width,
-            index_kv_width,
-        ))?;
-        let index_k_batch = view(
-            &index_batch,
-            index_q_width,
-            op.rows * index_width - index_q_width,
-        );
-        // The destination row offset travels as a scalar (`= position *
-        // index_kv_width`) against the base tensor, and the recorder declares it, so
-        // the tape keeps a position-independent pointer and replay re-derives the
-        // offset for its own position instead of replaying the capture-position row.
-        hip(gpu.copy_rows_strided_f32(
-            &index_k_batch,
-            op.state.raw_index_keys,
-            op.rows,
-            index_kv_width,
-            index_width,
-            index_kv_width,
-            initial_position * index_kv_width,
-            Some(index_kv_width),
-        ))?;
+        if op.state.format.index_dtype() == DType::BF16 {
+            // Round in place and append into the BF16 arena, as the decode
+            // prologue does.
+            hip(indexed_attention_index_key_append_batch(
+                gpu,
+                &IndexedAttentionIndexKeyAppendBatch {
+                    index_rows: &index_batch,
+                    raw_index_keys: op.state.raw_index_keys,
+                    rows: op.rows,
+                    index_q_width,
+                    index_kv_width,
+                    position_start: initial_position,
+                },
+            ))?;
+        } else {
+            hip(gpu.bf16_round_trip_f32_strided(
+                &index_batch,
+                op.rows,
+                index_q_width,
+                index_width,
+                index_kv_width,
+            ))?;
+            let index_k_batch = view(
+                &index_batch,
+                index_q_width,
+                op.rows * index_width - index_q_width,
+            );
+            // The destination row offset travels as a scalar (`= position *
+            // index_kv_width`) against the base tensor, and the recorder declares it,
+            // so the tape keeps a position-independent pointer and replay
+            // re-derives the offset for its own position instead of replaying the
+            // capture-position row.
+            hip(gpu.copy_rows_strided_f32(
+                &index_k_batch,
+                op.state.raw_index_keys,
+                op.rows,
+                index_kv_width,
+                index_width,
+                index_kv_width,
+                initial_position * index_kv_width,
+                Some(index_kv_width),
+            ))?;
+        }
         hip(indexed_attention_norm_rope_batch(
             gpu,
             &IndexedAttentionNormRopeBatch {
@@ -1887,7 +1918,9 @@ pub fn execute_indexed_attention(
                 full_values: op.state.full_values,
                 rows: op.rows,
                 position_start: initial_position,
-                kv_width,
+                kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                format: op.state.format,
             },
         ))?;
     }
@@ -1951,6 +1984,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 selected_len,
                 full_capacity: op.state.full_capacity,
+                format: op.state.format,
             },
         ))?;
         return project_weight(
@@ -2002,6 +2036,7 @@ pub fn execute_indexed_attention(
             compress: op.compress,
             capacity: op.state.selected_capacity,
             full_capacity: op.state.full_capacity,
+            format: op.state.format,
             shape_selected: op.state.selected_capacity,
         },
     ))?;
@@ -2703,6 +2738,7 @@ mod tests {
             k_norm: t,
             output: weight,
             state: IndexedAttentionState {
+                format: QsaKvFormat::F32,
                 full_keys: t,
                 full_values: t,
                 raw_index_keys: t,

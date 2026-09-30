@@ -23,7 +23,7 @@ use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::tensor_ops::{
     indexed_attention_cache_append, indexed_attention_pool_rope, indexed_attention_reuse_selection,
     indexed_attention_select, IndexedAttentionCacheAppend, IndexedAttentionPoolRope,
-    IndexedAttentionReuseSelection, IndexedAttentionSelect,
+    IndexedAttentionReuseSelection, IndexedAttentionSelect, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
@@ -71,9 +71,9 @@ type Families = BTreeMap<String, Value>;
 
 pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
     let config = compact_test_config();
-    let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ)
+    let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ, QsaKvFormat::F32)
         .map_err(|error| format!("allocate compact AR state: {error}"))?;
-    let mut native = match Qwen4State::new(gpu, &config, MAX_SEQ) {
+    let mut native = match Qwen4State::new(gpu, &config, MAX_SEQ, QsaKvFormat::F32) {
         Ok(state) => state,
         Err(error) => {
             let _ = ar.free_gpu(gpu);
@@ -1509,6 +1509,7 @@ fn run_profile_inner(
         &mut gpu,
         1,
         metadata,
+        QsaKvFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
@@ -1788,6 +1789,7 @@ pub fn run_state_parity(
         &mut gpu,
         2048,
         metadata,
+        QsaKvFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {

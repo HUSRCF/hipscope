@@ -2104,6 +2104,7 @@ impl Qwen4GpuForward {
                         k_norm: weights.k_norm,
                         output: weights.output,
                         state: IndexedAttentionState {
+                            format: state.format,
                             full_keys: &state.full_keys,
                             full_values: &state.full_values,
                             raw_index_keys: &state.raw_index_keys,

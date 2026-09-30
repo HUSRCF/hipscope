@@ -3619,10 +3619,6 @@ fn redline_qwen4_snapshot(
     logits: &rdna_compute::GpuTensor,
 ) -> Result<RedlineQwen4Snapshot, String> {
     let config = &bundle.config;
-    let full_width = config
-        .num_key_value_heads
-        .checked_mul(config.head_dim)
-        .ok_or("Qwen4 snapshot: full K/V width overflows")?;
     let raw_width = config
         .indexer_kv_heads
         .checked_mul(config.indexer_head_dim)
@@ -3655,8 +3651,8 @@ fn redline_qwen4_snapshot(
     let mut lengths = Vec::with_capacity(state.qsa.len());
     for (layer, qsa) in state.qsa.iter().enumerate() {
         let active = [
-            ("full_keys", &qsa.full_keys, qsa.full_len, full_width),
-            ("full_values", &qsa.full_values, qsa.full_len, full_width),
+            ("full_keys", &qsa.full_keys, qsa.full_len, qsa.full_row_units),
+            ("full_values", &qsa.full_values, qsa.full_len, qsa.full_row_units),
             ("raw_keys", &qsa.raw_index_keys, qsa.raw_len, raw_width),
             ("pooled_keys", &qsa.pooled_keys, qsa.pooled_len, raw_width),
         ];

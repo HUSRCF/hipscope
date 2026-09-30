@@ -889,7 +889,7 @@ pub fn admit_source_with_options(
                 hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
-        hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), 256)?;
+        hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?

@@ -793,9 +793,11 @@ impl Qwen4Manifest {
         for (layer_idx, kind) in config.layer_types.iter().copied().enumerate() {
             state.push(match kind {
                 LayerType::LinearAttention => StateEntry::new(StateKind::Recurrent, layer_idx),
+                // Full K/V plus raw/pooled index keys; their storage format is
+                // resolved at load (`resolve_qsa_format`, memory.kv_cache).
                 LayerType::FullAttention => StateEntry::new(
                     StateKind::Kv {
-                        quant: "f32-qsa-full-raw-pooled".into(),
+                        quant: "qsa-full-raw-pooled".into(),
                     },
                     layer_idx,
                 ),

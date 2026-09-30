@@ -441,12 +441,29 @@ impl Carrier for Qwen4Carrier {
                 );
             }
         }
-        // Context-sized QSA arenas (trunk layers plus the MTP head's), named
-        // in the refusal when they do not fit.
+        // The QSA state format (memory.kv_cache), resolved before any state
+        // allocation.
+        let qsa_format =
+            hipfire_arch_qwen4::resolve_qsa_format(&kv_mode_from_ctx(ctx), ctx.gpu, &config)?;
+        eprintln!(
+            "  qwen4 QSA K/V: {}",
+            match qsa_format {
+                hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
+                hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
+            }
+        );
+        // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
+        // head's, which stays F32), named in the refusal when they do not fit.
         let context_state_mib = config
-            .qsa_context_arena_bytes(ctx.max_seq)
-            .map(|bytes| bytes * (config.n_full_layers() + usize::from(native_mtp)) >> 20)
-            .unwrap_or(usize::MAX);
+            .qsa_context_arena_bytes(ctx.max_seq, qsa_format)
+            .and_then(|trunk| trunk.checked_mul(config.n_full_layers()))
+            .zip(if native_mtp {
+                config.qsa_context_arena_bytes(ctx.max_seq, hipfire_arch_qwen4::QsaKvFormat::F32)
+            } else {
+                Some(0)
+            })
+            .and_then(|(trunk, mtp)| trunk.checked_add(mtp))
+            .map_or(usize::MAX, |bytes| bytes >> 20);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
         let source = HfqModelSource::from_hfq(hfq);
@@ -484,6 +501,7 @@ impl Carrier for Qwen4Carrier {
             ctx.gpu,
             ctx.max_seq,
             metadata,
+            qsa_format,
         )
         .map_err(|error| {
             format!(
