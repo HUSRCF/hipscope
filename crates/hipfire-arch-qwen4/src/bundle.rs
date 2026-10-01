@@ -152,6 +152,13 @@ pub struct Qwen4PrefixPlan {
 /// One durable canonical-chunk checkpoint. The device bytes live in the
 /// state/MTP prefix arenas (their `active` flags are the device validity);
 /// this records which tokens they hold and under which schedule.
+///
+/// The key is only tokens, mode and admitted chunk because everything else
+/// is immutable for this owner: model artifact, device, state formats,
+/// config and placement are fixed per bundle (a reload builds a new bundle
+/// with no checkpoint), and numeric dispatch knobs come from the process
+/// config snapshot (`hipfire_config` `OnceLock`), fixed for the process. Any
+/// future mutable route knob or cross-bundle transport must join the key.
 struct Qwen4PrefixCache {
     /// Token ids `[0, p)` of the checkpoint; reused allocation.
     tokens: Vec<u32>,
