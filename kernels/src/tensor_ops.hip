@@ -356,8 +356,24 @@ extern "C" __global__ void gated_delta_step_norm128_q8(
 // Workgroup barrier ordering LDS only: every handoff in the persistent GDN
 // step is through LDS, and a full __syncthreads would also wait at each
 // barrier for the row's global stores (outputs, captured states) to land.
+// Each wave waits for its own LDS ops before it signals: s_wait_dscnt 0 on
+// gfx12 (no clang builtin, so the intrinsic is bound by name), lgkmcnt(0) with
+// vmcnt/expcnt left open (s_waitcnt 0xFC07) on gfx11. The release fence alone
+// adds a soft wait that SIInsertWaitcnts may erase as redundant without seeing
+// loop-carried stores (llvm/llvm-project#220357), e.g. q_norm[buf ^ 1] stored
+// at a row's tail and read after the next row's first barrier; in WGP mode a
+// read past the barrier could then overtake another wave's queued store (the
+// gfx1151 VerifyAttn race). Other arches (no persistent route) keep the fence.
+#if defined(__GFX12__)
+extern "C" __device__ void gdn_lds_wait_dscnt(unsigned short) __asm("llvm.amdgcn.s.wait.dscnt");
+#endif
 __device__ __forceinline__ void gdn_lds_barrier() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+#if defined(__GFX12__)
+    gdn_lds_wait_dscnt(0);
+#elif defined(__GFX11__)
+    __builtin_amdgcn_s_waitcnt(0xFC07);
+#endif
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
