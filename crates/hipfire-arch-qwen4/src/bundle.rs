@@ -156,8 +156,8 @@ impl Qwen4Bundle {
         };
         // One prefill chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows in
         // a single row-store request, so staging holds the requested chunk.
-        let staging_rows = qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len)
-            * crate::ple::PLE_HEAD_COUNT;
+        let staging_rows =
+            qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * crate::ple::PLE_HEAD_COUNT;
         let ple_rows = match RowStore::with_staging_rows(
             "qwen4-ple-reader",
             descriptors,

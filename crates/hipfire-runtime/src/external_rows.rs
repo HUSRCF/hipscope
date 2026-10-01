@@ -2443,7 +2443,10 @@ mod tests {
         assert_eq!(lease.row_ids(), ids.as_slice());
         let first = lease.row_bytes(0).unwrap().to_vec();
         let period = valid_rows as usize;
-        assert_eq!(lease.row_bytes(rows - 1 - (rows - 1) % period).unwrap(), first);
+        assert_eq!(
+            lease.row_bytes(rows - 1 - (rows - 1) % period).unwrap(),
+            first
+        );
         drop(lease);
         assert!(store.unload().unwrap().is_clean());
     }
