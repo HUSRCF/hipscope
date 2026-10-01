@@ -17,8 +17,9 @@ use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
-/// resident (the fully resident load). Set, it also keeps host memory out of
-/// reclaim from before the HIP runtime loads (hip-bridge owns the name).
+/// resident where they fit ([`resolve_expert_vram_layers`]) and is `auto`
+/// otherwise. Set, it also keeps host memory out of reclaim from before the
+/// HIP runtime loads (hip-bridge owns the name).
 pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_ENV;
 
 /// VRAM left free by `auto` beyond the resident non-expert weights: forward
@@ -48,12 +49,56 @@ pub enum ExpertVramLayers {
     Auto,
 }
 
-/// Parse [`EXPERT_VRAM_LAYERS_ENV`]. `Ok(None)` = unset (fully resident).
+/// Parse [`EXPERT_VRAM_LAYERS_ENV`]. `Ok(None)` = unset
+/// ([`resolve_expert_vram_layers`] picks the placement).
 pub fn expert_vram_layers_from_env() -> Result<Option<ExpertVramLayers>, String> {
     match hipfire_config::developer_var(EXPERT_VRAM_LAYERS_ENV) {
         Ok(value) => parse_expert_vram_layers(&value).map(Some),
         Err(_) => Ok(None),
     }
+}
+
+/// The placement for a discrete-GPU load: an explicit `policy` always wins.
+/// Unset (`None`) keeps every routed expert resident (`Ok(None)`) when
+/// `fits_resident` reports that the whole expert footprint, the non-expert
+/// weights and the `auto` reserve fit in VRAM, and is `auto` otherwise.
+/// `fits_resident` runs only when unset.
+pub fn resolve_expert_vram_layers(
+    policy: Option<ExpertVramLayers>,
+    fits_resident: impl FnOnce() -> Result<bool, String>,
+) -> Result<Option<ExpertVramLayers>, String> {
+    match policy {
+        Some(policy) => Ok(Some(policy)),
+        None => Ok((!fits_resident()?).then_some(ExpertVramLayers::Auto)),
+    }
+}
+
+/// Whether every routed expert (`expert_bytes`), the non-expert weights and
+/// `reserve` ([`auto_vram_reserve`]) fit in `free_vram`.
+pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: u64, reserve: u64) -> bool {
+    non_expert_bytes
+        .checked_add(expert_bytes)
+        .and_then(|bytes| bytes.checked_add(reserve))
+        .is_some_and(|need| need <= free_vram)
+}
+
+/// Bytes of every routed expert payload (trunk and MTP layers).
+pub fn routed_expert_bytes(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<u64, String> {
+    weights
+        .iter()
+        .filter(|entry| {
+            is_routed_expert(&entry.name)
+                && !entry.residency.is_external()
+                && !matches!(entry.policy, ShardPolicy::Tied { .. })
+        })
+        .try_fold(0u64, |total, entry| {
+            bytes_of(entry)
+                .map(|bytes| total + bytes)
+                .ok_or_else(|| format!("no payload size for '{}'", entry.name))
+        })
 }
 
 fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
@@ -616,5 +661,25 @@ mod tests {
         assert_eq!(parse_expert_vram_layers(" auto "), Ok(ExpertVramLayers::Auto));
         assert_eq!(parse_expert_vram_layers("16"), Ok(ExpertVramLayers::Layers(16)));
         assert!(parse_expert_vram_layers("16GB").is_err());
+    }
+
+    #[test]
+    fn unset_is_resident_only_where_everything_fits_and_explicit_wins() {
+        const GIB: u64 = 1 << 30;
+        // Flash-Next: ~5 GiB non-expert, ~64 GiB experts, 6.5 GiB reserve.
+        let r9700 = fits_fully_resident(32 * GIB, 5 * GIB, 64 * GIB, 6 * GIB + GIB / 2);
+        let halo = fits_fully_resident(120 * GIB, 5 * GIB, 64 * GIB, 6 * GIB + GIB / 2);
+        assert!(!r9700 && halo);
+        assert!(fits_fully_resident(10 * GIB, 2 * GIB, 7 * GIB, GIB));
+        assert!(!fits_fully_resident(10 * GIB, 2 * GIB, 7 * GIB, GIB + 1));
+        assert!(!fits_fully_resident(u64::MAX, 1, u64::MAX, 0));
+        assert_eq!(resolve_expert_vram_layers(None, || Ok(true)), Ok(None));
+        assert_eq!(resolve_expert_vram_layers(None, || Ok(false)), Ok(Some(ExpertVramLayers::Auto)));
+        assert!(resolve_expert_vram_layers(None, || Err("vram".into())).is_err());
+        // Explicit values never consult the fit.
+        for policy in [ExpertVramLayers::Layers(12), ExpertVramLayers::Layers(99), ExpertVramLayers::Auto] {
+            let resolved = resolve_expert_vram_layers(Some(policy), || panic!("explicit consulted the fit"));
+            assert_eq!(resolved, Ok(Some(policy)));
+        }
     }
 }

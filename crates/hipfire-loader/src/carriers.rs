@@ -412,88 +412,126 @@ impl Carrier for Qwen4Carrier {
             },
             state_format.gdn.name()
         );
-        if let Some(policy) = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
-            .map_err(|error| format!("qwen4: {error}"))?
-        {
-            use hipfire_arch_qwen4::expert_residency as residency;
+        use hipfire_arch_qwen4::expert_residency as residency;
+        const MIB: u64 = 1 << 20;
+        let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+        };
+        // What `auto` sizes its placement from: free VRAM, the non-expert and
+        // per-layer expert bytes, and the reserve (with its native MTP and
+        // QSA gather parts).
+        let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
+            let (free, _) = ctx
+                .gpu
+                .hip
+                .get_vram_info()
+                .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
+            let (non_expert, layer_experts) = residency::resident_split(&manifest.weights, bytes_of)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            // Every placement host-maps at least the MTP layer's routed
+            // experts, so the head is still attached after it only where the
+            // host-mapped policy keeps it (an explicit `--spec mtp`); only
+            // then does it need VRAM.
+            let mtp_kept = native_mtp && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, 1);
+            let mtp_bytes = if mtp_kept {
+                let head = residency::language_head_dtype(&manifest.weights)
+                    .ok_or("qwen4: manifest has no language head")?;
+                let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config);
+                Some(
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+                        &config,
+                        ctx.max_seq,
+                        max_k,
+                        head,
+                        row_capture,
+                    )
+                    .ok_or("qwen4: native MTP device bytes overflow")?,
+                )
+            } else {
+                None
+            };
+            // The gathered QSA prefill attention reserves its context-sized
+            // scratch at attach (none when the route is off: the reserve is
+            // then unchanged). A slot already reserved by an earlier load in
+            // this process is out of `free` and only its growth is charged.
+            let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
+                .then(|| {
+                    rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                        config.num_key_value_heads,
+                        ctx.max_seq,
+                    )
+                    .map(|bytes| (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64))
+                    .ok_or("qwen4: QSA gather scratch size overflows")
+                })
+                .transpose()?;
+            let reserve =
+                residency::auto_vram_reserve(&config, ctx.max_seq, qsa_format, mtp_bytes, gather_bytes)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+            Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
+        };
+        let explicit =
+            residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
+        // Unset on a discrete card: fully resident only where every routed
+        // expert, the non-expert weights and the `auto` reserve fit in free
+        // VRAM; otherwise `auto` (an unconditional resident load would fail
+        // `hipMalloc` part-way). Unified memory keeps the resident load.
+        let mut measured = None;
+        let mut unset_note = String::new();
+        let placement = if use_ranges {
+            explicit
+        } else {
+            residency::resolve_expert_vram_layers(explicit, || {
+                let inputs = auto_inputs()?;
+                let experts = residency::routed_expert_bytes(&manifest.weights, bytes_of)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                let (free, non_expert, _, reserve, ..) = inputs;
+                let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
+                unset_note = format!(
+                    " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve {} {} MiB free VRAM)",
+                    experts / MIB,
+                    non_expert / MIB,
+                    reserve / MIB,
+                    if fits { "fit in" } else { "exceed" },
+                    free / MIB
+                );
+                measured = Some(inputs);
+                Ok(fits)
+            })?
+        };
+        eprintln!(
+            "  qwen4 expert placement: {}{unset_note}",
+            match (explicit, placement) {
+                (Some(residency::ExpertVramLayers::Layers(layers)), _) => format!(
+                    "{}={layers}",
+                    residency::EXPERT_VRAM_LAYERS_ENV
+                ),
+                (Some(residency::ExpertVramLayers::Auto), _) =>
+                    format!("{}=auto", residency::EXPERT_VRAM_LAYERS_ENV),
+                (None, None) => format!("{} unset, fully resident", residency::EXPERT_VRAM_LAYERS_ENV),
+                (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
+            }
+        );
+        if let Some(policy) = placement {
             if use_ranges {
                 return Err(format!(
                     "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
                     residency::EXPERT_VRAM_LAYERS_ENV
                 ));
             }
-            let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-                hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
-            };
             let vram_layers = match policy {
                 residency::ExpertVramLayers::Layers(layers) => layers,
                 residency::ExpertVramLayers::Auto => {
-                    let (free, _) = ctx
-                        .gpu
-                        .hip
-                        .get_vram_info()
-                        .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
-                    let (non_expert, layer_experts) =
-                        residency::resident_split(&manifest.weights, bytes_of)
-                            .map_err(|error| format!("qwen4: {error}"))?;
-                    // Every placement host-maps at least the MTP layer's
-                    // routed experts, so the head is still attached after it
-                    // only where the host-mapped policy keeps it (an explicit
-                    // `--spec mtp`); only then does it need VRAM.
-                    let mtp_kept = native_mtp
-                        && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, 1);
-                    let mtp_bytes = if mtp_kept {
-                        let head = residency::language_head_dtype(&manifest.weights)
-                            .ok_or("qwen4: manifest has no language head")?;
-                        let row_capture =
-                            hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config);
-                        Some(
-                            hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
-                                &config,
-                                ctx.max_seq,
-                                max_k,
-                                head,
-                                row_capture,
-                            )
-                            .ok_or("qwen4: native MTP device bytes overflow")?,
-                        )
-                    } else {
-                        None
-                    };
-                    // The gathered QSA prefill attention reserves its
-                    // context-sized scratch at attach (none when the route is
-                    // off: the reserve is then unchanged). A slot already
-                    // reserved by an earlier load in this process is out of
-                    // `free` and only its growth is charged.
-                    let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(
-                        ctx.gpu, qsa_format,
-                    )
-                    .then(|| {
-                        rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                            config.num_key_value_heads,
-                            ctx.max_seq,
-                        )
-                        .map(|bytes| {
-                            (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64)
-                        })
-                        .ok_or("qwen4: QSA gather scratch size overflows")
-                    })
-                    .transpose()?;
-                    let reserve = residency::auto_vram_reserve(
-                        &config,
-                        ctx.max_seq,
-                        qsa_format,
-                        mtp_bytes,
-                        gather_bytes,
-                    )
-                    .map_err(|error| format!("qwen4: {error}"))?;
-                    const MIB: u64 = 1 << 20;
+                    let (free, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes) =
+                        match measured.take() {
+                            Some(inputs) => inputs,
+                            None => auto_inputs()?,
+                        };
                     let gather_note = gather_bytes
                         .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                         .unwrap_or_default();
                     eprintln!(
                         "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
-                        free as u64 / MIB,
+                        free / MIB,
                         non_expert / MIB,
                         reserve / MIB,
                         mtp_bytes.unwrap_or(0) / MIB,
@@ -503,16 +541,16 @@ impl Carrier for Qwen4Carrier {
                     // still leave less than the reserve, and fail later at
                     // the first request (e.g. beside another process's
                     // model): refuse before allocating instead.
-                    if (free as u64) < non_expert.saturating_add(reserve) {
+                    if free < non_expert.saturating_add(reserve) {
                         return Err(format!(
                             "qwen4: {} MiB of free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve even with every routed expert in host RAM; free VRAM on this GPU",
-                            free as u64 / MIB,
+                            free / MIB,
                             non_expert / MIB,
                             reserve / MIB
                         ));
                     }
                     residency::auto_vram_layers(
-                        free as u64,
+                        free,
                         non_expert,
                         layer_experts,
                         config.num_hidden_layers,
