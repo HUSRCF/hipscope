@@ -1,7 +1,8 @@
 use serde::Serialize;
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)] pub enum SlotState {Free,Publishing,Published,Reading}
 #[derive(Clone,Debug,Serialize)] pub struct LdsSlot {pub name:String,pub base:u32,pub len:u32,pub state:SlotState}
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)] pub enum Transition {Retire(usize),Ready(usize)}
+/// One barrier-carried slot transition (shared with the typed core).
+pub use peacemaker_author::SlotTransition as Transition;
 #[derive(Clone,Debug,Default)] pub struct Lds {pub slots:Vec<LdsSlot>,in_flight:Vec<Transition>,signalled:bool,retired:Vec<LdsSlot>}
 impl Lds {
  pub fn add(&mut self,name:impl Into<String>,base:u32,len:u32)->Result<usize,String>{ if len==0||base.checked_add(len).is_none(){return Err("invalid LDS slot".into())} if self.slots.iter().any(|s|base<s.base+s.len&&s.base<base+len){return Err("overlapping LDS slots".into())} self.slots.push(LdsSlot{name:name.into(),base,len,state:SlotState::Free});Ok(self.slots.len()-1) }
