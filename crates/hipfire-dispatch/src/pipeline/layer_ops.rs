@@ -17,8 +17,10 @@ use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
-    gated_delta_conv_params_batched, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
-    gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gated,
+    gated_delta_conv_params_batched, gated_delta_conv_params_qknorm_batched,
+    gated_delta_conv_qknorm_route, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
+    gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gate_wmma_qknormed,
+    gated_delta_step_gated,
     hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
@@ -1236,41 +1238,57 @@ pub fn execute_gated_delta_net(
         if chunked {
             conv_output.dtype = DType::BF16;
         }
+        let conv = GatedDeltaConvBatched {
+            input: &projection,
+            kernel: op.conv,
+            history: op.conv_state,
+            output: &conv_output,
+            next_history: op.conv_state,
+            rows: op.rows,
+            channels: qkv,
+            history_rows,
+            kernel_size: op.conv_kernel,
+            start_cursor,
+        };
+        let gate_params = GatedDeltaParamsBatched {
+            a: &a,
+            b: &b,
+            a_log: op.a_log,
+            dt_bias: op.dt_bias,
+            gate: &gate,
+            beta: &beta,
+            rows: op.rows,
+            heads: op.value_heads,
+        };
+        let step = GatedDeltaStepBatched {
+            projection: &conv_output,
+            ..dims
+        };
+        // Opt-in `HIPFIRE_QWEN4_GDN_CONV_QKNORM`: on the exact gfx1151 chunked
+        // route (never a row capture, recorder or graph capture, and never the
+        // persistent gfx1201 route) the convolution also stores the normalized
+        // Q/K the recurrence reads, so its Q/K columns of `conv_output` are not
+        // written and the separate Q/K-norm launch is skipped.
+        let fused_qk = chunked
+            && capture.is_none()
+            && gated_delta_conv_qknorm_route(gpu, &step, &conv);
         // Convolution and gate parameters in one launch.
-        hip(gated_delta_conv_params_batched(
-            gpu,
-            &GatedDeltaConvBatched {
-                input: &projection,
-                kernel: op.conv,
-                history: op.conv_state,
-                output: &conv_output,
-                next_history: op.conv_state,
-                rows: op.rows,
-                channels: qkv,
-                history_rows,
-                kernel_size: op.conv_kernel,
-                start_cursor,
-            },
-            &GatedDeltaParamsBatched {
-                a: &a,
-                b: &b,
-                a_log: op.a_log,
-                dt_bias: op.dt_bias,
-                gate: &gate,
-                beta: &beta,
-                rows: op.rows,
-                heads: op.value_heads,
-            },
-        ))?;
+        if fused_qk {
+            hip(gated_delta_conv_params_qknorm_batched(
+                gpu,
+                &conv,
+                &gate_params,
+                &step,
+                false,
+            ))?;
+        } else {
+            hip(gated_delta_conv_params_batched(gpu, &conv, &gate_params))?;
+        }
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
         if bf16_store(&op.output, gpu) {
             gdn_output.dtype = DType::BF16;
         }
-        let step = GatedDeltaStepBatched {
-            projection: &conv_output,
-            ..dims
-        };
         let gated = GatedDeltaGateBatched {
             recurrent_output: &recurrent_output,
             z: &z,
@@ -1283,7 +1301,11 @@ pub fn execute_gated_delta_net(
         // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
         if chunked {
-            hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
+            if fused_qk {
+                hip(gated_delta_step_gate_wmma_qknormed(gpu, &step, &gated))?;
+            } else {
+                hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
+            }
         } else {
             hip(gated_delta_step_batched(gpu, &step))?;
             // An FWHT-basis output projection rotates the gate output first:

@@ -439,6 +439,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC, ["fused_rmsnorm_mq_rotate_awq_i4"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_fold", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold"]);
+        // Qwen4 chunked-GDN inline-Q8 recurrence (opt-in `HIPFIRE_QWEN4_GDN_Q8_INLINE`, exact gfx1151; tensor_ops.rs gated_delta_step_gate_wmma_arms).
+        add!("gated_delta_chunk_q8_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_Q8_WMMA_SRC, ["gated_delta_chunk_gate_q8_wmma"]);
         add!("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC, ["gated_norm_mq_rotate_awq_i4_gfx11"]);
         add!("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC, ["gdn_chunk_scan_gfx1151"]);
         add!("gemm_mq4g256v2_residual_iu4_v2b_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC, ["gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"]);
@@ -750,6 +752,23 @@ mod tests {
         for arch in SUPPORTED_ARCHES {
             assert!(lookup(arch, "attention_q8_0_flash_prefill_br8_bc16", "").is_ok());
             assert!(lookup(arch, "attention_q8_0_flash_prefill_br16_bc32", "").is_err());
+        }
+    }
+
+    /// The opt-in Hyper inline-Q8 chunk module is inventoried on exact gfx1151
+    /// only, carries the source `gated_delta_step_gate_wmma` compiles, and
+    /// exports the symbol it launches.
+    #[test]
+    fn hyper_q8_chunk_module_is_exact_gfx1151_only() {
+        let entry = lookup("gfx1151", "gated_delta_chunk_q8_wmma", "").unwrap();
+        assert_eq!(entry.symbols, ["gated_delta_chunk_gate_q8_wmma"]);
+        assert_eq!(entry.source(), crate::tensor_ops::GATED_DELTA_CHUNK_Q8_WMMA_SRC);
+        assert!(entry.source().contains("void gated_delta_chunk_gate_q8_wmma("));
+        for arch in SUPPORTED_ARCHES.iter().filter(|arch| **arch != "gfx1151") {
+            assert!(
+                lookup(arch, "gated_delta_chunk_q8_wmma", "").is_err(),
+                "{arch} must not inventory the gfx1151 module"
+            );
         }
     }
 }
