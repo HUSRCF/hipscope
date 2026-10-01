@@ -2450,7 +2450,11 @@ fn main() {
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
                         // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
+                        // Qwen4 (16) only with its attached whole-chunk prefix
+                        // checkpoint (`Qwen4Bundle::attach_prefix_cache`).
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14)
+                            || (m.arch_id == 16
+                                && m.qwen4().is_some_and(|bundle| bundle.prefix_cache_attached()));
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)

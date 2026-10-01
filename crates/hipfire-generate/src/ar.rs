@@ -1833,7 +1833,7 @@ pub fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature:
 /// allocate logits, mutate device state before publishing tokens, roll back on
 /// every forward/semantic/terminal failure, and emit exactly one terminal.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_ar_with_forward<Prefill, Decode>(
+pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1855,8 +1855,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
     started_in_think: bool,
     stop: &[String],
     tool_protocol_enabled: bool,
+    // Prompt tokens the prefill restored rather than computed (reported as
+    // `cached_tokens`; prefill tok/s counts only the computed rest).
+    cached_tokens: usize,
     mut forward_chunk: Prefill,
     mut forward_token: Decode,
+    // Runs once after the client committed the terminal, before `done`.
+    on_commit: Commit,
 ) where
     Prefill: FnMut(
         &mut LoadedModel,
@@ -1872,6 +1877,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         Option<u32>,
         &rdna_compute::GpuTensor,
     ) -> Result<u32, String>,
+    Commit: FnOnce(&mut LoadedModel),
 {
     if vocab_size == 0 {
         emit_active_attempt_error(
@@ -2142,7 +2148,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         0.0
     };
     let prefill_tok_s = if prefill_ms > 0.0 {
-        prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
+        prompt_tokens.len().saturating_sub(cached_tokens) as f64 / (prefill_ms / 1000.0)
     } else {
         0.0
     };
@@ -2161,7 +2167,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         prefill_tok_s,
         decode_tok_s,
         prefill_ms,
-        0,
+        cached_tokens,
         "",
     );
     stage_terminal_tool_calls(
@@ -2176,6 +2182,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
+    on_commit(m);
     let _ = gpu.free_tensor(decode_logits);
     emit_active_route_done_value(stdout, &pending_done);
 }

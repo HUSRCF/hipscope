@@ -11,7 +11,7 @@
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
-use crate::bundle::Qwen4Bundle;
+use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
@@ -101,12 +101,12 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse native MTP prefill requests that would reuse a cached suffix.
+/// Validate a native MTP prefill request before touching either owner.
 ///
-/// Native MTP prefill is currently a cold, position-zero operation.  Silent
-/// truncation of a cache-hit suffix would leave target and MTP state at
-/// different positions, so callers must reject it before touching either
-/// owner.
+/// A cold fill is the complete prompt from position zero. A cache hit fills
+/// exactly `prompt_tokens[start_pos..]` after the bundle restored its
+/// checkpoint at `start_pos` (`Qwen4Bundle::begin_prefix` re-validates
+/// it), so target and MTP resume at the same absolute position.
 pub fn validate_native_mtp_prefill_request(
     prompt_tokens: &[u32],
     fill_tokens: &[u32],
@@ -116,16 +116,25 @@ pub fn validate_native_mtp_prefill_request(
     if prompt_tokens.is_empty() {
         return Err("Qwen4 native MTP prefill requires at least one prompt token".to_string());
     }
-    if cache_hit {
-        return Err("Qwen4 native MTP prefill refuses cache-hit suffix reuse".to_string());
+    if !cache_hit {
+        if start_pos != 0 {
+            return Err(format!(
+                "Qwen4 native MTP cold prefill requires position zero, got {start_pos}"
+            ));
+        }
+        if fill_tokens != prompt_tokens {
+            return Err("Qwen4 native MTP prefill requires a complete prompt fill".to_string());
+        }
+        return Ok(());
     }
-    if start_pos != 0 {
+    if start_pos == 0 || start_pos >= prompt_tokens.len() {
         return Err(format!(
-            "Qwen4 native MTP prefill requires position zero, got {start_pos}"
+            "Qwen4 native MTP cache hit at {start_pos} needs a non-empty suffix of a {}-token prompt",
+            prompt_tokens.len()
         ));
     }
-    if fill_tokens != prompt_tokens {
-        return Err("Qwen4 native MTP prefill requires a complete prompt fill".to_string());
+    if fill_tokens != &prompt_tokens[start_pos..] {
+        return Err("Qwen4 native MTP cache hit must fill exactly the prompt suffix".to_string());
     }
     Ok(())
 }
@@ -868,12 +877,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
         require_native_greedy(self.request.temp)?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
-        // Native Qwen4 MTP has no exact target+MTP suffix rehydration yet.
-        // Always discard any AR or stale MTP prefix and rebuild the complete
-        // rendered prompt from position zero.
-        target.reset_recurrent(gpu)?;
+        // A miss resets target, head and draft policy; a hit restores the
+        // bundle's canonical checkpoint at `start_pos` into all three.
+        let plan = Qwen4PrefixPlan {
+            start_pos: if cache_hit { start_pos } else { 0 },
+        };
+        Self::bundle(target)?
+            .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
+            .map_err(|error| error.to_string())?;
         self.ensure_resources(gpu, target)?;
-        {
+        let capture_at = {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
             let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -883,7 +896,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     target_position, mtp_position
                 ));
             }
-        }
+            bundle.prefix_capture_at()
+        };
         let pending = self.pending_hidden()?;
         let mut first_token = None;
         // One chunked target forward per chunk instead of one single-row forward
@@ -918,6 +932,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .map_err(|error| error.to_string())?;
                 bundle
                     .mtp_append_token(gpu, token, Some(pending), position)
+                    .map_err(|error| error.to_string())?;
+            }
+            // The head has caught up with the target: the only point a
+            // whole-chunk checkpoint of both owners is canonical.
+            let end = start_pos + base + chunk.len();
+            if capture_at == Some(end) {
+                Self::bundle(target)?
+                    .stage_prefix(gpu, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
