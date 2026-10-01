@@ -566,7 +566,8 @@ const GPU_PINNED_MIN_XFER_SIZE: &str = "GPU_PINNED_MIN_XFER_SIZE";
 const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 
 /// Keep host memory the GPU reads out of the kernel's reclaim path, unless
-/// the operator set the switches.
+/// the operator set the switches. `reason` names why, in the log line that
+/// reports the switches set.
 ///
 /// Under ROCm's defaults, host pages that the GPU reads are registered as
 /// KFD userptr BOs. That covers every `hipHostMalloc` block, which is shared
@@ -584,25 +585,34 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// caps them instead. `GPU_PINNED_MIN_XFER_SIZE` set past any copy size
 /// routes every pageable copy through clr's staging buffer, which is itself
 /// `hipHostMalloc` memory. libhsakmt and clr read both switches once, when
-/// the runtime initializes, so they are set before it loads. APUs ignore the
-/// first switch.
+/// the runtime initializes, so this must run before the first HIP runtime
+/// call, while the process is still single-threaded. APUs ignore the first
+/// switch.
 ///
 /// Both switches are process-global, and together they slow other loads: on
 /// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
-/// 1.00-1.01 s. So they are set only in a process configured to host-map
-/// Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), the one known to hold
-/// tens of GB of host memory the GPU reads.
-fn keep_host_memory_out_of_reclaim() {
-    if !cfg!(target_os = "linux") || !host_maps_qwen4_experts() {
+/// 1.00-1.01 s. So they are set only in a process that loads a Qwen4 model,
+/// the one known to hold tens of GB of host memory the GPU reads:
+/// [`HipRuntime::load`] sets them in a process configured to host-map Qwen4
+/// experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), and a process about to load a
+/// Qwen4 model on a discrete GPU calls this before the runtime loads
+/// (`hipfire_loader::prepare_host_memory_for`).
+pub fn keep_host_memory_out_of_reclaim(reason: &str) {
+    if !cfg!(target_os = "linux") {
         return;
     }
+    let mut set = Vec::new();
     for (name, value) in [
         (HSA_USERPTR_FOR_PAGED_MEM, "0"),
         (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
     ] {
         if std::env::var_os(name).is_none() {
             std::env::set_var(name, value);
+            set.push(format!("{name}={value}"));
         }
+    }
+    if !set.is_empty() {
+        eprintln!("[hip-bridge] {} ({reason}): host memory out of reclaim", set.join(" "));
     }
 }
 
@@ -628,7 +638,9 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
-        keep_host_memory_out_of_reclaim();
+        if host_maps_qwen4_experts() {
+            keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
+        }
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
         // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes

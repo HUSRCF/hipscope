@@ -2379,7 +2379,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let mut engine =
+        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2679,7 +2680,8 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let engine =
+        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -5287,7 +5289,7 @@ fn open_bench_engine(
             .values
             .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
     }
-    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config)?;
+    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
@@ -5734,7 +5736,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
         let (_, resolved) = resolved_global(paths, true)?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
         let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+        let mut engine =
+            Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)?;
         engine.ping()?;
         engine
     };
@@ -6957,7 +6960,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         let (_, resolved) = resolved_global(paths, true).ok()?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).ok()?;
         let mut engine =
-            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config).ok()?;
+            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config, None).ok()?;
         engine.ping().ok()?;
         engine.request(&serde_json::json!({ "type": "diag" })).ok()
     });
@@ -11587,7 +11590,7 @@ mod tests {
             let mut engine = None;
             let mut last = None;
             for attempt in 0..8 {
-                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config) {
+                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
                     Ok(e) => {
                         engine = Some(e);
                         break;

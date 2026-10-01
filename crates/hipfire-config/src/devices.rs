@@ -808,6 +808,41 @@ pub fn active_devices() -> Option<&'static ActiveDevices> {
     ACTIVE_DEVICES.get()
 }
 
+/// The cards this process may use, read from the KFD topology before any GPU
+/// runtime loads: the cards `hardware.devices` resolved to, else the GPUs
+/// that ROCr's filter (`ROCR_VISIBLE_DEVICES`, as [`apply_device_visibility`]
+/// left it) keeps. `None` when that cannot be told: no readable KFD topology
+/// (WSL2/ROCDXG, native Windows) or a filter entry that names no GPU.
+pub fn startup_devices() -> Option<Vec<GpuDevice>> {
+    if let Some(active) = active_devices() {
+        return Some(active.devices.clone());
+    }
+    let devices = enumerate_gpus(Path::new(KFD_TOPOLOGY_NODES)).ok()?;
+    let filter = std::env::var(ROCR_VISIBLE_DEVICES).ok();
+    rocr_visible(&devices, filter.as_deref())
+}
+
+/// The `devices` ROCr exposes under `filter`, a comma-separated list of ROCr
+/// agent ordinals and `GPU-<hex>` UUIDs; every device without one.
+fn rocr_visible(devices: &[GpuDevice], filter: Option<&str>) -> Option<Vec<GpuDevice>> {
+    let Some(filter) = filter else {
+        return Some(devices.to_vec());
+    };
+    filter
+        .split(',')
+        .map(|token| {
+            let token = token.trim();
+            devices
+                .iter()
+                .find(|device| match token.parse::<usize>() {
+                    Ok(ordinal) => device.rocr_index == ordinal,
+                    Err(_) => device.uuid().is_some_and(|uuid| uuid.eq_ignore_ascii_case(token)),
+                })
+                .cloned()
+        })
+        .collect()
+}
+
 /// What HIP reported for one logical device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedDevice {
@@ -1375,5 +1410,30 @@ mod tests {
         assert_eq!(gfx_name(110501), "gfx1151");
         assert_eq!(override_arch("9.0.10").as_deref(), Some("gfx90a"));
         assert_eq!(override_arch("11.0"), None);
+    }
+
+    #[test]
+    fn rocr_filter_keeps_the_cards_it_names() {
+        let topology = hipx();
+        let devices = enumerate_gpus(&topology.0).unwrap();
+        let archs = |filter: Option<&str>| {
+            rocr_visible(&devices, filter)
+                .map(|kept| kept.into_iter().map(|device| device.arch).collect::<Vec<_>>())
+        };
+        // Unfiltered: every GPU in BDF order, the APU included.
+        assert_eq!(
+            archs(None).unwrap(),
+            ["gfx1100", "gfx1030", "gfx1010", "gfx1151"]
+        );
+        // ROCr ordinals follow KFD node order; UUIDs match in any case.
+        assert_eq!(archs(Some("1")).unwrap(), ["gfx1151"]);
+        assert_eq!(
+            archs(Some("GPU-C7FF6B154D0128BC, 0")).unwrap(),
+            ["gfx1030", "gfx1100"]
+        );
+        // An entry naming no GPU (or an empty filter) cannot be told.
+        assert_eq!(archs(Some("GPU-0000000000000001")), None);
+        assert_eq!(archs(Some("7")), None);
+        assert_eq!(archs(Some("")), None);
     }
 }

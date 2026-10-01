@@ -217,6 +217,26 @@ impl Carrier for Qwen2Carrier {
 
 // ─── Qwen4Carrier ────────────────────────────────────────────────────
 
+/// Keep host memory out of reclaim before the HIP runtime loads, in a process
+/// about to load the HFQ model at `model`, when that is a Qwen4 model on
+/// discrete GPUs (`expert_residency::keeps_host_memory_out_of_reclaim`). The
+/// daemon calls it once device visibility is installed and before its first
+/// HIP call: the runtime reads the switches once, when it loads. A file that
+/// is not an HFQ container, or cards the KFD topology cannot name, keep
+/// ROCm's defaults.
+pub fn prepare_host_memory_for(model: &std::path::Path) {
+    let Ok(arch_id) = hipfire_runtime::hfq::HfqFile::probe_arch_id(model) else {
+        return;
+    };
+    let Some(devices) = hipfire_config::devices::startup_devices() else {
+        return;
+    };
+    let archs = devices.iter().map(|device| device.arch.as_str()).collect::<Vec<_>>();
+    if hipfire_arch_qwen4::expert_residency::keeps_host_memory_out_of_reclaim(arch_id, &archs) {
+        hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
+    }
+}
+
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
 /// artifact loadable.
@@ -511,6 +531,16 @@ impl Carrier for Qwen4Carrier {
                 (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
             }
         );
+        // Host memory is kept out of reclaim only by a process started for a
+        // Qwen4 model (`prepare_host_memory_for`) or with the placement set;
+        // one started for another model (serve switching models) can no
+        // longer, its runtime having read the switches.
+        if !use_ranges && std::env::var_os("HSA_USERPTR_FOR_PAGED_MEM").is_none() {
+            eprintln!(
+                "  qwen4: host memory the GPU reads stays in reclaim (this process started for another model), so host-memory pressure can stall the load; start it for this model or with {} set",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            );
+        }
         if let Some(policy) = placement {
             if use_ranges {
                 return Err(format!(

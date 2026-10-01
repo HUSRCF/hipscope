@@ -3840,7 +3840,7 @@ pub fn is_unified_memory_arch(arch: &str) -> bool {
 }
 
 /// Whether `arch` is a recognized discrete-VRAM GPU.
-fn is_discrete_memory_arch(arch: &str) -> bool {
+pub fn is_discrete_memory_arch(arch: &str) -> bool {
     DISCRETE_MEMORY_ARCHS
         .iter()
         .any(|known| arch.eq_ignore_ascii_case(known))

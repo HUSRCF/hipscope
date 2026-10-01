@@ -745,10 +745,20 @@ fn install_process_config(
 /// Read the first protocol message before GPU initialization. Native clients
 /// send `configure`; older/direct clients may send `load`, in which case the
 /// daemon resolves local TOML plus compatibility env itself and preserves the
-/// load as the first regular command.
+/// load as the first regular command. Also returns the model the client
+/// starts the daemon for, if it names one: `configure`'s optional `model`, or
+/// the startup `load`'s.
 fn receive_startup_config(
     stdout: &mut impl Write,
-) -> Result<Option<(hipfire_config::ProcessConfig, Option<DaemonMsg>, bool)>, String> {
+) -> Result<
+    Option<(
+        hipfire_config::ProcessConfig,
+        Option<DaemonMsg>,
+        bool,
+        Option<std::path::PathBuf>,
+    )>,
+    String,
+> {
     let stdin = std::io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::new();
@@ -779,6 +789,10 @@ fn receive_startup_config(
                 continue;
             }
         };
+        let model = msg
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(std::path::PathBuf::from);
         if msg.get("type").and_then(|value| value.as_str()) == Some("configure") {
             let config = serde_json::from_value::<hipfire_config::ProcessConfig>(
                 msg.get("config")
@@ -787,8 +801,9 @@ fn receive_startup_config(
             )
             .map_err(|error| format!("invalid process configuration: {error}"))?;
             config.validate().map_err(|error| error.to_string())?;
-            return Ok(Some((config, None, true)));
+            return Ok(Some((config, None, true, model)));
         }
+        let model = model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
         let pending = match announce_generate_terminal(&msg) {
@@ -809,7 +824,7 @@ fn receive_startup_config(
             }
             None => DaemonMsg::Regular(msg),
         };
-        return Ok(Some((config, Some(pending), false)));
+        return Ok(Some((config, Some(pending), false, model)));
     }
 }
 
@@ -916,7 +931,7 @@ fn main() {
     // context is created.
 
     let mut stdout = std::io::stdout();
-    let Some((process_config, pending_message, acknowledge_config)) =
+    let Some((process_config, pending_message, acknowledge_config, startup_model)) =
         receive_startup_config(&mut stdout).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to resolve startup configuration: {error}");
             std::process::exit(1);
@@ -933,6 +948,11 @@ fn main() {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
+    // The model the client starts this daemon for decides the host-memory
+    // switches the HIP runtime reads once, when it first loads just below.
+    if let Some(model) = &startup_model {
+        hipfire_loader::prepare_host_memory_for(model);
+    }
     reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);

@@ -130,8 +130,11 @@ pub(crate) struct EngineSpawner {
 }
 
 impl EngineSpawner {
-    pub(crate) fn spawn(&self) -> Result<Engine> {
-        let engine = Engine::spawn_configured(&self.daemon, &BTreeMap::new(), &self.process_config)?;
+    /// `model`: the model the new daemon is started for
+    /// ([`Engine::spawn_configured`]).
+    pub(crate) fn spawn(&self, model: Option<&Path>) -> Result<Engine> {
+        let engine =
+            Engine::spawn_configured(&self.daemon, &BTreeMap::new(), &self.process_config, model)?;
         engine.ping()?;
         Ok(engine)
     }
@@ -1233,7 +1236,17 @@ pub(crate) fn serve_foreground(
         attempts: ENGINE_RESPAWN_ATTEMPTS,
         backoff: ENGINE_RESPAWN_BACKOFF,
     };
-    let engine = spawner.spawn()?;
+    let default_model = args
+        .model
+        .clone()
+        .unwrap_or(config_string(&global, "serve.default_model")?);
+    // Started for the pre-warm model, when it is on disk.
+    let prewarm_path = if args.no_prewarm {
+        None
+    } else {
+        find_model_path(paths, &registry, &default_model)
+    };
+    let engine = spawner.spawn(prewarm_path.as_deref())?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
     let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
@@ -1321,10 +1334,6 @@ pub(crate) fn serve_foreground(
         args.idle_timeout
             .unwrap_or(config_u64(&global, "serve.idle_timeout_seconds")?),
     );
-    let default_model = args
-        .model
-        .clone()
-        .unwrap_or(config_string(&global, "serve.default_model")?);
     let request_policy = RequestModelPolicy {
         allow_pull: config_bool(&global, "serve.allow_request_pull")?,
         allow_paths: config_bool(&global, "serve.allow_request_paths")?,
@@ -1865,12 +1874,13 @@ impl ServeRuntime {
         set_engine_state(meta, EngineState::Restarting);
         let status = self.engine.terminate();
         let resident = self.resident_model.clone();
+        let resident_path = self.current_path.clone();
         self.clear_resident(meta);
         eprintln!("[hipfire] daemon exited ({status}); restarting it");
         let attempts = self.spawner.attempts.max(1);
         let mut backoff = self.spawner.backoff;
         for attempt in 1..=attempts {
-            match self.spawner.spawn() {
+            match self.spawner.spawn(resident_path.as_deref()) {
                 Ok(engine) => {
                     self.engine = engine;
                     eprintln!("[hipfire] daemon restarted (attempt {attempt}/{attempts})");

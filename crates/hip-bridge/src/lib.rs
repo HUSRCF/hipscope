@@ -22,7 +22,7 @@ pub use error::{
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-pub use ffi::arm_hip_fault;
+pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
