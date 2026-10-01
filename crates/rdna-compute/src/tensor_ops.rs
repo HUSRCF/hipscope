@@ -3793,16 +3793,60 @@ fn qsa_dense_wmma(
 /// sets of F16 probabilities (8 waves x 16 x 16) and of the per-wave max/sum.
 const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 * 2 * 8 * 16 * 4;
 
-/// Whether the gathered F16 WMMA attention applies (checked after the dense
-/// route): `HIPFIRE_QWEN4_QSA_WMMA_GATHER` set and the Qwen4 F16 route not
-/// opted out, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
-/// head_dim 256 with at most 16 query heads per KV head, a token list that
-/// fits the LDS budget, and the state format this arch has a kernel for
-/// (gfx1151: F32, gfx1201: fp8).  The flag is read first, so with it unset
-/// every launch is the incumbent's.
-fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+/// Whether this process runs QSA prefill attention in `format` on the
+/// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` set (read first,
+/// so with it unset nothing else is consulted), the Qwen4 F16 route not opted
+/// out, and an arch with a kernel for the state format (gfx1151: F32,
+/// gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
+pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
     *QWEN4_QSA_WMMA_GATHER
         && *crate::gemm::QWEN4_F16_WMMA
+        && match format {
+            QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
+            QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
+        }
+}
+
+/// Bytes of the gathered route's F16 scratch for a QSA cache of `tokens`
+/// rows with `n_kv_heads` heads of 256 channels: F16 K plus block-transposed
+/// V (whole four-token blocks), 2 bytes per KV channel each.
+pub fn qsa_gathered_wmma_scratch_bytes(n_kv_heads: usize, tokens: usize) -> Option<usize> {
+    let width = n_kv_heads.checked_mul(256)?;
+    tokens
+        .checked_add(tokens.div_ceil(4).checked_mul(4)?)?
+        .checked_mul(width)?
+        .checked_mul(2)
+}
+
+/// Reserve the gathered route's scratch for a QSA cache of `tokens` rows
+/// when the route is enabled for `format`; returns the bytes reserved (0 when
+/// it is not enabled, and nothing is allocated).  Call at load, before any
+/// graph capture or Redline record: a forward only needs the rows below its
+/// end position, which never exceed the cache capacity, so the scratch then
+/// never grows under a captured graph or tape.
+pub fn reserve_qsa_gathered_wmma_scratch(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    tokens: usize,
+) -> HipResult<usize> {
+    if !qsa_gathered_wmma_enabled(gpu, format) {
+        return Ok(0);
+    }
+    let bytes = qsa_gathered_wmma_scratch_bytes(n_kv_heads, tokens)
+        .ok_or_else(|| HipError::new(0, "QSA gathered scratch size overflows"))?;
+    gpu.qsa_gather_scratch(bytes)?;
+    Ok(bytes)
+}
+
+/// Whether the gathered F16 WMMA attention applies (checked after the dense
+/// route): the route is enabled for the state format
+/// ([`qsa_gathered_wmma_enabled`]), >= QWEN4_F16_WMMA_MIN_TOKENS rows, no
+/// recorder or capture, head_dim 256 with at most 16 query heads per KV head,
+/// and a token list that fits the LDS budget.  With the flag unset every
+/// launch is the incumbent's.
+fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    qsa_gathered_wmma_enabled(gpu, p.format)
         && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -3810,17 +3854,14 @@ fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) 
         && p.n_heads / p.n_kv_heads <= 16
         && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
             <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
-        && match p.format {
-            QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
-            QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
-        }
 }
 
 /// QSA attention over each row's selection in F16 WMMA
 /// (kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip).  The
 /// cache rows `[0, end_position)` are first written as F16 K and
-/// block-transposed V into the shared FP16 X scratch (2 bytes per KV channel
-/// each, i.e. 2 KiB per token at 2 x 256 KV channels).
+/// block-transposed V into the route's own scratch
+/// ([`reserve_qsa_gathered_wmma_scratch`]; 2 KiB per token at 2 x 256 KV
+/// channels).
 fn qsa_gathered_wmma(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -3843,10 +3884,10 @@ fn qsa_gathered_wmma(
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
     let k_elements = checked_product(end_position, width, "QSA gathered K")?;
-    // V blocks of four tokens: the last partial block is padded.
-    let vb_elements = checked_product(end_position.div_ceil(4) * 4, width, "QSA gathered V")?;
-    let scratch = gpu.qwen4_f16_x_scratch(k_elements + vb_elements)?;
-    let k16 = scratch.buf.as_ptr();
+    let bytes = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, end_position)
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let k16 = gpu.qsa_gather_scratch(bytes)?;
+    // V follows K: whole four-token blocks, the last one padded.
     let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
     let tokens = checked_i32(end_position, "QSA gathered tokens")?;
     let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;

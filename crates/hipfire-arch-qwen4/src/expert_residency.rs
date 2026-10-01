@@ -105,13 +105,17 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 
 /// VRAM `auto` leaves free beyond the non-expert weights for a load at
 /// `max_seq`: [`AUTO_VRAM_RESERVE_BYTES`], the trunk QSA arenas' growth in
-/// `qsa_format` past [`AUTO_VRAM_RESERVE_MAX_SEQ`], and `mtp_bytes` when a
-/// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`).
+/// `qsa_format` past [`AUTO_VRAM_RESERVE_MAX_SEQ`], `mtp_bytes` when a
+/// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
+/// `gather_bytes` when the gathered QSA prefill attention reserves its
+/// context-sized scratch at load
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`).
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     max_seq: usize,
     qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
     mtp_bytes: Option<u64>,
+    gather_bytes: Option<u64>,
 ) -> Result<u64, String> {
     let arena = |seq| {
         config
@@ -124,6 +128,7 @@ pub fn auto_vram_reserve(
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
 
@@ -418,7 +423,8 @@ mod tests {
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
-        let reserve = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None).unwrap();
+        let reserve =
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, None).unwrap();
         assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES);
         assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve), 16);
         // A card that holds everything keeps every layer resident.
@@ -433,7 +439,7 @@ mod tests {
     #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
-        let base = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None).unwrap();
+        let base = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, None).unwrap();
         let mtp = crate::mtp_spec::native_mtp_device_bytes(
             &config,
             AUTO_VRAM_RESERVE_MAX_SEQ,
@@ -443,8 +449,18 @@ mod tests {
         )
         .unwrap();
         let with_mtp =
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, Some(mtp)).unwrap();
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, Some(mtp), None).unwrap();
         assert_eq!(with_mtp - base, mtp);
+        // The gathered QSA attention's context-sized scratch is charged on
+        // top when that route reserves it at load.
+        let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+            config.num_key_value_heads,
+            AUTO_VRAM_RESERVE_MAX_SEQ,
+        )
+        .unwrap() as u64;
+        let with_gather =
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, Some(gather)).unwrap();
+        assert_eq!(with_gather - base, gather);
         // The draft head's F32 requant scratch (vocab x hidden x 4) goes back
         // to the device at attach, before the first request allocates its
         // verify rows and GDN capture: the reserve holds the larger phase on
@@ -484,8 +500,9 @@ mod tests {
         // A context past the measured one adds the trunk QSA arenas' growth
         // in the load's QSA format: fp8 K/V grows less than the F32 state.
         let growth = |format| {
-            let long = auto_vram_reserve(&config, 4 * AUTO_VRAM_RESERVE_MAX_SEQ, format, None)
-                .unwrap();
+            let long =
+                auto_vram_reserve(&config, 4 * AUTO_VRAM_RESERVE_MAX_SEQ, format, None, None)
+                    .unwrap();
             let arena = (config.qsa_context_arena_bytes(4 * AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap()
                 - config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap())
                 * config.n_full_layers();
@@ -494,7 +511,10 @@ mod tests {
         };
         assert!(growth(QsaKvFormat::Fp8) < growth(F32));
         // A shorter context keeps the measured reserve.
-        assert_eq!(auto_vram_reserve(&config, 2048, QsaKvFormat::Fp8, None).unwrap(), base);
+        assert_eq!(
+            auto_vram_reserve(&config, 2048, QsaKvFormat::Fp8, None, None).unwrap(),
+            base
+        );
     }
 
     #[test]

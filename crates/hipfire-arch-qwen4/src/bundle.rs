@@ -265,6 +265,27 @@ impl Qwen4Bundle {
             ));
         }
         let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP).min(ple_rows_cap);
+        // The gathered QSA prefill attention (HIPFIRE_QWEN4_QSA_WMMA_GATHER)
+        // converts the cache rows it reads into its own scratch: reserve it
+        // for the whole context now, before any capture or record, so a
+        // later longer prefill never grows (and frees) it. A no-op when the
+        // route is off for this arch and state format.
+        if let Some(qsa) = self.state.qsa.first() {
+            let reserved = rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                gpu,
+                qsa.format,
+                self.config.num_key_value_heads,
+                qsa.full_capacity,
+            )
+            .map_err(BundleError::Hip)?;
+            if reserved > 0 {
+                eprintln!(
+                    "  qwen4 QSA gather scratch: {} MiB reserved for {} context tokens",
+                    reserved >> 20,
+                    qsa.full_capacity
+                );
+            }
+        }
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
