@@ -133,6 +133,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | default **0 (off)** | RuntimeConfig |
 | `HIPFIRE_NGRAM_WINDOW` | default 256 | RuntimeConfig |
 | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` | auto / 3 | Config + RuntimeConfig |
+| `HIPFIRE_MTP_NGRAM` | off | `speculation.mtp_ngram` (`on`/`off`/`auto`, also `1`/`0`; `auto` = off): MTP + ngram-mod for greedy, thinking-off requests |
 | `HIPFIRE_MTP_OWN_PREFILL` | **unset / off**; `1` opts out | Qwen35 MTP prompt fill. Default: the trunk prefills the prompt through AR's own route (same outer chunks, widened chunk, GDN chunk scan, standard dispatch) and hands its hidden rows to the MTP head, so the prompt's KV, DeltaNet state and first-token logits match AR's. `1` restores MTP's previous route: 512-row trunk chunks captured as a speculative verify (sequential GDN recurrence; on Q8 KV, no query16 flash prefill). Resolved once per MTP load (`hipfire_config::mtp_own_prefill`); serve.log prints `qwen35 MTP prompt fill route: …`. |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
@@ -384,6 +385,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `memory.gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` |
 | `memory.offload_exec` | `HIPFIRE_OFFLOAD_EXEC` |
 | `mtp_mode` / `mtp_k` | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` |
+| `speculation.mtp_ngram` | `HIPFIRE_MTP_NGRAM` |
 | `chat_template` | `HIPFIRE_CHAT_TEMPLATE_FILE` |
 | `default_chatml=false` | `HIPFIRE_DEFAULT_CHATML=0` |
 | `speculation` | `HIPFIRE_SPECULATION` |
@@ -1386,7 +1388,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_INCREMENTAL` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | stable |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
-| `HIPFIRE_MTP_NGRAM` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/qwen.rs | developer |
+| `HIPFIRE_MTP_NGRAM` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/qwen.rs | stable |
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
 | `HIPFIRE_MTP_PAIRING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
