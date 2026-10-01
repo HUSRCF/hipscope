@@ -4583,7 +4583,8 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 875fb5649468329a7ba76ca1ed0bfec8faf9b5a75907de0d38ef73ae446f3b20:
+/// SHA-256 8edd7565f6a442b67224cad950b3532a07386c9543b7c04c65e024a8dd4df467
+/// (875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
 /// the fused GDN projection pads its LDS ring rows to 528 bytes; every symbol
 /// runs its K-loop at wave priority 1 and its epilogue (the fused projection:
@@ -4602,12 +4603,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 4ffe35803d306edfb97ffc59f87e5a0d7a8785a7c7f02dfc1b18774878e47117
+/// SHA-256 cc0288f8162aeb1329f0e1a2d9d0fbd88650b501e5be04e77c1205b8f7a1bab3
+/// (4ffe3580 with VCC counted in gfx12 `.sgpr_count`; `.text` identical)
 /// (d5190d97 with the `_b1` QKVZAGDN guard change).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 c4e5c52d441f248fe8c3ef5811012de2d906925c876e45d1cf431cfdd2818820:
+/// SHA-256 6a2dbe591a58680abbeef680be82a986dc0aee0beb2f46ef7cc74f4b3bfb9111
+/// (c4e5c52d with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
 /// the 1b26cd3a symbols with every Row fold's ratios batched (two
 /// `ds_load_b128` per 8-row group, loaded one group ahead through v168..v175
 /// and v[183:186]/v[188:191]) and the QKVZA+GDN ring rows padded to 1,040 B
