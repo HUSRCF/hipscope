@@ -735,11 +735,11 @@ mod c5_tests {
     use crate::operand::{ImmField, Modifiers, Operand, VmemToken};
     use crate::passes::cfg::build_blocks;
     use crate::provenance::Provenance;
-    use crate::reg::{Kind, RegRef};
+    use crate::reg::{Kind, RegRef, RegSet};
     use crate::state::ObligationKind;
-    use crate::wait::Counter;
+    use crate::wait::{Counter, CounterSet, EventId, PendingEvent, WaitState, N};
 
-    use super::{census, replay};
+    use super::{census, join_states, replay};
 
     fn table(name: &str) -> (Opcode, Form) {
         let row = crate::isa::gfx12().iter().find(|row| row.name == name).expect(name);
