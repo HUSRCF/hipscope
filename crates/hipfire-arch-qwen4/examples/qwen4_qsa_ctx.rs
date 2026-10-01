@@ -247,6 +247,10 @@ struct Probe {
     /// Per slot: pooled blocks already checked this session.
     pooled_checked: Vec<usize>,
     wmma_dense: bool,
+    /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` on the arch / state format it serves
+    /// (gfx1151 F32, gfx1201 fp8): prefill chunks past the dense route run
+    /// the gathered F16 WMMA kernel instead of hg4 (a route label only).
+    wmma_gather: bool,
     /// Teacher-forced decode rows after the prefill (the prefill's final row
     /// is `ctx - decode`).
     decode: usize,
@@ -358,6 +362,8 @@ impl Probe {
             "per_head"
         } else if self.wmma_dense && n >= 512 && blocks_end <= budget_blocks && end <= capacity {
             "dense_f16"
+        } else if self.wmma_gather && n >= 512 {
+            "gathered_f16"
         } else {
             "hg4"
         };
@@ -438,7 +444,8 @@ impl Probe {
                 &mut cpu_out,
             )
             .map_err(err)?;
-            let (mut max_abs, mut ref_max, mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut max_abs, mut ref_max, mut dot, mut na, mut nb, mut err2) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for (&a, &b) in cpu_out.iter().zip(&gpu_out) {
                 let (a, b) = (a as f64, b as f64);
                 max_abs = max_abs.max((a - b).abs());
@@ -446,6 +453,7 @@ impl Probe {
                 dot += a * b;
                 na += a * a;
                 nb += b * b;
+                err2 += (a - b) * (a - b);
             }
             self.rows.push(json!({
                 "kind": "row", "phase": self.phase, "ctx": self.ctx, "slot": slot,
@@ -456,6 +464,7 @@ impl Probe {
                 "attn_max_abs": max_abs, "attn_ref_max": ref_max,
                 "attn_rel": max_abs / ref_max.max(1.0e-30),
                 "attn_cos": dot / (na.sqrt() * nb.sqrt()).max(1.0e-30),
+                "attn_rel_l2": (err2 / na.max(1.0e-30)).sqrt(),
             }));
         }
         Ok(())
@@ -583,6 +592,12 @@ fn main() -> Result<()> {
         decode,
         wmma_dense: gpu.arch_caps.has_wmma_w32()
             && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
+        wmma_gather: std::env::var("HIPFIRE_QWEN4_QSA_WMMA_GATHER").is_ok_and(|v| v == "1")
+            && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
+            && match qsa_format {
+                QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
+                QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
+            },
     }));
     let mut out = std::fs::File::create(out_path).map_err(err)?;
     let run_start = Instant::now();

@@ -1430,6 +1430,61 @@ fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     requested && compact_offset == 0
 }
 
+/// Identity of the caller buffers the AR hipGraph bakes at capture: the
+/// model (embedding and lm_head), every KV tensor, every DeltaNet state
+/// tensor and every scratch buffer. The graph replays captured device
+/// pointers and ignores the buffers a later call passes, so a replay is valid
+/// only for the same allocations. A caller that passes a new `DeltaNetState`
+/// (or KV cache / scratch) for the next request must get a fresh capture, not
+/// a replay that reads and writes the previous request's state. Never 0 (the
+/// unbound value of `GraphState::ar_forward_binding`).
+fn ar_graph_binding(
+    weights: &Qwen35Weights,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+    s: &Qwen35Scratch,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |p: *mut std::ffi::c_void| h = (h ^ p as u64).wrapping_mul(0x100_0000_01b3);
+    mix(weights.token_embd.buf.as_ptr());
+    mix(weights.output.buf.buf.as_ptr());
+    for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
+        mix(t.buf.as_ptr());
+    }
+    for t in dn_state
+        .s_matrices
+        .iter()
+        .chain(&dn_state.s_scales)
+        .chain(&dn_state.conv_states)
+        .chain(&dn_state.s_ef_residual)
+    {
+        mix(t.buf.as_ptr());
+    }
+    mix(s.pos_buf.as_ptr());
+    mix(s.pos_buf3.as_ptr());
+    for t in [
+        &s.x, &s.tmp, &s.dn_qkv, &s.dn_z, &s.dn_alpha, &s.dn_beta, &s.dn_conv_out, &s.dn_q,
+        &s.dn_k, &s.dn_v, &s.dn_q_raw, &s.dn_k_raw, &s.dn_attn_out, &s.dn_normed, &s.fa_q_full,
+        &s.fa_q, &s.fa_gate, &s.fa_k, &s.fa_v, &s.fa_attn_out, &s.o, &s.gate_ffn, &s.up,
+        &s.ffn_hidden, &s.ffn_out, &s.logits, &s.sample_buf, &s.repeat_buf, &s.x_rot,
+        &s.flash_partials,
+    ] {
+        mix(t.buf.as_ptr());
+    }
+    for t in [
+        &s.moe_router_logits, &s.moe_scalar_buf, &s.moe_x_rot, &s.moe_gate_up_buf,
+        &s.moe_gate_buf, &s.moe_up_buf, &s.moe_ffn_hidden, &s.moe_ffn_out, &s.moe_gate_batch,
+        &s.moe_up_batch, &s.moe_rot_batch, &s.moe_topk_indices, &s.moe_topk_weights,
+        &s.moe_down_expanded,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        mix(t.buf.as_ptr());
+    }
+    h.max(1)
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1595,6 +1650,11 @@ pub fn forward_scratch(
         hipfire_dispatch::log_capture_disabled_once();
     }
     let use_graph = graph_would_be_used && !cpu_blocks_capture;
+    let binding = if use_graph {
+        ar_graph_binding(weights, kv_cache, dn_state, scratch)
+    } else {
+        0
+    };
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -1641,12 +1701,17 @@ pub fn forward_scratch(
             }
         };
     }
-    if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
+    if use_graph
+        && gpu.graphs.ar_forward_replay_enabled
+        && gpu.graphs.graph_exec.is_some()
+        && gpu.graphs.ar_forward_binding == binding
+    {
         // ── Replay path: graph captured + kernels clean. Cheapest path: pos
         // memcpy + graph replay. The graph is position-agnostic (pos via
         // pos_buf), so replay is correct across positions and requests as long
         // as the buffers are the plain-AR continuation — which the spec markers
-        // + verify invalidation guarantee. ──
+        // + verify invalidation guarantee — and this call passes the buffers
+        // the graph was captured with (`ar_graph_binding`). ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
@@ -1667,7 +1732,8 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
         // ── Capture + launch: kernels are clean but caller has not committed
-        // a replay yet (or graph_exec is None). Drop any prior captured graph,
+        // a replay yet (or graph_exec is None, or this call's buffers differ
+        // from the captured binding). Drop any prior captured graph,
         // record a fresh one, and launch it for this forward's output. After
         // the caller signals end_decode_turn(), the most recent capture is
         // promoted to the replay graph for the next decode turn. ──
@@ -1690,6 +1756,7 @@ pub fn forward_scratch(
             gpu.device_id,
             gpu.active_stream.as_ref().unwrap(),
         )?;
+        gpu.graphs.ar_forward_binding = binding;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
         if ar_graph_trace_enabled() {

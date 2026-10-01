@@ -3,42 +3,23 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
 use crate::quant_mq4v2_lloyd::{
     lloyd_levels_sidecar_name, lloyd_levels_to_f32_bytes, quantize_mq4g256v2_lloyd,
 };
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::path::Path;
 
 use crate::calibration::*;
-use crate::cli::{guard_qwen3_arch_override, QuantizeArgs};
-use crate::dequant::*;
-use crate::e8;
-use crate::e8_gptq;
+use crate::cli::guard_qwen3_arch_override;
 use crate::gguf_input;
 use crate::hfq::*;
-use crate::model_filter::*;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 use crate::quant_hfp4::*;
 use crate::quant_mq::*;
 use crate::quant_q4::*;
-use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 /// 2D-weight quantization target chosen at the per-tensor level. The choice
 /// per format flag:

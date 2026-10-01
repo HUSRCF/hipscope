@@ -27,9 +27,13 @@
 //! - The GDN path runs at wave priority 0 under the kernel's priority 1
 //!   (`mod.rs`), so co-resident K-loop waves win instruction arbitration and
 //!   the epilogue's VALU work fills their stall cycles.
-use super::{GDN, Gen, publish::vload};
+use super::{GDN, Gen, Lds, Wg, Wv, publish::vload};
 use crate::kernels::common::{mem, op, s, sop, sr, v, vr};
-use crate::{RegPlan, insn::{Instruction, MemoryClass}, kernels::fp8_gemm::gdn_region::{self, Binding, Half, Region}, lds::{SlotState, Transition}, ledger::Counter, reg::Live};
+use crate::{RegPlan, insn::{Instruction, MemoryClass}, kernels::fp8_gemm::gdn_region::{self, Binding, Half, Region}, ledger::Counter, reg::Live};
+use peacemaker_author::{LdsRegion, Published, Scc, Uniform, ready, retire, retire_cur};
+
+/// LDS tag of the token ring (19 rows of 528 bytes) after the K loop's re-layout.
+pub enum GdnRing {}
 
 const RING_ROWS: u32 = 19;
 /// Ring row pitch: 512 bytes of data plus 16 (bank skew; keeps b128 alignment).
@@ -125,12 +129,16 @@ fn mod19(b: &mut crate::Builder, dst: u8, x: u8, k: u32) -> Result<(), String> {
     sop(b, format!("s_cmp_ge_u32 s{dst}, {RING_ROWS}"), &[], &[dst])?;
     sop(b, format!("s_cselect_b32 s{dst}, s{S2}, s{dst}"), &[dst], &[S2, dst])
 }
-fn ds_store_b128(b: &mut crate::Builder, slot: usize, addr: u8, data: u8, offset: u32) -> Result<(), String> {
+fn ds_store_b128(addr: u8, data: u8, offset: u32) -> Instruction {
     let off = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
-    b.ds_store(slot, Instruction::new(format!("ds_store_b128 v{addr}, {}{off}", vr(data, 4)), vec![], vec![v(addr), vr(data, 4)]).memory(MemoryClass::DsStore))
+    Instruction::new(format!("ds_store_b128 v{addr}, {}{off}", vr(data, 4)), vec![], vec![v(addr), vr(data, 4)]).memory(MemoryClass::DsStore)
 }
-fn ds_load_b128(b: &mut crate::Builder, slot: usize, data: u8, addr: u8) -> Result<(), String> {
-    b.ds_load(slot, Instruction::new(format!("ds_load_b128 {}, v{addr}", vr(data, 4)), vec![vr(data, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad))
+fn ds_load_b128(data: u8, addr: u8) -> Instruction {
+    Instruction::new(format!("ds_load_b128 {}, v{addr}", vr(data, 4)), vec![vr(data, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad)
+}
+/// `s_cmp_lg_u32 TH, HALF`: this wave's token half is not block `BLK`'s.
+fn other_half(w: &mut Wv) -> Result<Uniform<Scc>, String> {
+    w.scmp(Instruction::new(format!("s_cmp_lg_u32 s{TH}, s{HALF}"), vec![], vec![s(TH), s(HALF)]))
 }
 
 struct Regions { conv: Region, norm_q: Region, norm_k: Region, cvt_v: Region }
@@ -166,22 +174,24 @@ fn norm_bind(r: &Region) -> Result<Binding, String> {
 }
 
 /// Load ring row `(R + k) mod 19` into window slot `slot`.
-fn load_row(b: &mut crate::Builder, ring: usize, k: u8, slot: u8) -> Result<(), String> {
+fn load_row(w: &mut Wv, ring: &LdsRegion<GdnRing, Published>, k: u8, slot: u8) -> Result<(), String> {
+    let b = w.isa();
     mod19(b, S0, R, u32::from(k))?;
     sop(b, format!("s_mul_i32 s{S0}, s{S0}, {ROW_BYTES:#x}"), &[S0], &[S0])?;
     vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
-    ds_load_b128(b, ring, ROWS + 4 * slot, VPA)
+    w.ds_load(ring, ds_load_b128(ROWS + 4 * slot, VPA))
 }
 
 /// Token `j` (window rotation, 0..3) of a P wave: tile-local token `T`,
 /// global `TG`, window rows starting at ring row `R`; rows t-3..t-1 are
 /// already in the window. `tag` keeps labels unique per emission site.
-fn token(b: &mut crate::Builder, ring: usize, re: &Regions, tag: &str, j: u8) -> Result<(), String> {
+fn token(w: &mut Wv, ring: &LdsRegion<GdnRing, Published>, re: &Regions, tag: &str, j: u8) -> Result<(), String> {
     // The previous token's stores have read their sources (rows, halves, addresses).
-    b.release_store_sources()?;
+    w.isa().release_store_sources()?;
     // Row t from the ring, over row t-4.
     let cur = ROWS + 4 * ((j + 3) % 4);
-    load_row(b, ring, 3, (j + 3) % 4)?;
+    load_row(w, ring, 3, (j + 3) % 4)?;
+    let b = w.isa();
     // Raw row for the completion pass: tile positions 0..2 / 125..127 and the
     // last three tokens. Others (and tokens >= N) go past num_records.
     sop(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
@@ -237,7 +247,8 @@ fn token(b: &mut crate::Builder, ring: usize, re: &Regions, tag: &str, j: u8) ->
     mod19(b, R, R, 1)
 }
 
-pub(crate) fn emit(b: &mut crate::Builder, g: &Gen) -> Result<(), String> {
+pub(crate) fn emit(wg: &mut Wg, g: &Gen, (ra, rw, rd, rs): Lds) -> Result<(), String> {
+    let b = wg.isa();
     let re = Regions { conv: Region::conv_silu_lean()?, norm_q: Region::norm_q()?, norm_k: Region::norm_k()?, cvt_v: Region::cvt_v()? };
     b.label(GDN)?;
     // Below the K-loop's priority 1: co-resident K-loops issue first.
@@ -287,85 +298,94 @@ pub(crate) fn emit(b: &mut crate::Builder, g: &Gen) -> Result<(), String> {
     // conv taps of this lane's four channels: w[tap][c] = conv_w[(ch + c) * 4 + tap].
     for c in 0..4u8 { for tap in 0..4u8 { vload(b, W + 4 * tap + c, 1, VWOFF, CWD, None, u32::from(c) * 16 + u32::from(tap) * 4)?; } }
     // Every wave has finished its last block's fragment and plane reads.
-    let reading: Vec<_> = b.lds.slots.iter().enumerate().filter(|(_, sl)| sl.state == SlotState::Reading).map(|(i, _)| Transition::Retire(i)).collect();
-    b.barrier(&reading)?;
-    b.lds.relayout()?;
-    let ring = b.lds.add("gdn_ring", 0, RING_BYTES)?;
+    let lds = wg.barrier((retire_cur(ra), retire_cur(rw), retire_cur(rd), retire_cur(rs)))?;
+    wg.relayout(lds)?;
+    let ring = wg.lds::<GdnRing>("gdn_ring", 0, RING_BYTES)?;
     if RING_BYTES > g.layout.launch { return Err("GDN ring exceeds the _b1 LDS allocation".into()) }
+    let b = wg.isa();
     sop(b, format!("s_mov_b32 s{BLK}, 0"), &[BLK], &[])?;
     sop(b, format!("s_mov_b32 s{RB}, 3"), &[RB], &[])?;
     b.wait_all()?;
-    b.loop_(&format!("{GDN}_block"), |b| {
+    let _free = wg.loop_carried(&format!("{GDN}_block"), ring, |wg, ring| {
+        let b = wg.isa();
         sop(b, format!("s_and_b32 s{TT}, s{BLK}, 3"), &[TT], &[BLK])?;
         sop(b, format!("s_lshr_b32 s{HALF}, s{BLK}, 2"), &[HALF], &[BLK])?;
         // W: the token half holding tokens 16b..16b+15 stores column block b % 4.
-        sop(b, format!("s_cmp_lg_u32 s{TH}, s{HALF}"), &[], &[TH, HALF])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_w_skip"), &[], &[])?;
-        vo(b, format!("v_add_nc_u32_e32 v{VA}, s{RB}, v{VL}"), &[VA], &[VL], &[RB])?;
-        vo(b, format!("v_subrev_nc_u32_e32 v{VPA}, {RING_ROWS}, v{VA}"), &[VPA], &[VA], &[])?;
-        vo(b, format!("v_min_u32_e32 v{VA}, v{VA}, v{VPA}"), &[VA], &[VA, VPA], &[])?;
-        vo(b, format!("v_mad_u32_u24 v{VA}, v{VA}, {ROW_BYTES:#x}, v{VC}"), &[VA], &[VA, VC], &[])?;
-        for tt in 0..4u8 {
-            sop(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
-            op(b, format!("s_cbranch_scc1 {GDN}_w{tt}"), &[], &[])?;
-        }
-        for tt in 0..4u8 {
-            b.label(&format!("{GDN}_w{tt}"))?;
-            for rg in 0..2u8 { for c in 0..2u8 {
-                ds_store_b128(b, ring, VA, g.acc + 8 * (2 * tt + rg) + 4 * c, u32::from(rg) * 64 + u32::from(c) * 16)?;
+        let other = other_half(wg)?;
+        let staged = wg.begin_write(ring);
+        let (ring, stores) = wg.skip_if(other, &format!("{GDN}_w_skip"), staged, |w, mut st| {
+            let b = w.isa();
+            vo(b, format!("v_add_nc_u32_e32 v{VA}, s{RB}, v{VL}"), &[VA], &[VL], &[RB])?;
+            vo(b, format!("v_subrev_nc_u32_e32 v{VPA}, {RING_ROWS}, v{VA}"), &[VPA], &[VA], &[])?;
+            vo(b, format!("v_min_u32_e32 v{VA}, v{VA}, v{VPA}"), &[VA], &[VA, VPA], &[])?;
+            vo(b, format!("v_mad_u32_u24 v{VA}, v{VA}, {ROW_BYTES:#x}, v{VC}"), &[VA], &[VA, VC], &[])?;
+            for tt in 0..4u8 {
+                sop(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
+                op(b, format!("s_cbranch_scc1 {GDN}_w{tt}"), &[], &[])?;
+            }
+            for tt in 0..4u8 {
+                w.label(&format!("{GDN}_w{tt}"))?;
+                for rg in 0..2u8 { for c in 0..2u8 {
+                    st = w.ds_store(st, ds_store_b128(VA, g.acc + 8 * (2 * tt + rg) + 4 * c, u32::from(rg) * 64 + u32::from(c) * 16))?;
+                }}
+                op(w.isa(), format!("s_branch {GDN}_w_done"), &[], &[])?;
+            }
+            let b = w.isa();
+            b.label(&format!("{GDN}_w_done"))?;
+            // Halo rows 0..2 (tokens -3..-1) before block 0: the conv ring for the
+            // first token tile, zeros elsewhere (those three outputs are the
+            // completion pass's). One wave (token half 0, pair 0) writes all 128 channels.
+            sop(b, format!("s_cmp_lg_u32 s{BLK}, 0"), &[], &[BLK])?;
+            op(b, format!("s_cbranch_scc1 {GDN}_w_skip"), &[], &[])?;
+            sop(b, format!("s_cmp_lg_u32 s{SUB}, 0"), &[], &[SUB])?;
+            op(b, format!("s_cbranch_scc1 {GDN}_w_skip"), &[], &[])?;
+            sop(b, format!("s_cmp_lg_u32 s{BS}, 0"), &[], &[BS])?;
+            op(b, format!("s_cbranch_scc1 {GDN}_halo_zero"), &[], &[])?;
+            vo(b, format!("v_mul_u32_u24_e32 v{VPA}, 3, v{VRAW}"), &[VPA], &[VRAW], &[])?;
+            for c in 0..4u8 { for k in 0..3u8 {
+                // conv_state[ch*3 + k] is x[-1-k]: ring row 2-k.
+                vload(b, ROWS + 4 * (2 - k) + c, 1, VPA, CSD, None, u32::from(c) * 12 + u32::from(k) * 4)?;
             }}
-            op(b, format!("s_branch {GDN}_w_done"), &[], &[])?;
-        }
-        b.label(&format!("{GDN}_w_done"))?;
-        // Halo rows 0..2 (tokens -3..-1) before block 0: the conv ring for the
-        // first token tile, zeros elsewhere (those three outputs are the
-        // completion pass's). One wave (token half 0, pair 0) writes all 128 channels.
-        sop(b, format!("s_cmp_lg_u32 s{BLK}, 0"), &[], &[BLK])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_w_skip"), &[], &[])?;
-        sop(b, format!("s_cmp_lg_u32 s{SUB}, 0"), &[], &[SUB])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_w_skip"), &[], &[])?;
-        sop(b, format!("s_cmp_lg_u32 s{BS}, 0"), &[], &[BS])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_halo_zero"), &[], &[])?;
-        vo(b, format!("v_mul_u32_u24_e32 v{VPA}, 3, v{VRAW}"), &[VPA], &[VRAW], &[])?;
-        for c in 0..4u8 { for k in 0..3u8 {
-            // conv_state[ch*3 + k] is x[-1-k]: ring row 2-k.
-            vload(b, ROWS + 4 * (2 - k) + c, 1, VPA, CSD, None, u32::from(c) * 12 + u32::from(k) * 4)?;
-        }}
-        // Both paths reach the stores with nothing pending (the ledger is path-insensitive).
-        b.wait(Counter::Load, 0)?;
-        op(b, format!("s_branch {GDN}_halo_store"), &[], &[])?;
-        b.label(&format!("{GDN}_halo_zero"))?;
-        for r in 0..12u8 { vo(b, format!("v_mov_b32_e32 v{}, 0", ROWS + r), &[ROWS + r], &[], &[])?; }
-        b.label(&format!("{GDN}_halo_store"))?;
-        for r in 0..3u8 { ds_store_b128(b, ring, VP, ROWS + 4 * r, u32::from(r) * ROW_BYTES)?; }
-        b.label(&format!("{GDN}_w_skip"))?;
-        b.barrier(&[Transition::Ready(ring)])?;
+            // Both paths reach the stores with nothing pending (the ledger is path-insensitive).
+            b.wait(Counter::Load, 0)?;
+            op(b, format!("s_branch {GDN}_halo_store"), &[], &[])?;
+            b.label(&format!("{GDN}_halo_zero"))?;
+            for r in 0..12u8 { vo(b, format!("v_mov_b32_e32 v{}, 0", ROWS + r), &[ROWS + r], &[], &[])?; }
+            b.label(&format!("{GDN}_halo_store"))?;
+            for r in 0..3u8 { st = w.ds_store(st, ds_store_b128(VP, ROWS + 4 * r, u32::from(r) * ROW_BYTES))?; }
+            Ok(st)
+        })?;
+        let drained = wg.wait(stores)?;
+        let (ring,) = wg.barrier((ready(ring, drained),))?;
         // P: wave pair SUB runs tokens 16b + 4*SUB .. +3.
-        sop(b, format!("s_cmp_lg_u32 s{TH}, s{HALF}"), &[], &[TH, HALF])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_p_skip"), &[], &[])?;
-        sop(b, format!("s_lshl_b32 s{T}, s{BLK}, 4"), &[T], &[BLK])?;
-        sop(b, format!("s_lshl_b32 s{S0}, s{SUB}, 2"), &[S0], &[SUB])?;
-        sop(b, format!("s_add_co_i32 s{T}, s{T}, s{S0}"), &[T], &[T, S0])?;
-        sop(b, format!("s_add_co_i32 s{TG}, s{BS}, s{T}"), &[TG], &[BS, T])?;
-        // Row of token t0-3 = t0 mod 19 = (RB + 16 + 4*sub) mod 19.
-        mod19(b, R, RB, 16)?;
-        sop(b, format!("s_add_co_i32 s{R}, s{R}, s{S0}"), &[R], &[R, S0])?;
-        mod19(b, R, R, 0)?;
-        // Window rows t0-3..t0-1 into slots 0..2.
-        for k in 0..3u8 { load_row(b, ring, k, k)?; }
-        b.wait(Counter::Ds, 0)?;
-        for j in 0..4u8 { token(b, ring, &re, &format!("t{j}"), j)?; }
-        b.release_store_sources()?;
-        b.label(&format!("{GDN}_p_skip"))?;
-        b.barrier(&[Transition::Retire(ring)])?;
+        let other = other_half(wg)?;
+        wg.skip_if(other, &format!("{GDN}_p_skip"), (), |w, ()| {
+            let b = w.isa();
+            sop(b, format!("s_lshl_b32 s{T}, s{BLK}, 4"), &[T], &[BLK])?;
+            sop(b, format!("s_lshl_b32 s{S0}, s{SUB}, 2"), &[S0], &[SUB])?;
+            sop(b, format!("s_add_co_i32 s{T}, s{T}, s{S0}"), &[T], &[T, S0])?;
+            sop(b, format!("s_add_co_i32 s{TG}, s{BS}, s{T}"), &[TG], &[BS, T])?;
+            // Row of token t0-3 = t0 mod 19 = (RB + 16 + 4*sub) mod 19.
+            mod19(b, R, RB, 16)?;
+            sop(b, format!("s_add_co_i32 s{R}, s{R}, s{S0}"), &[R], &[R, S0])?;
+            mod19(b, R, R, 0)?;
+            // Window rows t0-3..t0-1 into slots 0..2.
+            for k in 0..3u8 { load_row(w, &ring, k, k)?; }
+            w.isa().wait(Counter::Ds, 0)?;
+            for j in 0..4u8 { token(w, &ring, &re, &format!("t{j}"), j)?; }
+            w.isa().release_store_sources()
+        })?;
+        let (ring,) = wg.barrier((retire(ring),))?;
+        let b = wg.isa();
         // Every block starts from an empty ledger (loop fixpoint).
         b.release_store_sources()?;
         sop(b, format!("s_add_co_i32 s{BLK}, s{BLK}, 1"), &[BLK], &[BLK])?;
         mod19(b, RB, RB, 16)?;
-        sop(b, format!("s_cmp_lg_u32 s{BLK}, 8"), &[], &[BLK])?;
-        op(b, format!("s_cbranch_scc1 {GDN}_block"), &[], &[])
+        // BLK counts blocks from the constant 0: workgroup-uniform.
+        let more = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_lg_u32 s{BLK}, 8"), vec![], vec![s(BLK)]))?;
+        Ok((ring, more))
     })?;
-    b.wait_all()
+    wg.isa().wait_all()
 }
 
 /// Certify the fused projection's LDS use beyond the builder's slot model:

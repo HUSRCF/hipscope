@@ -460,16 +460,39 @@ impl Carrier for Qwen4Carrier {
                     } else {
                         None
                     };
+                    // The gathered QSA prefill attention reserves its
+                    // context-sized scratch at attach (none when the route is
+                    // off: the reserve is then unchanged). A slot already
+                    // reserved by an earlier load in this process is out of
+                    // `free` and only its growth is charged.
+                    let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(
+                        ctx.gpu, qsa_format,
+                    )
+                    .then(|| {
+                        rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                            config.num_key_value_heads,
+                            ctx.max_seq,
+                        )
+                        .map(|bytes| {
+                            (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64)
+                        })
+                        .ok_or("qwen4: QSA gather scratch size overflows")
+                    })
+                    .transpose()?;
                     let reserve = residency::auto_vram_reserve(
                         &config,
                         ctx.max_seq,
                         qsa_format,
                         mtp_bytes,
+                        gather_bytes,
                     )
                     .map_err(|error| format!("qwen4: {error}"))?;
                     const MIB: u64 = 1 << 20;
+                    let gather_note = gather_bytes
+                        .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
+                        .unwrap_or_default();
                     eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
                         free as u64 / MIB,
                         non_expert / MIB,
                         reserve / MIB,

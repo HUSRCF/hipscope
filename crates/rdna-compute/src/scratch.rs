@@ -215,6 +215,13 @@ pub struct ScratchState {
     /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
     pub gdn_state_f32: Option<DeviceBuffer>,
     pub gdn_state_f32_bytes: usize,
+    /// F16 K and block-transposed V of the QSA cache rows the gathered WMMA
+    /// attention reads (`tensor_ops::qsa_gathered_wmma`). Its own slot, not
+    /// the shared FP16 X scratch: Qwen4 reserves it for the whole context at
+    /// load (`tensor_ops::reserve_qsa_gathered_wmma_scratch`), so no captured
+    /// graph or recorded tape ever sees it move.
+    pub qsa_gather_f16: Option<DeviceBuffer>,
+    pub qsa_gather_f16_bytes: usize,
     pub fp16_x_source_ptr: *mut c_void,
     pub fp8_x_scratch: Option<DeviceBuffer>,
     pub fp8_x_scratch_bytes: usize,

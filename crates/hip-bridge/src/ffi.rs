@@ -104,6 +104,81 @@ pub mod launch_counters {
     counter!(graph_launch);
 }
 
+/// Per-thread tally of the HIP memory operations issued on this thread.
+///
+/// A retained Redline tape replays recorded kernel dispatches only, so a
+/// device copy, readback or memset issued inside its capture window is state
+/// the tape cannot reproduce. The replay controller differences two snapshots
+/// around the window. Unlike [`launch_counters`] this tally is never reset, so
+/// a profiler resetting its counters mid-window cannot hide an effect, and
+/// every synchronous and asynchronous variant counts.
+pub mod memory_effects {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct MemoryEffects {
+        /// Host→device uploads.
+        pub htod: u64,
+        /// Device→device copies, including peer copies.
+        pub dtod: u64,
+        /// Device→host readbacks.
+        pub dtoh: u64,
+        /// Memsets.
+        pub memset: u64,
+    }
+
+    impl MemoryEffects {
+        /// The operations issued since `earlier`, a snapshot taken on this thread.
+        pub fn since(self, earlier: Self) -> Self {
+            Self {
+                htod: self.htod - earlier.htod,
+                dtod: self.dtod - earlier.dtod,
+                dtoh: self.dtoh - earlier.dtoh,
+                memset: self.memset - earlier.memset,
+            }
+        }
+
+        /// Whether a capture window with these effects is fully described by
+        /// its recorded dispatches. Host→device uploads are excluded: a
+        /// retained-body boundary re-stages its inputs on every replay.
+        pub fn replayable(self) -> bool {
+            self.dtod == 0 && self.dtoh == 0 && self.memset == 0
+        }
+    }
+
+    thread_local! {
+        static TALLY: Cell<MemoryEffects> = const {
+            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0 })
+        };
+    }
+
+    /// This thread's running tally.
+    pub fn snapshot() -> MemoryEffects {
+        TALLY.with(Cell::get)
+    }
+
+    fn bump(update: impl FnOnce(&mut MemoryEffects)) {
+        TALLY.with(|tally| {
+            let mut value = tally.get();
+            update(&mut value);
+            tally.set(value);
+        });
+    }
+
+    pub(crate) fn htod() {
+        bump(|value| value.htod += 1);
+    }
+    pub(crate) fn dtod() {
+        bump(|value| value.dtod += 1);
+    }
+    pub(crate) fn dtoh() {
+        bump(|value| value.dtoh += 1);
+    }
+    pub(crate) fn memset() {
+        bump(|value| value.memset += 1);
+    }
+}
+
 // Opaque HIP handles (pointers to internal structs)
 type HipStream = *mut c_void;
 type HipModule = *mut c_void;
@@ -1198,6 +1273,7 @@ impl HipRuntime {
                 size,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyPeer")
     }
 
@@ -1234,6 +1310,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyPeerAsync")
     }
 
@@ -1522,6 +1599,7 @@ impl HipRuntime {
                 MemcpyKind::HostToDevice as c_uint,
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpy H2D offset")
     }
 
@@ -1550,6 +1628,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D at offset")
     }
 
@@ -1574,6 +1653,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst.ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D offset")
     }
 
@@ -1600,6 +1680,7 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_htod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::htod();
         self.check(code, "hipMemcpy H2D")
     }
 
@@ -1642,6 +1723,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::dtoh();
         self.check(code, "hipMemcpy D2H")
     }
 
@@ -1695,6 +1777,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::dtoh();
         self.check(code, "hipMemcpy D2H at offset")
     }
 
@@ -1718,6 +1801,7 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D")
     }
 
@@ -1748,6 +1832,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::memset();
         self.check(code, "hipMemset")
     }
 
@@ -1766,6 +1851,7 @@ impl HipRuntime {
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
+        memory_effects::memset();
         self.check(code, "hipMemsetD32Async")
     }
 
@@ -1804,6 +1890,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::memset();
         self.check(code, "hipMemsetAsync")
     }
 
@@ -2146,6 +2233,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D")
     }
 
@@ -2165,6 +2253,7 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D default stream")
     }
 
@@ -2187,6 +2276,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::dtoh();
         self.check(code, "hipMemcpyAsync D2H")
     }
 
@@ -2223,6 +2313,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset")
     }
 
@@ -2259,6 +2350,7 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset default stream")
     }
 

@@ -34,7 +34,27 @@
 use super::bf16::Bf16;
 use super::common::{self, GatherTemps, add64, add64_imm, bload, bstore_b128, lit, op, s, s_add_i32, smem, sop, srd_tail, v, SRD_WORD3};
 use super::iu4_fold::{self, MAGIC, REBIAS};
-use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, insn::MemoryClass, reg::Live};
+use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, insn::{Instruction, MemoryClass}, reg::Live};
+use peacemaker_author::{Gfx1151, Gfx1201, Scc, Target, WgUniform, Workgroup};
+
+type Wg<'b, T> = Workgroup<'b, T, Builder>;
+
+/// A `K`-derived trip counter: workgroup-uniform.
+fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str, trips: u8) -> Result<WgUniform<Scc>, String> {
+    wg.scmp_wg_uniform(Instruction::new(format!("{cmp} s{trips}, 0"), vec![], vec![s(trips)]))
+}
+
+/// Run the generic kernel body `$body::<T>(&mut Workgroup<T, Builder>, ..)`
+/// with `T` the target type of `$arch`.
+macro_rules! on_target {
+    ($arch:expr, $b:expr, $body:ident($($arg:expr),*)) => {
+        match $arch {
+            Arch::Gfx1151 => $body(&mut Workgroup::<Gfx1151, Builder>::new($b)?, $($arg),*),
+            Arch::Gfx1201 => $body(&mut Workgroup::<Gfx1201, Builder>::new($b)?, $($arg),*),
+            a => Err(format!("qwen4_moe_sym: no typed target for {}", a.name())),
+        }
+    };
+}
 
 pub const KERNARG_BYTES: u32 = 60;
 pub const VGPR_CEILING: u16 = 256;
@@ -397,44 +417,44 @@ fn advance(b: &mut Builder, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
-fn kloop(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    b.label(&g.label("k_begin"))?;
+/// Two-epoch trips over `TRIPS` (skipped at zero trips), then the tail
+/// epochs.
+fn kloop<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
+    wg.label(&g.label("k_begin"))?;
     let (head, done) = (g.label("k_loop"), g.label("k_loop_end"));
-    let entry = b.ledger.shape();
-    op(b, format!("s_cmp_eq_u32 s{TRIPS}, 0"), &[], &[s(TRIPS)])?;
-    op(b, format!("s_cbranch_scc1 {done}"), &[], &[])?;
-    b.loop_(&head, |b| {
-        load_set(b, g, 1)?;
-        compute(b, g, 0)?;
-        advance(b, g)?;
-        load_set(b, g, 0)?;
-        compute(b, g, 1)?;
-        op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
-        op(b, format!("s_cmp_lg_u32 s{TRIPS}, 0"), &[], &[s(TRIPS)])?;
-        op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
+    let entry = wg.isa().ledger.shape();
+    let no_trip = trips_cmp(wg, "s_cmp_eq_u32", TRIPS)?;
+    wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
+        wg.loop_carried(&head, (), |wg, ()| {
+            let b = wg.isa();
+            load_set(b, g, 1)?;
+            compute(b, g, 0)?;
+            advance(b, g)?;
+            load_set(b, g, 0)?;
+            compute(b, g, 1)?;
+            op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
+            Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
+        })?;
+        if wg.isa().ledger.shape() != entry { return Err("k loop exit ledger differs from its entry".into()) }
+        Ok(())
     })?;
-    if b.ledger.shape() != entry { return Err("k loop exit ledger differs from its entry".into()) }
-    b.label(&done)?;
     match g.spec.kind {
         // K % 256 == 0: an even epoch count, two epochs left.
         Kind::GateUp => {
+            let b = wg.isa();
             load_set(b, g, 1)?;
             compute(b, g, 0)?;
             compute(b, g, 1)
         }
         // K % 128 == 0: one epoch left when K/128 is odd, else two.
         Kind::Down => {
-            let odd = g.label("tail_odd");
-            let at_branch = b.ledger.clone();
-            op(b, format!("s_bitcmp1_b32 s{}, 7", ARGS1 + 3), &[], &[s(ARGS1 + 3)])?;
-            op(b, format!("s_cbranch_scc1 {odd}"), &[], &[])?;
-            load_set(b, g, 1)?;
-            compute(b, g, 0)?;
-            compute(b, g, 1)?;
-            op(b, format!("s_branch {}", g.label("epilogue")), &[], &[])?;
-            b.ledger = at_branch;
-            b.label(&odd)?;
-            compute(b, g, 0)
+            let odd = wg.scmp(Instruction::new(format!("s_bitcmp1_b32 s{}, 7", ARGS1 + 3), vec![], vec![s(ARGS1 + 3)]))?;
+            wg.if_else(odd, &g.label("tail_odd"), &g.label("epilogue"), |w| {
+                let b = w.isa();
+                load_set(b, g, 1)?;
+                compute(b, g, 0)?;
+                compute(b, g, 1)
+            }, |w| compute(w.isa(), g, 0))
         }
     }
 }
@@ -504,12 +524,17 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, g.plan()?);
     b.enable_delay_alu();
-    prologue(&mut b, &g)?;
-    kloop(&mut b, &g)?;
-    epilogue(&mut b, &g)?;
-    b.label(&g.label("end"))?;
-    b.push(crate::insn::Sop::End.encode(spec.arch)?)?;
+    on_target!(spec.arch, &mut b, body(&g))?;
     b.finish()
+}
+
+fn body<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
+    prologue(wg.isa(), g)?;
+    kloop(wg, g)?;
+    let b = wg.isa();
+    epilogue(b, g)?;
+    b.label(&g.label("end"))?;
+    b.push(crate::insn::Sop::End.encode(g.arch())?)
 }
 
 /// Every entry of one architecture (both kinds at every [`tile_widths`]
@@ -548,7 +573,10 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// the 16-slot entry.
 mod nt {
     use super::*;
-    use crate::lds::{SlotState, Transition};
+    use peacemaker_author::{Free, LdsRegion};
+
+    /// The gate/up handoff region: RNE(gate) of every tile.
+    enum Gate {}
 
     // VGPRs (the gfx12 NT8 maximum is v231).
     const XOFF: u8 = 16;   // + j: activation row offset of tile j (or X_OOB)
@@ -688,7 +716,8 @@ mod nt {
         sop(b, format!("s_or_b32 s{m}, s{m}, s{n}"), &[m], &[m, n])
     }
 
-    fn prologue(b: &mut Builder, g: &G) -> Result<(), String> {
+    fn prologue<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+        let b = wg.isa();
         let a = g.arch();
         let kind = g.spec.kind;
         let nt = g.nt();
@@ -739,7 +768,9 @@ mod nt {
         // before the start or another expert ends the run.
         sop(b, format!("s_mov_b32 s{BACK}, 0"), &[BACK], &[])?;
         let (walk, found) = (g.label("run_walk"), g.label("run_found"));
-        b.loop_(&walk, |b| {
+        // Wave-uniform: every lane mask is a compare over the same loads.
+        wg.loop_until(&walk, &found, |w, exit| {
+            let b = w.isa();
             sop(b, format!("{} s4, s{WGY}, -1", s_add_i32(a)), &[4], &[WGY])?;
             sop(b, format!("{} s4, s4, s{BACK}", sub_i32(a)), &[4], &[4, BACK])?;
             op(b, "v_sub_nc_u32_e32 v5, s4, v2", &[v(5)], &[s(4), v(2)])?;
@@ -748,12 +779,11 @@ mod nt {
             op(b, format!("v_cmp_ne_u32_e64 s{MASKA}, s23, v7"), &[s(MASKA)], &[s(23), v(7)])?;
             op(b, format!("v_cmp_gt_i32_e64 s{}, 0, v5", MASKT[0]), &[s(MASKT[0])], &[v(5)])?;
             or_mask(b, MASKA, MASKT[0])?;
-            sop(b, format!("s_cmp_lg_u32 s{MASKA}, 0"), &[], &[MASKA])?;
-            op(b, format!("s_cbranch_scc1 {found}"), &[], &[])?;
-            sop(b, format!("{} s{BACK}, s{BACK}, 32", s_add_i32(a)), &[BACK], &[BACK])?;
-            op(b, format!("s_branch {walk}"), &[], &[])
+            let hit = w.scmp(Instruction::new(format!("s_cmp_lg_u32 s{MASKA}, 0"), vec![], vec![s(MASKA)]))?;
+            w.break_if(hit, exit)?;
+            sop(w.isa(), format!("{} s{BACK}, s{BACK}, 32", s_add_i32(a)), &[BACK], &[BACK])
         })?;
-        b.label(&found)?;
+        let b = wg.isa();
         sop(b, format!("s_ctz_i32_b32 s{POS}, s{MASKA}"), &[POS], &[MASKA])?;
         sop(b, format!("{} s{POS}, s{POS}, s{BACK}", s_add_i32(a)), &[POS], &[POS, BACK])?;
         // Not a leader: another CTA folds this tile.
@@ -927,44 +957,42 @@ mod nt {
         Ok(())
     }
 
-    fn kloop(b: &mut Builder, g: &G) -> Result<(), String> {
-        b.label(&g.label("k_begin"))?;
+    fn kloop<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+        wg.label(&g.label("k_begin"))?;
         let (head, done) = (g.label("k_loop"), g.label("k_loop_end"));
-        let entry = b.ledger.shape();
-        op(b, format!("s_cmp_eq_u32 s{TRIPS}, 0"), &[], &[s(TRIPS)])?;
-        op(b, format!("s_cbranch_scc1 {done}"), &[], &[])?;
-        b.loop_(&head, |b| {
-            load_w(b, g, 1)?;
-            compute(b, g, 0, "l0", Some(SRD_X[1]))?;
-            advance(b)?;
-            load_w(b, g, 0)?;
-            compute(b, g, 1, "l1", Some(SRD_X[0]))?;
-            op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
-            op(b, format!("s_cmp_lg_u32 s{TRIPS}, 0"), &[], &[s(TRIPS)])?;
-            op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
+        let entry = wg.isa().ledger.shape();
+        let no_trip = trips_cmp(wg, "s_cmp_eq_u32", TRIPS)?;
+        wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
+            wg.loop_carried(&head, (), |wg, ()| {
+                let b = wg.isa();
+                load_w(b, g, 1)?;
+                compute(b, g, 0, "l0", Some(SRD_X[1]))?;
+                advance(b)?;
+                load_w(b, g, 0)?;
+                compute(b, g, 1, "l1", Some(SRD_X[0]))?;
+                op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
+                Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
+            })?;
+            if wg.isa().ledger.shape() != entry { return Err("k loop exit ledger differs from its entry".into()) }
+            Ok(())
         })?;
-        if b.ledger.shape() != entry { return Err("k loop exit ledger differs from its entry".into()) }
-        b.label(&done)?;
         match g.spec.kind {
             // K % 256 == 0: an even epoch count, two epochs left.
             Kind::GateUp => {
+                let b = wg.isa();
                 load_w(b, g, 1)?;
                 compute(b, g, 0, "t0", Some(SRD_X[1]))?;
                 compute(b, g, 1, "t1", None)
             }
             // K % 128 == 0: one epoch left when K/128 is odd, else two.
             Kind::Down => {
-                let odd = g.label("tail_odd");
-                let at_branch = b.ledger.clone();
-                op(b, "s_bitcmp1_b32 s19, 7", &[], &[s(19)])?;
-                op(b, format!("s_cbranch_scc1 {odd}"), &[], &[])?;
-                load_w(b, g, 1)?;
-                compute(b, g, 0, "t0", Some(SRD_X[1]))?;
-                compute(b, g, 1, "t1", None)?;
-                op(b, format!("s_branch {}", g.label("epilogue")), &[], &[])?;
-                b.ledger = at_branch;
-                b.label(&odd)?;
-                compute(b, g, 0, "t2", None)
+                let odd = wg.scmp(Instruction::new("s_bitcmp1_b32 s19, 7", vec![], vec![s(19)]))?;
+                wg.if_else(odd, &g.label("tail_odd"), &g.label("epilogue"), |w| {
+                    let b = w.isa();
+                    load_w(b, g, 1)?;
+                    compute(b, g, 0, "t0", Some(SRD_X[1]))?;
+                    compute(b, g, 1, "t1", None)
+                }, |w| compute(w.isa(), g, 0, "t2", None))
             }
         }
     }
@@ -1007,7 +1035,8 @@ mod nt {
 
     /// Stores of every live tile: tile 0 always, tile j while j < cnt; the
     /// descriptor base advances 16 output rows per tile.
-    fn store_tiles(b: &mut Builder, g: &G, vals: impl Fn(&mut Builder, u8) -> Result<u8, String>) -> Result<(), String> {
+    fn store_tiles<T: Target>(wg: &mut Wg<T>, g: &G, vals: impl Fn(&mut Wg<T>, u8) -> Result<u8, String>) -> Result<(), String> {
+        let b = wg.isa();
         sop(b, format!("s_mov_b32 s{SRD_Y}, s16"), &[SRD_Y], &[16])?;
         sop(b, format!("s_mov_b32 s{}, s17", SRD_Y + 1), &[SRD_Y + 1], &[17])?;
         srd_tail(b, SRD_Y, None)?;
@@ -1018,52 +1047,47 @@ mod nt {
         }
         for j in 0..g.nt() {
             if j > 0 {
+                let b = wg.isa();
                 sop(b, format!("s_cmp_gt_u32 s{CNT}, {j}"), &[], &[CNT])?;
                 op(b, format!("s_cbranch_scc0 {}", g.label("end")), &[], &[])?;
                 add64(b, SRD_Y, SRD_Y, YSTEP)?;
             }
-            let r = vals(b, j)?;
-            store_rows(b, g, r, g.live(j))?;
+            let r = vals(wg, j)?;
+            store_rows(wg.isa(), g, r, g.live(j))?;
         }
         Ok(())
     }
 
-    fn epilogue(b: &mut Builder, g: &G) -> Result<(), String> {
+    fn epilogue<T: Target>(wg: &mut Wg<T>, g: &G, gate: Option<LdsRegion<Gate, Free>>) -> Result<(), String> {
+        let b = wg.isa();
         b.label(&g.label("epilogue"))?;
-        if !g.gate_up() { return store_tiles(b, g, |_, j| Ok(g.sum(j))) }
+        let Some(gate) = gate else { return store_tiles(wg, g, |_, j| Ok(g.sum(j))) };
         // Every wave: BF16 round trip of its sums (gate or up).
         for j in 0..g.nt() { for i in 0..8u8 { Bf16::rne_finite_passthrough(b, g.sum(j) + i, RT_TMP + i, MASKT[usize::from(i % 2)], true)?; } }
-        let up = g.label("up");
-        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 2"), &[], &[WAVE])?;
-        op(b, format!("s_cbranch_scc1 {up}"), &[], &[])?;
-        let (ledger, lds) = (b.ledger.clone(), b.lds.clone());
-        // Gate waves: publish the rounded gate rows, then leave.
-        for j in 0..g.nt() {
-            for h in 0..2u8 {
-                let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
-                let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.sum(j) + 4 * h, len: 4 };
-                let text = format!("ds_store_b128 v{LDSA}, {d}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
-                b.ds_store(0, crate::insn::Instruction::new(text, vec![], vec![v(LDSA), d]).memory(MemoryClass::DsStore))?;
+        // Gate waves publish the rounded gate rows and leave; up waves meet
+        // them at their own barrier and read the publication.
+        let up = wg.scmp(Instruction::new(format!("s_cmp_ge_u32 s{WAVE}, 2"), vec![], vec![s(WAVE)]))?;
+        let gate = wg.handoff(up, &g.label("up"), &g.label("end"), gate, |w, gate| {
+            let mut out = w.begin_write(gate);
+            for j in 0..g.nt() {
+                for h in 0..2u8 {
+                    let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
+                    let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.sum(j) + 4 * h, len: 4 };
+                    let text = format!("ds_store_b128 v{LDSA}, {d}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
+                    out = w.ds_store(out, Instruction::new(text, vec![], vec![v(LDSA), d]).memory(MemoryClass::DsStore))?;
+                }
             }
-        }
-        b.barrier(&[Transition::Ready(0)])?;
-        op(b, format!("s_branch {}", g.label("end")), &[], &[])?;
-        // Up waves meet the gate waves at the same barrier: their LDS view is
-        // the gate waves' publication.
-        b.ledger = ledger;
-        b.lds = lds;
-        b.lds.slots[0].state = SlotState::Publishing;
-        b.label(&up)?;
-        b.barrier(&[Transition::Ready(0)])?;
+            Ok(out)
+        })?;
         let gv = g.gval();
-        store_tiles(b, g, |b, j| {
+        store_tiles(wg, g, |wg, j| {
             for h in 0..2u8 {
                 let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
                 let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: gv + 4 * h, len: 4 };
                 let text = format!("ds_load_b128 {d}, v{LDSA}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
-                b.ds_load(0, crate::insn::Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
+                wg.ds_load(&gate, Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
             }
-            for grp in 0..2u8 { super::super::iu4_v2b::silu_mul(b, gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
+            for grp in 0..2u8 { super::super::iu4_v2b::silu_mul(wg.isa(), gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
             Ok(gv)
         })
     }
@@ -1076,13 +1100,18 @@ mod nt {
             workgroup_size: spec.threads() as u16, group_segment_fixed_size: spec.lds_bytes(), wave32: true, cu_mode: false,
         };
         let mut b = Builder::new(kspec, g.plan()?);
-        if g.gate_up() && b.lds.add("swiglu_gate", 0, spec.lds_bytes())? != 0 { return Err("LDS slot order".into()) }
         b.enable_delay_alu();
-        prologue(&mut b, &g)?;
-        kloop(&mut b, &g)?;
-        epilogue(&mut b, &g)?;
-        b.label(&g.label("end"))?;
-        b.push(crate::insn::Sop::End.encode(spec.arch)?)?;
+        on_target!(spec.arch, &mut b, body(&g))?;
         b.finish()
+    }
+
+    fn body<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+        let gate = if g.gate_up() { Some(wg.lds::<Gate>("swiglu_gate", 0, g.spec.lds_bytes())?) } else { None };
+        prologue(wg, g)?;
+        kloop(wg, g)?;
+        epilogue(wg, g, gate)?;
+        let b = wg.isa();
+        b.label(&g.label("end"))?;
+        b.push(crate::insn::Sop::End.encode(g.arch())?)
     }
 }

@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hip_bridge::memory_effects::{self, MemoryEffects};
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
@@ -4615,6 +4616,10 @@ pub struct ReplayController {
     /// active; drained by the post-growth refresh before the next launch or
     /// replay. A replay that observes it armed fails closed (route re-armed).
     binding_refresh_pending: bool,
+    /// This thread's [`memory_effects`] tally when the open capture window
+    /// began, and the memory operations issued inside the last closed window.
+    window_effects_base: MemoryEffects,
+    window_effects: MemoryEffects,
     /// Shadow-only executor override for the next eligible forward.
     shadow_body_route: Option<ShadowBodyRoute>,
 }
@@ -4698,6 +4703,8 @@ impl ReplayController {
             binding_revision: BindingRevision(0),
             tape_resources: BTreeMap::new(),
             binding_refresh_pending: false,
+            window_effects_base: MemoryEffects::default(),
+            window_effects: MemoryEffects::default(),
         }
     }
 
@@ -4816,6 +4823,7 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects = MemoryEffects::default();
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -5066,6 +5074,33 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
+        // The linear AQL graph submits every recorded kernarg verbatim; only the
+        // GDN requant frame is patched per replay. A position-derived field or
+        // grid would replay at its capture-time value, so such a tape is the
+        // PM4 transport's (which applies every binding) or HIP's.
+        if let Some((dispatch, binding)) = self
+            .retained_kernarg_bindings(prefix)?
+            .into_iter()
+            .find(|(_, binding)| !matches!(binding, ReplayKernargBinding::GdnFrameU32 { .. }))
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived kernarg at offset {} of dispatch \
+                 {dispatch} ({}); the tape needs the PM4 transport",
+                binding.offset(),
+                self.recorded[dispatch].kernel
+            ));
+        }
+        if let Some(launch) = self.recorded[..prefix]
+            .iter()
+            .find(|launch| launch.grid_binding.is_some())
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived grid of {}; the tape needs the \
+                 PM4 transport",
+                launch.kernel
+            ));
+        }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
@@ -5306,6 +5341,7 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
@@ -6248,6 +6284,8 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects_base = memory_effects::snapshot();
+        self.window_effects = MemoryEffects::default();
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -6258,6 +6296,7 @@ impl ReplayController {
         if self.state != ReplayState::RecordingWarmup {
             return Err("no replay capture is active");
         }
+        self.window_effects = memory_effects::snapshot().since(self.window_effects_base);
         let summary = self.capture_summary();
         self.state = if self.certified_speedups.len() >= 2 {
             ReplayState::ShadowValidated
@@ -6265,6 +6304,34 @@ impl ReplayController {
             ReplayState::Captured
         };
         Ok(summary)
+    }
+
+    /// The memory operations issued on this thread inside the open capture
+    /// window, or inside the last closed one.
+    pub fn capture_window_effects(&self) -> MemoryEffects {
+        if self.state == ReplayState::RecordingWarmup {
+            memory_effects::snapshot().since(self.window_effects_base)
+        } else {
+            self.window_effects
+        }
+    }
+
+    /// Refuse to prepare an automatic forward body whose window issued a device
+    /// copy, readback or memset: the tape replays dispatches only, so that
+    /// state would be missing on every replay. Every adapter treats a prepare
+    /// error as sticky fallback, so the route runs on HIP. Manual captures
+    /// (benchmarks, speculative verify bodies) delimit windows spanning several
+    /// forwards and keep their own contracts.
+    fn refuse_effect_incomplete_window(&self) -> Result<(), String> {
+        let effects = self.capture_window_effects();
+        if self.auto_lifecycle && !effects.replayable() {
+            return Err(format!(
+                "effect-incomplete capture: {} device copy(ies), {} readback(s) and {} \
+                 memset(s) inside the window are state the tape cannot replay",
+                effects.dtod, effects.dtoh, effects.memset
+            ));
+        }
+        Ok(())
     }
 
     pub fn capture_summary(&self) -> ReplayCaptureSummary {
@@ -10212,6 +10279,39 @@ mod tests {
             .expect_err("second owner for one offset must be rejected");
         assert!(error.contains("already has an owner"), "{error}");
         assert_eq!(bindings.len(), 1, "the rejected binding is not pushed");
+    }
+
+    #[test]
+    fn linear_aql_refuses_a_tape_with_position_bindings() {
+        // Linear AQL submits recorded kernargs verbatim. A declared position
+        // field (here a QSA-style length) would replay frozen at the capture
+        // position, so prepare must refuse before any device work and leave the
+        // route unprepared.
+        let declared = [ReplayKernargBinding::PositionPlusU32 {
+            offset: 8,
+            addend: 1,
+        }];
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        for declared in [&[][..], &declared[..]] {
+            controller.record_hip_launch_with_accesses(
+                "qsa_select",
+                None,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                &[0u8; 16],
+                None,
+                declared,
+                None,
+                None,
+            );
+        }
+        controller.finish_capture().unwrap();
+        let error = controller
+            .prepare_linear_aql(0)
+            .expect_err("a position-bound tape must not prepare on linear AQL");
+        assert!(error.contains("offset 8 of dispatch 1"), "{error}");
+        assert_ne!(controller.state(), ReplayState::Ready);
     }
 
     #[test]

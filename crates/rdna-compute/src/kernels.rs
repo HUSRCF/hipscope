@@ -7901,14 +7901,32 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
-pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
-    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SRC.get_or_init(|| {
-        format!(
-            "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1100\n{}",
-            QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;",)
+/// Qwen3.6-27B 24Q/4K body shared by the gfx1100 and exact-gfx1201 twins. The
+/// RoPE pair is written with explicit fmaf in the contraction both archs'
+/// unfused decode RoPE (`rope_partial_halfsplit_f32` on gfx1100,
+/// `rope_partial_halfsplit_f32_headgrid` on gfx1201) compiles to:
+/// `fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`. Left to the
+/// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)` on
+/// both archs and differs from the unfused chain in the last bit, so the
+/// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
+fn qwen36_27b_fa_prep_body(entry: &str) -> String {
+    let body = QWEN35_FA_PREP_GFX1100_SRC
+        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;")
+        .replace(
+            "out[tid] = x0 * cos_a - x1 * sin_a;",
+            "out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));",
         )
-    })
+        .replace(
+            "out[tid + HALF] = x0 * sin_a + x1 * cos_a;",
+            "out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);",
+        );
+    assert_eq!(body.matches("__builtin_fmaf").count(), 2);
+    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n{body}")
+}
+pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| qwen36_27b_fa_prep_body("qwen36_27b_fa_prep_gfx1100"));
+    &SRC
 }
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
@@ -7926,26 +7944,9 @@ pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
 /// Exact-gfx1201 24Q/4K (Qwen3.6-27B) twin of `qwen36_27b_fa_prep_gfx1100`.
-/// The RoPE pair is written with explicit fmaf in the contraction the gfx1201
-/// decode chain's `rope_partial_halfsplit_f32_headgrid` compiles to
-/// (`fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`); left to the
-/// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)`
-/// and differs from the unfused chain in the last bit.
 pub fn qwen36_27b_fa_prep_gfx1201_src() -> &'static str {
-    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let body = QWEN35_FA_PREP_GFX1100_SRC
-            .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;")
-            .replace(
-                "out[tid] = x0 * cos_a - x1 * sin_a;",
-                "out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));",
-            )
-            .replace(
-                "out[tid + HALF] = x0 * sin_a + x1 * cos_a;",
-                "out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);",
-            );
-        assert_eq!(body.matches("__builtin_fmaf").count(), 2);
-        format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1201\n{body}")
-    });
+    static SRC: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| qwen36_27b_fa_prep_body("qwen36_27b_fa_prep_gfx1201"));
     &SRC
 }
 

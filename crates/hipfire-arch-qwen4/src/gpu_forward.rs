@@ -2423,7 +2423,6 @@ impl Qwen4GpuForward {
         let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
         let mut launched_before = 0u64;
-        let mut effects_before = (0u64, 0u64, 0u64, 0u64);
         let mut traced = false;
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
@@ -2580,13 +2579,11 @@ impl Qwen4GpuForward {
                     }
                     RetainedBodyAction::Arm { diagnostic } => {
                         diagnostic_capture = diagnostic;
+                        // The fused GDN rotation's arrival counters are zeroed once,
+                        // on first use; materialize them before the window opens so
+                        // that memset is not state the tape would have to replay.
+                        rdna_compute::tensor_ops::ensure_gdn_pair_counters(gpu)?;
                         launched_before = hip_bridge::launch_counters::launch_kernel::count();
-                        effects_before = (
-                            hip_bridge::launch_counters::memcpy_htod::count(),
-                            hip_bridge::launch_counters::memcpy_dtod::count(),
-                            hip_bridge::launch_counters::memcpy_dtoh::count(),
-                            hip_bridge::launch_counters::memset::count(),
-                        );
                         gpu.replay
                             .begin_auto_capture_if_armed()
                             .map_err(|reason| invalid(reason))?;
@@ -2817,7 +2814,7 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before, effects_before);
+                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before);
                 }
                 if traced {
                     self.write_route_trace(gpu, next_position)?;
@@ -2848,19 +2845,9 @@ impl Qwen4GpuForward {
 ///
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
 /// fallback) rather than failing the request that already produced output.
-fn finish_qwen4_capture(
-    gpu: &mut Gpu,
-    diagnostic_capture: bool,
-    launched_before: u64,
-    effects_before: (u64, u64, u64, u64),
-) {
+fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before: u64) {
     let launched = hip_bridge::launch_counters::launch_kernel::count();
-    let effects = (
-        hip_bridge::launch_counters::memcpy_htod::count().saturating_sub(effects_before.0),
-        hip_bridge::launch_counters::memcpy_dtod::count().saturating_sub(effects_before.1),
-        hip_bridge::launch_counters::memcpy_dtoh::count().saturating_sub(effects_before.2),
-        hip_bridge::launch_counters::memset::count().saturating_sub(effects_before.3),
-    );
+    let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
     let recorded = summary.launch_count;
     let computed = launched.saturating_sub(launched_before) as usize;
@@ -2871,7 +2858,7 @@ fn finish_qwen4_capture(
     );
     eprintln!(
         "[redline] qwen4 capture census: effects inside window — htod={} dtod={} dtoh={} memset={}",
-        effects.0, effects.1, effects.2, effects.3
+        effects.htod, effects.dtod, effects.dtoh, effects.memset
     );
     if computed != recorded {
         eprintln!(
@@ -2879,11 +2866,11 @@ fn finish_qwen4_capture(
              (#397-style truncated tape)"
         );
     }
-    if effects.1 > 0 || effects.2 > 0 || effects.3 > 0 {
+    if !effects.replayable() {
         eprintln!(
             "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies), {} readback(s) \
-             and {} memset(s) inside the window are state the tape cannot replay",
-            effects.1, effects.2, effects.3
+             and {} memset(s) inside the window are state the tape cannot replay; prepare refuses it",
+            effects.dtod, effects.dtoh, effects.memset
         );
     }
     if diagnostic_capture {

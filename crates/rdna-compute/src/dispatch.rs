@@ -1547,6 +1547,8 @@ impl Gpu {
                 qsa_select_scores_bytes: 0,
                 gdn_state_f32: None,
                 gdn_state_f32_bytes: 0,
+                qsa_gather_f16: None,
+                qsa_gather_f16_bytes: 0,
                 fp16_x_source_ptr: std::ptr::null_mut(),
                 fp8_x_scratch: None,
                 fp8_x_scratch_bytes: 0,
@@ -1605,6 +1607,7 @@ impl Gpu {
                 ar_forward_blobs: Vec::new(),
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
+                ar_forward_binding: 0,
                 ar_graph_eligible: true,
                 ar_segments: Vec::new(),
                 verify: crate::graph::PerBGraphCache {
@@ -3044,6 +3047,38 @@ impl Gpu {
             )?;
         }
         Ok(self.scratch.gdn_state_f32.as_ref().unwrap().as_ptr())
+    }
+
+    /// The gathered QSA attention's F16 K / V scratch
+    /// ([`crate::scratch::ScratchState::qsa_gather_f16`]), at least `bytes`.
+    /// Grows like the other scratch slots (captured state is invalidated
+    /// before the old buffer is freed); Qwen4 reserves the whole context at
+    /// load, so a forward never grows it.
+    pub(crate) fn qsa_gather_scratch(&mut self, bytes: usize) -> HipResult<*mut c_void> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qsa_gather_f16_bytes,
+            self.scratch.qsa_gather_f16.is_some(),
+            bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+            crate::scratch::grow_scratch_slot(
+                &self.hip,
+                &mut self.scratch.qsa_gather_f16,
+                &mut self.scratch.qsa_gather_f16_bytes,
+                bytes,
+            )?;
+        }
+        Ok(self.scratch.qsa_gather_f16.as_ref().unwrap().as_ptr())
+    }
+
+    /// Bytes currently allocated for the gathered QSA attention's scratch
+    /// (0 before the first reservation).
+    pub fn qsa_gather_scratch_bytes(&self) -> usize {
+        if self.scratch.qsa_gather_f16.is_some() {
+            self.scratch.qsa_gather_f16_bytes
+        } else {
+            0
+        }
     }
 
     pub(crate) fn ensure_fp16_x(
