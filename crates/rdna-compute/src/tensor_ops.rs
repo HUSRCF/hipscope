@@ -1637,6 +1637,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 /// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
 /// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let tiled = gpu.flags.qwen4_hc_up_tile_enabled();
+    hyper_read_up_wmma_tiled(gpu, p, tiled)
+}
+
+/// [`hyper_read_up_wmma`] on its baseline entries (`tiled == false`) or the
+/// retiled operand-swapped ones (`tiled == true`, bytewise the baseline's).
+fn hyper_read_up_wmma_tiled(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    tiled: bool,
+) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     let (module, source, entry) = if gpu.arch_caps.has_wmma_w32() {
@@ -1668,8 +1679,26 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
-    let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
+    // H3 (`HIPFIRE_QWEN4_HC_UP_TILE`, exact gfx1151 / gfx1201): the retiled
+    // operand-swapped entries.  gfx1151 keeps the baseline launch geometry;
+    // gfx1201's takes 128 rows per block, static LDS only, `low_rank % 64 == 0`.
+    let tile_1201 = tiled && entry == "hyper_read_up_wmma_bf16_gfx1201" && p.low_rank % 64 == 0;
+    let entry = match (tiled, entry) {
+        (true, "hyper_read_up_wmma_bf16") => "hyper_read_up_wmma_bf16_swap",
+        (true, "hyper_read_up_wmma_bf16_gfx1201") if tile_1201 => {
+            "hyper_read_up_wmma_bf16_gfx1201_t128"
+        }
+        (_, entry) => entry,
+    };
+    let row_grid = checked_u32(
+        p.rows.div_ceil(if tile_1201 { 128 } else { 512 }),
+        "HC read row grid",
+    )?;
+    let lds_bytes = if tile_1201 {
+        0
+    } else {
+        checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?
+    };
     gpu.ensure_kernel_public(module, source, entry)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
@@ -5041,6 +5070,30 @@ mod tests {
                 differ * 100 < reference.len(),
                 "WMMA HC read: {differ} differ"
             );
+            // H3: the retiled operand-swapped entries are bytewise the
+            // baseline entries' (also at the ragged row count 131).
+            let tiled_out = gpu.zeros(&[rows * hidden], DType::F32).expect("tiled");
+            hyper_read_up_wmma_tiled(
+                &mut gpu,
+                &HyperReadUpFused {
+                    up_weight: &up_weight,
+                    low: &low_bf16,
+                    normalized: &normalized_f16,
+                    mixed: &tiled_out,
+                    rows,
+                    hidden,
+                    low_rank,
+                    normalized_bf16: true,
+                },
+                true,
+            )
+            .expect("tiled wmma");
+            assert_eq!(
+                bits(&gpu, &tiled_out),
+                bits(&gpu, &wmma),
+                "retiled HC read differs from the baseline entry"
+            );
+            gpu.free_tensor(tiled_out).expect("free");
             gpu.free_tensor(normalized_f16).expect("free");
             gpu.free_tensor(low_bf16).expect("free");
         }
