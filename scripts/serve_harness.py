@@ -1047,6 +1047,16 @@ def apply_observed_kv_backend(cfg, txt):
             else:
                 cfg["kv_backend_warning"] = None
 
+    if cfg.get("kv_mode_effective"):
+        cfg["kv_mode_effective_src"] = "loaded ACK"
+    else:
+        # The loaded ACK is not echoed into every serve log; the loader's own
+        # "KV cache: requested mode=…, effective KV=…" line is the same fact.
+        m = re.search(r"KV cache: requested mode=\S+?, effective KV=(\w+)", txt or "")
+        if m:
+            cfg["kv_mode_effective"] = m.group(1)
+            cfg["kv_mode_effective_src"] = "serve log 'KV cache: ... effective KV'"
+
     _emit_legacy_kv_backend_notice(cfg, log_txt=txt)
     return cfg.get("kv_backend_effective"), cfg.get("kv_backend_effective_reason")
 
@@ -1099,6 +1109,21 @@ def stamp_kv_backend_out_fields(rows, cfg):
         if isinstance(row, dict):
             row.update(meta)
     return rows
+
+
+def kv_mode_report_line(cfg):
+    """One report-header line naming the KV mode this run actually certifies.
+
+    The requested value is usually ``auto`` (the product default), which is not a
+    mode: it resolves to native fp8 or Q8 at load. The loaded ACK (or the loader's
+    "effective KV" log line) is the authority, so say so when it was observed and say plainly when it was not.
+    """
+    eff = cfg.get("kv_mode_effective")
+    if eff:
+        src = cfg.get("kv_mode_effective_src", "loaded ACK")
+        return f"  kv_mode_resolved={eff} (observed in {src}; requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}])"
+    return (f"  kv_mode_resolved=UNOBSERVED (requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]; "
+            "no loaded ACK or KV-cache log line seen, e.g. --no-spawn)")
 
 
 
@@ -1721,6 +1746,12 @@ def _self_test_load_defaults():
             show_config(cfg_fp8)
         assert "kv_mode       : fp8 [observed(loaded)]" in buf.getvalue()
         assert stamp_kv_backend_out_fields([{}], cfg_fp8)[0]["kv_mode"] == "fp8"
+        assert "kv_mode_resolved=fp8 (observed in loaded ACK; requested auto" in kv_mode_report_line(cfg_fp8)
+        assert "kv_mode_resolved=UNOBSERVED (requested auto" in kv_mode_report_line(build_config(_ns()))
+        # No loaded ACK in the serve log: the loader's own effective-KV line still names the mode.
+        cfg_log = build_config(_ns())
+        apply_observed_kv_backend(cfg_log, "  KV cache: requested mode=auto, effective KV=fp8\n")
+        assert "kv_mode_resolved=fp8 (observed in serve log" in kv_mode_report_line(cfg_log)
 
         # Once-per-load legacy warning + --out row metadata (list shape preserved).
         cfg_leg = build_config(_ns(kv_backend="legacy"))
@@ -3795,6 +3826,7 @@ def run(cfg, args):
     bmd5, bpath = _daemon_binary_md5()
     if bmd5:
         print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    print(kv_mode_report_line(cfg), flush=True)
     # ---- Tool round-trip + ATEM leak gate (always checked when tool_calls involved) ----
     for idx, r in enumerate(g):
         if r.get("atem_leak"):
@@ -4117,6 +4149,7 @@ def main():
                 flush=True,
             )
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
+    print(kv_mode_report_line(cfg), flush=True)
     cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)
     if not args.no_spawn:
