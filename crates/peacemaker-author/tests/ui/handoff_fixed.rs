@@ -11,7 +11,7 @@ fn epilogue<B: Backend<Insn = String>>(wg: &mut Workgroup<Gfx1201, B>) -> Result
     wg.handoff(readers, ".Lup", end, gate, |w, gate| {
         let out = w.ds_store(gate, "ds_store_b128 v1, v[2:5]".into())?;
         w.ds_store(out, "ds_store_b128 v1, v[6:9] offset:16".into())
-    }, |w, gate| {
+    }, |w, gate, _| {
         w.ds_load(&gate, "ds_load_b128 v[8:11], v1".into())?;
         w.ds_load(&gate, "ds_load_b128 v[12:15], v1 offset:16".into())
     })
