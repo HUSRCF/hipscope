@@ -250,9 +250,9 @@ tile. Thresholds are N≥96 unless a band is noted. Source of truth:
 | **gfx1100** | 4 (MQ4V2) | adaptive (see bands) | adaptive | adaptive | adaptive |
 | **gfx1100** | 2 / 3 / 5 / 6 | base WMMA | base | base | base |
 
-Qwen4 MQ6 Halo tuning is **default off**. Set
-`HIPFIRE_QWEN4_MQ6_X4_TILE=auto` for the opt-in artifact-sweep table
-(entries are `BV/RW/prefetch`; `base` retains the incumbent):
+Qwen4 MQ6 Halo tuning is **default on gfx1151 inside the Qwen4 forward**:
+unset there (or `HIPFIRE_QWEN4_MQ6_X4_TILE=auto` anywhere) uses the
+artifact-sweep table and `0` keeps the incumbent (entries are `BV/RW/prefetch`; `base` retains the incumbent):
 
 | M,K | N=1536 | N=512 | N=1131 |
 |---|---|---|---|
@@ -268,8 +268,9 @@ Unmeasured shapes and token counts retain the incumbent. The table uses one
 conservative tile for both output dtypes. Explicit overrides use `BVxRWxprefetch`
 with `BV ∈ {8,12}`, `RW ∈ {4,8}`, and prefetch depth `∈ {1,2}`;
 BV12 overrides fall back to the incumbent unless `N % 192 == 0`.
-`HIPFIRE_QWEN4_MQ6_X4_REGIONS=1` independently enables the three-F32-output
-MQ6 a/b/z region fold on the admitted gfx1151/gfx1201 prepared-F16 route.
+`HIPFIRE_QWEN4_MQ6_X4_REGIONS` independently controls the three-F32-output
+MQ6 a/b/z region fold on the admitted prepared-F16 route: on by default in
+the Qwen4 forward on gfx1151 (`0` off), opt-in `1` on gfx1201.
 Both switches preserve independent WMMA chains and the existing shared rotation.
 
 The Halo three-run artifact F32 sweep at `N=1536` measured medians
@@ -282,7 +283,7 @@ was rejected. Artifact-bitwise
 checks cover all seven trunk shapes, F32/BF16 outputs, `N=1536/512/1131/16`,
 K=10240 row tails, extreme headers, zero guards, and poisoned output pads.
 The three-output fold also matches independent incumbent launches, including
-`N=0`. Full-model three-run timing remains a separate promotion gate.
+`N=0`.
 
 MQ4V2 adaptive bands on **gfx1100** (fuller narrative in `mq4-v2.md` §9):
 

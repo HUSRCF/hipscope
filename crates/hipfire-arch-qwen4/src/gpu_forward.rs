@@ -2210,8 +2210,37 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
+    /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        argmax_of: Option<&GpuTensor>,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_policy: Qwen4OutputPolicy,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+        let result = self.forward_chunk_scoped(
+            bundle,
+            gpu,
+            tokens,
+            argmax_of,
+            logits,
+            top1,
+            wide_hidden_capture,
+            output_policy,
+        );
+        gpu.qwen4_scope = scope;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk_scoped(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,

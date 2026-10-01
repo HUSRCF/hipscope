@@ -160,7 +160,7 @@ pub fn project_weights(
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
         // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
         // may share one row-region launch without sharing their accumulators.
-        if gpu.flags.qwen4_mq6_x4_regions
+        if gpu.qwen4_mq6_x4_regions()
             && projections.len() == 4
             && projections[0].1.dtype == DType::BF16
         {

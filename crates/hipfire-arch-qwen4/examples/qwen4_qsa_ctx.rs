@@ -253,7 +253,7 @@ struct Probe {
     /// Per slot: pooled blocks already checked this session.
     pooled_checked: Vec<usize>,
     wmma_dense: bool,
-    /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` on the arch / state format it serves
+    /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` on the arch / state format it serves
     /// (gfx1151 F32, gfx1201 fp8): prefill chunks past the dense route run
     /// the gathered F16 WMMA kernel instead of hg4 (a route label only).
     wmma_gather: bool,
@@ -706,7 +706,8 @@ fn main() -> Result<()> {
                 let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format)
                     .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, n_ctx))
                     .flatten().map(|bytes| bytes as u64);
-                let reserve = residency::auto_vram_reserve(&receipt.config, n_ctx, qsa_format, None, gather).map_err(err)?;
+                let reserve = residency::auto_vram_reserve(&receipt.config, n_ctx,
+                    hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx), qsa_format, None, gather).map_err(err)?;
                 if (free as u64) < non_expert.saturating_add(reserve) {
                     return Err("not enough free VRAM for non-expert weights plus auto reserve".into());
                 }
@@ -773,12 +774,7 @@ fn main() -> Result<()> {
         validation_cursor: None,
         wmma_dense: gpu.arch_caps.has_wmma_w32()
             && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
-        wmma_gather: std::env::var("HIPFIRE_QWEN4_QSA_WMMA_GATHER").is_ok_and(|v| v == "1")
-            && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
-            && match qsa_format {
-                QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
-                QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
-            },
+        wmma_gather: rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format),
     }));
     let mut out = std::fs::File::create(out_path).map_err(err)?;
     let run_start = Instant::now();

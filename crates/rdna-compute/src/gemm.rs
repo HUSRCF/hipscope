@@ -37946,7 +37946,7 @@ impl Gpu {
         };
         let (func_name, rows_per_block, block, batch_tile) =
             if xlds && overwrite && self.arch.as_str() == "gfx1151" {
-                let tile = match self.flags.qwen4_mq6_x4_tile {
+                let tile = match self.qwen4_mq6_x4_tile() {
                     Some([0, 0, 0]) => mq6_x4_halo_policy(m, k, batch_size),
                     explicit => explicit,
                 };
@@ -40527,13 +40527,37 @@ impl Gpu {
         self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
+    /// U2: the gfx1201 MQ6 X-LDS overwrite route.  Explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_GFX1201` wins; unset, on inside the Qwen4 forward.
+    pub fn qwen4_mq6_x4_gfx1201(&self) -> bool {
+        self.flags.qwen4_mq6_x4_gfx1201.unwrap_or(self.qwen4_scope)
+    }
+
+    /// U3: the gfx1151 MQ6 X-LDS tile (`[0, 0, 0]` = measured table, `None` =
+    /// incumbent).  Explicit `HIPFIRE_QWEN4_MQ6_X4_TILE` wins; unset, the
+    /// table inside the Qwen4 forward on gfx1151.
+    pub fn qwen4_mq6_x4_tile(&self) -> Option<[u8; 3]> {
+        self.flags
+            .qwen4_mq6_x4_tile
+            .unwrap_or((self.qwen4_scope && self.arch.as_str() == "gfx1151").then_some([0, 0, 0]))
+    }
+
+    /// U3: the MQ6 a/b/z row-region fold.  Explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_REGIONS` wins; unset, on inside the Qwen4 forward
+    /// on gfx1151.
+    pub fn qwen4_mq6_x4_regions(&self) -> bool {
+        self.flags
+            .qwen4_mq6_x4_regions
+            .unwrap_or(self.qwen4_scope && self.arch.as_str() == "gfx1151")
+    }
+
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
     /// overwrite route with no recorder or capture active.
     pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
         (self.arch_caps.has_wmma_w32()
             || (self.arch_caps.has_wmma_w32_gfx12()
                 && self.arch.as_str() == "gfx1201"
-                && self.flags.qwen4_mq6_x4_gfx1201))
+                && self.qwen4_mq6_x4_gfx1201()))
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
@@ -40573,7 +40597,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if !self.flags.qwen4_mq6_x4_regions
+        if !self.qwen4_mq6_x4_regions()
             || !matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
             || !self.gemm_mq6g256v2_xf16_applies(k, batch_size)
             || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
@@ -46321,9 +46345,9 @@ mod tests {
             }
         };
         if gpu.arch.as_str() == "gfx1201" {
-            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = false;
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = Some(false);
             assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
-            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = true;
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = Some(true);
             gpu.graphs.capture_mode = true;
             assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
             gpu.graphs.capture_mode = false;

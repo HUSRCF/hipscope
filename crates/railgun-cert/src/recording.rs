@@ -1024,7 +1024,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-f16-wmma-prefill",
         predicates: &[IsRecording, CaptureMode],
-        condition: "QWEN4_F16_WMMA routes at rows >= QWEN4_F16_WMMA_MIN_TOKENS and `!is_recording() && !capture_mode`: qwen4_f16_wmma_applies, qwen4_bf16_streams (gemm.rs:27873-27902), gated_delta_chunk_route (tensor_ops.rs:559), qsa_dense_wmma_applies (tensor_ops.rs:3685), qsa_gathered_wmma_applies (tensor_ops.rs:3858, opt-in HIPFIRE_QWEN4_QSA_WMMA_GATHER)",
+        condition: "QWEN4_F16_WMMA routes at rows >= QWEN4_F16_WMMA_MIN_TOKENS and `!is_recording() && !capture_mode`: qwen4_f16_wmma_applies, qwen4_bf16_streams (gemm.rs:27873-27902), gated_delta_chunk_route (tensor_ops.rs:559), qsa_dense_wmma_applies (tensor_ops.rs:3685), qsa_gathered_wmma_applies (tensor_ops.rs:3858, on unless HIPFIRE_QWEN4_QSA_WMMA_GATHER=0)",
         effect: KernelSelection,
         switches: "eager: F16 WMMA BF16 GEMM / chunked GDN / dense or gathered QSA WMMA; recorded: incumbent qwen4 kernels",
         kernels: &[],

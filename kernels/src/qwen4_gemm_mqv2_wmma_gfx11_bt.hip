@@ -946,7 +946,7 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
     resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N);
 }
 
-// U3 research entries: no production default changes before the Halo G0 gate.
+// U3 tiles: the gfx1151 default table (HIPFIRE_QWEN4_MQ6_X4_TILE) picks among these.
 #define U3_TILE(BV, RW, PF) \
 extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
 gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF( \

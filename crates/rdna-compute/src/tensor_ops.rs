@@ -33,14 +33,15 @@ const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
 const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
-/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes QSA prefill attention chunks
-/// (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window dense route does
-/// not take through the gathered F16 WMMA kernels: gfx1151 on the F32 state,
-/// gfx1201 on the fp8 state.  Not bit-exact against the hg4 kernel and no
-/// Flash-Next KLD reference exists yet, so it is off by default; unset or `0`
-/// keeps every launch of the incumbent route.  Read once.
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
+/// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
+/// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
+/// the F32 state, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// kernel; admitted because its error against an f64 reference is no worse
+/// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
+/// route.  Read once.
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
@@ -4160,8 +4161,8 @@ fn qsa_dense_wmma(
 const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 * 2 * 8 * 16 * 4;
 
 /// Whether this process runs QSA prefill attention in `format` on the
-/// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` set (read first,
-/// so with it unset nothing else is consulted), the Qwen4 F16 route not opted
+/// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` (read
+/// first, so with it `0` nothing else is consulted), the Qwen4 F16 route not opted
 /// out, and an arch with a kernel for the state format (gfx1151: F32,
 /// gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
 pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
@@ -4209,8 +4210,8 @@ pub fn reserve_qsa_gathered_wmma_scratch(
 /// route): the route is enabled for the state format
 /// ([`qsa_gathered_wmma_enabled`]), >= QWEN4_F16_WMMA_MIN_TOKENS rows, no
 /// recorder or capture, head_dim 256 with at most 16 query heads per KV head,
-/// and a token list that fits the LDS budget.  With the flag unset every
-/// launch is the incumbent's.
+/// and a token list that fits the LDS budget.  With
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
 fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
     qsa_gathered_wmma_enabled(gpu, p.format)
         && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
