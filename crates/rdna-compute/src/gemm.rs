@@ -44599,12 +44599,18 @@ const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 const QWEN4_MOE_SYM_CHECK_GFX1201_MODULE: &str = "qwen4_moe_sym_check_gfx1201";
 const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = ["qwen4_moe_iu4_sym_pm_gfx1151", "qwen4_moe_iu4_sym_pm_gfx1201"];
-/// Expert-run NT4 entries (block 128, four 16-slot tiles per weight stream);
-/// the module's 16-slot entries stay as their byte anchor. gfx1201 NT8 for
-/// host-mapped experts is in the module but not yet selected here.
-const QWEN4_MOE_SYM_PM_GATE_UP: [&str; 2] =
-    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"];
-const QWEN4_MOE_SYM_PM_DOWN: [&str; 2] = ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4"];
+/// Expert-run entries `[arch][host_mapped]` (block 128, several 16-slot tiles
+/// per weight stream): NT4 on VRAM-resident experts; on gfx1201 NT8 when the
+/// layer's experts are host-mapped (twice the reuse per PCIe weight stream).
+/// Every entry is bitwise the module's 16-slot entries, the ORACLE's anchor.
+const QWEN4_MOE_SYM_PM_GATE_UP: [[&str; 2]; 2] = [
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4"],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8"],
+];
+const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4"],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"],
+];
 /// Builder GEMMs divide `slot / x_row_div` through an f32 reciprocal that is
 /// exact (after two integer corrections) only for slots below 2^22.
 const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
@@ -44657,15 +44663,26 @@ impl Gpu {
     }
 
     /// `[gate/up, down]` entry names the route's GEMM launchers run on this
-    /// device: the builder entries, or the gfx1151 hipcc entries under
+    /// device for experts in VRAM or (`host_mapped`) in host-mapped memory:
+    /// the builder entries, or the gfx1151 hipcc entries under
     /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. `None` off gfx1151/gfx1201.
-    pub fn qwen4_moe_sym_gemm_symbols(&self) -> Option<[&'static str; 2]> {
+    pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
         let arch = self.qwen4_moe_sym_arch_index()?;
+        let h = host_mapped as usize;
         Some(if arch == 1 || *QWEN4_MOE_SYM_PM {
-            [QWEN4_MOE_SYM_PM_GATE_UP[arch], QWEN4_MOE_SYM_PM_DOWN[arch]]
+            [QWEN4_MOE_SYM_PM_GATE_UP[arch][h], QWEN4_MOE_SYM_PM_DOWN[arch][h]]
         } else {
             [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
         })
+    }
+
+    /// Loads entry `func` of this arch's embedded builder module (the route's
+    /// GEMMs and their 16-slot anchors), for launch by name.
+    pub fn ensure_qwen4_moe_sym_pm_entry(&mut self, func: &str) -> HipResult<()> {
+        let arch = self.qwen4_moe_sym_arch(func)?;
+        let image = if arch == 0 { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 } else { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 };
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(QWEN4_MOE_SYM_PM_MODULE[arch], image, func)
     }
 
     /// True when every K128 header of `experts` experts behind `ptrs`
@@ -45062,7 +45079,8 @@ impl Gpu {
     /// Grouped IU4 gate/up with the SwiGLU epilogue: `y` `[grouped_rows,
     /// m/2]` BF16 bits of rt(silu(rt(g)) * rt(u)), padding rows +0, sentinel
     /// tiles untouched. `xq` is the [`Gpu::qwen4_moe_rotate256_i4`] handle of
-    /// `x_src_rows` tokens; `x_row_div` = top-k.
+    /// `x_src_rows` tokens; `x_row_div` = top-k. `host_mapped`: the experts
+    /// behind `ptrs` live in host-mapped memory (selects the entry width).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_gate_up_silu_iu4_sym(
         &mut self,
@@ -45076,6 +45094,7 @@ impl Gpu {
         x_row_div: usize,
         grouped_rows: usize,
         x_src_rows: usize,
+        host_mapped: bool,
     ) -> HipResult<()> {
         if m == 0 || m % 64 != 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
@@ -45086,7 +45105,7 @@ impl Gpu {
         let (generation, live) = self.scratch.int4_mmq_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
-            false,
+            [false, host_mapped],
             [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
             128,
             [ptrs, tiles, sorted, y],
@@ -45098,7 +45117,7 @@ impl Gpu {
     /// Grouped IU4 down: `y` `[grouped_rows, m]` BF16 per grouped row (no
     /// residual, no combine), padding rows +0, sentinel tiles untouched.
     /// `xq` is the [`Gpu::qwen4_moe_rotate128_i4`] handle of `x_src_rows`
-    /// flat slots; `x_row_div` = 1.
+    /// flat slots; `x_row_div` = 1. `host_mapped` as for gate/up.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_down_iu4_sym(
         &mut self,
@@ -45112,6 +45131,7 @@ impl Gpu {
         x_row_div: usize,
         grouped_rows: usize,
         x_src_rows: usize,
+        host_mapped: bool,
     ) -> HipResult<()> {
         if m == 0 || m % 64 != 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
@@ -45122,7 +45142,7 @@ impl Gpu {
         let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
-            true,
+            [true, host_mapped],
             [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
             128,
             [ptrs, tiles, sorted, y],
@@ -45136,7 +45156,7 @@ impl Gpu {
     /// the byte-identical hipcc entry.
     fn qwen4_moe_sym_gemm(
         &mut self,
-        down: bool,
+        [down, host_mapped]: [bool; 2],
         grid: [u32; 3],
         block: u32,
         [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
@@ -45146,7 +45166,10 @@ impl Gpu {
         let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
         let arch = self.qwen4_moe_sym_arch(what)?;
         let pm = arch == 1 || *QWEN4_MOE_SYM_PM;
-        let func = self.qwen4_moe_sym_gemm_symbols().map(|[gate_up, dn]| if down { dn } else { gate_up }).unwrap_or(what);
+        let func = self
+            .qwen4_moe_sym_gemm_symbols(host_mapped)
+            .map(|[gate_up, dn]| if down { dn } else { gate_up })
+            .unwrap_or(what);
         let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
             dims.map(|value| i32::try_from(value).ok())
         else {

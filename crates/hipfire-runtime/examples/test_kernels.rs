@@ -468,7 +468,7 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
     let tt = gpu.upload_raw(&tiles, &[2]).map_err(err)?;
     let y = gpu.upload_raw(&vec![0x5Au8; ROWS * M * 2], &[ROWS * M * 2]).map_err(err)?;
     let xq = gpu.qwen4_moe_rotate128_i4(&ht, &st, K, ROWS, LIVE).map_err(err)?;
-    gpu.gemm_qwen4_moe_down_iu4_sym(&ptrs, &tt, &st, &xq, &y, M, K, 1, ROWS, LIVE)
+    gpu.gemm_qwen4_moe_down_iu4_sym(&ptrs, &tt, &st, &xq, &y, M, K, 1, ROWS, LIVE, false)
         .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
     let side = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no sidecar")?;

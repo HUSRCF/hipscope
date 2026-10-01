@@ -415,6 +415,13 @@ fn gateup_silu(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     gateup_bf16(gpu, p) && down_wmma(gpu, p) && p.mi % 128 == 0
 }
 
+/// Whether this layer's routed experts live in host-mapped memory (spilled
+/// past the VRAM budget); the symmetric IU4 GEMMs then take a wider expert-run
+/// tile. A layer's experts share one residency, so expert 0 decides.
+fn experts_host_mapped(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    p.routed_experts.get(0).is_some_and(|(gate_up, _)| gpu.host_located(gate_up.buf))
+}
+
 pub(crate) fn gate_up(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -435,6 +442,7 @@ pub(crate) fn gate_up(
             p.k_top,
             grouped_rows,
             p.batch_size,
+            experts_host_mapped(gpu, p),
         ));
     }
     if use_path2 && gateup_bf16(gpu, p) {
@@ -660,6 +668,7 @@ pub(crate) fn down(
             1,
             grouped_rows,
             total_slots,
+            experts_host_mapped(gpu, p),
         ));
     }
     if indexed_down(gpu, p, use_path2) {
