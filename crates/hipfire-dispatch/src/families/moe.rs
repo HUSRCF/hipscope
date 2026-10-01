@@ -720,6 +720,13 @@ pub trait RoutedExpertWeights {
     fn immutable_identity(&self) -> Option<u64> {
         None
     }
+
+    /// Whether the routed experts live in host-mapped memory. Expert views are
+    /// borrowed byte views, so the owner's placement must be carried here; a
+    /// layer's experts share one residency. `false` by default.
+    fn host_mapped(&self) -> bool {
+        false
+    }
 }
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from
