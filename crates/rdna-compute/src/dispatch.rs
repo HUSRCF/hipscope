@@ -198,6 +198,80 @@ impl ReplayLaunchBindings<'static> {
     };
 }
 
+/// A by-value kernel argument. Its kernarg-blob encoding is its native bytes at
+/// natural alignment, which is the layout HIP builds from a `void**` params
+/// array for the same kernel signature.
+pub(crate) trait KernargValue: Copy {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob);
+}
+
+impl KernargValue for *mut c_void {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob) {
+        blob.push_ptr(self);
+    }
+}
+impl KernargValue for *const c_void {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob) {
+        blob.push_ptr(self);
+    }
+}
+impl KernargValue for i32 {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob) {
+        blob.push_i32(self);
+    }
+}
+impl KernargValue for u32 {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob) {
+        blob.push_u32(self);
+    }
+}
+impl KernargValue for f32 {
+    fn push_to(self, blob: &mut hip_bridge::KernargBlob) {
+        blob.push_f32(self);
+    }
+}
+
+/// Native bytes of a kernel argument value (debug kernarg cross-check).
+#[cfg(debug_assertions)]
+pub(crate) fn kernarg_value_bytes<T: KernargValue>(v: &T) -> &[u8] {
+    // SAFETY: `T` is one of the plain-old-data impls above; reading its
+    // `size_of::<T>()` bytes through a shared reference is sound.
+    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+}
+
+/// Debug cross-check for [`launch_params_blob!`]: the `void**` params array and
+/// the blob argument list name the same values in the same order, so HIP's
+/// params-built kernargs and the captured blob are byte-identical.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_params_match(params: &[*mut c_void], values: &[&[u8]]) {
+    assert_eq!(params.len(), values.len(), "kernarg count: params vs blob values");
+    for (i, (p, v)) in params.iter().zip(values).enumerate() {
+        // SAFETY: each params entry points at a live local at least as large
+        // as the matching blob value (both lists name the same locals).
+        let got = unsafe { std::slice::from_raw_parts(*p as *const u8, v.len()) };
+        assert_eq!(got, *v, "kernarg {i}: params bytes differ from blob value");
+    }
+}
+
+/// Launch through [`Gpu::launch_maybe_blob`] with the blob built from the same
+/// locals the `params` array points at, listed in params order. Debug builds
+/// assert both lists agree byte for byte at every launch.
+macro_rules! launch_params_blob {
+    ($gpu:expr, $name:expr, $grid:expr, $block:expr, $smem:expr, $params:ident; $($v:ident),+ $(,)?) => {{
+        #[cfg(debug_assertions)]
+        $crate::dispatch::debug_assert_params_match(
+            &$params,
+            &[$($crate::dispatch::kernarg_value_bytes(&$v)),+],
+        );
+        $gpu.launch_maybe_blob($name, $grid, $block, $smem, &mut $params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            $($crate::dispatch::KernargValue::push_to($v, &mut b);)+
+            b
+        })
+    }};
+}
+pub(crate) use launch_params_blob;
+
 /// Resolve the compiled artifact that owns a launched symbol.
 ///
 /// `KernelCompiler::compiled_kernels()` is keyed by module name while the
@@ -1732,7 +1806,6 @@ impl Gpu {
         self.bind_thread()?;
         assert_eq!(k % 128, 0, "{name}: K must be a multiple of 128 (got {k})");
         self.ensure_kernel(name, src, name)?;
-        let func = &self.functions[name];
         let mut w_in = w_packed.as_ptr();
         let mut w_out = w_fp16.as_ptr();
         let mut mi = m as i32;
@@ -1744,16 +1817,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
         ];
         let groups = (k / 128) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, groups, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            name,
+            [m as u32, groups, 1],
+            [32, 1, 1],
+            0,
+            params; w_in, w_out, mi, ki
+        )
     }
 
     /// Dequantize an HFQ4-G256 weight [M × K] into an FP16 buffer [M × K]
@@ -1781,7 +1852,6 @@ impl Gpu {
             kernels::HFQ4G256_DEQUANTIZE_TO_F16_SRC,
             "hfq4g256_dequantize_to_f16",
         )?;
-        let func = &self.functions["hfq4g256_dequantize_to_f16"];
         let mut w_in = w_mq4.as_ptr();
         let mut w_out = w_fp16.as_ptr();
         let mut mi = m as i32;
@@ -1793,16 +1863,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
         ];
         let groups = (k / 256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, groups, 1],
-                [128, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "hfq4g256_dequantize_to_f16",
+            [m as u32, groups, 1],
+            [128, 1, 1],
+            0,
+            params; w_in, w_out, mi, ki
+        )
     }
 
     /// Dequantize MFP4G32-Lloyd matrix [M x K] to FP16 [M x K] row-major.
@@ -1826,7 +1894,6 @@ impl Gpu {
             kernels::DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC,
             "dequantize_mfp4g32_lloyd_to_f16",
         )?;
-        let func = &self.functions["dequantize_mfp4g32_lloyd_to_f16"];
         let mut w_in = w_mq4.as_ptr();
         let mut w_out = w_fp16.as_ptr();
         let mut mi = m as i32;
@@ -1838,16 +1905,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
         ];
         let groups = (k / 256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, groups, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "dequantize_mfp4g32_lloyd_to_f16",
+            [m as u32, groups, 1],
+            [32, 1, 1],
+            0,
+            params; w_in, w_out, mi, ki
+        )
     }
 
     /// Dequantize an mfp4+P matrix [M x K] to FP16 [M x K] row-major.
@@ -1871,7 +1936,6 @@ impl Gpu {
             kernels::DEQUANTIZE_MFP4G32_P_TO_F16_SRC,
             "dequantize_mfp4g32_p_to_f16",
         )?;
-        let func = &self.functions["dequantize_mfp4g32_p_to_f16"];
         let mut w_in = w_mq4.as_ptr();
         let mut w_out = w_fp16.as_ptr();
         let mut mi = m as i32;
@@ -1883,16 +1947,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
         ];
         let groups = (k / 256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, groups, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "dequantize_mfp4g32_p_to_f16",
+            [m as u32, groups, 1],
+            [32, 1, 1],
+            0,
+            params; w_in, w_out, mi, ki
+        )
     }
 
     /// Dequantize an mfp4-E8 matrix [M x K] to FP16 [M x K] row-major.
@@ -1917,7 +1979,6 @@ impl Gpu {
             kernels::DEQUANTIZE_MFP4G32_E8_TO_F16_SRC,
             "dequantize_mfp4g32_e8_to_f16",
         )?;
-        let func = &self.functions["dequantize_mfp4g32_e8_to_f16"];
         let mut w_in = w_mq4.as_ptr();
         let mut w_out = w_fp16.as_ptr();
         let mut mi = m as i32;
@@ -1929,16 +1990,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
         ];
         let groups = (k / 256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, groups, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "dequantize_mfp4g32_e8_to_f16",
+            [m as u32, groups, 1],
+            [32, 1, 1],
+            0,
+            params; w_in, w_out, mi, ki
+        )
     }
 
     /// Expand qt=35 MFP4G32E8SOA rows into row-major FP16 on gfx942.
@@ -6317,6 +6376,38 @@ mod tests {
         assert_eq!(DType::Raw.row_bytes(8), None);
     }
 
+    #[test]
+    fn kernarg_values_encode_natural_alignment_layout() {
+        let mut b = hip_bridge::KernargBlob::new();
+        let p = 0x1122_3344_5566_7788usize as *mut c_void;
+        super::KernargValue::push_to(p, &mut b);
+        super::KernargValue::push_to(7i32, &mut b);
+        super::KernargValue::push_to(p, &mut b);
+        super::KernargValue::push_to(1.5f32, &mut b);
+        let mut want = Vec::new();
+        want.extend_from_slice(&(p as usize).to_ne_bytes());
+        want.extend_from_slice(&7i32.to_ne_bytes());
+        want.extend_from_slice(&[0; 4]);
+        want.extend_from_slice(&(p as usize).to_ne_bytes());
+        want.extend_from_slice(&1.5f32.to_ne_bytes());
+        assert_eq!(b.as_bytes(), &want[..]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "kernarg 0")]
+    fn kernarg_cross_check_rejects_params_order_mismatch() {
+        let mut m = 3i32;
+        let mut k = 4i32;
+        let params: Vec<*mut c_void> =
+            vec![&mut k as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void];
+        super::debug_assert_params_match(
+            &params,
+            &[super::kernarg_value_bytes(&m), super::kernarg_value_bytes(&k)],
+        );
+    }
+
+    use std::ffi::c_void;
     use super::gen_fwht_signs;
     use super::DType;
     use super::Gpu;
