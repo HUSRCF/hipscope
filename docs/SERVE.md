@@ -96,7 +96,8 @@ Config and env owners for bind, idle, queue, and body limits:
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
    is deterministic for a fixed batch composition. 2 slots matched serial in
-   testing. A waiter that is still queued after `serve.queue_timeout_ms`
+   earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
+   1–4 of 4 prompts. A waiter that is still queued after `serve.queue_timeout_ms`
    (default 10 minutes, long enough for one full generation; `0` waits
    forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,

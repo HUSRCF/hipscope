@@ -60,9 +60,14 @@
 // reference's own `prefill_moe_ffn_body_batched` directly over the flat N-row
 // batch, gated by the reference's own `moe_ffn_batched_admissible` (uniform
 // MQ4G256V2 / MQ6G256V2 shared+routed paths ride that shared gate — no
-// duplicate MoE dispatch in this file). PARO/Lloyd/E8/mixed-dtype MoE
-// attention outside the shared gate, and mixed-dtype-within-layer attention
-// projections, remain out of scope here (see
+// duplicate MoE dispatch in this file). Legacy v1 MQ6G256 (qt=15) MoE
+// attention is admitted too: AWQ A3B checkpoints (`ornith-1.5:35b-a3b`,
+// `qwen3.6-35b-a3b.mq4-awq-mi300x`) ship 4/40 layers — 0, 1, 38, 39 — with
+// uniformly MQ6G256 attention. It shares HFQ6G256's 200 B/group container, so
+// the container selectors route it to the `*Hfq6G256` keys after the same
+// FWHT rotate, exactly the reference's `is_6bit` arms. PARO/Lloyd/E8/mixed-dtype
+// MoE attention outside the shared gate, and mixed-dtype-within-layer
+// attention projections, remain out of scope here (see
 // `require_batchable_deltanet_moe_layer` / `require_batchable_fullattn_moe_layer`
 // / `require_batchable_moe_ffn`) — each returns a clear `HipError` rather than
 // guessing at an untested path.
@@ -508,14 +513,15 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     }
 }
 
-/// Q8_0-or-MQ4G256 weight-dtype gate for a `DeltaNetMoeLayerWeights`,
+/// Q8_0-or-rotated-MQ weight-dtype gate for a `DeltaNetMoeLayerWeights`,
 /// uniform across all five attention projections (wqkv/wz/w_beta/w_alpha/wo)
 /// — a mixed Q8/MQ4 layer would misroute through a single-stride fused
 /// kernel against differently-strided weights, the same corruption class
-/// `require_q8_deltanet_layer` guards against for the dense path. MQ4G256
-/// requires the caller to additionally rotate activations via
-/// `fused_rmsnorm_rotate_mq_batched_for`/`rotate_x_mq_batched_for` before
-/// each GEMM — see `run_deltanet_moe_layer_slots`.
+/// `require_q8_deltanet_layer` guards against for the dense path. The MQ
+/// family (incl. legacy MQ6G256) requires the caller to additionally rotate
+/// activations via `fused_rmsnorm_rotate_mq_batched_for`/`rotate_x_mq_batched_for`
+/// before each GEMM, with keys picked by container (`fused_qkvza_key_for`,
+/// `residual_gemm_key_for`) — see `run_deltanet_moe_layer_slots`.
 fn require_batchable_deltanet_moe_layer(
     layer: &DeltaNetMoeLayerWeights,
 ) -> HipResult<AttnProjDtype> {
@@ -535,6 +541,7 @@ fn require_batchable_deltanet_moe_layer(
             DType::MQ4G256
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
+                | DType::MQ6G256
                 | DType::MQ6G256V2
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
@@ -552,9 +559,11 @@ fn require_batchable_deltanet_moe_layer(
     Err(HipError::new(
         0,
         "forward_batch_slots: DeltaNetMoe layer attention weights must be \
-         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
-         is_q8/is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and mixed-dtype \
-         MoE attention are out of scope for the multi-slot batched path",
+         uniformly Q8_0 or uniformly one rotated MQ container (MQ4G256 / \
+         MQ4G256V2 / MQ4CG256 / MQ6G256 / MQ6G256V2 / MQ5G256V2 / MQ3G256V2 / \
+         MQ2G256V2), mirroring forward_prefill_chunk's is_q8/is_mq dispatch; \
+         HFQ6G256, ParoQ4G128, Lloyd, and mixed-dtype MoE attention are out of \
+         scope for the multi-slot batched path",
     ))
 }
 
@@ -576,6 +585,7 @@ fn require_batchable_fullattn_moe_layer(
             DType::MQ4G256
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
+                | DType::MQ6G256
                 | DType::MQ6G256V2
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
@@ -592,8 +602,9 @@ fn require_batchable_fullattn_moe_layer(
     Err(HipError::new(
         0,
         "forward_batch_slots: FullAttnMoe layer attention weights must be \
-         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
-         qkv_is_q8/qkv_is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and \
+         uniformly Q8_0 or uniformly one rotated MQ container (see \
+         require_batchable_deltanet_moe_layer), mirroring forward_prefill_chunk's \
+         qkv_is_q8/qkv_is_mq dispatch; HFQ6G256, ParoQ4G128, Lloyd, and \
          mixed-dtype MoE attention are out of scope for the multi-slot \
          batched path",
     ))
@@ -634,10 +645,11 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     }
 }
 
-/// FWHT-rotated MQ4G256 residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])`.
-/// Mirrors the reference's default (non-Q8/non-6bit/non-PARO) wo / w_down
-/// dispatch fork for `DeltaNetMoe`/`FullAttnMoe` layers — `GemmHfq4G256Residual`
-/// against a `rotate_x_mq_batched_for`-rotated input. `scratch` is the
+/// FWHT-rotated MQ residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])`.
+/// Mirrors the reference's wo / w_down dispatch forks for rotated MQ
+/// containers (`GemmHfq4G256Residual`, the V2 keys, and `GemmHfq6G256Residual`
+/// for legacy MQ6G256 — all via `residual_gemm_key_for`) against a
+/// `rotate_x_mq_batched_for`-rotated input. `scratch` is the
 /// caller's dead buffer to rotate into (mirrors `pbs.dn_normed_rot_batch` /
 /// `pbs.fa_attn_out_rot_batch` reuse in the dense Q8 path's `q8_residual_proj`).
 fn mq4_residual_proj(
