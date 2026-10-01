@@ -28023,6 +28023,110 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Whether [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd`] applies to a
+    /// `[m × k]` BF16 weight at `batch_size` rows (H4 shared-down fold,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 3`): exact gfx1151 on the Qwen4 F16 WMMA
+    /// route, `m % 8 == 0`.
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(
+        &self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> bool {
+        self.arch_caps.is_gfx1151()
+            && m % 8 == 0
+            && self.qwen4_f16_wmma_applies(weight, k, batch_size)
+    }
+
+    /// The shared-expert down projection, its BF16 scaled add into `routed` and
+    /// the paired HC write in one GEMM: [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4`]
+    /// of `x` (F32, `[batch_size, k]`) followed by
+    /// `bf16_scaled_add_batched(routed, ·, selector)` and
+    /// `hyper_write(hc_streams, mixed = routed, hc_gates)`, bitwise.  `routed`
+    /// (`[batch_size, m]`) is rewritten with the scaled-add result only when
+    /// `hc_write_routed`; `hc_streams` is `[batch_size, 4 * m]` (BF16 bits when
+    /// `hc_bf16`), `hc_gates` `[batch_size, 4]` from the paired HC read.
+    /// Gate with [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        routed: &GpuTensor,
+        selector: &GpuTensor,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+        hc_write_routed: bool,
+    ) -> HipResult<()> {
+        if !self.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(weight, m, k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_bf16_xf32_f16_wmma_qwen4_hcsd: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+        const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_hcsd";
+        let (module, source) = self.lds256_tile_module(ENTRY);
+        self.ensure_kernel(module, source, ENTRY)?;
+        let mut ap = w16;
+        let mut xp = x16;
+        let mut yp: *mut c_void = std::ptr::null_mut();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut rp = routed.buf.as_ptr();
+        let mut sp = selector.buf.as_ptr();
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut routed_val = hc_write_routed as i32;
+        let mut lai = k as i32;
+        let mut lxi = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+            &mut routed_val as *mut _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        // 128 x 256 block tile, 32 x 64 wave tiles: (128/32) * (256/64) waves.
+        let grid = [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1];
+        self.launch_maybe_blob(ENTRY, grid, [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_ptr(rp);
+            b.push_ptr(sp);
+            b.push_ptr(streams_ptr);
+            b.push_ptr(gates_ptr);
+            b.push_i32(bf16_val);
+            b.push_i32(routed_val);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
     /// `Y[b, m] = Σ_k A[m, k]·X[b, k]` (A `[M, K]`, X `[B, K]` F16, Y `[B, M]`
     /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
     /// `tile.split > 1` the K-split partials go to the shared deterministic

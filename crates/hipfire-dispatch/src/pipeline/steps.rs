@@ -792,6 +792,7 @@ pub fn execute_validated_steps<'a>(
         gpu.flags.qwen4_hc_fuse_level()
     };
     let hc_fuse = hc_level >= 1;
+    let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < steps.len() {
         if hc_fuse {
             use crate::pipeline::layer_ops::{
@@ -847,6 +848,31 @@ pub fn execute_validated_steps<'a>(
                     }
                 }
                 _ => {}
+            }
+        }
+        // A sealed MoE call after its target's zero fill.  H8a
+        // (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the call's qt44 combine takes
+        // over the fill when it can start from +0.0, else the fill runs first
+        // inside the call.  H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): when the
+        // hyper write that closes the block already has its gates, the shared
+        // down may carry it; a write so carried is skipped.
+        if moe_zinit || hc_level >= 3 {
+            if let (Step::Clear(clear), Some(Step::Moe(call))) = (&steps[i], steps.get(i + 1)) {
+                let write = match steps.get(i + 2) {
+                    Some(Step::HyperWrite(write)) if hc_level >= 3 && pregated == Some(i + 2) => {
+                        Some(write)
+                    }
+                    _ => None,
+                };
+                gpu.scratch.prerotated = None;
+                let folded = crate::pipeline::sealed_moe::execute_sealed_after_clear(
+                    gpu, call, clear, write,
+                )?;
+                if folded {
+                    pregated = None;
+                }
+                i += 2 + usize::from(folded);
+                continue;
             }
         }
         // Fusion is bypassed for a window that contains a CPU-executed step: a

@@ -7997,4 +7997,139 @@ mod tests {
             gpu.free_tensor(tensor).expect("free");
         }
     }
+
+    /// H4 shared-down fold: the BF16 shared-down GEMM that applies the scaled
+    /// add and the paired HC write in its epilogue must leave the HC streams
+    /// (and, when asked, the routed rows) bytewise as the F16 WMMA GEMM,
+    /// `bf16_scaled_add_batched` and `hyper_write` do, F32 and BF16-bit
+    /// streams, ragged row counts.
+    #[test]
+    fn shared_down_hcsd_is_bytewise_the_gemm_scaled_add_hyper_write_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let mut weight = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, m * k, 0.3)), &[m * k * 2])
+            .expect("weight");
+        weight.dtype = DType::BF16;
+        weight.shape = vec![m * k];
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for rows in [512usize, 530, 1100] {
+            assert!(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(&weight, m, k, rows));
+            let x = gpu
+                .upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k])
+                .expect("x");
+            let selector = gpu
+                .upload_f32(&test_wave(3, rows, 1.0), &[rows])
+                .expect("selector");
+            let gates = gpu
+                .upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4])
+                .expect("gates");
+            let routed_values = test_wave(5, rows * m, 3.0);
+            let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+            for state_bf16 in [false, true] {
+                let initial = test_wave(6, rows * wide, 3.0);
+                let raw: Vec<u8> = if state_bf16 {
+                    let mut raw = bf16_le_bytes(&initial);
+                    raw.resize(rows * wide * 4, 0);
+                    raw
+                } else {
+                    initial.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                let mut streams = |gpu: &mut Gpu| {
+                    let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                    t.dtype = DType::F32;
+                    t.shape = vec![rows * wide];
+                    t
+                };
+                let reference_streams = streams(&mut gpu);
+                let reference_routed = gpu
+                    .upload_f32(&routed_values, &[rows * m])
+                    .expect("routed");
+                let projected = gpu.zeros(&[rows * m], DType::F32).expect("projected");
+                assert!(gpu
+                    .gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &projected, m)], &x, k, rows)
+                    .expect("gemm"));
+                bf16_scaled_add_batched(
+                    &mut gpu,
+                    &Bf16ScaledAddBatched {
+                        residual: &reference_routed,
+                        value: &projected,
+                        scalar: &selector,
+                        rows,
+                        elements: m,
+                    },
+                )
+                .expect("scaled add");
+                hyper_write(
+                    &mut gpu,
+                    &HyperWrite {
+                        input: &reference_streams,
+                        normalized: &normalized,
+                        mixed: &reference_routed,
+                        gates: &gates,
+                        output: &reference_streams,
+                        branches: 4,
+                        hidden: m,
+                        state_bf16,
+                    },
+                )
+                .expect("write");
+                for write_routed in [false, true] {
+                    let fused_streams = streams(&mut gpu);
+                    let fused_routed = gpu
+                        .upload_f32(&routed_values, &[rows * m])
+                        .expect("routed");
+                    gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                        &weight,
+                        &x,
+                        m,
+                        k,
+                        rows,
+                        &fused_routed,
+                        &selector,
+                        &fused_streams,
+                        &gates,
+                        state_bf16,
+                        write_routed,
+                    )
+                    .expect("hcsd");
+                    let (want, got) = (bits(&gpu, &reference_streams), bits(&gpu, &fused_streams));
+                    assert_ne!(want.len(), 0);
+                    let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differing, 0,
+                        "{differing} stream words differ: rows={rows} state_bf16={state_bf16} \
+                         write_routed={write_routed}"
+                    );
+                    if write_routed {
+                        assert_eq!(
+                            bits(&gpu, &reference_routed),
+                            bits(&gpu, &fused_routed),
+                            "routed rows differ: rows={rows}"
+                        );
+                    } else {
+                        assert_eq!(
+                            routed_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            bits(&gpu, &fused_routed),
+                            "routed rows were rewritten without hc_write_routed"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

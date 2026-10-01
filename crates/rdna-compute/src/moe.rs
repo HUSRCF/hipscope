@@ -1939,6 +1939,9 @@ impl Gpu {
     /// [`Gpu::moe_down_combine_grouped_top10`] reading the grouped rows as BF16 bits (written by a
     /// `*_bf16out` MoE GEMM).  The per-token rank order is resolved once into `order`
     /// (scratch of at least `tokens * 10 * 8` bytes) before the combine reads it.
+    /// With `initial_zero` the combine starts from +0.0 instead of `residual`'s
+    /// contents (bitwise the same as zero-filling `residual`'s `tokens * hidden`
+    /// elements first).
     #[allow(clippy::too_many_arguments)]
     pub fn moe_down_combine_grouped_top10_bf16in(
         &mut self,
@@ -1951,6 +1954,7 @@ impl Gpu {
         hidden: usize,
         grouped_rows: usize,
         tokens: usize,
+        initial_zero: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if hidden % 8 != 0 || order.buf.size() < tokens * 10 * 8 {
@@ -1960,10 +1964,14 @@ impl Gpu {
             ));
         }
         const MODULE: &str = "moe_down_combine_grouped_top10";
-        for func in [
-            "moe_combine_order_top10",
-            "moe_down_combine_grouped_top10_bf16in",
-        ] {
+        // H8a (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): `residual` is written, not
+        // accumulated into; the caller then owes no preceding zero fill.
+        let combine: &'static str = if initial_zero {
+            "moe_down_combine_grouped_top10_bf16in_zinit"
+        } else {
+            "moe_down_combine_grouped_top10_bf16in"
+        };
+        for func in ["moe_combine_order_top10", combine] {
             self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
         }
         let gp = grouped_down.buf.as_ptr();
@@ -2008,7 +2016,7 @@ impl Gpu {
             &tv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "moe_down_combine_grouped_top10_bf16in",
+            combine,
             [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
             [64, 1, 1],
             0,
@@ -3103,5 +3111,83 @@ mod tests {
             differing, 0,
             "fused unscatter+SwiGLU differs in {differing} cells"
         );
+    }
+
+    /// H8a: the BF16-row combine started from +0.0 (`initial_zero`) must leave
+    /// a dirty target bytewise as the zero-filled target the unchanged symbol
+    /// accumulates into, with dead (-1) and duplicate routes and ragged tokens.
+    #[test]
+    fn combine_bf16in_zero_init_is_bytewise_the_zero_filled_accumulate() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const HIDDEN: usize = 2560;
+        for tokens in [1usize, 37, 530] {
+            let grouped_rows = tokens * 10 + 16;
+            let wave = |seed: usize, n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                        (h as f32 - 4095.0) / 1365.0
+                    })
+                    .collect()
+            };
+            let grouped: Vec<u8> = wave(1, grouped_rows * HIDDEN)
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let inverse: Vec<i32> = (0..tokens * 10)
+                .map(|i| {
+                    if i % 13 == 5 {
+                        -1
+                    } else {
+                        ((i * 7919) % grouped_rows) as i32
+                    }
+                })
+                .collect();
+            let experts: Vec<i32> = (0..tokens * 10).map(|i| ((i * 37) % 64) as i32).collect();
+            let weights: Vec<f32> = wave(2, tokens * 10).iter().map(|v| v.abs() / 3.0).collect();
+            let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let grouped = gpu.upload_raw(&grouped, &[grouped.len()]).expect("grouped");
+            let inverse = gpu
+                .upload_raw(&to_bytes(&inverse), &[tokens * 40])
+                .expect("inverse");
+            let experts = gpu
+                .upload_raw(&to_bytes(&experts), &[tokens * 40])
+                .expect("experts");
+            let weights = gpu.upload_f32(&weights, &[tokens * 10]).expect("weights");
+            let order = gpu
+                .upload_raw(&vec![0u8; tokens * 10 * 8], &[tokens * 80])
+                .expect("order");
+            let zero_filled = gpu.zeros(&[tokens * HIDDEN], DType::F32).expect("zeros");
+            let dirty = gpu
+                .upload_f32(&wave(3, tokens * HIDDEN), &[tokens * HIDDEN])
+                .expect("dirty");
+            for (target, initial_zero) in [(&zero_filled, false), (&dirty, true)] {
+                gpu.moe_down_combine_grouped_top10_bf16in(
+                    &grouped,
+                    &inverse,
+                    &experts,
+                    &weights,
+                    target,
+                    &order,
+                    HIDDEN,
+                    grouped_rows,
+                    tokens,
+                    initial_zero,
+                )
+                .expect("combine");
+            }
+            let a = gpu.download_f32(&zero_filled).expect("download");
+            let b = gpu.download_f32(&dirty).expect("download");
+            assert!(a.iter().any(|v| *v != 0.0));
+            let differing = a
+                .iter()
+                .zip(&b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(differing, 0, "zero-init combine differs in {differing} cells, tokens={tokens}");
+        }
     }
 }
