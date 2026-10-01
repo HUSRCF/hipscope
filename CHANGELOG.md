@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+- **Qwen3.8-Flash-Next (Qwen4): opt-in gathered F16 WMMA QSA prefill attention (`HIPFIRE_QWEN4_QSA_WMMA_GATHER=1`, default off).** Prefill chunks of ≥ 512 rows that the full-window dense route does not take run on new modules: `indexed_attention_gathered_wmma.gfx1151.hip` (gfx1151, F32 state) and `indexed_attention_gathered_wmma.gfx1201.hip` (gfx1201, fp8 state). Without the flag, every launch is still `indexed_attention_attention_*_batched_hg4`, and every existing code object is byte-identical on gfx1100, gfx1151 and gfx1201.
+  - Each call first converts the layer's cache rows `[0, end)` to F16 K plus a block-transposed V (2 KiB per token in the shared FP16 scratch). One workgroup per (row, KV head) then walks the row's selection in 128-entry tiles.
+  - The route is not bit-exact. Sampled QSA rows vs the F32 reference: rel-L2 ≤ 2.9e-4 at 16K/64K/128K on both arches. The final-row argmax matches flag-off, and KL(off‖on) ≤ 2.3e-4.
+  - There is no Flash-Next KLD reference, so the route stays opt-in.
+  - `hipfire bench --matrix`, flag on vs off, 3 fresh processes each:
+    - Strix Halo: pp8192 996.5–1001.9 → 1186.3–1190.9 tok/s; pp65536 892.4–896.6 → 1080.6–1084.9 tok/s.
+    - R9700 (12 expert layers in VRAM): pp8192 710.5–718.2 → 769.6–783.2 tok/s; pp65536 707.2–716.1 → 774.0–790.2 tok/s.
+
 ## v0.4.0 — 2026-09-30
 - **Qwen3.8-Flash-Next (Qwen4, arch 16): `auto` KV is fp8 QSA K/V on exact gfx1201; the GDN recurrent state is Q8 by default; `max_seq` goes up to the native 262,144.** The QSA K/V arenas store E4M3 codes with one f16 scale per head and token, and the indexer's raw and pooled keys are stored as BF16, which holds the same values as the F32 arenas. `auto` keeps the exact `bf16` state (F32 arenas) on gfx1100, gfx1151 (Halo) and every other arch. An explicit `fp8` is refused off gfx1201, and every other `kv_cache` value is refused. The GatedDeltaNet state uses Qwen3.5's Q8 DeltaNet format on every arch; the `state_quant: "fp32"` load parameter opts out. Past 15,360 pooled blocks, the QSA selector keeps its score rows in global memory.
   - **Validation (gfx1201, host-mapped experts N=12, tp=1).** There is no Flash-Next KLD reference yet (the MI300X requant is 0.4.1), so fp8 was validated by parity and greedy agreement, **not by KLD**. At 2K, 8K, 16K, 32K and 64K, every sampled QSA row matches the CPU F32-FMA reference in all three arms (fp8+Q8, bf16+Q8, bf16+fp32). The final-row argmax equals bf16 at every context, KL(bf16‖fp8) ≤ 5.1e-3, and top-5 overlap is 4 or 5 out of 5. Greedy text on the three flash prompts is coherent but not byte-identical to bf16 (first divergence after 40–442 characters). The serve battery loads with `auto` and serves 5 of 5 turns with 0 runaway and 0 empty turns.
