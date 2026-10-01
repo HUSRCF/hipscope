@@ -6493,6 +6493,7 @@ mod tests {
             x_rot_batch: &s.x_rot_batch,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_stage_ptrs: None,
             routed_experts: routed,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,

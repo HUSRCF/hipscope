@@ -491,8 +491,16 @@ impl Carrier for Qwen4Carrier {
                     let gather_note = gather_bytes
                         .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                         .unwrap_or_default();
+                    let stage_note = if rdna_compute::gemm::qwen4_expert_stage_requested() {
+                        format!(
+                            ", {} MiB expert DMA stages",
+                            rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES / MIB
+                        )
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}{stage_note}), {} MiB per expert layer",
                         free as u64 / MIB,
                         non_expert / MIB,
                         reserve / MIB,

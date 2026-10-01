@@ -109,7 +109,8 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
 /// `gather_bytes` when the gathered QSA prefill attention reserves its
 /// context-sized scratch at load
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`).
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). G2's
+/// opt-in full-layer staging adds two expert layers' worth of device bytes.
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     max_seq: usize,
@@ -125,10 +126,17 @@ pub fn auto_vram_reserve(
             .ok_or_else(|| format!("QSA context state for max_seq {seq} overflows"))
     };
     let context = arena(max_seq)?.saturating_sub(arena(AUTO_VRAM_RESERVE_MAX_SEQ)?);
+    // G2: move into auto_inputs when fix/qwen4-default-placement lands.
+    let stage_bytes = if rdna_compute::gemm::qwen4_expert_stage_requested() {
+        rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES
+    } else {
+        0
+    };
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(stage_bytes))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
 
@@ -425,8 +433,17 @@ mod tests {
         let config = crate::config::compact_test_config();
         let reserve =
             auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None, None).unwrap();
-        assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES);
-        assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve), 16);
+        let staging = rdna_compute::gemm::qwen4_expert_stage_requested();
+        let stage_bytes = if staging {
+            rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES
+        } else {
+            0
+        };
+        assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES + stage_bytes);
+        assert_eq!(
+            auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve),
+            if staging { 14 } else { 16 }
+        );
         // A card that holds everything keeps every layer resident.
         assert_eq!(
             auto_vram_layers(u64::MAX / 2, 5_364_000_000, 1_336_900_000, 48, reserve),

@@ -1055,6 +1055,16 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 
 // ── Qwen3.5 softmax-top-k MoE prefill parameters (Ship 4.2) ──
 
+/// Static VRAM pointer tables for a full-layer prefill DMA stage.
+/// Live expert bindings still name the original mapped owners. The down
+/// launcher releases this parity buffer before combine/shared work begins.
+#[derive(Clone, Copy)]
+pub struct MoeStageTables<'a> {
+    pub gate_up: &'a GpuTensor,
+    pub down: &'a GpuTensor,
+    pub free: &'a hip_bridge::Event,
+}
+
 /// Parameters for the qwen35 batched/prefill MoE routed-expert block.
 ///
 /// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
@@ -1105,6 +1115,8 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Prefill-only table override; decode and live-binding validation ignore it.
+    pub expert_stage_ptrs: Option<MoeStageTables<'a>>,
     /// Exact live expert owners bound to the sealed load-time identity.
     pub routed_experts: &'a dyn RoutedExpertWeights,
     /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table (see
