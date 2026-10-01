@@ -320,7 +320,8 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
         }
     }
     obligations.extend(abi_obligations(kern, &summary));
-    Ok(Analyzed { program, facts: Facts { waits: replay.facts, lds: lds.facts, resources: vec![summary] }, obligations, revision })
+    let kernargs = passes::kernargs::analyze(kern, arch);
+    Ok(Analyzed { program, facts: Facts { waits: replay.facts, lds: lds.facts, resources: vec![summary], kernargs }, obligations, revision })
 }
 
 fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Vec<Obligation> {
@@ -625,13 +626,13 @@ fn operand_roles(arch: Arch, inst: &Inst) -> Result<Vec<(bool, bool)>, EditError
     let effects = match &inst.fields {
         FormFields::Vopd { y_op, x_operands } => {
             let split = usize::from(*x_operands).min(probe.len());
-            let mut x = Effects::from_table(arch, inst.op, inst.form, &probe[..split]).map_err(table)?;
-            let y = Effects::from_table(arch, *y_op, Form::Vopd, &probe[split..]).map_err(table)?;
+            let mut x = Effects::from_table(arch, inst.op, inst.form, &probe[..split], &inst.mods.cpol).map_err(table)?;
+            let y = Effects::from_table(arch, *y_op, Form::Vopd, &probe[split..], &inst.mods.cpol).map_err(table)?;
             x.defs.extend(y.defs);
             x.uses.extend(y.uses);
             x
         }
-        _ => Effects::from_table(arch, inst.op, inst.form, &probe).map_err(table)?,
+        _ => Effects::from_table(arch, inst.op, inst.form, &probe, &inst.mods.cpol).map_err(table)?,
     };
     Ok((0..inst.operands.len()).map(|k| {
         if k == 0 && vopc_prefix { return (true, false); }

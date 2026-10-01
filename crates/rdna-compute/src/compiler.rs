@@ -1031,15 +1031,81 @@ impl KernelCompiler {
         if symbols.is_empty() || !self.has_hipcc {
             return Err(self.compiler_unavailable_error(module, "packaging requires hipcc and at least one symbol"));
         }
-        std::fs::create_dir_all(dir).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         let object = self.compile_for_symbol(module, source, &symbols[0])?.to_path_buf();
-        let index = self.pack_index(module, source, symbols.to_vec(), &object)
-            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        self.publish_package(module, source, symbols, &object, dir)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))
+    }
+
+    /// Publish an existing object for `module` as an indexed install package
+    /// in `dir` (the same `{module}.hsaco` + `.hash` + `.index.json` triple
+    /// `pack_to` writes). The index binds the object's SHA-256 to this
+    /// compiler's recipe and toolchain for `source`.
+    pub fn publish_package(
+        &self,
+        module: &str,
+        source: &str,
+        symbols: &[String],
+        object: &Path,
+        dir: &Path,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let index = self.pack_index(module, source, symbols.to_vec(), object)?;
         let _ = std::fs::remove_file(dir.join(format!("{module}.index.json")));
-        publish_pair(dir, module, &object, &index.packaging_key, true)
-            .and_then(|_| publish_index(dir, &index))
-            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        publish_pair(dir, module, object, &index.packaging_key, true)
+            .and_then(|_| publish_index(dir, &index))?;
         Ok(dir.join(format!("{module}.hsaco")))
+    }
+
+    /// First line of `hipcc --version`, empty without a compiler: the
+    /// toolchain identity folded into [`Self::jit_cache_key`].
+    pub fn toolchain_id(&self) -> &str {
+        &self.toolchain_id
+    }
+
+    /// The target the compiler builds for (`gfx1201`, …).
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    /// The hot JIT cache key `compile_for_symbol` names `{module}.{key}.hsaco`
+    /// with: source, arch, extra/module flags, toolchain, profile and ABI.
+    pub fn jit_cache_key(&self, module: &str, source: &str) -> String {
+        self.cache_hash(module, source)
+    }
+
+    /// The complete hipcc invocation (compiler path first) the JIT runs for
+    /// `module`, with `src_path`/`obj_path` in place of its cache paths.
+    pub fn jit_argv(&self, module: &str, source: &str, src_path: &Path, obj_path: &Path) -> Vec<String> {
+        let passthrough = Self::hipcc_passthrough(module, source, &self.extra_flags, &self.module_flags(module));
+        std::iter::once(self.hipcc_bin.display().to_string())
+            .chain(Self::direct_hipcc_args(&self.arch, src_path, obj_path, passthrough))
+            .collect()
+    }
+
+    /// `ROCM_PATH` handed to the compiler child, when the runtime sets one.
+    pub fn rocm_env_root(&self) -> Option<&Path> {
+        self.rocm_env_root.as_deref()
+    }
+
+    /// Compile `source` exactly as the JIT does, but write the source to
+    /// `src_path` and the object to `obj_path` instead of the unique cache
+    /// temporaries. hipcc names the `__hip_cuid_*` marker after the input
+    /// path and argv, so a fixed pair makes the bytes repeatable on one host.
+    pub fn compile_to_paths(&self, module: &str, source: &str, src_path: &Path, obj_path: &Path) -> HipResult<()> {
+        if !self.has_hipcc {
+            return Err(self.compiler_unavailable_error(module, "an offline compile was requested"));
+        }
+        Self::hipcc_compile_to(
+            &self.hipcc_bin,
+            self.rocm_env_root.as_deref(),
+            &self.arch,
+            src_path,
+            obj_path,
+            module,
+            source,
+            &self.extra_flags,
+            &self.module_flags(module),
+        )
     }
 
     /// Persistent install dir for writeback. None when no cold location was

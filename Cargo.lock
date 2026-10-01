@@ -2730,6 +2730,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "railgun"
+version = "0.4.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "railgun-corpus",
+ "rdna-compute",
+ "redline-rocr",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-cert"
+version = "0.4.1"
+dependencies = [
+ "peacemaker-ir",
+ "peacemaker-lift",
+ "radiowave",
+ "railgun-corpus",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-corpus"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-jitcorpus"
+version = "0.4.1"
+dependencies = [
+ "hipfire-config",
+ "railgun-cert",
+ "railgun-corpus",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
