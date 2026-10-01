@@ -373,3 +373,17 @@ s_getreg_b32	sopk	0x11	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_getreg_b32 s30, hwreg
 s_sendmsg_rtn_b64	sop1	0x4d	SDST:64,SSRC0:32	SDST	-	-	Km:1	s_sendmsg_rtn_b64 s[12:13], sendmsg(MSG_RTN_GET_REALTIME)	BE8C4D83	-
 s_setprio	sopp	0x35	SIMM16:16	-	SIMM16	-	-	s_setprio 3	BFB50003	-
 global_store_addtid_b32	global	0x29	VSRC:32,SADDR:64	-	VSRC,SADDR	-	Store:1	global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT	EE0A401C 77900000 FFFFF800	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0,global_th:honored:0x700000:0x0/0x100000,global_nv:honored:0x80:0x0
+# railgun M0a (2026-09-29): rows for opcodes in the M0a decode sequences, derived from the named same-shape sibling row; sample/encoding from pinned llvm-mc.
+s_lshl1_add_u32	sop2	0xe	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_lshl1_add_u32 s20, ttmp9, s17	87141175	-
+s_cmp_le_u32	sopc	0xb	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_u32 s20, s17	BF0B1114	-
+s_and_b64	sop2	0x17	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_and_b64 s[0:1], s[16:17], s[14:15]	8B800E10	-
+s_and_saveexec_b64	sop1	0x21	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_saveexec_b64 s[2:3], s[8:9]	BE822108	-
+v_subrev_f32_e32	vop2	0x5	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_subrev_f32_e32 v17, s4, v17	0A222204	-
+v_cmpx_lt_i32_e64	vop3	0xc1	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_lt_i32_e64 v21, v20	D4C1007E 02022915	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_gt_u64_e64	vop3	0x5c	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_gt_u64_e64 s0, v[25:26], v[23:24]	D45C0000 02022F19	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_mbcnt_hi_u32_b32	vop3	0x320	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_mbcnt_hi_u32_b32 v5, -1, v5	D7200005 02020AC1	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_sub_nc_u16	vop3	0x304	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_sub_nc_u16 v4.l, v22.l, v21.l	D7040004 02022B16	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_add_f64_e32	vop2	0x2	VDST:64,SRC0:64,VSRC1:64	VDST	SRC0,VSRC1	-	-	v_add_f64_e32 v[33:34], v[33:34], v[37:38]	04424B21	-
+v_cvt_f32_f64_e32	vop1	0xf	VDST:32,SRC0:64	VDST	SRC0	-	-	v_cvt_f32_f64_e32 v33, v[33:34]	7E421F21	w0_extra:ignored:0x10000:0x0
+v_cvt_f64_f32_e32	vop1	0x10	VDST:64,SRC0:32	VDST	SRC0	-	-	v_cvt_f64_f32_e32 v[37:38], v37	7E4A2125	w0_extra:ignored:0x10000:0x0
+buffer_load_u16	buffer	0x12	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Load:1	buffer_load_u16 v33, v33, s[16:19], null offen	C404807C 40802021 00000021	w0_extra:ignored:0x3803f00:0x0,w1_extra:ignored:0x100:0x0,vbuffer_format:honored:0x3f800000:0x800000,vbuffer_offen:honored:0x40000000:0x0/0x40000000,vbuffer_idxen:honored:0x80000000:0x0,vbuffer_tfe:honored:0x400000:0x0,vbuffer_scope:honored:0xc0000:0x0/0x40000/0x80000/0xc0000,vbuffer_th:honored:0x700000:0x0/0x100000/0x200000/0x300000/0x400000/0x500000/0x600000/0x700000,vbuffer_nv:honored:0x80:0x0

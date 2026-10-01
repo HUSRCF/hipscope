@@ -2,10 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Build-time HIP source inventory for admitted Qwen3.5 routes. This is a
-//! packaging inventory, not a replacement for the runtime's dispatch policy.
-//! Every source below is the Rust source expression supplied to `ensure_kernel`
-//! or to `precompile_qwen35`; never infer module names from HIP filenames.
+//! Build-time HIP source inventory for admitted Qwen3.5 routes, for the
+//! JIT modules of the admitted default Redline programs, and for railgun's
+//! own copy kernels. This is a packaging inventory, not a replacement for the
+//! runtime's dispatch policy. Every source below is the Rust source
+//! expression supplied to `ensure_kernel` or to `precompile_qwen35` (for
+//! railgun, the source its lowering will JIT); never infer module names from
+//! HIP filenames.
 
 use std::borrow::Cow;
 
@@ -49,6 +52,15 @@ mod kernels {
     pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip");
     #[cfg(not(feature = "deltanet"))]
     pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+    #[cfg(not(feature = "deltanet"))]
+    pub const QWEN35_FA_PREP_GFX1100_SRC: &str = include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
+    #[cfg(not(feature = "deltanet"))]
+    pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
+        "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
+        include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+    );
+    /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
+    pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
 }
 
 pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
@@ -159,18 +171,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         .ok_or_else(|| RegistryError::UnsupportedArch(arch.to_owned()))?;
     let mut entries = Vec::new();
     macro_rules! add {
-        ($module:literal, $src:expr, [$($symbol:literal),+ $(,)?]) => {{
-            let source: Cow<'static, str> = ($src).into();
-            let recipe = KernelCompiler::recipe_for_source(arch, $module, &source, extra_flags);
-            entries.push(KernelEntry {
-                arch,
-                module: $module,
-                symbols: &[$($symbol),+],
-                flags: recipe.flags,
-                scheduler_profile: recipe.scheduler_profile,
-                source,
-            });
-        }};
+        ($module:literal, $src:expr, [$($symbol:literal),+ $(,)?]) => {
+            entries.push(entry(arch, $module, &[$($symbol),+], ($src).into(), extra_flags))
+        };
     }
 
     // precompile_qwen35 common kernels (dispatch.rs:4852-4897,5176-5203).
@@ -453,6 +456,163 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     Ok(entries)
 }
 
+fn entry(
+    arch: &'static str,
+    module: &'static str,
+    symbols: &'static [&'static str],
+    source: Cow<'static, str>,
+    extra_flags: &str,
+) -> KernelEntry {
+    let recipe = KernelCompiler::recipe_for_source(arch, module, &source, extra_flags);
+    KernelEntry {
+        arch,
+        module,
+        symbols,
+        flags: recipe.flags,
+        scheduler_profile: recipe.scheduler_profile,
+        source,
+    }
+}
+
+/// JIT modules that the admitted default Redline programs load
+/// (`hipfire-runtime` `retained_redline_default`: MQ4R on gfx1100/gfx1151/
+/// gfx1201, Qwen3.5 dense on gfx1201, DeepSeek4 MQ2R on gfx1151) and that the
+/// installer inventory [`entries`] does not carry. Module names are the ones
+/// the programs' captures record; each source is the expression the cited
+/// launcher passes to `ensure_kernel` on the default route. railgun's JIT
+/// receipt corpus compiles [`corpus_entries`], never a hand-picked source.
+pub fn default_route_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
+    let arch: &'static str = SUPPORTED_ARCHES
+        .iter()
+        .copied()
+        .find(|&candidate| candidate == arch)
+        .ok_or_else(|| RegistryError::UnsupportedArch(arch.to_owned()))?;
+    let mut entries = Vec::new();
+    macro_rules! add {
+        ($module:literal, $src:expr, [$($symbol:literal),+ $(,)?]) => {
+            entries.push(entry(arch, $module, &[$($symbol),+], ($src).into(), extra_flags))
+        };
+    }
+    let rdna3 = matches!(arch, "gfx1100" | "gfx1151");
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        // MoE routing and expert GEMVs shared by the three MQ4R programs.
+        add!("gated_delta_net_q8_compact2_b2", kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC, ["gated_delta_net_q8_compact2_b2"]); // norm.rs:2994
+        add!("gemv_hfq4g256_moe_down_k8_indexed_batched_expanded", kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC, ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"]); // gemv.rs:14599
+        add!("moe_down_combine_k8_batched", kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC, ["moe_down_combine_k8_batched"]); // moe.rs:41
+    }
+    if matches!(arch, "gfx1151" | "gfx1201") {
+        add!("gemv_hfq4g256_moe_gate_up_indexed", kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC, ["gemv_hfq4g256_moe_gate_up_k8_indexed"]); // gemv.rs:13888
+        // gemv.rs:12202,12266,12379: three launchers share the module.
+        add!("gemv_hfq4g256_residual_scaled", kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC, [
+            "gemv_hfq4g256_residual_sigmoid_scaled_gpu", "gemv_hfq4g256_residual_scaled_gpu", "gemv_hfq4g256_residual_scaled_cpu"]);
+    }
+    if rdna3 {
+        add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]); // norm.rs:4459
+        add!("fused_rmsnorm_mq_rotate_vecsum", kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC, ["fused_rmsnorm_mq_rotate_vecsum"]); // gemv.rs:2477
+        add!("kv_cache_write_q8_0_pair", kernels::KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC, ["kv_cache_write_q8_0_pair"]); // attention.rs:2502
+        add!("moe_router_softmax_topk_k8_wave64_exact", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SRC, ["moe_router_softmax_topk_k8_wave64_exact"]); // gemv.rs:13029
+    }
+    match arch {
+        "gfx1100" => {
+            add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"]); // attention.rs:10626
+            add!("gated_norm_mq_rotate_gfx1100", kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC, ["gated_norm_mq_rotate_gfx1100"]); // gemv.rs:4796
+            add!("gemv_hfq4g256_moe_gate_up_indexed_cpol_slc", kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC, ["gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"]); // gemv.rs:13770
+            add!("gemv_hfq4g256_residual_sigmoid_buffer_gfx1100", kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC, ["gemv_hfq4g256_residual_sigmoid_scaled_gpu"]); // gemv.rs:12369
+            add!("gemv_hfq4g256_residual_stage_x32_gfx1100", kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC, ["gemv_hfq4g256_residual"]); // gemv.rs:10262
+            add!("moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100", kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC, ["moe_down_combine_rmsnorm_mq_rotate_vecsum"]); // moe.rs:119
+            add!("qwen35_fa_prep_gfx1100", kernels::QWEN35_FA_PREP_GFX1100_SRC, ["qwen35_fa_prep_gfx1100"]); // norm.rs:1152
+        }
+        "gfx1151" => {
+            add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"]); // attention.rs:10620
+            add!("fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151", kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC, ["fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"]); // gemm.rs:3811
+            add!("fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151", kernels::FUSED_QKVZA_HFQ4G256_K2048_HYBRID_BUFFER_GFX1151_SRC, ["fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"]); // gemm.rs:3800
+            add!("gated_norm_mq_rotate_gfx1151", kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC, ["gated_norm_mq_rotate_gfx1151"]); // gemv.rs:4783
+            add!("gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151", kernels::GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC, ["gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"]); // gemv.rs:9892
+            add!("gemv_hfq4g256_residual_rt_low_gfx1151", kernels::GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC, ["gemv_hfq4g256_residual_rt_low_gfx1151"]); // gemv.rs:10226
+            add!("moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151", kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC, ["moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"]); // moe.rs:115
+            add!("qwen35_fa_prep_gfx1151", kernels::QWEN35_FA_PREP_GFX1151_SRC, ["qwen35_fa_prep_gfx1151"]); // norm.rs:1146
+            // DeepSeek4 MQ2R gfx1151 v2 route (registry/deepseek4-mq2r-gfx1151-v2.json).
+            add!("compressor_add_ape_buf", kernels::COMPRESSOR_ADD_APE_BATCHED_SRC, ["compressor_add_ape_f32_buf"]); // attention.rs:14675
+            add!("compressor_overlap_concat", kernels::COMPRESSOR_OVERLAP_CONCAT_SRC, ["compressor_overlap_concat_f32"]); // attention.rs:14720
+            add!("compressor_softmax_pool_f32_buf", kernels::COMPRESSOR_SOFTMAX_POOL_BUF_SRC, ["compressor_softmax_pool_f32_buf"]); // attention.rs:14852
+            add!("deepseek4_attn_swa_buf", kernels::V4F_ATTN_SWA_BUF_SRC, ["deepseek4_attn_swa_buf"]); // attention.rs:18544
+            add!("deepseek4_attn_swa_topk_scoregrid_f32_buf", kernels::V4F_ATTN_SWA_TOPK_BUF_SRC, ["deepseek4_attn_swa_topk_scoregrid_f32_buf"]); // attention.rs:19068
+            add!("deepseek4_fused_silu_mul_clamp_mq_rotate", kernels::V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC, ["deepseek4_fused_silu_mul_clamp_mq_rotate"]); // norm.rs:6165
+            add!("deepseek4_moe_topk_bias_aware", kernels::V4F_MOE_TOPK_BIAS_AWARE_SRC, ["deepseek4_moe_topk_bias_aware_f32"]); // moe.rs:878
+            add!("deepseek4_silu_mul_clamp", kernels::V4F_SILU_MUL_CLAMP_SRC, ["deepseek4_silu_mul_clamp_f32"]); // norm.rs:6224
+            add!("deepseek4_topk_kv_gather_f32_buf", kernels::V4F_TOPK_KV_GATHER_BUF_SRC, ["deepseek4_topk_kv_gather_f32_buf"]); // moe.rs:1159
+            add!("deepseek4_topk_kv_gather_identity_f32_buf", kernels::V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC, ["deepseek4_topk_kv_gather_identity_f32_buf"]); // moe.rs:1410
+            add!("fused_rmsnorm_mq_rotate_plain_nox", kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC, ["fused_rmsnorm_mq_rotate_plain_nox"]); // norm.rs:5946
+            add!("gemv_mfp4g32_e8_soa_grouped_gfx1151", kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC, ["gemv_mfp4g32_e8_soa_grouped_gfx1151"]); // gemv.rs:7564,8025
+            add!("gemv_mfp4g32_e8_soa_u4", kernels::GEMV_MFP4G32_E8_SOA_U4_SRC, ["gemv_mfp4g32_e8_soa_u4"]); // gemv.rs:8075,7448
+            add!("gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed", kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC, ["gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"]); // gemv.rs:16927
+            add!("gemv_mq2g256_lloyd_moe_gate_up_indexed", kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC, ["gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"]); // gemv.rs:17258
+            add!("hash_router_normalize_f32_buf", kernels::HASH_ROUTER_NORMALIZE_BUF_SRC, ["hash_router_normalize_f32_buf"]); // moe.rs:770
+            add!("hc_compute_control_vec4_finalize", kernels::HC_COMPUTE_CONTROL_SRC, ["hc_compute_control_vec4_finalize"]); // attention.rs:15414
+            add!("hc_head_compute_pre", kernels::HC_HEAD_COMPUTE_PRE_SRC, ["hc_head_compute_pre"]); // attention.rs:15697
+            add!("hc_input_map_4stream", kernels::HC_INPUT_MAP_SRC, ["hc_input_map_4stream"]); // attention.rs:15751
+            add!("hc_mix_4stream", kernels::HC_MIX_4STREAM_SRC, ["hc_mix_4stream"]); // attention.rs:15835
+            add!("indexer_relu_score_f32_buf", kernels::INDEXER_RELU_SCORE_BUF_SRC, ["indexer_relu_score_f32_buf"]); // attention.rs:16916
+            add!("indexer_top_k_buf_parallel", kernels::INDEXER_TOP_K_BUF_PARALLEL_GFX1151_SRC, ["indexer_top_k_buf_parallel"]); // attention.rs:17320
+            add!("rmsnorm_f32_at_slot_buf", kernels::RMSNORM_AT_SLOT_BUF_SRC, ["rmsnorm_f32_at_slot_buf"]); // norm.rs:6089
+            add!("rope_tail_interleaved", kernels::ROPE_TAIL_INTERLEAVED_SRC, ["rope_tail_interleaved_f32"]); // attention.rs:17562
+            add!("rope_tail_yarn_interleaved_at_slot_buf", kernels::ROPE_TAIL_YARN_INTERLEAVED_AT_SLOT_BUF_SRC, ["rope_tail_yarn_interleaved_at_slot_buf_f32"]); // attention.rs:17838
+            add!("rope_tail_yarn_interleaved_wide", kernels::ROPE_TAIL_YARN_INTERLEAVED_SRC, ["rope_tail_yarn_interleaved_wide_f32"]); // attention.rs:17768
+            add!("sqrt_softplus_f32", kernels::SQRT_SOFTPLUS_F32_SRC, ["sqrt_softplus_f32"]); // norm.rs:6128
+            add!("state_overlap_shift_f32_buf", kernels::STATE_OVERLAP_SHIFT_F32_BUF_SRC, ["state_overlap_shift_f32_buf"]); // attention.rs:17988
+            add!("state_ring_write_f32_buf", kernels::STATE_RING_WRITE_F32_BUF_SRC, ["state_ring_write_f32_buf"]); // attention.rs:18031
+            add!("swa_ring_write_f32_buf", kernels::SWA_RING_WRITE_BUF_SRC, ["swa_ring_write_f32_buf"]); // attention.rs:18171
+        }
+        "gfx1201" => {
+            add!("attention_flash_fp8_e4m3_tile_gqa_gfx1201", kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC, ["attention_flash_fp8_e4m3_tile_gqa_gfx1201"]); // attention.rs:7783
+            add!("attention_flash_reduce_dsplit_gfx1201", kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC, ["attention_flash_reduce_dsplit_gfx1201"]); // attention.rs:7784
+            add!("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC, ["gemv_hfq4g256_multirow_r2"]); // gemv.rs:10031
+            // Qwen3.6-27B decode fusions on exact gfx1201 (3be1cdbe9): the H2 tape's compact-3 GDN,
+            // 48-head AWQ gated-norm/MQ rotation and 24Q/4K FA prep.
+            add!("gated_delta_net_q8_compact3_b2", kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, ["gated_delta_net_q8_compact3_b2"]); // norm.rs:3045
+            add!("gated_norm_mq_rotate_awq_k6144_gfx1201", kernels::gated_norm_mq_rotate_awq_k6144_gfx1201_src(), ["gated_norm_mq_rotate_awq_k6144_gfx1201"]); // gemv.rs:4751
+            #[cfg(feature = "deltanet")]
+            add!("qwen36_27b_fa_prep_gfx1201", kernels::qwen36_27b_fa_prep_gfx1201_src(), ["qwen36_27b_fa_prep_gfx1201"]); // norm.rs:1149
+            add!("moe_router_softmax_topk_k8_wave64", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC, ["moe_router_softmax_topk_k8_wave64"]); // gemv.rs:12992
+        }
+        _ => {}
+    }
+    Ok(entries)
+}
+
+/// Modules railgun's own lowering launches (design §1.1 `Node::Copy` and
+/// `Node::CopyBatch`): the hipfire-owned copy kernels, JIT-compiled as module
+/// `railgun::copy::MODULE` from `railgun::copy::SOURCE`, on every arch
+/// railgun certifies. No Redline program loads them.
+pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
+    let arch: &'static str = SUPPORTED_ARCHES
+        .iter()
+        .copied()
+        .find(|&candidate| candidate == arch)
+        .ok_or_else(|| RegistryError::UnsupportedArch(arch.to_owned()))?;
+    let mut entries = Vec::new();
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        entries.push(entry(arch, "railgun_copy", &["railgun_copy", "railgun_copy_batch"], kernels::RAILGUN_COPY_SRC.into(), extra_flags));
+    }
+    Ok(entries)
+}
+
+/// Every module railgun's JIT receipt corpus may compile for `arch`: the
+/// installer inventory followed by [`default_route_entries`] and
+/// [`railgun_entries`]. A module name appears once per arch: a default-route
+/// module the installer inventory already carries with the same source is
+/// listed once (a differing source stays and fails the uniqueness test).
+pub fn corpus_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
+    let mut all = entries(arch, extra_flags)?;
+    for entry in default_route_entries(arch, extra_flags)? {
+        if !all.iter().any(|e| e.module == entry.module && e.source == entry.source) {
+            all.push(entry);
+        }
+    }
+    all.extend(railgun_entries(arch, extra_flags)?);
+    Ok(all)
+}
+
 pub fn lookup(arch: &str, module: &str, extra_flags: &str) -> Result<KernelEntry, RegistryError> {
     entries(arch, extra_flags)?
         .into_iter()
@@ -568,6 +728,17 @@ mod tests {
         }
         assert_eq!(repins_seen.len(), REPINNED_SINCE_P0.len(),
             "REPINNED_SINCE_P0 names a module no trace compiled: {repins_seen:?}");
+    }
+
+    #[test]
+    fn corpus_entries_name_each_module_once_per_arch() {
+        for arch in SUPPORTED_ARCHES {
+            let entries = corpus_entries(arch, "").unwrap();
+            let mut seen = std::collections::HashSet::new();
+            for entry in &entries {
+                assert!(seen.insert(entry.module), "{arch}: module {} inventoried twice", entry.module);
+            }
+        }
     }
 
     #[test]
