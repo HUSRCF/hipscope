@@ -350,6 +350,97 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
     Ok(())
 }
 
+/// The HC write that follows a sealed MoE call and may ride the shared down's
+/// GEMM epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 3): its streams, the gates the
+/// paired HC read produced, and the tensor it reads as `mixed` (which must be
+/// the routed target).
+pub(crate) struct HcSharedDown {
+    pub streams: GpuTensor,
+    pub gates: GpuTensor,
+    pub mixed: *mut std::ffi::c_void,
+    pub rows: usize,
+    pub hidden: usize,
+    pub state_bf16: bool,
+}
+
+impl HcSharedDown {
+    /// What the shared down needs of `write`, or `None` when its operands
+    /// are not the plain four-branch F32-typed streams / gates it folds into.
+    pub(crate) fn offer(write: &super::layer_ops::HyperWriteOp<'_>) -> Option<Self> {
+        let wide = write.branches.checked_mul(write.hidden)?;
+        let (streams_len, gates_len) = (write.rows.checked_mul(wide)?, write.rows.checked_mul(4)?);
+        (write.branches == 4
+            && write.input.buf.as_ptr() == write.output.buf.as_ptr()
+            && write.input.dtype == DType::F32
+            && write.input.numel() >= streams_len
+            && write.gates.dtype == DType::F32
+            && write.gates.numel() >= gates_len)
+            .then(|| Self {
+                streams: f32_view(write.input, 0, streams_len),
+                gates: f32_view(write.gates, 0, gates_len),
+                mixed: write.mixed.buf.as_ptr(),
+                rows: write.rows,
+                hidden: write.hidden,
+                state_bf16: write.state_bf16,
+            })
+    }
+}
+
+/// [`shared_down`] with the paired HC write folded into the GEMM epilogue
+/// (`hc`).  Bitwise the shared down followed by `hyper_write`: the BF16 shared
+/// down on the Qwen4 F16 WMMA route, the BF16 scaled add, then the write.  The
+/// routed target is not rewritten (it is dead after the write).  Returns
+/// `false`, having launched nothing, when `hc` does not fit this call; the
+/// caller then runs [`shared_down`] and the write unfused.
+pub(crate) fn shared_down_hc(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    hc: &HcSharedDown,
+) -> Result<bool, DispatchError> {
+    require_geometry(p)?;
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return Ok(false);
+    };
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    if gpu.flags.qwen4_hc_fuse_level() < 3
+        || down.dtype != DType::BF16
+        || down.rotation.is_some()
+        || down.awq_scale.is_some()
+        || !p.recipe.bf16_round_trip()
+        || !p.recipe.shared_after_combine()
+        || down.m != p.down_m
+        || down.k != shared.intermediate
+        || hc.rows != p.batch_size
+        || hc.hidden != p.down_m
+        || hc.mixed != target.buf.as_ptr()
+        || target.numel() < p.batch_size * p.down_m
+        || shared.scalar.numel() < p.batch_size
+        || !gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(
+            down.buf,
+            down.m,
+            down.k,
+            p.batch_size,
+        )
+    {
+        return Ok(false);
+    }
+    hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+        down.buf,
+        shared.rotated,
+        down.m,
+        down.k,
+        p.batch_size,
+        target,
+        shared.scalar,
+        &hc.streams,
+        &hc.gates,
+        hc.state_bf16,
+        false,
+    ))?;
+    Ok(true)
+}
+
 /// Whether path 2 takes the opt-in symmetric IU4 arm (fn-moe-sym): the layer's
 /// experts were verified symmetric at load (the policy says so), the recipe
 /// keeps the BF16 boundaries the kernels implement, the activation is F32,
@@ -742,16 +833,40 @@ pub(crate) fn down(
     Ok(())
 }
 
+/// Whether [`combine`] can start from +0.0 instead of the zero-filled target
+/// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the BF16-row combine of path 2, with
+/// nothing writing the target between its zero fill and the combine (the
+/// shared down, the only other writer, runs after it).
+pub(crate) fn combine_initial_zero_applies(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> bool {
+    use_path2
+        && !indexed_down(gpu, p, use_path2)
+        && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2))
+        && p.recipe.shared_after_combine()
+}
+
+/// `initial_zero`: the combine writes the target from +0.0 rather than
+/// accumulating into zeros the caller filled (requires
+/// [`combine_initial_zero_applies`]).
 pub(crate) fn combine(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
     grouped_rows: usize,
+    initial_zero: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    if initial_zero && !combine_initial_zero_applies(gpu, p, use_path2) {
+        return Err(DispatchError::Hip(
+            "qt44 combine: zero-initialized target requested off the BF16-row path".into(),
+        ));
+    }
     if indexed_down(gpu, p, use_path2) {
-        return combine(gpu, p, false, grouped_rows);
+        return combine(gpu, p, false, grouped_rows, false);
     }
     if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
         // Both downs store BF16 grouped rows. The rank order goes to
@@ -767,6 +882,7 @@ pub(crate) fn combine(
             p.down_m,
             grouped_rows,
             p.batch_size,
+            initial_zero,
         ))?;
     } else if use_path2 {
         hip(gpu.moe_down_combine_grouped_top10(

@@ -21,6 +21,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 
 #if defined(__GFX11__)
 
@@ -582,6 +583,119 @@ GEN_RESID_BT(6, 6)
 GEN_RESID_BT(3, 8)
 GEN_RESID_BT(5, 8)
 GEN_RESID_BT(6, 8)
+#ifndef HCW_EPILOGUE_BLOCK
+#define HCW_EPILOGUE_BLOCK
+// ---------------------------------------------------------------------------
+// H4 HC-write epilogue: the producer's own output stage applies
+// hyper_write_bf16x2 / hyper_write_f32's expression to the streams in place.
+// Stage 1 (per accumulator lane, tokens x 8 channels): the GEMM output as the
+// unfused kernel stores it (0.0f + acc) is rounded to BF16 bits and parked in
+// LDS (the unfused HC write rounds it to BF16 before use, so nothing is lost);
+// an optional F32 mirror gets the unrounded value.  Stage 2 (accumulators
+// dead): each item = (token t, channels c0..c0+7) reads the four stream
+// columns br*H + c0.. of token t (old values), applies the four gates (the
+// paired read's hyper_norm_gate_outputs logits through the same expression as
+// hyper_write_bf16x2) and overwrites them; one item owns its columns.
+// Requires H % 8 == 0 (the caller's M).  Keep byte-identical across the files
+// carrying this block (gfx11 bt, gfx12 bt, lds256).
+// ---------------------------------------------------------------------------
+static __device__ __forceinline__ float hcw_bf16f(float v) {
+    return static_cast<float>(static_cast<hip_bfloat16>(v));
+}
+static __device__ __forceinline__ unsigned int hcw_bf16bits(float v) {
+    return (unsigned int)static_cast<hip_bfloat16>(v).data;
+}
+// NaN propagation is operand-order dependent (the first NaN source wins) and the
+// compiler commutes fadd/fmul freely, so the two products/sums below are pinned to
+// the operand order hyper_write_bf16x2 (stream + injection) and hyper_write_f32
+// (injection + stream) compile to; gate * mixed is gate-first in both.
+static __device__ __forceinline__ float hcw_mul(float a, float b) {
+    float r;
+    asm("v_mul_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+static __device__ __forceinline__ float hcw_add(float a, float b) {
+    float r;
+    asm("v_add_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+static __device__ __forceinline__ float hcw_gate(float logit) {
+    const float gate_logit = hcw_bf16f(logit);
+    const float gate_scaled = hcw_bf16f(gate_logit / 4.0f);
+    return hcw_bf16f(2.0f * hcw_bf16f(1.0f / (1.0f + expf(-gate_scaled))));
+}
+// BF16 bits of (0.0f + r[i]), element i in half (i & 1) of word (i >> 1).
+static __device__ __forceinline__ uint4 hcw_pack8(const float (&r)[8]) {
+    unsigned int w[4];
+#pragma unroll
+    for (int p = 0; p < 4; p++)
+        w[p] = hcw_bf16bits(0.0f + r[2 * p]) | (hcw_bf16bits(0.0f + r[2 * p + 1]) << 16);
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+static __device__ __forceinline__ void hcw_mirror8(const float (&r)[8], int t, int c0, int H,
+                                                   float* mirror) {
+    float* o = mirror + (long long)t * H + c0;
+    *(float4*)o = make_float4(0.0f + r[0], 0.0f + r[1], 0.0f + r[2], 0.0f + r[3]);
+    *(float4*)(o + 4) = make_float4(0.0f + r[4], 0.0f + r[5], 0.0f + r[6], 0.0f + r[7]);
+}
+static __device__ __forceinline__ void hcw_apply8(const uint4 mq, int t, int c0, int H,
+                                                  void* streams, const float* gates,
+                                                  int bf16_state) {
+    const float4 gv = *(const float4*)(gates + (long long)t * 4);
+    // All four stream runs are requested before any arithmetic consumes them.
+    uint4 sw[4];
+    float4 sf[4][2];
+    if (bf16_state) {
+        const unsigned short* base = (const unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) sw[br] = *(const uint4*)(base + (long long)br * H);
+    } else {
+        const float* base = (const float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            sf[br][0] = *(const float4*)(base + (long long)br * H);
+            sf[br][1] = *(const float4*)(base + (long long)br * H + 4);
+        }
+    }
+    const unsigned int mw[4] = {mq.x, mq.y, mq.z, mq.w};
+    float mr[8];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        mr[2 * p] = __uint_as_float(mw[p] << 16);
+        mr[2 * p + 1] = __uint_as_float(mw[p] & 0xFFFF0000u);
+    }
+    const float g[4] = {hcw_gate(gv.x), hcw_gate(gv.y), hcw_gate(gv.z), hcw_gate(gv.w)};
+    if (bf16_state) {
+        unsigned short* base = (unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const unsigned int in[4] = {sw[br].x, sw[br].y, sw[br].z, sw[br].w};
+            unsigned int out[4];
+#pragma unroll
+            for (int p = 0; p < 4; p++) {
+                const float lo = hcw_add(__uint_as_float(in[p] << 16), hcw_bf16f(hcw_mul(g[br], mr[2 * p])));
+                const float hi = hcw_add(__uint_as_float(in[p] & 0xFFFF0000u), hcw_bf16f(hcw_mul(g[br], mr[2 * p + 1])));
+                out[p] = hcw_bf16bits(lo) | (hcw_bf16bits(hi) << 16);
+            }
+            *(uint4*)(base + (long long)br * H) = make_uint4(out[0], out[1], out[2], out[3]);
+        }
+    } else {
+        float* base = (float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const float v[8] = {sf[br][0].x, sf[br][0].y, sf[br][0].z, sf[br][0].w,
+                                sf[br][1].x, sf[br][1].y, sf[br][1].z, sf[br][1].w};
+            float o[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                o[i] = hcw_bf16f(hcw_add(hcw_bf16f(hcw_mul(g[br], mr[i])), hcw_bf16f(v[i])));
+            *(float4*)(base + (long long)br * H) = make_float4(o[0], o[1], o[2], o[3]);
+            *(float4*)(base + (long long)br * H + 4) = make_float4(o[4], o[5], o[6], o[7]);
+        }
+    }
+}
+#endif  // HCW_EPILOGUE_BLOCK
+
 
 // ---------------------------------------------------------------------------
 // Residual += BT with the X tile shared through LDS by RW row tiles.
@@ -592,11 +706,15 @@ GEN_RESID_BT(6, 8)
 // are the BT kernel's, so results are bitwise identical to it.
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
-template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1>
+template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1,
+          bool HC = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
-                                              int M, int K, int N, int row_block = -1) {
+                                              int M, int K, int N, int row_block = -1,
+                                              void* hc_streams = nullptr,
+                                              const float* hc_gates = nullptr,
+                                              int hc_bf16 = 0) {
     constexpr int GROUP_BYTES = 8 + 32 * BITS;
     constexpr int TOK = 16 * BV;
     constexpr int CK = 64;              // K per LDS chunk: four K-tiles
@@ -737,6 +855,15 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         const int out_col = batch_start + b * 16 + ml;
         const int row0 = row_start + 8 * lane_half;
         if (out_col >= N || row0 >= M) continue;
+        if (HC) {
+            // M % 8 == 0 (caller): no partial row run.  Park the BF16 bits of
+            // 0.0f + acc in LDS (xs: the staging buffer is dead after the last
+            // chunk's closing barrier); `Y`, when non-null, is the unfused
+            // kernel's own F32 output (debug/capture mirror).
+            if (Y) hcw_mirror8(r, out_col, row0, M, Y);
+            *(uint4*)(xs + (b * 16 + ml) * STRIDE + 16 * (tid >> 5) + 8 * lane_half) = hcw_pack8(r);
+            continue;
+        }
         if (OUT_BF16) {
             // Overwrite values rounded to BF16 (RNE; non-finite truncate), as
             // BF16 bits: what a consumer that rounds each value first reads.
@@ -767,6 +894,22 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             o1.x += r[4]; o1.y += r[5]; o1.z += r[6]; o1.w += r[7];
             *(float4*)out = o0;
             *(float4*)(out + 4) = o1;
+        }
+    }
+    if (HC) {
+        XL_BARRIER();
+        // Stage 2: TOK tokens x (16 * RW) channels of this block, 8 channels per item.
+        constexpr int CPT = 2 * RW;  // 8-channel chunks per token
+#pragma unroll 2
+        for (int it = 0; it < TOK * CPT / NT; it++) {
+            const int item = tid + it * NT;
+            const int tl = item / CPT;
+            const int c8 = item % CPT;
+            const int t = batch_start + tl;
+            const int c0 = (row_block < 0 ? (int)blockIdx.x : row_block) * RW * 16 + c8 * 8;
+            if (t >= N || c0 >= M) continue;
+            hcw_apply8(*(const uint4*)(xs + tl * STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
+                       hc_bf16);
         }
     }
 #undef XL_STORE
@@ -847,6 +990,19 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
     }
     if (M <= 0 || local_rb >= (M + 63) / 64) return;
     resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N, local_rb);
+}
+
+// Y = W·X applied to the HC streams in place: the unfused kernel's `0.0f + acc`
+// feeds hyper_write_{bf16x2,f32} with the paired read's gate logits.  M % 8 == 0.
+// `Y` is an optional F32 mirror of the GEMM output (may be null).
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw(const char* __restrict__ A,
+                                     const _Float16* __restrict__ X,
+                                     float* __restrict__ Y,
+                                     int M, int K, int N,
+                                     void* hc_streams, const float* hc_gates, int hc_bf16) {
+    resid_bt_xlds<6, 8, 4, true, false, 1, true>(A, X, Y, M, K, N, -1, hc_streams, hc_gates,
+                                                hc_bf16);
 }
 
 #endif // __GFX11__

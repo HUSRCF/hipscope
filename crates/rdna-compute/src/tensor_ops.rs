@@ -22,6 +22,9 @@ const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 const GATED_DELTA_CHUNK_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
+pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_chunk_q8_wmma.gfx1151.hip");
+
 const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
@@ -610,18 +613,116 @@ pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool
         && p.value_heads % p.key_heads == 0
 }
 
+/// Whether H6's inline-Q8 chunk kernel (`gated_delta_chunk_gate_q8_wmma`) can
+/// run this step, flag aside: exact gfx1151 on the chunked route, a Q8 slot
+/// whose base is 16-byte aligned (the kernel loads codes as `int4`).
+pub fn gated_delta_q8_inline_geometry(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.has_wmma_w32()
+        && gated_delta_chunk_route(gpu, p)
+        && matches!(GdnStateFormat::of(p.state), Ok(GdnStateFormat::Q8))
+        && (p.state.buf.as_ptr() as usize) % 16 == 0
+}
+
+/// [`gated_delta_q8_inline_geometry`] under `HIPFIRE_QWEN4_GDN_Q8_INLINE=1`
+/// (default off): the selector [`gated_delta_step_gate_wmma`] uses.
+pub fn gated_delta_q8_inline_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.flags.qwen4_gdn_q8_inline_enabled() && gated_delta_q8_inline_geometry(gpu, p)
+}
+
+/// Whether H5's convolution that also writes the normalized Q/K
+/// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`) can run this chunk, flag
+/// aside: exact gfx1151 wave32 on the chunked route (so never a recorder, a
+/// graph capture or the persistent gfx1201/gfx1100-persistent route), 16 key
+/// heads of 128 in q|k|v channel order, `channels % 256 == 0`, K=4 with a
+/// 3-row ring, and a BF16 convolution output.
+pub fn gated_delta_conv_qknorm_geometry(
+    gpu: &Gpu,
+    step: &GatedDeltaStepBatched<'_>,
+    conv: &GatedDeltaConvBatched<'_>,
+) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.has_wmma_w32()
+        && gated_delta_chunk_route(gpu, step)
+        && step.key_heads == 16
+        && step.key_dim == 128
+        && step.qkv_width == conv.channels
+        && conv.rows == step.rows
+        && conv.channels >= 4096
+        && conv.channels % 256 == 0
+        && conv.history_rows == 3
+        && conv.kernel_size == 4
+        && conv.output.dtype == DType::BF16
+}
+
+/// [`gated_delta_conv_qknorm_geometry`] under
+/// `HIPFIRE_QWEN4_GDN_CONV_QKNORM=1` (default off).  When it holds, the
+/// caller launches [`gated_delta_conv_params_qknorm_batched`] in place of
+/// [`gated_delta_conv_params_batched`] and then
+/// [`gated_delta_step_gate_wmma_qknormed`] in place of
+/// [`gated_delta_step_gate_wmma`].
+pub fn gated_delta_conv_qknorm_route(
+    gpu: &Gpu,
+    step: &GatedDeltaStepBatched<'_>,
+    conv: &GatedDeltaConvBatched<'_>,
+) -> bool {
+    gpu.flags.qwen4_gdn_conv_qknorm_enabled() && gated_delta_conv_qknorm_geometry(gpu, step, conv)
+}
+
+/// Opt-in arms of the chunked GDN launch.
+#[derive(Clone, Copy, Default)]
+struct GatedDeltaChunkArms {
+    /// The convolution already wrote the normalized Q/K into the scratch.
+    qk_prenormed: bool,
+    /// Q8 state decoded/requantized inside the recurrence kernel.
+    q8_inline: bool,
+}
+
 /// [`gated_delta_step_batched`] followed by [`gated_delta_gate_batched`] as
 /// one chunked (16-row WY form) F16 WMMA kernel where
 /// [`gated_delta_chunk_route`] holds; `p.projection` is the convolution
 /// output as packed BF16.  `gate.output` receives the gated rows and
 /// `p.output` is not written.  The recurrence's products round to F16, so
-/// the route is KLD-gated; the gate is that kernel's expression.
+/// the route is KLD-gated; the gate is that kernel's expression.  A Q8 state
+/// runs the inline-Q8 kernel where [`gated_delta_q8_inline_route`] holds.
 pub fn gated_delta_step_gate_wmma(
     gpu: &mut Gpu,
     p: &GatedDeltaStepBatched<'_>,
     gate: &GatedDeltaGateBatched<'_>,
 ) -> HipResult<()> {
-    if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
+    let arms = GatedDeltaChunkArms {
+        qk_prenormed: false,
+        q8_inline: gated_delta_q8_inline_route(gpu, p),
+    };
+    gated_delta_step_gate_wmma_arms(gpu, p, gate, arms)
+}
+
+/// [`gated_delta_step_gate_wmma`] after
+/// [`gated_delta_conv_params_qknorm_batched`] over the same rows: the
+/// normalized Q/K are already in the F16 activation scratch, so the
+/// Q/K-norm launch is skipped.  Nothing may use that scratch in between.
+pub fn gated_delta_step_gate_wmma_qknormed(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+    gate: &GatedDeltaGateBatched<'_>,
+) -> HipResult<()> {
+    let arms = GatedDeltaChunkArms {
+        qk_prenormed: true,
+        q8_inline: gated_delta_q8_inline_route(gpu, p),
+    };
+    gated_delta_step_gate_wmma_arms(gpu, p, gate, arms)
+}
+
+fn gated_delta_step_gate_wmma_arms(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+    gate: &GatedDeltaGateBatched<'_>,
+    arms: GatedDeltaChunkArms,
+) -> HipResult<()> {
+    if !gated_delta_chunk_route(gpu, p)
+        || p.projection.dtype != DType::BF16
+        || (arms.q8_inline && !gated_delta_q8_inline_geometry(gpu, p))
+    {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let format = GdnStateFormat::of(p.state)?;
@@ -657,36 +758,60 @@ pub fn gated_delta_step_gate_wmma(
     let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
     let qp = qn.buf.as_ptr();
     let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_qk_norm_bf16_batched",
-    )?;
-    gpu.ensure_kernel_public(
-        "gated_delta_chunk_wmma",
-        GATED_DELTA_CHUNK_WMMA_SRC,
-        "gated_delta_chunk_gate_wmma",
-    )?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.projection.buf.as_ptr());
-    args.push_ptr(qp);
-    args.push_ptr(kp);
-    args.push_i32(rows);
-    args.push_i32(qkv_width);
-    args.push_i32(key_heads);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        "gated_delta_qk_norm_bf16_batched",
-        [checked_u32(p.rows, "GDN chunk row grid")?, 1, 1],
-        [256, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
+    if !arms.qk_prenormed {
+        gpu.ensure_kernel_public(
+            "tensor_ops",
+            TENSOR_OPS_SRC,
+            "gated_delta_qk_norm_bf16_batched",
+        )?;
+    }
+    if arms.q8_inline {
+        gpu.ensure_kernel_public(
+            "gated_delta_chunk_q8_wmma",
+            GATED_DELTA_CHUNK_Q8_WMMA_SRC,
+            "gated_delta_chunk_gate_q8_wmma",
+        )?;
+    } else {
+        gpu.ensure_kernel_public(
+            "gated_delta_chunk_wmma",
+            GATED_DELTA_CHUNK_WMMA_SRC,
+            "gated_delta_chunk_gate_wmma",
+        )?;
+    }
+    // With `qk_prenormed` the convolution already stored the normalized Q/K
+    // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
+    if !arms.qk_prenormed {
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.projection.buf.as_ptr());
+        args.push_ptr(qp);
+        args.push_ptr(kp);
+        args.push_i32(rows);
+        args.push_i32(qkv_width);
+        args.push_i32(key_heads);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_qk_norm_bf16_batched",
+            [checked_u32(p.rows, "GDN chunk row grid")?, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+    }
     // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
     // and is requantized from it after the chunk, seeded by the last row.
+    // The inline arm (`gated_delta_chunk_gate_q8_wmma`) does both inside the
+    // kernel on the slot itself.  Both seed the requantization with the last
+    // row's absolute position, `position + rows - 1`.  The route excludes a
+    // recorder and graph capture (`gated_delta_chunk_route`), so the frame is
+    // never a replayed kernarg and needs no mutable-frame binding.
+    let frame = match format {
+        GdnStateFormat::F32 => 0,
+        GdnStateFormat::Q8 => checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?,
+    };
     let state = match format {
         GdnStateFormat::F32 => p.state.buf.as_ptr(),
+        GdnStateFormat::Q8 if arms.q8_inline => p.state.buf.as_ptr(),
         GdnStateFormat::Q8 => {
             let scratch = gpu.gdn_state_f32_scratch(
                 GdnStateFormat::F32.state_bytes(p.value_heads, p.key_dim, p.value_dim),
@@ -711,17 +836,25 @@ pub fn gated_delta_step_gate_wmma(
     args.push_i32(value_heads);
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.push_i32(i32::from(output_bf16));
+    if arms.q8_inline {
+        args.push_i32(1);
+        args.push_u32(frame);
+    }
     args.pad_to(16);
+    let chunk_kernel = if arms.q8_inline {
+        "gated_delta_chunk_gate_q8_wmma"
+    } else {
+        "gated_delta_chunk_gate_wmma"
+    };
     gpu.launch_blob_recorded(
-        "gated_delta_chunk_gate_wmma",
+        chunk_kernel,
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
-    if format == GdnStateFormat::Q8 {
-        let frame = checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?;
+    if format == GdnStateFormat::Q8 && !arms.q8_inline {
         gdn_state_convert(gpu, "gdn_state_f32_to_q8", state, p.state.buf.as_ptr(), p.value_heads, Some(frame))?;
     }
     Ok(())
@@ -1391,6 +1524,70 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     )
 }
 
+/// H4 read side: [`hyper_norm_gate`]'s norm + BF16 gate projection of the
+/// streams and [`hyper_norm_f16`]'s F16 normalized row (the HC down GEMM's
+/// input) in one launch (`hyper_norm_gate_outputs`).  `gates` receives the
+/// gate logits the paired HC write would have computed from the same streams;
+/// the write then skips its own norm + gate launch.  Bytewise the two
+/// launches' outputs (hence not the F32/BF16 `normalized` copies).
+pub struct HyperNormGateOutputs<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    /// The paired write's BF16 `[branches, branches * hidden]` gate weight.
+    pub gate_weight: &'a GpuTensor,
+    pub gates: &'a GpuTensor,
+    /// F16 `rows * branches * hidden` elements.
+    pub normalized_f16: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
+}
+
+pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> HipResult<()> {
+    ensure_f32(p.input)?;
+    ensure_f32(p.gates)?;
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate-outputs width")?;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || p.normalized_f16.dtype != DType::F16
+        || p.rows == 0
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !HyperNormGate::supports(p.branches, p.hidden)
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.input.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+        || p.normalized_f16.numel() < p.rows * wide
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC norm-gate-outputs hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate-outputs row grid")?;
+    let lds_bytes = checked_u32(p.hidden * 8 + 4 * 256 * 4, "HC norm-gate-outputs LDS")?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_norm_gate_outputs")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_ptr(p.normalized_f16.buf.as_ptr());
+    args.push_ptr(std::ptr::null());
+    args.push_ptr(std::ptr::null());
+    args.push_i32(hidden);
+    args.push_i32(i32::from(p.state_bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_outputs",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 /// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
 /// `low` fused with `hyper_read_projected` (four branches), bitwise
 /// identical to the multi-row BF16 GEMM followed by that kernel; the
@@ -1459,6 +1656,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 /// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
 /// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let tiled = gpu.flags.qwen4_hc_up_tile_enabled();
+    hyper_read_up_wmma_tiled(gpu, p, tiled)
+}
+
+/// [`hyper_read_up_wmma`] on its baseline entries (`tiled == false`) or the
+/// retiled operand-swapped ones (`tiled == true`, bytewise the baseline's).
+fn hyper_read_up_wmma_tiled(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    tiled: bool,
+) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     let (module, source, entry) = if gpu.arch_caps.has_wmma_w32() {
@@ -1490,8 +1698,26 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
-    let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
+    // H3 (`HIPFIRE_QWEN4_HC_UP_TILE`, exact gfx1151 / gfx1201): the retiled
+    // operand-swapped entries.  gfx1151 keeps the baseline launch geometry;
+    // gfx1201's takes 128 rows per block, static LDS only, `low_rank % 64 == 0`.
+    let tile_1201 = tiled && entry == "hyper_read_up_wmma_bf16_gfx1201" && p.low_rank % 64 == 0;
+    let entry = match (tiled, entry) {
+        (true, "hyper_read_up_wmma_bf16") => "hyper_read_up_wmma_bf16_swap",
+        (true, "hyper_read_up_wmma_bf16_gfx1201") if tile_1201 => {
+            "hyper_read_up_wmma_bf16_gfx1201_t128"
+        }
+        (_, entry) => entry,
+    };
+    let row_grid = checked_u32(
+        p.rows.div_ceil(if tile_1201 { 128 } else { 512 }),
+        "HC read row grid",
+    )?;
+    let lds_bytes = if tile_1201 {
+        0
+    } else {
+        checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?
+    };
     gpu.ensure_kernel_public(module, source, entry)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
@@ -1662,7 +1888,7 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
-    gated_delta_conv_batched_impl(gpu, p, None)
+    gated_delta_conv_batched_impl(gpu, p, None, None)
 }
 
 /// [`gated_delta_conv_batched`] and [`gated_delta_params_batched`] in one
@@ -1673,13 +1899,67 @@ pub fn gated_delta_conv_params_batched(
     params: &GatedDeltaParamsBatched<'_>,
 ) -> HipResult<()> {
     validate_gated_delta_params_batched(params)?;
-    gated_delta_conv_batched_impl(gpu, conv, Some(params))
+    gated_delta_conv_batched_impl(gpu, conv, Some(params), None)
+}
+
+/// [`gated_delta_conv_params_batched`] that also stores the Q/K the chunked
+/// recurrence consumes already normalized
+/// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`): the convolution values
+/// and parameters are bitwise the plain launch's, and the normalized Q/K are
+/// bitwise what `gated_delta_qk_norm_bf16_batched` stores, written into the
+/// shared F16 activation scratch ([`Gpu::qwen4_f16_x_scratch`]) where
+/// [`gated_delta_step_gate_wmma_qknormed`] reads them.  `step` is the
+/// recurrence this convolution feeds; it must satisfy
+/// [`gated_delta_conv_qknorm_geometry`].  Without `keep_qk_conv` the Q/K
+/// columns of `conv.output` are NOT written (the chunk kernel reads only V
+/// from it): a caller that consumes them (debug / capture) passes `true`,
+/// or stays on [`gated_delta_conv_params_batched`] and
+/// [`gated_delta_step_gate_wmma`].
+pub fn gated_delta_conv_params_qknorm_batched(
+    gpu: &mut Gpu,
+    conv: &GatedDeltaConvBatched<'_>,
+    params: &GatedDeltaParamsBatched<'_>,
+    step: &GatedDeltaStepBatched<'_>,
+    keep_qk_conv: bool,
+) -> HipResult<()> {
+    if !gated_delta_conv_qknorm_geometry(gpu, step, conv) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    validate_gated_delta_params_batched(params)?;
+    let qk = checked_product(step.key_heads, step.key_dim, "GDN chunk qk extent")?;
+    let scratch = gpu.qwen4_f16_x_scratch(2 * step.rows * qk)?;
+    let qn = scratch.buf.as_ptr();
+    let kn = unsafe { (qn as *mut u8).add(step.rows * qk * 2) } as *mut std::ffi::c_void;
+    // The kernel stores qn / kn as 8-byte vectors.
+    if (qn as usize) % 8 != 0 || (kn as usize) % 8 != 0 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    gated_delta_conv_batched_impl(
+        gpu,
+        conv,
+        Some(params),
+        Some(ConvQkNorm {
+            qn,
+            kn,
+            keep_qk_conv,
+        }),
+    )
+}
+
+/// H5's extra outputs: the normalized Q/K (`[rows, 16, 128]` BF16 each).
+#[derive(Clone, Copy)]
+struct ConvQkNorm {
+    qn: *mut std::ffi::c_void,
+    kn: *mut std::ffi::c_void,
+    /// Also store the unnormalized Q/K convolution into the output.
+    keep_qk_conv: bool,
 }
 
 fn gated_delta_conv_batched_impl(
     gpu: &mut Gpu,
     p: &GatedDeltaConvBatched<'_>,
     params: Option<&GatedDeltaParamsBatched<'_>>,
+    qk_norm: Option<ConvQkNorm>,
 ) -> HipResult<()> {
     for tensor in [p.history, p.next_history] {
         ensure_f32(tensor)?;
@@ -1725,7 +2005,11 @@ fn gated_delta_conv_batched_impl(
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
     let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
-    let kernel = "gated_delta_conv_bf16_f32_batched_k4";
+    let kernel = if qk_norm.is_some() {
+        "gated_delta_conv_qknorm_bf16_f32_batched_k4"
+    } else {
+        "gated_delta_conv_bf16_f32_batched_k4"
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
@@ -1737,7 +2021,9 @@ fn gated_delta_conv_batched_impl(
     args.push_i32(kernel_size);
     args.push_i32(start_cursor);
     let start_cursor_offset = args.len() - 4;
-    args.push_i32(i32::from(output_bf16));
+    // H5's `output_bf16` is a flag word: bit 0 = packed BF16 output, bit 1 =
+    // also store the unnormalized Q/K convolution (debug / capture).
+    args.push_i32(i32::from(output_bf16) | qk_norm.map_or(0, |n| 2 * i32::from(n.keep_qk_conv)));
     args.push_i32(i32::from(input_bf16));
     let (param_elements, param_heads) = match params {
         Some(q) => {
@@ -1755,6 +2041,10 @@ fn gated_delta_conv_batched_impl(
     };
     args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
     args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
+    if let Some(norm) = qk_norm {
+        args.push_ptr(norm.qn);
+        args.push_ptr(norm.kn);
+    }
     args.pad_to(16);
     let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
@@ -4421,6 +4711,125 @@ mod tests {
         }
     }
 
+    /// H4 read side: `hyper_norm_gate_outputs` stores, bytewise, the gates of
+    /// `hyper_norm_gate` and the F16 normalized row of `hyper_norm_f16`, for F32
+    /// streams and for BF16-bit streams, over ragged row counts.
+    #[test]
+    fn hyper_norm_gate_outputs_is_bytewise_the_norm_gate_and_norm_f16_pair() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs gfx11+ wave32");
+            return;
+        }
+        let (branches, hidden) = (4usize, 2560usize);
+        let wide = branches * hidden;
+        let norm = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(2, wide, 0.5)), &[wide * 2])
+                .expect("norm");
+            t.dtype = DType::BF16;
+            t.shape = vec![wide];
+            t
+        };
+        let gate_weight = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(3, branches * wide, 0.05)), &[branches * wide * 2])
+                .expect("gate weight");
+            t.dtype = DType::BF16;
+            t.shape = vec![branches * wide];
+            t
+        };
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        for rows in [1usize, 37, 512, 530] {
+            for state_bf16 in [false, true] {
+                let values = test_wave(1, rows * wide, 3.0);
+                let input = if state_bf16 {
+                    // BF16 bits in the first half of an F32-typed buffer.
+                    let mut raw = bf16_le_bytes(&values);
+                    raw.resize(rows * wide * 4, 0);
+                    gpu.upload_raw(&raw, &[rows * wide * 4])
+                        .map(|mut t| {
+                            t.dtype = DType::F32;
+                            t.shape = vec![rows * wide];
+                            t
+                        })
+                        .expect("input")
+                } else {
+                    gpu.upload_f32(&values, &[rows * wide]).expect("input")
+                };
+                let gates_ref = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16_ref = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+                hyper_norm_gate(
+                    &mut gpu,
+                    &HyperNormGate {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates_ref,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("norm gate");
+                hyper_norm_f16(
+                    &mut gpu,
+                    &HyperNorm {
+                        input: &input,
+                        norm_weight: &norm,
+                        normalized: &normalized,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                    &x16_ref,
+                    false,
+                )
+                .expect("norm f16");
+                let gates = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16 = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                hyper_norm_gate_outputs(
+                    &mut gpu,
+                    &HyperNormGateOutputs {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates,
+                        normalized_f16: &x16,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("outputs");
+                assert!(
+                    bytes(&gpu, &gates) == bytes(&gpu, &gates_ref),
+                    "{rows} rows bf16={state_bf16}: gates differ"
+                );
+                assert!(
+                    bytes(&gpu, &x16) == bytes(&gpu, &x16_ref),
+                    "{rows} rows bf16={state_bf16}: F16 normalized row differs"
+                );
+                assert!(bytes(&gpu, &gates).iter().any(|b| *b != 0), "gates are all zero");
+                for tensor in [input, gates_ref, x16_ref, normalized, gates, x16] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        gpu.free_tensor(norm).expect("free");
+        gpu.free_tensor(gate_weight).expect("free");
+    }
+
     /// HC streams stored as BF16 bits (the Qwen4 F16 prefill route) must give
     /// every stream reader exactly the F32 stream's result: the norm, the
     /// norm-gate and the write all round the stream to BF16 on load, and the
@@ -4727,6 +5136,30 @@ mod tests {
                 differ * 100 < reference.len(),
                 "WMMA HC read: {differ} differ"
             );
+            // H3: the retiled operand-swapped entries are bytewise the
+            // baseline entries' (also at the ragged row count 131).
+            let tiled_out = gpu.zeros(&[rows * hidden], DType::F32).expect("tiled");
+            hyper_read_up_wmma_tiled(
+                &mut gpu,
+                &HyperReadUpFused {
+                    up_weight: &up_weight,
+                    low: &low_bf16,
+                    normalized: &normalized_f16,
+                    mixed: &tiled_out,
+                    rows,
+                    hidden,
+                    low_rank,
+                    normalized_bf16: true,
+                },
+                true,
+            )
+            .expect("tiled wmma");
+            assert_eq!(
+                bits(&gpu, &tiled_out),
+                bits(&gpu, &wmma),
+                "retiled HC read differs from the baseline entry"
+            );
+            gpu.free_tensor(tiled_out).expect("free");
             gpu.free_tensor(normalized_f16).expect("free");
             gpu.free_tensor(low_bf16).expect("free");
         }
@@ -5353,6 +5786,355 @@ mod tests {
         }
         eprintln!("GDN_Q8_CHUNK_DIGEST {digest:016x}");
         for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// Round-to-nearest-even BF16 bits of `values`, little-endian.
+    fn bf16_le_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn test_wave(seed: usize, n: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                (h as f32 - 5003.0) / 5003.0 * scale
+            })
+            .collect()
+    }
+
+    /// H5 hookup: the opt-in convolution that also stores the normalized Q/K
+    /// plus the Q/K-norm-skipping chunk launch is bytewise the plain
+    /// convolution + `gated_delta_qk_norm_bf16_batched` + chunk launch pair:
+    /// gated output, final state, convolution ring, gate/beta and the V
+    /// columns of the convolution output (all columns with `keep_qk_conv`).
+    /// Ragged last row tile, a nonzero ring cursor and the in-place ring the
+    /// pipeline uses.  The flag is off by default, and the geometry guards
+    /// refuse every other head layout.
+    #[test]
+    fn gdn_conv_qknorm_hookup_is_bytewise_the_two_launch_pair() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx1151 and the F16 WMMA route");
+            return;
+        }
+        let (key_heads, value_heads, dim, rows) = (16usize, 16usize, 128usize, 530usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let projection = gpu
+            .upload_f32(&test_wave(1, rows * qkv, 1.5), &[rows * qkv])
+            .expect("projection");
+        let mut conv_kernel = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(7, qkv * 4, 0.6)), &[qkv * 4 * 2])
+            .expect("conv kernel");
+        conv_kernel.dtype = DType::BF16;
+        conv_kernel.shape = vec![qkv * 4];
+        let history0 = test_wave(8, 3 * qkv, 1.0);
+        let a = gpu
+            .upload_f32(&test_wave(9, rows * value_heads, 2.0), &[rows * value_heads])
+            .expect("a");
+        let b = gpu
+            .upload_f32(&test_wave(10, rows * value_heads, 2.0), &[rows * value_heads])
+            .expect("b");
+        let mut a_log = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(11, value_heads, 1.0)), &[value_heads * 2])
+            .expect("a_log");
+        a_log.dtype = DType::BF16;
+        a_log.shape = vec![value_heads];
+        let mut dt_bias = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(12, value_heads, 1.0)), &[value_heads * 2])
+            .expect("dt_bias");
+        dt_bias.dtype = DType::BF16;
+        dt_bias.shape = vec![value_heads];
+        let state0 = test_wave(4, value_heads * dim * dim, 0.2);
+        let z = gpu
+            .upload_f32(&test_wave(5, rows * value, 2.0), &[rows * value])
+            .expect("z");
+        let mut norm = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(6, dim, 1.0)), &[dim * 2])
+            .expect("norm");
+        norm.dtype = DType::BF16;
+        norm.shape = vec![dim];
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        // (gated output, state, ring, gate, beta, convolution output)
+        let run = |gpu: &mut Gpu, fused: bool, keep_qk_conv: bool| -> [Vec<u8>; 6] {
+            let history = gpu.upload_f32(&history0, &[history0.len()]).expect("history");
+            let conv_out = gpu.zeros(&[rows * qkv], DType::BF16).expect("conv out");
+            let gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("gate");
+            let beta = gpu.zeros(&[rows * value_heads], DType::F32).expect("beta");
+            let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+            let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
+            let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+            let conv = GatedDeltaConvBatched {
+                input: &projection,
+                kernel: &conv_kernel,
+                history: &history,
+                output: &conv_out,
+                next_history: &history,
+                rows,
+                channels: qkv,
+                history_rows: 3,
+                kernel_size: 4,
+                start_cursor: 1,
+            };
+            let params = GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate: &gate,
+                beta: &beta,
+                rows,
+                heads: value_heads,
+            };
+            let step = GatedDeltaStepBatched {
+                projection: &conv_out,
+                gate: &gate,
+                beta: &beta,
+                state: &state,
+                output: &recurrent,
+                row_states: None,
+                rows,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+                position: 0,
+            };
+            let gated = GatedDeltaGateBatched {
+                recurrent_output: &recurrent,
+                z: &z,
+                norm: &norm,
+                output: &out,
+                rows,
+                value_heads,
+                value_dim: dim,
+            };
+            assert!(gated_delta_chunk_route(gpu, &step), "chunked route did not apply");
+            assert!(gated_delta_conv_qknorm_geometry(gpu, &step, &conv));
+            // Default off: the flag alone selects the new kernels.
+            assert_eq!(
+                gated_delta_conv_qknorm_route(gpu, &step, &conv),
+                gpu.flags.qwen4_gdn_conv_qknorm_enabled()
+            );
+            if fused {
+                gated_delta_conv_params_qknorm_batched(gpu, &conv, &params, &step, keep_qk_conv)
+                    .expect("conv + qk norm");
+                gated_delta_step_gate_wmma_qknormed(gpu, &step, &gated).expect("chunk");
+            } else {
+                gated_delta_conv_params_batched(gpu, &conv, &params).expect("conv");
+                gated_delta_step_gate_wmma(gpu, &step, &gated).expect("chunk");
+            }
+            let values = [
+                bytes(gpu, &out),
+                bytes(gpu, &state),
+                bytes(gpu, &history),
+                bytes(gpu, &gate),
+                bytes(gpu, &beta),
+                bytes(gpu, &conv_out),
+            ];
+            for tensor in [history, conv_out, gate, beta, state, recurrent, out] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+            values
+        };
+        let plain = run(&mut gpu, false, false);
+        let fused = run(&mut gpu, true, false);
+        let kept = run(&mut gpu, true, true);
+        for (i, label) in ["gated output", "state", "conv ring", "gate", "beta"].iter().enumerate() {
+            assert!(plain[i] == fused[i], "{label} differs (qk columns dropped)");
+            assert!(plain[i] == kept[i], "{label} differs (qk columns kept)");
+        }
+        assert!(plain[5] == kept[5], "convolution output differs with keep_qk_conv");
+        let (row_bytes, v_from) = (qkv * 2, 2 * qk * 2);
+        for r in 0..rows {
+            assert!(
+                plain[5][r * row_bytes + v_from..(r + 1) * row_bytes]
+                    == fused[5][r * row_bytes + v_from..(r + 1) * row_bytes],
+                "row {r}: V convolution columns differ"
+            );
+        }
+        // The geometry guards: only 16 key heads of 128 in q|k|v order.
+        let conv_out = gpu.zeros(&[rows * qkv], DType::BF16).expect("conv out");
+        let history = gpu.upload_f32(&history0, &[history0.len()]).expect("history");
+        let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+        let gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("gate");
+        let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
+        let step = GatedDeltaStepBatched {
+            projection: &conv_out,
+            gate: &gate,
+            beta: &gate,
+            state: &state,
+            output: &recurrent,
+            row_states: None,
+            rows,
+            qkv_width: qkv,
+            key_heads,
+            value_heads,
+            key_dim: dim,
+            value_dim: dim,
+            position: 0,
+        };
+        let conv = GatedDeltaConvBatched {
+            input: &projection,
+            kernel: &conv_kernel,
+            history: &history,
+            output: &conv_out,
+            next_history: &history,
+            rows,
+            channels: qkv,
+            history_rows: 3,
+            kernel_size: 4,
+            start_cursor: 0,
+        };
+        assert!(gated_delta_conv_qknorm_geometry(&gpu, &step, &conv));
+        let eight = GatedDeltaStepBatched { key_heads: 8, ..step };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &eight, &conv));
+        let short = GatedDeltaStepBatched { rows: 511, ..eight };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &short, &conv));
+        let f32_out = gpu.zeros(&[rows * qkv], DType::F32).expect("f32 conv out");
+        let f32_conv = GatedDeltaConvBatched { output: &f32_out, ..conv };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &step, &f32_conv));
+        let ring4 = GatedDeltaConvBatched { history_rows: 4, ..f32_conv };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &step, &ring4));
+        for tensor in [
+            projection, conv_kernel, a, b, a_log, dt_bias, z, norm, conv_out, history, state, gate,
+            recurrent, f32_out,
+        ] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// H6 hookup: the inline-Q8 chunk module is bytewise the
+    /// dequantize + chunk + requantize arm it replaces (gated output and the
+    /// whole Q8 slot), over the route's minimum rows and the 16-row chunk
+    /// boundary +-1, at a nonzero start position (the requantization seed).
+    #[test]
+    fn gdn_q8_inline_hookup_is_bytewise_the_conversion_arm() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx1151 and the F16 WMMA route");
+            return;
+        }
+        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 530usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let mut proj_bf16 = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, max_rows * qkv, 1.5)), &[max_rows * qkv * 2])
+            .expect("projection");
+        proj_bf16.dtype = DType::BF16;
+        proj_bf16.shape = vec![max_rows * qkv];
+        let gate_values: Vec<f32> =
+            test_wave(2, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta_values: Vec<f32> =
+            test_wave(3, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let gate_gpu = gpu.upload_f32(&gate_values, &[gate_values.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta_values, &[beta_values.len()]).expect("beta");
+        let z_gpu = gpu
+            .upload_f32(&test_wave(5, max_rows * value, 2.0), &[max_rows * value])
+            .expect("z");
+        let mut norm_gpu = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(6, dim, 1.0)), &[dim * 2])
+            .expect("norm");
+        norm_gpu.dtype = DType::BF16;
+        norm_gpu.shape = vec![dim];
+        let state0 = test_wave(4, value_heads * dim * dim, 0.2);
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), seed_slot.buf.as_ptr(), value_heads, Some(3))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        for (n, position) in [(512usize, 0usize), (513, 7), (527, 4096), (528, 1), (529, 99), (530, 262_143)] {
+            let mut results = Vec::new();
+            for inline in [false, true] {
+                let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+                gpu.copy_d2d(&seed_slot, &slot, slot_bytes).expect("copy slot");
+                let recurrent = gpu.zeros(&[n * value], DType::F32).expect("recurrent");
+                let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+                let step = GatedDeltaStepBatched {
+                    projection: &proj_bf16.sub_offset(0, n * qkv),
+                    gate: &gate_gpu.sub_offset(0, n * value_heads),
+                    beta: &beta_gpu.sub_offset(0, n * value_heads),
+                    state: &slot,
+                    output: &recurrent,
+                    row_states: None,
+                    rows: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    key_dim: dim,
+                    value_dim: dim,
+                    position,
+                };
+                let gated = GatedDeltaGateBatched {
+                    recurrent_output: &recurrent,
+                    z: &z_gpu.sub_offset(0, n * value),
+                    norm: &norm_gpu,
+                    output: &out,
+                    rows: n,
+                    value_heads,
+                    value_dim: dim,
+                };
+                assert!(gated_delta_q8_inline_geometry(&gpu, &step));
+                // Default off: the flag alone selects the new module.
+                assert_eq!(
+                    gated_delta_q8_inline_route(&gpu, &step),
+                    gpu.flags.qwen4_gdn_q8_inline_enabled()
+                );
+                let arms = GatedDeltaChunkArms { qk_prenormed: false, q8_inline: inline };
+                gated_delta_step_gate_wmma_arms(&mut gpu, &step, &gated, arms).expect("chunked GDN");
+                results.push((bytes(&gpu, &out), bytes(&gpu, &slot)));
+                for tensor in [slot, recurrent, out] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+            assert!(results[0].0 == results[1].0, "{n} rows @ {position}: gated output differs");
+            assert!(results[0].1 == results[1].1, "{n} rows @ {position}: Q8 slot differs");
+        }
+        // An F32 state or a misaligned slot never takes the inline arm.
+        let f32_state = gpu.zeros(&[value_heads * dim * dim], DType::F32).expect("f32 state");
+        let step = GatedDeltaStepBatched {
+            projection: &proj_bf16,
+            gate: &gate_gpu,
+            beta: &beta_gpu,
+            state: &f32_state,
+            output: &f32_state,
+            row_states: None,
+            rows: 512,
+            qkv_width: qkv,
+            key_heads,
+            value_heads,
+            key_dim: dim,
+            value_dim: dim,
+            position: 0,
+        };
+        assert!(!gated_delta_q8_inline_geometry(&gpu, &step));
+        for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot, f32_state] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -7279,6 +8061,141 @@ mod tests {
         }
         for tensor in [raw_f32, raw_bf16, norm, pooled_f32, pooled_bf16, query_gpu] {
             gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// H4 shared-down fold: the BF16 shared-down GEMM that applies the scaled
+    /// add and the paired HC write in its epilogue must leave the HC streams
+    /// (and, when asked, the routed rows) bytewise as the F16 WMMA GEMM,
+    /// `bf16_scaled_add_batched` and `hyper_write` do, F32 and BF16-bit
+    /// streams, ragged row counts.
+    #[test]
+    fn shared_down_hcsd_is_bytewise_the_gemm_scaled_add_hyper_write_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let mut weight = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, m * k, 0.3)), &[m * k * 2])
+            .expect("weight");
+        weight.dtype = DType::BF16;
+        weight.shape = vec![m * k];
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for rows in [512usize, 530, 1100] {
+            assert!(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(&weight, m, k, rows));
+            let x = gpu
+                .upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k])
+                .expect("x");
+            let selector = gpu
+                .upload_f32(&test_wave(3, rows, 1.0), &[rows])
+                .expect("selector");
+            let gates = gpu
+                .upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4])
+                .expect("gates");
+            let routed_values = test_wave(5, rows * m, 3.0);
+            let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+            for state_bf16 in [false, true] {
+                let initial = test_wave(6, rows * wide, 3.0);
+                let raw: Vec<u8> = if state_bf16 {
+                    let mut raw = bf16_le_bytes(&initial);
+                    raw.resize(rows * wide * 4, 0);
+                    raw
+                } else {
+                    initial.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                let mut streams = |gpu: &mut Gpu| {
+                    let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                    t.dtype = DType::F32;
+                    t.shape = vec![rows * wide];
+                    t
+                };
+                let reference_streams = streams(&mut gpu);
+                let reference_routed = gpu
+                    .upload_f32(&routed_values, &[rows * m])
+                    .expect("routed");
+                let projected = gpu.zeros(&[rows * m], DType::F32).expect("projected");
+                assert!(gpu
+                    .gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &projected, m)], &x, k, rows)
+                    .expect("gemm"));
+                bf16_scaled_add_batched(
+                    &mut gpu,
+                    &Bf16ScaledAddBatched {
+                        residual: &reference_routed,
+                        value: &projected,
+                        scalar: &selector,
+                        rows,
+                        elements: m,
+                    },
+                )
+                .expect("scaled add");
+                hyper_write(
+                    &mut gpu,
+                    &HyperWrite {
+                        input: &reference_streams,
+                        normalized: &normalized,
+                        mixed: &reference_routed,
+                        gates: &gates,
+                        output: &reference_streams,
+                        branches: 4,
+                        hidden: m,
+                        state_bf16,
+                    },
+                )
+                .expect("write");
+                for write_routed in [false, true] {
+                    let fused_streams = streams(&mut gpu);
+                    let fused_routed = gpu
+                        .upload_f32(&routed_values, &[rows * m])
+                        .expect("routed");
+                    gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                        &weight,
+                        &x,
+                        m,
+                        k,
+                        rows,
+                        &fused_routed,
+                        &selector,
+                        &fused_streams,
+                        &gates,
+                        state_bf16,
+                        write_routed,
+                    )
+                    .expect("hcsd");
+                    let (want, got) = (bits(&gpu, &reference_streams), bits(&gpu, &fused_streams));
+                    assert_ne!(want.len(), 0);
+                    let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differing, 0,
+                        "{differing} stream words differ: rows={rows} state_bf16={state_bf16} \
+                         write_routed={write_routed}"
+                    );
+                    if write_routed {
+                        assert_eq!(
+                            bits(&gpu, &reference_routed),
+                            bits(&gpu, &fused_routed),
+                            "routed rows differ: rows={rows}"
+                        );
+                    } else {
+                        assert_eq!(
+                            routed_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            bits(&gpu, &fused_routed),
+                            "routed rows were rewritten without hc_write_routed"
+                        );
+                    }
+                }
+            }
         }
     }
 }
