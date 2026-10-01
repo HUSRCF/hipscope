@@ -10,7 +10,10 @@
 //! local may outlive publication as a second owner.
 
 use crate::config::Qwen4Config;
-use crate::gpu_forward::{Qwen4GpuForward, Qwen4OutputRows, QWEN4_PREFILL_CHUNK_CAP};
+use crate::gpu_forward::{
+    qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
+    qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+};
 use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -151,7 +154,16 @@ impl Qwen4Bundle {
                 return Err(cleanup_bundle_failure(error, weight_result, cleanup));
             }
         };
-        let ple_rows = match RowStore::new("qwen4-ple-reader", descriptors, metadata.valid_rows()) {
+        // One prefill chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows in
+        // a single row-store request, so staging holds the requested chunk.
+        let staging_rows = qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len)
+            * crate::ple::PLE_HEAD_COUNT;
+        let ple_rows = match RowStore::with_staging_rows(
+            "qwen4-ple-reader",
+            descriptors,
+            metadata.valid_rows(),
+            staging_rows,
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 let weight_result = weights.free_gpu(gpu);
@@ -253,24 +265,34 @@ impl Qwen4Bundle {
                 "Qwen4 forward chunk capacity is zero".to_string(),
             ));
         }
-        // One chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows through a
-        // single row-store staging buffer (26,214 rows = 1,638 tokens), so the
-        // chunk cannot exceed it; round down to 256 rows so a full chunk keeps
-        // the M/N-aligned prefill GEMM tiles.  Longer prompts tile.
-        let ple_rows_cap =
-            self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT / 256 * 256;
-        if ple_rows_cap == 0 {
+        // A chunk's PLE prefetch is one row-store request: the staging sized
+        // at assembly bounds it.
+        let ple_rows_cap = self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
+        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
+        if requested == 0 {
             return Err(BundleError::Forward(
-                "Qwen4 PLE row store cannot stage one 256-token chunk".to_string(),
+                "Qwen4 PLE row store cannot stage one chunk row".to_string(),
             ));
         }
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP).min(ple_rows_cap);
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
+        // The largest rung whose chunk-sized resources fit the free device
+        // memory beside the kernels' lazily sized workspaces; the smallest
+        // rung is attempted regardless and fails at allocation if it must.
+        let (free, _) = gpu.hip.get_vram_info().map_err(BundleError::Hip)?;
+        let max_chunk = qwen4_prefill_chunk_rungs(requested)
+            .find(|&rows| {
+                qwen4_forward_device_bytes(&self.config, rows)
+                    .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                    .is_some_and(|bytes| bytes <= free as u64)
+            })
+            .unwrap_or_else(|| requested.min(1536));
+        eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
         let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
-        let logits_len = max_chunk
+        let spec_rows = qwen4_spec_logit_rows(max_chunk);
+        let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
             .ok_or_else(|| BundleError::Forward("spec logit scratch overflow".to_string()))?;
         let spec_logits = match gpu.zeros(&[logits_len], rdna_compute::DType::F32) {
@@ -280,7 +302,7 @@ impl Qwen4Bundle {
                 return Err(BundleError::Hip(error));
             }
         };
-        let top1_len = match max_chunk.checked_mul(std::mem::size_of::<i32>()) {
+        let top1_len = match spec_rows.checked_mul(std::mem::size_of::<i32>()) {
             Some(len) => len,
             None => {
                 let _ = gpu.free_tensor(spec_logits);

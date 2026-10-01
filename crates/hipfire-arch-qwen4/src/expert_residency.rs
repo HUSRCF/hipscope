@@ -23,16 +23,21 @@ pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_EN
 
 /// VRAM left free by `auto` beyond the resident non-expert weights: forward
 /// scratch, KV and state for [`AUTO_VRAM_RESERVE_MAX_SEQ`] tokens plus
-/// headroom, without native MTP. Measured on a gfx1201 R9700 at N=16: every
-/// context-sized buffer is allocated at load, and a 32,700-token prefill
-/// plus decode at that context peaked at 6,199 MiB beyond the non-expert and
-/// expert weights, 457 MiB under this reserve. [`auto_vram_reserve`] adds
-/// what a longer context and native MTP take; a shorter one keeps it.
+/// headroom, without native MTP. Measured on a gfx1201 R9700 at N=16 with a
+/// [`AUTO_VRAM_RESERVE_CHUNK`]-row prefill chunk: every context-sized buffer
+/// is allocated at load, and a 32,700-token prefill plus decode at that
+/// context peaked at 6,199 MiB beyond the non-expert and expert weights,
+/// 457 MiB under this reserve. [`auto_vram_reserve`] adds what a longer
+/// context, a different chunk and native MTP take; a shorter context keeps it.
 pub const AUTO_VRAM_RESERVE_BYTES: u64 = 6656 << 20;
 
 /// Context [`AUTO_VRAM_RESERVE_BYTES`] was measured at (`hipfire run`'s
 /// legacy-KV `max_seq`).
 pub const AUTO_VRAM_RESERVE_MAX_SEQ: usize = 32768;
+
+/// Prefill chunk [`AUTO_VRAM_RESERVE_BYTES`] was measured at; its forward
+/// scratch then carried speculative logits and argmax for every chunk row.
+pub const AUTO_VRAM_RESERVE_CHUNK: usize = 1536;
 
 /// Host RAM that must remain available after the pinned experts are placed.
 pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
@@ -104,12 +109,15 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 }
 
 /// VRAM `auto` leaves free beyond the non-expert weights for a load at
-/// `max_seq`: [`AUTO_VRAM_RESERVE_BYTES`], the trunk QSA arenas' growth in
-/// `qsa_format` past [`AUTO_VRAM_RESERVE_MAX_SEQ`], and `mtp_bytes` when a
-/// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`).
+/// `max_seq` with a `chunk_rows` prefill chunk: [`AUTO_VRAM_RESERVE_BYTES`],
+/// the trunk QSA arenas' growth in `qsa_format` past
+/// [`AUTO_VRAM_RESERVE_MAX_SEQ`], the chunk-sized forward resources' change
+/// from the measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, and `mtp_bytes` when
+/// a native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`).
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     max_seq: usize,
+    chunk_rows: usize,
     qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
     mtp_bytes: Option<u64>,
 ) -> Result<u64, String> {
@@ -121,8 +129,23 @@ pub fn auto_vram_reserve(
             .ok_or_else(|| format!("QSA context state for max_seq {seq} overflows"))
     };
     let context = arena(max_seq)?.saturating_sub(arena(AUTO_VRAM_RESERVE_MAX_SEQ)?);
+    let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
+    let measured = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+        config,
+        AUTO_VRAM_RESERVE_CHUNK,
+    )
+    .ok()
+    .and_then(|scratch| {
+        let spec = AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
+        scratch.checked_add(spec as u64)
+    })
+    .ok_or_else(overflow)?;
+    let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows)
+        .ok_or_else(overflow)?;
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
+        .and_then(|bytes| bytes.checked_add(forward))
+        .and_then(|bytes| bytes.checked_sub(measured))
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
@@ -418,7 +441,7 @@ mod tests {
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
-        let reserve = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None).unwrap();
+        let reserve = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, F32, None).unwrap();
         assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES);
         assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve), 16);
         // A card that holds everything keeps every layer resident.
@@ -433,17 +456,11 @@ mod tests {
     #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
-        let base = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, None).unwrap();
-        let mtp = crate::mtp_spec::native_mtp_device_bytes(
-            &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
-            3,
-            DType::MQ6G256V2,
-            true,
-        )
+        let base = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, F32, None).unwrap();
+        let mtp = crate::mtp_spec::native_mtp_device_bytes(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, 3, DType::MQ6G256V2, true)
         .unwrap();
         let with_mtp =
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, F32, Some(mtp)).unwrap();
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, F32, Some(mtp)).unwrap();
         assert_eq!(with_mtp - base, mtp);
         // The draft head's F32 requant scratch (vocab x hidden x 4) goes back
         // to the device at attach, before the first request allocates its
@@ -458,13 +475,7 @@ mod tests {
         let (resident, scratch) = (resident as u64, scratch as u64);
         assert_eq!(scratch, (config.vocab_size * config.hidden_size * 4) as u64);
         let native = |max_k, row_capture| {
-            crate::mtp_spec::native_mtp_device_bytes(
-                &config,
-                AUTO_VRAM_RESERVE_MAX_SEQ,
-                max_k,
-                DType::MQ6G256V2,
-                row_capture,
-            )
+            crate::mtp_spec::native_mtp_device_bytes(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, max_k, DType::MQ6G256V2, row_capture)
             .unwrap()
         };
         // At K = 3 the scratch outweighs the request, row capture included.
@@ -484,7 +495,7 @@ mod tests {
         // A context past the measured one adds the trunk QSA arenas' growth
         // in the load's QSA format: fp8 K/V grows less than the F32 state.
         let growth = |format| {
-            let long = auto_vram_reserve(&config, 4 * AUTO_VRAM_RESERVE_MAX_SEQ, format, None)
+            let long = auto_vram_reserve(&config, 4 * AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, format, None)
                 .unwrap();
             let arena = (config.qsa_context_arena_bytes(4 * AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap()
                 - config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format).unwrap())
@@ -494,7 +505,8 @@ mod tests {
         };
         assert!(growth(QsaKvFormat::Fp8) < growth(F32));
         // A shorter context keeps the measured reserve.
-        assert_eq!(auto_vram_reserve(&config, 2048, QsaKvFormat::Fp8, None).unwrap(), base);
+        let short = auto_vram_reserve(&config, 2048, AUTO_VRAM_RESERVE_CHUNK, QsaKvFormat::Fp8, None);
+        assert_eq!(short.unwrap(), base);
     }
 
     #[test]

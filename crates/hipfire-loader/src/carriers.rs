@@ -436,6 +436,10 @@ impl Carrier for Qwen4Carrier {
                     let (non_expert, layer_experts) =
                         residency::resident_split(&manifest.weights, bytes_of)
                             .map_err(|error| format!("qwen4: {error}"))?;
+                    let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+                        &ctx.gpu.arch,
+                        ctx.max_seq,
+                    );
                     // Every placement host-maps at least the MTP layer's
                     // routed experts, so the head is still attached after it
                     // only where the host-mapped policy keeps it (an explicit
@@ -451,6 +455,7 @@ impl Carrier for Qwen4Carrier {
                             hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                                 &config,
                                 ctx.max_seq,
+                                chunk_rows,
                                 max_k,
                                 head,
                                 row_capture,
@@ -463,6 +468,7 @@ impl Carrier for Qwen4Carrier {
                     let reserve = residency::auto_vram_reserve(
                         &config,
                         ctx.max_seq,
+                        chunk_rows,
                         qsa_format,
                         mtp_bytes,
                     )
