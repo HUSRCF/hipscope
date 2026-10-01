@@ -2269,6 +2269,22 @@ mod tests {
     }
 
     #[test]
+    fn immutable_guard_definedness_survives_a_long_instruction_chain() {
+        let mut items = vec![I(smov(s(32), s(0))), I(mk("s_cmp_ge_u32", vec![s(32), int(2)])),
+            B("s_cbranch_scc1", "skip_def"), I(vmov(150, int(1))), L("skip_def")];
+        items.extend((0..40_000).map(|_| I(nop())));
+        items.extend([I(mk("s_cmp_ge_u32", vec![s(32), int(2)])),
+            B("s_cbranch_scc1", "done"), I(vadd(151, 150, 150)), L("done"), I(endpgm())]);
+        let program = program_of(body_of(items));
+        let kernel = &program.kernels[0];
+        let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+        let (defined, _) = flow.defined(entry_seed(kernel, ARCH).unwrap());
+        let consumer = kernel.body.layout.len() - 2;
+        assert!(flow.acc[consumer].reads.minus(&defined[consumer]).is_empty(),
+            "both reaching immutable-guard outcomes must retain the guarded definition");
+    }
+
+    #[test]
     fn loop_carried_load_order_is_position_correct_at_a_join() {
         for threshold in [1, 2] {
             let a = analyzed(vec![I(gload(150, 0)), L("loop"), I(gload(151, 0)),
