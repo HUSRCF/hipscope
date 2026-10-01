@@ -3,6 +3,21 @@ use smallvec::SmallVec;
 use crate::{inst::{Arch, Form, FormFields, Inst, NamedField}, isa::{self, FieldClass, OpRow}, operand::{CachePolicy, CacheScope, DelayAluHint, Dpp, Half, ImmField, InlineConst, Modifiers, Msg, Omod, Operand, Special, VmemToken}, provenance::Provenance, reg::{Kind, RegRef}, wait::{Counter, WaitImm}};
 use super::forms::{self, Field};
 
+/// Encoding tables reserve 64-bit lane-mask slots even in wave32. Keep the
+/// raw codec wave-neutral, but consumers with kernel metadata must use this
+/// width for explicit scalar masks, not for genuine scalar data pairs.
+pub fn operand_register(arch: Arch, wave: crate::inst::Wave, inst: &Inst, index: usize) -> Option<RegRef> {
+    let mut reg = match inst.operands.get(index)? { Operand::Reg(r) | Operand::Half(r, _) => *r, _ => return None };
+    let name = inst.op.name(arch).unwrap_or("");
+    let mask_output = (name.starts_with("v_cmp") && index == 0)
+        || ((name.starts_with("v_div_scale_") || name.starts_with("v_") && name.contains("_co_")) && index == 1);
+    let mask_input = (name.starts_with("v_cndmask_") || name.starts_with("v_") && name.contains("_co_ci_"))
+        && index + 1 == inst.operands.len();
+    if reg.kind == Kind::S && (mask_output || mask_input) {
+        reg.len = if wave == crate::inst::Wave::Wave32 { 1 } else { 2 };
+    }
+    Some(reg)
+}
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("unrecognized machine instruction at byte offset {offset}: {reason}")]
@@ -107,6 +122,12 @@ fn operand(arch: Arch, name: &str, bits: u16, code: u32, literal: Option<u32>, r
             && field_value(arch, "IDXEN", row, words) ^ field_value(arch, "OFFEN", row, words) == 1 {
             return Ok(Operand::Reg(RegRef { len: 1, ..r }));
         }
+        // GLOBAL with an SGPR base consumes a 32-bit vector offset on both
+        // RDNA3 and RDNA4. With SADDR=off it consumes a 64-bit vector address.
+        if form == Form::Vmem(crate::inst::VmemForm::Global) && matches!(name, "VADDR" | "ADDR")
+            && field_value(arch, "SADDR", row, words) != 124 {
+            return Ok(Operand::Reg(RegRef { len: 1, ..r }));
+        }
         if form == Form::Vmem(crate::inst::VmemForm::Scratch) && name == "VADDR" {
             return Ok(Operand::Reg(RegRef { len: 1, ..r }));
         }
@@ -143,7 +164,9 @@ fn encoded_operand(arch: Arch, name: &str, bits: u16, op: &Operand, form: Form) 
         }
         (_, Operand::Reg(r)) if name.starts_with('V') || name.starts_with("DATA") || name == "ADDR" => {
             if r.kind != Kind::V && !(name == "VDST" && (form == Form::Vop1 || form == Form::Vop3)) { return Err(reject("vector operand has wrong register bank")); }
-            if r.len != (bits / 32).max(1) as u8 && !(name=="VADDR" && (form==Form::Vmem(crate::inst::VmemForm::Buffer) || form==Form::Vmem(crate::inst::VmemForm::Scratch)) && r.len==1) { return Err(reject(format!("{name} register width mismatch"))); }
+            let short_address = r.len == 1 && ((name == "VADDR" && matches!(form, Form::Vmem(crate::inst::VmemForm::Buffer | crate::inst::VmemForm::Scratch)))
+                || (matches!(name, "VADDR" | "ADDR") && form == Form::Vmem(crate::inst::VmemForm::Global)));
+            if r.len != (bits / 32).max(1) as u8 && !short_address { return Err(reject(format!("{name} register width mismatch"))); }
             Ok(u32::from(r.base))
         }
         ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8),
@@ -454,6 +477,16 @@ pub fn encode(inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> { encode_f
 pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
     inst.validate(arch).map_err(|e|reject(e.to_string()))?;
     let row=isa::lookup(arch,inst.op,inst.form).ok_or_else(||reject("unknown opcode/form"))?;
+    if row.form == Form::Vmem(crate::inst::VmemForm::Global) {
+        let address = row.slots(isa::atomic_returns(arch, &inst.mods.cpol)).position(|(name, _)| matches!(name, "VADDR" | "ADDR"));
+        let scalar = row.slots(isa::atomic_returns(arch, &inst.mods.cpol)).position(|(name, _)| name == "SADDR");
+        if let (Some(a), Some(s)) = (address, scalar) {
+            if let Some(Operand::Reg(r)) = inst.operands.get(a) {
+                let expected = if inst.operands.get(s) == Some(&Operand::Vmem(VmemToken::Off)) { 2 } else { 1 };
+                if r.len != expected { return Err(reject("GLOBAL VADDR width disagrees with SADDR mode")); }
+            }
+        }
+    }
     let mut words=[0u32;3];
     let (_,prefix)=forms::prefix_for(arch, row.form).ok_or_else(||reject("unsupported form"))?; words[0]=prefix;
     assign(forms::opcode_for(arch, row.form).expect("form opcode"),&mut words,inst.op.id.into())?;
@@ -622,6 +655,21 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
 mod tests {
     use super::*;
 
+
+    /// LLVM gfx1201 `v_min_u32_e64 v72, s92, v24`, used by GDN scan.
+    #[test]
+    fn gdn_unsigned_min_roundtrip_and_sgpr_use() {
+        let words = [0xd513_0048, 0x0202_305c];
+        let (inst, consumed) = decode(&words).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("v_min_u32_e64"));
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef {kind: Kind::V, base: 72, len: 1}]);
+        assert_eq!(inst.effects.uses.as_slice(), &[
+            RegRef {kind: Kind::S, base: 92, len: 1},
+            RegRef {kind: Kind::V, base: 24, len: 1},
+        ]);
+        assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+    }
     #[test]
     fn every_declared_example_roundtrips() {
         let mut failures = Vec::new();
@@ -928,6 +976,33 @@ mod tests {
             let (decoded,count)=decode(&encoded).unwrap();
             proptest::prop_assert_eq!(count,encoded.len());
             proptest::prop_assert_eq!(decoded,inst);
+        }
+    }
+    #[test]
+    fn global_address_width_matches_llvm_disassembly_in_both_modes() {
+        use std::{io::Write, process::{Command, Stdio}};
+        for (arch, cpu) in [(Arch::Gfx1100, "gfx1100"), (Arch::Gfx1151, "gfx1151"), (Arch::Gfx1201, "gfx1201")] {
+            for (saddr, width) in [(4u32, 1u8), (124, 2)] {
+                let words = if arch == Arch::Gfx1201 { vec![0xee050000 | saddr, 10, 20] }
+                    else { vec![0xdc520000, 0x0a000014 | saddr << 16] };
+                let input = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(" ");
+                let mut mc = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+                    .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-disassemble"])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                mc.stdin.take().unwrap().write_all(format!("{input}\n").as_bytes()).unwrap();
+                let out = mc.wait_with_output().unwrap();
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(if width == 1 { "v10, v20, s[4:5]" } else { "v10, v[20:21], off" }), "{text}");
+                let (mut inst, _) = decode_for(arch, &words).unwrap();
+                let addr = RegRef { kind: Kind::V, base: 20, len: width };
+                assert!(inst.effects.uses.contains(&addr));
+                assert!(!inst.effects.uses.iter().any(|r| r.kind == Kind::V && r.base == 20 && r.len != width));
+                assert_eq!(encode_for(arch, &inst).unwrap().as_slice(), words.as_slice());
+                let slot = inst.operands.iter().position(|o| *o == Operand::Reg(addr)).unwrap();
+                inst.operands[slot] = Operand::Reg(RegRef { len: 3 - width, ..addr });
+                assert!(encode_for(arch, &inst).is_err());
+            }
         }
     }
 }

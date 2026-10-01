@@ -21,9 +21,10 @@
 //! * `s_wait_alu depctr_vm_vsrc(0)` clears VMEM store locks
 //!   (`ledger_replay.rs:109-114`); every other `s_wait_alu` is replay-neutral.
 //! * `s_endpgm` empties the state; barriers never retire.
-//! * Join at a block entry is the maximal pending set keyed by issuing
-//!   `InstId`: counters union, units per-counter maximum, satisfied
-//!   intersection, defs/locks union (core.md §2.6).
+//! * Join retains the maximal pending set keyed by issuing `InstId`. For
+//!   in-order counters, the minimum younger-unit suffix over reaching paths
+//!   determines retirement; mutually exclusive issues never pad a queue.
+//!   Out-of-order families still require a zero wait.
 //!
 //! Depctr bit positions below are pinned by `llvm-mc -mcpu=gfx1201`
 //! (single-field probes): `sa_sdst` = bit 0, `va_vcc` = bit 1,
@@ -68,7 +69,7 @@ pub struct WaitCensus {
 /// facts, per-site obligations, and the converged state before each inst.
 #[derive(Clone, Debug)]
 pub struct WaitReplay {
-    /// One entry per memory instruction, in first-issue order.
+    /// One entry per reachable memory instruction, with stable layout-order IDs.
     pub events: Vec<PendingEvent>,
     pub facts: Vec<WaitFact>,
     pub obligations: Vec<Obligation>,
@@ -253,6 +254,7 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
                 prior.counters = prior.counters.union(event.counters);
                 for i in 0..N {
                     prior.units[i] = prior.units[i].max(event.units[i]);
+                    prior.younger[i] = prior.younger[i].min(event.younger[i]);
                 }
                 prior.satisfied = prior.satisfied.intersection(event.satisfied);
                 let mut defs = prior.defs.0.clone();
@@ -272,19 +274,10 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
             }
         }
     }
-    // Both paths pending the same events in the same order: that order is
-    // the issue order on every reaching path, so keep it. Otherwise fall
-    // back to first-issue order, which can misplace a load re-issued by a
-    // later loop iteration.
-    let same_order = a.pending.len() == b.pending.len()
-        && a.pending.iter().zip(&b.pending).all(|(x, y)| x.id == y.id);
-    let pending: Vec<PendingEvent> = if same_order {
-        a.pending.iter().map(|event| merged.remove(&event.id).expect("joined event")).collect()
-    } else {
-        let mut pending: Vec<PendingEvent> = merged.into_values().collect();
-        pending.sort_by_key(|event| event.id.0);
-        pending
-    };
+    // Presentation order is deterministic; retirement uses path-local suffix
+    // bounds, never this first-issue order. Union size is not a queue length.
+    let mut pending: Vec<PendingEvent> = merged.into_values().collect();
+    pending.sort_by_key(|event| event.id.0);
     WaitState { pending }
 }
 
@@ -347,21 +340,12 @@ fn retire(
         }
     }
     let mut retired = Vec::new();
-    loop {
-        let units: u32 = state
-            .pending
-            .iter()
-            .filter(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
-            .map(|e| u32::from(e.units[counter as usize]))
-            .sum();
-        if units <= u32::from(count) {
-            break;
+    for position in (0..state.pending.len()).rev() {
+        let event = &state.pending[position];
+        if !event.counters.contains(counter) || event.satisfied.contains(counter)
+            || (count != 0 && event.younger[counter as usize] < count) {
+            continue;
         }
-        let Some(position) =
-            state.pending.iter().position(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
-        else {
-            break;
-        };
         let event = &mut state.pending[position];
         event.satisfied.insert(counter);
         if event.satisfied == event.counters {
@@ -486,16 +470,28 @@ fn push_event(
         inst: id,
         counters: mem.counters,
         units: unit_weights(inst, arch),
+        younger: [0; N],
         satisfied: CounterSet::default(),
         class: mem.class,
         defs,
         src_locks: locks,
         in_order_type: mem.in_order_type,
     };
-    match state.pending.iter_mut().find(|e| e.id == id_event) {
-        Some(slot) => *slot = fresh.clone(),
-        None => state.pending.push(fresh.clone()),
+    // Reissue belongs at the tail, including across a loop back-edge.
+    // A still-pending previous issue is diagnosed above. It still consumes
+    // hardware counter units: replacing its static-site record must not
+    // subtract those units from other events' proven suffix bounds.
+    if let Some(position) = state.pending.iter().position(|e| e.id == id_event) {
+        state.pending.remove(position);
     }
+    for event in &mut state.pending {
+        for i in 0..N {
+            if event.counters.contains(counter_at(i)) {
+                event.younger[i] = event.younger[i].saturating_add(fresh.units[i]);
+            }
+        }
+    }
+    state.pending.push(fresh.clone());
     if record_issued && events.events.iter().all(|e| e.id != id_event) {
         events.events.push(fresh);
     }
@@ -565,18 +561,18 @@ fn walk_block(
             }
             _ => {}
         }
-        let touch = dwords(&explicit_regs(inst));
-        let war = dwords(&war_defs(inst, arch));
-        let mut war_hits: Vec<PendingEvent> = Vec::new();
-        let mut raw_hits: Vec<PendingEvent> = Vec::new();
-        for event in &state.pending {
-            if overlaps(&regset_dwords(&event.src_locks), &war) {
-                war_hits.push(event.clone());
-            } else if overlaps(&regset_dwords(&event.defs), &touch) {
-                raw_hits.push(event.clone());
-            }
-        }
         if let Some(recorder) = recorder.as_mut() {
+            let touch = dwords(&explicit_regs(inst));
+            let war = dwords(&war_defs(inst, arch));
+            let mut war_hits: Vec<PendingEvent> = Vec::new();
+            let mut raw_hits: Vec<PendingEvent> = Vec::new();
+            for event in &state.pending {
+                if overlaps(&regset_dwords(&event.src_locks), &war) {
+                    war_hits.push(event.clone());
+                } else if overlaps(&regset_dwords(&event.defs), &touch) {
+                    raw_hits.push(event.clone());
+                }
+            }
             if !war_hits.is_empty() || !raw_hits.is_empty() {
                 record_finding(recorder, id, &war_hits, &raw_hits, &touch, &war);
             }
@@ -593,14 +589,6 @@ fn walk_block(
     Ok(BlockExits { fall: state, branches })
 }
 
-/// Blocks in layout order, or one synthetic straight-line block when the
-/// body has no built CFG (synthetic streams).
-fn ranges_of(body: &Body) -> Vec<(BlockId, (usize, usize), Vec<BlockId>)> {
-    if body.blocks.is_empty() {
-        return vec![(BlockId(0), (0, body.layout.len()), Vec::new())];
-    }
-    body.blocks.iter().map(|block| (block.id, block.range, block.preds.iter().copied().collect())).collect()
-}
 
 /// CFG-aware wait replay with fixpoint over the block graph.
 pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
@@ -612,83 +600,83 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
             return Err(WaitError::DanglingInst { id: *id });
         }
     }
-    let ranges = ranges_of(body);
-    let entries = fixpoint(body, arch, &ranges)?;
-    // Final recording pass in layout order.
     let mut events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
+    for id in &body.layout {
+        if body.insts.get(*id).unwrap().effects.mem.is_some() { events.id_of(*id); }
+    }
     let mut recorder = Recorder {
         facts: Vec::new(),
         obligations: Vec::new(),
         before: HashMap::new(),
     };
-    for ((_, range, _), entry) in ranges.iter().zip(&entries) {
-        walk_block(body, arch, *range, entry, &mut events, Some(&mut recorder))?;
+    for choices in super::predicates::partitions(body, arch) {
+        let entries = fixpoint(body, arch, &choices, &mut events)?;
+        for (p, entry) in entries.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let prior = recorder.before.get(&body.layout[p]).cloned();
+            walk_block(body, arch, (p, p + 1), entry, &mut events, Some(&mut recorder))?;
+            if let Some(prior) = prior {
+                recorder.before.insert(body.layout[p], join_states(&prior, entry));
+            }
+        }
+    }
+    recorder.obligations.sort_unstable_by(|a, b| a.insts.iter().map(|id| id.0).cmp(b.insts.iter().map(|id| id.0))
+        .then_with(|| a.rule_id.cmp(&b.rule_id)).then_with(|| a.text.cmp(&b.text)));
+    recorder.obligations.dedup();
+    let mut facts: Vec<WaitFact> = Vec::new();
+    for fact in recorder.facts {
+        if let Some(prior) = facts.iter_mut().find(|f| f.wait == fact.wait) {
+            for event in fact.satisfies { if !prior.satisfies.contains(&event) { prior.satisfies.push(event); } }
+        } else { facts.push(fact); }
     }
     Ok(WaitReplay {
         events: events.events,
-        facts: recorder.facts,
+        facts,
         obligations: recorder.obligations,
         before: recorder.before,
     })
 }
 
-/// Block entry states: the least fixpoint of "entry = join of the incoming
-/// exits" from empty states, solved with a worklist so a block is re-walked
-/// only when its entry changes and a changed exit only revisits its own
-/// successors. Each block's exit edges (fall-through, and every mid-block
-/// branch the walk reaches) do not depend on the entry state, so the edge
-/// lists come from the first walk.
-fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize), Vec<BlockId>)]) -> Result<Vec<WaitState>, WaitError> {
-    let count = ranges.len();
-    let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(i, (id, _, _))| (*id, i)).collect();
-    let mut first_at: HashMap<usize, usize> = HashMap::new();
-    for (i, (_, range, _)) in ranges.iter().enumerate() {
-        first_at.entry(range.0).or_insert(i);
-    }
-    let mut scratch_events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
-    let mut entries = vec![WaitState::default(); count];
-    let mut exits = Vec::with_capacity(count);
-    for (_, range, _) in ranges {
-        exits.push(walk_block(body, arch, *range, &WaitState::default(), &mut scratch_events, None)?);
-    }
-    // Incoming edges per block: true fall-through first (p ends where b
-    // begins and p's last instruction can fall through; C4 `preds`
-    // conflate these with mid-block conditional-branch targets, which the
-    // walk reports as branch exits instead), then branch exits.
-    let mut incoming: Vec<Vec<(usize, Option<usize>)>> = vec![Vec::new(); count];
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); count];
-    for (p, (_, range, _)) in ranges.iter().enumerate() {
-        let falls = range.0 != range.1 && body.insts.get(body.layout[range.1 - 1])
-            .is_some_and(|last| !matches!(last.effects.control, Control::Jump | Control::EndPgm));
-        if let (true, Some(&b)) = (falls, first_at.get(&range.1)) {
-            incoming[b].push((p, None));
-            succs[p].push(b);
+/// Instruction-position fixpoint. Unreachable instructions have no state;
+/// they must not manufacture issues at a join. Predicate partitions select
+/// only proven-correlated edges; mutable/unknown guards keep both edges.
+fn fixpoint(body: &Body, arch: Arch, choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
+    let count = body.layout.len();
+    let mut graph = super::predicates::successors(body);
+    for (p, id) in body.layout.iter().enumerate() {
+        if let Some(&taken) = choices.get(id) {
+            let target = branch_target(body.insts.get(*id).unwrap()).map(|b| body.blocks[b.0].range.0);
+            graph[p].retain(|&q| if taken { Some(q) == target } else { q == p + 1 });
         }
     }
-    for (p, exit) in exits.iter().enumerate() {
-        for (k, (target, _)) in exit.branches.iter().enumerate() {
-            if let Some(&b) = index.get(target) {
-                incoming[b].push((p, Some(k)));
-                if !succs[p].contains(&b) { succs[p].push(b); }
+    let mut incoming = vec![Vec::new(); count];
+    for (p, succs) in graph.iter().enumerate() { for &q in succs { incoming[q].push(p); } }
+    let mut entries: Vec<Option<WaitState>> = vec![None; count];
+    let mut exits: Vec<Option<WaitState>> = vec![None; count];
+    let mut work: std::collections::BTreeSet<usize> = (0..count.min(1)).collect();
+    let budget = count.saturating_mul(1000).max(1000);
+    let mut walks = 0;
+    while let Some(p) = work.pop_first() {
+        let mut joined = (p == 0).then(WaitState::default);
+        for &q in &incoming[p] {
+            if let Some(state) = &exits[q] {
+                joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
             }
         }
-    }
-    let mut work: std::collections::BTreeSet<usize> = (0..count).collect();
-    let budget = count.saturating_mul(1000).max(1000);
-    let mut walks = 0usize;
-    while let Some(b) = work.pop_first() {
-        let mut joined: Option<WaitState> = None;
-        for &(p, edge) in &incoming[b] {
-            let state = match edge { None => &exits[p].fall, Some(k) => &exits[p].branches[k].1 };
-            joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
-        }
-        let joined = joined.unwrap_or_default();
-        if joined == entries[b] { continue; }
+        if joined == entries[p] { continue; }
         walks += 1;
         if walks > budget { return Err(WaitError::NoFixpoint { walks }); }
-        exits[b] = walk_block(body, arch, ranges[b].1, &joined, &mut scratch_events, None)?;
-        entries[b] = joined;
-        work.extend(succs[b].iter().copied());
+        let exit = match &joined {
+            None => None,
+            Some(state) => {
+                let walked = walk_block(body, arch, (p, p + 1), state, events, None)?;
+                Some(if matches!(body.insts.get(body.layout[p]).unwrap().effects.control, Control::Jump) {
+                    walked.branches.into_iter().next().map(|(_, state)| state).unwrap_or_default()
+                } else { walked.fall })
+            }
+        };
+        entries[p] = joined;
+        if exits[p] != exit { exits[p] = exit; work.extend(graph[p].iter().copied()); }
     }
     Ok(entries)
 }
@@ -735,11 +723,11 @@ mod c5_tests {
     use crate::operand::{ImmField, Modifiers, Operand, VmemToken};
     use crate::passes::cfg::build_blocks;
     use crate::provenance::Provenance;
-    use crate::reg::{Kind, RegRef, RegSet};
+    use crate::reg::{Kind, RegRef};
     use crate::state::ObligationKind;
-    use crate::wait::{Counter, CounterSet, EventId, PendingEvent, WaitState, N};
+    use crate::wait::Counter;
 
-    use super::{census, join_states, replay};
+    use super::{census, replay};
 
     fn table(name: &str) -> (Opcode, Form) {
         let row = crate::isa::gfx12().iter().find(|row| row.name == name).expect(name);
@@ -1249,25 +1237,4 @@ mod c5_tests {
             "{:?}", replay.obligations);
     }
 
-    /// Two paths pending the same loads in the same order join in that order:
-    /// a load re-issued by a later loop iteration (larger first-issue id, but
-    /// older) must stay ahead of this iteration's load, so a partial wait
-    /// retires it first. Disagreeing paths fall back to first-issue order.
-    #[test]
-    fn join_keeps_a_common_issue_order() {
-        let load = |id: u64| {
-            let mut counters = CounterSet::default();
-            counters.insert(Counter::Load);
-            PendingEvent {
-                id: EventId(id), inst: crate::cfg::InstId(id as usize), counters, units: [1; N],
-                satisfied: CounterSet::default(), class: MemClass::VmemLoad, defs: RegSet(Vec::new()),
-                src_locks: RegSet(Vec::new()), in_order_type: crate::effects::OrderType::Load,
-            }
-        };
-        let ids = |s: &WaitState| s.pending.iter().map(|e| e.id.0).collect::<Vec<_>>();
-        let path = WaitState { pending: vec![load(7), load(3)] };
-        assert_eq!(ids(&join_states(&path, &path.clone())), [7, 3]);
-        let other = WaitState { pending: vec![load(3), load(7)] };
-        assert_eq!(ids(&join_states(&path, &other)), [3, 7]);
-    }
 }
