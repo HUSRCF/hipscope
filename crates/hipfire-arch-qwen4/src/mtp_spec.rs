@@ -337,10 +337,12 @@ impl SpecTarget for Qwen4Bundle {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (offset + max_chunk).min(tokens.len());
-            let picks = self
-                .spec_forward_rows(gpu, &tokens[offset..end], false)
+            // Only the final row's argmax is returned, so each chunk writes
+            // one logit row instead of one per chunk row.
+            let pick = self
+                .spec_prefill_rows(gpu, &tokens[offset..end], false)
                 .map_err(|error| error.to_string())?;
-            last_argmax = picks.last().copied();
+            last_argmax = Some(pick);
             offset = end;
         }
         if self.state.position != end_pos {
@@ -899,7 +901,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             let base = chunk_index * chunk_rows;
             let pick = Self::bundle(target)?
-                .spec_prefill_rows(gpu, chunk)
+                .spec_prefill_rows(gpu, chunk, true)
                 .map_err(|error| error.to_string())?;
             for (index, &token) in chunk.iter().enumerate() {
                 if abort() {

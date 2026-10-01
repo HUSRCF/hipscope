@@ -97,10 +97,15 @@ pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item 
     )
 }
 
-/// Rows of the speculative logit and argmax buffers: every chunk row, since
-/// `spec_forward_rows` returns one argmax per row of a whole chunk.
+/// Rows of the speculative logit and argmax buffers.  Only verify blocks
+/// return every row's argmax (native MTP verifies at most `K + 1 = 11`
+/// rows; block drafters on the shared `SpecTarget` contract get the rest);
+/// prompt advances and MTP prefill read their final row only.  A
+/// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
+pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
+
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
-    max_chunk
+    QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
 }
 
 /// Device bytes of the forward resources that scale with the chunk: the

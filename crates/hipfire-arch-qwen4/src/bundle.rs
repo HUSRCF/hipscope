@@ -403,12 +403,15 @@ impl Qwen4Bundle {
         self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All)
     }
 
+    /// Final-row argmax of one forward over `tokens`: prompt fills and
+    /// advances, which read no other row's logits.
     pub(crate) fn spec_prefill_rows(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
+        capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, true, Qwen4OutputRows::Final)?
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final)?
             .into_iter()
             .next()
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
@@ -442,6 +445,12 @@ impl Qwen4Bundle {
         }
         let vocab = self.config.vocab_size;
         let output_count = output_rows.count(tokens.len());
+        let spec_rows = qwen4_spec_logit_rows(max_chunk);
+        if output_count > spec_rows {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec block of {output_count} output rows exceeds the {spec_rows}-row verify capacity"
+            )));
+        }
         let logits_len = output_count
             .checked_mul(vocab)
             .ok_or_else(|| BundleError::Forward("Qwen4 spec logits overflow".to_string()))?;

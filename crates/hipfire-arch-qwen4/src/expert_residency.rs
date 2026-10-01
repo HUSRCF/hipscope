@@ -441,8 +441,16 @@ mod tests {
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
-        let reserve = auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, AUTO_VRAM_RESERVE_CHUNK, F32, None).unwrap();
-        assert_eq!(reserve, AUTO_VRAM_RESERVE_BYTES);
+        let reserve = |chunk| {
+            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, chunk, F32, None).unwrap()
+        };
+        // Verify-sized spec logits free 1472 logit rows of the measured
+        // 1536-row layout: one layer past the measured N = 16 fits.
+        let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
+        assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, measured_chunk), 17);
+        // gfx1201's 2048-row chunk spends most of it on forward scratch.
+        let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"));
+        assert!(reserve > measured_chunk);
         assert_eq!(auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve), 16);
         // A card that holds everything keeps every layer resident.
         assert_eq!(
