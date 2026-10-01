@@ -1012,7 +1012,12 @@ reuse of the earlier one.
 the capture window (`effect-incomplete — … 1 memset(s)`), while a capture later
 in the same process reports zero. The plan still prepares, and gates 4–6 hold on
 those processes, which is consistent with a first-use lazy initialisation rather
-than per-token state. It is not yet named, so it stays open.
+than per-token state. *Closed 2026-10-01:* the memset is the one-time zeroing of
+the fused GDN rotation's head-pair counters (`tensor_ops::ensure_gdn_pair_counters`).
+The kernel resets those counters on every launch, so the memset was harmless. The
+retained-body boundary now runs it before arming the window. An automatic capture
+whose window holds any device copy, readback or memset is now refused at
+prepare (`ReplayController::refuse_effect_incomplete_window`).
 
 **Disposition:** this is evidence for gates 1–8 at this head, with gate 7
 collected at context 128 only. It is **not** a promotion or an admission:

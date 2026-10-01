@@ -227,6 +227,20 @@ pub struct GatedDeltaStep<'a> {
 /// Head-pair arrival counters of the fused GDN step's optional rotation.
 const GDN_PAIR_COUNTERS: usize = 256;
 
+/// Allocate and zero the fused GDN step's head-pair arrival counters if they
+/// do not exist yet. Each launch leaves them zero, so the zeroing memset runs
+/// once. A retained-body boundary calls this before opening its capture
+/// window: the tape replays dispatches only, and a memset inside the window
+/// makes the capture effect-incomplete.
+pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
+    if gpu.scratch.gdn_pair_counters.is_none() {
+        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
+        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
+        gpu.scratch.gdn_pair_counters = Some(counters);
+    }
+    Ok(())
+}
+
 pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> {
     gated_delta_step_launch(gpu, p, None, None)
 }
@@ -340,11 +354,7 @@ fn gated_delta_step_launch(
         let (rotated, signs1, signs2, counters) = match rotate_into {
             Some(rotated) => {
                 gpu.ensure_mq_signs()?;
-                if gpu.scratch.gdn_pair_counters.is_none() {
-                    let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
-                    gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
-                    gpu.scratch.gdn_pair_counters = Some(counters);
-                }
+                ensure_gdn_pair_counters(gpu)?;
                 if p.value_heads / 2 > GDN_PAIR_COUNTERS {
                     return Err(HipError::new(0, "GDN rotate: too many head pairs"));
                 }
