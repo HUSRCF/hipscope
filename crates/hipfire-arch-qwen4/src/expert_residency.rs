@@ -19,7 +19,9 @@ use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
 /// resident where they fit ([`resolve_expert_vram_layers`]) and is `auto`
 /// otherwise. Set, it also keeps host memory out of reclaim from before the
-/// HIP runtime loads (hip-bridge owns the name).
+/// HIP runtime loads (hip-bridge owns the name), as a process about to load
+/// a Qwen4 model on a discrete GPU does unset
+/// ([`keeps_host_memory_out_of_reclaim`]).
 pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_ENV;
 
 /// VRAM left free by `auto` beyond the resident non-expert weights: forward
@@ -85,6 +87,22 @@ pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: 
         .checked_add(expert_bytes)
         .and_then(|bytes| bytes.checked_add(reserve))
         .is_some_and(|need| need <= free_vram)
+}
+
+/// Whether a process about to load the model with HFQ `arch_id` on the GPUs
+/// `device_archs` (every card it may use) keeps host memory out of reclaim
+/// before the HIP runtime loads (`hip_bridge::keep_host_memory_out_of_reclaim`),
+/// as an explicit [`EXPERT_VRAM_LAYERS_ENV`] does: a Qwen4 model on discrete
+/// GPUs. It rests on those static facts, not on the placement the load
+/// resolves: unset, that depends on the free VRAM and the reserve at load
+/// time, after the runtime has read the switches, and the upload of tens of
+/// GB out of the mapped file needs them under host-memory pressure whatever
+/// the placement. Unified memory never host-maps experts, and an
+/// unrecognized arch keeps ROCm's defaults.
+pub fn keeps_host_memory_out_of_reclaim(arch_id: u32, device_archs: &[&str]) -> bool {
+    arch_id == crate::ARCH_ID
+        && !device_archs.is_empty()
+        && device_archs.iter().all(|arch| hipfire_config::is_discrete_memory_arch(arch))
 }
 
 /// Bytes of every routed expert payload (trunk and MTP layers).
@@ -759,5 +777,19 @@ mod tests {
             let resolved = resolve_expert_vram_layers(Some(policy), || panic!("explicit consulted the fit"));
             assert_eq!(resolved, Ok(Some(policy)));
         }
+    }
+
+    #[test]
+    fn only_qwen4_on_discrete_gpus_keeps_host_memory_out_of_reclaim() {
+        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1201"]));
+        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx942"]));
+        // Another model on the same card (arch 5: the Qwen3.5-family trunk).
+        assert!(!keeps_host_memory_out_of_reclaim(5, &["gfx1201"]));
+        // Unified memory, alone or beside a discrete card ROCr also exposes.
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1151"]));
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx1151"]));
+        // No card known, or one whose memory kind is not known.
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &[]));
+        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx90a"]));
     }
 }

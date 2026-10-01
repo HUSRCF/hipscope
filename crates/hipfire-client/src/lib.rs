@@ -547,17 +547,25 @@ impl Engine {
     /// environment map is reserved for non-hipfire bootstrap state inherited
     /// by external launchers. The daemon itself resolves `hardware.devices`,
     /// reserving the chosen cards in the same step, and lowers it to ROCr/HIP
-    /// visibility; resolving here could not hold those reservations.
+    /// visibility; resolving here could not hold those reservations. `model`
+    /// names the model the daemon is started for, which settles runtime
+    /// switches only readable before its GPU runtime loads (host memory for
+    /// a Qwen4 model on a discrete GPU).
     pub fn spawn_configured(
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
+        model: Option<&Path>,
     ) -> Result<Self> {
         let engine = Self::spawn(daemon, environment)?;
-        let response = engine.request(&serde_json::json!({
+        let mut configure = serde_json::json!({
             "type": "configure",
             "config": config,
-        }))?;
+        });
+        if let Some(model) = model {
+            configure["model"] = serde_json::json!(model);
+        }
+        let response = engine.request(&configure)?;
         expect_type(&response, "configured")?;
         Ok(engine)
     }
@@ -2471,7 +2479,7 @@ done
         const MAX_ATTEMPTS: usize = 8;
         let mut last = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Engine::spawn_configured(daemon, &BTreeMap::new(), config) {
+            match Engine::spawn_configured(daemon, &BTreeMap::new(), config, None) {
                 Ok(engine) => return engine,
                 Err(ClientError::Spawn { source, path })
                     if source.raw_os_error() == Some(ETXTBSY) =>
