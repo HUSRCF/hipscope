@@ -22,8 +22,11 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
   **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
   hardcode a required release — install a supported stack for your GPU.
-- **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
-- **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
+- **Windows (recommended): WSL2 with ROCm 7.2.1 and AMD's ROCDXG library.**
+  hipfire runs as the ordinary Linux build inside the distro; see
+  [Windows — WSL2](#windows--wsl2-recommended) for the driver, ROCm and
+  `librocdxg` steps and the supported GPU list.
+- **Windows (native, best-effort):** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`). Slower and narrower than WSL2; see [the limits](#windows--native-best-effort).
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
@@ -154,7 +157,78 @@ no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
 and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
 declares a range other than the default; it must contain the build's ROCm.
 
-### Windows — select a branch, tag, or commit
+### Windows — WSL2 (recommended)
+
+WSL2 is the supported way to run hipfire on Windows. Inside the distro hipfire
+is the Linux build (Linux installer, `hipfire update`, file locks, signals);
+ROCm reaches the GPU through AMD's ROCDXG library and Microsoft's DXCore
+device `/dev/dxg`, while the Windows Adrenalin driver owns the card. AMD's
+current method (ROCm 7.2.1, ROCDXG; the older `amdgpu-install --usecase=wsl`
+/ roc4wsl packaging stops at ROCm 7.2) is documented in
+[WSL How-to — Use ROCm on Radeon](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/howto_wsl.html),
+[WSL How-to — Use ROCm on Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html)
+and the [librocdxg Quickstart](https://github.com/ROCm/librocdxg#quickstart):
+
+1. On Windows 11, install **AMD Software: Adrenalin Edition 26.2.2 for
+   WSL2** ([release notes](https://www.amd.com/en/resources/support-articles/release-notes/RN-RAD-WIN-26-2-2.html)).
+   It is the first driver with Ryzen Strix / Strix Halo support on WSL; the
+   Radeon [WSL support matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html)
+   lists 26.1.1 as the minimum for discrete cards.
+2. Install WSL2 with **Ubuntu 24.04 or 22.04**
+   ([Microsoft: install WSL](https://learn.microsoft.com/en-us/windows/wsl/install)).
+3. In the distro, install the **ROCm 7.2.1** packages with the
+   [ROCm Linux quick start](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html).
+   Install ROCm userspace only; there is no Linux kernel driver to install
+   under WSL.
+4. Install **librocdxg** (1.2.x for ROCm 7.2.x): the prebuilt
+   `rocdxg-roct_<version>_amd64.deb` from the
+   [librocdxg releases](https://github.com/ROCm/librocdxg/releases)
+   (`sudo dpkg -i rocdxg-roct_<version>_amd64.deb`), or build it from source
+   as the Quickstart describes. Its source now lives in
+   [rocm-systems](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocr-runtime/libhsakmt/src/dxg).
+5. ROCm releases before 7.13 (so 7.2.1) need DXG detection switched on. Add it
+   to your shell profile so the hipfire daemon inherits it:
+
+   ```bash
+   echo 'export HSA_ENABLE_DXG_DETECTION=1' >> ~/.bashrc && source ~/.bashrc
+   ```
+6. Check that `rocminfo` lists your GPU as an agent (`Name: gfx1201`, …),
+   then run the [Linux installer](#linux--master-or-beta-in-one-command)
+   inside the distro.
+
+Supported GPUs for ROCm 7.2.x on WSL (librocdxg 1.2.0 matrix; hipfire's tuned
+targets are gfx1201, gfx1100 and gfx1151):
+
+| arch | products |
+|---|---|
+| gfx1201 | Radeon AI PRO R9700, RX 9070, RX 9070 XT, RX 9070 GRE |
+| gfx1200 | RX 9060, RX 9060 XT |
+| gfx1100 | RX 7900 XTX, RX 7900 XT, RX 7900 GRE, PRO W7900 (incl. Dual Slot), PRO W7800 (incl. 48GB) |
+| gfx1101 | RX 7800 XT, PRO W7700 |
+| gfx1151 | Ryzen AI Max+ 395, Ryzen AI Max 390, Ryzen AI Max 385 (Strix Halo) |
+| gfx1150 | Ryzen AI 9 HX 375, Ryzen AI 9 HX 370, Ryzen AI 9 365 |
+
+What differs from native Linux until each piece is certified on WSL hardware:
+
+- The daemon identifies cards from HIP's UUID and PCI address (there is no
+  KFD topology), so `hardware.devices` is refused; select cards with
+  `HIP_VISIBLE_DEVICES`. AMD does not support multi-GPU under WSL.
+- The retained Redline PM4 default falls back to the HIP graph with one
+  `[redline] retained default refused` log line (about 4–6% slower decode on
+  the routes that default to PM4), and an explicit `replay.backend=redline`
+  is refused. `HIPFIRE_UNSAFE_WSL_REDLINE=1` lifts this; it is **unsafe
+  until certified**.
+- The KV cache uses the legacy backend; an explicit `kv_backend=vmm` is
+  refused. `HIPFIRE_UNSAFE_WSL_VMM_KV=1` lifts this; it is **unsafe until
+  certified** (WDDM VA growth may alias earlier KV pages, as it does on native
+  Windows).
+- Host RAM guards see the WSL VM's memory. On Strix Halo the GPU pool is also
+  bounded by the `.wslconfig` `memory=` setting
+  ([ROCm#6022](https://github.com/ROCm/ROCm/issues/6022)); raise it for large
+  models. `rocm-smi`/`amd-smi` are limited and the ROCm profiler and debugger
+  are unsupported under WSL.
+
+### Windows — native (best-effort)
 
 ```powershell
 # Current master:
@@ -193,6 +267,27 @@ upgrading: copying bare `.hsaco` files is insufficient.
 
 Unsupported GPU architectures likewise require hipcc JIT at runtime; the
 installer does not copy bare checkout objects into the installed cache.
+
+Native Windows is best-effort: it builds and runs, but it is slower and
+narrower than WSL2 on the same card. Known limits:
+
+- **No Redline PM4.** The Windows HIP SDK ships no ROCr (`libhsa-runtime64`),
+  so decode runs on the HIP graph: about 4–6% slower than the Linux/WSL PM4
+  default (gfx1201 Qwen3.8 27B tg128 at 8K: ≈38.2 instead of 40.3 tok/s).
+  An explicit `replay.backend=redline` is refused.
+- **Legacy KV only.** HIP VMM growth is not certified on Windows; automatic
+  KV selects legacy and `kv_backend=vmm` is refused.
+- **No tensor or pipeline parallel**: the HIP SDK has no RCCL. One GPU per
+  daemon; `hardware.devices` is unavailable, so select the card with
+  `HIP_VISIBLE_DEVICES`.
+- GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
+  (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
+  holder PID, as on Linux.
+- hipfire resolves its home and kernel cache from `HOME`; when `HOME` is not
+  set they land in the current directory. Set it once with
+  `setx HOME "%USERPROFILE%"`.
+- `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
+  cannot find a native `serve` process; stop it with Ctrl-C.
 
 ### Source checkout
 
