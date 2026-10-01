@@ -51,7 +51,7 @@ use hipfire_generate::ar::{
     deepseek4_spec_requested_from_policy, emit_qwen_ar_done, emit_qwen_ar_open_think_terminal,
     generate, llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible,
     model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
-    qwen_ar_done_value, qwen_ar_drain_pending_into_router, qwen_ar_eos_filter_config,
+    qwen_ar_done_value, qwen_ar_drain_pending_into_router,
     qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
     qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
     qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
@@ -651,6 +651,39 @@ fn write_typed_error(
         retryable,
         rolled_back,
     );
+}
+
+/// The request's wire `seed`, or `None` after refusing an out-of-domain one
+/// (negative, fractional, non-numeric) with a typed `validation` error — a
+/// client fault, never an `internal` one.
+fn client_seed_or_refuse(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    seed: Option<&serde_json::Value>,
+) -> Option<Option<u64>> {
+    match parse_wire_seed(seed) {
+        Ok(seed) => Some(seed),
+        Err(reason) => {
+            write_typed_error(stdout, id, &reason, "validation", false, false);
+            None
+        }
+    }
+}
+
+/// Refuse an image sent to a model with no vision encoder: the client asked
+/// for a capability this load lacks (`unsupported`), not a server fault.
+fn refuse_image_without_vision(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    vision_gated_off: Option<&str>,
+) {
+    let message = match vision_gated_off {
+        Some(sidecar) => format!(
+            "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+        ),
+        None => "model has no vision encoder".to_owned(),
+    };
+    write_typed_error(stdout, id, &message, "unsupported", false, false);
 }
 
 /// Resident KV backend metadata for `loaded` ACK and `diag`.
@@ -1813,27 +1846,15 @@ fn main() {
                         .get("params")
                         .and_then(|p| p.get("dspark_mode"))
                         .and_then(|v| v.as_str())
-                        .and_then(|s| match s {
-                            "on" => Some(true),
-                            "off" => Some(false),
-                            _ => None, // "auto" → loader default
-                        }),
+                        .and_then(hipfire_config::parse_tri_state),
                     dspark_conf_threshold: msg
                         .get("params")
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
                     // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
-                    dflash: match dflash_mode {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
-                    mtp: match mtp_mode.as_str() {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
+                    dflash: hipfire_config::parse_tri_state(dflash_mode),
+                    mtp: hipfire_config::parse_tri_state(&mtp_mode),
                     mtp_k: Some(mtp_k),
                     dflash_adaptive_b: Some(adaptive_b),
                 };
@@ -3331,16 +3352,7 @@ fn main() {
                     batch_scope.rebind_for(gen_attempt_id);
                 }
                 if has_image && !has_vl {
-                    match vision_gated_off.as_deref() {
-                        Some(sidecar) => write_error(
-                            &mut stdout,
-                            id,
-                            &format!(
-                                "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
-                            ),
-                        ),
-                        None => write_error(&mut stdout, id, "model has no vision encoder"),
-                    }
+                    refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw
@@ -3457,13 +3469,16 @@ fn main() {
                     }
                     let source = if let Some(b64) = image_base64 {
                         if b64.len() > MAX_BASE64_ENCODED_LEN {
-                            write_error(
+                            write_typed_error(
                                 &mut stdout,
                                 id,
                                 &format!(
                                     "image payload exceeds maximum encoded size ({} bytes)",
                                     MAX_BASE64_ENCODED_LEN,
                                 ),
+                                "validation",
+                                false,
+                                false,
                             );
                             continue;
                         }
@@ -3486,12 +3501,9 @@ fn main() {
                     // wire `seed` wins, else attempt key + counter entropy.
                     // Out-of-domain seeds (negative, fractional, non-numeric)
                     // are rejected — never silently treated as unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let vl_request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
@@ -3711,17 +3723,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -3873,17 +3879,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -4056,12 +4056,9 @@ fn main() {
                     // streams. Out-of-domain seeds (negative, fractional,
                     // non-numeric) are rejected — never silently treated as
                     // unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
@@ -5160,8 +5157,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_generate_terminal, apply_vision_mode_gate, emit_batch_admission_error,
-        require_wire_attempt_id, TERMINAL_TEST_LOCK,
+        announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
+        emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,
+        TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -5190,6 +5188,71 @@ mod tests {
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
+    }
+
+    fn error_events(output: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Client faults in the generate arm carry a client class (HTTP 400 at
+    /// the gateway), never `internal` (HTTP 500).
+    #[test]
+    fn generate_client_faults_are_typed_not_internal() {
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One live generate attempt per refusal, as the generate arm has.
+        let announce = |id: &str| {
+            clear_terminal_control();
+            batch_clear_all_terminals();
+            set_active_attempt_id(7);
+            announce_generate_terminal(
+                &serde_json::json!({"type": "generate", "id": id, "attempt_id": 7}),
+            );
+        };
+        for seed in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("abc"),
+        ] {
+            announce("req-seed");
+            let _scope = BatchAttemptScope::enter_for("req-seed", 7);
+            let mut output = Vec::new();
+            assert_eq!(client_seed_or_refuse(&mut output, "req-seed", Some(&seed)), None);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1, "{seed}");
+            assert_eq!(events[0]["type"], "error");
+            assert_eq!(events[0]["id"], "req-seed");
+            assert_eq!(events[0]["attempt_id"], 7);
+            assert_eq!(events[0]["class"], "validation", "{seed}");
+        }
+        announce("req-seed");
+        let mut output = Vec::new();
+        assert_eq!(
+            client_seed_or_refuse(&mut output, "req-seed", Some(&serde_json::json!(42))),
+            Some(Some(42))
+        );
+        assert_eq!(client_seed_or_refuse(&mut output, "req-seed", None), Some(None));
+        assert!(output.is_empty(), "a valid or absent seed emits nothing");
+
+        for gated in [None, Some("/models/x-vision.hfq")] {
+            announce("req-img");
+            let _scope = BatchAttemptScope::enter_for("req-img", 7);
+            let mut output = Vec::new();
+            refuse_image_without_vision(&mut output, "req-img", gated);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["class"], "unsupported");
+            assert!(events[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("model has no vision encoder"));
+        }
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
     }
 
     #[test]

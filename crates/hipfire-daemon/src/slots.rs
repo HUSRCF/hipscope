@@ -1628,17 +1628,29 @@ impl SlotBackend {
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
-        let ticket = accepted_ticket.expect("accepted session binds a lane ticket");
+        let Some(ticket) = accepted_ticket else {
+            if let Some(sess) = accepted_session.take() {
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                "slot terminal without a bound lane ticket",
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        };
         let _ =
             batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
-        let mut commit_ready = pending_done.clone();
-        if let Some(map) = commit_ready.as_object_mut() {
-            map.insert(
-                "type".to_string(),
-                serde_json::Value::String("commit_ready".to_string()),
-            );
-        }
-        let _ = writeln!(stdout, "{}", commit_ready);
+        // commit_ready is the staged done with only `type` changed.
+        pending_done["type"] = serde_json::Value::String("commit_ready".to_string());
+        let _ = writeln!(stdout, "{}", pending_done);
+        pending_done["type"] = serde_json::Value::String("done".to_string());
         let _ = stdout.flush();
 
         let decision =
@@ -1772,11 +1784,7 @@ fn cpu_preflight(
     {
         return Err("empty chat_template".to_string());
     }
-    let arch_str = match hfq.arch_id {
-        5 => "qwen3_5".to_string(),
-        6 => "qwen3_5_moe".to_string(),
-        _ => unreachable!(),
-    };
+    let arch_str = hipfire_loader::arch_label(hfq.arch_id).to_string();
     Ok(Preflight {
         arch_id: hfq.arch_id,
         arch_str,
