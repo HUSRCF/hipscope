@@ -60,15 +60,18 @@ const EPSILON: f32 = 1.0e-6;
 /// those requests over this bounded capacity instead of allocating
 /// prompt-sized grouped MoE buffers.  Every chunk re-streams all routed
 /// expert weights, so pp throughput rises with the chunk until another
-/// kernel's shape envelope ends.  Measured pp8192 against the earlier
-/// 1536-row chunk: gfx1151 at 8192 rows +10.2% (resident experts); gfx1201
-/// at 2048 rows +15.1% with 12 expert layers in VRAM, where past 2048 rows
-/// the BF16 r16w4 GEMM's row envelope ends and 4096 adds only 1.3% for
-/// 4 GiB of scratch.  Other architectures keep the measured 1536.
+/// kernel's shape envelope ends.  Measured against the earlier 1536-row
+/// chunk: gfx1151 pp8192 +10.2% at 8192 rows (resident experts).  On
+/// gfx1201 under `auto` expert placement the larger chunk costs VRAM expert
+/// layers, so the rung is the fastest pp8192 within 3% of the 2048-row
+/// rung's tg64: 4096 rows (14 layers at max_seq 66,560) measured pp8192
+/// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
+/// measured +22.6% at -6.9% tg64.  Other architectures keep the measured
+/// 1536.
 pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
     match arch {
         "gfx1151" => 8192,
-        "gfx1201" => 2048,
+        "gfx1201" => 4096,
         _ => 1536,
     }
 }

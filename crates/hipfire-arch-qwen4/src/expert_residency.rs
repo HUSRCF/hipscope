@@ -450,12 +450,13 @@ mod tests {
             auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, measured_chunk),
             17
         );
-        // gfx1201's 2048-row chunk spends most of it on forward scratch.
+        // gfx1201's 4096-row chunk spends that and one layer more on
+        // forward scratch.
         let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"));
         assert!(reserve > measured_chunk);
         assert_eq!(
             auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve),
-            16
+            15
         );
         // A card that holds everything keeps every layer resident.
         assert_eq!(
