@@ -3,8 +3,9 @@
 ## v0.4.1 — unreleased (target 2026-10-06)
 
 ### Highlights
-- **Flash-Next prefill chunk per arch** (8192 rows on gfx1151, 4096 on gfx1201): pp8192 on an R9700 with `auto` expert placement 745.6–746.6 → 1009.6–1012.5 tok/s (+35.5 %); Strix Halo 1044.5–1054.8 → 1156.0–1168.2 tok/s (+11.0 %). 3 fresh processes per arm.
-- **Flash-Next gathered F16 WMMA QSA prefill attention**, measured opt-in on the Strix Halo: pp8192 1041.4–1048.1 → 1238.7–1259.5 tok/s (+19.4 % on the means), 3 fresh processes per arm.
+- **Flash-Next prefill at the new defaults** (gathered F16 WMMA QSA attention on gfx1151/gfx1201, MQ6 X-LDS trunk projections), against the previous land head `20f981d7a`: pp8192 on an R9700 with `auto` expert placement 1011.6 → 1216.7 tok/s (+20.3 %); Strix Halo 1158.5 → 1446.2 tok/s (+24.8 %). Medians of 3 fresh processes per arm.
+- **Flash-Next prefill chunk per arch** (8192 rows on gfx1151, 4096 on gfx1201), against `cd2b9d91a`: pp8192 on an R9700 with `auto` expert placement 746.2 → 1011.9 tok/s (+35.6 %); Strix Halo 1048.9 → 1164.8 tok/s (+11.0 %). Medians of 3 fresh processes per arm.
+- **Flash-Next quality at the new defaults:** KLD against the BF16 source (WikiText-2, 32 × 512 tokens, Strix Halo) is 0.074318, with the same logits, byte for byte, as the earlier reference run. With only the gathered attention opted out, 16K logits are byte-identical to `20f981d7a` on both arches. At the defaults, the worst sampled 16K attention row is within 7.2e-4 relative error of the F32 reference on gfx1201 and 5.1e-4 on gfx1151, and the 128K needle answers correctly on both.
 
 ### Flash-Next performance
 - **Qwen4: experimental projection-region LDS WMMA launch (`HIPFIRE_QWEN4_PROJ_REGIONS=1`, default off).** The admitted F16 route combines router/shared gate/up/selector output rows without packing weights, sharing X staging across region boundaries. gfx11 HC-down can use the same ascending-K kernel alone. Native gfx1201 fragments are supported; its exact short selector and split-K=4 HC-down remain separate. This flag does not enable the F16 route, alter PLE/shared-down dispatch, or change HC-write hooks.
