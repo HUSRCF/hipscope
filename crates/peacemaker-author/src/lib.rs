@@ -32,7 +32,7 @@ pub use lds::{
     join, prime, ready, retire, retire_cur, rotate, AllFree, Free, JoinPart, LdsRegion, Published, Ring, State, StoreTarget,
     Transition, Transitions, Writing,
 };
-pub use scope::{Arrived, Carried, End, LoopExit, Scc, Uniform, Wave, WgUniform, Workgroup};
+pub use scope::{Arrived, Carried, End, Forward, LoopExit, Scc, Uniform, Wave, WgUniform, Workgroup};
 pub use target::{
     BarrierModel, Full, Gfx11Waits, Gfx1100, Gfx1151, Gfx1201, Gfx12Waits, LdsCounter, MmaIu4, Split, SplitBarrier, Target,
     WaitModel,

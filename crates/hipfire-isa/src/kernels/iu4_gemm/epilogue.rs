@@ -6,9 +6,10 @@
 //! tokens < N. SET writes acc, ADD writes RN(Y + acc), and gate/up uses the
 //! imported hipcc SiLU region `h = g / (1 + expf(-g)) * u`; the packed
 //! variant rounds each h to bf16 RNE before storing.
-use super::{EPI, Epi, Gen, region::{self, Binding, Region}};
+use super::{EPI, Epi, Gen, Wg, region::{self, Binding, Region}};
 use crate::kernels::{bf16::Bf16, common::{lit, mem, op, s, sop, sr, v, vr}};
-use crate::{Builder, insn::MemoryClass};
+use crate::{Builder, insn::{Instruction, MemoryClass}};
+use peacemaker_author::End;
 
 struct Epilogue { tok: u8, row: u8, off: u8, lim: u8, lim_off: [u8; 4], ntok: [u8; 4], rm: [u8; 4], tm: [u8; 4], nbo: [u8; 4], masks: [u8; 4] }
 /// Concurrently live SiLU region instances (register slots).
@@ -21,9 +22,10 @@ fn layout(g: &Gen) -> Epilogue {
         tm: [e + 13, e + 14, e + 15, e + 16], nbo: [e + 17, e + 18, e + 19, e + 20], masks: [e + 21, e + 22, e + 23, g.tmp + 7] }
 }
 
-pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    b.label(EPI)?;
-    if g.spec.epi == Epi::QkvzaGdn { return fused_stores(b, g) }
+pub(crate) fn emit(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
+    wg.label(EPI)?;
+    if g.spec.epi == Epi::QkvzaGdn { return fused_stores(wg, g, end) }
+    let b = wg.isa();
     // Below the K-loop's priority 1: co-resident K-loops issue first.
     op(b, "s_setprio 0", &[], &[])?;
     let a = g.args;
@@ -33,29 +35,35 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
 
 /// Fused projection, non-GDN tiles: Z tiles store like SET into Yz (stride
 /// Mz); the beta/alpha tile stores rows 0..47 (waves 0-3) into Ybeta and rows
-/// 64..111 (waves 4-7) into Yalpha, both with stride 48. QKV tiles branch to
-/// the GDN preparation.
-fn fused_stores(b: &mut Builder, g: &Gen) -> Result<(), String> {
+/// 64..111 (waves 4-7) into Yalpha, both with stride 48; both then leave the
+/// kernel. QKV tiles continue at the GDN preparation (`gdn_epilogue`).
+fn fused_stores(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
     let (mz, seg, yz, yb, ya) = (21u8, 31u8, 14u8, 16u8, 18u8);
     let (adj, mba, zero) = (g.srd_w, g.srd_w + 1, g.srd_w + 2);
-    sop(b, format!("s_cmp_eq_u32 s{seg}, 0"), &[], &[seg])?;
-    op(b, format!("s_cbranch_scc1 {}", super::GDN), &[], &[])?;
-    sop(b, format!("s_cmp_ge_u32 s{}, s{mz}", g.rs), &[], &[g.rs, mz])?;
-    op(b, format!("s_cbranch_scc1 {EPI}_ba"), &[], &[])?;
-    store(b, g, Epi::Set, yz, mz, g.rs, None)?;
-    b.wait_all()?;
-    op(b, format!("s_branch {EPI}_stored"), &[], &[])?;
-    b.label(&format!("{EPI}_ba"))?;
-    sop(b, format!("s_bitcmp1_b32 s{}, 2", g.wave), &[], &[g.wave])?;
-    op(b, format!("s_cselect_b64 s[{yb}:{}], s[{ya}:{}], s[{yb}:{}]", yb + 1, ya + 1, yb + 1), &[sr(yb, 2)], &[sr(ya, 2), sr(yb, 2)])?;
-    sop(b, format!("s_cselect_b32 s{adj}, {}, 0", lit(super::spec::GDN_FOLD_ALPHA_ROW)), &[adj], &[])?;
-    sop(b, format!("s_mov_b32 s{mba}, 48"), &[mba], &[])?;
-    sop(b, format!("s_mov_b32 s{zero}, 0"), &[zero], &[])?;
-    store(b, g, Epi::Set, yb, mba, zero, Some(adj))?;
-    b.wait_all()?;
-    b.label(&format!("{EPI}_stored"))?;
-    op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
-    op(b, format!("s_branch {}", super::END), &[], &[])
+    // The segment comes from the row tile (workgroup ids and kernel arguments).
+    let qkv = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_eq_u32 s{seg}, 0"), vec![], vec![s(seg)]))?;
+    wg.exit_unless(qkv, super::GDN, end, |wg| {
+        let (ba, stored) = (format!("{EPI}_ba"), format!("{EPI}_stored"));
+        wg.forward(|w, f| {
+            let beta_alpha = w.scmp(Instruction::new(format!("s_cmp_ge_u32 s{}, s{mz}", g.rs), vec![], vec![s(g.rs), s(mz)]))?;
+            f.branch_if(w, beta_alpha, &ba)?;
+            let b = w.isa();
+            store(b, g, Epi::Set, yz, mz, g.rs, None)?;
+            b.wait_all()?;
+            f.goto(w, &stored)?;
+            f.place(w, &ba)?;
+            let b = w.isa();
+            sop(b, format!("s_bitcmp1_b32 s{}, 2", g.wave), &[], &[g.wave])?;
+            op(b, format!("s_cselect_b64 s[{yb}:{}], s[{ya}:{}], s[{yb}:{}]", yb + 1, ya + 1, yb + 1), &[sr(yb, 2)], &[sr(ya, 2), sr(yb, 2)])?;
+            sop(b, format!("s_cselect_b32 s{adj}, {}, 0", lit(super::spec::GDN_FOLD_ALPHA_ROW)), &[adj], &[])?;
+            sop(b, format!("s_mov_b32 s{mba}, 48"), &[mba], &[])?;
+            sop(b, format!("s_mov_b32 s{zero}, 0"), &[zero], &[])?;
+            store(b, g, Epi::Set, yb, mba, zero, Some(adj))?;
+            b.wait_all()?;
+            f.place(w, &stored)
+        })?;
+        op(wg.isa(), "s_mov_b32 exec_lo, -1", &[], &[])
+    })
 }
 
 /// `rg` row groups x `quads` quads per lane; SET/ADD: 2 x 2, gate/up: 1 x 2.

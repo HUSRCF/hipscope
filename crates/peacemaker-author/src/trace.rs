@@ -30,6 +30,8 @@ pub struct Trace {
     signalled: Option<Vec<SlotTransition>>,
     seal: Seal,
     exits: Vec<String>,
+    /// Code falls through to the current point (false after `s_branch`).
+    reachable: bool,
 }
 
 impl Trace {
@@ -43,6 +45,7 @@ impl Trace {
             signalled: None,
             seal: Seal::default(),
             exits: Vec::new(),
+            reachable: true,
         }
     }
     /// Instructions whose mnemonic is `m`.
@@ -218,7 +221,7 @@ impl Backend for Trace {
         self.exits.push(name.into());
         Ok(())
     }
-    fn end_program(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
+    fn place_exit(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         if !self.exits.iter().any(|e| e == name) {
             return Err(format!("{name} is not a reserved kernel exit"));
@@ -226,7 +229,13 @@ impl Backend for Trace {
         if self.signalled.is_some() {
             return Err("kernel ends with a split barrier in flight".into());
         }
-        self.place(name)?;
+        self.place(name)
+    }
+    fn end_program(&mut self, auth: &Auth) -> Result<(), String> {
+        self.seal.check(auth)?;
+        if !self.exits.iter().any(|e| self.text.iter().any(|t| t.strip_suffix(':') == Some(e.as_str()))) {
+            return Err("s_endpgm without a placed kernel exit".into());
+        }
         self.emit("s_endpgm");
         self.seal.end(auth)
     }
@@ -246,6 +255,7 @@ impl Backend for Trace {
     fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         self.emit(format!("s_branch {target}"));
+        self.reachable = false;
         Ok(())
     }
     type Fork = TraceFork;
@@ -256,10 +266,17 @@ impl Backend for Trace {
         self.seal.check(auth)?;
         self.slots = slots;
         self.stores = stores;
+        self.reachable = true;
         Ok(())
     }
     fn join(&mut self, auth: &Auth, TraceFork(slots, stores): Self::Fork) -> Result<(), String> {
         self.seal.check(auth)?;
+        if !self.reachable {
+            self.slots = slots;
+            self.stores = stores;
+            self.reachable = true;
+            return Ok(());
+        }
         if slots.len() != self.slots.len() {
             return Err("paths join with different LDS layouts".into());
         }
@@ -322,7 +339,8 @@ impl Backend for Trace {
         if second.text[start..] != first.text[start..] {
             return Err("loop body did not reach a fixed point".into());
         }
-        *self = first;
+        // The core carries the last run's state (its store events) past the loop.
+        *self = second;
         Ok(())
     }
 }

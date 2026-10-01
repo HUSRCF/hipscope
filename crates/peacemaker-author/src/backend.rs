@@ -118,18 +118,21 @@ pub trait Backend: Sized {
     fn barrier_wait(&mut self, auth: &Auth) -> Result<(), String>;
 
     fn label(&mut self, auth: &Auth, name: &str) -> Result<(), String>;
-    /// Reserve `name` as a kernel exit: from now on only `end_program` may
+    /// Reserve `name` as a kernel exit: from now on only `place_exit` may
     /// place it, and the backend refuses to finish a program that never
     /// placed it.
     fn reserve_exit(&mut self, auth: &Auth, name: &str) -> Result<(), String>;
-    /// Place the exit `name` followed by `s_endpgm`; the program has ended
-    /// (`Seal::end`).
-    fn end_program(&mut self, auth: &Auth, name: &str) -> Result<(), String>;
+    /// Place the reserved exit `name`; only `end_program` and raw
+    /// straight-line instructions may follow.
+    fn place_exit(&mut self, auth: &Auth, name: &str) -> Result<(), String>;
+    /// `s_endpgm` after a placed exit; the program has ended (`Seal::end`).
+    fn end_program(&mut self, auth: &Auth) -> Result<(), String>;
     /// Issue a scalar compare (`s_cmp*`, `s_bitcmp*`) that defines SCC.
     fn scalar_compare(&mut self, auth: &Auth, insn: Self::Insn) -> Result<(), String>;
     /// `s_cbranch_scc1 target`.
     fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
-    /// `s_branch target`.
+    /// `s_branch target`. Nothing reaches the point after it until a
+    /// `join` brings in the state of a branch to that point.
     fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
     /// Backend state at a branch: everything later waits, hazard guards and
     /// slot checks depend on (wait ledger, LDS slots, hazard trackers).
@@ -140,7 +143,8 @@ pub trait Backend: Sized {
     /// `other` is another path into the current point: make the current
     /// state hold on both, conservatively (every wait or hazard guard either
     /// path needs is emitted), or refuse when the paths disagree on LDS
-    /// ownership.
+    /// ownership. When nothing falls through to the current point (it
+    /// follows a `branch`), the state is `other`'s.
     fn join(&mut self, auth: &Auth, other: Self::Fork) -> Result<(), String>;
     /// Other waves of the workgroup have drained stores into `slots`, which
     /// the next barrier publishes (the reading side of a wave-role handoff).
@@ -151,6 +155,6 @@ pub trait Backend: Sized {
     fn exec_all(&mut self, auth: &Auth) -> Result<(), String>;
     /// Emit `body` once as a loop at `head`; the backend verifies that its
     /// state reaches a fixed point across the back edge. `body` may be run
-    /// more than once; the first run's code is the one kept.
+    /// more than once; the last run's code is the one kept.
     fn loop_(&mut self, auth: &Auth, head: &str, body: &dyn Fn(&mut Self) -> Result<(), String>) -> Result<(), String>;
 }

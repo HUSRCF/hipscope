@@ -825,18 +825,18 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.enable_delay_alu();
     let mut wg = Wg::new(&mut b)?;
     let rings = declare_lds(&mut wg)?;
+    let end = wg.exit(&g.label("end"))?;
     let rings = prologue(&mut wg, &g, rings)?;
     // The last epoch's slot stays published: nothing writes LDS after it.
     let _published = kloop(&mut wg, &g, rings)?;
-    let isa = wg.isa();
-    epilogue(isa, &g)?;
-    isa.label(&g.label("end"))?;
+    epilogue(wg.isa(), &g)?;
     // One CTA per WGP: release the VGPRs before the epilogue's stores drain
     // so the next CTA's waves launch (hipcc emits the same message).
     // M7 models `s_sendmsg` as reading M0; the message carries no data.
-    op(isa, "s_mov_b32 m0, 0", &[], &[])?;
-    isa.push(Sop::Dealloc.encode(spec.arch)?)?;
-    isa.push(Sop::End.encode(spec.arch)?)?;
+    wg.end_with(end, |w| {
+        op(w.isa(), "s_mov_b32 m0, 0", &[], &[])?;
+        w.isa().push(Sop::Dealloc.encode(spec.arch)?)
+    })?;
     b.finish()
 }
 

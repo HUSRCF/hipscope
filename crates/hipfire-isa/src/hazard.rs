@@ -2,7 +2,7 @@ use crate::{arch::Arch,reg::{Kind,RegRef}};
 use serde::Serialize;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum Pipeline { Salu,Valu,Vmem,Smem,Ds }
 #[derive(Clone,Debug,Serialize)] pub struct HazardProof { pub pc_index:usize,pub insn:String,pub rule:String }
-#[derive(Clone,Debug)] pub struct Gfx12Sgpr { tracked:[bool;64],salu:[bool;128],valu:[bool;128],vcc_salu:bool,vcc_valu:bool }
+#[derive(Clone,Debug,PartialEq)] pub struct Gfx12Sgpr { tracked:[bool;64],salu:[bool;128],valu:[bool;128],vcc_salu:bool,vcc_valu:bool }
 impl Default for Gfx12Sgpr { fn default()->Self {Self {tracked:[false;64],salu:[false;128],valu:[false;128],vcc_salu:false,vcc_valu:false}} }
 impl Gfx12Sgpr {
     /// Join another control path's tracker: a write pending a guard on
@@ -34,7 +34,7 @@ impl Gfx12Sgpr {
 /// VALU-SGPR -> VMEM NOP rule does not apply. The mask-write and
 /// partial-forwarding hazards apply only to wave64, which this builder does
 /// not emit; WMMA chaining is handled by the builder itself.
-#[derive(Clone,Debug,Default)]
+#[derive(Clone,Debug,Default,PartialEq)]
 pub struct Gfx11Hazards {
     trans_use: bool,
     trans_defs: Vec<(RegRef,u8,u8)>,

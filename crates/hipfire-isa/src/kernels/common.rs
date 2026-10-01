@@ -11,8 +11,11 @@ pub fn sr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len } }
 /// Literal spelling as llvm-objdump prints it: inline integers in decimal,
 /// everything else in hex, so parse-back compares canonical text.
 pub fn lit(x: u32) -> String { if x <= 64 { x.to_string() } else if x as i32 >= -16 && (x as i32) < 0 { (x as i32).to_string() } else { format!("{x:#x}") } }
+/// One instruction. An untyped kernel's branches and `s_endpgm` go
+/// through `Builder::control` (a typed kernel's through its typed scopes).
 pub fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
+    let insn = Instruction::new(text, defs.to_vec(), uses.to_vec());
+    if crate::insn::control_flow(insn.mnemonic()) { b.control(insn) } else { b.push(insn) }
 }
 pub fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
     b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))

@@ -21,6 +21,14 @@ pub struct Pending {
     pub family: MemoryFamily,
     /// Pending on only some of the control paths that joined here.
     pub maybe: bool,
+    /// Ids of the same counter slot on other joined paths (`Ledger::join`).
+    pub aliases: Vec<u64>,
+}
+impl Pending {
+    fn has(&self, id: u64) -> bool { self.id == id || self.aliases.contains(&id) }
+    fn ids(&self) -> impl Iterator<Item = u64> + '_ { std::iter::once(self.id).chain(self.aliases.iter().copied()) }
+    /// A load whose counter retires its operations in issue order.
+    fn positional(&self) -> bool { self.in_order && !self.maybe && self.src_locks.is_empty() }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,7 +67,7 @@ impl Ledger {
             id: self.next_id, counter,
             defs: if load { insn.defs.clone() } else { vec![] },
             src_locks: if load { vec![] } else { insn.uses.clone() },
-            in_order, family, maybe: false,
+            in_order, family, maybe: false, aliases: vec![],
         });
         self.next_id += 1;
     }
@@ -105,22 +113,55 @@ impl Ledger {
         self.pending.retain(|_| keep.next().unwrap_or(true));
     }
 
-    /// Join the ledger of another control path into this point. Equal
-    /// shapes need the same waits on both paths, so this one stands.
-    /// Otherwise every operation pending on either path stays pending, and
-    /// one pending on only one path is `maybe`: waits on its counter drain
-    /// to zero (`required`) and a partial wait retires only what is
-    /// certain (`wait`), which holds on both paths.
+    /// Join the ledger of another control path into this point, per
+    /// operation id: ids say which operation a `Wave::wait` token awaits,
+    /// so every id pending on either path stays pending. Ids stay unique
+    /// across paths (`resume`), so an equal id is the same operation.
+    ///
+    /// A counter whose pending operations are in-order loads of one family
+    /// on both paths, with equal shapes, retires them by position: the
+    /// paths' operations are merged slot by slot, each slot certain and
+    /// carrying both paths' ids. On any other counter (stores, SMEM and
+    /// other out-of-order families, or different shapes) an operation
+    /// pending on only one path is `maybe`: waits on its counter drain to
+    /// zero (`required`) and a partial wait retires only what is certain
+    /// (`wait`), which holds on both paths.
     pub fn join(&mut self, other: &Ledger) {
-        if self.shape() == other.shape() { return }
-        let mut merged: Vec<Pending> = self.pending.iter().cloned().map(|mut p| {
-            p.maybe |= !other.pending.iter().any(|o| o.id == p.id);
-            p
-        }).collect();
-        for o in &other.pending {
-            match merged.iter_mut().find(|p| p.id == o.id) {
-                Some(p) => p.maybe |= o.maybe,
-                None => merged.push(Pending { maybe: true, ..o.clone() }),
+        fn on(l: &Ledger, c: Counter) -> Vec<&Pending> { l.pending.iter().filter(|p| p.counter == c).collect() }
+        let mut positional = Vec::new();
+        for c in self.pending.iter().chain(&other.pending).map(|p| p.counter) {
+            if positional.contains(&c) { continue }
+            let (mine, theirs) = (on(self, c), on(other, c));
+            let family = mine.first().map(|p| p.family);
+            let slot = |p: &&Pending| p.positional() && Some(p.family) == family;
+            if mine.len() == theirs.len() && mine.iter().chain(&theirs).all(slot)
+                && mine.iter().zip(&theirs).all(|(p, o)| p.defs == o.defs) {
+                positional.push(c);
+            }
+        }
+        let mut merged: Vec<Pending> = Vec::with_capacity(self.pending.len());
+        for c in &positional {
+            let theirs = on(other, *c);
+            for (p, o) in self.pending.iter().filter(|p| p.counter == *c).zip(theirs) {
+                let mut p = p.clone();
+                for id in o.ids() { if !p.has(id) { p.aliases.push(id) } }
+                merged.push(p);
+            }
+        }
+        for p in self.pending.iter().filter(|p| !positional.contains(&p.counter)) {
+            let mut p = p.clone();
+            match other.pending.iter().find(|o| o.ids().any(|id| p.has(id))) {
+                Some(o) => {
+                    p.maybe |= o.maybe;
+                    for id in o.ids() { if !p.has(id) { p.aliases.push(id) } }
+                }
+                None => p.maybe = true,
+            }
+            merged.push(p);
+        }
+        for o in other.pending.iter().filter(|o| !positional.contains(&o.counter)) {
+            if !self.pending.iter().any(|p| o.ids().any(|id| p.has(id))) {
+                merged.push(Pending { maybe: true, ..o.clone() });
             }
         }
         merged.sort_by_key(|p| p.id);
@@ -129,6 +170,15 @@ impl Ledger {
     }
     /// Continue from another path's ledger without reusing an id this one
     /// issued (ids stay unique across the paths of one program).
+    pub fn resume(&mut self, at: Ledger) {
+        let next_id = self.next_id.max(at.next_id);
+        *self = at;
+        self.next_id = next_id;
+    }
+
+    /// Continue at a branch target with the ledger of the branch point.
+    /// Ids issued on the path that fell through stay used, so the two
+    /// paths' operations keep distinct ids when they join later.
     pub fn resume(&mut self, at: Ledger) {
         let next_id = self.next_id.max(at.next_id);
         *self = at;
@@ -162,8 +212,8 @@ impl Ledger {
     pub fn is_empty(&self) -> bool { self.pending.is_empty() }
     /// Id of the most recently recorded operation.
     pub fn last_id(&self) -> Option<u64> { self.next_id.checked_sub(1) }
-    /// Operation `id` has not been retired by a wait.
-    pub fn is_pending(&self, id: u64) -> bool { self.pending.iter().any(|p| p.id == id) }
+    /// Operation `id` (on any joined path) has not been retired by a wait.
+    pub fn is_pending(&self, id: u64) -> bool { self.pending.iter().any(|p| p.has(id)) }
     /// Pending operations without their ids: two ledgers with equal shapes
     /// require the same waits for every later instruction.
     pub fn shape(&self) -> Vec<(Counter, Vec<RegRef>, Vec<RegRef>, bool, MemoryFamily, bool)> {
@@ -187,5 +237,51 @@ impl Ledger {
             out.push((*counter, *count, text, reason.clone()));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use crate::reg::Kind;
+
+    fn r(kind: Kind, base: u8) -> RegRef { RegRef { kind, base, len: 1 } }
+    /// Two paths issue the same instructions after a fork (distinct ids).
+    fn paths(arch: Arch, insns: &[Instruction]) -> (Ledger, Ledger, Vec<u64>, Vec<u64>) {
+        let mut a = Ledger::default();
+        for i in insns { a.record(arch, i) }
+        let ids_a = (0..insns.len() as u64).collect::<Vec<_>>();
+        let mut b = Ledger { pending: vec![], next_id: a.next_id };
+        for i in insns { b.record(arch, i) }
+        let ids_b = ids_a.iter().map(|i| i + a.next_id).collect();
+        (a, b, ids_a, ids_b)
+    }
+
+    /// gfx11 LGKMcnt shared by DS and SMEM, and gfx12 KMcnt, retire out of
+    /// order: an equal-shape join keeps both paths' operations (every id),
+    /// marked maybe, so a use drains the counter. In-order loads merge slot
+    /// by slot, each slot carrying both ids, and keep exact counts.
+    #[test]
+    fn equal_shape_join_merges_by_position_only_for_in_order_loads() {
+        let ds = Instruction::new("ds_load_b32 v1, v2", vec![r(Kind::V, 1)], vec![r(Kind::V, 2)]).memory(MemoryClass::DsLoad);
+        let smem = Instruction::new("s_load_b32 s4, s[0:1], 0x0", vec![r(Kind::S, 4)], vec![]).memory(MemoryClass::SmemLoad);
+        let vm = Instruction::new("global_load_b32 v5, v2, s[0:1]", vec![r(Kind::V, 5)], vec![r(Kind::V, 2)]).memory(MemoryClass::VmemLoad);
+        let use_v1 = Instruction::new("v_mov_b32 v3, v1", vec![r(Kind::V, 3)], vec![r(Kind::V, 1)]);
+        let ds6 = Instruction::new("ds_load_b32 v6, v2", vec![r(Kind::V, 6)], vec![r(Kind::V, 2)]).memory(MemoryClass::DsLoad);
+        for (arch, insns, maybe, wait) in [
+            (Arch::Gfx1100, vec![ds.clone(), smem.clone(), ds6.clone()], true, 0),
+            (Arch::Gfx1201, vec![smem.clone(), smem.clone()], true, 0),
+            (Arch::Gfx1100, vec![ds.clone(), vm.clone(), ds6.clone()], false, 1),
+        ] {
+            let (mut a, b, ids_a, ids_b) = paths(arch, &insns);
+            a.join(&b);
+            assert!(ids_a.iter().chain(&ids_b).all(|&id| a.is_pending(id)), "{arch:?} lost an id");
+            assert_eq!(a.shape().len(), insns.len() * if maybe { 2 } else { 1 }, "{arch:?}");
+            let lgkm = a.shape().into_iter().filter(|s| matches!(s.0, Counter::Lgkm | Counter::Km)).all(|s| s.5 == maybe);
+            assert!(lgkm, "{arch:?}: slots maybe={maybe}");
+            if insns[0].mnemonic().starts_with("ds_") {
+                assert_eq!(a.required(&use_v1).first().map(|w| w.1), Some(wait), "{arch:?}");
+            }
+        }
     }
 }

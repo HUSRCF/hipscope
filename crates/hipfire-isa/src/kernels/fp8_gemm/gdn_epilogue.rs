@@ -270,8 +270,8 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
     // conv taps of this lane's four channels: w[tap][c] = conv_w[(ch + c) * 4 + tap].
     for c in 0..4u8 { for tap in 0..4u8 { vload(b, W + 4 * tap + c, 1, VWOFF, CWD, None, u32::from(c) * 16 + u32::from(tap) * 4)?; } }
     // The K-loop's last barrier retired every staging slot.
-    b.lds.relayout()?;
-    let g = b.lds.add("gdn_ring", 0, RING_BYTES)?;
+    b.lds_relayout()?;
+    let g = b.lds_slot("gdn_ring", 0, RING_BYTES)?;
     sop(b, format!("s_mov_b32 s{BLK}, 0"), &[BLK], &[])?;
     sop(b, format!("s_mov_b32 s{RB}, 3"), &[RB], &[])?;
     b.wait_all()?;

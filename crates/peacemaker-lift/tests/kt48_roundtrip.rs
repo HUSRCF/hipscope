@@ -161,9 +161,9 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
-        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e", 12, 362_032),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8", 5, 83_224),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63", 5, 83_504),
+        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "c4e5c52d441f248fe8c3ef5811012de2d906925c876e45d1cf431cfdd2818820", 12, 362_048),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "875fb5649468329a7ba76ca1ed0bfec8faf9b5a75907de0d38ef73ae446f3b20", 5, 83_192),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "4ffe35803d306edfb97ffc59f87e5a0d7a8785a7c7f02dfc1b18774878e47117", 5, 83_472),
     ] {
         let input = load(relative, sha);
         assert_eq!(input.len(), bytes);
