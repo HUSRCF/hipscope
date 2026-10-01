@@ -598,6 +598,10 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
     fn immutable_identity(&self) -> Option<u64> {
         Some(self.identity)
     }
+
+    fn host_mapped(&self) -> bool {
+        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+    }
 }
 
 /// Source of [`Qwen4MoeLayerRuntime::identity`].
@@ -647,6 +651,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn immutable_identity(&self) -> Option<u64> {
         Some(self.identity)
+    }
+
+    fn host_mapped(&self) -> bool {
+        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
     }
 }
 
