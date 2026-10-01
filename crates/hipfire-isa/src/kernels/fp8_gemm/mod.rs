@@ -10,8 +10,8 @@ mod gdn_epilogue;
 pub mod gdn_region;
 
 pub use spec::{ActScale, Epi, Spec};
-use crate::{Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan,
-    insn::{Instruction, MemoryClass}, reg::{Kind, Live, RegRef}};
+use crate::{Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass}, reg::Live};
+use crate::kernels::common::{mem, op, s, sr, v, vr};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -21,19 +21,6 @@ const LOOP_END: &str = ".Lfp8_loop_end";
 const EPILOGUE: &str = ".Lfp8_epilogue";
 const END: &str = ".Lfp8_end";
 
-fn v(n:u8)->RegRef { RegRef { kind:Kind::V,base:n,len:1 } }
-fn vr(n:u8,len:u8)->RegRef { RegRef { kind:Kind::V,base:n,len } }
-fn s(n:u8)->RegRef { RegRef { kind:Kind::S,base:n,len:1 } }
-fn sr(n:u8,len:u8)->RegRef { RegRef { kind:Kind::S,base:n,len } }
-fn op(b:&mut Builder,text:impl Into<String>,defs:&[RegRef],uses:&[RegRef])->Result<(),String> {
-    b.push(Instruction::new(text,defs.to_vec(),uses.to_vec()))
-}
-fn mem(b:&mut Builder,text:impl Into<String>,defs:&[RegRef],uses:&[RegRef],class:MemoryClass)->Result<(),String> {
-    b.push(Instruction::new(text,defs.to_vec(),uses.to_vec()).memory(class))
-}
-fn so(b:&mut Builder,text:impl Into<String>,defs:&[u8],uses:&[u8])->Result<(),String> {
-    op(b,text,&defs.iter().map(|&n|s(n)).collect::<Vec<_>>(),&uses.iter().map(|&n|s(n)).collect::<Vec<_>>())
-}
 fn vo(b:&mut Builder,text:impl Into<String>,defs:&[u8],uses:&[u8],su:&[u8])->Result<(),String> {
     op(b,text,&defs.iter().map(|&n|v(n)).collect::<Vec<_>>(),&uses.iter().map(|&n|v(n)).chain(su.iter().map(|&n|s(n))).collect::<Vec<_>>())
 }

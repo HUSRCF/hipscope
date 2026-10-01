@@ -6,7 +6,8 @@
 //! tokens < N. SET writes acc, ADD writes RN(Y + acc), and gate/up uses the
 //! imported hipcc SiLU region `h = g / (1 + expf(-g)) * u`; the packed
 //! variant rounds each h to bf16 RNE before storing.
-use super::{EPI, Epi, Gen, lit, mem, op, region::{self, Binding, Region}, s, sr, v, vr};
+use super::{EPI, Epi, Gen, region::{self, Binding, Region}};
+use crate::kernels::{bf16::Bf16, common::{lit, mem, op, s, sop, sr, v, vr}};
 use crate::{Builder, insn::MemoryClass};
 
 struct Epilogue { tok: u8, row: u8, off: u8, lim: u8, lim_off: [u8; 4], ntok: [u8; 4], rm: [u8; 4], tm: [u8; 4], nbo: [u8; 4], masks: [u8; 4] }
@@ -18,27 +19,6 @@ fn layout(g: &Gen) -> Epilogue {
     Epilogue { tok: g.f[0], row: g.f[0] + 1, off: g.f[0] + 2, lim: e,
         lim_off: [e + 1, e + 2, e + 3, e + 4], ntok: [e + 5, e + 6, e + 7, e + 8], rm: [e + 9, e + 10, e + 11, e + 12],
         tm: [e + 13, e + 14, e + 15, e + 16], nbo: [e + 17, e + 18, e + 19, e + 20], masks: [e + 21, e + 22, e + 23, g.tmp + 7] }
-}
-
-fn sop(b: &mut Builder, text: String, d: &[u8], u: &[u8]) -> Result<(), String> {
-    op(b, text, &d.iter().map(|&n| s(n)).collect::<Vec<_>>(), &u.iter().map(|&n| s(n)).collect::<Vec<_>>())
-}
-/// Exact hip_bfloat16::round_to_bfloat16: RNE on finite values, preserve
-/// infinities and NaN payloads (including a low-only signaling NaN bit).
-/// v0/v1 are packed-lane results; dead SiLU temporaries v2..v5 are scratch.
-fn round_bf16(b: &mut Builder, src: u8, dst: u8) -> Result<(), String> {
-    op(b, format!("v_lshrrev_b32_e32 v2, 16, v{src}"), &[v(2)], &[v(src)])?;
-    op(b, "v_and_b32_e32 v2, 1, v2", &[v(2)], &[v(2)])?;
-    op(b, "v_add_nc_u32_e32 v2, 0x7fff, v2", &[v(2)], &[v(2)])?;
-    op(b, format!("v_add_nc_u32_e32 v3, v{src}, v2"), &[v(3)], &[v(src), v(2)])?;
-    op(b, format!("v_and_b32_e32 v4, 0xffff, v{src}"), &[v(4)], &[v(src)])?;
-    op(b, "v_cmp_ne_u32_e32 vcc_lo, 0, v4", &[], &[v(4)])?;
-    op(b, "v_cndmask_b32_e64 v4, 0, 0x10000, vcc_lo", &[v(4)], &[])?;
-    op(b, format!("v_or_b32_e32 v4, v{src}, v4"), &[v(4)], &[v(src), v(4)])?;
-    op(b, format!("v_and_b32_e32 v5, 0x7f800000, v{src}"), &[v(5)], &[v(src)])?;
-    op(b, "v_cmp_eq_u32_e32 vcc_lo, 0x7f800000, v5", &[], &[v(5)])?;
-    op(b, format!("v_cndmask_b32_e32 v{dst}, v3, v4, vcc_lo"), &[v(dst)], &[v(3), v(4)])?;
-    op(b, format!("v_lshrrev_b32_e32 v{dst}, 16, v{dst}"), &[v(dst)], &[v(dst)])
 }
 
 pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
@@ -199,8 +179,9 @@ fn store(b: &mut Builder, g: &Gen, epi: Epi, yp: u8, m: u8, rbase: u8, row_adjus
                     for k in 0..4u8 {
                         let dst = out + k;
                         let src0 = out + 2 * k;
-                        round_bf16(b, src0, 0)?;
-                        round_bf16(b, src0 + 1, 1)?;
+                        // v0/v1 are packed-lane results; dead SiLU temporaries v2..v5 are scratch.
+                        Bf16::hip_bfloat16(b, src0, 0, [2, 3, 4, 5])?;
+                        Bf16::hip_bfloat16(b, src0 + 1, 1, [2, 3, 4, 5])?;
                         op(b, "v_lshlrev_b32_e32 v1, 16, v1", &[v(1)], &[v(1)])?;
                         op(b, format!("v_or_b32_e32 v{dst}, v0, v1"), &[v(dst)], &[v(0), v(1)])?;
                     }

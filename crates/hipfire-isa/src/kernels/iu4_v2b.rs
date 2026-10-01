@@ -37,8 +37,10 @@
 //!   residual tile is touched over epochs `E-16..E-9` like `_add_touch`.
 //! - SiLU `G, U, Xq, Y, M, K, N`, grid `[N/256, 2M/256]`; `Y = h [N][M]`,
 //!   `h = g / (1 + expf(-g)) * u` with hipcc's exact expf/fdiv expansion.
-use super::iu4_gemm::{ds_offsets, lit, s, sr, v, vr};
-use super::iu4_v2c::{mem, off, op};
+use super::common::{add64, add64_imm, lit, mem, op, s, sop, sr, v, vr};
+use super::iu4_fold::{self, GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
+use super::iu4_gemm::ds_offsets;
+use super::iu4_v2c::off;
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
     insn::{Instruction, MemoryClass, Sop, Wmma}, lds::Transition,
     reg::Live, vopd::{Operand, VopdF32, VopdOp}};
@@ -50,12 +52,6 @@ pub const LDS_BYTES: u32 = 65536;
 pub const SLOT_BYTES: u32 = 32768;
 pub const A_BYTES: u32 = 16384;
 pub const VGPR_CEILING: u16 = 256;
-pub const MAGIC: u32 = 0x4b40_0000;
-/// `-12582912.0f`: `float(C) = bits(C + magic) - 1.5*2^23` exactly.
-pub const MAGIC_NEG: u32 = 0xcb40_0000;
-pub const REBIAS: u32 = 0x8888_8888;
-pub const GROUP_BYTES: u32 = 136;
-pub const XBLK_BYTES: u32 = 72;
 /// ADD residual touch window: epochs `E-TOUCH_LEAD .. E-TOUCH_LEAD+8`.
 pub const TOUCH_LEAD: u32 = 16;
 /// Smallest K the ADD entry accepts (its touch window must fit the loop).
@@ -273,27 +269,13 @@ fn declare_lds(b: &mut Builder) -> Result<(), String> {
     Ok(())
 }
 
-fn salu(b: &mut Builder, text: String, defs: &[u8], uses: &[u8]) -> Result<(), String> {
-    op(b, text, &defs.iter().map(|&r| s(r)).collect::<Vec<_>>(), &uses.iter().map(|&r| s(r)).collect::<Vec<_>>())
-}
-
 /// `dst = base + x*y` (64-bit), `x*y` as a full 64-bit product.
 fn mul_add64(b: &mut Builder, dst: u8, base: u8, x: u8, y: u8) -> Result<(), String> {
     let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
-    salu(b, format!("s_mul_i32 s{lo}, s{x}, s{y}"), &[lo], &[x, y])?;
-    salu(b, format!("s_mul_hi_u32 s{hi}, s{x}, s{y}"), &[hi], &[x, y])?;
-    salu(b, format!("s_add_u32 s{dst}, s{base}, s{lo}"), &[dst], &[base, lo])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, s{hi}", dst + 1, base + 1), &[dst + 1], &[base + 1, hi])
-}
-
-fn add64_imm(b: &mut Builder, reg: u8, imm: u32) -> Result<(), String> {
-    salu(b, format!("s_add_u32 s{reg}, s{reg}, {}", lit(imm)), &[reg], &[reg])?;
-    salu(b, format!("s_addc_u32 s{0}, s{0}, 0", reg + 1), &[reg + 1], &[reg + 1])
-}
-
-fn add64_sreg(b: &mut Builder, reg: u8, x: u8) -> Result<(), String> {
-    salu(b, format!("s_add_u32 s{reg}, s{reg}, s{x}"), &[reg], &[reg, x])?;
-    salu(b, format!("s_addc_u32 s{0}, s{0}, 0", reg + 1), &[reg + 1], &[reg + 1])
+    sop(b, format!("s_mul_i32 s{lo}, s{x}, s{y}"), &[lo], &[x, y])?;
+    sop(b, format!("s_mul_hi_u32 s{hi}, s{x}, s{y}"), &[hi], &[x, y])?;
+    sop(b, format!("s_add_u32 s{dst}, s{base}, s{lo}"), &[dst], &[base, lo])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", dst + 1, base + 1), &[dst + 1], &[base + 1, hi])
 }
 
 /// Kernel arguments, tile bases and every lane-invariant offset.
@@ -316,74 +298,74 @@ fn prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     op(b, format!("v_readfirstlane_b32 s{}, v1", Regs::WAVE), &[s(Regs::WAVE)], &[v(1)])?;
     op(b, "v_and_b32_e32 v3, 15, v2", &[v(3)], &[v(2)])?;
     op(b, "v_lshrrev_b32_e32 v4, 4, v2", &[v(4)], &[v(2)])?;
-    salu(b, format!("s_lshr_b32 s{}, s{}, 2", Regs::WR, Regs::WAVE), &[Regs::WR], &[Regs::WAVE])?;
-    salu(b, format!("s_and_b32 s{}, s{}, 3", Regs::WC, Regs::WAVE), &[Regs::WC], &[Regs::WAVE])?;
+    sop(b, format!("s_lshr_b32 s{}, s{}, 2", Regs::WR, Regs::WAVE), &[Regs::WR], &[Regs::WAVE])?;
+    sop(b, format!("s_and_b32 s{}, s{}, 3", Regs::WC, Regs::WAVE), &[Regs::WC], &[Regs::WAVE])?;
     // row_bytes = (K/256)*136; trips = K/256 - 1 whole two-epoch trips before
     // the tail pair (ADD: K/256 - 8 before the touch phase).
-    salu(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, a.k), &[Regs::ROWB], &[a.k])?;
-    salu(b, format!("s_add_i32 s{}, s{}, {}", Regs::TRIPS, Regs::ROWB, if g.add() { "-8" } else { "-1" }), &[Regs::TRIPS], &[Regs::ROWB])?;
-    salu(b, format!("s_mulk_i32 s{}, {}", Regs::ROWB, lit(GROUP_BYTES)), &[Regs::ROWB], &[Regs::ROWB])?;
+    sop(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, a.k), &[Regs::ROWB], &[a.k])?;
+    sop(b, format!("s_add_i32 s{}, s{}, {}", Regs::TRIPS, Regs::ROWB, if g.add() { "-8" } else { "-1" }), &[Regs::TRIPS], &[Regs::ROWB])?;
+    sop(b, format!("s_mulk_i32 s{}, {}", Regs::ROWB, lit(GROUP_BYTES)), &[Regs::ROWB], &[Regs::ROWB])?;
     if let Some(gs) = a.gshift {
         // Grouped raster: row tile y*G + x%G, token tile x/G.
-        salu(b, format!("s_lshl_b32 s{t0}, 1, s{gs}"), &[t0], &[gs])?;
-        salu(b, format!("s_add_i32 s{t0}, s{t0}, -1"), &[t0], &[t0])?;
-        salu(b, format!("s_and_b32 s{t0}, s{}, s{t0}", Regs::WGX), &[t0], &[Regs::WGX, t0])?;
-        salu(b, format!("s_lshl_b32 s{}, s{}, s{gs}", Regs::BY, Regs::WGY), &[Regs::BY], &[Regs::WGY, gs])?;
-        salu(b, format!("s_add_i32 s{0}, s{0}, s{t0}", Regs::BY), &[Regs::BY], &[Regs::BY, t0])?;
-        salu(b, format!("s_lshr_b32 s{}, s{}, s{gs}", Regs::BX, Regs::WGX), &[Regs::BX], &[Regs::WGX, gs])?;
+        sop(b, format!("s_lshl_b32 s{t0}, 1, s{gs}"), &[t0], &[gs])?;
+        sop(b, format!("s_add_i32 s{t0}, s{t0}, -1"), &[t0], &[t0])?;
+        sop(b, format!("s_and_b32 s{t0}, s{}, s{t0}", Regs::WGX), &[t0], &[Regs::WGX, t0])?;
+        sop(b, format!("s_lshl_b32 s{}, s{}, s{gs}", Regs::BY, Regs::WGY), &[Regs::BY], &[Regs::WGY, gs])?;
+        sop(b, format!("s_add_i32 s{0}, s{0}, s{t0}", Regs::BY), &[Regs::BY], &[Regs::BY, t0])?;
+        sop(b, format!("s_lshr_b32 s{}, s{}, s{gs}", Regs::BX, Regs::WGX), &[Regs::BX], &[Regs::WGX, gs])?;
     }
     let (by, bx) = (g.by(), g.bx());
     if let Some(u) = a.u {
         // t0 = row0/2: the tile's h rows (and its gate/up row window).
-        salu(b, format!("s_lshl_b32 s{t0}, s{by}, 7"), &[t0], &[by])?;
+        sop(b, format!("s_lshl_b32 s{t0}, s{by}, 7"), &[t0], &[by])?;
         // Staging wave w owns tile fragment w: (w odd ? U : G) rows t0 + 16*(w/2).
-        salu(b, format!("s_lshr_b32 s{t1}, s{}, 1", Regs::WAVE), &[t1], &[Regs::WAVE])?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{t1}, 4"), &[t1], &[t1])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
-        salu(b, format!("s_bitcmp1_b32 s{}, 0", Regs::WAVE), &[], &[Regs::WAVE])?;
+        sop(b, format!("s_lshr_b32 s{t1}, s{}, 1", Regs::WAVE), &[t1], &[Regs::WAVE])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{t1}, 4"), &[t1], &[t1])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_bitcmp1_b32 s{}, 0", Regs::WAVE), &[], &[Regs::WAVE])?;
         op(b, format!("s_cselect_b64 s[{}:{}], s[{u}:{}], s[{}:{}]", Regs::T64, Regs::T64 + 1, u + 1, a.a, a.a + 1), &[sr(Regs::T64, 2)], &[sr(u, 2), sr(a.a, 2)])?;
         mul_add64(b, Regs::SS, Regs::T64, t1, Regs::ROWB)?;
         // Scale words: gate (word 0) and up (word 1) rows t0 + 32*wr + lane part.
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 5", Regs::WR), &[t1], &[Regs::WR])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 5", Regs::WR), &[t1], &[Regs::WR])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SW0, a.a, t1, Regs::ROWB)?;
         mul_add64(b, Regs::SW1, u, t1, Regs::ROWB)?;
     } else {
         // t0 = row0. Staging wave w owns rows t0 + 16w.
-        salu(b, format!("s_lshl_b32 s{t0}, s{by}, 8"), &[t0], &[by])?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::WAVE), &[t1], &[Regs::WAVE])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t0}, s{by}, 8"), &[t0], &[by])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::WAVE), &[t1], &[Regs::WAVE])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SS, a.a, t1, Regs::ROWB)?;
         // Scale words 0/1: rows t0 + 64*wr (+16 for word 1) + lane part.
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 6", Regs::WR), &[t1], &[Regs::WR])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 6", Regs::WR), &[t1], &[Regs::WR])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SW0, a.a, t1, Regs::ROWB)?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::ROWB), &[t1], &[Regs::ROWB])?;
-        salu(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SW1, Regs::SW0), &[Regs::SW1], &[Regs::SW0, t1])?;
-        salu(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SW1 + 1, Regs::SW0 + 1), &[Regs::SW1 + 1], &[Regs::SW0 + 1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::ROWB), &[t1], &[Regs::ROWB])?;
+        sop(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SW1, Regs::SW0), &[Regs::SW1], &[Regs::SW0, t1])?;
+        sop(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SW1 + 1, Regs::SW0 + 1), &[Regs::SW1 + 1], &[Regs::SW0 + 1])?;
     }
     // X base: Xq + (256*bx)*72.
-    salu(b, format!("s_mul_i32 s{t1}, s{bx}, {}", lit(TILE * XBLK_BYTES)), &[t1], &[bx])?;
-    salu(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, a.xq), &[Regs::SX], &[a.xq, t1])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, a.xq + 1), &[Regs::SX + 1], &[a.xq + 1])?;
-    salu(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, a.n, lit(XBLK_BYTES)), &[Regs::N72], &[a.n])?;
-    salu(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, a.m), &[Regs::M64], &[a.m])?;
+    sop(b, format!("s_mul_i32 s{t1}, s{bx}, {}", lit(TILE * XBLK_BYTES)), &[t1], &[bx])?;
+    sop(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, a.xq), &[Regs::SX], &[a.xq, t1])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, a.xq + 1), &[Regs::SX + 1], &[a.xq + 1])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, a.n, lit(XBLK_BYTES)), &[Regs::N72], &[a.n])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, a.m), &[Regs::M64], &[a.m])?;
     // Y base: Y + 4*(256*bx*M + t0), 64-bit (t0 = row0, or row0/2 for h).
     let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
-    salu(b, format!("s_lshl_b32 s{t1}, s{bx}, 8"), &[t1], &[bx])?;
-    salu(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{}", a.m), &[hi], &[t1, a.m])?;
-    salu(b, format!("s_mul_i32 s{lo}, s{t1}, s{}", a.m), &[lo], &[t1, a.m])?;
-    salu(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
-    salu(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
+    sop(b, format!("s_lshl_b32 s{t1}, s{bx}, 8"), &[t1], &[bx])?;
+    sop(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{}", a.m), &[hi], &[t1, a.m])?;
+    sop(b, format!("s_mul_i32 s{lo}, s{t1}, s{}", a.m), &[lo], &[t1, a.m])?;
+    sop(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
+    sop(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
     op(b, format!("s_lshl_b64 s[{lo}:{hi}], s[{lo}:{hi}], 2"), &[sr(lo, 2)], &[sr(lo, 2)])?;
-    salu(b, format!("s_add_u32 s{}, s{}, s{lo}", Regs::SY, a.y), &[Regs::SY], &[a.y, lo])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, a.y + 1), &[Regs::SY + 1], &[a.y + 1, hi])?;
+    sop(b, format!("s_add_u32 s{}, s{}, s{lo}", Regs::SY, a.y), &[Regs::SY], &[a.y, lo])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, a.y + 1), &[Regs::SY + 1], &[a.y + 1, hi])?;
     if g.early {
         // Token fragment c's Y base = SY + c*16*M*4 (M64 bytes per fragment).
         let mut prev = Regs::SY;
         for r in Regs::SYC {
-            salu(b, format!("s_add_u32 s{r}, s{prev}, s{}", Regs::M64), &[r], &[prev, Regs::M64])?;
-            salu(b, format!("s_addc_u32 s{}, s{}, 0", r + 1, prev + 1), &[r + 1], &[prev + 1])?;
+            sop(b, format!("s_add_u32 s{r}, s{prev}, s{}", Regs::M64), &[r], &[prev, Regs::M64])?;
+            sop(b, format!("s_addc_u32 s{}, s{}, 0", r + 1, prev + 1), &[r + 1], &[prev + 1])?;
             prev = r;
         }
     }
@@ -526,29 +508,7 @@ fn scales(b: &mut Builder, a: u8) -> Result<(), String> {
 /// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum),
 /// with the pass's row scales already broadcast into SCF by `scales(a)`.
 fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
-    for c in 0..4u8 {
-        // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
-        // destination parity, distinct src1 banks); then the fmac pairs,
-        // each at least four packets after the products it reads.
-        // Element j's product sits at t + (j^2): acc and C of element j are
-        // both in VGPR bank j%4, so an fmac half then reads that bank twice
-        // and bank (j^2)%4 once instead of bank j%4 three times (HaloR2
-        // price list: fmac packets cost 2.3-2.9 cycles, mul/add ~1.1).
-        let t = Regs::T;
-        let ts = |j: u8| t + (j ^ 2);
-        for j in 0..8u8 {
-            let mul = VopdOp { op: VopdF32::Mul, dst: ts(j), src0: Operand::V(dc + c), src1: Regs::SCF + j };
-            let cf = Regs::C + 8 * c + (j ^ 1);
-            let add = VopdOp { op: VopdF32::Add, dst: cf, src0: Operand::Lit(MAGIC_NEG), src1: cf };
-            b.vopd(mul, add)?;
-        }
-        let acc = Regs::ACC + 8 * (4 * a + c);
-        for j in (0..8u8).step_by(2) {
-            let x = VopdOp { op: VopdF32::Fmac, dst: acc + j, src0: Operand::V(ts(j)), src1: Regs::C + 8 * c + j };
-            let y = VopdOp { op: VopdF32::Fmac, dst: acc + j + 1, src0: Operand::V(ts(j + 1)), src1: Regs::C + 8 * c + j + 1 };
-            b.vopd(x, y)?;
-        }
-    }
+    for c in 0..4u8 { iu4_fold::fold_pass(b, Regs::C + 8 * c, Regs::ACC + 8 * (4 * a + c), Regs::SCF, dc + c, Regs::T)?; }
     Ok(())
 }
 
@@ -575,9 +535,9 @@ fn head(b: &mut Builder, p: usize, stage: bool, touch: bool) -> Result<(), Strin
         if p == 1 {
             // Epoch e+1 starts the next 136-byte A group.
             for base in [Regs::SS, Regs::SW0, Regs::SW1] { add64_imm(b, base, GROUP_BYTES)?; }
-            if touch { add64_sreg(b, Regs::STB, Regs::M64)?; }
+            if touch { add64(b, Regs::STB, Regs::STB, Regs::M64)?; }
         }
-        add64_sreg(b, Regs::SX, Regs::N72)?;
+        add64(b, Regs::SX, Regs::SX, Regs::N72)?;
         stage_loads(b, if p == 0 { 64 } else { 0 })?;
     }
     Ok(())
@@ -747,9 +707,17 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
 /// checks and the IEEE `fdiv` expansion with f32 denormals enabled). The
 /// eight elements are interleaved op by op.
 fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
-    const TMP: u8 = 160;
-    let t = |k: u8, i: u8| TMP + SILU_TEMPS * k + i;
-    let (m_under, m_over, m_num) = (|k: u8| Regs::MASK + 2 * k, |k: u8| Regs::MASK + 2 * (SILU_GROUP + k), |k: u8| Regs::MASK + 2 * (2 * SILU_GROUP + k));
+    silu_mul(b, gate, up, 160, Regs::MASK, SILU_GROUP)
+}
+
+/// [`silu_group`]'s DAG over the `n` elements `gate..gate+n` / `up..up+n`
+/// (h written over the gate values), interleaved op by op: the builder's one
+/// SiLU emitter for gfx11 and gfx12. Element `k` uses the temporaries
+/// `tmp + 6k ..+6` and the lane-mask pairs `mask + 2k` (underflow),
+/// `mask + 2(n+k)` (overflow), `mask + 2(2n+k)` (numerator scale).
+pub(crate) fn silu_mul(b: &mut Builder, gate: u8, up: u8, tmp: u8, mask: u8, n: u8) -> Result<(), String> {
+    let t = |k: u8, i: u8| tmp + SILU_TEMPS * k + i;
+    let (m_under, m_over, m_num) = (|k: u8| mask + 2 * k, |k: u8| mask + 2 * (n + k), |k: u8| mask + 2 * (2 * n + k));
     type Step<'a> = &'a dyn Fn(&mut Builder, u8) -> Result<(), String>;
     let steps: [Step; 26] = [
         // ph = RN(-log2e * g); pl = fma(-log2e, g, -ph); pl = fma(-log2e_lo, g, pl)
@@ -788,7 +756,7 @@ fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
         &|b, k| op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", gate + k, t(k, 5), up + k), &[v(gate + k)], &[v(t(k, 5)), v(up + k)]),
     ];
     for step in steps {
-        for k in 0..SILU_GROUP { step(b, k)?; }
+        for k in 0..n { step(b, k)?; }
     }
     Ok(())
 }

@@ -9,7 +9,7 @@
 //! instantiated per element. Only the registers, the interleaving of
 //! independent elements, the VOPD packing of their VOP2 operations and hazard
 //! waits are chosen here; every element keeps its ops in golden order.
-use super::op;
+use crate::kernels::common::op;
 use crate::{Builder, reg::{Kind, RegRef}, vopd::{self, VopdF32, VopdOp}};
 use std::collections::{BTreeMap, BTreeSet};
 
