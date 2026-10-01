@@ -123,6 +123,10 @@ impl Ledger {
             && p.family == MemoryFamily::Ds && !p.src_locks.is_empty())
     }
     pub fn is_empty(&self) -> bool { self.pending.is_empty() }
+    /// Id of the most recently recorded operation.
+    pub fn last_id(&self) -> Option<u64> { self.next_id.checked_sub(1) }
+    /// Operation `id` has not been retired by a wait.
+    pub fn is_pending(&self, id: u64) -> bool { self.pending.iter().any(|p| p.id == id) }
     /// Pending operations without their ids: two ledgers with equal shapes
     /// require the same waits for every later instruction.
     pub fn shape(&self) -> Vec<(Counter, Vec<RegRef>, Vec<RegRef>, bool, MemoryFamily)> {
