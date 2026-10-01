@@ -20145,13 +20145,21 @@ impl Gpu {
     }
 
     /// Pad F32 [N,K] to next multiple of 128 (zero pad rows). MMQ-LUT twin of
-    /// `pad_f32_batch_to_64`.
+    /// `pad_f32_batch_to_64`.  Eager-only: the pool temps are freed when the
+    /// call returns and the copies are synchronous, so a capture or PM4
+    /// recording would keep dead pointers.  Rejected like `prepare_mq4v2_fp8_x`.
     fn pad_f32_batch_to_128(
         &mut self,
         x: &GpuTensor,
         n: usize,
         k: usize,
     ) -> HipResult<(GpuTensor, usize)> {
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "lloyd MMQ pad-to-128: eager-only (capture/replay rejected)",
+            ));
+        }
         let n_padded = n.div_ceil(128) * 128;
         let padded = self.alloc_tensor(&[n_padded, k], DType::F32)?;
         self.hip.memcpy_dtod(&padded.buf, &x.buf, n * k * 4)?;
@@ -27903,8 +27911,16 @@ impl Gpu {
 
     /// The shared FP16 activation scratch as an `elems`-long F16 view, for a
     /// producer that writes the F16 WMMA input itself.  Valid until the next
-    /// FP16 conversion.
+    /// FP16 conversion.  Growth frees the old buffer, so it invalidates
+    /// captured graphs / PM4 tapes first, like `ensure_fp16_x`.
     pub fn qwen4_f16_x_scratch(&mut self, elems: usize) -> HipResult<GpuTensor> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let ptr = self.scratch.fp16_x_scratch_writable(&self.hip, elems)?;
         Ok(GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(ptr, elems * 2) },
@@ -34269,14 +34285,17 @@ impl Gpu {
         x_pad: GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        for ((y, t), &m) in ys.iter().zip(tmps.iter()).zip(y_ms.iter()) {
-            self.hip.memcpy_dtod(&y.buf, &t.buf, n * m * 4)?;
-        }
+        let copied = ys
+            .iter()
+            .zip(tmps.iter())
+            .zip(y_ms.iter())
+            .try_for_each(|((y, t), &m)| self.hip.memcpy_dtod(&y.buf, &t.buf, n * m * 4));
+        // Free every temp before propagating a copy error, or they leak.
         for t in tmps {
             let _ = self.free_tensor(t);
         }
         let _ = self.free_tensor(x_pad);
-        Ok(())
+        copied
     }
 
     /// MQ4G256V2-Lloyd (qt=52) residual FP8 prefill, prepared-X form. LUT twin

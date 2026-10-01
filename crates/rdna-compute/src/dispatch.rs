@@ -3585,6 +3585,13 @@ impl Gpu {
     /// output row's max abs error exceeds `mmq_screen_threshold`, the weight
     /// is marked unsafe. Result is cached by device pointer.
     ///
+    /// Eager-only, and it never touches capture state: its scratch growth
+    /// invalidates captured graphs like any other eager call, and its
+    /// launches are not blob-recorded. Inside a capture or PM4 recording it
+    /// does not screen (sync copies, pool temps freed on return) and reports
+    /// `false` without caching, so the weight takes the WMMA path there and is
+    /// screened at its next eager use.
+    ///
     /// Returns `true` if MMQ is safe for this weight, `false` if it should
     /// fall back to WMMA.
     pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
@@ -3592,6 +3599,9 @@ impl Gpu {
         let key = a_raw.buf.as_ptr() as usize;
         if let Some(&safe) = self.mmq_screen.cache.get(&key) {
             return safe;
+        }
+        if self.graphs.capture_mode || self.replay.is_recording() {
+            return false;
         }
 
         let screen_batch = 16usize;
@@ -3613,9 +3623,6 @@ impl Gpu {
             let x_gpu = self.upload_f32(&x_data, &[screen_batch * k])?;
             let y_wmma = self.zeros(&[screen_batch * m], DType::F32)?;
             let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
-
-            let saved_capture = self.graphs.capture_mode;
-            self.graphs.capture_mode = true;
 
             // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
             if self.arch_caps.is_gfx906() {
@@ -3639,7 +3646,6 @@ impl Gpu {
                 self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
             }
 
-            self.graphs.capture_mode = saved_capture;
             self.hip.device_synchronize()?;
 
             let ref_out = self.download_f32(&y_wmma)?;
