@@ -2632,19 +2632,6 @@ pub fn render_client_events(
     }
 }
 
-/// Release held terminal `ClientEvent::ToolCalls` after a tool-safe verdict.
-pub fn release_held_finish_tool_calls(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    finish: &FinishSummary,
-) {
-    for ev in &finish.events {
-        if let ClientEvent::ToolCalls(calls) = ev {
-            emit_tool_calls_event(stdout, id, calls);
-        }
-    }
-}
-
 pub fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -3114,7 +3101,7 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: env opt-in, thinking off. `enable_thinking`
+    // ngram-mod is greedy MTP only: `speculation.mtp_ngram` (env HIPFIRE_MTP_NGRAM), thinking off. `enable_thinking`
     // is the resolved Jinja toggle; serve lowers thinking-off to
     // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
     if let Some(spec) = m.speculator.as_mut() {
@@ -3126,10 +3113,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                && hipfire_config::mtp_ngram_enabled()
                 && temp <= 1e-6
                 && !enable_thinking,
         });
@@ -4319,7 +4303,7 @@ pub fn generate_spec(
         spec_cycles += 1;
         spec_accepted += step.accepted;
         // `emit` is already the committed tail with the seed re-echo stripped.
-        let committed_tail: Vec<u32> = step.emit.to_vec();
+        let committed_tail = step.emit;
         // Absolute host cursor before this window's commit. Spec.step left
         // target/drafter advanced over the FULL emit; semantic observe may
         // stop on a strict prefix (EOT/stop/forced/budget) and must not keep
@@ -5672,7 +5656,8 @@ pub fn generate_multi(
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
+    // A terminator ended the turn (vs. the budget running out).
+    let mut decoded_eot = false;
     while generated < max_tokens {
         if check_abort(id) {
             // G4.9: the mesh dispatcher resets recurrent state and attests
@@ -5756,13 +5741,11 @@ pub fn generate_multi(
             let _ = stdout.flush();
         }
 
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
+        if next_token == config.eos_token
+            || im_end_token == Some(next_token)
+            || tokenizer.is_terminator(next_token)
+        {
+            decoded_eot = true;
             break;
         }
         // max_think_tokens / force-answer enforcement: same decoded-text scan
@@ -6208,6 +6191,7 @@ pub fn generate_multi(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {

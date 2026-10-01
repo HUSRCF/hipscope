@@ -19,7 +19,7 @@ use crate::grammar;
 use hipfire_runtime::emit_text::{
     currently_in_think, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteEvent,
 };
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
@@ -30,9 +30,9 @@ use hipfire_runtime::tokenizer::Tokenizer;
 pub struct Qwen35Emit<'a> {
     tokenizer: &'a Tokenizer,
     filter: EosFilter,
-    /// Index into the freshly-decoded byte stream past which bytes have not yet
-    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
-    bytes_fed_to_filter: usize,
+    /// Raw bytes of `streamed_tokens`, grown one token at a time; its length
+    /// is the offset past which bytes have not yet been fed to the filter.
+    stream_bytes: Vec<u8>,
     /// Every committed token in order, for byte decoding + the cache-store the
     /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
@@ -73,17 +73,6 @@ pub struct Qwen35Emit<'a> {
 fn think_continuation_text() -> String {
     hipfire_config::developer_var("HIPFIRE_THINK_CONTINUATION")
         .unwrap_or_else(|_| "</think>\n\n".to_string())
-}
-
-/// EosFilter config for the Qwen DFlash/spec semantic-v2 producer. EosFilter
-/// owns UTF-8/EOT filtering; ThinkOutputRouter owns think-channel routing.
-fn qwen_dflash_eos_filter_config() -> EosFilterConfig {
-    EosFilterConfig {
-        strip_think: false,
-        started_in_think: false,
-        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
-        holdback_prefixes: Vec::new(),
-    }
 }
 
 impl<'a> Qwen35Emit<'a> {
@@ -128,8 +117,8 @@ impl<'a> Qwen35Emit<'a> {
         let open_think_prefix = matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
-            filter: EosFilter::new(qwen_dflash_eos_filter_config()),
-            bytes_fed_to_filter: 0,
+            filter: EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config()),
+            stream_bytes: Vec::new(),
             streamed_tokens: Vec::new(),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
@@ -250,10 +239,10 @@ impl<'a> Qwen35Emit<'a> {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
-        let action = self.filter.observe(new_bytes);
+        let fed = self.stream_bytes.len();
+        self.tokenizer
+            .decode_token_bytes_into(token, &mut self.stream_bytes);
+        let action = self.filter.observe(&self.stream_bytes[fed..]);
         self.apply_filter_action(action, &mut events);
         events
     }
@@ -398,8 +387,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         // max_think_tokens enforcement. Mirrors 4632-4664.
         if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
             let in_think = currently_in_think(raw_str, self.open_think_prefix);
             if in_think && !self.prev_in_think {
                 self.think_count = 0;
@@ -1026,7 +1014,7 @@ mod tests {
 
     #[test]
     fn filter_config_matches_ar_semantic_v2() {
-        let cfg = qwen_dflash_eos_filter_config();
+        let cfg = hipfire_runtime::eos_filter::qwen35_eos_filter_config();
         assert!(!cfg.strip_think);
         assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));

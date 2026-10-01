@@ -262,6 +262,13 @@ impl Backend for Trace {
     fn fork(&self) -> Self::Fork {
         TraceFork(self.slots.clone(), self.stores.clone())
     }
+    fn resume(&mut self, auth: &Auth, TraceFork(slots, stores): Self::Fork) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.slots = slots;
+        self.stores = stores;
+        self.reachable = true;
+        Ok(())
+    }
     fn join(&mut self, auth: &Auth, TraceFork(slots, stores): Self::Fork) -> Result<(), String> {
         self.seal.check(auth)?;
         if !self.reachable {
@@ -292,6 +299,17 @@ impl Backend for Trace {
             }
         }
         self.stores.sort_unstable();
+        Ok(())
+    }
+    fn lds_peer_stores(&mut self, auth: &Auth, slots: &[usize]) -> Result<(), String> {
+        self.seal.check(auth)?;
+        for &id in slots {
+            let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
+            if slot.1 != Slot::Free {
+                return Err(format!("{} cannot be stored by other waves while {:?}", slot.0, slot.1));
+            }
+            slot.1 = Slot::Publishing;
+        }
         Ok(())
     }
     fn exec_from_scc(&mut self, auth: &Auth) -> Result<(), String> {

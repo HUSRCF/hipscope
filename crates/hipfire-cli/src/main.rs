@@ -3827,7 +3827,7 @@ pub(crate) fn apply_http_reasoning_request(
     if body.get("enable_thinking").is_some() {
         if let Some(value) = body.get("enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("enable_thinking must be a boolean");
+                serve::bail_invalid!("enable_thinking must be a boolean");
             }
         }
     }
@@ -3840,7 +3840,7 @@ pub(crate) fn apply_http_reasoning_request(
     {
         if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+                serve::bail_invalid!("chat_template_kwargs.enable_thinking must be a boolean");
             }
         }
     }
@@ -3853,7 +3853,7 @@ pub(crate) fn apply_http_reasoning_request(
     let mut thinking_type_str: Option<&str> = None;
     if let Some(raw) = thinking_type_raw {
         if !raw.is_string() {
-            bail!("thinking.type must be enabled or disabled");
+            serve::bail_invalid!("thinking.type must be enabled or disabled");
         } else {
             let s = raw.as_str().unwrap();
             if s == "enabled" || s == "disabled" {
@@ -3884,14 +3884,14 @@ pub(crate) fn apply_http_reasoning_request(
             .pointer("/chat_template_kwargs/reasoning_effort")
             .is_some();
     if effort_present && effort_raw.is_none() {
-        bail!("reasoning_effort must be a string");
+        serve::bail_invalid!("reasoning_effort must be a string");
     }
     let body_budget_present = body.get("thinking_budget").is_some();
     let body_budget_str = body
         .get("thinking_budget")
         .and_then(serde_json::Value::as_str);
     if body_budget_present && body_budget_str.is_none() {
-        bail!("thinking_budget must be a string preset");
+        serve::bail_invalid!("thinking_budget must be a string preset");
     }
     let body_top_max_present = body.get("max_think_tokens").is_some();
     let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
@@ -3900,14 +3900,14 @@ pub(crate) fn apply_http_reasoning_request(
             serde_json::Value::Number(number) => {
                 if let Some(parsed) = number.as_u64() {
                     if parsed > 393_216 {
-                        bail!("{field} must be between 0 and 393216");
+                        serve::bail_invalid!("{field} must be between 0 and 393216");
                     }
                     Ok(parsed)
                 } else {
-                    bail!("{field} must be between 0 and 393216");
+                    serve::bail_invalid!("{field} must be between 0 and 393216");
                 }
             }
-            _ => bail!("{field} must be between 0 and 393216"),
+            _ => serve::bail_invalid!("{field} must be between 0 and 393216"),
         }
     };
     let top_max_opt = if body_top_max_present {

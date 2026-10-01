@@ -10,7 +10,9 @@
 //! transformations that convert daemon events into OpenAI responses.
 
 use crate::serve::http::request_id;
-use crate::serve::{Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared};
+use crate::serve::{
+    bail_invalid, invalid_request, Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared,
+};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
     insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
@@ -515,20 +517,20 @@ fn parse_tool_choice_policy(
             "none" => Ok(ToolChoicePolicy::None),
             "required" => {
                 if !has_tools {
-                    bail!("tool_choice \"required\" requires a non-empty tools array");
+                    bail_invalid!("tool_choice \"required\" requires a non-empty tools array");
                 }
                 Ok(ToolChoicePolicy::Required)
             }
-            other => bail!("unsupported tool_choice value: {other}"),
+            other => bail_invalid!("unsupported tool_choice value: {other}"),
         };
     }
     let Some(obj) = choice.as_object() else {
-        bail!("tool_choice must be a string, null, or function object");
+        bail_invalid!("tool_choice must be a string, null, or function object");
     };
     match obj.get("type").and_then(serde_json::Value::as_str) {
         Some("function") => {}
-        Some(other) => bail!("tool_choice object type must be \"function\", got {other}"),
-        None => bail!("tool_choice object requires type \"function\""),
+        Some(other) => bail_invalid!("tool_choice object type must be \"function\", got {other}"),
+        None => bail_invalid!("tool_choice object requires type \"function\""),
     }
     let name = obj
         .get("function")
@@ -536,16 +538,16 @@ fn parse_tool_choice_policy(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| anyhow!("tool_choice function object requires function.name"))?;
+        .ok_or_else(|| invalid_request!("tool_choice function object requires function.name"))?;
     if !has_tools {
-        bail!("tool_choice specific function requires a non-empty tools array");
+        bail_invalid!("tool_choice specific function requires a non-empty tools array");
     }
     let present = tools_arr
         .expect("has_tools")
         .iter()
         .any(|tool| tool_schema_name(tool) == Some(name));
     if !present {
-        bail!("tool_choice function `{name}` is not present in tools");
+        bail_invalid!("tool_choice function `{name}` is not present in tools");
     }
     Ok(ToolChoicePolicy::Function(name.to_owned()))
 }
@@ -1631,11 +1633,11 @@ pub(crate) struct RequestContract {
     /// after the prompt (wire `max_tokens_fit`).
     pub max_tokens_fit: bool,
     pub messages: serde_json::Value,
-    /// Normalized/default-system-projected messages before tool-choice prompt
-    /// instructions are added.  Slot ownership uses this stable view so a
-    /// normal tool-result request may change `tool_choice` without changing
-    /// conversation identity.
-    pub conversation_messages: serde_json::Value,
+    /// Multi-slot only: normalized/default-system-projected messages before
+    /// tool-choice prompt instructions are added. Slot ownership uses this
+    /// stable view so a normal tool-result request may change `tool_choice`
+    /// without changing conversation identity.
+    pub conversation_messages: Option<serde_json::Value>,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
     /// Validated `response_format` (spec §7 G1). `None` when the request
@@ -1704,15 +1706,16 @@ pub(crate) fn project_request_contract(
         None => config_u64(resolved, "generation.max_tokens")?,
     };
     if max_tokens == 0 || max_tokens > 393_216 {
-        bail!("max_tokens must be between 1 and 393216");
+        bail_invalid!("max_tokens must be between 1 and 393216");
     }
+    validate_single_choice(body)?;
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
     }
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
-    let conversation_messages = messages.clone();
+    let conversation_messages = multi_slot.then(|| messages.clone());
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
     let response_format = if multi_slot {
@@ -1731,6 +1734,19 @@ pub(crate) fn project_request_contract(
     })
 }
 
+/// Every serve route returns one completion per request: `n` other than 1
+/// is refused rather than silently answered with a single choice.
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
+        if n.as_u64() != Some(1) {
+            bail_invalid!(
+                "n != 1 is not supported on this serve route (one completion per request)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
 /// refused, never silently dropped. The daemon's `validate_generate_caps` has
 /// typed refusals for exactly these, but this gateway builds the generate
@@ -1743,19 +1759,14 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
     for field in ["max_tokens", "max_completion_tokens"] {
         if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
             if value.as_u64().is_none() {
-                bail!("max_tokens must be an integer between 1 and 393216");
+                bail_invalid!("max_tokens must be an integer between 1 and 393216");
             }
-        }
-    }
-    if let Some(n) = body.get("n") {
-        if n.as_u64() != Some(1) {
-            bail!("n != 1 is not supported on this serve route (one completion per request)");
         }
     }
     for field in ["best_of", "logit_bias", "echo", "suffix"] {
         if let Some(v) = body.get(field) {
             if !v.is_null() {
-                bail!("{field} is not supported on this serve route");
+                bail_invalid!("{field} is not supported on this serve route");
             }
         }
     }
@@ -1764,9 +1775,9 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let number = value
                 .as_f64()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
             if number < min || number > max || field == "top_p" && number == 0.0 {
-                bail!(
+                bail_invalid!(
                     "{field} must be within {}",
                     if field == "top_p" { "(0, 1]" } else { "[0, 2]" }
                 );
@@ -1776,7 +1787,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
     if let Some(value) = body.get("repeat_window").filter(|v| !v.is_null()) {
         match value.as_u64() {
             Some(v) if v <= 2048 => {}
-            _ => bail!("repeat_window must be an integer between 0 and 2048"),
+            _ => bail_invalid!("repeat_window must be an integer between 0 and 2048"),
         }
     }
     // Token penalties + min_p + top_k: the daemon's slot sampler honors
@@ -1794,16 +1805,16 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let number = value
                 .as_f64()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
             if number < min || number > max {
-                bail!("{field} must be within [{min}, {max}]");
+                bail_invalid!("{field} must be within [{min}, {max}]");
             }
         }
     }
     if let Some(value) = body.get("top_k").filter(|v| !v.is_null()) {
         match value.as_u64() {
             Some(v) if v >= 1 => {}
-            _ => bail!("top_k must be a positive integer"),
+            _ => bail_invalid!("top_k must be a positive integer"),
         }
     }
     if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
@@ -1811,7 +1822,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let role = message
                 .get("role")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("each message must have a string role"))?;
+                .ok_or_else(|| invalid_request!("each message must have a string role"))?;
             if !matches!(
                 role,
                 "developer"
@@ -1822,7 +1833,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
                     | "toolResult"
                     | "tool_result"
             ) {
-                bail!("unknown message role: {role}");
+                bail_invalid!("unknown message role: {role}");
             }
         }
     }
@@ -1837,7 +1848,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
 ///   validates the schema against the supported strict subset and returns
 ///   a [`ResponseFormat``.
 ///
-/// Rejects (HTTP 400 via `bail!`):
+/// Rejects (HTTP 400 via `bail_invalid!`):
 /// - `{"type": "json_object"}`: the multi-slot serve route has no
 ///   json_object enforcement — silently dropping the requested constraint
 ///   and returning 200 would be exactly the "silent semantic downgrade"
@@ -1860,10 +1871,10 @@ pub(crate) fn validate_response_format(
     let ty = value
         .get("type")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("response_format.type is required"))?;
+        .ok_or_else(|| invalid_request!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            bail!(
+            bail_invalid!(
                 "response_format type 'json_object' is not supported on this \
                  serve route (no enforcement exists; only json_schema strict \
                  output is supported)"
@@ -1872,15 +1883,15 @@ pub(crate) fn validate_response_format(
         "json_schema" => {
             let js = value
                 .get("json_schema")
-                .ok_or_else(|| anyhow!("response_format.json_schema is required"))?;
+                .ok_or_else(|| invalid_request!("response_format.json_schema is required"))?;
             if !js.is_object() {
-                bail!("response_format.json_schema must be an object");
+                bail_invalid!("response_format.json_schema must be an object");
             }
             let schema = js
                 .get("schema")
-                .ok_or_else(|| anyhow!("response_format.json_schema.schema is required"))?;
+                .ok_or_else(|| invalid_request!("response_format.json_schema.schema is required"))?;
             if !schema.is_object() {
-                bail!("response_format.json_schema.schema must be an object");
+                bail_invalid!("response_format.json_schema.schema must be an object");
             }
             // Validate the schema against the supported strict subset (spec
             // §7.1 G1). Reject unsupported keywords before generation so no
@@ -1903,7 +1914,7 @@ pub(crate) fn validate_response_format(
             Ok(None)
         }
         other => {
-            bail!("response_format.type '{other}' is not supported");
+            bail_invalid!("response_format.type '{other}' is not supported");
         }
     }
 }
@@ -1978,14 +1989,14 @@ const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
 /// different constraints server-side.
 fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
     if !schema.is_object() {
-        bail!("schema at {path} must be an object");
+        bail_invalid!("schema at {path} must be an object");
     }
     let obj = schema.as_object().unwrap();
 
     // Check for rejected keywords first.
     for &kw in REJECTED_ASSERTION_KEYWORDS {
         if obj.contains_key(kw) {
-            bail!(
+            bail_invalid!(
                 "unsupported JSON Schema keyword '{kw}' at {path} \
                  (strict subset does not allow this assertion)"
             );
@@ -2016,7 +2027,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     ];
     for key in obj.keys() {
         if !KNOWN_KEYWORDS.contains(&key.as_str()) {
-            bail!(
+            bail_invalid!(
                 "unsupported JSON Schema keyword '{key}' at {path} \
                  (strict subset default-deny: not in the compiler's allowlist)"
             );
@@ -2028,23 +2039,23 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     // pre-flighted schema die at admit). Match the compiler's refusals.
     if let Some(v) = obj.get("enum") {
         if !v.is_array() {
-            bail!("enum at {path} must be an array");
+            bail_invalid!("enum at {path} must be an array");
         }
     }
     if let Some(v) = obj.get("properties") {
         if !v.is_object() {
-            bail!("properties at {path} must be an object");
+            bail_invalid!("properties at {path} must be an object");
         }
     }
     if let Some(v) = obj.get("required") {
         if !v.is_array() {
-            bail!("required at {path} must be an array of strings");
+            bail_invalid!("required at {path} must be an array of strings");
         }
     }
     for kw in ["minItems", "maxItems"] {
         if let Some(v) = obj.get(kw) {
             if v.as_u64().is_none() {
-                bail!("{kw} at {path} must be a non-negative integer");
+                bail_invalid!("{kw} at {path} must be a non-negative integer");
             }
         }
     }
@@ -2057,13 +2068,13 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         match tv.as_str() {
             Some(ty) => {
                 if !SUPPORTED_TYPE_VALUES.contains(&ty) {
-                    bail!(
+                    bail_invalid!(
                         "unsupported JSON Schema type '{ty}' at {path} \
                          (supported: {SUPPORTED_TYPE_VALUES:?})"
                     );
                 }
             }
-            None => bail!(
+            None => bail_invalid!(
                 "unsupported JSON Schema 'type' at {path}: union/array forms \
                  are outside the strict subset"
             ),
@@ -2074,7 +2085,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     // `enum` must be a non-empty array; `const` can be any value.
     if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
         if arr.is_empty() {
-            bail!("enum at {path} must be a non-empty array");
+            bail_invalid!("enum at {path} must be a non-empty array");
         }
     }
 
@@ -2089,7 +2100,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         // AND in the compiler — it used to be accepted by this validator
         // while the compiler silently flattened it to `true`.
         if !ap.is_boolean() {
-            bail!(
+            bail_invalid!(
                 "additionalProperties at {path} must be a boolean (schema form \
                  is outside the strict subset)"
             );
@@ -2098,7 +2109,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
         for item in req {
             if !item.is_string() {
-                bail!("required at {path} must be an array of strings");
+                bail_invalid!("required at {path} must be an array of strings");
             }
         }
     }
@@ -2111,13 +2122,13 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         if items.is_object() {
             validate_json_schema_subset(items, &format!("{path}.items"))?;
         } else {
-            bail!("items at {path} must be a schema object (boolean form is outside the supported subset)");
+            bail_invalid!("items at {path} must be a schema object (boolean form is outside the supported subset)");
         }
     }
     if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {
         if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
             if n > max {
-                bail!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
+                bail_invalid!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
             }
         }
     }
@@ -2170,7 +2181,7 @@ pub(crate) fn complete_request_attempt(
     let model = body
         .get("model")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("model is required"))?
+        .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
@@ -2212,7 +2223,7 @@ pub(crate) fn complete_request_attempt(
             runtime.current_max_seq
         };
         if !contract.max_tokens_fit && context > 0 && max_tokens >= context {
-            bail!(
+            bail_invalid!(
                 "max_tokens={max_tokens} does not fit the loaded context window of {context} \
                  tokens, which the prompt shares; lower max_tokens, or omit it to use the room \
                  left after the prompt"
@@ -2226,7 +2237,7 @@ pub(crate) fn complete_request_attempt(
         let response_format = contract.response_format;
         let mut generate = serde_json::json!({
             "type": "generate",
-            "id": request_id(),
+            "id": identity.0.clone(),
             "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
             "messages": normalized_messages,
             "max_tokens": max_tokens,
@@ -2326,15 +2337,12 @@ pub(crate) fn complete_request_attempt(
             effort_native,
             &supported_efforts,
         )?;
-        let (id, created) = identity.clone();
-        generate["id"] = serde_json::Value::String(id.clone());
-        generate["attempt_id"] = serde_json::json!(attempt_id);
         if guard.is_eligible && !runtime.multi_slot_enabled {
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
         if runtime.multi_slot_enabled {
             generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
-            generate["conversation_messages"] = conversation_messages;
+            generate["conversation_messages"] = conversation_messages.unwrap_or_default();
             // The gateway has already validated and projected the raw OpenAI
             // choice. Carry only that typed decision across the slot wire;
             // the daemon must never reinterpret the original HTTP body.
@@ -2350,12 +2358,7 @@ pub(crate) fn complete_request_attempt(
             // Re-check the fully projected wire request, not only the raw HTTP
             // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
-            if let Err(reason) = multi_slot_request_supported(&generate) {
-                bail!(
-                    "{}experimental multi-slot does not support this request: {reason}",
-                    crate::serve::REQUEST_VALIDATION_TAG
-                );
-            }
+            require_multi_slot_support(&generate)?;
         }
         let engine_clone = runtime.engine.clone();
         (
@@ -2380,7 +2383,8 @@ pub(crate) fn complete_request_attempt(
     let mut legacy_reasoning = String::new();
     let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
     let mut legacy_done: Option<serde_json::Value> = None;
-    let mut terminal_delivered = false;
+    // The completion delivered at commit_ready; it is the attempt's result.
+    let mut committed: Option<Completion> = None;
     let preserve_thinking = body
         .pointer("/chat_template_kwargs/preserve_thinking")
         .and_then(serde_json::Value::as_bool)
@@ -2402,7 +2406,7 @@ pub(crate) fn complete_request_attempt(
         // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
         if event_type == Some("commit_ready") {
             latches.borrow_mut().commit_ready_seen = true;
-            if terminal_delivered {
+            if committed.is_some() {
                 return Err(hipfire_client::ClientError::Protocol(
                     "duplicate commit_ready".into(),
                 ));
@@ -2509,7 +2513,7 @@ pub(crate) fn complete_request_attempt(
                 }
             };
             terminal_callback(&preview)?;
-            terminal_delivered = true;
+            committed = Some(preview);
             return Ok(());
         }
 
@@ -2605,7 +2609,7 @@ pub(crate) fn complete_request_attempt(
                     Some("done") => {
                         // Prefer staged commit_ready terminal; keep post-commit done
                         // only as payload fill if staging was skipped (legacy path).
-                        if !terminal_delivered {
+                        if committed.is_none() {
                             forward_think_fragments(
                                 legacy_router.finish(),
                                 &mut legacy_content,
@@ -2657,6 +2661,9 @@ pub(crate) fn complete_request_attempt(
     );
     meta.last_activity = Instant::now();
 
+    if let Some(completion) = committed {
+        return Ok(completion);
+    }
     if contract_gate.is_v2() {
         let mut done = fold.done().cloned().unwrap_or(done);
         let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
@@ -2744,6 +2751,13 @@ fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
         }
     }
     false
+}
+
+/// [`multi_slot_request_supported`] as a typed client error (HTTP 400).
+fn require_multi_slot_support(request: &serde_json::Value) -> Result<()> {
+    multi_slot_request_supported(request).map_err(|reason| {
+        invalid_request!("experimental multi-slot does not support this request: {reason}")
+    })
 }
 
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
@@ -2864,12 +2878,7 @@ pub(crate) fn complete_request_cancellable(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if runtime.multi_slot_enabled {
-            if let Err(reason) = multi_slot_request_supported(body) {
-                bail!(
-                    "{}experimental multi-slot does not support this request: {reason}",
-                    crate::serve::REQUEST_VALIDATION_TAG
-                );
-            }
+            require_multi_slot_support(body)?;
         }
     }
 
@@ -3023,22 +3032,22 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
             let url = part
                 .pointer("/image_url/url")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("image_url content part requires image_url.url"))?;
+                .ok_or_else(|| invalid_request!("image_url content part requires image_url.url"))?;
             let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
                 .into_iter()
                 .find_map(|prefix| url.strip_prefix(prefix))
                 .ok_or_else(|| {
                     if url.starts_with("data:") {
-                        anyhow!("only base64 PNG and JPEG image_url data URIs are supported")
+                        invalid_request!("only base64 PNG and JPEG image_url data URIs are supported")
                     } else {
-                        anyhow!("remote image_url values are unsupported; send a base64 data URI")
+                        invalid_request!("remote image_url values are unsupported; send a base64 data URI")
                     }
                 })?;
             if payload.is_empty() {
-                bail!("image_url data URI has an empty base64 payload");
+                bail_invalid!("image_url data URI has an empty base64 payload");
             }
             if image.replace(payload.to_owned()).is_some() {
-                bail!("at most one image_url is supported per request");
+                bail_invalid!("at most one image_url is supported per request");
             }
         }
     }
@@ -3249,25 +3258,25 @@ pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> 
     if let Some(v) = body.get("top_logprobs") {
         let logprobs_true = body.get("logprobs").and_then(|x| x.as_bool()) == Some(true);
         if !logprobs_true {
-            bail!("top_logprobs requires logprobs to be true");
+            bail_invalid!("top_logprobs requires logprobs to be true");
         }
         let n = if let Some(n) = v.as_u64() {
             n
         } else if let Some(n) = v.as_i64() {
             if n < 0 {
-                bail!("top_logprobs must be an integer between 0 and 20");
+                bail_invalid!("top_logprobs must be an integer between 0 and 20");
             }
             n as u64
         } else {
-            bail!("top_logprobs must be an integer between 0 and 20");
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
         };
         if n > 20 {
-            bail!("top_logprobs must be an integer between 0 and 20");
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
         }
     }
     if let Some(v) = body.get("logprobs") {
         if !v.is_boolean() {
-            bail!("logprobs must be a boolean");
+            bail_invalid!("logprobs must be a boolean");
         }
     }
     Ok(())
@@ -3373,6 +3382,11 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
+/// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
+/// tokens; drafted/rejected spec tokens never count). Terminator policy is
+/// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
+/// EOS token, DS4 AR/spec and LFM batch do not
+/// (`spec_usage_counts_eos_for_qwen_not_ds4`).
 pub(crate) fn completion_usage(completion: &Completion) -> serde_json::Value {
     let cached_tokens = completion
         .done
@@ -7462,6 +7476,38 @@ mod tests {
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
     }
 
+    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
+    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    #[test]
+    fn project_request_contract_refuses_n_on_every_route() {
+        let resolved = contract_resolved_with_system("");
+        for multi_slot in [false, true] {
+            for bad in [
+                serde_json::json!(2),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+            ] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": bad,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                let err = project_request_contract(&body, &resolved, false, multi_slot)
+                    .expect_err("n != 1 must be refused");
+                assert!(
+                    err.downcast_ref::<super::super::InvalidRequest>().is_some(),
+                    "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
+                );
+            }
+            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": ok,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                assert!(project_request_contract(&body, &resolved, false, multi_slot).is_ok());
+            }
+        }
+    }
+
     /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
     /// accept it as unconstrained instead of erroring.
     #[test]
@@ -7553,15 +7599,140 @@ mod tests {
                 { "role": "user", "content": "hi" }
             ]
         });
-        let contract = project_request_contract(&body, &resolved, false, false).expect("specific");
+        let contract = project_request_contract(&body, &resolved, false, true).expect("specific");
         assert_eq!(
-            contract.conversation_messages[0]["content"],
+            contract.conversation_messages.as_ref().unwrap()[0]["content"],
             "stable system"
         );
         assert_eq!(
             contract.messages[0]["content"],
             "stable system\n\nYou must call the `echo` tool."
         );
+    }
+
+    /// Every gateway-side client mistake is answered 400 by type, whatever
+    /// its wording; a model-output failure stays a 500.
+    #[test]
+    fn gateway_client_faults_map_to_http_400() {
+        use crate::serve::http::request_error_status;
+        use saddle_core::caps::ReasoningContract;
+        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let status = |result: Result<()>| {
+            let error = result.expect_err("client fault must be refused");
+            (request_error_status(&error), error.to_string())
+        };
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let image = |url: &str| {
+            serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+        };
+        let reasoning = |body: serde_json::Value| -> Result<()> {
+            apply_http_reasoning_request(
+                &body,
+                &resolved,
+                &mut serde_json::json!({}),
+                ReasoningContract::QwenJinja,
+                true,
+                &[],
+            )
+            .map(drop)
+        };
+        let contract = |body: serde_json::Value| -> Result<()> {
+            project_request_contract(&body, &resolved, false, true).map(drop)
+        };
+        let cases: Vec<(&str, Result<()>)> = vec![
+            (
+                "experimental multi-slot does not support this request",
+                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+            ),
+            (
+                "top_logprobs requires logprobs to be true",
+                validate_logprobs_request(&serde_json::json!({"top_logprobs": 2})),
+            ),
+            (
+                "logprobs must be a boolean",
+                validate_logprobs_request(&serde_json::json!({"logprobs": "yes"})),
+            ),
+            (
+                "unsupported tool_choice value: x",
+                parse_tool_choice_policy(Some(&serde_json::json!("x")), Some(&tools)).map(drop),
+            ),
+            (
+                "is not present in tools",
+                parse_tool_choice_policy(
+                    Some(&serde_json::json!({"type": "function", "function": {"name": "g"}})),
+                    Some(&tools),
+                )
+                .map(drop),
+            ),
+            (
+                "remote image_url values are unsupported",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [image("https://x/y.png")]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "at most one image_url",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [
+                        image("data:image/png;base64,AA"),
+                        image("data:image/png;base64,AA")
+                    ]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "max_tokens must be between",
+                contract(serde_json::json!({"max_tokens": 0})),
+            ),
+            ("n != 1", contract(serde_json::json!({"max_tokens": 8, "n": 2}))),
+            (
+                "temperature must be within",
+                contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),
+            ),
+            (
+                "unknown message role",
+                contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
+            ),
+            (
+                "response_format type 'json_object' is not supported",
+                contract(serde_json::json!({
+                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                })),
+            ),
+            (
+                "unsupported JSON Schema keyword 'pattern'",
+                contract(serde_json::json!({"max_tokens": 8, "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "string", "pattern": "a"}}
+                }})),
+            ),
+            (
+                "enable_thinking must be a boolean",
+                reasoning(serde_json::json!({"enable_thinking": "true"})),
+            ),
+            (
+                "thinking_budget must be a string preset",
+                reasoning(serde_json::json!({"thinking_budget": 3})),
+            ),
+            (
+                "max_think_tokens must be between",
+                reasoning(serde_json::json!({"max_think_tokens": -1})),
+            ),
+        ];
+        for (needle, result) in cases {
+            let (code, message) = status(result);
+            assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+            assert_eq!(code, 400, "{message}");
+        }
+        // The model, not the client, failed to honor tool_choice.
+        let (code, _) = status(finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut Vec::new(),
+            &mut serde_json::json!({}),
+            &serde_json::json!({}),
+        ));
+        assert_eq!(code, 500);
     }
 
     /// Experimental multi-slot accepts sampling that the daemon slot engine

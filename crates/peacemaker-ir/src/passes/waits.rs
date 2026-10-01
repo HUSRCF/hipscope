@@ -272,8 +272,19 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
             }
         }
     }
-    let mut pending: Vec<PendingEvent> = merged.into_values().collect();
-    pending.sort_by_key(|event| event.id.0);
+    // Both paths pending the same events in the same order: that order is
+    // the issue order on every reaching path, so keep it. Otherwise fall
+    // back to first-issue order, which can misplace a load re-issued by a
+    // later loop iteration.
+    let same_order = a.pending.len() == b.pending.len()
+        && a.pending.iter().zip(&b.pending).all(|(x, y)| x.id == y.id);
+    let pending: Vec<PendingEvent> = if same_order {
+        a.pending.iter().map(|event| merged.remove(&event.id).expect("joined event")).collect()
+    } else {
+        let mut pending: Vec<PendingEvent> = merged.into_values().collect();
+        pending.sort_by_key(|event| event.id.0);
+        pending
+    };
     WaitState { pending }
 }
 
@@ -724,11 +735,11 @@ mod c5_tests {
     use crate::operand::{ImmField, Modifiers, Operand, VmemToken};
     use crate::passes::cfg::build_blocks;
     use crate::provenance::Provenance;
-    use crate::reg::{Kind, RegRef};
+    use crate::reg::{Kind, RegRef, RegSet};
     use crate::state::ObligationKind;
-    use crate::wait::Counter;
+    use crate::wait::{Counter, CounterSet, EventId, PendingEvent, WaitState, N};
 
-    use super::{census, replay};
+    use super::{census, join_states, replay};
 
     fn table(name: &str) -> (Opcode, Form) {
         let row = crate::isa::gfx12().iter().find(|row| row.name == name).expect(name);
@@ -1236,5 +1247,27 @@ mod c5_tests {
         let replay = replay(&body, Arch::Gfx1201).unwrap();
         assert!(replay.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
             "{:?}", replay.obligations);
+    }
+
+    /// Two paths pending the same loads in the same order join in that order:
+    /// a load re-issued by a later loop iteration (larger first-issue id, but
+    /// older) must stay ahead of this iteration's load, so a partial wait
+    /// retires it first. Disagreeing paths fall back to first-issue order.
+    #[test]
+    fn join_keeps_a_common_issue_order() {
+        let load = |id: u64| {
+            let mut counters = CounterSet::default();
+            counters.insert(Counter::Load);
+            PendingEvent {
+                id: EventId(id), inst: crate::cfg::InstId(id as usize), counters, units: [1; N],
+                satisfied: CounterSet::default(), class: MemClass::VmemLoad, defs: RegSet(Vec::new()),
+                src_locks: RegSet(Vec::new()), in_order_type: crate::effects::OrderType::Load,
+            }
+        };
+        let ids = |s: &WaitState| s.pending.iter().map(|e| e.id.0).collect::<Vec<_>>();
+        let path = WaitState { pending: vec![load(7), load(3)] };
+        assert_eq!(ids(&join_states(&path, &path.clone())), [7, 3]);
+        let other = WaitState { pending: vec![load(3), load(7)] };
+        assert_eq!(ids(&join_states(&path, &other)), [3, 7]);
     }
 }

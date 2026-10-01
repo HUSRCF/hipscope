@@ -13,7 +13,7 @@ The typed core of the PM kernel language (design: `pm-kernel-lang-design.md` §4
 - `scope`: `Workgroup` (barriers, `loop_carried`, `wg_skip_if`, kernel exits `exit`/`exit_if`/`exit_unless`/`end`/`end_with`) dereferencing to `Wave` (LDS ops, waits, `skip_if`, `exec_if`, `forward` blocks of wave-uniform forward branches, raw ISA), affine `Uniform`/`WgUniform` SCC handles. Every branch target (skip target, `Forward` target) joins the backend state of every path into it (`Backend::join`); branches only go forward, except a loop's back edge.
 - `backend`: the lowering seam. Every state-changing entry point takes an `Auth` that only the core mints (one session per `Workgroup::new`); a backend keeps a `Seal` and refuses other sessions' tokens and anything after the kernel exit.
 
-The Halo VerifyAttn `lgkmcnt` race and the gfx11 FA2 mailbox race are compile errors (`tests/ui`), as is a lowering call without an `Auth`.
+The Halo VerifyAttn `lgkmcnt` race and the gfx11 FA2 mailbox race are compile errors (`tests/ui`), as are a lowering call without an `Auth` and a barrier in a wave scope, a `loop_until` body or a handoff's reader continuation.
 
 ## Gotchas
 

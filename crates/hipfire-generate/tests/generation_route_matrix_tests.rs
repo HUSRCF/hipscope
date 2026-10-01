@@ -1080,3 +1080,14 @@ fn route_cancel_releases_start_latch_and_claims_once() {
     clear_terminal_control();
     set_active_attempt_id(0);
 }
+
+/// VL and pipeline-parallel `done` carry `finish_reason`: a budget that runs
+/// out is `length`, a terminator (even on the last budget token) is `stop`.
+#[test]
+fn vl_and_pp_done_report_length_on_budget_exhaustion() {
+    assert_eq!(length_or_stop(16, 16, false), "length");
+    assert_eq!(length_or_stop(16, 16, true), "stop");
+    assert_eq!(length_or_stop(5, 16, true), "stop");
+    // Early exit without a terminator (loop guard / forced EOS) is a stop.
+    assert_eq!(length_or_stop(5, 16, false), "stop");
+}

@@ -5,7 +5,7 @@
 //! ledger, slot machine, hazards and loop fixpoint stay the second evaluator.
 //! Each entry point checks the typed core's `Auth` against the session that
 //! sealed this builder.
-use crate::{Builder, MemoryScope, hazard::{Gfx11Hazards, Gfx12Sgpr}, insn::{Instruction, Sop}, lds::Lds, ledger::{Counter, Ledger}, reg::RegRef};
+use crate::{Builder, MemoryScope, hazard::{Gfx11Hazards, Gfx12Sgpr}, insn::{Instruction, Sop}, lds::{Lds, SlotState}, ledger::{Counter, Ledger}, reg::RegRef};
 use peacemaker_author::{Auth, Backend, EventId, LdsCounter, SlotTransition};
 
 /// Builder state at a branch: the wait ledger, the LDS slot machine and
@@ -83,6 +83,16 @@ impl Backend for Builder {
     fn fork(&self) -> BuilderFork {
         BuilderFork { ledger: self.ledger.clone(), lds: self.lds.clone(), sgpr: self.hazard.clone(), trans: self.gfx11_hazard.clone(), wmma: self.previous_wmma_dst.clone() }
     }
+    fn resume(&mut self, auth: &Auth, at: BuilderFork) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.ledger.resume(at.ledger);
+        self.lds = at.lds;
+        self.hazard = at.sgpr;
+        self.gfx11_hazard = at.trans;
+        self.previous_wmma_dst = at.wmma;
+        self.reachable = true;
+        Ok(())
+    }
     fn join(&mut self, auth: &Auth, other: BuilderFork) -> Result<(), String> {
         self.seal.check(auth)?;
         if !self.reachable {
@@ -98,6 +108,15 @@ impl Backend for Builder {
         self.lds.join(&other.lds)?;
         self.ledger.join(&other.ledger);
         self.join_hazards(&other.sgpr, &other.trans, &other.wmma);
+        Ok(())
+    }
+    fn lds_peer_stores(&mut self, auth: &Auth, slots: &[usize]) -> Result<(), String> {
+        self.seal.check(auth)?;
+        for &id in slots {
+            let slot = self.lds.slots.get_mut(id).ok_or("unknown LDS slot")?;
+            if slot.state != SlotState::Free { return Err(format!("{} cannot be stored by other waves while {:?}", slot.name, slot.state)) }
+            slot.state = SlotState::Publishing;
+        }
         Ok(())
     }
     fn exec_from_scc(&mut self, auth: &Auth) -> Result<(), String> { self.seal.check(auth)?; self.push(Instruction::new("s_cselect_b32 exec_lo, -1, 0", vec![], vec![])) }

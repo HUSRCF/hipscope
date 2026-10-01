@@ -92,3 +92,25 @@ fn cohere2moe_spec_emitter_streams_split_characters_whole() {
     let emit = hipfire_arch_cohere2moe::spec_emit::Cohere2MoeEmit::from_ctx(ctx(&tokenizer));
     assert_eq!(stream_visible(emit, text.as_bytes()), text);
 }
+
+/// P16 usage policy pin (0.4.1: documented, not changed). Spec decode counts a
+/// token into `done.tokens` (→ `usage.completion_tokens`) exactly when
+/// `spec_outcome_seed_committable` accepts the emitter outcome. Qwen3.5 emits a
+/// `Committed` event for EOS, so the terminator is counted; DeepSeek V4 returns
+/// no events for EOS, so it is not. The AR loops follow the same split (Qwen AR
+/// increments before classify; DS4 AR / LFM batch stop before counting EOS).
+#[test]
+fn spec_usage_counts_eos_for_qwen_not_ds4() {
+    let tokenizer = byte_level_tokenizer();
+    let counted = |mut emit: Box<dyn SpecEmit + '_>| {
+        let outcomes = [emit.begin(100 + u32::from(b'h')), emit.observe(100 + u32::from(b'i')), emit.observe(EOS)];
+        outcomes
+            .iter()
+            .filter(|o| hipfire_generate::qwen::spec_outcome_seed_committable(o))
+            .count()
+    };
+    let qwen = hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(ctx(&tokenizer));
+    assert_eq!(counted(qwen), 3, "Qwen spec: 2 text tokens + EOS");
+    let ds4 = hipfire_arch_deepseek4::spec_emit::Deepseek4Emit::from_ctx(ctx(&tokenizer));
+    assert_eq!(counted(ds4), 2, "DS4 spec: 2 text tokens, EOS excluded");
+}
