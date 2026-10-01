@@ -573,7 +573,7 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// the 16-slot entry.
 mod nt {
     use super::*;
-    use peacemaker_author::{Free, LdsRegion};
+    use peacemaker_author::{End, Free, LdsRegion, Wave};
 
     /// The gate/up handoff region: RNE(gate) of every tile.
     enum Gate {}
@@ -1035,8 +1035,8 @@ mod nt {
 
     /// Stores of every live tile: tile 0 always, tile j while j < cnt; the
     /// descriptor base advances 16 output rows per tile.
-    fn store_tiles<T: Target>(wg: &mut Wg<T>, g: &G, vals: impl Fn(&mut Wg<T>, u8) -> Result<u8, String>) -> Result<(), String> {
-        let b = wg.isa();
+    fn store_tiles<T: Target>(w: &mut Wave<'_, T, Builder>, g: &G, vals: impl Fn(&mut Wave<'_, T, Builder>, u8) -> Result<u8, String>) -> Result<(), String> {
+        let b = w.isa();
         sop(b, format!("s_mov_b32 s{SRD_Y}, s16"), &[SRD_Y], &[16])?;
         sop(b, format!("s_mov_b32 s{}, s17", SRD_Y + 1), &[SRD_Y + 1], &[17])?;
         srd_tail(b, SRD_Y, None)?;
@@ -1047,27 +1047,32 @@ mod nt {
         }
         for j in 0..g.nt() {
             if j > 0 {
-                let b = wg.isa();
+                let b = w.isa();
                 sop(b, format!("s_cmp_gt_u32 s{CNT}, {j}"), &[], &[CNT])?;
                 op(b, format!("s_cbranch_scc0 {}", g.label("end")), &[], &[])?;
                 add64(b, SRD_Y, SRD_Y, YSTEP)?;
             }
-            let r = vals(wg, j)?;
-            store_rows(wg.isa(), g, r, g.live(j))?;
+            let r = vals(w, j)?;
+            store_rows(w.isa(), g, r, g.live(j))?;
         }
         Ok(())
     }
 
-    fn epilogue<T: Target>(wg: &mut Wg<T>, g: &G, gate: Option<LdsRegion<Gate, Free>>) -> Result<(), String> {
+    fn epilogue<T: Target>(wg: &mut Wg<T>, g: &G, end: End, gate: Option<LdsRegion<Gate, Free>>) -> Result<(), String> {
         let b = wg.isa();
         b.label(&g.label("epilogue"))?;
-        let Some(gate) = gate else { return store_tiles(wg, g, |_, j| Ok(g.sum(j))) };
+        let Some(gate) = gate else {
+            store_tiles(wg, g, |_, j| Ok(g.sum(j)))?;
+            return wg.end(end);
+        };
         // Every wave: BF16 round trip of its sums (gate or up).
         for j in 0..g.nt() { for i in 0..8u8 { Bf16::rne_finite_passthrough(b, g.sum(j) + i, RT_TMP + i, MASKT[usize::from(i % 2)], true)?; } }
         // Gate waves publish the rounded gate rows and leave; up waves meet
-        // them at their own barrier and read the publication.
+        // them at their own barrier, read the publication and store the
+        // tiles (wave scope, up to the kernel exit).
         let up = wg.scmp(Instruction::new(format!("s_cmp_ge_u32 s{WAVE}, 2"), vec![], vec![s(WAVE)]))?;
-        let gate = wg.handoff(up, &g.label("up"), &g.label("end"), gate, |w, gate| {
+        let gv = g.gval();
+        wg.handoff(up, &g.label("up"), end, gate, |w, gate| {
             let mut out = w.begin_write(gate);
             for j in 0..g.nt() {
                 for h in 0..2u8 {
@@ -1078,18 +1083,16 @@ mod nt {
                 }
             }
             Ok(out)
-        })?;
-        let gv = g.gval();
-        store_tiles(wg, g, |wg, j| {
+        }, |w, gate| store_tiles(w, g, |w, j| {
             for h in 0..2u8 {
                 let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
                 let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: gv + 4 * h, len: 4 };
                 let text = format!("ds_load_b128 {d}, v{LDSA}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
-                wg.ds_load(&gate, Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
+                w.ds_load(&gate, Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
             }
-            for grp in 0..2u8 { super::super::iu4_v2b::silu_mul(wg.isa(), gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
+            for grp in 0..2u8 { super::super::iu4_v2b::silu_mul(w.isa(), gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
             Ok(gv)
-        })
+        }))
     }
 
     pub(super) fn emit(spec: Spec) -> Result<Emitted, String> {
@@ -1107,11 +1110,9 @@ mod nt {
 
     fn body<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
         let gate = if g.gate_up() { Some(wg.lds::<Gate>("swiglu_gate", 0, g.spec.lds_bytes())?) } else { None };
+        let end = wg.exit(&g.label("end"))?;
         prologue(wg, g)?;
         kloop(wg, g)?;
-        epilogue(wg, g, gate)?;
-        let b = wg.isa();
-        b.label(&g.label("end"))?;
-        b.push(crate::insn::Sop::End.encode(g.arch())?)
+        epilogue(wg, g, end, gate)
     }
 }
