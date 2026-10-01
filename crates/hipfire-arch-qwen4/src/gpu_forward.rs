@@ -54,14 +54,78 @@ use std::fmt;
 use std::time::Instant;
 
 const EPSILON: f32 = 1.0e-6;
-/// Maximum number of rows resident in the reusable Qwen4 forward scratch.
+/// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
 /// those requests over this bounded capacity instead of allocating
-/// prompt-sized grouped MoE buffers.  Every chunk re-streams all expert
-/// weights, so the cap equals the Qwen4 contract's 2048-token `max_seq`:
-/// a prompt is one chunk (1131 tokens: 3 chunks at 512 were 8% slower).
-pub(crate) const QWEN4_PREFILL_CHUNK_CAP: usize = 2048;
+/// prompt-sized grouped MoE buffers.  Every chunk re-streams all routed
+/// expert weights, so pp throughput rises with the chunk until another
+/// kernel's shape envelope ends.  Measured against the earlier 1536-row
+/// chunk: gfx1151 pp8192 +10.2% at 8192 rows (resident experts).  On
+/// gfx1201 under `auto` expert placement the larger chunk costs VRAM expert
+/// layers, so the rung is the fastest pp8192 within 3% of the 2048-row
+/// rung's tg64: 4096 rows (14 layers at max_seq 66,560) measured pp8192
+/// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
+/// measured +22.6% at -6.9% tg64.  Other architectures keep the measured
+/// 1536.
+pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
+    match arch {
+        "gfx1151" => 8192,
+        "gfx1201" => 4096,
+        _ => 1536,
+    }
+}
+
+/// Requested prefill chunk ceiling: `prefill.chunk_rows`
+/// (`HIPFIRE_PREFILL_CHUNK_ROWS`) rounded down to whole 256-row GEMM tiles,
+/// else [`qwen4_prefill_chunk_default`]; never above `max_seq`.  Load-time
+/// admission ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
+pub fn qwen4_prefill_chunk_requested(arch: &str, max_seq: usize) -> usize {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|rows| rows / 256 * 256)
+        .filter(|&rows| rows >= 256)
+        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch))
+        .min(max_seq)
+}
+
+/// Chunk rungs admission tries, largest first: `requested`, then each
+/// smaller default rung down to 1536 (or `requested` itself when smaller).
+pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item = usize> {
+    std::iter::once(requested).chain(
+        [4096, 2048, 1536]
+            .into_iter()
+            .filter(move |&rows| rows < requested),
+    )
+}
+
+/// Rows of the speculative logit and argmax buffers.  Only verify blocks
+/// return every row's argmax (native MTP verifies at most `K + 1 = 11`
+/// rows; block drafters on the shared `SpecTarget` contract get the rest);
+/// prompt advances and MTP prefill read their final row only.  A
+/// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
+pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
+
+pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
+    QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
+}
+
+/// Device bytes of the forward resources that scale with the chunk: the
+/// reusable scratch for `rows` rows plus the speculative logits and argmax.
+/// Load admission and the auto expert placement reserve size against this.
+pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u64> {
+    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows).ok()?;
+    let spec = qwen4_spec_logit_rows(rows)
+        .checked_mul(config.vocab_size.checked_mul(4)?.checked_add(4)?)?;
+    scratch.checked_add(spec as u64)
+}
+
+/// Free device memory a chunk rung must leave beside its chunk-sized
+/// resources for the kernels' lazily sized workspaces (333-347 MiB at
+/// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
+pub(crate) const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
+
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
@@ -1052,15 +1116,15 @@ pub struct Qwen4GpuForwardScratch {
 }
 
 impl Qwen4GpuForwardScratch {
-    pub fn new(
-        gpu: &mut Gpu,
+    /// Every device allocation of a `max_chunk`-row scratch as
+    /// `(elements, dtype)` in field order, plus the host PLE staging bytes.
+    fn plan(
         config: &Qwen4Config,
         max_chunk: usize,
-    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+    ) -> Result<(Vec<(usize, DType)>, usize), Qwen4GpuForwardError> {
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
-        let max_chunk = max_chunk.min(QWEN4_PREFILL_CHUNK_CAP);
         let dims = program_dims(config);
         let layout = Qwen4ScratchLayout::for_rows(dims, max_chunk)
             .map_err(|error| invalid(error.to_string()))?;
@@ -1104,10 +1168,9 @@ impl Qwen4GpuForwardScratch {
         let tile_i32_bytes = (grouped_bound / 16)
             .checked_mul(i32_bytes)
             .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
-        let mut allocated = Vec::new();
+        let mut plan = Vec::new();
         let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), Qwen4GpuForwardError> {
-            let tensor = gpu.zeros(shape, dtype)?;
-            allocated.push(tensor);
+            plan.push((shape.iter().product::<usize>(), dtype));
             Ok(())
         };
         let result = (|| {
@@ -1204,11 +1267,39 @@ impl Qwen4GpuForwardScratch {
             alloc(&[config.vocab_size], DType::F32)?;
             Ok::<(), Qwen4GpuForwardError>(())
         })();
-        if let Err(error) = result {
-            for tensor in allocated {
-                let _ = gpu.free_tensor(tensor);
+        result?;
+        Ok((plan, max_ple_bytes))
+    }
+
+    /// Device bytes [`Self::new`] allocates for `max_chunk` rows.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<u64, Qwen4GpuForwardError> {
+        let (plan, _) = Self::plan(config, max_chunk)?;
+        Ok(plan
+            .iter()
+            .map(|&(elements, dtype)| (elements * dtype.size()) as u64)
+            .sum())
+    }
+
+    pub fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let (plan, max_ple_bytes) = Self::plan(config, max_chunk)?;
+        let mut allocated = Vec::with_capacity(plan.len());
+        for &(elements, dtype) in &plan {
+            match gpu.zeros(&[elements], dtype) {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
             }
-            return Err(error);
         }
         let mut next = || allocated.remove(0);
         Ok((

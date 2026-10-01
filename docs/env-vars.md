@@ -214,7 +214,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_G12_DEC_NORM` | gfx1201 and gfx1151 decode norms as multi-workgroup grids (f32 AWQ RMSNorm+FWHT: K/256 workgroups, each redoing the row's reduction and rotating one group; out-of-place single-row `rmsnorm_f32`: n/256 workgroups; half-split partial RoPE: one workgroup per head; bit-identical) — default ON on exact gfx1201 and exact gfx1151 (`kernel.g12_dec_norm`); `=0` restores the single-workgroup launches |
 | `HIPFIRE_GFX1100_DEC_NORM` | gfx1100 decode norms as multi-workgroup grids (the `HIPFIRE_G12_DEC_NORM` twins built for gfx1100: f32 AWQ RMSNorm+FWHT K/256 workgroups, out-of-place single-row `rmsnorm_f32` n/256 workgroups; bit-identical) — default ON on exact gfx1100 (`kernel.gfx1100_dec_norm`); `=0` restores the single-workgroup launches |
 | `HIPFIRE_G12_A4C2` | gfx1201 int4 producers search two activation scales ({5,7}, as gfx11's `-DIU4_A4_CANDIDATES=2`) instead of RTN d = amax/7; one-pass producer-layout search, bit-identical to that flag — default ON on exact gfx1201 (`kernel.g12_a4c2`; appends `-DIU4_A4_CANDIDATES=2` to the gfx1201 JIT flags); `=0` restores RTN |
-| `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
+| `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung). Qwen4 (Flash-Next) reads it as its prefill chunk ceiling, rounded down to 256 rows: default 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere. The PLE row staging follows the chunk, and load admission steps down 4096/2048/1536 until the chunk scratch fits free VRAM with 1 GiB to spare |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -1462,7 +1462,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
-| `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | stable |
 | `HIPFIRE_PREFILL_MAX_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_PREFILL_REUSE_PBS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_PROBE_ALIGN` | crates/hipfire-runtime/src/hfq.rs | developer |

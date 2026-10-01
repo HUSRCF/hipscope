@@ -50,8 +50,10 @@ pub const PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const ROWS_PER_PAGE: usize = 4;
 /// Concurrent source reads of one request's scattered page groups.
 const PARALLEL_READERS: usize = 16;
-/// Byte budget of one coalesced read or one staging buffer.  The effective
-/// size is rounded down to a whole number of decoded rows.
+/// Default byte budget of one coalesced read or one staging buffer.  The
+/// effective size is rounded down to a whole number of decoded rows; a
+/// caller that requests more rows at once sizes it with
+/// [`RowStore::with_staging_rows`].
 const STAGING_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 /// At most two staging buffers exist: one completed output and one read buffer.
 pub const MAX_STAGING_BUFFERS: usize = 2;
@@ -564,12 +566,24 @@ impl RowStore {
         descriptors: Vec<SourceRangeDescriptor>,
         valid_rows: u64,
     ) -> Result<Self, RowStoreError> {
+        Self::with_staging_rows(name, descriptors, valid_rows, 0)
+    }
+
+    /// [`RowStore::new`] whose staging buffers (and coalesced reads) hold at
+    /// least `rows` decoded rows, so a prefetch of `rows` row ids is
+    /// admissible.  Never smaller than the default budget.
+    pub fn with_staging_rows(
+        name: &str,
+        descriptors: Vec<SourceRangeDescriptor>,
+        valid_rows: u64,
+        rows: usize,
+    ) -> Result<Self, RowStoreError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
         let layout = validate_descriptors(&descriptors, valid_rows)?;
         let source: Arc<dyn PositionalRowSource> = Arc::new(DescriptorRowSource {
             descriptors: descriptors.clone(),
         });
-        Self::spawn(name, source, descriptors, layout)
+        Self::spawn(name, source, descriptors, layout, rows)
     }
 
     fn spawn(
@@ -577,9 +591,16 @@ impl RowStore {
         source: Arc<dyn PositionalRowSource>,
         descriptors: Arc<[SourceRangeDescriptor]>,
         layout: Layout,
+        staging_rows: usize,
     ) -> Result<Self, RowStoreError> {
         let decoded_row_bytes = layout.row_width * 2;
-        let staging_bytes = (STAGING_BUDGET_BYTES / decoded_row_bytes) * decoded_row_bytes;
+        let staging_bytes = staging_rows
+            .checked_mul(decoded_row_bytes)
+            .ok_or_else(|| RowStoreError::Descriptor {
+                index: 0,
+                reason: format!("{staging_rows} staging rows overflow"),
+            })?
+            .max((STAGING_BUDGET_BYTES / decoded_row_bytes) * decoded_row_bytes);
         let inner = Arc::new(RowStoreInner {
             source,
             stopped: AtomicBool::new(false),
@@ -2313,6 +2334,7 @@ mod tests {
                     valid_rows: metadata.valid_rows,
                     encoding,
                 },
+                0,
             )
         }
     }
@@ -2369,6 +2391,62 @@ mod tests {
         for (index, (_, row)) in expected.iter().rev().enumerate() {
             assert_eq!(lease.row_bytes(index).unwrap(), row.as_slice());
         }
+        drop(lease);
+        assert!(store.unload().unwrap().is_clean());
+    }
+
+    /// A store sized with `with_staging_rows` admits a prefetch of exactly
+    /// that many rows (here past the default budget) and returns them; one
+    /// more row is refused, as the default store refuses its own bound + 1.
+    #[test]
+    fn staging_rows_set_the_prefetch_bound() {
+        use crate::hfq::hfq_test_fixture::{write_compact_qwen4_ple_hfq, COMPACT_PLE_NAMES};
+        use crate::hfq::HfqFile;
+        use crate::model_source::{ModelSource, SourcePayload};
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("rows.hfq");
+        write_compact_qwen4_ple_hfq(&path).expect("write compact fixture");
+        let hfq = HfqFile::open(&path).expect("open compact fixture");
+        let descriptors: Vec<SourceRangeDescriptor> = COMPACT_PLE_NAMES
+            .iter()
+            .map(
+                |name| match (&hfq as &dyn ModelSource).tensor_payload(name) {
+                    Ok(Some(SourcePayload::Range(descriptor))) => descriptor,
+                    _ => panic!("fixture tensor {name} is not a lazy range"),
+                },
+            )
+            .collect();
+        let valid_rows = descriptors
+            .iter()
+            .map(|descriptor| descriptor.logical_shape()[0] as u64)
+            .sum::<u64>();
+
+        let default = RowStore::new("t", descriptors.clone(), valid_rows).unwrap();
+        let default_max = default.max_rows_per_prefetch();
+        assert!(matches!(
+            default.prefetch(0, vec![0; default_max + 1]),
+            Err(RowStoreError::RequestTooLarge { .. })
+        ));
+        assert!(default.unload().unwrap().is_clean());
+
+        let rows = default_max * 2 + 3;
+        let store = RowStore::with_staging_rows("t", descriptors, valid_rows, rows).unwrap();
+        assert_eq!(store.max_rows_per_prefetch(), rows);
+        assert!(matches!(
+            store.prefetch(0, vec![0; rows + 1]),
+            Err(RowStoreError::RequestTooLarge { .. })
+        ));
+        let ids: Vec<u64> = (0..rows as u64).map(|index| index % valid_rows).collect();
+        let ticket = store.prefetch(0, ids.clone()).unwrap();
+        let lease = store.wait_completed_lease(&ticket).unwrap();
+        assert_eq!(lease.row_ids(), ids.as_slice());
+        let first = lease.row_bytes(0).unwrap().to_vec();
+        let period = valid_rows as usize;
+        assert_eq!(
+            lease.row_bytes(rows - 1 - (rows - 1) % period).unwrap(),
+            first
+        );
         drop(lease);
         assert!(store.unload().unwrap().is_clean());
     }
