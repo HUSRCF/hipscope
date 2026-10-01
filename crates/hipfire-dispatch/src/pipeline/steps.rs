@@ -786,11 +786,18 @@ pub fn execute_validated_steps<'a>(
     // The hyper write at this index takes its gates from its paired read
     // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
     let mut pregated: Option<usize> = None;
-    let hc_fuse = gpu.flags.qwen4_hc_fuse_level() >= 1 && !cpu_exec::cpu_exec_enabled();
+    let hc_level = if cpu_exec::cpu_exec_enabled() {
+        0
+    } else {
+        gpu.flags.qwen4_hc_fuse_level()
+    };
+    let hc_fuse = hc_level >= 1;
     while i < steps.len() {
         if hc_fuse {
             use crate::pipeline::layer_ops::{
-                execute_hyper_read_paired, execute_hyper_write_pregated, hyper_read_pairs_write,
+                execute_gated_delta_net_hc, execute_hyper_read_paired,
+                execute_hyper_write_pregated, execute_indexed_attention_hc,
+                hyper_read_pairs_write,
             };
             match &steps[i] {
                 Step::HyperWrite(write) if pregated == Some(i) => {
@@ -809,6 +816,34 @@ pub fn execute_validated_steps<'a>(
                             i += 1;
                             continue;
                         }
+                    }
+                }
+                // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the mixer whose paired
+                // write already has its gates carries that write in its output
+                // projection's epilogue; unfused when its projection is not
+                // covered (the write then runs pregated as at level 1).
+                Step::GatedDeltaNet(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
+                    }
+                }
+                Step::IndexedAttention(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
                     }
                 }
                 _ => {}

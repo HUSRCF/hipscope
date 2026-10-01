@@ -40420,6 +40420,134 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(ptr))
     }
 
+    /// Whether [`Gpu::gemm_mq6g256v2_hcw`] applies (H4 attention epilogue,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 2`): the exact gfx1151 BT8 X-LDS overwrite
+    /// route or gfx1201 with at least 64 tokens, no recorder or capture
+    /// active, `m % 8 == 0`, `k % 256 == 0`.
+    pub fn gemm_mq6g256v2_hcw_applies(&self, m: usize, k: usize, batch_size: usize) -> bool {
+        m % 8 == 0
+            && k % 256 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && match self.arch.as_str() {
+                "gfx1151" => {
+                    mqv2_prefill_batch_tile(
+                        "gfx1151",
+                        6,
+                        MqV2PrefillProjection::Residual,
+                        batch_size,
+                    ) == Some(8)
+                }
+                "gfx1201" => batch_size >= 64,
+                _ => false,
+            }
+    }
+
+    /// `hyper_write(streams, mixed = W·X)` in the GEMM epilogue: the MQ6G256V2
+    /// output projection accumulates in the unfused kernel's order and
+    /// applies the HC residual write to `hc_streams` (`[batch_size, 4 * m]`,
+    /// BF16 bits when `hc_bf16`) with the gate logits `hc_gates`
+    /// (`[batch_size, 4]`) the paired HC read produced.  `mirror` receives the
+    /// GEMM output as the unfused route stores it.  `x` is the rotated input
+    /// (`x_is_f16`: already F16, else converted here).  Bitwise the
+    /// `gemm_mq6g256v2` + `hyper_write` pair; gate with
+    /// [`Gpu::gemm_mq6g256v2_hcw_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_hcw(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        x_is_f16: bool,
+        mirror: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (module, source, func_name): (&str, &str, &'static str) = match self.arch.as_str() {
+            "gfx1151" => (
+                "qwen4_gemm_mqv2_wmma_gfx11_bt",
+                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw",
+            ),
+            "gfx1201" => (
+                "gemm_mq6g256v2_residual_wmma_gfx12_bt8_mq5v2",
+                kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+                "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq6g256v2_hcw: gfx1151 or gfx1201 required",
+                ));
+            }
+        };
+        if m == 0 || batch_size == 0 || m % 8 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6g256v2_hcw: m % 8 and k % 256 required",
+            ));
+        }
+        self.ensure_kernel(module, source, func_name)?;
+        let x_ptr = if x_is_f16 {
+            x.buf.as_ptr()
+        } else {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_ptr;
+        let mut y_ptr = mirror.map_or(std::ptr::null_mut(), |y| y.buf.as_ptr());
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_mq6g256v2_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [m.div_ceil(64) as u32, batch_size.div_ceil(128) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_ptr(streams_ptr);
+                b.push_ptr(gates_ptr);
+                b.push_i32(bf16_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_mq6g256v2(
         &mut self,
         a_raw: &GpuTensor,
