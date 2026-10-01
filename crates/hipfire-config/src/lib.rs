@@ -5273,7 +5273,6 @@ mod tests {
         names.extend([
             "HIPFIRE_DSPARK_Q8_WMMA",
             "HIPFIRE_NGRAM_WINDOW",
-            "HIPFIRE_NOT_A_KEY",
             "NOT_HIPFIRE",
         ]);
         let mut answered = 0;
@@ -5283,6 +5282,10 @@ mod tests {
             answered += usize::from(cached.is_some());
         }
         assert!(answered > 2, "the fixture must exercise rendered values");
+        // An unset developer-shaped name (built at runtime so the env-docs
+        // inventory does not read it as a real knob).
+        let unset = ["HIPFIRE", "UNSET", "PROBE"].join("_");
+        assert_eq!(table.get(&unset).cloned(), config.legacy_value(&unset));
     }
 
     #[test]
