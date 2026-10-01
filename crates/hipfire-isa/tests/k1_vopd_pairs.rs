@@ -43,7 +43,7 @@ fn all_96_k1_fold_packets_encode_on_gfx1201() {
     };
     let mut b = Builder::new(spec, plan);
     emit_fold(&mut b, FoldRegisters { cacc, acc, sc: [sc_quads; 2], t, d }).unwrap();
-    let packets: Vec<_> = b.program.instructions.iter().map(|i| i.text.as_str()).collect();
+    let packets: Vec<_> = b.program().instructions.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(packets.len(), 96);
     for op in ["v_dual_subrev_f32", "v_dual_mul_f32", "v_dual_fmac_f32"] {
         assert_eq!(packets.iter().filter(|p| p.starts_with(op)).count(), 32, "{op}");

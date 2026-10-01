@@ -84,11 +84,11 @@ fn builder_combines_simultaneous_load_and_ds_waits() {
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut builder = Builder::new(spec, plan);
-    let slot = builder.lds.add("A0", 0, 256).unwrap();
+    let slot = builder.lds_slot("A0", 0, 256).unwrap();
     builder.ds_store(slot, Instruction::new("ds_store_b32 v2, v0", vec![], vec![address.reg(), value.reg()]).memory(MemoryClass::DsStore)).unwrap();
     builder.push(Instruction::new("global_load_b32 v1, v2, s[0:1]", vec![loaded.reg()], vec![address.reg(), srd.reg()]).memory(MemoryClass::VmemLoad)).unwrap();
     builder.push(Instruction::new("v_mov_b32 v0, v1", vec![value.reg()], vec![loaded.reg()])).unwrap();
-    let combined: Vec<_> = builder.program.instructions.iter().filter(|i| i.mnemonic()=="s_wait_loadcnt_dscnt").collect();
+    let combined: Vec<_> = builder.program().instructions.iter().filter(|i| i.mnemonic()=="s_wait_loadcnt_dscnt").collect();
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0].text, "s_wait_loadcnt_dscnt 0x0");
     assert_eq!(builder.waits.iter().filter(|p| p.insn==combined[0].text).count(), 2);
@@ -116,7 +116,7 @@ fn wmma_to_wmma_ab_dependency_inserts_nop() {
         "v_wmma_i32_16x16x32_iu4 v[12:19], v[0:1], v[10:11], 0 neg_lo:[1,1,0]",
         vec![second.reg()], vec![RegRef { kind: Kind::V, base: 0, len: 2 }, b.reg()],
     )).unwrap();
-    assert_eq!(builder.program.instructions[1].text, "v_nop");
+    assert_eq!(builder.program().instructions[1].text, "v_nop");
     assert_eq!(builder.hazards[0].rule, "WMMA destination feeds next WMMA A/B or SWMMAC index");
 }
 
@@ -140,11 +140,11 @@ fn global_visibility_is_explicit_not_implied_by_lds_barrier() {
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
     builder.barrier(&[]).unwrap();
-    assert_eq!(builder.program.instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 0);
+    assert_eq!(builder.program().instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 0);
     builder.barrier_with_scope(&[], MemoryScope::Workgroup).unwrap();
-    assert_eq!(builder.program.instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 1);
+    assert_eq!(builder.program().instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 1);
     assert!(builder.push(Instruction::new("s_barrier_signal -1", vec![], vec![])).is_err());
-    builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+    builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
     assert_eq!(builder.finish().unwrap().proof.barriers.len(), 2);
 }
 
@@ -198,7 +198,7 @@ fn hip_hidden_kernarg_metadata_assembles() {
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: true, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
-    builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+    builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
     let emitted = builder.finish().unwrap();
     assert!(emitted.s_text.contains(".amdhsa_system_sgpr_workgroup_id_y 1"));
     let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
@@ -219,7 +219,7 @@ fn gfx11_descriptor_extras_assemble() {
             user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
         };
         let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
-        builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+        builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
         let emitted = builder.finish().unwrap();
         let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
             .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={}", arch.name()), "-filetype=obj", "-o", "/dev/null"])

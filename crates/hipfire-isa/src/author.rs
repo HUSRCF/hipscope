@@ -54,12 +54,16 @@ impl Backend for Builder {
         self.exits.push(name.into());
         Ok(())
     }
-    fn end_program(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
+    fn place_exit(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         if !self.exits.iter().any(|e| e == name) { return Err(format!("{name} is not a reserved kernel exit")) }
         if self.pending_barrier.is_some() { return Err("kernel ends with a split barrier in flight".into()) }
-        self.place_label(name)?;
-        self.push(Sop::End.encode(self.spec.arch)?)?;
+        self.place_label(name)
+    }
+    fn end_program(&mut self, auth: &Auth) -> Result<(), String> {
+        self.seal.check(auth)?;
+        if !self.exits.iter().any(|e| self.labels.contains(e)) { return Err("s_endpgm without a placed kernel exit".into()) }
+        self.emit(Sop::End.encode(self.spec.arch)?)?;
         self.seal.end(auth)
     }
     fn scalar_compare(&mut self, auth: &Auth, insn: Instruction) -> Result<(), String> {
@@ -68,13 +72,29 @@ impl Backend for Builder {
         if !(m.starts_with("s_cmp") || m.starts_with("s_bitcmp")) { return Err(format!("{m} does not define SCC")) }
         self.push(insn)
     }
-    fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String> { self.seal.check(auth)?; self.push(Instruction::new(format!("s_cbranch_scc1 {target}"), vec![], vec![])) }
+    fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String> { self.seal.check(auth)?; self.emit(Instruction::new(format!("s_cbranch_scc1 {target}"), vec![], vec![])) }
+    fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.emit(Instruction::new(format!("s_branch {target}"), vec![], vec![]))?;
+        self.reachable = false;
+        Ok(())
+    }
     type Fork = BuilderFork;
     fn fork(&self) -> BuilderFork {
         BuilderFork { ledger: self.ledger.clone(), lds: self.lds.clone(), sgpr: self.hazard.clone(), trans: self.gfx11_hazard.clone(), wmma: self.previous_wmma_dst.clone() }
     }
     fn join(&mut self, auth: &Auth, other: BuilderFork) -> Result<(), String> {
         self.seal.check(auth)?;
+        if !self.reachable {
+            // Nothing falls through: the state is the branch's.
+            self.ledger.resume(other.ledger);
+            self.lds = other.lds;
+            self.hazard = other.sgpr;
+            self.gfx11_hazard = other.trans;
+            self.previous_wmma_dst = other.wmma;
+            self.reachable = true;
+            return Ok(());
+        }
         self.lds.join(&other.lds)?;
         self.ledger.join(&other.ledger);
         self.join_hazards(&other.sgpr, &other.trans, &other.wmma);

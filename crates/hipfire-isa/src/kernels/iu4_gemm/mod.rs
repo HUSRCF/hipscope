@@ -220,8 +220,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     op(wg.isa(), "s_setprio 1", &[], &[])?;
     let lds = prologue::emit(&mut wg, &g, &end, lds)?;
     let lds = kloop::emit(&mut wg, &g, lds)?;
-    epilogue::emit(wg.isa(), &g)?;
-    // Only the fused projection reuses the LDS after the K loop.
+    epilogue::emit(&mut wg, &g, &end)?;
+    // Only the fused projection reuses the LDS after the K loop: its QKV
+    // tiles continue at the GDN label the epilogue's exit branch skips to.
     if spec.epi == Epi::QkvzaGdn { gdn_epilogue::emit(&mut wg, &g, lds)?; }
     wg.end(end)?;
     b.finish()

@@ -38,7 +38,7 @@ use super::common::{lit, mem, op, s, sr, v, vr};
 use super::iu4_fold::{GROUP_BYTES, MAGIC, MAGIC_NEG, REBIAS, XBLK_BYTES};
 use super::iu4_gemm::{ds_offsets, region::{self, Binding, Region}};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
-    insn::{Instruction, MemoryClass, Sop, Wmma},
+    insn::{Instruction, MemoryClass, Wmma},
     reg::Live, vopd::{Operand, VopdF32, VopdOp}};
 use peacemaker_author::{Free, Gfx1100, Gfx11Waits, LdsWrite, MmaIu4, Pending, Published, Ring, Scc, State, Wave, WgUniform,
     Workgroup, Writing, prime, rotate};
@@ -712,6 +712,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.enable_delay_alu();
     let mut wg = Wg::new(&mut b)?;
     let rings = declare_lds(&mut wg)?;
+    let end = wg.exit(END)?;
     // PRIO (gate/up only): prologue and K loop at wave priority 1, the SiLU
     // epilogue at 0. On the ADD entry the same split starves the epilogue
     // (K6144 +1.8%), and SET is neutral.
@@ -720,8 +721,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     // The last epoch's slot stays published: nothing writes LDS after it.
     let _published = kloop(&mut wg, spec.epi, rings)?;
     epilogue(wg.isa(), spec.epi)?;
-    wg.label(END)?;
-    wg.isa().push(Sop::End.encode(spec.arch)?)?;
+    wg.end(end)?;
     b.finish()
 }
 

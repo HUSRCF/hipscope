@@ -224,7 +224,7 @@ fn plan() -> Result<RegPlan, String> {
 fn declare_lds(b: &mut Builder) -> R {
     for (id, (name, base, len)) in [("score", SCORE, STATE - SCORE), ("state", STATE, DB - STATE), ("d", DB, CTRL - DB),
         ("ctrl", CTRL, GROUP_BYTES - CTRL)].into_iter().enumerate() {
-        if b.lds.add(name, base, len)? != id { return Err("LDS slot order".into()) }
+        if b.lds_slot(name, base, len)? != id { return Err("LDS slot order".into()) }
     }
     Ok(())
 }
@@ -847,7 +847,7 @@ fn epilogue(b: &mut Builder) -> R {
     }}
     b.wait_all()?;
     b.label(END)?;
-    b.push(Sop::End.encode(Arch::Gfx1201)?)
+    b.control(Sop::End.encode(Arch::Gfx1201)?)
 }
 
 pub fn emit(arch: Arch) -> Result<Emitted, String> {

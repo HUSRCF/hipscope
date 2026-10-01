@@ -491,7 +491,7 @@ mod tests {
             group_segment_fixed_size: 0, wave32: true, cu_mode: false };
         let mut b = Builder::new(spec, p);
         emit_interleaved(&mut b, &Region::silu().unwrap(), binds).unwrap();
-        b.program.instructions.iter().map(|i| i.text.clone()).collect()
+        b.program().instructions.iter().map(|i| i.text.clone()).collect()
     }
 
     /// Interleaving and VOPD packing only: the stream is exactly each

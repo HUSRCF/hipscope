@@ -72,7 +72,7 @@ fn plan()->Result<RegPlan,String>{
 }
 fn declare_lds(b:&mut Builder)->Result<(),String>{
     for (id,(name,base,len)) in [("A0",0,8192),("A1",8192,8192),("R0",16384,1024),("R1",17408,1024),("D0",18432,512),("D1",18944,512)].into_iter().enumerate(){
-        if b.lds.add(name,base,len)?!=id {return Err("LDS slot order".into())}
+        if b.lds_slot(name,base,len)?!=id {return Err("LDS slot order".into())}
     }
     Ok(())
 }
@@ -89,7 +89,7 @@ pub fn emit(spec:Spec)->Result<Emitted,String>{
     kloop::emit(&mut b,spec)?;
     epilogue::emit(&mut b,spec)?;
     b.label(END)?;
-    b.push(crate::insn::Sop::End.encode(Arch::Gfx1201)?)?;
+    b.control(crate::insn::Sop::End.encode(Arch::Gfx1201)?)?;
     b.finish()
 }
 #[derive(Serialize)]

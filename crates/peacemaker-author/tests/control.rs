@@ -74,3 +74,69 @@ fn raw_trace_refuses_lds_barriers_and_branches() {
     }
     wg.isa().raw("v_mov_b32 v1, 0").unwrap();
 }
+
+/// `Forward` targets are placed once, after every branch to them, and
+/// inside their block: no branch re-enters code.
+#[test]
+fn forward_branches_only_go_forward() {
+    let mut b = Trace::new("gfx1151");
+    let mut wg = Workgroup::<Gfx1151, Trace>::new(&mut b).unwrap();
+    let err = wg
+        .forward(|w, f| {
+            let c = w.scmp("s_cmp_eq_u32 s2, 0".into())?;
+            f.branch_if(w, c, ".Lx")?;
+            f.place(w, ".Lx")?;
+            f.goto(w, ".Lx")
+        })
+        .unwrap_err();
+    assert!(err.contains("branches only go forward"), "{err}");
+    let err = wg
+        .forward(|w, f| {
+            let c = w.scmp("s_cmp_eq_u32 s2, 0".into())?;
+            f.branch_if(w, c, ".Ly")
+        })
+        .unwrap_err();
+    assert!(err.contains(".Ly is never placed"), "{err}");
+}
+
+/// A target joins every branch to it: a slot stored only on the path of
+/// the middle branch is still being written at the target.
+#[test]
+fn forward_target_joins_a_store_of_any_branch() {
+    let mut b = Trace::new("gfx1151");
+    let mut wg = Workgroup::<Gfx1151, Trace>::new(&mut b).unwrap();
+    let gate = wg.lds::<Gate>("gate", 0, 2048).unwrap();
+    let other = wg.lds::<Gate>("other", 2048, 2048).unwrap();
+    let _gate = wg
+        .forward(|w, f| {
+            let c = w.scmp("s_cmp_eq_u32 s2, 0".into())?;
+            f.branch_if(w, c, ".Lout")?;
+            let (gate, pending) = w.ds_store(gate, "ds_store_b128 v1, v[2:5]".into())?;
+            let c = w.scmp("s_cmp_eq_u32 s2, 1".into())?;
+            f.branch_if(w, c, ".Lout")?;
+            let _drained = w.wait(pending)?;
+            f.place(w, ".Lout")?;
+            Ok(gate)
+        })
+        .unwrap();
+    assert!(wg.relayout((other,)).unwrap_err().contains("gate is Publishing"));
+}
+
+/// `exit_unless` continues at its target from the branch point: the
+/// body's store leaves the kernel with it. An exit something branches to
+/// takes no tail.
+#[test]
+fn exit_unless_target_starts_from_the_branch() {
+    let mut b = Trace::new("gfx1151");
+    let mut wg = Workgroup::<Gfx1151, Trace>::new(&mut b).unwrap();
+    let gate = wg.lds::<Gate>("gate", 0, 2048).unwrap();
+    let other = wg.lds::<Gate>("other", 2048, 2048).unwrap();
+    let end = wg.exit(".Lend").unwrap();
+    let c = wg.scmp_wg_uniform("s_cmp_eq_u32 s2, 0".into()).unwrap();
+    wg.exit_unless(c, ".Lgo", &end, |wg| wg.ds_store(gate, "ds_store_b128 v1, v[2:5]".into()).map(drop)).unwrap();
+    // Every slot is Free at the target: the path that stored left the kernel.
+    wg.relayout((other,)).unwrap();
+    let err = wg.end_with(end, |w| w.isa().raw("v_mov_b32 v1, 0")).unwrap_err();
+    assert!(err.contains("takes no tail"), "{err}");
+    assert_eq!(b.text[..4], ["s_cmp_eq_u32 s2, 0", "s_cbranch_scc1 .Lgo", "ds_store_b128 v1, v[2:5]", "s_branch .Lend"]);
+}
