@@ -3720,14 +3720,15 @@ QSA_SELECT_PARALLEL(indexed_attention_select_f32_batched, float)
 QSA_SELECT_PARALLEL(indexed_attention_select_bf16_batched, __hip_bfloat16)
 #undef QSA_SELECT_PARALLEL
 
-// Block scores of up to eight consecutive query rows (index_heads == 4,
+// Block scores of up to R (8 or 16) consecutive query rows (index_heads == 4,
 // index_dim % 4 == 0, index_dim <= 128): each pooled key row is read once for
-// the eight rows instead of once per row.  Every (row, block) score is
+// the R rows instead of once per row.  Every (row, block) score is
 // indexed_attention_select_score4_f32's exact arithmetic (per-head serial
 // d-order dots, heads summed in order).  Row r scores blocks below its own
 // visible count into scores[r * score_stride + block].
-// Grid [ceil(block_count / 256), ceil(rows / 8)], block 256.
-extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows8_f32(
+// Grid [ceil(block_count / 256), ceil(rows / R)], block 256.
+template <int R>
+__device__ __forceinline__ void indexed_attention_select_scores_rows(
     const float* query,
     const float* pooled,
     float* scores,
@@ -3738,9 +3739,9 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_score
     int compress,
     int position_start,
     int score_stride) {
-    __shared__ __align__(16) float qs[8 * 4 * 128];
-    const int row0 = (int)blockIdx.y * 8;
-    const int nrows = min(8, rows - row0);
+    __shared__ __align__(16) float qs[R * 4 * 128];
+    const int row0 = (int)blockIdx.y * R;
+    const int nrows = min(R, rows - row0);
     const int width = 4 * index_dim;
     for (int i = (int)threadIdx.x; i < nrows * width; i += 256) {
         const int r = i / width;
@@ -3751,15 +3752,15 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_score
     const int block = (int)blockIdx.x * 256 + (int)threadIdx.x;
     if (block >= block_count) return;
     const float4* p4 = reinterpret_cast<const float4*>(pooled + block * index_dim);
-    float dot[8][4];
+    float dot[R][4];
 #pragma unroll
-    for (int r = 0; r < 8; ++r)
+    for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int h = 0; h < 4; ++h) dot[r][h] = 0.0f;
     for (int d4 = 0; d4 < index_dim / 4; ++d4) {
         const float4 p = p4[d4];
 #pragma unroll
-        for (int r = 0; r < 8; ++r) {
+        for (int r = 0; r < R; ++r) {
 #pragma unroll
             for (int h = 0; h < 4; ++h) {
                 const float4 a = *reinterpret_cast<const float4*>(qs + r * 4 * 128 + h * 128 + d4 * 4);
@@ -3770,18 +3771,37 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_score
             }
         }
     }
+    // No break/continue: the loop must fully unroll so `dot` stays in
+    // registers (with them, the 16-row kernel spills it to scratch).
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        if (r >= nrows) break;
-        int visible_blocks = (position_start + row0 + r + 1) / compress;
-        if (block >= visible_blocks) continue;
-        float score = 0.0f;
+    for (int r = 0; r < R; ++r) {
+        const int visible_blocks = (position_start + row0 + r + 1) / compress;
+        if (r < nrows && block < visible_blocks) {
+            float score = 0.0f;
 #pragma unroll
-        for (int h = 0; h < 4; ++h) score += fmaxf(dot[r][h] / sqrtf((float)index_dim), 0.0f);
-        scores[(row0 + r) * score_stride + block] = score;
+            for (int h = 0; h < 4; ++h) score += fmaxf(dot[r][h] / sqrtf((float)index_dim), 0.0f);
+            scores[(row0 + r) * score_stride + block] = score;
+        }
     }
 }
 
+// Eight rows per pooled read: decode and few-row verify.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows8_f32(
+    const float* query, const float* pooled, float* scores, int rows, int query_row_stride,
+    int block_count, int index_dim, int compress, int position_start, int score_stride) {
+    indexed_attention_select_scores_rows<8>(query, pooled, scores, rows, query_row_stride,
+                                            block_count, index_dim, compress, position_start,
+                                            score_stride);
+}
+
+// Sixteen rows per pooled read: prefill (half the pooled-key reads per row).
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows16_f32(
+    const float* query, const float* pooled, float* scores, int rows, int query_row_stride,
+    int block_count, int index_dim, int compress, int position_start, int score_stride) {
+    indexed_attention_select_scores_rows<16>(query, pooled, scores, rows, query_row_stride,
+                                             block_count, index_dim, compress, position_start,
+                                             score_stride);
+}
 // indexed_attention_select_f32_batched's selection over block scores already
 // in memory (indexed_attention_select_scores_rows8_f32, row stride
 // `score_stride`), emitting the same bytes: the top `chosen` blocks by

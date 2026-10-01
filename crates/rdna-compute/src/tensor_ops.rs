@@ -3536,7 +3536,7 @@ const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
 const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
 
 /// [`indexed_attention_select_batch_impl`]'s live route: row groups of
-/// `indexed_attention_select_scores_rows8_f32` scores, each followed by
+/// `indexed_attention_select_scores_rows{8,16}_f32` scores, each followed by
 /// `indexed_attention_select_from_scores` reading them. Selection bytes are
 /// unchanged.
 fn indexed_attention_select_rows8(
@@ -3545,12 +3545,19 @@ fn indexed_attention_select_rows8(
     mirror: Option<&GpuTensor>,
 ) -> HipResult<bool> {
     let stride = p.block_count;
-    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 8 * 8)
-        .max(8)
+    // Prefill scores sixteen rows per pooled-key read; decode and few-row
+    // verify keep eight (the sixteen-row kernel costs them more than it saves).
+    let (score_kernel, score_rows) = if p.rows > 8 {
+        ("indexed_attention_select_scores_rows16_f32", 16)
+    } else {
+        ("indexed_attention_select_scores_rows8_f32", 8)
+    };
+    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
+        .max(16)
         .min(p.rows);
     // Growth goes through the accessor that invalidates captured state first.
     let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
-    for kernel in ["indexed_attention_select_scores_rows8_f32", "indexed_attention_select_from_scores"] {
+    for kernel in [score_kernel, "indexed_attention_select_from_scores"] {
         gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     }
     let mirror =
@@ -3582,8 +3589,12 @@ fn indexed_attention_select_rows8(
         args.push_i32(block_count);
         args.pad_to(16);
         gpu.launch_blob_recorded(
-            "indexed_attention_select_scores_rows8_f32",
-            [block_tiles, checked_u32(n.div_ceil(8), "QSA select row groups")?, 1],
+            score_kernel,
+            [
+                block_tiles,
+                checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
+                1,
+            ],
             [256, 1, 1],
             0,
             args.as_mut_slice(),
@@ -8330,14 +8341,26 @@ mod tests {
         for &compress in &[2usize, 4, 8] {
             for &index_dim in &[8usize, 128] {
                 for &index_heads in &[1usize, 4] {
-                    for &rows in &[1usize, 5] {
+                    // 37 rows: three sixteen-row scoring groups, the last
+                    // partial, each row with its own visible block count.
+                    for &rows in &[1usize, 5, 37] {
                         // `(position_start + rows) / compress` must equal the
                         // wrapper's declared block count.
-                        if rows > compress - 1 {
+                        if rows < 37 && rows > compress - 1 {
                             continue;
                         }
                         for &block_count in &[0usize, 1, 3, 17, 72, 128, 500] {
                             for &budget_blocks in &[1usize, 4, 64, 512] {
+                                // Many rows: the pinned geometry (the live
+                                // rows16 route), smaller budgets.
+                                let pinned = compress == 4 && index_heads == 4 && index_dim == 128;
+                                if rows == 37
+                                    && (!pinned
+                                        || budget_blocks > 64
+                                        || block_count * compress + compress - 1 < rows)
+                                {
+                                    continue;
+                                }
                                 let case = SelectCase {
                                     compress,
                                     index_heads,
@@ -8346,7 +8369,11 @@ mod tests {
                                     block_count,
                                     budget_blocks,
                                     capacity: budget_blocks * compress + compress - 1,
-                                    position_start: block_count * compress,
+                                    position_start: if rows < compress {
+                                        block_count * compress
+                                    } else {
+                                        block_count * compress + compress - 1 - rows
+                                    },
                                 };
                                 let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
                                     .map(|_| next())
