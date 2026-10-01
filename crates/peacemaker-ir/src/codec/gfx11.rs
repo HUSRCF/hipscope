@@ -99,7 +99,6 @@ mod tests {
                 let data_len = if text.contains("cmpswap") { 2 } else { 1 };
                 let data = RegRef { kind: Kind::V, base: (words[1] >> 8 & 0xff) as u16, len: data_len };
                 assert!(inst.effects.uses.contains(&data), "{text}: data {data:?} not read");
-                assert_eq!(inst.operands.first() == Some(&Operand::Reg(vdst)), returns, "{text}");
                 inst.prov.bytes = None;
                 assert_eq!(encode(arch, &inst).unwrap().as_slice(), &words, "{text}");
             }

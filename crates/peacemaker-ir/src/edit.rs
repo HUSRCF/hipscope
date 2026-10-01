@@ -286,7 +286,7 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
     let lds = passes::lds::analyze(body, arch).map_err(|e| fail("lds", &e))?;
     let barriers = passes::barriers::analyze(body, arch).map_err(|e| fail("barriers", &e))?;
     let lds_fixed = match &kern.abi { Abi::Hsa { descriptor, .. } => descriptor.group_segment_fixed_size, Abi::Raw { lds_bytes, .. } => *lds_bytes };
-    let summary = passes::resources::summarize(body, lds_fixed);
+    let summary = passes::resources::summarize(body, arch, kern.wave, lds_fixed);
     let mut obligations = replay.obligations;
     obligations.extend(hazards.obligations);
     obligations.extend(barriers.obligations);
@@ -648,10 +648,10 @@ fn access(arch: Arch, wave: Wave, inst: &Inst) -> Result<Access, EditError> {
     let roles = operand_roles(arch, inst)?;
     let mut acc = Access::default();
     let name = inst.op.name(arch).unwrap_or("");
-    for (operand, &(def, used)) in inst.operands.iter().zip(&roles) {
+    for (index, (operand, &(def, used))) in inst.operands.iter().zip(&roles).enumerate() {
         match operand {
             Operand::Reg(reg) => {
-                let bits = Bits::of_reg(*reg);
+                let bits = Bits::of_reg(crate::codec::gfx12::operand_register(arch, wave, inst, index).unwrap_or(*reg));
                 if def { acc.writes.or(&bits); }
                 if used { acc.reads.or(&bits); acc.uses.or(&bits); }
             }
@@ -1935,7 +1935,7 @@ impl Tx {
         Ok(())
     }
 
-    fn summary(&self) -> crate::state::ResourceSummary { passes::resources::summarize(self.body(), 0) }
+    fn summary(&self) -> crate::state::ResourceSummary { passes::resources::summarize(self.body(), self.arch, self.wave(), 0) }
 
     fn rename(&mut self, name: &str, checked: bool) -> Result<String, EditError> {
         if checked {
