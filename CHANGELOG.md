@@ -10,6 +10,26 @@
     - 4096 rows, 12 layers: 835.5 → 1006.9 tok/s (+20.5%).
     - 8192 rows, 6 layers: 877.9 → 1082.6 tok/s (+23.3%).
   - **Unaffected:** the shipped 1536-row chunk; H2, which uses neither kernel; and Strix Halo's Flash-Next prefill, which takes the F16 WMMA route.
+- **Qwen3.8-Flash-Next (Qwen4) prefill chunk per arch: 8192 rows on gfx1151 and 4096 on gfx1201 (was 1536 everywhere). pp8192 is +36.6% on an R9700 with auto expert placement (with the GEMM cliff fix above) and +10.7% on Strix Halo.** Every prefill chunk re-streams all routed experts, so fewer chunks mean fewer expert passes. The effective chunk had been 1,536 rows by accident: one chunk's PLE n-gram prefetch had to fit the row store's 8 MiB staging buffer (26,214 rows, i.e. 1,638 tokens of 16 heads), which sat below the 2,048-row cap.
+  - The PLE row store now sizes its staging from the chunk (`RowStore::with_staging_rows`). `prefill.chunk_rows` / `HIPFIRE_PREFILL_CHUNK_ROWS` is the ceiling, rounded down to 256 rows. Other arches keep 1536.
+  - At load the chunk steps down 4096 → 2048 → 1536 until its scratch fits free VRAM with 1 GiB to spare. `auto` expert placement charges the chunk's scratch against its reserve.
+  - **gfx1201 rung.** A larger chunk costs VRAM expert layers under `auto`, so the default is the fastest pp8192 that costs at most 3% of the 2048-row rung's tg64. Measured on an R9700 at max_seq 66,560 (pp8192 / tg64 at ctx 512 / tg64 at ctx 8K):
+    - 2048 rows: 16 layers; 877.7–879.4 / 35.0 / 32.8.
+    - **4096 rows:** 14 layers; 1001.7–1004.1 / 34.0 / 31.9, i.e. −2.9% and −2.7% tg64.
+    - 8192 rows: 11 layers; 1076.6–1077.9 / 32.6 / 30.7, i.e. −6.9% and −6.5% tg64, past the bound.
+    - v0.4.0 (15 layers): tg64 34.5 / 32.4.
+  - **Speculative logits are sized for verify blocks (64 rows), not the chunk.** Previously they held `vocab × 4` bytes per chunk row: 1.45 GiB at 1536 rows, 7.6 GiB at 8192. Prompt advances and the MTP prompt fill read only their final row.
+    - MTP greedy serve on Strix Halo is byte-identical, with identical τ, to v0.4.0 and to the build before this change.
+  - **Measured (3 fresh processes per arm, v0.4.0 `3c4ef29dd` vs this build, graph on, spec off).**
+    - R9700, auto placement, max_seq 66,560: pp8192 733.5–738.4 → 1002.1–1002.3 tok/s; pp65536 730.4–736.1 → 963.0–963.9. Expert layers in VRAM go 15 → 14; free VRAM after load is 3,192 → 3,242 MiB.
+    - Strix Halo, resident experts, max_seq 69,632: pp8192 997.9–1009.1 → 1108.9–1112.9; pp65536 897.2–903.3 → 997.8–1001.2. Free GPU pool after load is 21,658 → 16,218 MiB.
+    - None of the ranges overlap. The pp operand is the bench's synthetic stream `token[i] = 10 + (i % 1000)`.
+  - **Correctness.**
+    - `qwen4_qsa_ctx` at 16K and 65K: every sampled QSA row is fma-exact against the CPU reference at the new chunk on both arches (144/144 and 288/288 rows; gfx1201 fp8, gfx1151 F32).
+    - Results are not bit-exact across chunk sizes; the final-row argmax is unchanged.
+    - The 128K needle answers correctly on both arches.
+    - Stress shows 0 mismatches: the gfx1201 H2 co-tenant + Flash-Next MTP run, and Strix Halo retained record/replay.
+    - H2 greedy is 33/33 byte-identical. Kernel objects are unchanged on gfx1100, gfx1151 and gfx1201.
 
 ## v0.4.0 — 2026-09-30
 - **Qwen3.8-Flash-Next (Qwen4, arch 16): `auto` KV is fp8 QSA K/V on exact gfx1201; the GDN recurrent state is Q8 by default; `max_seq` goes up to the native 262,144.** The QSA K/V arenas store E4M3 codes with one f16 scale per head and token, and the indexer's raw and pooled keys are stored as BF16, which holds the same values as the F32 arenas. `auto` keeps the exact `bf16` state (F32 arenas) on gfx1100, gfx1151 (Halo) and every other arch. An explicit `fp8` is refused off gfx1201, and every other `kv_cache` value is refused. The GatedDeltaNet state uses Qwen3.5's Q8 DeltaNet format on every arch; the `state_quant: "fp32"` load parameter opts out. Past 15,360 pooled blocks, the QSA selector keeps its score rows in global memory.
