@@ -20,21 +20,24 @@ pub(crate) fn successors(body: &Body) -> Vec<Vec<usize>> {
 }
 
 
+fn reachable(edges: &[Vec<usize>], starts: &[usize], avoid: Option<usize>) -> Vec<bool> {
+    let mut seen = vec![false; edges.len()];
+    let mut work = Vec::new();
+    for &p in starts {
+        if Some(p) != avoid && !seen[p] { seen[p] = true; work.push(p); }
+    }
+    while let Some(p) = work.pop() {
+        for &q in &edges[p] {
+            if Some(q) != avoid && !seen[q] { seen[q] = true; work.push(q); }
+        }
+    }
+    seen
+}
+
 /// Each map fixes taken/not-taken for correlated branches. Enumerating both
 /// outcomes retains every feasible execution, without guessing scalar values.
 pub(crate) fn partitions(body: &Body, arch: Arch) -> Vec<HashMap<InstId, bool>> {
     if body.layout.is_empty() { return vec![HashMap::new()]; }
-    let edges = successors(body);
-    let mut graph = petgraph::graph::DiGraph::<(), ()>::new();
-    let nodes: Vec<_> = (0..body.layout.len()).map(|_| graph.add_node(())).collect();
-    for (p, succs) in edges.iter().enumerate() { for &q in succs { graph.add_edge(nodes[p], nodes[q], ()); } }
-    let dominators = petgraph::algo::dominators::simple_fast(&graph, nodes[0]);
-    let mut cyclic = vec![false; nodes.len()];
-    for component in petgraph::algo::tarjan_scc(&graph) {
-        if component.len() > 1 || edges[component[0].index()].contains(&component[0].index()) {
-            for node in component { cyclic[node.index()] = true; }
-        }
-    }
     let mut definitions: HashMap<u16, Option<usize>> = HashMap::new();
     for (p, id) in body.layout.iter().enumerate() {
         for reg in &body.insts.get(*id).unwrap().effects.defs {
@@ -60,9 +63,7 @@ pub(crate) fn partitions(body: &Body, arch: Arch) -> Vec<HashMap<InstId, bool>> 
             Operand::Reg(r) if r.kind == Kind::S => {
                 has_register = true;
                 (r.base..r.base + u16::from(r.len)).all(|s| {
-                    let Some(Some(def)) = definitions.get(&s) else { return false };
-                    !cyclic[*def] && dominators.dominators(nodes[p - 1])
-                        .is_some_and(|mut ds| ds.any(|d| d == nodes[*def]))
+                    definitions.get(&s).is_some_and(|def| def.is_some())
                 })
             }
             Operand::Inline(_) | Operand::Literal(_) => true,
@@ -79,6 +80,28 @@ pub(crate) fn partitions(body: &Body, arch: Arch) -> Vec<HashMap<InstId, bool>> 
         groups[group].1.push((body.layout[p], name == "s_cbranch_scc1"));
     }
     groups.retain(|(_, branches)| branches.len() > 1);
+    if groups.is_empty() { return vec![HashMap::new()]; }
+    // Most kernels have no repeated immutable comparison. Do not build an
+    // instruction graph, much less run dominance/SCC algorithms, for them.
+    // Reachability is iterative so long straight-line kernels cannot exhaust
+    // the test thread's (or a certifier caller's) stack.
+    let edges = successors(body);
+    let mut proofs: HashMap<usize, (bool, Vec<bool>)> = HashMap::new();
+    groups.retain(|(_, branches)| branches.iter().all(|(id, _)| {
+        let p = body.layout.iter().position(|candidate| candidate == id).expect("branch in layout");
+        let cmp = body.insts.get(body.layout[p - 1]).unwrap();
+        cmp.operands.iter().all(|operand| {
+            let Operand::Reg(reg) = operand else { return true };
+            (reg.base..reg.base + u16::from(reg.len)).all(|s| {
+                let def = definitions[&s].expect("single definition");
+                let (cyclic, bypass) = proofs.entry(def).or_insert_with(|| {
+                    let cycle = reachable(&edges, &edges[def], None)[def];
+                    (cycle, reachable(&edges, &[0], Some(def)))
+                });
+                !*cyclic && !bypass[p - 1]
+            })
+        })
+    }));
     // A precision-only bound: unselected predicates keep both CFG edges.
     groups.truncate(8);
     (0..1usize << groups.len()).map(|mask| {

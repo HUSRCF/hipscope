@@ -438,8 +438,9 @@ fn inst_of(body: &Body, id: InstId) -> Result<&Inst, WaitError> {
 /// branches (conditional fall-through is not a leader), so the
 /// fall-through exit alone is path-ambiguous: every mid-block conditional
 /// branch contributes its own exit state, taken at the branch point.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockExits {
-    fall: WaitState,
+    fall: Option<WaitState>,
     branches: Vec<(BlockId, WaitState)>,
 }
 
@@ -486,7 +487,11 @@ fn push_event(
     }
     for event in &mut state.pending {
         for i in 0..N {
-            if event.counters.contains(counter_at(i)) {
+            let counter = counter_at(i);
+            // Out-of-order families only retire at zero. Their suffix is
+            // irrelevant; aging it would force useless loop walks to 255.
+            if !matches!(counter, Counter::Km | Counter::Store | Counter::Vs)
+                && event.counters.contains(counter) {
                 event.younger[i] = event.younger[i].saturating_add(fresh.units[i]);
             }
         }
@@ -506,6 +511,7 @@ fn walk_block(
     range: (usize, usize),
     entry: &WaitState,
     events: &mut EventTable,
+    choices: &HashMap<InstId, bool>,
     mut recorder: Option<&mut Recorder>,
 ) -> Result<BlockExits, WaitError> {
     let mut state = entry.clone();
@@ -514,12 +520,17 @@ fn walk_block(
         let id = body.layout[index];
         let inst = inst_of(body, id)?;
         if let Some(recorder) = recorder.as_mut() {
-            recorder.before.insert(id, state.clone());
+            match recorder.before.entry(id) {
+                std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(state.clone()); }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let joined = join_states(slot.get(), &state);
+                    slot.insert(joined);
+                }
+            }
         }
         match inst.effects.control {
-            Control::EndPgm => {
-                state.pending.clear();
-                continue;
+            Control::EndPgm | Control::Halt | Control::Trap => {
+                return Ok(BlockExits { fall: None, branches });
             }
             Control::Wait => {
                 if let Some(wait) = &inst.mods.wait {
@@ -551,12 +562,16 @@ fn walk_block(
                 if let Some(target) = branch_target(inst) {
                     branches.push((target, state.clone()));
                 }
-                state = WaitState::default();
-                break;
+                return Ok(BlockExits { fall: None, branches });
             }
             Control::Branch { .. } => {
-                if let Some(target) = branch_target(inst) {
-                    branches.push((target, state.clone()));
+                if choices.get(&id) != Some(&false) {
+                    if let Some(target) = branch_target(inst) {
+                        branches.push((target, state.clone()));
+                    }
+                }
+                if choices.get(&id) == Some(&true) {
+                    return Ok(BlockExits { fall: None, branches });
                 }
             }
             _ => {}
@@ -586,7 +601,7 @@ fn walk_block(
             }
         }
     }
-    Ok(BlockExits { fall: state, branches })
+    Ok(BlockExits { fall: Some(state), branches })
 }
 
 
@@ -609,16 +624,28 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
         obligations: Vec::new(),
         before: HashMap::new(),
     };
-    for choices in super::predicates::partitions(body, arch) {
-        let entries = fixpoint(body, arch, &choices, &mut events)?;
-        for (p, entry) in entries.iter().enumerate() {
-            let Some(entry) = entry else { continue };
-            let prior = recorder.before.get(&body.layout[p]).cloned();
-            walk_block(body, arch, (p, p + 1), entry, &mut events, Some(&mut recorder))?;
-            if let Some(prior) = prior {
-                recorder.before.insert(body.layout[p], join_states(&prior, entry));
+    let ranges: Vec<(BlockId, (usize, usize))> = if body.blocks.is_empty() {
+        vec![(BlockId(0), (0, body.layout.len()))]
+    } else { body.blocks.iter().map(|block| (block.id, block.range)).collect() };
+    // A successful conservative replay already proves every path. Correlating
+    // immutable guards is only necessary to discharge remaining hazards.
+    let mut partitions = vec![HashMap::new()];
+    let mut refined = false;
+    loop {
+        for choices in &partitions {
+            let entries = fixpoint(body, arch, &ranges, choices, &mut events)?;
+            for ((_, range), entry) in ranges.iter().zip(&entries) {
+                let Some(entry) = entry else { continue };
+                walk_block(body, arch, *range, entry, &mut events, choices, Some(&mut recorder))?;
             }
         }
+        if refined || recorder.obligations.is_empty() { break; }
+        partitions = super::predicates::partitions(body, arch);
+        if partitions.len() == 1 && partitions[0].is_empty() { break; }
+        recorder.facts.clear();
+        recorder.obligations.clear();
+        recorder.before.clear();
+        refined = true;
     }
     recorder.obligations.sort_unstable_by(|a, b| a.insts.iter().map(|id| id.0).cmp(b.insts.iter().map(|id| id.0))
         .then_with(|| a.rule_id.cmp(&b.rule_id)).then_with(|| a.text.cmp(&b.text)));
@@ -637,29 +664,42 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
     })
 }
 
-/// Instruction-position fixpoint. Unreachable instructions have no state;
-/// they must not manufacture issues at a join. Predicate partitions select
-/// only proven-correlated edges; mutable/unknown guards keep both edges.
-fn fixpoint(body: &Body, arch: Arch, choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
-    let count = body.layout.len();
-    let mut graph = super::predicates::successors(body);
-    for (p, id) in body.layout.iter().enumerate() {
-        if let Some(&taken) = choices.get(id) {
-            let target = branch_target(body.insts.get(*id).unwrap()).map(|b| body.blocks[b.0].range.0);
-            graph[p].retain(|&q| if taken { Some(q) == target } else { q == p + 1 });
+/// Reachable block-entry fixpoint. Transfer captures mid-block branch exits
+/// at their instruction positions, including partition-selected edges.
+/// Keeping straight-line transfer in one walk avoids retaining and cloning
+/// the entire pending state at each instruction during convergence.
+fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize))], choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
+    let count = ranges.len();
+    let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(p, (id, _))| (*id, p)).collect();
+    let first_at: HashMap<usize, usize> = ranges.iter().enumerate().map(|(p, (_, range))| (range.0, p)).collect();
+    let mut incoming: Vec<Vec<(usize, Option<usize>)>> = vec![Vec::new(); count];
+    let mut succs = vec![Vec::new(); count];
+    for (p, (_, range)) in ranges.iter().enumerate() {
+        let shape = walk_block(body, arch, *range, &WaitState::default(), events, choices, None)?;
+        if shape.fall.is_some() {
+            if let Some(&q) = first_at.get(&range.1).filter(|&&q| q != p) {
+                incoming[q].push((p, None));
+                succs[p].push(q);
+            }
+        }
+        for (k, (target, _)) in shape.branches.iter().enumerate() {
+            if let Some(&q) = index.get(target) {
+                incoming[q].push((p, Some(k)));
+                if !succs[p].contains(&q) { succs[p].push(q); }
+            }
         }
     }
-    let mut incoming = vec![Vec::new(); count];
-    for (p, succs) in graph.iter().enumerate() { for &q in succs { incoming[q].push(p); } }
     let mut entries: Vec<Option<WaitState>> = vec![None; count];
-    let mut exits: Vec<Option<WaitState>> = vec![None; count];
+    let mut exits: Vec<Option<BlockExits>> = vec![None; count];
     let mut work: std::collections::BTreeSet<usize> = (0..count.min(1)).collect();
-    let budget = count.saturating_mul(1000).max(1000);
+    let budget = body.layout.len().saturating_mul(1000).max(1000);
     let mut walks = 0;
     while let Some(p) = work.pop_first() {
         let mut joined = (p == 0).then(WaitState::default);
-        for &q in &incoming[p] {
-            if let Some(state) = &exits[q] {
+        for &(q, edge) in &incoming[p] {
+            let Some(exit) = &exits[q] else { continue };
+            let state = match edge { None => exit.fall.as_ref(), Some(k) => Some(&exit.branches[k].1) };
+            if let Some(state) = state {
                 joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
             }
         }
@@ -668,15 +708,10 @@ fn fixpoint(body: &Body, arch: Arch, choices: &HashMap<InstId, bool>, events: &m
         if walks > budget { return Err(WaitError::NoFixpoint { walks }); }
         let exit = match &joined {
             None => None,
-            Some(state) => {
-                let walked = walk_block(body, arch, (p, p + 1), state, events, None)?;
-                Some(if matches!(body.insts.get(body.layout[p]).unwrap().effects.control, Control::Jump) {
-                    walked.branches.into_iter().next().map(|(_, state)| state).unwrap_or_default()
-                } else { walked.fall })
-            }
+            Some(state) => Some(walk_block(body, arch, ranges[p].1, state, events, choices, None)?),
         };
         entries[p] = joined;
-        if exits[p] != exit { exits[p] = exit; work.extend(graph[p].iter().copied()); }
+        if exits[p] != exit { exits[p] = exit; work.extend(succs[p].iter().copied()); }
     }
     Ok(entries)
 }

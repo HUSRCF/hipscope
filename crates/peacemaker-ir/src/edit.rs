@@ -843,6 +843,13 @@ impl Flow {
 
     /// Must-defined (in, out) per position from the entry seed.
     fn defined(&self, seed: Bits) -> (Vec<Bits>, Vec<Bits>) {
+        let coarse = self.defined_on(seed, &self.succ, &self.pred);
+        // Must-defined without guard correlation is conservative. Refine only
+        // when a consumer lacks a definition, not merely because guards exist.
+        if (self.predicates.len() == 1 && self.predicates[0].is_empty())
+            || self.acc.iter().zip(&coarse.0).all(|(acc, inn)| acc.reads.minus(inn).is_empty()) {
+            return coarse;
+        }
         let mut joined_in = vec![Bits::FULL; self.n];
         let mut joined_out = vec![Bits::FULL; self.n];
         for choices in &self.predicates {
@@ -2266,6 +2273,22 @@ mod tests {
         assert!(run(true, false, false).iter().any(|o| o.kind == ObligationKind::Definedness));
         assert!(run(false, true, false).iter().any(|o| o.rule_id == "wait-raw-ds-load"));
         assert!(run(false, false, true).iter().any(|o| o.kind == ObligationKind::Definedness));
+    }
+
+    #[test]
+    fn immutable_guard_definedness_survives_a_long_instruction_chain() {
+        let mut items = vec![I(smov(s(32), s(0))), I(mk("s_cmp_ge_u32", vec![s(32), int(2)])),
+            B("s_cbranch_scc1", "skip_def"), I(vmov(150, int(1))), L("skip_def")];
+        items.extend((0..40_000).map(|_| I(nop())));
+        items.extend([I(mk("s_cmp_ge_u32", vec![s(32), int(2)])),
+            B("s_cbranch_scc1", "done"), I(vadd(151, 150, 150)), L("done"), I(endpgm())]);
+        let program = program_of(body_of(items));
+        let kernel = &program.kernels[0];
+        let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+        let (defined, _) = flow.defined(entry_seed(kernel, ARCH).unwrap());
+        let consumer = kernel.body.layout.len() - 2;
+        assert!(flow.acc[consumer].reads.minus(&defined[consumer]).is_empty(),
+            "both reaching immutable-guard outcomes must retain the guarded definition");
     }
 
     #[test]
