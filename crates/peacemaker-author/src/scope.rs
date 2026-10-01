@@ -34,7 +34,6 @@ use crate::wait::{Drained, Event, LdsWrite, Pending, Pendings};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 
 /// The scalar condition code.
 pub enum Scc {}
@@ -150,7 +149,7 @@ carried_tuple!(A, B, C, D, E, F, G, H);
 pub struct Wave<'b, T: Target, B: Backend> {
     b: &'b mut B,
     auth: Auth,
-    wave_exit: Rc<Cell<bool>>,
+    wave_exit: Cell<bool>,
     _t: PhantomData<T>,
 }
 
@@ -386,8 +385,10 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
             // first run whose loop-head state has not yet been joined.
             x.exits.borrow_mut().clear();
             x.recording.set(true);
-            let mut w = Wave { b, auth: auth.reenter(), wave_exit: self.wave_exit.clone(), _t: PhantomData };
-            body(&mut w, &x)?;
+            let mut w = Wave { b, auth: auth.reenter(), wave_exit: Cell::new(self.wave_exit.get()), _t: PhantomData };
+            let out = body(&mut w, &x);
+            self.wave_exit.set(w.wave_exit.get());
+            out?;
             x.recording.set(false);
             w.b.branch(&w.auth, head)
         };
@@ -453,7 +454,7 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         }
         let auth = Auth::mint();
         b.seal(&auth)?;
-        Ok(Self { wave: Wave { b, auth, wave_exit: Rc::new(Cell::new(false)), _t: PhantomData } })
+        Ok(Self { wave: Wave { b, auth, wave_exit: Cell::new(false), _t: PhantomData } })
     }
     /// Declare one LDS region (one backend slot; ids follow declaration order).
     pub fn lds<R: 'static>(&mut self, name: &str, base: u32, len: u32) -> Result<LdsRegion<R, Free>, String> {
@@ -595,8 +596,10 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
                 Some(s) => s,
                 None => last.borrow().as_ref().ok_or("loop re-emitted before its first emission finished")?.respawn(&Token),
             };
-            let mut wg = Workgroup { wave: Wave { b, auth: auth.reenter(), wave_exit: self.wave.wave_exit.clone(), _t: PhantomData } };
-            let (out, back) = body(&mut wg, s)?;
+            let mut wg = Workgroup { wave: Wave { b, auth: auth.reenter(), wave_exit: Cell::new(self.wave.wave_exit.get()), _t: PhantomData } };
+            let out = body(&mut wg, s);
+            self.wave.wave_exit.set(wg.wave.wave_exit.get());
+            let (out, back) = out?;
             fresh(wg.wave.b, back.at)?;
             wg.wave.b.branch_scc1(&wg.wave.auth, head)?;
             // The backend keeps the last run's code: carry its state out.
