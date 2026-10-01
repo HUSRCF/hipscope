@@ -1325,6 +1325,201 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
     if (lane == 0) gates[(size_t)row * branches + wave] = sum;
 }
+
+// H4 read side: hyper_norm_gate_f32's exact norm + BF16 gate projection of the
+// streams, plus the normalized row for the HC down projection, in ONE launch,
+// so the paired HC write consumes `gate_logits` instead of re-reading the
+// streams (the streams cannot change between a read and its paired write).
+// Same arithmetic as hyper_norm_gate_f32 (gate projection reads the BF16 LDS
+// row, never an F16-rounded value).  The gate projection is run by waves 0..3
+// with hyper_norm_gate_f32's text; waves 4..7 store the BF16 LDS row.  The two
+// entries differ only in WHICH row copy waves 4..7 store, because adding the
+// second store loop to one kernel changes the gate projection's instruction
+// schedule and with it the sign of a NaN gate when the row mixes NaN signs
+// (the fuzz in fn-wmo/h4 gates this; keep the entries separate):
+//   hyper_norm_gate_outputs      : normalized16 (RNE F16, the F16 WMMA down input)
+//   hyper_norm_gate_outputs_f32  : normalized32 (BF16-rounded value as F32)
+// Both: inv4[row*4+branch] = the branch inverse RMS before normalization
+// (optional), gate_logits[row*4 + branch] always.  The other row pointer is
+// ignored.  Any optional output may be null.
+// Grid [rows], block 256, dynamic LDS (hidden * 8 + 4 * 256 * 4) bytes.
+// Requires four branches, hidden % 256 == 0 and hidden <= 2560.
+template <bool F32OUT>
+static __device__ __forceinline__ void hyper_norm_gate_outputs_body(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* gate_logits,
+    _Float16* normalized16,
+    float* normalized32,
+    float* inv4,
+    int hidden,
+    int state_bf16) {
+    constexpr int branches = 4;
+    constexpr int U = 10;
+    extern __shared__ float hc_lds[];
+    const int wide = branches * hidden;
+    const int per = hidden / 256;
+    unsigned short* xsb = (unsigned short*)hc_lds;
+    float* rms_sum = hc_lds + wide / 2;
+    const int row = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const size_t in = (size_t)row * wide;
+    float raw[branches][U];
+    if (state_bf16) {
+        const uint4* s = (const uint4*)((const unsigned short*)input + in);
+        for (int v = tid; v < wide / 8; v += 256) ((uint4*)xsb)[v] = s[v];
+        __syncthreads();
+#pragma unroll
+        for (int b = 0; b < branches; ++b)
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = u < per
+                    ? __uint_as_float((unsigned int)xsb[b * hidden + tid + 256 * u] << 16)
+                    : 0.0f;
+    } else {
+        const float* s = (const float*)input + in;
+#pragma unroll
+        for (int b = 0; b < branches; ++b)
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = u < per ? s[b * hidden + tid + 256 * u] : 0.0f;
+    }
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            raw[b][u] = bf16_to_f32(bf16_round(raw[b][u]));
+            if (u < per) partial += raw[b][u] * raw[b][u];
+        }
+        rms_sum[b * 256 + tid] = partial;
+    }
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int b = 0; b < branches; ++b)
+                rms_sum[b * 256 + tid] += rms_sum[b * 256 + tid + stride];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = b * hidden + tid + 256 * u;
+            if (u < per)
+                xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
+                    raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+        }
+    }
+    __syncthreads();
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    if (wave >= branches) {
+        // Waves 4..7 (idle in the gate projection) store the BF16 LDS row; the
+        // projection below, run by waves 0..3, is hyper_norm_gate_f32's text.
+        const int t2 = tid - branches * 32;
+        if (inv4 && t2 < branches)
+            inv4[(size_t)row * branches + t2] =
+                rsqrtf(rms_sum[t2 * 256] / (float)hidden + 1.0e-6f);
+        if constexpr (!F32OUT) if (normalized16) {
+            for (int v = t2; v < wide / 8; v += 4 * 32) {
+                const uint4 xv = ((const uint4*)xsb)[v];
+                typedef _Float16 half8v __attribute__((ext_vector_type(8)));
+                half8v h;
+                h[0] = (_Float16)__uint_as_float(xv.x << 16);
+                h[1] = (_Float16)__uint_as_float(xv.x & 0xFFFF0000u);
+                h[2] = (_Float16)__uint_as_float(xv.y << 16);
+                h[3] = (_Float16)__uint_as_float(xv.y & 0xFFFF0000u);
+                h[4] = (_Float16)__uint_as_float(xv.z << 16);
+                h[5] = (_Float16)__uint_as_float(xv.z & 0xFFFF0000u);
+                h[6] = (_Float16)__uint_as_float(xv.w << 16);
+                h[7] = (_Float16)__uint_as_float(xv.w & 0xFFFF0000u);
+                ((half8v*)(normalized16 + in))[v] = h;
+            }
+        }
+        if constexpr (F32OUT) if (normalized32) {
+            for (int v = t2; v < wide / 8; v += 4 * 32) {
+                const uint4 xv = ((const uint4*)xsb)[v];
+                float4* o = (float4*)(normalized32 + in) + 2 * v;
+                o[0] = make_float4(__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u),
+                                   __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u));
+                o[1] = make_float4(__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u),
+                                   __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u));
+            }
+        }
+        return;
+    }
+    const unsigned short* w_row = gate_weight + (size_t)wave * wide;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    constexpr int BATCH = 10;
+    int i = lane * 8;
+    for (; i + 8 + (BATCH - 1) * 256 <= wide; i += BATCH * 256) {
+        uint4 wb[BATCH];
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) wb[u] = *(const uint4*)(w_row + i + u * 256);
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const uint4 wv = wb[u];
+            const uint4 xv = *(const uint4*)(xsb + i + u * 256);
+            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+            a0 += __uint_as_float(wv.x << 16) * xa.x;
+            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+            a2 += __uint_as_float(wv.y << 16) * xa.z;
+            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+            a0 += __uint_as_float(wv.z << 16) * xb.x;
+            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+            a2 += __uint_as_float(wv.w << 16) * xb.z;
+            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+        }
+    }
+    for (; i + 8 <= wide; i += 32 * 8) {
+        const uint4 wv = *(const uint4*)(w_row + i);
+        const uint4 xv = *(const uint4*)(xsb + i);
+        const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+        const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+        a0 += __uint_as_float(wv.x << 16) * xa.x;
+        a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+        a2 += __uint_as_float(wv.y << 16) * xa.z;
+        a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+        a0 += __uint_as_float(wv.z << 16) * xb.x;
+        a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+        a2 += __uint_as_float(wv.w << 16) * xb.z;
+        a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+    }
+    const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) gate_logits[(size_t)row * branches + wave] = sum;
+}
+extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_outputs(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* gate_logits,
+    _Float16* normalized16,
+    float* normalized32,
+    float* inv4,
+    int hidden,
+    int state_bf16) {
+    hyper_norm_gate_outputs_body<false>(input, norm_weight, gate_weight, gate_logits,
+                                        normalized16, normalized32, inv4, hidden, state_bf16);
+}
+extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_outputs_f32(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* gate_logits,
+    _Float16* normalized16,
+    float* normalized32,
+    float* inv4,
+    int hidden,
+    int state_bf16) {
+    hyper_norm_gate_outputs_body<true>(input, norm_weight, gate_weight, gate_logits,
+                                       normalized16, normalized32, inv4, hidden, state_bf16);
+}
 // HC read tail on gfx1151: the BF16 [wide, low_rank] up projection
 // (gemm_bf16_xf32_multirow's per-thread route, 256 < low_rank <= 512) fused
 // with hyper_read_projected_f32, so the projected gate logits never reach

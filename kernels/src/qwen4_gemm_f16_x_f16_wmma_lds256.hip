@@ -618,6 +618,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
@@ -626,6 +627,126 @@ typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 #define EPI_GELU    2
 #define EPI_ADDIN   4
 #define EPI_GATED   8
+// EPI_HC_SD (64): shared-down fold + HC write.  Y[b, m] (F32, may be null) is an
+// optional mirror of the GEMM output; R is the routed residual [B, M] F32 (updated
+// in place with the scaled-add result when hc_write_routed), Gate is the per-token
+// selector [B] (NOT [M]), and the four streams of token b are updated in place
+// with the hyper write.  Alone (no other EPI bit); requires has_bias == 0, M % 8 == 0.
+#define EPI_HC_SD   64
+
+#ifndef HCW_EPILOGUE_BLOCK
+#define HCW_EPILOGUE_BLOCK
+// ---------------------------------------------------------------------------
+// H4 HC-write epilogue: the producer's own output stage applies
+// hyper_write_bf16x2 / hyper_write_f32's expression to the streams in place.
+// Stage 1 (per accumulator lane, tokens x 8 channels): the GEMM output as the
+// unfused kernel stores it (0.0f + acc) is rounded to BF16 bits and parked in
+// LDS (the unfused HC write rounds it to BF16 before use, so nothing is lost);
+// an optional F32 mirror gets the unrounded value.  Stage 2 (accumulators
+// dead): each item = (token t, channels c0..c0+7) reads the four stream
+// columns br*H + c0.. of token t (old values), applies the four gates (the
+// paired read's hyper_norm_gate_outputs logits through the same expression as
+// hyper_write_bf16x2) and overwrites them; one item owns its columns.
+// Requires H % 8 == 0 (the caller's M).  Keep byte-identical across the files
+// carrying this block (gfx11 bt, gfx12 bt, lds256).
+// ---------------------------------------------------------------------------
+static __device__ __forceinline__ float hcw_bf16f(float v) {
+    return static_cast<float>(static_cast<hip_bfloat16>(v));
+}
+static __device__ __forceinline__ unsigned int hcw_bf16bits(float v) {
+    return (unsigned int)static_cast<hip_bfloat16>(v).data;
+}
+// NaN propagation is operand-order dependent (the first NaN source wins) and the
+// compiler commutes fadd/fmul freely, so the two products/sums below are pinned to
+// the operand order hyper_write_bf16x2 (stream + injection) and hyper_write_f32
+// (injection + stream) compile to; gate * mixed is gate-first in both.
+static __device__ __forceinline__ float hcw_mul(float a, float b) {
+    float r;
+    asm("v_mul_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+static __device__ __forceinline__ float hcw_add(float a, float b) {
+    float r;
+    asm("v_add_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+static __device__ __forceinline__ float hcw_gate(float logit) {
+    const float gate_logit = hcw_bf16f(logit);
+    const float gate_scaled = hcw_bf16f(gate_logit / 4.0f);
+    return hcw_bf16f(2.0f * hcw_bf16f(1.0f / (1.0f + expf(-gate_scaled))));
+}
+// BF16 bits of (0.0f + r[i]), element i in half (i & 1) of word (i >> 1).
+static __device__ __forceinline__ uint4 hcw_pack8(const float (&r)[8]) {
+    unsigned int w[4];
+#pragma unroll
+    for (int p = 0; p < 4; p++)
+        w[p] = hcw_bf16bits(0.0f + r[2 * p]) | (hcw_bf16bits(0.0f + r[2 * p + 1]) << 16);
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+static __device__ __forceinline__ void hcw_mirror8(const float (&r)[8], int t, int c0, int H,
+                                                   float* mirror) {
+    float* o = mirror + (long long)t * H + c0;
+    *(float4*)o = make_float4(0.0f + r[0], 0.0f + r[1], 0.0f + r[2], 0.0f + r[3]);
+    *(float4*)(o + 4) = make_float4(0.0f + r[4], 0.0f + r[5], 0.0f + r[6], 0.0f + r[7]);
+}
+static __device__ __forceinline__ void hcw_apply8(const uint4 mq, int t, int c0, int H,
+                                                  void* streams, const float* gates,
+                                                  int bf16_state) {
+    const float4 gv = *(const float4*)(gates + (long long)t * 4);
+    // All four stream runs are requested before any arithmetic consumes them.
+    uint4 sw[4];
+    float4 sf[4][2];
+    if (bf16_state) {
+        const unsigned short* base = (const unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) sw[br] = *(const uint4*)(base + (long long)br * H);
+    } else {
+        const float* base = (const float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            sf[br][0] = *(const float4*)(base + (long long)br * H);
+            sf[br][1] = *(const float4*)(base + (long long)br * H + 4);
+        }
+    }
+    const unsigned int mw[4] = {mq.x, mq.y, mq.z, mq.w};
+    float mr[8];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        mr[2 * p] = __uint_as_float(mw[p] << 16);
+        mr[2 * p + 1] = __uint_as_float(mw[p] & 0xFFFF0000u);
+    }
+    const float g[4] = {hcw_gate(gv.x), hcw_gate(gv.y), hcw_gate(gv.z), hcw_gate(gv.w)};
+    if (bf16_state) {
+        unsigned short* base = (unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const unsigned int in[4] = {sw[br].x, sw[br].y, sw[br].z, sw[br].w};
+            unsigned int out[4];
+#pragma unroll
+            for (int p = 0; p < 4; p++) {
+                const float lo = hcw_add(__uint_as_float(in[p] << 16), hcw_bf16f(hcw_mul(g[br], mr[2 * p])));
+                const float hi = hcw_add(__uint_as_float(in[p] & 0xFFFF0000u), hcw_bf16f(hcw_mul(g[br], mr[2 * p + 1])));
+                out[p] = hcw_bf16bits(lo) | (hcw_bf16bits(hi) << 16);
+            }
+            *(uint4*)(base + (long long)br * H) = make_uint4(out[0], out[1], out[2], out[3]);
+        }
+    } else {
+        float* base = (float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const float v[8] = {sf[br][0].x, sf[br][0].y, sf[br][0].z, sf[br][0].w,
+                                sf[br][1].x, sf[br][1].y, sf[br][1].z, sf[br][1].w};
+            float o[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                o[i] = hcw_bf16f(hcw_add(hcw_bf16f(hcw_mul(g[br], mr[i])), hcw_bf16f(v[i])));
+            *(float4*)(base + (long long)br * H) = make_float4(o[0], o[1], o[2], o[3]);
+            *(float4*)(base + (long long)br * H + 4) = make_float4(o[4], o[5], o[6], o[7]);
+        }
+    }
+}
+#endif  // HCW_EPILOGUE_BLOCK
+
 
 // COALESCED EPILOGUE (CST)
 // ------------------------
@@ -805,7 +926,12 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
     // K-loop accesses are address-space-disambiguated LDS.
     _Float16* a_lds,                // [KT][BM][16]
     _Float16* x_lds,                // [KT][BN][16]
-    float*    stage                 // CST only: aliases a_lds/x_lds, dead by now
+    float*    stage,                // CST only: aliases a_lds/x_lds, dead by now
+    // EPI_HC_SD only
+    void* hc_streams = nullptr,
+    const float* hc_gates = nullptr,
+    int hc_bf16 = 0,
+    int hc_write_routed = 0
 ) {
     constexpr int KT     = KS / 16;             // WMMA k-substeps per stage
     constexpr int WROWS  = 16 * WP;             // M rows per wave
@@ -949,6 +1075,85 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
 
             WLDS_BARRIER();
         }
+    }
+
+    if constexpr (EPI & EPI_HC_SD) {
+        // Stage 1 (per 16-token column slab j of this wave's patch): park the BF16
+        // bits of `acc + 0.0f` (the F32 GEMM output the unfused kernel stores;
+        // bf16_scaled_add rounds it to BF16 before use) in this wave's private LDS
+        // slab, [token][row] with row pitch WROWS + 8.  Stage 2: items = (token,
+        // 8 channels): the scaled-add fold into the routed residual, then the HC
+        // write of the four streams, as in the unfused bf16_scaled_add_batched_f32
+        // -> hyper_write_* pair.  The slab lives in the dead K staging buffer.
+        constexpr int SLAB = WROWS + 8;
+        constexpr int CHUNKS = WROWS / 8;
+        static_assert(WAVE_M * WAVE_N * 16 * SLAB * 2 <= WLDS_KSTAGE_BYTES(BM, BN, KS),
+                      "the HC slabs must fit inside the K staging buffer");
+        static_assert((16 * CHUNKS) % 32 == 0, "slab items must tile by the wave");
+        unsigned short* slab = (unsigned short*)stage + wave_id * 16 * SLAB;
+        const int hc_half = lane >> 4;
+        #pragma unroll 1
+        for (int j = 0; j < WQ; j++) {
+            WLDS_BARRIER();  // the K loop's reads / the previous slab's reads are done
+            const int out_b = n_wave + j * 16 + ml;
+            #pragma unroll
+            for (int i = 0; i < WP; i++) {
+                // acc[] must stay in registers: pick column j by constant index.
+                float8_t v = acc[i * WQ];
+                #pragma unroll
+                for (int jj = 1; jj < WQ; jj++) {
+                    if (jj == j) {
+                        v = acc[i * WQ + jj];
+                    }
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const float o = v[e] + 0.0f;
+                    const int row = i * 16 + 2 * e + hc_half;
+                    if (Y != nullptr && out_b < B && m_wave + row < M) {
+                        ((float*)Y)[(long long)out_b * M + m_wave + row] = o;
+                    }
+                    slab[ml * SLAB + row] = (unsigned short)hcw_bf16bits(o);
+                }
+            }
+            WLDS_BARRIER();
+            #pragma unroll
+            for (int it = lane; it < 16 * CHUNKS; it += 32) {
+                const int tok = it / CHUNKS;
+                const int chunk = it % CHUNKS;
+                const int t = n_wave + j * 16 + tok;
+                const int c0 = m_wave + chunk * 8;
+                if (t >= B || c0 >= M) {
+                    continue;
+                }
+                const uint4 rq = *(const uint4*)(slab + tok * SLAB + chunk * 8);
+                float* rp = (float*)R + (long long)t * M + c0;
+                const float4 l0 = *(const float4*)rp;
+                const float4 l1 = *(const float4*)(rp + 4);
+                const float lhs[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+                const float gate = hcw_bf16f(Gate[t]);
+                const unsigned int rw[4] = {rq.x, rq.y, rq.z, rq.w};
+                float res[8];
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const float r0 = __uint_as_float(rw[q] << 16);
+                    const float r1 = __uint_as_float(rw[q] & 0xFFFF0000u);
+                    res[2 * q] = hcw_bf16f(hcw_add(hcw_bf16f(lhs[2 * q]), hcw_bf16f(hcw_mul(r0, gate))));
+                    res[2 * q + 1] = hcw_bf16f(hcw_add(hcw_bf16f(lhs[2 * q + 1]), hcw_bf16f(hcw_mul(r1, gate))));
+                }
+                if (hc_write_routed) {
+                    *(float4*)rp = make_float4(res[0], res[1], res[2], res[3]);
+                    *(float4*)(rp + 4) = make_float4(res[4], res[5], res[6], res[7]);
+                }
+                const uint4 mq = make_uint4(
+                    hcw_bf16bits(res[0]) | (hcw_bf16bits(res[1]) << 16),
+                    hcw_bf16bits(res[2]) | (hcw_bf16bits(res[3]) << 16),
+                    hcw_bf16bits(res[4]) | (hcw_bf16bits(res[5]) << 16),
+                    hcw_bf16bits(res[6]) | (hcw_bf16bits(res[7]) << 16));
+                hcw_apply8(mq, t, c0, M, hc_streams, hc_gates, hc_bf16);
+            }
+        }
+        return;
     }
 
     // Epilogue. RDNA3 wave32 WMMA: acc[e] = C[2*e + (lane>>4)][lane & 15],
@@ -1199,3 +1404,32 @@ WLDS_EPI_SET(gemm_wmma_lds_128_256_32_64_k64_p, 128, 256, 2, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_128_128_32_64_k64_p, 128, 128, 2, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_256_256_64_64_k64_p, 256, 256, 4, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_128_256_64_64_k32_p, 128, 256, 4, 4, 32, false, true)
+
+// HC fold entries: `Y` is the optional F32 mirror, R/Gate as in EPI_HC_SD above.
+#define WLDS_KERNEL_HC(NAME, BM, BN, WP, WQ, KS, SWAPXY, PIPE)                 \
+    __launch_bounds__((BM / (16 * WP)) * (BN / (16 * WQ)) * 32, 1)             \
+    extern "C" __global__ void NAME(                                           \
+        const _Float16* __restrict__ A,                                        \
+        const _Float16* __restrict__ X,                                        \
+        void*                        Y,                                        \
+        int M, int K, int B,                                                   \
+        float* R, const float* Selector,                                       \
+        void* hc_streams, const float* hc_gates, int hc_bf16,                  \
+        int hc_write_routed, int lda, int ldx                                  \
+    ) {                                                                        \
+        __shared__ __align__(32) char lds_raw[WLDS_KSTAGE_BYTES(BM, BN, KS)];  \
+        _Float16* a_lds = (_Float16*)lds_raw;                                  \
+        _Float16* x_lds = a_lds + (KS / 16) * (BM) * 16;                       \
+        gemm_f16_wmma_lds_tile<BM, BN, WP, WQ, KS, SWAPXY, EPI_HC_SD, false,   \
+                               PIPE>(                                          \
+            A, X, Y, nullptr, M, K, B, 0, lda, ldx, nullptr, R, Selector,      \
+            a_lds, x_lds, (float*)lds_raw,                                     \
+            hc_streams, hc_gates, hc_bf16, hc_write_routed);                   \
+    }
+
+WLDS_KERNEL_HC(gemm_wmma_lds_256_256_64_64_k64_hcsd,   256, 256, 4, 4, 64, false, false)
+WLDS_KERNEL_HC(gemm_wmma_lds_256_256_64_64_k64_p_hcsd, 256, 256, 4, 4, 64, false, true)
+WLDS_KERNEL_HC(gemm_wmma_lds_128_256_32_64_k64_hcsd,   128, 256, 2, 4, 64, false, false)
+WLDS_KERNEL_HC(gemm_wmma_lds_128_256_32_64_k64_p_hcsd, 128, 256, 2, 4, 64, false, true)
+WLDS_KERNEL_HC(gemm_wmma_lds_128_128_32_64_k64_hcsd,   128, 128, 2, 4, 64, false, false)
+WLDS_KERNEL_HC(gemm_wmma_lds_128_128_32_64_k64_p_hcsd, 128, 128, 2, 4, 64, false, true)
