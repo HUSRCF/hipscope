@@ -30,6 +30,8 @@ cargo test -p rdna-compute --lib
 cargo test -p hipfire-cpu --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
+# peacemaker audit: lds_store_unwaited_at_barrier on committed code objects (no ROCm).
+cargo test -p hipfire-isa --features toolchain --lib audit::
 
 echo "== Python CPU tests =="
 # Explicit paths only: scripts/*_test.py includes torch+CUDA scripts.
