@@ -757,6 +757,7 @@ struct Flow {
     succ: Vec<SmallVec<[usize; 2]>>,
     pred: Vec<SmallVec<[usize; 2]>>,
     acc: Vec<Access>,
+    predicates: Vec<HashMap<InstId, bool>>,
 }
 
 fn label_of(inst: &Inst) -> Option<BlockId> {
@@ -795,7 +796,8 @@ impl Flow {
         for p in 0..n {
             for &s in succ[p].clone().iter() { pred[s].push(p); }
         }
-        Ok(Self { n, ids: body.layout.clone(), pos, block_of, succ, pred, acc })
+        Ok(Self { n, ids: body.layout.clone(), pos, block_of, succ, pred, acc,
+            predicates: passes::predicates::partitions(body, arch) })
     }
 
     /// Live-in per position. A VGPR write kills only lanes-alike reads: a
@@ -841,6 +843,32 @@ impl Flow {
 
     /// Must-defined (in, out) per position from the entry seed.
     fn defined(&self, seed: Bits) -> (Vec<Bits>, Vec<Bits>) {
+        let mut joined_in = vec![Bits::FULL; self.n];
+        let mut joined_out = vec![Bits::FULL; self.n];
+        for choices in &self.predicates {
+            let mut succ = self.succ.clone();
+            for (p, id) in self.ids.iter().enumerate() {
+                if let Some(&taken) = choices.get(id) {
+                    if succ[p].len() > 1 { succ[p].retain(|q| (*q != p + 1) == taken); }
+                }
+            }
+            let reachable = self.reach(&[0], &|_| false, &|p| succ[p].clone(), self.n);
+            let mut pred = vec![SmallVec::<[usize; 2]>::new(); self.n];
+            for p in 0..self.n {
+                if reachable[p] { for &q in &succ[p] { pred[q].push(p); } }
+            }
+            let (inn, out) = self.defined_on(seed, &succ, &pred);
+            for p in 0..self.n {
+                if reachable[p] {
+                    joined_in[p] = joined_in[p].inter(&inn[p]);
+                    joined_out[p] = joined_out[p].inter(&out[p]);
+                }
+            }
+        }
+        (joined_in, joined_out)
+    }
+
+    fn defined_on(&self, seed: Bits, succ: &[SmallVec<[usize; 2]>], pred: &[SmallVec<[usize; 2]>]) -> (Vec<Bits>, Vec<Bits>) {
         let mut def_in = vec![Bits::FULL; self.n];
         let mut def_out = vec![Bits::FULL; self.n];
         let mut work: Vec<usize> = (0..self.n).rev().collect();
@@ -848,12 +876,12 @@ impl Flow {
         while let Some(p) = work.pop() {
             queued[p] = false;
             let mut inn = if p == 0 { seed } else { Bits::FULL };
-            for &q in &self.pred[p] { inn = inn.inter(&def_out[q]); }
+            for &q in &pred[p] { inn = inn.inter(&def_out[q]); }
             let out = inn.union(&self.acc[p].writes);
             def_in[p] = inn;
             if out != def_out[p] {
                 def_out[p] = out;
-                for &s in &self.succ[p] { if !queued[s] { queued[s] = true; work.push(s); } }
+                for &s in &succ[p] { if !queued[s] { queued[s] = true; work.push(s); } }
             }
         }
         (def_in, def_out)
@@ -2219,6 +2247,50 @@ mod tests {
     }
 
     fn analyzed(items: Vec<It>) -> Analyzed<Program> { analyze(program_of(body_of(items)), &sym()).unwrap() }
+
+    #[test]
+    fn immutable_guards_correlate_definitions_and_waits_but_mutable_guards_do_not() {
+        let run = |mutate: bool, omit_wait: bool, omit_def: bool| {
+            let mut items = vec![I(smov(s(32), s(0))), I(mk("s_cmp_ge_u32", vec![s(32), int(2)])),
+                B("s_cbranch_scc1", "skip_def")];
+            if !omit_def { items.push(I(ds_load(150, 1))); }
+            items.push(L("skip_def"));
+            if mutate { items.push(I(smov(s(32), s(1)))); }
+            items.extend([I(mk("s_cmp_ge_u32", vec![s(32), int(2)])), B("s_cbranch_scc1", "done")]);
+            if !omit_wait { items.push(I(dscnt(0))); }
+            items.extend([I(vadd(151, 150, 150)), L("done"), I(endpgm())]);
+            let a = analyzed(items);
+            a.obligations.into_iter().filter(|o| o.insts == [a.program.kernels[0].body.layout[a.program.kernels[0].body.layout.len() - 2]]).collect::<Vec<_>>()
+        };
+        assert!(run(false, false, false).is_empty());
+        assert!(run(true, false, false).iter().any(|o| o.kind == ObligationKind::Definedness));
+        assert!(run(false, true, false).iter().any(|o| o.rule_id == "wait-raw-ds-load"));
+        assert!(run(false, false, true).iter().any(|o| o.kind == ObligationKind::Definedness));
+    }
+
+    #[test]
+    fn loop_carried_load_order_is_position_correct_at_a_join() {
+        for threshold in [1, 2] {
+            let a = analyzed(vec![I(gload(150, 0)), L("loop"), I(gload(151, 0)),
+                I(wait("s_wait_loadcnt", Counter::Load, threshold)), I(vadd(152, 150, 150)),
+                I(wait("s_wait_loadcnt", Counter::Load, 0)), I(gload(150, 0)),
+                I(mk("s_cmp_eq_u32", vec![s(0), int(0)])), B("s_cbranch_scc1", "loop"),
+                I(endpgm())]);
+            let consumer = a.program.kernels[0].body.layout[3];
+            assert_eq!(a.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
+                threshold == 2);
+        }
+    }
+
+    #[test]
+    fn unlike_join_sequences_do_not_count_mutually_exclusive_loads_as_younger() {
+        let a = analyzed(vec![I(mk("s_cmp_eq_u32", vec![s(0), int(0)])), B("s_cbranch_scc1", "other"),
+            I(gload(150, 0)), B("s_branch", "join"), L("other"),
+            I(gload(151, 0)), I(gload(152, 0)), L("join"),
+            I(wait("s_wait_loadcnt", Counter::Load, 1)), I(vadd(153, 150, 150)), I(endpgm())]);
+        let consumer = a.program.kernels[0].body.layout[a.program.kernels[0].body.layout.len() - 2];
+        assert!(a.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]));
+    }
 
     fn kt48_program() -> Program {
         let words: Vec<u32> = IMAGE[KT48_TEXT].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
