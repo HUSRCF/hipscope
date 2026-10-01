@@ -52,9 +52,10 @@ static QWEN4_QSA_SELECT_EXACT: std::sync::LazyLock<bool> = std::sync::LazyLock::
 const QSA_SELECT_EXACT_MAX_BLOCKS: usize = 2048;
 /// Budget blocks the exact selector's 512-entry merge bound covers.
 const QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS: usize = 512;
-/// Static LDS of the exact selector kernels
-/// (`indexed_attention_select_exact.hip`), beside the dynamic score row.
-const QSA_SELECT_EXACT_STATIC_LDS_BYTES: usize = 6 * 1024;
+/// Dynamic LDS floor of the exact selector kernels
+/// (`indexed_attention_select_exact.hip`), which keep no static LDS:
+/// 6144 B even in global-score mode, otherwise 4 B per live block.
+const QSA_SELECT_EXACT_DYNAMIC_LDS_FLOOR_BYTES: usize = 6 * 1024;
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -2980,19 +2981,26 @@ fn indexed_attention_select_batch_impl(
     } else {
         (serial_kernel, [1, 1, 1], 0)
     };
-    // `HIPFIRE_QWEN4_QSA_SELECT_EXACT`: the tile-sort selector replaces the
-    // incumbent parallel kernel (same ABI, grid, block and dynamic LDS) for
+    // `HIPFIRE_QWEN4_QSA_SELECT_EXACT`: the exact selector replaces the
+    // incumbent parallel kernel (same ABI, grid and block) for live
     // complete <= 2048 blocks and <= 512 budget blocks, never under a
-    // recorder or capture; every other launch is the incumbent's.
-    let launch_kernel = if *QWEN4_QSA_SELECT_EXACT
+    // recorder or capture; every other launch is the incumbent's.  The
+    // exact kernel keeps no static LDS and needs max(6144, live-score-row)
+    // bytes of dynamic LDS: the floor applies even in global-score mode,
+    // otherwise 4 B per live block.
+    let exact_dynamic_need = QSA_SELECT_EXACT_DYNAMIC_LDS_FLOOR_BYTES.max(if global {
+        0
+    } else {
+        p.block_count.saturating_mul(std::mem::size_of::<f32>())
+    });
+    let launch_exact = *QWEN4_QSA_SELECT_EXACT
         && kernel_name == parallel_kernel
         && p.block_count <= QSA_SELECT_EXACT_MAX_BLOCKS
         && p.budget_blocks <= QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS
-        && shared_mem as usize + QSA_SELECT_EXACT_STATIC_LDS_BYTES
-            <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+        && exact_dynamic_need <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
         && !gpu.replay.is_recording()
-        && !gpu.graphs.capture_mode
-    {
+        && !gpu.graphs.capture_mode;
+    let (launch_kernel, shared_mem) = if launch_exact {
         let exact = match p.pooled.dtype {
             DType::F32 => "indexed_attention_select_f32_batched_exact",
             _ => "indexed_attention_select_bf16_batched_exact",
@@ -3002,10 +3010,10 @@ fn indexed_attention_select_batch_impl(
             INDEXED_ATTENTION_SELECT_EXACT_SRC,
             exact,
         )?;
-        exact
+        (exact, exact_dynamic_need as u32)
     } else {
         gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
-        kernel_name
+        (kernel_name, shared_mem)
     };
     let mut args = KernargBlob::new();
     for tensor in [p.query, p.pooled, p.selected] {
