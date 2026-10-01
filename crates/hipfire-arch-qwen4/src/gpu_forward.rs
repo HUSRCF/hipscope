@@ -2651,8 +2651,10 @@ impl Qwen4GpuForward {
             //
             // Eligible only for a plain single-token continuation: the wide-hidden
             // capture is the speculative-verify shape and must never enter the tape.
-            let eligible =
-                n == 1 && wide_hidden_capture.is_none() && self.qsa_tap.is_none();
+            let eligible = n == 1
+                && wide_hidden_capture.is_none()
+                && self.qsa_tap.is_none()
+                && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
             gpu.replay.set_forward_eligible(eligible);
             // A manual shadow controller states the executor directly: one prepared
             // tape is compared across the exact-kernarg HIP oracle, the retained
@@ -2741,6 +2743,9 @@ impl Qwen4GpuForward {
             };
 
             if !routed {
+                // Parity harness only: a QSA projection hook counts slots from
+                // each forward's first QSA step (no-op with no hook installed).
+                hipfire_dispatch::pipeline::reset_qsa_projection_slot();
                 let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
                     execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
                         Qwen4GpuForwardError::Dispatch(format!(

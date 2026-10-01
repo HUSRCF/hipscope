@@ -841,3 +841,7 @@ required-features = ["lab"]
 [[example]]
 name = "bench_vit_attention_shapes"
 required-features = ["lab"]
+
+[[example]]
+name = "bench_qsa_indexed"
+required-features = ["lab"]

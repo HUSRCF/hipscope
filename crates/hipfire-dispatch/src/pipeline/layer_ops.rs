@@ -1772,6 +1772,51 @@ impl IndexedAttentionOp<'_> {
     }
 }
 
+/// Developer observer of the QSA reference harness: called with `(gpu, qsa
+/// slot, op)` right after a QSA step's projections, so the op's index / query
+/// + gate / K / V scratch holds the raw projected rows and the cache, pool
+/// and selection are still the step's pre-prologue state.
+pub type QsaProjectionHook =
+    Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String>>;
+
+thread_local! {
+    // Const-initialized `None`: no allocation, one thread-local read per QSA
+    // step while no harness installed a hook.
+    static QSA_PROJECTION_HOOK: std::cell::RefCell<Option<(usize, QsaProjectionHook)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) this thread's [`QsaProjectionHook`]; the slot counter
+/// restarts at 0.
+pub fn set_qsa_projection_hook(hook: Option<QsaProjectionHook>) {
+    QSA_PROJECTION_HOOK.with(|cell| *cell.borrow_mut() = hook.map(|hook| (0, hook)));
+}
+
+/// Whether this thread has a [`QsaProjectionHook`] installed.
+pub fn qsa_projection_hook_installed() -> bool {
+    QSA_PROJECTION_HOOK.with(|cell| cell.borrow().is_some())
+}
+
+/// Restart the hook's QSA slot counter (a forward's first QSA step is slot 0).
+pub fn reset_qsa_projection_slot() {
+    QSA_PROJECTION_HOOK.with(|cell| {
+        if let Some((slot, _)) = cell.borrow_mut().as_mut() {
+            *slot = 0;
+        }
+    });
+}
+
+fn qsa_projection_hook_run(gpu: &mut Gpu, op: &IndexedAttentionOp<'_>) -> Result<(), DispatchError> {
+    QSA_PROJECTION_HOOK.with(|cell| match cell.borrow_mut().as_mut() {
+        None => Ok(()),
+        Some((slot, hook)) => {
+            let index = *slot;
+            *slot += 1;
+            hook(gpu, index, op).map_err(DispatchError::Hip)
+        }
+    })
+}
+
 pub fn execute_indexed_attention(
     gpu: &mut Gpu,
     op: &IndexedAttentionOp<'_>,
@@ -1805,6 +1850,7 @@ pub fn execute_indexed_attention(
         _ => &all,
     };
     project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
+    qsa_projection_hook_run(gpu, op)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
         // Decode / few-row verify: the norms, RoPE, cache append and
