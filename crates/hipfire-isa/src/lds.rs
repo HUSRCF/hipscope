@@ -17,6 +17,27 @@ impl Lds {
  /// retired by a barrier) and no split barrier may be in flight; LDS bytes
  /// carry no typed meaning across the boundary. Slot ids restart at zero.
  pub fn relayout(&mut self)->Result<(),String>{if self.signalled{return Err("relayout with a split barrier in flight".into())}if let Some(s)=self.slots.iter().find(|s|s.state!=SlotState::Free){return Err(format!("{} is {:?} at relayout",s.name,s.state))}self.retired.append(&mut self.slots);Ok(())}
+ /// Join another control path's slot states into this point. Equal states
+ /// stay; a slot published on both paths and read on one is `Reading` (its
+ /// reads still need a barrier to retire); a slot stored on one path and
+ /// untouched on the other is `Publishing` (a typed region `Writing` on both:
+ /// the next barrier publishes whatever this and the other waves stored);
+ /// any other disagreement, or a different layout or barrier in flight, is
+ /// refused.
+ pub fn join(&mut self,other:&Lds)->Result<(),String>{
+  if self.signalled!=other.signalled||self.in_flight!=other.in_flight{return Err("paths join with different split barriers in flight".into())}
+  if self.slots.len()!=other.slots.len()||self.retired.len()!=other.retired.len(){return Err("paths join with different LDS layouts".into())}
+  for (mine,theirs) in self.slots.iter_mut().zip(&other.slots){
+   if (&mine.name,mine.base,mine.len)!=(&theirs.name,theirs.base,theirs.len){return Err("paths join with different LDS layouts".into())}
+   mine.state=match (mine.state,theirs.state){
+    (a,b) if a==b=>a,
+    (SlotState::Published|SlotState::Reading,SlotState::Published|SlotState::Reading)=>SlotState::Reading,
+    (SlotState::Free|SlotState::Publishing,SlotState::Free|SlotState::Publishing)=>SlotState::Publishing,
+    (a,b)=>return Err(format!("paths join with {} {a:?} on one and {b:?} on the other",mine.name)),
+   };
+  }
+  Ok(())
+ }
  /// Every slot of every layout, retired phases first (the proof record).
  pub fn all_slots(&self)->Vec<LdsSlot>{self.retired.iter().chain(&self.slots).cloned().collect()}
 }

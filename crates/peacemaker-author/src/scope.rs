@@ -1,11 +1,23 @@
 //! Execution scopes, condition handles and loops (design §4.6-§4.7).
 //!
 //! - `Workgroup`: workgroup-uniform control. Barriers, LDS layout,
-//!   `loop_carried` and `wg_skip_if` live here. It dereferences to `Wave`.
+//!   `loop_carried`, `wg_skip_if`, kernel exits and the wave-role `handoff`
+//!   live here. It dereferences to `Wave`.
 //! - `Wave`: one wave's program. LDS stores/loads, waits, raw ISA, and
-//!   wave-uniform scopes (`skip_if`, `exec_if`) whose bodies see only a
-//!   `Wave`, so a barrier under wave- or lane-dependent control does not
-//!   compile.
+//!   wave-uniform scopes (`skip_if`, `exec_if`, `if_else`, `loop_until`)
+//!   whose bodies see only a `Wave`, so a barrier under wave- or
+//!   lane-dependent control does not compile.
+//!
+//! A `Workgroup` owns its backend for one session (`backend::Auth`): the
+//! backend refuses a second `Workgroup::new`, so a wave scope cannot
+//! rebuild a workgroup scope from `Wave::isa`, and raw access through
+//! `isa` cannot reach the authorized LDS, barrier, branch and loop entry
+//! points.
+//!
+//! Every place two control paths meet (a skip target, an `if_else` join)
+//! joins the backend state of every path into it
+//! (`Backend::join`): waits and hazard guards hold on each path, and paths
+//! that disagree on LDS ownership are refused.
 //!
 //! Conditions are affine handles: `Uniform<Scc>` (wave-uniform, from any
 //! scalar compare) and `WgUniform<Scc>` (workgroup-uniform). A handle is
@@ -14,7 +26,7 @@
 //! byte identity), so the workgroup uniformity of a compare's operands is
 //! the caller's claim at `Workgroup::scmp_wg_uniform`, not a derivation.
 
-use crate::backend::{Backend, SlotTransition};
+use crate::backend::{Auth, Backend, SlotTransition};
 use crate::lds::{AllFree, LdsRegion, Lowering, Published, Ring, State, StoreTarget, Transitions, Free, Slots, Writing, ready};
 use crate::target::{SplitBarrier, Target, WaitModel};
 use crate::wait::{Drained, Event, LdsWrite, Pending, Pendings};
@@ -41,6 +53,19 @@ pub struct WgUniform<C> {
 /// The exit of a `Wave::loop_until` loop.
 pub struct LoopExit {
     label: String,
+}
+/// A kernel exit: its label followed by `s_endpgm`. `Workgroup::exit_if`
+/// branches to it; `Workgroup::end` places it, after which nothing more may
+/// be emitted, and the backend refuses to finish a kernel that never placed
+/// it.
+#[must_use = "a kernel exit must be placed with `Workgroup::end`"]
+pub struct End {
+    label: String,
+}
+impl End {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
 }
 fn fresh<B: Backend>(b: &B, at: usize) -> Result<(), String> {
     if b.position() != at {
@@ -116,6 +141,7 @@ carried_tuple!(A, B, C, D, E, F, G, H);
 /// One wave of a kernel on target `T`, lowered by backend `B`.
 pub struct Wave<'b, T: Target, B: Backend> {
     b: &'b mut B,
+    auth: Auth,
     _t: PhantomData<T>,
 }
 
@@ -144,7 +170,8 @@ pub struct Arrived<X> {
 
 impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
     /// The backend for raw instructions (ALU, VMEM, SMEM, crossbar). Its
-    /// LDS, barrier and loop entry points are sealed.
+    /// LDS, barrier, branch and loop entry points need an `Auth` this scope
+    /// never hands out, and a `Workgroup` cannot be rebuilt over it.
     pub fn isa(&mut self) -> &mut B {
         self.b
     }
@@ -155,7 +182,7 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
     }
     /// One LDS store into `x`; returns the writing state and its token.
     pub fn ds_store<X: StoreTarget<T::Waits>>(&mut self, x: X, insn: B::Insn) -> Result<X::Out, String> {
-        let e = self.b.ds_store(x.slots().ids(), insn)?;
+        let e = self.b.ds_store(&self.auth, x.slots().ids(), insn)?;
         Ok(x.stored(e))
     }
     /// One LDS store covering two regions (one instruction, two slots).
@@ -170,24 +197,24 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         let n = sx.ids().len() + sy.ids().len();
         ids[..sx.ids().len()].copy_from_slice(sx.ids());
         ids[sx.ids().len()..n].copy_from_slice(sy.ids());
-        let e = self.b.ds_store(&ids[..n], insn)?;
+        let e = self.b.ds_store(&self.auth, &ids[..n], insn)?;
         Ok((x.stored(e), y.stored(e)))
     }
     /// One LDS load from a published region. Its destination registers
     /// are awaited by the backend on first use.
     pub fn ds_load<R>(&mut self, r: &LdsRegion<R, Published>, insn: B::Insn) -> Result<(), String> {
-        self.b.ds_load(r.slots.ids(), insn)
+        self.b.ds_load(&self.auth, r.slots.ids(), insn)
     }
     /// One LDS load from a ring's current buffer.
     pub fn ds_load_cur<R, N: State>(&mut self, r: &Ring<R, Published, N>, insn: B::Insn) -> Result<(), String> {
         let slots: Slots = r.cur_slots().ok_or("read of a ring buffer no barrier has published")?;
-        self.b.ds_load(slots.ids(), insn)
+        self.b.ds_load(&self.auth, slots.ids(), insn)
     }
     /// Wait for a token's operations; emits the counter wait the backend
     /// still needs (none when an earlier wait retired them).
     pub fn wait<E: Event>(&mut self, p: Pending<T::Waits, E>) -> Result<Drained<E>, String> {
         if p.last.is_some_and(|e| self.b.lds_store_pending(e)) {
-            self.b.drain_lds_stores(<T::Waits as WaitModel>::LDS)?;
+            self.b.drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
         }
         Ok(Drained::new(p.last))
     }
@@ -197,17 +224,18 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         let b = &*self.b;
         p.each_event(&mut |e| pending |= b.lds_store_pending(e));
         if pending {
-            self.b.drain_lds_stores(<T::Waits as WaitModel>::LDS)?;
+            self.b.drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
         }
         Ok(p.drained())
     }
     /// A scalar compare (`s_cmp*`, `s_bitcmp*`): SCC is wave-uniform.
     pub fn scmp(&mut self, insn: B::Insn) -> Result<Uniform<Scc>, String> {
-        self.b.scalar_compare(insn)?;
+        self.b.scalar_compare(&self.auth, insn)?;
         Ok(Uniform { at: self.b.position(), _p: PhantomData })
     }
     /// Branch over `body` to `target` when `cond` holds. Both paths reach
-    /// `target` with `state`'s type; the body cannot reach a barrier.
+    /// `target` with `state`'s type, and the backend joins the branch
+    /// point's state into the body's; the body cannot reach a barrier.
     pub fn skip_if<S>(
         &mut self,
         cond: Uniform<Scc>,
@@ -216,9 +244,11 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         body: impl FnOnce(&mut Self, S) -> Result<S, String>,
     ) -> Result<S, String> {
         fresh(self.b, cond.at)?;
-        self.b.branch_scc1(target)?;
+        self.b.branch_scc1(&self.auth, target)?;
+        let skipped = self.b.fork();
         let state = body(self, state)?;
-        self.b.label(target)?;
+        self.b.join(&self.auth, skipped)?;
+        self.b.label(&self.auth, target)?;
         Ok(state)
     }
     /// Run `body` with EXEC = all lanes if `cond`, else none, then restore
@@ -226,9 +256,9 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
     /// through; the body cannot reach a barrier.
     pub fn exec_if<R>(&mut self, cond: Uniform<Scc>, body: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
         fresh(self.b, cond.at)?;
-        self.b.exec_from_scc()?;
+        self.b.exec_from_scc(&self.auth)?;
         let out = body(self)?;
-        self.b.exec_all()?;
+        self.b.exec_all(&self.auth)?;
         Ok(out)
     }
     /// A loop at `head` whose back edge is `s_branch head`; it is left only
@@ -242,24 +272,25 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         body: impl for<'x> Fn(&mut Wave<'x, T, B>, &LoopExit) -> Result<(), String>,
     ) -> Result<(), String> {
         let x = LoopExit { label: exit.into() };
+        let auth = &self.auth;
         let emit = |b: &mut B| -> Result<(), String> {
-            let mut w = Wave { b, _t: PhantomData };
+            let mut w = Wave { b, auth: auth.reenter(), _t: PhantomData };
             body(&mut w, &x)?;
-            w.b.branch(head)
+            w.b.branch(&w.auth, head)
         };
-        self.b.loop_(head, &emit)?;
-        self.b.label(exit)
+        self.b.loop_(&self.auth, head, &emit)?;
+        self.b.label(&self.auth, exit)
     }
     /// Leave the enclosing `loop_until` when `cond` holds.
     pub fn break_if(&mut self, cond: Uniform<Scc>, exit: &LoopExit) -> Result<(), String> {
         fresh(self.b, cond.at)?;
-        self.b.branch_scc1(&exit.label)
+        self.b.branch_scc1(&self.auth, &exit.label)
     }
     /// Two-way branch: when `cond` holds, jump to `else_label` and run
     /// `els` from the state of the branch point; otherwise run `then`,
     /// which ends with `s_branch join`. The caller places `join` right
-    /// after (the else arm falls through to it). Both arms must reach it
-    /// with the same wait state; neither can reach a barrier.
+    /// after (the else arm falls through to it). The backend joins the
+    /// arms' states there; neither arm can reach a barrier.
     pub fn if_else(
         &mut self,
         cond: Uniform<Scc>,
@@ -269,47 +300,46 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         els: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
         fresh(self.b, cond.at)?;
-        self.b.branch_scc1(else_label)?;
+        self.b.branch_scc1(&self.auth, else_label)?;
         let at = self.b.fork();
         then(self)?;
-        self.b.branch(join)?;
+        self.b.branch(&self.auth, join)?;
         let then_end = self.b.fork();
-        self.b.resume(at);
-        self.b.label(else_label)?;
+        self.b.resume(&self.auth, at)?;
+        self.b.label(&self.auth, else_label)?;
         els(self)?;
-        if !self.b.joins(&then_end) {
-            return Err(format!("both arms must reach {join} with the same wait state"));
-        }
-        Ok(())
+        self.b.join(&self.auth, then_end).map_err(|e| format!("the arms cannot join at {join}: {e}"))
     }
     /// A label (branch target) in straight-line code.
     pub fn label(&mut self, name: &str) -> Result<(), String> {
-        self.b.label(name)
+        self.b.label(&self.auth, name)
     }
 }
 
 impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
     /// Take ownership of a backend built for `T`. From here on the
-    /// backend's untyped LDS, barrier and loop entry points refuse.
+    /// backend's untyped LDS, barrier and loop entry points refuse, and so
+    /// does a second `Workgroup::new` over it.
     pub fn new(b: &'b mut B) -> Result<Self, String> {
         if b.arch_name() != T::NAME {
             return Err(format!("backend targets {}, kernel is typed for {}", b.arch_name(), T::NAME));
         }
-        b.seal();
-        Ok(Self { wave: Wave { b, _t: PhantomData } })
+        let auth = Auth::mint();
+        b.seal(&auth)?;
+        Ok(Self { wave: Wave { b, auth, _t: PhantomData } })
     }
     /// Declare one LDS region (one backend slot; ids follow declaration order).
     pub fn lds<R: 'static>(&mut self, name: &str, base: u32, len: u32) -> Result<LdsRegion<R, Free>, String> {
         if base.checked_add(len).is_none_or(|end| end > T::LDS_BYTES) {
             return Err(format!("LDS region {name} [{base}, +{len}) exceeds {} bytes on {}", T::LDS_BYTES, T::NAME));
         }
-        Ok(LdsRegion::new(Slots::one(self.wave.b.lds_slot(name, base, len)?), None))
+        Ok(LdsRegion::new(Slots::one(self.wave.b.lds_slot(&self.wave.auth, name, base, len)?), None))
     }
     /// End the slot layout so a later phase can carve its own. Takes every
     /// region (all `Free`); the backend refuses if any slot is still live.
     pub fn relayout<X: AllFree>(&mut self, regions: X) -> Result<(), String> {
         drop(regions);
-        self.wave.b.lds_relayout()
+        self.wave.b.lds_relayout(&self.wave.auth)
     }
     fn lower<X: Transitions>(x: &X) -> Result<Lowering, String> {
         let mut l = Lowering::new();
@@ -319,7 +349,7 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
     /// One workgroup barrier carrying the transitions `x`.
     pub fn barrier<X: Transitions>(&mut self, x: X) -> Result<X::After, String> {
         let l = Self::lower(&x)?;
-        self.wave.b.barrier(l.list())?;
+        self.wave.b.barrier(&self.wave.auth, l.list())?;
         Ok(x.after())
     }
     /// Split barrier, first half: this wave has arrived; its regions are
@@ -329,7 +359,7 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         T: SplitBarrier,
     {
         let l = Self::lower(&x)?;
-        self.wave.b.barrier_signal(l.list())?;
+        self.wave.b.barrier_signal(&self.wave.auth, l.list())?;
         Ok(Arrived { x })
     }
     /// Split barrier, second half.
@@ -337,18 +367,19 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
     where
         T: SplitBarrier,
     {
-        self.wave.b.barrier_wait()?;
+        self.wave.b.barrier_wait(&self.wave.auth)?;
         Ok(a.x.after())
     }
     /// A scalar compare whose operands the caller asserts are
     /// workgroup-uniform (kernel arguments, workgroup ids, constants and
     /// counters derived only from them).
     pub fn scmp_wg_uniform(&mut self, insn: B::Insn) -> Result<WgUniform<Scc>, String> {
-        self.wave.b.scalar_compare(insn)?;
+        self.wave.b.scalar_compare(&self.wave.auth, insn)?;
         Ok(WgUniform { at: self.wave.b.position(), _p: PhantomData })
     }
     /// Branch over `body` (which may hold barriers) to `target` when
-    /// `cond` holds; both paths reach `target` with `state`'s type.
+    /// `cond` holds; both paths reach `target` with `state`'s type, and the
+    /// backend joins the branch point's state into the body's.
     pub fn wg_skip_if<S>(
         &mut self,
         cond: WgUniform<Scc>,
@@ -357,23 +388,35 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         body: impl FnOnce(&mut Self, S) -> Result<S, String>,
     ) -> Result<S, String> {
         fresh(self.wave.b, cond.at)?;
-        self.wave.b.branch_scc1(target)?;
+        self.wave.b.branch_scc1(&self.wave.auth, target)?;
+        let skipped = self.wave.b.fork();
         let state = body(self, state)?;
-        self.wave.b.label(target)?;
+        self.wave.b.join(&self.wave.auth, skipped)?;
+        self.wave.b.label(&self.wave.auth, target)?;
         Ok(state)
     }
-    /// Leave the kernel (branch to its `end` label) when `cond` holds:
-    /// skipping every later barrier is legal only for the whole workgroup.
-    pub fn exit_if(&mut self, cond: WgUniform<Scc>, end: &str) -> Result<(), String> {
+    /// Reserve the kernel exit `label` (placed later by `end`).
+    pub fn exit(&mut self, label: &str) -> Result<End, String> {
+        self.wave.b.reserve_exit(&self.wave.auth, label)?;
+        Ok(End { label: label.into() })
+    }
+    /// Leave the kernel when `cond` holds: skipping every later barrier is
+    /// legal only for the whole workgroup, and only to the kernel's exit.
+    pub fn exit_if(&mut self, cond: WgUniform<Scc>, end: &End) -> Result<(), String> {
         fresh(self.wave.b, cond.at)?;
-        self.wave.b.branch_scc1(end)
+        self.wave.b.branch_scc1(&self.wave.auth, &end.label)
+    }
+    /// Place the kernel exit (`end:` then `s_endpgm`). Nothing may follow.
+    pub fn end(&mut self, end: End) -> Result<(), String> {
+        self.wave.b.end_program(&self.wave.auth, &end.label)
     }
     /// A loop at `head`: `body` receives the carried state and returns the
     /// same type plus the workgroup-uniform condition of its back edge
     /// (`s_cbranch_scc1 head`). Pending tokens and region states are part
     /// of `S`, so a store that reaches the loop head undrained, where a
     /// barrier needs `Drained`, is a type error. The backend still checks
-    /// the exact wait state reaches a fixed point.
+    /// the exact wait state reaches a fixed point; the loop's only exit is
+    /// the fall-through of its back edge.
     pub fn loop_carried<S: Carried>(
         &mut self,
         head: &str,
@@ -382,23 +425,24 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
     ) -> Result<S, String> {
         let input = RefCell::new(Some(state));
         let first: RefCell<Option<S>> = RefCell::new(None);
+        let auth = &self.wave.auth;
         let emit = |b: &mut B| -> Result<(), String> {
             let entry = input.borrow_mut().take();
             let s = match entry {
                 Some(s) => s,
                 None => first.borrow().as_ref().ok_or("loop re-emitted before its first emission finished")?.respawn(&Token),
             };
-            let mut wg = Workgroup { wave: Wave { b, _t: PhantomData } };
+            let mut wg = Workgroup { wave: Wave { b, auth: auth.reenter(), _t: PhantomData } };
             let (out, back) = body(&mut wg, s)?;
             fresh(wg.wave.b, back.at)?;
-            wg.wave.b.branch_scc1(head)?;
+            wg.wave.b.branch_scc1(&wg.wave.auth, head)?;
             let mut f = first.borrow_mut();
             if f.is_none() {
                 *f = Some(out);
             }
             Ok(())
         };
-        self.wave.b.loop_(head, &emit)?;
+        self.wave.b.loop_(&self.wave.auth, head, &emit)?;
         first.into_inner().ok_or_else(|| format!("loop {head} emitted no body"))
     }
     /// Wave-role LDS handoff. Waves where `readers` holds branch to
@@ -417,18 +461,18 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         write: impl FnOnce(&mut Wave<'_, T, B>, LdsRegion<R, Free>) -> Result<(LdsRegion<R, Writing>, Pending<T::Waits, LdsWrite<R>>), String>,
     ) -> Result<LdsRegion<R, Published>, String> {
         fresh(self.wave.b, readers.at)?;
-        self.wave.b.branch_scc1(reader_label)?;
+        self.wave.b.branch_scc1(&self.wave.auth, reader_label)?;
         let at = self.wave.b.fork();
         let slots = region.slots;
         let (written, pending) = write(&mut self.wave, region)?;
         let drained = self.wave.wait(pending)?;
         let _writers_leave = self.barrier((ready(written, drained),))?;
-        self.wave.b.branch(end)?;
-        self.wave.b.resume(at);
-        self.wave.b.label(reader_label)?;
-        self.wave.b.lds_peer_stores(slots.ids())?;
+        self.wave.b.branch(&self.wave.auth, end)?;
+        self.wave.b.resume(&self.wave.auth, at)?;
+        self.wave.b.label(&self.wave.auth, reader_label)?;
+        self.wave.b.lds_peer_stores(&self.wave.auth, slots.ids())?;
         let ts: Vec<SlotTransition> = slots.ids().iter().map(|&id| SlotTransition::Ready(id)).collect();
-        self.wave.b.barrier(&ts)?;
+        self.wave.b.barrier(&self.wave.auth, &ts)?;
         Ok(LdsRegion::new(slots, None))
     }
 }
