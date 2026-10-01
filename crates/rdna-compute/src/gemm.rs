@@ -28216,9 +28216,14 @@ impl Gpu {
         //
         // The allowlist is unchanged; only the tile shape and grid inside this
         // route change.  blockIdx.y is sixteen bits, so a wave may only cover
-        // a token tile while the row groups fit that limit.
+        // a token tile while the row groups (r16w4t) and token tiles (r16w4)
+        // fit that limit.  No other bound on the token count: past 2048
+        // tokens the four-row kernel is 2.0-2.6x slower per row on gfx1201
+        // while r16w4 keeps its rate through 8192 (2560 x 2560 at 4096:
+        // 11.40 vs 5.52 ms; 320 x 10240 at 8192: 13.22 vs 5.27 ms).
         let r16_shape = self.arch_caps.has_gfx11_plus_simt()
-            && (64..=2048).contains(&batch_size)
+            && batch_size >= 64
+            && batch_size.div_ceil(8) <= 0xffff
             && m.div_ceil(16) <= 0xffff
             && matches!(
                 (m, k),
@@ -40182,13 +40187,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
+        // From 1024 tokens BT12 beats the exact BT8/BT4 tiling whenever it
+        // still launches at least 256 waves, ragged last tile included
+        // (gfx1201, per-kernel event medians; BT8 -> BT12 at 2048 tokens:
+        // 10240 x 2560 2.91 -> 2.05 ms, 2560 x 6144 2.06 -> 1.04 ms,
+        // 512 x 2560 0.31 -> 0.21 ms).  Below that wave count (M = 48) or
+        // below 1024 tokens the exact-divisor order stays.
+        let bt12_waves = m.div_ceil(16) * batch_size.div_ceil(192);
+        let bt_b = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true)
         {
             if batch_size < 64 {
                 1
+            } else if batch_size >= 1024 && bt12_waves >= 256 {
+                12
             } else if batch_size % 192 == 0 {
                 12
             } else if batch_size % 128 == 0 {
@@ -40205,6 +40218,25 @@ impl Gpu {
         } else {
             1
         };
+        self.gemm_mq6g256v2_residual_wmma_gfx12_bt(a_raw, x, y, m, k, batch_size, bt_b)
+    }
+
+    /// [`Gpu::gemm_mq6g256v2_residual_wmma_gfx12`] with an explicit batch
+    /// tile: `bt_b` sixteen-token WMMA tiles per wave (4, 8 or 12), or 1 for
+    /// the base kernel.  Every tile runs each output's WMMA chain in the same
+    /// order, so the tile choice does not change a bit of `y`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_residual_wmma_gfx12_bt(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt_b: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt12",
@@ -40218,10 +40250,16 @@ impl Gpu {
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt4",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
             ),
-            _ => (
+            1 => (
                 "gemm_mq6g256v2_residual_wmma_gfx12",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC,
             ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!("gemm_mq6g256v2_residual_wmma_gfx12: no {bt_b}-tile kernel"),
+                ))
+            }
         };
         let module_v2 = format!("{}_mq5v2", kname);
         self.ensure_kernel(&module_v2, ksrc, kname)?;
@@ -45589,7 +45627,8 @@ mod tests {
 
     /// Every gfx1151 BF16 multirow route (R16 allowlist shapes and the
     /// four-row kernel, wide and scalar-tail K) must equal the batch-1 BF16
-    /// GEMV bit for bit, including partial token tiles (N = 131).
+    /// GEMV bit for bit, including partial token tiles (N = 131) and ragged
+    /// prefill chunks past 2048 tokens (r16w4 and r16w4t, 2049 and 4097).
     #[test]
     #[ignore = "requires a gfx11/gfx12 GPU and working HIP toolchain"]
     fn bf16_multirow_routes_are_bit_identical_to_gemv() {
@@ -45600,10 +45639,10 @@ mod tests {
                 return;
             }
         };
-        const N: usize = 131;
         for (m, k) in [
             (640usize, 2560usize),
             (512, 2560),
+            (2560, 2560),
             (320, 10240),
             (10240, 320),
             (2560, 640),
@@ -45620,36 +45659,42 @@ mod tests {
                 .expect("w upload");
             w.dtype = DType::BF16;
             w.shape = vec![m, k];
-            let x: Vec<f32> = (0..N * k)
-                .map(|i| ((i * 7919 % 3001) as f32 - 1500.0) / 977.0)
-                .collect();
-            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
-            let y = gpu.zeros(&[N * m], DType::F32).expect("y");
-            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, N)
-                .expect("multirow GEMM");
-            let y_ref = gpu.zeros(&[N * m], DType::F32).expect("y ref");
-            for n in 0..N {
-                gpu.gemv_bf16_xf32(
-                    &w,
-                    &x_gpu.sub_offset(n * k, k),
-                    &y_ref.sub_offset(n * m, m),
-                    m,
-                    k,
-                )
-                .expect("gemv row");
+            for n_rows in [131usize, 2049, 4097] {
+                let x: Vec<f32> = (0..n_rows * k)
+                    .map(|i| ((i * 7919 % 3001) as f32 - 1500.0) / 977.0)
+                    .collect();
+                let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+                let y = gpu.zeros(&[n_rows * m], DType::F32).expect("y");
+                gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, n_rows)
+                    .expect("multirow GEMM");
+                let y_ref = gpu.zeros(&[n_rows * m], DType::F32).expect("y ref");
+                for n in 0..n_rows {
+                    gpu.gemv_bf16_xf32(
+                        &w,
+                        &x_gpu.sub_offset(n * k, k),
+                        &y_ref.sub_offset(n * m, m),
+                        m,
+                        k,
+                    )
+                    .expect("gemv row");
+                }
+                let got = gpu.download_f32(&y).expect("y download");
+                let want = gpu.download_f32(&y_ref).expect("y ref download");
+                assert!(want.iter().any(|v| *v != 0.0));
+                let differing = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "({m},{k}) N={n_rows}: multirow GEMM differs from GEMV in {differing} cells"
+                );
+                for t in [x_gpu, y, y_ref] {
+                    gpu.free_tensor(t).expect("free");
+                }
             }
-            let got = gpu.download_f32(&y).expect("y download");
-            let want = gpu.download_f32(&y_ref).expect("y ref download");
-            assert!(want.iter().any(|v| *v != 0.0));
-            let differing = got
-                .iter()
-                .zip(&want)
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            assert_eq!(
-                differing, 0,
-                "({m},{k}): multirow GEMM differs from GEMV in {differing} cells"
-            );
+            gpu.free_tensor(w).expect("free w");
         }
     }
 
@@ -45918,6 +45963,72 @@ mod tests {
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         assert_eq!(differing, 0, "overwrite differs in {differing} cells");
+    }
+
+    /// Every gfx12 MQ6 residual batch tile (and the default tile choice) must
+    /// add the base kernel's bytes into a non-zero `Y` at ragged batches: a
+    /// row tail (M = 200), token tails inside the last 192-token tile, and
+    /// prefill chunk sizes that are not a multiple of 192 (2048, 2049).
+    #[test]
+    #[ignore = "requires a gfx12 WMMA GPU and working HIP toolchain"]
+    fn mq6_gfx12_residual_tiles_match_base_kernel() {
+        const M: usize = 200;
+        const K: usize = 512;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx12 WMMA");
+                return;
+            }
+        };
+        let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let mut weights = vec![0u8; M * K / 256 * group];
+        let mut state = 7u32;
+        for chunk in weights.chunks_mut(group) {
+            for byte in chunk.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let a = gpu
+            .upload_raw(&weights, &[weights.len()])
+            .expect("w upload");
+        for n in [131usize, 200, 383, 2048, 2049] {
+            let x: Vec<f32> = (0..n * K)
+                .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+            let y0: Vec<f32> = (0..n * M).map(|i| (i % 97) as f32 / 31.0 - 1.5).collect();
+            let run = |gpu: &mut Gpu, bt: Option<usize>| {
+                let y = gpu.upload_f32(&y0, &[y0.len()]).expect("y upload");
+                match bt {
+                    Some(bt) => gpu.gemm_mq6g256v2_residual_wmma_gfx12_bt(&a, &x_gpu, &y, M, K, n, bt),
+                    None => gpu.gemm_mq6g256v2_residual_wmma_gfx12(&a, &x_gpu, &y, M, K, n),
+                }
+                .expect("residual");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, Some(1));
+            assert!(want.iter().zip(&y0).any(|(w, y)| w != y));
+            for bt in [Some(4), Some(8), Some(12), None] {
+                let got = run(&mut gpu, bt);
+                let differing = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(g, w)| g.to_bits() != w.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "tile {bt:?} differs from the base kernel in {differing} cells at N={n}"
+                );
+            }
+            gpu.free_tensor(x_gpu).expect("free x");
+        }
     }
 }
 
