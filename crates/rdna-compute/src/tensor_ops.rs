@@ -28,6 +28,10 @@ const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
+const INDEXED_ATTENTION_PREFILL_PROLOGUE_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_prefill_prologue.hip");
+const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes QSA prefill attention chunks
 /// (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window dense route does
 /// not take through the gathered F16 WMMA kernels: gfx1151 on the F32 state,
@@ -36,6 +40,30 @@ const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
 /// keeps every launch of the incumbent route.  Read once.
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", false)
+});
+/// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
+/// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
+/// ranks; selected indices and mirror byte-identical) for complete <= 2048
+/// pooled blocks, outside recording and capture.  Unset or `0` keeps the
+/// incumbent selector.  Read once.
+static QWEN4_QSA_SELECT_EXACT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_EXACT", false)
+});
+/// Pooled blocks the exact selector handles; larger contexts keep the
+/// incumbent selector.
+const QSA_SELECT_EXACT_MAX_BLOCKS: usize = 2048;
+/// Budget blocks the exact selector's 512-entry merge bound covers.
+const QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS: usize = 512;
+/// Static LDS of the exact selector kernels
+/// (`indexed_attention_select_exact.hip`), beside the dynamic score row.
+const QSA_SELECT_EXACT_STATIC_LDS_BYTES: usize = 6 * 1024;
+/// `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE=1` runs the multi-row QSA prologue
+/// (norm + RoPE, source-cache append and index-key round trip) of prefill
+/// chunks in one launch instead of the separate norm / append launches
+/// (byte-identical outputs), outside recording and capture.  Unset or `0`
+/// keeps the separate launches.  Read once.
+static QWEN4_QSA_PREFILL_PROLOGUE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE", false)
 });
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
@@ -2262,6 +2290,36 @@ pub fn indexed_attention_decode_prologue(
     gpu: &mut Gpu,
     p: &IndexedAttentionDecodePrologue<'_>,
 ) -> HipResult<()> {
+    indexed_attention_prologue_impl(gpu, p, false)
+}
+
+/// Whether prefill chunks run [`indexed_attention_prefill_prologue`] instead
+/// of the separate norm / RoPE / append launches:
+/// `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE` set, and no recorder or capture (the
+/// prefill kernel declares no replay bindings).  With the flag unset every
+/// launch is the incumbent's.
+pub fn qsa_prefill_prologue_enabled(gpu: &Gpu) -> bool {
+    *QWEN4_QSA_PREFILL_PROLOGUE && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
+}
+
+/// The decode prologue's operations over arbitrary prefill rows
+/// (`kernels/src/indexed_attention_prefill_prologue.hip`): same fields,
+/// geometry and outputs as [`indexed_attention_decode_prologue`] (bitwise the
+/// separate launches), one block per index-Q / Q / K / index-K task per row.
+/// Eager only: it declares no replay position binding, so callers gate on
+/// [`qsa_prefill_prologue_enabled`].
+pub fn indexed_attention_prefill_prologue(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionDecodePrologue<'_>,
+) -> HipResult<()> {
+    indexed_attention_prologue_impl(gpu, p, true)
+}
+
+fn indexed_attention_prologue_impl(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionDecodePrologue<'_>,
+    prefill: bool,
+) -> HipResult<()> {
     for tensor in [p.index_row, p.qgate, p.keys, p.values] {
         ensure_f32(tensor)?;
     }
@@ -2304,11 +2362,26 @@ pub fn indexed_attention_decode_prologue(
         p.index_heads + p.heads + p.kv_heads + 1,
         "QSA prologue block count",
     )?;
-    let kernel = p.format.kernel([
-        "indexed_attention_decode_prologue_f32",
-        "indexed_attention_decode_prologue_fp8",
-    ]);
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let kernel = p.format.kernel(if prefill {
+        [
+            "indexed_attention_prefill_prologue_f32",
+            "indexed_attention_prefill_prologue_fp8",
+        ]
+    } else {
+        [
+            "indexed_attention_decode_prologue_f32",
+            "indexed_attention_decode_prologue_fp8",
+        ]
+    });
+    if prefill {
+        gpu.ensure_kernel_public(
+            "indexed_attention_prefill_prologue",
+            INDEXED_ATTENTION_PREFILL_PROLOGUE_SRC,
+            kernel,
+        )?;
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    }
     let mut args = KernargBlob::new();
     for tensor in [
         p.index_row,
@@ -2343,6 +2416,16 @@ pub fn indexed_attention_decode_prologue(
         offset: position_offset,
         addend: 0,
     }];
+    if prefill {
+        return gpu.launch_blob_recorded(
+            kernel,
+            [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        );
+    }
     gpu.launch_blob_recorded(
         kernel,
         [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
@@ -2962,7 +3045,33 @@ fn indexed_attention_select_batch_impl(
     } else {
         (serial_kernel, [1, 1, 1], 0)
     };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    // `HIPFIRE_QWEN4_QSA_SELECT_EXACT`: the tile-sort selector replaces the
+    // incumbent parallel kernel (same ABI, grid, block and dynamic LDS) for
+    // complete <= 2048 blocks and <= 512 budget blocks, never under a
+    // recorder or capture; every other launch is the incumbent's.
+    let launch_kernel = if *QWEN4_QSA_SELECT_EXACT
+        && kernel_name == parallel_kernel
+        && p.block_count <= QSA_SELECT_EXACT_MAX_BLOCKS
+        && p.budget_blocks <= QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS
+        && shared_mem as usize + QSA_SELECT_EXACT_STATIC_LDS_BYTES
+            <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+    {
+        let exact = match p.pooled.dtype {
+            DType::F32 => "indexed_attention_select_f32_batched_exact",
+            _ => "indexed_attention_select_bf16_batched_exact",
+        };
+        gpu.ensure_kernel_public(
+            "indexed_attention_select_exact",
+            INDEXED_ATTENTION_SELECT_EXACT_SRC,
+            exact,
+        )?;
+        exact
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+        kernel_name
+    };
     let mut args = KernargBlob::new();
     for tensor in [p.query, p.pooled, p.selected] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -3006,7 +3115,7 @@ fn indexed_attention_select_batch_impl(
         },
     ];
     gpu.launch_blob_recorded(
-        kernel_name,
+        launch_kernel,
         [row_grid, 1, 1],
         block,
         shared_mem,
@@ -3510,6 +3619,20 @@ pub fn indexed_attention_attention_batch(
     p: &IndexedAttentionAttentionBatch<'_>,
 ) -> HipResult<()> {
     indexed_attention_attention_batch_impl(gpu, p, true)
+}
+
+/// Developer-only exact reference for the QSA oracle: the same
+/// `IndexedAttentionAttentionBatch` through the per-head kernels
+/// (`allow_fast = false`), bypassing the grouped hg4 and dense/gathered WMMA
+/// routes. Not a production route; Unit0 harness only. Gated behind `lab`
+/// (or test) so production builds expose no new API.
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_attention_batch_exact(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_impl(gpu, p, false)
 }
 
 /// `allow_fast` admits the grouped hg4 kernel and the dense F16 WMMA route;

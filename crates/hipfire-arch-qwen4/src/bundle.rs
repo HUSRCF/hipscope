@@ -384,6 +384,26 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Install (or clear) the QSA projection hook of this thread's forward:
+    /// `(gpu, qsa_slot, op)` right after each QSA step's projections, i.e. on
+    /// the raw projected index row / query + gate / K / V rows before the
+    /// prologue (the step's cache and pool are still pre-step). Same contract
+    /// as [`Self::set_qsa_tap`]: a forward with a hook never records or replays a
+    /// retained body, and with none installed nothing runs or allocates.
+    #[cfg(feature = "reference-parity")]
+    pub fn set_qsa_projection_hook(
+        &mut self,
+        hook: Option<hipfire_dispatch::pipeline::QsaProjectionHook>,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 forward resources are not attached".to_string(),
+            ));
+        }
+        hipfire_dispatch::pipeline::set_qsa_projection_hook(hook);
+        Ok(())
+    }
+
     /// Rows the attached forward can process in one chunked call.  The MTP
     /// prefill uses this to batch a whole prompt chunk through the shared
     /// forward instead of one single-row forward per prompt token.

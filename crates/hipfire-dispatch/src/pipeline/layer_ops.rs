@@ -23,6 +23,7 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
+    indexed_attention_prefill_prologue, qsa_prefill_prologue_enabled,
     indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
@@ -1772,6 +1773,51 @@ impl IndexedAttentionOp<'_> {
     }
 }
 
+/// Developer observer of the QSA reference harness: called with `(gpu, qsa
+/// slot, op)` right after a QSA step's projections, so the op's index / query
+/// + gate / K / V scratch holds the raw projected rows and the cache, pool
+/// and selection are still the step's pre-prologue state.
+pub type QsaProjectionHook =
+    Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String>>;
+
+thread_local! {
+    // Const-initialized `None`: no allocation, one thread-local read per QSA
+    // step while no harness installed a hook.
+    static QSA_PROJECTION_HOOK: std::cell::RefCell<Option<(usize, QsaProjectionHook)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) this thread's [`QsaProjectionHook`]; the slot counter
+/// restarts at 0.
+pub fn set_qsa_projection_hook(hook: Option<QsaProjectionHook>) {
+    QSA_PROJECTION_HOOK.with(|cell| *cell.borrow_mut() = hook.map(|hook| (0, hook)));
+}
+
+/// Whether this thread has a [`QsaProjectionHook`] installed.
+pub fn qsa_projection_hook_installed() -> bool {
+    QSA_PROJECTION_HOOK.with(|cell| cell.borrow().is_some())
+}
+
+/// Restart the hook's QSA slot counter (a forward's first QSA step is slot 0).
+pub fn reset_qsa_projection_slot() {
+    QSA_PROJECTION_HOOK.with(|cell| {
+        if let Some((slot, _)) = cell.borrow_mut().as_mut() {
+            *slot = 0;
+        }
+    });
+}
+
+fn qsa_projection_hook_run(gpu: &mut Gpu, op: &IndexedAttentionOp<'_>) -> Result<(), DispatchError> {
+    QSA_PROJECTION_HOOK.with(|cell| match cell.borrow_mut().as_mut() {
+        None => Ok(()),
+        Some((slot, hook)) => {
+            let index = *slot;
+            *slot += 1;
+            hook(gpu, index, op).map_err(DispatchError::Hip)
+        }
+    })
+}
+
 pub fn execute_indexed_attention(
     gpu: &mut Gpu,
     op: &IndexedAttentionOp<'_>,
@@ -1805,11 +1851,40 @@ pub fn execute_indexed_attention(
         _ => &all,
     };
     project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
+    qsa_projection_hook_run(gpu, op)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
         // Decode / few-row verify: the norms, RoPE, cache append and
         // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
+            gpu,
+            &IndexedAttentionDecodePrologue {
+                index_row: &index_batch,
+                qgate: &qgate_batch,
+                keys: &k_batch,
+                values: &v_batch,
+                full_keys: op.state.full_keys,
+                full_values: op.state.full_values,
+                raw_index_keys: op.state.raw_index_keys,
+                index_q_norm: op.indexer_q_norm,
+                q_norm: op.q_norm,
+                k_norm: op.k_norm,
+                index_heads: op.index_heads,
+                index_dim: op.index_dim,
+                index_kv_width,
+                heads: op.heads,
+                kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                position: initial_position,
+                rows: op.rows,
+                format: op.state.format,
+            },
+        ))?;
+    } else if qsa_prefill_prologue_enabled(gpu) && op.index_dim <= 256 && op.head_dim <= 256 {
+        // `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE`: the same prologue as the
+        // decode launch above over every prefill row (outputs byte-identical to
+        // the separate launches below); eager only.
+        hip(indexed_attention_prefill_prologue(
             gpu,
             &IndexedAttentionDecodePrologue {
                 index_row: &index_batch,

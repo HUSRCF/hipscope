@@ -37,6 +37,8 @@ pub use layer_ops::{
     project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
     GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
     IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
+    qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
+    QsaProjectionHook,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,
