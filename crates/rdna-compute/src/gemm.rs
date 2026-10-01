@@ -44585,8 +44585,10 @@ pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<bool> =
 /// the incumbent.
 pub const QWEN4_MOE_SYM_IU4_MIN_ROWS: usize = QWEN4_F16_WMMA_MIN_TOKENS;
 const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
-const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151";
-const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151";
+/// Expert-run tile entries (four 16-slot tiles per weight stream, block 128);
+/// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
+const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
@@ -45043,7 +45045,7 @@ impl Gpu {
         self.qwen4_moe_sym_gemm(
             QWEN4_MOE_SYM_GATE_UP,
             [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
-            64,
+            128,
             [ptrs, tiles, sorted, y],
             xp,
             [m, k, x_row_div, grouped_rows, x_src_rows],
