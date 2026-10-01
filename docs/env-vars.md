@@ -296,6 +296,8 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` only from the automatic product defaults in `retained_redline_default`: `mq4r_redline_default` — exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic; no `arch_id` gate; `gfx1200` and all other arches remain opt-in); Qwen3.5 dense (`qwen3_5`, any weight format) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter (retained PM4; byte-identical to the HIP AR graph); and DeepSeek4 `.mq2r` AR on gfx1151. Existing LFM `.mq4` registry evidence is **not** automatically selected because it is not `.mq4r`; any usable non-default retained route is explicit opt-in and must still prove route support. The sealed LFM [`admissions.yml`](admissions.yml) row is registry evidence/admission only and does not wire runtime defaults. Runtime default ≠ Redline certification/registry admission. Built-in `hip` config profile, another explicit backend selection, `replay.backend = "hip"` or `=hip` disables the automatic default. |
 | `HIPFIRE_GFX1201_PM4_PACING` | NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape (`replay.gfx1201_pm4_pacing`): `auto` (default) = one 64-body-dword `NOP` after every `DISPATCH_DIRECT`; `off`/`0` = unpaced tape; `nop:N` = N-body-dword NOP. Applied only when the Redline default admits exact gfx1201 + `qwen3_5` (not MQ4R, not MoE, not gfx11). NOPs write no register or memory, so decode is byte-identical |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
+| `HIPFIRE_UNSAFE_WSL_REDLINE` | **Unsafe until certified.** `replay.unsafe_wsl_redline`, default off. Under WSL2/ROCDXG (`/dev/dxg` present, `/dev/kfd` absent) the retained Redline PM4 default falls back to the HIP graph with one `[redline] retained default refused` log line, and an explicit `replay.backend = "redline"`/`"shadow"` makes the daemon exit at startup. `1` lifts both. No effect on native Linux; native Windows (no ROCr) stays refused. |
+| `HIPFIRE_UNSAFE_WSL_VMM_KV` | **Unsafe until certified.** `memory.unsafe_wsl_vmm_kv`, default off. Under WSL2/ROCDXG automatic KV selects `legacy` (reason in `kv_backend_reason`) and an explicit `kv_backend = "vmm"` is refused, because WDDM VA growth may alias earlier KV segments as it does on native Windows. `1` lifts it. Native Windows stays legacy-only. |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
 | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the daemon emits one post-generate retained-route proof marker per successful request: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n> request_id=<id> replays=<count>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
@@ -445,7 +447,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1355
+**Count:** 1357
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1586,7 +1588,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REDLINE_QUEUE_TIMEOUT` | crates/redline-rocr/src/runtime.rs | developer |
 | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh | harness |
-| `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | stable |
+| `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs | stable |
 | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE` | crates/hipfire-dispatch/src/pipeline/sealed_moe.rs | developer |
 | `HIPFIRE_REPLAY_GRAPH` | crates/hipfire-arch-qwen35/src/speculative.rs | developer |
@@ -1748,6 +1750,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs | harness |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-cli/src/serve/complete.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_UNSAFE_WSL_REDLINE` | crates/hipfire-config/src/devices.rs, crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_UNSAFE_WSL_VMM_KV` | crates/hipfire-config/src/devices.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_V2B_ADDEPI` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_V2B_DOWN_SWZ` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_V2B_PM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |

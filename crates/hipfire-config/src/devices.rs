@@ -27,7 +27,7 @@ use crate::{ConfigError, ProcessConfig, Result};
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
 };
 
 pub const HIP_VISIBLE_DEVICES: &str = "HIP_VISIBLE_DEVICES";
@@ -78,6 +78,81 @@ impl DeviceRoot {
             IdentitySource::Kfd
         }
     }
+}
+
+/// Driver models on which Redline PM4 and VMM KV growth are not certified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UncertifiedPlatform {
+    /// Windows HIP SDK: no ROCr, VMM growth observed to alias segments.
+    NativeWindows,
+    /// WSL2/ROCDXG: ROCr over WDDM; PM4 passthrough and VMM growth unproven.
+    WslDxg,
+}
+
+impl UncertifiedPlatform {
+    pub fn detect_at(root: &DeviceRoot) -> Option<Self> {
+        if cfg!(windows) {
+            Some(Self::NativeWindows)
+        } else if root.is_wsl_dxg() {
+            Some(Self::WslDxg)
+        } else {
+            None
+        }
+    }
+
+    /// This host, probed once.
+    pub fn detect() -> Option<Self> {
+        static PLATFORM: LazyLock<Option<UncertifiedPlatform>> =
+            LazyLock::new(|| UncertifiedPlatform::detect_at(&DeviceRoot::system()));
+        *PLATFORM
+    }
+}
+
+/// Process knob that admits Redline under WSL/ROCDXG; unsafe until certified.
+pub const UNSAFE_WSL_REDLINE: &str = "HIPFIRE_UNSAFE_WSL_REDLINE";
+/// Process knob that admits VMM KV under WSL/ROCDXG; unsafe until certified.
+pub const UNSAFE_WSL_VMM_KV: &str = "HIPFIRE_UNSAFE_WSL_VMM_KV";
+
+/// Why Redline PM4 (retained default or explicit backend) is refused on
+/// `platform`, or `None` when it may run. Native Windows has no ROCr, so no
+/// knob lifts it there.
+pub fn redline_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+    match platform? {
+        UncertifiedPlatform::NativeWindows => Some(
+            "Redline PM4 needs ROCr (libhsa-runtime64), which the Windows HIP SDK does not ship".into(),
+        ),
+        UncertifiedPlatform::WslDxg if unsafe_override => None,
+        UncertifiedPlatform::WslDxg => Some(format!(
+            "Redline PM4 is not certified under WSL/ROCDXG (/dev/dxg without /dev/kfd); set {UNSAFE_WSL_REDLINE}=1 (replay.unsafe_wsl_redline) to override, unsafe until certified"
+        )),
+    }
+}
+
+/// Why the VMM KV backend is refused on `platform`, or `None` when allowed.
+pub fn vmm_kv_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+    match platform? {
+        UncertifiedPlatform::NativeWindows => {
+            Some("Windows VMM mapping/graph semantics are not certified".into())
+        }
+        UncertifiedPlatform::WslDxg if unsafe_override => None,
+        UncertifiedPlatform::WslDxg => Some(format!(
+            "VMM KV growth is not certified under WSL/ROCDXG (WDDM may alias earlier KV segments); set {UNSAFE_WSL_VMM_KV}=1 (memory.unsafe_wsl_vmm_kv) to override, unsafe until certified"
+        )),
+    }
+}
+
+fn process_flag(name: &str) -> bool {
+    crate::process_value(name).as_deref() == Some("1")
+}
+
+/// [`redline_refusal`] for this host and process configuration.
+pub fn redline_platform_refusal() -> Option<String> {
+    redline_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_REDLINE))
+}
+
+/// [`vmm_kv_refusal`] for this host and process configuration.
+pub fn vmm_kv_platform_refusal() -> Option<String> {
+    vmm_kv_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_VMM_KV))
 }
 
 const KEY: &str = "hardware.devices";
@@ -1192,6 +1267,7 @@ mod tests {
         let root = DeviceRoot::at(&wsl.0);
         assert!(root.is_wsl_dxg());
         assert_eq!(root.identity_source(), IdentitySource::Hip);
+        assert_eq!(UncertifiedPlatform::detect_at(&root), Some(UncertifiedPlatform::WslDxg));
 
         let devices = identify_observed(
             &root,
@@ -1237,6 +1313,7 @@ mod tests {
             let host = device_root(nodes, true);
             let root = DeviceRoot::at(&host.0);
             assert_eq!(root.identity_source(), IdentitySource::Kfd, "{nodes:?}");
+            assert_eq!(UncertifiedPlatform::detect_at(&root), None, "{nodes:?}");
             let devices =
                 identify_observed(&root, &[seen_uuid(0, "0000:03:00.0", "GPU-ffffffffffffffff")])
                     .unwrap();
@@ -1248,6 +1325,20 @@ mod tests {
         let missing = device_root(&[], false);
         assert!(identify_observed(&DeviceRoot::at(&missing.0), &[seen(0, "gfx1201", "0000:03:00.0")])
             .is_err());
+    }
+
+    #[test]
+    fn uncertified_platform_gates_need_the_unsafe_knob_on_wsl_only() {
+        use UncertifiedPlatform::{NativeWindows, WslDxg};
+        for refusal in [redline_refusal, vmm_kv_refusal] {
+            assert_eq!(refusal(None, false), None);
+            assert_eq!(refusal(Some(WslDxg), true), None);
+            assert!(refusal(Some(NativeWindows), true).is_some());
+        }
+        let redline = redline_refusal(Some(WslDxg), false).unwrap();
+        assert!(redline.contains("WSL/ROCDXG") && redline.contains("HIPFIRE_UNSAFE_WSL_REDLINE=1"), "{redline}");
+        let vmm = vmm_kv_refusal(Some(WslDxg), false).unwrap();
+        assert!(vmm.contains("WSL/ROCDXG") && vmm.contains("HIPFIRE_UNSAFE_WSL_VMM_KV=1"), "{vmm}");
     }
 
     #[test]

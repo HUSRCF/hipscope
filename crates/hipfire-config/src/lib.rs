@@ -3199,6 +3199,24 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_REPLAY_TRANSPORT",
         "Retained replay transport; auto follows the runtime default route predicate, not certification/admission."
     ),
+    process_bool_field!(
+        "replay.unsafe_wsl_redline",
+        "unsafe_wsl_redline",
+        Replay,
+        false,
+        true,
+        "HIPFIRE_UNSAFE_WSL_REDLINE",
+        "UNSAFE until certified: allow Redline PM4/retained replay under WSL/ROCDXG (/dev/dxg without /dev/kfd). Default off: the retained default falls back to the HIP graph and an explicit replay.backend=redline/shadow is refused."
+    ),
+    process_bool_field!(
+        "memory.unsafe_wsl_vmm_kv",
+        "unsafe_wsl_vmm_kv",
+        Memory,
+        false,
+        true,
+        "HIPFIRE_UNSAFE_WSL_VMM_KV",
+        "UNSAFE until certified: allow the VMM KV backend under WSL/ROCDXG (/dev/dxg without /dev/kfd), where WDDM VA growth may alias earlier KV pages. Default off: automatic KV selects legacy and an explicit kv_backend=vmm is refused."
+    ),
     diagnostic_bool_field!(
         "diagnostic.replay.route_proof_log",
         "replay_route_proof_log",

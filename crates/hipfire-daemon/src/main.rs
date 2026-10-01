@@ -904,6 +904,18 @@ fn main() {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
+    // Uncertified driver models (WSL2/ROCDXG, native Windows) refuse an
+    // explicit Redline backend outright; the per-load default falls back to
+    // the HIP graph instead (load handler).
+    if let Some(refusal) = hipfire_config::devices::redline_platform_refusal() {
+        let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(backend.as_str(), "redline" | "shadow") {
+            eprintln!("FATAL: replay.backend={backend} refused: {refusal}");
+            std::process::exit(1);
+        }
+    }
     if acknowledge_config {
         writeln!(
             stdout,
@@ -2186,7 +2198,10 @@ fn main() {
                             pp,
                             tp,
                             drafter.is_some(),
-                        );
+                        ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
+                            eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
+                            false
+                        });
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
