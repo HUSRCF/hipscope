@@ -29,7 +29,6 @@ fn sg(n: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len: 1 } }
 /// `v1 = global[v2]`: pending on VMcnt/LOADcnt until awaited.
 fn gload() -> Instruction { Instruction::new("global_load_b32 v1, v2, s[0:1]", vec![v(1)], vec![v(2)]).memory(MemoryClass::VmemLoad) }
 fn cmp(text: &str) -> Instruction { Instruction::new(text, vec![], vec![]) }
-fn sg(n: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len: 1 } }
 /// A VALU read of s5 (gfx12 tracks VALU-read SGPRs for SALU write hazards).
 fn read_s5() -> Instruction { Instruction::new("v_add_nc_u32_e32 v3, s5, v0", vec![v(3)], vec![sg(5), v(0)]) }
 fn write_s5() -> Instruction { Instruction::new("s_mov_b32 s5, 1", vec![sg(5)], vec![]) }
