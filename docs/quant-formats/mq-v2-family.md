@@ -250,6 +250,40 @@ tile. Thresholds are N≥96 unless a band is noted. Source of truth:
 | **gfx1100** | 4 (MQ4V2) | adaptive (see bands) | adaptive | adaptive | adaptive |
 | **gfx1100** | 2 / 3 / 5 / 6 | base WMMA | base | base | base |
 
+Qwen4 MQ6 Halo tuning is **default off**. Set
+`HIPFIRE_QWEN4_MQ6_X4_TILE=auto` for the opt-in artifact-sweep table
+(entries are `BV/RW/prefetch`; `base` retains the incumbent):
+
+| M,K | N=1536 | N=512 | N=1131 |
+|---|---|---|---|
+| 48,2560 | 8/4/2 | 8/4/2 | 8/4/2 |
+| 512,2560 | base | base | base |
+| 640,2560 | 8/8/1 | 8/4/2 | base |
+| 2560,6144 | 8/8/1 | 8/8/1 | 8/8/1 |
+| 6144,2560 | 8/8/1 | 8/8/1 | 8/8/1 |
+| 10240,2560 | 12/8/2 | 8/8/2 | 8/8/1 |
+| 12288,2560 | 12/8/2 | 8/8/1 | 8/8/1 |
+
+Unmeasured shapes and token counts retain the incumbent. The table uses one
+conservative tile for both output dtypes. Explicit overrides use `BVxRWxprefetch`
+with `BV ∈ {8,12}`, `RW ∈ {4,8}`, and prefetch depth `∈ {1,2}`;
+BV12 overrides fall back to the incumbent unless `N % 192 == 0`.
+`HIPFIRE_QWEN4_MQ6_X4_REGIONS=1` independently enables the three-F32-output
+MQ6 a/b/z region fold on the admitted gfx1151/gfx1201 prepared-F16 route.
+Both switches preserve independent WMMA chains and the existing shared rotation.
+
+The Halo three-run artifact F32 sweep at `N=1536` measured medians
+`1.559106 → 1.455083 ms` for `(2560,6144)` and
+`2.216403 → 2.089681 ms` for `(10240,2560)`; the latter's BF16 output
+measured `2.174003 → 2.021261 ms`. These are isolated-kernel measurements,
+**not** full-prefill or MQ6-group savings. In the initial synthetic sweep,
+`s_setprio` slowed the first winner from `1.402878` to `1.620221 ms` and
+was rejected. Artifact-bitwise
+checks cover all seven trunk shapes, F32/BF16 outputs, `N=1536/512/1131/16`,
+K=10240 row tails, extreme headers, zero guards, and poisoned output pads.
+The three-output fold also matches independent incumbent launches, including
+`N=0`. Full-model three-run timing remains a separate promotion gate.
+
 MQ4V2 adaptive bands on **gfx1100** (fuller narrative in `mq4-v2.md` §9):
 
 - QKV / QKVZA: BT4 @ N≥96, BT12 @ N≥192

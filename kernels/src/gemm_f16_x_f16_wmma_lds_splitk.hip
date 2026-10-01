@@ -40,6 +40,17 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+
+static __device__ __forceinline__ float sk_bf16_scaled_add(float r, float v, float s) {
+    const hip_bfloat16 lhs = static_cast<hip_bfloat16>(r);
+    const hip_bfloat16 rhs = static_cast<hip_bfloat16>(v);
+    const hip_bfloat16 gate = static_cast<hip_bfloat16>(s);
+    const hip_bfloat16 product = static_cast<hip_bfloat16>(
+        static_cast<float>(gate) * static_cast<float>(rhs));
+    return static_cast<float>(static_cast<hip_bfloat16>(
+        static_cast<float>(lhs) + static_cast<float>(product)));
+}
 
 typedef _Float16 __attribute__((ext_vector_type(16))) sk_half16_t;
 typedef _Float16 __attribute__((ext_vector_type(8)))  sk_half8_t;
@@ -107,13 +118,14 @@ __device__ __forceinline__ void sk_wmma_stage(
     }
 }
 
-template <int BM, int BN, int WP, int WQ, int KS, bool PIPE, int SPLIT>
+template <int BM, int BN, int WP, int WQ, int KS, bool PIPE, int SPLIT, bool BF16_ADD = false>
 __device__ __forceinline__ void sk_lds_tile(
     const _Float16* __restrict__ A,
     const _Float16* __restrict__ X,
-    float*          __restrict__ Y,
+    float* Y,
     int M, int K, int B,
-    _Float16* a_lds, _Float16* x_lds
+    _Float16* a_lds, _Float16* x_lds,
+    const float* R = nullptr, const float* Gate = nullptr
 ) {
     constexpr int KT     = KS / 16;
     constexpr int WROWS  = 16 * WP;
@@ -127,6 +139,7 @@ __device__ __forceinline__ void sk_lds_tile(
     constexpr int X_PASS = (X_VEC + NT - 1) / NT;
 
     static_assert(KS == 32 || KS == 64, "KS must be 32 or 64");
+    static_assert(!BF16_ADD || SPLIT == 1, "epilogue requires completed accumulator");
     static_assert(BM % WROWS == 0 && BN % WCOLS == 0, "tile must divide into waves");
     static_assert(NT <= 1024, "block exceeds the 1024-thread limit");
     static_assert((BM + BN) * KS * 2 <= 65536, "LDS exceeds 64 KB per workgroup");
@@ -235,7 +248,14 @@ __device__ __forceinline__ void sk_lds_tile(
         #pragma unroll
         for (int i = 0; i < WP; i++) {
             const int m0 = m_wave + i * 16 + 8 * kh;
-            const sk_float8_t v = acc[i * WQ + j];
+            sk_float8_t v = acc[i * WQ + j];
+            if constexpr (BF16_ADD) {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    if (m0 + e < M)
+                        v[e] = sk_bf16_scaled_add(R[(long long)out_b * M + m0 + e], v[e], Gate[out_b]);
+                }
+            }
             if (m0 + 8 <= M && (M & 3) == 0) {
                 *(float4*)(yrow + m0)     = float4{v[0], v[1], v[2], v[3]};
                 *(float4*)(yrow + m0 + 4) = float4{v[4], v[5], v[6], v[7]};
@@ -260,7 +280,11 @@ __device__ __forceinline__ void sk_lds_tile(
             #pragma unroll
             for (int e = 0; e < 8; e++) {
                 const int out_m = m_wave + i * 16 + 2 * e + kh;
-                if (out_m < M) yrow[out_m] = v[e];
+                if (out_m < M) {
+                    if constexpr (BF16_ADD)
+                        yrow[out_m] = sk_bf16_scaled_add(R[(long long)out_b * M + out_m], v[e], Gate[out_b]);
+                    else yrow[out_m] = v[e];
+                }
             }
         }
     }
@@ -312,6 +336,17 @@ SK_KERNEL(qwen4_wmma_lds_64_128_32_64_k64_p_s8,  64, 128, 2, 4, 64, true,  8)
 SK_KERNEL(qwen4_wmma_lds_64_64_32_32_k64_p_s4,   64,  64, 2, 2, 64, true,  4)
 SK_KERNEL(qwen4_wmma_lds_64_128_32_32_k64_p_s4,  64, 128, 2, 2, 64, true,  4)
 
+
+// Shared-down incumbent gfx1201 tile, single completed accumulator.
+extern "C" __global__ __launch_bounds__(512, 1)
+void qwen4_wmma_lds_128_256_32_64_k64_bsr(
+    const _Float16* A, const _Float16* X, float* Y,
+    int M, int K, int B, const float* R, const float* Gate) {
+    __shared__ __align__(32) _Float16 a_lds[128 * 64];
+    __shared__ __align__(32) _Float16 x_lds[256 * 64];
+    sk_lds_tile<128, 256, 2, 4, 64, false, 1, true>(
+        A, X, Y, M, K, B, a_lds, x_lds, R, Gate);
+}
 // Y[b, m] = sum over z ascending of P[z, b, m].  Grid [ceil(B*M / 256)],
 // block 256.
 extern "C" __global__ void qwen4_wmma_lds_reduce(

@@ -154,6 +154,31 @@ pub fn project_weights(
             continue;
         }
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
+        // may share one row-region launch without sharing their accumulators.
+        if gpu.flags.qwen4_mq6_x4_regions
+            && projections.len() == 4
+            && projections[0].1.dtype == DType::BF16
+        {
+            let mut indices = [0usize; 3];
+            let mut count = 0;
+            for j in i..projections.len() {
+                let (w, out) = projections[j];
+                if !done[j] && w.k == weight.k && shared(w, gpu) && out.dtype == DType::F32 {
+                    if count < 3 { indices[count] = j; }
+                    count += 1;
+                }
+            }
+            if count == 3 {
+                let regions = indices.map(|j| {
+                    let (w, out) = projections[j];
+                    (w.buf, out, w.m)
+                });
+                if hip(gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows))? {
+                    for j in indices { done[j] = true; }
+                }
+            }
+        }
         for j in i..projections.len() {
             let (w, out) = projections[j];
             if !done[j] && w.k == weight.k && shared(w, gpu) {

@@ -592,11 +592,11 @@ GEN_RESID_BT(6, 8)
 // are the BT kernel's, so results are bitwise identical to it.
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
-template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false>
+template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
-                                              int M, int K, int N) {
+                                              int M, int K, int N, int row_block = -1) {
     constexpr int GROUP_BYTES = 8 + 32 * BITS;
     constexpr int TOK = 16 * BV;
     constexpr int CK = 64;              // K per LDS chunk: four K-tiles
@@ -609,7 +609,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int ml = lane & 15;
-    const int row_start = (blockIdx.x * RW + (tid >> 5)) * 16;
+    const int row_start = ((row_block < 0 ? (int)blockIdx.x : row_block) * RW + (tid >> 5)) * 16;
     const int batch_start = blockIdx.y * TOK;
     const int safe_row = (row_start + ml < M) ? (row_start + ml) : (M - 1);
     const int groups_per_row = K / 256;
@@ -628,23 +628,32 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // Slot i covers token i * (NT / VPT) + tid / VPT, so its LDS offset is
     // lds0 plus a compile-time constant.  Named scalars, not an array: the
     // array stays in scratch because SROA runs before the loops unroll.
-    static_assert(VECS == 8, "staging is written out for eight slots");
-#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
+    static_assert(VECS == 4 || VECS == 6 || VECS == 8 || VECS == 12);
+    static_assert(PREFETCH == 1 || PREFETCH == 2);
+    static_assert(TOK * STRIDE * sizeof(_Float16) <= 32768);
+#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11)
 #define XL_OFF(I) \
     const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
         ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * K + (tid % VPT) * 8;
     XL_FOR8(XL_OFF)
 #undef XL_OFF
     _Float16* lds0 = xs + (tid / VPT) * STRIDE + (tid % VPT) * 8;
-#define XL_LOAD(I) st##I = *(const uint4*)(X + xo##I + cn * CK);
-#define XL_STORE(I) *(uint4*)(lds0 + I * (NT / VPT) * STRIDE) = st##I;
+#define XL_LOAD(I) if constexpr (I < VECS) st##I = *(const uint4*)(X + xo##I + cn * CK);
+#define XL_STORE(I) if constexpr (I < VECS) *(uint4*)(lds0 + I * (NT / VPT) * STRIDE) = st##I;
+#define XL_NEXT(I) if constexpr (I < VECS && PREFETCH == 2) nx##I = *(const uint4*)(X + xo##I + cn * CK);
+#define XL_ADVANCE(I) if constexpr (I < VECS && PREFETCH == 2) st##I = nx##I;
     // The barriers order LDS only: __syncthreads would also wait for the
     // in-flight next-chunk X and payload loads (WGP-mode workgroup fence).
 #define XL_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
-    uint4 st0, st1, st2, st3, st4, st5, st6, st7;
+    uint4 st0, st1, st2, st3, st4, st5, st6, st7, st8, st9, st10, st11;
+    uint4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nx8, nx9, nx10, nx11;
     {
         const int cn = 0;
         XL_FOR8(XL_LOAD)
+    }
+    if constexpr (PREFETCH == 2) {
+        const int cn = (K > CK) ? 1 : 0;
+        XL_FOR8(XL_NEXT)
     }
 
     float8_t acc[BV];
@@ -676,8 +685,14 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             XL_BARRIER();
             // Next chunk's global loads fly while this chunk computes (the
             // last chunk harmlessly reloads itself).
-            const int cn = (c + 1 < nchunks) ? (c + 1) : c;
-            XL_FOR8(XL_LOAD)
+            if constexpr (PREFETCH == 2) {
+                XL_FOR8(XL_ADVANCE)
+                const int cn = (c + 2 < nchunks) ? (c + 2) : c;
+                XL_FOR8(XL_NEXT)
+            } else {
+                const int cn = (c + 1 < nchunks) ? (c + 1) : c;
+                XL_FOR8(XL_LOAD)
+            }
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const int kt = cq * 4 + j;
@@ -755,6 +770,8 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         }
     }
 #undef XL_STORE
+#undef XL_NEXT
+#undef XL_ADVANCE
 #undef XL_BARRIER
 #undef XL_LOAD
 #undef XL_FOR8
@@ -784,6 +801,52 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out(const char* __restrict__ A,
                                          float* __restrict__ Y,
                                          int M, int K, int N) {
     resid_bt_xlds<6, 8, 4, true, true>(A, X, Y, M, K, N);
+}
+
+// U3 research entries: no production default changes before the Halo G0 gate.
+#define U3_TILE(BV, RW, PF) \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, false, PF>(A, X, Y, M, K, N); \
+} \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_bf16out( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, true, PF>(A, X, Y, M, K, N); \
+}
+U3_TILE(8, 4, 1)
+U3_TILE(8, 4, 2)
+U3_TILE(8, 8, 1)
+U3_TILE(8, 8, 2)
+U3_TILE(12, 4, 1)
+U3_TILE(12, 4, 2)
+U3_TILE(12, 8, 1)
+U3_TILE(12, 8, 2)
+#undef U3_TILE
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
+    const char* A0, const char* A1, const char* A2, const _Float16* X,
+    float* Y0, float* Y1, float* Y2, int M0, int M1, int M2, int K, int N) {
+    if (N <= 0 || K <= 0) return;
+    const int r0 = (M0 + 63) / 64;
+    const int r1 = (M1 + 63) / 64;
+    const int rb = blockIdx.x;
+    const char* A;
+    float* Y;
+    int M, local_rb;
+    if (rb < r0) {
+        A = A0; Y = Y0; M = M0; local_rb = rb;
+    } else if (rb < r0 + r1) {
+        A = A1; Y = Y1; M = M1; local_rb = rb - r0;
+    } else {
+        A = A2; Y = Y2; M = M2; local_rb = rb - r0 - r1;
+    }
+    if (M <= 0 || local_rb >= (M + 63) / 64) return;
+    resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N, local_rb);
 }
 
 #endif // __GFX11__

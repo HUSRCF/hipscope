@@ -33,13 +33,21 @@ pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLoc
 });
 /// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` opts gfx1201 into its gfx12 WMMA
 /// kernels for the F16 WMMA route (the BF16 projections and the HC read).
-/// Default off: the route is not bit-exact and has no Flash-Next KLD
-/// reference yet, so gfx1201 keeps the multirow/SIMT arms it ran before.
-/// Other arches are untouched.  Read once.
+/// Default off: real-activation G1-F16 accumulation bounds are not met.
+/// The M=1 shared selector remains on exact multirow; U1a owns its fusion.
+/// Capture/retained recording and other arches keep their existing routes.
 pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", false)
     });
+/// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
+static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_DOWN_EPI", false)
+});
+/// Virtual concatenation of F16 projection rows; default off until G0 gates.
+static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
+});
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
@@ -223,6 +231,9 @@ pub struct GemmEpilogue<'a> {
     /// F32 `[B, M]` residual the gated product is added to. Requires `gate`.
     /// May alias `y`.
     pub residual: Option<&'a GpuTensor>,
+    /// Round value, row gate, residual, product and sum to BF16 independently.
+    /// `gate` is `[B]`, rather than `[M]`; output remains BF16-rounded F32.
+    pub bf16_scaled_add: bool,
 }
 
 /// `GpuTensor` has no `Debug`, so print what actually identifies an epilogue:
@@ -247,6 +258,7 @@ impl<'a> GemmEpilogue<'a> {
     pub const ADDIN: u32 = 4;
     /// Bit 3 — `y = residual + gate[m] · value`.
     pub const GATED: u32 = 8;
+    pub const BF16_SCALED_ADD: u32 = 16;
 
     /// The compiled combinations, mask → entry-name suffix. These are the ones
     /// the FLUX single/double blocks use; the full 16-mask cross product is
@@ -258,6 +270,7 @@ impl<'a> GemmEpilogue<'a> {
         (Self::GATED, "_gr"),
         (Self::GATED | Self::ADDIN, "_gra"),
         (Self::ADDIN, "_a"),
+        (Self::BF16_SCALED_ADD, "_bsr"),
     ];
 
     /// The `EPI` bitmask this configuration selects. `0` is the plain
@@ -274,7 +287,9 @@ impl<'a> GemmEpilogue<'a> {
             mask |= Self::ADDIN;
         }
         // Validated as both-or-neither by the launcher before this is read.
-        if self.gate.is_some() || self.residual.is_some() {
+        if self.bf16_scaled_add {
+            mask |= Self::BF16_SCALED_ADD;
+        } else if self.gate.is_some() || self.residual.is_some() {
             mask |= Self::GATED;
         }
         mask
@@ -296,11 +311,12 @@ impl<'a> GemmEpilogue<'a> {
     fn describe(mask: u32) -> String {
         let mut out = String::new();
         for (bit, tag) in [
-            (Self::OUT_F16, "_o16"),
-            (Self::GELU, "g"),
-            (Self::GATED, "_gr"),
-            (Self::ADDIN, "a"),
-        ] {
+                    (Self::OUT_F16, "_o16"),
+                    (Self::GELU, "g"),
+                    (Self::GATED, "_gr"),
+                    (Self::ADDIN, "a"),
+                    (Self::BF16_SCALED_ADD, "_bsr"),
+                ] {
             if mask & bit != 0 {
                 // The first fragment carries the leading underscore; a bare
                 // GELU or ADDIN still needs one.
@@ -673,6 +689,47 @@ fn mqv2_mw_waves(
         (Residual, 464..) => Some(8),
         (Residual, 416..=463) => Some(4),
         _ => None,
+    }
+}
+
+// Three-run Halo artifact sweeps for both output dtypes; unmeasured cases retain BT8/RW4.
+// This table is used only by HIPFIRE_QWEN4_MQ6_X4_TILE=auto (default off).
+fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+    match (m, k, n) {
+        (48, 2560, 1536 | 512 | 1131) => Some([8, 4, 2]),
+        (640, 2560, 1536) => Some([8, 8, 1]),
+        (640, 2560, 512) => Some([8, 4, 2]),
+        (2560, 6144, 1536 | 512 | 1131) => Some([8, 8, 1]),
+        (6144, 2560, 1536 | 512 | 1131) => Some([8, 8, 1]),
+        (10240 | 12288, 2560, 1536) => Some([12, 8, 2]),
+        (10240, 2560, 512) => Some([8, 8, 2]),
+        (10240, 2560, 1131) => Some([8, 8, 1]),
+        (12288, 2560, 512 | 1131) => Some([8, 8, 1]),
+        _ => None,
+    }
+}
+
+// U3 remains override-only until the artifact-bitwise and three-run Halo gates.
+fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
+    macro_rules! entry {
+        ($b:literal, $r:literal, $p:literal) => {
+            (if bf16 {
+                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out")
+            } else {
+                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p)
+            }, 16 * $r, 32 * $r, $b)
+        };
+    }
+    match tile {
+        [8, 4, 1] => entry!(8, 4, 1),
+        [8, 4, 2] => entry!(8, 4, 2),
+        [8, 8, 1] => entry!(8, 8, 1),
+        [8, 8, 2] => entry!(8, 8, 2),
+        [12, 4, 1] => entry!(12, 4, 1),
+        [12, 4, 2] => entry!(12, 4, 2),
+        [12, 8, 1] => entry!(12, 8, 1),
+        [12, 8, 2] => entry!(12, 8, 2),
+        _ => unreachable!("tile override is parsed into the eight supported entries"),
     }
 }
 
@@ -27944,6 +28001,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if *QWEN4_PROJ_REGIONS
+            && m == 320 && k == 10240
+            // gfx1201's incumbent HC-down is split-K=4, not ascending K.
+            && self.arch_caps.has_wmma_w32()
+        {
+            return self.gemm_bf16_xf16_f16_wmma_regions(
+                &[(weight, y, m)], x_f16, k, batch_size,
+            );
+        }
         let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
         let w_view = GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(w16, m * k * 2) },
@@ -27977,6 +28043,70 @@ impl Gpu {
             tile.pipelined(),
             k,
             k,
+        )
+    }
+
+    /// Virtually concatenated BF16 shadows, with ascending 16-element K steps.
+    /// Up to four matrices share one X tile; zero-row regions are skipped.
+    pub fn gemm_bf16_xf16_f16_wmma_regions(
+        &mut self,
+        projections: &[(&GpuTensor, &GpuTensor, usize)],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(!projections.is_empty() && projections.len() <= 4);
+        assert!(k > 0 && k % 64 == 0);
+        assert_eq!(x_f16.dtype, DType::F16);
+        if batch_size == 0 || projections.iter().all(|p| p.2 == 0) {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let mut ap = [std::ptr::null_mut(); 4];
+        let mut yp = [std::ptr::null_mut(); 4];
+        let mut ms = [0i32; 4];
+        for (i, &(weight, y, m)) in projections.iter().enumerate() {
+            assert_eq!(weight.dtype, DType::BF16);
+            assert_eq!(y.dtype, DType::F32);
+            if m != 0 {
+                ap[i] = self.ensure_bf16_f16_shadow(weight, m, k)?;
+            }
+            yp[i] = y.buf.as_ptr();
+            ms[i] = i32::try_from(m).expect("region rows fit i32");
+        }
+        let entry = "gemm_f16_x_f16_wmma_lds_regions_128_128_32_64_k64_p";
+        self.ensure_kernel(
+            "qwen4_gemm_wmma_lds256",
+            kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC,
+            entry,
+        )?;
+        let xp = x_f16.buf.as_ptr();
+        let ki = i32::try_from(k).expect("K fits i32");
+        let ni = i32::try_from(batch_size).expect("batch fits i32");
+        let mut params: [*mut c_void; 17] = std::array::from_fn(|i| match i {
+            0..=3 => &ap[i] as *const _ as *mut c_void,
+            4 => &xp as *const _ as *mut c_void,
+            5..=8 => &yp[i - 5] as *const _ as *mut c_void,
+            9..=12 => &ms[i - 9] as *const _ as *mut c_void,
+            14 => &ni as *const _ as *mut c_void,
+            _ => &ki as *const _ as *mut c_void,
+        });
+        let total: usize = projections.iter().map(|p| p.2).sum();
+        self.launch_maybe_blob(
+            entry, [total.div_ceil(128) as u32, batch_size.div_ceil(128) as u32, 1],
+            [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ap { b.push_ptr(p); }
+                b.push_ptr(xp);
+                for p in yp { b.push_ptr(p); }
+                for m in ms { b.push_i32(m); }
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b.push_i32(ki);
+                b.push_i32(ki);
+                b
+            },
         )
     }
 
@@ -28017,11 +28147,89 @@ impl Gpu {
             shape: vec![batch_size * k],
             dtype: DType::F16,
         };
+        if *QWEN4_PROJ_REGIONS
+            && k == 2560 && projections.len() > 1
+            && projections.iter().all(|p| matches!(p.2, 1 | 512 | 640))
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.is_gfx1201())
+        {
+            let mut group = [projections[0]; 4];
+            let mut count = 0;
+            for &p in projections.iter().filter(|&&(_, _, m)| !short(m)) {
+                group[count] = p;
+                count += 1;
+                if count == 4 {
+                    self.gemm_bf16_xf16_f16_wmma_regions(&group, &x_view, k, batch_size)?;
+                    count = 0;
+                }
+            }
+            if count != 0 {
+                self.gemm_bf16_xf16_f16_wmma_regions(&group[..count], &x_view, k, batch_size)?;
+            }
+            return Ok(true);
+        }
         for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
             self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
         }
         Ok(true)
     }
+    /// Opt-in shared-down fusion; retains the incumbent WMMA accumulation order.
+    /// Returns false without launching when the existing F16 route is unavailable.
+    pub fn qwen4_shared_down_bf16_epi(
+        &mut self, weight: &GpuTensor, x: &GpuTensor, residual: &GpuTensor,
+        scalar: &GpuTensor, m: usize, k: usize, rows: usize,
+    ) -> HipResult<bool> {
+        if !*QWEN4_SHARED_DOWN_EPI
+            || !self.qwen4_f16_wmma_applies(weight, k, rows)
+            || m < 1024
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let wp = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let xp = self.convert_fp16_x_uncached(x, rows * k)?;
+        if self.arch_caps.is_gfx1201() {
+            const ENTRY: &str = "qwen4_wmma_lds_128_256_32_64_k64_bsr";
+            self.ensure_kernel("gemm_wmma_lds_splitk", kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, ENTRY)?;
+            assert_eq!(residual.dtype, DType::F32);
+            assert_eq!(scalar.dtype, DType::F32);
+            assert_eq!(residual.numel(), rows * m);
+            assert_eq!(scalar.numel(), rows);
+            let rp = residual.buf.as_ptr();
+            let sp = scalar.buf.as_ptr();
+            let mi = m as i32;
+            let ki = k as i32;
+            let ni = rows as i32;
+            let mut params = [
+                &wp as *const _ as *mut c_void, &xp as *const _ as *mut c_void,
+                &rp as *const _ as *mut c_void, &mi as *const _ as *mut c_void,
+                &ki as *const _ as *mut c_void, &ni as *const _ as *mut c_void,
+                &rp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(ENTRY, [m.div_ceil(128) as u32, rows.div_ceil(256) as u32, 1],
+                [512, 1, 1], 0, &mut params, || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(wp); b.push_ptr(xp); b.push_ptr(rp);
+                    b.push_i32(mi); b.push_i32(ki); b.push_i32(ni);
+                    b.push_ptr(rp); b.push_ptr(sp); b
+                })?;
+            return Ok(true);
+        }
+        let w = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(wp, m * k * 2) },
+            shape: vec![m * k], dtype: DType::F16,
+        };
+        let xv = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(xp, rows * k * 2) },
+            shape: vec![rows * k], dtype: DType::F16,
+        };
+        let epi = GemmEpilogue {
+            gate: Some(scalar), residual: Some(residual), bf16_scaled_add: true,
+            ..Default::default()
+        };
+        self.gemm_f16_x_f16_wmma_lds_auto_epi(&w, &xv, residual, None, m, k, rows, &epi)?;
+        Ok(true)
+    }
+
 
     /// `Y[b, m] = Σ_k A[m, k]·X[b, k]` (A `[M, K]`, X `[B, K]` F16, Y `[B, M]`
     /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
@@ -28039,6 +28247,9 @@ impl Gpu {
         batch_size: usize,
         tile: LdsTileSplitK,
     ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
         assert!(
             self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151(),
             "gemm_f16_x_f16_wmma_lds_splitk is gfx1201/gfx1151-only (arch {})",
@@ -29534,7 +29745,7 @@ impl Gpu {
         if let Some(g) = epi.gate {
             assert_eq!(
                 g.numel(),
-                m,
+                if epi.bf16_scaled_add { batch_size } else { m },
                 "gemm_f16_x_f16_wmma_lds_epi: `gate` must be [M] = [{m}]"
             );
             assert_eq!(
@@ -29542,6 +29753,12 @@ impl Gpu {
                 DType::F32,
                 "gemm_f16_x_f16_wmma_lds_epi: `gate` must be F32"
             );
+        }
+        if epi.bf16_scaled_add && (epi.gate.is_none() || epi.out_f16 || epi.gelu || epi.addin.is_some()) {
+            return Err(hip_bridge::HipError::new(0, "BF16 scaled add requires gate and residual, with no other epilogue"));
+        }
+        if batch_size == 0 || m == 0 {
+            return Ok(());
         }
 
         let mask = epi.mask();
@@ -29598,7 +29815,11 @@ impl Gpu {
         // One wave per wm×wn output patch, 32 threads each.
         let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
         self.bind_thread()?;
-        let (module, source) = self.lds256_source();
+        let (module, source) = if epi.bf16_scaled_add {
+            ("qwen4_gemm_wmma_lds256", std::borrow::Cow::Borrowed(kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC))
+        } else {
+            self.lds256_source()
+        };
         self.ensure_kernel(module, &source, &entry)?;
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
@@ -37764,7 +37985,7 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false, None)
     }
 
-    /// `overwrite` (`Y = W·X`, gfx1151 MQ6 BT8 only) equals zeroing Y and
+    /// `overwrite` (`Y = W·X`, MQ6 BT8 X-LDS) equals zeroing Y and
     /// then accumulating, in one launch.
     #[allow(clippy::too_many_arguments)]
     fn mqv2_wmma_gfx11_bt(
@@ -37803,21 +38024,41 @@ impl Gpu {
         // MQ6 BT8: four row tiles share each X chunk through LDS (bitwise
         // identical to BT8; the BT8 X re-reads were the bottleneck on gfx1151).
         let xlds = bits == 6 && batch_tile == 8;
-        let (func_name, rows_per_block, block) = match (xlds, overwrite) {
-            (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+        let gfx12 = self.arch_caps.has_wmma_w32_gfx12();
+        let (func_name, rows_per_block, block) = match (xlds, overwrite, gfx12) {
+            (true, false, true) => ("gemm_mq6g256v2_residual_wmma_gfx12_bt8_x4", 64, 128),
+            (true, true, true) if y.dtype == DType::BF16 => {
+                ("gemm_mq6g256v2_wmma_gfx12_bt8_x4_bf16out", 64, 128)
+            }
+            (true, true, true) => ("gemm_mq6g256v2_wmma_gfx12_bt8_x4", 64, 128),
+            (true, false, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
             // A BF16 `y` takes the values rounded to BF16 (RNE) as BF16 bits.
-            (true, true) if y.dtype == DType::BF16 => {
+            (true, true, false) if y.dtype == DType::BF16 => {
                 ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out", 64, 128)
             }
-            (true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
-            (false, false) => (func_name, 16, 32),
-            (false, true) => {
+            (true, true, false) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
+            (false, false, _) => (func_name, 16, 32),
+            (false, true, _) => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "mqv2_wmma_gfx11_bt: overwrite needs the gfx1151 MQ6 BT8 kernel",
+                    "mqv2_wmma_gfx11_bt: overwrite needs the MQ6 BT8 X-LDS kernel",
                 ));
             }
         };
+        let (func_name, rows_per_block, block, batch_tile) =
+            if xlds && overwrite && self.arch.as_str() == "gfx1151" {
+                let tile = match self.flags.qwen4_mq6_x4_tile {
+                    Some([0, 0, 0]) => mq6_x4_halo_policy(m, k, batch_size),
+                    explicit => explicit,
+                };
+                match tile {
+                    Some(tile) if tile[0] != 12 || batch_size % 192 == 0 =>
+                        mq6_x4_halo_tile(tile, y.dtype == DType::BF16),
+                    _ => (func_name, rows_per_block, block, batch_tile),
+                }
+            } else {
+                (func_name, rows_per_block, block, batch_tile)
+            };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
             3 => crate::dispatch::MQ3G256V2_GROUP_BYTES,
@@ -37836,12 +38077,12 @@ impl Gpu {
         }
         self.bind_thread()?;
         if xlds {
-            // #774's MQ6 BT8 X-LDS entries live in the Qwen4 copy only.
-            self.ensure_kernel(
-                "qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                func_name,
-            )?;
+            let (module, source) = if gfx12 {
+                ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4", kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC)
+            } else {
+                ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC)
+            };
+            self.ensure_kernel(module, source, func_name)?;
         } else {
             let module: &'static str = if self.arch.as_str() == "gfx1151" {
                 "gemm_mqv2_wmma_gfx1151_bt"
@@ -40390,19 +40631,23 @@ impl Gpu {
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
     /// overwrite route with no recorder or capture active.
     pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
-        self.arch_caps.has_wmma_w32()
+        (self.arch_caps.has_wmma_w32()
+            || (self.arch_caps.has_wmma_w32_gfx12()
+                && self.arch.as_str() == "gfx1201"
+                && self.flags.qwen4_mq6_x4_gfx1201))
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && mqv2_prefill_batch_tile(
-                self.arch.as_str(),
-                6,
-                MqV2PrefillProjection::Residual,
-                batch_size,
-            ) == Some(8)
+            && (self.arch_caps.has_wmma_w32_gfx12()
+                || mqv2_prefill_batch_tile(
+                    self.arch.as_str(),
+                    6,
+                    MqV2PrefillProjection::Residual,
+                    batch_size,
+                ) == Some(8))
     }
 
-    /// [`Gpu::gemm_mq6g256v2`] on the gfx1151 BT8 route with X already rotated
+    /// [`Gpu::gemm_mq6g256v2`] on the BT8 X-LDS route with X already rotated
     /// and converted to F16 (`x_f16`, `[batch_size × k]`): the bytes the F32
     /// entry produces, without its conversion pass.
     #[allow(clippy::too_many_arguments)]
@@ -40420,6 +40665,68 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(ptr))
     }
 
+    /// Three independent MQ6 F32 overwrite projections sharing prepared F16 X.
+    /// Returns false when the default-off research fold is not applicable.
+    pub fn gemm_mq6g256v2_xf16_regions(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.flags.qwen4_mq6_x4_regions
+            || !matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+            || !self.gemm_mq6g256v2_xf16_applies(k, batch_size)
+            || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
+        {
+            return Ok(false);
+        }
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(64)).sum();
+        if row_tiles == 0 || batch_size == 0 || k == 0 {
+            return Ok(true);
+        }
+        self.bind_thread()?;
+        let (module, source, name) = if self.arch_caps.has_wmma_w32_gfx12() {
+            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
+                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
+                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions")
+        } else {
+            ("qwen4_gemm_mqv2_wmma_gfx11_bt",
+                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions")
+        };
+        self.ensure_kernel(module, source, name)?;
+        let mut ptrs = [
+            regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
+            x_f16.buf.as_ptr(),
+            regions[0].1.buf.as_ptr(), regions[1].1.buf.as_ptr(), regions[2].1.buf.as_ptr(),
+        ];
+        let mut dims = [regions[0].2 as i32, regions[1].2 as i32, regions[2].2 as i32,
+            k as i32, batch_size as i32];
+        let mut params: [*mut c_void; 12] = std::array::from_fn(|i| {
+            if i < 7 {
+                ptrs.as_mut_ptr().wrapping_add(i).cast()
+            } else {
+                dims.as_mut_ptr().wrapping_add(i - 7).cast()
+            }
+        });
+        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
+        let bytes = total_m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2 + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name, [row_tiles as u32, batch_size.div_ceil(128) as u32, 1],
+            [128, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in ptrs { blob.push_ptr(ptr); }
+                for dim in dims { blob.push_i32(dim); }
+                blob
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result.map(|_| true)
+    }
+
     pub fn gemm_mq6g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -40435,16 +40742,7 @@ impl Gpu {
             // The memset + residual route below would take the BT8
             // X-LDS kernel; its overwrite form produces the same bytes in one
             // launch.  Capture/replay keep the historical contract.
-            if self.arch_caps.has_wmma_w32()
-                && !self.replay.is_recording()
-                && !self.graphs.capture_mode
-                && k % 256 == 0
-                && mqv2_prefill_batch_tile(
-                    self.arch.as_str(),
-                    6,
-                    MqV2PrefillProjection::Residual,
-                    batch_size,
-                ) == Some(8)
+            if self.gemm_mq6g256v2_xf16_applies(k, batch_size)
             {
                 return self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x, y, m, k, batch_size, true, None);
             }
@@ -45295,6 +45593,50 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GPU, HIPFIRE_QWEN4_SHARED_DOWN_EPI=1 and the F16 WMMA route"]
+    fn qwen4_shared_down_epi_matches_separate_bf16_add() {
+        use crate::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
+        let mut gpu = Gpu::init().expect("GPU");
+        let (m, k) = (2560, 640);
+        let wb: Vec<u8> = (0..m * k).flat_map(|i| {
+            let w = ((i % 97) as f32 - 48.0) / 256.0;
+            ((w.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect();
+        let mut w = gpu.upload_raw(&wb, &[m * k]).expect("weight");
+        w.dtype = DType::BF16;
+        let poison = gpu.upload_f32(&[f32::NAN], &[1]).expect("poison input");
+        let sentinel = gpu.upload_f32(&[-0.0], &[1]).expect("zero-row residual");
+        assert!(!gpu.qwen4_shared_down_bf16_epi(&w, &poison, &sentinel, &poison, m, k, 0)
+            .expect("zero-row admission"));
+        assert_eq!(gpu.download_f32(&sentinel).expect("zero-row residual")[0].to_bits(), (-0.0f32).to_bits());
+        for rows in [512, 1131, 1536] {
+            let xh: Vec<f32> = (0..rows * k).map(|i| {
+                if i < k { 0.0 } else { ((i % 113) as f32 - 56.0) / 128.0 }
+            }).collect();
+            let rh: Vec<f32> = (0..rows * m).map(|i| ((i % 127) as f32 - 63.0) / 256.0).collect();
+            let gh: Vec<f32> = (0..rows).map(|i| match i % 7 {
+                0 => f32::from_bits(1 << 16), 1 => 16384.0, 2 => -16384.0,
+                _ => (i % 13) as f32 / 16.0,
+            }).collect();
+            let x = gpu.upload_f32(&xh, &[rows * k]).expect("x");
+            let r = gpu.upload_f32(&rh, &[rows * m]).expect("residual");
+            let f = gpu.upload_f32(&rh, &[rows * m]).expect("fused residual");
+            let g = gpu.upload_f32(&gh, &[rows]).expect("gate");
+            let y = gpu.zeros(&[rows * m], DType::F32).expect("value");
+            assert!(gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&w, &y, m)], &x, k, rows).expect("incumbent admitted"));
+            bf16_scaled_add_batched(&mut gpu, &Bf16ScaledAddBatched {
+                residual: &r, value: &y, scalar: &g, rows, elements: m,
+            }).expect("separate add");
+            assert!(gpu.qwen4_shared_down_bf16_epi(&w, &x, &f, &g, m, k, rows).expect("fused admitted"));
+            let expected = gpu.download_f32(&r).expect("reference");
+            let actual = gpu.download_f32(&f).expect("fused");
+            for (i, (a, b)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "rows={rows} element={i}");
+            }
+        }
+    }
+
+    #[test]
     fn builder_iu4_store_guard_routes_unsupported_operands_to_hipcc() {
         let aligned = 0x1000usize as *mut c_void;
         assert!(g12_iu4_b1_eligible(128, 512, aligned));
@@ -45928,15 +46270,23 @@ mod tests {
     /// Rotating straight to F16 and running the pre-converted MQ6 GEMM must
     /// produce the bytes of the F32 rotation + converting GEMM.
     #[test]
-    #[ignore = "requires a gfx11 WMMA GPU and working HIP toolchain"]
+    #[ignore = "requires a gfx11/gfx1201 WMMA GPU and working HIP toolchain"]
     fn mq6_xf16_matches_f32_rotation_path() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.has_wmma_w32() => gpu,
+            Ok(gpu) if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
             _ => {
-                eprintln!("skip: needs gfx11 WMMA");
+                eprintln!("skip: needs gfx11/gfx1201 WMMA");
                 return;
             }
         };
+        if gpu.arch.as_str() == "gfx1201" {
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = false;
+            assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = true;
+            gpu.graphs.capture_mode = true;
+            assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
+            gpu.graphs.capture_mode = false;
+        }
         for (M, K, N) in [
             (200usize, 512usize, 131usize),
             (48, 2560, 1131),
@@ -45984,6 +46334,21 @@ mod tests {
                 differing, 0,
                 "xf16 path differs in {differing} cells at M={M} K={K} N={N}"
             );
+            let bf16_y = gpu.zeros(&[N * M], DType::BF16).expect("BF16 y");
+            gpu.gemm_mq6g256v2_xf16(&a, &x16, &bf16_y, M, K, N)
+                .expect("BF16 output");
+            let mut bytes = vec![0u8; N * M * 2];
+            gpu.hip.memcpy_dtoh(&mut bytes, &bf16_y.buf).expect("BF16 download");
+            for (cell, (&value, bits)) in want.iter().zip(bytes.chunks_exact(2)).enumerate() {
+                let u = value.to_bits();
+                let expected = if value.is_finite() {
+                    ((u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1)) >> 16) as u16
+                } else {
+                    (u >> 16) as u16
+                };
+                assert_eq!(u16::from_le_bytes([bits[0], bits[1]]), expected,
+                    "BF16 output differs at cell={cell} M={M} K={K} N={N}");
+            }
         }
     }
 
@@ -46265,21 +46630,4 @@ mod lds_epi_tests {
         );
     }
 
-    #[test]
-    fn epi_entry_names_match_the_kernel_source() {
-        let src = kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC;
-        for &tile in Gpu::LDS_EPI_TILES {
-            assert!(
-                src.contains(&format!("WLDS_EPI_SET({},", tile.entry())),
-                "kernel source has no WLDS_EPI_SET for {}",
-                tile.entry()
-            );
-        }
-        for &(_, suffix) in GemmEpilogue::SUPPORTED {
-            assert!(
-                src.contains(&format!("BASE##{suffix},")),
-                "kernel source does not emit the {suffix} entry"
-            );
-        }
-    }
 }

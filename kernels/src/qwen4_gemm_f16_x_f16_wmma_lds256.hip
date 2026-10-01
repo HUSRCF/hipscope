@@ -596,6 +596,8 @@
 //   EPI_ADDIN   (4) : acc += C[b, m], C an F32 [B, M] matrix.
 //   EPI_GATED   (8) : Y[b, m] = R[b, m] + gate[m] · value, R F32 [B, M],
 //                     gate F32 [M].
+//   EPI_BF16_SCALED_ADD (16): BF16-rounded row-scaled residual fold;
+//                     Gate F32 [B], R F32 [B, M], Y BF16-rounded F32.
 //
 // The evaluation order is fixed and is what the parity gate reproduces:
 //
@@ -604,6 +606,7 @@
 //   v += has_bias ? Bias[m] : 0   (always — same expression as EPI = 0)
 //   v  = gelu_tanh(v)             if EPI_GELU
 //   v  = fma(gate[m], v, R[b, m]) if EPI_GATED
+//   v  = wlds_bf16_scaled_add(R[b,m], v, Gate[b]) if EPI_BF16_SCALED_ADD
 //   store v (RNE to F16 if EPI_OUT_F16)
 //
 // EPI = 0 reduces to `v[e] + bv` — the original store, unchanged and bit-exact.
@@ -618,6 +621,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
@@ -626,6 +630,19 @@ typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 #define EPI_GELU    2
 #define EPI_ADDIN   4
 #define EPI_GATED   8
+#define EPI_BF16_SCALED_ADD 16
+
+// Same independent BF16 boundaries as tensor_ops' batched scaled add.
+static __device__ __forceinline__ float wlds_bf16_scaled_add(
+    float residual, float value, float scalar) {
+    const hip_bfloat16 lhs = static_cast<hip_bfloat16>(residual);
+    const hip_bfloat16 rhs = static_cast<hip_bfloat16>(value);
+    const hip_bfloat16 gate = static_cast<hip_bfloat16>(scalar);
+    const hip_bfloat16 product = static_cast<hip_bfloat16>(
+        static_cast<float>(gate) * static_cast<float>(rhs));
+    return static_cast<float>(static_cast<hip_bfloat16>(
+        static_cast<float>(lhs) + static_cast<float>(product)));
+}
 
 // COALESCED EPILOGUE (CST)
 // ------------------------
@@ -737,6 +754,18 @@ __device__ __forceinline__ half16_t* wlds_dst(_Float16* lds, int v) {
     return (half16_t*)(&lds[(kt * ROWS + row) * 16]);
 }
 
+#if defined(__gfx1201__)
+typedef _Float16 __attribute__((ext_vector_type(8))) wlds_frag_t;
+#define WLDS_FRAG_OFFSET ((threadIdx.x & 31) >> 4) * 8
+#define WLDS_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c)
+#define WLDS_ACC_ROW(e, h) (8 * (h) + (e))
+#else
+typedef half16_t wlds_frag_t;
+#define WLDS_FRAG_OFFSET 0
+#define WLDS_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)
+#define WLDS_ACC_ROW(e, h) (2 * (e) + (h))
+#endif
+
 // One K stage of WMMA out of LDS. This is the ONLY place the accumulation order
 // is written down, so the pipelined and the non-pipelined main loop provably
 // sum K in the same order and stay bit-exact against each other.
@@ -752,20 +781,20 @@ __device__ __forceinline__ void wlds_wmma_stage(
         // All WP A fragments stay live and are reused across every B subtile;
         // one B fragment is live at a time. That is what makes the LDS traffic
         // WP + WQ loads per WP·WQ WMMA.
-        half16_t a[WP];
+        wlds_frag_t a[WP];
         #pragma unroll
         for (int i = 0; i < WP; i++) {
-            a[i] = *(const half16_t*)(
-                &a_lds[(kt * BM + wave_m * WROWS + i * 16 + ml) * 16]);
+            a[i] = *(const wlds_frag_t*)(
+                &a_lds[(kt * BM + wave_m * WROWS + i * 16 + ml) * 16 + WLDS_FRAG_OFFSET]);
         }
         #pragma unroll
         for (int j = 0; j < WQ; j++) {
-            const half16_t b = *(const half16_t*)(
-                &x_lds[(kt * BN + wave_n * WCOLS + j * 16 + ml) * 16]);
+            const wlds_frag_t b = *(const wlds_frag_t*)(
+                &x_lds[(kt * BN + wave_n * WCOLS + j * 16 + ml) * 16 + WLDS_FRAG_OFFSET]);
             #pragma unroll
             for (int i = 0; i < WP; i++) {
                 acc[i * WQ + j] =
-                    __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b, acc[i * WQ + j]);
+                    WLDS_WMMA(a[i], b, acc[i * WQ + j]);
             }
         }
     }
@@ -978,7 +1007,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                 const float8_t v = acc[i * WQ + j];
                 #pragma unroll
                 for (int e = 0; e < 8; e++) {
-                    slab[(i * 16 + 2 * e + row_half) * STG + ml] = v[e];
+                    slab[(i * 16 + WLDS_ACC_ROW(e, row_half)) * STG + ml] = v[e];
                 }
             }
             WLDS_BARRIER();
@@ -1009,6 +1038,9 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                     if (EPI & EPI_GATED) {
                         o = __builtin_fmaf(gv, o, R[idx]);
                     }
+                    if (EPI & EPI_BF16_SCALED_ADD) {
+                        o = wlds_bf16_scaled_add(R[idx], o, Gate[out_b]);
+                    }
                     if (EPI & EPI_OUT_F16) {
                         ((_Float16*)Y)[idx] = (_Float16)o;
                     } else {
@@ -1031,7 +1063,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
             const float8_t v = acc[i * WQ + j];
             #pragma unroll
             for (int e = 0; e < 8; e++) {
-                const int out_m = m_wave + i * 16 + 2 * e + row_half;
+                const int out_m = m_wave + i * 16 + WLDS_ACC_ROW(e, row_half);
                 if (out_m < M) {
                     const long long idx = (long long)out_b * M + out_m;
                     float o = v[e];
@@ -1048,6 +1080,9 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                         // f32::mul_add, so the contraction is pinned on both
                         // sides instead of left to -ffp-contract.
                         o = __builtin_fmaf(Gate[out_m], o, R[idx]);
+                    }
+                    if (EPI & EPI_BF16_SCALED_ADD) {
+                        o = wlds_bf16_scaled_add(R[idx], o, Gate[out_b]);
                     }
                     if (EPI & EPI_OUT_F16) {
                         ((_Float16*)Y)[idx] = (_Float16)o;
@@ -1105,10 +1140,9 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
             a_lds, x_lds, (float*)lds_raw);                                    \
     }
 
-// The five combinations Task 5 dispatches, for one tile. Nothing else is
-// instantiated: each entry is a full kernel in this translation unit, and the
-// JIT compiles the whole file per module — the cross product (16 masks × every
-// tile) would cost minutes of hipcc for entries no caller names.
+// The five FLUX combinations and the Qwen4 BF16 shared-down fold, per tile.
+// Each entry is a full kernel in this translation unit; instantiate only
+// combinations with callers rather than the complete mask cross product.
 #define WLDS_EPI_SET(BASE, BM, BN, WP, WQ, KS, SWAPXY, PIPE)                   \
     WLDS_KERNEL_EPI(BASE##_o16,  BM, BN, WP, WQ, KS, SWAPXY, EPI_OUT_F16, PIPE)\
     WLDS_KERNEL_EPI(BASE##_o16g, BM, BN, WP, WQ, KS, SWAPXY,                   \
@@ -1116,7 +1150,9 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
     WLDS_KERNEL_EPI(BASE##_gr,   BM, BN, WP, WQ, KS, SWAPXY, EPI_GATED, PIPE)  \
     WLDS_KERNEL_EPI(BASE##_gra,  BM, BN, WP, WQ, KS, SWAPXY,                   \
                     EPI_GATED | EPI_ADDIN, PIPE)                               \
-    WLDS_KERNEL_EPI(BASE##_a,    BM, BN, WP, WQ, KS, SWAPXY, EPI_ADDIN, PIPE)
+    WLDS_KERNEL_EPI(BASE##_a,    BM, BN, WP, WQ, KS, SWAPXY, EPI_ADDIN, PIPE)  \
+    WLDS_KERNEL_EPI(BASE##_bsr,  BM, BN, WP, WQ, KS, SWAPXY,                   \
+                    EPI_BF16_SCALED_ADD, PIPE)
 
 // --- KS = 64, wave tile 32×64 (I_lds 10.67) — the shipped inner loop --------
 WLDS_KERNEL(gemm_wmma_lds_128_128_32_64_k64,    128, 128, 2, 4, 64, false, false)
@@ -1199,3 +1235,90 @@ WLDS_EPI_SET(gemm_wmma_lds_128_256_32_64_k64_p, 128, 256, 2, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_128_128_32_64_k64_p, 128, 128, 2, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_256_256_64_64_k64_p, 256, 256, 4, 4, 64, false, true)
 WLDS_EPI_SET(gemm_wmma_lds_128_256_64_64_k32_p, 128, 256, 4, 4, 32, false, true)
+
+// Virtual concatenation: even a one-row region can share its X tile with the
+// next matrix. Region boundaries need not be WMMA-aligned.
+__device__ __forceinline__ int wlds_region(int& row, int m0, int m1, int m2) {
+    if (row < m0) return 0;
+    row -= m0;
+    if (row < m1) return 1;
+    row -= m1;
+    if (row < m2) return 2;
+    row -= m2;
+    return 3;
+}
+
+__device__ __forceinline__ half16_t wlds_region_load(
+    const _Float16* const* a, const int* m, int total, int lda,
+    int block, int k0, int v
+) {
+    int row = block + v / 4;
+    // A padded tile row reads a valid row, just like wlds_src; never a pad.
+    if (row >= total) row = total - 1;
+    const int r = wlds_region(row, m[0], m[1], m[2]);
+    return *(const half16_t*)(a[r] + (long long)row * lda + k0 + (v % 4) * 16);
+}
+
+__launch_bounds__(256, 1)
+extern "C" __global__ void gemm_f16_x_f16_wmma_lds_regions_128_128_32_64_k64_p(
+    const _Float16* A0, const _Float16* A1,
+    const _Float16* A2, const _Float16* A3, const _Float16* X,
+    float* Y0, float* Y1, float* Y2, float* Y3,
+    int m0, int m1, int m2, int m3, int K, int N, int lda, int ldx
+) {
+    const int total = m0 + m1 + m2 + m3;
+    const int mb = blockIdx.x * 128, nb = blockIdx.y * 128;
+    if (mb >= total || nb >= N) return;
+    const _Float16* a[4] = {A0, A1, A2, A3};
+    float* y[4] = {Y0, Y1, Y2, Y3};
+    const int m[4] = {m0, m1, m2, m3};
+    __shared__ __align__(32) _Float16 al[128 * 64];
+    __shared__ __align__(32) _Float16 xl[128 * 64];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int wm = (tid >> 5) % 4, wn = (tid >> 5) / 4;
+    float8_t acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = float8_t{0,0,0,0,0,0,0,0};
+    half16_t ar[2], xr[2];
+    #pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int v = tid + p * 256;
+        ar[p] = wlds_region_load(a, m, total, lda, mb, 0, v);
+        xr[p] = *wlds_src<4>(X, N, ldx, nb, 0, v);
+    }
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int v = tid + p * 256;
+            *wlds_dst<128, 4>(al, v) = ar[p];
+            *wlds_dst<128, 4>(xl, v) = xr[p];
+        }
+        WLDS_BARRIER();
+        if (k0 + 64 < K) {
+            #pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int v = tid + p * 256;
+                ar[p] = wlds_region_load(a, m, total, lda, mb, k0 + 64, v);
+                xr[p] = *wlds_src<4>(X, N, ldx, nb, k0 + 64, v);
+            }
+        }
+        // Same ascending 16-element substeps as every incumbent LDS tile.
+        wlds_wmma_stage<128, 128, 2, 4, 4>(al, xl, wm, wn, lane & 15, acc);
+        WLDS_BARRIER();
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int b = nb + wn * 64 + j * 16 + (lane & 15);
+            if (b >= N) continue;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                int row = mb + wm * 32 + i * 16 + WLDS_ACC_ROW(e, lane >> 4);
+                if (row >= total) continue;
+                const int r = wlds_region(row, m0, m1, m2);
+                y[r][(long long)b * m[r] + row] = acc[i * 4 + j][e] + 0.0f;
+            }
+        }
+    }
+}

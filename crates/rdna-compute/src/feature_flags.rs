@@ -134,6 +134,12 @@ pub struct FeatureFlags {
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
     pub lm_head_overwrite: bool,
+    /// Eager-only gfx1201 MQ6 X-LDS overwrite and fused F16 rotation.
+    pub qwen4_mq6_x4_gfx1201: bool,
+    /// Halo override: [BV, RW, prefetch], or [0, 0, 0] for the measured table.
+    pub qwen4_mq6_x4_tile: Option<[u8; 3]>,
+    /// Fold three MQ6 sibling projections into independent row regions.
+    pub qwen4_mq6_x4_regions: bool,
     /// Calibration-only override keeping native-BF16 teachers in BF16
     /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
     /// read so fresh `Gpu` code can take the flag from `self.flags`
@@ -687,6 +693,20 @@ impl FeatureFlags {
             wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
             lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
             lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
+            qwen4_mq6_x4_gfx1201: value("HIPFIRE_QWEN4_MQ6_X4_GFX1201").as_deref() == Ok("1"),
+            qwen4_mq6_x4_tile: match value("HIPFIRE_QWEN4_MQ6_X4_TILE").ok().as_deref() {
+                Some("auto") => Some([0, 0, 0]),
+                Some("8x4x1") => Some([8, 4, 1]),
+                Some("8x4x2") => Some([8, 4, 2]),
+                Some("8x8x1") => Some([8, 8, 1]),
+                Some("8x8x2") => Some([8, 8, 2]),
+                Some("12x4x1") => Some([12, 4, 1]),
+                Some("12x4x2") => Some([12, 4, 2]),
+                Some("12x8x1") => Some([12, 8, 1]),
+                Some("12x8x2") => Some([12, 8, 2]),
+                _ => None,
+            },
+            qwen4_mq6_x4_regions: value("HIPFIRE_QWEN4_MQ6_X4_REGIONS").as_deref() == Ok("1"),
             calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
 
             // MMQ screening
@@ -1109,6 +1129,9 @@ impl FeatureFlags {
             wo_mmq: false,
             lm_head_wmma_disabled: false,
             lm_head_overwrite: false,
+            qwen4_mq6_x4_gfx1201: false,
+            qwen4_mq6_x4_tile: None,
+            qwen4_mq6_x4_regions: false,
             calib_force_bf16: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
