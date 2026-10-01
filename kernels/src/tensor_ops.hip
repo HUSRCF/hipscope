@@ -1609,6 +1609,250 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Convolution + Q/K norm in one launch (Flash-Next H5; opt-in, chunked-GDN
+// wave32 route only: gfx1151 / gfx1201 with a gated_delta_qk_norm_bf16_batched
+// consumer).  `gated_delta_conv_qknorm_bf16_f32_batched_k4` is
+// gated_delta_conv_bf16_f32_batched_k4's body plus the normalized Q/K that
+// gated_delta_qk_norm_bf16_batched stores, byte for byte:
+//   * the four-tap multiply/add order, the BF16 SiLU rounding and the ring
+//     history are the plain kernel's expressions (one helper, same order);
+//   * the first 16 blocks of the channel grid (channels [0, 4096) = the 16 q
+//     heads then the 16 k heads, 128 channels each) are remapped: a wave owns
+//     one head (32 lanes x 4 contiguous channels) and 4 rows of the 16-row
+//     tile, wave w -> head blockIdx.x * 2 + (w & 1), rows r0 + 4 * (w >> 1)
+//     .. +3.  Each output row is independent (only the 3-row history
+//     window is replayed from the input at the wave's first row), so the
+//     conv values are the plain kernel's;
+//   * the BF16 conv result is normalized in registers by the qk-norm kernel's
+//     exact expressions (lane partial of 4 BF16-rounded squares in element
+//     order, then the same DPP/swizzle/xor tree) and stored as BF16 to
+//     qn / kn [rows, 16, 128];
+//   * the V channels use the same wave tile (4 contiguous channels per lane,
+//     no norm) when channels % 256 == 0, else the plain scalar body; the
+//     parameter blocks run gated_delta_params_flat as in the plain kernel.
+// Extra ABI vs the plain kernel: `qn`, `kn` (8-byte aligned, [rows,16,128]
+// BF16).  Layout contract (the wrapper must check): channels >= 4096, q|k|v
+// channel order, key_heads == 16, key_dim == 128; otherwise do not use this
+// symbol (below 4096 channels the kernel degrades to the plain body and
+// leaves qn / kn untouched).  `output_bf16` is a flag word: bit 0 = store
+// the V output as packed BF16 (the plain kernel's meaning); bit 1 = also
+// store the *unnormalized* Q/K convolution output into `output` (debug /
+// capture); without bit 1 the Q/K columns of `output` are NOT written.
+// Grid [ceil(channels / 256) + param blocks, ceil(rows / 16)], block 256
+// (identical to the plain kernel's launch).  wave32 (the DPP rows/xor-16
+// shuffle are the plain qk-norm kernel's).
+// ---------------------------------------------------------------------------
+static __device__ __forceinline__ __hip_bfloat16 gated_delta_conv_silu_tap(
+    float k0, float k1, float k2, float k3,
+    __hip_bfloat16 current_bf16, __hip_bfloat16 h0, __hip_bfloat16 h1, __hip_bfloat16 h2) {
+    float value = k3 * bf16_to_f32(current_bf16);
+    value += k0 * bf16_to_f32(h0);
+    value += k1 * bf16_to_f32(h1);
+    value += k2 * bf16_to_f32(h2);
+    return bf16_round(value * (1.0f / (1.0f + expf(-value))));
+}
+
+// gated_delta_qk_norm_bf16_batched's inverse-RMS for one lane's 4 BF16 values
+// of a 128-channel head (a full wave32 must be converged here).
+static __device__ __forceinline__ float gated_delta_qk_norm_inv_wave32(const float v[4]) {
+    float part = 0.0f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) part += bf16_to_f32(bf16_round(v[u] * v[u]));
+    part += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(part), 0xB1, 0xF, 0xF, false));
+    part += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(part), 0x4E, 0xF, 0xF, false));
+    part += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(part), 0x101F));
+    part += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(part), 0x201F));
+    part += __shfl_xor(part, 16, 32);
+    const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+    return bf16_to_f32(bf16_round(rsqrtf(bf16_to_f32(bf16_round(part)) + bf16_to_f32(eps))));
+}
+
+extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f32_batched_k4(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* output,
+    float* next_history,
+    int rows,
+    int channels,
+    int history_rows,
+    int kernel_size,
+    int start_cursor,
+    int output_bf16,
+    int input_bf16,
+    const float* param_a,
+    const float* param_b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int param_elements,
+    int heads,
+    __hip_bfloat16* qn,
+    __hip_bfloat16* kn) {
+    const int conv_blocks = (channels + 255) / 256;
+    if ((int)blockIdx.x >= conv_blocks) {
+        const int flat = ((int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
+        if (blockIdx.y == 0 && flat < param_elements)
+            gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+        return;
+    }
+    const int r0 = (int)blockIdx.y * 16;
+    if (r0 >= rows || history_rows != 3 || kernel_size != 4) return;
+    const int store_bf16 = output_bf16 & 1;
+
+    // 128-channel slices (4 contiguous channels per lane) x 4-row quarters.  The
+    // q / k heads (blocks 0..15) are also normalized; the V channels use the
+    // same tile when channels is a multiple of 256, else the scalar body below.
+    const bool norm = (int)blockIdx.x < 16 && channels >= 4096;
+    if (norm || (channels & 255) == 0) {
+        const int wave = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
+        const int head = (int)blockIdx.x * 2 + (wave & 1);
+        const int rb = r0 + (wave >> 1) * 4;
+        if (rb >= rows) return;  // wave-uniform; no block barrier follows
+        const int re = min(rb + 4, min(r0 + 16, rows));
+        const int c0 = head * 128 + lane * 4;
+        const bool is_k = head >= 16;
+        const int kh = head & 15;
+        const unsigned short* in_u16 = (const unsigned short*)input;
+        const unsigned short* kern_u16 = (const unsigned short*)kernel;
+        auto in4 = [&](int j, __hip_bfloat16 (&o)[4]) {
+            if (input_bf16) {
+                const uint2 w = *(const uint2*)(in_u16 + (size_t)j * channels + c0);
+                o[0].data = (unsigned short)(w.x & 0xFFFFu);
+                o[1].data = (unsigned short)(w.x >> 16);
+                o[2].data = (unsigned short)(w.y & 0xFFFFu);
+                o[3].data = (unsigned short)(w.y >> 16);
+            } else {
+#pragma unroll
+                for (int u = 0; u < 4; ++u) o[u] = bf16_round(input[(size_t)j * channels + c0 + u]);
+            }
+        };
+        auto x4 = [&](int j, __hip_bfloat16 (&o)[4]) {
+            if (j >= 0) {
+                in4(j, o);
+            } else {
+#pragma unroll
+                for (int u = 0; u < 4; ++u)
+                    o[u] = bf16_round(history[((start_cursor + j + 3) % 3) * channels + c0 + u]);
+            }
+        };
+        float k0[4], k1[4], k2[4], k3[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const uint2 w = *(const uint2*)(kern_u16 + (size_t)(c0 + u) * 4);
+            k0[u] = __uint_as_float(w.x << 16);
+            k1[u] = __uint_as_float(w.x & 0xFFFF0000u);
+            k2[u] = __uint_as_float(w.y << 16);
+            k3[u] = __uint_as_float(w.y & 0xFFFF0000u);
+        }
+        __hip_bfloat16 h0[4], h1[4], h2[4];
+        x4(rb - 3, h0);
+        x4(rb - 2, h1);
+        x4(rb - 1, h2);
+        // Ring slot s after the last row (see the plain kernel).  Only the
+        // row-0 quarter-0 wave reads the history (rb - 3 < 0) or writes
+        // next_history, each lane its own channels, reads first.
+        const bool writes_tail = (r0 == 0) && (wave >> 1) == 0;
+        __hip_bfloat16 tail[3][4];
+        if (writes_tail) {
+            for (int s = 0; s < 3; ++s) {
+                const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+                x4(j, tail[s]);
+            }
+        }
+        for (int r = rb; r < re; ++r) {
+            __hip_bfloat16 cur[4];
+            in4(r, cur);
+            float v[4];
+            unsigned short bits[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const __hip_bfloat16 out =
+                    gated_delta_conv_silu_tap(k0[u], k1[u], k2[u], k3[u], cur[u], h0[u], h1[u], h2[u]);
+                v[u] = bf16_to_f32(out);
+                bits[u] = out.data;
+            }
+            if (!norm || (output_bf16 & 2)) {
+                if (store_bf16) {
+                    uint2 packed;
+                    packed.x = (unsigned)bits[0] | ((unsigned)bits[1] << 16);
+                    packed.y = (unsigned)bits[2] | ((unsigned)bits[3] << 16);
+                    *(uint2*)((unsigned short*)output + (size_t)r * channels + c0) = packed;
+                } else {
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) output[(size_t)r * channels + c0 + u] = v[u];
+                }
+            }
+            if (norm) {
+                const float inv = gated_delta_qk_norm_inv_wave32(v);
+                uint2 packed;
+                packed.x = (unsigned)bf16_round(v[0] * inv).data | ((unsigned)bf16_round(v[1] * inv).data << 16);
+                packed.y = (unsigned)bf16_round(v[2] * inv).data | ((unsigned)bf16_round(v[3] * inv).data << 16);
+                *(uint2*)((unsigned short*)(is_k ? kn : qn) + ((size_t)r * 16 + kh) * 128 + lane * 4) = packed;
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                h0[u] = h1[u];
+                h1[u] = h2[u];
+                h2[u] = cur[u];
+            }
+        }
+        if (writes_tail) {
+            for (int s = 0; s < 3; ++s)
+#pragma unroll
+                for (int u = 0; u < 4; ++u)
+                    next_history[s * channels + c0 + u] = bf16_to_f32(tail[s][u]);
+        }
+        return;
+    }
+
+    // V channels: the plain kernel's body.
+    const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (channel >= channels) return;
+    auto in = [&](int j) {
+        if (input_bf16) {
+            __hip_bfloat16 b;
+            b.data = ((const unsigned short*)input)[j * channels + channel];
+            return b;
+        }
+        return bf16_round(input[j * channels + channel]);
+    };
+    auto x = [&](int j) {
+        return j >= 0 ? in(j)
+                      : bf16_round(history[((start_cursor + j + 3) % 3) * channels + channel]);
+    };
+    const float k0 = bf16_to_f32(kernel[channel * 4 + 0]);
+    const float k1 = bf16_to_f32(kernel[channel * 4 + 1]);
+    const float k2 = bf16_to_f32(kernel[channel * 4 + 2]);
+    const float k3 = bf16_to_f32(kernel[channel * 4 + 3]);
+    __hip_bfloat16 h0 = x(r0 - 3), h1 = x(r0 - 2), h2 = x(r0 - 1);
+    __hip_bfloat16 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
+        }
+    }
+    const int r1 = min(r0 + 16, rows);
+    for (int r = r0; r < r1; ++r) {
+        const __hip_bfloat16 current_bf16 = in(r);
+        const __hip_bfloat16 out = gated_delta_conv_silu_tap(k0, k1, k2, k3, current_bf16, h0, h1, h2);
+        if (store_bf16)
+            ((unsigned short*)output)[r * channels + channel] = out.data;
+        else
+            output[r * channels + channel] = bf16_to_f32(out);
+        h0 = h1;
+        h1 = h2;
+        h2 = current_bf16;
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            next_history[s * channels + channel] = bf16_to_f32(tail[s]);
+    }
+}
+
 // Row-batched parameter expansion; source BF16 boundaries match decode.
 extern "C" __global__ void gated_delta_params_bf16_f32_batched(
     const float* a,
