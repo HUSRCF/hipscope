@@ -487,8 +487,8 @@ impl Carrier for Qwen4Carrier {
                     .ok_or("qwen4: QSA gather scratch size overflows")
                 })
                 .transpose()?;
-            // The prefix cache's checkpoint is allocated at load after the
-            // forward, so it is charged here, before placement.
+            // The prefix cache's checkpoint is allocated at load (before the
+            // forward), so it is charged here, before placement.
             let prefix_bytes = if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
                 hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(&config, state_format, mtp_kept)
                     .ok_or("qwen4: prefix cache device bytes overflow")?
@@ -684,6 +684,16 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             )
         })?;
+        // The target checkpoint is allocated before the forward so the
+        // admitted chunk rung is chosen from the VRAM left after it; the
+        // second call below adds the MTP head's part.
+        if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
+            if let Err(error) = bundle.attach_prefix_cache(ctx.gpu) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: prefix cache setup failed: {detail}"));
+            }
+        }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);

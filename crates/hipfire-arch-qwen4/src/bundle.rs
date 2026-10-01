@@ -1034,12 +1034,10 @@ impl Qwen4Bundle {
     /// attached, the MTP head). Call after `attach_forward` and MTP attach;
     /// its bytes are charged by the load reserve
     /// (`Qwen4State::prefix_arena_bytes`).
+    /// Idempotent: call once right after assembly, before `attach_forward`
+    /// (so its free-VRAM chunk rung sees the checkpoint already allocated),
+    /// and again after MTP attach to add the head's part.
     pub fn attach_prefix_cache(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        if self.execution.is_none() {
-            return Err(BundleError::Forward(
-                "Qwen4 prefix cache needs the attached forward".to_string(),
-            ));
-        }
         self.state
             .attach_prefix_arena(gpu)
             .map_err(BundleError::State)?;
@@ -1049,7 +1047,7 @@ impl Qwen4Bundle {
         }
         if self.prefix.is_none() {
             self.prefix = Some(Qwen4PrefixCache {
-                tokens: Vec::new(),
+                tokens: Vec::with_capacity(self.state.max_seq_len),
                 mode: Qwen4PrefixMode::Ar,
                 chunk: 0,
                 published: false,
