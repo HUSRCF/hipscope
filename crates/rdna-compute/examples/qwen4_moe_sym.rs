@@ -1,4 +1,5 @@
-//! Qwen4 symmetric IU4 MoE ORACLE (fn-moe-sym, gfx1151; developer example).
+//! Qwen4 symmetric IU4 MoE ORACLE (fn-moe-sym, gfx1151 + gfx1201; developer
+//! example).
 //!
 //! Drives the production `Gpu` launchers of the opt-in route, the same calls
 //! the Qwen4 prefill makes under `HIPFIRE_QWEN4_MOE_SYM_IU4=1`:
@@ -9,18 +10,24 @@
 //! host references: a CPU stable sort, the packed-A4 fold
 //! `sum = fma(RN(sc*d), float(C_h), sum)`, the shipped SwiGLU expression (on
 //! the device, over the CPU folds) and the down sidecar produced by the real
-//! `mq_rotate_x_128_v2` plus the shared quantizer. The route's GEMMs are the
-//! expert-run (`_nt4`) entries; every check also runs the module's 16-slot
-//! entries on the same sidecars and requires byte-identical outputs
-//! (`nt4_vs_nt1_byte_diff`, poison and guards included). The incumbent
-//! (moe_scatter_fused_top10 + mq_rotate_x_f16 + F16 WMMA gate/up SiLU +
-//! moe_unscatter_rotate128_f16 + F16 WMMA down) runs on the same weights for
+//! `mq_rotate_x_128_v2` plus the shared quantizer. The GEMMs are the certified
+//! builder (PM) expert-run entries the launchers select for the residency
+//! (gfx1201 host-mapped: NT8, else NT4), or the gfx1151 hipcc NT4 under
+//! `HIPFIRE_QWEN4_MOE_SYM_PM=0`. Every other entry of the arch (PM NT1/NT4/NT8,
+//! gfx1151 hipcc NT1/NT4) is an anchor: it runs on the same grouping and
+//! sidecars and every byte of both output buffers (poison included) must
+//! agree with the candidate's. The incumbent
+//! (gfx1151: moe_scatter_fused_top10 + mq_rotate_x_f16 + F16 WMMA gate/up
+//! SiLU + moe_unscatter_rotate128_f16 + F16 WMMA down; gfx1201: the scatter,
+//! the gfx12 F16 WMMA gate/up over the upstream rotated X, the fused
+//! unscatter/SiLU/FWHT128 and the SIMT down) runs on the same weights for
 //! timing and an informative general-input delta.
 //!
 //! CLI: --mode check|graph|time|sweep|stress --routing one|all|skew|FILE
-//!      [--x FILE.f16] [--tokens T] [--seed N] [--iters N]
+//!      [--x FILE.f16] [--tokens T] [--seed N] [--iters N] [--residency vram|host]
 //! Routing FILE = little-endian i32 top-10 expert ids [T*10]; X FILE = F16
-//! [T*2560] (captured activations). Output: one JSON object on stdout.
+//! [T*2560] (captured activations). `--residency host` places the expert
+//! weights in host-mapped memory. Output: one JSON object on stdout.
 //! Needs `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only for the route predicate report;
 //! the launchers themselves run regardless.
 
@@ -40,6 +47,7 @@ const BLK: usize = 72;
 const GUARD: usize = 4096;
 
 const QUANT: &str = include_str!("../../../kernels/src/block_i4_128_quant.hip");
+/// The gfx1151 hipcc GEMMs (production source `kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC`).
 const K11: &str = include_str!("../../../kernels/src/qwen4_moe_iu4_sym.gfx1151.hip");
 const ROT128: &str = include_str!("../../../kernels/src/mq_rotate_x_128_v2.hip");
 /// Oracle-only kernels: the shared quantizer over stored FWHT rows (the
@@ -424,6 +432,14 @@ struct Case {
     i_inverse: GpuTensor,
     i_ygu: GpuTensor,
     i_ydn: GpuTensor,
+    /// gfx1201 incumbent operands: upstream rotated X, compact SwiGLU rows.
+    x_rot: GpuTensor,
+    i_rot: GpuTensor,
+    /// Anchor GEMM outputs.
+    h_ygu: GpuTensor,
+    h_ydn: GpuTensor,
+    /// Expert weights in host-mapped memory (`--residency host`).
+    host: bool,
 }
 
 const GU_STRIDE: usize = GU_M * (HID / 256) * GU_GB;
@@ -436,6 +452,7 @@ fn make_case(
     x: &[f32],
     gu_w: Vec<u8>,
     dn_w: Vec<u8>,
+    host: bool,
 ) -> Res<Case> {
     let l = topk.len();
     let t = l / TOPK;
@@ -443,8 +460,11 @@ fn make_case(
     let pmax = pmax.div_ceil(16) * 16;
     let gu_distinct = gu_w.len() / GU_STRIDE;
     let dn_distinct = dn_w.len() / DN_STRIDE;
-    let gu_t = gpu.upload_raw(&gu_w, &[gu_w.len()])?;
-    let dn_t = gpu.upload_raw(&dn_w, &[dn_w.len()])?;
+    let (gu_t, dn_t) = if host {
+        (gpu.upload_raw_host_mapped(&gu_w, &[gu_w.len()])?, gpu.upload_raw_host_mapped(&dn_w, &[dn_w.len()])?)
+    } else {
+        (gpu.upload_raw(&gu_w, &[gu_w.len()])?, gpu.upload_raw(&dn_w, &[dn_w.len()])?)
+    };
     let gu_ptrs = gpu.upload_raw(&ptr_table(&gu_t, GU_STRIDE, gu_distinct), &[E * 8])?;
     let dn_ptrs = gpu.upload_raw(&ptr_table(&dn_t, DN_STRIDE, dn_distinct), &[E * 8])?;
     Ok(Case {
@@ -476,14 +496,21 @@ fn make_case(
         i_inverse: alloc(gpu, l * 4)?,
         i_ygu: alloc(gpu, pmax * GU_M * 4)?,
         i_ydn: alloc(gpu, pmax * DN_M * 4)?,
+        x_rot: alloc(gpu, t * HID * 4)?,
+        i_rot: alloc(gpu, l * MI * 4)?,
+        h_ygu: alloc(gpu, pmax * MI * 2 + GUARD)?,
+        h_ydn: alloc(gpu, pmax * DN_M * 2 + GUARD)?,
+        host,
     })
 }
 
-/// The route's five stages, handles carried between them.
+/// The route's five stages, handles carried between them; `entry` names the
+/// anchor GEMMs of [`anchor_stage`].
 #[derive(Default)]
 struct Handles {
     gate: Option<Int4MmqPrepared>,
     down: Option<Int4MmqPrepared>,
+    entry: Option<Entry>,
 }
 
 fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
@@ -503,6 +530,7 @@ fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
             TOPK,
             c.pmax,
             c.t,
+            c.host,
         )?,
         3 => h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?),
         _ => gpu.gemm_qwen4_moe_down_iu4_sym(
@@ -516,6 +544,7 @@ fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
             1,
             c.pmax,
             c.l,
+            c.host,
         )?,
     }
     Ok(())
@@ -529,11 +558,150 @@ fn cand_all(gpu: &mut Gpu, c: &Case) -> Res<()> {
     Ok(())
 }
 
-/// The shipped gfx1151 incumbent envelope on the same operands.
+/// One GEMM pair the route can run: the builder (PM) entries at each
+/// expert-run tile width and, on gfx1151, the hipcc entries (the production
+/// module `kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC`). NT1 gate/up runs block
+/// 64; every NT>1 entry and every down runs block 128; the grid is
+/// ceil(M/64) x P/16 for all. Every entry must produce the same bytes.
+#[derive(Clone, Copy)]
+struct Entry {
+    name: &'static str,
+    gate_up: &'static str,
+    down: &'static str,
+    gu_block: u32,
+    pm: bool,
+}
+
+const fn entry(name: &'static str, gate_up: &'static str, down: &'static str, gu_block: u32, pm: bool) -> Entry {
+    Entry { name, gate_up, down, gu_block, pm }
+}
+
+const ENTRIES_GFX1151: [Entry; 4] = [
+    entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151", "qwen4_moe_down_iu4_sym_pm_gfx1151", 64, true),
+    entry("pm_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", 128, true),
+    entry("hip_nt1", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151", "qwen4_moe_down_iu4_sym_gfx1151", 64, false),
+    entry("hip_nt4", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4", "qwen4_moe_down_iu4_sym_gfx1151_nt4", 128, false),
+];
+const ENTRIES_GFX1201: [Entry; 3] = [
+    entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201", "qwen4_moe_down_iu4_sym_pm_gfx1201", 64, true),
+    entry("pm_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", 128, true),
+    entry("pm_nt8", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8", 128, true),
+];
+const HIP_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
+
+fn entries(gpu: &Gpu) -> &'static [Entry] {
+    if gpu.arch == "gfx1201" { &ENTRIES_GFX1201 } else { &ENTRIES_GFX1151 }
+}
+
+/// Loads every entry of this arch.
+fn load_entries(gpu: &mut Gpu) -> Res<()> {
+    let src = format!("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n{QUANT}{K11}");
+    for e in entries(gpu) {
+        for f in [e.gate_up, e.down] {
+            if e.pm {
+                gpu.ensure_qwen4_moe_sym_pm_entry(f)?;
+            } else {
+                gpu.ensure_kernel_public(HIP_SYM_MODULE, &src, f)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The candidate (the entry the launchers select for this residency) and
+/// its anchors: every other entry of the arch.
+fn cand_and_anchors(gpu: &Gpu, host: bool) -> Res<(Entry, Vec<Entry>)> {
+    let [gu, _] = gpu.qwen4_moe_sym_gemm_symbols(host).ok_or("no sym GEMM symbols on this arch")?;
+    let all = entries(gpu);
+    let cand = *all.iter().find(|e| e.gate_up == gu).ok_or("route GEMM is not an ORACLE entry")?;
+    Ok((cand, all.iter().copied().filter(|e| e.gate_up != gu).collect()))
+}
+
+fn diff(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+}
+
+/// Entry `e`'s GEMM `down` (else gate/up) from the current grouping and
+/// production sidecar into `y` ([`load_entries`] first).
+fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> Res<()> {
+    let (f, ptrs, xq, m, k, div, src_rows, block) = if down {
+        let xq = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no down sidecar")?.as_ptr();
+        (e.down, &c.dn_ptrs, xq, DN_M, MI, 1, c.l, 128)
+    } else {
+        let xq = gpu.scratch.int4_mmq_x_scratch.as_ref().ok_or("no gate sidecar")?.as_ptr();
+        (e.gate_up, &c.gu_ptrs, xq, GU_M, HID, TOPK, c.t, e.gu_block)
+    };
+    let mut a = KernargBlob::new();
+    for ptr in [p(ptrs), p(&c.tiles), p(&c.sorted), xq as *const _, p(y)] {
+        a.push_ptr(ptr);
+    }
+    for v in [m, k, div, c.pmax, src_rows] {
+        a.push_i32(v as i32);
+    }
+    launch(gpu, f, [(m / 64) as u32, (c.pmax / 16) as u32, 1], block, &mut a)
+}
+
+/// Every anchor's GEMMs over the current grouping and gate sidecar (its own
+/// down sidecar from its own gate/up) into outputs poisoned with `v`, as the
+/// candidate's were; per anchor, byte mismatches of both whole buffers
+/// (poison and guard included) vs `ygu`, `ydn`.
+fn anchor_mismatch(
+    gpu: &mut Gpu,
+    c: &Case,
+    anchors: &[Entry],
+    v: i32,
+    ygu: &[u8],
+    ydn: &[u8],
+) -> Res<Vec<(&'static str, [usize; 2])>> {
+    let mut out = Vec::with_capacity(anchors.len());
+    for &e in anchors {
+        gpu.hip.memset(&c.h_ygu.buf, v, c.pmax * MI * 2 + GUARD)?;
+        gpu.hip.memset(&c.h_ydn.buf, v, c.pmax * DN_M * 2 + GUARD)?;
+        let mut h = Handles { entry: Some(e), ..Handles::default() };
+        for s in 2..5 {
+            anchor_stage(gpu, c, &mut h, s)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let a = download(gpu, &c.h_ygu.buf, c.pmax * MI * 2 + GUARD)?;
+        let d = download(gpu, &c.h_ydn.buf, c.pmax * DN_M * 2 + GUARD)?;
+        out.push((e.name, [diff(&a, ygu), diff(&d, ydn)]));
+    }
+    Ok(out)
+}
+
+fn anchor_json(m: &[(&str, [usize; 2])]) -> String {
+    let body: Vec<String> = m.iter().map(|(n, [a, b])| format!("\"{n}\":[{a},{b}]")).collect();
+    format!("{{{}}}", body.join(","))
+}
+
+fn anchor_total(m: &[(&str, [usize; 2])]) -> usize {
+    m.iter().map(|(_, [a, b])| a + b).sum()
+}
+
+/// The route with the GEMMs of `h.entry` (production grouping, producers).
+fn anchor_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
+    let e = h.entry.ok_or("anchor stage without an entry")?;
+    match s {
+        2 => entry_gemm(gpu, c, e, false, &c.h_ygu),
+        3 => {
+            h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.h_ygu, &c.sorted, MI, c.pmax, c.l)?);
+            Ok(())
+        }
+        4 => entry_gemm(gpu, c, e, true, &c.h_ydn),
+        _ => cand_stage(gpu, c, h, s),
+    }
+}
+
+/// The shipped incumbent envelope on the same operands (per arch).
 fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
+    let gfx1201 = gpu.arch == "gfx1201";
     match s {
         0 => gpu.moe_scatter_fused_top10(
             &c.topk, &c.i_counts, &c.i_offsets, &c.i_sorted, &c.i_tiles, &c.i_inverse, c.l, E, c.pmax, 16,
+        )?,
+        // gfx1201 consumes the upstream rotated X (`x_rot`, set up once).
+        2 if gfx1201 => gpu.gemm_mq4g256v2_moe_grouped_top10(
+            &c.gu_ptrs, &c.i_tiles, &c.i_sorted, &c.x_rot, &c.i_ygu, GU_M, HID, TOPK, c.pmax, c.t,
         )?,
         2 => {
             let xf16 = gpu.rotate_x_mq_batched_f16(&c.x_in, HID, c.t)?;
@@ -541,6 +709,12 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
                 &c.gu_ptrs, &c.i_tiles, &c.i_sorted, &xf16, &c.i_ygu, GU_M, HID, TOPK, c.pmax, c.t,
             )?;
         }
+        3 if gfx1201 => {
+            gpu.moe_gate_up_unscatter_silu_rotate128_top10(&c.i_ygu, &c.i_sorted, &c.i_rot, MI, c.pmax, true, None)?
+        }
+        4 if gfx1201 => gpu.gemm_mq4g128v2_moe_grouped_top10(
+            &c.dn_ptrs, &c.i_tiles, &c.i_sorted, &c.i_rot, &c.i_ydn, DN_M, MI, 1, c.pmax, c.l, E,
+        )?,
         4 => {
             let x16 = gpu.moe_unscatter_rotate128_f16(&c.i_ygu, &c.i_sorted, MI, c.pmax, c.l)?;
             gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
@@ -552,11 +726,22 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
     Ok(())
 }
 
+/// gfx1201 incumbent setup: the production `mq_rotate_x` output it consumes
+/// (upstream of the MoE in the shipped route, not charged to either arm).
+fn inc_setup(gpu: &mut Gpu, c: &Case) -> Res<()> {
+    if gpu.arch == "gfx1201" {
+        let r = gpu.reserve_int4_mmq(HID, c.t)?;
+        gpu.rotate_x_mq_i4_batched(&c.x_in, None, Some(&c.x_rot), r, HID, c.t)?;
+        gpu.hip.device_synchronize()?;
+    }
+    Ok(())
+}
+
 type Stage = fn(&mut Gpu, &Case, &mut Handles, usize) -> Res<()>;
 
-fn timed(gpu: &mut Gpu, c: &Case, f: Stage) -> Res<(Vec<f64>, f64)> {
+fn timed(gpu: &mut Gpu, c: &Case, f: Stage, entry: Option<Entry>) -> Res<(Vec<f64>, f64)> {
     let ev: Vec<_> = (0..6).map(|_| gpu.hip.event_create()).collect::<Result<_, _>>()?;
-    let mut h = Handles::default();
+    let mut h = Handles { entry, ..Handles::default() };
     gpu.hip.event_record(&ev[0], None)?;
     for s in 0..5 {
         f(gpu, c, &mut h, s)?;
@@ -594,59 +779,13 @@ fn live_bytes(g: &Grouping, ygu: &[u8], ydn: &[u8]) -> Vec<u8> {
     [&ygu[..used * MI * 2], &ydn[..used * DN_M * 2]].concat()
 }
 
-/// The route's GEMM entries (expert-run tiles) and their 16-slot byte anchor.
-const NT4_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
-const NT4_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
-const NT1_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151";
-const NT1_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151";
-
 fn load_oracle(gpu: &mut Gpu) -> Res<()> {
     let src = format!("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n{QUANT}{ORACLE_KERNELS}");
     for f in ["qwen4_moe_sym_ref_quant", "qwen4_moe_sym_ref_widen", "qwen4_moe_sym_ref_swiglu"] {
         gpu.ensure_kernel_public("qwen4_moe_sym_oracle", &src, f)?;
     }
     gpu.ensure_kernel_public("qwen4_moe_sym_oracle_rot128", ROT128, "mq_rotate_x_128_v2")?;
-    // The production module source (kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC).
-    let k11 = format!("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n{QUANT}{K11}");
-    for f in [NT1_GATE_UP, NT1_DOWN, NT4_GATE_UP, NT4_DOWN] {
-        gpu.ensure_kernel_public("qwen4_moe_iu4_sym_gfx1151", &k11, f)?;
-    }
-    Ok(())
-}
-
-/// Runs the 16-slot anchor GEMMs on the live gate and down sidecars into
-/// anchor buffers poisoned with `poison_v` and counts differing bytes against
-/// the route's (NT4) outputs, which the caller poisoned with the same value.
-fn nt1_anchor_diff(gpu: &mut Gpu, c: &Case, poison_v: i32) -> Res<usize> {
-    let (gb, db) = (c.pmax * MI * 2 + GUARD, c.pmax * DN_M * 2 + GUARD);
-    let ag = alloc(gpu, gb)?;
-    let ad = alloc(gpu, db)?;
-    gpu.hip.memset(&ag.buf, poison_v, gb)?;
-    gpu.hip.memset(&ad.buf, poison_v, db)?;
-    let xg = gpu.scratch.int4_mmq_x_scratch.as_ref().ok_or("no gate sidecar")?.as_ptr() as *const _;
-    let xd = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no down sidecar")?.as_ptr() as *const _;
-    for (func, ptrs, x, y, m, k, div, src, block) in [
-        (NT1_GATE_UP, &c.gu_ptrs, xg, &ag, GU_M, HID, TOPK, c.t, 64u32),
-        (NT1_DOWN, &c.dn_ptrs, xd, &ad, DN_M, MI, 1, c.l, 128u32),
-    ] {
-        let mut a = KernargBlob::new();
-        a.push_ptr(p(ptrs));
-        a.push_ptr(p(&c.tiles));
-        a.push_ptr(p(&c.sorted));
-        a.push_ptr(x);
-        a.push_ptr(p(y));
-        for v in [m, k, div, c.pmax, src] {
-            a.push_i32(v as i32);
-        }
-        launch(gpu, func, [(m / 64) as u32, (c.pmax / 16) as u32, 1], block, &mut a)?;
-    }
-    gpu.hip.device_synchronize()?;
-    let (rg, rd) = outputs(gpu, c)?;
-    let diff = download(gpu, &ag.buf, gb)?.iter().zip(&rg).filter(|(a, b)| a != b).count()
-        + download(gpu, &ad.buf, db)?.iter().zip(&rd).filter(|(a, b)| a != b).count();
-    gpu.free_tensor(ag)?;
-    gpu.free_tensor(ad)?;
-    Ok(diff)
+    load_entries(gpu)
 }
 
 /// Device SwiGLU of host-exact gate/up folds (`live` per row), BF16 bits.
@@ -848,11 +987,18 @@ fn weight_sweep(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<i32>) {
     (gu, dn, topk)
 }
 
-/// One-hot activation sweep through the production GEMM symbols with crafted
+/// One-hot activation sweep through the candidate GEMM entry with crafted
 /// sidecars: slot/token j carries value v = (j / 128) % 16 - 8 at in-block
 /// position j % 128 of every epoch (d varied per block), the rest zero; random
-/// symmetric weights. Returns (gate/up mismatches, down mismatches, probes).
-fn x_onehot_sweep(gpu: &mut Gpu, seed: u64) -> Res<(usize, usize, usize)> {
+/// symmetric weights. Every anchor runs on the same operands and must agree
+/// with the candidate byte for byte. Returns (gate/up mismatches, down
+/// mismatches, probes, per-anchor byte mismatches).
+fn x_onehot_sweep(
+    gpu: &mut Gpu,
+    seed: u64,
+    cand: Entry,
+    anchors: &[Entry],
+) -> Res<(usize, usize, usize, Vec<(&'static str, [usize; 2])>)> {
     let n = 128 * 16; // every position x every value
     let mut r = Rng(seed ^ 0x1e1e);
     let craft = |epochs: usize, r: &mut Rng| {
@@ -886,20 +1032,12 @@ fn x_onehot_sweep(gpu: &mut Gpu, seed: u64) -> Res<(usize, usize, usize)> {
     let xdt = gpu.upload_raw(&xd, &[xd.len()])?;
     let ygu = alloc(gpu, n * MI * 2)?;
     let ydn = alloc(gpu, n * DN_M * 2)?;
-    // Both the route's NT4 entries and the 16-slot anchor entries.
-    let (mut gu_mis, mut dn_mis) = (0usize, 0usize);
-    let fg = fold_reference(&gu_w, &xg, GU_M, HID, n, GU_GB);
-    let fd = fold_reference(&dn_w, &xd, DN_M, MI, n, DN_GB);
-    let (mut gs, mut us) = (Vec::with_capacity(n * MI), Vec::with_capacity(n * MI));
-    for j in 0..n {
-        gs.extend_from_slice(&fg[j * GU_M..j * GU_M + MI]);
-        us.extend_from_slice(&fg[j * GU_M + MI..(j + 1) * GU_M]);
-    }
-    let r_gu = ref_swiglu(gpu, &gs, &us, &vec![1; n])?;
-    for (gsym, gblock, dsym) in [(NT1_GATE_UP, 64u32, NT1_DOWN), (NT4_GATE_UP, 128, NT4_DOWN)] {
+    let run = |gpu: &mut Gpu, e: Entry| -> Res<(Vec<u8>, Vec<u8>)> {
+        gpu.hip.memset(&ygu.buf, 0x7B, n * MI * 2)?;
+        gpu.hip.memset(&ydn.buf, 0x7B, n * DN_M * 2)?;
         for (func, ptrs, xq, y, m, k, block) in [
-            (gsym, &gu_ptrs, &xgt, &ygu, GU_M, HID, gblock),
-            (dsym, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32),
+            (e.gate_up, &gu_ptrs, &xgt, &ygu, GU_M, HID, e.gu_block),
+            (e.down, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32),
         ] {
             let mut a = KernargBlob::new();
             a.push_ptr(p(ptrs));
@@ -913,23 +1051,36 @@ fn x_onehot_sweep(gpu: &mut Gpu, seed: u64) -> Res<(usize, usize, usize)> {
             launch(gpu, func, [(m / 64) as u32, (n / 16) as u32, 1], block, &mut a)?;
         }
         gpu.hip.device_synchronize()?;
-        let got_gu = download(gpu, &ygu.buf, n * MI * 2)?;
-        let got_dn = download(gpu, &ydn.buf, n * DN_M * 2)?;
-        gu_mis += r_gu
-            .iter()
-            .enumerate()
-            .filter(|(i, w)| u16::from_le_bytes([got_gu[2 * i], got_gu[2 * i + 1]]) != **w)
-            .count();
-        dn_mis += fd
-            .iter()
-            .enumerate()
-            .filter(|(i, v)| u16::from_le_bytes([got_dn[2 * i], got_dn[2 * i + 1]]) != bf16_bits(**v))
-            .count();
+        Ok((download(gpu, &ygu.buf, n * MI * 2)?, download(gpu, &ydn.buf, n * DN_M * 2)?))
+    };
+    let (got_gu, got_dn) = run(gpu, cand)?;
+    let mut anchor_mis = Vec::with_capacity(anchors.len());
+    for &e in anchors {
+        let (ag, ad) = run(gpu, e)?;
+        anchor_mis.push((e.name, [diff(&ag, &got_gu), diff(&ad, &got_dn)]));
     }
+    let fg = fold_reference(&gu_w, &xg, GU_M, HID, n, GU_GB);
+    let fd = fold_reference(&dn_w, &xd, DN_M, MI, n, DN_GB);
+    let (mut gs, mut us) = (Vec::with_capacity(n * MI), Vec::with_capacity(n * MI));
+    for j in 0..n {
+        gs.extend_from_slice(&fg[j * GU_M..j * GU_M + MI]);
+        us.extend_from_slice(&fg[j * GU_M + MI..(j + 1) * GU_M]);
+    }
+    let r_gu = ref_swiglu(gpu, &gs, &us, &vec![1; n])?;
+    let gu_mis = r_gu
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| u16::from_le_bytes([got_gu[2 * i], got_gu[2 * i + 1]]) != **w)
+        .count();
+    let dn_mis = fd
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| u16::from_le_bytes([got_dn[2 * i], got_dn[2 * i + 1]]) != bf16_bits(**v))
+        .count();
     for tsr in [gu_t, dn_t, gu_ptrs, dn_ptrs, tiles, sorted, xgt, xdt, ygu, ydn] {
         gpu.free_tensor(tsr)?;
     }
-    Ok((gu_mis, dn_mis, n))
+    Ok((gu_mis, dn_mis, n, anchor_mis))
 }
 
 // ---------------------------------------------------------------- main
@@ -946,10 +1097,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iters: usize = arg(&args, "--iters", "10").parse()?;
     let tokens: usize = arg(&args, "--tokens", "1536").parse()?;
     let xfile = arg(&args, "--x", "");
+    let residency = arg(&args, "--residency", "vram");
+    let host = match residency.as_str() {
+        "vram" => false,
+        "host" => true,
+        other => return Err(format!("--residency {other}: expected vram or host").into()),
+    };
 
     let mut gpu = Gpu::init()?;
-    if gpu.arch != "gfx1151" {
-        return Err(format!("the symmetric IU4 MoE route is gfx1151-only, device is {}", gpu.arch).into());
+    if !matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") {
+        return Err(format!("the symmetric IU4 MoE route is gfx1151/gfx1201-only, device is {}", gpu.arch).into());
     }
     load_oracle(&mut gpu)?;
     let mut out = BTreeMap::<String, String>::new();
@@ -959,6 +1116,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out.insert("seed".into(), seed.to_string());
     out.insert("hipcc_extra_flags".into(), q(&gpu.flags.hipcc_extra_flags));
     out.insert("route_requested".into(), gpu.qwen4_moe_sym_iu4_requested().to_string());
+    let (cand, anchors) = cand_and_anchors(&gpu, host)?;
+    out.insert("gemm_symbols".into(), format!("[{},{}]", q(cand.gate_up), q(cand.down)));
+    out.insert("candidate_entry".into(), q(cand.name));
+    out.insert("residency".into(), q(&residency));
+    let names: Vec<String> = anchors.iter().map(|e| q(e.name)).collect();
+    out.insert("anchors".into(), format!("[{}]", names.join(",")));
     let mut fails: Vec<String> = Vec::new();
 
     if mode == "sweep" {
@@ -967,7 +1130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = topk.len() / TOPK;
         let mut r = Rng(seed ^ 0x77);
         let x: Vec<f32> = (0..t * HID).map(|_| (r.unit() - 0.5) * 4.0).collect();
-        let c = make_case(&mut gpu, topk, &x, gu_w, dn_w)?;
+        let c = make_case(&mut gpu, topk, &x, gu_w, dn_w, host)?;
         let (gok, dok) = header_checks(&mut gpu, &c)?;
         poison(&gpu, &c, 0x7B)?;
         cand_all(&mut gpu, &c)?;
@@ -988,12 +1151,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !(gok && dok) || gm + dm + pb != 0 {
             fails.push("weight one-hot sweep".into());
         }
+        let am = anchor_mismatch(&mut gpu, &c, &anchors, 0x7B, &ygu, &ydn)?;
+        out.insert("weight_onehot_anchor_byte_mismatch".into(), anchor_json(&am));
+        if anchor_total(&am) != 0 {
+            fails.push("weight one-hot anchor mismatch".into());
+        }
         // (b) activation one-hot, every position x value, every epoch.
-        let (xg, xd, n) = x_onehot_sweep(&mut gpu, seed)?;
+        let (xg, xd, n, xa) = x_onehot_sweep(&mut gpu, seed, cand, &anchors)?;
         out.insert("x_onehot_slots".into(), n.to_string());
         out.insert("x_onehot_gate_up_mismatch".into(), xg.to_string());
         out.insert("x_onehot_down_mismatch".into(), xd.to_string());
-        if xg + xd != 0 {
+        out.insert("x_onehot_anchor_byte_mismatch".into(), anchor_json(&xa));
+        if xg + xd + anchor_total(&xa) != 0 {
             fails.push("activation one-hot sweep".into());
         }
     } else {
@@ -1016,7 +1185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out.insert("md5_x".into(), q(&md5_hex(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())));
         out.insert("md5_gu_w".into(), q(&md5_hex(&gu_w)));
         out.insert("md5_dn_w".into(), q(&md5_hex(&dn_w)));
-        let c = make_case(&mut gpu, topk, &x, gu_w, dn_w)?;
+        let c = make_case(&mut gpu, topk, &x, gu_w, dn_w, host)?;
+        inc_setup(&mut gpu, &c)?;
         let g = cpu_group(&c.topk_host, c.pmax);
         let used = g.offsets[E] as usize / 16;
         out.insert("tokens".into(), c.t.to_string());
@@ -1099,12 +1269,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if gm + dm + pb != 0 {
                 fails.push("GEMM fold mismatch".into());
             }
-            // Expert-run tile (the route's NT4 entries) vs the 16-slot anchor
-            // on the same sidecars: every byte, poison and guards included.
-            let anchor = nt1_anchor_diff(&mut gpu, &c, 0x7B)?;
-            out.insert("nt4_vs_nt1_byte_diff".into(), anchor.to_string());
-            if anchor != 0 {
-                fails.push("NT4 differs from the 16-slot anchor".into());
+            let am = anchor_mismatch(&mut gpu, &c, &anchors, 0x7B, &ygu, &ydn)?;
+            out.insert("anchor_byte_mismatch_gate_up_down".into(), anchor_json(&am));
+            if anchor_total(&am) != 0 {
+                fails.push("candidate GEMMs differ from an anchor".into());
             }
             let h_eager = md5_hex(&live_bytes(&g, &ygu, &ydn));
             out.insert("hash_live".into(), q(&h_eager));
@@ -1223,6 +1391,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cand_all(&mut gpu, &c)?;
                     gpu.hip.device_synchronize()?;
                     let eager = snapshot(&gpu)?;
+                    let am = anchor_mismatch(&mut gpu, &c, &anchors, 0x5A, &eager[0].1, &eager[1].1)?;
+                    let at = anchor_total(&am);
                     let mut mism = Vec::new();
                     let mut total = 0usize;
                     for ((n, a), (_, b)) in replay.iter().zip(&eager) {
@@ -1251,19 +1421,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let hash = md5_hex(&live_bytes(&gr, &replay[0].1, &replay[1].1));
                     let changed = hash != prev_hash;
                     let empty = gr.counts.iter().filter(|&&n| n == 0).count();
-                    // The 16-slot anchor on this round's eager sidecars: every
-                    // byte of both outputs (poison and guards included).
-                    let anchor = nt1_anchor_diff(&mut gpu, &c, 0x5A)?;
-                    let ok = total == 0 && anchor == 0 && grp_ok && gm + dm + pb == 0
+                    let ok = total == 0 && grp_ok && gm + dm + pb == 0 && at == 0
                         && (changed || *name == "original")
                         && (*name != "original" || hash == h_eager);
                     if !ok {
                         fails.push(format!("changed-input graph replay round {name}"));
                     }
                     round_reports.push(format!(
-                        "{{\"round\":\"{name}\",\"empty_experts\":{empty},\"padded_P\":{},\"replay_vs_eager_mismatch\":{{{}}},\"nt4_vs_nt1_byte_diff\":{anchor},\"replay_group_matches_cpu\":{grp_ok},\"replay_fold_mismatch\":[{gm},{dm},{pb}],\"live_hash\":\"{hash}\",\"changed_vs_previous_round\":{changed},\"pass\":{ok}}}",
+                        "{{\"round\":\"{name}\",\"empty_experts\":{empty},\"padded_P\":{},\"replay_vs_eager_mismatch\":{{{}}},\"replay_group_matches_cpu\":{grp_ok},\"replay_fold_mismatch\":[{gm},{dm},{pb}],\"eager_vs_anchor_byte_mismatch\":{},\"live_hash\":\"{hash}\",\"changed_vs_previous_round\":{changed},\"pass\":{ok}}}",
                         gr.offsets[E],
-                        mism.join(",")
+                        mism.join(","),
+                        anchor_json(&am)
                     ));
                     prev_hash = hash;
                 }
@@ -1274,16 +1442,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stale_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
                 let _fresh_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
                 let gate_err = gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                    &c.gu_ptrs, &c.tiles, &c.sorted, &stale_gate, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t,
+                    &c.gu_ptrs, &c.tiles, &c.sorted, &stale_gate, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t, c.host,
                 );
                 let stale_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
                 let fresh_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
                 let down_err = gpu.gemm_qwen4_moe_down_iu4_sym(
-                    &c.dn_ptrs, &c.tiles, &c.sorted, &stale_down, &c.ydn, DN_M, MI, 1, c.pmax, c.l,
+                    &c.dn_ptrs, &c.tiles, &c.sorted, &stale_down, &c.ydn, DN_M, MI, 1, c.pmax, c.l, c.host,
                 );
                 // A live handle of the other sidecar is refused too.
                 let cross_err = gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                    &c.gu_ptrs, &c.tiles, &c.sorted, &fresh_down, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t,
+                    &c.gu_ptrs, &c.tiles, &c.sorted, &fresh_down, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t, c.host,
                 );
                 gpu.hip.device_synchronize()?;
                 let msg = |r: &hip_bridge::HipResult<()>| match r {
@@ -1304,7 +1472,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             gpu.hip.device_synchronize()?;
             let isorted = to_i32(&download(&gpu, &c.i_sorted.buf, c.pmax * 4)?);
-            let ydi = download(&gpu, &c.i_ydn.buf, c.pmax * DN_M * 2)?;
+            // gfx1151's WMMA down stores BF16 rows, gfx1201's SIMT down F32.
+            let f32_rows = gpu.arch == "gfx1201";
+            let ydi = download(&gpu, &c.i_ydn.buf, c.pmax * DN_M * 4)?;
             let (mut num, mut den) = (0f64, 0f64);
             for (pi, &s) in isorted.iter().enumerate() {
                 if s < 0 {
@@ -1312,8 +1482,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let pc = g.inverse[s as usize] as usize;
                 for col in (0..DN_M).step_by(7) {
-                    let o = (pi * DN_M + col) * 2;
-                    let inc = f32::from_bits((u16::from_le_bytes([ydi[o], ydi[o + 1]]) as u32) << 16) as f64;
+                    let i = pi * DN_M + col;
+                    let inc = if f32_rows {
+                        f32::from_le_bytes(ydi[4 * i..4 * i + 4].try_into().unwrap()) as f64
+                    } else {
+                        f32::from_bits((u16::from_le_bytes([ydi[2 * i], ydi[2 * i + 1]]) as u32) << 16) as f64
+                    };
                     let o = (pc * DN_M + col) * 2;
                     let cand = f32::from_bits((u16::from_le_bytes([ydn[o], ydn[o + 1]]) as u32) << 16) as f64;
                     num += (cand - inc) * (cand - inc);
@@ -1347,32 +1521,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if mode == "time" {
-            for _ in 0..2 {
-                let mut h = Handles::default();
-                for s in 0..5 {
-                    inc_stage(&mut gpu, &c, &mut h, s)?;
-                }
-                cand_all(&mut gpu, &c)?;
+            // Arms: the shipped incumbent, the candidate route and the same
+            // route with each expert-run anchor's GEMMs (gfx1151: the hipcc
+            // NT4; gfx1201: the other tile width). Two warm passes each, then
+            // a palindromic order per iteration (ABC, CBA, ...) so drift
+            // charges every arm alike.
+            let mut arms: Vec<(&str, Stage, Option<Entry>)> =
+                vec![("incumbent", inc_stage, None), ("candidate", cand_stage, None)];
+            for &e in anchors.iter().filter(|e| e.gu_block == 128) {
+                arms.push((e.name, anchor_stage, Some(e)));
             }
-            gpu.hip.device_synchronize()?;
-            let (mut inc_t, mut cand_t) = (Vec::new(), Vec::new());
-            let (mut inc_st, mut cand_st) = (vec![Vec::new(); 5], vec![Vec::new(); 5]);
-            for i in 0..iters {
-                let order = if i % 2 == 0 { [false, true] } else { [true, false] };
-                for is_cand in order {
-                    let (st, tot) = timed(&mut gpu, &c, if is_cand { cand_stage } else { inc_stage })?;
-                    let (t, sv) = if is_cand { (&mut cand_t, &mut cand_st) } else { (&mut inc_t, &mut inc_st) };
-                    t.push(tot);
+            for _ in 0..2 {
+                for &(_, f, entry) in &arms {
+                    let mut h = Handles { entry, ..Handles::default() };
                     for s in 0..5 {
-                        sv[s].push(st[s]);
+                        f(&mut gpu, &c, &mut h, s)?;
                     }
                 }
             }
-            out.insert("incumbent_envelope_ms_min_med_max".into(), stats(&inc_t));
-            out.insert("candidate_envelope_ms_min_med_max".into(), stats(&cand_t));
-            for s in 0..5 {
-                out.insert(format!("incumbent_stage{s}_ms"), stats(&inc_st[s]));
-                out.insert(format!("candidate_stage{s}_ms"), stats(&cand_st[s]));
+            gpu.hip.device_synchronize()?;
+            let mut tot = vec![Vec::new(); arms.len()];
+            let mut st = vec![vec![Vec::new(); 5]; arms.len()];
+            for i in 0..iters {
+                let order: Vec<usize> =
+                    if i % 2 == 0 { (0..arms.len()).collect() } else { (0..arms.len()).rev().collect() };
+                for a in order {
+                    let (sv, t) = timed(&mut gpu, &c, arms[a].1, arms[a].2)?;
+                    tot[a].push(t);
+                    for s in 0..5 {
+                        st[a][s].push(sv[s]);
+                    }
+                }
+            }
+            out.insert("time_iters".into(), iters.to_string());
+            out.insert("time_pid".into(), std::process::id().to_string());
+            for (a, (name, _, _)) in arms.iter().enumerate() {
+                out.insert(format!("{name}_envelope_ms_min_med_max"), stats(&tot[a]));
+                for s in 0..5 {
+                    out.insert(format!("{name}_stage{s}_ms"), stats(&st[a][s]));
+                }
             }
         }
     }

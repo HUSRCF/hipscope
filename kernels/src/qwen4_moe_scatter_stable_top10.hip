@@ -22,8 +22,8 @@
 
 #include <hip/hip_runtime.h>
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
-#error "qwen4_moe_scatter_stable_top10.hip is gfx1151-only"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__)
+#error "qwen4_moe_scatter_stable_top10.hip is gfx1151/gfx1201-only"
 #endif
 
 extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_ranks(

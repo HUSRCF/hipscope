@@ -129,15 +129,22 @@ pub trait Backend: Sized {
     fn scalar_compare(&mut self, auth: &Auth, insn: Self::Insn) -> Result<(), String>;
     /// `s_cbranch_scc1 target`.
     fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
+    /// `s_branch target`.
+    fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
     /// Backend state at a branch: everything later waits, hazard guards and
     /// slot checks depend on (wait ledger, LDS slots, hazard trackers).
     type Fork;
     fn fork(&self) -> Self::Fork;
+    /// Continue at the branch's target with the state of the branch point.
+    fn resume(&mut self, auth: &Auth, at: Self::Fork) -> Result<(), String>;
     /// `other` is another path into the current point: make the current
     /// state hold on both, conservatively (every wait or hazard guard either
     /// path needs is emitted), or refuse when the paths disagree on LDS
     /// ownership.
     fn join(&mut self, auth: &Auth, other: Self::Fork) -> Result<(), String>;
+    /// Other waves of the workgroup have drained stores into `slots`, which
+    /// the next barrier publishes (the reading side of a wave-role handoff).
+    fn lds_peer_stores(&mut self, auth: &Auth, slots: &[usize]) -> Result<(), String>;
     /// EXEC = SCC ? all lanes : none.
     fn exec_from_scc(&mut self, auth: &Auth) -> Result<(), String>;
     /// EXEC = all lanes.

@@ -44,6 +44,15 @@ fn iu4_v2b(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=iu4_v2b::emit(Spec{arch,epi:epi.parse()?})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// `--epi all` emits every entry of the arch as one module; `gate_up`/`down`
+/// one 16-slot entry, `gate_up_ntN`/`down_ntN` one expert-run entry.
+fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_moe_sym::{self,Spec};
+ if epi=="all"{let (_,text,proof)=qwen4_moe_sym::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let (kind,nt)=match epi.rsplit_once("_nt"){Some((k,n))=>(k,n.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?),None=>(epi,1)};
+ let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::fp8_gemm::{self,Spec,ActScale,Epi};
  if scale=="both" {
@@ -132,6 +141,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "gdn_scan"=>{let e=hipfire_isa::kernels::gdn_scan::emit(arch)?;(e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?)}
   "iu4_v2c"=>iu4_v2c(epi.as_deref().unwrap_or("set"),arch)?,
   "iu4_v2b"=>iu4_v2b(epi.as_deref().ok_or("missing --epi")?,arch)?,
+  "qwen4_moe_sym"=>qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
  fs::write(out.ok_or("missing --out")?,text).map_err(|e|e.to_string())?;fs::write(proof.ok_or("missing --proof")?,proof_json).map_err(|e|e.to_string())?;Ok(())}

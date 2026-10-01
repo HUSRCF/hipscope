@@ -79,3 +79,55 @@ pub fn bstore_b128(b: &mut Builder, data: u8, voff: u8, srd: u8, offset: u32) ->
 }
 fn zero_soffset(a: Arch) -> &'static str { if a.gfx12() { "null" } else { "0" } }
 fn imm_offset(o: u32) -> String { if o == 0 { String::new() } else { format!(" offset:{o}") } }
+
+/// Buffer offset of a masked gather row: at or past any `num_records` a
+/// gather descriptor declares, so every load of the row reads 0 and touches
+/// no memory.
+pub const GATHER_OOB: u32 = 0x7fff_ff00;
+/// Largest index (exclusive) for which [`gather_offset`]'s `index / div`
+/// is exact: the f32 reciprocal quotient is within one of the true quotient
+/// below 2^22, and two integer corrections fix it.
+pub const GATHER_MAX_INDEX: u32 = 1 << 22;
+
+/// Registers of [`gather_offset`]: four dead VGPRs and a dead lane-mask
+/// SGPR pair for the quotient corrections.
+#[derive(Clone, Copy, Debug)]
+pub struct GatherTemps { pub v: [u8; 4], pub mask: u8 }
+
+/// Masked indexed-row gather through a raw buffer descriptor (QSA K3, the
+/// grouped MoE activation rows): per lane, `index` is a signed row index,
+/// negative for a padding lane. Writes `live` (lane-mask pair: `index >= 0`)
+/// and `dst = live ? (index / div) * row_bytes : GATHER_OOB`, with `div` a
+/// uniform SGPR divisor (`None`: 1). Loads at `dst + k` against a descriptor
+/// of `rows * row_bytes` records then fetch row `index / div` for live lanes
+/// and 0 for padding lanes, which never touch memory. Requires
+/// `0 <= index < GATHER_MAX_INDEX` on live lanes and `row_bytes < 2^24`.
+pub fn gather_offset(b: &mut Builder, dst: u8, index: u8, div: Option<u8>, row_bytes: u32, live: u8, t: GatherTemps) -> Result<(), String> {
+    if row_bytes >= 1 << 24 { return Err("gather row_bytes must fit 24 bits".into()) }
+    let [q, r, w, f] = t.v;
+    let m = t.mask;
+    match div {
+        Some(d) => {
+            op(b, format!("v_cvt_f32_u32_e32 v{f}, s{d}"), &[v(f)], &[s(d)])?;
+            op(b, format!("v_rcp_iflag_f32_e32 v{f}, v{f}"), &[v(f)], &[v(f)])?;
+            op(b, format!("v_cvt_f32_u32_e32 v{q}, v{index}"), &[v(q)], &[v(index)])?;
+            op(b, format!("v_mul_f32_e32 v{q}, v{q}, v{f}"), &[v(q)], &[v(q), v(f)])?;
+            op(b, format!("v_cvt_u32_f32_e32 v{q}, v{q}"), &[v(q)], &[v(q)])?;
+            op(b, format!("v_mul_lo_u32 v{r}, v{q}, s{d}"), &[v(r)], &[v(q), s(d)])?;
+            op(b, format!("v_sub_nc_u32_e32 v{r}, v{index}, v{r}"), &[v(r)], &[v(index), v(r)])?;
+            // remainder < 0: q -= 1, r += d; then r >= d: q += 1.
+            op(b, format!("v_cmp_gt_i32_e64 s{m}, 0, v{r}"), &[s(m)], &[v(r)])?;
+            op(b, format!("v_add_nc_u32_e32 v{w}, -1, v{q}"), &[v(w)], &[v(q)])?;
+            op(b, format!("v_cndmask_b32_e64 v{q}, v{q}, v{w}, s{m}"), &[v(q)], &[v(q), v(w), s(m)])?;
+            op(b, format!("v_add_nc_u32_e32 v{w}, s{d}, v{r}"), &[v(w)], &[s(d), v(r)])?;
+            op(b, format!("v_cndmask_b32_e64 v{r}, v{r}, v{w}, s{m}"), &[v(r)], &[v(r), v(w), s(m)])?;
+            op(b, format!("v_cmp_le_u32_e64 s{m}, s{d}, v{r}"), &[s(m)], &[s(d), v(r)])?;
+            op(b, format!("v_add_nc_u32_e32 v{w}, 1, v{q}"), &[v(w)], &[v(q)])?;
+            op(b, format!("v_cndmask_b32_e64 v{q}, v{q}, v{w}, s{m}"), &[v(q)], &[v(q), v(w), s(m)])?;
+        }
+        None => op(b, format!("v_mov_b32_e32 v{q}, v{index}"), &[v(q)], &[v(index)])?,
+    }
+    op(b, format!("v_cmp_le_i32_e64 s{live}, 0, v{index}"), &[s(live)], &[v(index)])?;
+    op(b, format!("v_mul_u32_u24_e32 v{q}, {}, v{q}", lit(row_bytes)), &[v(q)], &[v(q)])?;
+    op(b, format!("v_cndmask_b32_e64 v{dst}, {}, v{q}, s{live}", lit(GATHER_OOB)), &[v(dst)], &[v(q), s(live)])
+}

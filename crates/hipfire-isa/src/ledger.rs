@@ -127,6 +127,13 @@ impl Ledger {
         self.pending = merged;
         self.next_id = self.next_id.max(other.next_id);
     }
+    /// Continue from another path's ledger without reusing an id this one
+    /// issued (ids stay unique across the paths of one program).
+    pub fn resume(&mut self, at: Ledger) {
+        let next_id = self.next_id.max(at.next_id);
+        *self = at;
+        self.next_id = next_id;
+    }
 
     pub fn drain(&mut self) -> Vec<(Counter, u8, Reason)> {
         let mut waits = Vec::new();
@@ -172,7 +179,7 @@ impl Ledger {
                 (true, Counter::Ds) => format!("s_wait_dscnt {count:#x}"),
                 (true, Counter::Km) => format!("s_wait_kmcnt {count:#x}"),
                 (false, Counter::Vm) => format!("s_waitcnt vmcnt({count})"),
-                (false, Counter::Vs) => format!("s_waitcnt_vscnt null, {count}"),
+                (false, Counter::Vs) => format!("s_waitcnt_vscnt null, {count:#x}"),
                 (false, Counter::Lgkm) => format!("s_waitcnt lgkmcnt({count})"),
                 (_, Counter::Exp) => format!("s_waitcnt expcnt({count})"),
                 _ => return Err("counter/architecture mismatch".into()),
