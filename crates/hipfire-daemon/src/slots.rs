@@ -221,6 +221,11 @@ pub struct SlotBackend {
     /// over-budget request can be rejected with an actionable message
     /// before it occupies a slot.
     cap_tokens: usize,
+    /// Sampling-default inputs shared with the sequential route
+    /// ([`resolve_slot_sampling`]): carrier arch ladder + `.hfq` recs.
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
     active: AtomicUsize,
     tool_grammar: bool,
     pending_tools: Mutex<PendingToolBroker>,
@@ -388,6 +393,8 @@ impl SlotBackend {
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
         let vision_config = preflight.vision_config;
+        let rec_temperature = preflight.rec_temperature;
+        let rec_top_p = preflight.rec_top_p;
         // Read prefix cache config (spec §4.5–4.6). Keys are registered in
         // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
         // with env HIPFIRE_SERVE_PREFIX_CACHE*. Default false/0.
@@ -555,6 +562,9 @@ impl SlotBackend {
             is_vl,
             vision_config,
             cap_tokens,
+            arch_id,
+            rec_temperature,
+            rec_top_p,
             active: AtomicUsize::new(0),
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
@@ -707,11 +717,22 @@ impl SlotBackend {
             return Ok(());
         }
 
-        let temperature = msg
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32;
-        let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let (temperature, top_p, max_tokens, fit) =
+            match resolve_slot_sampling(msg, self.arch_id, self.rec_temperature, self.rec_top_p) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &err,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
         let top_k = msg.get("top_k").and_then(|v| v.as_i64()).unwrap_or(0);
         if !(0..=i32::MAX as i64).contains(&top_k) {
             hipfire_engine::emit::emit_active_attempt_error(
@@ -796,23 +817,6 @@ impl SlotBackend {
             .unwrap_or(0.0)
             .max(0.0) as f32;
 
-        let max_tokens = match msg.get("max_tokens") {
-            None | Some(serde_json::Value::Null) => 512usize,
-            Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
-                Some(v) if v > 0 => v,
-                _ => {
-                    hipfire_engine::emit::emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        "max_tokens must be a positive integer",
-                        "validation",
-                        false,
-                        false,
-                    );
-                    return Ok(());
-                }
-            },
-        };
         let max_think_tokens = msg
             .get("max_think_tokens")
             .and_then(|v| v.as_u64())
@@ -1189,6 +1193,14 @@ impl SlotBackend {
             return Ok(());
         }
         let prompt_len = prompt_tokens.len();
+        // A client that omitted max_tokens gets the default clamped to the
+        // room left after the prompt, exactly like the sequential route.
+        let max_tokens = hipfire_generate::common::fit_max_tokens_if(
+            fit,
+            max_tokens,
+            prompt_len,
+            self.cap_tokens,
+        );
         // vLLM-style admission: prompt + generation budget must fit the
         // slot's context cap. The engine's per-token ctx guard would stop
         // the decode at the cap anyway, but that surfaces as a silently
@@ -1705,6 +1717,9 @@ struct Preflight {
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
     vl_path: Option<PathBuf>,
+    /// `.hfq`-baked author sampling recommendation (`generation_config`).
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
 }
 
 fn cpu_preflight(
@@ -1785,7 +1800,10 @@ fn cpu_preflight(
         return Err("empty chat_template".to_string());
     }
     let arch_str = hipfire_loader::arch_label(hfq.arch_id).to_string();
+    let rec = hfq.recommended_sampling();
     Ok(Preflight {
+        rec_temperature: rec.as_ref().and_then(|r| r.temperature),
+        rec_top_p: rec.as_ref().and_then(|r| r.top_p),
         arch_id: hfq.arch_id,
         arch_str,
         dim: config.dim,
@@ -1964,6 +1982,32 @@ pub fn is_experimental_generate(msg: &serde_json::Value) -> bool {
         return true;
     }
     false
+}
+
+/// Effective `(temperature, top_p, max_tokens, max_tokens_fit)` for a slot
+/// generate request. Defaults are the sequential route's
+/// ([`hipfire_engine::scheduler::resolve_temp_top_p`],
+/// [`hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS`], wire
+/// `max_tokens_fit`); a present-but-malformed `max_tokens` is refused.
+pub(crate) fn resolve_slot_sampling(
+    msg: &serde_json::Value,
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+) -> Result<(f32, f32, usize, bool), String> {
+    let (temperature, top_p) =
+        hipfire_engine::scheduler::resolve_temp_top_p(msg, arch_id, rec_temperature, rec_top_p);
+    let max_tokens = match msg.get("max_tokens") {
+        None | Some(serde_json::Value::Null) => {
+            hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS
+        }
+        Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+            Some(v) if v > 0 => v,
+            _ => return Err("max_tokens must be a positive integer".to_owned()),
+        },
+    };
+    let fit = msg.get("max_tokens_fit").and_then(|v| v.as_bool()) == Some(true);
+    Ok((temperature, top_p, max_tokens, fit))
 }
 
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
@@ -2768,6 +2812,36 @@ mod tests {
         assert!(validate_arch_id(6).is_ok());
         assert!(validate_arch_id(7).is_err());
         assert!(validate_arch_id(9).is_err());
+    }
+
+    /// P10: a generate with no sampling fields resolves on the multi-slot
+    /// route to exactly what the sequential route resolves (arch ladder /
+    /// `.hfq` recs, default max_tokens 4096, the `max_tokens_fit` clamp) —
+    /// not the old slot-local 0.0 / 1.0 / 512 / no-fit.
+    #[test]
+    fn slot_sampling_defaults_match_sequential_route() {
+        use hipfire_engine::scheduler::{resolve_temp_top_p, DEFAULT_GENERATE_MAX_TOKENS};
+        let bare = json!({"type": "generate", "max_tokens_fit": true});
+        for (rec_t, rec_p) in [(None, None), (Some(0.6), Some(0.95)), (Some(0.7), None)] {
+            let (seq_t, seq_p) = resolve_temp_top_p(&bare, 5, rec_t, rec_p);
+            let (t, p, max_tokens, fit) = resolve_slot_sampling(&bare, 5, rec_t, rec_p).unwrap();
+            assert_eq!((t, p), (seq_t, seq_p));
+            assert_eq!(max_tokens, DEFAULT_GENERATE_MAX_TOKENS);
+            assert!(fit);
+        }
+        // Pinned values: qwen35 ladder, then per-knob .hfq recs.
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().0, 0.3);
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().1, 0.8);
+        let partial = resolve_slot_sampling(&bare, 5, Some(0.7), None).unwrap();
+        assert_eq!((partial.0, partial.1), (0.7, 0.8));
+        // Explicit fields win over recs, and an explicit max_tokens is never
+        // marked for fitting.
+        let explicit = json!({"max_tokens": 64, "temperature": 0.0, "top_p": 1.0});
+        assert_eq!(
+            resolve_slot_sampling(&explicit, 5, Some(0.6), Some(0.95)).unwrap(),
+            (0.0, 1.0, 64, false)
+        );
+        assert!(resolve_slot_sampling(&json!({"max_tokens": 0}), 5, None, None).is_err());
     }
 
     #[test]

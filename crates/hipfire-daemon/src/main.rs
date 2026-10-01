@@ -3107,48 +3107,29 @@ fn main() {
                     continue;
                 };
 
-                // Sampling defaults differ by arch: qwen35 family was tuned
-                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
-                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
-                // for local deployment, and lower values consistently fall
-                // into block-level attractors on this quantized instruct
-                // model. Pick arch-shaped defaults so a vanilla
-                // `/v1/chat/completions` POST (no sampling fields) works on
-                // both. Explicit per-request values still override either.
-                // Hardcoded arch ladder — the LAST-RESORT fallback for the
-                // sampling defaults. The author-recommended values baked into
-                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
-                // populated at load time via HfqFile::recommended_sampling) take
-                // precedence over this ladder; an explicit per-request field
-                // (set below via `msg.get(...)`) overrides both. The CLI's
-                // curated registry `recommended_settings` reach this handler as
-                // explicit request fields (CLI explicit-send guard), so they sit
-                // above the .hfq layer on that path.
+                // Sampling defaults (shared with the batch and multi-slot
+                // routes via `resolve_temp_top_p`): explicit request field >
+                // the .hfq-baked author recommendation (m.rec_temperature /
+                // m.rec_top_p, from HfqFile::recommended_sampling) > the
+                // carrier's arch ladder (qwen35 `temp=0.3, top_p=0.8`;
+                // DeepSeek V4 Flash `1.0/1.0`). The CLI's curated registry
+                // `recommended_settings` reach this handler as explicit
+                // request fields (CLI explicit-send guard).
                 let defaults = hipfire_loader::carrier_for(m.arch_id)
                     .map(|c| c.sampling_defaults())
                     .unwrap_or_default();
-                let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
-                // Layer the .hfq-baked author recommendation OVER the arch
-                // ladder. Per-knob: a model that bakes only `temperature` still
-                // gets the arch-ladder `top_p`.
-                let default_temp = m
-                    .rec_temperature
-                    .map(|x| x as f64)
-                    .unwrap_or(arch_default_temp);
-                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
-                let temp = msg
-                    .get("temperature")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_temp) as f32;
+                let (temp, top_p) = hipfire_engine::scheduler::resolve_temp_top_p(
+                    &msg,
+                    m.arch_id,
+                    m.rec_temperature,
+                    m.rec_top_p,
+                );
                 let max_tokens = msg
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
+                    .map(|v| v as usize)
+                    .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
-                let top_p = msg
-                    .get("top_p")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_top_p) as f32;
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a

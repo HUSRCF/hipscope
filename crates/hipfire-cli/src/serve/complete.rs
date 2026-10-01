@@ -1708,6 +1708,7 @@ pub(crate) fn project_request_contract(
     if max_tokens == 0 || max_tokens > 393_216 {
         bail_invalid!("max_tokens must be between 1 and 393216");
     }
+    validate_single_choice(body)?;
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
     }
@@ -1733,6 +1734,19 @@ pub(crate) fn project_request_contract(
     })
 }
 
+/// Every serve route returns one completion per request: `n` other than 1
+/// is refused rather than silently answered with a single choice.
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
+        if n.as_u64() != Some(1) {
+            bail_invalid!(
+                "n != 1 is not supported on this serve route (one completion per request)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
 /// refused, never silently dropped. The daemon's `validate_generate_caps` has
 /// typed refusals for exactly these, but this gateway builds the generate
@@ -1747,11 +1761,6 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             if value.as_u64().is_none() {
                 bail_invalid!("max_tokens must be an integer between 1 and 393216");
             }
-        }
-    }
-    if let Some(n) = body.get("n") {
-        if n.as_u64() != Some(1) {
-            bail_invalid!("n != 1 is not supported on this serve route (one completion per request)");
         }
     }
     for field in ["best_of", "logit_bias", "echo", "suffix"] {
@@ -7465,6 +7474,38 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
+    }
+
+    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
+    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    #[test]
+    fn project_request_contract_refuses_n_on_every_route() {
+        let resolved = contract_resolved_with_system("");
+        for multi_slot in [false, true] {
+            for bad in [
+                serde_json::json!(2),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+            ] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": bad,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                let err = project_request_contract(&body, &resolved, false, multi_slot)
+                    .expect_err("n != 1 must be refused");
+                assert!(
+                    err.downcast_ref::<super::super::InvalidRequest>().is_some(),
+                    "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
+                );
+            }
+            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": ok,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                assert!(project_request_contract(&body, &resolved, false, multi_slot).is_ok());
+            }
+        }
     }
 
     /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
