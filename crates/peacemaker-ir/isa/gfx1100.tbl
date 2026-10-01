@@ -367,5 +367,9 @@ v_sub_co_u32	vop3	0x301	VDST:32,SDST:64,SRC0:32,SRC1:32	VDST,SDST	SRC0,SRC1	-	-	
 v_wmma_f32_16x16x16_f16	vop3p	0x40	VDST:256,SRC0:256,SRC1:256,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_f16 v[146:153], v[204:211], v[162:169], v[146:153]	CC404092 1E4B45CC	w0_extra:ignored:0x800000:0x0
 v_wmma_i32_16x16x16_iu4	vop3p	0x45	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu4 v[114:121], v[146:147], v[150:151], v[0:7] neg_lo:[1,1,0]	CC454072 7C032D92	w0_extra:ignored:0x800000:0x0
 v_wmma_i32_16x16x16_iu8	vop3p	0x44	VDST:256,SRC0:128,SRC1:128,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu8 v[140:147], v[16:19], v[32:35], v[0:7] neg_lo:[1,1,0] clamp	CC44C08C 7C024110	w0_extra:ignored:0x800000:0x0
+# attention_verify_wmma.gfx1151 (lds_store_unwaited_at_barrier fixture); samples are that object's words, re-encoded by llvm-mc -mcpu=gfx1100.
+buffer_load_u16	buffer	0x12	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_u16 v158, v116, s[16:19], 0 offen	E0480000 80449E74	-
+v_cvt_f16_i16_e32	vop1	0x51	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_i16_e32 v116.h, v116.l	7FE8A374	w0_extra:ignored:0x10000:0x0
+v_mul_f16_e32	vop2	0x35	VDST:16,SRC0:16,VSRC1:16	VDST	SRC0,VSRC1,VDST	-	-	v_mul_f16_e32 v13.l, v70.l, v13.l	6A1A1B46	-
 # Non-runtime LLVM-MC conformance probe: the V_NOP between VCMPX and PERMLANE is not a safe separator.
 v_nop_e32	vop1	0x0	-	-	-	-	-	v_nop_e32	7E000000	-
