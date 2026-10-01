@@ -843,6 +843,13 @@ impl Flow {
 
     /// Must-defined (in, out) per position from the entry seed.
     fn defined(&self, seed: Bits) -> (Vec<Bits>, Vec<Bits>) {
+        let coarse = self.defined_on(seed, &self.succ, &self.pred);
+        // Must-defined without guard correlation is conservative. Refine only
+        // when a consumer lacks a definition, not merely because guards exist.
+        if (self.predicates.len() == 1 && self.predicates[0].is_empty())
+            || self.acc.iter().zip(&coarse.0).all(|(acc, inn)| acc.reads.minus(inn).is_empty()) {
+            return coarse;
+        }
         let mut joined_in = vec![Bits::FULL; self.n];
         let mut joined_out = vec![Bits::FULL; self.n];
         for choices in &self.predicates {

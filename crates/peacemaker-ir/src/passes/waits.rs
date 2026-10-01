@@ -487,7 +487,11 @@ fn push_event(
     }
     for event in &mut state.pending {
         for i in 0..N {
-            if event.counters.contains(counter_at(i)) {
+            let counter = counter_at(i);
+            // Out-of-order families only retire at zero. Their suffix is
+            // irrelevant; aging it would force useless loop walks to 255.
+            if !matches!(counter, Counter::Km | Counter::Store | Counter::Vs)
+                && event.counters.contains(counter) {
                 event.younger[i] = event.younger[i].saturating_add(fresh.units[i]);
             }
         }
@@ -623,12 +627,25 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
     let ranges: Vec<(BlockId, (usize, usize))> = if body.blocks.is_empty() {
         vec![(BlockId(0), (0, body.layout.len()))]
     } else { body.blocks.iter().map(|block| (block.id, block.range)).collect() };
-    for choices in super::predicates::partitions(body, arch) {
-        let entries = fixpoint(body, arch, &ranges, &choices, &mut events)?;
-        for ((_, range), entry) in ranges.iter().zip(&entries) {
-            let Some(entry) = entry else { continue };
-            walk_block(body, arch, *range, entry, &mut events, &choices, Some(&mut recorder))?;
+    // A successful conservative replay already proves every path. Correlating
+    // immutable guards is only necessary to discharge remaining hazards.
+    let mut partitions = vec![HashMap::new()];
+    let mut refined = false;
+    loop {
+        for choices in &partitions {
+            let entries = fixpoint(body, arch, &ranges, choices, &mut events)?;
+            for ((_, range), entry) in ranges.iter().zip(&entries) {
+                let Some(entry) = entry else { continue };
+                walk_block(body, arch, *range, entry, &mut events, choices, Some(&mut recorder))?;
+            }
         }
+        if refined || recorder.obligations.is_empty() { break; }
+        partitions = super::predicates::partitions(body, arch);
+        if partitions.len() == 1 && partitions[0].is_empty() { break; }
+        recorder.facts.clear();
+        recorder.obligations.clear();
+        recorder.before.clear();
+        refined = true;
     }
     recorder.obligations.sort_unstable_by(|a, b| a.insts.iter().map(|id| id.0).cmp(b.insts.iter().map(|id| id.0))
         .then_with(|| a.rule_id.cmp(&b.rule_id)).then_with(|| a.text.cmp(&b.text)));
