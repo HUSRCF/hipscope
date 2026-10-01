@@ -1759,7 +1759,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MTP_NGRAM"),
-        "MTP + ngram-mod composition. on/auto arm it for greedy (temperature 0), thinking-off requests on native MTP; off keeps MTP alone."
+        "MTP + ngram-mod composition for greedy (temperature 0), thinking-off requests on native MTP. on arms it; off and auto keep MTP alone (auto stays off: greedy text differs from MTP-only on gfx1201)."
     ),
     field!(
         "speculation.mode",
@@ -3932,14 +3932,15 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
     }
 }
 /// MTP n-gram-modifier arm enablement (`speculation.mtp_ngram`, env override
-/// `HIPFIRE_MTP_NGRAM`). `on`/`1` and `auto` both arm the modifier; the
-/// composition itself is only eligible for greedy, thinking-off MTP requests,
-/// so `auto` names exactly that scope. Anything else (`off`, `0`, unset) is off.
+/// `HIPFIRE_MTP_NGRAM`). Only `on`/`1` arms it, and only greedy, thinking-off
+/// MTP requests are eligible. `auto` resolves to off: on gfx1201 / H2 the
+/// composition changes greedy text against MTP-only (the wider verify
+/// windows round differently), so it is not promoted to a default.
 pub fn mtp_ngram_enabled() -> bool {
     mtp_ngram_enabled_for(process_value("HIPFIRE_MTP_NGRAM").as_deref())
 }
 fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
-    matches!(value, Some("1" | "on" | "auto"))
+    matches!(value, Some("1" | "on"))
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk
@@ -5224,7 +5225,7 @@ mod tests {
             (Some("0"), false),
             (Some("on"), true),
             (Some("1"), true),
-            (Some("auto"), true),
+            (Some("auto"), false),
         ] {
             assert_eq!(mtp_ngram_enabled_for(raw), want, "{raw:?}");
         }

@@ -499,7 +499,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
-| `mtp_ngram` | `"off"` | `off` \| `on` \| `auto` | MTP + ngram-mod composition: an n-gram pool proposes long drafts the trunk verifies inside native MTP. Only greedy (temperature 0), thinking-off requests arm it; `on` and `auto` both mean "arm where eligible". Greedy text matches MTP alone. `HIPFIRE_MTP_NGRAM` overrides. |
+| `mtp_ngram` | `"off"` | `off` \| `on` \| `auto` | MTP + ngram-mod composition: an n-gram pool proposes long drafts the trunk verifies inside native MTP. `on` arms it for greedy (temperature 0), thinking-off requests; `auto` currently resolves to off. Up to +387 % decode on copy-heavy turns on gfx1201 / H2, but greedy text differs from MTP alone on some prompts (the wider verify windows round differently). `HIPFIRE_MTP_NGRAM` overrides. |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
 | `ngram_mode` | `"off"` | `off` \| `on` \| `auto` | Model-free; byte-identical to AR when used. |
 | `ngram_k` | `12` | int 2–32 | |
