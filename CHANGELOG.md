@@ -1,7 +1,14 @@
 # Changelog
 
 ## Unreleased
-
+- **Qwen3.8-Flash-Next (Qwen4): opt-in gathered F16 WMMA QSA prefill attention (`HIPFIRE_QWEN4_QSA_WMMA_GATHER=1`, default off).** Prefill chunks of ≥ 512 rows that the full-window dense route does not take run on new modules: `indexed_attention_gathered_wmma.gfx1151.hip` (gfx1151, F32 state) and `indexed_attention_gathered_wmma.gfx1201.hip` (gfx1201, fp8 state). Without the flag, every launch is still `indexed_attention_attention_*_batched_hg4`, and every existing code object is byte-identical on gfx1100, gfx1151 and gfx1201.
+  - Each call first converts the layer's cache rows `[0, end)` to F16 K plus a block-transposed V. One workgroup per (row, KV head) then walks the row's selection in 128-entry tiles.
+  - The conversion uses the route's own scratch (2 KiB per context token, 512 MiB at 262K). It is reserved for the whole `max_seq` at load, before any capture or record, so it never grows under a captured graph or tape. `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=auto` charges it to its reserve; with the flag off the reserve is unchanged.
+  - The route is not bit-exact. Sampled QSA rows vs the F32 reference: rel-L2 ≤ 2.9e-4 at 16K/64K/128K on both arches. The final-row argmax matches flag-off, and KL(off‖on) ≤ 2.3e-4.
+  - There is no Flash-Next KLD reference, so the route stays opt-in.
+  - `hipfire bench --matrix`, flag on vs off, 3 fresh processes each:
+    - Strix Halo: pp8192 996.5–1001.9 → 1186.3–1190.9 tok/s; pp65536 892.4–896.6 → 1080.6–1084.9 tok/s.
+    - R9700 (12 expert layers in VRAM): pp8192 710.5–718.2 → 769.6–783.2 tok/s; pp65536 707.2–716.1 → 774.0–790.2 tok/s.
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
 
 ## v0.4.0 — 2026-09-30
