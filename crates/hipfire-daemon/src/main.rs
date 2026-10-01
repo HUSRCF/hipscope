@@ -2316,7 +2316,6 @@ fn main() {
                         mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_k_override.as_deref(),
-                        kv_v_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,

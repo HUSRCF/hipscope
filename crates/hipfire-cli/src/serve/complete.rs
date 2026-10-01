@@ -3373,6 +3373,11 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
+/// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
+/// tokens; drafted/rejected spec tokens never count). Terminator policy is
+/// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
+/// EOS token, DS4 AR/spec and LFM batch do not
+/// (`spec_usage_counts_eos_for_qwen_not_ds4`).
 pub(crate) fn completion_usage(completion: &Completion) -> serde_json::Value {
     let cached_tokens = completion
         .done

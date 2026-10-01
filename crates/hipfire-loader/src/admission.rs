@@ -54,6 +54,31 @@ pub fn qwen_default_q8_enabled() -> bool {
     )
 }
 
+/// Effective Qwen3.5 V axis: a typed `kv_v` wins, else developer
+/// `HIPFIRE_KV_V` (empty / `q8` = neutral). Resolved once in admission so
+/// VMM sizing and the carrier load see the same pair. The env fallback only
+/// applies to the Qwen3.5 carrier (arch 5/6) on single-rank tensor topology;
+/// other owners never honored it.
+fn resolve_kv_v(typed: Option<&str>, arch_id: u32, tp: usize) -> Option<String> {
+    let env = hipfire_config::developer_var("HIPFIRE_KV_V").ok();
+    resolve_kv_v_from(typed, env.as_deref(), arch_id, tp).map(str::to_string)
+}
+
+fn resolve_kv_v_from<'a>(
+    typed: Option<&'a str>,
+    env: Option<&'a str>,
+    arch_id: u32,
+    tp: usize,
+) -> Option<&'a str> {
+    if let Some(v) = typed.filter(|s| !s.is_empty()) {
+        return Some(v);
+    }
+    if !matches!(arch_id, 5 | 6) || tp > 1 {
+        return None;
+    }
+    env.filter(|v| !matches!(*v, "" | "q8"))
+}
+
 /// Single authoritative operator warning for an admitted legacy trunk.
 pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String> {
     if backend != KvBackend::Legacy {
@@ -259,6 +284,9 @@ pub struct SourceAdmission {
     pub sequence_reason: Option<&'static str>,
     pub kv_backend_request: KvBackendRequest,
     pub qwen_default_q8: bool,
+    /// Effective V axis ([`resolve_kv_v`]); the loader hands exactly this to
+    /// the carrier.
+    pub kv_v: Option<String>,
     /// The resolved carrier (single/pp path). `None` for expert-parallel, which
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
@@ -862,6 +890,11 @@ pub fn admit_source_with_options(
     let arch_id = source
         .arch_id()
         .ok_or_else(|| format!("unrecognized source: {}", source.describe()))?;
+    let kv_v = resolve_kv_v(hints.kv_v, arch_id, tp);
+    let hints = KvBackendHints {
+        kv_v: kv_v.as_deref(),
+        ..hints
+    };
     let is_dir = source.is_dir();
 
     // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
@@ -1276,6 +1309,7 @@ pub fn admit_source_with_options(
         sequence_reason,
         kv_backend_request: request,
         qwen_default_q8: hints.qwen_default_q8,
+        kv_v,
         carrier,
         vision_path,
         vision_mode: vision_mode.to_string(),
@@ -1868,6 +1902,40 @@ mod tests {
                 .map(|_| ())
                 .unwrap_err();
             assert!(error.contains("gfx940") && error.contains("legacy"));
+            cleanup(&trunk);
+        }
+        /// P2: the V axis admission sizes VMM KV with is the one the carrier
+        /// loads (`SourceAdmission::kv_v` → `LoadCtx::kv_v_override`), for
+        /// every `HIPFIRE_KV_V` setting.
+        #[test]
+        fn kv_v_resolves_once_for_admission_and_carrier() {
+            use super::super::resolve_kv_v_from as r;
+            for env in [None, Some(""), Some("q8")] {
+                assert_eq!(r(None, env, 5, 1), None, "neutral env {env:?}");
+                assert_eq!(r(Some("lloyd3"), env, 5, 1), Some("lloyd3"));
+            }
+            assert_eq!(r(None, Some("lloyd3"), 5, 1), Some("lloyd3"));
+            assert_eq!(r(None, Some("lloyd3"), 6, 1), Some("lloyd3"));
+            assert_eq!(r(Some("q8"), Some("lloyd3"), 5, 1), Some("q8"), "typed wins");
+            assert_eq!(r(Some(""), Some("lloyd3"), 5, 1), Some("lloyd3"), "empty typed = unset");
+            assert_eq!(r(None, Some("lloyd3"), 1, 1), None, "non-qwen35 ignores env");
+            assert_eq!(r(None, Some("lloyd3"), 5, 2), None, "EP ignores env");
+
+            let trunk = write_hfq("kv-v-once", 5, false);
+            let admit = |kv_mode, kv_v| {
+                super::super::admit_source(
+                    trunk.to_str().unwrap(), 1, 1, KvBackendRequest::Automatic, None,
+                    "gfx1100", None, "auto", None, 4096,
+                    KvBackendHints { kv_mode: Some(kv_mode), kv_v, ..KvBackendHints::without_device() },
+                )
+                .map(|a| a.kv_v)
+            };
+            assert_eq!(admit("fwht3", Some("lloyd3")).unwrap().as_deref(), Some("lloyd3"));
+            assert_eq!(admit("q8", Some("q8")).unwrap().as_deref(), Some("q8"));
+            // The pair is validated at admission, before the resident model is
+            // touched — not first discovered by the carrier.
+            let err = admit("q8", Some("lloyd3")).unwrap_err();
+            assert!(err.contains("Lloyd V"), "{err}");
             cleanup(&trunk);
         }
         #[test]
