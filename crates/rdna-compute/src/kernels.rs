@@ -4292,6 +4292,9 @@ pub const GEMM_MQV2_WMMA_GFX11_BT_SRC: &str =
 /// modules compile it on gfx1151 only ([`gemm_mqv2_wmma_gfx11_bt_src`]).
 pub const QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/qwen4_gemm_mqv2_wmma_gfx11_bt.hip");
+/// Opt-in gfx1201 MQ6 BT8 X-LDS overwrite/residual/BF16-output entries.
+pub const QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemm_mq6g256v2_wmma_gfx12_x4.hip");
 /// Source of the shipped MQ{2,3,5,6}V2 BT modules: #774's text on gfx1151, the
 /// shipped text everywhere else.
 pub fn gemm_mqv2_wmma_gfx11_bt_src(is_gfx1151: bool) -> &'static str {

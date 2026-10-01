@@ -299,6 +299,14 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    if down.dtype == DType::BF16 && p.recipe.bf16_round_trip()
+        && hip(gpu.qwen4_shared_down_bf16_epi(
+            down.buf, shared.rotated, target, shared.scalar,
+            down.m, down.k, p.batch_size,
+        ))?
+    {
+        return Ok(());
+    }
     let out = f32_view(p.down_expanded, 0, p.batch_size * p.down_m);
     match down.dtype {
         DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
