@@ -4570,13 +4570,15 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8:
+/// SHA-256 875fb5649468329a7ba76ca1ed0bfec8faf9b5a75907de0d38ef73ae446f3b20:
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
 /// the fused GDN projection pads its LDS ring rows to 528 bytes; every symbol
 /// runs its K-loop at wave priority 1 and its epilogue (the fused projection:
 /// its GDN epilogue) at 0; the fold subtracts the magic as a VOPD literal,
 /// keeps each fmac's product in another VGPR bank than its C/acc, and pairs
-/// row group 1's subrev with row group 0's fmac in one packet.
+/// row group 1's subrev with row group 0's fmac in one packet. The fused
+/// projection's `s_wait_alu` guards follow its branch joins and GDN loop back
+/// edge (c6e714e7 plus 5, minus 12 `depctr` guards; nothing else changed).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco");
 /// Original certified `_b1` bundle for same-binary model/performance controls.
@@ -4587,17 +4589,20 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63.
+/// SHA-256 4ffe35803d306edfb97ffc59f87e5a0d7a8785a7c7f02dfc1b18774878e47117
+/// (d5190d97 with the `_b1` QKVZAGDN guard change).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e:
+/// SHA-256 c4e5c52d441f248fe8c3ef5811012de2d906925c876e45d1cf431cfdd2818820:
 /// the 1b26cd3a symbols with every Row fold's ratios batched (two
 /// `ds_load_b128` per 8-row group, loaded one group ahead through v168..v175
 /// and v[183:186]/v[188:191]) and the QKVZA+GDN ring rows padded to 1,040 B
 /// (304 B fixed LDS). K128 symbols code-identical; outputs byte-identical to
-/// 1b26cd3a (/home/kaden/qcal/perf/fp8-rb2g/report.md). A/B against the former
-/// bundle with `HIPFIRE_G12_FP8_F2_BUNDLE=<path>`.
+/// 1b26cd3a (/home/kaden/qcal/perf/fp8-rb2g/report.md). The QKVZA+GDN symbol
+/// carries 4 more `s_wait_alu depctr` guards its GDN loop back edges need
+/// (73168098 otherwise). A/B against the former bundle with
+/// `HIPFIRE_G12_FP8_F2_BUNDLE=<path>`.
 /// Regenerate with `hipfire-isa emit --kernel fp8_gemm --scale both --epi all`
 /// and one contract-checked `peacemaker custom build` per Row epilogue.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
