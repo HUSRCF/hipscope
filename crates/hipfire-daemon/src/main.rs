@@ -22,7 +22,7 @@
 
 use base64::Engine;
 use hipfire_config::developer_var;
-use hipfire_config::devices::{Claim, DeviceSelection, GpuDevice, ObservedDevice};
+use hipfire_config::devices::{Claim, DeviceSelection, ObservedDevice};
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -82,6 +82,8 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod gpu_lock;
+use gpu_lock::GpuLocks;
 mod request_guards;
 mod slots;
 mod vision_ladder;
@@ -388,157 +390,9 @@ fn gpu_block_attractor_token(
             .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
     }
 }
-#[cfg(unix)]
-fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if !path.is_absolute() {
-        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
-    }
-    if !path.exists() {
-        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
-            .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
-    }
-    if !path.is_dir() {
-        return Err(format!("GPU lock path is not a directory: {}", path.display()));
-    }
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
-    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!("GPU lock directory is not writable: {}", path.display()));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("HIPFIRE_LOCK_DIR") {
-        let dir = std::path::PathBuf::from(override_dir);
-        prepare_gpu_lock_dir(&dir)?;
-        return Ok(dir);
-    }
-    let primary = Path::new("/run/lock/hipfire");
-    if prepare_gpu_lock_dir(primary).is_ok() {
-        return Ok(primary.to_path_buf());
-    }
-    let fallback = Path::new("/tmp/hipfire-locks");
-    prepare_gpu_lock_dir(fallback)?;
-    Ok(fallback.to_path_buf())
-}
-
-/// Machine-wide GPU reservations held until process exit. Lock files are
-/// keyed by [`GpuDevice::lock_identity`]: `gpu-GPU-<uuid>.lock`, or
-/// `gpu-pci-<bdf>.lock` for cards without a UUID. The per-HOME PID file is
-/// advisory discovery for uninstall tooling, not a mutex: two daemons using
-/// different cards in one HOME must both run.
-#[cfg(unix)]
-struct GpuLocks {
-    dir: std::path::PathBuf,
-    held: Vec<(String, std::fs::File)>,
-}
-
-#[cfg(unix)]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        let dir = gpu_lock_dir()?;
-        eprintln!("[gpu-lock] directory={}", dir.display());
-        Ok(Self { dir, held: Vec::new() })
-    }
-
-    /// Non-blocking reservation; a busy card reports its holder so arch
-    /// selectors can move on to the next card. Never waits, so the claim
-    /// order cannot deadlock against another daemon.
-    fn try_claim(&mut self, device: &GpuDevice) -> Result<Claim, String> {
-        use std::io::{Read, Seek, Write};
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        use std::os::unix::io::AsRawFd;
-
-        let identity = device.lock_identity();
-        if self.held.iter().any(|(held, _)| *held == identity) {
-            return Ok(Claim::Claimed);
-        }
-        let path = self.dir.join(device.lock_file_name());
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
-        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                let mut holder = String::new();
-                let _ = file.read_to_string(&mut holder);
-                return Ok(Claim::Busy(format!(
-                    "already reserved by holder PID {}",
-                    holder.split_whitespace().next().unwrap_or("<unknown>")
-                )));
-            }
-            return Err(format!("flock {}: {error}", path.display()));
-        }
-        // The lock file stays on disk forever; never unlink an active inode.
-        // Loosen files created under a restrictive umask for other HOME/users.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
-        file.set_len(0).map_err(|e| e.to_string())?;
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
-        eprintln!("[gpu-lock] reserved {}", path.display());
-        self.held.push((identity, file));
-        Ok(Claim::Claimed)
-    }
-
-    /// Reserve every card in `devices`, sorted by identity; any busy card
-    /// fails the whole set (held descriptors close on process exit).
-    fn claim_all(&mut self, devices: &[GpuDevice]) -> Result<(), String> {
-        let mut sorted = devices.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|device| device.lock_identity());
-        for device in sorted {
-            if let Claim::Busy(holder) = self.try_claim(device)? {
-                return Err(format!(
-                    "GPU {} (PCI {}) {holder}",
-                    device.lock_identity(),
-                    device.bdf
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn write_pid_file(&self) -> Result<(), String> {
-        if self.held.is_empty() {
-            return Err("no visible GPUs to reserve".into());
-        }
-        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
-        identities.sort_unstable();
-        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
-        let hipfire_dir = Path::new(&home).join(".hipfire");
-        std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
-        let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
-        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
-            .map_err(|e| format!("write {}: {e}", pid_path.display()))
-    }
-}
-
-#[cfg(not(unix))]
-struct GpuLocks;
-
-#[cfg(not(unix))]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
-    }
-    fn try_claim(&mut self, _: &GpuDevice) -> Result<Claim, String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn claim_all(&mut self, _: &[GpuDevice]) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn write_pid_file(&self) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-}
-
-/// Query what HIP exposes: one entry per logical device.
-fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
+/// Query what HIP exposes: one entry per logical device. The UUID is read
+/// only where identity comes from HIP rather than the KFD topology.
+fn observe_hip_devices(with_uuid: bool) -> Result<Vec<ObservedDevice>, String> {
     let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
     let count = hip.device_count().map_err(|e| e.to_string())?;
     if count < 1 {
@@ -550,6 +404,9 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
                 logical: id as usize,
                 arch: hip.get_arch(id).map_err(|e| e.to_string())?,
                 pci_bus_id: hip.device_pci_bus_id(id).map_err(|e| e.to_string())?,
+                uuid: with_uuid
+                    .then(|| hip.device_uuid(id).map_err(|e| e.to_string()))
+                    .transpose()?,
             })
         })
         .collect()
@@ -561,9 +418,14 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
 /// `hardware.devices` already reserved its cards while resolving; here each
 /// logical device must be exactly the resolved card (arch and PCI bus ID).
 /// Without it (raw inherited filters or none), the HIP-visible cards are
-/// identified by PCI address in the KFD topology and reserved all-or-nothing.
+/// identified — by PCI address in the KFD topology on native Linux, from HIP
+/// UUID and PCI address on WSL2/ROCDXG and native Windows — and reserved
+/// all-or-nothing.
 fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
-    let observed = observe_hip_devices()?;
+    use hipfire_config::devices::{DeviceRoot, IdentitySource};
+    let root = DeviceRoot::system();
+    let source = root.identity_source();
+    let observed = observe_hip_devices(source == IdentitySource::Hip)?;
     if let Some(active) = hipfire_config::devices::active_devices() {
         active.verify_visible(&observed)?;
         for (seen, device) in observed.iter().zip(&active.devices) {
@@ -578,32 +440,15 @@ fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
             );
         }
     } else {
-        let topology = hipfire_config::devices::enumerate_gpus(Path::new(
-            hipfire_config::devices::KFD_TOPOLOGY_NODES,
-        ))
-        .map_err(|e| e.to_string())?;
-        let devices = observed
-            .iter()
-            .map(|seen| {
-                let bdf = hipfire_config::devices::PciBdf::parse(&seen.pci_bus_id);
-                topology
-                    .iter()
-                    .find(|device| Some(device.bdf) == bdf)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
-                            seen.logical,
-                            seen.pci_bus_id,
-                            hipfire_config::devices::device_table(&topology)
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let devices = hipfire_config::devices::identify_observed(&root, &observed)?;
         locks.claim_all(&devices)?;
+        let source = match source {
+            IdentitySource::Kfd => "",
+            IdentitySource::Hip => " (identity from HIP: no KFD topology)",
+        };
         for (seen, device) in observed.iter().zip(&devices) {
             eprintln!(
-                "[devices] logical {}: HIP {} {} = index {} {}",
+                "[devices] logical {}: HIP {} {} = index {} {}{source}",
                 seen.logical,
                 seen.arch,
                 seen.pci_bus_id,
@@ -1059,6 +904,18 @@ fn main() {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
+    // Uncertified driver models (WSL2/ROCDXG, native Windows) refuse an
+    // explicit Redline backend outright; the per-load default falls back to
+    // the HIP graph instead (load handler).
+    if let Some(refusal) = hipfire_config::devices::redline_platform_refusal() {
+        let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(backend.as_str(), "redline" | "shadow") {
+            eprintln!("FATAL: replay.backend={backend} refused: {refusal}");
+            std::process::exit(1);
+        }
+    }
     if acknowledge_config {
         writeln!(
             stdout,
@@ -2341,7 +2198,10 @@ fn main() {
                             pp,
                             tp,
                             drafter.is_some(),
-                        );
+                        ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
+                            eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
+                            false
+                        });
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \

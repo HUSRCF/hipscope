@@ -1000,8 +1000,8 @@ pub fn admit_source_with_options(
         )
     } else if !hints.vmm_runtime_available {
         Some("HIP VMM symbols/granularity unavailable".to_string())
-    } else if cfg!(windows) {
-        Some("Windows VMM mapping/graph semantics are not certified".to_string())
+    } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
+        Some(reason)
     } else if gpu_arch != "gfx1201"
         && !(matches!(gpu_arch, "gfx1100" | "gfx1151")
             && matches!(arch_id, 5 | 6)
