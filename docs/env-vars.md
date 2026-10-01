@@ -380,6 +380,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `memory.gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` |
 | `memory.offload_exec` | `HIPFIRE_OFFLOAD_EXEC` |
 | `mtp_mode` / `mtp_k` | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` |
+| `speculation.mtp_ngram` | `HIPFIRE_MTP_NGRAM` |
 | `chat_template` | `HIPFIRE_CHAT_TEMPLATE_FILE` |
 | `default_chatml=false` | `HIPFIRE_DEFAULT_CHATML=0` |
 | `speculation` | `HIPFIRE_SPECULATION` |

@@ -3114,7 +3114,7 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: env opt-in, thinking off. `enable_thinking`
+    // ngram-mod is greedy MTP only: `speculation.mtp_ngram` (env HIPFIRE_MTP_NGRAM), thinking off. `enable_thinking`
     // is the resolved Jinja toggle; serve lowers thinking-off to
     // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
     if let Some(spec) = m.speculator.as_mut() {
@@ -3126,10 +3126,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                && hipfire_config::mtp_ngram_enabled()
                 && temp <= 1e-6
                 && !enable_thinking,
         });

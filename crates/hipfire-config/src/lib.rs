@@ -1750,6 +1750,18 @@ pub static FIELDS: &[ConfigField] = &[
         "MTP draft window."
     ),
     field!(
+        "speculation.mtp_ngram",
+        "mtp_ngram",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_MTP_NGRAM"),
+        "MTP + ngram-mod composition. on/auto arm it for greedy (temperature 0), thinking-off requests on native MTP; off keeps MTP alone."
+    ),
+    field!(
         "speculation.mode",
         "speculation",
         Speculation,
@@ -3919,11 +3931,15 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
         window_rollback: developer_bool("HIPFIRE_SPEC_WINDOW_ROLLBACK", true),
     }
 }
-/// MTP n-gram-modifier arm enablement (`HIPFIRE_MTP_NGRAM=1`). Strict
-/// snapshot boolean, default off — identical to the former
-/// `developer_var(..) == Some("1")` call sites.
+/// MTP n-gram-modifier arm enablement (`speculation.mtp_ngram`, env override
+/// `HIPFIRE_MTP_NGRAM`). `on`/`1` and `auto` both arm the modifier; the
+/// composition itself is only eligible for greedy, thinking-off MTP requests,
+/// so `auto` names exactly that scope. Anything else (`off`, `0`, unset) is off.
 pub fn mtp_ngram_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_NGRAM", false)
+    mtp_ngram_enabled_for(process_value("HIPFIRE_MTP_NGRAM").as_deref())
+}
+fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "on" | "auto"))
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk
@@ -5198,6 +5214,24 @@ mod tests {
         // through the live snapshot (no install, no TOML, no env).
         assert!(!developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_OFF", false));
         assert!(developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_ON", true));
+    }
+
+    #[test]
+    fn mtp_ngram_key_resolves_tri_state_with_env_override() {
+        for (raw, want) in [
+            (None, false),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("on"), true),
+            (Some("1"), true),
+            (Some("auto"), true),
+        ] {
+            assert_eq!(mtp_ngram_enabled_for(raw), want, "{raw:?}");
+        }
+        let field = field("speculation.mtp_ngram").expect("mtp_ngram schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM"));
+        assert!(field.validate(&ConfigValue::String("1".into())).is_ok());
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
     }
 
     #[test]
