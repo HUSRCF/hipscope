@@ -1078,6 +1078,159 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !all_eq {
                     fails.push("graph replay differs from eager".into());
                 }
+
+                // Changed-input replay: rewrite routing and activations at the
+                // captured pointers, replay, and compare every output, grouping
+                // array and both sidecars against a fresh eager run of the same
+                // inputs; also against the CPU grouping and exact folds.
+                let mut rounds: Vec<(&str, Vec<i32>, Vec<f32>)> = Vec::new();
+                let mut r = Rng(seed ^ 0x6a6a);
+                let distinct = |pool: &dyn Fn(&mut Rng) -> i32, r: &mut Rng| -> Vec<i32> {
+                    let mut v = Vec::with_capacity(c.l);
+                    for _ in 0..c.t {
+                        let mut row: Vec<i32> = Vec::with_capacity(TOPK);
+                        while row.len() < TOPK {
+                            let e = pool(r);
+                            if !row.contains(&e) {
+                                row.push(e);
+                            }
+                        }
+                        v.extend(row);
+                    }
+                    v
+                };
+                let uniform = distinct(&|r: &mut Rng| r.below(E as u64) as i32, &mut r);
+                // Skewed: experts 0..15 drawn 8x as often as the rest.
+                let skewed = distinct(
+                    &|r: &mut Rng| if r.below(2) == 0 { r.below(16) as i32 } else { r.below(E as u64) as i32 },
+                    &mut r,
+                );
+                // Empty experts: 64..512 only, so experts 0..63 receive no slot.
+                let sparse = distinct(&|r: &mut Rng| 64 + r.below((E - 64) as u64) as i32, &mut r);
+                let newx = |scale: f32, r: &mut Rng| -> Vec<f32> {
+                    (0..c.t * HID).map(|_| (r.unit() - 0.5) * scale).collect()
+                };
+                let (x1, x2, x3) = (newx(3.0, &mut r), newx(9.0, &mut r), newx(0.5, &mut r));
+                rounds.push(("uniform", uniform, x1));
+                rounds.push(("skewed", skewed, x2));
+                rounds.push(("empty_experts_0_63", sparse, x3));
+                rounds.push(("original", c.topk_host.clone(), x.clone()));
+                let poison_all = |gpu: &Gpu, v: i32| -> Res<()> {
+                    poison(gpu, &c, v)?;
+                    for (t, n) in [
+                        (&c.sorted, c.pmax * 4),
+                        (&c.tiles, c.pmax / 16 * 4),
+                        (&c.inverse, c.l * 4),
+                        (&c.counts, E * 4),
+                        (&c.offsets, (E + 1) * 4),
+                    ] {
+                        gpu.hip.memset(&t.buf, v, n)?;
+                    }
+                    let gs = gpu.scratch.int4_mmq_x_scratch.as_ref().ok_or("no gate sidecar")?;
+                    gpu.hip.memset(gs, v, (HID / 128) * c.t * BLK)?;
+                    let ds = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no down sidecar")?;
+                    gpu.hip.memset(ds, v, (MI / 128) * c.l * BLK)?;
+                    gpu.hip.device_synchronize()?;
+                    Ok(())
+                };
+                let snapshot = |gpu: &Gpu| -> Res<Vec<(&'static str, Vec<u8>)>> {
+                    let (a, d) = outputs(gpu, &c)?;
+                    let (xg, xd) = sidecars(gpu, &c)?;
+                    Ok(vec![
+                        ("y_gate_up", a),
+                        ("y_down", d),
+                        ("sorted", download(gpu, &c.sorted.buf, c.pmax * 4)?),
+                        ("tiles", download(gpu, &c.tiles.buf, c.pmax / 16 * 4)?),
+                        ("inverse", download(gpu, &c.inverse.buf, c.l * 4)?),
+                        ("counts", download(gpu, &c.counts.buf, E * 4)?),
+                        ("offsets", download(gpu, &c.offsets.buf, (E + 1) * 4)?),
+                        ("gate_sidecar", xg),
+                        ("down_sidecar", xd),
+                    ])
+                };
+                let mut prev_hash = h_eager.clone();
+                let mut round_reports = Vec::new();
+                for (name, topk, xr) in &rounds {
+                    gpu.hip.memcpy_htod(&c.topk.buf, &i32_bytes(topk))?;
+                    let xb: Vec<u8> = xr.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    gpu.hip.memcpy_htod(&c.x_in.buf, &xb)?;
+                    poison_all(&gpu, 0x5A)?;
+                    gpu.launch_graph(&exec)?;
+                    gpu.hip.device_synchronize()?;
+                    let replay = snapshot(&gpu)?;
+                    poison_all(&gpu, 0x5A)?;
+                    cand_all(&mut gpu, &c)?;
+                    gpu.hip.device_synchronize()?;
+                    let eager = snapshot(&gpu)?;
+                    let mut mism = Vec::new();
+                    let mut total = 0usize;
+                    for ((n, a), (_, b)) in replay.iter().zip(&eager) {
+                        let d = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                        total += d;
+                        mism.push(format!("\"{n}\":{d}"));
+                    }
+                    // Host references on the replayed bytes.
+                    let gr = cpu_group(topk, c.pmax);
+                    let grp_ok = to_i32(&replay[2].1) == gr.sorted
+                        && to_i32(&replay[3].1) == gr.tiles
+                        && to_i32(&replay[4].1) == gr.inverse
+                        && to_i32(&replay[5].1) == gr.counts
+                        && to_i32(&replay[6].1) == gr.offsets;
+                    let used = gr.offsets[E] as usize / 16;
+                    let (gm, dm, pb) = fold_check(
+                        &mut gpu,
+                        &c,
+                        &gr,
+                        &sample_tiles(used),
+                        &replay[7].1,
+                        &replay[8].1,
+                        &replay[0].1,
+                        &replay[1].1,
+                    )?;
+                    let hash = md5_hex(&live_bytes(&gr, &replay[0].1, &replay[1].1));
+                    let changed = hash != prev_hash;
+                    let empty = gr.counts.iter().filter(|&&n| n == 0).count();
+                    let ok = total == 0 && grp_ok && gm + dm + pb == 0 && (changed || *name == "original")
+                        && (*name != "original" || hash == h_eager);
+                    if !ok {
+                        fails.push(format!("changed-input graph replay round {name}"));
+                    }
+                    round_reports.push(format!(
+                        "{{\"round\":\"{name}\",\"empty_experts\":{empty},\"padded_P\":{},\"replay_vs_eager_mismatch\":{{{}}},\"replay_group_matches_cpu\":{grp_ok},\"replay_fold_mismatch\":[{gm},{dm},{pb}],\"live_hash\":\"{hash}\",\"changed_vs_previous_round\":{changed},\"pass\":{ok}}}",
+                        gr.offsets[E],
+                        mism.join(",")
+                    ));
+                    prev_hash = hash;
+                }
+                out.insert("graph_changed_input_rounds".into(), format!("[{}]", round_reports.join(",")));
+
+                // Stale prepared handles must be refused once the producer
+                // generation advances, never silently consumed.
+                let stale_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
+                let _fresh_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
+                let gate_err = gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                    &c.gu_ptrs, &c.tiles, &c.sorted, &stale_gate, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t,
+                );
+                let stale_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
+                let fresh_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
+                let down_err = gpu.gemm_qwen4_moe_down_iu4_sym(
+                    &c.dn_ptrs, &c.tiles, &c.sorted, &stale_down, &c.ydn, DN_M, MI, 1, c.pmax, c.l,
+                );
+                // A live handle of the other sidecar is refused too.
+                let cross_err = gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                    &c.gu_ptrs, &c.tiles, &c.sorted, &fresh_down, &c.ygu, GU_M, HID, TOPK, c.pmax, c.t,
+                );
+                gpu.hip.device_synchronize()?;
+                let msg = |r: &hip_bridge::HipResult<()>| match r {
+                    Ok(()) => "\"accepted\"".to_string(),
+                    Err(e) => format!("\"{}\"", e.to_string().replace('"', "'")),
+                };
+                out.insert("stale_gate_handle".into(), msg(&gate_err));
+                out.insert("stale_down_handle".into(), msg(&down_err));
+                out.insert("cross_sidecar_handle".into(), msg(&cross_err));
+                if gate_err.is_ok() || down_err.is_ok() || cross_err.is_ok() {
+                    fails.push("stale or mismatched IU4 handle accepted".into());
+                }
             }
             // General-input delta vs the incumbent (informative only).
             let mut h = Handles::default();
