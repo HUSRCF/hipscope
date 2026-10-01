@@ -168,14 +168,6 @@ impl Ledger {
         self.pending = merged;
         self.next_id = self.next_id.max(other.next_id);
     }
-    /// Continue from another path's ledger without reusing an id this one
-    /// issued (ids stay unique across the paths of one program).
-    pub fn resume(&mut self, at: Ledger) {
-        let next_id = self.next_id.max(at.next_id);
-        *self = at;
-        self.next_id = next_id;
-    }
-
     /// Continue at a branch target with the ledger of the branch point.
     /// Ids issued on the path that fell through stay used, so the two
     /// paths' operations keep distinct ids when they join later.
