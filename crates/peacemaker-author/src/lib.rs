@@ -27,12 +27,12 @@ pub mod target;
 pub mod trace;
 pub mod wait;
 
-pub use backend::{Backend, EventId, SlotTransition};
+pub use backend::{Auth, Backend, EventId, Seal, SlotTransition};
 pub use lds::{
     join, prime, ready, retire, retire_cur, rotate, AllFree, Free, JoinPart, LdsRegion, Published, Ring, State, StoreTarget,
     Transition, Transitions, Writing,
 };
-pub use scope::{Arrived, Carried, Scc, Uniform, Wave, WgUniform, Workgroup};
+pub use scope::{Arrived, Carried, End, Scc, Uniform, Wave, WgUniform, Workgroup};
 pub use target::{
     BarrierModel, Full, Gfx11Waits, Gfx1100, Gfx1151, Gfx1201, Gfx12Waits, LdsCounter, MmaIu4, Split, SplitBarrier, Target,
     WaitModel,

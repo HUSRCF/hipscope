@@ -1,10 +1,10 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{END, Epi, Gen, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg, publish};
+use super::{Epi, Gen, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg, publish};
 use crate::kernels::common::{lit, mem, op, s, sop, sr, v};
 use crate::{Builder, insn::{Instruction, MemoryClass}};
-use peacemaker_author::{Free, Ring, prime};
+use peacemaker_author::{End, Free, Ring, prime};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
 /// reciprocal refined once, then two quotient corrections. Exact for all
@@ -38,7 +38,7 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
     op(b, text, &[v(vdst)], &uses)
 }
 
-pub(crate) fn emit(wg: &mut Wg, g: &Gen, (ra, rw, rd, rs): (Ring<PayA, Free, Free>, Ring<PayW, Free, Free>, Ring<MetaD, Free, Free>, Ring<MetaS, Free, Free>)) -> Result<Lds, String> {
+pub(crate) fn emit(wg: &mut Wg, g: &Gen, end: &End, (ra, rw, rd, rs): (Ring<PayA, Free, Free>, Ring<PayW, Free, Free>, Ring<MetaD, Free, Free>, Ring<MetaS, Free, Free>)) -> Result<Lds, String> {
     let b = wg.isa();
     let a = g.args;
     let silu = g.spec.epi.is_silu();
@@ -81,9 +81,9 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, (ra, rw, rd, rs): (Ring<PayA, Free, Fre
     sop(b, format!("s_lshl_b32 s54, s{}, {}", a.m, u32::from(silu)), &[54], &[a.m])?;
     // rs/bs come from the workgroup ids and kernel arguments only.
     let outside = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_ge_u32 s{}, s54", g.rs), vec![], vec![s(g.rs), s(54)]))?;
-    wg.exit_if(outside, END)?;
+    wg.exit_if(outside, end)?;
     let outside = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_ge_u32 s{}, s{}", g.bs, a.n), vec![], vec![s(g.bs), s(a.n)]))?;
-    wg.exit_if(outside, END)?;
+    wg.exit_if(outside, end)?;
     let b = wg.isa();
 
     // Scalars: M-1 (row clamp), 136 * K/256 (row stride), loop trips, h-rows.

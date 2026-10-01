@@ -5,6 +5,14 @@ use serde::Serialize;
 #[derive(Clone,Debug)] pub struct Gfx12Sgpr { tracked:[bool;64],salu:[bool;128],valu:[bool;128],vcc_salu:bool,vcc_valu:bool }
 impl Default for Gfx12Sgpr { fn default()->Self {Self {tracked:[false;64],salu:[false;128],valu:[false;128],vcc_salu:false,vcc_valu:false}} }
 impl Gfx12Sgpr {
+    /// Join another control path's tracker: a write pending a guard on
+    /// either path is pending at the join.
+    pub fn join(&mut self,other:&Gfx12Sgpr) {
+        for (a,b) in self.tracked.iter_mut().zip(other.tracked) {*a|=b}
+        for (a,b) in self.salu.iter_mut().zip(other.salu) {*a|=b}
+        for (a,b) in self.valu.iter_mut().zip(other.valu) {*a|=b}
+        self.vcc_salu|=other.vcc_salu;self.vcc_valu|=other.vcc_valu;
+    }
     pub fn clear_on_memory(&mut self) { self.salu.fill(false);self.valu.fill(false);self.vcc_salu=false;self.vcc_valu=false; }
     pub fn step(&mut self,pipe:Pipeline,uses:&[RegRef],defs:&[RegRef],vcc_use:bool,vcc_def:bool)->Vec<&'static str> {
         if matches!(pipe,Pipeline::Vmem|Pipeline::Smem) {self.clear_on_memory();return vec![]}
@@ -33,6 +41,16 @@ pub struct Gfx11Hazards {
 }
 impl Gfx11Hazards {
     pub fn for_arch(arch:Arch)->Self { Self { trans_use: arch==Arch::Gfx1100, trans_defs: Vec::new() } }
+    /// Join another control path's tracker: every recent transcendental
+    /// result of either path stays tracked, at its younger age.
+    pub fn join(&mut self,other:&Gfx11Hazards) {
+        for &(def,valu_age,trans_age) in &other.trans_defs {
+            match self.trans_defs.iter_mut().find(|(d,_,_)|*d==def) {
+                Some((_,v,t))=>{*v=(*v).min(valu_age);*t=(*t).min(trans_age)}
+                None=>self.trans_defs.push((def,valu_age,trans_age)),
+            }
+        }
+    }
     pub fn step(&mut self,pipe:Pipeline,mnemonic:&str,uses:&[RegRef],defs:&[RegRef])->Vec<String>{
         let mut waits=Vec::new();
         if !self.trans_use {return waits}
