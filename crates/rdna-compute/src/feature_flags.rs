@@ -155,7 +155,8 @@ pub struct FeatureFlags {
     pub lm_head_overwrite: bool,
     /// Eager-only gfx1201 MQ6 X-LDS overwrite and fused F16 rotation (U2):
     /// `Some` = set (`1` on, any other value off); unset = on inside the
-    /// Qwen4 forward (`Gpu::qwen4_mq6_x4_gfx1201`).  Read only on gfx1201.
+    /// Qwen4 forward for prefill chunks of >= 512 rows
+    /// (`Gpu::qwen4_mq6_x4_gfx1201`).  Read only on gfx1201.
     pub qwen4_mq6_x4_gfx1201: Option<bool>,
     /// Halo MQ6 X-LDS tile (U3): `Some(Some([BV, RW, prefetch]))`, or
     /// `[0, 0, 0]` for the measured table; `Some(None)` (`0` or an unknown

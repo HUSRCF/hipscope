@@ -973,8 +973,9 @@ pub struct Gpu {
     /// `hipfire-dispatch::pipeline::run_moe_decode_cpu_fallback` for the hook.
     pub hessian_capture: Option<HessianCapture>,
     /// True while the Qwen4 (Flash-Next) forward runs: admits the Qwen4-only
-    /// arch defaults of `HIPFIRE_QWEN4_MQ6_X4_{GFX1201,TILE,REGIONS}`.  An
-    /// explicit value of those variables applies everywhere, as before.
+    /// arch defaults of `HIPFIRE_QWEN4_MQ6_X4_{GFX1201,TILE,REGIONS}` (U2 only
+    /// on prefill chunks of >= 512 rows).  An explicit value of those
+    /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed

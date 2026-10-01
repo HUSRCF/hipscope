@@ -694,7 +694,7 @@ fn mqv2_mw_waves(
 }
 
 // Three-run Halo artifact sweeps for both output dtypes; unmeasured cases retain BT8/RW4.
-// This table is used only by HIPFIRE_QWEN4_MQ6_X4_TILE=auto (default off).
+// This table is used by HIPFIRE_QWEN4_MQ6_X4_TILE=auto and, with it unset, inside the Qwen4 forward.
 fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     match (m, k, n) {
         (48, 2560, 1536 | 512 | 1131) => Some([8, 4, 2]),
@@ -710,7 +710,7 @@ fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     }
 }
 
-// U3 remains override-only until the artifact-bitwise and three-run Halo gates.
+// U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
 fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
     macro_rules! entry {
         ($b:literal, $r:literal, $p:literal) => {
@@ -40527,10 +40527,14 @@ impl Gpu {
         self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
-    /// U2: the gfx1201 MQ6 X-LDS overwrite route.  Explicit
-    /// `HIPFIRE_QWEN4_MQ6_X4_GFX1201` wins; unset, on inside the Qwen4 forward.
-    pub fn qwen4_mq6_x4_gfx1201(&self) -> bool {
-        self.flags.qwen4_mq6_x4_gfx1201.unwrap_or(self.qwen4_scope)
+    /// U2: the gfx1201 MQ6 X-LDS overwrite route at `batch_size` rows.
+    /// Explicit `HIPFIRE_QWEN4_MQ6_X4_GFX1201` wins at every row count; unset,
+    /// on inside the Qwen4 forward for prefill chunks of
+    /// >= QWEN4_F16_WMMA_MIN_TOKENS rows (decode keeps its GEMV).
+    pub fn qwen4_mq6_x4_gfx1201(&self, batch_size: usize) -> bool {
+        self.flags
+            .qwen4_mq6_x4_gfx1201
+            .unwrap_or(self.qwen4_scope && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS)
     }
 
     /// U3: the gfx1151 MQ6 X-LDS tile (`[0, 0, 0]` = measured table, `None` =
@@ -40557,7 +40561,7 @@ impl Gpu {
         (self.arch_caps.has_wmma_w32()
             || (self.arch_caps.has_wmma_w32_gfx12()
                 && self.arch.as_str() == "gfx1201"
-                && self.qwen4_mq6_x4_gfx1201()))
+                && self.qwen4_mq6_x4_gfx1201(batch_size)))
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
@@ -40589,7 +40593,7 @@ impl Gpu {
     }
 
     /// Three independent MQ6 F32 overwrite projections sharing prepared F16 X.
-    /// Returns false when the default-off research fold is not applicable.
+    /// Returns false when the fold (`Gpu::qwen4_mq6_x4_regions`) is not applicable.
     pub fn gemm_mq6g256v2_xf16_regions(
         &mut self,
         regions: &[(&GpuTensor, &GpuTensor, usize); 3],
