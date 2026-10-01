@@ -22,7 +22,7 @@ pub mod region;
 pub mod gdn_epilogue;
 
 pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
-use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::Sop, reg::Live};
+use crate::{Builder, Emitted, KernelSpec, RegPlan, reg::Live};
 use crate::kernels::common::op;
 use peacemaker_author::{Free, Gfx1201, Gfx12Waits, LdsWrite, Pending, Published, Ring, Wave, Workgroup, Writing};
 use serde::Serialize;
@@ -211,19 +211,19 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     let mut b = Builder::new(kspec, g.plan()?);
     let mut wg = Wg::new(&mut b)?;
     let lds = g.declare_lds(&mut wg)?;
+    let end = wg.exit(END)?;
     // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its
     // epilogue (`epilogue::emit`; the fused projection keeps its stores at 1
     // and drops at the QKV tiles' GDN epilogue, `gdn_epilogue`), so
     // co-resident K-loops win issue arbitration over a finishing tile.
     // Scheduling only; every result bit is unchanged.
     op(wg.isa(), "s_setprio 1", &[], &[])?;
-    let lds = prologue::emit(&mut wg, &g, lds)?;
+    let lds = prologue::emit(&mut wg, &g, &end, lds)?;
     let lds = kloop::emit(&mut wg, &g, lds)?;
     epilogue::emit(wg.isa(), &g)?;
     // Only the fused projection reuses the LDS after the K loop.
     if spec.epi == Epi::QkvzaGdn { gdn_epilogue::emit(&mut wg, &g, lds)?; }
-    wg.label(END)?;
-    wg.isa().push(Sop::End.encode(spec.arch)?)?;
+    wg.end(end)?;
     b.finish()
 }
 

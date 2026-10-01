@@ -21,10 +21,12 @@ use sha2::{Sha256,Digest};
 
 #[derive(Clone)] pub struct Builder { pub spec:KernelSpec,pub regs:RegPlan,pub program:Program,pub ledger:Ledger,pub lds:Lds,
  pub waits:Vec<WaitProof>,pub hazards:Vec<HazardProof>,pub clauses:Vec<plan::ClauseProof>,pub barriers:Vec<plan::BarrierProof>,pub loop_fixpoints:Vec<plan::LoopFixpoint>,
- hazard:Gfx12Sgpr,gfx11_hazard:Gfx11Hazards,delay_alu:Option<DelayAlu>,labels:Vec<String>,current_label:String,lds_access_allowed:bool,previous_wmma_dst:Option<reg::RegRef>,pending_barrier:Option<Vec<Transition>>,
+ hazard:Gfx12Sgpr,gfx11_hazard:Gfx11Hazards,delay_alu:Option<DelayAlu>,labels:Vec<String>,current_label:String,lds_access_allowed:bool,previous_wmma_dst:Vec<reg::RegRef>,pending_barrier:Option<Vec<Transition>>,
  /// Driven by `peacemaker_author::Workgroup`: LDS, barriers and loops go
  /// through the typed core (`author`), and the untyped entry points refuse.
- typed:bool,}
+ seal:peacemaker_author::Seal,
+ /// Kernel exits reserved by the typed core: placed only with `s_endpgm` after them.
+ exits:Vec<String>,}
 // RDNA4 ISA §5.7.1: bits 15:8 are LOADcnt, bits 7:0 are DScnt.
 fn load_ds_wait_imm(load_count:u8,ds_count:u8)->u16 {
  (u16::from(load_count)<<8)|u16::from(ds_count)
@@ -37,11 +39,12 @@ fn combined_wait(arch:Arch,first:u8,second:u8)->(Counter,Counter,String) {
  else{(Counter::Vm,Counter::Lgkm,format!("s_waitcnt vmcnt({first}) lgkmcnt({second})"))}
 }
 impl Builder {
- pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::for_arch(arch),delay_alu:None,labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None,typed:false}}
+ pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::for_arch(arch),delay_alu:None,labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:vec![],pending_barrier:None,seal:Default::default(),exits:vec![]}}
  /// Emit `s_delay_alu` issue hints before dependent VALU instructions (see
  /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
  pub fn enable_delay_alu(&mut self){self.delay_alu=Some(DelayAlu::default())}
- pub fn label(&mut self,name:&str)->Result<(),String>{if self.labels.iter().any(|l|l==name){return Err(format!("duplicate label {name}"))}self.labels.push(name.into());self.current_label=name.into();if let Some(d)=&mut self.delay_alu{d.label()}self.program.instructions.push(Instruction::new(format!("{name}:"),vec![],vec![]));Ok(())}
+ pub fn label(&mut self,name:&str)->Result<(),String>{if self.exits.iter().any(|e|e==name){return Err(format!("{name} is a kernel exit: only Workgroup::end places it"))}self.place_label(name)}
+ fn place_label(&mut self,name:&str)->Result<(),String>{if self.labels.iter().any(|l|l==name){return Err(format!("duplicate label {name}"))}self.labels.push(name.into());self.current_label=name.into();if let Some(d)=&mut self.delay_alu{d.label()}self.program.instructions.push(Instruction::new(format!("{name}:"),vec![],vec![]));Ok(())}
  fn emit_wait(&mut self,c:Counter,n:u8,reason:Reason)->Result<(),String> {let entries=Ledger::wait_instruction(self.spec.arch,&[(c,n,reason.clone())])?;for (_,_,text,_) in entries {let pc_index=self.program.instructions.len();self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));self.waits.push(WaitProof{pc_index,insn:text,counter:c,count:n,reason:reason.clone()})}self.ledger.wait(c,n);Ok(())}
  pub fn wait(&mut self,c:Counter,n:u8)->Result<(),String>{self.emit_wait(c,n,Reason::Barrier)}
  fn emit_required(&mut self,mut required:Vec<(Counter,u8,Reason)>)->Result<(),String>{
@@ -82,15 +85,15 @@ impl Builder {
   if mnemonic.starts_with("v_wmma_")||mnemonic.starts_with("v_swmmac_"){
    let dst=*insn.defs.first().ok_or("WMMA destination is missing from instruction defs")?;
    if insn.uses.len()<2{return Err("WMMA A/B operands are missing from instruction uses".into())}
-   if self.previous_wmma_dst.is_some_and(|old|insn.uses[..2].iter().any(|source|old.overlaps(*source))||
+   if self.previous_wmma_dst.iter().any(|&old|insn.uses[..2].iter().any(|source|old.overlaps(*source))||
       (mnemonic.starts_with("v_swmmac_")&&insn.uses.get(2).is_some_and(|index|old.overlaps(*index)))){
     let pc_index=self.program.instructions.len();
     self.program.instructions.push(Instruction::new("v_nop",vec![],vec![]));
     self.hazards.push(HazardProof{pc_index,insn:"v_nop".into(),rule:"WMMA destination feeds next WMMA A/B or SWMMAC index".into()});
     if let Some(d)=&mut self.delay_alu{d.step("v_nop",&[],&[]);}
    }
-   self.previous_wmma_dst=Some(dst);
-  }else if pipe==Pipeline::Valu{self.previous_wmma_dst=None}
+   self.previous_wmma_dst=vec![dst];
+  }else if pipe==Pipeline::Valu{self.previous_wmma_dst.clear()}
   // gfx11 WMMA chains accumulate in the matrix core, where LLVM emits no
   // `s_delay_alu`: a WMMA counts as an issued VALU but neither takes a hint
   // nor becomes a hint producer.
@@ -103,7 +106,7 @@ impl Builder {
   }}
   self.ledger.record(self.spec.arch,&insn);if mnemonic=="s_endpgm"{self.ledger=Ledger::default()}self.program.instructions.push(insn);Ok(())
  }
- fn untyped(&self)->Result<(),String>{if self.typed{Err("typed kernel: LDS, barriers and loops go through peacemaker-author".into())}else{Ok(())}}
+ fn untyped(&self)->Result<(),String>{if self.seal.is_sealed(){Err("typed kernel: LDS, barriers and loops go through peacemaker-author".into())}else{Ok(())}}
  pub fn ds_store(&mut self,slot:usize,insn:Instruction)->Result<(),String>{self.untyped()?;self.ds_store_slot(slot,insn)}
  fn ds_store_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsStore)||!insn.mnemonic().starts_with("ds_store"){return Err("ds_store requires an LDS store instruction".into())}let old=self.lds.clone();self.lds.store(slot)?;self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
  pub fn ds_load(&mut self,slot:usize,insn:Instruction)->Result<(),String>{self.untyped()?;self.ds_load_slot(slot,insn)}
@@ -172,8 +175,11 @@ impl Builder {
  /// the code before the loop issues the same ones.
  pub fn loop_(&mut self,head:&str,body:impl Fn(&mut Builder)->Result<(),String>)->Result<(),String>{self.untyped()?;self.fixpoint_loop(head,body)}
  fn fixpoint_loop(&mut self,head:&str,body:impl Fn(&mut Builder)->Result<(),String>)->Result<(),String>{let entry=self.ledger.shape();let mut first=self.clone();first.label(head)?;let start=first.program.instructions.len();body(&mut first)?;if first.ledger.shape()!=entry{return Err("loop back-edge ledger must equal the entry ledger".into())}let expected=first.program.instructions[start..].iter().map(|i|i.text.as_str()).collect::<Vec<_>>().join("\n");let mut second=self.clone();second.ledger=first.ledger.clone();second.label(head)?;body(&mut second)?;let actual=second.program.instructions[start..].iter().map(|i|i.text.as_str()).collect::<Vec<_>>().join("\n");if second.ledger.shape()!=entry||expected!=actual {return Err("loop wait ledger did not reach fixed point".into())}*self=first;self.loop_fixpoints.push(plan::LoopFixpoint{head:head.into(),iterations:2});Ok(())}
+ /// Join another control path's hazard trackers into this point (a write
+ /// pending a guard on either path is pending here).
+ pub(crate) fn join_hazards(&mut self,sgpr:&Gfx12Sgpr,trans:&Gfx11Hazards,wmma:&[reg::RegRef]){self.hazard.join(sgpr);self.gfx11_hazard.join(trans);for r in wmma{if !self.previous_wmma_dst.contains(r){self.previous_wmma_dst.push(*r)}}}
  /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
- pub fn finish(self)->Result<Emitted,String>{if self.pending_barrier.is_some(){return Err("unmatched barrier signal".into())}if self.program.instructions.last().is_none_or(|i|i.mnemonic()!="s_endpgm"){return Err("kernel must end with s_endpgm".into())}if !self.ledger.is_empty(){return Err("outstanding memory operations: wait or end the kernel before finish".into())}self.regs.verify_lifetimes(&self.labels)?;if self.regs.next_free_vgpr()>self.regs.vgpr_budget||self.regs.next_free_sgpr()>self.regs.sgpr_budget {return Err("register plan exceeds budget".into())}let text=emit::assembly(&self.spec,&self.regs,&self.program)?;let hash=format!("{:x}",Sha256::digest(text.as_bytes()));let mut shape=IsaShape {instructions:self.program.instructions.len(),next_free_vgpr:self.regs.next_free_vgpr(),next_free_sgpr:self.regs.next_free_sgpr(),waits:self.waits.len()+self.hazards.len(),barriers:self.barriers.len(),..Default::default()};for i in &self.program.instructions{let name=i.mnemonic();if name.starts_with("v_dual_"){shape.vopd_pairs+=1;shape.valu_slots+=1}else if name.starts_with("v_wmma_"){shape.wmma+=1}else if name.starts_with('v'){shape.valu_slots+=1}if name.starts_with("ds_"){shape.ds+=1}if name.starts_with("buffer_")||name.starts_with("global_"){shape.vmem+=1}}
+ pub fn finish(self)->Result<Emitted,String>{if self.pending_barrier.is_some(){return Err("unmatched barrier signal".into())}if let Some(e)=self.exits.iter().find(|e|!self.labels.contains(e)){return Err(format!("kernel exit {e} is never placed"))}if self.program.instructions.last().is_none_or(|i|i.mnemonic()!="s_endpgm"){return Err("kernel must end with s_endpgm".into())}if !self.ledger.is_empty(){return Err("outstanding memory operations: wait or end the kernel before finish".into())}self.regs.verify_lifetimes(&self.labels)?;if self.regs.next_free_vgpr()>self.regs.vgpr_budget||self.regs.next_free_sgpr()>self.regs.sgpr_budget {return Err("register plan exceeds budget".into())}let text=emit::assembly(&self.spec,&self.regs,&self.program)?;let hash=format!("{:x}",Sha256::digest(text.as_bytes()));let mut shape=IsaShape {instructions:self.program.instructions.len(),next_free_vgpr:self.regs.next_free_vgpr(),next_free_sgpr:self.regs.next_free_sgpr(),waits:self.waits.len()+self.hazards.len(),barriers:self.barriers.len(),..Default::default()};for i in &self.program.instructions{let name=i.mnemonic();if name.starts_with("v_dual_"){shape.vopd_pairs+=1;shape.valu_slots+=1}else if name.starts_with("v_wmma_"){shape.wmma+=1}else if name.starts_with('v'){shape.valu_slots+=1}if name.starts_with("ds_"){shape.ds+=1}if name.starts_with("buffer_")||name.starts_with("global_"){shape.vmem+=1}}
  let proof=BuilderProof{kernel_id:self.spec.kernel_id,variant:self.spec.variant,arch:self.spec.arch,builder_crate_version:env!("CARGO_PKG_VERSION").into(),builder_git_sha:option_env!("HIPFIRE_BUILDER_GIT_SHA").unwrap_or("unknown").into(),reg_plan:self.regs.ranges,next_free_vgpr:shape.next_free_vgpr,next_free_sgpr:shape.next_free_sgpr,waits:self.waits,hazards:self.hazards,clauses:self.clauses,vopd_pairs:shape.vopd_pairs,lds_slots:self.lds.all_slots(),barriers:self.barriers,loop_fixpoints:self.loop_fixpoints,forbidden_mnemonics_checked:vec!["s_waitcnt (gfx12)".into(),"scratch_*".into()],s_text_sha256:hash};Ok(Emitted{s_text:text,proof,shape})}
 }
 
