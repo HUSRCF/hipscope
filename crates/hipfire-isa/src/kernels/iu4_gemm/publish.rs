@@ -2,7 +2,8 @@
 //! token/row metadata. Staging map (hipcc K1's, bank-swizzled): lane `tid`
 //! moves 8 bytes of slab row `R = r * round_rows + tid / 4`, quad `tid % 4`,
 //! to fragment-order slot `st_ldsoff + r * round_rows * 32`.
-use super::{Gen, Tile, ds_offset, ds_offsets, mem, op, s, sr, v, vr};
+use super::{Gen, Tile, ds_offset, ds_offsets};
+use crate::kernels::{common::{mem, op, s, sr, v, vr}, iu4_fold::{GROUP_BYTES, XBLK_BYTES}};
 use crate::{Builder, insn::{Instruction, MemoryClass}};
 
 /// `buffer_load_b{32,64}` with an optional scalar offset (objdump spelling).
@@ -31,7 +32,7 @@ pub(crate) fn ds_load(b: &mut Builder, slot: usize, text: String, dst: crate::re
 pub(crate) fn a_offset(g: &Gen, slab: u32, r: usize) -> (Option<u8>, u32) {
     let rows = r as u32 * g.tile.round_rows();
     match g.a_slab1 {
-        None => (None, 8 + 32 * slab + rows * super::spec::BLOCK_I4_128),
+        None => (None, 8 + 32 * slab + rows * XBLK_BYTES),
         Some(s1) => ((slab == 1).then_some(s1), rows * 32),
     }
 }
@@ -43,7 +44,7 @@ pub(crate) fn fetch_slab1(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Stri
 
 /// Fetch the next group's even block before `goff` advances at trip end.
 pub(crate) fn fetch_slab1_next_group(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    fetch_slab1_at(b, g, 0, super::spec::GROUP_BYTES + 40)
+    fetch_slab1_at(b, g, 0, GROUP_BYTES + 40)
 }
 
 fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Result<(), String> {
@@ -62,7 +63,7 @@ fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Res
 /// Issue next-block token scale and packed row header before B1: neither
 /// payload register is still live after the preceding block's B2 publication.
 pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
-    let header = if h == 0 { 4 } else { super::spec::GROUP_BYTES };
+    let header = if h == 0 { 4 } else { GROUP_BYTES };
     b.clause(|b| {
         vload(b, g.ds_nx, 1, g.ds_voff, g.srd_a[h ^ 1], None, 0)?;
         vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), header)
@@ -72,7 +73,7 @@ pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), 
 /// Next-block slab-0 fetch epoch after B1 of block `h`.
 pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
     // Next (group, half) relative to the current group offset in `goff`.
-    let next = if h == 0 { 64 } else { super::spec::GROUP_BYTES };
+    let next = if h == 0 { 64 } else { GROUP_BYTES };
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
             let (soff, offset) = a_offset(g, 0, r);

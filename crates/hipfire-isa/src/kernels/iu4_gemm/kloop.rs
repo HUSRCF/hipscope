@@ -12,7 +12,8 @@
 //!   next block into slot 0; B2 signal retires its payload; fetch next block's
 //!   slab 1 during the fold's `mul`/`fmac` stage (row group 1's `subrev`
 //!   rides in row group 0's `fmac` packets); B2 wait.
-use super::{Gen, K_LOOP, K_LOOP_END, EPI, fold, op, publish::{self, ds_load}, s, sr};
+use super::{Gen, K_LOOP, K_LOOP_END, EPI, fold, publish::{self, ds_load}};
+use crate::kernels::common::{op, s, sr, vr};
 use crate::{Builder, V, insn::Wmma, lds::Transition, reg::Live};
 
 fn between(a: &str, b: &str) -> Live { Live::Between(a.into(), b.into()) }
@@ -80,17 +81,17 @@ fn block_with(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, e
     let dp = h as u32 * (l.ds[1] - l.ds[0]) / 4;
     for pair in 0..2u32 {
         ds_load(b, g.slot_ds[h], format!("ds_load_2addr_b32 v[{}:{}], v{}{}", g.d + 2 * pair as u8, g.d + 2 * pair as u8 + 1, g.d_addr,
-            super::ds_offsets(dp + 32 * pair, dp + 32 * pair + 16)), super::vr(g.d + 2 * pair as u8, 2), g.d_addr)?;
+            super::ds_offsets(dp + 32 * pair, dp + 32 * pair + 16)), vr(g.d + 2 * pair as u8, 2), g.d_addr)?;
     }
     bundle(b, g, 0, false, |_, _| Ok(()))?;
     b.label(&x0)?;
     let sz = l.sz[h];
     for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16), (f0, 64)] {
-        ds_load(b, g.slot_sz[h], format!("ds_load_b128 v[{}:{}], v{}{}", dst, dst + 3, g.sc_addr, super::ds_offset(sz + off)), super::vr(dst, 4), g.sc_addr)?;
+        ds_load(b, g.slot_sz[h], format!("ds_load_b128 v[{}:{}], v{}{}", dst, dst + 3, g.sc_addr, super::ds_offset(sz + off)), vr(dst, 4), g.sc_addr)?;
     }
     bundle(b, g, 1, false, |b, i| fold::unbias_after_wmma(b, g, i))?;
     b.label(&x1)?;
-    ds_load(b, g.slot_sz[h], format!("ds_load_b128 v[{}:{}], v{}{}", f1, f1 + 3, g.sc_addr, super::ds_offset(sz + 80)), super::vr(f1, 4), g.sc_addr)?;
+    ds_load(b, g.slot_sz[h], format!("ds_load_b128 v[{}:{}], v{}{}", f1, f1 + 3, g.sc_addr, super::ds_offset(sz + 80)), vr(f1, 4), g.sc_addr)?;
     if fetch_next {
         publish::publish_slab(b, g, 0)?;
         publish::publish_meta(b, g, h ^ 1)?;
@@ -115,11 +116,11 @@ fn fragments(b: &mut Builder, g: &Gen, slot: usize) -> Result<(), String> {
     let (a, w) = (l.a[slot] / 512, l.w[slot] / 512);
     for sb in 0..2 {
         let f = g.f[sb];
-        ds_load(b, g.slot_w[slot], format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", f, f + 3, g.fr_w[sb], super::ds_offsets(w, w + 1)), super::vr(f, 4), g.fr_w[sb])?;
+        ds_load(b, g.slot_w[slot], format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", f, f + 3, g.fr_w[sb], super::ds_offsets(w, w + 1)), vr(f, 4), g.fr_w[sb])?;
         for half in 0..2u8 {
             let dst = f + 4 + 4 * half;
             let o = a + 2 * u32::from(half);
-            ds_load(b, g.slot_a[slot], format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", dst, dst + 3, g.fr_a[sb], super::ds_offsets(o, o + 1)), super::vr(dst, 4), g.fr_a[sb])?;
+            ds_load(b, g.slot_a[slot], format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", dst, dst + 3, g.fr_a[sb], super::ds_offsets(o, o + 1)), vr(dst, 4), g.fr_a[sb])?;
         }
     }
     Ok(())

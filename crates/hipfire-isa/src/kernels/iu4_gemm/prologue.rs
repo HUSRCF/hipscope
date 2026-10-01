@@ -1,7 +1,8 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{END, Epi, Gen, Tile, lit, mem, op, publish, s, sr, v};
+use super::{END, Epi, Gen, Tile, publish};
+use crate::kernels::common::{lit, mem, op, s, sop, sr, v};
 use crate::{Builder, insn::MemoryClass, lds::Transition};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
@@ -30,9 +31,6 @@ fn udiv(b: &mut Builder, num: u8, den: u8, q: u8, r: u8, x: u8, y: u8) -> Result
     Ok(())
 }
 
-fn sop(b: &mut Builder, text: String, d: &[u8], u: &[u8]) -> Result<(), String> {
-    op(b, text, &d.iter().map(|&n| s(n)).collect::<Vec<_>>(), &u.iter().map(|&n| s(n)).collect::<Vec<_>>())
-}
 /// VALU helper: `vdst` defined, `vuse`/`suse` read.
 fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Result<(), String> {
     let uses = vuse.iter().map(|&n| v(n)).chain(suse.iter().map(|&n| s(n))).collect::<Vec<_>>();
@@ -250,7 +248,7 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     }
     for i in (0..8u8).step_by(2) {
         let r = g.magic + i;
-        op(b, format!("v_dual_mov_b32 v{r}, {m} :: v_dual_mov_b32 v{}, {m}", r + 1, m = lit(super::spec::MAGIC)), &[v(r), v(r + 1)], &[])?;
+        op(b, format!("v_dual_mov_b32 v{r}, {m} :: v_dual_mov_b32 v{}, {m}", r + 1, m = lit(crate::kernels::iu4_fold::MAGIC)), &[v(r), v(r + 1)], &[])?;
     }
     publish::publish_slab(b, g, 0)?;
     publish::publish_meta(b, g, 0)?;

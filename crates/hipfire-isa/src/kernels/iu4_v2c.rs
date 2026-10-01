@@ -34,22 +34,18 @@
 //! == 0`, `K % 256 == 0`, `M * 4 < 2^24`; kernargs `A, Xq, Y, M, K, N`
 //! (gate/up: `G, U, Xq, H, M, K, N` with `M` the gate row count), Y/H
 //! token-major `[N][M]` f32.
-use super::iu4_gemm::{ds_offsets, lit, region::{self, Binding, Region}, s, sr, v, vr};
+use super::common::{lit, mem, op, s, sr, v, vr};
+use super::iu4_fold::{GROUP_BYTES, MAGIC, MAGIC_NEG, REBIAS, XBLK_BYTES};
+use super::iu4_gemm::{ds_offsets, region::{self, Binding, Region}};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
     insn::{Instruction, MemoryClass, Sop, Wmma}, lds::Transition,
-    reg::{Live, RegRef}, vopd::{Operand, VopdF32, VopdOp}};
+    reg::Live, vopd::{Operand, VopdF32, VopdOp}};
 
 pub const THREADS: u16 = 256;
 pub const LDS_BYTES: u32 = 32768;
 pub const SLOT_BYTES: u32 = 16384;
 pub const A_BYTES: u32 = 8192;
 pub const VGPR_CEILING: u16 = 192;
-pub const MAGIC: u32 = 0x4b40_0000;
-/// `-12582912.0f`: `float(C) = bits(C + magic) - 1.5*2^23` exactly.
-pub const MAGIC_NEG: u32 = 0xcb40_0000;
-pub const REBIAS: u32 = 0x8888_8888;
-pub const GROUP_BYTES: u32 = 136;
-pub const XBLK_BYTES: u32 = 72;
 
 pub const K_BEGIN: &str = ".Lv2c_k_begin";
 pub const K_LOOP: &str = ".Lv2c_k_loop";
@@ -168,12 +164,6 @@ fn stage_base(epi: Epi) -> u8 { if epi.silu() { Regs::SS } else { Regs::SA } }
 const SLOT_A: [usize; 2] = [0, 2];
 const SLOT_X: [usize; 2] = [1, 3];
 
-pub(super) fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
-}
-pub(super) fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))
-}
 pub(super) fn off(o: u32) -> Result<String, String> {
     if o > 4095 { return Err(format!("global offset {o} exceeds the gfx11 13-bit signed field")) }
     Ok(if o == 0 { String::new() } else { format!(" offset:{o}") })

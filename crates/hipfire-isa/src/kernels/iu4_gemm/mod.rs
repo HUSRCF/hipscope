@@ -22,7 +22,8 @@ pub mod region;
 pub mod gdn_epilogue;
 
 pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
-use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass, Sop}, reg::{Kind, Live, RegRef}};
+use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::Sop, reg::Live};
+use crate::kernels::common::op;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -35,19 +36,6 @@ pub(crate) const END: &str = ".Liu4_end";
 /// Fused projection only: the QKV tiles' GDN preparation (after the stores).
 pub(crate) const GDN: &str = ".Liu4_gdn";
 
-pub(crate) fn v(n: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len: 1 } }
-pub(crate) fn vr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len } }
-pub(crate) fn s(n: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len: 1 } }
-pub(crate) fn sr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len } }
-/// Literal spelling as llvm-objdump prints it: inline integers in decimal,
-/// everything else in hex, so parse-back compares canonical text.
-pub(crate) fn lit(x: u32) -> String { if x <= 64 { x.to_string() } else if x as i32 >= -16 && (x as i32) < 0 { (x as i32).to_string() } else { format!("{x:#x}") } }
-pub(crate) fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
-}
-pub(crate) fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))
-}
 /// DS offset fields spelled as objdump prints them (zero fields omitted).
 pub(crate) fn ds_offsets(o0: u32, o1: u32) -> String {
     let mut t = String::new();
