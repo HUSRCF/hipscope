@@ -14,10 +14,10 @@ pub mod rocm;
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
 };
 use thiserror::Error;
 
@@ -3735,8 +3735,49 @@ pub fn active_or_local_process_config() -> &'static ProcessConfig {
 /// Read one process-start value from the validated in-memory policy. The
 /// argument is the temporary compatibility spelling used by compact runtime
 /// parsers; this function never reads or mutates the ambient environment.
+/// One hash lookup into a table rendered once from the active policy (it is
+/// read on per-request and per-kernel paths); same answers as
+/// [`ProcessConfig::legacy_value`].
 pub fn process_value(name: &str) -> Option<String> {
-    active_or_local_process_config().legacy_value(name)
+    static TABLE: LazyLock<HashMap<String, String>> =
+        LazyLock::new(|| legacy_table(active_or_local_process_config()));
+    match TABLE.get(name) {
+        Some(value) => Some(value.clone()),
+        // The table holds canonical upper-case spellings; legacy_value also
+        // folds the case of developer names, so defer to it for those.
+        None if name.bytes().any(|b| b.is_ascii_lowercase()) => {
+            active_or_local_process_config().legacy_value(name)
+        }
+        None => None,
+    }
+}
+
+/// Every compatibility name `config` answers, rendered: schema fields under
+/// their `env_compat` spelling, then developer keys under their `HIPFIRE_*`
+/// name unless a schema field owns that spelling (which `legacy_value`
+/// consults first, present or not).
+fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
+    let mut table = HashMap::new();
+    for schema in FIELDS {
+        let Some(name) = schema.env_compat else {
+            continue;
+        };
+        if let Some(value) = config.values.get(schema.key).and_then(render_compat_value) {
+            table.insert(name.to_owned(), value);
+        }
+    }
+    for (key, value) in &config.values.values {
+        let Some(name) = developer_env_for_key(key) else {
+            continue;
+        };
+        if FIELDS.iter().any(|schema| schema.env_compat == Some(name.as_str())) {
+            continue;
+        }
+        if let Some(value) = render_compat_value(value) {
+            table.insert(name, value);
+        }
+    }
+    table
 }
 
 /// Resolve the memory preflight OOM guard (`memory.oom_guard`, compat
@@ -3909,6 +3950,17 @@ fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
         Some("1") => true,
         Some("0") => false,
         _ => default,
+    }
+}
+/// The `on`/`off`/`auto` mode knobs the CLI lowers into load params
+/// (`dspark_mode`, `dflash_mode`, `mtp_mode`): `"on"` forces the feature
+/// (`Some(true)`), `"off"` skips it (`Some(false)`), and `"auto"` or any
+/// other value defers to the loader default (`None`). Exact, lower-case.
+pub fn parse_tri_state(mode: &str) -> Option<bool> {
+    match mode {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
     }
 }
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
@@ -5224,6 +5276,61 @@ mod tests {
             assert_eq!(parse_developer_bool(Some("yes"), default), default);
             assert_eq!(parse_developer_bool(Some(""), default), default);
             assert_eq!(parse_developer_bool(Some("2"), default), default);
+        }
+    }
+
+    /// The cached lookup behind `process_value` answers exactly what the
+    /// per-call `legacy_value` scan does, for every compatibility name.
+    #[test]
+    fn legacy_table_matches_legacy_value() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut values = ConfigLayer::default();
+        for schema in FIELDS.iter().filter(|schema| schema.env_compat.is_some()) {
+            if let Some(resolved_value) = resolved.get(schema.key) {
+                values
+                    .values
+                    .insert(schema.key.to_owned(), resolved_value.value.clone());
+            }
+        }
+        values.values.insert(
+            "developer.dspark_q8_wmma".into(),
+            ConfigValue::String("1".into()),
+        );
+        values
+            .values
+            .insert("developer.ngram_window".into(), ConfigValue::Integer(64));
+        let config = ProcessConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            values,
+        };
+        let table = legacy_table(&config);
+        let mut names: Vec<&str> = FIELDS.iter().filter_map(|schema| schema.env_compat).collect();
+        names.extend([
+            "HIPFIRE_DSPARK_Q8_WMMA",
+            "HIPFIRE_NGRAM_WINDOW",
+            "NOT_HIPFIRE",
+        ]);
+        let mut answered = 0;
+        for name in names {
+            let cached = table.get(name).cloned();
+            assert_eq!(cached, config.legacy_value(name), "{name}");
+            answered += usize::from(cached.is_some());
+        }
+        assert!(answered > 2, "the fixture must exercise rendered values");
+        // An unset developer-shaped name (built at runtime so the env-docs
+        // inventory does not read it as a real knob).
+        let unset = ["HIPFIRE", "UNSET", "PROBE"].join("_");
+        assert_eq!(table.get(&unset).cloned(), config.legacy_value(&unset));
+    }
+
+    #[test]
+    fn tri_state_truth_table() {
+        // Only the exact lower-case modes force; everything else, including
+        // "auto" and the boolean spellings other parsers accept, defers.
+        assert_eq!(parse_tri_state("on"), Some(true));
+        assert_eq!(parse_tri_state("off"), Some(false));
+        for deferred in ["auto", "", "ON", "Off", "1", "0", "true", "false", "yes"] {
+            assert_eq!(parse_tri_state(deferred), None, "{deferred:?}");
         }
     }
 

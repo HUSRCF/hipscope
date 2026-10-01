@@ -1324,11 +1324,11 @@ def e15(t):
 # --------------------------------------------------------------------------
 
 
-# Gateway-side request validation prefixes its refusals with a typed tag so
-# the HTTP layer maps them to 400 by CLASS, not by message wording
-# (`REQUEST_VALIDATION_TAG` in hipfire-cli/src/serve/mod.rs). The contract a
-# client observes is "HTTP 400 naming the refused field/knob"; the exact
-# sentence is an implementation detail, so accept either spelling.
+# Gateway-side request validation is typed (`InvalidRequest` in
+# hipfire-cli/src/serve/mod.rs), so the HTTP layer maps it to 400 by TYPE, not
+# by message wording. The contract a client observes is "HTTP 400 naming the
+# refused field/knob"; the exact sentence is an implementation detail. Older
+# gateways prefixed the message with this tag, so accept either spelling.
 REFUSAL_TAG = "[request validation] "
 
 

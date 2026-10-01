@@ -2491,7 +2491,6 @@ pub fn load_model_with_gemma4_drafter(
         None,
         kv_mode_override,
         kv_k_override,
-        kv_v_override,
         kv_adaptive_override,
         state_quant_override,
         cask,
@@ -2525,7 +2524,6 @@ pub fn load_admitted_with_gemma4_drafter(
     mtp_path: Option<&Path>,
     kv_mode_override: Option<&str>,
     kv_k_override: Option<&str>,
-    kv_v_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
@@ -2537,6 +2535,7 @@ pub fn load_admitted_with_gemma4_drafter(
         source,
         kv_backend,
         qwen_default_q8,
+        kv_v,
         max_seq,
         sequence,
         carrier,
@@ -2569,7 +2568,7 @@ pub fn load_admitted_with_gemma4_drafter(
         vision_mode,
         kv_mode_override,
         kv_k_override,
-        kv_v_override,
+        kv_v_override: kv_v.as_deref(),
         qwen_default_q8,
         kv_backend,
         kv_adaptive_override,
@@ -4735,6 +4734,18 @@ mod lfm2_batch_admission_tests {
 #[cfg(test)]
 mod registry_tests {
     use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+
+    /// `arch_label` is the one wire name for the load ACK, `diag` and the
+    /// multi-slot preflight: a loaded dots-ocr model must never report the
+    /// `qwen3` fallback.
+    #[test]
+    fn arch_label_names_vision_and_slot_arches() {
+        use super::arch_label;
+        assert_eq!(arch_label(8), "dots-ocr");
+        assert_eq!(arch_label(5), "qwen3_5");
+        assert_eq!(arch_label(6), "qwen3_5_moe");
+        assert_eq!(arch_label(0), "qwen3");
+    }
 
     #[test]
     fn deepseek4_kv_mode_is_truthful_and_fail_closed() {
