@@ -622,6 +622,21 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
 mod tests {
     use super::*;
 
+
+    /// LLVM gfx1201 `v_min_u32_e64 v72, s92, v24`, used by GDN scan.
+    #[test]
+    fn gdn_unsigned_min_roundtrip_and_sgpr_use() {
+        let words = [0xd513_0048, 0x0202_305c];
+        let (inst, consumed) = decode(&words).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("v_min_u32_e64"));
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef {kind: Kind::V, base: 72, len: 1}]);
+        assert_eq!(inst.effects.uses.as_slice(), &[
+            RegRef {kind: Kind::S, base: 92, len: 1},
+            RegRef {kind: Kind::V, base: 24, len: 1},
+        ]);
+        assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+    }
     #[test]
     fn every_declared_example_roundtrips() {
         let mut failures = Vec::new();
