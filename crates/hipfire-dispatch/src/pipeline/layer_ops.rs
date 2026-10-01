@@ -23,7 +23,6 @@ use rdna_compute::tensor_ops::{
     hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_prefill_prologue, qsa_prefill_prologue_enabled,
     indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
@@ -1857,34 +1856,6 @@ pub fn execute_indexed_attention(
         // Decode / few-row verify: the norms, RoPE, cache append and
         // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
-            gpu,
-            &IndexedAttentionDecodePrologue {
-                index_row: &index_batch,
-                qgate: &qgate_batch,
-                keys: &k_batch,
-                values: &v_batch,
-                full_keys: op.state.full_keys,
-                full_values: op.state.full_values,
-                raw_index_keys: op.state.raw_index_keys,
-                index_q_norm: op.indexer_q_norm,
-                q_norm: op.q_norm,
-                k_norm: op.k_norm,
-                index_heads: op.index_heads,
-                index_dim: op.index_dim,
-                index_kv_width,
-                heads: op.heads,
-                kv_heads: op.kv_heads,
-                head_dim: op.head_dim,
-                position: initial_position,
-                rows: op.rows,
-                format: op.state.format,
-            },
-        ))?;
-    } else if qsa_prefill_prologue_enabled(gpu) && op.index_dim <= 256 && op.head_dim <= 256 {
-        // `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE`: the same prologue as the
-        // decode launch above over every prefill row (outputs byte-identical to
-        // the separate launches below); eager only.
-        hip(indexed_attention_prefill_prologue(
             gpu,
             &IndexedAttentionDecodePrologue {
                 index_row: &index_batch,

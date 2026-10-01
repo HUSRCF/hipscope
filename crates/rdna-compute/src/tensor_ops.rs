@@ -28,8 +28,6 @@ const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
-const INDEXED_ATTENTION_PREFILL_PROLOGUE_SRC: &str =
-    include_str!("../../../kernels/src/indexed_attention_prefill_prologue.hip");
 const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=1` routes QSA prefill attention chunks
@@ -57,14 +55,6 @@ const QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS: usize = 512;
 /// Static LDS of the exact selector kernels
 /// (`indexed_attention_select_exact.hip`), beside the dynamic score row.
 const QSA_SELECT_EXACT_STATIC_LDS_BYTES: usize = 6 * 1024;
-/// `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE=1` runs the multi-row QSA prologue
-/// (norm + RoPE, source-cache append and index-key round trip) of prefill
-/// chunks in one launch instead of the separate norm / append launches
-/// (byte-identical outputs), outside recording and capture.  Unset or `0`
-/// keeps the separate launches.  Read once.
-static QWEN4_QSA_PREFILL_PROLOGUE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE", false)
-});
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -2290,36 +2280,6 @@ pub fn indexed_attention_decode_prologue(
     gpu: &mut Gpu,
     p: &IndexedAttentionDecodePrologue<'_>,
 ) -> HipResult<()> {
-    indexed_attention_prologue_impl(gpu, p, false)
-}
-
-/// Whether prefill chunks run [`indexed_attention_prefill_prologue`] instead
-/// of the separate norm / RoPE / append launches:
-/// `HIPFIRE_QWEN4_QSA_PREFILL_PROLOGUE` set, and no recorder or capture (the
-/// prefill kernel declares no replay bindings).  With the flag unset every
-/// launch is the incumbent's.
-pub fn qsa_prefill_prologue_enabled(gpu: &Gpu) -> bool {
-    *QWEN4_QSA_PREFILL_PROLOGUE && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
-}
-
-/// The decode prologue's operations over arbitrary prefill rows
-/// (`kernels/src/indexed_attention_prefill_prologue.hip`): same fields,
-/// geometry and outputs as [`indexed_attention_decode_prologue`] (bitwise the
-/// separate launches), one block per index-Q / Q / K / index-K task per row.
-/// Eager only: it declares no replay position binding, so callers gate on
-/// [`qsa_prefill_prologue_enabled`].
-pub fn indexed_attention_prefill_prologue(
-    gpu: &mut Gpu,
-    p: &IndexedAttentionDecodePrologue<'_>,
-) -> HipResult<()> {
-    indexed_attention_prologue_impl(gpu, p, true)
-}
-
-fn indexed_attention_prologue_impl(
-    gpu: &mut Gpu,
-    p: &IndexedAttentionDecodePrologue<'_>,
-    prefill: bool,
-) -> HipResult<()> {
     for tensor in [p.index_row, p.qgate, p.keys, p.values] {
         ensure_f32(tensor)?;
     }
@@ -2362,26 +2322,11 @@ fn indexed_attention_prologue_impl(
         p.index_heads + p.heads + p.kv_heads + 1,
         "QSA prologue block count",
     )?;
-    let kernel = p.format.kernel(if prefill {
-        [
-            "indexed_attention_prefill_prologue_f32",
-            "indexed_attention_prefill_prologue_fp8",
-        ]
-    } else {
-        [
-            "indexed_attention_decode_prologue_f32",
-            "indexed_attention_decode_prologue_fp8",
-        ]
-    });
-    if prefill {
-        gpu.ensure_kernel_public(
-            "indexed_attention_prefill_prologue",
-            INDEXED_ATTENTION_PREFILL_PROLOGUE_SRC,
-            kernel,
-        )?;
-    } else {
-        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    }
+    let kernel = p.format.kernel([
+        "indexed_attention_decode_prologue_f32",
+        "indexed_attention_decode_prologue_fp8",
+    ]);
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.index_row,
@@ -2416,16 +2361,6 @@ fn indexed_attention_prologue_impl(
         offset: position_offset,
         addend: 0,
     }];
-    if prefill {
-        return gpu.launch_blob_recorded(
-            kernel,
-            [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
-            [256, 1, 1],
-            0,
-            args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
-        );
-    }
     gpu.launch_blob_recorded(
         kernel,
         [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
