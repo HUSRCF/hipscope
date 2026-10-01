@@ -474,6 +474,9 @@ enum AttnProjDtype {
 
 pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
+        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
+        // read them at the 136 B HFQ4 stride and return noise at full speed.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
@@ -490,6 +493,7 @@ pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 
 pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
@@ -4233,6 +4237,19 @@ mod tests {
             fused_qkv_key_for(DType::HFQ4G256),
             KernelKey::FusedQkvHfq4G256
         );
+    }
+
+    #[test]
+    fn six_bit_g256_container_selects_hfq6_keys() {
+        // MQ6G256 MoE attention and shared-expert gate/up (AWQ A3B layers
+        // 0/1/38/39) route through these selectors; an HFQ4 key here reads the
+        // 200 B/group container at the 136 B stride and decodes noise.
+        for dt in [DType::MQ6G256, DType::HFQ6G256] {
+            assert_eq!(fused_qkvza_key_for(dt), KernelKey::FusedQkvzaHfq6G256, "{dt:?}");
+            assert_eq!(fused_qkv_key_for(dt), KernelKey::FusedQkvHfq6G256, "{dt:?}");
+            assert_eq!(fused_gate_up_key_for(dt), KernelKey::FusedGateUpHfq6G256, "{dt:?}");
+            assert_eq!(residual_gemm_key_for(dt), KernelKey::GemmHfq6G256Residual, "{dt:?}");
+        }
     }
 
     #[test]

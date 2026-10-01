@@ -66,6 +66,9 @@ pub fn run_q8_projection_fresh(
 /// Select the residual GEMM key for a packed weight container.
 pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
     match dtype {
+        // qt=15/qt=8 share the 200 B/group 6-bit container; the HFQ4 default
+        // below would read them at the 136 B stride and return noise.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::GemmHfq6G256Residual,
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
         DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
         DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
