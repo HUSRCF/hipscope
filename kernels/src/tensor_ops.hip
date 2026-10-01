@@ -1628,8 +1628,9 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
 //     exact expressions (lane partial of 4 BF16-rounded squares in element
 //     order, then the same DPP/swizzle/xor tree) and stored as BF16 to
 //     qn / kn [rows, 16, 128];
-//   * every other block (V channels, channel >= 4096; parameter blocks) runs
-//     the plain body unchanged.
+//   * the V channels use the same wave tile (4 contiguous channels per lane,
+//     no norm) when channels % 256 == 0, else the plain scalar body; the
+//     parameter blocks run gated_delta_params_flat as in the plain kernel.
 // Extra ABI vs the plain kernel: `qn`, `kn` (8-byte aligned, [rows,16,128]
 // BF16).  Layout contract (the wrapper must check): channels >= 4096, q|k|v
 // channel order, key_heads == 16, key_dim == 128; otherwise do not use this
@@ -1701,8 +1702,11 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     if (r0 >= rows || history_rows != 3 || kernel_size != 4) return;
     const int store_bf16 = output_bf16 & 1;
 
-    if ((int)blockIdx.x < 16 && channels >= 4096) {
-        // q / k heads: wave = (head, 4-row quarter) of this 16-row tile.
+    // 128-channel slices (4 contiguous channels per lane) x 4-row quarters.  The
+    // q / k heads (blocks 0..15) are also normalized; the V channels use the
+    // same tile when channels is a multiple of 256, else the scalar body below.
+    const bool norm = (int)blockIdx.x < 16 && channels >= 4096;
+    if (norm || (channels & 255) == 0) {
         const int wave = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
         const int head = (int)blockIdx.x * 2 + (wave & 1);
         const int rb = r0 + (wave >> 1) * 4;
@@ -1770,7 +1774,7 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
                 v[u] = bf16_to_f32(out);
                 bits[u] = out.data;
             }
-            if (output_bf16 & 2) {
+            if (!norm || (output_bf16 & 2)) {
                 if (store_bf16) {
                     uint2 packed;
                     packed.x = (unsigned)bits[0] | ((unsigned)bits[1] << 16);
@@ -1781,11 +1785,13 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
                     for (int u = 0; u < 4; ++u) output[(size_t)r * channels + c0 + u] = v[u];
                 }
             }
-            const float inv = gated_delta_qk_norm_inv_wave32(v);
-            uint2 packed;
-            packed.x = (unsigned)bf16_round(v[0] * inv).data | ((unsigned)bf16_round(v[1] * inv).data << 16);
-            packed.y = (unsigned)bf16_round(v[2] * inv).data | ((unsigned)bf16_round(v[3] * inv).data << 16);
-            *(uint2*)((unsigned short*)(is_k ? kn : qn) + ((size_t)r * 16 + kh) * 128 + lane * 4) = packed;
+            if (norm) {
+                const float inv = gated_delta_qk_norm_inv_wave32(v);
+                uint2 packed;
+                packed.x = (unsigned)bf16_round(v[0] * inv).data | ((unsigned)bf16_round(v[1] * inv).data << 16);
+                packed.y = (unsigned)bf16_round(v[2] * inv).data | ((unsigned)bf16_round(v[3] * inv).data << 16);
+                *(uint2*)((unsigned short*)(is_k ? kn : qn) + ((size_t)r * 16 + kh) * 128 + lane * 4) = packed;
+            }
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 h0[u] = h1[u];
