@@ -44961,6 +44961,21 @@ impl Gpu {
 pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_SYM_IU4", false));
 
+/// Opt-in full-layer DMA staging; shared by load-time reserve and prefill.
+/// Read once, independently of the symmetric arithmetic route.
+static QWEN4_EXPERT_STAGE: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_EXPERT_STAGE", false));
+
+pub fn qwen4_expert_stage_requested() -> bool {
+    *QWEN4_EXPERT_STAGE
+}
+
+pub const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 512 * 1_740_800;
+pub const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 512 * 870_400;
+pub const QWEN4_EXPERT_STAGE_LAYER_BYTES: usize =
+    QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
+pub const QWEN4_EXPERT_STAGE_BYTES: u64 = 2 * QWEN4_EXPERT_STAGE_LAYER_BYTES as u64;
+
 /// The route's GEMMs run from the certified builder modules
 /// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores
 /// the byte-identical gfx1151 hipcc entries (same-binary control); gfx1201 has

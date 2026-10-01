@@ -518,7 +518,7 @@ fn gateup_silu(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// past the VRAM budget); the symmetric IU4 GEMMs then take a wider expert-run
 /// tile. A layer's experts share one residency, so expert 0 decides.
 fn experts_host_mapped(p: &MoePrefillParams<'_>) -> bool {
-    p.routed_experts.host_mapped()
+    p.expert_stage_ptrs.is_none() && p.routed_experts.host_mapped()
 }
 
 pub(crate) fn gate_up(
@@ -528,10 +528,13 @@ pub(crate) fn gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    let gate_up_ptrs = p
+        .expert_stage_ptrs
+        .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
     if sym_iu4(gpu, p, use_path2) {
         let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -561,7 +564,7 @@ pub(crate) fn gate_up(
         };
         hip(gemm(
             gpu,
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             x_f16.as_ref().unwrap_or(p.x_rot_batch),
@@ -574,7 +577,7 @@ pub(crate) fn gate_up(
         ))
     } else if use_path2 {
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10(
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             p.x_rot_batch,
@@ -587,7 +590,7 @@ pub(crate) fn gate_up(
         ))
     } else {
         hip(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.topk_indices,
             p.x_rot_batch,
             p.gate_batch,
@@ -738,6 +741,14 @@ fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     use_path2 && p.batch_size <= 8 && !down_wmma(gpu, p)
 }
 
+/// Release the stage immediately after the routed down, before combine.
+fn release_stage(gpu: &Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    if let Some(stage) = p.expert_stage_ptrs {
+        hip(gpu.hip.event_record(stage.free, gpu.active_stream.as_ref()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -745,6 +756,9 @@ pub(crate) fn down(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    let down_ptrs = p
+        .expert_stage_ptrs
+        .map_or(p.expert_down_ptrs, |stage| stage.down);
     let total_slots = p.batch_size * p.k_top;
     if sym_iu4(gpu, p, use_path2) {
         // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
@@ -756,8 +770,8 @@ pub(crate) fn down(
             grouped_rows,
             total_slots,
         ))?;
-        return hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-            p.expert_down_ptrs,
+        hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+            down_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -768,7 +782,8 @@ pub(crate) fn down(
             grouped_rows,
             total_slots,
             experts_host_mapped(p),
-        ));
+        ))?;
+        return release_stage(gpu, p);
     }
     if indexed_down(gpu, p, use_path2) {
         return down(gpu, p, false, grouped_rows);
@@ -788,7 +803,7 @@ pub(crate) fn down(
             hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?
         };
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
-            p.expert_down_ptrs,
+            down_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &x_f16,
@@ -800,7 +815,7 @@ pub(crate) fn down(
         ))?;
     } else if use_path2 {
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10(
-            p.expert_down_ptrs,
+            down_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             p.rot_batch,
@@ -819,7 +834,7 @@ pub(crate) fn down(
         // re-round values that are already BF16-exact.
     } else {
         hip(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-            p.expert_down_ptrs,
+            down_ptrs,
             p.topk_indices,
             p.rot_batch,
             p.down_expanded,
@@ -830,7 +845,7 @@ pub(crate) fn down(
         ))?;
         // The combine rounds every expert output it reads to BF16 itself.
     }
-    Ok(())
+    release_stage(gpu, p)
 }
 
 /// Whether [`combine`] can start from +0.0 instead of the zero-filled target
