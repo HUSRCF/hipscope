@@ -1605,12 +1605,13 @@ impl RequestFailure {
     }
 }
 
-/// HTTP status for a failed completion. A typed daemon error maps on its wire
-/// `class`, never on its message: `validation`, `context_length` and
-/// `unsupported` are the client's to fix (400), `transient` and the
-/// multi-slot engine's `overload` (capacity) are worth a retry (503), and
-/// every other class is a server fault (500). Only gateway-side errors, which
-/// carry no class, fall back to their validation tag, then their message.
+/// HTTP status for a failed completion, by error TYPE, never by message. A
+/// typed daemon error maps on its wire `class`: `validation`,
+/// `context_length` and `unsupported` are the client's to fix (400),
+/// `transient` and the multi-slot engine's `overload` (capacity) are worth a
+/// retry (503), and every other class is a server fault (500). Gateway-side
+/// errors are 400 when they carry [`InvalidRequest`](crate::serve::InvalidRequest),
+/// 404 for [`ModelNotFound`](crate::serve::ModelNotFound), else 500.
 pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     use hipfire_client::error_class;
     let typed = error
@@ -1624,22 +1625,10 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
             _ => 500,
         };
     }
-    let message = error.to_string();
-    if message.contains(crate::serve::REQUEST_VALIDATION_TAG) {
-        return 400;
-    }
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("model not found") {
-        404
-    } else if lower.contains("kv budget")
-        || lower.contains("max_tokens")
-        || lower.contains("invalid")
-        || lower.contains("required")
-        || lower.contains("endpoint adapter")
-        || lower.contains("lossy")
-        || lower.contains("malformed canonical tool call")
-    {
+    if error.chain().any(|cause| cause.is::<crate::serve::InvalidRequest>()) {
         400
+    } else if error.chain().any(|cause| cause.is::<crate::serve::ModelNotFound>()) {
+        404
     } else {
         500
     }
@@ -1664,7 +1653,11 @@ pub(crate) fn request_id() -> String {
 }
 
 pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
-    format!("data: {}\n\n", value).into_bytes()
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut bytes, value).expect("serializing a JSON value cannot fail");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
 }
 
 /// Commit point of one SSE response, shared by the handler and its worker.
@@ -2127,8 +2120,8 @@ mod tests {
         ))
     }
 
-    /// A typed daemon error gets its status from `class`, whatever its text
-    /// says; only classless gateway errors are matched by message.
+    /// A typed daemon error gets its status from `class`, a gateway error
+    /// from its type; no message text is ever read.
     #[test]
     fn request_error_status_maps_daemon_class_before_message() {
         for (class, status) in [
@@ -2146,8 +2139,8 @@ mod tests {
                 "class {class}"
             );
         }
-        // Text that the gateway fallback reads as a client error does not
-        // override a server-fault class, and vice versa.
+        // Text that reads like a client error does not override a
+        // server-fault class, and vice versa.
         assert_eq!(
             request_error_status(&typed_daemon_error("internal", "invalid state: required")),
             500
@@ -2164,15 +2157,32 @@ mod tests {
             ),
             503
         );
-        // Classless gateway errors keep the message fallback.
+        // Gateway errors map by type, through context layers.
         assert_eq!(
-            request_error_status(&anyhow!("max_tokens must be between 1 and 393216")),
+            request_error_status(
+                &crate::serve::invalid_request!("unsupported tool_choice value: x")
+                    .context("projecting request")
+            ),
             400
         );
-        assert_eq!(request_error_status(&anyhow!("model not found: x")), 404);
+        assert_eq!(
+            request_error_status(&anyhow::Error::new(crate::serve::ModelNotFound(
+                "model not found: x".into()
+            ))),
+            404
+        );
+        // Untyped errors are server faults, whatever their wording.
+        for message in [
+            "boom",
+            "max_tokens must be between 1 and 393216",
+            "model not found: x",
+            "invalid state: required",
+        ] {
+            assert_eq!(request_error_status(&anyhow!("{message}")), 500, "{message}");
+        }
         assert_eq!(
             request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(
-                "failed to serialize request".into()
+                "malformed canonical tool call: x".into()
             ))),
             500
         );

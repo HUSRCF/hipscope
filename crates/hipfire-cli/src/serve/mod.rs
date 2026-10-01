@@ -1626,10 +1626,11 @@ impl ServeRuntime {
         let mut path = find_model_path(&self.paths, &self.registry, model);
         if path.is_none() && entry.is_some() {
             if origin == ModelOrigin::Request && !self.request_policy.allow_pull {
-                bail!(
+                return Err(ModelNotFound(format!(
                     "model not found locally: {model}; run `hipfire pull {model}` on the server \
                      first (downloads named by a request are off: serve.allow_request_pull)"
-                );
+                ))
+                .into());
             }
             pull_command(
                 &self.paths,
@@ -1640,14 +1641,15 @@ impl ServeRuntime {
             )?;
             path = entry.map(|entry| self.paths.models.join(&entry.file));
         }
-        let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
+        let path = path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
-                bail!(
+                return Err(ModelNotFound(format!(
                     "model not found: {model} (a request may name only installed models; \
                      loading other files is off: serve.allow_request_paths)"
-                );
+                ))
+                .into());
             }
             let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
             let mut params = load_params(
@@ -2041,14 +2043,47 @@ pub(crate) fn validate_multi_slot_startup(
     Ok(())
 }
 
-/// Machine-readable prefix for gateway-side request-validation failures.
-///
-/// Mirrors the daemon's typed error prefix so the HTTP layer classifies by
-/// CLASS rather than by wording: any message carrying this tag is a
-/// client-fixable 400, whatever English it happens to contain. New
-/// validation text is therefore safe to reword without changing status
-/// semantics.
-pub(crate) const REQUEST_VALIDATION_TAG: &str = "[request validation] ";
+/// A request the client must fix. The HTTP layer answers it with 400 by
+/// TYPE, never by wording: build it with [`invalid_request!`] or return it
+/// with [`bail_invalid!`], and the message may say anything.
+#[derive(Debug)]
+pub(crate) struct InvalidRequest(pub(crate) String);
+
+impl std::fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidRequest {}
+
+/// A model the request names that this server will not serve (404).
+#[derive(Debug)]
+pub(crate) struct ModelNotFound(pub(crate) String);
+
+impl std::fmt::Display for ModelNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ModelNotFound {}
+
+/// `anyhow::Error` carrying an [`InvalidRequest`] (HTTP 400).
+macro_rules! invalid_request {
+    ($($arg:tt)*) => {
+        ::anyhow::Error::new($crate::serve::InvalidRequest(format!($($arg)*)))
+    };
+}
+pub(crate) use invalid_request;
+
+/// `return Err(invalid_request!(..))`: the `bail!` for client faults.
+macro_rules! bail_invalid {
+    ($($arg:tt)*) => {
+        return Err($crate::serve::invalid_request!($($arg)*).into())
+    };
+}
+pub(crate) use bail_invalid;
 
 pub(crate) fn serve_instance_token() -> String {
     let now = std::time::SystemTime::now()
