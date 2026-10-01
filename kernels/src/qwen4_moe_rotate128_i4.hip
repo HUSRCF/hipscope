@@ -13,8 +13,8 @@
 // of this file; no quantizer copy here.
 // Grid (K/128, P, 1), block 32.
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__)
-#error "qwen4_moe_rotate128_i4.hip is gfx1151-only"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__)
+#error "qwen4_moe_rotate128_i4.hip is gfx1151/gfx1201-only"
 #endif
 
 extern "C" __global__ __launch_bounds__(32) void qwen4_moe_rotate128_i4(

@@ -4111,15 +4111,28 @@ pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
 );
-/// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 only), three
-/// separately named JIT modules; no incumbent module is extended.
-/// Grouped IU4 gate/up SwiGLU + down GEMMs and the per-header symmetric-grid
-/// checker. The shared `block_i4_128` prelude supplies the sidecar layout.
+/// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),
+/// separately named modules; no incumbent module is extended.
+/// gfx1151 hipcc twin of the builder GEMMs (the `HIPFIRE_QWEN4_MOE_SYM_PM=0`
+/// control) and the gfx1151 per-header symmetric-grid checker. The shared
+/// `block_i4_128` prelude supplies the sidecar layout.
 pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/qwen4_moe_iu4_sym.gfx1151.hip")
 );
+/// Certified builder modules of the route's grouped IU4 gate/up SwiGLU and
+/// down GEMMs (`hipfire-isa emit --kernel qwen4_moe_sym --epi all --arch
+/// ARCH`, one contract-checked `peacemaker custom build` per symbol, M7
+/// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
+/// gfx1151 SHA-256 (see `crates/hipfire-isa/kernels/qwen4_moe_sym.*.contract.json`).
+pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
+pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// gfx1201 per-header symmetric-grid checker of the route.
+pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
 /// Stable `(expert, flat_slot)` pad16 grouping in three launches, no atomics;
 /// the same six outputs as [`MOE_SCATTER_FUSED_TOP10_SRC`].
 pub const QWEN4_MOE_SCATTER_STABLE_TOP10_SRC: &str =
