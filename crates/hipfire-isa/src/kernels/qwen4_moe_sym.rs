@@ -208,6 +208,17 @@ impl Gen {
         p.s::<2>("w_ptr", WPTR, kernel())?;
         p.s::<2>("live", LIVE, Live::Whole)?;
         for m in MASKT { p.s::<2>("cmp_mask", m, Live::Whole)?; }
+        // Keep the reservation a whole 8-VGPR granule, so the descriptor's
+        // allocation equals the metadata count.
+        let top = p.next_free_vgpr();
+        if top % 8 != 0 { p.v::<1>("granule_pad", (top.div_ceil(8) * 8 - 1) as u8, Live::Whole)?; }
+        // gfx12 emission leaves VCC (read by `v_div_fmas_f32` and the BF16
+        // rounding) out of `.sgpr_count`; two reserved SGPRs above the plan
+        // make the metadata count cover it, as hipcc and M7 account.
+        if self.arch().gfx12() {
+            let top = p.next_free_sgpr();
+            p.s::<2>("vcc_accounting", top as u8, Live::Whole)?;
+        }
         Ok(p)
     }
 }

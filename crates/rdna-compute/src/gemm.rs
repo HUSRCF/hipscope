@@ -44651,6 +44651,18 @@ impl Gpu {
         })
     }
 
+    /// `[gate/up, down]` entry names the route's GEMM launchers run on this
+    /// device: the builder entries, or the gfx1151 hipcc entries under
+    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. `None` off gfx1151/gfx1201.
+    pub fn qwen4_moe_sym_gemm_symbols(&self) -> Option<[&'static str; 2]> {
+        let arch = self.qwen4_moe_sym_arch_index()?;
+        Some(if arch == 1 || *QWEN4_MOE_SYM_PM {
+            [QWEN4_MOE_SYM_PM_GATE_UP[arch], QWEN4_MOE_SYM_PM_DOWN[arch]]
+        } else {
+            [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
+        })
+    }
+
     /// True when every K128 header of `experts` experts behind `ptrs`
     /// (`[experts]` device pointers) is finite and satisfies
     /// `float(zp) == -8 * float(sc)`. `group_bytes` 136 = QT44 (`k % 256`),
@@ -45129,12 +45141,7 @@ impl Gpu {
         let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
         let arch = self.qwen4_moe_sym_arch(what)?;
         let pm = arch == 1 || *QWEN4_MOE_SYM_PM;
-        let func = match (pm, down) {
-            (true, false) => QWEN4_MOE_SYM_PM_GATE_UP[arch],
-            (true, true) => QWEN4_MOE_SYM_PM_DOWN[arch],
-            (false, false) => QWEN4_MOE_SYM_GATE_UP,
-            (false, true) => QWEN4_MOE_SYM_DOWN,
-        };
+        let func = self.qwen4_moe_sym_gemm_symbols().map(|[gate_up, dn]| if down { dn } else { gate_up }).unwrap_or(what);
         let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
             dims.map(|value| i32::try_from(value).ok())
         else {

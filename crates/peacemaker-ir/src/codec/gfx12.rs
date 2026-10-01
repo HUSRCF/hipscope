@@ -26,7 +26,8 @@ fn select(code: u32, width: u8, scalar_dest: bool, literal: Option<u32>) -> Resu
         106 => Operand::Special(Special::VccLo), 107 => Operand::Special(Special::VccHi),
         108 => Operand::Special(Special::Ttmp(0)), 109 => Operand::Special(Special::Ttmp(1)),
         110..=123 => Operand::Reg(RegRef { kind: Kind::Ttmp, base: (code - 108) as u16, len: width }),
-        124 => Operand::Special(Special::M0), 125 => Operand::Special(Special::Null),
+        // gfx11+ selectors: 124 is `null`, 125 is `m0` (sources and destinations alike).
+        124 => Operand::Special(Special::Null), 125 => Operand::Special(Special::M0),
         126 => Operand::Special(Special::ExecLo), 127 => Operand::Special(Special::ExecHi),
         128..=192 => Operand::Inline(InlineConst::Integer((code - 128) as i8)),
         193..=208 => Operand::Inline(InlineConst::Integer((192 - code as i32) as i8)),
@@ -39,7 +40,7 @@ fn select(code: u32, width: u8, scalar_dest: bool, literal: Option<u32>) -> Resu
         _ => return Err(reject(format!("unknown source selector {code:#x}"))),
     })
 }
-fn selector(operand: &Operand, width: u8, scalar_dest: bool) -> Result<u32, DecodeError> {
+fn selector(operand: &Operand, width: u8) -> Result<u32, DecodeError> {
     match operand {
         Operand::Reg(r) | Operand::Half(r, _) => {
             if r.len != width { return Err(reject(format!("register width mismatch: {} instead of {width}", r.len))); }
@@ -47,8 +48,7 @@ fn selector(operand: &Operand, width: u8, scalar_dest: bool) -> Result<u32, Deco
         }
         Operand::Special(s) => Ok(match s {
             Special::VccLo | Special::Vcc => 106, Special::VccHi => 107,
-            Special::Ttmp(n) => u32::from(*n) + 108, Special::M0 if scalar_dest => 125,
-            Special::M0 => 124, Special::Null if scalar_dest => 124, Special::Null => 125,
+            Special::Ttmp(n) => u32::from(*n) + 108, Special::M0 => 125, Special::Null => 124,
             Special::ExecLo | Special::Exec => 126, Special::ExecHi => 127,
             _ => return Err(reject(format!("unencodable special register {s:?}"))),
         }),
@@ -146,9 +146,9 @@ fn encoded_operand(arch: Arch, name: &str, bits: u16, op: &Operand, form: Form) 
             if r.len != (bits / 32).max(1) as u8 && !(name=="VADDR" && (form==Form::Vmem(crate::inst::VmemForm::Buffer) || form==Form::Vmem(crate::inst::VmemForm::Scratch)) && r.len==1) { return Err(reject(format!("{name} register width mismatch"))); }
             Ok(u32::from(r.base))
         }
-        ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8, true),
+        ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8),
         ("VDST" | "SRC0", Operand::Half(r, _)) => Ok(if name=="VDST" { u32::from(r.base) } else { u32::from(r.base) + 256 }),
-        (_, _) => selector(op, (bits / 32).max(1) as u8, name == "SDST"),
+        (_, _) => selector(op, (bits / 32).max(1) as u8),
     }
 }
 fn grammars(row: &OpRow) -> impl Iterator<Item = (&str, u16)> {
@@ -659,6 +659,20 @@ mod tests {
                     (th != 0).then_some(&Operand::CacheTh(th as u8)));
                 assert_eq!(encode(&inst).unwrap().as_slice(), &words);
             }
+        }
+    }
+
+    /// gfx11+ selector 124 is `null` and 125 is `m0` in source operands as
+    /// in destinations: a `null` buffer SOFFSET must not read M0.
+    #[test]
+    fn source_null_and_m0_selectors() {
+        let (store, _) = decode(&[0xc407_407c, 0x4080_6800, 0x0000_00b9]).unwrap();
+        assert!(store.operands.contains(&Operand::Special(Special::Null)));
+        assert!(!store.operands.contains(&Operand::Special(Special::M0)));
+        for (word, special) in [(0xbe84_007c, Special::Null), (0xbe84_007d, Special::M0)] {
+            let (mov, _) = decode(&[word]).unwrap();
+            assert_eq!(mov.operands.last(), Some(&Operand::Special(special)));
+            assert_eq!(encode(&mov).unwrap().as_slice(), &[word]);
         }
     }
 
