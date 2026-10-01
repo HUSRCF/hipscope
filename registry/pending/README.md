@@ -1,1 +1,0 @@
-`mq4l.json` holds the three `qwen3.8:27b-mq4l*` curated entries, unpublished and out of `registry/models.json` until `scripts/registry_gen.py` supports the mq4l quant (target 0.4.1); move them back into `models.json` then.
