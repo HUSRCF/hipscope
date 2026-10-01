@@ -334,7 +334,7 @@ def build_config(args):
             f"serve_harness: --ngram on is exclusive; got dflash={dflash} mtp={args.mtp}. "
             "Pick one speculative mechanism."
         )
-    # Opt-in long-gated ngram-mod composition inside native MTP (harness/env only).
+    # Opt-in long-gated ngram-mod composition inside native MTP (TOML `speculation.mtp_ngram`; the harness drives it by env).
     # Not a separate speculation selector: TOML stays mode=mtp; daemon sees
     # HIPFIRE_MTP_NGRAM + HIPFIRE_NGRAM_MOD_*. Requires --mtp on, greedy sampling,
     # thinking off; exclusive with standalone --ngram / --dflash on and with
@@ -2384,7 +2384,7 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1")
-    # Experimental long-gated ngram-mod inside native MTP (harness-only; no TOML key).
+    # Experimental long-gated ngram-mod inside native MTP (TOML key `speculation.mtp_ngram`; the harness drives the env override).
     # Opt-off must clear inherited vars so a parent shell cannot contradict preflight.
     if cfg.get("mtp_ngram") == "on":
         env["HIPFIRE_MTP_NGRAM"] = "1"
