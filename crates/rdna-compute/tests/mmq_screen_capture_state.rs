@@ -66,6 +66,13 @@ fn screen_error_leaves_capture_mode_off() {
 fn screen_scratch_growth_invalidates_captured_graph() {
     let _l = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let Some(mut gpu) = gpu_or_skip() else { return };
+    // The screen's WMMA reference is the gfx11 kernel: elsewhere it fails to
+    // compile before any scratch grows (gfx1201: "needs wmma-256b-insts"), so
+    // there is no growth to observe. The error test above covers that arch.
+    if !gpu.arch_caps.has_wmma_w32() {
+        eprintln!("skip: {} has no gfx11 WMMA screen path", gpu.arch);
+        return;
+    }
     gpu.ensure_capture_stream().expect("stream");
 
     // Capture any graph so scratch growth has something to invalidate.
