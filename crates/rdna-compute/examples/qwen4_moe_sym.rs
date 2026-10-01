@@ -44,6 +44,7 @@ const BLK: usize = 72;
 const GUARD: usize = 4096;
 
 const QUANT: &str = include_str!("../../../kernels/src/block_i4_128_quant.hip");
+const K11: &str = include_str!("../../../kernels/src/qwen4_moe_iu4_sym.gfx1151.hip");
 const ROT128: &str = include_str!("../../../kernels/src/mq_rotate_x_128_v2.hip");
 /// The gfx1151 hipcc twin of the builder GEMMs, under the production module
 /// name and source (`kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC`).
@@ -702,13 +703,59 @@ fn live_bytes(g: &Grouping, ygu: &[u8], ydn: &[u8]) -> Vec<u8> {
     [&ygu[..used * MI * 2], &ydn[..used * DN_M * 2]].concat()
 }
 
+/// The route's GEMM entries (expert-run tiles) and their 16-slot byte anchor.
+const NT4_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
+const NT4_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
+const NT1_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151";
+const NT1_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151";
+
 fn load_oracle(gpu: &mut Gpu) -> Res<()> {
     let src = format!("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n{QUANT}{ORACLE_KERNELS}");
     for f in ["qwen4_moe_sym_ref_quant", "qwen4_moe_sym_ref_widen", "qwen4_moe_sym_ref_swiglu"] {
         gpu.ensure_kernel_public("qwen4_moe_sym_oracle", &src, f)?;
     }
     gpu.ensure_kernel_public("qwen4_moe_sym_oracle_rot128", ROT128, "mq_rotate_x_128_v2")?;
+    // The production module source (kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC).
+    let k11 = format!("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n{QUANT}{K11}");
+    for f in [NT1_GATE_UP, NT1_DOWN, NT4_GATE_UP, NT4_DOWN] {
+        gpu.ensure_kernel_public("qwen4_moe_iu4_sym_gfx1151", &k11, f)?;
+    }
     Ok(())
+}
+
+/// Runs the 16-slot anchor GEMMs on the live gate and down sidecars into
+/// anchor buffers poisoned with `poison_v` and counts differing bytes against
+/// the route's (NT4) outputs, which the caller poisoned with the same value.
+fn nt1_anchor_diff(gpu: &mut Gpu, c: &Case, poison_v: i32) -> Res<usize> {
+    let (gb, db) = (c.pmax * MI * 2 + GUARD, c.pmax * DN_M * 2 + GUARD);
+    let ag = alloc(gpu, gb)?;
+    let ad = alloc(gpu, db)?;
+    gpu.hip.memset(&ag.buf, poison_v, gb)?;
+    gpu.hip.memset(&ad.buf, poison_v, db)?;
+    let xg = gpu.scratch.int4_mmq_x_scratch.as_ref().ok_or("no gate sidecar")?.as_ptr() as *const _;
+    let xd = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no down sidecar")?.as_ptr() as *const _;
+    for (func, ptrs, x, y, m, k, div, src, block) in [
+        (NT1_GATE_UP, &c.gu_ptrs, xg, &ag, GU_M, HID, TOPK, c.t, 64u32),
+        (NT1_DOWN, &c.dn_ptrs, xd, &ad, DN_M, MI, 1, c.l, 128u32),
+    ] {
+        let mut a = KernargBlob::new();
+        a.push_ptr(p(ptrs));
+        a.push_ptr(p(&c.tiles));
+        a.push_ptr(p(&c.sorted));
+        a.push_ptr(x);
+        a.push_ptr(p(y));
+        for v in [m, k, div, c.pmax, src] {
+            a.push_i32(v as i32);
+        }
+        launch(gpu, func, [(m / 64) as u32, (c.pmax / 16) as u32, 1], block, &mut a)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let (rg, rd) = outputs(gpu, c)?;
+    let diff = download(gpu, &ag.buf, gb)?.iter().zip(&rg).filter(|(a, b)| a != b).count()
+        + download(gpu, &ad.buf, db)?.iter().zip(&rd).filter(|(a, b)| a != b).count();
+    gpu.free_tensor(ag)?;
+    gpu.free_tensor(ad)?;
+    Ok(diff)
 }
 
 /// Device SwiGLU of host-exact gate/up folds (`live` per row), BF16 bits.
@@ -981,23 +1028,43 @@ fn x_onehot_sweep(gpu: &mut Gpu, seed: u64, twin: bool) -> Res<(usize, usize, us
         0
     };
     let fg = fold_reference(&gu_w, &xg, GU_M, HID, n, GU_GB);
+    let fd = fold_reference(&dn_w, &xd, DN_M, MI, n, DN_GB);
     let (mut gs, mut us) = (Vec::with_capacity(n * MI), Vec::with_capacity(n * MI));
     for j in 0..n {
         gs.extend_from_slice(&fg[j * GU_M..j * GU_M + MI]);
         us.extend_from_slice(&fg[j * GU_M + MI..(j + 1) * GU_M]);
     }
     let r_gu = ref_swiglu(gpu, &gs, &us, &vec![1; n])?;
-    let gu_mis = r_gu
-        .iter()
-        .enumerate()
-        .filter(|(i, w)| u16::from_le_bytes([got_gu[2 * i], got_gu[2 * i + 1]]) != **w)
-        .count();
-    let fd = fold_reference(&dn_w, &xd, DN_M, MI, n, DN_GB);
-    let dn_mis = fd
-        .iter()
-        .enumerate()
-        .filter(|(i, v)| u16::from_le_bytes([got_dn[2 * i], got_dn[2 * i + 1]]) != bf16_bits(**v))
-        .count();
+    for (gsym, gblock, dsym) in [(NT1_GATE_UP, 64u32, NT1_DOWN), (NT4_GATE_UP, 128, NT4_DOWN)] {
+        for (func, ptrs, xq, y, m, k, block) in [
+            (gsym, &gu_ptrs, &xgt, &ygu, GU_M, HID, gblock),
+            (dsym, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32),
+        ] {
+            let mut a = KernargBlob::new();
+            a.push_ptr(p(ptrs));
+            a.push_ptr(p(&tiles));
+            a.push_ptr(p(&sorted));
+            a.push_ptr(p(xq));
+            a.push_ptr(p(y));
+            for v in [m, k, 1, n, n] {
+                a.push_i32(v as i32);
+            }
+            launch(gpu, func, [(m / 64) as u32, (n / 16) as u32, 1], block, &mut a)?;
+        }
+        gpu.hip.device_synchronize()?;
+        let got_gu = download(gpu, &ygu.buf, n * MI * 2)?;
+        let got_dn = download(gpu, &ydn.buf, n * DN_M * 2)?;
+        gu_mis += r_gu
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| u16::from_le_bytes([got_gu[2 * i], got_gu[2 * i + 1]]) != **w)
+            .count();
+        dn_mis += fd
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| u16::from_le_bytes([got_dn[2 * i], got_dn[2 * i + 1]]) != bf16_bits(**v))
+            .count();
+    }
     for tsr in [gu_t, dn_t, gu_ptrs, dn_ptrs, tiles, sorted, xgt, xdt, ygu, ydn] {
         gpu.free_tensor(tsr)?;
     }

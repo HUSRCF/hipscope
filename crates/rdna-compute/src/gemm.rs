@@ -44592,14 +44592,19 @@ static QWEN4_MOE_SYM_PM: LazyLock<bool> =
 /// the incumbent.
 pub const QWEN4_MOE_SYM_IU4_MIN_ROWS: usize = QWEN4_F16_WMMA_MIN_TOKENS;
 const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
-const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151";
-const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151";
+/// Expert-run tile entries (four 16-slot tiles per weight stream, block 128);
+/// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
+const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 const QWEN4_MOE_SYM_CHECK_GFX1201_MODULE: &str = "qwen4_moe_sym_check_gfx1201";
 const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = ["qwen4_moe_iu4_sym_pm_gfx1151", "qwen4_moe_iu4_sym_pm_gfx1201"];
+/// Expert-run NT4 entries (block 128, four 16-slot tiles per weight stream);
+/// the module's 16-slot entries stay as their byte anchor. gfx1201 NT8 for
+/// host-mapped experts is in the module but not yet selected here.
 const QWEN4_MOE_SYM_PM_GATE_UP: [&str; 2] =
-    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201"];
-const QWEN4_MOE_SYM_PM_DOWN: [&str; 2] = ["qwen4_moe_down_iu4_sym_pm_gfx1151", "qwen4_moe_down_iu4_sym_pm_gfx1201"];
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"];
+const QWEN4_MOE_SYM_PM_DOWN: [&str; 2] = ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4"];
 /// Builder GEMMs divide `slot / x_row_div` through an f32 reciprocal that is
 /// exact (after two integer corrections) only for slots below 2^22.
 const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
@@ -45083,7 +45088,7 @@ impl Gpu {
         self.qwen4_moe_sym_gemm(
             false,
             [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
-            64,
+            128,
             [ptrs, tiles, sorted, y],
             xp,
             [m, k, x_row_div, grouped_rows, x_src_rows],

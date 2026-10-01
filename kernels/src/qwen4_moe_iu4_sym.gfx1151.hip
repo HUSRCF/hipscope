@@ -23,8 +23,10 @@
 // A/B int32x2 per lane = 16 nibbles (K16) of row/token lane&15, lanes r and
 // r+16 identical; C acc[j] = C[row 2j+(lane>>4)][token lane&15].
 //
-// Operands are loaded straight into registers, the next epoch prefetched
-// while the current one is consumed (measured by the fn-moe-sym kill run;
+// The route launches the `_nt4` expert-run entries at the end of this file;
+// the 16-slot entries below are their byte anchor. Operands are loaded
+// straight into registers, the next epoch prefetched while the current one is
+// consumed (measured by the fn-moe-sym kill run;
 // the planned fragment-major LDS double buffer was not needed to clear it).
 // LDS holds only the coalesced BF16 output transpose. Tiles: gate/up 32x16
 // (block 64, two waves, each one 16-row gate/up pair: gate rows r and up rows
@@ -255,3 +257,207 @@ extern "C" __global__ void qwen4_moe_sym_check_gfx1151(
     const int any = __syncthreads_or(viol ? 1 : 0);
     if (threadIdx.x == 0 && base < total) bad[blockIdx.x] = any ? 1u : 0u;
 }
+
+// ---------------------------------------------------------------------------
+// Expert-run tiles (the route's production entries, `_nt4`). Same ABI and grid
+// as the 16-slot entries above; block 128. A CTA is a *leader* when its tile
+// starts an NT-aligned group within its expert run (run position % NT == 0,
+// found by a cooperative walk-back over expert_tile_ids); non-leaders exit.
+// The leader loads each weight K128 epoch once (next epoch prefetched) and
+// applies it to up to NT consecutive 16-slot tiles of the same expert, so an
+// expert's weights stream ceil(tiles/NT) times per chunk instead of `tiles`
+// times (fn-moe-sym-bigT.md: Halo chunk 8192 envelope x1.78 vs x1.55 for the
+// 16-slot tile). Gate/up runs four waves, (row pair) x (gate | up), and joins
+// SwiGLU through LDS. Per output element the epoch order, fold and BF16
+// boundaries are those of the 16-slot entries, which stay in this module as
+// the byte anchor: outputs are bitwise identical (ORACLE `nt1` comparison).
+#define SYM_CROW(j, hi) (2 * (j) + (hi))
+
+__device__ __forceinline__ int sym_run_pos(const int* __restrict__ tiles, int tile, int e) {
+    __shared__ int s_min;
+    int back = 0;
+    for (;;) {
+        if (threadIdx.x == 0) s_min = 0x7fffffff;
+        __syncthreads();
+        const int t = tile - 1 - back - (int)threadIdx.x;
+        if (t < 0 || tiles[t] != e) atomicMin(&s_min, (int)threadIdx.x);
+        __syncthreads();
+        const int m = s_min;
+        __syncthreads();
+        if (m != 0x7fffffff) return back + m;
+        back += blockDim.x;
+    }
+}
+
+template <int NT, bool PF>
+__device__ __forceinline__ void sym_gate_up_nt(
+    const unsigned long long* __restrict__ expert_weight_ptrs, const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index, const block_i4_128* __restrict__ Xq,
+    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    // Four waves: (row pair p = w & 1) x (gate w < 2 / up w >= 2); 32 output columns per CTA as NT=1.
+    const int tile = blockIdx.y;
+    if (tile * 16 >= m_total) return;
+    const int e = expert_tile_ids[tile];
+    if (e < 0) return;
+    if (sym_run_pos(expert_tile_ids, tile, e) % NT != 0) return;
+    const int ntiles = m_total >> 4;
+    int cnt = 1;
+    while (cnt < NT && tile + cnt < ntiles && expert_tile_ids[tile + cnt] == e) ++cnt;
+    __shared__ float sG[16][32];
+    __shared__ unsigned short sOut[16][32];
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, lr = lane & 15;
+    const int pair = wave & 1, up = wave >> 1;
+    const int half = M >> 1;
+    const size_t row_bytes = (size_t)(K >> 8) * 136;
+    const unsigned char* W = (const unsigned char*)expert_weight_ptrs[e];
+    const unsigned char* wr = W + (size_t)(blockIdx.x * 32 + pair * 16 + lr + (up ? half : 0)) * row_bytes;
+    int slot[NT];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) slot[j] = j < cnt ? sorted_slot_index[(tile + j) * 16 + lr] : -1;
+    const int epochs = K >> 7;
+    float s[NT][8];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) s[j][i] = 0.0f;
+    const sym_k128 zero = {};
+    sym_k128 a, a1;
+    unsigned int hw, hw1 = 0;
+#define SYM_W(h, A, HW) do { \
+        const size_t go = (size_t)((h) >> 1) * 136; \
+        HW = *(const unsigned int*)(wr + go + 4 * ((h) & 1)); \
+        sym_load_k128(A, wr + go + 8 + 64 * ((h) & 1)); } while (0)
+    SYM_W(0, a, hw);
+    for (int h = 0; h < epochs; ++h) {
+        if (PF && h + 1 < epochs) SYM_W(h + 1, a1, hw1);
+        const float sc = sym_f16((unsigned short)(hw & 0xFFFFu));
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            if (j < cnt) {
+                sym_k128 xx = zero;
+                float dx = 0.0f;
+                if (slot[j] >= 0) {
+                    const block_i4_128* xb = Xq + (size_t)h * x_src_rows + slot[j] / x_row_div;
+                    sym_load_k128(xx, xb->qs);
+                    dx = xb->d;
+                }
+                sym_fold(s[j], sym_epoch(a, xx), sc, dx, lane);
+            }
+        }
+        if (h + 1 < epochs) {
+            if (PF) { a = a1; hw = hw1; }
+            else SYM_W(h + 1, a, hw);
+        }
+    }
+#undef SYM_W
+    const int hi = lane >> 4;
+    const int t = threadIdx.x, orow = t >> 2, q = t & 3;
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        if (j < cnt) {
+            if (!up) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sG[lr][pair * 16 + SYM_CROW(i, hi)] = sym_bf16_rt(s[j][i]);
+            }
+            __syncthreads();
+            if (up) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int c = pair * 16 + SYM_CROW(i, hi);
+                    const float v = sG[lr][c];
+                    const float w = sym_bf16_rt(s[j][i]);
+                    const float r = slot[j] >= 0 ? sym_bf16_rt((v / (1.0f + expf(-v))) * w) : 0.0f;
+                    sOut[lr][c] = sym_bf16_bits(r);
+                }
+            }
+            __syncthreads();
+            if (t < 64) {
+                uint4 v = *(const uint4*)&sOut[orow][q * 8];
+                *(uint4*)(Y_grouped + (size_t)((tile + j) * 16 + orow) * half + blockIdx.x * 32 + q * 8) = v;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+template <int NT, bool PF>
+__device__ __forceinline__ void sym_down_nt(
+    const unsigned long long* __restrict__ expert_weight_ptrs, const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index, const block_i4_128* __restrict__ Xq,
+    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    const int tile = blockIdx.y;
+    if (tile * 16 >= m_total) return;
+    const int e = expert_tile_ids[tile];
+    if (e < 0) return;
+    if (sym_run_pos(expert_tile_ids, tile, e) % NT != 0) return;
+    const int ntiles = m_total >> 4;
+    int cnt = 1;
+    while (cnt < NT && tile + cnt < ntiles && expert_tile_ids[tile + cnt] == e) ++cnt;
+    __shared__ unsigned short sOut[16][64];
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, lr = lane & 15;
+    const int rbase = blockIdx.x * 64 + wave * 16;
+    const size_t row_bytes = (size_t)(K >> 7) * 68;
+    const unsigned char* W = (const unsigned char*)expert_weight_ptrs[e];
+    const unsigned char* wr = W + (size_t)(rbase + lr) * row_bytes;
+    int slot[NT];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) slot[j] = j < cnt ? sorted_slot_index[(tile + j) * 16 + lr] : -1;
+    const int epochs = K >> 7;
+    float s[NT][8];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) s[j][i] = 0.0f;
+    const sym_k128 zero = {};
+    sym_k128 a, a1;
+    unsigned int hw, hw1 = 0;
+    hw = *(const unsigned int*)wr;
+    sym_load_k128(a, wr + 4);
+    for (int h = 0; h < epochs; ++h) {
+        if (PF && h + 1 < epochs) { hw1 = *(const unsigned int*)(wr + (size_t)(h + 1) * 68); sym_load_k128(a1, wr + (size_t)(h + 1) * 68 + 4); }
+        const float sc = sym_f16((unsigned short)(hw & 0xFFFFu));
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            if (j < cnt) {
+                sym_k128 xx = zero;
+                float dx = 0.0f;
+                if (slot[j] >= 0) {
+                    const block_i4_128* xb = Xq + (size_t)h * x_src_rows + slot[j] / x_row_div;
+                    sym_load_k128(xx, xb->qs);
+                    dx = xb->d;
+                }
+                sym_fold(s[j], sym_epoch(a, xx), sc, dx, lane);
+            }
+        }
+        if (h + 1 < epochs) {
+            if (PF) { a = a1; hw = hw1; }
+            else { hw = *(const unsigned int*)(wr + (size_t)(h + 1) * 68); sym_load_k128(a, wr + (size_t)(h + 1) * 68 + 4); }
+        }
+    }
+    const int hi = lane >> 4;
+    const int t = threadIdx.x, orow = t >> 3, q = t & 7;
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        if (j < cnt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sOut[lr][wave * 16 + SYM_CROW(i, hi)] = slot[j] >= 0 ? sym_bf16_bits(s[j][i]) : (unsigned short)0;
+            __syncthreads();
+            uint4 v = *(const uint4*)&sOut[orow][q * 8];
+            *(uint4*)(Y_grouped + (size_t)((tile + j) * 16 + orow) * M + blockIdx.x * 64 + q * 8) = v;
+            __syncthreads();
+        }
+    }
+}
+
+#define SYM_ARGS const unsigned long long* __restrict__ p, const int* __restrict__ ti, const int* __restrict__ so, \
+    const block_i4_128* __restrict__ xq, unsigned short* __restrict__ y, int M, int K, int d, int mt, int xs
+#define SYM_PASS p, ti, so, xq, y, M, K, d, mt, xs
+extern "C" __global__ __launch_bounds__(128) void qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4(SYM_ARGS) {
+    sym_gate_up_nt<4, true>(SYM_PASS);
+}
+extern "C" __global__ __launch_bounds__(128) void qwen4_moe_down_iu4_sym_gfx1151_nt4(SYM_ARGS) {
+    sym_down_nt<4, true>(SYM_PASS);
+}
+#undef SYM_PASS
+#undef SYM_ARGS
+#undef SYM_CROW

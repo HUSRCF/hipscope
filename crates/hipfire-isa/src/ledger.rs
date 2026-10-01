@@ -138,7 +138,7 @@ impl Ledger {
                 (true, Counter::Ds) => format!("s_wait_dscnt {count:#x}"),
                 (true, Counter::Km) => format!("s_wait_kmcnt {count:#x}"),
                 (false, Counter::Vm) => format!("s_waitcnt vmcnt({count})"),
-                (false, Counter::Vs) => format!("s_waitcnt_vscnt null, {count}"),
+                (false, Counter::Vs) => format!("s_waitcnt_vscnt null, {count:#x}"),
                 (false, Counter::Lgkm) => format!("s_waitcnt lgkmcnt({count})"),
                 (_, Counter::Exp) => format!("s_waitcnt expcnt({count})"),
                 _ => return Err("counter/architecture mismatch".into()),
