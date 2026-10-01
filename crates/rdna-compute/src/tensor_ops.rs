@@ -1505,6 +1505,70 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     )
 }
 
+/// H4 read side: [`hyper_norm_gate`]'s norm + BF16 gate projection of the
+/// streams and [`hyper_norm_f16`]'s F16 normalized row (the HC down GEMM's
+/// input) in one launch (`hyper_norm_gate_outputs`).  `gates` receives the
+/// gate logits the paired HC write would have computed from the same streams;
+/// the write then skips its own norm + gate launch.  Bytewise the two
+/// launches' outputs (hence not the F32/BF16 `normalized` copies).
+pub struct HyperNormGateOutputs<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    /// The paired write's BF16 `[branches, branches * hidden]` gate weight.
+    pub gate_weight: &'a GpuTensor,
+    pub gates: &'a GpuTensor,
+    /// F16 `rows * branches * hidden` elements.
+    pub normalized_f16: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
+}
+
+pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> HipResult<()> {
+    ensure_f32(p.input)?;
+    ensure_f32(p.gates)?;
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate-outputs width")?;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || p.normalized_f16.dtype != DType::F16
+        || p.rows == 0
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !HyperNormGate::supports(p.branches, p.hidden)
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.input.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+        || p.normalized_f16.numel() < p.rows * wide
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC norm-gate-outputs hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate-outputs row grid")?;
+    let lds_bytes = checked_u32(p.hidden * 8 + 4 * 256 * 4, "HC norm-gate-outputs LDS")?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_norm_gate_outputs")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_ptr(p.normalized_f16.buf.as_ptr());
+    args.push_ptr(std::ptr::null());
+    args.push_ptr(std::ptr::null());
+    args.push_i32(hidden);
+    args.push_i32(i32::from(p.state_bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_outputs",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 /// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
 /// `low` fused with `hyper_read_projected` (four branches), bitwise
 /// identical to the multi-row BF16 GEMM followed by that kernel; the
@@ -4550,6 +4614,125 @@ mod tests {
         for tensor in [input, norm, gate_weight, fused, normalized, reference] {
             gpu.free_tensor(tensor).expect("free");
         }
+    }
+
+    /// H4 read side: `hyper_norm_gate_outputs` stores, bytewise, the gates of
+    /// `hyper_norm_gate` and the F16 normalized row of `hyper_norm_f16`, for F32
+    /// streams and for BF16-bit streams, over ragged row counts.
+    #[test]
+    fn hyper_norm_gate_outputs_is_bytewise_the_norm_gate_and_norm_f16_pair() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs gfx11+ wave32");
+            return;
+        }
+        let (branches, hidden) = (4usize, 2560usize);
+        let wide = branches * hidden;
+        let norm = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(2, wide, 0.5)), &[wide * 2])
+                .expect("norm");
+            t.dtype = DType::BF16;
+            t.shape = vec![wide];
+            t
+        };
+        let gate_weight = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(3, branches * wide, 0.05)), &[branches * wide * 2])
+                .expect("gate weight");
+            t.dtype = DType::BF16;
+            t.shape = vec![branches * wide];
+            t
+        };
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        for rows in [1usize, 37, 512, 530] {
+            for state_bf16 in [false, true] {
+                let values = test_wave(1, rows * wide, 3.0);
+                let input = if state_bf16 {
+                    // BF16 bits in the first half of an F32-typed buffer.
+                    let mut raw = bf16_le_bytes(&values);
+                    raw.resize(rows * wide * 4, 0);
+                    gpu.upload_raw(&raw, &[rows * wide * 4])
+                        .map(|mut t| {
+                            t.dtype = DType::F32;
+                            t.shape = vec![rows * wide];
+                            t
+                        })
+                        .expect("input")
+                } else {
+                    gpu.upload_f32(&values, &[rows * wide]).expect("input")
+                };
+                let gates_ref = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16_ref = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+                hyper_norm_gate(
+                    &mut gpu,
+                    &HyperNormGate {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates_ref,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("norm gate");
+                hyper_norm_f16(
+                    &mut gpu,
+                    &HyperNorm {
+                        input: &input,
+                        norm_weight: &norm,
+                        normalized: &normalized,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                    &x16_ref,
+                    false,
+                )
+                .expect("norm f16");
+                let gates = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16 = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                hyper_norm_gate_outputs(
+                    &mut gpu,
+                    &HyperNormGateOutputs {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates,
+                        normalized_f16: &x16,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("outputs");
+                assert!(
+                    bytes(&gpu, &gates) == bytes(&gpu, &gates_ref),
+                    "{rows} rows bf16={state_bf16}: gates differ"
+                );
+                assert!(
+                    bytes(&gpu, &x16) == bytes(&gpu, &x16_ref),
+                    "{rows} rows bf16={state_bf16}: F16 normalized row differs"
+                );
+                assert!(bytes(&gpu, &gates).iter().any(|b| *b != 0), "gates are all zero");
+                for tensor in [input, gates_ref, x16_ref, normalized, gates, x16] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        gpu.free_tensor(norm).expect("free");
+        gpu.free_tensor(gate_weight).expect("free");
     }
 
     /// HC streams stored as BF16 bits (the Qwen4 F16 prefill route) must give

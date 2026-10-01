@@ -783,7 +783,37 @@ pub fn execute_validated_steps<'a>(
     // A fused hyper write that produced the gate quarters of the hyper write
     // at this index, and the quarter slot it used.
     let mut gates_ready: Option<(usize, usize)> = None;
+    // The hyper write at this index takes its gates from its paired read
+    // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
+    let mut pregated: Option<usize> = None;
+    let hc_fuse = gpu.flags.qwen4_hc_fuse_level() >= 1 && !cpu_exec::cpu_exec_enabled();
     while i < steps.len() {
+        if hc_fuse {
+            use crate::pipeline::layer_ops::{
+                execute_hyper_read_paired, execute_hyper_write_pregated, hyper_read_pairs_write,
+            };
+            match &steps[i] {
+                Step::HyperWrite(write) if pregated == Some(i) => {
+                    pregated = None;
+                    execute_hyper_write_pregated(gpu, write)?;
+                    i += 1;
+                    continue;
+                }
+                Step::HyperRead(read) => {
+                    if let Some((j, write)) = paired_hyper_write(steps, i + 1, read) {
+                        if hyper_read_pairs_write(gpu, read, write) {
+                            if execute_hyper_read_paired(gpu, read, write)? {
+                                pregated = Some(j);
+                            }
+                            gpu.scratch.prerotated = None;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // Fusion is bypassed for a window that contains a CPU-executed step: a
         // fused entry is one kernel launch over several weights, so it cannot
         // half-land on the CPU seam, and splitting it costs launches it was
@@ -898,6 +928,32 @@ pub fn execute_validated_steps<'a>(
         }
     }
     Ok(())
+}
+
+/// The hyper write that closes `read`'s block: the first `HyperWrite` of the
+/// same streams from `from`, with only mixer steps (which never write the
+/// streams) between.  Anything else, or a write of other streams, ends the
+/// search: the read and write are then not paired.
+fn paired_hyper_write<'s, 'a>(
+    steps: &'s [Step<'a>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<(usize, &'s crate::pipeline::layer_ops::HyperWriteOp<'a>)> {
+    let streams = read.input.buf.as_ptr();
+    for (j, step) in steps.iter().enumerate().skip(from) {
+        match step {
+            Step::GatedDeltaNet(_)
+            | Step::IndexedAttention(_)
+            | Step::Clear(_)
+            | Step::Moe(_)
+            | Step::MoeStage(..) => {}
+            Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
+                return Some((j, write));
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The index of the next hyper write of `read`'s streams when it is itself
