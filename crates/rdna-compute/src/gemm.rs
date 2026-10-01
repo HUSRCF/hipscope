@@ -44573,6 +44573,582 @@ impl Gpu {
     }
 }
 
+/// `HIPFIRE_QWEN4_MOE_SYM_IU4=1` opts gfx1151 Qwen4 prefill into the grouped
+/// symmetric IU4 MoE route (fn-moe-sym) for layers whose every routed-expert
+/// header passed [`Gpu::qwen4_moe_sym_check`]. Unset or `0` keeps the whole
+/// incumbent route (scatter, producers and GEMMs). Read once.
+pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_SYM_IU4", false));
+
+/// Prefill rows from which the symmetric IU4 MoE route applies: the F16 WMMA
+/// gate/up threshold it replaces. Smaller prefill, decode and verify stay on
+/// the incumbent.
+pub const QWEN4_MOE_SYM_IU4_MIN_ROWS: usize = QWEN4_F16_WMMA_MIN_TOKENS;
+const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
+const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151";
+const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151";
+const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
+const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
+const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
+
+/// Qwen4 symmetric IU4 MoE route (fn-moe-sym): header check, stable
+/// grouping, the two A4 producers and the two grouped IU4 GEMMs. gfx1151
+/// only; every launcher refuses other arches.
+impl Gpu {
+    /// The route is requested and possible on this device: the flag, exact
+    /// gfx1151, and the frozen C2 producer candidate set
+    /// (`-DIU4_A4_CANDIDATES=2`, the gfx11 default; any other value keeps
+    /// the incumbent). Row count and verified headers are checked separately.
+    pub fn qwen4_moe_sym_iu4_requested(&self) -> bool {
+        let mut candidates = self
+            .flags
+            .hipcc_extra_flags
+            .split_whitespace()
+            .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
+            .peekable();
+        *QWEN4_MOE_SYM_IU4
+            && self.arch == "gfx1151"
+            && candidates.peek().is_some()
+            && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2")
+    }
+
+    /// Whether a `rows`-row prefill takes the route (smaller prefill, decode
+    /// and speculative verify stay on the incumbent).
+    pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
+        rows >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.qwen4_moe_sym_iu4_requested()
+    }
+
+    fn qwen4_moe_sym_arch(&self, what: &str) -> HipResult<()> {
+        if self.arch == "gfx1151" {
+            Ok(())
+        } else {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: the symmetric IU4 MoE route is gfx1151-only, got {}", self.arch),
+            ))
+        }
+    }
+
+    /// True when every K128 header of `experts` experts behind `ptrs`
+    /// (`[experts]` device pointers) is finite and satisfies
+    /// `float(zp) == -8 * float(sc)`. `group_bytes` 136 = QT44 (`k % 256`),
+    /// 68 = QT53 (`k % 128`). Synchronous; load-time only, never captured.
+    pub fn qwen4_moe_sym_check(
+        &mut self,
+        ptrs: &GpuTensor,
+        m: usize,
+        k: usize,
+        experts: usize,
+        group_bytes: usize,
+    ) -> HipResult<bool> {
+        self.qwen4_moe_sym_arch("qwen4_moe_sym_check")?;
+        let shape_ok = match group_bytes {
+            136 => k % 256 == 0,
+            68 => k % 128 == 0,
+            _ => false,
+        };
+        let headers = experts
+            .checked_mul(m)
+            .and_then(|rows| rows.checked_mul(k / 128))
+            .filter(|&headers| headers > 0 && shape_ok);
+        let Some(headers) = headers else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_sym_check: need m, k, experts > 0 and a QT44 (136) or QT53 (68) group",
+            ));
+        };
+        let words = headers.div_ceil(256);
+        let (Ok(grid), Ok(mv), Ok(kv), Ok(ev), Ok(gv)) = (
+            u32::try_from(words),
+            i32::try_from(m),
+            i32::try_from(k),
+            i32::try_from(experts),
+            i32::try_from(group_bytes),
+        ) else {
+            return Err(hip_bridge::HipError::new(0, "qwen4_moe_sym_check: extent overflow"));
+        };
+        self.bind_thread()?;
+        self.ensure_kernel(
+            QWEN4_MOE_SYM_MODULE,
+            kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC,
+            QWEN4_MOE_SYM_CHECK,
+        )?;
+        let bad = self.alloc_tensor(&[words], DType::F32)?;
+        let pp = ptrs.buf.as_ptr();
+        let bp = bad.buf.as_ptr();
+        let mut params = [
+            &pp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &gv as *const _ as *mut c_void,
+        ];
+        let launched = self.launch_maybe_blob(
+            QWEN4_MOE_SYM_CHECK,
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(bp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(ev);
+                b.push_i32(gv);
+                b
+            },
+        );
+        let words_read = launched
+            .and_then(|()| self.hip.device_synchronize())
+            .and_then(|()| self.download_raw_bytes(&bad));
+        let freed = self.free_tensor(bad);
+        let words_read = words_read?;
+        freed?;
+        Ok(words_read.iter().all(|&byte| byte == 0))
+    }
+
+    /// Grow the route's scratch for prefills of up to `max_rows` tokens
+    /// (`k_top` routed slots each) before any graph capture: the grouping
+    /// scratch, the down sidecar and the shared gate/up `int4_mmq_x_scratch`.
+    pub fn reserve_qwen4_moe_sym(
+        &mut self,
+        max_rows: usize,
+        k_top: usize,
+        experts: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> HipResult<()> {
+        self.qwen4_moe_sym_arch("reserve_qwen4_moe_sym")?;
+        let slots = max_rows.saturating_mul(k_top);
+        let group = crate::scratch::qwen4_moe_group_layout(slots, experts).bytes;
+        let down = intermediate / 128 * slots * 72;
+        let gate = crate::scratch::int4_mmq_reserve_needed(hidden, max_rows);
+        let scratch = &self.scratch;
+        if crate::scratch::scratch_will_grow(
+            scratch.qwen4_moe_group_scratch_bytes,
+            scratch.qwen4_moe_group_scratch.is_some(),
+            group,
+        ) || crate::scratch::scratch_will_grow(
+            scratch.qwen4_moe_down_i4_scratch_bytes,
+            scratch.qwen4_moe_down_i4_scratch.is_some(),
+            down,
+        ) || crate::scratch::scratch_will_grow(
+            scratch.int4_mmq_x_scratch_bytes,
+            scratch.int4_mmq_x_scratch.is_some(),
+            gate,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.bind_thread()?;
+        self.scratch.reserve_qwen4_moe_group(&self.hip, slots, experts)?;
+        self.scratch.reserve_qwen4_moe_down_i4(&self.hip, intermediate, slots)?;
+        self.scratch.reserve_int4_mmq(&self.hip, hidden, max_rows)?;
+        Ok(())
+    }
+
+    /// Stable `(expert, flat_slot)` pad16 grouping: the six outputs of
+    /// [`Gpu::moe_scatter_fused_top10`] (padded counts, offsets `[E+1]`,
+    /// sorted slots with -1 padding and tail, tile ids with -1 tail,
+    /// inverse permutation), in a deterministic order. Three launches, no
+    /// atomics, no pre-clear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_stable_top10(
+        &mut self,
+        topk: &GpuTensor,
+        counts: &GpuTensor,
+        offsets: &GpuTensor,
+        sorted: &GpuTensor,
+        tiles: &GpuTensor,
+        inverse: &GpuTensor,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.qwen4_moe_sym_arch("moe_scatter_stable_top10")?;
+        if total_slots == 0
+            || experts == 0
+            || experts > 1024
+            || grouped_rows % 16 != 0
+            || grouped_rows < total_slots
+            || i32::try_from(grouped_rows).is_err()
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_scatter_stable_top10: need slots > 0, 0 < experts <= 1024, \
+                 grouped_rows >= slots and a multiple of 16",
+            ));
+        }
+        self.bind_thread()?;
+        for func in ["qwen4_moe_group_ranks", "qwen4_moe_group_prefix", "qwen4_moe_group_scatter"] {
+            self.ensure_kernel(
+                QWEN4_MOE_GROUP_MODULE,
+                kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+                func,
+            )?;
+        }
+        let layout = crate::scratch::qwen4_moe_group_layout(total_slots, experts);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_group_scratch_bytes,
+            self.scratch.qwen4_moe_group_scratch.is_some(),
+            layout.bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.reserve_qwen4_moe_group(&self.hip, total_slots, experts)?;
+        let base = self.scratch.qwen4_moe_group_scratch.as_ref().unwrap().as_ptr() as *mut u8;
+        // SAFETY: both offsets lie inside the allocation just sized for `layout`.
+        let (rank, partial, prefix) = unsafe {
+            (
+                base as *mut c_void,
+                base.add(layout.partial_offset) as *mut c_void,
+                base.add(layout.prefix_offset) as *mut c_void,
+            )
+        };
+        let tp = topk.buf.as_ptr();
+        let cp = counts.buf.as_ptr();
+        let op = offsets.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let tip = tiles.buf.as_ptr();
+        let ip = inverse.buf.as_ptr();
+        let lv = total_slots as i32;
+        let ev = experts as i32;
+        let cv = layout.chunks as i32;
+        let pv = grouped_rows as i32;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_scatter_stable_top10",
+            (4 * total_slots + 3 * experts * layout.chunks + grouped_rows + total_slots) * 4,
+        );
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+            &partial as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "qwen4_moe_group_ranks",
+            [layout.chunks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(rank);
+                b.push_ptr(partial);
+                b.push_i32(lv);
+                b.push_i32(ev);
+                b.push_i32(cv);
+                b
+            },
+        )?;
+        let mut params = [
+            &partial as *const _ as *mut c_void,
+            &prefix as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "qwen4_moe_group_prefix",
+            [1, 1, 1],
+            [experts as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(partial);
+                b.push_ptr(prefix);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_i32(ev);
+                b.push_i32(cv);
+                b
+            },
+        )?;
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+            &prefix as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tip as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "qwen4_moe_group_scatter",
+            [grouped_rows.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(rank);
+                b.push_ptr(prefix);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tip);
+                b.push_ptr(ip);
+                b.push_i32(lv);
+                b.push_i32(ev);
+                b.push_i32(pv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Gate/up A4 producer: the shipped FWHT256 + `block_i4_128` sidecar
+    /// (`mq_rotate_x_i4`, C2) of F32 `x` `[rows, k]` into the shared
+    /// `int4_mmq_x_scratch`, epoch-major `[k/128, rows]`.
+    pub fn qwen4_moe_rotate256_i4(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.qwen4_moe_sym_arch("qwen4_moe_rotate256_i4")?;
+        if x.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(0, "qwen4_moe_rotate256_i4: F32 input only"));
+        }
+        let reservation = self.reserve_int4_mmq(k, rows)?;
+        self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)
+    }
+
+    /// Down A4 producer: grouped BF16 SwiGLU rows `h` `[grouped_rows, k]`
+    /// -> FWHT128 -> `block_i4_128` (C2) into the compact flat-slot down
+    /// sidecar `[k/128, total_slots]`, row `sorted[p]`; padding rows emit
+    /// nothing.
+    pub fn qwen4_moe_rotate128_i4(
+        &mut self,
+        h: &GpuTensor,
+        sorted: &GpuTensor,
+        k: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.qwen4_moe_sym_arch("qwen4_moe_rotate128_i4")?;
+        if k == 0 || k % 128 != 0 || grouped_rows == 0 || total_slots == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_rotate128_i4: need k % 128 == 0 and nonzero rows",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_mq_signs_128()?;
+        self.ensure_kernel(
+            QWEN4_MOE_ROTATE128_I4,
+            kernels::QWEN4_MOE_ROTATE128_I4_SRC,
+            QWEN4_MOE_ROTATE128_I4,
+        )?;
+        let needed = k / 128 * total_slots * 72;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_down_i4_scratch_bytes,
+            self.scratch.qwen4_moe_down_i4_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let reservation = self.scratch.reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)?;
+        let hp = h.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let xp = reservation.ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let kv = k as i32;
+        let pv = grouped_rows as i32;
+        let lv = total_slots as i32;
+        let mut params = [
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            QWEN4_MOE_ROTATE128_I4,
+            grouped_rows * (k * 2 + 4) + needed,
+        );
+        let result = self.launch_maybe_blob(
+            QWEN4_MOE_ROTATE128_I4,
+            [(k / 128) as u32, grouped_rows as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(hp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b.push_i32(pv);
+                b.push_i32(lv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+
+    /// Grouped IU4 gate/up with the SwiGLU epilogue: `y` `[grouped_rows,
+    /// m/2]` BF16 bits of rt(silu(rt(g)) * rt(u)), padding rows +0, sentinel
+    /// tiles untouched. `xq` is the [`Gpu::qwen4_moe_rotate256_i4`] handle of
+    /// `x_src_rows` tokens; `x_row_div` = top-k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_gate_up_silu_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_gate_up_silu_iu4_sym: need m % 64 == 0 and k % 256 == 0",
+            ));
+        }
+        let (generation, live) = self.scratch.int4_mmq_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_gemm(
+            QWEN4_MOE_SYM_GATE_UP,
+            [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            64,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Grouped IU4 down: `y` `[grouped_rows, m]` BF16 per grouped row (no
+    /// residual, no combine), padding rows +0, sentinel tiles untouched.
+    /// `xq` is the [`Gpu::qwen4_moe_rotate128_i4`] handle of `x_src_rows`
+    /// flat slots; `x_row_div` = 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_down_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_down_iu4_sym: need m % 64 == 0 and k % 128 == 0",
+            ));
+        }
+        let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_gemm(
+            QWEN4_MOE_SYM_DOWN,
+            [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            128,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Shared 60-byte kernarg launch of the two grouped IU4 GEMMs.
+    fn qwen4_moe_sym_gemm(
+        &mut self,
+        func: &'static str,
+        grid: [u32; 3],
+        block: u32,
+        [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
+        xp: *mut c_void,
+        dims: [usize; 5],
+    ) -> HipResult<()> {
+        self.qwen4_moe_sym_arch(func)?;
+        let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
+            dims.map(|value| i32::try_from(value).ok())
+        else {
+            return Err(hip_bridge::HipError::new(0, &format!("{func}: extent overflow")));
+        };
+        if dv <= 0 || gv % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: need x_row_div > 0 and grouped_rows % 16 == 0"),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(QWEN4_MOE_SYM_MODULE, kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC, func)?;
+        let pp = ptrs.buf.as_ptr();
+        let tp = tiles.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut params = [
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+            &gv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+        ];
+        let (m, k, rows) = (dims[0], dims[1], dims[3]);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, rows * (k / 2 + m));
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b.push_i32(dv);
+            b.push_i32(gv);
+            b.push_i32(sv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,6 +9,7 @@
   - `hipfire bench --matrix`, flag on vs off, 3 fresh processes each:
     - Strix Halo: pp8192 996.5–1001.9 → 1186.3–1190.9 tok/s; pp65536 892.4–896.6 → 1080.6–1084.9 tok/s.
     - R9700 (12 expert layers in VRAM): pp8192 710.5–718.2 → 769.6–783.2 tok/s; pp65536 707.2–716.1 → 774.0–790.2 tok/s.
+- **Qwen3.8-Flash-Next (Qwen4) on gfx1151: experimental opt-in symmetric IU4 MoE prefill route (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`, default off). It requires a symmetric requant of the routed experts.** At load, with the flag set, every layer's routed QT44 gate/up and QT53 down headers are checked on the device for the symmetric grid (`zp == -8*sc`). A layer passes only if every header does; prefill chunks of 512+ rows on passing layers then use stable deterministic grouping, A4 activations and grouped IU4 GEMMs. The shipped asymmetric artifacts fail the check and keep the default route. Unset or `0` restores the whole default route; decode, MTP, smaller prefill and every other arch never take it. The new kernels are three separately named JIT modules, and no existing module changes. Not bit-exact against the default F16 WMMA route, and no model-quality reference exists yet.
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
 
 ## v0.4.0 — 2026-09-30

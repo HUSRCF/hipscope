@@ -107,6 +107,12 @@ pub struct MoeRouteFormats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRouteCapability {
     Qt44Qt53Grouped,
+    /// The same fixed-shape route over an expert set whose every QT44/QT53
+    /// header was verified symmetric (`zp == -8*sc`) on the device after
+    /// load. Declared from that verification only, never from a dtype; it
+    /// lowers exactly like [`Self::Qt44Qt53Grouped`] except that the opt-in
+    /// symmetric IU4 prefill arm may take the routed experts.
+    Qt44Qt53GroupedSymmetric,
 }
 
 impl MoeRouteCapability {
@@ -114,8 +120,14 @@ impl MoeRouteCapability {
     /// is enabled; the fixed geometry and format contract is checked separately.
     pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped => cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
         }
+    }
+
+    /// Either QT44/QT53 grouped declaration: both lower through the same
+    /// fixed-shape stages.
+    pub fn is_qt44_qt53_grouped(self) -> bool {
+        matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
     }
 }
 
@@ -143,7 +155,7 @@ pub(crate) fn grouped_route_geometry_supported(
         routed_intermediate: 640,
         shared_intermediate: 640,
     };
-    matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped)
+    policy.capability.is_qt44_qt53_grouped()
         && geometry == fixed_geometry
         && experts == geometry.experts
         && top_k == geometry.top_k

@@ -280,10 +280,20 @@ pub(crate) fn dense_ref<'a>(
 /// The admitted Qwen4 grouped route is declared by this architecture
 /// constructor and consumed as data by shared sealing/lowering.  The shared
 /// expert's formats are those of the bound weights: BF16, or the Q8_0 decode
-/// copies (`Qwen4GpuForward::decode_q8`).
-fn qwen4_route_policy(config: &Qwen4Config, shared: &MoeSharedWeights<'_>) -> MoeRoutePolicy {
+/// copies (`Qwen4GpuForward::decode_q8`). `symmetric` (a prefill chunk over
+/// a layer whose expert headers were verified symmetric) declares the
+/// symmetric variant the opt-in IU4 arm requires.
+fn qwen4_route_policy(
+    config: &Qwen4Config,
+    shared: &MoeSharedWeights<'_>,
+    symmetric: bool,
+) -> MoeRoutePolicy {
     MoeRoutePolicy {
-        capability: MoeRouteCapability::Qt44Qt53Grouped,
+        capability: if symmetric {
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric
+        } else {
+            MoeRouteCapability::Qt44Qt53Grouped
+        },
         geometry: MoeRouteGeometry {
             experts: config.num_experts,
             top_k: config.num_experts_per_tok,
@@ -473,7 +483,11 @@ fn layer_desc<'a>(
         mlp_hyper: hyper_desc(weights, &layer.mlp_hyper)?,
         attention,
         moe: Qwen4MoeBinding {
-            route_policy: qwen4_route_policy(config, &shared),
+            route_policy: qwen4_route_policy(
+                config,
+                &shared,
+                moe.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            ),
             table: &moe.table,
             cache: &moe.cache,
             routed_experts: moe,
@@ -548,6 +562,12 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// body records them.
     expert_gate_up_entries: Vec<usize>,
     expert_down_entries: Vec<usize>,
+    /// Every routed QT44 gate/up and QT53 down header behind the two tables
+    /// satisfies `zp == -8*sc`, checked on the device once after load
+    /// ([`Self::verify_symmetric`]); only then may this layer declare
+    /// [`MoeRouteCapability::Qt44Qt53GroupedSymmetric`]. False unless the
+    /// opt-in route was requested.
+    symmetric: bool,
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -783,7 +803,37 @@ impl Qwen4MoeLayerRuntime {
             expert_down_ptrs,
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
+            symmetric: false,
         })
+    }
+
+    /// Check every routed expert header of this layer for the symmetric grid
+    /// the IU4 route needs and record the verdict. QT44 gate/up and QT53
+    /// down only; one asymmetric or non-finite header refuses the layer.
+    fn verify_symmetric(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+    ) -> Result<bool, Qwen4GpuForwardError> {
+        let formats = self.experts.iter().all(|expert| {
+            expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
+        });
+        self.symmetric = formats
+            && gpu.qwen4_moe_sym_check(
+                &self.expert_gate_up_ptrs,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+                config.num_experts,
+                136,
+            )?
+            && gpu.qwen4_moe_sym_check(
+                &self.expert_down_ptrs,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.num_experts,
+                68,
+            )?;
+        Ok(self.symmetric)
     }
 
     /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
@@ -877,7 +927,8 @@ pub(crate) fn seal_moe_decode<'a>(
             bf16_round_trip: true,
             shared_after_combine: true,
         },
-        route_policy: Some(qwen4_route_policy(config, &shared)),
+        // Single-token decode/MTP binding: never the symmetric IU4 prefill arm.
+        route_policy: Some(qwen4_route_policy(config, &shared, false)),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
@@ -1424,6 +1475,29 @@ impl Qwen4GpuForward {
                     layer,
                     &bundle.config,
                 )?);
+            }
+            // Opt-in symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`): verify
+            // each layer's final expert headers once, before any capture, and
+            // size the route's scratch for the chunk cap. Nothing runs (and no
+            // new module loads) unless the route was requested.
+            if gpu.qwen4_moe_sym_iu4_requested() {
+                let mut verified = 0usize;
+                for layer in &mut moe {
+                    verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
+                }
+                eprintln!(
+                    "  qwen4 symmetric IU4 MoE: {verified}/{} layers verified symmetric",
+                    moe.len()
+                );
+                if verified > 0 {
+                    gpu.reserve_qwen4_moe_sym(
+                        max_chunk,
+                        bundle.config.num_experts_per_tok,
+                        bundle.config.num_experts,
+                        bundle.config.hidden_size,
+                        bundle.config.moe_intermediate_size,
+                    )?;
+                }
             }
             let sources = bundle
                 .weights
