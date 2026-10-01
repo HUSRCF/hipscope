@@ -131,6 +131,8 @@ pub trait Backend: Sized {
     fn scalar_compare(&mut self, auth: &Auth, insn: Self::Insn) -> Result<(), String>;
     /// `s_cbranch_scc1 target`.
     fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
+    /// `s_cbranch_scc0 target`.
+    fn branch_scc0(&mut self, auth: &Auth, target: &str) -> Result<(), String>;
     /// `s_branch target`. Nothing reaches the point after it until a
     /// `join` brings in the state of a branch to that point.
     fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String>;

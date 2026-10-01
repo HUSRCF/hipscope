@@ -73,6 +73,7 @@ impl Backend for Builder {
         self.push(insn)
     }
     fn branch_scc1(&mut self, auth: &Auth, target: &str) -> Result<(), String> { self.seal.check(auth)?; self.emit(Instruction::new(format!("s_cbranch_scc1 {target}"), vec![], vec![])) }
+    fn branch_scc0(&mut self, auth: &Auth, target: &str) -> Result<(), String> { self.seal.check(auth)?; self.emit(Instruction::new(format!("s_cbranch_scc0 {target}"), vec![], vec![])) }
     fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         self.emit(Instruction::new(format!("s_branch {target}"), vec![], vec![]))?;

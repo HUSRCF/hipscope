@@ -252,6 +252,11 @@ impl Backend for Trace {
         self.emit(format!("s_cbranch_scc1 {target}"));
         Ok(())
     }
+    fn branch_scc0(&mut self, auth: &Auth, target: &str) -> Result<(), String> {
+        self.seal.check(auth)?;
+        self.emit(format!("s_cbranch_scc0 {target}"));
+        Ok(())
+    }
     fn branch(&mut self, auth: &Auth, target: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         self.emit(format!("s_branch {target}"));

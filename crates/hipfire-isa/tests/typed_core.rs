@@ -130,7 +130,7 @@ fn handoff<T: Target>(arch: Arch) -> Builder {
     let gate = wg.lds::<Gate>("gate", 0, 256).unwrap();
     let end = wg.exit(".Lend").unwrap();
     let readers = wg.scmp(cmp("s_cmp_ge_u32 s6, 2")).unwrap();
-    let gate = wg.handoff(readers, ".Lup", end, gate, |w, gate| w.ds_store(gate, store(0)), |w, gate| {
+    let gate = wg.handoff(readers, ".Lup", end, gate, |w, gate| w.ds_store(gate, store(0)), |w, gate, _| {
         w.ds_load(&gate, load(0))?;
         w.isa().push(mul())?;
         Ok(gate)
