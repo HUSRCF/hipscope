@@ -767,7 +767,17 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     constexpr int NT = 32 * RW;
     constexpr int VPT = CK / 8;         // 16 B vectors per token per chunk
     constexpr int VECS = TOK * VPT / NT;
-    __shared__ __attribute__((aligned(16))) _Float16 xs[TOK * STRIDE];
+    // HC parking reuses xs for TOK x (16 * RW) BF16 channel halfs.  RW <= 4 parks at
+    // the staging STRIDE (72 for RW4: the incumbent layout, unchanged).  RW8 needs 128
+    // halfs per token, and the unpadded 16 * RW stride (no padding) is what keeps the
+    // BV16/RW8 tile at exactly TOK * 128 * 2 B = 64 KB, the LDS limit.  Every HC
+    // store and the stage-2 read use PARK_STRIDE, so the chain (WMMA -> permlanex16
+    // swap -> hcw_pack8 -> LDS -> hcw_apply8) is the incumbent's, only re-addressed.
+    constexpr int PARK_STRIDE = (RW <= 4) ? STRIDE : 16 * RW;
+    constexpr int STAGE_HALFS = TOK * STRIDE;
+    constexpr int PARK_HALFS = HC ? TOK * PARK_STRIDE : 0;
+    constexpr int LDS_HALFS = STAGE_HALFS > PARK_HALFS ? STAGE_HALFS : PARK_HALFS;
+    __shared__ __attribute__((aligned(16))) _Float16 xs[LDS_HALFS];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -791,10 +801,10 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // Slot i covers token i * (NT / VPT) + tid / VPT, so its LDS offset is
     // lds0 plus a compile-time constant.  Named scalars, not an array: the
     // array stays in scratch because SROA runs before the loops unroll.
-    static_assert(VECS == 4 || VECS == 6 || VECS == 8 || VECS == 12);
+    static_assert(VECS == 4 || VECS == 6 || VECS == 8 || VECS == 12 || VECS == 16);
     static_assert(PREFETCH == 1 || PREFETCH == 2);
-    static_assert(TOK * STRIDE * sizeof(_Float16) <= 32768);
-#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11)
+    static_assert(LDS_HALFS * sizeof(_Float16) <= 65536);
+#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11) F(12) F(13) F(14) F(15)
 #define XL_OFF(I) \
     const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
         ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * K + (tid % VPT) * 8;
@@ -808,8 +818,8 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // The barriers order LDS only: __syncthreads would also wait for the
     // in-flight next-chunk X and payload loads (WGP-mode workgroup fence).
 #define XL_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
-    uint4 st0, st1, st2, st3, st4, st5, st6, st7, st8, st9, st10, st11;
-    uint4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nx8, nx9, nx10, nx11;
+    uint4 st0, st1, st2, st3, st4, st5, st6, st7, st8, st9, st10, st11, st12, st13, st14, st15;
+    uint4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nx8, nx9, nx10, nx11, nx12, nx13, nx14, nx15;
     {
         const int cn = 0;
         XL_FOR8(XL_LOAD)
@@ -918,10 +928,10 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         if (HC) {
             // M % 8 == 0 (caller): no partial row run.  Park the BF16 bits of
             // 0.0f + acc in LDS (xs: the staging buffer is dead after the last
-            // chunk's closing barrier); `Y`, when non-null, is the unfused
-            // kernel's own F32 output (debug/capture mirror).
+            // chunk's closing barrier) at row stride PARK_STRIDE; `Y`, when
+            // non-null, is the unfused kernel's own F32 output (debug/capture mirror).
             if (Y) hcw_mirror8(r, out_col, row0, M, Y);
-            *(uint4*)(xs + (b * 16 + ml) * STRIDE + 16 * (tid >> 5) + 8 * lane_half) = hcw_pack8(r);
+            *(uint4*)(xs + (b * 16 + ml) * PARK_STRIDE + 16 * (tid >> 5) + 8 * lane_half) = hcw_pack8(r);
             continue;
         }
         if (OUT_BF16) {
@@ -968,7 +978,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             const int t = batch_start + tl;
             const int c0 = (row_block < 0 ? (int)blockIdx.x : row_block) * RW * 16 + c8 * 8;
             if (t >= N || c0 >= M) continue;
-            hcw_apply8(*(const uint4*)(xs + tl * STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
+            hcw_apply8(*(const uint4*)(xs + tl * PARK_STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
                        hc_bf16);
         }
     }
@@ -1028,7 +1038,58 @@ U3_TILE(12, 4, 1)
 U3_TILE(12, 4, 2)
 U3_TILE(12, 8, 1)
 U3_TILE(12, 8, 2)
+// BV16 U3 tiles (TOK = 256 tokens; VECS = 16 for RW4, 8 for RW8).
+U3_TILE(16, 4, 1)
+U3_TILE(16, 4, 2)
+U3_TILE(16, 8, 1)
+U3_TILE(16, 8, 2)
 #undef U3_TILE
+
+// Tile-twin multi-region and HC-fused entries, generated separately from U3_TILE
+// so the incumbent U3 wrappers and the *_bt8_x4_{regions,hcw} entries stay byte-
+// identical.  `_regions`: the incumbent three-region ABI with r_i = ceil(M_i / (16*RW))
+// row blocks per region (RW 16-row tiles per block) and the same dispatch /
+// local_rb pattern.  `_hcw`: the incumbent HC ABI (M % 8 == 0), body
+// resid_bt_xlds<6, BV, RW, true, false, PF, true>.
+#define U3_TWIN_TILE(BV, RW, PF) \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_regions( \
+    const char* A0, const char* A1, const char* A2, const _Float16* X, \
+    float* Y0, float* Y1, float* Y2, int M0, int M1, int M2, int K, int N) { \
+    if (N <= 0 || K <= 0) return; \
+    const int r0 = (M0 + 16 * RW - 1) / (16 * RW); \
+    const int r1 = (M1 + 16 * RW - 1) / (16 * RW); \
+    const int rb = blockIdx.x; \
+    const char* A; \
+    float* Y; \
+    int M, local_rb; \
+    if (rb < r0) { \
+        A = A0; Y = Y0; M = M0; local_rb = rb; \
+    } else if (rb < r0 + r1) { \
+        A = A1; Y = Y1; M = M1; local_rb = rb - r0; \
+    } else { \
+        A = A2; Y = Y2; M = M2; local_rb = rb - r0 - r1; \
+    } \
+    if (M <= 0 || local_rb >= (M + 16 * RW - 1) / (16 * RW)) return; \
+    resid_bt_xlds<6, BV, RW, true, false, PF>(A, X, Y, M, K, N, local_rb); \
+} \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_hcw( \
+    const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y, \
+    int M, int K, int N, \
+    void* hc_streams, const float* hc_gates, int hc_bf16) { \
+    resid_bt_xlds<6, BV, RW, true, false, PF, true>(A, X, Y, M, K, N, -1, hc_streams, \
+                                                     hc_gates, hc_bf16); \
+}
+U3_TWIN_TILE(8, 4, 1)
+U3_TWIN_TILE(8, 4, 2)
+U3_TWIN_TILE(8, 8, 1)
+U3_TWIN_TILE(8, 8, 2)
+U3_TWIN_TILE(16, 4, 1)
+U3_TWIN_TILE(16, 4, 2)
+U3_TWIN_TILE(16, 8, 1)
+U3_TWIN_TILE(16, 8, 2)
+#undef U3_TWIN_TILE
 
 extern "C" __launch_bounds__(128, 1) __global__ void
 gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
