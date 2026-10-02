@@ -446,10 +446,11 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // The register-use audit covers every builder symbol that reuses
         // registers across phases: F2 and the fused A4 GDN projection.
         let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
-        // gfx11 builder kernels and the gfx1201 Qwen4 MoE family carry M7's
-        // lift identity and analyses (M7's gfx1201 tables).
+        // gfx11 builder kernels and the gfx1201 Qwen4 MoE and QSA gathered
+        // families carry M7's lift identity and analyses (M7's gfx1201 tables).
+        let qsa_pm=contract.symbol.starts_with("indexed_attention_")&&contract.symbol.contains("_pm_gfx");
         let m7_cert=matches!(arch,"gfx1100"|"gfx1151")
-            || arch=="gfx1201" && contract.symbol.starts_with("qwen4_moe_");
+            || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm);
         if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {
             let mut highest_v=0u32;
             let mut highest_s=0u32;
@@ -505,7 +506,14 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             let dynamic=contract.launch_dynamic_lds_bytes.ok_or("M7-certified contract missing launch dynamic LDS bytes")?;
             let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
             let waves=workgroup_size(&source_text,&contract.symbol)?.div_ceil(32);
-            let max_end=crate::pm_check::lds_bounds(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic)?;
+            let max_end=if qsa_pm {
+                // The token list is the launch's dynamic LDS (`launch_dynamic_lds_bytes`
+                // is its largest size); every other access is bounded by the static part.
+                crate::pm_check::lds_bounds_host(&source_text,&contract.symbol,waves,kd.group_segment_size,
+                    &crate::kernels::qsa_gather::TOKEN_ADDRESS_VGPRS)?.0.max(kd.group_segment_size+dynamic)
+            } else {
+                crate::pm_check::lds_bounds(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic)?
+            };
             shape.launch_dynamic_lds_bytes=Some(dynamic);
             shape.max_lds_access_end=Some(max_end);
             shape.m7_analysis=Some(crate::pm_check::m7(&build.elf,arch,&contract.symbol)?);

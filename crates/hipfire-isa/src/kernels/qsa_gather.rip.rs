@@ -148,15 +148,22 @@ const MA: u8 = 60; const MB: u8 = 62; const MC: u8 = 64; const MALL: u8 = 66; co
 const PSEL: u8 = 70; const X: u8 = 71; const Y: u8 = 72; const Z: u8 = 73;
 const D0: u8 = 74; const D1: u8 = 75; const D2: u8 = 76; const D3: u8 = 77;
 
-// VGPRs fixed over the attention.
+// VGPRs fixed over the attention. Every LDS address register is dedicated:
+// the static ones are derived from the work-item id before the first branch
+// (`pm_check::lds_bounds`), the token-list ones (`TOKEN_ADDRESS_VGPRS`) are
+// `s_tokens + lane offset` sums bounded by the launch's dynamic LDS.
 const TID: u8 = 0; const LANE: u8 = 1; const L16: u8 = 2; const HALF: u8 = 3; const L16X4: u8 = 4;
 const M_RUN: u8 = 5; const L_RUN: u8 = 6; const O: u8 = 8; // o[0] 8..15, o[1] 16..23
 const VCOFF: u8 = 24; const VPB: u8 = 25; const VRED: u8 = 26; const VREDL: u8 = 27; const VSUML: u8 = 28;
-const VPST: u8 = 29; const VQB: u8 = 30; const VKLANE: u8 = 31; const VHALFT: u8 = 32;
+const VPST: u8 = 29; const VQB: u8 = 30; const VKLANE: u8 = 31; const VHALFT: u8 = 32; const VQS: u8 = 33;
+const VTF: u8 = 34; const VTS: u8 = 35; const VTR: u8 = 36; const VTP: u8 = 37; const LANE4: u8 = 38;
+/// Token-list address VGPRs of the attention (fill store, score token, score
+/// rows, PV chunk).
+pub const TOKEN_ADDRESS_VGPRS: [u16; 4] = [VTF as u16, VTS as u16, VTR as u16, VTP as u16];
 // Tile scope (between the score and the PV labels).
-const SV: u8 = 33; const LMAX: u8 = 41; const TMP: u8 = 42; const MNEW: u8 = 43; const ALPHA: u8 = 44; const LSUM: u8 = 45; const TSUM: u8 = 46; const AX: u8 = 47;
+const SV: u8 = 40; const LMAX: u8 = 48; const TMP: u8 = 49; const MNEW: u8 = 50; const ALPHA: u8 = 51; const LSUM: u8 = 52; const TSUM: u8 = 53; const AX: u8 = 54;
 /// Phase-aliased block: prologue, score, softmax, PV and epilogue registers.
-const R: u8 = 48;
+const R: u8 = 56;
 
 struct Gen { arch: Arch, kind: Kind }
 
@@ -212,6 +219,8 @@ impl Gen {
             p.s::<2>("mask", MA, Live::Whole)?;
             for (name, r) in [("tid", TID), ("c", 1), ("off_in", 2), ("off_v", 3), ("kv", 4), ("vv", 5), ("kh", 6), ("vh", 7), ("scale_off", 8)] { p.v::<1>(name, r, Live::Whole)?; }
             if self.g12() { p.v::<2>("kpair", 10, Live::Whole)?; p.v::<2>("vpair", 12, Live::Whole)?; p.v::<1>("ks", 14, Live::Whole)?; p.v::<1>("vs", 15, Live::Whole)?; }
+            // A whole 8-VGPR granule: the descriptor's allocation equals the metadata count.
+            if !self.g12() { p.v::<1>("granule_pad", 15, Live::Whole)?; }
             return Ok(p);
         }
         let l = |n: &str| self.label(n);
@@ -231,7 +240,7 @@ impl Gen {
         for (name, r) in [("mask_a", MA), ("mask_b", MB), ("mask_c", MC), ("mask_all", MALL), ("mask_live", MLIVE)] { p.s::<2>(name, r, Live::Whole)?; }
         for (name, r) in [("tid", TID), ("lane", LANE), ("l16", L16), ("half", HALF), ("l16x4", L16X4), ("m_run", M_RUN), ("l_run", L_RUN),
             ("v_coff", VCOFF), ("p_b_addr", VPB), ("red_st", VRED), ("red_ld", VREDL), ("sum_ld", VSUML), ("p_st", VPST), ("q_b_addr", VQB),
-            ("k_lane", VKLANE), ("half_tok", VHALFT)] {
+            ("k_lane", VKLANE), ("half_tok", VHALFT), ("q_st", VQS), ("tok_fill", VTF), ("tok_score", VTS), ("tok_rows", VTR), ("tok_pv", VTP), ("lane4", LANE4)] {
             p.v::<1>(name, r, Live::Whole)?;
         }
         p.v::<8>("o0", O, Live::Whole)?;
@@ -520,18 +529,47 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String>
     smem(b, A1, 8, KARG, 0x20)?;
     smem(b, A2, 2, KARG, 0x40)?;
     wg_ids(wg, g.g12())?;
+    // Lane constants and the static LDS addresses, from the work-item id
+    // alone and before the first branch.
+    let b = wg.isa();
+    let t = g.pro();
+    op(b, "v_and_b32_e32 v1, 31, v0", &[v(LANE)], &[v(TID)])?;
+    op(b, format!("v_and_b32_e32 v{L16}, 15, v0"), &[v(L16)], &[v(TID)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{HALF}, 4, v{LANE}"), &[v(HALF)], &[v(LANE)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{L16X4}, 2, v{L16}"), &[v(L16X4)], &[v(L16)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{LANE4}, 2, v{LANE}"), &[v(LANE4)], &[v(LANE)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{t}, 5, v0"), &[v(t)], &[v(TID)])?;
+    op(b, format!("v_readfirstlane_b32 s{WAVE}, v{t}"), &[s(WAVE)], &[v(t)])?;
+    let hb = if g.g12() { 4 } else { 1 }; // half -> (16 or 2) byte shift for P/Q fragments
+    // P B-fragment read: P + l16*32 (+16*half on gfx12); Q B-fragment likewise.
+    op(b, format!("v_lshlrev_b32_e32 v{VPB}, 5, v{L16}"), &[v(VPB)], &[v(L16)])?;
+    if g.g12() { op(b, format!("v_lshl_add_u32 v{VPB}, v{HALF}, 4, v{VPB}"), &[v(VPB)], &[v(HALF), v(VPB)])?; }
+    op(b, format!("v_add_nc_u32_e32 v{VQB}, {}, v{VPB}", lit(Q_BASE)), &[v(VQB)], &[v(VPB)])?;
+    // Max/sum slots: [wave][l16] stores, [l16] loads.
+    op(b, format!("v_lshl_add_u32 v{VRED}, s{WAVE}, 6, v{L16X4}"), &[v(VRED)], &[s(WAVE), v(L16X4)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VRED}, {}, v{VRED}", lit(RED_BASE)), &[v(VRED)], &[v(VRED)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VREDL}, {}, v{L16X4}", lit(RED_BASE)), &[v(VREDL)], &[v(L16X4)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VSUML}, {}, v{L16X4}", lit(SUM_BASE)), &[v(VSUML)], &[v(L16X4)])?;
+    // P store: P + wave*512 + l16*32 + (2 or 16)*half.
+    op(b, format!("v_lshlrev_b32_e32 v{VPST}, {hb}, v{HALF}"), &[v(VPST)], &[v(HALF)])?;
+    op(b, format!("v_lshl_add_u32 v{VPST}, v{L16}, 5, v{VPST}"), &[v(VPST)], &[v(L16), v(VPST)])?;
+    op(b, format!("v_lshl_add_u32 v{VPST}, s{WAVE}, 9, v{VPST}"), &[v(VPST)], &[s(WAVE), v(VPST)])?;
+    // Q store (e = tid + 256k: head 4k + tid/64, dims (tid & 63)*4):
+    // Q + ((tid & 63) >> 2)*512 + (tid >> 6)*32 + (tid & 3)*8, plus 128k.
+    op(b, format!("v_and_b32_e32 v{VQS}, 63, v0"), &[v(VQS)], &[v(TID)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{VQS}, 2, v{VQS}"), &[v(VQS)], &[v(VQS)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{t}, 6, v0"), &[v(t)], &[v(TID)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{t}, 5, v{t}"), &[v(t)], &[v(t)])?;
+    op(b, format!("v_lshl_add_u32 v{VQS}, v{VQS}, 9, v{t}"), &[v(VQS)], &[v(VQS), v(t)])?;
+    op(b, format!("v_and_b32_e32 v{t}, 3, v0"), &[v(t)], &[v(TID)])?;
+    op(b, format!("v_lshl_add_u32 v{VQS}, v{t}, 3, v{VQS}"), &[v(VQS)], &[v(t), v(VQS)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VQS}, {}, v{VQS}", lit(Q_BASE)), &[v(VQS)], &[v(VQS)])?;
+    // Token-list lane offsets: score rows 4*half (gfx12 32*half).
+    op(b, format!("v_lshlrev_b32_e32 v{VHALFT}, {}, v{HALF}", if g.g12() { 5 } else { 2 }), &[v(VHALFT)], &[v(HALF)])?;
     let outside = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_ge_i32 s{ROW}, s{}", A1 + 2), vec![], vec![s(ROW), s(A1 + 2)]))?;
     wg.exit_if(outside, end)?;
     let b = wg.isa();
     let (nh, nkv, budget, compress, cap, full) = (A1 + 4, A1 + 5, A1 + 6, A1 + 7, A2, A2 + 1);
-    // Lane constants.
-    op(b, "v_and_b32_e32 v1, 31, v0", &[v(LANE)], &[v(TID)])?;
-    op(b, format!("v_and_b32_e32 v{L16}, 15, v0"), &[v(L16)], &[v(TID)])?;
-    op(b, format!("v_bfe_u32 v{HALF}, v0, 4, 1"), &[v(HALF)], &[v(TID)])?;
-    op(b, format!("v_lshlrev_b32_e32 v{L16X4}, 2, v{L16}"), &[v(L16X4)], &[v(L16)])?;
-    let t = g.pro();
-    op(b, format!("v_lshrrev_b32_e32 v{t}, 5, v0"), &[v(t)], &[v(TID)])?;
-    op(b, format!("v_readfirstlane_b32 s{WAVE}, v{t}"), &[s(WAVE)], &[v(t)])?;
     // group = n_heads / n_kv_heads; selection length as the hipcc kernel derives it.
     let vt = [t, t + 1, t + 2];
     udiv(b, GROUP, nh, nkv, vt, [D0, D1, D2])?;
@@ -576,29 +614,10 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String>
     sop(b, format!("{} s{T0}, s{T0}, s{T1}", s_add_i32(a)), &[T0], &[T0, T1])?;
     op(b, format!("v_add_nc_u32_e32 v{VCOFF}, s{T0}, v{L16}"), &[v(VCOFF)], &[s(T0), v(L16)])?;
     op(b, format!("v_lshlrev_b32_e32 v{VCOFF}, 3, v{VCOFF}"), &[v(VCOFF)], &[v(VCOFF)])?;
-    let hb = if g.g12() { 4 } else { 1 }; // half -> (16 or 2) byte shift for P/Q fragments
-    // P B-fragment read: P + l16*32 (+16*half on gfx12); Q B-fragment likewise.
-    op(b, format!("v_lshlrev_b32_e32 v{VPB}, 5, v{L16}"), &[v(VPB)], &[v(L16)])?;
-    if g.g12() { op(b, format!("v_lshl_add_u32 v{VPB}, v{HALF}, 4, v{VPB}"), &[v(VPB)], &[v(HALF), v(VPB)])?; }
-    op(b, format!("v_add_nc_u32_e32 v{VQB}, {}, v{VPB}", lit(Q_BASE)), &[v(VQB)], &[v(VPB)])?;
-    // Max/sum slots: [wave][l16] stores, [l16] loads.
-    op(b, format!("v_lshl_add_u32 v{VRED}, s{WAVE}, 6, v{L16X4}"), &[v(VRED)], &[s(WAVE), v(L16X4)])?;
-    op(b, format!("v_add_nc_u32_e32 v{VRED}, {}, v{VRED}", lit(RED_BASE)), &[v(VRED)], &[v(VRED)])?;
-    op(b, format!("v_add_nc_u32_e32 v{VREDL}, {}, v{L16X4}", lit(RED_BASE)), &[v(VREDL)], &[v(L16X4)])?;
-    op(b, format!("v_add_nc_u32_e32 v{VSUML}, {}, v{L16X4}", lit(SUM_BASE)), &[v(VSUML)], &[v(L16X4)])?;
-    // P store: P + wave*512 + l16*32 + (2 or 16)*half.
-    op(b, format!("v_lshlrev_b32_e32 v{VPST}, {hb}, v{HALF}"), &[v(VPST)], &[v(HALF)])?;
-    op(b, format!("v_lshl_add_u32 v{VPST}, v{L16}, 5, v{VPST}"), &[v(VPST)], &[v(L16), v(VPST)])?;
-    op(b, format!("v_lshl_add_u32 v{VPST}, s{WAVE}, 9, v{VPST}"), &[v(VPST)], &[s(WAVE), v(VPST)])?;
-    // K lane offset: kvh*512 (+16*half on gfx12); score-row token offset 4*half (gfx12 32*half).
+    // K lane offset: kvh*512 (+16*half on gfx12).
     sop(b, format!("s_lshl_b32 s{T0}, s{KVH}, 9"), &[T0], &[KVH])?;
-    if g.g12() {
-        op(b, format!("v_lshl_add_u32 v{VKLANE}, v{HALF}, 4, s{T0}"), &[v(VKLANE)], &[v(HALF), s(T0)])?;
-        op(b, format!("v_lshlrev_b32_e32 v{VHALFT}, 5, v{HALF}"), &[v(VHALFT)], &[v(HALF)])?;
-    } else {
-        op(b, format!("v_mov_b32_e32 v{VKLANE}, s{T0}"), &[v(VKLANE)], &[s(T0)])?;
-        op(b, format!("v_lshlrev_b32_e32 v{VHALFT}, 2, v{HALF}"), &[v(VHALFT)], &[v(HALF)])?;
-    }
+    if g.g12() { op(b, format!("v_lshl_add_u32 v{VKLANE}, v{HALF}, 4, s{T0}"), &[v(VKLANE)], &[v(HALF), s(T0)])?; }
+    else { op(b, format!("v_mov_b32_e32 v{VKLANE}, s{T0}"), &[v(VKLANE)], &[s(T0)])?; }
     sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
     for m in [MA, MB, MC, MALL, MLIVE] { sop(b, format!("s_mov_b32 s{}, 0", m + 1), &[m + 1], &[])?; }
     Ok(())
@@ -642,8 +661,11 @@ fn stage<T: Target>(wg: &mut Wg<T>, g: &Gen, tok: LdsRegion<Tok, Free>, q: LdsRe
                 op(b, format!("v_cmp_gt_i32_e64 s{MB}, s{VISIBLE}, v{tk}"), &mask(MB), &[s(VISIBLE), v(tk)])?;
                 sop(b, format!("s_and_b32 s{MA}, s{MA}, s{MB}"), &[MA], &[MA, MB])?;
                 select(b, tk, "-1", tk, MA)?;
-                op(b, format!("v_add_nc_u32_e32 v{off}, {}, v{off}", lit(TOK_BASE)), &[v(off)], &[v(off)])?;
-                w.ds_store(st, Instruction::new(format!("ds_store_b32 v{off}, v{tk}"), vec![], vec![v(off), v(tk)]).memory(MemoryClass::DsStore))
+                // Token-list address: TOK + 4*i.
+                sop(b, format!("s_lshl_b32 s{Y}, s{X}, 2"), &[Y], &[X])?;
+                sop(b, format!("{} s{Y}, s{Y}, {}", s_add_i32(b.spec.arch), lit(TOK_BASE)), &[Y], &[Y])?;
+                op(b, format!("v_add_nc_u32_e32 v{VTF}, s{Y}, v{LANE4}"), &[v(VTF)], &[s(Y), v(LANE4)])?;
+                w.ds_store(st, Instruction::new(format!("ds_store_b32 v{VTF}, v{tk}"), vec![], vec![v(VTF), v(tk)]).memory(MemoryClass::DsStore))
             })?;
             // Retire the trip's store so the back edge carries no pending
             // operation (the token stays a typed `Pending` until the barrier).
@@ -657,17 +679,10 @@ fn stage<T: Target>(wg: &mut Wg<T>, g: &Gen, tok: LdsRegion<Tok, Free>, q: LdsRe
     })?;
     // Q: e = tid + 256k, head h = 4k + tid/64 (wave-uniform), dims d = (tid & 63) * 4.
     // Load q_row[(kvh*group + h)*512 + d] (zero for h >= group), store F16 at
-    // Q + ((d >> 4)*16 + h)*32 + (d & 15)*2 = lane base + 128k.
+    // Q + ((d >> 4)*16 + h)*32 + (d & 15)*2 = VQS + 128k.
     let b = wg.isa();
     op(b, format!("v_and_b32_e32 v{t}, 63, v0"), &[v(t)], &[v(TID)])?;
     op(b, format!("v_lshlrev_b32_e32 v{}, 4, v{t}", t + 1), &[v(t + 1)], &[v(t)])?;
-    op(b, format!("v_lshrrev_b32_e32 v{t}, 2, v{t}"), &[v(t)], &[v(t)])?;
-    op(b, format!("v_lshrrev_b32_e32 v{}, 6, v0", t + 2), &[v(t + 2)], &[v(TID)])?;
-    op(b, format!("v_lshlrev_b32_e32 v{}, 5, v{}", t + 2, t + 2), &[v(t + 2)], &[v(t + 2)])?;
-    op(b, format!("v_lshl_add_u32 v{t}, v{t}, 9, v{}", t + 2), &[v(t)], &[v(t), v(t + 2)])?;
-    op(b, format!("v_and_b32_e32 v{}, 3, v0", t + 2), &[v(t + 2)], &[v(TID)])?;
-    op(b, format!("v_lshl_add_u32 v{t}, v{}, 3, v{t}", t + 2), &[v(t)], &[v(t + 2), v(t)])?;
-    op(b, format!("v_add_nc_u32_e32 v{t}, {}, v{t}", lit(Q_BASE)), &[v(t)], &[v(t)])?;
     // s_hrow = kvh*group + wave/2.
     sop(b, format!("s_mul_i32 s{T2}, s{KVH}, s{GROUP}"), &[T2], &[KVH, GROUP])?;
     sop(b, format!("s_lshr_b32 s{Z}, s{WAVE}, 1"), &[Z], &[WAVE])?;
@@ -687,7 +702,7 @@ fn stage<T: Target>(wg: &mut Wg<T>, g: &Gen, tok: LdsRegion<Tok, Free>, q: LdsRe
             let (dst, h) = (t + 12 + i / 2, if i % 2 == 0 { "l" } else { "h" });
             op(b, format!("v_cvt_f16_f32_e32 v{dst}.{h}, v{}", t + 4 + i), &[v(dst)], &[v(t + 4 + i), v(dst)])?;
         }
-        let insn = Instruction::new(format!("ds_store_b64 v{t}, v[{}:{}]{}", t + 12, t + 13, imm(128 * k)), vec![], vec![v(t), vr(t + 12, 2)]).memory(MemoryClass::DsStore);
+        let insn = Instruction::new(format!("ds_store_b64 v{VQS}, v[{}:{}]{}", t + 12, t + 13, imm(128 * k)), vec![], vec![v(VQS), vr(t + 12, 2)]).memory(MemoryClass::DsStore);
         st = wg.ds_store(st, insn)?;
     }
     let (q_w, q_pend) = st;
@@ -804,20 +819,20 @@ fn score<T: Target>(w: &mut Wave<'_, T, Builder>, g: &Gen, tok: &LdsRegion<Tok, 
     let sc = g.score();
     let kw = g.kw();
     let b = w.isa();
-    op(b, format!("v_add_nc_u32_e32 v{}, s{TOKS}, v{L16X4}", sc.koff), &[v(sc.koff)], &[s(TOKS), v(L16X4)])?;
-    op(b, format!("v_add_nc_u32_e32 v{}, s{TOKS}, v{VHALFT}", sc.mytok), &[v(sc.mytok)], &[s(TOKS), v(VHALFT)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VTS}, s{TOKS}, v{L16X4}"), &[v(VTS)], &[s(TOKS), v(L16X4)])?;
+    op(b, format!("v_add_nc_u32_e32 v{VTR}, s{TOKS}, v{VHALFT}"), &[v(VTR)], &[s(TOKS), v(VHALFT)])?;
     // Row tokens of the accumulator rows (the -inf mask).
     if g.g12() {
         for k in 0..2u8 {
-            w.ds_load(tok, Instruction::new(format!("ds_load_b128 v[{}:{}], v{}{}", sc.rtok + 4 * k, sc.rtok + 4 * k + 3, sc.mytok, imm(16 * u32::from(k))), vec![vr(sc.rtok + 4 * k, 4)], vec![v(sc.mytok)]).memory(MemoryClass::DsLoad))?;
+            w.ds_load(tok, Instruction::new(format!("ds_load_b128 v[{}:{}], v{VTR}{}", sc.rtok + 4 * k, sc.rtok + 4 * k + 3, imm(16 * u32::from(k))), vec![vr(sc.rtok + 4 * k, 4)], vec![v(VTR)]).memory(MemoryClass::DsLoad))?;
         }
     } else {
         for k in 0..4u8 {
             let off = if k == 0 { "offset1:2".to_string() } else { format!("offset0:{} offset1:{}", 4 * k, 4 * k + 2) };
-            w.ds_load(tok, Instruction::new(format!("ds_load_2addr_b32 v[{}:{}], v{} {off}", sc.rtok + 2 * k, sc.rtok + 2 * k + 1, sc.mytok), vec![vr(sc.rtok + 2 * k, 2)], vec![v(sc.mytok)]).memory(MemoryClass::DsLoad))?;
+            w.ds_load(tok, Instruction::new(format!("ds_load_2addr_b32 v[{}:{}], v{VTR} {off}", sc.rtok + 2 * k, sc.rtok + 2 * k + 1), vec![vr(sc.rtok + 2 * k, 2)], vec![v(VTR)]).memory(MemoryClass::DsLoad))?;
         }
     }
-    w.ds_load(tok, Instruction::new(format!("ds_load_b32 v{}, v{}", sc.mytok, sc.koff), vec![v(sc.mytok)], vec![v(sc.koff)]).memory(MemoryClass::DsLoad))?;
+    w.ds_load(tok, Instruction::new(format!("ds_load_b32 v{}, v{VTS}", sc.mytok), vec![v(sc.mytok)], vec![v(VTS)]).memory(MemoryClass::DsLoad))?;
     let qload = |w: &mut Wave<'_, T, Builder>, dc: u8| -> Result<(), String> {
         let dst = sc.qbuf + (dc % 2) * kw;
         for h in 0..kw / 4 {
@@ -875,10 +890,10 @@ fn pv<T: Target>(wg: &mut Wg<T>, g: &Gen, tok: &LdsRegion<Tok, Published>, p: &L
             // Entry tokens of this lane: k0 + 0..15 (gfx12: k0 + 8*half + 0..7).
             sop(b, format!("s_lshl_b32 s{T1}, s{T0}, 2"), &[T1], &[T0])?;
             sop(b, format!("{} s{T1}, s{T1}, {}", s_add_i32(a), lit(TOK_BASE)), &[T1], &[T1])?;
-            if g.g12() { op(b, format!("v_add_nc_u32_e32 v{}, s{T1}, v{VHALFT}", r.xt), &[v(r.xt)], &[s(T1), v(VHALFT)])?; }
-            else { op(b, format!("v_mov_b32_e32 v{}, s{T1}", r.xt), &[v(r.xt)], &[s(T1)])?; }
+            if g.g12() { op(b, format!("v_add_nc_u32_e32 v{VTP}, s{T1}, v{VHALFT}"), &[v(VTP)], &[s(T1), v(VHALFT)])?; }
+            else { op(b, format!("v_mov_b32_e32 v{VTP}, s{T1}"), &[v(VTP)], &[s(T1)])?; }
             for k in 0..n / 4 {
-                w.ds_load(tok, Instruction::new(format!("ds_load_b128 v[{}:{}], v{}{}", r.vtok + 4 * k, r.vtok + 4 * k + 3, r.xt, imm(16 * u32::from(k))), vec![vr(r.vtok + 4 * k, 4)], vec![v(r.xt)]).memory(MemoryClass::DsLoad))?;
+                w.ds_load(tok, Instruction::new(format!("ds_load_b128 v[{}:{}], v{VTP}{}", r.vtok + 4 * k, r.vtok + 4 * k + 3, imm(16 * u32::from(k))), vec![vr(r.vtok + 4 * k, 4)], vec![v(VTP)]).memory(MemoryClass::DsLoad))?;
             }
             for h in 0..kw / 4 {
                 let off = 512 * u32::from(kc) + 16 * u32::from(h);
