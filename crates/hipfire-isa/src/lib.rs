@@ -10,6 +10,7 @@ pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
 #[cfg(feature="toolchain")] pub mod pm_check;
+#[cfg(feature="toolchain")] pub mod cost_lint;
 pub use arch::Arch;
 pub use reg::{RegPlan,V,S};
 pub use plan::{KernelSpec,KernargLayout,Emitted,BuilderProof,IsaShape,MemoryScope};
