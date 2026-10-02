@@ -140,10 +140,11 @@ pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
 /// smaller ones, decode and verify keep the mapped reads.
 pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS";
 
-/// K3 measured 56.7 GB/s: a 1,336,934,400-byte layer copy takes 23.6 ms,
-/// hidden behind a 4096-row layer. Smaller chunks (notably 1536 rows)
-/// expose DMA and keep the mapped path.
-const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 4096;
+/// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
+/// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
+/// and the restore that was not hidden cost 18 ms of that chunk. Smaller
+/// forwards keep the mapped path (K3: 1536 rows expose the DMA).
+const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 
 /// One Flash-Next layer's routed experts: 512 QT44 gate/up, 512 QT53 down.
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 512 * 1_740_800;
