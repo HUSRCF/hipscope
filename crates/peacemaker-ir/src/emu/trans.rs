@@ -55,7 +55,8 @@
 //!   `V_RCP_F32`, does not use the `FLUSH_NEAREST` SDWA OMOD policy. Neither is
 //!   modelled here.
 //!
-//! Only `Gfx1151` and `Gfx1201` are qualified; every other [`Arch`] panics.
+//! Only `Gfx1151` and `Gfx1201` are supported by this value API; every other
+//! [`Arch`] panics. Hardware qualification requires the own exhaustive gate above.
 
 use crate::Arch;
 
