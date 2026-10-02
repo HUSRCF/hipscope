@@ -1,5 +1,5 @@
 use hipfire_isa::{Arch, kernels::qsa_gather::{self, Kind, Spec}, pm_check,
-    toolchain::{assemble_link_bundle, Toolchain}};
+    toolchain::{build, oracle_assemble_link_bundle, Toolchain}};
 use std::{fs, path::PathBuf};
 
 const SOURCE: &str = include_str!("../../hipfire-isa/src/kernels/qsa_gather.rip");
@@ -28,9 +28,12 @@ fn standalone_qsa_matches_rust_and_shipped_objects() {
         let ds = dir.join("rip.s");
         fs::write(&rs, &rust_text).unwrap();
         fs::write(&ds, &rip_text).unwrap();
-        let a = assemble_link_bundle(&tools, &rs, &dir.join("rust.hxaco"), arch.name()).unwrap();
-        let b = assemble_link_bundle(&tools, &ds, &dir.join("rip.hxaco"), arch.name()).unwrap();
-        assert_eq!(fs::read(&a.object).unwrap(), fs::read(&b.object).unwrap(), "assembler object");
+        let a = build(&tools, &rs, &dir.join("rust.hxaco"), arch.name()).unwrap();
+        let b = build(&tools, &ds, &dir.join("rip.hxaco"), arch.name()).unwrap();
+        // The native writer against the ROCm oracle on the `.rip` module.
+        let oracle = oracle_assemble_link_bundle(&tools, &ds, &dir.join("rip-oracle.hxaco"), arch.name()).unwrap();
+        assert_eq!(fs::read(&b.elf).unwrap(), fs::read(&oracle.elf).unwrap(), "native code object vs llvm-mc + ld.lld");
+        assert_eq!(fs::read(&b.hsaco).unwrap(), fs::read(&oracle.hsaco).unwrap(), "native bundle vs clang-offload-bundler");
         assert_eq!(fs::read(&a.elf).unwrap(), fs::read(&b.elf).unwrap(), "code object");
         assert_eq!(fs::read(&a.hsaco).unwrap(), fs::read(&b.hsaco).unwrap(), "bundle");
         let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels")
@@ -42,7 +45,7 @@ fn standalone_qsa_matches_rust_and_shipped_objects() {
             assert_eq!(report["lift"], "byte-exact");
             assert_eq!(report["obligations"], serde_json::json!({}));
             fs::write(dir.join(format!("{}.cert.json", kind.tag())), serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-            println!("PASS {} {}: .s BuilderProof ModuleProof object .co .hxaco shipped bundle; pm_check obligations=0", arch.name(), kind.tag());
+            println!("PASS {} {}: .s BuilderProof ModuleProof native .co .hxaco = ROCm oracle = shipped bundle; pm_check obligations=0", arch.name(), kind.tag());
         }
     }
 }

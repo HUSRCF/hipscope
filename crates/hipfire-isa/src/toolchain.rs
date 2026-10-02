@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Offline ROCm assembler/linker/bundler path. Enabled only for host tooling.
+//! Host-tooling certification of builder code objects. [`build`] emits them
+//! with the native writer; the ROCm assembler/linker/bundler path survives
+//! only as the test oracle [`oracle_assemble_link_bundle`].
 
 use radiowave::{ExistingCodeObjectRequest, PeacemakerArm, PeacemakerProducer, PeacemakerRecord,
     PeacemakerTool, PeacemakerToolRole};
@@ -36,7 +38,7 @@ impl Default for Toolchain {
             bundler: llvm.join("clang-offload-bundler"),
             objdump: llvm.join("llvm-objdump"), readobj: llvm.join("llvm-readobj"),
             hipcc: root.join("bin/hipcc"),
-            host_target: "host-x86_64-unknown-linux-gnu".into(),
+            host_target: crate::native::DEFAULT_HOST_TARGET.into(),
         }
     }
 }
@@ -353,7 +355,6 @@ pub fn read_kd(object: &Path, symbol: &str) -> Result<Gfx12KernelImageFields> {
 pub struct BuildOutput {
     pub hsaco: PathBuf,
     pub elf: PathBuf,
-    pub object: PathBuf,
     pub disassembly: String,
     pub argv: Vec<String>,
     pub tools: Vec<PeacemakerTool>,
@@ -396,8 +397,34 @@ fn workgroup_size(source: &str, symbol: &str) -> Result<u32> {
 fn wait_arch(arch: &str) -> Result<crate::Arch> {
     if arch == "gfx1200" { Ok(crate::Arch::Gfx1201) } else { arch.parse() }
 }
-/// The external commands are deliberately fixed: no HIP compilation or compression.
-pub fn assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
+/// The production build: the native writer (`crate::native`) emits the code
+/// object (`<output stem>.co`) and its HIP bundle (`output`) — no ROCm
+/// assembler, linker or bundler — then the linked object's disassembly must
+/// parse back to the source.
+pub fn build(toolchain: &Toolchain, source: &Path, output: &Path, arch: &str) -> Result<BuildOutput> {
+    let target: crate::Arch = arch.parse().map_err(|_| format!("unsupported AMDGPU architecture: {arch}"))?;
+    let elf = output.with_extension("").with_extension("co");
+    let source_text = fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+    let code_object = crate::native::assemble(&source_text, target)?;
+    fs::write(&elf, &code_object).map_err(|e| format!("{}: {e}", elf.display()))?;
+    fs::write(output, crate::native::bundle(&code_object, target, &toolchain.host_target))
+        .map_err(|e| format!("{}: {e}", output.display()))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let argv = vec![exe.display().to_string(), "native".into(), format!("--arch={arch}"), source.display().to_string(),
+        format!("--co={}", elf.display()), format!("--bundle={}", output.display()), format!("--host-target={}", toolchain.host_target)];
+    let tools = vec![PeacemakerTool { role: PeacemakerToolRole::Native, path: exe.clone(), version: crate::native::VERSION.into(),
+        argv: argv.clone(), sha256: file_digest(&exe)? }];
+    let disassembly = invoke(&toolchain.objdump,
+        &["--disassemble".into(), format!("--mcpu={arch}"), elf.display().to_string()])?;
+    parse_back(&source_text, &disassembly)?;
+    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, argv, tools })
+}
+
+/// TEST ORACLE ONLY: the ROCm path the native writer replaces (`llvm-mc`,
+/// `ld.lld -shared`, `clang-offload-bundler -bundle-align=4096`; no HIP
+/// compilation or compression). The intermediate object is `<stem>.o`; no
+/// parse-back (that is [`build`]'s certification step).
+pub fn oracle_assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
     arch: &str) -> Result<BuildOutput> {
     if !matches!(arch, "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151") {
         return Err(format!("unsupported AMDGPU architecture: {arch}"));
@@ -422,9 +449,7 @@ pub fn assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
     invoke(&toolchain.bundler, &bundle_args)?;
     let disassembly = invoke(&toolchain.objdump,
         &["--disassemble".into(), format!("--mcpu={arch}"), elf.display().to_string()])?;
-    let source_text = fs::read_to_string(source).map_err(|e| e.to_string())?;
-    parse_back(&source_text, &disassembly)?;
-    Ok(BuildOutput { hsaco: output.into(), elf, object, disassembly, argv, tools })
+    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, argv, tools })
 }
 
 /// Bind the final HIP bundle and optional shape evidence to schema-5 radiowave.
