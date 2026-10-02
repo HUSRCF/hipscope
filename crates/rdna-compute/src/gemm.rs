@@ -906,13 +906,30 @@ fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
 
 // U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
 fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
+    let kind = if bf16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
+    let (name, rows, block) = mq6_x4_halo_entry(tile, kind);
+    (name, rows, block, tile[0] as usize)
+}
+
+/// Output form of a gfx1151 MQ6 X-LDS tile twin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mq6X4Kind {
+    Plain,
+    Bf16,
+    Regions,
+    Hcw,
+}
+
+/// Twin entry name, rows per workgroup (16 * RW) and block size (32 * RW).
+fn mq6_x4_halo_entry(tile: [u8; 3], kind: Mq6X4Kind) -> (&'static str, usize, u32) {
     macro_rules! entry {
         ($b:literal, $r:literal, $p:literal) => {
-            (if bf16 {
-                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out")
-            } else {
-                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p)
-            }, 16 * $r, 32 * $r, $b)
+            (match kind {
+                Mq6X4Kind::Plain => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p),
+                Mq6X4Kind::Bf16 => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out"),
+                Mq6X4Kind::Regions => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_regions"),
+                Mq6X4Kind::Hcw => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_hcw"),
+            }, 16 * $r, 32 * $r)
         };
     }
     match tile {
@@ -924,7 +941,11 @@ fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usi
         [12, 4, 2] => entry!(12, 4, 2),
         [12, 8, 1] => entry!(12, 8, 1),
         [12, 8, 2] => entry!(12, 8, 2),
-        _ => unreachable!("tile override is parsed into the eight supported entries"),
+        [16, 4, 1] => entry!(16, 4, 1),
+        [16, 4, 2] => entry!(16, 4, 2),
+        [16, 8, 1] => entry!(16, 8, 1),
+        [16, 8, 2] => entry!(16, 8, 2),
+        _ => unreachable!("tile override is parsed into the twelve supported entries"),
     }
 }
 
