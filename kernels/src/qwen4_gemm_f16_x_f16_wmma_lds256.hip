@@ -1431,6 +1431,12 @@ WLDS_KERNEL(gemm_wmma_lds_128_256_64_64_k32_p,  128, 256, 4, 4, 32, false, true)
 // workgroups for 40 CUs; 64 x 64 gives 90 (same K order per output, bitwise).
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64,       64,  64, 2, 4, 64, false, false)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
+// HIPFIRE_QWEN4_HC_DOWN_TILE (shape-specific narrow long-K HC-down scheduling, idea from Gufo
+// upstream: gufo-org/gufo @1071b361, MIT): the same 320 x 10240 shape on one 160 x 64 block of
+// five 32 x 64 waves, 256 workgroups instead of 640. Each output's K order and store are the
+// 64 x 64 tile's, so the bytes are identical; measured 3.10 vs 3.66 ms at N = 8192.
+WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64_p,   160,  64, 2, 4, 64, false, true)
+WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64,     160,  64, 2, 4, 64, false, false)
 
 // --- Fused-epilogue instantiations ------------------------------------------
 // Only the five tiles Gpu::lds_tile_for can return (the three per-arch
