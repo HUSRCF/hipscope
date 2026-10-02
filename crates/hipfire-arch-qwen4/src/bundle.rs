@@ -103,9 +103,9 @@ pub struct Qwen4Bundle {
     prefix: Option<Qwen4PrefixCache>,
 }
 
-/// The Qwen4 prefix cache's default; `HIPFIRE_QWEN_PROMPT_CACHE=0|1`
+/// The Qwen4 prefix cache is opt-in until its serve gates pass; `HIPFIRE_QWEN_PROMPT_CACHE=0|1`
 /// (the prompt-cache switch every Qwen family reads) overrides it.
-pub const QWEN4_PREFIX_CACHE_DEFAULT: bool = true;
+pub const QWEN4_PREFIX_CACHE_DEFAULT: bool = false;
 
 /// Whether a load should attach (and charge) the prefix cache.
 pub fn prefix_cache_requested() -> bool {

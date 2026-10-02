@@ -2162,7 +2162,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         finish.finish_reason,
         generated,
         tok_s,
-        prompt_tokens.len(),
+        // Computed prompt tokens; serve adds `cached_tokens` back for usage.
+        prompt_tokens.len() - cached_tokens,
         prefill_ms,
         prefill_tok_s,
         decode_tok_s,
