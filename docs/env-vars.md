@@ -321,12 +321,23 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` only from the automatic product defaults in `retained_redline_default`: `mq4r_redline_default` — exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic; no `arch_id` gate; `gfx1200` and all other arches remain opt-in); Qwen3.5 dense (`qwen3_5`, any weight format) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter (retained PM4; byte-identical to the HIP AR graph); and DeepSeek4 `.mq2r` AR on gfx1151. Existing LFM `.mq4` registry evidence is **not** automatically selected because it is not `.mq4r`; any usable non-default retained route is explicit opt-in and must still prove route support. The sealed LFM [`admissions.yml`](admissions.yml) row is registry evidence/admission only and does not wire runtime defaults. Runtime default ≠ Redline certification/registry admission. Built-in `hip` config profile, another explicit backend selection, `replay.backend = "hip"` or `=hip` disables the automatic default. |
-| `HIPFIRE_GFX1201_PM4_PACING` | NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape (`replay.gfx1201_pm4_pacing`): `auto` (default) = one 64-body-dword `NOP` after every `DISPATCH_DIRECT`; `off`/`0` = unpaced tape; `nop:N` = N-body-dword NOP. Applied only when the Redline default admits exact gfx1201 + `qwen3_5` (not MQ4R, not MoE, not gfx11). NOPs write no register or memory, so decode is byte-identical |
+| `HIPFIRE_GFX1201_PM4_PACING` | NOP pacing of the retained gfx1201 Qwen3.5-dense decode PM4 tape (`replay.gfx1201_pm4_pacing`): `auto` (default) = one 64-body-dword `NOP` after every `DISPATCH_DIRECT`; `off`/`0` = unpaced tape; `nop:N` = N-body-dword NOP. Applied only when the Redline default admits exact gfx1201 + `qwen3_5` (not MQ4R, not MoE, not gfx11). NOPs write no register or memory, so decode is byte-identical. railgun's gfx1201 lowering (`HIPFIRE_RAILGUN_BACKEND=railgun`) paces the same way by its per-arch default; an explicit `off`/`nop:N` applies to it too |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_UNSAFE_WSL_REDLINE` | **Unsafe until certified.** `replay.unsafe_wsl_redline`, default off. Under WSL2/ROCDXG (`/dev/dxg` present, `/dev/kfd` absent) the retained Redline PM4 default falls back to the HIP graph with one `[redline] retained default refused` log line, and an explicit `replay.backend = "redline"`/`"shadow"` makes the daemon exit at startup. `1` lifts both. No effect on native Linux; native Windows (no ROCr) stays refused. |
 | `HIPFIRE_UNSAFE_WSL_VMM_KV` | **Unsafe until certified.** `memory.unsafe_wsl_vmm_kv`, default off. Under WSL2/ROCDXG automatic KV selects `legacy` (reason in `kv_backend_reason`) and an explicit `kv_backend = "vmm"` is refused, because WDDM VA growth may alias earlier KV segments as it does on native Windows. `1` lifts it. Native Windows stays legacy-only. |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
+| `HIPFIRE_REDLINE_GAP_TIMING` | Developer-only diagnostic: `1` = per-token host breakdown of the Qwen3.5 plain-AR decode step (embedding, position copy, retained-PM4 patch, submit+wait with its in-IB GPU span, or the HIP-graph launch, and the host time between consecutive steps), one `[gap-timing]` stderr summary per run of consecutive decode positions. Unset reads no clocks. |
+| `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | Developer-only diagnostic: `1` lets the gfx1151 `HIPFIRE_GFX1151_PM4_INITIATOR` / `_INTERLEAVE` / `_RESOURCE_LIMITS` knobs apply to gfx1100 too. Unset, gfx1100 keeps its legacy encoding byte for byte. |
+| `HIPFIRE_RAILGUN_SHADOW` | Developer-only railgun M1 shadow: a `railgun-jit-corpus` directory. railgun authors its program next to every Redline recording from the corpus facts and diffs its prepared PM4 lowering against the gfx12 tape; never submitted, route unchanged. See REDLINE.md §5 "railgun shadow diff". |
+| `HIPFIRE_RAILGUN_SHADOW_OUT` | Directory for the shadow's JSON reports (one per prepare). |
+| `HIPFIRE_RAILGUN_INVENTORY` | `railgun-cert recording-inventory json` output; the matched route's recording-dependent decisions go into the shadow report. |
+| `HIPFIRE_RAILGUN_CACHE_TABLE` | railgun M2: a G4 probe `cache-table.<arch>.json` (`cargo run -p railgun --features g4-probe --example g4_probe`). Attaches silicon receipts to the cache-table rows whose tier-D rung the probe ran clean for ≥2²⁰ trials; a row whose own rung the probe saw stale fails the prepare. |
+| `HIPFIRE_RAILGUN_BACKEND` | railgun M2, developer-only: `railgun` makes the gfx12 single-IB prepared tape execute railgun's lowering (needs `HIPFIRE_RAILGUN_SHADOW`); any refusal fails the prepare closed to HIP, never to the Redline planner. |
+| `HIPFIRE_RAILGUN_CHECK` | railgun M2 check mode, developer-only: `off` (default) / `sample(N)` / `always`. Runs the prepared Qwen3.5 PM4 lowering and its HIP twin on the same state and byte-compares every surface: `always` = every live `State` allocation of the `hip_bridge::registry` allocator registry (the immutable `Weights` digested before and after the first checked step of each prepared program), `sample(N)` = one step in N, the program's written allocations only. A difference poisons the route; the twin's result stands. The registry records allocations only while this (or `HIPFIRE_RAILGUN_DIGEST=1`) is set. |
+| `HIPFIRE_RAILGUN_CHECK_OUT` | railgun M2: file receiving one JSON line per replayed step (check result, phase timings, digests). |
+| `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | railgun M2 check-mode negative controls, developer-only: `flip_byte` XORs one byte of one surface into the PM4 arm's result at every checked step, which must come back unequal on exactly that byte (`negative_control.caught` in `HIPFIRE_RAILGUN_CHECK_OUT`); `drop_boundaries` executes railgun's lowering without any mid-segment wait/acquire (with `HIPFIRE_RAILGUN_BACKEND=railgun`), so `HIPFIRE_RAILGUN_CHECK` must report a difference. Never for serving. |
+| `HIPFIRE_RAILGUN_DIGEST` | railgun M2: `1` = after every replayed step, digest every live `State` allocation (paired by allocation order) into `HIPFIRE_RAILGUN_CHECK_OUT`; the G2 third arm compares these between a railgun and a pre-railgun process. |
 | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the daemon emits one post-generate retained-route proof marker per successful request: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n> request_id=<id> replays=<count>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
 
 ### Chat template
@@ -475,7 +486,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1376
+**Count:** 1387
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -764,7 +775,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_SEED_ORACLE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/seed_oracle_collect.sh | developer |
 | `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_DFLASH_TREE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/dflash_generic.rs | experimental |
-| `HIPFIRE_DFLASH_VERIFY_PM4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
+| `HIPFIRE_DFLASH_VERIFY_PM4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-generate/src/redline.rs | developer |
 | `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/src/dflash_slot.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer; `0` (legacy contiguous DFlash) deprecated, removal 0.5.0 |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py | harness |
 | `HIPFIRE_DIR` | .agents/skills/hipfire-autoheal/triage.sh, scripts/ab-dispatch-validation.sh | harness |
@@ -1023,6 +1034,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8` | crates/hipfire-runtime/examples/mq4v2_fused_parity.rs | harness |
 | `HIPFIRE_GFX1100_MQ4_WIDE_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_GFX1100_PACKED_MQ4_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_PM_GEMM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
@@ -1581,6 +1593,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh | harness |
 | `HIPFIRE_QWEN_MTP` | scripts/benchlocal_campaign.py, scripts/serve_harness.py | harness |
 | `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-generate/src/ar.rs | developer |
+| `HIPFIRE_RAILGUN_BACKEND` | crates/rdna-compute/src/replay.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_CACHE_TABLE` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/rdna-compute/src/railgun_check.rs | developer |
+| `HIPFIRE_RAILGUN_CHECK_OUT` | crates/rdna-compute/src/railgun_check.rs | developer |
+| `HIPFIRE_RAILGUN_DIGEST` | crates/hip-bridge/src/registry.rs, crates/rdna-compute/src/railgun_check.rs | developer |
+| `HIPFIRE_RAILGUN_INVENTORY` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | crates/rdna-compute/src/railgun_check.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAILGUN_SHADOW` | crates/rdna-compute/src/railgun_check.rs, crates/rdna-compute/src/replay.rs | developer |
+| `HIPFIRE_RAILGUN_SHADOW_OUT` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RDNA3` | crates/hipfire-runtime/examples/tmp_halo_iu4_calibrate.rs | harness |
@@ -1628,6 +1649,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RDNA3_SIGMOID_ROWS4` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_REAP_PLAN` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-lfm2moe/src/config.rs | developer |
 | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
+| `HIPFIRE_REDLINE_GAP_TIMING` | crates/rdna-compute/src/gap_timing.rs | developer |
 | `HIPFIRE_REDLINE_IB_POOL` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_REDLINE_PM4_PROGRESS` | crates/redline-dispatch/src/aql/replay.rs | developer |
 | `HIPFIRE_REDLINE_POOL_DEBUG` | crates/hipfire-config/src/lib.rs, crates/redline-rocr/src/runtime.rs | experimental |

@@ -66,8 +66,8 @@ use hipfire_generate::batch::{
     lfm_prefill_cancellable_or_fallback,
 };
 use hipfire_generate::redline::{
-    handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4, handle_redline_pm4_prefix_profile,
+    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
+    handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace, handle_redline_pm4_prefix_profile,
     handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
     redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
     redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
@@ -4732,6 +4732,28 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
+                // Railgun G0: one plain-AR token either observed eagerly or
+                // recorded, compared by `scripts/redline_daemon_harness.py --g0`.
+                let g0 = match hipfire_engine::redline::G0Arm::from_request(&msg) {
+                    Ok(g0) => g0,
+                    Err(reason) => {
+                        emit_uncorrelated_error(&mut stdout, None, &reason, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if g0.is_some() && (capture || product_route || iterations != 1) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "g0 requires iterations == 1 and excludes redline_capture/redline_product_route",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if context == 0 || iterations == 0 {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -4763,6 +4785,13 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
+                // Railgun G0: both arms author the same forward, so both prime
+                // from the same GDN requant frame (a host word the forward
+                // consumes: kernarg +76 of gated_delta_net_*). Without this the
+                // arms differ only by how many forwards ran before them.
+                if g0.is_some() {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
@@ -4817,6 +4846,14 @@ fn main() {
                         continue;
                     }
                 }
+                let g0_before = match g0.map(|arm| arm.begin(&mut gpu)).transpose() {
+                    Ok(before) => before,
+                    Err(reason) => {
+                        emit_uncorrelated_error(&mut stdout, None, &reason, "unsupported", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 if product_route {
                     gpu.replay.begin_replay_observation_window();
@@ -4879,6 +4916,17 @@ fn main() {
                 } else {
                     None
                 };
+                let g0_result = match (g0, g0_before) {
+                    (Some(arm), Some(before)) => match arm.finish(&mut gpu, before) {
+                        Ok(value) => Some(value),
+                        Err(reason) => {
+                            emit_uncorrelated_error(&mut stdout, None, &reason, "internal", false, false);
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    _ => None,
+                };
 
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
@@ -4897,6 +4945,9 @@ fn main() {
                     if let Some(summary) = capture_summary {
                         response["redline_capture"] =
                             redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    if let Some(value) = g0_result {
+                        response["g0"] = value;
                     }
                     if product_route {
                         let prepared = gpu.replay.prepared_route_identity().map(|identity| {
@@ -4962,8 +5013,16 @@ fn main() {
                 handle_redline_dflash_verify_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
+            "railgun_g0_dflash_cycle" => {
+                handle_railgun_g0_dflash_cycle(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
             "redline_shadow_aql" | "redline_shadow_pm4" => {
                 handle_redline_shadow(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
+            "redline_greedy_trace" => {
+                handle_redline_greedy_trace(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
             "redline_dispatch_profile" => {

@@ -3000,6 +3000,8 @@ dependencies = [
  "hipfire-config",
  "libloading",
  "radiowave",
+ "railgun",
+ "railgun-corpus",
  "rayon",
  "redline-dispatch",
  "redline-rocr",
