@@ -76,6 +76,9 @@ pub struct FeatureFlags {
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
+    /// MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): combine + shared fold + HC
+    /// write + the next HC read's norm/gate in one row kernel; default off.
+    pub qwen4_hc_row_fold: bool,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
     /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
     pub gfx11_iu4_gridspec: bool,
@@ -679,6 +682,7 @@ impl FeatureFlags {
             qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE").unwrap_or(halo_hyper_default),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(halo_hyper_default),
+            qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(false),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
             gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
@@ -1057,6 +1061,16 @@ impl FeatureFlags {
         self.qwen4_moe_combine_zinit && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// Row fold of the MoE tail (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exact gfx1151,
+    /// on top of the `HIPFIRE_QWEN4_HC_FUSE` >= 3 shared-down route and the
+    /// zero-initialized combine.
+    pub fn qwen4_hc_row_fold_enabled(&self) -> bool {
+        self.qwen4_hc_row_fold
+            && self.arch == "gfx1151"
+            && self.qwen4_hc_fuse_level() >= 3
+            && self.qwen4_moe_combine_zinit_enabled()
+    }
+
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
@@ -1186,6 +1200,7 @@ impl FeatureFlags {
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_moe_combine_zinit: false,
+            qwen4_hc_row_fold: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
             gfx11_iu4_symfold: false,
