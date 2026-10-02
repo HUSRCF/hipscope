@@ -13,7 +13,8 @@ railgun-corpus = { path = "../railgun-corpus" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 
-# GPU examples (`examples/g4_probe.rs`, `--features g4-probe`).
+# GPU examples (`examples/mc_g2.rs`, the MC G2 copies-only gate; `examples/g4_probe.rs`,
+# `--features g4-probe`; `examples/boundary_bench.rs`, `--features boundary-bench`).
 [dev-dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }

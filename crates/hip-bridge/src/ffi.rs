@@ -443,6 +443,8 @@ pub struct HipRuntime {
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
+    /// `hipMemcpyDtoD(dst, src, bytes)` (driver-style device pointers).
+    fn_memcpy_dtod: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32>,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_memset_d32_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
@@ -829,6 +831,12 @@ impl HipRuntime {
                         c_uint,
                         HipStream,
                     ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_dtod: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemcpyDtoD",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_memset: unsafe { load_fn!(
@@ -1829,6 +1837,29 @@ impl HipRuntime {
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         memory_effects::dtod();
         self.check(code, "hipMemcpy D2D")
+    }
+
+    /// `hipMemcpyDtoD(dst, src, size)` on raw device addresses.
+    ///
+    /// # Safety
+    /// `[src, src+size)` and `[dst, dst+size)` must lie in live device
+    /// allocations and must not overlap.
+    pub unsafe fn memcpy_dtod_raw(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+    ) -> HipResult<()> {
+        let f = self.fn_memcpy_dtod.ok_or_else(|| {
+            HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
+        })?;
+        let t = std::time::Instant::now();
+        // SAFETY: the caller guarantees both ranges lie in live, disjoint
+        // device allocations; Rust does not deref device pointers.
+        let code = unsafe { f(dst, src as *mut c_void, size) };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
+        self.check(code, "hipMemcpyDtoD")
     }
 
     #[track_caller]
