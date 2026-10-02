@@ -932,7 +932,7 @@ mod nt {
         for j in 0..nt {
             let slot = 6 + j;
             let b = wg.isa();
-            if j > 0 {
+            if j > 0 && !g.experimental() {
                 let m = MASKT[1];
                 sop(b, format!("s_cmp_gt_u32 s{CNT}, {j}"), &[], &[CNT])?;
                 sop(b, format!("s_cselect_b32 s{m}, -1, 0"), &[m], &[])?;
@@ -983,24 +983,24 @@ mod nt {
 
     /// Tile `j`'s initial activations (epoch 0). An experimental schedule
     /// defines a dead whole tile's fragments (`d` and `x`) with zeros on a
-    /// dead arm instead of loading them: `if_else` takes its else arm when
-    /// SCC holds, so the condition is `cnt <= j`. Tile 0 is always live.
+    /// dead arm instead of loading them. `if_else` branches to the live
+    /// else arm when `cnt > j`; tile 0 is always live.
     fn load_x_init<T: Target>(w: &mut Wave<'_, T, Builder>, g: &G, j: u8) -> Result<(), String> {
         if !g.experimental() || j == 0 { return load_x(w.isa(), g, j, SRD_X[0]); }
-        let dead = w.scmp(Instruction::new(format!("s_cmp_le_u32 s{CNT}, {j}"), vec![], vec![s(CNT)]))?;
+        let live = w.scmp(Instruction::new(format!("s_cmp_gt_u32 s{CNT}, {j}"), vec![], vec![s(CNT)]))?;
         let join = g.label(&format!("pro_x_join{j}"));
-        w.if_else(dead, &g.label(&format!("pro_x_dead{j}")), &join, |w| load_x(w.isa(), g, j, SRD_X[0]), |w| {
+        w.if_else(live, &g.label(&format!("pro_x_live{j}")), &join, |w| {
             let b = w.isa();
             op(b, format!("v_mov_b32_e32 v{}, 0", g.d(j)), &[v(g.d(j))], &[])?;
             for i in 0..g.aw() { op(b, format!("v_mov_b32_e32 v{}, 0", g.x(j) + i), &[v(g.x(j) + i)], &[])?; }
             Ok(())
-        })?;
+        }, |w| load_x(w.isa(), g, j, SRD_X[0]))?;
         w.label(&join)
     }
 
     /// Fold weight set `p` into every live tile's sums; with `reload`, each
     /// tile's next-epoch activations are issued (through that descriptor)
-    /// right after its fold, live or dead.
+    /// right after its fold; experimental schedules skip dead whole tiles.
     fn compute<T: Target + peacemaker_author::MmaIu4>(w: &mut Wave<'_, T, Builder>, g: &G, p: usize, site: &str, reload: Option<u8>) -> Result<(), String> {
         let b = w.isa();
         let a = g.arch();
