@@ -7922,17 +7922,9 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
     let body = QWEN35_FA_PREP_GFX1100_SRC
-        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;")
-        .replace(
-            "out[tid] = x0 * cos_a - x1 * sin_a;",
-            "out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));",
-        )
-        .replace(
-            "out[tid + HALF] = x0 * sin_a + x1 * cos_a;",
-            "out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);",
-        );
+        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");
     assert_eq!(body.matches("__builtin_fmaf").count(), 2);
-    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n{body}")
+    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n#define HIPFIRE_FA_PREP_EXACT_ROPE 1\n{body}")
 }
 pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
     static SRC: std::sync::LazyLock<String> =

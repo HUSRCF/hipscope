@@ -24,8 +24,6 @@
 
 use rdna_compute::{Gpu, GpuTensor};
 
-const NQ: usize = 24;
-const NK: usize = 4;
 const HD: usize = 256;
 const NROT: usize = 64;
 const EPS: f32 = 1e-6;
@@ -70,6 +68,22 @@ fn qwen36_27b_fa_prep_matches_unfused_chain_bit_for_bit() {
         eprintln!("skip: {} does not admit the 24Q/4K FA prep fusion", gpu.arch);
         return;
     }
+    check_prep(&mut gpu, 24, 4);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn qwen35_16q2k_fa_prep_matches_unfused_chain_bit_for_bit() {
+    let mut gpu = Gpu::init().expect("gpu init");
+    if !(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151()) {
+        eprintln!("skip: {} is not a corrected gfx11 twin", gpu.arch);
+        return;
+    }
+    check_prep(&mut gpu, 16, 2);
+}
+
+#[allow(non_snake_case)]
+fn check_prep(mut gpu: &mut Gpu, NQ: usize, NK: usize) {
     let alloc = |gpu: &mut Gpu, n: usize| gpu.upload_f32(&vec![0.0; n], &[n]).unwrap();
     let mut seed = 0x5eed_fa27;
     let q_full = alloc(&mut gpu, NQ * 2 * HD);
