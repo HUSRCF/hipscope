@@ -845,3 +845,7 @@ required-features = ["lab"]
 [[example]]
 name = "bench_qsa_indexed"
 required-features = ["lab"]
+
+[[example]]
+name = "qsa_pm_check"
+required-features = ["lab"]

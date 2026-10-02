@@ -4130,6 +4130,14 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// Certified builder module of the gathered QSA prefill attention
+/// (`hipfire-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
+/// the F16 K / block-transposed V producer and the gathered F16 WMMA
+/// attention, with the ABI, grid, LDS and output bytes of
+/// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
+/// Opt-in through `HIPFIRE_QWEN4_QSA_PM=1`.
+pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
+pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
 pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
