@@ -9100,12 +9100,11 @@ mod tests {
 
     #[test]
     fn prepared_grid_rejects_oversized_yz_on_gfx1201_only() {
-        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_535, 1]).is_ok());
-        assert!(check_prepared_grid("gfx1201", "k.kd", [1 << 20, 1, 65_535]).is_ok());
-        let err = check_prepared_grid("gfx1201", "k.kd", [7, 65_536, 1]).unwrap_err();
-        assert!(err.starts_with("k.kd: ") && err.contains("grid.y=65536"), "{err}");
-        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_536]).is_err());
-        assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_536, 65_536]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_536, 1]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [1 << 20, 1, 65_536]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_537, 1]).is_err());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_537]).is_err());
+        assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_537, 65_537]).is_ok());
     }
 
     #[test]

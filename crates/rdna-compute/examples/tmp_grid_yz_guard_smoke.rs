@@ -5,10 +5,10 @@
 //! THROWAWAY smoke (not permanent wiring): gfx1201 grid.y/grid.z launch guard.
 //!
 //! Real-GPU proof of the `hip-bridge` fail-closed guard through the public
-//! `Gpu::launch_kernel_blob` entry:
-//!   * grid `[1,65535,1]` and `[1,1,65535]` launch and write every expected
+//! `HipRuntime::launch_kernel_blob` entry via `Gpu::hip`:
+//!   * grid `[1,65536,1]` and `[1,1,65536]` launch and write every expected
 //!     word (a canary word past the last row stays untouched);
-//!   * grid `[1,65536,1]` and `[1,1,65536]` return `HipError` (code 1, message
+//!   * grid `[1,65537,1]` and `[1,1,65537]` return `HipError` (code 1, message
 //!     names the axis and value) BEFORE the device sees them: the output
 //!     buffer stays all-zero after a device sync.
 //!
@@ -28,6 +28,7 @@ use std::ffi::c_void;
 
 const NAME: &str = "tmp_grid_yz_guard_smoke";
 const SRC: &str = r#"
+#include <hip/hip_runtime.h>
 extern "C" __global__ void tmp_grid_yz_guard_smoke(unsigned int* out, int rows) {
     unsigned int idx = blockIdx.z * gridDim.y + blockIdx.y;
     if ((int)idx < rows) {
@@ -36,8 +37,8 @@ extern "C" __global__ void tmp_grid_yz_guard_smoke(unsigned int* out, int rows) 
 }
 "#;
 
-/// 65535 rows written; word 65535 is the canary that must stay zero.
-const ROWS: usize = 65_535;
+/// 65536 rows written; word 65536 is the canary that must stay zero.
+const ROWS: usize = 65_536;
 const WORDS: usize = ROWS + 1;
 
 fn words(bytes: &[u8]) -> Vec<u32> {
@@ -75,8 +76,8 @@ fn main() {
         }
     };
 
-    // Boundary acceptance: y = 65535, z = 1 and y = 1, z = 65535.
-    for grid in [[1u32, 65_535, 1], [1, 1, 65_535]] {
+    // Boundary acceptance: y = 65536, z = 1 and y = 1, z = 65536.
+    for grid in [[1u32, 65_536, 1], [1, 1, 65_536]] {
         let (r, w) = run(&mut gpu, grid);
         check(r.is_ok(), &format!("{grid:?} launch accepted ({r:?})"));
         let rows_ok = (0..ROWS).all(|i| w[i] == (0xA500_0000u32 ^ i as u32));
@@ -85,7 +86,7 @@ fn main() {
     }
 
     // Oversized rejection: error before the device, output never touched.
-    for (grid, axis) in [([1u32, 65_536, 1], "grid.y=65536"), ([1, 1, 65_536], "grid.z=65536")] {
+    for (grid, axis) in [([1u32, 65_537, 1], "grid.y=65537"), ([1, 1, 65_537], "grid.z=65537")] {
         let (r, w) = run(&mut gpu, grid);
         match r {
             Ok(()) => check(false, &format!("{grid:?} must be rejected but launched")),

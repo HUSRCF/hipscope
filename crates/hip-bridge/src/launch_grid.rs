@@ -4,12 +4,11 @@
 
 //! Fail-closed launch-grid guard.
 //!
-//! `hipModuleLaunchKernel` on gfx1201 (RDNA4) rejects any launch whose
-//! `gridDim.y` or `gridDim.z` is >= 65536 (measured on raw HIP: <= 65535
-//! launches, >= 65536 fails). `gridDim.x` is not bound. The failure only shows
-//! up at submission, which is too late for the graph-capture / replay-record
-//! tapes: a rejected geometry must be refused *before* it is recorded or
-//! captured so the tapes can never hold a launch HIP will not run.
+//! gfx1201 (RDNA4) presents 16-bit y/z workgroup IDs. Raw module-launch
+//! measurements show that 65536 workgroups execute all IDs 0..65535, while
+//! larger launches succeed but wrap those IDs, leaving higher rows unwritten.
+//! Reject unsafe geometry before graph capture or replay recording; do not
+//! rely on the module-launch API to reject it. This policy does not bound x.
 //!
 //! The limit is applied only to architectures with measured evidence
 //! ([`grid_yz_limit_for_arch`]); every other architecture keeps its historic
@@ -21,8 +20,8 @@
 
 use crate::error::{HipError, HipResult};
 
-/// Largest `gridDim.y` / `gridDim.z` raw HIP accepts on gfx1201.
-pub const GFX1201_MAX_GRID_YZ: u32 = 65_535;
+/// Largest y/z workgroup count that preserves every workgroup ID on gfx1201.
+pub const GFX1201_MAX_GRID_YZ: u32 = 65_536;
 
 /// `hipErrorInvalidValue`.
 const HIP_ERROR_INVALID_VALUE: u32 = 1;
@@ -64,27 +63,19 @@ mod tests {
     #[test]
     fn gfx1201_accepts_boundary_and_rejects_next() {
         let limit = grid_yz_limit_for_arch("gfx1201");
-        assert_eq!(limit, Some(65_535));
-        assert!(check_launch_grid([1, 65_535, 1], limit).is_ok());
-        assert!(check_launch_grid([1, 1, 65_535], limit).is_ok());
-        assert!(check_launch_grid([u32::MAX, 65_535, 65_535], limit).is_ok());
-        let y = check_launch_grid([8, 65_536, 1], limit).unwrap_err();
-        assert!(y.message.contains("grid.y=65536"), "{}", y.message);
-        let z = check_launch_grid([8, 1, 65_536], limit).unwrap_err();
-        assert!(z.message.contains("grid.z=65536"), "{}", z.message);
-    }
-
-    #[test]
-    fn grid_x_is_not_bound() {
-        let limit = grid_yz_limit_for_arch("gfx1201");
-        assert!(check_launch_grid([1 << 20, 1, 1], limit).is_ok());
+        assert!(check_launch_grid([1, 65_536, 1], limit).is_ok());
+        assert!(check_launch_grid([1, 1, 65_536], limit).is_ok());
+        assert!(check_launch_grid([u32::MAX, 65_536, 65_536], limit).is_ok());
+        let y = check_launch_grid([8, 65_537, 1], limit).unwrap_err();
+        assert_eq!(y.code, HIP_ERROR_INVALID_VALUE);
+        let z = check_launch_grid([8, 1, 65_537], limit).unwrap_err();
+        assert_eq!(z.code, HIP_ERROR_INVALID_VALUE);
     }
 
     #[test]
     fn other_architectures_are_unguarded() {
         for arch in ["gfx1100", "gfx1200", "gfx1151", "gfx942", "gfx1010"] {
-            assert_eq!(grid_yz_limit_for_arch(arch), None, "{arch}");
+            assert!(check_launch_grid([1, 70_000, 70_000], grid_yz_limit_for_arch(arch)).is_ok());
         }
-        assert!(check_launch_grid([1, 1 << 20, 1 << 20], None).is_ok());
     }
 }
