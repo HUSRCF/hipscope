@@ -2882,6 +2882,10 @@ pub const MOE_TOPK_RENORM_TOP10_BATCHED_SRC: &str =
 /// source so widening the new grammar cannot change legacy dispatch.
 pub const MOE_ROUTER_SOFTMAX_TOP10_F32_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_top10_f32.hip");
+/// Wave-per-token build of the router above (`HIPFIRE_QWEN4_ROUTER_FAST`,
+/// gfx1151); byte-identical outputs.
+pub const MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip");
 /// Qwen4 qt=53 (MQ4G128V2) activation transform.  This is deliberately
 /// separate from the legacy 72-byte MQ4G128 route: the source codec uses a
 /// 68-byte row stride and permits a ragged final logical group.

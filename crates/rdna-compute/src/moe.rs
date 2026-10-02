@@ -1807,8 +1807,24 @@ impl Gpu {
         round_logits: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const FUNC: &str = "moe_router_softmax_top10_f32";
-        self.ensure_kernel(FUNC, kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_SRC, FUNC)?;
+        // `HIPFIRE_QWEN4_ROUTER_FAST` (exact gfx1151): eager batched calls take
+        // the wave-per-token kernel, bytewise the same outputs; decode (one
+        // token), recording and graph capture keep the incumbent symbol.
+        let fast = tokens > 1
+            && self.flags.qwen4_router_fast_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        let func: &str = if fast {
+            "moe_router_softmax_top10_f32_fast"
+        } else {
+            "moe_router_softmax_top10_f32"
+        };
+        let src = if fast {
+            kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC
+        } else {
+            kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_SRC
+        };
+        self.ensure_kernel(func, src, func)?;
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
@@ -1816,6 +1832,7 @@ impl Gpu {
         let kt = 10i32;
         let norm = i32::from(normalize_topk_prob);
         let round = i32::from(round_logits);
+        let token_count = tokens as i32;
         let mut params = [
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -1824,15 +1841,18 @@ impl Gpu {
             &kt as *const _ as *mut c_void,
             &norm as *const _ as *mut c_void,
             &round as *const _ as *mut c_void,
+            &token_count as *const _ as *mut c_void,
         ];
+        let params = if fast { &mut params[..] } else { &mut params[..7] };
         let bytes = (tokens * 512 + tokens * 10 * 2) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        let grid = if fast { tokens.div_ceil(8) } else { tokens } as u32;
         let result = self.launch_maybe_blob(
-            FUNC,
-            [tokens as u32, 1, 1],
+            func,
+            [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
+            params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(lp);
@@ -1842,6 +1862,9 @@ impl Gpu {
                 b.push_i32(kt);
                 b.push_i32(norm);
                 b.push_i32(round);
+                if fast {
+                    b.push_i32(token_count);
+                }
                 b
             },
         );
