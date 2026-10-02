@@ -206,7 +206,7 @@ fn control(name:&str,i:&Inst,s:&mut State,k:&Kernel)->Result<()> {
         add("s_mov_b32",vec![s(4),Operand::Literal(0x10000)]);
         add("s_mov_b32",vec![s(5),Operand::Literal(0)]);
         add("s_mov_b32",vec![s(6),Operand::Literal(256)]);
-        add("s_mov_b32",vec![s(7),Operand::Literal(3<<28)]);
+        add("s_mov_b32",vec![s(7),Operand::Literal(0x3100_4000)]);
         add("v_lshlrev_b32_e32",vec![v(1),Operand::Inline(InlineConst::Integer(2)),v(0)]);
         add("v_readfirstlane_b32",vec![s(0),v(0)]);
         add("s_cmp_lt_u32",vec![s(0),Operand::Inline(InlineConst::Integer(32))]);
@@ -261,7 +261,7 @@ fn control(name:&str,i:&Inst,s:&mut State,k:&Kernel)->Result<()> {
     }
     // A raw b64 access straddling NUM_RECORDS bounds is checked per DWORD.
     #[test] fn raw_buffer_zeroes_oob_dword_and_drops_store() {
-        let mut st=state();st.exec=1;st.s[4]=0x1000;st.s[6]=4;st.s[7]=3<<28;
+        let mut st=state();st.exec=1;st.s[4]=0x1000;st.s[6]=4;st.s[7]=0x3100_4000;
         let args=vec![reg(Kind::V,0,2),v(2),reg(Kind::S,4,4),Operand::Special(Special::Null),Operand::Vmem(crate::operand::VmemToken::Offen)];
         let mut mem=Memory::default();mem.map("input".into(),0x1000,0x12345678u32.to_le_bytes().to_vec()).unwrap();
         memory::execute("buffer_load_b64",&insn("buffer_load_b64",args),&mut st,&mut mem,&mut []).unwrap();

@@ -39,6 +39,20 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         Operand::Inline(_) | Operand::Literal(_) => {}
         other => return Err(format!("{name}: unsupported C source {other:?}")),
     }
+    if !gfx12 {
+        // RDNA3 requires the A/B fragments replicated across lanes 0..15 and 16..31;
+        // divergent halves are out of contract, so reject them before any gather.
+        for (role, op, regs) in [("A", &o[1], a_regs), ("B", &o[2], b_regs)] {
+            for vgpr in 0..usize::from(regs) {
+                for lane in 0..16 {
+                    let (lo, hi) = (s.read(op, lane, vgpr)?, s.read(op, lane + 16, vgpr)?);
+                    if lo != hi {
+                        return Err(format!("{name}: gfx11 {role} fragment VGPR {vgpr} lane {lane} ({lo:#010x}) differs from replica lane {} ({hi:#010x})", lane + 16));
+                    }
+                }
+            }
+        }
+    }
 
     let mut out = [[0u32; 32]; 8];
     match shape {
@@ -123,7 +137,7 @@ fn vgprs(op: &Operand, want: u8, role: &str) -> Result<()> {
 }
 
 /// F16 A[r,k] / B[k,n] (`idx` = r or n) -> (lane, VGPR, half). gfx11 replicates
-/// the fragment in lanes 16..31; the low copy is the one read.
+/// the fragment in lanes 16..31 (validated in `execute`); the low copy is read.
 fn f16_loc(arch: Arch, idx: usize, k: usize) -> (usize, usize, usize) {
     if arch == Arch::Gfx1201 { (((k >> 2) & 1) * 16 + idx, (k >> 3) * 2 + ((k >> 1) & 1), k & 1) } else { (idx, k >> 1, k & 1) }
 }
@@ -214,7 +228,8 @@ fn acc_loc(arch: Arch, row: usize, col: usize) -> (usize, usize) {
     #[test] fn gfx11_iu4_fragments_and_signedness() {
         let run = |neg_lo: u8| {
             let mut st = state();
-            put_nib(&mut st, A, 1, 3, 2, 0xe); put_nib(&mut st, B, 1, 6, 2, 3);
+            for lane in [3, 19] { put_nib(&mut st, A, 1, lane, 2, 0xe); }
+            for lane in [6, 22] { put_nib(&mut st, B, 1, lane, 2, 3); }
             st.v[usize::from(C) + 1][22] = 100;
             let i = insn(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4", [reg(D, 8), reg(A, 2), reg(B, 2), reg(C, 8)], mods(neg_lo, 0));
             execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4", &i, &mut st).unwrap();
@@ -223,6 +238,41 @@ fn acc_loc(arch: Arch, row: usize, col: usize) -> (usize, usize) {
         assert_eq!(run(3), 94);  // 0xe signed = -2; -2*3 + 100
         assert_eq!(run(2), 142); // A unsigned 14, B signed 3
         assert_eq!(run(0), 142);
+    }
+
+    #[test] fn gfx11_divergent_replicas_are_hard_errors() {
+        let f16 = |a_hi: bool, b_hi: bool, exec: u32| {
+            let mut st = state(); st.exec = exec;
+            for lane in [5, 21] { put_half(&mut st, A, 6, lane, 1, 0x4200); }
+            for lane in [7, 23] { put_half(&mut st, B, 6, lane, 1, 0x4000); }
+            if a_hi { st.v[usize::from(A) + 7][31] ^= 1; }
+            if b_hi { st.v[usize::from(B)][16] ^= 0x8000; }
+            let i = insn(Arch::Gfx1151, "v_wmma_f32_16x16x16_f16", [reg(D, 8), reg(A, 8), reg(B, 8), reg(C, 8)], mods(0, 0));
+            let r = execute(Arch::Gfx1151, "v_wmma_f32_16x16x16_f16", &i, &mut st);
+            (r, st)
+        };
+        assert!(f16(false, false, u32::MAX).0.is_ok());
+        assert!(f16(false, false, 0).0.is_ok());
+        for exec in [u32::MAX, 0] {
+            for (a, b) in [(true, false), (false, true), (true, true)] {
+                let (r, st) = f16(a, b, exec);
+                assert!(r.is_err(), "a={a} b={b} exec={exec:#x}");
+                assert!(st.v[..8].iter().all(|row| row.iter().all(|&w| w == 0)), "D written despite error");
+            }
+        }
+        let iu4 = |a_hi: bool, b_hi: bool, exec: u32| {
+            let mut st = state(); st.exec = exec;
+            for lane in [3, 19] { put_nib(&mut st, A, 1, lane, 2, 0xe); }
+            for lane in [6, 22] { put_nib(&mut st, B, 1, lane, 2, 3); }
+            if a_hi { put_nib(&mut st, A, 0, 31, 7, 1); }
+            if b_hi { put_nib(&mut st, B, 1, 16, 0, 1); }
+            let i = insn(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4", [reg(D, 8), reg(A, 2), reg(B, 2), reg(C, 8)], mods(3, 0));
+            execute(Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4", &i, &mut st)
+        };
+        assert!(iu4(false, false, 0).is_ok());
+        for exec in [u32::MAX, 0] {
+            for (a, b) in [(true, false), (false, true)] { assert!(iu4(a, b, exec).is_err(), "a={a} b={b} exec={exec:#x}"); }
+        }
     }
 
     // gfx12 K32 A[3,26]: k=0b11010 -> nibble 2, lane group 1 => lane 19, VGPR 1. B[26,6]: lane 22.

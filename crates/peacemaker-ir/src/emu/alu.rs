@@ -626,7 +626,10 @@ fn cvt_pk_f32_fp8(i: &Inst, s: &mut State) -> Result<()> {
 /// `v_permlane16_b32` / `v_permlanex16_b32`. OPSEL[0] is fetch-inactive, OPSEL[1] bound
 /// control: an inactive source lane disables the write, reads zero (BC) or is read (FI).
 fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    let o = &i.operands;
+    let (o, m) = (&i.operands, &i.mods);
+    if m.abs | m.neg != 0 || m.omod != Omod::None || m.clamp || m.op_sel & 0b1100 != 0 {
+        return Err(format!("{name}: abs/neg/omod/clamp and OPSEL[2]/OPSEL[3] are not modeled (only OPSEL[0]=FI, OPSEL[1]=BC)"));
+    }
     let sel = u64::from(s.read(&o[2], 0, 0)?) | (u64::from(s.read(&o[3], 0, 0)?) << 32);
     let cross = name == "v_permlanex16_b32";
     let mut vals = [None; 32];
@@ -1072,6 +1075,58 @@ mod tests {
         run("v_dual_mul_f32", &i, &mut st).unwrap();
         assert_eq!((st.v[0][0], st.v[1][0]), (12f32.to_bits(), 2.5f32.to_bits()), "X=v1*v2 and Y=old v0+v3");
         assert_eq!((st.v[0][1], st.v[1][1]), (2f32.to_bits(), 3f32.to_bits()), "inactive lane untouched");
+    }
+
+    // Permlane supports only FI=OPSEL[0] and BC=OPSEL[1]; every other modifier errors, even with EXEC=0.
+    #[test]
+    fn permlane_rejects_unsupported_modifiers_and_reserved_opsel() {
+        // gfx12 has no v_permlane16_b32: build it from the gfx1100 table, with SGPR selectors.
+        for (name, arch) in [("v_permlane16_b32", Arch::Gfx1100), ("v_permlanex16_b32", Arch::Gfx1201)] {
+            let (table, ops) = if arch == Arch::Gfx1100 {
+                (crate::isa::gfx1100(), vec![v(0), v(1), reg(Kind::S, 0, 1), reg(Kind::S, 1, 1)])
+            } else {
+                (crate::isa::gfx12(), vec![v(0), v(1), lit(0x76543210), lit(0xfedcba98)])
+            };
+            let r = table.iter().find(|r| r.name == name).unwrap();
+            let base = Inst::from_parts(arch, r.op, r.form, Default::default(), ops.into_iter().collect(), Default::default(), None, Default::default()).unwrap();
+            let fresh = || {
+                let mut st = state();
+                st.s[0] = 0x7654_3210;
+                st.s[1] = 0xfedc_ba98;
+                for l in 0..32 {
+                    st.v[1][l] = 100 + l as u32;
+                }
+                st
+            };
+            let run = |i: &Inst, s: &mut State| execute(arch, name, i, s);
+            let mut legal=base.clone();legal.mods.op_sel=3;
+            let mut st=fresh();run(&legal,&mut st).unwrap();
+            for lane in 0..32 {
+                let source=if name=="v_permlanex16_b32"{lane^16}else{lane};
+                assert_eq!(st.v[0][lane],100+source as u32,"{name} FI+BC lane {lane}");
+            }
+            let bad: [(&str, fn(&mut Inst)); 8] = [
+                ("abs", |i| i.mods.abs = 1),
+                ("neg", |i| i.mods.neg = 0b100),
+                ("omod", |i| i.mods.omod = Omod::Mul2),
+                ("clamp", |i| i.mods.clamp = true),
+                ("op_sel[2]", |i| i.mods.op_sel = 0b0100),
+                ("op_sel[3]", |i| i.mods.op_sel = 0b1000),
+                ("op_sel[3]+FI", |i| i.mods.op_sel = 0b1001),
+                ("op_sel[2]+BC", |i| i.mods.op_sel = 0b0110),
+            ];
+            for (what, apply) in bad {
+                for exec in [u32::MAX, 0] {
+                    let mut i = base.clone();
+                    apply(&mut i);
+                    let mut st = fresh();
+                    st.exec = exec;
+                    let before = st.v[0];
+                    assert!(run(&i, &mut st).is_err(), "{name}: {what} exec {exec:#x} must error");
+                    assert_eq!(st.v[0], before, "{name}: {what} must not write");
+                }
+            }
+        }
     }
 
     // Input neg/abs apply abs first; OMOD then CLAMP; -0 clamps to +0 and -0*OMOD = +0.

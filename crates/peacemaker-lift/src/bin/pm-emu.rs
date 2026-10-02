@@ -23,6 +23,8 @@ fn replay(dir:&Path,selection:&[[u32;3]])->Result<u64>{
     let program=peacemaker_lift::lift_object(&code,peacemaker_lift::Options{frontend:Frontend::Builder}).map_err(|e|e.to_string())?.program;
     let arch=format!("{:?}",program.target.arch).to_lowercase();if arch!=text(&manifest,"arch")?{return Err("manifest target differs from ELF".into());}
     let symbol=text(&manifest,"symbol")?;let grid=triple(&manifest,"grid_wg")?;let block=triple(&manifest,"block")?;let dynamic_lds=uint(&manifest,"dynamic_lds")?;
+    let workgroups=if selection.is_empty(){grid.iter().map(|&n|u128::from(n)).product::<u128>()}else{selection.len()as u128};
+    println!("{}\t{}\tcoverage={}\tworkgroups={}\tgrid={grid:?}",dir.display(),symbol,if selection.is_empty(){"full-grid/all-buffer-bytes"}else{"coverage-limited/selected-written-bytes"},workgroups);
     let mut memory=Memory::default();
     let buffers=manifest["buffers"].as_array().ok_or("missing buffers")?;
     for b in buffers {
