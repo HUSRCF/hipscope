@@ -3249,6 +3249,17 @@ pub enum ReplayState {
     Fallback,
 }
 
+/// One launch seen by the G0 eager arm: the eager branch's kernel, geometry
+/// and exact padded kernarg bytes (the same bytes a recording would keep).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct G0Launch {
+    pub kernel: String,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+    pub kernarg: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedHipLaunch {
     pub kernel: String,
@@ -4675,6 +4686,10 @@ pub struct ReplayController {
     window_effects: MemoryEffects,
     /// Shadow-only executor override for the next eligible forward.
     shadow_body_route: Option<ShadowBodyRoute>,
+    /// G0 recording-invariance eager arm (railgun design §5 G0): `Some`
+    /// while every funnel launch is observed with `is_recording()` false, so
+    /// recording-dependent predicates take their eager branch.
+    g0_observation: Option<Vec<G0Launch>>,
 }
 
 /// Which executor the retained body uses on the next eligible forward.
@@ -4758,6 +4773,7 @@ impl ReplayController {
             binding_refresh_pending: false,
             window_effects_base: MemoryEffects::default(),
             window_effects: MemoryEffects::default(),
+            g0_observation: None,
         }
     }
 
@@ -5022,6 +5038,52 @@ impl ReplayController {
 
     pub fn is_recording(&self) -> bool {
         self.state == ReplayState::RecordingWarmup && self.forward_eligible
+    }
+
+    /// Start the G0 eager arm (railgun design §5 G0). Launches through the
+    /// recorder funnels are observed (kernel, geometry, exact kernarg bytes)
+    /// while [`Self::is_recording`] stays false, so every recording-dependent
+    /// predicate takes its eager branch. Refused while a recording is live.
+    pub fn begin_g0_observation(&mut self) -> Result<(), &'static str> {
+        if self.is_recording() {
+            return Err("G0 observation cannot overlap a replay recording");
+        }
+        if self.g0_observation.is_some() {
+            return Err("G0 observation is already active");
+        }
+        self.g0_observation = Some(Vec::new());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn is_g0_observing(&self) -> bool {
+        self.g0_observation.is_some()
+    }
+
+    pub(crate) fn observe_g0_launch(
+        &mut self,
+        kernel: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg: &[u8],
+    ) {
+        if let Some(launches) = self.g0_observation.as_mut() {
+            launches.push(G0Launch {
+                kernel: kernel.to_owned(),
+                grid,
+                block,
+                shared_mem,
+                kernarg: kernarg.to_vec(),
+            });
+        }
+    }
+
+    /// Close the G0 eager arm and return the observed launches.
+    pub fn finish_g0_observation(&mut self) -> Result<Vec<G0Launch>, &'static str> {
+        self.g0_observation
+            .take()
+            .ok_or("no G0 observation is active")
     }
 
     /// Apply the model's one-shot plain-AR eligibility decision to this
@@ -6325,6 +6387,9 @@ impl ReplayController {
             ReplayState::Fallback => return Err("replay controller is in sticky fallback"),
             ReplayState::Ready => return Err("cannot capture after a prepared plan is installed"),
             _ => {}
+        }
+        if self.g0_observation.is_some() {
+            return Err("cannot capture during a G0 observation");
         }
         self.recorded.clear();
         self.radiowave_effect_launches = 0;
@@ -9970,6 +10035,31 @@ mod tests {
         controller.observe_shadow(passing(2.0));
         assert_eq!(controller.state(), ReplayState::Fallback);
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn g0_observation_keeps_the_eager_branch_and_excludes_recording() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_g0_observation().unwrap();
+        // The eager arm must not look like a recording to any predicate, and
+        // a recording cannot start underneath it.
+        assert!(!controller.is_recording());
+        assert!(controller.begin_capture().is_err());
+        assert!(controller.begin_g0_observation().is_err());
+        controller.observe_g0_launch("a", [1, 2, 3], [32, 1, 1], 0, &[1, 2]);
+        controller.observe_g0_launch("b", [4, 1, 1], [64, 1, 1], 128, &[3]);
+        // Observed launches never enter the replay tape.
+        assert!(controller.recorded_launches().is_empty());
+        let seen = controller.finish_g0_observation().unwrap();
+        assert_eq!(
+            seen.iter().map(|l| (l.kernel.as_str(), l.grid, l.shared_mem, l.kernarg.clone())).collect::<Vec<_>>(),
+            vec![("a", [1, 2, 3], 0, vec![1, 2]), ("b", [4, 1, 1], 128, vec![3])]
+        );
+        assert!(controller.finish_g0_observation().is_err());
+
+        controller.begin_capture().unwrap();
+        assert!(controller.is_recording());
+        assert!(controller.begin_g0_observation().is_err());
     }
 
     #[test]

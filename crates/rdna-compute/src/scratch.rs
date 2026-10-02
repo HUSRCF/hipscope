@@ -370,8 +370,9 @@ pub(crate) fn module_load_or_recompile(
 }
 
 /// Launch a kernel, routing through the blob path when graph capture, replay
-/// recording, or force_blob is active. Shared between `Gpu::launch_maybe_blob`
-/// and `ScratchState` methods so the branching logic stays in one place.
+/// recording, a G0 observation, or force_blob is active. Shared between
+/// `Gpu::launch_maybe_blob` and `ScratchState` methods so the branching logic
+/// stays in one place.
 ///
 /// Invariant: for any body, `capture_blobs.len()` after a HipGraph capture
 /// equals `replay.recorded_launches().len()` after a ReplayController capture.
@@ -396,9 +397,16 @@ pub(crate) fn launch_maybe_blob(
     hip.validate_launch_grid(grid)
         .map_err(|e| e.with_kernel(func_name))?;
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
-    let result: HipResult<()> = if record || capture_mode || force_blob_path {
+    let observe = replay.as_ref().is_some_and(|r| r.is_g0_observing());
+    let result: HipResult<()> = if record || observe || capture_mode || force_blob_path {
         let mut blob = blob_builder();
         blob.pad_to(16);
+        if observe {
+            replay
+                .as_mut()
+                .unwrap()
+                .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+        }
         if record {
             // Single decision point for how a launch is recorded: the artifact
             // alias table and the record shape are shared with

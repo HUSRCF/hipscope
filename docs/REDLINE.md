@@ -465,6 +465,40 @@ Section 7 ledger. The diagnostic commands above still do **not** emit that full
 ledger; use the product bench (or the Golden wrapper around it) for certification
 evidence.
 
+### Recording-invariance diagnostic (railgun G0)
+
+A tape records the kernels chosen while `is_recording()` is true; an ordinary
+forward runs the eager branch of every recording-dependent predicate. The
+inventory of those predicates is `railgun-cert recording-inventory
+markdown|json` (`crates/railgun-cert/src/recording.rs`); its source scan fails
+`cargo test -p railgun-cert` when a new `is_recording()`/`capture_mode`-style
+check has no inventory row. The G0 gate runs one forward both ways in the same
+process and compares the launch sequences:
+
+- `bench_decode` with `"g0": "observe" | "record"` (`iterations == 1`):
+  `observe` brackets the token with `ReplayController::begin_g0_observation`
+  (every funnel launch is copied, `is_recording()` stays false), `record`
+  with a manual capture. The response's `g0` object carries the sequence
+  (kernel, grid, block, shared memory, exact kernarg bytes) and the HIP
+  launch/copy counter deltas, so a launch that bypasses the funnels is
+  visible in either arm. DeepSeek4 supports the same field.
+- `railgun_g0_dflash_cycle` with `g0` and `context_tokens`: one served DFlash
+  acceptance window (`Speculator::step`: draft + verify + commit) after a
+  synthetic prefill. Requires `HIPFIRE_VERIFY_GRAPH=0` and refuses
+  `HIPFIRE_DFLASH_VERIFY_PM4=1`.
+
+```bash
+cargo run --release -p railgun-cert -- recording-inventory json > .redline-work/g0/inventory.json
+HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
+python3 scripts/redline_daemon_harness.py --model "$MODEL" --max-seq 16384 \
+  --g0 --inventory .redline-work/g0/inventory.json --out .redline-work/g0/decode.json
+```
+
+Add `--dflash-cycle --draft "$DRAFT"` for the DFlash cycle. A difference passes
+only when every kernel involved is attributed to a `byte_exact` inventory
+decision of the matching effect; G0 is diagnostic evidence, and G2 arm 3
+remains the byte-exactness proof.
+
 ### Steady-state dispatch profiler (attribution-only diagnostic)
 
 `python3 -m tools.redline.dispatch_profile` is a **named manual diagnostic** for

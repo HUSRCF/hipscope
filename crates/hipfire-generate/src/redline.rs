@@ -29,7 +29,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_engine::redline::{
     redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash, RedlineRegionHash,
+    redline_capture_json, redline_hash, G0Arm, RedlineRegionHash,
 };
 use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::LoadedModel;
@@ -1170,6 +1170,12 @@ pub fn redline_bench_decode_deepseek4(
     if capture && product_route {
         return Err("redline_capture and redline_product_route are mutually exclusive".to_string());
     }
+    let g0 = G0Arm::from_request(msg)?;
+    if g0.is_some() && (capture || product_route || iterations != 1) {
+        return Err(
+            "g0 requires iterations == 1 and excludes redline_capture/redline_product_route".to_string(),
+        );
+    }
     if context == 0 || iterations == 0 {
         return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
     }
@@ -1192,10 +1198,11 @@ pub fn redline_bench_decode_deepseek4(
         .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
     loaded.seq_pos = context;
 
-    if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+    if capture || g0.is_some() || (product_route && gpu.replay.prepared_route_identity().is_some()) {
         // Manual capture and prepared product routes are already warm paths.
         // The first product warmup must still materialize lazy allocations and
         // record the route; later requests replay from their first timed token.
+        // Both G0 arms run the same warm body so only the recording differs.
         bundle.state.ar_forward_warmed_up = true;
     }
     if capture {
@@ -1203,21 +1210,29 @@ pub fn redline_bench_decode_deepseek4(
             .begin_capture()
             .map_err(|reason| format!("redline decode capture refused: {reason}"))?;
     }
+    let g0_before = g0.map(|arm| arm.begin(gpu)).transpose()?;
 
     if product_route {
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())?;
+    let settled = gpu.hip.device_synchronize().map_err(|error| error.to_string());
     let started = Instant::now();
-    redline_run_deepseek4_decode(gpu, bundle, context, iterations)
-        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())?;
+    let run = settled
+        .and_then(|()| {
+            redline_run_deepseek4_decode(gpu, bundle, context, iterations)
+                .map_err(|error| format!("bench_decode forward failed: {error}"))
+        })
+        .and_then(|()| gpu.hip.device_synchronize().map_err(|error| error.to_string()));
     let elapsed = started.elapsed().as_secs_f64();
+    // A G0 arm is always closed, so a failed forward cannot leave the
+    // controller observing (or recording) every later launch.
+    let g0_result = match (g0, g0_before) {
+        (Some(arm), Some(before)) => Some(arm.finish(gpu, before)),
+        _ => None,
+    };
+    run?;
+    let g0_result = g0_result.transpose()?;
     let replay_after = gpu.replay.replay_observation();
     let capture_summary = if capture {
         Some(
@@ -1243,6 +1258,9 @@ pub fn redline_bench_decode_deepseek4(
     });
     if let Some(summary) = capture_summary {
         response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
+    }
+    if let Some(value) = g0_result {
+        response["g0"] = value;
     }
     if product_route {
         let prepared = gpu.replay.prepared_route_identity().map(|identity| {
@@ -4021,6 +4039,112 @@ fn redline_shadow_qwen4(
     }))
 }
 
+/// Railgun G0 (recording invariance, design §5 G0) for the DFlash cycle:
+/// one served acceptance window (`Speculator::step` = draft + verify +
+/// commit) from a synthetic primed prompt, run as one G0 arm. The prompt
+/// prefill and both resets stay outside the arm. Refuses the retained-PM4
+/// verify route (it swaps controllers mid-window) and a verify HipGraph (its
+/// launches would not reach the funnels); the harness runs with
+/// `HIPFIRE_VERIFY_GRAPH=0` and compares the arms with
+/// `scripts/redline_daemon_harness.py --g0 --dflash-cycle`.
+pub fn railgun_g0_dflash_cycle(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    arm: G0Arm,
+    context: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1 || loaded.ep.is_some() || (loaded.arch_id != 5 && loaded.arch_id != 6) {
+        return Err("railgun_g0_dflash_cycle requires a single-GPU Qwen3.5/3.8-family target".into());
+    }
+    if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4").as_deref() == Ok("1") {
+        return Err("railgun_g0_dflash_cycle refuses HIPFIRE_DFLASH_VERIFY_PM4=1 (retained verify swaps controllers)".into());
+    }
+    if hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").as_deref() != Ok("0") {
+        return Err("railgun_g0_dflash_cycle requires HIPFIRE_VERIFY_GRAPH=0 (graph launches bypass the funnels)".into());
+    }
+    if context == 0 || context.saturating_add(4 * DFLASH_VERIFY_PM4_BLOCK) > loaded.physical_cap {
+        return Err(format!(
+            "railgun_g0_dflash_cycle context {context} must be non-zero and leave a window below physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+    let spec = loaded
+        .speculator
+        .as_mut()
+        .filter(|s| s.name() == "dflash")
+        .ok_or("railgun_g0_dflash_cycle requires a loaded DFlash sidecar")?;
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let slot = guard.model_slot()?;
+    spec.reset(gpu)?;
+    redline_reset_qwen_slot(gpu, slot)?;
+    let prompt: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    let first = match spec.prefill(gpu, slot, &prompt, &prompt, 0, false, None, &|| false)? {
+        hipfire_runtime::spec::PrefillOutcome::Ready { first_token } => first_token,
+        hipfire_runtime::spec::PrefillOutcome::Aborted => {
+            return Err("railgun_g0_dflash_cycle prefill aborted".into())
+        }
+    };
+    gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+    // The spec window is not a plain-AR forward; make the record arm's
+    // recorder live for it (the observe arm ignores eligibility).
+    gpu.replay.set_forward_eligible(true);
+    let before = arm.begin(gpu)?;
+    let step = spec.step(gpu, slot, context, first, &[first], None, 0.0, usize::MAX);
+    let settled = gpu.hip.device_synchronize().map_err(|e| e.to_string());
+    let result = arm.finish(gpu, before);
+    let step = step?;
+    settled?;
+    let mut value = result?;
+    spec.reset(gpu)?;
+    redline_reset_qwen_slot(gpu, slot)?;
+    drop(guard);
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    value["type"] = serde_json::json!("railgun_g0_dflash_cycle");
+    value["context_tokens"] = serde_json::json!(context);
+    value["window"] = serde_json::json!({
+        "seed": first,
+        "emit": step.emit.to_vec(),
+        "next_seed": step.next_seed,
+        "proposed": step.proposed,
+        "accepted": step.accepted,
+    });
+    Ok(value)
+}
+
+/// `"railgun_g0_dflash_cycle"` daemon message handler.
+pub fn handle_railgun_g0_dflash_cycle(
+    msg: &serde_json::Value,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+) {
+    let context = msg
+        .get("context_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(128) as usize;
+    let response = G0Arm::from_request(msg)
+        .and_then(|arm| arm.ok_or_else(|| "railgun_g0_dflash_cycle requires g0".to_string()))
+        .and_then(|arm| {
+            model
+                .as_mut()
+                .ok_or_else(|| "railgun_g0_dflash_cycle requires a loaded model".to_string())
+                .and_then(|loaded| railgun_g0_dflash_cycle(gpu, loaded, arm, context))
+        });
+    match response {
+        Ok(response) => {
+            let _ = writeln!(stdout, "{response}");
+        }
+        Err(reason) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "error", "message": reason})
+            );
+        }
+    }
+    let _ = stdout.flush();
+}
 /// `"redline_shadow_aql" | "redline_shadow_pm4"` daemon message handler.
 fn redline_shadow_gemma4(
     gpu: &mut rdna_compute::Gpu,

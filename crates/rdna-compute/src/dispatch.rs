@@ -2718,6 +2718,7 @@ impl Gpu {
             .validate_launch_grid(grid)
             .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
+        let observe = self.replay.is_g0_observing();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
         // before this point (callers invalidate, then grow, then launch), so
@@ -2731,9 +2732,13 @@ impl Gpu {
             }
         }
         let result: HipResult<()> =
-            if record || self.graphs.capture_mode || self.flags.force_blob_path {
+            if record || observe || self.graphs.capture_mode || self.flags.force_blob_path {
                 let mut blob = blob_builder();
                 blob.pad_to(16);
+                if observe {
+                    self.replay
+                        .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+                }
                 if record {
                     let artifact = recorded_launch_artifact(&self.compiler, func_name);
                     self.replay.record_hip_launch_typed_bound(
