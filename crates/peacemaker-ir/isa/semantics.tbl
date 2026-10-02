@@ -3,6 +3,8 @@
 # The bounded replay gate is QSA convert/attend and sym NT4 gate_up/down.
 # BF16 and FP8 WMMA are unqualified and intentionally have no semantics rows:
 # decoded programs using either hard-error rather than invoke provisional math.
+# v_log_f32_e32, v_rsq_f32_e32 and v_sqrt_f32_e32 are outside that gate;
+# their candidate numeric paths remain unqualified for the full input domain.
 buffer_load_b128	memory
 buffer_load_b32	memory
 buffer_load_b64	memory
