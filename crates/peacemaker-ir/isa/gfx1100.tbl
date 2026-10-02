@@ -378,6 +378,7 @@ s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_
 s_cmpk_lt_u32	sopk	0xd	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_lt_u32 s24, 0x100	B6980100	-
 flat_load_b32	flat	0x14	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b32 v33, v[1:2] offset:8	DC500008 217C0001	-
 flat_load_b64	flat	0x15	VDST:64,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b64 v[17:18], v[1:2]	DC540000 117C0001	-
+flat_load_b128	flat	0x17	VDST:128,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b128 v[33:36], v[22:23]	DC5C0000 217C0016	-
 buffer_gl1_inv	buffer	0x2c	-	-	-	-	-	buffer_gl1_inv	E0B00000 00000000	-
 s_bcnt1_i32_b32	sop1	0x18	SDST:32,SSRC0:32	SDST	SSRC0	scc:w	-	s_bcnt1_i32_b32 s3, s6	BE831806	-
 v_cmp_u_f32_e64	vop3	0x18	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_u_f32_e64 s0, v4, v3	D4180000 02020704	src2_unused:ignored:0x1ff:0x00/0x80/0x101
