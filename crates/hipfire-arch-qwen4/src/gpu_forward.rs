@@ -2616,6 +2616,10 @@ impl Qwen4GpuForward {
         let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
         let mut gdn_slot = 0usize;
         let mut qsa_slot = 0usize;
+        // `HIPFIRE_QWEN4_PLE_FUSE`: the PLE rows are staged straight as F16 for
+        // the BF16 key/value projections (decided once; the step op and the
+        // staging closure agree on it).
+        let mut ple_rows_f16 = false;
         for layer_index in 0..config.num_hidden_layers {
             let layer = &bundle.weights.layer_refs[layer_index];
             if layer_index == ple_layer_index {
@@ -2629,9 +2633,18 @@ impl Qwen4GpuForward {
                     ));
                 }
                 let ple = ple_desc(&bundle.weights, ple_weights)?;
+                ple_rows_f16 = bf16_state
+                    && gpu.flags.qwen4_ple_fuse_enabled()
+                    && dims.hc_count <= 4
+                    && config.hidden_size % 32 == 0
+                    && ple.key.k == config.hidden_size
+                    && ple.value.k == config.hidden_size
+                    && gpu.qwen4_f16_wmma_applies(ple.key.buf, ple.key.k, n)
+                    && gpu.qwen4_f16_wmma_applies(ple.value.buf, ple.value.k, n);
                 steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
                     rotation: &self.scratch.rotation,
                     state_bf16: bf16_state,
+                    rows_f16: ple_rows_f16,
                     key: ple.key,
                     value: ple.value,
                     norm_key: ple.norm_key,
@@ -3108,13 +3121,23 @@ impl Qwen4GpuForward {
                     .validate_after_upload()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let apply_started = qwen4_profile_start();
-                gpu.grouped_gather_convert_bf16(
-                    &staged,
-                    &ple_rows,
-                    n,
-                    PLE_HEAD_COUNT,
-                    PLE_ROW_WIDTH,
-                )?;
+                if ple_rows_f16 {
+                    gpu.grouped_gather_convert_bf16_f16(
+                        &staged,
+                        &ple_rows,
+                        n,
+                        PLE_HEAD_COUNT,
+                        PLE_ROW_WIDTH,
+                    )?;
+                } else {
+                    gpu.grouped_gather_convert_bf16(
+                        &staged,
+                        &ple_rows,
+                        n,
+                        PLE_HEAD_COUNT,
+                        PLE_ROW_WIDTH,
+                    )?;
+                }
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
                 Ok(())
             };

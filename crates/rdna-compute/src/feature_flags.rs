@@ -82,6 +82,9 @@ pub struct FeatureFlags {
     /// Wave-per-token Qwen4 E512/top-10 prefill router
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default off.
     pub qwen4_router_fast: bool,
+    /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`), default off.
+    pub qwen4_ple_fuse: bool,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
     /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
     pub gfx11_iu4_gridspec: bool,
@@ -687,6 +690,7 @@ impl FeatureFlags {
                 .unwrap_or(halo_hyper_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(false),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(false),
+            qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(false),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
             gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
@@ -1080,6 +1084,12 @@ impl FeatureFlags {
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && self.arch == "gfx1151"
     }
+
+    /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 only.
+    pub fn qwen4_ple_fuse_enabled(&self) -> bool {
+        self.qwen4_ple_fuse && self.arch == "gfx1151"
+    }
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
@@ -1211,6 +1221,7 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
             gfx11_iu4_symfold: false,
@@ -1420,6 +1431,25 @@ mod tests {
             assert_eq!(
                 FeatureFlags::from_lookup(arch, with("junk", "1")).qwen4_hc_fuse_level(),
                 if halo { 3 } else { 0 }
+            );
+        }
+    }
+
+    /// The fused PLE tail is opt-in and exact gfx1151.
+    #[test]
+    fn qwen4_ple_fuse_flag_is_opt_in_and_exact_gfx1151() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_PLE_FUSE" { Ok(value.into()) } else { Err(()) }
+            }
+        };
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1201"] {
+            assert!(!FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_ple_fuse_enabled());
+            assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_ple_fuse_enabled());
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, with("1")).qwen4_ple_fuse_enabled(),
+                arch == "gfx1151",
+                "{arch}"
             );
         }
     }
