@@ -25,11 +25,13 @@ fn ir_arch(arch: Arch) -> IrArch {
     match arch { Arch::Gfx1100 => IrArch::Gfx1100, Arch::Gfx1151 => IrArch::Gfx1151, Arch::Gfx1201 => IrArch::Gfx1201 }
 }
 
-/// Encode one instruction line (no label operands).
-pub fn encode_line(line: &str, arch: Arch) -> Result<Vec<u32>, String> {
+/// Encode one instruction line (no label operands) onto `out`; returns its dword count.
+fn encode_into(line: &str, arch: Arch, out: &mut Vec<u32>) -> Result<usize, String> {
     let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)).map_err(|e| format!("{line}: {e}"))?;
-    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch), &inst) };
-    words.map(|w| w.to_vec()).map_err(|e| format!("{line}: {e}"))
+    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch), &inst) }
+        .map_err(|e| format!("{line}: {e}"))?;
+    out.extend_from_slice(&words);
+    Ok(words.len())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -136,7 +138,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
                     kernel.branches.push((kernel.words.len(), head, rest));
                     kernel.words.push(0);
                 } else {
-                    kernel.words.extend(encode_line(line, arch)?);
+                    encode_into(line, arch, &mut kernel.words)?;
                 }
             }
         }
@@ -144,15 +146,16 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
     if !target || !version { return Err("missing .amdgcn_target or .amdhsa_code_object_version".into()) }
     let metadata = metadata::msgpack(&metadata.ok_or("missing .amdgpu_metadata")?)?;
     let mut linked = Vec::with_capacity(kernels.len());
+    let mut branch = Vec::with_capacity(1);
     for (k, kernel) in kernels.iter_mut().enumerate() {
         for &(at, mnemonic, label) in &kernel.branches {
             let &(target_kernel, target) = labels.get(label).ok_or_else(|| format!("{}: undefined label {label}", kernel.symbol))?;
             if target_kernel != k { return Err(format!("{}: branch to {label} leaves the kernel", kernel.symbol)) }
             let offset = target as i64 - (at as i64 + 1);
             if i16::try_from(offset).is_err() { return Err(format!("{}: branch to {label} is out of range", kernel.symbol)) }
-            let words = encode_line(&format!("{mnemonic} {offset}"), arch)?;
-            if words.len() != 1 { return Err(format!("{mnemonic}: branch is not one dword")) }
-            kernel.words[at] = words[0];
+            branch.clear();
+            if encode_into(&format!("{mnemonic} {offset}"), arch, &mut branch)? != 1 { return Err(format!("{mnemonic}: branch is not one dword")) }
+            kernel.words[at] = branch[0];
         }
         let (end, start) = kernel.size.ok_or_else(|| format!("{}: missing .size", kernel.symbol))?;
         if start != kernel.symbol || labels.get(end) != Some(&(k, kernel.words.len())) {
