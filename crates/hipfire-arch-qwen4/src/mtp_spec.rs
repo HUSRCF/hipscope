@@ -273,6 +273,14 @@ impl SpecTarget for Qwen4Bundle {
             .map_err(|error| format!("Qwen4 reset_recurrent: {error}"))
     }
 
+    /// Native MTP retains no pre-window snapshot to repair from, and the
+    /// prompt-cache checkpoint references the live QSA K/V rows a reset would
+    /// zero: rewind to it so the next turn can still restore it.
+    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.rewind_to_prefix(gpu)
+            .map_err(|error| format!("Qwen4 terminal rewind: {error}"))
+    }
+
     fn retry_reset_eligible(&self) -> bool {
         true
     }

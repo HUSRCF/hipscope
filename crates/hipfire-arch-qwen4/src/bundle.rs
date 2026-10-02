@@ -1078,25 +1078,56 @@ impl Qwen4Bundle {
             return cold;
         };
         let p = cache.tokens.len();
-        let device_valid = self.state.prefix_position() == Some(p)
-            && match mode {
-                Qwen4PrefixMode::Ar => true,
-                Qwen4PrefixMode::NativeMtp => {
-                    self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position) == Some(p)
-                }
-            };
         if cache.published
             && cache.mode == mode
             && Some(cache.chunk) == self.spec_chunk_rows()
             && p > 0
             && p < prompt.len()
-            && device_valid
+            && self.prefix_device_valid(p, mode)
             && prompt[..p] == cache.tokens[..]
         {
             Qwen4PrefixPlan { start_pos: p }
         } else {
             cold
         }
+    }
+
+    /// Whether the device arenas hold the checkpoint after `p` tokens: the
+    /// target's always, the head's too for native MTP.
+    fn prefix_device_valid(&self, p: usize, mode: Qwen4PrefixMode) -> bool {
+        self.state.prefix_position() == Some(p)
+            && match mode {
+                Qwen4PrefixMode::Ar => true,
+                Qwen4PrefixMode::NativeMtp => {
+                    self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position) == Some(p)
+                }
+            }
+    }
+
+    /// Discard live decode state the host will never extend, keeping the
+    /// checkpoint: restore it into every owner (its token record and publish
+    /// state untouched), as a hit's prefill would. Without a valid checkpoint,
+    /// or if the restore fails, reset instead. Every later prefill begins
+    /// with [`Self::begin_prefix`], so the live state is never built on.
+    pub fn rewind_to_prefix(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let mode = match self.prefix.as_ref() {
+            Some(cache)
+                if !cache.tokens.is_empty()
+                    && self.prefix_device_valid(cache.tokens.len(), cache.mode) =>
+            {
+                cache.mode
+            }
+            _ => return self.reset(gpu),
+        };
+        if let Err(error) = self.restore_prefix_owners(gpu, mode) {
+            return match self.reset(gpu) {
+                Ok(()) => Ok(()),
+                Err(reset) => Err(BundleError::Forward(format!(
+                    "{error}; reset after the failed prefix rewind also failed: {reset}"
+                ))),
+            };
+        }
+        Ok(())
     }
 
     /// Start a prefill of `prompt` under `plan` (re-validated here): a cold

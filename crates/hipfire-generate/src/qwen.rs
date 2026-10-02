@@ -4466,7 +4466,8 @@ pub fn generate_spec(
         if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
             // Prefer a window-local repair: restore the pre-window target/drafter
             // snapshot and replay only the consumed prefix. Speculators without
-            // that capability retain the conservative reset + cache invalidation.
+            // that capability drop live state via the target's terminal reset
+            // (Qwen4: rewind to its durable prefix checkpoint) + cache invalidation.
             let repaired = match spec.repair_terminal_prefix(
                 gpu,
                 slot,
@@ -4512,9 +4513,9 @@ pub fn generate_spec(
             let reset_error = if repaired {
                 None
             } else {
-                slot.reset_recurrent(gpu)
+                slot.reset_after_unrepaired_terminal(gpu)
                     .err()
-                    .map(|e| format!("reset_recurrent: {e}"))
+                    .map(|e| format!("reset_after_unrepaired_terminal: {e}"))
                     .or_else(|| {
                         spec.reset_for_realign(gpu)
                             .err()
