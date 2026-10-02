@@ -175,7 +175,7 @@ fn rejected_requests_emit_nothing_and_leave_the_driver_usable() {
     assert!(err(d.ds_load(mbox, MBOX_LOAD.into())).contains("not published"));
     assert!(err(d.barrier(&[Transition::Ready(v)])).contains("only a Writing region"));
     assert_eq!(d.position(), before);
-    assert_eq!((d.region_phase(mbox).unwrap(), d.region_phase(v).unwrap()), (Phase::Writing, Phase::Free));
+    assert_eq!((d.region_phase(mbox).unwrap(), d.region_phase(v).unwrap()), (Phase::RtWriting, Phase::RtFree));
     d.wait(mbox).unwrap();
     d.barrier(&[Transition::Ready(mbox)]).unwrap();
     // A published region takes no store and cannot be waited on again.
@@ -214,7 +214,7 @@ fn barriers_and_layout_refuse_under_wave_uniform_control() {
     assert!(e.contains("workgroup scope"), "{e}");
     let e = err(d.loop_until(".Lh", ".Lx", |d, _| d.barrier(&[])));
     assert!(e.contains("workgroup scope"), "{e}");
-    assert_eq!(d.region_phase(r).unwrap(), Phase::Writing);
+    assert_eq!(d.region_phase(r).unwrap(), Phase::RtWriting);
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn split_barrier_holds_its_regions_until_wait_arrived() {
     assert!(err(d.ds_load(r, LOAD.into())).contains("held by a split barrier"));
     assert!(err(d.signal(&[])).contains("already in flight"));
     d.wait_arrived(a).unwrap();
-    assert_eq!(d.region_phase(r).unwrap(), Phase::Published);
+    assert_eq!(d.region_phase(r).unwrap(), Phase::RtPublished);
     d.ds_load(r, LOAD.into()).unwrap();
 }
 

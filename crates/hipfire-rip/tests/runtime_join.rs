@@ -65,7 +65,7 @@ fn joined_frontier<T: Target>(arch: Arch, counter: Counter) {
         "{arch:?}: the explicit wait must drain the skipped path's store before the publishing barrier"
     );
     d.barrier(&[Transition::Ready(r)]).unwrap();
-    assert_eq!(d.region_phase(r).unwrap(), Phase::Published);
+    assert_eq!(d.region_phase(r).unwrap(), Phase::RtPublished);
 }
 
 #[test]

@@ -85,14 +85,28 @@ impl From<RingId> for Place {
 }
 
 /// Workgroup-level ownership of a region (or of one ring buffer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The variants carry an `Rt` prefix so rustc diagnostics for the typed
+/// core's `Free`/`Writing`/`Published` states stay unqualified; `Debug`
+/// prints the unprefixed ownership names that error text and `.rip` programs
+/// use.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// No wave reads it; a wave may start writing.
-    Free,
+    RtFree,
     /// This wave has stores into it; nobody may read it yet.
-    Writing,
+    RtWriting,
     /// Readable by every wave; not writable.
-    Published,
+    RtPublished,
+}
+impl std::fmt::Debug for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Phase::RtFree => "Free",
+            Phase::RtWriting => "Writing",
+            Phase::RtPublished => "Published",
+        })
+    }
 }
 
 /// One barrier-carried transition (the typed core's `ready`, `retire`,
@@ -539,7 +553,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             return Err(format!("LDS region {name} [{base}, +{len}) exceeds {} bytes on {}", T::LDS_BYTES, T::NAME));
         }
         let slot = self.b.lds_slot(&self.auth, name, base, len)?;
-        self.st.regions.push(Region { name: name.into(), slots: vec![slot], phase: Phase::Free, stores: Stores::default(), hold: Hold::Live });
+        self.st.regions.push(Region { name: name.into(), slots: vec![slot], phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
         Ok(RegionId { owner: self.owner, idx: self.st.regions.len() - 1 })
     }
     /// End the slot layout so a later phase can carve its own. Every region
@@ -547,12 +561,12 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn relayout(&mut self) -> Result<(), String> {
         self.wg("relayout")?;
         for r in self.st.regions.iter().filter(|r| r.hold != Hold::Gone) {
-            if r.hold != Hold::Live || r.phase != Phase::Free {
+            if r.hold != Hold::Live || r.phase != Phase::RtFree {
                 return Err(format!("{} is {} at relayout: a barrier must retire every reader first", r.name, desc(r.phase, r.stores.undrained(), r.hold)));
             }
         }
         for g in self.st.rings.iter().filter(|g| g.hold != Hold::Gone) {
-            if g.hold != Hold::Live || g.cur_phase != Phase::Free || g.next != Phase::Free {
+            if g.hold != Hold::Live || g.cur_phase != Phase::RtFree || g.next != Phase::RtFree {
                 return Err(format!("ring {} is not Free at relayout: a barrier must retire every reader first", g.name));
             }
         }
@@ -574,7 +588,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 return Err("a region cannot be joined with itself".into());
             }
             let r = &self.st.regions[self.region_ix(p)?];
-            if r.phase != Phase::Free {
+            if r.phase != Phase::RtFree {
                 return Err(format!("cannot join {}: it is {:?}; other waves may still be reading it, only a barrier can retire their reads", r.name, r.phase));
             }
             slots.extend_from_slice(&r.slots);
@@ -589,21 +603,21 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         for &p in parts {
             self.st.regions[p.idx].hold = Hold::Gone;
         }
-        self.st.regions.push(Region { name, slots, phase: Phase::Free, stores: Stores::default(), hold: Hold::Live });
+        self.st.regions.push(Region { name, slots, phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
         Ok(RegionId { owner: self.owner, idx: self.st.regions.len() - 1 })
     }
     /// Undo a `join`: the first `first` slots become one region, the rest another.
     pub fn split(&mut self, r: RegionId, first: usize) -> Result<(RegionId, RegionId), String> {
         let i = self.region_ix(r)?;
         let g = &self.st.regions[i];
-        if g.phase != Phase::Free {
+        if g.phase != Phase::RtFree {
             return Err(format!("cannot split {}: it is {:?}", g.name, g.phase));
         }
         if first == 0 || first >= g.slots.len() {
             return Err(format!("cannot split a {}-slot region after {first} slots", g.slots.len()));
         }
         let (a, b) = g.slots.split_at(first);
-        let (a, b) = (Region { name: format!("{}.0", g.name), slots: a.to_vec(), phase: Phase::Free, stores: Stores::default(), hold: Hold::Live }, Region { name: format!("{}.1", g.name), slots: b.to_vec(), phase: Phase::Free, stores: Stores::default(), hold: Hold::Live });
+        let (a, b) = (Region { name: format!("{}.0", g.name), slots: a.to_vec(), phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live }, Region { name: format!("{}.1", g.name), slots: b.to_vec(), phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
         self.st.regions[i].hold = Hold::Gone;
         self.st.regions.push(a);
         self.st.regions.push(b);
@@ -618,14 +632,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let (i, j) = (self.region_ix(first)?, self.region_ix(second)?);
         for k in [i, j] {
             let r = &self.st.regions[k];
-            if r.phase != Phase::Free {
+            if r.phase != Phase::RtFree {
                 return Err(format!("ring {name}: {} is {:?}, a ring is built over Free regions", r.name, r.phase));
             }
         }
         let bufs = [self.st.regions[i].slots.clone(), self.st.regions[j].slots.clone()];
         self.st.regions[i].hold = Hold::Gone;
         self.st.regions[j].hold = Hold::Gone;
-        self.st.rings.push(RingBuf { name: name.into(), bufs, cur: 1, cur_live: false, cur_phase: Phase::Free, next: Phase::Free, stores: Stores::default(), hold: Hold::Live });
+        self.st.rings.push(RingBuf { name: name.into(), bufs, cur: 1, cur_live: false, cur_phase: Phase::RtFree, next: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
         Ok(RingId { owner: self.owner, idx: self.st.rings.len() - 1 })
     }
     /// Enter steady-state role typing before a loop whose head barrier
@@ -634,10 +648,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn ring_steady(&mut self, g: RingId) -> Result<(), String> {
         let i = self.ring_ix(g)?;
         let r = &mut self.st.rings[i];
-        if r.cur_phase != Phase::Free || r.cur_live {
+        if r.cur_phase != Phase::RtFree || r.cur_live {
             return Err(format!("ring {}: only a ring whose current buffer is Free and vacant can become steady", r.name));
         }
-        r.cur_phase = Phase::Published;
+        r.cur_phase = Phase::RtPublished;
         Ok(())
     }
 
@@ -645,8 +659,8 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
 
     fn storable(&self, l: Loc) -> Result<(), String> {
         match self.name_phase(l) {
-            (_, Phase::Free | Phase::Writing) => Ok(()),
-            (name, Phase::Published) => Err(format!("cannot store into {name}: it is Published and other waves may still be reading it until a barrier retires it")),
+            (_, Phase::RtFree | Phase::RtWriting) => Ok(()),
+            (name, Phase::RtPublished) => Err(format!("cannot store into {name}: it is Published and other waves may still be reading it until a barrier retires it")),
         }
     }
     fn slots_of(st: &St, l: Loc) -> &[usize] {
@@ -657,8 +671,8 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     }
     fn note_store(&mut self, l: Loc, e: EventId) {
         match l {
-            Loc::Region(i) => self.st.regions[i].phase = Phase::Writing,
-            Loc::Ring(i) => self.st.rings[i].next = Phase::Writing,
+            Loc::Region(i) => self.st.regions[i].phase = Phase::RtWriting,
+            Loc::Ring(i) => self.st.rings[i].next = Phase::RtWriting,
         }
         self.stores_mut(l).store(e);
     }
@@ -669,12 +683,12 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn begin_write(&mut self, to: impl Into<Place>) -> Result<(), String> {
         let l = self.loc(to.into())?;
         match l {
-            Loc::Region(i) if self.st.regions[i].phase == Phase::Free => {
-                self.st.regions[i].phase = Phase::Writing;
+            Loc::Region(i) if self.st.regions[i].phase == Phase::RtFree => {
+                self.st.regions[i].phase = Phase::RtWriting;
                 self.st.regions[i].stores.pending = true;
             }
-            Loc::Ring(i) if self.st.rings[i].next == Phase::Free => {
-                self.st.rings[i].next = Phase::Writing;
+            Loc::Ring(i) if self.st.rings[i].next == Phase::RtFree => {
+                self.st.rings[i].next = Phase::RtWriting;
                 self.st.rings[i].stores.pending = true;
             }
             _ => {
@@ -716,7 +730,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn ds_load(&mut self, r: RegionId, insn: B::Insn) -> Result<(), String> {
         let i = self.region_ix(r)?;
         let g = &self.st.regions[i];
-        if g.phase != Phase::Published {
+        if g.phase != Phase::RtPublished {
             return Err(format!("{} is not published: it is {:?}", g.name, g.phase));
         }
         self.b.ds_load(&self.auth, &g.slots, insn)
@@ -725,7 +739,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn ds_load_cur(&mut self, g: RingId, insn: B::Insn) -> Result<(), String> {
         let i = self.ring_ix(g)?;
         let r = &self.st.rings[i];
-        if r.cur_phase != Phase::Published {
+        if r.cur_phase != Phase::RtPublished {
             return Err(format!("ring {}: current buffer is {:?}, not published", r.name, r.cur_phase));
         }
         if !r.cur_live {
@@ -745,7 +759,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         for &p in ps {
             let l = self.loc(p)?;
             let (name, phase) = self.name_phase(l);
-            if phase != Phase::Writing {
+            if phase != Phase::RtWriting {
                 return Err(format!("wait on {name}: no store of this wave is in flight ({phase:?})"));
             }
             locs.push(l);
@@ -787,7 +801,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             match *t {
                 Transition::Ready(r) => {
                     let g = &self.st.regions[self.region_ix(r)?];
-                    if g.phase != Phase::Writing {
+                    if g.phase != Phase::RtWriting {
                         return Err(format!("ready of {}: it is {:?}, only a Writing region can be published", g.name, g.phase));
                     }
                     Self::covered(&g.name, &g.stores)?;
@@ -795,14 +809,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 }
                 Transition::Retire(r) => {
                     let g = &self.st.regions[self.region_ix(r)?];
-                    if g.phase != Phase::Published {
+                    if g.phase != Phase::RtPublished {
                         return Err(format!("retire of {}: it is {:?}, only a Published region can be retired", g.name, g.phase));
                     }
                     retire.extend(g.slots.iter().map(|&id| SlotTransition::Retire(id)));
                 }
                 Transition::Rotate(g) => {
                     let r = &self.st.rings[self.ring_ix(g)?];
-                    if r.cur_phase != Phase::Published || r.next != Phase::Writing {
+                    if r.cur_phase != Phase::RtPublished || r.next != Phase::RtWriting {
                         return Err(format!("rotate of ring {}: cur is {:?}, next is {:?}; it needs cur Published and next Writing", r.name, r.cur_phase, r.next));
                     }
                     Self::covered(&r.name, &r.stores)?;
@@ -813,7 +827,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 }
                 Transition::Prime(g) => {
                     let r = &self.st.rings[self.ring_ix(g)?];
-                    if r.cur_phase != Phase::Free || r.next != Phase::Writing {
+                    if r.cur_phase != Phase::RtFree || r.next != Phase::RtWriting {
                         return Err(format!("prime of ring {}: cur is {:?}, next is {:?}; it needs cur Free and next Writing", r.name, r.cur_phase, r.next));
                     }
                     Self::covered(&r.name, &r.stores)?;
@@ -821,7 +835,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 }
                 Transition::RetireCur(g) => {
                     let r = &self.st.rings[self.ring_ix(g)?];
-                    if r.cur_phase != Phase::Published {
+                    if r.cur_phase != Phase::RtPublished {
                         return Err(format!("retire_cur of ring {}: cur is {:?}, only a Published buffer can be retired", r.name, r.cur_phase));
                     }
                     if r.cur_live {
@@ -841,25 +855,25 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             match *t {
                 Transition::Ready(r) => {
                     let g = &mut self.st.regions[r.idx];
-                    g.phase = Phase::Published;
+                    g.phase = Phase::RtPublished;
                     g.stores.clear();
                 }
                 Transition::Retire(r) => {
                     let g = &mut self.st.regions[r.idx];
-                    g.phase = Phase::Free;
+                    g.phase = Phase::RtFree;
                     g.stores.clear();
                 }
                 Transition::Rotate(g) | Transition::Prime(g) => {
                     let r = &mut self.st.rings[g.idx];
                     r.cur = 1 - r.cur;
                     r.cur_live = true;
-                    r.cur_phase = Phase::Published;
-                    r.next = Phase::Free;
+                    r.cur_phase = Phase::RtPublished;
+                    r.next = Phase::RtFree;
                     r.stores.clear();
                 }
                 Transition::RetireCur(g) => {
                     let r = &mut self.st.rings[g.idx];
-                    r.cur_phase = Phase::Free;
+                    r.cur_phase = Phase::RtFree;
                     r.cur_live = false;
                 }
             }
@@ -1193,7 +1207,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.wg("handoff")?;
         self.own_exit(&end)?;
         let i = self.region_ix(region)?;
-        if self.st.regions[i].phase != Phase::Free {
+        if self.st.regions[i].phase != Phase::RtFree {
             return Err(format!("handoff of {}: it is {:?}, a handoff starts from a Free region", self.st.regions[i].name, self.st.regions[i].phase));
         }
         self.fresh(readers.owner, readers.at)?;
@@ -1201,7 +1215,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let at = self.b.fork();
         let saved = self.st.clone();
         self.scoped(|d| write(d, region))?;
-        if self.st.regions[i].phase != Phase::Writing {
+        if self.st.regions[i].phase != Phase::RtWriting {
             return Err(format!("handoff writers left {} {:?}: they must write it", self.st.regions[i].name, self.st.regions[i].phase));
         }
         self.wait(region)?;
@@ -1216,7 +1230,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.check_barrier_scope()?;
         let ts: Vec<SlotTransition> = self.st.regions[i].slots.iter().map(|&id| SlotTransition::Ready(id)).collect();
         self.b.barrier(&self.auth, &ts)?;
-        self.st.regions[i].phase = Phase::Published;
+        self.st.regions[i].phase = Phase::RtPublished;
         self.st.regions[i].stores.clear();
         let out = self.scoped(|d| read(d, region, &end))?;
         self.end(end)?;
