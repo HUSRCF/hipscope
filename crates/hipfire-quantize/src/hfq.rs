@@ -261,6 +261,16 @@ pub(crate) enum QuantLevel {
     Base,
 }
 
+/// Whether K-map `Promote6` under the MQ4 V2 family (`mq4`/`mq4v2`, V2 Lloyd)
+/// may emit MQ6G256V2 (qt47) for this `arch_id`. Only loader families whose
+/// runtime accepts qt47 on every promoted role are listed: Llama (0, 1),
+/// Qwen3.5 dense/MoE (5, 6) and Qwen2 (7, 8). Every other arch (MiniMax 10,
+/// LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any arch not
+/// yet audited) keeps the v1 MQ6G256 (qt15) promotion its loader understands.
+pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
+    matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
+}
+
 
 
 /// Extract layer index from a tensor name.

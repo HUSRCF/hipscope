@@ -3442,6 +3442,7 @@ pub(crate) fn run() {
                 use_mq6g256,
                 use_mq4g256,
                 use_mq4v2,
+                use_mq4v2_lloyd,
                 use_mq4c,
                 use_mq4_mq6exp,
                 use_mq4_mq2lloydexp,
@@ -5100,6 +5101,7 @@ fn handle_moe_expert_3d(
     // reach here, `--format mq4` silently yields a qt13 model with a handful of
     // qt44 tensors bolted on. See the default `supports_g256` arm below.
     use_mq4v2: bool,
+    use_mq4v2_lloyd: bool,
     use_mq4c: bool,
     use_mq4_mq6exp: bool,
     use_mq4_mq2lloydexp: bool,
@@ -5147,7 +5149,7 @@ fn handle_moe_expert_3d(
     let name = ctx.name;
     let file_idx = ctx.file_idx;
     let _n_elements = ctx.n_elements;
-    let _arch_id = ctx.arch_id;
+    let arch_id = ctx.arch_id;
     let _is_vision = ctx.is_vision;
 
     // Guard: this handler is only valid for stacked 3D MoE expert tensors
@@ -5236,6 +5238,7 @@ fn handle_moe_expert_3d(
         // when K%256==0". That holds on the non-expert path; this arm is where
         // routed experts are decided, and it was never updated.
         || (kmap_promote && use_mq4v2)
+        || (kmap_promote && use_mq4v2_lloyd && mq6v2_promote_supported(arch_id))
         || (kmap_promote && use_mq4c)
         || (kmap_promote && use_mq4_mq2lloyd_kmap)
         || (kmap_promote && use_mq4_mq2lloyd_imatrix)
@@ -5723,8 +5726,18 @@ fn handle_moe_expert_3d(
                 let q = quantize_mq5g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ5G256, 256u32)
             } else if expert_mq6 || down_mq6 {
-                let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
-                (q, QuantType::MQ6G256, 256u32)
+                if kmap_promote
+                    && (use_mq4v2 || use_mq4v2_lloyd)
+                    && mq6v2_promote_supported(arch_id)
+                {
+                    let q = quantize_mq6g256v2(
+                        &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                    );
+                    (q, QuantType::MQ6G256V2, 256u32)
+                } else {
+                    let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32)
+                }
             } else if expert_hfq6 {
                 let q = quantize_hfq6g256(&f32_slice);
                 (q, QuantType::HFQ6G256, 256u32)
@@ -5984,7 +5997,7 @@ fn handle_main_quant(
     let name = ctx.name;
     let n_elements = ctx.n_elements;
     let _is_vision = ctx.is_vision;
-    let _arch_id = ctx.arch_id;
+    let arch_id = ctx.arch_id;
     let _vision_quant = flags.vision_quant.as_str();
     let _is_gemma4_family = flags.is_gemma4_family;
     let _q8_conv1d_default = flags.q8_conv1d_default;
@@ -6102,8 +6115,18 @@ fn handle_main_quant(
                 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    if (flags.use_mq4v2 || flags.use_mq4v2_lloyd)
+                        && mq6v2_promote_supported(arch_id)
+                    {
+                        let m = n_elements / k_dim;
+                        let q = quantize_mq6g256v2(
+                            &f32_data, m, k_dim, &signs1, &signs2,
+                        );
+                        (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                    } else {
+                        let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    }
                 } else if (flags.use_hfq4g256
                     || flags.use_hfq3g256
                     || flags.use_hfq3g128
