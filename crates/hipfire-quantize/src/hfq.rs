@@ -266,7 +266,9 @@ pub(crate) enum QuantLevel {
 /// runtime accepts qt47 on every promoted role are listed: Llama (0, 1),
 /// Qwen3.5 dense/MoE (5, 6) and Qwen2 (7, 8). Every other arch (MiniMax 10,
 /// LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any arch not
-/// yet audited) keeps the v1 MQ6G256 (qt15) promotion its loader understands.
+/// yet audited) keeps its unchanged legacy encoder routes: ordinary MQ4 V2
+/// and nonexpert V2 Lloyd promotions use MQ6G256 (qt15), while V2 Lloyd
+/// stacked experts remain unpromoted MQ4G256 (qt13).
 pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
     matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
 }
