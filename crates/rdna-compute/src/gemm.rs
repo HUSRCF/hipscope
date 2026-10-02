@@ -49,6 +49,10 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
+/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default off.
+static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", false)
+});
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
@@ -27830,6 +27834,29 @@ impl Gpu {
             let tile = Self::qwen4_lds_tile_gfx1201(m, k);
             return self.gemm_f16_x_f16_wmma_lds_splitk(&w_view, x_f16, y, m, k, batch_size, tile);
         }
+        // Measured gfx1151 (flushed, N = 8192 / 2048 / 512): 3.66 / 1.75 / 0.60 ms on 64 x 64
+        // vs 3.10 / 1.54 / 1.12 ms on 160 x 64, so only the large batches take it.
+        if *QWEN4_HC_DOWN_TILE
+            && m == 320
+            && k == 10240
+            && batch_size >= 2048
+            && self.arch_caps.is_gfx1151()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+        {
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                &w_view,
+                x_f16,
+                y,
+                None,
+                m,
+                k,
+                batch_size,
+                LdsTile::new(160, 64, 32, 64, 64, false).pipelined(),
+                k,
+                k,
+            );
+        }
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
         // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
@@ -29430,6 +29457,9 @@ impl Gpu {
         // Short-M, long-K Qwen4 projections; see gemm_bf16_xf16_f16_wmma.
         LdsTile::new(64, 64, 32, 64, 64, false),
         LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
+        // HC input_mix_down 160 x 64 (HIPFIRE_QWEN4_HC_DOWN_TILE).
+        LdsTile::new(160, 64, 32, 64, 64, false),
+        LdsTile::new(160, 64, 32, 64, 64, false).pipelined(),
     ];
 
     /// Pick a tile and dispatch it.
