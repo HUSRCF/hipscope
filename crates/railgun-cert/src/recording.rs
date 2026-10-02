@@ -634,7 +634,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "replay-recorder-lifecycle",
         predicates: &[IsRecording, ReplayState],
-        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170)",
+        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170); gemma4 lowered forward_scratch keeps its AR HipGraph off while `is_recording()` (lowered.rs)",
         effect: Lifecycle,
         switches: "finish the one-shot capture after the recorded forward",
         kernels: &[],
@@ -1090,6 +1090,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "redline_dspark_verify_direct", occurrences: 2, decisions: &["dspark-capture-safe-verify-body"] },
     Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "redline_dspark_verify_pm4", occurrences: 1, decisions: &["dspark-capture-safe-verify-body"] },
     Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "forward_prefill_batch_v2", occurrences: 6, decisions: &["kv-tier-capture-forces-flash"] },
+    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "forward_scratch", occurrences: 3, decisions: &["graph-capture-lifecycle", "replay-recorder-lifecycle"] },
     Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "full_layer_decode_impl", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "run_attend", occurrences: 4, decisions: &["kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "sliding_layer_decode_impl", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
