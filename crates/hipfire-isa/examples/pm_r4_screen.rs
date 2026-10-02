@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 row["lift"] = json!("byte-exact");
                                 let symbol = &lifted.program.kernels[0].symbol.0;
                                 let routes = BTreeMap::from([(symbol.clone(), hipfire_isa::cost_lint::Route {
-                                    rows: counts.clone(), tile_rows: 16, k128_epochs: Some(2),
+                                    rows: counts.clone(), tile_rows: 16, k128_epochs: Some(2), epoch_starts: BTreeMap::new(),
                                 })]);
                                 row["cost"] = serde_json::to_value(hipfire_isa::cost_lint::analyze(&lifted.program, &routes)?)?;
                                 if nt == 4 && prefetch && grouped && matches!(chains, 2 | 4) {
