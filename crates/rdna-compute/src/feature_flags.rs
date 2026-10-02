@@ -393,7 +393,6 @@ pub struct FeatureFlags {
     pub gfx11_fa2_prefill: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
-    pub mw16: bool,
     pub q8_batched_legacy: bool,
     /// Optional ABI-v3 CK runtime artifact. Resolved once at GPU startup;
     /// absence or load/capability failure leaves native dispatch unchanged.
@@ -864,7 +863,6 @@ impl FeatureFlags {
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
-            mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
             flash_attn_ck_lib: value("HIPFIRE_FLASH_ATTN_CK_LIB")
                 .ok()
@@ -1288,7 +1286,6 @@ impl FeatureFlags {
             gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,
-            mw16: false,
             q8_batched_legacy: false,
             flash_attn_ck_lib: None,
             flash_attn_ck_workspace_bytes: 0,

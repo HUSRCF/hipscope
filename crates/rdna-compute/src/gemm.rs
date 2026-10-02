@@ -25,6 +25,153 @@ pub struct F2GdnTargets<'a> {
     pub eps: f32,
 }
 
+// Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
+static DISPATCH_IU4_SYMFOLD: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+});
+
+static DISPATCH_GFX1151_QKVZA_WAVE64: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false)
+});
+
+static DISPATCH_GFX1151_QKV_ALL_BUFFER_CPOL: LazyLock<String> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL").unwrap_or_default().to_ascii_lowercase()
+});
+
+static DISPATCH_GFX1151_QKV_X_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKV_X_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_WEIGHT_BUFFER_LOADS: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
+});
+
+static DISPATCH_GFX1151_WEIGHT_BUFFER_QKVZA: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_X_BUFFER_LARGE: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_ALL_BUFFER_CPOL: LazyLock<String> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL").unwrap_or_default().to_ascii_lowercase()
+});
+
+static DISPATCH_GFX1151_QKVZA_LDSX8_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_PAIR_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_K2048_HOIST: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_K2048_HOIST", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R2_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R4_STREAM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_WAVE64_SHARE_X: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false)
+});
+
+static DISPATCH_RDNA3_QKVZA_R2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false)
+});
+
+static DISPATCH_QKVZA_CPOL: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
+});
+
+static DISPATCH_IU4_V2C: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0")
+});
+
+static DISPATCH_IU4_V2B: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0")
+});
+
+static DISPATCH_G12_RASTER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0")
+});
+
+static DISPATCH_IU4_X5: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0")
+});
+
+static DISPATCH_V2C_ADDEPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0")
+});
+
+static DISPATCH_V2B_ADDEPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0")
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_DOT_REFORM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_SETPRIO: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false)
+});
+
+static GATE_UP_BT: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+});
+
+#[inline]
+fn gfx12_bt_tile(batch_size: usize) -> usize {
+    if !*GATE_UP_BT || batch_size < 64 {
+        return 1;
+    }
+    // Exact divisors take precedence over masked tiles, including N >= 192.
+    const TILES: [(usize, usize); 3] = [(192, 12), (128, 8), (64, 4)];
+    for (tokens, tile) in TILES {
+        if batch_size % tokens == 0 {
+            return tile;
+        }
+    }
+    for (tokens, tile) in TILES {
+        if batch_size >= tokens {
+            return tile;
+        }
+    }
+    unreachable!("batch sizes below 64 returned above")
+}
+
 /// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
 /// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
 /// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
@@ -792,7 +939,7 @@ impl Gpu {
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
     fn g12_iu4_isa_requested(&self) -> bool {
         self.mq4v2_symmetric
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && self.flags.g12_iu4_isa
     }
 
@@ -3317,19 +3464,16 @@ impl Gpu {
         }
 
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false);
-        let gfx1151_all_buffer_cpol_owned: String =
-            hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            && *DISPATCH_GFX1151_QKVZA_WAVE64;
+        let gfx1151_all_buffer_cpol_owned: &str = &*DISPATCH_GFX1151_QKV_ALL_BUFFER_CPOL;
         let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            gfx1151_all_buffer_cpol_owned.as_str()
+            gfx1151_all_buffer_cpol_owned
         } else {
             ""
         };
         let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKV_X_BUFFER", false);
+            && *DISPATCH_GFX1151_QKV_X_BUFFER;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
@@ -3716,39 +3860,36 @@ impl Gpu {
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 && k == 2_048;
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
-                || hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA", false));
+            && (*DISPATCH_GFX1151_WEIGHT_BUFFER_LOADS
+                || *DISPATCH_GFX1151_WEIGHT_BUFFER_QKVZA);
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151() && k == 2_048;
         let gfx1151_k2048_hybrid_buffer =
             self.arch_caps.is_gfx1151() && k == 2_048 && total_m == 1_281;
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE", false);
-        let gfx1151_k2048_all_buffer_cpol_owned: String =
-            hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            && *DISPATCH_GFX1151_QKVZA_X_BUFFER_LARGE;
+        let gfx1151_k2048_all_buffer_cpol_owned: &str = &*DISPATCH_GFX1151_QKVZA_ALL_BUFFER_CPOL;
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            gfx1151_k2048_all_buffer_cpol_owned.as_str()
+            gfx1151_k2048_all_buffer_cpol_owned
         } else {
             ""
         };
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_LDSX8_BUFFER;
         let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_PAIR_BUFFER;
         let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_K2048_HOIST", false);
+            && *DISPATCH_GFX1151_QKVZA_K2048_HOIST;
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2", false);
+            && *DISPATCH_GFX1151_QKVZA_R2;
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_R2_BUFFER;
         let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
@@ -3756,14 +3897,14 @@ impl Gpu {
             && z_m.is_multiple_of(4)
             && beta_m.is_multiple_of(4)
             && alpha_m.is_multiple_of(4)
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false);
+            && *DISPATCH_GFX1151_QKVZA_R4_STREAM;
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false);
+            && *DISPATCH_GFX1151_QKVZA_WAVE64_SHARE_X;
         let rdna3_k2048_r2 =
-            rdna3_k2048 && hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false);
+            rdna3_k2048 && *DISPATCH_RDNA3_QKVZA_R2;
         let rdna3_k2048_cpol_slc = rdna3_k2048
-            && hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc");
+            && *DISPATCH_QKVZA_CPOL;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let glimmer_qkvg_k6656_gfx1100 = self.arch_caps.is_gfx1100()
@@ -9554,28 +9695,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -10945,28 +11065,7 @@ impl Gpu {
                 alpha_m, k, batch_size, 1,
             );
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -12823,28 +12922,7 @@ impl Gpu {
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -13006,28 +13084,7 @@ impl Gpu {
             return result;
         }
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -20461,7 +20518,7 @@ impl Gpu {
             && n % 128 == 0
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
         if !eligible {
@@ -20469,7 +20526,7 @@ impl Gpu {
         }
         match self.arch.as_str() {
             "gfx1100"
-                if hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0") =>
+                if *DISPATCH_IU4_V2C =>
             {
                 Some(Iu4V2Tile::V2c)
             }
@@ -20477,7 +20534,7 @@ impl Gpu {
                 if m % 256 == 0
                     && n % 256 == 0
                     && (m / 256) * (n / 256) >= self.cu_count_or_default()
-                    && hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0") =>
+                    && *DISPATCH_IU4_V2B =>
             {
                 Some(Iu4V2Tile::V2b)
             }
@@ -20532,7 +20589,7 @@ impl Gpu {
             // 128-K block; partial M/N handled natively (zero-filled slab /
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
-                && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+                && *DISPATCH_IU4_SYMFOLD;
             // The ISA bundle has the K1 ABI/geometry but only the masked
             // b128 store. Unsupported shapes/pointers use hipcc `_v3`.
             let isa_requested = symfold && self.flags.g12_iu4_isa;
@@ -20541,7 +20598,7 @@ impl Gpu {
             // Banded CTA raster + wide epilogue (bit-identical outputs, see
             // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
             // incumbent modules.
-            let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
+            let g12r = *DISPATCH_G12_RASTER;
             // Slab-layout activations (a slab producer twin wrote the live
             // scratch) have exactly one reader: the `_b1s` bundle.
             let slab = self.scratch.int4_mmq_slab_at(x_i4_ptr);
@@ -20680,7 +20737,7 @@ impl Gpu {
         let symfold_requested = matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+            && *DISPATCH_IU4_SYMFOLD;
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
@@ -20716,7 +20773,7 @@ impl Gpu {
             && k > 0
             && batch_size > 0
             && (self.arch.as_str() == "gfx1151" || shape_lf16)
-            && hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0");
+            && *DISPATCH_IU4_X5;
         // GEMM v2 V2C (gfx1100) / V2B (gfx1151): see `iu4_v2_tile` for the
         // eligibility rule and kill switches.
         let v2_tile = self.iu4_v2_tile(m, k, batch_size);
@@ -20732,7 +20789,7 @@ impl Gpu {
                 (true, false) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
                 (true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
                 (false, false) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (false, true) if hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0") => {
+                (false, true) if *DISPATCH_V2C_ADDEPI => {
                     "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11"
                 }
                 (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
@@ -20797,7 +20854,7 @@ impl Gpu {
             // otherwise touch the residual ahead of the epilogue
             // (`_add_touch`). Both are byte-identical to `_add`.
             let addepi =
-                add && hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0");
+                add && *DISPATCH_V2B_ADDEPI;
             let fold = if addepi {
                 self.residual_fold_arm
                     .take()
@@ -20816,11 +20873,13 @@ impl Gpu {
             // 32 MiB MALL; grouping row tiles lets each dispatch round re-read
             // its X tiles from the MALL. Byte-identical to `_add_touch`.
             let swz_grp = if kernel_name == "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11" {
-                hipfire_config::developer_var("HIPFIRE_V2B_DOWN_SWZ")
-                    .ok()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(V2B_DOWN_SWZ_GRP)
-                    .clamp(0, (m / 256) as i32)
+                static DOWN_SWZ: LazyLock<i32> = LazyLock::new(|| {
+                    hipfire_config::developer_var("HIPFIRE_V2B_DOWN_SWZ")
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(V2B_DOWN_SWZ_GRP)
+                });
+                (*DOWN_SWZ).clamp(0, (m / 256) as i32)
             } else {
                 0
             };
@@ -21314,10 +21373,6 @@ impl Gpu {
         self.bind_thread()?;
         // Compile both kernels (convert + WMMA GEMM share the FP16 convert)
         // Kernel variant selection
-        // MW16 path: dequant weights to FP16 per-call, then run no-dequant WMMA
-        if self.flags.mw16 {
-            return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
-        }
         // LDS-staged multi-wave residual (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
@@ -21921,89 +21976,6 @@ impl Gpu {
         self.gemm_hfq3g256_residual_wmma(a_raw, x_rot, y, m, k, batch_size)
     }
 
-    /// MW16: dequant 4-bit weights to FP16, then run the no-dequant WMMA kernel.
-    /// Per-call dequant (wasteful) — for benchmarking only. Production would
-    /// dequant at model load time.
-    fn gemm_mw16_residual_wmma_via_dequant(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        batch_size: usize,
-    ) -> HipResult<()> {
-        self.ensure_kernel(
-            "dequant_hfq4g256_to_f16",
-            kernels::DEQUANT_HFQ4G256_TO_F16_SRC,
-            "dequant_hfq4g256_to_f16",
-        )?;
-        self.ensure_kernel(
-            "gemm_mw16_residual_wmma",
-            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
-            "gemm_mw16_residual_wmma",
-        )?;
-        let x_f16 = self.ensure_fp16_x(x, batch_size * k)?;
-
-        // Dequant weights to FP16 scratch
-        let w_elems = m * k;
-        let w_f16 = self.hip.malloc(w_elems * 2)?;
-        {
-            let groups = k / 256;
-            let mut ap = a_raw.buf.as_ptr();
-            let mut wp = w_f16.as_ptr();
-            let mut mv = m as i32;
-            let mut kv = k as i32;
-            let mut p: Vec<*mut c_void> = vec![
-                &mut ap as *mut _ as *mut c_void,
-                &mut wp as *mut _ as *mut c_void,
-                &mut mv as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            launch_params_blob!(
-                self,
-                "dequant_hfq4g256_to_f16",
-                [m as u32, groups as u32, 1],
-                [32, 1, 1],
-                0,
-                p; ap, wp, mv, kv
-            )?;
-        }
-
-        // MW16 WMMA GEMM
-        let mut wp = w_f16.as_ptr();
-        let mut xp = x_f16;
-        let mut yp = y.buf.as_ptr();
-        let mut mv = m as i32;
-        let mut kv = k as i32;
-        let mut nv = batch_size as i32;
-        let mut p: Vec<*mut c_void> = vec![
-            &mut wp as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mv as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut nv as *mut _ as *mut c_void,
-        ];
-        let rows = (m + 15) / 16;
-        let batches = (batch_size + 15) / 16;
-        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 8;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
-        let result = launch_params_blob!(
-            self,
-            "gemm_mw16_residual_wmma",
-            [rows as u32, batches as u32, 1],
-            [32, 1, 1],
-            0,
-            p; wp, xp, yp, mv, kv, nv
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        drop(w_f16);
-        result
-    }
 
     /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
     /// x: [batch_size × K], y: [batch_size × M], both row-major.
@@ -26455,17 +26427,17 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32;
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR;
         let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR2;
         // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
         // campaigns measured +0.42% and +0.49% decode throughput. Keep this
         // explicit because the algebraic rewrite changes FP association even
@@ -26474,7 +26446,7 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_DOT_REFORM;
         // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
         // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
         // opt-in: 92 VGPR remains spill-free, but the gain is too small to
@@ -26483,17 +26455,17 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH;
         let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_SETPRIO;
         let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS;
         let dense_gate_up_dot_prefetch_gfx1100 =
             dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;
         let (func_name, block, grid_x) = if dense_gate_up_pair2_gfx1100 {
@@ -31464,7 +31436,7 @@ impl Gpu {
             && self.iu4_producer_sidecar_active(n, k)
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() != Ok("0")
             && qkv_m > 0
             && qkv_m % 128 == 0
@@ -31731,7 +31703,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && self.flags.g12_iu4_isa
             && !*G12_IU4_B1_CONTROL
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
             && dims == [10240, 6144, 48, 48]
             && k > 0
@@ -33000,28 +32972,7 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, 1,
             );
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -34013,7 +33964,7 @@ impl Gpu {
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
                 "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
             )
-        } else if hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0") {
+        } else if *DISPATCH_G12_RASTER {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
@@ -35467,28 +35418,7 @@ impl Gpu {
             return self
                 .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -38395,28 +38325,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq5g256v2_wmma_gfx12_bt12",
@@ -38889,28 +38798,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq5g256v2_wmma_gfx12_bt12",
@@ -39102,28 +38990,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq5g256v2_residual_wmma_gfx12_bt12",
@@ -39621,28 +39488,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq6g256v2_wmma_gfx12_bt12",
@@ -40115,28 +39961,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq6g256v2_wmma_gfx12_bt12",
@@ -40334,30 +40159,7 @@ impl Gpu {
         // 512 x 2560 0.31 -> 0.21 ms).  Below that wave count (M = 48) or
         // below 1024 tokens the exact-divisor order stays.
         let bt12_waves = m.div_ceil(16) * batch_size.div_ceil(192);
-        let bt_b = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size >= 1024 && bt12_waves >= 256 {
-                12
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b = if *GATE_UP_BT && batch_size >= 1024 && bt12_waves >= 256 { 12 } else { gfx12_bt_tile(batch_size) };
         self.gemm_mq6g256v2_residual_wmma_gfx12_bt(a_raw, x, y, m, k, batch_size, bt_b)
     }
 
@@ -41158,28 +40960,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq3g256v2_wmma_gfx12_bt12",
@@ -41637,28 +41418,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq3g256v2_wmma_gfx12_bt12",
@@ -41850,28 +41610,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq3g256v2_residual_wmma_gfx12_bt12",
@@ -42369,28 +42108,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq2g256v2_wmma_gfx12_bt12",
@@ -42879,28 +42597,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq2g256v2_wmma_gfx12_bt12",
@@ -43100,28 +42797,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq2g256v2_residual_wmma_gfx12_bt12",
@@ -43633,28 +43309,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq4cg256_wmma_gfx12_bt12",
@@ -43921,28 +43576,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq4cg256_wmma_gfx12_bt12",
@@ -44163,28 +43797,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq4cg256_residual_wmma_gfx12_bt12",

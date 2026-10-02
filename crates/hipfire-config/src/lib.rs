@@ -3014,15 +3014,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Select deterministic kernel variants where available."
     ),
     process_bool_field!(
-        "kernel.mw16",
-        "mw16",
-        Kernel,
-        false,
-        true,
-        "HIPFIRE_MW16",
-        "Enable the MW16 kernel experiment."
-    ),
-    process_bool_field!(
         "kernel.q8_batched_legacy",
         "q8_batched_legacy",
         Kernel,
@@ -5862,7 +5853,7 @@ mod tests {
     #[test]
     fn process_config_is_sparse_versioned_and_revalidated() {
         let mut global = ConfigLayer::default();
-        global.set_cli("kernel.mw16", "true").unwrap();
+        global.set_cli("kernel.deterministic", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         global
             .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
@@ -5879,7 +5870,7 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
