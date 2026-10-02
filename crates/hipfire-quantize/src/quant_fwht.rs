@@ -1471,7 +1471,7 @@ mod tests {
             ("FA k_proj", 14, format!("{L}39.self_attn.k_proj.weight"), None),
             ("FA v_proj", 14, format!("{L}39.self_attn.v_proj.weight"), None),
             ("FA o_proj", 13, format!("{L}39.self_attn.o_proj.weight"), Some(256)),
-            ("routed gate_up e0", 6, format!("{L}0.mlp.experts.gate_up_proj"), Some(512)),
+            ("routed gate_up e0", 6, format!("{L}0.mlp.experts.gate_up_proj"), Some(1024)),
             ("routed down e0", 12, format!("{L}0.mlp.experts.down_proj"), Some(512)),
             ("shared gate", 14, format!("{L}0.mlp.shared_expert.gate_proj.weight"), None),
             ("shared up", 14, format!("{L}0.mlp.shared_expert.up_proj.weight"), None),
