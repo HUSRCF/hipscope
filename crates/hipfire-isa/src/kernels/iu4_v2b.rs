@@ -38,14 +38,15 @@
 //! - SiLU `G, U, Xq, Y, M, K, N`, grid `[N/256, 2M/256]`; `Y = h [N][M]`,
 //!   `h = g / (1 + expf(-g)) * u` with hipcc's exact expf/fdiv expansion.
 use super::common::{add64, add64_imm, lit, mem, op, s, sop, sr, v, vr};
-use super::iu4_fold::{self, GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
+use super::iu4_fold::{GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
 use super::iu4_gemm::ds_offsets;
 use super::iu4_v2c::off;
+use super::gemm_uk::{Chain, Epilogue, FragmentLayout, Iu4, Lds, Prefetch, Tile as MicroTile};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
-    insn::{Instruction, MemoryClass, Sop, Wmma},
+    insn::{Instruction, MemoryClass, Sop},
     reg::Live, vopd::{Operand, VopdF32, VopdOp}};
 use peacemaker_author::{Free, Gfx1151, Gfx11Waits, LdsWrite, MmaIu4, Pending, Published, Ring, Scc, State, Wave, WgUniform,
-    Workgroup, Writing, prime, rotate};
+    Workgroup, Writing, prime};
 
 pub const THREADS: u16 = 512;
 pub const WAVES: u32 = 16;
@@ -479,29 +480,25 @@ fn stage_store<C: State>(w: &mut Wv, ra: Ring<A, C, Free>, rx: Ring<X, C, Free>)
 fn step_loads<N: State>(w: &mut Wv, ra: &Ring<A, Published, N>, rx: &Ring<X, Published, N>, i: usize) -> Result<(), String> {
     let slot = ra.cur_index();
     let (a, s_) = ((i / 8) as u32, (i % 8) as u32);
+    let layout = FragmentLayout { rows: 32, k_slices: 8, row_bytes: 8 };
     if s_ % 2 == 0 {
         let dst = Regs::AV[(i / 2) % 2];
         let base = Regs::AB[slot][(a / 2) as usize];
-        let o = (a % 2) * 128 + 16 * s_;
-        w.ds_load_cur(ra, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        let o = layout.offset((a % 2) * 16, s_)? / 8;
+        MicroTile::<Gfx1151, Lds<2>>::load_cur(w, ra, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     for half in 0..2usize {
         let dst = Regs::XV[i % 2] + 4 * half as u8;
         let base = Regs::XB[slot][half];
-        w.ds_load_cur(rx, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        MicroTile::<Gfx1151, Lds<2>>::load_cur(w, rx, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     Ok(())
 }
 
 fn step_wmma<T: MmaIu4>(w: &mut Wave<T, Builder>, i: usize) -> Result<(), String> {
-    let b = w.isa();
-    let a = V::<2>(Regs::AV[(i / 2) % 2] + 2 * (i % 2) as u8);
-    for c in 0..4u8 {
-        let dst = V::<8>(Regs::C + 8 * c);
-        let seed = if i % 8 == 0 { V::<8>(Regs::MAGIC) } else { dst };
-        b.push(Wmma::iu4(b.spec.arch, dst, a, V::<2>(Regs::XV[i % 2] + 2 * c), Some(seed)))?;
-    }
-    Ok(())
+    Chain::<4, Iu4>::new(std::array::from_fn(|c| V::<8>(Regs::C + 8 * c as u8)), V::<8>(Regs::MAGIC))?
+        .step(w, V::<2>(Regs::AV[(i / 2) % 2] + 2 * (i % 2) as u8),
+            std::array::from_fn(|c| V::<2>(Regs::XV[i % 2] + 2 * c as u8)), i % 8 == 0)
 }
 
 /// Scale broadcast of fold pass `a` on the LDS crossbar, off the VALU port:
@@ -525,8 +522,9 @@ fn scales(b: &mut Builder, a: u8) -> Result<(), String> {
 /// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum),
 /// with the pass's row scales already broadcast into SCF by `scales(a)`.
 fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
-    for c in 0..4u8 { iu4_fold::fold_pass(b, Regs::C + 8 * c, Regs::ACC + 8 * (4 * a + c), Regs::SCF, dc + c, Regs::T)?; }
-    Ok(())
+    Chain::<4, Iu4>::new(std::array::from_fn(|c| V::<8>(Regs::C + 8 * c as u8)), V::<8>(Regs::MAGIC))?
+        .fold(b, std::array::from_fn(|c| Regs::ACC + 8 * (4 * a + c as u8)),
+            Regs::SCF, std::array::from_fn(|c| dc + c as u8), Regs::T)
 }
 
 /// Epoch `e`'s head: its metadata (scale words, token d) and, with `stage`,
@@ -611,8 +609,7 @@ fn epoch(wg: &mut Wg, g: &Gen, rings: Rings, next: bool, succ_stages: bool, touc
     if !pending.is_empty() { return Err("early stores left pending".into()) }
     let rings = match (e, next) {
         (Epoch::Publishing((ra, pa), (rx, px)), true) => {
-            let (da, dx) = wg.wait_all((pa, px))?;
-            let (ra, rx) = wg.barrier((rotate(ra, da), rotate(rx, dx)))?;
+            let (ra, rx) = Prefetch::<1>::rotate(wg, (ra, pa), (rx, px))?;
             step_loads(wg, &ra, &rx, 0)?;
             if sched == Sched::Early { head(wg.isa(), 1 - p, succ_stages, false)?; }
             (ra, rx)
@@ -759,7 +756,7 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
 /// checks and the IEEE `fdiv` expansion with f32 denormals enabled). The
 /// eight elements are interleaved op by op.
 fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
-    silu_mul(b, gate, up, 160, Regs::MASK, SILU_GROUP)
+    Epilogue::silu_dense(b, gate, up, 160, Regs::MASK, SILU_GROUP)
 }
 
 /// [`silu_group`]'s DAG over the `n` elements `gate..gate+n` / `up..up+n`
