@@ -2,19 +2,27 @@
 //!
 //! Every opcode is keyed by its exact ISA name; an unknown name is an error, never a
 //! best guess. Float arithmetic uses host IEEE-754 binary32 (`+ - * fma`, round to
-//! nearest even), which is bit-exact for every non-NaN operand and result. Whatever the
+//! nearest even), which is bit-exact for every non-NaN operand and every non-NaN result. Whatever the
 //! ISA documents only loosely is a hard error rather than a guess:
 //!
-//! * NaN operands or NaN results of arithmetic (propagation order, payload, sign of the
-//!   default NaN are not specified for add/mul/fma/ldexp/convert), except where the ISA
-//!   gives an explicit rule (`max_num`/`min_num`, `div_fixup`, compares, class, f32->int).
+//! * NaN operands of any arithmetic (propagation order and payload are not measured), and NaN
+//!   results of arithmetic not listed below (sign/payload of the default NaN is not specified
+//!   for add/fma/ldexp/convert), except where the ISA gives an explicit rule
+//!   (`max_num`/`min_num`, `div_fixup`, compares, class, f32->int).
+//! * Invalid operations (NaN result from non-NaN operands) of `v_sub_f32`/`v_subrev_f32`/
+//!   `v_mul_f32` (and their VOPD aliases) on every arch except gfx1151, where all 32 lanes of
+//!   the device probe (`gfx1151-alu-edges.log`: `-inf - -inf`, `-inf * 0`) produced the default
+//!   NaN `0xffc00000`. The rule is applied to any invalid operation of those opcodes, not to
+//!   the probed operands only; gfx1201 is not measured.
 //! * `v_div_scale_f32` lanes whose 1/S1 is possibly denormal (`exponent(S1) >= 253`),
 //!   whose quotient lies on the denormal boundary, or that need `NAN.f32`.
 //! * `v_div_fmas_f32` with a set VCC lane (the document says `2.0F ** 32` while
-//!   `v_div_scale_f32` scales by `ldexp(.., 64)`; hardware disambiguation required).
+//!   `v_div_scale_f32` scales by `ldexp(.., 64)`; the gfx1151 probe measured a `2^-64` factor,
+//!   but fused scaled rounding, subnormal and overflow behavior are not qualified).
 //! * `v_div_fixup_f32` quotients that underflow (`UNDERFLOW_F32` is not defined).
-//! * `v_rndne_f32` of a negative input that rounds to zero (documented pseudocode gives
-//!   `+0`, IEEE gives `-0`).
+//! * `v_rndne_f32` of a negative input that rounds to zero on any arch except gfx1151 (documented
+//!   pseudocode gives `+0`, IEEE gives `-0`; gfx1151 measured `-0` = `0x80000000` for
+//!   `-0.25, -0.5, -minsub, -0`, so host `round_ties_even` is exact there; gfx1201 is not measured).
 //! * OMOD results that would flush a non-zero denormal (sign of the flushed zero).
 //! * DPP with FI=1 and an out-of-range source (the BC/FI table disagrees with its prose).
 //!
@@ -81,6 +89,20 @@ fn fin(x: f32) -> Result<u32> {
         Err(NAN_OUT.into())
     } else {
         Ok(x.to_bits())
+    }
+}
+
+/// gfx1151 default NaN of an invalid operation, measured on hardware for `v_sub_f32` and `v_mul_f32`.
+const GFX1151_DEFAULT_NAN: u32 = 0xffc0_0000;
+
+/// Result of `v_sub_f32`/`v_subrev_f32`/`v_mul_f32`, whose operands are already known to be
+/// non-NaN (`num`): a NaN result is then an invalid operation. Only gfx1151 has a measured
+/// default NaN; other arches keep the hard error.
+fn fin_invalid(arch: Arch, x: f32) -> Result<u32> {
+    if x.is_nan() && arch == Arch::Gfx1151 {
+        Ok(GFX1151_DEFAULT_NAN)
+    } else {
+        fin(x)
     }
 }
 
@@ -483,8 +505,8 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
             let bits = f(0)?;
             let x = num(bits)?;
             let r = x.round_ties_even();
-            if bits >> 31 != 0 && r == 0.0 {
-                return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0".into());
+            if bits >> 31 != 0 && r == 0.0 && arch != Arch::Gfx1151 {
+                return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0; only gfx1151 is measured (-0)".into());
             }
             (Class::F32, r.to_bits())
         }
@@ -502,9 +524,9 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
         }
         "v_ldexp_f32" => (Class::F32, convert::ldexp_f32(fnum(0)?.to_bits(), raw(1)? as i32)),
         "v_add_f32" | "v_dual_add_f32" => (Class::F32, fin(fnum(0)? + fnum(1)?)?),
-        "v_sub_f32" | "v_dual_sub_f32" => (Class::F32, fin(fnum(0)? - fnum(1)?)?),
-        "v_subrev_f32" | "v_dual_subrev_f32" => (Class::F32, fin(fnum(1)? - fnum(0)?)?),
-        "v_mul_f32" | "v_dual_mul_f32" => (Class::F32, fin(fnum(0)? * fnum(1)?)?),
+        "v_sub_f32" | "v_dual_sub_f32" => (Class::F32, fin_invalid(arch, fnum(0)? - fnum(1)?)?),
+        "v_subrev_f32" | "v_dual_subrev_f32" => (Class::F32, fin_invalid(arch, fnum(1)? - fnum(0)?)?),
+        "v_mul_f32" | "v_dual_mul_f32" => (Class::F32, fin_invalid(arch, fnum(0)? * fnum(1)?)?),
         "v_fma_f32" => (Class::F32, fin(fnum(0)?.mul_add(fnum(1)?, fnum(2)?))?),
         "v_fmac_f32" | "v_dual_fmac_f32" => {
             let acc = num(s.read(&o[0], lane, 0)?)?;
@@ -1434,19 +1456,94 @@ mod tests {
         assert_eq!(st.s[5], 9);
     }
 
-    // The pseudocode of v_rndne_f32 disagrees with IEEE on the sign of a zero result.
+    fn insn_1151(name: &str, ops: Vec<Operand>) -> Inst {
+        let r = crate::isa::gfx1151().iter().find(|r| r.name == name).unwrap();
+        Inst::from_parts(Arch::Gfx1151, r.op, r.form, Default::default(), ops.into_iter().collect(), Default::default(), None, Default::default()).unwrap()
+    }
+
+    // gfx1151 measured v_rndne_f32 (gfx1151-alu-edges.log): negative inputs rounding to zero give -0,
+    // positive ones +0, normal ties are even. gfx1201 is not measured and stays a hard error.
     #[test]
-    fn rndne_ties_even_and_negative_zero_is_an_error() {
-        let i = insn("v_rndne_f32_e32", vec![v(0), v(1)]);
+    fn rndne_gfx1151_signed_zero_and_ties_even_while_gfx1201_stays_unqualified() {
+        let name = "v_rndne_f32_e32";
+        let i = insn_1151(name, vec![v(0), v(1)]);
         let mut st = state();
         st.exec = 1;
-        for (x, want) in [(2.5f32, 2.0f32), (3.5, 4.0), (-2.5, -2.0), (0.5, 0.0)] {
-            st.v[1][0] = x.to_bits();
-            run("v_rndne_f32_e32", &i, &mut st).unwrap();
-            assert_eq!(st.v[0][0], want.to_bits(), "{x}");
+        let neg_zero = 0x8000_0000;
+        for (x, want) in [
+            ((-0.25f32).to_bits(), neg_zero),
+            ((-0.5f32).to_bits(), neg_zero),
+            (0x8000_0001, neg_zero),
+            (0x8000_0000, neg_zero),
+            (0.25f32.to_bits(), 0),
+            (0.5f32.to_bits(), 0),
+            (0x0000_0001, 0),
+            (0, 0),
+            (2.5f32.to_bits(), 2.0f32.to_bits()),
+            (3.5f32.to_bits(), 4.0f32.to_bits()),
+            ((-2.5f32).to_bits(), (-2.0f32).to_bits()),
+            ((-1.5f32).to_bits(), (-2.0f32).to_bits()),
+        ] {
+            st.v[1][0] = x;
+            execute(Arch::Gfx1151, name, &i, &mut st).unwrap();
+            assert_eq!(st.v[0][0], want, "rndne({x:#010x})");
         }
+        let i = insn(name, vec![v(0), v(1)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 2.5f32.to_bits();
+        run(name, &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 2.0f32.to_bits());
         st.v[1][0] = (-0.3f32).to_bits();
-        assert!(run("v_rndne_f32_e32", &i, &mut st).is_err());
+        assert!(run(name, &i, &mut st).is_err());
+    }
+
+    // gfx1151 measured default NaN 0xffc00000 for invalid sub/subrev/mul of non-NaN operands; valid
+    // arithmetic is unchanged, NaN operands and every unmeasured arch (gfx1201) stay hard errors.
+    #[test]
+    fn invalid_sub_mul_default_nan_is_gfx1151_only_and_valid_arithmetic_is_exact() {
+        let ninf = f32::NEG_INFINITY.to_bits();
+        let pinf = f32::INFINITY.to_bits();
+        let zero = 0f32.to_bits();
+        let nan_default = 0xffc0_0000u32;
+        // (opcode, src0, src1, expected) -- invalid: inf-inf (same sign), inf*0 either order.
+        let cases = [
+            ("v_sub_f32_e32", ninf, ninf, Some(nan_default)),
+            ("v_sub_f32_e32", pinf, pinf, Some(nan_default)),
+            ("v_subrev_f32_e32", ninf, ninf, Some(nan_default)),
+            ("v_mul_f32_e32", ninf, zero, Some(nan_default)),
+            ("v_mul_f32_e32", zero, pinf, Some(nan_default)),
+            ("v_sub_f32_e32", 5f32.to_bits(), 2f32.to_bits(), Some(3f32.to_bits())),
+            ("v_subrev_f32_e32", 5f32.to_bits(), 2f32.to_bits(), Some((-3f32).to_bits())),
+            ("v_sub_f32_e32", pinf, ninf, Some(pinf)),
+            ("v_mul_f32_e32", ninf, 2f32.to_bits(), Some(ninf)),
+            ("v_mul_f32_e32", (-0f32).to_bits(), 3f32.to_bits(), Some((-0f32).to_bits())),
+            ("v_sub_f32_e32", 0x7fc0_0000, 1f32.to_bits(), None),
+            ("v_mul_f32_e32", 1f32.to_bits(), 0x7f80_0001, None),
+        ];
+        for (name, a, b, want) in cases {
+            let mut st = state();
+            st.exec = 1;
+            st.v[1][0] = a;
+            st.v[2][0] = b;
+            let i = insn_1151(name, vec![v(0), v(1), v(2)]);
+            match want {
+                Some(w) => {
+                    execute(Arch::Gfx1151, name, &i, &mut st).unwrap();
+                    assert_eq!(st.v[0][0], w, "{name} {a:#010x} {b:#010x}");
+                }
+                None => assert!(execute(Arch::Gfx1151, name, &i, &mut st).is_err(), "{name} NaN operand"),
+            }
+        }
+        for (name, a, b) in [("v_sub_f32_e32", ninf, ninf), ("v_mul_f32_e32", ninf, zero)] {
+            let mut st = state();
+            st.exec = 1;
+            st.v[1][0] = a;
+            st.v[2][0] = b;
+            let i = insn(name, vec![v(0), v(1), v(2)]);
+            assert!(run(name, &i, &mut st).is_err(), "{name} gfx1201 default NaN is not measured");
+            assert_eq!(st.v[0][0], 0, "{name} must not write on error");
+        }
     }
 
     #[test]
