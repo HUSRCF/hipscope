@@ -3,26 +3,39 @@
 //! Every opcode is keyed by its exact ISA name; an unknown name is an error, never a
 //! best guess. Float arithmetic uses host IEEE-754 binary32 (`+ - * fma`, round to
 //! nearest even), which is bit-exact for every non-NaN operand and every non-NaN result. Whatever the
-//! ISA documents only loosely is a hard error rather than a guess:
+//! ISA documents only loosely is a hard error rather than a guess.
 //!
-//! * NaN operands of any arithmetic (propagation order and payload are not measured), and NaN
-//!   results of arithmetic not listed below (sign/payload of the default NaN is not specified
-//!   for add/fma/ldexp/convert), except where the ISA gives an explicit rule
-//!   (`max_num`/`min_num`, `div_fixup`, compares, class, f32->int).
-//! * Invalid operations (NaN result from non-NaN operands) of `v_sub_f32`/`v_subrev_f32`/
-//!   `v_mul_f32` (and their VOPD aliases) on every arch except gfx1151, where all 32 lanes of
-//!   the device probe (`gfx1151-alu-edges.log`: `-inf - -inf`, `-inf * 0`) produced the default
-//!   NaN `0xffc00000`. The rule is applied to any invalid operation of those opcodes, not to
-//!   the probed operands only; gfx1201 is not measured.
-//! * `v_div_scale_f32` lanes whose 1/S1 is possibly denormal (`exponent(S1) >= 253`),
-//!   whose quotient lies on the denormal boundary, or that need `NAN.f32`.
-//! * `v_div_fmas_f32` with a set VCC lane (the document says `2.0F ** 32` while
-//!   `v_div_scale_f32` scales by `ldexp(.., 64)`; the gfx1151 probe measured a `2^-64` factor,
-//!   but fused scaled rounding, subnormal and overflow behavior are not qualified).
-//! * `v_div_fixup_f32` quotients that underflow (`UNDERFLOW_F32` is not defined).
-//! * `v_rndne_f32` of a negative input that rounds to zero on any arch except gfx1151 (documented
-//!   pseudocode gives `+0`, IEEE gives `-0`; gfx1151 measured `-0` = `0x80000000` for
-//!   `-0.25, -0.5, -minsub, -0`, so host `round_ties_even` is exact there; gfx1201 is not measured).
+//! gfx1151 special values come from the exhaustive hardware sweep
+//! (`pm-r2/probe/capture-gfx1151.manifest.json`, `edge_recon.py`; every table below agrees with the
+//! rule for all 4 VCC/SCC input states and leaves VCC/SCC untouched unless stated):
+//!
+//! * NaN operands of `v_add_f32`, `v_sub_f32`, `v_mul_f32`, `v_fma_f32`, `v_fmac_f32`, `v_fmamk_f32`,
+//!   `v_div_fmas_f32` (VCC clear) and the VOPD `add`/`mul`/`fmac`: the first NaN operand in source order
+//!   (`S0`, `S1`, `S2`; fmamk: `S0`, `K`, `S1`) wins, keeps sign and payload and gets bit 22 set. `v_sub_f32`
+//!   negates `S1` before the pick (a NaN `S1` comes out with its sign flipped). A fused multiply-add whose
+//!   product is `inf * 0` returns the default NaN `0xffc00000` even when the addend is a NaN; the default NaN
+//!   is also the result of every invalid operation on non-NaN operands (`inf - inf`, `inf * 0`).
+//!   Source `neg` on a NaN operand is measured only for `v_fma_f32` `S0`/`S2`; any other `abs`/`neg` on a
+//!   NaN operand is an error.
+//! * `v_max_f32`/`v_min_f32`/`v_max3_f32`/`v_min3_f32` (`((S0,S1),S2)`): the first signalling NaN is quieted and
+//!   returned, otherwise two quiet NaNs give `S0`, one quiet NaN loses to the number.
+//! * `v_rndne_f32` and `v_ldexp_f32` quiet a NaN input (sign and payload kept); `v_cvt_f16_f32` converts NaN
+//!   to `sign | 0x7c00 | 0x200 | payload >> 13`; `v_cvt_f32_f16` quiets and widens it.
+//! * `v_div_scale_f32`: the measured exponent-field chain, see [`div_scale_1151`], with exact scalar-destination,
+//!   NULL and VCC behavior (the SGPR predicate itself is not captured by the sweep, it shares VCC's write-back).
+//! * `v_div_fixup_f32`: NaN quotient gives `sign | inf`, an underflowing quotient `sign | 0`.
+//! * `v_div_fmas_f32` with a set VCC lane: a NaN/Inf operand gives the plain fused-multiply-add exceptional result
+//!   (all 164808 nonfinite tuples of gid 32 agree in VCC states 2/3); finite operands stay an error (the sweep
+//!   lacks the rounding discriminators), as does any set VCC lane on an unmeasured arch.
+//! * `v_rndne_f32` of a negative input that rounds to zero gives `-0` (`0x80000000`, measured for
+//!   `-0.25, -0.5, -minsub, -0`), so host `round_ties_even` is exact on gfx1151.
+//!
+//! NaN operands of `v_subrev_f32`, `v_dual_sub_f32`, `v_dual_subrev_f32`, `v_dual_fmamk_f32`, `v_fmaak_f32`,
+//! `v_dual_fmaak_f32` and the `v_fma_mix*` family are not in the sweep and stay errors; the invalid operations
+//! (NaN result from non-NaN operands) of `v_subrev_f32`/`v_dual_sub_f32`/`v_dual_subrev_f32` give the default
+//! NaN on gfx1151 only. Every other arch (gfx1201 included) keeps the hard errors for NaN operands, NaN
+//! results, the documented-but-unmeasured `v_div_scale_f32`/`v_div_fixup_f32` corner cases and:
+//! * `v_rndne_f32` of a negative input rounding to zero (documented pseudocode gives `+0`, IEEE `-0`).
 //! * OMOD results that would flush a non-zero denormal (sign of the flushed zero).
 //! * DPP with FI=1 and an out-of-range source (the BC/FI table disagrees with its prose).
 //!
@@ -92,11 +105,12 @@ fn fin(x: f32) -> Result<u32> {
     }
 }
 
-/// gfx1151 default NaN of an invalid operation, measured on hardware for `v_sub_f32` and `v_mul_f32`.
+/// gfx1151 default NaN of an invalid operation (`inf - inf`, `inf * 0`, inf-minus-inf in a fused multiply-add),
+/// measured on hardware for add/sub/mul/fma/fmac/fmamk/div_fmas.
 const GFX1151_DEFAULT_NAN: u32 = 0xffc0_0000;
 
-/// Result of `v_sub_f32`/`v_subrev_f32`/`v_mul_f32`, whose operands are already known to be
-/// non-NaN (`num`): a NaN result is then an invalid operation. Only gfx1151 has a measured
+/// Result of `v_subrev_f32`/`v_dual_sub_f32`/`v_dual_subrev_f32`, whose NaN operands are not measured
+/// (`num` errors on them): a NaN result is then an invalid operation. Only gfx1151 has a measured
 /// default NaN; other arches keep the hard error.
 fn fin_invalid(arch: Arch, x: f32) -> Result<u32> {
     if x.is_nan() && arch == Arch::Gfx1151 {
@@ -104,6 +118,73 @@ fn fin_invalid(arch: Arch, x: f32) -> Result<u32> {
     } else {
         fin(x)
     }
+}
+
+const QUIET: u32 = 0x0040_0000;
+const SIGN: u32 = 0x8000_0000;
+const NAN_MOD: &str = "abs/neg source modifier on a NaN operand: not measured for this opcode operand";
+
+/// The special-value rules below were measured on gfx1151 only.
+fn measured(arch: Arch) -> bool {
+    arch == Arch::Gfx1151
+}
+
+fn is_snan(bits: u32) -> bool {
+    is_nan(bits) && bits & QUIET == 0
+}
+
+fn is_zero(bits: u32) -> bool {
+    bits & 0x7fff_ffff == 0
+}
+
+fn is_inf(bits: u32) -> bool {
+    bits & 0x7fff_ffff == INF
+}
+
+/// A non-NaN host result is exact; a NaN one is an invalid operation of non-NaN operands.
+fn or_default_nan(x: f32) -> u32 {
+    if x.is_nan() {
+        GFX1151_DEFAULT_NAN
+    } else {
+        x.to_bits()
+    }
+}
+
+/// The first NaN operand in source order, quieted (bit 22 set, sign and payload kept).
+fn first_nan(ops: &[u32]) -> Option<u32> {
+    ops.iter().find(|&&x| is_nan(x)).map(|&x| x | QUIET)
+}
+
+/// `a + b` of post-modifier operand words (gfx1151: measured NaN rules; other arches: NaN is an error).
+fn add_bits(arch: Arch, a: u32, b: u32) -> Result<u32> {
+    if !measured(arch) {
+        return fin(num(a)? + num(b)?);
+    }
+    Ok(first_nan(&[a, b]).unwrap_or_else(|| or_default_nan(f32::from_bits(a) + f32::from_bits(b))))
+}
+
+fn mul_bits(arch: Arch, a: u32, b: u32) -> Result<u32> {
+    if !measured(arch) {
+        return fin(num(a)? * num(b)?);
+    }
+    Ok(first_nan(&[a, b]).unwrap_or_else(|| or_default_nan(f32::from_bits(a) * f32::from_bits(b))))
+}
+
+/// `fma(a, b, c)`: an invalid product (`inf * 0`) beats a NaN addend, which in turn comes after the factors.
+fn fma_bits(arch: Arch, a: u32, b: u32, c: u32) -> Result<u32> {
+    if !measured(arch) {
+        return fin(num(a)?.mul_add(num(b)?, num(c)?));
+    }
+    if let Some(n) = first_nan(&[a, b]) {
+        return Ok(n);
+    }
+    if is_inf(a) && is_zero(b) || is_zero(a) && is_inf(b) {
+        return Ok(GFX1151_DEFAULT_NAN);
+    }
+    if is_nan(c) {
+        return Ok(c | QUIET);
+    }
+    Ok(or_default_nan(f32::from_bits(a).mul_add(f32::from_bits(b), f32::from_bits(c))))
 }
 
 /// Source modifiers: absolute value first, negate after.
@@ -360,10 +441,27 @@ fn num_select(a: u32, b: u32, max: bool) -> u32 {
     }
 }
 
-/// Legacy `v_max_f32`/`v_min_f32`: NaN behavior depends on MODE.IEEE, so NaN is an error.
-fn legacy_select(a: u32, b: u32, max: bool) -> Result<u32> {
-    let (fa, fb) = (num(a)?, num(b)?);
-    Ok(if if max { max_gt(fa, fb) } else { min_lt(fa, fb) } { a } else { b })
+/// Legacy `v_max_f32`/`v_min_f32`. gfx1151 (measured): a signalling NaN wins and is returned quieted (first one
+/// in source order), two quiet NaNs give `a`, one quiet NaN loses to the number. Other arches: NaN is an error
+/// (the behavior depends on MODE.IEEE and is not measured there).
+fn legacy_select(arch: Arch, a: u32, b: u32, max: bool) -> Result<u32> {
+    if !measured(arch) {
+        let (fa, fb) = (num(a)?, num(b)?);
+        return Ok(if if max { max_gt(fa, fb) } else { min_lt(fa, fb) } { a } else { b });
+    }
+    Ok(if is_snan(a) {
+        a | QUIET
+    } else if is_snan(b) {
+        b | QUIET
+    } else if is_nan(a) {
+        if is_nan(b) { a } else { b }
+    } else if is_nan(b) {
+        a
+    } else if if max { max_gt(f32::from_bits(a), f32::from_bits(b)) } else { min_lt(f32::from_bits(a), f32::from_bits(b)) } {
+        a
+    } else {
+        b
+    })
 }
 
 fn f16_in(h: u16) -> Result<u32> {
@@ -436,6 +534,15 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
         Ok(sgn(v, m.abs >> n & 1 != 0, m.neg >> n & 1 != 0))
     };
     let fnum = |n: usize| -> Result<f32> { num(f(n)?) };
+    // Post-modifier operand word for NaN-propagating opcodes: `abs`, and `neg` where it was not measured, on a
+    // NaN operand is an error (its effect on sign/payload/priority is not measured).
+    let g = |n: usize, neg_ok: bool| -> Result<u32> {
+        let v = f(n)?;
+        if is_nan(v) && (m.abs >> n & 1 != 0 || (m.neg >> n & 1 != 0 && !neg_ok)) {
+            return Err(NAN_MOD.into());
+        }
+        Ok(v)
+    };
     // Literal constant of fmamk/fmaak: VOP2 keeps it in `Inst::literal`, VOPD as an operand.
     let lit = |pos: usize| -> Result<u32> {
         if o.len() > 3 {
@@ -502,75 +609,91 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
         "v_cvt_i32_f32" => (Class::FloatToInt, convert::f32_to_i32(f(0)?)),
         "v_cvt_u32_f32" => (Class::FloatToInt, convert::f32_to_u32(f(0)?)),
         "v_rndne_f32" => {
-            let bits = f(0)?;
-            let x = num(bits)?;
-            let r = x.round_ties_even();
-            if bits >> 31 != 0 && r == 0.0 && arch != Arch::Gfx1151 {
-                return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0; only gfx1151 is measured (-0)".into());
+            let bits = g(0, false)?;
+            if is_nan(bits) {
+                if !measured(arch) {
+                    return Err(NAN_IN.into());
+                }
+                (Class::F32, bits | QUIET)
+            } else {
+                let r = f32::from_bits(bits).round_ties_even();
+                if bits >> 31 != 0 && r == 0.0 && !measured(arch) {
+                    return Err("v_rndne_f32 of a negative input rounding to zero: pseudocode gives +0, IEEE gives -0; only gfx1151 is measured (-0)".into());
+                }
+                (Class::F32, r.to_bits())
             }
-            (Class::F32, r.to_bits())
         }
         "v_cvt_f32_f16" => {
             let h = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
-            let h = sgn(u32::from(h) << 16, m.abs & 1 != 0, m.neg & 1 != 0) >> 16;
-            (Class::F32, f16_in(h as u16)?)
+            if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 {
+                if !measured(arch) {
+                    return Err("NaN half operand: payload handling not specified".into());
+                }
+                if (m.abs | m.neg) & 1 != 0 {
+                    return Err(NAN_MOD.into());
+                }
+                (Class::F32, convert::f16_to_f32(h) | QUIET)
+            } else {
+                let h = sgn(u32::from(h) << 16, m.abs & 1 != 0, m.neg & 1 != 0) >> 16;
+                (Class::F32, f16_in(h as u16)?)
+            }
         }
         "v_cvt_f16_f32" => {
             plain(i)?;
             if !matches!(o[0], Operand::Half(..)) {
                 return Err("16-bit destination without a true16 half selector: upper-half policy not specified".into());
             }
-            (Class::Own, u32::from(convert::f32_to_f16(fnum(0)?.to_bits())))
+            let x = f(0)?;
+            if is_nan(x) && !measured(arch) {
+                return Err(NAN_IN.into());
+            }
+            (Class::Own, u32::from(convert::f32_to_f16(x)))
         }
-        "v_ldexp_f32" => (Class::F32, convert::ldexp_f32(fnum(0)?.to_bits(), raw(1)? as i32)),
-        "v_add_f32" | "v_dual_add_f32" => (Class::F32, fin(fnum(0)? + fnum(1)?)?),
-        "v_sub_f32" | "v_dual_sub_f32" => (Class::F32, fin_invalid(arch, fnum(0)? - fnum(1)?)?),
+        "v_ldexp_f32" => {
+            let x = g(0, false)?;
+            if is_nan(x) && !measured(arch) {
+                return Err(NAN_IN.into());
+            }
+            (Class::F32, convert::ldexp_f32(x, raw(1)? as i32))
+        }
+        "v_add_f32" | "v_dual_add_f32" => (Class::F32, add_bits(arch, g(0, false)?, g(1, false)?)?),
+        // v_sub_f32 negates S1 before the NaN pick (measured: a NaN S1 returns with its sign flipped).
+        "v_sub_f32" => (Class::F32, add_bits(arch, g(0, false)?, g(1, false)? ^ SIGN)?),
+        "v_dual_sub_f32" => (Class::F32, fin_invalid(arch, fnum(0)? - fnum(1)?)?),
         "v_subrev_f32" | "v_dual_subrev_f32" => (Class::F32, fin_invalid(arch, fnum(1)? - fnum(0)?)?),
-        "v_mul_f32" | "v_dual_mul_f32" => (Class::F32, fin_invalid(arch, fnum(0)? * fnum(1)?)?),
-        "v_fma_f32" => (Class::F32, fin(fnum(0)?.mul_add(fnum(1)?, fnum(2)?))?),
+        "v_mul_f32" | "v_dual_mul_f32" => (Class::F32, mul_bits(arch, g(0, false)?, g(1, false)?)?),
+        // Source `neg` on a NaN is measured for S0 and S2 only.
+        "v_fma_f32" => (Class::F32, fma_bits(arch, g(0, true)?, g(1, false)?, g(2, true)?)?),
         "v_fmac_f32" | "v_dual_fmac_f32" => {
-            let acc = num(s.read(&o[0], lane, 0)?)?;
-            (Class::F32, fin(fnum(0)?.mul_add(fnum(1)?, acc))?)
+            let acc = s.read(&o[0], lane, 0)?;
+            (Class::F32, fma_bits(arch, g(0, false)?, g(1, false)?, acc)?)
         }
         // fmamk: D = S0 * K + S1; fmaak: D = S0 * S1 + K.
-        "v_fmamk_f32" | "v_dual_fmamk_f32" => (Class::F32, fin(fnum(0)?.mul_add(num(lit(1)?)?, fnum(if o.len() > 3 { 2 } else { 1 })?))?),
+        "v_fmamk_f32" => (Class::F32, fma_bits(arch, g(0, false)?, lit(1)?, g(1, false)?)?),
+        "v_dual_fmamk_f32" => (Class::F32, fin(fnum(0)?.mul_add(num(lit(1)?)?, fnum(2)?))?),
         "v_fmaak_f32" | "v_dual_fmaak_f32" => (Class::F32, fin(fnum(0)?.mul_add(fnum(1)?, num(lit(2)?)?))?),
-        "v_max_f32" => (Class::F32, legacy_select(f(0)?, f(1)?, true)?),
-        "v_min_f32" => (Class::F32, legacy_select(f(0)?, f(1)?, false)?),
-        "v_max3_f32" => (Class::F32, legacy_select(legacy_select(f(0)?, f(1)?, true)?, f(2)?, true)?),
-        "v_min3_f32" => (Class::F32, legacy_select(legacy_select(f(0)?, f(1)?, false)?, f(2)?, false)?),
+        "v_max_f32" => (Class::F32, legacy_select(arch, g(0, false)?, g(1, false)?, true)?),
+        "v_min_f32" => (Class::F32, legacy_select(arch, g(0, false)?, g(1, false)?, false)?),
+        "v_max3_f32" => (Class::F32, legacy_select(arch, legacy_select(arch, g(0, false)?, g(1, false)?, true)?, g(2, false)?, true)?),
+        "v_min3_f32" => (Class::F32, legacy_select(arch, legacy_select(arch, g(0, false)?, g(1, false)?, false)?, g(2, false)?, false)?),
         "v_max_num_f32" | "v_dual_max_num_f32" => (Class::F32, num_select(f(0)?, f(1)?, true)),
         "v_min_num_f32" | "v_dual_min_num_f32" => (Class::F32, num_select(f(0)?, f(1)?, false)),
         "v_max3_num_f32" => (Class::F32, num_select(num_select(f(0)?, f(1)?, true), f(2)?, true)),
         "v_min3_num_f32" => (Class::F32, num_select(num_select(f(0)?, f(1)?, false), f(2)?, false)),
         "v_div_fmas_f32" => {
-            if s.vcc & (1 << lane) != 0 {
-                return Err("v_div_fmas_f32 with VCC set: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; hardware-verified factor required".into());
+            let vcc = s.vcc & (1 << lane) != 0;
+            if vcc && !measured(arch) {
+                return Err("v_div_fmas_f32 with VCC set: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; the sweep lacks the fused-rounding discriminators, so the scaled result is not qualified".into());
             }
-            (Class::F32, fin(fnum(0)?.mul_add(fnum(1)?, fnum(2)?))?)
+            let (a, b, c) = (g(0, false)?, g(1, false)?, g(2, false)?);
+            // gfx1151 VCC set scales the result; the sweep qualifies that only where an operand is NaN/Inf, whose
+            // result (priority/sign/payload) does not depend on the scale. Finite operands stay unqualified.
+            if vcc && [a, b, c].iter().all(|&x| x & 0x7f80_0000 != 0x7f80_0000) {
+                return Err("v_div_fmas_f32 with VCC set and finite operands: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; the gfx1151 sweep lacks the fused-rounding discriminators, so the scaled result is not qualified".into());
+            }
+            (Class::F32, fma_bits(arch, a, b, c)?)
         }
-        "v_div_fixup_f32" => {
-            let (q, den, nu) = (f(0)?, f(1)?, f(2)?);
-            let (da, na) = (den & 0x7fff_ffff, nu & 0x7fff_ffff);
-            let sign = (den ^ nu) & 0x8000_0000;
-            let r = if na > INF {
-                nu | 0x0040_0000
-            } else if da > INF {
-                den | 0x0040_0000
-            } else if (da == 0 && na == 0) || (da == INF && na == INF) {
-                0xffc0_0000
-            } else if da == 0 || na == INF {
-                sign | INF
-            } else if da == INF || na == 0 {
-                sign
-            } else if ((na >> 23) as i32) - ((da >> 23) as i32) < -150 {
-                return Err("v_div_fixup_f32 underflow branch: UNDERFLOW_F32 is not defined by the ISA".into());
-            } else {
-                // exponent(S1) == 255 is unreachable here: NaN and infinity were handled above.
-                sign | (q & 0x7fff_ffff)
-            };
-            (Class::F32, r)
-        }
+        "v_div_fixup_f32" => (Class::F32, div_fixup(arch, g(0, false)?, g(1, false)?, g(2, false)?)?),
         "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
             let [a, b, c] = mix_in(s, o, i, lane)?;
             let mut r = a.mul_add(b, c);
@@ -674,54 +797,128 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     Ok(())
 }
 
-/// `v_div_scale_f32`: chain of the RDNA4 pseudocode, restricted to its proven domain.
-fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
-    let o = &i.operands;
-    let m = &i.mods;
+/// `v_div_scale_f32` on gfx1151, from the hardware sweep (spec gids 29/30/31, all 262144 operand tuples of the
+/// 64-member f32 set including zeros, denormals, infinities and NaNs, all 4 VCC/SCC states). Operands are
+/// `S0` (the value to scale), `S1` (denominator), `S2` (numerator), post-modifier words; everything is decided
+/// by the raw biased exponent fields (`e1`, `e2`, so NaN/infinity count as 255), `d = e2 - e1`:
+///
+/// * VCC lane predicate = `d >= 96 || d <= -96`, also for zero operands; the ISA document's "denormal
+///   quotient" test is not what the hardware does.
+/// * `S1 == 0 || S2 == 0`: `D = 0xffc00000` (S0 ignored, even a NaN).
+/// * `d >= 96`: `D = S0 == S1 ? S0 * 2^64 : S0`.
+/// * `e1 == 0` (denormal denominator): `D = S0 * 2^64`.
+/// * `e1 >= 254` (reciprocal denormal): `D = S0 * 2^-64`, except `D = S0` when the predicate is set and
+///   `S0 != S1`. The hardware subtracts 64 from the exponent field: `S0` with exponent field <= 63 (denormals
+///   included, zero excluded) gives `+-inf`, exponent fields >= 91 are exact.
+/// * `d <= -96`: `D = S0 == S1 ? S0 : S0 * 2^64` (the numerator is scaled).
+/// * `e2 <= 23`: `D = S0 * 2^64`; otherwise `D = S0`.
+///
+/// `S0 * 2^64` leaves NaN and infinity untouched (a signalling NaN stays signalling); `S0 == S1` is a bitwise
+/// comparison. Domains the sweep leaves open (`e1` 228..=253, `d == -96` with `e1 != 254`, `e2` 24..=26 where the
+/// scale decision is reached, the `2^-64` of exponent fields 64..=90) are errors.
+fn div_scale_1151(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
+    let exp = |x: u32| (x >> 23 & 255) as i32;
+    let (e0, e1, e2) = (exp(s0), exp(s1), exp(s2));
+    let d = e2 - e1;
+    if d == -96 && e1 != 254 {
+        return Err("v_div_scale_f32: exponent difference -96 is measured only for denominator exponent 254".into());
+    }
+    let flag = d >= 96 || d <= -96;
+    if is_zero(s1) || is_zero(s2) {
+        return Ok((0xffc0_0000, flag));
+    }
+    let up = |x: u32| if x >> 23 & 255 == 255 { x } else { convert::ldexp_f32(x, 64) };
+    let down = || -> Result<u32> {
+        Ok(match e0 {
+            255 => s0,
+            _ if is_zero(s0) => s0,
+            0..=63 => (s0 & SIGN) | INF,
+            64..=90 => return Err("v_div_scale_f32: S0 * 2^-64 with exponent field 64..=90 is not measured".into()),
+            _ => convert::ldexp_f32(s0, -64),
+        })
+    };
+    let scaled = if d >= 96 {
+        if s0 == s1 { up(s0) } else { s0 }
+    } else if e1 == 0 {
+        up(s0)
+    } else if (228..=253).contains(&e1) {
+        return Err("v_div_scale_f32: denominator exponent 228..=253 is not measured".into());
+    } else if e1 >= 254 {
+        if flag && s0 != s1 { s0 } else { down()? }
+    } else if d <= -96 {
+        if s0 == s1 { s0 } else { up(s0) }
+    } else if e2 <= 23 {
+        up(s0)
+    } else if e2 <= 26 {
+        return Err("v_div_scale_f32: numerator exponent 24..=26 is not measured".into());
+    } else {
+        s0
+    };
+    Ok((scaled, flag))
+}
+
+/// `v_div_scale_f32` per the RDNA4 pseudocode, restricted to its proven domain (every arch except gfx1151,
+/// where the pseudocode does not match the measured hardware).
+fn div_scale_isa(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
     let ldexp64 = |x: u32| -> Result<u32> {
         if is_nan(x) {
             return Err(NAN_IN.into());
         }
         Ok(convert::ldexp_f32(x, 64))
     };
+    let (e1, e2) = ((s1 >> 23 & 255) as i32, (s2 >> 23 & 255) as i32);
+    if s1 & 0x7fff_ffff == 0 || s2 & 0x7fff_ffff == 0 {
+        return Err("v_div_scale_f32 with a zero numerator/denominator yields NAN.f32: encoding not specified".into());
+    }
+    if is_nan(s1) || is_nan(s2) {
+        return Err(NAN_IN.into());
+    }
+    if e1 >= 253 {
+        return Err("v_div_scale_f32: `1.0/S1 == DENORM.f64` is ambiguous when |S1| >= 2^126".into());
+    }
+    let mut flag = false;
+    let d = if e2 - e1 >= 96 {
+        flag = true;
+        if s0 == s1 { ldexp64(s0)? } else { s0 }
+    } else if e1 == 0 {
+        ldexp64(s0)?
+    } else {
+        let qf = f32::from_bits(s2) / f32::from_bits(s1);
+        let qd = f64::from(f32::from_bits(s2)) / f64::from(f32::from_bits(s1));
+        let denorm32 = qf != 0.0 && qf.abs() < f32::MIN_POSITIVE;
+        let denorm64 = qd.abs() < f64::from(f32::MIN_POSITIVE);
+        if denorm32 != denorm64 || qd.abs() == f64::from(f32::MIN_POSITIVE) {
+            return Err("v_div_scale_f32: quotient lies on the denormal boundary; hardware rounding not specified".into());
+        }
+        if denorm32 {
+            flag = true;
+            if f32::from_bits(s0) == f32::from_bits(s2) { ldexp64(s0)? } else { s0 }
+        } else if e2 <= 23 {
+            ldexp64(s0)?
+        } else {
+            s0
+        }
+    };
+    Ok((d, flag))
+}
+
+/// `v_div_scale_f32 D, SDST, S0, S1, S2`. The predicate lands in SDST: VCC is replaced as a whole (SCC and every
+/// other state untouched), a NULL destination discards it, so VCC is then preserved.
+fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
+    let o = &i.operands;
+    let m = &i.mods;
     let mut out = [None; 32];
     let mut vcc = 0u32;
     for lane in active(s) {
-        let src = |n: usize| -> Result<u32> { Ok(sgn(s.read(&o[2 + n], lane, 0)?, m.abs >> n & 1 != 0, m.neg >> n & 1 != 0)) };
-        let (s0, s1, s2) = (src(0)?, src(1)?, src(2)?);
-        let (e1, e2) = ((s1 >> 23 & 255) as i32, (s2 >> 23 & 255) as i32);
-        if s1 & 0x7fff_ffff == 0 || s2 & 0x7fff_ffff == 0 {
-            return Err("v_div_scale_f32 with a zero numerator/denominator yields NAN.f32: encoding not specified".into());
-        }
-        if is_nan(s1) || is_nan(s2) {
-            return Err(NAN_IN.into());
-        }
-        if e1 >= 253 {
-            return Err("v_div_scale_f32: `1.0/S1 == DENORM.f64` is ambiguous when |S1| >= 2^126".into());
-        }
-        let mut flag = false;
-        let d = if e2 - e1 >= 96 {
-            flag = true;
-            if s0 == s1 { ldexp64(s0)? } else { s0 }
-        } else if e1 == 0 {
-            ldexp64(s0)?
-        } else {
-            let qf = f32::from_bits(s2) / f32::from_bits(s1);
-            let qd = f64::from(f32::from_bits(s2)) / f64::from(f32::from_bits(s1));
-            let denorm32 = qf != 0.0 && qf.abs() < f32::MIN_POSITIVE;
-            let denorm64 = qd.abs() < f64::from(f32::MIN_POSITIVE);
-            if denorm32 != denorm64 || qd.abs() == f64::from(f32::MIN_POSITIVE) {
-                return Err("v_div_scale_f32: quotient lies on the denormal boundary; hardware rounding not specified".into());
+        let src = |n: usize| -> Result<u32> {
+            let v = sgn(s.read(&o[2 + n], lane, 0)?, m.abs >> n & 1 != 0, m.neg >> n & 1 != 0);
+            if measured(arch) && is_nan(v) && (m.abs | m.neg) >> n & 1 != 0 {
+                return Err(NAN_MOD.into());
             }
-            if denorm32 {
-                flag = true;
-                if f32::from_bits(s0) == f32::from_bits(s2) { ldexp64(s0)? } else { s0 }
-            } else if e2 <= 23 {
-                ldexp64(s0)?
-            } else {
-                s0
-            }
+            Ok(v)
         };
+        let (s0, s1, s2) = (src(0)?, src(1)?, src(2)?);
+        let (d, flag) = if measured(arch) { div_scale_1151(s0, s1, s2)? } else { div_scale_isa(s0, s1, s2)? };
         if flag {
             vcc |= 1 << lane;
         }
@@ -733,6 +930,36 @@ fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
         }
     }
     s.put(&o[1], 0, 0, vcc)
+}
+
+/// `v_div_fixup_f32 D, S0 (quotient), S1 (denominator), S2 (numerator)`. The special-case chain is the ISA's
+/// (`cvtToQuietNAN` of `S2`, else `S1`; `0xffc00000` for 0/0 and inf/inf; signed inf/zero). Measured on gfx1151
+/// (gid 33, all 262144 tuples): a NaN quotient reaching the final branch gives `sign | inf` and an
+/// underflowing quotient (`exponent(S2) - exponent(S1) < -150`) gives the signed zero.
+fn div_fixup(arch: Arch, q: u32, den: u32, nu: u32) -> Result<u32> {
+    let (da, na) = (den & 0x7fff_ffff, nu & 0x7fff_ffff);
+    let sign = (den ^ nu) & SIGN;
+    Ok(if na > INF {
+        nu | QUIET
+    } else if da > INF {
+        den | QUIET
+    } else if (da == 0 && na == 0) || (da == INF && na == INF) {
+        0xffc0_0000
+    } else if da == 0 || na == INF {
+        sign | INF
+    } else if da == INF || na == 0 {
+        sign
+    } else if ((na >> 23) as i32) - ((da >> 23) as i32) < -150 {
+        if !measured(arch) {
+            return Err("v_div_fixup_f32 underflow branch: UNDERFLOW_F32 is not defined by the ISA".into());
+        }
+        sign
+    } else if measured(arch) && is_nan(q) {
+        sign | INF
+    } else {
+        // exponent(S1) == 255 is unreachable here: NaN and infinity were handled above.
+        sign | (q & 0x7fff_ffff)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1498,44 +1725,51 @@ mod tests {
         assert!(run(name, &i, &mut st).is_err());
     }
 
-    // gfx1151 measured default NaN 0xffc00000 for invalid sub/subrev/mul of non-NaN operands; valid
-    // arithmetic is unchanged, NaN operands and every unmeasured arch (gfx1201) stay hard errors.
+    /// One active lane of a gfx1151 instruction: sources in `v1..`, destination `v0` preset to `dst`.
+    fn lane1151(name: &str, srcs: &[u32], dst: u32, tweak: impl Fn(&mut Inst)) -> std::result::Result<u32, String> {
+        // The decode tables lack v_min_f32/v_min3_f32; they share the operand shape of their max twins.
+        let row = match name {
+            "v_min_f32_e32" => "v_max_f32_e32",
+            "v_min3_f32" => "v_max3_f32",
+            n => n,
+        };
+        let mut i = insn_1151(row, (0..=srcs.len() as u16).map(v).collect());
+        tweak(&mut i);
+        let mut st = state();
+        st.exec = 1;
+        st.v[0][0] = dst;
+        for (n, x) in srcs.iter().enumerate() {
+            st.v[n + 1][0] = *x;
+        }
+        execute(Arch::Gfx1151, name, &i, &mut st).map(|_| st.v[0][0])
+    }
+
+    // gfx1151 measured default NaN 0xffc00000 for invalid operations of non-NaN operands; valid
+    // arithmetic is unchanged and every unmeasured arch (gfx1201) keeps the hard errors.
     #[test]
-    fn invalid_sub_mul_default_nan_is_gfx1151_only_and_valid_arithmetic_is_exact() {
+    fn invalid_operations_give_the_default_nan_on_gfx1151_only_and_valid_arithmetic_is_exact() {
         let ninf = f32::NEG_INFINITY.to_bits();
         let pinf = f32::INFINITY.to_bits();
         let zero = 0f32.to_bits();
         let nan_default = 0xffc0_0000u32;
-        // (opcode, src0, src1, expected) -- invalid: inf-inf (same sign), inf*0 either order.
+        // (opcode, src0, src1, expected) -- invalid: inf-inf (same sign), inf*0 either order, inf+(-inf).
         let cases = [
-            ("v_sub_f32_e32", ninf, ninf, Some(nan_default)),
-            ("v_sub_f32_e32", pinf, pinf, Some(nan_default)),
-            ("v_subrev_f32_e32", ninf, ninf, Some(nan_default)),
-            ("v_mul_f32_e32", ninf, zero, Some(nan_default)),
-            ("v_mul_f32_e32", zero, pinf, Some(nan_default)),
-            ("v_sub_f32_e32", 5f32.to_bits(), 2f32.to_bits(), Some(3f32.to_bits())),
-            ("v_subrev_f32_e32", 5f32.to_bits(), 2f32.to_bits(), Some((-3f32).to_bits())),
-            ("v_sub_f32_e32", pinf, ninf, Some(pinf)),
-            ("v_mul_f32_e32", ninf, 2f32.to_bits(), Some(ninf)),
-            ("v_mul_f32_e32", (-0f32).to_bits(), 3f32.to_bits(), Some((-0f32).to_bits())),
-            ("v_sub_f32_e32", 0x7fc0_0000, 1f32.to_bits(), None),
-            ("v_mul_f32_e32", 1f32.to_bits(), 0x7f80_0001, None),
+            ("v_sub_f32_e32", ninf, ninf, nan_default),
+            ("v_sub_f32_e32", pinf, pinf, nan_default),
+            ("v_subrev_f32_e32", ninf, ninf, nan_default),
+            ("v_add_f32_e32", pinf, ninf, nan_default),
+            ("v_mul_f32_e32", ninf, zero, nan_default),
+            ("v_mul_f32_e32", zero, pinf, nan_default),
+            ("v_sub_f32_e32", 5f32.to_bits(), 2f32.to_bits(), 3f32.to_bits()),
+            ("v_subrev_f32_e32", 5f32.to_bits(), 2f32.to_bits(), (-3f32).to_bits()),
+            ("v_sub_f32_e32", pinf, ninf, pinf),
+            ("v_mul_f32_e32", ninf, 2f32.to_bits(), ninf),
+            ("v_mul_f32_e32", (-0f32).to_bits(), 3f32.to_bits(), (-0f32).to_bits()),
         ];
         for (name, a, b, want) in cases {
-            let mut st = state();
-            st.exec = 1;
-            st.v[1][0] = a;
-            st.v[2][0] = b;
-            let i = insn_1151(name, vec![v(0), v(1), v(2)]);
-            match want {
-                Some(w) => {
-                    execute(Arch::Gfx1151, name, &i, &mut st).unwrap();
-                    assert_eq!(st.v[0][0], w, "{name} {a:#010x} {b:#010x}");
-                }
-                None => assert!(execute(Arch::Gfx1151, name, &i, &mut st).is_err(), "{name} NaN operand"),
-            }
+            assert_eq!(lane1151(name, &[a, b], 0, |_| {}), Ok(want), "{name} {a:#010x} {b:#010x}");
         }
-        for (name, a, b) in [("v_sub_f32_e32", ninf, ninf), ("v_mul_f32_e32", ninf, zero)] {
+        for (name, a, b) in [("v_sub_f32_e32", ninf, ninf), ("v_mul_f32_e32", ninf, zero), ("v_add_f32_e32", pinf, ninf)] {
             let mut st = state();
             st.exec = 1;
             st.v[1][0] = a;
@@ -1544,6 +1778,311 @@ mod tests {
             assert!(run(name, &i, &mut st).is_err(), "{name} gfx1201 default NaN is not measured");
             assert_eq!(st.v[0][0], 0, "{name} must not write on error");
         }
+    }
+
+    // gfx1151 sweep (gids 0/2/3/8/11/12/13/15, all 4 VCC/SCC states): the first NaN operand in source order wins,
+    // keeps sign and payload and is quieted; `v_sub_f32` negates S1 first; fmamk orders S0, K, S1; an `inf * 0`
+    // product beats a NaN addend; the pure default NaN is 0xffc00000.
+    #[test]
+    fn nan_operands_select_first_nan_quiet_it_and_keep_sign_and_payload() {
+        let (qn, qn2, sn) = (0x7fc1_2345u32, 0xffc0_abcdu32, 0x7f80_0001u32);
+        let one = 1f32.to_bits();
+        let ok = |name: &str, srcs: &[u32], want: u32| assert_eq!(lane1151(name, srcs, 0, |_| {}), Ok(want), "{name} {srcs:x?}");
+        ok("v_mul_f32_e32", &[one, 0xffc0_0002], 0xffc0_0002);
+        ok("v_mul_f32_e32", &[qn, qn2], qn);
+        ok("v_mul_f32_e32", &[sn, qn2], 0x7fc0_0001); // a signalling S0 is quieted, not skipped
+        ok("v_mul_f32_e32", &[qn2, sn], qn2); // a quiet S0 beats a signalling S1
+        ok("v_mul_f32_e32", &[one, sn], 0x7fc0_0001);
+        ok("v_add_f32_e32", &[0x7fc0_0000, one], 0x7fc0_0000);
+        ok("v_add_f32_e32", &[one, 0xff80_0002], 0xffc0_0002);
+        ok("v_sub_f32_e32", &[one, qn2], 0x7fc0_abcd); // S1 is negated: sign flips
+        ok("v_sub_f32_e32", &[one, sn], 0xffc0_0001);
+        ok("v_sub_f32_e32", &[qn, qn2], qn);
+        ok("v_fma_f32", &[qn, qn2, 0x7fc0_0001], qn);
+        ok("v_fma_f32", &[sn, qn2, one], 0x7fc0_0001);
+        ok("v_fma_f32", &[one, one, 0xff80_0002], 0xffc0_0002);
+        // The product's invalid operation (inf * 0) has priority over a NaN addend; so has inf + (-inf).
+        ok("v_fma_f32", &[0, INF, qn], 0xffc0_0000);
+        ok("v_fma_f32", &[INF, 0, sn], 0xffc0_0000);
+        ok("v_fma_f32", &[one, 0xff80_0000, INF], 0xffc0_0000);
+        ok("v_fma_f32", &[one, one, sn], 0x7fc0_0001);
+        assert_eq!(lane1151("v_fmac_f32_e32", &[one, one], sn, |_| {}), Ok(0x7fc0_0001), "accumulator is the destination");
+        // A NaN S0 wins over a NaN K even when K comes first in the encoding.
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = qn;
+        st.v[2][0] = one;
+        let r = crate::isa::gfx1151().iter().find(|r| r.name == "v_fmamk_f32").unwrap();
+        let i = Inst::from_parts(Arch::Gfx1151, r.op, r.form, Default::default(), vec![v(0), v(1), v(2)].into_iter().collect(), Default::default(), Some(qn2), Default::default()).unwrap();
+        execute(Arch::Gfx1151, "v_fmamk_f32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], qn, "fmamk: S0 before K");
+        st.v[1][0] = one;
+        st.v[2][0] = sn;
+        execute(Arch::Gfx1151, "v_fmamk_f32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xffc0_abcd, "fmamk: K before S1");
+        // The VOPD halves behave like their VOP2 forms: X = v0 = v1 * v2, Y = v1 = v0 + v3.
+        let t = crate::isa::gfx1151();
+        let (x, y) = (t.iter().find(|r| r.name == "v_dual_mul_f32").unwrap(), t.iter().find(|r| r.name == "v_dual_add_f32").unwrap());
+        let i = Inst::from_parts(Arch::Gfx1151, x.op, x.form, FormFields::Vopd { y_op: y.op, x_operands: 3 }, vec![v(0), v(1), v(2), v(1), v(0), v(3)].into_iter().collect(), Default::default(), None, Default::default()).unwrap();
+        let mut st = state();
+        st.exec = 1;
+        (st.v[0][0], st.v[1][0], st.v[2][0], st.v[3][0]) = (one, sn, qn, qn2);
+        execute(Arch::Gfx1151, "v_dual_mul_f32", &i, &mut st).unwrap();
+        assert_eq!((st.v[0][0], st.v[1][0]), (0x7fc0_0001, qn2));
+    }
+
+    // Source modifiers on NaN operands: `neg` is measured for fma S0 and S2 (gids 13..16), nothing else.
+    #[test]
+    fn nan_operands_with_source_modifiers_are_qualified_only_where_measured() {
+        let (qn, qn2, sn) = (0x7fc1_2345u32, 0xffc0_abcdu32, 0x7f80_0001u32);
+        let one = 1f32.to_bits();
+        fn neg(bits: u8) -> impl Fn(&mut Inst) {
+            move |i| i.mods.neg = bits
+        }
+        assert_eq!(lane1151("v_fma_f32", &[qn2, one, one], 0, neg(0b001)), Ok(0x7fc0_abcd), "-S0 flips the NaN sign");
+        assert_eq!(lane1151("v_fma_f32", &[one, one, qn], 0, neg(0b100)), Ok(0xffc1_2345), "-S2");
+        assert_eq!(lane1151("v_fma_f32", &[one, one, sn], 0, neg(0b100)), Ok(0xffc0_0001));
+        assert_eq!(lane1151("v_fma_f32", &[0, INF, qn], 0, neg(0b100)), Ok(0xffc0_0000), "invalid product beats -C NaN");
+        assert_eq!(lane1151("v_fma_f32", &[2f32.to_bits(), 3f32.to_bits(), 10f32.to_bits()], 0, neg(0b001)), Ok(4f32.to_bits()), "-2 * 3 + 10");
+        assert!(lane1151("v_fma_f32", &[one, qn, one], 0, neg(0b010)).is_err(), "-S1 on a NaN is not measured");
+        assert!(lane1151("v_fma_f32", &[qn, one, one], 0, |i| i.mods.abs = 0b001).is_err(), "abs on a NaN is not measured");
+        assert!(lane1151("v_mul_f32_e64", &[qn, one], 0, neg(0b001)).is_err(), "-S0 on a mul NaN is not measured");
+        assert!(lane1151("v_max_f32_e64", &[qn, one], 0, |i| i.mods.abs = 0b001).is_err());
+        assert_eq!(lane1151("v_mul_f32_e64", &[(-1f32).to_bits(), 2f32.to_bits()], 0, |i| i.mods.abs = 0b001), Ok(2f32.to_bits()), "abs on numbers is unchanged");
+    }
+
+    // gfx1151 sweep (gids 34..38, exhaustive): signalling NaN first (quieted), two quiet NaNs give S0, one quiet NaN
+    // loses to a number; max3/min3 are ((S0,S1),S2); signed zeros order -0 < +0.
+    #[test]
+    fn legacy_max_min_nan_rules_are_gfx1151_only() {
+        let (qn, qn2, sn) = (0x7fc1_2345u32, 0xffc0_abcdu32, 0x7f80_0001u32);
+        let (one, two) = (1f32.to_bits(), 2f32.to_bits());
+        let ok = |name: &str, srcs: &[u32], want: u32| assert_eq!(lane1151(name, srcs, 0, |_| {}), Ok(want), "{name} {srcs:x?}");
+        ok("v_max_f32_e32", &[sn, one], 0x7fc0_0001);
+        ok("v_max_f32_e32", &[0x7fc0_0000, one], one);
+        ok("v_max_f32_e32", &[0x7fc0_0000, sn], 0x7fc0_0001);
+        ok("v_max_f32_e32", &[one, qn2], one);
+        ok("v_max_f32_e32", &[qn, qn2], qn);
+        ok("v_min_f32_e32", &[two, sn], 0x7fc0_0001);
+        ok("v_max_f32_e32", &[0x8000_0000, 0], 0);
+        ok("v_max_f32_e32", &[0, 0x8000_0000], 0);
+        ok("v_min_f32_e32", &[0x8000_0000, 0], 0x8000_0000);
+        ok("v_min_f32_e32", &[0, 0x8000_0000], 0x8000_0000);
+        ok("v_max3_f32", &[one, sn, two], two); // stage 1 yields a quiet NaN, which loses to S2
+        ok("v_max3_f32", &[0x7fc0_0001, one, sn], 0x7fc0_0001); // a signalling S2 wins stage 2
+        ok("v_min3_f32", &[0x7fc0_0000, one, qn], one);
+        for (name, srcs) in [("v_max_f32_e32", vec![qn, one]), ("v_max3_f32", vec![one, sn, two])] {
+            let i = insn_1151(name, (0..=srcs.len() as u16).map(v).collect());
+            let mut st = state();
+            st.exec = 1;
+            for (n, x) in srcs.iter().enumerate() {
+                st.v[n + 1][0] = *x;
+            }
+            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_err(), "{name} NaN on gfx1201 stays unqualified");
+        }
+    }
+
+    // gfx1151 sweep (gids 23, 28, 89..92): NaN inputs keep sign and payload; f32->f16 sets the quiet bit and keeps
+    // payload bits 22..13; f16->f32 quiets and widens; everything else is unchanged.
+    #[test]
+    fn rndne_ldexp_and_f16_conversions_handle_nan_inputs_on_gfx1151_only() {
+        let (qn2, sn) = (0xffc0_abcdu32, 0x7f80_0001u32);
+        assert_eq!(lane1151("v_rndne_f32_e32", &[sn], 0, |_| {}), Ok(0x7fc0_0001));
+        assert_eq!(lane1151("v_rndne_f32_e32", &[qn2], 0, |_| {}), Ok(qn2));
+        assert_eq!(lane1151("v_ldexp_f32", &[sn, 3], 0, |_| {}), Ok(0x7fc0_0001));
+        assert_eq!(lane1151("v_ldexp_f32", &[0xff80_0002, 1], 0, |_| {}), Ok(0xffc0_0002));
+        assert_eq!(lane1151("v_ldexp_f32", &[1f32.to_bits(), 3], 0, |_| {}), Ok(8f32.to_bits()));
+        for (name, src) in [("v_rndne_f32_e32", sn), ("v_ldexp_f32", sn)] {
+            let i = insn_1151(name, if name == "v_ldexp_f32" { vec![v(0), v(1), v(2)] } else { vec![v(0), v(1)] });
+            let mut st = state();
+            st.exec = 1;
+            (st.v[1][0], st.v[2][0]) = (src, 3);
+            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_err(), "{name} NaN on gfx1201 stays unqualified");
+        }
+        // f32 -> f16 into either half; the other half is preserved.
+        for (src, h) in [(0x7f80_0001u32, 0x7e00u32), (0xffe5_a5a5, 0xff2d), (0xff80_0001, 0xfe00)] {
+            let lo = insn_1151("v_cvt_f16_f32_e32", vec![half(0, Half::Lo), v(1)]);
+            let hi = insn_1151("v_cvt_f16_f32_e32", vec![half(0, Half::Hi), v(1)]);
+            for (i, want) in [(lo, 0xdead_0000 | h), (hi, (h << 16) | 0xbeef)] {
+                let mut st = state();
+                st.exec = 1;
+                st.v[1][0] = src;
+                st.v[0][0] = 0xdead_beef;
+                execute(Arch::Gfx1151, "v_cvt_f16_f32_e32", &i, &mut st).unwrap();
+                assert_eq!(st.v[0][0], want, "{src:#x}");
+            }
+        }
+        let lo = insn_1151("v_cvt_f32_f16_e64", vec![v(0), half(1, Half::Lo)]);
+        let hi = insn_1151("v_cvt_f32_f16_e64", vec![v(0), half(1, Half::Hi)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0x7dff_7c01;
+        execute(Arch::Gfx1151, "v_cvt_f32_f16_e64", &lo, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x7fc0_2000);
+        execute(Arch::Gfx1151, "v_cvt_f32_f16_e64", &hi, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x7fff_e000);
+        let mut neg = lo;
+        neg.mods.neg = 1;
+        assert!(execute(Arch::Gfx1151, "v_cvt_f32_f16_e64", &neg, &mut st).is_err(), "neg on a NaN half is not measured");
+        assert!(execute(Arch::Gfx1201, "v_cvt_f32_f16_e64", &insn_1151("v_cvt_f32_f16_e64", vec![v(0), half(1, Half::Lo)]), &mut st).is_err());
+    }
+
+    // gfx1151 sweep (gids 29/30/31, all 262144 tuples x 4 states): D0, the VCC predicate per exponent fields, and
+    // the scalar/NULL/VCC destinations.
+    #[test]
+    fn div_scale_gfx1151_measured_chain_flags_and_destinations() {
+        let one = 1f32.to_bits();
+        // (S0, S1 denominator, S2 numerator) -> (D0, VCC lane bit)
+        let rows: [([u32; 3], u32, bool); 17] = [
+            ([one, 0, one], 0xffc0_0000, true),                       // zero denominator: default NaN, flag from d = 127
+            ([0, 0, 0], 0xffc0_0000, false),                          // 0/0
+            ([0x7f80_0001, one, one], 0x7f80_0001, false),            // NaN S0 passes through unquieted
+            ([0x1f80_0000, 0x1f80_0000, 0x7f00_0000], one, true),     // d >= 96, S0 == S1: scaled by 2^64
+            ([0x0b80_0000, 0x7180_0000, 0x0b80_0000], 0x2b80_0000, true), // d <= -96: numerator scaled although the quotient is normal
+            ([0x7180_0000, 0x7180_0000, 0x0b80_0000], 0x7180_0000, true), // d <= -96, S0 == S1: unscaled
+            ([0x7f00_0000, 0x7f00_0000, one], 0x5f00_0000, true),     // e1 = 254: denominator scaled by 2^-64
+            ([0x1f80_0000, 0x7f00_0000, 0x7f00_0000], 0x7f80_0000, false), // e1 = 254, S0 exponent <= 63: +inf
+            ([one, 1, 0x0080_0000], 0x5f80_0000, false),              // denormal denominator
+            ([one, 0x0b80_0000, 0x0b80_0000], 0x5f80_0000, false),    // e2 <= 23
+            ([one, one, 0x0b80_0000], one, true),                     // d = -104, S0 == S1
+            ([one, one, 0x1500_0000], one, false),                    // d = -85: nothing to do
+            ([0x7fc1_2345, 0x7f7f_ffff, 0x7fc1_2345], 0x7fc1_2345, false),
+            ([0x8000_0000, 0x7f00_0000, 0x7f00_0000], 0x8000_0000, false), // zero stays zero
+            ([0x5f80_0000, 0x7f00_0000, one], 0x5f80_0000, true),     // e1 = 254 and flagged: S0 != S1 is unscaled
+            ([1, 0x7f00_0000, 0x7f00_0000], 0x7f80_0000, false),      // denormal S0 * 2^-64 = +inf
+            ([0xbf80_0000, 0x7f00_0000, 0x7f00_0000], 0x9f80_0000, false), // sign kept
+        ];
+        let mask = rows.iter().enumerate().filter(|(_, r)| r.2).fold(0u32, |m, (l, _)| m | 1 << l);
+        let load = |st: &mut State| {
+            st.exec = 0x1_ffff | 1 << 20;
+            for (l, (src, ..)) in rows.iter().enumerate() {
+                (st.v[1][l], st.v[2][l], st.v[3][l]) = (src[0], src[1], src[2]);
+            }
+            st.v[0][20] = 0x1234_5678;
+            st.v[1][20] = one;
+            (st.v[2][20], st.v[3][20]) = (one, one);
+            st.v[0][25] = 0xdead_beef;
+        };
+        // VCC destination: replaced as a whole (inactive lanes cleared), SCC untouched, inactive lane 25 untouched.
+        let i = insn_1151("v_div_scale_f32", vec![v(0), Operand::Special(Special::VccLo), v(1), v(2), v(3)]);
+        let mut st = state();
+        load(&mut st);
+        st.exec &= !(1 << 16); // lane 16 inactive: its D0 and VCC bit stay
+        st.v[0][16] = 0xcafe_f00d;
+        st.vcc = u32::MAX;
+        st.scc = true;
+        execute(Arch::Gfx1151, "v_div_scale_f32", &i, &mut st).unwrap();
+        for (l, (_, want, _)) in rows.iter().enumerate() {
+            assert_eq!(st.v[0][l], if l == 16 { 0xcafe_f00d } else { *want }, "lane {l}");
+        }
+        assert_eq!(st.v[0][20], one, "lane 20: 1/1 passes S0");
+        assert_eq!(st.v[0][25], 0xdead_beef);
+        assert_eq!(st.vcc, mask & !(1 << 16), "VCC is overwritten by the predicate, inactive lanes read 0");
+        assert!(st.scc, "SCC is untouched");
+        // NULL destination: VCC and SCC both preserved.
+        let i = insn_1151("v_div_scale_f32", vec![v(0), Operand::Special(Special::Null), v(1), v(2), v(3)]);
+        let mut st = state();
+        load(&mut st);
+        st.vcc = 0xa5a5_5a5a;
+        st.scc = true;
+        execute(Arch::Gfx1151, "v_div_scale_f32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][3], one);
+        assert_eq!((st.vcc, st.scc), (0xa5a5_5a5a, true));
+        // SGPR destination receives the predicate; VCC is untouched.
+        let i = insn_1151("v_div_scale_f32", vec![v(0), reg(Kind::S, 10, 1), v(1), v(2), v(3)]);
+        let mut st = state();
+        load(&mut st);
+        st.vcc = 0xa5a5_5a5a;
+        execute(Arch::Gfx1151, "v_div_scale_f32", &i, &mut st).unwrap();
+        assert_eq!((st.s[10], st.vcc), (mask, 0xa5a5_5a5a));
+        // Domains the sweep leaves open stay errors: e1 228..=253, d = -96 with e1 != 254, e2 24..=26, S0 * 2^-64 with
+        // exponent field 64..=90.
+        for src in [
+            [one, 0x7800_0000, one],
+            [one, 0x3200_0000, 0x0200_0000],
+            [one, 0x0c80_0000, 0x0c80_0000],
+            [0x2300_0000, 0x7f00_0000, 0x7f00_0000],
+        ] {
+            let mut st = state();
+            st.exec = 1;
+            (st.v[1][0], st.v[2][0], st.v[3][0]) = (src[0], src[1], src[2]);
+            st.v[0][0] = 7;
+            assert!(execute(Arch::Gfx1151, "v_div_scale_f32", &i, &mut st).is_err(), "{src:x?}");
+            assert_eq!(st.v[0][0], 7, "an error must not write");
+        }
+        // A NaN operand with abs/neg is not measured.
+        let mut st = state();
+        st.exec = 1;
+        (st.v[1][0], st.v[2][0], st.v[3][0]) = (one, one, 0x7fc0_0000);
+        let mut j = i.clone();
+        j.mods.neg = 0b100;
+        assert!(execute(Arch::Gfx1151, "v_div_scale_f32", &j, &mut st).is_err());
+    }
+
+    // gfx1151 sweep (gid 33): ISA special-case chain plus NaN quotient -> sign|inf and underflow -> signed zero;
+    // gid 32 is a plain fma including NaN/Inf rules, with VCC clear or (NaN/Inf operand present) set.
+    #[test]
+    fn div_fixup_and_div_fmas_special_values_on_gfx1151() {
+        let one = 1f32.to_bits();
+        let ok = |name: &str, srcs: &[u32], want: u32| assert_eq!(lane1151(name, srcs, 0, |_| {}), Ok(want), "{name} {srcs:x?}");
+        ok("v_div_fixup_f32", &[0x7fc0_0000, one, one], 0x7f80_0000);
+        ok("v_div_fixup_f32", &[0x7fc0_0000, 0xbf80_0000, one], 0xff80_0000);
+        ok("v_div_fixup_f32", &[0x7f80_0001, one, one], 0x7f80_0000);
+        ok("v_div_fixup_f32", &[one, 0x7f7f_ffff, 0x0080_0000], 0); // exponent(S2) - exponent(S1) < -150
+        ok("v_div_fixup_f32", &[one, 0xff7f_ffff, 0x0080_0000], 0x8000_0000);
+        ok("v_div_fixup_f32", &[one, 0xffc0_abcd, 0x7f80_0001], 0x7fc0_0001); // S2 first, quieted
+        ok("v_div_fixup_f32", &[one, 0xffc0_abcd, one], 0xffc0_abcd);
+        ok("v_div_fixup_f32", &[one, 0x7f80_0001, 0x7fc1_2345], 0x7fc1_2345);
+        ok("v_div_fixup_f32", &[one, 0, 0], 0xffc0_0000);
+        ok("v_div_fixup_f32", &[0x7fc0_0001, 0, one], 0x7f80_0000);
+        ok("v_div_fixup_f32", &[one, 0x7f80_0000, 0x7f80_0000], 0xffc0_0000);
+        ok("v_div_fmas_f32", &[0x7fc1_2345, one, one], 0x7fc1_2345);
+        ok("v_div_fmas_f32", &[0, 0x7f80_0000, 0x7fc1_2345], 0xffc0_0000);
+        ok("v_div_fmas_f32", &[0x7f80_0001, 0xffc0_abcd, one], 0x7fc0_0001);
+        ok("v_div_fmas_f32", &[one, one, 2f32.to_bits()], 3f32.to_bits());
+        // VCC set with a NaN/Inf operand is the plain exceptional result (sweep gid 32 states 2/3 equal state 0/1
+        // for all 164808 nonfinite tuples), lane by lane; a finite-operand lane under VCC stays a hard error.
+        let i = insn_1151("v_div_fmas_f32", vec![v(0), v(1), v(2), v(3)]);
+        let two = 2f32.to_bits();
+        let lanes_in = [
+            [0x7f80_0000, 0, 0x7fc1_2345], // inf*0 beats the NaN addend: default NaN
+            [one, one, two],               // VCC clear: plain finite fma
+            [0xff80_0000, two, 5f32.to_bits()], // -inf product, finite addend
+            [one, 0x7f80_0001, 0xffc0_0005], // S1 sNaN quieted, ahead of the addend
+        ];
+        let mut st = state();
+        st.exec = 0b1111;
+        st.vcc = 0b1101;
+        for (l, [a, b, c]) in lanes_in.into_iter().enumerate() {
+            (st.v[1][l], st.v[2][l], st.v[3][l]) = (a, b, c);
+        }
+        execute(Arch::Gfx1151, "v_div_fmas_f32", &i, &mut st).unwrap();
+        assert_eq!(&st.v[0][..4], &[0xffc0_0000, 3f32.to_bits(), 0xff80_0000, 0x7fc0_0001]);
+        // Finite operands with VCC set: the whole instruction fails and nothing is written.
+        st.vcc = 0b1111;
+        st.v[0][..4].fill(0x1234);
+        let err = execute(Arch::Gfx1151, "v_div_fmas_f32", &i, &mut st).unwrap_err();
+        assert!(err.contains("VCC") && err.contains("finite"), "{err}");
+        assert_eq!(&st.v[0][..4], &[0x1234; 4]);
+        // Finite operands whose fma would overflow are just as unqualified.
+        let (mut st, big) = (state(), f32::MAX.to_bits());
+        st.exec = 1;
+        st.vcc = 1;
+        (st.v[1][0], st.v[2][0], st.v[3][0]) = (big, two, big);
+        assert!(execute(Arch::Gfx1151, "v_div_fmas_f32", &i, &mut st).unwrap_err().contains("VCC"));
+        // gfx1201 is not measured: VCC set errors even for NaN/Inf operands.
+        let mut st = state();
+        st.exec = 1;
+        st.vcc = 1;
+        (st.v[1][0], st.v[2][0], st.v[3][0]) = (0x7f80_0000, one, one);
+        assert!(execute(Arch::Gfx1201, "v_div_fmas_f32", &i, &mut st).unwrap_err().contains("VCC"));
+        assert_eq!(st.v[0][0], 0);
+        // Unmeasured arches keep the documented chain's hard errors.
+        let i = insn_1151("v_div_fixup_f32", vec![v(0), v(1), v(2), v(3)]);
+        let mut st = state();
+        st.exec = 1;
+        (st.v[1][0], st.v[2][0], st.v[3][0]) = (one, 0x7f7f_ffff, 0x0080_0000);
+        assert!(execute(Arch::Gfx1201, "v_div_fixup_f32", &i, &mut st).is_err());
     }
 
     #[test]

@@ -169,7 +169,8 @@ impl<'a> Emulator<'a> {
 fn failure_bits(arch:Arch,wave:usize,st:&State,inst:&Inst)->String {
     use std::fmt::Write as _;
     let mut out=String::new();
-    let _=write!(out," | arch={arch:?} wave={wave} exec={:#010x} vcc={:#010x} scc={} m0={:#010x} mods={:?} fields={:?} literal={:?}",st.exec,st.vcc,u8::from(st.scc),st.m0,inst.mods,inst.fields,inst.literal.map(|n|format!("{n:#010x}")));
+    let _=write!(out," | arch={arch:?} wave={wave} exec={:#010x} vcc={:#010x} scc={} m0={:#010x} mods={:?} fields={:?}",st.exec,st.vcc,u8::from(st.scc),st.m0,inst.mods,inst.fields);
+    match inst.literal {Some(value)=>{let _=write!(out," literal={value:#010x}");},None=>out.push_str(" literal=None")}
     for (i,op) in inst.operands.iter().enumerate() {
         let _=write!(out," | op{i} {op} {op:?}:");
         if let Err(e)=op.validate() {let _=write!(out," invalid({e})");continue;}
