@@ -35,8 +35,14 @@ The superseded `gfx1151-edges-v1.tar.zst` is removed from this checkout rather t
 
 Each historical operation captured 66 physical packed-K fragments × 66 fragments × 34 FP32 accumulator values × four flag states = 592,416 tuples. Historical own-run `mma.rs` comparisons reported 151,658,496 destination words per operation and zero mismatches for f16 and bf16. Those are captured-corpus results only, not randomized or full-domain qualification; this archive-integrity work did not rerun numeric comparisons.
 
+## Local gfx1201 WMMA census
+
+The later `wmma-capture-gfx1201-v2.{f16,bf16,fp8}.v0.*` raw artifacts remain under the artifact root, outside this core archive. Own production-linked comparisons checked **151,658,496** words each: f16 had **zero** differences; BF16 had **32,384** differences across 40 operand triples and is **UNQUALIFIED**. The BF16 report is `edge-wmma-model-gfx1201-v2-bf16.json`; for example, factors `A=[0001;16]`, `B=[4040,4100,0,…]`, and `C=80000001` produced hardware `000afffc`, versus model `000b0000`.
+
+The FP8 capture contains **382,024** tuples (**97,798,144** destination words). Every one of 54 experimental traversal/arithmetic candidates was compared against all words; none had zero differences (`edge-wmma-fp8-candidates-gfx1201-54.json`). FP8 is **UNQUALIFIED** and has no production value API. BF16/FP8 WMMA are outside the QSA/sym-NT4 fold; the emulator rejects them rather than using these unqualified models.
+
 ## Qualification limits
 
 The scalar F32 set does **not** contain DIV_FMAS scaled-rounding discriminator words `0x14800000` and `0x88800000`, or the `2^80` overflow discriminator `0x67800000`. Do not infer generic VCC=1 DIV_FMAS rounding semantics from these captures. Ordinary ABS/CLAMP/OMOD variants absent from the audited census are not claimed measured.
 
-Raw table integrity is **not CPU-model numerical proof**. This archive makes no full SFU, WMMA, or finite-FMAS qualification claim. Trans APIs support gfx1151/gfx1201, but full-domain qualification remains pending. Full `2^32` SFU comparisons, randomized WMMA gates and the production FP8 WMMA value model remain unqualified here. Preliminary source-derived models must not be described as hardware-certified.
+Raw table integrity is **not CPU-model numerical proof**. This archive makes no full SFU, WMMA, or finite-FMAS qualification claim. The fold covers only QSA convert/attend and sym-NT4 gate-up/down. Every exercised SFU and F16/IU4 WMMA model requires its numerical gate; unused SFUs and BF16/FP8 WMMA remain **UNQUALIFIED** and have no permitted emulator execution path. Preliminary source-derived models must not be described as hardware-certified.
