@@ -2661,6 +2661,34 @@ impl Gpu {
             shared_mem,
             params,
             ReplayLaunchBindings::NONE,
+            &[],
+            blob_builder,
+        )
+    }
+
+    /// [`Self::launch_maybe_blob`] for a launch whose kernarg carries dynamic
+    /// words (railgun design §1.6: words are declared by the composer at the
+    /// launch site). The declaration reaches the railgun shadow observer only;
+    /// the launch and Redline's recording are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_maybe_blob_declared(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut [*mut std::ffi::c_void],
+        declared_words: &[railgun::kernel::DeclaredWord],
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        self.launch_maybe_blob_bound(
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            ReplayLaunchBindings::NONE,
+            declared_words,
             blob_builder,
         )
     }
@@ -2697,6 +2725,7 @@ impl Gpu {
                 grid: grid_binding,
                 kernargs: &[],
             },
+            &[],
             blob_builder,
         )
     }
@@ -2710,6 +2739,7 @@ impl Gpu {
         shared_mem: u32,
         params: &mut [*mut std::ffi::c_void],
         bindings: ReplayLaunchBindings<'_>,
+        railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         // Fail closed before the recorder / capture tapes see the launch: an
@@ -2751,6 +2781,8 @@ impl Gpu {
                         blob.as_bytes(),
                         bindings.grid,
                         bindings.kernargs,
+                        Some(&self.compiler),
+                        railgun_words,
                     );
                 }
                 let func = &self.functions[func_name];
@@ -2990,6 +3022,10 @@ impl Gpu {
         self.hip
             .validate_launch_grid(grid)
             .map_err(|e| e.with_kernel(func_name))?;
+        if self.replay.is_g0_observing() {
+            self.replay
+                .observe_g0_launch(func_name, grid, block, shared_mem, kernargs);
+        }
         if self.replay.is_recording() {
             let artifact = recorded_launch_artifact(&self.compiler, func_name);
             self.replay.record_hip_launch_typed_bound(
@@ -3002,6 +3038,8 @@ impl Gpu {
                 kernargs,
                 bindings.grid,
                 bindings.kernargs,
+                Some(&self.compiler),
+                &[],
             );
         }
         let result = if self.graphs.capture_mode {

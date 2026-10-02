@@ -27,6 +27,22 @@ pub fn reserve_gdn_requant_frames(count: u32) -> u32 {
     GDN_REQUANT_FRAME.fetch_add(count, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Kernarg byte offset of the requant frame in the single-token GDN launch
+/// ABI (`gated_delta_net_q8{,_fast}`, the compact variants): eight pointers,
+/// then `n_tokens`, `n_heads`, `head_dim`, `frame`.
+#[cfg(feature = "deltanet")]
+const GDN_FRAME_KERNARG_OFFSET: u32 = 8 * 8 + 3 * 4;
+
+/// The frame dword as a declared railgun word: the launch reserved `frames`
+/// frames, so a replay of it must reserve the same count per submit.
+#[cfg(feature = "deltanet")]
+fn gdn_frame_word(frames: u32) -> [railgun::kernel::DeclaredWord; 1] {
+    [railgun::kernel::DeclaredWord {
+        offset: GDN_FRAME_KERNARG_OFFSET,
+        role: railgun::kernel::WordRole::GdnFrame { frames },
+    }]
+}
+
 /// Snapshot the next Q8 GatedDeltaNet frame for a single-threaded coherence
 /// experiment. Production replay only reserves frames monotonically.
 pub fn gdn_requant_frame_checkpoint() -> u32 {
@@ -3174,12 +3190,13 @@ impl Gpu {
                 "gated_delta_net_q8_fast",
                 bytes,
             );
-            let r = self.launch_maybe_blob(
+            let r = self.launch_maybe_blob_declared(
                 "gated_delta_net_q8_fast",
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
                 &mut params,
+                &gdn_frame_word(1),
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(qp);
@@ -3227,12 +3244,13 @@ impl Gpu {
             ];
             let timer =
                 crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
-            let r = self.launch_maybe_blob(
+            let r = self.launch_maybe_blob_declared(
                 "gated_delta_net_q8",
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
                 &mut params,
+                &gdn_frame_word(1),
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(qp);
@@ -3391,12 +3409,13 @@ impl Gpu {
             &efp as *const _ as *mut c_void,
         ];
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_maybe_blob_declared(
             kernel_name,
             [n_heads as u32, n_tiles as u32, 1],
             [block_size, 1, 1],
             0,
             &mut params,
+            &gdn_frame_word(1),
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp);

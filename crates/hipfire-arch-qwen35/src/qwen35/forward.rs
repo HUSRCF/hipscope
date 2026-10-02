@@ -1696,10 +1696,10 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
-        let replay = unsafe { gpu.replay.replay_pm4(pos) };
+        let replay = unsafe { gpu.replay_pm4_routed(pos) };
         rdna_compute::gap_timing::end_forward(gap_started, pos, "pm4");
         return match replay {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(reason) => {
                 gpu.replay
                     .poison(format!("prepared PM4 replay failed: {reason}"));

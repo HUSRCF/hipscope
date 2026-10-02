@@ -14,6 +14,7 @@ mod ffi;
 mod kernarg;
 mod launch_grid;
 mod rccl;
+pub mod registry;
 mod rocblas;
 mod rocsolver;
 mod vmm;

@@ -424,6 +424,8 @@ pub(crate) fn launch_maybe_blob(
                 blob.as_bytes(),
                 None,
                 &[],
+                compiler,
+                &[],
             );
         }
         if capture_mode {

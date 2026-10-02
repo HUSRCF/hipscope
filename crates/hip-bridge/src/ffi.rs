@@ -1365,6 +1365,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1390,6 +1391,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
         self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Signal);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1409,7 +1411,9 @@ impl HipRuntime {
         // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
         // caller must ensure GPU work on it is quiesced (documented on free).
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        self.check(code, "hipFree")
+        self.check(code, "hipFree")?;
+        crate::registry::forget(buf.ptr as usize);
+        Ok(())
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -1540,7 +1544,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
-        self.check(code, "hipMemMap")
+        self.check(code, "hipMemMap")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::VmmChunk);
+        Ok(())
     }
 
     /// # Safety
@@ -1550,7 +1556,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size) };
-        self.check(code, "hipMemUnmap")
+        self.check(code, "hipMemUnmap")?;
+        crate::registry::forget(ptr as usize);
+        Ok(())
     }
 
     /// # Safety

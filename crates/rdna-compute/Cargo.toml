@@ -16,6 +16,8 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
+railgun = { path = "../railgun" }
+railgun-corpus = { path = "../railgun-corpus" }
 libloading = { workspace = true, optional = true }
 rayon = "1"
 serde = { workspace = true, features = ["derive"] }

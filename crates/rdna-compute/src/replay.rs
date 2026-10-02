@@ -35,6 +35,8 @@ use redline_dispatch::{
     ResourceBinding, ResourceId,
 };
 
+pub(crate) mod railgun_shadow;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayQuiescence {
     Proven,
@@ -431,6 +433,14 @@ impl Pm4Commands {
         }
     }
 
+    /// The gfx12 command dwords (railgun's shadow diff reads both tapes).
+    fn gfx12_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Gfx12(commands) => Some(commands.dwords()),
+            Self::Legacy { .. } => None,
+        }
+    }
+
     fn dispatch(
         &mut self,
         kernel: &Kernel,
@@ -599,6 +609,29 @@ fn radiowave_vmem_only_consumer(
     certifications.get(artifact).is_some_and(|certification| {
         certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
     })
+}
+
+/// Where Redline's resource effects for `launch` came from: the object's
+/// Radiowave sidecar, the name-keyed `pointer_effects` table, or neither
+/// (railgun shadow report).
+fn redline_effect_source(
+    certifications: &BTreeMap<PathBuf, Option<CodeObjectCertification>>,
+    launch: &RecordedHipLaunch,
+) -> String {
+    let radiowave = launch
+        .artifact
+        .as_ref()
+        .and_then(|artifact| certifications.get(artifact))
+        .and_then(Option::as_ref)
+        .is_some_and(|certification| certification.argument_effects(&launch.kernel).is_some());
+    if radiowave {
+        "radiowave"
+    } else if launch.accesses.is_some() {
+        "table"
+    } else {
+        "none"
+    }
+    .to_owned()
 }
 
 fn pm4_vmem_acquire_enabled(
@@ -3878,6 +3911,17 @@ pub fn gfx1201_pm4_pacing_from_config() -> Gfx12DispatchPacing {
     })
 }
 
+/// An explicit `HIPFIRE_GFX1201_PM4_PACING` (`off` / `nop:N`), or `None` when
+/// it is unset, `auto` or unparseable. railgun's gfx1201 lowering keeps its
+/// own per-arch pacing (`railgun::plan::ArchLowering`) unless this is set.
+pub(crate) fn gfx1201_pm4_pacing_override() -> Option<Gfx12DispatchPacing> {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1201_PM4_PACING")?;
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "" | "auto") {
+        return None;
+    }
+    parse_gfx1201_pm4_pacing(Some(&value)).ok()
+}
+
 fn parse_gfx1201_pm4_pacing(value: Option<&str>) -> Result<Gfx12DispatchPacing, String> {
     let value = value.map(str::trim).unwrap_or("auto");
     let count = |text: &str| {
@@ -4690,6 +4734,16 @@ pub struct ReplayController {
     /// while every funnel launch is observed with `is_recording()` false, so
     /// recording-dependent predicates take their eager branch.
     g0_observation: Option<Vec<G0Launch>>,
+    /// railgun M1 shadow (`HIPFIRE_RAILGUN_SHADOW`): authors railgun's
+    /// program next to every recording and diffs its PM4 lowering against
+    /// the prepared tape. Never changes the route.
+    railgun_shadow: Option<railgun_shadow::RailgunShadow>,
+    /// railgun M2 check mode (`HIPFIRE_RAILGUN_CHECK`): run by
+    /// `Gpu::replay_pm4_routed`, parked here between steps.
+    pub(crate) railgun_check: Option<Box<crate::railgun_check::CheckState>>,
+    /// Count of PM4 programs prepared by this controller: the check mode's
+    /// once-per-program weights verification keys on it.
+    pm4_generation: u64,
 }
 
 /// Which executor the retained body uses on the next eligible forward.
@@ -4774,6 +4828,9 @@ impl ReplayController {
             window_effects_base: MemoryEffects::default(),
             window_effects: MemoryEffects::default(),
             g0_observation: None,
+            railgun_shadow: railgun_shadow::RailgunShadow::from_config(),
+            railgun_check: crate::railgun_check::CheckState::from_config().map(Box::new),
+            pm4_generation: 0,
         }
     }
 
@@ -4893,6 +4950,9 @@ impl ReplayController {
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
         self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -5771,6 +5831,8 @@ impl ReplayController {
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
             let mut dependency_acquires = 0usize;
+            let shadow_on = self.railgun_shadow.is_some();
+            let mut shadow_decisions = Vec::new();
             for (position, index) in order.iter().copied().enumerate() {
                 let mut boundary = Pm4DispatchBoundary::default();
                 if position != 0 {
@@ -5835,8 +5897,22 @@ impl ReplayController {
                         );
                         commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
                     }
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(&self.radiowave_effect_certifications, current_launch),
+                            resource_independent: resources_independent,
+                            name_acquire: self.pm4_mid_acquire_policy.acquire_between(previous, current),
+                            pre_dispatch_name: gfx12_pre_dispatch_acquire,
+                        });
+                    }
                 } else {
                     resource_frontier.advance(&self.recorded[index], false);
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(&self.radiowave_effect_certifications, &self.recorded[index]),
+                            ..Default::default()
+                        });
+                    }
                 }
                 commands
                     .dispatch(
@@ -5916,6 +5992,79 @@ impl ReplayController {
                     }
                 }
             }
+            // railgun M1 shadow: prepare railgun's lowering of the same tape
+            // and diff it against this one. Nothing railgun builds is
+            // submitted; the route below is unchanged.
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let skip = if pm4_architecture != Pm4Architecture::Gfx12 {
+                    Some("railgun M1 authors gfx12 tapes only")
+                } else if reorder_window.is_some() {
+                    Some("the single-IB reorder permutes the recorded order")
+                } else if dispatch_profile {
+                    Some("per-dispatch profile tape")
+                } else {
+                    None
+                };
+                match skip {
+                    Some(reason) if shadow.backend_railgun() => {
+                        return Err(format!("railgun backend refused: {reason}"));
+                    }
+                    Some(reason) => eprintln!("[railgun] shadow skipped: {reason}"),
+                    None => {
+                        let register_policy = self.pm4_register_policy;
+                        let new_commands = || {
+                            Pm4Commands::new_with_dependency(
+                                pm4_architecture,
+                                register_policy,
+                                dispatch_initiator_policy,
+                                dispatch_interleave,
+                                resource_limits_policy,
+                                LegacyDependencyMode::CsPartialFlush,
+                            )
+                        };
+                        let kernarg_images = kernargs
+                            .iter_mut()
+                            .map(|buffer| {
+                                let address = buffer.address() as usize as u64;
+                                (buffer.as_mut_bytes().to_vec(), address)
+                            })
+                            .collect();
+                        let resources = self
+                            .tape_resources
+                            .iter()
+                            .map(|(&(base, bytes), id)| (id.index(), (base, bytes)))
+                            .collect();
+                        let executable = shadow.compare(
+                            railgun_shadow::RedlinePrepared {
+                                device_name: device.name(),
+                                launches: recorded,
+                                ib: commands.gfx12_dwords().unwrap_or(&[]),
+                                kernels: &kernels,
+                                kernargs: kernarg_images,
+                                decisions: std::mem::take(&mut shadow_decisions),
+                                word_patches: &dynamic_kernarg_bindings,
+                                grid_patches: &dynamic_grids,
+                                resources,
+                            },
+                            railgun_shadow::Transport {
+                                pool: &pool,
+                                new_commands: &new_commands,
+                                gcr_trim: gfx12_gcr_trim,
+                                entry_policy: entry_acquire_policy,
+                            },
+                        );
+                        // HIPFIRE_RAILGUN_BACKEND=railgun (M2): the prepared
+                        // tape runs railgun's lowering; a refusal fails the
+                        // prepare closed, never back to this planner's IB.
+                        match executable {
+                            None => {}
+                            Some(Ok(railgun_commands)) => commands = railgun_commands,
+                            Some(Err(reason)) => return Err(format!("railgun backend refused: {reason}")),
+                        }
+                    }
+                }
+            }
+            let command_dwords = commands.len_dwords();
             // HIPFIRE_REDLINE_IB_POOL=vmem: allocate the retained indirect
             // buffer from a GPU-agent (VRAM) pool so the command processor
             // fetches the tape from VRAM instead of re-reading it over the
@@ -5949,6 +6098,9 @@ impl ReplayController {
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
+            if self.railgun_shadow.as_ref().is_some_and(railgun_shadow::RailgunShadow::backend_railgun) {
+                return Err("railgun backend refused: multi-queue PM4 tapes are not lowered by railgun".to_owned());
+            }
             let min_parallel_width = pm4_min_parallel_width_from_config();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
             let max_parallel_phases = pm4_max_parallel_phases_from_config();
@@ -6206,6 +6358,7 @@ impl ReplayController {
             self.binding_revision.0,
             backlog.join(" "),
         );
+        self.pm4_generation += 1;
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -6303,6 +6456,28 @@ impl ReplayController {
             unsafe { prepared.replay_and_wait_dispatch_profiled(position) }
         };
         self.observe_replay_result(position, result)
+    }
+
+    /// The HIP twin's inputs (railgun check mode, design §2.4): each prepared
+    /// dispatch's kernarg bytes exactly as the last PM4 replay submitted them
+    /// (bindings already applied for that position). Refused while the tape
+    /// patches grids, which the twin would have to re-derive.
+    pub(crate) fn prepared_pm4_submitted_kernargs(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        let prepared = self.prepared_pm4.as_mut().ok_or("no prepared PM4 replay")?;
+        if !prepared.dynamic_grids.is_empty() {
+            return Err(format!("{} dynamic grid patches", prepared.dynamic_grids.len()));
+        }
+        Ok(prepared.kernargs.iter_mut().map(|k| k.as_mut_bytes().to_vec()).collect())
+    }
+
+    /// Generation of the prepared PM4 program (see `pm4_generation`).
+    pub(crate) fn prepared_pm4_generation(&self) -> u64 {
+        self.pm4_generation
+    }
+
+    /// The prepared railgun program's surfaces (`None` without the shadow).
+    pub(crate) fn railgun_program_surfaces(&self) -> Option<railgun_shadow::ProgramSurfaces> {
+        self.railgun_shadow.as_ref().and_then(|s| s.surfaces().cloned())
     }
 
     pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
@@ -6406,6 +6581,9 @@ impl ReplayController {
         self.binding_refresh_pending = false;
         self.window_effects_base = memory_effects::snapshot();
         self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -6648,6 +6826,7 @@ impl ReplayController {
         Ok(count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_hip_launch_typed_bound(
         &mut self,
         hip: &HipRuntime,
@@ -6659,6 +6838,8 @@ impl ReplayController {
         kernarg: &[u8],
         grid_binding: Option<ReplayGridBinding>,
         declared_kernarg_bindings: &[ReplayKernargBinding],
+        compiler: Option<&crate::compiler::KernelCompiler>,
+        declared_words: &[railgun::kernel::DeclaredWord],
     ) {
         if !self.is_recording() {
             return;
@@ -6700,6 +6881,7 @@ impl ReplayController {
         // unresolvable slot (or unknown kernel) leaves the launch untyped on
         // the raw snapshot path — never a partial slot set.
         let binding_layout = self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
+        let before = self.recorded.len();
         self.record_hip_launch_with_accesses(
             kernel,
             artifact,
@@ -6712,6 +6894,12 @@ impl ReplayController {
             accesses,
             binding_layout,
         );
+        if self.recorded.len() > before {
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_deref());
+                shadow.observe(hip, compiler, kernel, artifact, grid, block, shared_mem, kernarg, declared_words);
+            }
+        }
     }
 
     #[cfg(test)]

@@ -43,6 +43,7 @@ pub mod profile_rocprof;
 pub mod profiler;
 pub mod qwen35_fa_batch;
 pub mod rdna;
+pub mod railgun_check;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
