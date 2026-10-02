@@ -44,6 +44,14 @@ static __device__ __forceinline__ float hcw_add(float a, float b) {
     asm("v_add_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
     return r;
 }
+// fma(a, b, c) with the operand order pinned: hyper_norm_gate_outputs' gate projection
+// compiles to fma(weight, x, acc), and which NaN a mixed-NaN row propagates follows the
+// operand order of every fma/add in the chain, so the chain below is pinned to that ISA.
+static __device__ __forceinline__ float hcw_fma(float a, float b, float c) {
+    float r;
+    asm("v_fma_f32 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+}
 static __device__ __forceinline__ float hcw_gate(float logit) {
     const float gate_logit = hcw_bf16f(logit);
     const float gate_scaled = hcw_bf16f(gate_logit / 4.0f);
@@ -233,14 +241,14 @@ extern "C" __global__ __launch_bounds__(256) void hc_row_fold_norm_gate(
             const uint4 xv = *(const uint4*)(xsb + i + u * 256);
             const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
             const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
-            a0 += __uint_as_float(wv.x << 16) * xa.x;
-            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
-            a2 += __uint_as_float(wv.y << 16) * xa.z;
-            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
-            a0 += __uint_as_float(wv.z << 16) * xb.x;
-            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
-            a2 += __uint_as_float(wv.w << 16) * xb.z;
-            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+            a0 = hcw_fma(__uint_as_float(wv.x << 16), xa.x, a0);
+            a1 = hcw_fma(__uint_as_float(wv.x & 0xFFFF0000u), xa.y, a1);
+            a2 = hcw_fma(__uint_as_float(wv.y << 16), xa.z, a2);
+            a3 = hcw_fma(__uint_as_float(wv.y & 0xFFFF0000u), xa.w, a3);
+            a0 = hcw_fma(__uint_as_float(wv.z << 16), xb.x, a0);
+            a1 = hcw_fma(__uint_as_float(wv.z & 0xFFFF0000u), xb.y, a1);
+            a2 = hcw_fma(__uint_as_float(wv.w << 16), xb.z, a2);
+            a3 = hcw_fma(__uint_as_float(wv.w & 0xFFFF0000u), xb.w, a3);
         }
     }
     for (; i + 8 <= wide; i += 32 * 8) {
@@ -248,15 +256,16 @@ extern "C" __global__ __launch_bounds__(256) void hc_row_fold_norm_gate(
         const uint4 xv = *(const uint4*)(xsb + i);
         const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
         const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
-        a0 += __uint_as_float(wv.x << 16) * xa.x;
-        a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
-        a2 += __uint_as_float(wv.y << 16) * xa.z;
-        a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
-        a0 += __uint_as_float(wv.z << 16) * xb.x;
-        a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
-        a2 += __uint_as_float(wv.w << 16) * xb.z;
-        a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+        a0 = hcw_fma(__uint_as_float(wv.x << 16), xa.x, a0);
+        a1 = hcw_fma(__uint_as_float(wv.x & 0xFFFF0000u), xa.y, a1);
+        a2 = hcw_fma(__uint_as_float(wv.y << 16), xa.z, a2);
+        a3 = hcw_fma(__uint_as_float(wv.y & 0xFFFF0000u), xa.w, a3);
+        a0 = hcw_fma(__uint_as_float(wv.z << 16), xb.x, a0);
+        a1 = hcw_fma(__uint_as_float(wv.z & 0xFFFF0000u), xb.y, a1);
+        a2 = hcw_fma(__uint_as_float(wv.w << 16), xb.z, a2);
+        a3 = hcw_fma(__uint_as_float(wv.w & 0xFFFF0000u), xb.w, a3);
     }
-    const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
+    // hyper_norm_gate_outputs compiles (a0 + a1) + (a2 + a3) to (a3 + a2) + (a1 + a0).
+    const float sum = hc_lane0_tree_sum(hcw_add(hcw_add(a3, a2), hcw_add(a1, a0)));
     if (lane == 0) next_gates[(size_t)row * branches + wave] = sum;
 }
