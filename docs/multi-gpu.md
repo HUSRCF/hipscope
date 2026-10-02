@@ -286,6 +286,11 @@ sits beside the trunk, so existing `tp>1` serves are unchanged. Block-verify
 drafters (n-gram, DFlash, DSpark) stay refused on dense TP, and the n-gram-mod
 composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts natively there.
 
+Dense-TP MTP is not a byte-identical replacement for TP AR: speculative
+verification runs a multi-row trunk geometry, whereas AR advances one token at
+a time. The H2 greedy gate observed different output in some workloads, so a
+throughput improvement alone does not qualify this route for automatic use.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
