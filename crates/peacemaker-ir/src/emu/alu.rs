@@ -36,9 +36,14 @@
 //!   differs: every signalling NaN that would be returned as `D` (`S0` passed through or scaled; 30752 of 262144
 //!   tuples) comes out quieted (bit 22 set).
 //! * `v_div_fixup_f32`: NaN quotient gives `sign | inf`, an underflowing quotient `sign | 0`.
-//! * `v_div_fmas_f32` with a set VCC lane: a NaN/Inf operand gives the plain fused-multiply-add exceptional result
-//!   (all 164808 nonfinite tuples of gid 32 agree in VCC states 2/3); finite operands stay an error (the sweeps
-//!   lack the fused-rounding discriminators), as does any set VCC lane on an unqualified arch.
+//! * `v_div_fmas_f32`: VCC clear is the plain fused multiply-add. A set VCC lane with a NaN/Inf operand gives the same
+//!   exceptional result (all 164808 nonfinite tuples of gid 32 agree in VCC states 2/3). A set VCC lane with finite
+//!   operands is qualified on gfx1201 only, by the finite fused-rounding discriminator capture
+//!   (`pm-r2/probe/fmas-gfx1201.raw.tsv`: 96 cases x 4 VCC/SCC states x 32 lanes, with the subnormal tie, the
+//!   pre-rounding overflow and high-`S2` cancellation cases) together with the full generic gid-32 corpus: the exact
+//!   fused sum is scaled by 2**64 when the biased exponent of `S2` exceeds 127, otherwise by 2**-64, and rounded to f32
+//!   **once** ([`fmas_f32`]). gfx1151 (Halo) has no such discriminators and keeps the hard error for finite operands,
+//!   as does any set VCC lane on an unqualified arch.
 //! * `v_fma_mix_f32`/`v_fma_mixlo_f16`/`v_fma_mixhi_f16` (gfx1151 gids 93..=101, gfx1201 gids 95..=103; the f32/f16
 //!   source variants with immediate zero addend): NaN operands follow the fma rule above, a half source widens
 //!   exactly (NaN payload kept) before it. A half result is rounded **once** from the exact fused result
@@ -57,8 +62,8 @@
 //! * OMOD results that would flush a non-zero denormal (sign of the flushed zero).
 //! * DPP with FI=1 and an out-of-range source (the BC/FI table disagrees with its prose).
 //!
-//! Not qualified on any arch: `v_med3_num_f32` (not modeled), finite operands of `v_div_fmas_f32` under VCC, the
-//! `v_div_scale_f32` exponent domains the sweeps leave open, BF16/FP8 encoders.
+//! Not qualified on any arch: `v_med3_num_f32` (not modeled), the `v_div_scale_f32` exponent domains the sweeps leave
+//! open, BF16/FP8 encoders. Finite operands of `v_div_fmas_f32` under VCC are unqualified on every arch but gfx1201.
 //!
 //! Descriptor float mode must be round to nearest even, allow input/output denormals,
 //! use FP16_OVFL=0, and on gfx1151 use IEEE_MODE=1/DX10_CLAMP=1; `State::new` checks it.
@@ -545,23 +550,39 @@ fn mix_in(arch: Arch, s: &State, o: &[Operand], i: &Inst, lane: usize) -> Result
     Ok(out)
 }
 
-/// `a * b + c` of finite f32 words, rounded once to binary16 (nearest even, overflow to infinity), as the
-/// `v_fma_mix{lo,hi}_f16` tables require. The f64 product is exact (24 x 24 bit significands); the f64 sum plus its
-/// exact TwoSum error rounds to odd, which keeps the sticky information a later 11-bit nearest-even rounding needs.
-fn fma_f16(a: u32, b: u32, c: u32) -> u16 {
+/// Exact `a * b + c` of finite f32 words as an f64 that rounds to odd. The f64 product is exact (24 x 24 bit
+/// significands); the f64 sum plus its exact TwoSum error rounds to odd, which keeps the sticky information a later
+/// nearest-even rounding to at most 24 bits needs.
+fn fma_wide_odd(a: u32, b: u32, c: u32) -> f64 {
     let (a, b, c) = (f64::from(f32::from_bits(a)), f64::from(f32::from_bits(b)), f64::from(f32::from_bits(c)));
     let p = a * b;
     let s = p + c;
     let bb = s - p;
     let err = (p - (s - bb)) + (c - bb);
-    let odd = if err != 0.0 && s.to_bits() & 1 == 0 {
+    if err != 0.0 && s.to_bits() & 1 == 0 {
         // `s` has the even neighbor's parity: step to the odd neighbor on the side of the error.
         let away = (err > 0.0) == (s > 0.0);
         f64::from_bits(if away { s.to_bits() + 1 } else { s.to_bits() - 1 })
     } else {
         s
-    };
-    f64_to_f16(odd)
+    }
+}
+
+/// `a * b + c` of finite f32 words, rounded once to binary16 (nearest even, overflow to infinity), as the
+/// `v_fma_mix{lo,hi}_f16` tables require.
+fn fma_f16(a: u32, b: u32, c: u32) -> u16 {
+    f64_to_f16(fma_wide_odd(a, b, c))
+}
+
+/// `v_div_fmas_f32` with a set VCC lane and finite operands (gfx1201): the exact fused sum scaled by 2**64 if the
+/// biased exponent of `c` is above 127, else by 2**-64, then one nearest-even rounding to f32. The scale is a power of
+/// two that keeps every finite f32 term in the normal f64 range, so it is exact; rounding happens only in the final
+/// conversion, which also covers subnormal and overflowing f32 results.
+fn fmas_f32(a: u32, b: u32, c: u32) -> u32 {
+    const UP: f64 = f64::from_bits((1023 + 64) << 52);
+    const DOWN: f64 = f64::from_bits((1023 - 64) << 52);
+    let scale = if c >> 23 & 0xff > 127 { UP } else { DOWN };
+    ((fma_wide_odd(a, b, c) * scale) as f32).to_bits()
 }
 
 fn rne64(x: u64, shift: u32) -> u64 {
@@ -768,12 +789,16 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
                 return Err("v_div_fmas_f32 with VCC set on an unqualified architecture: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; the sweep lacks the fused-rounding discriminators, so the scaled result is not qualified".into());
             }
             let (a, b, c) = (g(0, false)?, g(1, false)?, g(2, false)?);
-            // VCC set scales the result; the sweeps qualify that only where an operand is NaN/Inf, whose result
-            // (priority/sign/payload) does not depend on the scale. Finite operands stay unqualified.
             if vcc && [a, b, c].iter().all(|&x| x & 0x7f80_0000 != 0x7f80_0000) {
-                return Err("v_div_fmas_f32 with VCC set and finite operands: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; the gfx1151/gfx1201 sweeps lack the fused-rounding discriminators, so the scaled result is not qualified".into());
+                // VCC set scales the result. Only gfx1201 has the finite fused-rounding discriminators; for a
+                // NaN/Inf operand the result (priority/sign/payload) does not depend on the scale on any qualified arch.
+                if arch != Arch::Gfx1201 {
+                    return Err("v_div_fmas_f32 with VCC set and finite operands: ISA says 2.0F**32 while v_div_scale_f32 scales by 2**64; the gfx1151 sweep lacks the fused-rounding discriminators, so the scaled result is not qualified".into());
+                }
+                (Class::F32, fmas_f32(a, b, c))
+            } else {
+                (Class::F32, fma_bits(arch, a, b, c)?)
             }
-            (Class::F32, fma_bits(arch, a, b, c)?)
         }
         "v_div_fixup_f32" => (Class::F32, div_fixup(arch, g(0, false)?, g(1, false)?, g(2, false)?)?),
         "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
@@ -1632,7 +1657,11 @@ mod tests {
         run("v_div_fmas_f32", &fmas, &mut st).unwrap();
         assert_eq!(f32::from_bits(st.v[0][0]), 7.0);
         st.vcc = 1;
-        assert!(run("v_div_fmas_f32", &fmas, &mut st).unwrap_err().contains("VCC"));
+        st.scc = true;
+        run("v_div_fmas_f32", &fmas, &mut st).unwrap();
+        // gfx1201 finite VCC: (2 * 3 + 1) scaled by 2**-64 (the exponent of S2 = 1.0 is not above 127).
+        assert_eq!(st.v[0][0], (7f32 * f32::from_bits(p2(-64))).to_bits());
+        assert_eq!((st.vcc, st.scc, st.exec), (1, true, 1));
 
         let fix = insn("v_div_fixup_f32", vec![v(0), v(1), v(2), v(3)]);
         let q = (1f32 / 3f32).to_bits();
@@ -2257,7 +2286,7 @@ mod tests {
             ok("v_div_fmas_f32", &[0x7f80_0001, 0xffc0_abcd, one], 0x7fc0_0001);
             ok("v_div_fmas_f32", &[one, one, two], 3f32.to_bits());
             // VCC set with a NaN/Inf operand is the plain exceptional result (sweep gid 32 states 2/3 equal state 0/1
-            // for all 164808 nonfinite tuples), lane by lane; a finite-operand lane under VCC stays a hard error.
+            // for all 164808 nonfinite tuples), lane by lane; finite operands under VCC are gfx1201-only.
             let i = insn_on(arch, "v_div_fmas_f32", vec![v(0), v(1), v(2), v(3)]);
             let lanes_in = [
                 [0x7f80_0000, 0, 0x7fc1_2345], // inf*0 beats the NaN addend: default NaN
@@ -2273,18 +2302,32 @@ mod tests {
             }
             execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap();
             assert_eq!(&st.v[0][..4], &[0xffc0_0000, 3f32.to_bits(), 0xff80_0000, 0x7fc0_0001], "{arch:?}");
-            // Finite operands with VCC set: the whole instruction fails and nothing is written.
+            // Finite operands with VCC set: only gfx1201 qualifies them (its lane 1 is 3.0 scaled by 2**64, as
+            // the exponent of S2 = 2.0 is above 127); elsewhere the whole instruction fails and nothing is written.
             st.vcc = 0b1111;
             st.v[0][..4].fill(0x1234);
-            let err = execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap_err();
-            assert!(err.contains("VCC") && err.contains("finite"), "{err}");
-            assert_eq!(&st.v[0][..4], &[0x1234; 4]);
-            // Finite operands whose fma would overflow are just as unqualified.
-            let (mut st, big) = (state(), f32::MAX.to_bits());
-            st.exec = 1;
-            st.vcc = 1;
-            (st.v[1][0], st.v[2][0], st.v[3][0]) = (big, two, big);
-            assert!(execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap_err().contains("VCC"), "{arch:?}");
+            let big = f32::MAX.to_bits();
+            if arch == Arch::Gfx1201 {
+                execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap();
+                assert_eq!(&st.v[0][..4], &[0xffc0_0000, (3f32 * f32::from_bits(p2(64))).to_bits(), 0xff80_0000, 0x7fc0_0001]);
+                // 3 * f32::MAX scaled by 2**64 overflows the single f32 rounding.
+                let mut st = state();
+                st.exec = 1;
+                st.vcc = 1;
+                (st.v[1][0], st.v[2][0], st.v[3][0]) = (big, two, big);
+                execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap();
+                assert_eq!(st.v[0][0], 0x7f80_0000);
+            } else {
+                let err = execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap_err();
+                assert!(err.contains("VCC") && err.contains("finite"), "{err}");
+                assert_eq!(&st.v[0][..4], &[0x1234; 4]);
+                // Finite operands whose fma would overflow are just as unqualified.
+                let mut st = state();
+                st.exec = 1;
+                st.vcc = 1;
+                (st.v[1][0], st.v[2][0], st.v[3][0]) = (big, two, big);
+                assert!(execute(arch, "v_div_fmas_f32", &i, &mut st).unwrap_err().contains("VCC"), "{arch:?}");
+            }
         }
         // Gfx1100 is not measured: VCC set errors even for NaN/Inf operands.
         let i = insn_on(Arch::Gfx1100, "v_div_fmas_f32", vec![v(0), v(1), v(2), v(3)]);
@@ -2296,6 +2339,58 @@ mod tests {
         assert_eq!(st.v[0][0], 0);
         // Unmeasured arches keep the documented chain's hard errors.
         assert!(lane_on(Arch::Gfx1100, "v_div_fixup_f32", &[one, 0x7f7f_ffff, 0x0080_0000], 0, |_| {}).is_err());
+    }
+
+    // gfx1201 finite VCC (`fmas-gfx1201.raw.tsv`): one F32 rounding of (a * b + c) * 2**(+-64), upscale iff the biased
+    // exponent of S2 is above 127. The first tie row separates single rounding from f32-first double rounding.
+    #[test]
+    fn gfx1201_div_fmas_finite_vcc_rounds_the_scaled_fused_sum_once() {
+        let i = insn_on(Arch::Gfx1201, "v_div_fmas_f32", vec![v(0), v(1), v(2), v(3)]);
+        let fmas = |vcc: bool, [a, b, c]: [u32; 3]| {
+            let mut st = state();
+            st.exec = 1;
+            st.vcc = u32::from(vcc);
+            (st.v[1][0], st.v[2][0], st.v[3][0]) = (a, b, c);
+            execute(Arch::Gfx1201, "v_div_fmas_f32", &i, &mut st).unwrap();
+            st.v[0][0]
+        };
+        // Exact sum 2**-86 * (1 + 2**-24) is an f32 tie that rounds to 2**-86 when VCC is clear; scaled by 2**-64 it is
+        // just above half the smallest subnormal, so one rounding gives 1 (f32-first would give 0).
+        assert_eq!(fmas(false, [0x1480_0000, 0x3f80_0001, 0x8880_0000]), 0x1480_0000);
+        assert_eq!(fmas(true, [0x1480_0000, 0x3f80_0001, 0x8880_0000]), 0x0000_0001);
+        assert_eq!(fmas(true, [0x9480_0000, 0x3f80_0001, 0x0880_0000]), 0x8000_0001, "signed tie");
+        // The product alone overflows f32; the scaled result does not.
+        assert_eq!(fmas(false, [0x6780_0000, 0x6780_0000, 0]), 0x7f80_0000);
+        assert_eq!(fmas(true, [0x6780_0000, 0x6780_0000, 0]), 0x6f80_0000);
+        assert_eq!(fmas(true, [0xe780_0000, 0x6780_0000, 0]), 0xef80_0000);
+        // Exponent of S2 selects the scale: 1.0 (biased 127) scales down, 2.0 (128) up, whatever its sign.
+        let (one, two) = (1f32.to_bits(), 2f32.to_bits());
+        assert_eq!(fmas(true, [one, one, one]), p2(-63));
+        assert_eq!(fmas(true, [one, one, two]), (3f32 * f32::from_bits(p2(64))).to_bits());
+        assert_eq!(fmas(true, [one, one, (-2f32).to_bits()]), 0xdf80_0000);
+        assert_eq!(fmas(true, [one, one, 128f32.to_bits()]), (129f32 * f32::from_bits(p2(64))).to_bits());
+        // Exact cancellation stays a positive zero.
+        assert_eq!(fmas(true, [one, one, (-1f32).to_bits()]), 0);
+    }
+
+    // VCC picks the scaled path per lane; the instruction leaves EXEC, VCC and SCC alone and skips inactive lanes.
+    #[test]
+    fn gfx1201_div_fmas_vcc_is_lane_selective_and_preserves_flags() {
+        let i = insn_on(Arch::Gfx1201, "v_div_fmas_f32", vec![v(0), v(1), v(2), v(3)]);
+        let mut st = state();
+        st.exec = 0b0111;
+        st.vcc = 0b1101;
+        st.scc = true;
+        let tie = [0x1480_0000, 0x3f80_0001, 0x8880_0000];
+        let lanes = [tie, tie, [0x6780_0000, 0x6780_0000, 0], tie];
+        for (l, [a, b, c]) in lanes.into_iter().enumerate() {
+            (st.v[1][l], st.v[2][l], st.v[3][l]) = (a, b, c);
+        }
+        st.v[0][..4].fill(0x1234);
+        execute(Arch::Gfx1201, "v_div_fmas_f32", &i, &mut st).unwrap();
+        // lane 0 VCC set, lane 1 VCC clear, lane 2 VCC set, lane 3 VCC set but inactive.
+        assert_eq!(&st.v[0][..4], &[0x0000_0001, 0x1480_0000, 0x6f80_0000, 0x1234]);
+        assert_eq!((st.exec, st.vcc, st.scc), (0b0111, 0b1101, true));
     }
 
     // Sweeps gfx1151 gids 93..=101 / gfx1201 gids 95..=103: NaN operands follow the fma rule (a half source widens with
