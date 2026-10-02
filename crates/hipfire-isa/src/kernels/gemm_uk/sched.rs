@@ -56,6 +56,10 @@ mod tests {
     }
     #[test]
     fn captured_l4_l24_l44_routes_reach_pad16_floor() {
+        // Histograms of tokens*10 little-endian i32 IDs from the prefix of
+        // qcal/release-0.4.1/iu4-roofline/raw/routes/L{4,24,44}.topk.i32.
+        // source_md5 identifies the full 8192-token capture; real_rows/q16
+        // are independently pinned by fn-wmo/gemm-compare/real-routing.json.
         let fixtures: serde_json::Value = serde_json::from_str(include_str!("routes.json")).unwrap();
         for route in fixtures.as_array().unwrap() {
             let rows: Vec<usize> = route["rows"].as_array().unwrap().iter().map(|r| r.as_u64().unwrap() as usize).collect();
