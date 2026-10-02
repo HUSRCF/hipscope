@@ -11,6 +11,7 @@ fn run() -> Result<(), String> {
     if command == "audit" { return run_audit(args); }
     if command == "profile" { return run_profile(args); }
     if command == "lint" { return run_lint(args); }
+    if command == "native" { return run_native(args); }
     if command != "custom" || args.next().as_deref() != Some("build") {
         return Err(usage().into());
     }
@@ -69,10 +70,33 @@ fn run() -> Result<(), String> {
 
 fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
+     peacemaker native --arch=gfx1201 file.s [--co=file.co] [--bundle=file.hxaco] [--host-target=triple]   (no ROCm: the code object and bundle `custom build` emits, uncertified)\n\
      peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
      peacemaker audit --lds-barrier PATH...   (CPU-only: every *.hsaco/*.co under PATH; fails on lds_store_unwaited_at_barrier or an unliftable module)\n\
      peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)\n\
      peacemaker lint OBJECT.co [--routes routes.json]   (CPU-only: JSON schedule report per lifted kernel/loop)"
+}
+
+/// The native build alone, spelled the way `toolchain::build` records it.
+fn run_native(args: impl Iterator<Item=String>) -> Result<(), String> {
+    let (mut arch, mut source, mut co, mut bundle) = (None, None, None, None);
+    let mut host = hipfire_isa::native::DEFAULT_HOST_TARGET.to_owned();
+    for arg in args {
+        match arg.split_once('=') {
+            Some(("--arch", v)) => arch = Some(v.parse::<hipfire_isa::Arch>()?),
+            Some(("--co", v)) => co = Some(PathBuf::from(v)),
+            Some(("--bundle", v)) => bundle = Some(PathBuf::from(v)),
+            Some(("--host-target", v)) => host = v.to_owned(),
+            _ if !arg.starts_with("--") && source.is_none() => source = Some(PathBuf::from(arg)),
+            _ => return Err(format!("unrecognized native argument {arg}\n{}", usage())),
+        }
+    }
+    let (arch, source) = (arch.ok_or("missing --arch=")?, source.ok_or("missing source .s")?);
+    let text = fs::read_to_string(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+    let elf = hipfire_isa::native::assemble(&text, arch)?;
+    if let Some(path) = &co { fs::write(path, &elf).map_err(|e| format!("{}: {e}", path.display()))? }
+    if let Some(path) = &bundle { fs::write(path, hipfire_isa::native::bundle(&elf, arch, &host)).map_err(|e| format!("{}: {e}", path.display()))? }
+    Ok(())
 }
 
 fn run_lint(mut args: impl Iterator<Item=String>) -> Result<(), String> {
