@@ -4290,18 +4290,17 @@ pub fn forward_scratch(
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
     // Same explicit per-model override as the hand path; HIPFIRE_GRAPH also
-    // controls this carrier. Unset remains off until exactness/perf are gated.
-    static GRAPH_ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    // controls this carrier. With both switches unset, capture/replay is the
+    // measured default on exact gfx1201 only; every other arch stays opt-in.
+    static GRAPH_ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         let parse = |name| match hipfire_config::developer_var(name).ok().as_deref() {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
         };
-        parse("HIPFIRE_GEMMA4_GRAPH")
-            .or_else(|| parse("HIPFIRE_GRAPH"))
-            .unwrap_or(false)
+        parse("HIPFIRE_GEMMA4_GRAPH").or_else(|| parse("HIPFIRE_GRAPH"))
     });
-    let graph_on = *GRAPH_ENV;
+    let graph_on = (*GRAPH_ENV).unwrap_or(gpu.arch == "gfx1201");
     let eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
     let use_graph = graph_on
         && eligible
