@@ -103,7 +103,7 @@ pub fn analyze(program: &peacemaker_ir::Program, routes: &BTreeMap<String, Route
     for kernel in &program.kernels {
         let body = &kernel.body;
         let graph = Cfg::build(body).map_err(|e| format!("{}: {e}", kernel.symbol.0))?;
-        let waits = replay(body, arch).map_err(|e| format!("{}: {e}", kernel.symbol.0))?;
+        let waits = replay(body, arch, kernel.wave).map_err(|e| format!("{}: {e}", kernel.symbol.0))?;
         let mut loops = Vec::new();
         for info in graph.loops() {
             // A natural loop may have multiple exits; no dynamic branch frequency
