@@ -276,14 +276,15 @@ string or a blanket “always refuse at load.”
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 
-Dense Qwen3.5/3.6 at `tp>1` is the one mesh topology that speculates: when the
-artifact carries an MTP head (bundled `.mq4-mtp` trailer, the CLI-resolved
-`.mtp` sidecar, or the trunk's sibling `.mtp`) the loader replicates it on rank 0
-and the request takes the spec route, drafting on rank 0 and verifying across
-ranks. `speculation.mtp = off` keeps the AR mesh loop; `on` makes a missing head
-a load error. Block-verify drafters (n-gram, DFlash, DSpark) stay refused on
-dense TP, and the n-gram-mod composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts
-natively there.
+Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
+`speculation = "mtp"` (`speculation.mtp = on`, `--spec mtp`) takes the spec route.
+The loader then replicates the MTP head on rank 0 (bundled `.mq4-mtp` trailer, the
+CLI-resolved `.mtp` sidecar, or the trunk's sibling `.mtp`); the request drafts on
+rank 0 and verifies across ranks. A missing head is a load error, as `mtp=on` is
+on one GPU. `auto` (the default) and `off` keep the AR mesh loop even when a head
+sits beside the trunk, so existing `tp>1` serves are unchanged. Block-verify
+drafters (n-gram, DFlash, DSpark) stay refused on dense TP, and the n-gram-mod
+composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts natively there.
 
 ### Architectural limits (current)
 

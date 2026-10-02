@@ -4163,14 +4163,15 @@ fn load_model_tp_qwen35_dense(
     }
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
-    // The MTP head is replicated on rank 0 (the trunk stays sharded), under the
-    // same typed `spec.mtp` policy the single-GPU loader honors. Resolved while
-    // `staging` still owns the ranks: a required-but-missing head returns
-    // through its `Drop`, which frees every rank's weights, KV, DeltaNet state
-    // and scratch instead of stranding the sharded trunk in a live daemon.
-    let mtp_head = if spec.mtp == Some(false) {
-        None
-    } else {
+    // The MTP head is replicated on rank 0 (the trunk stays sharded) only for
+    // an explicit `speculation.mtp = on` (`spec.mtp == Some(true)`). `auto`
+    // (`None`) and `off` keep the AR mesh loop that dense TP ran before MTP
+    // was wired on the mesh, so a sidecar beside the trunk never enables it
+    // by itself. A missing head is a load error, as `mtp=on` is on one GPU.
+    // Resolved while `staging` still owns the ranks: the error returns through
+    // its `Drop`, which frees every rank's weights, KV, DeltaNet state and
+    // scratch instead of stranding the sharded trunk in a live daemon.
+    let mtp_head = if spec.mtp == Some(true) {
         let (head, errors) = resolve_qwen35_mtp_head(
             Path::new(path),
             // The CLI-resolved sidecar (a symlinked trunk's canonical path
@@ -4182,22 +4183,16 @@ fn load_model_tp_qwen35_dense(
             Some("dense TP rank 0"),
         );
         if head.is_none() {
-            if spec.mtp == Some(true) {
-                let reason = if errors.is_empty() {
-                    "no bundled trailer or .mtp sidecar found".to_string()
-                } else {
-                    errors.join("; ")
-                };
-                return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
-            }
-            if !errors.is_empty() {
-                eprintln!(
-                    "  dense TP MTP head not loaded: {} — falling back to AR",
-                    errors.join("; ")
-                );
-            }
+            let reason = if errors.is_empty() {
+                "no bundled trailer or .mtp sidecar found".to_string()
+            } else {
+                errors.join("; ")
+            };
+            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
         }
         head
+    } else {
+        None
     };
     let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
     eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
