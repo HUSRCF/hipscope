@@ -520,10 +520,12 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // which warn and fall back for anything they cannot allocate. `bf16` is
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
+// `legacy-asym3` is the Gemma4 lowered full-tier opt-out back to Givens asym3
+// (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
+    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).

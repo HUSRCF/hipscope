@@ -390,6 +390,7 @@ fn redline_reset_gemma4(
             .memset(buffer, 0, buffer.size())
             .map_err(|error| error.to_string())?;
     }
+    gpu.invalidate_graph_state();
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())

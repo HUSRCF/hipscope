@@ -279,7 +279,7 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2` (family-dependent; see below) |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `legacy-asym3` (family-dependent; see below) |
 | `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
@@ -351,10 +351,13 @@ constructor); and Qwen3 dense (flat constructor). gfx1200 / gfx11 / gfx94x
 never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
 `default_kv_mode = "q8"` is not lowered into config).
 
-**Non-Qwen families are unchanged:** Maple keeps BF16/BF16 (registry and
-direct-path auto; explicit `--kv-mode q8` still works). Gemma4 eager stays
-Q8/Q8; lowered hard-codes sliding Q8 plus a full-attention tier in legacy
-Givens Asym3 + Q8 V and ignores `kv_cache`. DeepSeek4 keeps its F32
+**Non-Qwen families:** Maple keeps BF16/BF16 (registry and direct-path
+auto; explicit `--kv-mode q8` still works). Gemma4 eager stays Q8/Q8.
+Gemma4 lowered keeps the sliding Q8 ring; its full-attention tier follows
+`kv_cache`: `auto`/`q8` → Q8 on every arch (no lowered Gemma4 attend site
+admits native FP8), `legacy-asym3` → the previous Givens Asym3 K + Q8 V,
+`fp8`/`bf16` → load error, anything else → Q8 with a warning. llama HFQ,
+MiniMax and LFM2-MoE resolve `auto` to q8. DeepSeek4 keeps its F32
 compressor default (or explicit F16); V is not independently selectable
 there. Other carriers keep their existing site policy (llama, MiniMax and
 LFM2-MoE resolve `auto` to q8).
