@@ -10,6 +10,7 @@ fn run() -> Result<(), String> {
     let Some(command) = args.next() else { return Err(usage().into()); };
     if command == "audit" { return run_audit(args); }
     if command == "profile" { return run_profile(args); }
+    if command == "lint" { return run_lint(args); }
     if command != "custom" || args.next().as_deref() != Some("build") {
         return Err(usage().into());
     }
@@ -70,7 +71,29 @@ fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
      peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
      peacemaker audit --lds-barrier PATH...   (CPU-only: every *.hsaco/*.co under PATH; fails on lds_store_unwaited_at_barrier or an unliftable module)\n\
-     peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
+     peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)\n\
+     peacemaker lint OBJECT.co [--routes routes.json]   (CPU-only: JSON schedule report per lifted kernel/loop)"
+}
+
+fn run_lint(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+    use hipfire_isa::cost_lint::{self, Route};
+    use std::collections::BTreeMap;
+    let path = args.next().ok_or_else(|| usage().to_owned())?;
+    let mut routes = BTreeMap::<String, Route>::new();
+    if let Some(option) = args.next() {
+        if option != "--routes" { return Err(format!("unknown lint option {option}")); }
+        let file = args.next().ok_or("missing --routes path")?;
+        routes = serde_json::from_slice(&fs::read(&file).map_err(|e| format!("{file}: {e}"))?)
+            .map_err(|e| format!("{file}: {e}"))?;
+    }
+    if args.next().is_some() { return Err(usage().into()); }
+    let object = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+    let lifted = peacemaker_lift::lift_object(&object, peacemaker_lift::Options {
+        frontend: peacemaker_ir::inst::Frontend::Hipcc,
+    }).map_err(|e| format!("{path}: {e}"))?;
+    let report = cost_lint::analyze(&lifted.program, &routes)?;
+    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 /// DIAGNOSTIC: instrument one kernel with timestamp records, verify the
