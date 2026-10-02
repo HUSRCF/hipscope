@@ -79,7 +79,7 @@ impl Gpu {
         let grid_x = (m as u32).div_ceil(block_m * columns_per_thread);
         let result = self.launch_maybe_blob(
             func_name,
-            [grid_x, batch_size as u32, 1],
+            [batch_size as u32, grid_x, 1],
             [block_m, 1, 1],
             0,
             &mut params,
@@ -484,7 +484,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "moe_down_combine_grouped_k8",
-            [grid_x, n as u32, 1],
+            [n as u32, grid_x, 1],
             [block, 1, 1],
             0,
             &mut params,
@@ -685,7 +685,9 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "moe_unscatter_silu_clamp_k8",
-            [grid_x, m_total as u32, 1],
+            // m_total on grid.x (limit 2^31); the mi tile stays on grid.y.
+            // grid.y = m_total exceeds 65535 for top-8 chunks >= 8192 tokens.
+            [m_total as u32, grid_x, 1],
             [block, 1, 1],
             0,
             &mut params,
@@ -3188,6 +3190,183 @@ mod tests {
                 .filter(|(x, y)| x.to_bits() != y.to_bits())
                 .count();
             assert_eq!(differing, 0, "zero-init combine differs in {differing} cells, tokens={tokens}");
+        }
+    }
+
+    /// Runs `moe_unscatter_silu_clamp_k8` over `tokens` top-8 tokens with
+    /// interleaved -1 padding slots and checks (a) every output cell against
+    /// an independent CPU SwiGLU-clamp evaluation and (b) byte identity with
+    /// the same kernel run over three smaller slot chunks. Returns the
+    /// grouped slot count (the launch's m_total).
+    fn silu_clamp_k8_case(gpu: &mut Gpu, tokens: usize) -> usize {
+        const MI: usize = 8;
+        const K_TOP: usize = 8;
+        const LIMIT: f32 = 7.0;
+        let slots = tokens * K_TOP;
+        let mut sorted = Vec::new();
+        for i in 0..slots {
+            // 37 is coprime with 8 * tokens for the sizes used: a permutation.
+            sorted.push(((i * 37) % slots) as i32);
+            if i % 97 == 96 {
+                sorted.push(-1);
+            }
+        }
+        let grouped = sorted.len();
+        let y: Vec<f32> = (0..grouped * 2 * MI)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 20011) as f32 - 10005.0) / 1000.0)
+            .collect();
+        let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+
+        let y_gpu = gpu.upload_f32(&y, &[y.len()]).expect("y");
+        let sorted_bytes = to_bytes(&sorted);
+        let sorted_gpu = gpu
+            .upload_raw(&sorted_bytes, &[sorted_bytes.len()])
+            .expect("sorted");
+        let big = gpu.zeros(&[slots * MI], DType::F32).expect("big");
+        gpu.moe_unscatter_silu_clamp_k8(&y_gpu, &sorted_gpu, &big, MI, K_TOP, grouped, LIMIT)
+            .expect("launch");
+        let big_host = gpu.download_f32(&big).expect("download big");
+
+        let mut expected = vec![0.0f32; slots * MI];
+        for (slot, &flat) in sorted.iter().enumerate() {
+            if flat < 0 {
+                continue;
+            }
+            for c in 0..MI {
+                let g = y[slot * 2 * MI + c].min(LIMIT);
+                let u = y[slot * 2 * MI + MI + c].clamp(-LIMIT, LIMIT);
+                expected[flat as usize * MI + c] = g / (1.0 + (-g).exp()) * u;
+            }
+        }
+        for (i, (got, want)) in big_host.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "cell {i} (tokens={tokens}): got {got}, want {want}"
+            );
+        }
+
+        let chunked = gpu.zeros(&[slots * MI], DType::F32).expect("chunked");
+        let step = grouped / 3 + 1;
+        let mut start = 0usize;
+        while start < grouped {
+            let end = (start + step).min(grouped);
+            let y_chunk = gpu
+                .upload_f32(&y[start * 2 * MI..end * 2 * MI], &[(end - start) * 2 * MI])
+                .expect("y chunk");
+            let s_bytes = to_bytes(&sorted[start..end]);
+            let s_chunk = gpu
+                .upload_raw(&s_bytes, &[s_bytes.len()])
+                .expect("sorted chunk");
+            gpu.moe_unscatter_silu_clamp_k8(
+                &y_chunk, &s_chunk, &chunked, MI, K_TOP, end - start, LIMIT,
+            )
+            .expect("chunk launch");
+            start = end;
+        }
+        let chunk_host = gpu.download_f32(&chunked).expect("download chunked");
+        let differing = big_host
+            .iter()
+            .zip(&chunk_host)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "tokens={tokens}: launch differs from chunked in {differing} cells"
+        );
+        grouped
+    }
+
+    /// Small slot count and an 8200-token top-8 chunk (65600 slots + padding
+    /// > 65535, the old grid.y limit) both match the CPU reference and the
+    /// chunked run.
+    #[test]
+    fn unscatter_silu_clamp_k8_small_and_past_65535_slots() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(_) => {
+                eprintln!("skip: no GPU");
+                return;
+            }
+        };
+        assert!(silu_clamp_k8_case(&mut gpu, 100) < 65536);
+        assert!(silu_clamp_k8_case(&mut gpu, 8200) > 65535);
+    }
+
+    /// Exactly representable inputs (small integers times {0.25..2}), so the
+    /// GPU result must equal the sequential CPU fold bit for bit whether or
+    /// not the compiler contracts multiply-add.
+    fn combine_k8_case(gpu: &mut Gpu, n: usize, grouped: bool) {
+        const M: usize = 8;
+        const K: usize = 8;
+        let slots = n * K;
+        let weights: Vec<f32> = (0..slots)
+            .map(|i| [0.5f32, 0.25, 1.0, 2.0][(i / K + i % K) % 4])
+            .collect();
+        let x0: Vec<f32> = (0..n * M).map(|i| ((i / M) % 13) as f32).collect();
+        // Grouped: inverse_perm is a permutation (37 coprime with 8 * n here).
+        let inv: Vec<i32> = (0..slots).map(|f| ((f * 37) % slots) as i32).collect();
+        let src: Vec<f32> = if grouped {
+            (0..slots * M)
+                .map(|i| (((i / M) * 29 + (i % M) * 5) % 53) as f32 - 26.0)
+                .collect()
+        } else {
+            (0..slots * M)
+                .map(|i| ((i / M / K * 131 + (i / M % K) * 17 + (i % M) * 7) % 61) as f32 - 30.0)
+                .collect()
+        };
+        let mut expected = x0.clone();
+        for t in 0..n {
+            for c in 0..M {
+                let mut acc = 0.0f32;
+                for k in 0..K {
+                    let v = if grouped {
+                        src[inv[t * K + k] as usize * M + c]
+                    } else {
+                        src[(t * K + k) * M + c]
+                    };
+                    acc += weights[t * K + k] * v;
+                }
+                expected[t * M + c] += acc;
+            }
+        }
+        let src_gpu = gpu.upload_f32(&src, &[src.len()]).expect("src");
+        let w_gpu = gpu.upload_f32(&weights, &[weights.len()]).expect("w");
+        let x_gpu = gpu.upload_f32(&x0, &[x0.len()]).expect("x");
+        if grouped {
+            let inv_bytes: Vec<u8> = inv.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let inv_gpu = gpu.upload_raw(&inv_bytes, &[inv_bytes.len()]).expect("inv");
+            gpu.moe_down_combine_grouped_k8(&src_gpu, &inv_gpu, &w_gpu, &x_gpu, M, K, n)
+                .expect("grouped combine");
+        } else {
+            gpu.moe_down_combine_k8_batched(&src_gpu, &w_gpu, &x_gpu, M, K, n)
+                .expect("batched combine");
+        }
+        let got = gpu.download_f32(&x_gpu).expect("download");
+        let differing = got
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "n={n} grouped={grouped}: {differing} cells differ from CPU fold"
+        );
+    }
+
+    /// Token axis on grid.x: 100 tokens (small) and 65600 tokens (> 65535,
+    /// the old grid.y limit) for both k8 combine launchers.
+    #[test]
+    fn moe_down_combine_k8_small_and_past_65535_tokens() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(_) => {
+                eprintln!("skip: no GPU");
+                return;
+            }
+        };
+        for grouped in [false, true] {
+            combine_k8_case(&mut gpu, 100, grouped);
+            combine_k8_case(&mut gpu, 65_600, grouped);
         }
     }
 }

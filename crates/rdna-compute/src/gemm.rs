@@ -27088,7 +27088,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_sigmoid_alpha_gate_f32`. Grid.y is the batch dim.
+    /// Batched `fused_sigmoid_alpha_gate_f32`. Batch rows fold into grid.x.
     #[cfg(feature = "deltanet")]
     pub fn fused_sigmoid_alpha_gate_f32_batched(
         &mut self,
@@ -27118,7 +27118,9 @@ impl Gpu {
             &mut nn as *mut _ as *mut c_void,
         ];
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        // Rows fold into grid.x (row = x / blocks_per_row); grid.y is bounded
+        // at 65535 and the explicit prefill chunk ceiling can exceed it.
+        let grid = crate::scratch::fold_rows_into_x(n.div_ceil(block as usize), batch_size)?;
         let bytes = n * 4 * 4 * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -27128,7 +27130,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_sigmoid_alpha_gate_f32",
-            [grid, batch_size as u32, 1],
+            grid,
             [block, 1, 1],
             0,
             &mut params,
@@ -27209,7 +27211,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_qk_l2_norm_scale_f32`. Grid.y is the batch dim.
+    /// Batched `fused_qk_l2_norm_scale_f32`. Batch rows fold into grid.x.
     #[cfg(feature = "deltanet")]
     pub fn fused_qk_l2_norm_scale_f32_batched(
         &mut self,
@@ -27242,6 +27244,8 @@ impl Gpu {
             &mut ep as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2 * batch_size;
+        // Rows fold into grid.x (row = x / n_heads), not bound by grid.y.
+        let grid = crate::scratch::fold_rows_into_x(n_heads, batch_size)?;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -27250,7 +27254,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_qk_l2_norm_scale_f32",
-            [n_heads as u32, batch_size as u32, 1],
+            grid,
             [32, 1, 1],
             0,
             &mut params,
@@ -27321,6 +27325,8 @@ impl Gpu {
         ];
         let bytes =
             crate::profile::elementwise1_bytes(n_key_heads * ratio * head_dim) * 2 * batch_size;
+        // Rows fold into grid.x (row = x / n_key_heads), not bound by grid.y.
+        let grid = crate::scratch::fold_rows_into_x(n_key_heads, batch_size)?;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -27329,7 +27335,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_qk_l2_norm_scale_interleave_f32_batched",
-            [n_key_heads as u32, batch_size as u32, 1],
+            grid,
             [32, 1, 1],
             0,
             &mut params,
@@ -27632,28 +27638,41 @@ impl Gpu {
             kernels::GEMM_F32_SRC,
             "gemm_f32_batched",
         )?;
-        let mut ap = a.buf.as_ptr();
-        let mut bp = b.buf.as_ptr();
-        let mut yp = y.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut ni = n as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-        ];
-        launch_params_blob!(
-            self,
-            "gemm_f32_batched",
-            [m as u32, n as u32, 1],
-            [32, 1, 1],
-            0,
-            params; ap, bp, yp, mi, ki, ni
-        )
+        // The kernel reads batch row `n` from blockIdx.y (<= 65535 blocks), so
+        // rows beyond that launch in chunks with B and Y advanced by whole
+        // rows; every row keeps the same K-loop and reduction as one launch.
+        const MAX_GRID_Y: usize = 65535;
+        let mut result = Ok(());
+        for chunk in 0..n.div_ceil(MAX_GRID_Y).max(1) {
+            let off = chunk * MAX_GRID_Y;
+            let take = (n - off).min(MAX_GRID_Y);
+            let mut ap = a.buf.as_ptr();
+            let mut bp = b.buf.as_ptr().wrapping_byte_add(off * k * std::mem::size_of::<f32>());
+            let mut yp = y.buf.as_ptr().wrapping_byte_add(off * m * std::mem::size_of::<f32>());
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut ni = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut ap as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            result = launch_params_blob!(
+                self,
+                "gemm_f32_batched",
+                [m as u32, take as u32, 1],
+                [32, 1, 1],
+                0,
+                params; ap, bp, yp, mi, ki, ni
+            );
+            if result.is_err() {
+                break;
+            }
+        }
+        result
     }
     /// Native-BF16 weight × F32 input batched GEMM.
     ///
@@ -45039,6 +45058,11 @@ impl Gpu {
                 "qwen4_moe_rotate128_i4: need k % 128 == 0 and nonzero rows",
             ));
         }
+        // Fold the grouped row into grid x (p = x / (k/128), group = x % (k/128)):
+        // grid y is bounded at 65535 and grouped_rows can exceed it.
+        let grid_x = u32::try_from((k / 128) * grouped_rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "qwen4_moe_rotate128_i4: grid exceeds u32")
+        })?;
         self.bind_thread()?;
         self.ensure_mq_signs_128()?;
         self.ensure_kernel(
@@ -45081,7 +45105,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             QWEN4_MOE_ROTATE128_I4,
-            [(k / 128) as u32, grouped_rows as u32, 1],
+            [grid_x, 1, 1],
             [32, 1, 1],
             0,
             &mut params,

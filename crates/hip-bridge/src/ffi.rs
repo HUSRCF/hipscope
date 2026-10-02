@@ -10,7 +10,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -525,6 +525,12 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+    /// `gridDim.y`/`gridDim.z` ceiling (`u32::MAX` = unguarded, the default).
+    /// Per-runtime, not per-device or per-thread: it is set once by the owner
+    /// of a runtime bound to a single device (`Gpu::init_with_device`) via
+    /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
+    /// configures is unguarded.
+    launch_grid_yz_limit: AtomicU32,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -1111,6 +1117,7 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ) },
                 _lib: lib,
+                launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -1995,6 +2002,30 @@ impl HipRuntime {
         Ok(Function(func))
     }
 
+    /// Install the `gridDim.y`/`gridDim.z` ceiling for the architecture this
+    /// runtime launches on ([`crate::launch_grid::grid_yz_limit_for_arch`]).
+    /// Architectures without a recorded ceiling clear the guard.
+    pub fn set_launch_grid_limit_for_arch(&self, arch: &str) {
+        let limit = crate::launch_grid::grid_yz_limit_for_arch(arch).unwrap_or(u32::MAX);
+        self.launch_grid_yz_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The installed `gridDim.y`/`gridDim.z` ceiling, if any.
+    pub fn launch_grid_yz_limit(&self) -> Option<u32> {
+        match self.launch_grid_yz_limit.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// Fail-closed geometry check shared by the raw launch entry points and
+    /// the dispatch record/capture funnels. Never clamps; see
+    /// [`crate::launch_grid::check_launch_grid`].
+    #[inline]
+    pub fn validate_launch_grid(&self, grid: [u32; 3]) -> HipResult<()> {
+        crate::launch_grid::check_launch_grid(grid, self.launch_grid_yz_limit())
+    }
+
     /// Launch a kernel on the GPU.
     ///
     /// # Safety
@@ -2008,6 +2039,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
@@ -2063,6 +2095,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }

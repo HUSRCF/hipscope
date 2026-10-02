@@ -47,6 +47,14 @@ name = "qwen4_moe_sym"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_rotate128_rows_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen35_batch_rows_smoke"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "bench_packed_mq4_shapes"
 required-features = ["lab"]
 
@@ -848,4 +856,36 @@ required-features = ["lab"]
 
 [[example]]
 name = "qsa_pm_check"
+required-features = ["lab"]
+
+[[example]]
+name = "kv_transcode_grid_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "kv_row_chunk_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_grid_rows_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "norm_rows_grid_smoke"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "scratch_rows_fold_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "gemv_batch_grid_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "vae_grid_fold_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_grid_yz_guard_smoke"
 required-features = ["lab"]

@@ -1502,6 +1502,11 @@ impl Gpu {
         // APU vs discrete GPU) from physical topology, which a
         // HIPFIRE_TARGET_ARCH override does not change.
         crate::arch_caps::note_process_gpu_arch(&detected_arch);
+        // The grid.y/grid.z ceiling is a property of the physical device, so
+        // it keys off the detected arch, not the HIPFIRE_TARGET_ARCH override.
+        // Set once here: this `Gpu` owns its `HipRuntime` for exactly one
+        // device, so the per-runtime limit is race-free.
+        hip.set_launch_grid_limit_for_arch(&detected_arch);
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -2701,6 +2706,11 @@ impl Gpu {
         bindings: ReplayLaunchBindings<'_>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        // Fail closed before the recorder / capture tapes see the launch: an
+        // oversized grid.y/grid.z must never be recorded, captured, or clamped.
+        self.hip
+            .validate_launch_grid(grid)
+            .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
@@ -2965,6 +2975,10 @@ impl Gpu {
         bindings: ReplayLaunchBindings<'_>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Fail closed before the recorder / capture tapes see the launch.
+        self.hip
+            .validate_launch_grid(grid)
+            .map_err(|e| e.with_kernel(func_name))?;
         if self.replay.is_recording() {
             let artifact = recorded_launch_artifact(&self.compiler, func_name);
             self.replay.record_hip_launch_typed_bound(

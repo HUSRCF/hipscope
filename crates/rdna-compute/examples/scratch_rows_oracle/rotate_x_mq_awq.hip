@@ -29,15 +29,12 @@ __global__ void rotate_x_mq_awq(
     const float* __restrict__ signs2,
     int K
 ) {
-    // Folded 1-D launch, grid [(K/256) * batch, 1, 1]: batch row is
-    // blockIdx.x / (K/256), so the batch is not bound by gridDim.y.
+    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (groups_total <= 0) return;
-    const int group = (int)(blockIdx.x % (unsigned)groups_total);
-    const long long batch = (long long)(blockIdx.x / (unsigned)groups_total);
+    if (group >= groups_total) return;
 
-    const long long batch_off = batch * K;
+    const long long batch_off = (long long)blockIdx.y * K;
     const float* x_in_b  = x_in  + batch_off;
           float* x_out_b = x_out + batch_off;
 
