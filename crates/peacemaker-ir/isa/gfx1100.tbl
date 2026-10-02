@@ -40,6 +40,7 @@ s_cmp_lt_i32	sopc	0x4	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lt_i32 s15, 
 s_cmp_le_i32	sopc	0x5	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_i32 s7, s3	BF050307	-
 s_cmp_lg_u32	sopc	0x7	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lg_u32 s4, 24	BF079804	-
 s_cmp_lt_u32	sopc	0xa	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lt_u32 s25, 2	BF0A8219	-
+s_cmp_le_u32	sopc	0xb	SSRC0:32,SSRC1:32,literal@last	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_u32 s57, s4	BF0B0439	-
 s_mulk_i32	sopk	0x10	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_mulk_i32 s4, 0x6180	B8046180	-
 s_nop	sopp	0x0	SIMM16:16	-	SIMM16	-	-	s_nop 0	BF800000	-
 s_clause	sopp	0x5	SIMM16:16	-	SIMM16	-	-	s_clause 0x1	BF850001	-

@@ -462,7 +462,7 @@ fn wait_facts_and_obligations() {
     assert_eq!(counts.kmcnt, vec![0; 7]);
     assert_eq!((counts.loadcnt, counts.dscnt, counts.loadcnt_dscnt, counts.alu), (16, 28, 3, 142));
 
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, kernel.wave).unwrap();
     assert_eq!(facts.obligations.len(), 124);
     let ds_stores: Vec<_> = facts.events.iter()
         .filter(|e| name(body.insts.get(e.inst).unwrap()) == "ds_store_2addr_b64")
@@ -494,7 +494,7 @@ fn wait_facts_and_obligations() {
     mutated[at..at + 4].copy_from_slice(&0xbfc7_0001u32.to_le_bytes());
     let weakened = lift(&mutated, Frontend::Hipcc);
     let body = &selected(&weakened.program).body;
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, selected(&weakened.program).wave).unwrap();
     let load = body.insts.get(smem[0].inst).unwrap();
     assert_eq!(name(load), "s_load_b128");
     let stranded: Vec<_> = facts.obligations.iter()
@@ -514,7 +514,7 @@ fn wait_facts_and_obligations() {
 fn replay_follows_feasible_paths_only() {
     let lifted = lift(&kt48_co(), Frontend::Hipcc);
     let kernel = selected(&lifted.program);
-    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH).unwrap();
+    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH, kernel.wave).unwrap();
     let sites: BTreeSet<usize> = facts.obligations.iter().map(|o| position(kernel, o.insts[0])).collect();
     for site in [956, 957, 973, 974] {
         assert!(sites.contains(&site), "feasible first-iteration site {site}");
