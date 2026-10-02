@@ -44982,12 +44982,18 @@ impl Gpu {
     }
 }
 
-/// `HIPFIRE_QWEN4_MOE_SYM_IU4=1` opts gfx1151 / gfx1201 Qwen4 prefill into the
-/// grouped symmetric IU4 MoE route (fn-moe-sym) for layers whose every
-/// routed-expert header passed [`Gpu::qwen4_moe_sym_check`]. Unset or `0`
-/// keeps the whole incumbent route (scatter, producers and GEMMs). Read once.
-pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_SYM_IU4", false));
+/// `HIPFIRE_QWEN4_MOE_SYM_IU4` selects the grouped symmetric IU4 MoE route
+/// (fn-moe-sym) for gfx1151 / gfx1201 Qwen4 prefill on layers whose every
+/// routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: `1` requests it,
+/// `0` keeps the whole incumbent route (scatter, producers and GEMMs), and
+/// unset requests it on gfx1151 only (an asymmetric artifact fails the check
+/// and stays on the incumbent). Read once.
+pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
+    LazyLock::new(|| match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_IU4").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
 
 /// The route's GEMMs run from the certified builder modules
 /// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores
@@ -45030,10 +45036,11 @@ const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 /// grouping, the two A4 producers and the two grouped IU4 GEMMs. gfx1151 and
 /// gfx1201 only; every launcher refuses other arches.
 impl Gpu {
-    /// The route is requested and possible on this device: the flag, exact
-    /// gfx1151 or gfx1201, and the frozen C2 producer candidate set
-    /// (`-DIU4_A4_CANDIDATES=2`, the default on both; any other value keeps
-    /// the incumbent). Row count and verified headers are checked separately.
+    /// The route is requested and possible on this device: the flag (unset =
+    /// gfx1151 only), exact gfx1151 or gfx1201, and the frozen C2 producer
+    /// candidate set (`-DIU4_A4_CANDIDATES=2`, the default on both; any other
+    /// value keeps the incumbent). Row count and verified headers are checked
+    /// separately.
     pub fn qwen4_moe_sym_iu4_requested(&self) -> bool {
         let mut candidates = self
             .flags
@@ -45041,7 +45048,7 @@ impl Gpu {
             .split_whitespace()
             .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
             .peekable();
-        *QWEN4_MOE_SYM_IU4
+        QWEN4_MOE_SYM_IU4.unwrap_or(self.arch == "gfx1151")
             && self.qwen4_moe_sym_arch_index().is_some()
             && candidates.peek().is_some()
             && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2")

@@ -4135,7 +4135,7 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// the F16 K / block-transposed V producer and the gathered F16 WMMA
 /// attention, with the ABI, grid, LDS and output bytes of
 /// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
-/// Opt-in through `HIPFIRE_QWEN4_QSA_PM=1`.
+/// Default on (`HIPFIRE_QWEN4_QSA_PM=0` keeps the hipcc kernels).
 pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
 pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.

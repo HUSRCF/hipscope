@@ -43,12 +43,13 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
-/// `HIPFIRE_QWEN4_QSA_PM=1` runs the gathered route's producer and attention
-/// from the certified builder module (`kernels::QSA_GATHER_PM_*`, same ABI,
-/// grid, LDS and output bytes as the hipcc kernels) instead of the JIT
-/// source.  Unset or `0` keeps the hipcc kernels.  Read once.
+/// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
+/// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
+/// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
+/// JIT source, on every gathered-route arch (gfx1151, gfx1201).  `0` keeps the
+/// hipcc kernels.  Read once.
 static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
 });
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
