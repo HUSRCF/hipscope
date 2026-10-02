@@ -683,11 +683,17 @@ mod tests {
         // digests above are re-pinned to the current source.
         // The five KV-write modules gained paged-only code behind
         // `#ifdef HIPFIRE_KV_SLOT_PAGED` (fold/scs); their preprocessed source
-        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged.
-        const REPINNED_SINCE_P0: [&str; 10] = [
+        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged. The four
+        // grid.y row-fold modules (qk-L2 norm, sigmoid-alpha gate, SiLU-mul
+        // rotate, AWQ rotate) moved their row axis onto grid.x for the
+        // gfx1201 65536-workgroup limit.
+        const REPINNED_SINCE_P0: [&str; 14] = [
             "conv1d_silu_split_qknorm_b256",
+            "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
+            "fused_sigmoid_alpha_gate",
+            "fused_silu_mul_mq_rotate",
             "fused_silu_mul_mq_rotate_awq",
             "gated_delta_net_q8_fast",
             "kv_cache_write_asym_k_givens3_batched",
@@ -695,6 +701,7 @@ mod tests {
             "kv_cache_write_q8_0_batched",
             "kv_cache_write_q8_0_independent",
             "kv_cache_write_q8_0_independent_masked",
+            "rotate_x_mq_awq",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
         let mut repins_seen = HashSet::new();

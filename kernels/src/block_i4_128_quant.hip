@@ -415,9 +415,11 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
 #endif
 }
 
-// Standalone quantizer: same (X, Y, K, N) grid contract as
-// quantize_q8_1_mmq_ds4_x128 (block (256,1,1), each thread 4 floats,
-// grid [(K+1023)/1024, N]). One wave32 covers exactly one 128-K group.
+// Standalone quantizer: same (X, Y, K, N) contract as
+// quantize_q8_1_mmq_ds4_x128 (block (256,1,1), each thread 4 floats). The
+// launch is folded into one dimension, grid [((K+1023)/1024) * N, 1, 1]:
+// token = blockIdx.x / blocks_per_row, so N is not bound by gridDim.y.
+// One wave32 covers exactly one 128-K group.
 #ifndef HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
 extern "C" __global__ void quantize_int4_mmq_ds128(
     const float* __restrict__ X,
@@ -425,8 +427,10 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
     int K,
     int N
 ) {
-    const int token = blockIdx.y;
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per_row = (K + (int)blockDim.x * 4 - 1) / ((int)blockDim.x * 4);
+    if (per_row <= 0) return;
+    const int token = (int)(blockIdx.x / (unsigned)per_row);
+    const int t = (int)(blockIdx.x % (unsigned)per_row) * blockDim.x + threadIdx.x;
     const int i0 = t * 4;
     if (token >= N || i0 >= K) return;
     const int lane = threadIdx.x & 31;

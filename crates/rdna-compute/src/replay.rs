@@ -3546,6 +3546,15 @@ pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
     kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
 }
 
+/// Fail-closed gate for the PM4/AQL lowering, which turns a recorded HIP
+/// geometry (or the prepared maximum of a position-bound grid) into a direct
+/// dispatch. HIP rejects such a grid on the device's grid.y/grid.z ceiling, so
+/// the retained transport must not accept a geometry the raw launch refuses.
+fn check_prepared_grid(device_name: &str, symbol: &str, grid: [u32; 3]) -> Result<(), String> {
+    hip_bridge::check_launch_grid(grid, hip_bridge::grid_yz_limit_for_arch(device_name))
+        .map_err(|error| format!("{symbol}: {}", error.message))
+}
+
 fn is_plausible_device_address(value: u64) -> bool {
     // Heuristic: real device pointers are at least page-aligned and in a
     // high virtual range. Small integers (positions, scales, sizes) are
@@ -5143,6 +5152,7 @@ impl ReplayController {
                 workgroup[axis] = u16::try_from(value)
                     .map_err(|_| format!("{symbol}: workgroup dimension {value} exceeds u16"))?;
             }
+            check_prepared_grid(device.name(), &symbol, launch.grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(launch.grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             let dispatch = RecordedDispatch::new(0, kernel, geometry, kernarg)
@@ -5435,6 +5445,7 @@ impl ReplayController {
                     // Keep launch.grid replaced for geometry; dynamic_grids stores prepared_grid.
                 }
             }
+            check_prepared_grid(device.name(), &symbol, geometry_grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(geometry_grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             device
@@ -9085,6 +9096,15 @@ mod tests {
             gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
+    }
+
+    #[test]
+    fn prepared_grid_rejects_oversized_yz_on_gfx1201_only() {
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_536, 1]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [1 << 20, 1, 65_536]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_537, 1]).is_err());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_537]).is_err());
+        assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_537, 65_537]).is_ok());
     }
 
     #[test]
