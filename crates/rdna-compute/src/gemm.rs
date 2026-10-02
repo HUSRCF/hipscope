@@ -889,17 +889,21 @@ fn mqv2_mw_waves(
 
 // Three-run Halo artifact sweeps for both output dtypes; unmeasured cases retain BT8/RW4.
 // This table is used by HIPFIRE_QWEN4_MQ6_X4_TILE=auto and, with it unset, inside the Qwen4 forward.
+// N=8192/2048 rows: cold-cache three-process sweep (qcal/release-0.4.1/mq6-exact/bench/profile.md).
 fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     match (m, k, n) {
         (48, 2560, 1536 | 512 | 1131) => Some([8, 4, 2]),
         (640, 2560, 1536) => Some([8, 8, 1]),
         (640, 2560, 512) => Some([8, 4, 2]),
+        (640, 2560, 8192 | 2048) => Some([8, 8, 2]),
+        (512, 2560, 8192 | 2048) => Some([8, 8, 1]),
         (2560, 6144, 1536 | 512 | 1131) => Some([8, 8, 1]),
         (6144, 2560, 1536 | 512 | 1131) => Some([8, 8, 1]),
         (10240 | 12288, 2560, 1536) => Some([12, 8, 2]),
         (10240, 2560, 512) => Some([8, 8, 2]),
-        (10240, 2560, 1131) => Some([8, 8, 1]),
-        (12288, 2560, 512 | 1131) => Some([8, 8, 1]),
+        (10240, 2560, 1131 | 8192 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 512 | 1131 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 8192) => Some([8, 8, 2]),
         _ => None,
     }
 }
