@@ -44645,6 +44645,113 @@ const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
 const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 
+/// `HIPFIRE_QWEN4_TRUNK_IU4=1` opts gfx1151 Qwen4 prefill into the dense IU4
+/// route for a symmetric MQ4G256V2 trunk (the linear_attn / self_attn
+/// projections): A4 activations from the dense producers and the dense SET
+/// GEMMs (V2B / PeaceMaker `pm_v2b` where eligible, X5 / symfold otherwise).
+/// Applies only once the Qwen4 forward verified every trunk header
+/// ([`Gpu::qwen4_trunk_iu4`]). Unset or `0` keeps exact activations. Read once.
+static QWEN4_TRUNK_IU4: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_TRUNK_IU4", false));
+
+/// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
+/// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
+impl Gpu {
+    /// The trunk route is requested and possible: the flag, exact gfx1151, a
+    /// symmetric artifact and the IU4 prefill / symmetric-fold switches the
+    /// dense SET kernels need. Verified headers are checked separately.
+    pub fn qwen4_trunk_iu4_requested(&self) -> bool {
+        *QWEN4_TRUNK_IU4
+            && self.arch == "gfx1151"
+            && self.mq4v2_symmetric
+            && self.flags.iu4_prefill_enabled()
+            && self.flags.gfx11_iu4_symfold
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+    }
+
+    /// Whether a `rows`-row trunk projection takes the IU4 route: verified
+    /// trunk, prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows, eager
+    /// (no replay recording or graph capture).
+    pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
+        self.qwen4_trunk_iu4
+            && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// Check every header of one `m x k` QT44 trunk matrix for the symmetric
+    /// grid (`zp == -8*sc`, finite) on the device.
+    pub fn qwen4_trunk_sym_check(&mut self, w: &GpuTensor, m: usize, k: usize) -> HipResult<bool> {
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        if k % 256 != 0 || w.byte_size() < m * row_bytes {
+            return Ok(false);
+        }
+        let table = self.upload_raw(&(w.buf.as_ptr() as u64).to_le_bytes(), &[8])?;
+        let verdict = self.qwen4_moe_sym_check(&table, m, k, 1, 136);
+        self.free_tensor(table)?;
+        verdict
+    }
+
+    /// GDN Z|beta|alpha as one V2B SET over the folded rows `a_fold` (Z's
+    /// `z_m` rows, beta's 48, alpha's 48, zero rows up to `z_m + 256`) whose
+    /// epilogue writes Z `[n][z_m]`, beta and alpha `[n][48]` (the dense
+    /// `_set_zba` entry). `Ok(false)` when V2B does not take this shape; the
+    /// caller then runs the three SETs separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_trunk_zba_iu4(
+        &mut self,
+        a_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let folded_m = z_m + 256;
+        if z_m % 256 != 0
+            || a_fold.byte_size() != folded_m * row_bytes
+            || self.iu4_v2_tile(folded_m, k, n) != Some(Iu4V2Tile::V2b)
+            || y_z.byte_size() < n * z_m * 4
+            || y_beta.byte_size() < n * 48 * 4
+            || y_alpha.byte_size() < n * 48 * 4
+            || hipfire_config::developer_var("HIPFIRE_V2B_ZBA_SCATTER").as_deref() == Ok("0")
+        {
+            return Ok(false);
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_zba_v2b_scatter(a_fold, xq, y_z, y_beta, y_alpha, z_m, k, n)?;
+        Ok(true)
+    }
+
+    /// Exact-activation (F16 X) MQ4G256V2 prefill for the Qwen4 trunk when
+    /// the IU4 route is off: SET semantics over the gfx1151 BT4 F16 WMMA
+    /// kernel on the rotated F32 `x`. `Ok(false)` off gfx1151, below 96 rows
+    /// or under replay/capture (the caller keeps the generic projection).
+    pub fn gemm_qwen4_trunk_mq4_xf16(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1151" || n < 96 || self.replay.is_recording() || self.graphs.capture_mode {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, n * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, n * m * 4)?,
+        }
+        self.gemm_mq4g256v2_residual_wmma_gfx1151_bt(a, x, y, m, k, n, 4)?;
+        Ok(true)
+    }
+}
+
 /// Qwen4 symmetric IU4 MoE route (fn-moe-sym): header check, stable
 /// grouping, the two A4 producers and the two grouped IU4 GEMMs. gfx1151 and
 /// gfx1201 only; every launcher refuses other arches.

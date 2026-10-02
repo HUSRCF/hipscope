@@ -1941,6 +1941,10 @@ pub struct Qwen4GpuForward {
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
     pub(crate) qsa_tap: Option<Qwen4QsaTap>,
+    /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the GDN Z|beta|alpha fold the
+    /// IU4 trunk's V2B SET reads (see [`prepare_trunk_iu4`]); empty when the
+    /// route is off or the trunk did not verify.
+    trunk_zba: Vec<Option<GpuTensor>>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1963,6 +1967,80 @@ struct RouteTrace {
     out: std::io::BufWriter<std::fs::File>,
 }
 
+/// Opt-in symmetric IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=1`): check on the
+/// device that every trunk projection (GDN qkv/z/a/b/out, QSA indexer/q/k/v/o)
+/// is a symmetric QT44 matrix, then fold each GDN layer's Z, beta
+/// (`in_proj_b`) and alpha (`in_proj_a`) rows plus zero rows into one
+/// `z.m + 256`-row matrix for the dense V2B Z|beta|alpha SET (the rows are
+/// copied verbatim; the original tensors stay for decode). Arms
+/// `gpu.qwen4_trunk_iu4` only when every projection verified. Nothing runs
+/// unless the route was requested.
+fn prepare_trunk_iu4(
+    gpu: &mut Gpu,
+    bundle: &Qwen4Bundle,
+) -> Result<Vec<Option<GpuTensor>>, Qwen4GpuForwardError> {
+    gpu.qwen4_trunk_iu4 = false;
+    let mut folds = Vec::new();
+    if !gpu.qwen4_trunk_iu4_requested() {
+        return Ok(folds);
+    }
+    let weights = &bundle.weights;
+    let (mut verified, mut total) = (0usize, 0usize);
+    for layer in &weights.layer_refs {
+        let matrices = match (&layer.gdn, &layer.attention) {
+            (Some(gdn), _) => {
+                let g = gdn_desc(weights, gdn)?;
+                [g.qkv, g.z, g.in_proj_a, g.in_proj_b, g.output]
+            }
+            (None, Some(qsa)) => {
+                let q = qsa_desc(weights, qsa)?;
+                [q.indexer_qk, q.q, q.k, q.v, q.output]
+            }
+            (None, None) => return Err(invalid("trunk layer without attention weights")),
+        };
+        for w in matrices {
+            total += 1;
+            if w.dtype == DType::MQ4G256V2 && gpu.qwen4_trunk_sym_check(w.buf, w.m, w.k)? {
+                verified += 1;
+            }
+        }
+    }
+    eprintln!("  qwen4 IU4 trunk: {verified}/{total} projections verified symmetric QT44");
+    if verified != total {
+        return Ok(folds);
+    }
+    let result = (|| {
+        for layer in &weights.layer_refs {
+            let Some(gdn) = &layer.gdn else {
+                folds.push(None);
+                continue;
+            };
+            let g = gdn_desc(weights, gdn)?;
+            let k = g.z.k;
+            if g.in_proj_a.k != k || g.in_proj_b.k != k || g.in_proj_a.m != 48 || g.in_proj_b.m != 48 {
+                folds.push(None);
+                continue;
+            }
+            let row_bytes = k / 256 * rdna_compute::MQ4V2_GROUP_BYTES;
+            let mut rows = vec![0u8; (g.z.m + 256) * row_bytes];
+            for (w, start) in [(&g.z, 0), (&g.in_proj_b, g.z.m), (&g.in_proj_a, g.z.m + 48)] {
+                let span = start * row_bytes..(start + w.m) * row_bytes;
+                gpu.hip.memcpy_dtoh(&mut rows[span], &w.buf.buf)?;
+            }
+            folds.push(Some(gpu.upload_raw(&rows, &[rows.len()])?));
+        }
+        Ok::<(), Qwen4GpuForwardError>(())
+    })();
+    if let Err(error) = result {
+        for tensor in folds.into_iter().flatten() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        return Err(error);
+    }
+    gpu.qwen4_trunk_iu4 = true;
+    Ok(folds)
+}
+
 impl Qwen4GpuForward {
     pub fn new(
         gpu: &mut Gpu,
@@ -1975,6 +2053,7 @@ impl Qwen4GpuForward {
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut expert_stage = None;
+        let mut trunk_zba = Vec::new();
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -2009,6 +2088,7 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            trunk_zba = prepare_trunk_iu4(gpu, bundle)?;
             expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
             let sources = bundle
                 .weights
@@ -2060,7 +2140,8 @@ impl Qwen4GpuForward {
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
             }
-            for tensor in decode_q8 {
+            gpu.qwen4_trunk_iu4 = false;
+            for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
                 let _ = gpu.free_tensor(tensor);
             }
             if let Some(trace) = route_trace {
@@ -2078,6 +2159,7 @@ impl Qwen4GpuForward {
             moe,
             decode_q8,
             route_trace,
+            trunk_zba,
             qsa_tap: None,
         })
     }
@@ -2094,6 +2176,7 @@ impl Qwen4GpuForward {
             token_readback,
             decode_q8,
             route_trace,
+            trunk_zba,
             ..
         } = self;
         // Drain both streams before releasing stage tables, events or scratch.
@@ -2114,7 +2197,8 @@ impl Qwen4GpuForward {
                 first.get_or_insert(error);
             }
         }
-        for tensor in decode_q8 {
+        gpu.qwen4_trunk_iu4 = false;
+        for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -2745,6 +2829,7 @@ impl Qwen4GpuForward {
                         conv_kernel: dims.linear_conv_kernel_dim,
                         input_width: dims.hidden,
                         row_capture: bundle.state.gdn_row_capture(gdn_slot - 1, n),
+                        zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
                     }));
                 }
                 LayerType::FullAttention => {

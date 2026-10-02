@@ -303,6 +303,87 @@ pub fn project_weights(
     Ok(())
 }
 
+/// GDN Z|beta|alpha fold of [`project_trunk`]: the folded rows and the
+/// indices of Z, beta (`in_proj_b`) and alpha (`in_proj_a`) in its
+/// projection list.
+struct ZbaFold<'a> {
+    rows: &'a GpuTensor,
+    z: usize,
+    beta: usize,
+    alpha: usize,
+}
+
+/// Qwen4 trunk projections (GDN in/out, QSA in/out) of one shared input.
+///
+/// A symmetric MQ4G256V2 group on a verified trunk
+/// ([`Gpu::qwen4_trunk_iu4_applies`], `HIPFIRE_QWEN4_TRUNK_IU4=1`) takes the
+/// dense IU4 route: one A4 producer per K (`rotate_x_mq_i4`, FWHT +
+/// `block_i4_128`, no F32 store) feeding SET GEMMs
+/// (`gemm_mq4g256v2_mmq_set_prequant_iu4`: Halo V2B / `pm_v2b` where
+/// eligible, X5 / symfold otherwise); a GDN `zba` fold runs Z|beta|alpha as
+/// one V2B SET with the split in its epilogue. With the route off an MQ4G256V2
+/// prefill group reads exact (F16) activations on gfx1151. Everything else is
+/// [`project_weights`].
+fn project_trunk(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: &GpuTensor,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    zba: Option<ZbaFold<'_>>,
+) -> Result<(), DispatchError> {
+    let k = projections[0].0.k;
+    let mq4 = input.dtype == DType::F32
+        && projections.iter().all(|(w, _)| w.dtype == DType::MQ4G256V2 && w.k == k);
+    if !mq4 {
+        return project_weights(gpu, input, rows, Some(rotation), projections);
+    }
+    if gpu.qwen4_trunk_iu4_applies(rows) {
+        let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
+        let prepared = hip(gpu.rotate_x_mq_i4_batched(input, None, None, reservation, k, rows))?;
+        let mut done: SmallVec<[bool; 4]> = SmallVec::from_elem(false, projections.len());
+        if let Some(fold) = zba {
+            let (z, y_z) = projections[fold.z];
+            if hip(gpu.gemm_qwen4_trunk_zba_iu4(
+                fold.rows,
+                &prepared,
+                y_z,
+                projections[fold.beta].1,
+                projections[fold.alpha].1,
+                z.m,
+                k,
+                rows,
+            ))? {
+                done[fold.z] = true;
+                done[fold.beta] = true;
+                done[fold.alpha] = true;
+            }
+        }
+        for (j, (w, out)) in projections.iter().enumerate() {
+            if !done[j] {
+                let xq = hip(gpu.int4_mmq_prepared_ptr(&prepared, k, rows))?;
+                hip(gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(w.buf, xq, out, w.m, k, rows))?;
+            }
+        }
+        return Ok(());
+    }
+    if rows > 8 {
+        let x = view(rotation, 0, rows * k);
+        hip(gpu.rotate_x_mq_batched(input, &x, k, rows))?;
+        let mut all = true;
+        for (w, out) in projections {
+            all &= hip(gpu.gemm_qwen4_trunk_mq4_xf16(w.buf, &x, out, w.m, k, rows))?;
+            if !all {
+                break;
+            }
+        }
+        if all {
+            return Ok(());
+        }
+    }
+    project_weights(gpu, input, rows, Some(rotation), projections)
+}
+
 /// FWHT basis a quantized projection payload reads: the aligned-K 256-wide
 /// one (MQ4G256V2, MQ6G256V2, MFP4G32E8SOA) or MQ4G128V2's row-local 128-wide
 /// one. `None` for payloads that read the natural activation.
@@ -1184,6 +1265,11 @@ pub struct GatedDeltaNetOp<'a> {
     /// Few-row speculative verify: per-row rollback points (see
     /// [`GdnRowCapture`]); ignored by the one-row and chunked routes.
     pub row_capture: Option<GdnRowCapture<'a>>,
+    /// Qwen4 IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4`): Z, beta and alpha rows
+    /// folded into one QT44 matrix (`z.m + 256` rows: Z, `in_proj_b`,
+    /// `in_proj_a`, zero rows) for the V2B Z|beta|alpha SET; `None` runs the
+    /// three projections separately.
+    pub zba_fold: Option<&'a GpuTensor>,
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
@@ -1407,17 +1493,18 @@ pub fn execute_gated_delta_net_hc(
     if bf16_store(&op.qkv, gpu) {
         projection.dtype = DType::BF16;
     }
-    project_weights(
+    project_trunk(
         gpu,
         op.input,
         op.rows,
-        Some(op.rotation),
+        op.rotation,
         &[
             (&op.qkv, &projection),
             (&op.in_proj_a, &a),
             (&op.in_proj_b, &b),
             (&op.z, &z),
         ],
+        op.zba_fold.map(|rows| ZbaFold { rows, z: 3, beta: 2, alpha: 1 }),
     )?;
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
@@ -1606,13 +1693,13 @@ pub fn execute_gated_delta_net_hc(
         }
     }
     let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
-    project_weight(
+    project_trunk(
         gpu,
-        &op.output,
         &gdn_output,
-        &output_batch,
         op.rows,
-        Some(op.rotation),
+        op.rotation,
+        &[(&op.output, &output_batch)],
+        None,
     )?;
     // The output stays the F32 projection: its reader, the HC write, rounds
     // it to BF16 as it reads it, so no round-trip pass is owed here.
@@ -2086,7 +2173,7 @@ pub fn execute_indexed_attention_hc(
         IndexedAttentionMode::AppendOnly => &without_q,
         _ => &all,
     };
-    project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
+    project_trunk(gpu, op.input, op.rows, op.rotation, projections, None)?;
     qsa_projection_hook_run(gpu, op)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
@@ -2345,13 +2432,13 @@ pub fn execute_indexed_attention_hc(
     if fused_hc {
         *fused = true;
     } else {
-        project_weight(
+        project_trunk(
             gpu,
-            &op.output,
             &qsa_output_batch,
-            &view(op.attention_output, 0, op.rows * op.output.m),
             op.rows,
-            Some(op.rotation),
+            op.rotation,
+            &[(&op.output, &view(op.attention_output, 0, op.rows * op.output.m))],
+            None,
         )?;
     }
     let final_selected = view(
@@ -2975,6 +3062,7 @@ mod tests {
                 conv_kernel: 2,
                 input_width: 2,
                 row_capture: None,
+                zba_fold: None,
             }
         }
     }
