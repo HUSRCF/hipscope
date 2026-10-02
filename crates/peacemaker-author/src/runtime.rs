@@ -127,6 +127,7 @@ impl Transition {
 #[derive(Clone, Copy, Debug)]
 #[must_use = "a condition must be consumed by a branch"]
 pub struct Cond {
+    owner: u64,
     at: usize,
 }
 /// A workgroup-uniform condition: the caller's claim, as
@@ -135,6 +136,7 @@ pub struct Cond {
 #[derive(Clone, Copy, Debug)]
 #[must_use = "a condition must be consumed by a branch"]
 pub struct WgCond {
+    owner: u64,
     at: usize,
 }
 /// A kernel exit reserved by `Driver::exit` and placed by `end`/`end_with`.
@@ -143,6 +145,7 @@ pub struct WgCond {
 #[derive(Clone, Debug)]
 #[must_use = "a kernel exit must be placed with `Driver::end`"]
 pub struct Exit {
+    owner: u64,
     label: String,
     branched: Rc<Cell<bool>>,
 }
@@ -155,6 +158,7 @@ impl Exit {
 #[derive(Clone, Debug)]
 #[must_use = "a signalled barrier must be waited"]
 pub struct Arrived {
+    serial: u64,
     ts: Vec<Transition>,
 }
 
@@ -176,7 +180,13 @@ enum Hold {
 /// at joins and loop fixpoints that nothing is really outstanding.
 #[derive(Clone, Debug, Default)]
 struct Stores {
-    last: Option<EventId>,
+    /// The youngest store on each live path into this point (one per
+    /// incoming path after a join): a `wait` asks the backend about every
+    /// one, so a path that did not wait still gets the drain. Cleared by a
+    /// wait or a publishing/retiring barrier; a new store collapses it to
+    /// itself (on one path a drain that retires the youngest store retires
+    /// the older ones too).
+    events: Vec<EventId>,
     pending: bool,
 }
 impl Stores {
@@ -186,9 +196,18 @@ impl Stores {
     fn clear(&mut self) {
         *self = Self::default();
     }
-    /// The state of two paths with equal shapes (so equal `pending`).
+    fn store(&mut self, e: EventId) {
+        self.events = vec![e];
+        self.pending = true;
+    }
+    /// Another path (of equal shape, so equal `pending`) into this point.
     fn join(&mut self, other: &Stores) {
-        self.last = self.last.max(other.last);
+        for &e in &other.events {
+            if !self.events.contains(&e) {
+                self.events.push(e);
+            }
+        }
+        self.events.sort_unstable();
     }
 }
 
@@ -219,7 +238,8 @@ struct RingBuf {
 struct St {
     regions: Vec<Region>,
     rings: Vec<RingBuf>,
-    in_flight: Option<Vec<Transition>>,
+    /// The split barrier in flight: its signal serial and transitions.
+    in_flight: Option<(u64, Vec<Transition>)>,
     /// Code falls through to the current point (false after `s_branch`).
     reachable: bool,
     wave_exit: bool,
@@ -284,6 +304,7 @@ fn merge(into: &mut St, other: &St) -> Result<(), String> {
 }
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+static NEXT_SIGNAL: AtomicU64 = AtomicU64::new(1);
 
 /// One workgroup's kernel over a backend `B` for target `T`, driven by
 /// dynamic region ids. Workgroup scope and wave scope are one value; the
@@ -332,7 +353,7 @@ impl<B: Backend> Forward<B> {
     }
     /// `s_cbranch_scc1 label`: when `cond` holds, continue at `label`.
     pub fn branch_if<T: Target>(&mut self, w: &mut Driver<'_, T, B>, cond: Cond, label: &str) -> Result<(), String> {
-        w.fresh(cond.at)?;
+        w.fresh(cond.owner, cond.at)?;
         let i = self.open(label)?;
         w.b.branch_scc1(&w.auth, label)?;
         self.targets[i].forks.push((w.b.fork(), w.st.clone()));
@@ -340,7 +361,7 @@ impl<B: Backend> Forward<B> {
     }
     /// `s_cbranch_scc0 label`: when `cond` does not hold, continue at `label`.
     pub fn branch_unless<T: Target>(&mut self, w: &mut Driver<'_, T, B>, cond: Cond, label: &str) -> Result<(), String> {
-        w.fresh(cond.at)?;
+        w.fresh(cond.owner, cond.at)?;
         let i = self.open(label)?;
         w.b.branch_scc0(&w.auth, label)?;
         self.targets[i].forks.push((w.b.fork(), w.st.clone()));
@@ -478,9 +499,18 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.wave_scope -= 1;
         out
     }
-    fn fresh(&self, at: usize) -> Result<(), String> {
+    fn fresh(&self, owner: u64, at: usize) -> Result<(), String> {
+        if owner != self.owner {
+            return Err("condition from another Driver".into());
+        }
         if self.b.position() != at {
             return Err("SCC was redefined between its compare and the branch that consumes it".into());
+        }
+        Ok(())
+    }
+    fn own_exit(&self, end: &Exit) -> Result<(), String> {
+        if end.owner != self.owner {
+            return Err(format!("kernel exit {} belongs to another Driver", end.label));
         }
         Ok(())
     }
@@ -630,9 +660,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             Loc::Region(i) => self.st.regions[i].phase = Phase::Writing,
             Loc::Ring(i) => self.st.rings[i].next = Phase::Writing,
         }
-        let s = self.stores_mut(l);
-        s.last = Some(e);
-        s.pending = true;
+        self.stores_mut(l).store(e);
     }
     /// A `Free` region (or ring `next` buffer) as `Writing` with an empty
     /// `Pending` token and no store yet (as `Wave::begin_write`): stores
@@ -729,14 +757,13 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 Loc::Region(i) => &st.regions[i].stores,
                 Loc::Ring(i) => &st.rings[i].stores,
             };
-            s.last.is_some_and(|e| b.lds_store_pending(e))
+            s.events.iter().any(|&e| b.lds_store_pending(e))
         });
         if pending {
             self.b.drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
         }
         for l in locs {
-            let s = self.stores_mut(l);
-            s.pending = false;
+            self.stores_mut(l).clear();
         }
         Ok(())
     }
@@ -869,8 +896,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let list = self.plan(ts)?;
         self.b.barrier_signal(&self.auth, &list)?;
         self.hold(ts, Hold::Barrier);
-        self.st.in_flight = Some(ts.to_vec());
-        Ok(Arrived { ts: ts.to_vec() })
+        let serial = NEXT_SIGNAL.fetch_add(1, Ordering::Relaxed);
+        self.st.in_flight = Some((serial, ts.to_vec()));
+        Ok(Arrived { serial, ts: ts.to_vec() })
     }
     /// Split barrier, second half.
     pub fn wait_arrived(&mut self, a: Arrived) -> Result<(), String>
@@ -879,7 +907,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     {
         self.wg("wait_arrived")?;
         self.check_barrier_scope()?;
-        if self.st.in_flight.as_deref() != Some(&a.ts[..]) {
+        if self.st.in_flight.as_ref().map(|(n, _)| *n) != Some(a.serial) {
             return Err("wait_arrived without the signal that produced it".into());
         }
         self.b.barrier_wait(&self.auth)?;
@@ -894,7 +922,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// A scalar compare (`s_cmp*`, `s_bitcmp*`): SCC is wave-uniform.
     pub fn scmp(&mut self, insn: B::Insn) -> Result<Cond, String> {
         self.b.scalar_compare(&self.auth, insn)?;
-        Ok(Cond { at: self.b.position() })
+        Ok(Cond { owner: self.owner, at: self.b.position() })
     }
     /// A scalar compare whose operands the caller asserts are
     /// workgroup-uniform (kernel arguments, workgroup ids, constants and
@@ -902,14 +930,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn scmp_wg_uniform(&mut self, insn: B::Insn) -> Result<WgCond, String> {
         self.wg("scmp_wg_uniform")?;
         self.b.scalar_compare(&self.auth, insn)?;
-        Ok(WgCond { at: self.b.position() })
+        Ok(WgCond { owner: self.owner, at: self.b.position() })
     }
     /// A label in straight-line code (a register lifetime boundary).
     pub fn label(&mut self, name: &str) -> Result<(), String> {
         self.b.label(&self.auth, name)
     }
-    fn skip(&mut self, at: usize, target: &str, scc0: bool, wave: bool, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        self.fresh(at)?;
+    fn skip(&mut self, owner: u64, at: usize, target: &str, scc0: bool, wave: bool, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        self.fresh(owner, at)?;
         if scc0 {
             self.b.branch_scc0(&self.auth, target)?;
         } else {
@@ -922,27 +950,29 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             return Err(format!("the skipped path and the body disagree on LDS ownership at {target}: {d}"));
         }
         self.b.join(&self.auth, skipped)?;
-        self.st.reachable = true;
+        // The skipped path keeps the stores the body's path may have
+        // waited on: both paths' evidence survives the join.
+        merge(&mut self.st, &before)?;
         self.b.label(&self.auth, target)
     }
     /// Branch over `body` to `target` when `cond` holds. The body runs in
     /// wave scope (no barrier) and must leave LDS ownership as it found it.
     pub fn skip_if(&mut self, cond: Cond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        self.skip(cond.at, target, false, true, body)
+        self.skip(cond.owner, cond.at, target, false, true, body)
     }
     /// Skip `body` when `cond` does not hold.
     pub fn skip_unless(&mut self, cond: Cond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        self.skip(cond.at, target, true, true, body)
+        self.skip(cond.owner, cond.at, target, true, true, body)
     }
     /// `skip_if` over a workgroup-uniform condition: `body` may hold barriers.
     pub fn wg_skip_if(&mut self, cond: WgCond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
         self.wg("wg_skip_if")?;
-        self.skip(cond.at, target, false, false, body)
+        self.skip(cond.owner, cond.at, target, false, false, body)
     }
     /// Run `body` with EXEC = all lanes if `cond`, else none, then restore
     /// EXEC. The body is wave scope.
     pub fn exec_if<R>(&mut self, cond: Cond, body: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
-        self.fresh(cond.at)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.exec_from_scc(&self.auth)?;
         let out = self.scoped(body)?;
         self.b.exec_all(&self.auth)?;
@@ -970,7 +1000,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         then: impl FnOnce(&mut Self) -> Result<(), String>,
         els: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.fresh(cond.at)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc1(&self.auth, else_label)?;
         let at = self.b.fork();
         let saved = self.st.clone();
@@ -1035,7 +1065,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     }
     /// Leave the enclosing `loop_until` when `cond` holds.
     pub fn break_if(&mut self, cond: Cond, exit: &Breaks<B>) -> Result<(), String> {
-        self.fresh(cond.at)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc1(&self.auth, &exit.label)?;
         if exit.recording.get() {
             exit.exits.borrow_mut().push((self.b.fork(), self.st.clone()));
@@ -1058,7 +1088,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let emit = |b: &mut B| -> Result<(), String> {
             let mut d = Driver { b, auth: auth.reenter(), owner, st: carried.borrow().clone(), wave_scope: 0, _t: PhantomData };
             let back = body(&mut d)?;
-            d.fresh(back.at)?;
+            d.fresh(back.owner, back.at)?;
             if let Some(diff) = shape_diff(&entry, &d.st) {
                 return Err(format!("loop {head}: LDS ownership differs between the entry and the back edge: {diff}"));
             }
@@ -1082,13 +1112,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn exit(&mut self, label: &str) -> Result<Exit, String> {
         self.wg("exit")?;
         self.b.reserve_exit(&self.auth, label)?;
-        Ok(Exit { label: label.into(), branched: Rc::new(Cell::new(false)) })
+        Ok(Exit { owner: self.owner, label: label.into(), branched: Rc::new(Cell::new(false)) })
     }
     /// Leave the kernel when `cond` holds: skipping every later barrier is
     /// legal only for the whole workgroup, and only to the kernel's exit.
     pub fn exit_if(&mut self, cond: WgCond, end: &Exit) -> Result<(), String> {
         self.wg("exit_if")?;
-        self.fresh(cond.at)?;
+        self.own_exit(end)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc1(&self.auth, &end.label)?;
         end.branched.set(true);
         Ok(())
@@ -1096,7 +1127,8 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// Leave through the reserved kernel exit unless `cond` holds (wave
     /// scope). No workgroup barrier may follow.
     pub fn wave_exit_unless(&mut self, cond: Cond, end: &Exit) -> Result<(), String> {
-        self.fresh(cond.at)?;
+        self.own_exit(end)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc0(&self.auth, &end.label)?;
         end.branched.set(true);
         self.st.wave_exit = true;
@@ -1113,7 +1145,8 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         body: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
         self.wg("wg_exit_unless")?;
-        self.fresh(cond.at)?;
+        self.own_exit(end)?;
+        self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc1(&self.auth, target)?;
         let taken = self.b.fork();
         let saved = self.st.clone();
@@ -1132,6 +1165,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// exit something branches to takes no tail.
     pub fn end_with(&mut self, end: Exit, tail: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
         self.wg("end")?;
+        self.own_exit(&end)?;
         self.b.place_exit(&self.auth, &end.label)?;
         let at = self.b.position();
         self.scoped(tail)?;
@@ -1157,11 +1191,12 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         read: impl FnOnce(&mut Self, RegionId, &Exit) -> Result<R, String>,
     ) -> Result<R, String> {
         self.wg("handoff")?;
+        self.own_exit(&end)?;
         let i = self.region_ix(region)?;
         if self.st.regions[i].phase != Phase::Free {
             return Err(format!("handoff of {}: it is {:?}, a handoff starts from a Free region", self.st.regions[i].name, self.st.regions[i].phase));
         }
-        self.fresh(readers.at)?;
+        self.fresh(readers.owner, readers.at)?;
         self.b.branch_scc1(&self.auth, reader_label)?;
         let at = self.b.fork();
         let saved = self.st.clone();

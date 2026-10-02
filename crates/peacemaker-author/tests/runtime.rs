@@ -334,3 +334,63 @@ fn a_begun_write_is_pending_even_before_its_first_store() {
     let c = d.scmp("s_cmp_lg_u32 s4, 0".into()).unwrap();
     assert!(err(d.skip_if(c, ".Lskip2", |d| d.wait(r))).contains("disagree on LDS ownership"));
 }
+
+// ---- handle identity -------------------------------------------------------
+
+#[test]
+fn a_condition_from_another_driver_is_refused_at_a_matching_position() {
+    let (mut a, mut b) = (Trace::new("gfx1100"), Trace::new("gfx1100"));
+    let mut da = Driver::<Gfx1100, Trace>::new(&mut a).unwrap();
+    let mut db = Driver::<Gfx1100, Trace>::new(&mut b).unwrap();
+    let wg_cond = da.scmp_wg_uniform(CMP.into()).unwrap();
+    let wave_cond = da.scmp(CMP.into()).unwrap();
+    // B's own compare ends at the position A's handle was made at.
+    let own = db.scmp(CMP.into()).unwrap();
+    let before = db.position();
+    // A wave-dependent SCC must not become workgroup control.
+    let e = err(db.wg_skip_if(wg_cond, ".Lskip", |d| d.barrier(&[])));
+    assert!(e.contains("another Driver"), "{e}");
+    assert!(err(db.skip_if(wave_cond, ".Lskip", |_| Ok(()))).contains("another Driver"));
+    let end = db.exit(".Lend").unwrap();
+    assert!(err(db.exit_if(wg_cond, &end)).contains("another Driver"));
+    assert_eq!(db.position(), before, "nothing was branched");
+    // The local condition is still usable.
+    db.skip_if(own, ".Lskip", |_| Ok(())).unwrap();
+}
+
+#[test]
+fn an_exit_from_another_driver_is_refused_and_a_local_clone_still_forbids_a_tail() {
+    let (mut a, mut b) = (Trace::new("gfx1100"), Trace::new("gfx1100"));
+    let mut da = Driver::<Gfx1100, Trace>::new(&mut a).unwrap();
+    let mut db = Driver::<Gfx1100, Trace>::new(&mut b).unwrap();
+    let foreign = da.exit(".Lend").unwrap();
+    let own = db.exit(".Lend").unwrap();
+    let c = db.scmp_wg_uniform(CMP.into()).unwrap();
+    let before = db.position();
+    assert!(err(db.exit_if(c, &foreign)).contains("another Driver"));
+    assert!(err(db.end(foreign.clone())).contains("another Driver"));
+    assert_eq!(db.position(), before, "no branch and no exit placed");
+    // A clone of the local exit shares the "a branch reaches it" flag.
+    let c = db.scmp_wg_uniform(CMP.into()).unwrap();
+    db.exit_if(c, &own.clone()).unwrap();
+    let e = err(db.end_with(own, |d| d.raw(|b| b.raw("v_mov_b32 v0, 1"))));
+    assert!(e.contains("takes no tail"), "{e}");
+}
+
+#[test]
+fn a_stale_or_foreign_arrived_token_is_refused() {
+    let (mut a, mut b) = (Trace::new("gfx1201"), Trace::new("gfx1201"));
+    let mut da = Driver::<Gfx1201, Trace>::new(&mut a).unwrap();
+    let mut db = Driver::<Gfx1201, Trace>::new(&mut b).unwrap();
+    // A clone of a completed signal must not consume a newer identical one.
+    let first = da.signal(&[]).unwrap();
+    let stale = first.clone();
+    da.wait_arrived(first).unwrap();
+    let second = da.signal(&[]).unwrap();
+    assert!(err(da.wait_arrived(stale)).contains("without the signal"));
+    // Nor may another driver's token (an empty list matches anything by value).
+    let foreign = db.signal(&[]).unwrap();
+    assert!(err(da.wait_arrived(foreign.clone())).contains("without the signal"));
+    da.wait_arrived(second).unwrap();
+    db.wait_arrived(foreign).unwrap();
+}
