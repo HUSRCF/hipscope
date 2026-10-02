@@ -38206,19 +38206,11 @@ impl Gpu {
                 ));
             }
         };
+        let kind = if y.dtype == DType::BF16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
         let (func_name, rows_per_block, block, batch_tile) =
-            if xlds && overwrite && self.arch.as_str() == "gfx1151" {
-                let tile = match self.qwen4_mq6_x4_tile() {
-                    Some([0, 0, 0]) => mq6_x4_halo_policy(m, k, batch_size),
-                    explicit => explicit,
-                };
-                match tile {
-                    Some(tile) if tile[0] != 12 || batch_size % 192 == 0 =>
-                        mq6_x4_halo_tile(tile, y.dtype == DType::BF16),
-                    _ => (func_name, rows_per_block, block, batch_tile),
-                }
-            } else {
-                (func_name, rows_per_block, block, batch_tile)
+            match (xlds && overwrite).then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size)).flatten() {
+                Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
+                None => (func_name, rows_per_block, block, batch_tile),
             };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
@@ -40680,6 +40672,26 @@ impl Gpu {
             .unwrap_or((self.qwen4_scope && self.arch.as_str() == "gfx1151").then_some([0, 0, 0]))
     }
 
+    /// The gfx1151 X-LDS tile twin for one MQ6 launch of `kind`: an explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_TILE` wins, `auto`/the Qwen4 forward uses the
+    /// measured table, `None` keeps the incumbent entry.  BV12 needs
+    /// `n % 192 == 0` and has no regions/HC-write twins.
+    fn qwen4_mq6_x4_pick(&self, kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+        if self.arch.as_str() != "gfx1151" {
+            return None;
+        }
+        let tile = match self.qwen4_mq6_x4_tile()? {
+            [0, 0, 0] => match kind {
+                Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
+                // No measured regions/HC-write rows yet: the table keeps the incumbent.
+                Mq6X4Kind::Regions | Mq6X4Kind::Hcw => return None,
+            },
+            explicit => explicit,
+        };
+        let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+        (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+    }
+
     /// U3: the MQ6 a/b/z row-region fold.  Explicit
     /// `HIPFIRE_QWEN4_MQ6_X4_REGIONS` wins; unset, on inside the Qwen4 forward
     /// on gfx1151.
@@ -40742,20 +40754,27 @@ impl Gpu {
         {
             return Ok(false);
         }
-        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(64)).sum();
+        let (module, source, name, rows, block, bv) = if self.arch_caps.has_wmma_w32_gfx12() {
+            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
+                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
+                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 8)
+        } else {
+            let (name, rows, block, bv) =
+                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, regions[0].2, k, batch_size) {
+                    Some(tile) => {
+                        let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Regions);
+                        (name, rows, block, tile[0] as usize)
+                    }
+                    None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions", 64, 128, 8),
+                };
+            ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                name, rows, block, bv)
+        };
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(rows)).sum();
         if row_tiles == 0 || batch_size == 0 || k == 0 {
             return Ok(true);
         }
         self.bind_thread()?;
-        let (module, source, name) = if self.arch_caps.has_wmma_w32_gfx12() {
-            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
-                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
-                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions")
-        } else {
-            ("qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions")
-        };
         self.ensure_kernel(module, source, name)?;
         let mut ptrs = [
             regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
@@ -40776,8 +40795,8 @@ impl Gpu {
             + batch_size * k * 2 + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
         let result = self.launch_maybe_blob(
-            name, [row_tiles as u32, batch_size.div_ceil(128) as u32, 1],
-            [128, 1, 1], 0, &mut params, || {
+            name, [row_tiles as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            [block, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 for ptr in ptrs { blob.push_ptr(ptr); }
                 for dim in dims { blob.push_i32(dim); }
@@ -40835,16 +40854,27 @@ impl Gpu {
         hc_bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, source, func_name): (&str, &str, &'static str) = match self.arch.as_str() {
-            "gfx1151" => (
-                "qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw",
-            ),
+        type Entry = (&'static str, &'static str, &'static str, usize, u32, usize);
+        let (module, source, func_name, rows, block, bv): Entry = match self.arch.as_str() {
+            "gfx1151" => {
+                let (name, rows, block, bv) =
+                    match self.qwen4_mq6_x4_pick(Mq6X4Kind::Hcw, m, k, batch_size) {
+                        Some(tile) => {
+                            let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Hcw);
+                            (name, rows, block, tile[0] as usize)
+                        }
+                        None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw", 64, 128, 8),
+                    };
+                ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                    name, rows, block, bv)
+            }
             "gfx1201" => (
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt8_mq5v2",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
                 "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+                64,
+                128,
+                8,
             ),
             _ => {
                 return Err(hip_bridge::HipError::new(
@@ -40892,8 +40922,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
-            [m.div_ceil(64) as u32, batch_size.div_ceil(128) as u32, 1],
-            [128, 1, 1],
+            [m.div_ceil(rows) as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
