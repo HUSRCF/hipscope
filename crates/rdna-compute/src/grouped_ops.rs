@@ -858,6 +858,53 @@ impl Gpu {
             },
         )?;
 
+        // The model's 4-tap, dilation-3 window runs the register-window kernel
+        // (two channels per thread, 64-token chunks: still >= the 9 history rows).
+        if kernel_size == 4 && dilation == 3 && group_size % 2 == 0 {
+            const WINDOW_CHUNK: usize = 64;
+            let window_chunk_i = checked_i32(WINDOW_CHUNK, "fused PLE window chunk")?;
+            let window_grid = checked_u32(tokens.div_ceil(WINDOW_CHUNK), "fused PLE window grid")?;
+            self.ensure_kernel(GROUPED_MODULE, GROUPED_KERNEL_SRC, "ple_conv_add_bf16s_k4d3")?;
+            let mut window_params = [
+                &gate_ptr as *const _ as *mut c_void,
+                &inverse_ptr as *const _ as *mut c_void,
+                &value_ptr as *const _ as *mut c_void,
+                &conv_norm_ptr as *const _ as *mut c_void,
+                &conv_weight_ptr as *const _ as *mut c_void,
+                &state_ptr as *const _ as *mut c_void,
+                &streams_ptr as *const _ as *mut c_void,
+                &tokens_i as *const _ as *mut c_void,
+                &groups_i as *const _ as *mut c_void,
+                &hidden_i as *const _ as *mut c_void,
+                &window_chunk_i as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                "ple_conv_add_bf16s_k4d3",
+                [
+                    checked_grid(channels / 2, BLOCK, "fused PLE channel-pair grid")?,
+                    window_grid,
+                    1,
+                ],
+                [BLOCK, 1, 1],
+                0,
+                &mut window_params,
+                || {
+                    let mut blob = KernargBlob::new();
+                    blob.push_ptr(gate_ptr);
+                    blob.push_ptr(inverse_ptr);
+                    blob.push_ptr(value_ptr);
+                    blob.push_ptr(conv_norm_ptr);
+                    blob.push_ptr(conv_weight_ptr);
+                    blob.push_ptr(state_ptr);
+                    blob.push_ptr(streams_ptr);
+                    blob.push_i32(tokens_i);
+                    blob.push_i32(groups_i);
+                    blob.push_i32(hidden_i);
+                    blob.push_i32(window_chunk_i);
+                    blob
+                },
+            );
+        }
         let mut conv_params = [
             &gate_ptr as *const _ as *mut c_void,
             &inverse_ptr as *const _ as *mut c_void,

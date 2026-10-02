@@ -359,7 +359,12 @@ extern "C" __global__ void grouped_depthwise_conv_silu_add_bf16(
 //                         the BF16 stream: bf16(stream + (gated + silu(conv))).
 // Every product that the incumbent stores to F32 and re-reads goes through
 // ple_mul_rn here so no contraction can fuse across the old kernel boundary.
+#ifndef PLE_GATE_ROWS
 #define PLE_GATE_ROWS 64
+#endif
+#ifndef PLE_GATE_LDS_PAD
+#define PLE_GATE_LDS_PAD 0
+#endif
 #define PLE_GATE_COLS 32
 #define PLE_GATE_PAD 33
 #define PLE_NORM_MAX_BRANCHES 4
@@ -389,6 +394,10 @@ extern "C" __global__ __launch_bounds__(PLE_GATE_ROWS) void ple_gate_rows_bf16s(
     float epsilon) {
     __shared__ float key_tile[PLE_GATE_ROWS * PLE_GATE_PAD];
     __shared__ float query_tile[PLE_GATE_ROWS * PLE_GATE_PAD];
+#if PLE_GATE_LDS_PAD > 0
+    __shared__ float occupancy_pad[PLE_GATE_LDS_PAD];
+    if (hidden_size < 0) occupancy_pad[threadIdx.x] = 0.0f;
+#endif
     const int tid = static_cast<int>(threadIdx.x);
     const int row0 = static_cast<int>(blockIdx.x) * PLE_GATE_ROWS;
     const int row = row0 + tid;
@@ -588,4 +597,108 @@ extern "C" __global__ __launch_bounds__(256) void grouped_gather_convert_bf16_f1
         half_out[2 * i + 1] = (_Float16)__uint_as_float(word[i] & 0xffff0000u);
     }
     *reinterpret_cast<uint4*>(output + at) = *reinterpret_cast<const uint4*>(half_out);
+}
+
+// `ple_conv_add_bf16s` specialised to the model's 4-tap, dilation-3 window
+// (history 9): two adjacent channels per thread, a 10-deep register window of
+// the convolution input so each token's gated/normed value is computed once.
+// Same per-element expressions and tap order as `ple_conv_add_bf16s`.
+extern "C" __global__ __launch_bounds__(256) void ple_conv_add_bf16s_k4d3(
+    const float* __restrict__ gate,
+    const float* __restrict__ inverse,
+    const float* __restrict__ value,
+    const unsigned short* __restrict__ norm_weight,
+    const unsigned short* __restrict__ conv_weight,
+    float* __restrict__ state,
+    unsigned short* __restrict__ streams,
+    int tokens,
+    int hc_count,
+    int hidden_size,
+    int token_chunk) {
+    const int channels = hc_count * hidden_size;
+    const int channel = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (channel >= channels) return;
+    const int branch = channel / hidden_size;
+    const int h = channel - branch * hidden_size;
+    const unsigned int nw = *reinterpret_cast<const unsigned int*>(norm_weight + channel);
+    const float scale0 = 1.0f + ple_bf16_to_f32(nw & 0xffffu);
+    const float scale1 = 1.0f + ple_bf16_to_f32(nw >> 16);
+    const uint4 cwv = *reinterpret_cast<const uint4*>(conv_weight + channel * 4);
+    const unsigned int cww[4] = {cwv.x, cwv.y, cwv.z, cwv.w};
+    float cw0[4], cw1[4];
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+        cw0[2 * w] = ple_bf16_to_f32(cww[w] & 0xffffu);
+        cw0[2 * w + 1] = ple_bf16_to_f32(cww[w] >> 16);
+        cw1[2 * w] = ple_bf16_to_f32(cww[2 + w] & 0xffffu);
+        cw1[2 * w + 1] = ple_bf16_to_f32(cww[2 + w] >> 16);
+    }
+    const int token_begin = static_cast<int>(blockIdx.y) * token_chunk;
+    const int token_end = min(tokens, token_begin + token_chunk);
+    // gated (`gate * value`) and normed pairs of token t.
+    auto gated_at = [&](int t, float& g0, float& g1, float& n0, float& n1) {
+        const float scalar = gate[t * hc_count + branch];
+        const float inv = inverse[t * hc_count + branch];
+        const float2 v = *reinterpret_cast<const float2*>(value + t * hidden_size + h);
+        g0 = ple_mul_rn(scalar, v.x);
+        g1 = ple_mul_rn(scalar, v.y);
+        n0 = ple_mul_rn(ple_mul_rn(g0, inv), scale0);
+        n1 = ple_mul_rn(ple_mul_rn(g1, inv), scale1);
+    };
+    // Convolution input at source row `source` (history rows, then normed).
+    auto input_at = [&](int source, float& u0, float& u1) {
+        if (source < 9) {
+            const float2 st = *reinterpret_cast<const float2*>(state + source * channels + channel);
+            u0 = st.x;
+            u1 = st.y;
+        } else if (source - 9 < tokens) {
+            float g0, g1;
+            gated_at(source - 9, g0, g1, u0, u1);
+        } else {
+            u0 = 0.0f;
+            u1 = 0.0f;
+        }
+    };
+    float win0[10], win1[10];
+#pragma unroll
+    for (int i = 0; i < 10; ++i) input_at(token_begin + i, win0[i], win1[i]);
+    float g0c = 0.0f, g1c = 0.0f, ignore0, ignore1;
+    if (token_begin < tokens) gated_at(token_begin, g0c, g1c, ignore0, ignore1);
+    for (int token = token_begin; token < token_end; ++token) {
+        float total0 = 0.0f, total1 = 0.0f;
+#pragma unroll
+        for (int tap = 0; tap < 4; ++tap) {
+            total0 += win0[3 * tap] * cw0[tap];
+            total1 += win1[3 * tap] * cw1[tap];
+        }
+        const float out0 = g0c + grouped_silu(total0);
+        const float out1 = g1c + grouped_silu(total1);
+        const int at = token * channels + channel;
+        const unsigned int word = *reinterpret_cast<const unsigned int*>(streams + at);
+        const unsigned short r0 = static_cast<hip_bfloat16>(ple_bf16_to_f32(word & 0xffffu) + out0).data;
+        const unsigned short r1 = static_cast<hip_bfloat16>(ple_bf16_to_f32(word >> 16) + out1).data;
+        *reinterpret_cast<unsigned int*>(streams + at) = static_cast<unsigned int>(r0) | (static_cast<unsigned int>(r1) << 16);
+#pragma unroll
+        for (int i = 0; i < 9; ++i) { win0[i] = win0[i + 1]; win1[i] = win1[i + 1]; }
+        if (token + 1 < tokens) {
+            gated_at(token + 1, g0c, g1c, win0[9], win1[9]);
+        } else {
+            win0[9] = 0.0f;
+            win1[9] = 0.0f;
+        }
+    }
+    if (blockIdx.y != 0) return;
+    for (int row = 0; row < 9; ++row) {
+        const int source = tokens + row;
+        float u0, u1;
+        if (source < 9) {
+            const float2 st = *reinterpret_cast<const float2*>(state + source * channels + channel);
+            u0 = st.x;
+            u1 = st.y;
+        } else {
+            float g0, g1;
+            gated_at(source - 9, g0, g1, u0, u1);
+        }
+        *reinterpret_cast<float2*>(state + row * channels + channel) = make_float2(u0, u1);
+    }
 }
