@@ -1676,6 +1676,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-rip"
+version = "0.4.1"
+dependencies = [
+ "hipfire-isa",
+ "peacemaker-author",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "hipfire-runtime"
 version = "0.4.1"
 dependencies = [
