@@ -1,6 +1,5 @@
 //! Per-projection / per-layer mask of the Qwen4 dense IU4 trunk route
-//! (`HIPFIRE_QWEN4_TRUNK_IU4`) and of its lab A8 emulation
-//! (`HIPFIRE_QWEN4_TRUNK_A8EMU`).
+//! (`HIPFIRE_QWEN4_TRUNK_IU4`).
 //!
 //! Grammar: unset, empty or `0` = no projection; `1` or `all` = every family
 //! on every layer; otherwise a comma list of `family[@lo-hi]` tokens. `lo-hi`
@@ -75,6 +74,8 @@ pub struct Qwen4TrunkMask {
     /// `(family bits, lo, hi)`, inclusive layer indices; `hi == u32::MAX` is
     /// open-ended.
     ranges: Vec<(u16, u32, u32)>,
+    /// The source token of each range (same index), for error messages.
+    tokens: Vec<String>,
 }
 
 impl Qwen4TrunkMask {
@@ -83,10 +84,16 @@ impl Qwen4TrunkMask {
         let text = raw.trim();
         match text {
             "" | "0" => return Ok(Self::default()),
-            "1" => return Ok(Self { ranges: vec![(TRUNK_ALL_BITS, 0, u32::MAX)] }),
+            "1" => {
+                return Ok(Self {
+                    ranges: vec![(TRUNK_ALL_BITS, 0, u32::MAX)],
+                    tokens: vec!["1".to_owned()],
+                })
+            }
             _ => {}
         }
         let mut ranges = Vec::new();
+        let mut tokens = Vec::new();
         for token in text.split(',') {
             let token = token.trim();
             let bad = |why: &str| format!("bad token `{token}` ({why})");
@@ -108,8 +115,10 @@ impl Qwen4TrunkMask {
                 None => (0, u32::MAX),
                 Some(span) => {
                     let layer = |s: &str| {
-                        s.parse::<u32>()
-                            .ok()
+                        // Digits only: `str::parse` also takes a leading `+`.
+                        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                            .then(|| s.parse::<u32>().ok())
+                            .flatten()
                             .filter(|n| *n != u32::MAX)
                             .ok_or_else(|| bad("layer index is not a non-negative integer"))
                     };
@@ -126,8 +135,24 @@ impl Qwen4TrunkMask {
                 return Err(bad("range start is above its end"));
             }
             ranges.push((bits, lo, hi));
+            tokens.push(token.to_owned());
         }
-        Ok(Self { ranges })
+        Ok(Self { ranges, tokens })
+    }
+
+    /// Reject a mask that names layers a `layers`-layer trunk does not have:
+    /// any band with `lo >= layers`, or with `hi >= layers` unless it is
+    /// open-ended (no `@`). The error names the token.
+    pub fn check_layers(&self, layers: usize) -> Result<(), String> {
+        let layers = u32::try_from(layers).unwrap_or(u32::MAX);
+        for (&(_, lo, hi), token) in self.ranges.iter().zip(&self.tokens) {
+            if lo >= layers || (hi >= layers && hi != u32::MAX) {
+                return Err(format!(
+                    "bad token `{token}` (layers {lo}..={hi} are outside the trunk's {layers} layers)"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Families selected on `layer`, as [`TrunkFamily::bit`]s.
@@ -301,6 +326,33 @@ mod tests {
             ("gdn,1", "1"),
         ] {
             let error = Qwen4TrunkMask::parse(raw).unwrap_err();
+            assert!(error.contains(&format!("`{token}`")), "{raw}: {error}");
+        }
+    }
+
+    #[test]
+    fn layer_indices_are_digits_only() {
+        for raw in ["gdn.z@+3", "gdn.z@+3-9", "gdn.z@3-+9", "gdn.z@-3", "gdn.z@3--9"] {
+            assert!(Qwen4TrunkMask::parse(raw).is_err(), "{raw}");
+        }
+        assert!(Qwen4TrunkMask::parse("gdn.z@3-9").is_ok());
+    }
+
+    #[test]
+    fn check_layers_rejects_bands_outside_the_trunk() {
+        let trunk = 48;
+        for raw in ["all", "1", "0", "gdn", "gdn.qkv@0-47", "qsa.o@47", "gdn,qsa.o@3-15"] {
+            Qwen4TrunkMask::parse(raw).unwrap().check_layers(trunk).unwrap_or_else(|e| {
+                panic!("{raw}: {e}");
+            });
+        }
+        for (raw, token) in [
+            ("gdn.qkv@48", "gdn.qkv@48"),
+            ("gdn,qsa.o@40-48", "qsa.o@40-48"),
+            ("gdn.z@0-47,gdn.a@50-60", "gdn.a@50-60"),
+            ("qsa.k@100", "qsa.k@100"),
+        ] {
+            let error = Qwen4TrunkMask::parse(raw).unwrap().check_layers(trunk).unwrap_err();
             assert!(error.contains(&format!("`{token}`")), "{raw}: {error}");
         }
     }

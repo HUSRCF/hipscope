@@ -147,22 +147,26 @@ pub fn project_weights(
     projections: &[(&WeightRef<'_>, &GpuTensor)],
 ) -> Result<(), DispatchError> {
     // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
+    let members = [false, true, true, true];
     let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
-    project_weights_inner(gpu, input, rows, rotation, projections, gdn_regions)
+    project_weights_inner(gpu, input, rows, rotation, projections, gdn_regions.then_some(&members[..]))
 }
 
 /// [`project_weights`] with the MQ6 a/b/z row-region fold (three F32 outputs
-/// of shared-rotation MQ6 siblings, one launch) enabled by `gdn_regions`
-/// instead of inferred from the group's shape: [`project_trunk`] sets it on a
-/// GDN in-projection group whose qkv was taken by another route.
+/// of shared-rotation MQ6 siblings, one launch) enabled for exactly the
+/// projections `region_members` flags (parallel to `projections`) instead of
+/// inferred from the group's shape: [`project_trunk`] flags the original GDN
+/// a/b/z of a group whose siblings were taken by another route, so qkv can
+/// never join the fold.
 fn project_weights_inner(
     gpu: &mut Gpu,
     input: &GpuTensor,
     rows: usize,
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
-    gdn_regions: bool,
+    region_members: Option<&[bool]>,
 ) -> Result<(), DispatchError> {
+    debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
     let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
         w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
     };
@@ -177,12 +181,17 @@ fn project_weights_inner(
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
         // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
         // may share one row-region launch without sharing their accumulators.
-        if gdn_regions && gpu.qwen4_mq6_x4_regions() {
+        if let (Some(members), true) = (region_members, gpu.qwen4_mq6_x4_regions()) {
             let mut indices = [0usize; 3];
             let mut count = 0;
             for j in i..projections.len() {
                 let (w, out) = projections[j];
-                if !done[j] && w.k == weight.k && shared(w, gpu) && out.dtype == DType::F32 {
+                if members[j]
+                    && !done[j]
+                    && w.k == weight.k
+                    && shared(w, gpu)
+                    && out.dtype == DType::F32
+                {
                     if count < 3 { indices[count] = j; }
                     count += 1;
                 }
@@ -345,7 +354,8 @@ struct ZbaFold<'a> {
 ///    rows, gfx1151): exact (F16) activations, one shared rotation.
 /// 3. Everything else (MQ6 and the rest): [`project_weights`] exactly as if
 ///    no MQ4 sibling existed. When siblings were split off a GDN in-projection
-///    group (`gdn_in_proj`), the MQ6 a/b/z row-region fold stays enabled.
+///    group (`gdn_in_proj`), the MQ6 row-region fold stays enabled for the
+///    group's original a/b/z only (never qkv).
 #[allow(clippy::too_many_arguments)]
 fn project_trunk(
     gpu: &mut Gpu,
@@ -422,7 +432,20 @@ fn project_trunk(
     if rest.is_empty() {
         return Ok(());
     }
-    project_weights_inner(gpu, input, rows, Some(rotation), &rest, gdn_in_proj)
+    // Only the original GDN a/b/z (positions 1.. of the in-projection group)
+    // may join the row-region fold; qkv (position 0) never does.
+    let members: SmallVec<[bool; 4]> = (0..projections.len())
+        .filter(|&j| !done[j])
+        .map(|j| gdn_in_proj && j != 0)
+        .collect();
+    project_weights_inner(
+        gpu,
+        input,
+        rows,
+        Some(rotation),
+        &rest,
+        gdn_in_proj.then_some(&members[..]),
+    )
 }
 
 /// FWHT basis a quantized projection payload reads: the aligned-K 256-wide
