@@ -192,6 +192,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented) |
+| `HIPFIRE_GEMMA4_GRAPH` | Gemma4 per-model decode graph: `1` enables, `0` disables. Hand carrier defaults on. Lowered carrier defaults off and uses `HIPFIRE_GRAPH` only when this switch is unset. Lowered captures after one eager warm-up, stages position on-device before replay, and re-captures when KV/weight/scratch allocations or shapes change. Dense bodies and indexed MoE with HFQ4G128 expert down are admitted; CPU expert fallback and atomic Q8 expert down remain eager. |
 | `HIPFIRE_GRAPH_MOE` | MoE graph opt-in |
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
 | `HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ` | MMQ activation |
@@ -980,7 +981,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GEMMA4_FUSED_QK` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
 | `HIPFIRE_GEMMA4_FUSED_QK_ROPE` | crates/hipfire-arch-gemma4/src/forward.rs | developer |
 | `HIPFIRE_GEMMA4_GEMM_VERIFY` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
-| `HIPFIRE_GEMMA4_GRAPH` | crates/hipfire-arch-gemma4/examples/infer_gemma4.rs, crates/hipfire-arch-gemma4/src/forward.rs | developer |
+| `HIPFIRE_GEMMA4_GRAPH` | crates/hipfire-arch-gemma4/examples/infer_gemma4.rs, crates/hipfire-arch-gemma4/src/forward.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_GEMMA4_LOGIT_TRACE_DIR` | crates/hipfire-generate/src/dense.rs, scripts/diag-gemma4-logit-routes.sh | developer |
 | `HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS` | crates/hipfire-generate/src/dense.rs, scripts/diag-gemma4-logit-routes.sh | developer |
 | `HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS` | crates/hipfire-generate/src/dense.rs, scripts/diag-gemma4-logit-routes.sh | developer |

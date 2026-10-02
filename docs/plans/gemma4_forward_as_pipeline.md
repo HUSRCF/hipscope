@@ -351,8 +351,8 @@ Add to `crates/hipfire-arch-gemma4/src/gemma4.rs`:
    `forward_lowered_enabled() && hidden_rb.is_none()`, where `hidden_rb` is the
    **spec-decode** ring buffer, not graph capture (review N7 / Gemini REV-04).
    Gemma 4 has no equivalent spec-decode capture path, so there is nothing extra to
-   gate on. (Graph capture is hardwired off in gemma4 today anyway —
-   `!false /* graph-capture-not-wired */`.)
+   gate on. The original implementation left graph capture hardwired off;
+   v0.4.1 wires warm-up/capture/replay for graph-safe lowered decode bodies.
 
 **Validation:** `cargo test` passes, existing behavior unchanged (gate off).
 
