@@ -4221,6 +4221,7 @@ fn lowered_graph_binding(
         for v in [
             kv.max_seq, kv.physical_cap, kv.compact_offset,
             kv.quant_q8 as usize, kv.quant_asym3 as usize, kv.quant_fwht as usize,
+            kv.quant_asym4 as usize, kv.quant_asym2 as usize,
             kv.v_mode_bits() as usize,
         ] {
             mix(v as u64);
@@ -4247,9 +4248,8 @@ fn lowered_graph_binding(
 
 /// Single-token decode. Phase 3 implementation.
 ///
-/// Precondition: `scratch.sliding_cos/sin` + `scratch.full_cos/sin` +
-/// `scratch.v_norm_ones_full` must be populated by the loader before the
-/// first forward call (one-time init).
+/// Precondition: the loader initializes `scratch.v_norm_ones_full` once before
+/// the first forward call.
 pub fn forward_scratch(
     gpu: &mut Gpu,
     weights: &Gemma4Weights,
@@ -4337,7 +4337,11 @@ pub fn forward_scratch(
         gpu.hip.device_synchronize()?;
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
-    if use_graph && gpu.graphs.graph_exec.is_some() {
+    if use_graph
+        && gpu.graphs.ar_forward_replay_enabled
+        && !gpu.graphs.ar_forward_kernel_dirty
+        && gpu.graphs.graph_exec.is_some()
+    {
         gpu.hip.stream_write_value32(
             gpu.active_stream.as_ref().unwrap(), &scratch.pos_buf, pos as u32, 0,
         )?;
