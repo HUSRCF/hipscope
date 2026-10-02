@@ -395,3 +395,5 @@ v_min3_i32	vop3	0x21a	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_
 v_cmpx_eq_f32_e32	vopc	0x92	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_f32_e32 0xff800000, v66	7D2484FF FF800000	-
 # feat/qsa-pm (2026-10-02): the QSA PM convert kernel's F16 store; sample = pinned llvm-mc -mcpu=gfx1151 encoding.
 buffer_store_b16	buffer	0x19	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	-	VDATA,VADDR,RSRC,SOFFSET	-	Vs:1	buffer_store_b16 v5, v6, s[40:43], 0 offen offset:8	E0640008 804A0506	-
+# pm/native-emit (2026-10-02): PM corpus s_getreg_b32 (hwreg id/offset/size packed in SIMM16); sample = pinned llvm-mc -mcpu=gfx1100 encoding.
+s_getreg_b32	sopk	0x11	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_getreg_b32 s13, hwreg(HW_REG_HW_ID1)	B88DF817	-

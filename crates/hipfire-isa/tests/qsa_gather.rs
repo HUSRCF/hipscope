@@ -63,7 +63,7 @@ fn text_section(bytes: &[u8]) -> Vec<u8> {
 #[cfg(feature = "toolchain")]
 mod toolchain {
     use super::*;
-    use hipfire_isa::{ledger_replay, pm_check, toolchain::{assemble_link_bundle, certify, Toolchain}};
+    use hipfire_isa::{ledger_replay, pm_check, toolchain::{build, certify, Toolchain}};
 
     /// Every symbol of both modules certifies: parse-back, independent wait
     /// replay, its committed shape contract, the static LDS bound with the
@@ -79,7 +79,7 @@ mod toolchain {
             let s = dir.join("module.s");
             std::fs::write(&s, &text).unwrap();
             let toolchain = Toolchain::default();
-            let build = assemble_link_bundle(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+            let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
             for kind in Kind::ALL {
                 let symbol = Spec { arch, kind }.symbol();
                 let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));

@@ -169,7 +169,7 @@ pub use certify::{certify, Certificate};
 #[cfg(feature = "certify")]
 mod certify {
     use super::*;
-    use hipfire_isa::toolchain::{assemble_link_bundle, Toolchain};
+    use hipfire_isa::toolchain::{build, Toolchain};
     use hipfire_isa::{ledger_replay, pm_check};
     use std::path::Path;
 
@@ -194,7 +194,7 @@ mod certify {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let s = dir.join(format!("{module_name}.s"));
         std::fs::write(&s, text).map_err(|e| format!("{}: {e}", s.display()))?;
-        let build = assemble_link_bundle(&Toolchain::default(), &s, &dir.join(format!("{module_name}.hsaco")), arch.name()).map_err(|e| format!("{module_name}: assemble/link: {e}"))?;
+        let build = build(&Toolchain::default(), &s, &dir.join(format!("{module_name}.hsaco")), arch.name()).map_err(|e| format!("{module_name}: assemble/link: {e}"))?;
         let mut out = Vec::new();
         for e in emitted {
             let symbol = symbol_of(e)?;

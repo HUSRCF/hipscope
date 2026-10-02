@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use hipfire_isa::audit::{self, Options as AuditOptions};
-use hipfire_isa::toolchain::{assemble_link_bundle, certify, read_kd, IsaShapeContract, Toolchain};
+use hipfire_isa::toolchain::{build, certify, read_kd, IsaShapeContract, Toolchain};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -57,7 +57,7 @@ fn run() -> Result<(), String> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let build = assemble_link_bundle(&toolchain, &source, &output, &arch)?;
+    let build = build(&toolchain, &source, &output, &arch)?;
     certify(&toolchain, &build, &source, &arch, &manifest, contract.as_ref(),
         &proof_digest, &builder_git_sha)?;
     if let Some(symbol) = descriptor {
@@ -132,7 +132,7 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     let s_path = output.with_extension("s");
     fs::write(&s_path, &text).map_err(|e| e.to_string())?;
-    let build = assemble_link_bundle(&Toolchain::default(), &s_path, &output, &arch)?;
+    let build = build(&Toolchain::default(), &s_path, &output, &arch)?;
     let mut json = serde_json::to_value(&map).map_err(|e| e.to_string())?;
     json["source"] = source_path.display().to_string().into();
     json["source_sha256"] = format!("{:x}", Sha256::digest(source.as_bytes())).into();

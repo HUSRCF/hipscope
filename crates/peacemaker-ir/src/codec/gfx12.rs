@@ -142,7 +142,9 @@ fn operand(arch: Arch, name: &str, bits: u16, code: u32, literal: Option<u32>, r
     if bits == 16 {
         if let Operand::Reg(r) = &src {
             if r.kind == Kind::V {
-                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & 1 != 0 { Half::Hi } else { Half::Lo }));
+                // OPSEL bit n selects the half of source n (SRC0 bit 0, SRC1 bit 1, SRC2 bit 2).
+                let bit = match name { "SRC1" => 2, "SRC2" => 4, _ => 1 };
+                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & bit != 0 { Half::Hi } else { Half::Lo }));
             }
         }
     }
