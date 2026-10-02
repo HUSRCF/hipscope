@@ -1,27 +1,42 @@
 # Measured floating edges
 
-`gfx1151-edges-v1.tar.zst` is a lossless hardware capture, not a general numerical-model certificate. It contains the gfx1151 scalar/packed/VOPD manifest and its files, f16/bf16 WMMA records, native code objects and executable fingerprints, producer sources, reconstruction tools, and the own-run model reports. There is no measured gfx1201 table in this archive.
+`gfx1151-gfx1201-core-edges-v2.tar.zst` is a lossless combined **empirical raw hardware capture**, not a numerical-model certificate. Architecture directories prevent basename collisions. It includes both completed core manifests, every referenced scalar/packed/VOPD table and exception payload, both packed-extra payloads per architecture, reconstruction readers, raw producer sources/generators/headers, predicate smoke records, and saved build provenance. Each `build/` contains the matching executable, linked device code object, host/device relocatable objects, preprocessed source snapshots, disassembly, build JSON and inspection tables. No pending WMMA, full-domain SFU or finite-FMAS corpus is included.
 
-Extract with `zstd -dc gfx1151-edges-v1.tar.zst | tar -xf -`. The original manifests retain absolute producer paths; bundled readers relocate absent paths by basename beside the manifest.
+Extract with `zstd -dc gfx1151-gfx1201-core-edges-v2.tar.zst | tar -xf -`. Raw source artifacts remain at `/home/kaden/qcal/release-0.4.1/pm-r2/probe/`; gfx1151 originated at `hipx:/home/kaden/pm-wave/pm-r2-edge/`. Corrected build products are saved in `v2-gfx1151/` and `edge_v2_gfx1201/` under the local artifact root. The manifests retain exact original field pointers (`file`, pair-exception and packed-extra paths); bundled readers relocate absent paths by basename beside the manifest. When original absolute paths still exist, the reader prefers them; independent archive verification explicitly used extracted member paths.
 
 ## Scalar, packed and VOPD
 
-`capture-gfx1151.manifest.json` describes 99 ordinary table specs, their typed operand sets, exact native instructions and modifiers, operand axis order, descriptor FP modes, seeds and binary fingerprints. All 26,303,051 ordinary tuples per state were measured in all four VCC/SCC initial states. Literal and SGPR operands are wave-uniform; any unused lanes are not counted.
+| Architecture | Manifest | Ordinary table specs | Ordinary tuples per state | Table/pair payloads verified | Extra payloads verified |
+|---|---|---:|---:|---:|---:|
+| gfx1151 | `gfx1151/capture-v2-gfx1151.manifest.json` | 99 | 26,303,051 | 313 | 2 |
+| gfx1201 | `gfx1201/edge-capture-v2-gfx1201.manifest.json` | 101 | 26,311,243 | 319 | 2 |
 
-A table records one or two raw destination words and captured per-lane VCC/SCC bits. Wave32 VCC masks are reconstructed from the manifest's lane/axis tiling; these fields are not independent whole-wave VCC masks. `fold` tables retain a baseline and lossless exceptions for the other states; `full` tables retain every state. Compressed file hashes refer to decompressed bytes, with exact lengths recorded in the manifest. `edge_recon.py MANIFEST verify` checks the 313 ordinary/pair files; `spec NAME --idx i,j,k [--state S]` reconstructs raw operands and outputs. The two packed-extra files have their own raw SHA256/length fields and were separately checked.
+Both captures measured all ordinary tuples in all four VCC/SCC initial states: `s=0..3`, `vcc_in=(s>>1)&1`, `scc_in=s&1`. Literal and SGPR operands are wave-uniform; unused lanes are not counted. Manifests retain typed operand sets, exact native instructions/modifiers, axis order, descriptor FP modes, seeds and object fingerprints.
 
-VOPD captures use native paired instructions. The full pair contexts are checked against independent native-half tables, retaining any exceptions. The measured fmac/fmac context count is 274,877,906,944; mul/add-literal and its forced-literal twin each check 67,108,864. All three report zero pair-context and half-reference exceptions. This is a context-independence measurement, not comparison against a CPU arithmetic model.
+A table records one or two raw destination words and per-lane VCC/SCC bits. Wave32 VCC masks are reconstructed from lane/axis tiling; these fields are not independent whole-wave masks. `fold` retains a state-zero baseline plus every exception; `full` retains every state. Hashes and lengths describe decompressed bytes. Run `python3 gfx1151/edge_recon.py gfx1151/capture-v2-gfx1151.manifest.json verify` (analogously for gfx1201); `spec NAME --idx i,j,k [--state S]` reconstructs raw operands and outputs. The reader's `verify` covers table/pair files; packed extras require their separate manifest SHA256/length checks. Each architecture includes 18 extra tuples × four states in a 1,152-byte record payload and a 2,270-byte index payload.
 
-## WMMA
+The v2 SGPR predicate correction applies to gid 29, `v_div_scale_f32.sdst_vvv`: the generator emits `@PREDD1`, waits for the VALU-to-SGPR result (`s_waitcnt_depctr 0` on gfx1151, `s_wait_alu 0` on gfx1201), then reads this lane's actual predicate bit into D1 with `v_cndmask_b32_e64`. D1 is an early-clobber pure output, not the `EDGE_D_INIT` seed. A generator contract checks that SGPR-predicate writers declare and perform the matching readback. Both new captures include this corrected D1 payload.
 
-For each f16/bf16 operation, `.frag.bin` contains 66 fragments of 256 little-endian u16 words in row-major **physical packed K** order, and `.cset.bin` contains 34 raw FP32 accumulator values. The complete Cartesian corpus contains 592,416 tuples including four flag initial states. Tuple order is `((ia*66+ib)*34+ic)*4+flags`.
+VOPD uses native paired instructions over full Cartesian grids, not sampled pair contexts. On **each** architecture, fmac/fmac checks 274,877,906,944 tuple-states (`64^6 × 4`); mul/add-literal and its forced-literal twin each check 67,108,864 (`64^4 × 4`). All three report zero pair-context and half-reference exception records. Half-reference checks cover 2,097,152 tuple-states for fmac/fmac and 32,768 for each mul/add variant. Independent native-half tables plus retained exceptions reconstruct full pair outputs. This is an empirical context-independence measurement, not CPU arithmetic-model equality.
 
-Each 16-byte `.rec.bin` record is four little-endian u32 words `{meta,word,vcc_lo,vcc_hi}`. `meta.bit0` is captured SCC; `meta.bit1` says all 256 D words are equal to `word`. Otherwise `word` indexes a 1024-byte `.blk.bin` block of all 256 raw FP32 outputs in row-major order. No physical destination word is omitted. On gfx1151 D register j/lane l maps to row `2*j+(l>>4)`, column `l&15`.
+## Archive integrity
 
-`edge_wmma_read.py verify META --data-dir DIR` validates completeness, all record references, sizes, counters and fingerprints. `lookup META --tuple N --data-dir DIR` reconstructs the inputs, all outputs and flags. Native descriptor round modes are zero, both denorm modes are three, Wave32 is enabled, IEEE/DX10 are enabled on gfx1151, and measured MODE is `0x000003f0`. VCC and SCC are unchanged in every captured WMMA tuple.
+Independent temporary extraction verified all **636** lossless core payloads (315 gfx1151, 321 gfx1201), including extras, against raw SHA256 and exact length with zero failures. Their decompressed lengths total 139,489,930 and 139,555,466 bytes respectively. Every one of the **682 file members**, including manifests, sources and objects, was also compared byte-for-byte against its original. Both executable/device-object/build-JSON fingerprints matched the capture manifests. A second streamed archive build was byte-identical.
 
-Own-run production `mma.rs` comparisons checked **151,658,496 destination words per operation**, with **zero mismatches** for both f16 and bf16. This proves equality on the captured Cartesian corpus only, not the required randomized or full-domain gates.
+The deterministic archive uses sorted USTAR members, zero timestamps/uid/gid, mode `0644`, and streamed `zstd -19 -T4 --long=27` compression. No measured core payload was discarded for size.
+
+- Compressed size: **5,452,076 bytes**
+- SHA256: `6dbf478885069842f3df0d63028cac3287dca487ffcffb8c4a8516279794c98f`
+- MD5: `da87324f363e9c4072cefa427b82e639`
+
+## Historical WMMA evidence
+
+The superseded `gfx1151-edges-v1.tar.zst` is removed from this checkout rather than duplicated. Its original gfx1151 f16/bf16 WMMA raw artifacts remain unmodified under the artifact root (`wmma-capture-gfx1151.{f16,bf16}.v0.*`), with readers and own-run reports; the v1 archive remains in commit `42a51b3f9`. The new core-only archive does not replace or include that WMMA corpus.
+
+Each historical operation captured 66 physical packed-K fragments × 66 fragments × 34 FP32 accumulator values × four flag states = 592,416 tuples. Historical own-run `mma.rs` comparisons reported 151,658,496 destination words per operation and zero mismatches for f16 and bf16. Those are captured-corpus results only, not randomized or full-domain qualification; this archive-integrity work did not rerun numeric comparisons.
 
 ## Qualification limits
 
-The scalar F32 set does **not** contain the proposed DIV_FMAS scaled-rounding discriminator words `0x14800000` and `0x88800000`, or the `2^80` overflow discriminator `0x67800000`. Do not enable generic VCC=1 DIV_FMAS rounding semantics from this capture alone. Ordinary ABS/CLAMP/OMOD variants absent from the audited census are not claimed measured. Full 2^32 SFU comparisons, the randomized WMMA gates, gfx1201 measurements, and the production FP8 WMMA value model remain unqualified. Preliminary source-derived models must not be described as hardware-certified.
+The scalar F32 set does **not** contain DIV_FMAS scaled-rounding discriminator words `0x14800000` and `0x88800000`, or the `2^80` overflow discriminator `0x67800000`. Do not infer generic VCC=1 DIV_FMAS rounding semantics from these captures. Ordinary ABS/CLAMP/OMOD variants absent from the audited census are not claimed measured.
+
+Raw table integrity is **not CPU-model numerical proof**. This archive makes no full SFU, WMMA, or finite-FMAS qualification claim. Trans APIs support gfx1151/gfx1201, but full-domain qualification remains pending. Full `2^32` SFU comparisons, randomized WMMA gates and the production FP8 WMMA value model remain unqualified here. Preliminary source-derived models must not be described as hardware-certified.
