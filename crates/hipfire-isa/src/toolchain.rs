@@ -177,7 +177,14 @@ pub fn parse_back(source: &str, disassembly: &str) -> Result<()> {
             let canonical_author = if a == "s_barrier_wait" && author.ends_with(" -1") {
                 author.replace(" -1", " 0xffff")
             } else { author.to_string() };
-            let canonical_decoded = if author.contains(".h") || author.contains(".l") {
+            // Source may spell the same redundant op_sel the disassembler
+            // prints; normalize both sides identically so only a select not
+            // implied by the `.h`/`.l` operand spelling can differ.
+            let has_half = author.contains(".h") || author.contains(".l");
+            let canonical_author = if has_half {
+                redundant_op_sel(&canonical_author).unwrap_or(canonical_author)
+            } else { canonical_author };
+            let canonical_decoded = if has_half {
                 redundant_op_sel(decoded).unwrap_or_else(|| decoded.to_string())
             } else { decoded.to_string() };
             if normalize(&canonical_author) != normalize(&canonical_decoded) {
@@ -651,6 +658,15 @@ mod tests {
         assert!(parse_back(source, &decoded("[1,0]")).is_ok());
         // A dst-high select the source never spelled must not be hidden.
         assert!(parse_back(source, &decoded("[1,1]")).is_err());
+    }
+    #[test]
+    fn parse_back_accepts_source_spelling_redundant_op_sel() {
+        let source = "v_cvt_f16_f32_e64 v128.h, v41 op_sel:[0,1]\ns_endpgm";
+        let decoded = |sel: &str| format!("000000 <k>:\n v_cvt_f16_f32_e64 v128.h, v41 op_sel:{sel} // 0\n s_endpgm // 0");
+        assert!(parse_back(source, &decoded("[0,1]")).is_ok());
+        // A select contradicting the `.h` spelling must still be reported.
+        assert!(parse_back(source, &decoded("[1,1]")).is_err());
+        assert!(parse_back(source, &decoded("[0,0]")).is_err());
     }
     #[test]
     fn shape_counts_packets_not_wmma_as_valu() {
