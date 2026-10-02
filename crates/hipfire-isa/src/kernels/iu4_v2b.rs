@@ -41,7 +41,7 @@ use super::common::{add64, add64_imm, lit, mem, op, s, sop, sr, v, vr};
 use super::iu4_fold::{GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
 use super::iu4_gemm::ds_offsets;
 use super::iu4_v2c::off;
-use super::gemm_uk::{Chain, Epilogue, FragmentLayout, Iu4, Lds, Prefetch, Tile as MicroTile};
+use super::gemm_uk::{Chain, DENSE_SILU_TEMPS, Epilogue, FragmentLayout, Iu4, Lds, Prefetch, Tile as MicroTile};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
     insn::{Instruction, MemoryClass, Sop},
     reg::Live, vopd::{Operand, VopdF32, VopdOp}};
@@ -145,7 +145,6 @@ struct Args { a: u8, u: Option<u8>, xq: u8, y: u8, m: u8, k: u8, n: u8, gshift: 
 
 /// SiLU elements folded per interleaved group.
 const SILU_GROUP: u8 = 8;
-const SILU_TEMPS: u8 = 6;
 /// The staged packet is published after this pass's fold (see `epoch`).
 const PUBLISH_AFTER_PASS: usize = 2;
 
@@ -230,7 +229,7 @@ impl Gen {
             // Residual rings: three 32-register sets of one row fragment each.
             Epi::Add => for base in [160u8, 192, 224] { for i in 0..4u8 { p.v::<8>("residual", base + 8 * i, body())?; } },
             Epi::GateUpSilu => {
-                for i in 0..(SILU_GROUP * SILU_TEMPS / 8) { p.v::<8>("silu_tmp", 160 + 8 * i, body())?; }
+                for i in 0..(SILU_GROUP * DENSE_SILU_TEMPS / 8) { p.v::<8>("silu_tmp", 160 + 8 * i, body())?; }
                 for i in 0..(3 * SILU_GROUP) { p.s::<2>("silu_mask", Regs::MASK + 2 * i, body())?; }
             }
         }
@@ -757,57 +756,6 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
 /// eight elements are interleaved op by op.
 fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
     Epilogue::silu_dense(b, gate, up, 160, Regs::MASK, SILU_GROUP)
-}
-
-/// [`silu_group`]'s DAG over the `n` elements `gate..gate+n` / `up..up+n`
-/// (h written over the gate values), interleaved op by op: the builder's one
-/// SiLU emitter for gfx11 and gfx12. Element `k` uses the temporaries
-/// `tmp + 6k ..+6` and the lane-mask pairs `mask + 2k` (underflow),
-/// `mask + 2(n+k)` (overflow), `mask + 2(2n+k)` (numerator scale).
-pub(crate) fn silu_mul(b: &mut Builder, gate: u8, up: u8, tmp: u8, mask: u8, n: u8) -> Result<(), String> {
-    let t = |k: u8, i: u8| tmp + SILU_TEMPS * k + i;
-    let (m_under, m_over, m_num) = (|k: u8| mask + 2 * k, |k: u8| mask + 2 * (n + k), |k: u8| mask + 2 * (2 * n + k));
-    type Step<'a> = &'a dyn Fn(&mut Builder, u8) -> Result<(), String>;
-    let steps: [Step; 26] = [
-        // ph = RN(-log2e * g); pl = fma(-log2e, g, -ph); pl = fma(-log2e_lo, g, pl)
-        &|b, k| op(b, format!("v_mul_f32_e32 v{}, 0xbfb8aa3b, v{}", t(k, 0), gate + k), &[v(t(k, 0))], &[v(gate + k)]),
-        &|b, k| op(b, format!("v_fma_f32 v{}, 0xbfb8aa3b, v{}, -v{}", t(k, 1), gate + k, t(k, 0)), &[v(t(k, 1))], &[v(gate + k), v(t(k, 0))]),
-        &|b, k| op(b, format!("v_fmac_f32_e32 v{}, 0xb2a5705f, v{}", t(k, 1), gate + k), &[v(t(k, 1))], &[v(t(k, 1)), v(gate + k)]),
-        // e = rndne(ph); a = (ph - e) + pl; r = ldexp(exp2(a), int(e))
-        &|b, k| op(b, format!("v_rndne_f32_e32 v{}, v{}", t(k, 2), t(k, 0)), &[v(t(k, 2))], &[v(t(k, 0))]),
-        &|b, k| op(b, format!("v_sub_f32_e32 v{0}, v{0}, v{1}", t(k, 0), t(k, 2)), &[v(t(k, 0))], &[v(t(k, 0)), v(t(k, 2))]),
-        &|b, k| op(b, format!("v_add_f32_e32 v{0}, v{0}, v{1}", t(k, 0), t(k, 1)), &[v(t(k, 0))], &[v(t(k, 0)), v(t(k, 1))]),
-        &|b, k| op(b, format!("v_exp_f32_e32 v{0}, v{0}", t(k, 0)), &[v(t(k, 0))], &[v(t(k, 0))]),
-        &|b, k| op(b, format!("v_cvt_i32_f32_e32 v{0}, v{0}", t(k, 2)), &[v(t(k, 2))], &[v(t(k, 2))]),
-        &|b, k| op(b, format!("v_ldexp_f32 v{0}, v{0}, v{1}", t(k, 0), t(k, 2)), &[v(t(k, 0))], &[v(t(k, 0)), v(t(k, 2))]),
-        // r = -g < -103.28 ? 0 : r; r = -g > 88.72 ? +inf : r
-        &|b, k| op(b, format!("v_cmp_nlt_f32_e64 s{}, 0x42ce8ed0, v{}", m_under(k), gate + k), &[s(m_under(k))], &[v(gate + k)]),
-        &|b, k| op(b, format!("v_cndmask_b32_e64 v{0}, 0, v{0}, s{1}", t(k, 0), m_under(k)), &[v(t(k, 0))], &[v(t(k, 0)), s(m_under(k))]),
-        &|b, k| op(b, format!("v_cmp_ngt_f32_e64 s{}, 0xc2b17218, v{}", m_over(k), gate + k), &[s(m_over(k))], &[v(gate + k)]),
-        &|b, k| op(b, format!("v_cndmask_b32_e64 v{0}, 0x7f800000, v{0}, s{1}", t(k, 0), m_over(k)), &[v(t(k, 0))], &[v(t(k, 0)), s(m_over(k))]),
-        // d = 1 + r; q = g / d (div_scale, rcp, three fma refinements, fmas, fixup)
-        &|b, k| op(b, format!("v_add_f32_e32 v{0}, 1.0, v{0}", t(k, 0)), &[v(t(k, 0))], &[v(t(k, 0))]),
-        &|b, k| op(b, format!("v_div_scale_f32 v{0}, null, v{1}, v{1}, v{2}", t(k, 1), t(k, 0), gate + k), &[v(t(k, 1))], &[v(t(k, 0)), v(gate + k)]),
-        &|b, k| op(b, format!("v_div_scale_f32 v{0}, s{1}, v{2}, v{3}, v{2}", t(k, 2), m_num(k), gate + k, t(k, 0)), &[v(t(k, 2)), s(m_num(k))], &[v(t(k, 0)), v(gate + k)]),
-        &|b, k| op(b, format!("v_rcp_f32_e32 v{}, v{}", t(k, 3), t(k, 1)), &[v(t(k, 3))], &[v(t(k, 1))]),
-        &|b, k| op(b, format!("v_fma_f32 v{}, -v{}, v{}, 1.0", t(k, 4), t(k, 1), t(k, 3)), &[v(t(k, 4))], &[v(t(k, 1)), v(t(k, 3))]),
-        &|b, k| op(b, format!("v_fmac_f32_e32 v{0}, v{1}, v{0}", t(k, 3), t(k, 4)), &[v(t(k, 3))], &[v(t(k, 3)), v(t(k, 4))]),
-        &|b, k| op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", t(k, 4), t(k, 2), t(k, 3)), &[v(t(k, 4))], &[v(t(k, 2)), v(t(k, 3))]),
-        &|b, k| op(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", t(k, 5), t(k, 1), t(k, 4), t(k, 2)), &[v(t(k, 5))], &[v(t(k, 1)), v(t(k, 4)), v(t(k, 2))]),
-        &|b, k| op(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", t(k, 4), t(k, 5), t(k, 3)), &[v(t(k, 4))], &[v(t(k, 4)), v(t(k, 5)), v(t(k, 3))]),
-        &|b, k| op(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", t(k, 5), t(k, 1), t(k, 4), t(k, 2)), &[v(t(k, 5))], &[v(t(k, 1)), v(t(k, 4)), v(t(k, 2))]),
-        &|b, k| {
-            op(b, format!("s_mov_b32 vcc_lo, s{}", m_num(k)), &[], &[s(m_num(k))])?;
-            op(b, format!("v_div_fmas_f32 v{0}, v{0}, v{1}, v{2}", t(k, 5), t(k, 3), t(k, 4)), &[v(t(k, 5))], &[v(t(k, 5)), v(t(k, 3)), v(t(k, 4))])
-        },
-        &|b, k| op(b, format!("v_div_fixup_f32 v{0}, v{0}, v{1}, v{2}", t(k, 5), t(k, 0), gate + k), &[v(t(k, 5))], &[v(t(k, 5)), v(t(k, 0)), v(gate + k)]),
-        // h = q * u
-        &|b, k| op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", gate + k, t(k, 5), up + k), &[v(gate + k)], &[v(t(k, 5)), v(up + k)]),
-    ];
-    for step in steps {
-        for k in 0..n { step(b, k)?; }
-    }
-    Ok(())
 }
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {

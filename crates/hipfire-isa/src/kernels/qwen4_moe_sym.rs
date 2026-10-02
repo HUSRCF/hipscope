@@ -30,7 +30,7 @@
 //! from a `ds_swizzle_b32` broadcast: lane `(hi, k)` loads the header of the
 //! row its broadcast partner needs (gfx11 C rows `2j + hi`, gfx12 `8hi + j`).
 //! BF16 rounding is RNE with non-finite values passed through; the SiLU is
-//! the hipcc `g / (1 + expf(-g)) * u` DAG ([`super::iu4_v2b::silu_mul`]).
+//! the hipcc `g / (1 + expf(-g)) * u` DAG ([`crate::kernels::gemm_uk::Epilogue::silu_dense`]).
 use super::bf16::Bf16;
 use super::common::{self, GatherTemps, add64, add64_imm, bload, bstore_b128, lit, op, s, s_add_i32, smem, sop, srd_tail, v, SRD_WORD3};
 use super::iu4_fold::{self, MAGIC, REBIAS};
@@ -461,7 +461,7 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     if g.spec.kind == Kind::GateUp {
         // g and u rounded to BF16 before the shipped SwiGLU expression.
         for t in 0..2u8 { for j in 0..8u8 { Bf16::rne_finite_passthrough(b, SUM + 8 * t + j, RT_TMP + j, MASKT[usize::from(j % 2)], true)?; } }
-        for grp in 0..2u8 { super::iu4_v2b::silu_mul(b, SUM + SILU_N * grp, SUM + 8 + SILU_N * grp, SET0, SILU_MASK, SILU_N)?; }
+        for grp in 0..2u8 { crate::kernels::gemm_uk::Epilogue::silu_dense(b, SUM + SILU_N * grp, SUM + 8 + SILU_N * grp, SET0, SILU_MASK, SILU_N)?; }
     }
     for j in 0..8u8 { Bf16::rne_finite_passthrough(b, vals + j, RT_TMP + j, MASKT[usize::from(j % 2)], false)?; }
     // Padding slots store +0.
@@ -1087,7 +1087,7 @@ mod nt {
                 let text = format!("ds_load_b128 {d}, v{LDSA}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
                 w.ds_load(&gate, Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
             }
-            for grp in 0..2u8 { super::super::iu4_v2b::silu_mul(w.isa(), gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
+            for grp in 0..2u8 { crate::kernels::gemm_uk::Epilogue::silu_dense(w.isa(), gv + SILU_N * grp, g.sum(j) + SILU_N * grp, SILU_TMP, SILU_MASK, SILU_N)?; }
             Ok(gv)
         }))
     }
