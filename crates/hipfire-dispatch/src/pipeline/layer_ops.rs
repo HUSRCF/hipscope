@@ -38,7 +38,7 @@ use rdna_compute::tensor_ops::{
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
     IndexedAttentionSelectBatch, QsaKvFormat, ScaleF32,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
 
 #[inline]
@@ -146,6 +146,27 @@ pub fn project_weights(
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
 ) -> Result<(), DispatchError> {
+    // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
+    let members = [false, true, true, true];
+    let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
+    project_weights_inner(gpu, input, rows, rotation, projections, gdn_regions.then_some(&members[..]))
+}
+
+/// [`project_weights`] with the MQ6 a/b/z row-region fold (three F32 outputs
+/// of shared-rotation MQ6 siblings, one launch) enabled for exactly the
+/// projections `region_members` flags (parallel to `projections`) instead of
+/// inferred from the group's shape: [`project_trunk`] flags the original GDN
+/// a/b/z of a group whose siblings were taken by another route, so qkv can
+/// never join the fold.
+fn project_weights_inner(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    region_members: Option<&[bool]>,
+) -> Result<(), DispatchError> {
+    debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
     let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
         w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
     };
@@ -160,15 +181,17 @@ pub fn project_weights(
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
         // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
         // may share one row-region launch without sharing their accumulators.
-        if gpu.qwen4_mq6_x4_regions()
-            && projections.len() == 4
-            && projections[0].1.dtype == DType::BF16
-        {
+        if let (Some(members), true) = (region_members, gpu.qwen4_mq6_x4_regions()) {
             let mut indices = [0usize; 3];
             let mut count = 0;
             for j in i..projections.len() {
                 let (w, out) = projections[j];
-                if !done[j] && w.k == weight.k && shared(w, gpu) && out.dtype == DType::F32 {
+                if members[j]
+                    && !done[j]
+                    && w.k == weight.k
+                    && shared(w, gpu)
+                    && out.dtype == DType::F32
+                {
                     if count < 3 { indices[count] = j; }
                     count += 1;
                 }
@@ -301,6 +324,128 @@ pub fn project_weights(
         }
     }
     Ok(())
+}
+
+/// GDN Z|beta|alpha fold of [`project_trunk`]: the folded rows and the
+/// indices of Z, beta (`in_proj_b`) and alpha (`in_proj_a`) in its
+/// projection list.
+struct ZbaFold<'a> {
+    rows: &'a GpuTensor,
+    z: usize,
+    beta: usize,
+    alpha: usize,
+}
+
+/// Qwen4 trunk projections (GDN in/out, QSA in/out) of one shared input.
+///
+/// `a4[i]` says the per-layer mask (`HIPFIRE_QWEN4_TRUNK_IU4`) selected
+/// `projections[i]`. Each projection takes one of three routes, run as
+/// groups that each finish before the next starts (the A4 sidecar, the
+/// rotation scratch and the shared F16 X scratch are reused group to group):
+///
+/// 1. Symmetric MQ4G256V2 and masked, on a verified trunk
+///    ([`Gpu::qwen4_trunk_iu4_applies`]): the dense IU4 route. One A4
+///    producer per shared input (`rotate_x_mq_i4`, FWHT + `block_i4_128`, no
+///    F32 store) feeds SET GEMMs (`gemm_mq4g256v2_mmq_set_prequant_iu4`: Halo
+///    V2B / `pm_v2b` where eligible, X5 / symfold otherwise); a GDN `zba`
+///    fold, when all of Z, beta and alpha are in this group, runs
+///    Z|beta|alpha as one V2B SET with the split in its epilogue.
+/// 2. Any other MQ4G256V2 projection of an F32 prefill input (more than 8
+///    rows, gfx1151): exact (F16) activations, one shared rotation.
+/// 3. Everything else (MQ6 and the rest): [`project_weights`] exactly as if
+///    no MQ4 sibling existed. When siblings were split off a GDN in-projection
+///    group (`gdn_in_proj`), the MQ6 row-region fold stays enabled for the
+///    group's original a/b/z only (never qkv).
+#[allow(clippy::too_many_arguments)]
+fn project_trunk(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: &GpuTensor,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    a4: &[bool],
+    zba: Option<ZbaFold<'_>>,
+    gdn_in_proj: bool,
+) -> Result<(), DispatchError> {
+    debug_assert_eq!(a4.len(), projections.len());
+    let mut done: SmallVec<[bool; 4]> = SmallVec::from_elem(false, projections.len());
+    let k = projections.iter().find(|(w, _)| w.dtype == DType::MQ4G256V2).map(|(w, _)| w.k);
+    if let (Some(k), DType::F32) = (k, input.dtype) {
+        let mq4: SmallVec<[usize; 4]> = (0..projections.len())
+            .filter(|&j| projections[j].0.dtype == DType::MQ4G256V2 && projections[j].0.k == k)
+            .collect();
+        let dense: SmallVec<[usize; 4]> = if gpu.qwen4_trunk_iu4_applies(rows) {
+            mq4.iter().copied().filter(|&j| a4[j]).collect()
+        } else {
+            SmallVec::new()
+        };
+        if !dense.is_empty() {
+            let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
+            let prepared =
+                hip(gpu.rotate_x_mq_i4_batched(input, None, None, reservation, k, rows))?;
+            if let Some(fold) = zba {
+                let (z, y_z) = projections[fold.z];
+                if [fold.z, fold.beta, fold.alpha].iter().all(|j| dense.contains(j))
+                    && hip(gpu.gemm_qwen4_trunk_zba_iu4(
+                        fold.rows,
+                        &prepared,
+                        y_z,
+                        projections[fold.beta].1,
+                        projections[fold.alpha].1,
+                        z.m,
+                        k,
+                        rows,
+                    ))?
+                {
+                    done[fold.z] = true;
+                    done[fold.beta] = true;
+                    done[fold.alpha] = true;
+                }
+            }
+            for &j in &dense {
+                if !done[j] {
+                    let (w, out) = projections[j];
+                    let xq = hip(gpu.int4_mmq_prepared_ptr(&prepared, k, rows))?;
+                    hip(gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(w.buf, xq, out, w.m, k, rows))?;
+                    done[j] = true;
+                }
+            }
+        }
+        let exact: SmallVec<[usize; 4]> = mq4.iter().copied().filter(|&j| !done[j]).collect();
+        if rows > 8 && !exact.is_empty() {
+            let x = view(rotation, 0, rows * k);
+            hip(gpu.rotate_x_mq_batched(input, &x, k, rows))?;
+            for &j in &exact {
+                let (w, out) = projections[j];
+                if !hip(gpu.gemm_qwen4_trunk_mq4_xf16(w.buf, &x, out, w.m, k, rows))? {
+                    break;
+                }
+                done[j] = true;
+            }
+        }
+    }
+    if done.iter().all(|d| !d) {
+        return project_weights(gpu, input, rows, Some(rotation), projections);
+    }
+    let rest: SmallVec<[(&WeightRef<'_>, &GpuTensor); 4]> =
+        (0..projections.len()).filter(|&j| !done[j]).map(|j| projections[j]).collect();
+    if rest.is_empty() {
+        return Ok(());
+    }
+    // Only the original GDN a/b/z (positions 1.. of the in-projection group)
+    // may join the row-region fold; qkv (position 0) never does.
+    let members: SmallVec<[bool; 4]> = (0..projections.len())
+        .filter(|&j| !done[j])
+        .map(|j| gdn_in_proj && j != 0)
+        .collect();
+    project_weights_inner(
+        gpu,
+        input,
+        rows,
+        Some(rotation),
+        &rest,
+        gdn_in_proj.then_some(&members[..]),
+    )
 }
 
 /// FWHT basis a quantized projection payload reads: the aligned-K 256-wide
@@ -1184,6 +1329,15 @@ pub struct GatedDeltaNetOp<'a> {
     /// Few-row speculative verify: per-row rollback points (see
     /// [`GdnRowCapture`]); ignored by the one-row and chunked routes.
     pub row_capture: Option<GdnRowCapture<'a>>,
+    /// Qwen4 IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4`): Z, beta and alpha rows
+    /// folded into one QT44 matrix (`z.m + 256` rows: Z, `in_proj_b`,
+    /// `in_proj_a`, zero rows) for the V2B Z|beta|alpha SET; `None` runs the
+    /// three projections separately.
+    pub zba_fold: Option<&'a GpuTensor>,
+    /// [`TrunkFamily`] bits of this layer's GDN projections that take the A4
+    /// route when their weight is symmetric MQ4G256V2 and the route applies
+    /// (`0` = none; tests).
+    pub trunk_a4: u16,
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
@@ -1407,17 +1561,25 @@ pub fn execute_gated_delta_net_hc(
     if bf16_store(&op.qkv, gpu) {
         projection.dtype = DType::BF16;
     }
-    project_weights(
+    project_trunk(
         gpu,
         op.input,
         op.rows,
-        Some(op.rotation),
+        op.rotation,
         &[
             (&op.qkv, &projection),
             (&op.in_proj_a, &a),
             (&op.in_proj_b, &b),
             (&op.z, &z),
         ],
+        &[
+            op.trunk_a4 & TrunkFamily::GdnQkv.bit() != 0,
+            op.trunk_a4 & TrunkFamily::GdnA.bit() != 0,
+            op.trunk_a4 & TrunkFamily::GdnB.bit() != 0,
+            op.trunk_a4 & TrunkFamily::GdnZ.bit() != 0,
+        ],
+        op.zba_fold.map(|rows| ZbaFold { rows, z: 3, beta: 2, alpha: 1 }),
+        true,
     )?;
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
     if persistent_batch {
@@ -1606,13 +1768,15 @@ pub fn execute_gated_delta_net_hc(
         }
     }
     let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
-    project_weight(
+    project_trunk(
         gpu,
-        &op.output,
         &gdn_output,
-        &output_batch,
         op.rows,
-        Some(op.rotation),
+        op.rotation,
+        &[(&op.output, &output_batch)],
+        &[op.trunk_a4 & TrunkFamily::GdnOut.bit() != 0],
+        None,
+        false,
     )?;
     // The output stays the F32 projection: its reader, the HC write, rounds
     // it to BF16 as it reads it, so no round-trip pass is owed here.
@@ -1690,6 +1854,11 @@ pub struct IndexedAttentionOp<'a> {
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
     pub mode: IndexedAttentionMode<'a>,
+    /// Qwen4 IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4`): [`TrunkFamily`] bits of
+    /// this layer's QSA projections that take the A4 route when their weight
+    /// is symmetric MQ4G256V2 and the route applies (`0` = none; MTP and
+    /// tests).
+    pub trunk_a4: u16,
 }
 
 impl IndexedAttentionOp<'_> {
@@ -2086,7 +2255,18 @@ pub fn execute_indexed_attention_hc(
         IndexedAttentionMode::AppendOnly => &without_q,
         _ => &all,
     };
-    project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
+    let a4_all = [
+        op.trunk_a4 & TrunkFamily::QsaIdx.bit() != 0,
+        op.trunk_a4 & TrunkFamily::QsaQ.bit() != 0,
+        op.trunk_a4 & TrunkFamily::QsaK.bit() != 0,
+        op.trunk_a4 & TrunkFamily::QsaV.bit() != 0,
+    ];
+    let a4_without_q = [a4_all[0], a4_all[2], a4_all[3]];
+    let a4: &[bool] = match op.mode {
+        IndexedAttentionMode::AppendOnly => &a4_without_q,
+        _ => &a4_all,
+    };
+    project_trunk(gpu, op.input, op.rows, op.rotation, projections, a4, None, false)?;
     qsa_projection_hook_run(gpu, op)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
@@ -2345,13 +2525,15 @@ pub fn execute_indexed_attention_hc(
     if fused_hc {
         *fused = true;
     } else {
-        project_weight(
+        project_trunk(
             gpu,
-            &op.output,
             &qsa_output_batch,
-            &view(op.attention_output, 0, op.rows * op.output.m),
             op.rows,
-            Some(op.rotation),
+            op.rotation,
+            &[(&op.output, &view(op.attention_output, 0, op.rows * op.output.m))],
+            &[op.trunk_a4 & TrunkFamily::QsaO.bit() != 0],
+            None,
+            false,
         )?;
     }
     let final_selected = view(
@@ -2975,6 +3157,8 @@ mod tests {
                 conv_kernel: 2,
                 input_width: 2,
                 row_capture: None,
+                zba_fold: None,
+                trunk_a4: 0,
             }
         }
     }
@@ -3082,6 +3266,7 @@ mod tests {
             input_width: 1,
             rotation: t,
             mode,
+            trunk_a4: 0,
         }
     }
 

@@ -909,6 +909,11 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
+    /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
+    /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
+    /// [`Gpu::qwen4_trunk_iu4_applies`].
+    pub qwen4_trunk_iu4: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -1670,6 +1675,7 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]

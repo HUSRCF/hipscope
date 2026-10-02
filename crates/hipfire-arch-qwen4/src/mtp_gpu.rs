@@ -1475,6 +1475,7 @@ impl Qwen4MtpGpu {
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
+                trunk_a4: 0,
             };
             let lengths = attention.next_lengths()?;
             let moe = if step == MtpStep::Append {
