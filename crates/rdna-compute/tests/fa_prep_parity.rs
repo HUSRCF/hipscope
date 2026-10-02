@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 and gfx1201: the Qwen3.6/3.8-27B (24Q/4K) decode fusion
-//! `qwen36_27b_fa_prep_*` must produce the same bytes as the chain it
-//! replaces: `deinterleave_f32`, `rmsnorm_batched` on Q and on K, then
+//! gfx1100/gfx1151: the A3B 16Q/2K decode fusion; gfx1100/gfx1201:
+//! the Qwen3.6/3.8-27B 24Q/4K decode fusion must produce the same bytes
+//! as the chain it replaces: `deinterleave_f32`, Q/K `rmsnorm_batched`, then
 //! `rope_partial_interleaved_f32` (the half-split partial RoPE). The Qwen3.5
 //! lowered decode uses the fusion and the hand decode
 //! (`HIPFIRE_FORWARD_LOWERED=0`) uses the chain, so any difference makes the
@@ -13,7 +13,7 @@
 //! computes `fma(x0, sin, x1 * cos)`.
 //!
 //! Q, gate and K are compared bit for bit at positions from 0 to 2^20.
-//! Other arches do not admit the 24Q/4K fusion, so the test skips there.
+//! Each shape skips arches that do not admit its certified fusion.
 //!
 //! `#[ignore]`d: needs a GPU with a working HIP toolchain. Run explicitly:
 //!
