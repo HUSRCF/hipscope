@@ -124,6 +124,51 @@ __device__ __forceinline__ half16_t decode6_tile_split(unsigned long long code,
     return __builtin_bit_cast(half16_t, both);
 }
 
+// Packed-pair variant of decode6_tile_split: two codes per VALU op.  The
+// codes ride in the mantissas of 1024 + q (0x6400 | q, exact for q < 64);
+// v_pk_add_f16 of -1024 (0xe400) recovers q exactly, and v_pk_fma_f16
+// computes sc * q + zp in one rounding (RNE), the same fused expression as
+// the scalar path's v_fma_f16 with the same operand order (sc, q, zp).
+// Explicit asm pins the fusion and operand order against reordering or
+// contraction.  `sc2`/`zp2` carry the raw half bits replicated in both halves.
+__device__ __forceinline__ unsigned int pk_add_f16_bt(unsigned int a, unsigned int b) {
+    unsigned int r;
+    asm("v_pk_add_f16 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+__device__ __forceinline__ unsigned int pk_fma_f16_bt(unsigned int a, unsigned int b,
+                                                      unsigned int c) {
+    unsigned int r;
+    asm("v_pk_fma_f16 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+}
+__device__ __forceinline__ half16_t decode6_tile_split_pk(unsigned long long code,
+                                                          unsigned int sc2,
+                                                          unsigned int zp2,
+                                                          int lane_half) {
+    uint4_bt_t m;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const unsigned int q0 = (unsigned int)(code >> (12 * k)) & 63u;
+        const unsigned int q1 = (unsigned int)(code >> (12 * k + 6)) & 63u;
+        const unsigned int q2bits = 0x64006400u | q0 | (q1 << 16);
+        const unsigned int q2 = pk_add_f16_bt(q2bits, 0xe400e400u);
+        m[k] = pk_fma_f16_bt(sc2, q2, zp2);
+    }
+    uint4_bt_t o;
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+        o[k] = (unsigned int)__builtin_amdgcn_permlanex16(
+            (int)m[k], (int)m[k], 0x76543210u, 0xfedcba98u, false, false);
+    uint8_bt_t both;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        both[k] = lane_half ? o[k] : m[k];
+        both[k + 4] = lane_half ? m[k] : o[k];
+    }
+    return __builtin_bit_cast(half16_t, both);
+}
+
 // ---------------------------------------------------------------------------
 // QKVZA overwrite BT4 — four projection regions (QKV/Z/beta/alpha)
 // Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*BV))]. Block: [32].
@@ -707,7 +752,7 @@ static __device__ __forceinline__ void hcw_apply8(const uint4 mq, int t, int c0,
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
 template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1,
-          bool HC = false>
+          bool HC = false, bool DQ = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
@@ -787,6 +832,14 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
         const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
         const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
+        // DQ: raw half bits replicated into both 16-bit halves (v_perm_b32).
+        unsigned int sc2_0 = 0, zp2_0 = 0, sc2_1 = 0, zp2_1 = 0;
+        if constexpr (DQ) {
+            sc2_0 = __builtin_amdgcn_perm(hA, hA, 0x01000100u);
+            zp2_0 = __builtin_amdgcn_perm(hA, hA, 0x03020302u);
+            sc2_1 = __builtin_amdgcn_perm(hB, hB, 0x01000100u);
+            zp2_1 = __builtin_amdgcn_perm(hB, hB, 0x03020302u);
+        }
 #pragma unroll
         for (int cq = 0; cq < 4; cq++) {
             const int c = g * 4 + cq;
@@ -821,8 +874,15 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                 const unsigned int lo = lane_half
                     ? __builtin_amdgcn_alignbit(d[3 * j + 2], d[3 * j + 1], 16) : d[3 * j];
                 const unsigned int hi = lane_half ? (d[3 * j + 2] >> 16) : (d[3 * j + 1] & 0xFFFFu);
-                half16_t a_reg = decode6_tile_split(
-                    ((unsigned long long)hi << 32) | lo, sc_h, zp_h, lane_half);
+                half16_t a_reg;
+                if constexpr (DQ) {
+                    a_reg = decode6_tile_split_pk(((unsigned long long)hi << 32) | lo,
+                                                  (kt < 8) ? sc2_0 : sc2_1,
+                                                  (kt < 8) ? zp2_0 : zp2_1, lane_half);
+                } else {
+                    a_reg = decode6_tile_split(
+                        ((unsigned long long)hi << 32) | lo, sc_h, zp_h, lane_half);
+                }
 #pragma unroll
                 for (int b = 0; b < BV; b++) {
                     half16_t b_reg = *(const half16_t*)(xs + (b * 16 + ml) * STRIDE + j * 16);
@@ -990,6 +1050,62 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
     }
     if (M <= 0 || local_rb >= (M + 63) / 64) return;
     resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N, local_rb);
+}
+
+// DQ entries: the U3 b8 tiles / regions / hcw paths with the packed-pair dequant
+// (resid_bt_xlds DQ = true).  Incumbent entries are unchanged; this block stays
+// before the final incumbent kernel (gemm_..._bt8_x4_hcw) so that kernel's code is
+// not perturbed by appended entries.
+#define U3_DQ_TILE(BV, RW, PF) \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_dq( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, false, PF, false, true>(A, X, Y, M, K, N); \
+} \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_dq_bf16out( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, true, PF, false, true>(A, X, Y, M, K, N); \
+}
+U3_DQ_TILE(8, 4, 1)
+U3_DQ_TILE(8, 4, 2)
+U3_DQ_TILE(8, 8, 1)
+U3_DQ_TILE(8, 8, 2)
+#undef U3_DQ_TILE
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_regions(
+    const char* A0, const char* A1, const char* A2, const _Float16* X,
+    float* Y0, float* Y1, float* Y2, int M0, int M1, int M2, int K, int N) {
+    if (N <= 0 || K <= 0) return;
+    const int r0 = (M0 + 63) / 64;
+    const int r1 = (M1 + 63) / 64;
+    const int rb = blockIdx.x;
+    const char* A;
+    float* Y;
+    int M, local_rb;
+    if (rb < r0) {
+        A = A0; Y = Y0; M = M0; local_rb = rb;
+    } else if (rb < r0 + r1) {
+        A = A1; Y = Y1; M = M1; local_rb = rb - r0;
+    } else {
+        A = A2; Y = Y2; M = M2; local_rb = rb - r0 - r1;
+    }
+    if (M <= 0 || local_rb >= (M + 63) / 64) return;
+    resid_bt_xlds<6, 8, 4, true, false, 1, false, true>(A, X, Y, M, K, N, local_rb);
+}
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_hcw(const char* __restrict__ A,
+                                             const _Float16* __restrict__ X,
+                                             float* __restrict__ Y,
+                                             int M, int K, int N,
+                                             void* hc_streams, const float* hc_gates, int hc_bf16) {
+    if (M <= 0 || K <= 0 || N <= 0) return;
+    resid_bt_xlds<6, 8, 4, true, false, 1, true, true>(A, X, Y, M, K, N, -1, hc_streams, hc_gates,
+                                                      hc_bf16);
 }
 
 // Y = W·X applied to the HC streams in place: the unfused kernel's `0.0f + acc`
