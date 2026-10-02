@@ -126,6 +126,31 @@ impl Spec {
     fn aw(self) -> u8 { if self.arch.gfx12() { 8 } else { 16 } }
 }
 
+/// Default-off schedule experiment. Chains belong to distinct output tiles;
+/// no output's K-step or K128-fold order changes. Not part of `emit_module`.
+#[derive(Clone, Copy, Debug)]
+pub struct R4Spec {
+    pub base: Spec,
+    pub chains: u8,
+    pub prefetch: bool,
+    /// Compact heaviest-first list of pad16 tile leaders at kernarg offset64.
+    /// Grid.y equals the list length; every item owns one expert M-panel.
+    pub grouped: bool,
+}
+
+pub fn emit_r4(spec: R4Spec) -> Result<Emitted, String> {
+    spec.base.validate()?;
+    if spec.base.nt == 1 || !matches!(spec.chains, 1 | 2 | 4 | 8) || spec.chains > spec.base.nt {
+        return Err("qwen4_moe_sym R4: NT >= 2 and chains <= NT required".into());
+    }
+    let nt = u16::from(spec.base.nt);
+    let aw = u16::from(spec.base.aw());
+    let end = (72 + 8 * nt + 2 * aw + 2 + nt).div_ceil(8) * 8 + aw * nt
+        + 8 * u16::from(spec.chains - 1);
+    if end > VGPR_CEILING { return Err(format!("qwen4_moe_sym R4: {end} VGPR exceeds {VGPR_CEILING}")); }
+    nt::emit_with(spec)
+}
+
 // VGPRs.
 const TID: u8 = 0;
 const XOFF: u8 = 16;   // d offset of this lane's slot row (or X_OOB)
@@ -602,7 +627,7 @@ mod nt {
     const SRD_Y: u8 = 76; const PSEL: u8 = 80;
     const SILU_MASK: u8 = 24;
 
-    struct G { spec: Spec }
+    struct G { spec: Spec, chains: u8, prefetch: bool, grouped: bool }
     impl G {
         fn arch(&self) -> Arch { self.spec.arch }
         fn nt(&self) -> u8 { self.spec.nt }
@@ -617,6 +642,9 @@ mod nt {
         fn d(&self, j: u8) -> u8 { self.sums_end() + 2 * self.aw() + 2 + j }
         fn x(&self, j: u8) -> u8 { (self.d(self.nt())).div_ceil(8) * 8 + self.aw() * j }
         fn live(&self, j: u8) -> u8 { LIVE0 + 2 * j }
+        fn cacc(&self, j: u8) -> u8 {
+            if j == 0 { CACC } else { self.x(self.nt()) + 8 * (j - 1) }
+        }
         // Epilogue temporaries: gate values over tile 0's activations, the
         // gfx11 lane exchange over the weight sets.
         fn gval(&self) -> u8 { self.x(0) }
@@ -651,6 +679,7 @@ mod nt {
             if self.gate_up() { p.v::<1>("lds_addr", LDSA, Live::Whole)?; }
             p.v::<8>("magic8", MAGIC8, kernel())?;
             p.v::<8>("cacc", CACC, kernel())?;
+            for j in 1..self.chains { p.v::<8>("tile_cacc", self.cacc(j), kernel())?; }
             p.v::<8>("fold_t", TPROD, kernel())?;
             p.v::<8>("scale_rows", SCF, kernel())?;
             for set in 0..2 {
@@ -732,6 +761,12 @@ mod nt {
             sop(b, format!("s_mov_b32 s{WGX}, s2"), &[WGX], &[2])?;
             sop(b, format!("s_mov_b32 s{WGY}, s3"), &[WGY], &[3])?;
         }
+        if g.grouped {
+            smem(b, 6, 2, 0, 0x40)?;
+            sop(b, format!("s_lshl_b32 s4, s{WGY}, 2"), &[4], &[WGY])?;
+            add64(b, 6, 6, 4)?;
+            smem(b, WGY, 1, 6, 0)?;
+        }
         // v1 = wave, v2 = lane, v3 = lr, v4 = hi.
         op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(0)])?;
         op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(0)])?;
@@ -759,6 +794,7 @@ mod nt {
         sop(b, format!("s_mov_b32 s{}, s11", SRD_S + 1), &[SRD_S + 1], &[11])?;
         sop(b, format!("s_lshr_b32 s5, s21, 2"), &[5], &[21])?;
         srd_tail(b, SRD_S, Some(5))?;
+        if !g.grouped {
         // Run position: lanes test tiles tile-1-back-lane; the first that is
         // before the start or another expert ends the run.
         sop(b, format!("s_mov_b32 s{BACK}, 0"), &[BACK], &[])?;
@@ -785,6 +821,7 @@ mod nt {
         sop(b, format!("s_and_b32 s{POS}, s{POS}, {}", nt - 1), &[POS], &[POS])?;
         let follower = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_lg_u32 s{POS}, 0"), vec![], vec![s(POS)]))?;
         wg.exit_if(follower, end)?;
+        }
         let b = wg.isa();
         // cnt: the first lane l < nt whose tile tile+l is past the end or of
         // another expert (lanes >= nt always stop).
@@ -915,7 +952,7 @@ mod nt {
     /// Fold weight set `p` into every live tile's sums; with `reload`, each
     /// tile's next-epoch activations are issued (through that descriptor)
     /// right after its fold, live or dead.
-    fn compute<T: Target>(w: &mut Wave<'_, T, Builder>, g: &G, p: usize, site: &str, reload: Option<u8>) -> Result<(), String> {
+    fn compute<T: Target + peacemaker_author::MmaIu4>(w: &mut Wave<'_, T, Builder>, g: &G, p: usize, site: &str, reload: Option<u8>) -> Result<(), String> {
         let b = w.isa();
         let a = g.arch();
         op(b, format!("v_cvt_f32_f16_e64 v{HF}, v{}.l", g.wh(p)), &[v(HF)], &[v(g.wh(p))])?;
@@ -928,6 +965,50 @@ mod nt {
             let r = g.wa(p) + i;
             op(b, format!("v_xor_b32_e32 v{r}, {}, v{r}", lit(REBIAS)), &[v(r)], &[v(r)])?;
         }
+        if !g.prefetch {
+            super::super::gemm_uk::Prefetch::<0>::wait_load(b)?;
+        }
+        if g.chains == 1 { return serial_tiles(w, g, p, site, reload); }
+        // The full-live path has no per-step predicates. Ragged runs retain
+        // the incumbent's skipped-tile arithmetic and output ownership.
+        for j in 0..g.nt() {
+            let b = w.isa();
+            let x = Instruction::new("", vec![], vec![v(g.d(j)), crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.x(j), len: g.aw() }]);
+            for (c, n, _) in b.ledger.required(&x) { b.wait(c, n)?; }
+        }
+        let full = w.scmp(Instruction::new(format!("s_cmp_eq_u32 s{CNT}, {}", g.nt()), vec![], vec![s(CNT)]))?;
+        w.if_else(full, &g.label(&format!("{site}_partial")), &g.label(&format!("{site}_join")), |w| {
+            match g.chains {
+                2 => full_tiles::<2, T>(w, g, p, reload),
+                4 => full_tiles::<4, T>(w, g, p, reload),
+                8 => full_tiles::<8, T>(w, g, p, reload),
+                _ => unreachable!("validated chain count"),
+            }
+        }, |w| serial_tiles(w, g, p, site, reload))?;
+        w.label(&g.label(&format!("{site}_join")))
+    }
+
+    fn full_tiles<const N: usize, T: Target + peacemaker_author::MmaIu4>(
+        w: &mut Wave<'_, T, Builder>, g: &G, p: usize, reload: Option<u8>,
+    ) -> Result<(), String> {
+        use super::super::gemm_uk::{Chain, Iu4};
+        let chain = Chain::<N, Iu4>::new(std::array::from_fn(|j| V::<8>(g.cacc(j as u8))), V::<8>(MAGIC8))?;
+        for first in (0..g.nt()).step_by(N) {
+            for i in 0..g.aw() / 2 {
+                chain.step(w, V::<2>(g.wa(p) + 2 * i),
+                    std::array::from_fn(|j| V::<2>(g.x(first + j as u8) + 2 * i)), i == 0)?;
+            }
+            for j in first..first + N as u8 {
+                let single = Chain::<1, Iu4>::new([V::<8>(g.cacc(j - first))], V::<8>(MAGIC8))?;
+                single.fold(w.isa(), [g.sum(j)], SCF, [g.d(j)], TPROD)?;
+                if let Some(srd) = reload { load_x(w.isa(), g, j, srd)?; }
+            }
+        }
+        Ok(())
+    }
+
+    fn serial_tiles<T: Target>(w: &mut Wave<'_, T, Builder>, g: &G, p: usize, site: &str, reload: Option<u8>) -> Result<(), String> {
+        let a = g.arch();
         for j in 0..g.nt() {
             let fold = |w: &mut Wave<'_, T, Builder>, ()| {
                 let b = w.isa();
@@ -937,15 +1018,12 @@ mod nt {
                 iu4_fold::fold_pass(b, CACC, g.sum(j), SCF, g.d(j), TPROD)
             };
             if j > 0 {
-                // Retire the tile's loads on both paths before joining.
                 let b = w.isa();
                 let x = Instruction::new("", vec![], vec![v(g.d(j)), crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.x(j), len: g.aw() }]);
                 for (c, n, _) in b.ledger.required(&x) { b.wait(c, n)?; }
                 let live = w.scmp(Instruction::new(format!("s_cmp_gt_u32 s{CNT}, {j}"), vec![], vec![s(CNT)]))?;
                 w.skip_unless(live, &g.label(&format!("{site}_dead{j}")), (), fold)?;
-            } else {
-                fold(w, ())?;
-            }
+            } else { fold(w, ())?; }
             if let Some(srd) = reload { load_x(w.isa(), g, j, srd)?; }
         }
         Ok(())
@@ -957,18 +1035,26 @@ mod nt {
         Ok(())
     }
 
-    fn kloop<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+    fn kloop<T: Target + peacemaker_author::MmaIu4>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
         wg.label(&g.label("k_begin"))?;
         let (head, done) = (g.label("k_loop"), g.label("k_loop_end"));
         let entry = wg.isa().ledger.shape();
         let no_trip = trips_cmp(wg, "s_cmp_eq_u32", TRIPS)?;
         wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
             wg.loop_carried(&head, (), |wg, ()| {
-                load_w(wg.isa(), g, 1)?;
-                compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
-                advance(wg.isa())?;
-                load_w(wg.isa(), g, 0)?;
-                compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
+                if g.prefetch {
+                    load_w(wg.isa(), g, 1)?;
+                    compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
+                    advance(wg.isa())?;
+                    load_w(wg.isa(), g, 0)?;
+                    compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
+                } else {
+                    compute(wg, g, 0, "l0", None)?;
+                    load_epoch(wg.isa(), g, 1)?;
+                    advance(wg.isa())?;
+                    compute(wg, g, 1, "l1", None)?;
+                    load_epoch(wg.isa(), g, 0)?;
+                }
                 let b = wg.isa();
                 op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
                 Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
@@ -979,20 +1065,33 @@ mod nt {
         match g.spec.kind {
             // K % 256 == 0: an even epoch count, two epochs left.
             Kind::GateUp => {
-                load_w(wg.isa(), g, 1)?;
-                compute(wg, g, 0, "t0", Some(SRD_X[1]))?;
-                compute(wg, g, 1, "t1", None)
+                tail_pair(wg, g)
             }
             // K % 128 == 0: one epoch left when K/128 is odd, else two.
             Kind::Down => {
                 let odd = wg.scmp(Instruction::new("s_bitcmp1_b32 s19, 7", vec![], vec![s(19)]))?;
                 wg.if_else(odd, &g.label("tail_odd"), &g.label("epilogue"), |w| {
-                    load_w(w.isa(), g, 1)?;
-                    compute(w, g, 0, "t0", Some(SRD_X[1]))?;
-                    compute(w, g, 1, "t1", None)
+                    tail_pair(w, g)
                 }, |w| compute(w, g, 0, "t2", None))
             }
         }
+    }
+
+    fn load_epoch(b: &mut Builder, g: &G, p: usize) -> Result<(), String> {
+        load_w(b, g, p)?;
+        for j in 0..g.nt() { load_x(b, g, j, SRD_X[p])?; }
+        Ok(())
+    }
+
+    fn tail_pair<T: Target + peacemaker_author::MmaIu4>(w: &mut Wave<'_, T, Builder>, g: &G) -> Result<(), String> {
+        if g.prefetch {
+            load_w(w.isa(), g, 1)?;
+            compute(w, g, 0, "t0", Some(SRD_X[1]))?;
+        } else {
+            compute(w, g, 0, "t0", None)?;
+            load_epoch(w.isa(), g, 1)?;
+        }
+        compute(w, g, 1, "t1", None)
     }
 
     /// RNE BF16 bits of `vals` (8 rows), +0 on padding slots, packed to this
@@ -1093,10 +1192,19 @@ mod nt {
     }
 
     pub(super) fn emit(spec: Spec) -> Result<Emitted, String> {
-        let g = G { spec };
+        emit_with(R4Spec { base: spec, chains: 1, prefetch: true, grouped: false })
+    }
+
+    pub(super) fn emit_with(r4: R4Spec) -> Result<Emitted, String> {
+        let spec = r4.base;
+        let g = G { spec, chains: r4.chains, prefetch: r4.prefetch, grouped: r4.grouped };
+        let experimental = g.chains != 1 || !g.prefetch || g.grouped;
+        let suffix = if experimental { format!("_r4c{}p{}{}", g.chains, u8::from(g.prefetch), if g.grouped { "g" } else { "" }) } else { String::new() };
+        let mut kernargs = spec.kernargs();
+        if g.grouped { kernargs.size = 72; kernargs = kernargs.pointer("tile_leaders", 64); }
         let kspec = KernelSpec {
-            kernel_id: "qwen4_moe_sym".into(), variant: format!("{}_nt{}", spec.kind.tag(), spec.nt), arch: spec.arch, symbol: spec.symbol(),
-            kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
+            kernel_id: "qwen4_moe_sym".into(), variant: format!("{}_nt{}{suffix}", spec.kind.tag(), spec.nt), arch: spec.arch, symbol: format!("{}{suffix}", spec.symbol()),
+            kernargs, user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
             workgroup_size: spec.threads() as u16, group_segment_fixed_size: spec.lds_bytes(), wave32: true, cu_mode: false,
         };
         let mut b = Builder::new(kspec, g.plan()?);
@@ -1105,7 +1213,7 @@ mod nt {
         b.finish()
     }
 
-    fn body<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+    fn body<T: Target + peacemaker_author::MmaIu4>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
         let gate = if g.gate_up() { Some(wg.lds::<Gate>("swiglu_gate", 0, g.spec.lds_bytes())?) } else { None };
         let end = wg.exit(&g.label("end"))?;
         prologue(wg, g, &end)?;

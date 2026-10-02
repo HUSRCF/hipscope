@@ -9,6 +9,10 @@ name = "peacemaker"
 path = "src/bin/peacemaker.rs"
 required-features = ["toolchain"]
 
+[[example]]
+name = "pm_r4_screen"
+required-features = ["toolchain"]
+
 [features]
 # gfx11 certification lifts the linked object with M7 (`pm_check`).
 toolchain = ["dep:radiowave", "lift"]
