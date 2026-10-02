@@ -28142,6 +28142,70 @@ impl Gpu {
         })
     }
 
+    /// The shared-down projection for the HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`):
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd`]'s GEMM and BF16 rounding of
+    /// `acc + 0.0f`, stored as BF16 bits to `out` (`[batch_size, m]`, at least
+    /// `batch_size * m * 2` bytes; the fold and HC write are then
+    /// [`Gpu::hc_row_fold_norm_gate`]'s).  Gate with
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies`].
+    /// idea from Gufo upstream (gufo-org/gufo @1071b361, MIT)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_bf16st(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        if !self.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(weight, m, k, batch_size)
+            || out.buf.size() < batch_size * m * 2
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_bf16_xf32_f16_wmma_qwen4_bf16st: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+        const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_bf16st";
+        let (module, source) = self.lds256_tile_module(ENTRY);
+        self.ensure_kernel(module, source, ENTRY)?;
+        let mut ap = w16;
+        let mut xp = x16;
+        let mut yp = out.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut lai = k as i32;
+        let mut lxi = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1];
+        self.launch_maybe_blob(ENTRY, grid, [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
     /// `Y[b, m] = Σ_k A[m, k]·X[b, k]` (A `[M, K]`, X `[B, K]` F16, Y `[B, M]`
     /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
     /// `tile.split > 1` the K-split partials go to the shared deterministic

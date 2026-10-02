@@ -8273,4 +8273,124 @@ mod tests {
             }
         }
     }
+
+    /// HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the BF16-store shared-down GEMM
+    /// plus `hc_row_fold_norm_gate` must leave the HC streams, the next read's F16
+    /// normalized row and its paired write's gate logits bytewise as the
+    /// zero-initialized combine, the `hcsd` fold + HC write GEMM and
+    /// `hyper_norm_gate_outputs` do, with dead (-1) routes, tied experts and
+    /// ragged token counts.
+    #[test]
+    fn hc_row_fold_is_bytewise_combine_hcsd_norm_gate_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let bf16_tensor = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(values), &[values.len() * 2])
+                .expect("bf16 upload");
+            t.dtype = DType::BF16;
+            t.shape = vec![values.len()];
+            t
+        };
+        let weight = bf16_tensor(&mut gpu, &test_wave(1, m * k, 0.3));
+        let norm_weight = bf16_tensor(&mut gpu, &test_wave(7, wide, 0.3));
+        let gate_weight = bf16_tensor(&mut gpu, &test_wave(8, 4 * wide, 0.05));
+        let ints = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for rows in [512usize, 530, 1100] {
+            let grouped_rows = rows * 10 + 16;
+            let grouped = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(9, grouped_rows * m, 2.0)), &[grouped_rows * m * 2])
+                .expect("grouped");
+            let inverse: Vec<i32> = (0..rows * 10)
+                .map(|i| if i % 13 == 5 { -1 } else { ((i * 7919) % grouped_rows) as i32 })
+                .collect();
+            let experts: Vec<i32> = (0..rows * 10).map(|i| ((i * 37) % 64) as i32).collect();
+            let inverse = gpu.upload_raw(&ints(&inverse), &[rows * 40]).expect("inverse");
+            let experts = gpu.upload_raw(&ints(&experts), &[rows * 40]).expect("experts");
+            let route_weights: Vec<f32> =
+                test_wave(10, rows * 10, 1.0).iter().map(|v| v.abs() / 3.0).collect();
+            let route_weights = gpu.upload_f32(&route_weights, &[rows * 10]).expect("weights");
+            let order = gpu.zeros(&[rows * 20], DType::F32).expect("order");
+            let x = gpu.upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k]).expect("x");
+            let selector = gpu.upload_f32(&test_wave(3, rows, 1.0), &[rows]).expect("selector");
+            let gates = gpu.upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4]).expect("gates");
+            let mut raw = bf16_le_bytes(&test_wave(6, rows * wide, 3.0));
+            raw.resize(rows * wide * 4, 0);
+            let streams = |gpu: &mut Gpu| {
+                let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                t.dtype = DType::F32;
+                t.shape = vec![rows * wide];
+                t
+            };
+            // Reference: zero-initialized combine, hcsd, hyper_norm_gate_outputs.
+            let routed = gpu.zeros(&[rows * m], DType::F32).expect("routed");
+            gpu.moe_down_combine_grouped_top10_bf16in(
+                &grouped, &inverse, &experts, &route_weights, &routed, &order, m, grouped_rows, rows, true,
+            )
+            .expect("combine");
+            let ref_streams = streams(&mut gpu);
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                &weight, &x, m, k, rows, &routed, &selector, &ref_streams, &gates, true, false,
+            )
+            .expect("hcsd");
+            let ref_gates = gpu.zeros(&[rows * 4], DType::F32).expect("ref gates");
+            let ref_row = gpu.zeros(&[rows * wide], DType::F16).expect("ref row");
+            hyper_norm_gate_outputs(
+                &mut gpu,
+                &HyperNormGateOutputs {
+                    input: &ref_streams,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    gates: &ref_gates,
+                    normalized_f16: &ref_row,
+                    rows,
+                    branches: 4,
+                    hidden: m,
+                    state_bf16: true,
+                },
+            )
+            .expect("norm gate");
+            // Row fold.
+            let new_streams = streams(&mut gpu);
+            let shared = gpu.zeros(&[rows * m], DType::F32).expect("shared");
+            let new_gates = gpu.zeros(&[rows * 4], DType::F32).expect("new gates");
+            let new_row = gpu.zeros(&[rows * wide], DType::F16).expect("new row");
+            gpu.moe_combine_order_top10(&inverse, &experts, &route_weights, &order, grouped_rows, rows)
+                .expect("order");
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(&weight, &x, m, k, rows, &shared)
+                .expect("bf16st");
+            gpu.hc_row_fold_norm_gate(&crate::hc_row_fold::HcRowFold {
+                grouped_down: &grouped,
+                order: &order,
+                shared_bf16: &shared,
+                selector: &selector,
+                streams: &new_streams,
+                gates: &gates,
+                norm_weight: &norm_weight,
+                gate_weight: &gate_weight,
+                next_gates: &new_gates,
+                normalized_f16: &new_row,
+                rows,
+                hidden: m,
+            })
+            .expect("row fold");
+            let words = |gpu: &Gpu, t: &GpuTensor| gpu.download_raw_bytes(t).expect("download");
+            for (name, want, got) in [
+                ("streams", words(&gpu, &ref_streams), words(&gpu, &new_streams)),
+                ("gate logits", words(&gpu, &ref_gates), words(&gpu, &new_gates)),
+                ("normalized f16 row", words(&gpu, &ref_row), words(&gpu, &new_row)),
+            ] {
+                assert_ne!(want.len(), 0);
+                assert!(want == got, "{name} differ: rows={rows}");
+            }
+        }
+    }
 }
