@@ -19,7 +19,9 @@
 //!    holds the globals stably sorted by GNU-hash bucket (`max(n / 4, 1)`
 //!    buckets); its Bloom filter has `NextPowerOf2(12 n / 64)` words, shift 26;
 //!    the SysV `.hash` has one bucket per `.dynsym` entry.
-//! 5. `.comment` is the pinned linker's identification string.
+//! 5. `.comment` is this writer's own stamp, `hipfire peacemaker native-emit <crate version>`
+//!    (NUL-terminated; the section is mergeable strings). Its length feeds
+//!    `.symtab`'s offset, so every later offset follows the stamp.
 use crate::Arch;
 use super::descriptor::{ENTRY_OFFSET, KD_SIZE};
 
@@ -34,8 +36,9 @@ const DYN: u64 = 16;
 const DYNAMIC_ENTRIES: u64 = 7;
 const KERNEL_ALIGN: u64 = 256;
 const S_NOP_0: u32 = 0xbf80_0000;
-/// `.comment` of the pinned ROCm `ld.lld` (AMD LLVM 23.0.0git, ROCm llvm-project 8f497e09).
-pub(crate) const LINKER_COMMENT: &str = "Linker: AMD LLD 23.0.0 (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)";
+/// `.comment`: the native writer's identity. It is deliberately not the ROCm linker's
+/// `Linker: AMD LLD ...` string, which would claim a tool that never ran.
+pub(crate) const NATIVE_COMMENT: &str = concat!("hipfire peacemaker native-emit ", env!("CARGO_PKG_VERSION"));
 const SHSTRTAB: &[u8] = b"\0.note\0.dynsym\0.gnu.hash\0.hash\0.dynstr\0.rodata\0.text\0.dynamic\0.relro_padding\0.comment\0.symtab\0.shstrtab\0.strtab\0";
 const NT_AMDGPU_METADATA: u32 = 32;
 const GNU_HASH_SHIFT2: u32 = 26;
@@ -137,7 +140,7 @@ pub(crate) fn link(arch: Arch, kernels: &[Kernel], metadata: &[u8]) -> Result<Ve
     let relro_addr = dynamic_addr + dynamic_size;
     let relro_size = align(relro_addr, PAGE) - relro_addr;
     let comment_off = dynamic_off + dynamic_size;
-    let comment_size = LINKER_COMMENT.len() as u64 + 1;
+    let comment_size = NATIVE_COMMENT.len() as u64 + 1;
     let symtab_off = align(comment_off + comment_size, 8);
     let symtab_size = (2 + names.len() as u64) * SYM;
     let shstrtab_off = symtab_off + symtab_size;
@@ -227,7 +230,7 @@ pub(crate) fn link(arch: Arch, kernels: &[Kernel], metadata: &[u8]) -> Result<Ve
     for (tag, value) in [(6u64, dynsym_off), (11, SYM), (5, dynstr_off), (10, dynstr.len() as u64), (0x6fff_fef5, gnu_hash_off), (4, hash_off), (0, 0)] {
         out.u64(tag); out.u64(value);
     }
-    let mut comment = LINKER_COMMENT.as_bytes().to_vec();
+    let mut comment = NATIVE_COMMENT.as_bytes().to_vec();
     comment.push(0);
     out.bytes(comment_off, &comment);
     // .symtab: null, local _DYNAMIC, then the globals in source order.

@@ -164,7 +164,7 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     json["profiled_co_sha256"] = format!("{:x}", Sha256::digest(fs::read(&build.elf).map_err(|e| e.to_string())?)).into();
     json["wait_replay_hazards_original"] = original_replay.len().into();
     json["wait_replay_hazards_profiled"] = profiled_replay.len().into();
-    json["parse_back"] = "pass".into();
+    json["parse_back"] = if build.parse_back_checked { "pass" } else { "skipped: llvm-objdump absent" }.into();
     let map_path = output.with_extension("map.json");
     fs::write(&map_path, serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     println!("DIAGNOSTIC {} sites={} delay_fixups={} vgpr {}->{} (limit {}) sgpr {}->{} kernarg {}+{}\n{}\n{}\n{}",

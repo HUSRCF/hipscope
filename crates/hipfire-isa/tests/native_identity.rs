@@ -1,8 +1,14 @@
 //! The native code-object writer against the ROCm oracle it replaces: every
 //! PM-emitted kernel symbol on gfx1100, gfx1151 and gfx1201, alone and in its
-//! product module, must link to the byte-identical code object `llvm-mc` +
-//! `ld.lld -shared` produce, and bundle to the byte-identical
-//! `clang-offload-bundler -bundle-align=4096` output.
+//! product module, must link to the code object `llvm-mc` + `ld.lld -shared`
+//! produce and bundle to the `clang-offload-bundler -bundle-align=4096` output,
+//! equal field by field and byte by byte in everything except the one place
+//! the writer differs on purpose: the `.comment` identification string (the
+//! oracle's is the ROCm linker's, the native one is the peacemaker native-emit
+//! stamp). The comparison and its exact normalization rules live in
+//! `support/native_compare.rs` (`compare_code_objects`, `compare_bundles`),
+//! shared with `hipfire-rip`'s `qsa` test; the strict whole-file comparison is
+//! kept there as `strict_whole_file_difference`.
 #![cfg(feature = "toolchain")]
 use hipfire_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2c, qsa_gather, qwen4_moe_sym};
 use hipfire_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
@@ -10,6 +16,9 @@ use hipfire_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use hipfire_isa::{native, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, reg::Live};
 use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, MmaIu4, Workgroup};
 use std::collections::BTreeMap;
+
+#[path = "support/native_compare.rs"]
+mod native_compare;
 
 const ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
 /// The host entry spelling of the committed `.hxaco` bundles.
@@ -138,30 +147,6 @@ fn corpus() -> Vec<Unit> {
     units
 }
 
-/// The section holding byte `at` of an ELF, for a mismatch report.
-fn section_at(elf: &[u8], at: usize) -> String {
-    let u16_ = |o: usize| u16::from_le_bytes([elf[o], elf[o + 1]]) as usize;
-    let u32_ = |o: usize| u32::from_le_bytes(elf[o..o + 4].try_into().unwrap()) as usize;
-    let u64_ = |o: usize| u64::from_le_bytes(elf[o..o + 8].try_into().unwrap()) as usize;
-    let (shoff, shnum, shstrndx) = (u64_(0x28), u16_(0x3c), u16_(0x3e));
-    if at < 64 { return "ELF header".into() }
-    if at >= shoff { return format!("section header {}", (at - shoff) / 64) }
-    let names = u64_(shoff + 64 * shstrndx + 24);
-    for i in 0..shnum {
-        let sh = shoff + 64 * i;
-        let (off, size) = (u64_(sh + 24), u64_(sh + 32));
-        if (off..off + size).contains(&at) && u32_(sh + 4) != 8 {
-            let name = &elf[names + u32_(sh)..];
-            return format!("{} +{:#x}", String::from_utf8_lossy(&name[..name.iter().position(|&b| b == 0).unwrap()]), at - off);
-        }
-    }
-    "padding/program headers".into()
-}
-
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    a.iter().zip(b).position(|(x, y)| x != y).or((a.len() != b.len()).then(|| a.len().min(b.len())))
-}
-
 #[test]
 fn native_code_objects_and_bundles_equal_the_rocm_oracle_for_every_symbol() {
     let toolchain = Toolchain { host_target: HOST.into(), ..Toolchain::default() };
@@ -181,11 +166,7 @@ fn native_code_objects_and_bundles_equal_the_rocm_oracle_for_every_symbol() {
         let (oracle_elf, oracle_bundle) = (std::fs::read(&oracle.elf).unwrap(), std::fs::read(&oracle.hsaco).unwrap());
         let verdict = native::assemble(&unit.text, unit.arch).map(|elf| {
             let bundle = native::bundle(&elf, unit.arch, HOST);
-            match (first_difference(&elf, &oracle_elf), first_difference(&bundle, &oracle_bundle)) {
-                (None, None) => None,
-                (Some(at), _) => Some(format!("code object differs at {at:#x} ({})", section_at(&oracle_elf, at))),
-                (None, Some(at)) => Some(format!("bundle differs at {at:#x}")),
-            }
+            native_compare::compare_native_to_oracle(&elf, &bundle, &oracle_elf, &oracle_bundle)
         });
         let identical = matches!(verdict, Ok(None));
         match verdict {

@@ -2,6 +2,9 @@ use hipfire_isa::{Arch, kernels::qsa_gather::{self, Kind, Spec}, pm_check,
     toolchain::{build, oracle_assemble_link_bundle, Toolchain}};
 use std::{fs, path::PathBuf};
 
+#[path = "../../hipfire-isa/tests/support/native_compare.rs"]
+mod native_compare;
+
 const SOURCE: &str = include_str!("../../hipfire-isa/src/kernels/qsa_gather.rip");
 
 #[test]
@@ -10,7 +13,7 @@ fn standalone_qsa_matches_rust_and_shipped_objects() {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("rip-qsa-{}", std::process::id())));
     fs::create_dir_all(&artifacts).unwrap();
     // Reproduce the shipped recipe, including hipcc's trailing-hyphen host target.
-    let tools = Toolchain { host_target: "host-x86_64-unknown-linux-gnu-".into(), ..Toolchain::default() };
+    let tools = Toolchain { host_target: "host-x86_64-unknown-linux-gnu-".into(), ..Toolchain::oracle() };
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
         let (rust, rust_text, rust_proof) = qsa_gather::emit_module(arch).unwrap();
         let (rip, rip_text, rip_proof) = hipfire_rip::module(SOURCE, arch,
@@ -32,8 +35,9 @@ fn standalone_qsa_matches_rust_and_shipped_objects() {
         let b = build(&tools, &ds, &dir.join("rip.hxaco"), arch.name()).unwrap();
         // The native writer against the ROCm oracle on the `.rip` module.
         let oracle = oracle_assemble_link_bundle(&tools, &ds, &dir.join("rip-oracle.hxaco"), arch.name()).unwrap();
-        assert_eq!(fs::read(&b.elf).unwrap(), fs::read(&oracle.elf).unwrap(), "native code object vs llvm-mc + ld.lld");
-        assert_eq!(fs::read(&b.hsaco).unwrap(), fs::read(&oracle.hsaco).unwrap(), "native bundle vs clang-offload-bundler");
+        let difference = native_compare::compare_native_to_oracle(&fs::read(&b.elf).unwrap(), &fs::read(&b.hsaco).unwrap(),
+            &fs::read(&oracle.elf).unwrap(), &fs::read(&oracle.hsaco).unwrap());
+        assert!(difference.is_none(), "{} native code object/bundle vs llvm-mc + ld.lld + clang-offload-bundler: {}", arch.name(), difference.unwrap_or_default());
         assert_eq!(fs::read(&a.elf).unwrap(), fs::read(&b.elf).unwrap(), "code object");
         assert_eq!(fs::read(&a.hsaco).unwrap(), fs::read(&b.hsaco).unwrap(), "bundle");
         let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels")

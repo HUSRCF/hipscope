@@ -294,7 +294,7 @@ mod toolchain {
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("v2c.s");
         std::fs::write(&s, &text).unwrap();
-        let toolchain = Toolchain::default();
+        let toolchain = Toolchain::oracle();
         let build = build(&toolchain, &s, &dir.join("v2c.hsaco"), "gfx1100").unwrap();
         for epi in iu4_v2c::Epi::ALL {
             let symbol = iu4_v2c::Spec { arch: Arch::Gfx1100, epi }.symbol();
@@ -318,7 +318,7 @@ mod toolchain {
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("v2b.s");
         std::fs::write(&s, &text).unwrap();
-        let build = build(&Toolchain::default(), &s, &dir.join("v2b.hsaco"), "gfx1151").unwrap();
+        let build = build(&Toolchain::oracle(), &s, &dir.join("v2b.hsaco"), "gfx1151").unwrap();
         for epi in iu4_v2b::Epi::ALL {
             let symbol = iu4_v2b::Spec { arch: Arch::Gfx1151, epi }.symbol();
             assert_eq!(pm_check::lds_bounds(&text, &symbol, iu4_v2b::WAVES, iu4_v2b::LDS_BYTES).unwrap(), iu4_v2b::LDS_BYTES);
