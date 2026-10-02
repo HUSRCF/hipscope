@@ -126,6 +126,7 @@
 
 ### Internal & CI
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
+- The experimental MW16 GEMM route (`kernel.mw16` / `HIPFIRE_MW16`, default off) is removed together with its call-site predicates and tests; the live F16 mw16 kernels stay. Kernel packs are unchanged.
 - **Perf: Qwen AR (and the generic AR and secondary AR loops) and the DFlash/MTP spec emitter append each token's bytes to one buffer instead of re-decoding the whole generated history every token.** The think-budget scans read that buffer too. `Tokenizer::decode_token_bytes_into` is the per-token decode; `decode_bytes` is built on it.
 - **Perf: `process_value`/`developer_var` answer from a table rendered once from the active policy, not a scan of the whole config schema plus three allocations per call.** The DSpark drafter's Q8/HFQ4 GEMM knobs (`HIPFIRE_DSPARK_Q8_WMMA`, `_Q8_4W`, `_HFQ4_WMMA`) are read once per process instead of on every GEMM.
 - Usage accounting is unchanged and now pinned by a test: Qwen AR/spec/batch count the EOS token in `completion_tokens`; DeepSeek V4 and LFM do not.
