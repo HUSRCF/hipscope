@@ -295,16 +295,17 @@ const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
 
-/// Largest extent HIP accepts on `gridDim.y` / `gridDim.z` (gfx1201 rejects
-/// 65536 and above; `gridDim.x` is unbounded). A token/row-scaled axis either
-/// rides `grid.x` or is launched in pieces of at most this many units.
+/// Largest safe extent on `gridDim.y` / `gridDim.z` (measured on gfx1201:
+/// 65536 workgroups are addressed correctly, larger module launches alias
+/// `blockIdx` modulo 65536; `gridDim.x` is unbounded). A token/row-scaled axis
+/// either rides `grid.x` or is launched in pieces of at most this many units.
 const GRID_YZ_MAX: usize = hip_bridge::GFX1201_MAX_GRID_YZ as usize;
 
 /// `(start, len)` pieces of `total` units, each `len <= GRID_YZ_MAX`, in
 /// order. A launcher that keeps a token/row axis on `grid.y`/`grid.z` runs one
 /// launch per piece with the per-row pointers advanced by `start` rows, so no
 /// row is truncated and every output is computed by the same arithmetic.
-fn grid_yz_chunks(total: usize) -> impl Iterator<Item = (usize, usize)> {
+pub(crate) fn grid_yz_chunks(total: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..total.div_ceil(GRID_YZ_MAX)).map(move |i| {
         let start = i * GRID_YZ_MAX;
         (start, (total - start).min(GRID_YZ_MAX))
@@ -330,7 +331,7 @@ fn folded_rows_grid(what: &str, groups: usize, rows: usize) -> HipResult<[u32; 3
 
 /// `ptr` advanced by `bytes` (chunked launches address later rows of a
 /// device buffer; the kernels only touch rows inside the original extent).
-fn ptr_add_bytes(ptr: *mut c_void, bytes: usize) -> *mut c_void {
+pub(crate) fn ptr_add_bytes(ptr: *mut c_void, bytes: usize) -> *mut c_void {
     (ptr as *mut u8).wrapping_add(bytes) as *mut c_void
 }
 

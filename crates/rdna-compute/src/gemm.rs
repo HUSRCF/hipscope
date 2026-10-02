@@ -1172,29 +1172,35 @@ impl Gpu {
             return self.gemm_hfq4g128_mmq_gfx1151(a_raw, x, y, m, k, batch_size);
         }
         self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
-        let batch_tiles = ((batch_size + 7) / 8) as u32;
-        launch_params_blob!(
-            self,
-            "gemm_hfq4g128",
-            [m as u32, batch_tiles, 1],
-            [32, 1, 1],
-            0,
-            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
-        )
+        let a_ptr = a_raw.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // 8-row batch tiles ride grid.y: launch row pieces of at most
+        // GRID_YZ_MAX tiles with X/Y advanced to the piece's first row.
+        for (start, n) in crate::gemv::grid_yz_chunks(batch_size.div_ceil(8)) {
+            let row0 = start * 8;
+            let rows = (n * 8).min(batch_size - row0);
+            let x_ptr = crate::gemv::ptr_add_bytes(x.buf.as_ptr(), row0 * k * 4);
+            let y_ptr = crate::gemv::ptr_add_bytes(y.buf.as_ptr(), row0 * m * 4);
+            let bs_val = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &bs_val as *const _ as *mut c_void,
+            ];
+            launch_params_blob!(
+                self,
+                "gemm_hfq4g128",
+                [m as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+            )?;
+        }
+        Ok(())
     }
 
     /// gfx1151 i8 MMQ dispatch helper for HFQ4-G128. Pre-quantizes X to
@@ -28984,28 +28990,26 @@ impl Gpu {
         };
         self.ensure_kernel(module, source, symbol)?;
         let ap = a_f16.buf.as_ptr();
-        let xp = x_f16.buf.as_ptr();
-        let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
-        let grid_m = ((m + 15) / 16) as u32;
-        let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
-            module,
-            [grid_m, grid_b, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
+        let mi = m as i32;
+        let ki = k as i32;
+        let grid_m = m.div_ceil(16) as u32;
+        // 16-row batch tiles ride grid.y: launch row pieces of at most
+        // GRID_YZ_MAX tiles with X/Y advanced to the piece's first row.
+        for (start, n) in crate::gemv::grid_yz_chunks(batch_size.div_ceil(16)) {
+            let row0 = start * 16;
+            let rows = (n * 16).min(batch_size - row0);
+            let xp = crate::gemv::ptr_add_bytes(x_f16.buf.as_ptr(), row0 * k * 2);
+            let yp = crate::gemv::ptr_add_bytes(y_f32.buf.as_ptr(), row0 * m * 4);
+            let bi = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &ap as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mi as *const _ as *mut c_void,
+                &ki as *const _ as *mut c_void,
+                &bi as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(module, [grid_m, n as u32, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ap);
                 b.push_ptr(xp);
@@ -29014,8 +29018,9 @@ impl Gpu {
                 b.push_i32(ki);
                 b.push_i32(bi);
                 b
-            },
-        )
+            })?;
+        }
+        Ok(())
     }
 
     /// LDS-staged 128×128 macro-tile GEMM: `Y[b, m] = bias[m] + Σ_k A[m,k]·X[b,k]`.
