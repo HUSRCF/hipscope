@@ -26,6 +26,7 @@ mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
 pub mod grouped_ops;
+pub mod hc_row_fold;
 pub mod kernel_pack;
 pub mod kernel_registry;
 mod kernels;
