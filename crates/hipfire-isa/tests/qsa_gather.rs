@@ -78,7 +78,7 @@ mod toolchain {
             std::fs::create_dir_all(&dir).unwrap();
             let s = dir.join("module.s");
             std::fs::write(&s, &text).unwrap();
-            let toolchain = Toolchain::default();
+            let toolchain = Toolchain::oracle();
             let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
             for kind in Kind::ALL {
                 let symbol = Spec { arch, kind }.symbol();

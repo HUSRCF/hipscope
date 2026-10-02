@@ -1,12 +1,12 @@
 //! Offline R4 MoE schedule inventory: emit, assemble, lift and record resources.
 //! Run with --features toolchain and an evidence directory argument.
-use hipfire_isa::{Arch, kernels::qwen4_moe_sym::{self, Kind, Spec, R4Spec}, toolchain::{Toolchain, assemble_link_bundle}};
+use hipfire_isa::{Arch, kernels::qwen4_moe_sym::{self, Kind, Spec, R4Spec}, toolchain::{Toolchain, build}};
 use serde_json::json;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(std::env::args().nth(1).ok_or("evidence directory required")?);
     fs::create_dir_all(&root)?;
-    let tools = Toolchain::default();
+    let tools = Toolchain::oracle();
     let route_file = PathBuf::from(std::env::args().nth(2).ok_or("captured top10 i32 route required")?);
     let mut counts = vec![0u32; 512];
     let route_bytes = fs::read(route_file)?;
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 fs::write(&source, &e.s_text)?;
                                 fs::write(root.join(format!("{name}.proof.json")), serde_json::to_vec_pretty(&e.proof)?)?;
                                 row["shape"] = serde_json::to_value(&e.shape)?;
-                                let build = assemble_link_bundle(&tools, &source, &root.join(format!("{name}.hxaco")), arch.name())?;
+                                let build = build(&tools, &source, &root.join(format!("{name}.hxaco")), arch.name())?;
                                 let bytes = fs::read(&build.elf)?;
                                 let lifted = peacemaker_lift::lift_object(&bytes, peacemaker_lift::Options {frontend:peacemaker_ir::inst::Frontend::Builder})?;
                                 if peacemaker_lift::emit::module(&lifted.program)? != bytes { return Err(format!("{name}: lift identity differs").into()); }

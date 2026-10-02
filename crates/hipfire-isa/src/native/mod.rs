@@ -1,6 +1,9 @@
 //! Native code-object emission: the builder's `.s` (one kernel or a product
-//! module) → the code object `llvm-mc` + `ld.lld -shared` produce, and its
-//! HIP offload bundle — no ROCm tool in the path.
+//! module) → a code object laid out exactly as `llvm-mc` + `ld.lld -shared`
+//! lay it out, and its HIP offload bundle — no ROCm tool in the path. The
+//! only byte difference from the ROCm oracle is the `.comment` stamp
+//! (`hipfire peacemaker native-emit <version>` instead of the linker's
+//! identification string) and the file offsets that follow it.
 //!
 //! Each instruction line is lowered to a `peacemaker_ir` instruction by
 //! `peacemaker_lift::text::parse_line` and encoded by the gfx11/gfx12

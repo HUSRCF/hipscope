@@ -26,6 +26,11 @@ pub struct Toolchain {
     /// ROCm `hipcc` uses the trailing-hyphen spelling; the hand-assembly
     /// control in §2.4 used the target without it.
     pub host_target: String,
+    /// When false (production default), [`build`] skips the objdump parse-back
+    /// with one logged line if `objdump` is not an installed file; when true
+    /// (see [`Toolchain::oracle`]) parse-back is mandatory and an absent
+    /// `llvm-objdump` is an error.
+    pub require_objdump: bool,
 }
 
 impl Default for Toolchain {
@@ -39,8 +44,13 @@ impl Default for Toolchain {
             objdump: llvm.join("llvm-objdump"), readobj: llvm.join("llvm-readobj"),
             hipcc: root.join("bin/hipcc"),
             host_target: crate::native::DEFAULT_HOST_TARGET.into(),
+            require_objdump: false,
         }
     }
+}
+impl Toolchain {
+    /// The test/oracle toolchain: ROCm discovery as [`Default`], parse-back mandatory.
+    pub fn oracle() -> Self { Self { require_objdump: true, ..Self::default() } }
 }
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
@@ -167,7 +177,14 @@ pub fn parse_back(source: &str, disassembly: &str) -> Result<()> {
             let canonical_author = if a == "s_barrier_wait" && author.ends_with(" -1") {
                 author.replace(" -1", " 0xffff")
             } else { author.to_string() };
-            let canonical_decoded = if author.contains(".h") || author.contains(".l") {
+            // Source may spell the same redundant op_sel the disassembler
+            // prints; normalize both sides identically so only a select not
+            // implied by the `.h`/`.l` operand spelling can differ.
+            let has_half = author.contains(".h") || author.contains(".l");
+            let canonical_author = if has_half {
+                redundant_op_sel(&canonical_author).unwrap_or(canonical_author)
+            } else { canonical_author };
+            let canonical_decoded = if has_half {
                 redundant_op_sel(decoded).unwrap_or_else(|| decoded.to_string())
             } else { decoded.to_string() };
             if normalize(&canonical_author) != normalize(&canonical_decoded) {
@@ -355,7 +372,10 @@ pub fn read_kd(object: &Path, symbol: &str) -> Result<Gfx12KernelImageFields> {
 pub struct BuildOutput {
     pub hsaco: PathBuf,
     pub elf: PathBuf,
+    /// `llvm-objdump` disassembly of `elf`; empty when `parse_back_checked` is false.
     pub disassembly: String,
+    /// Whether the disassembly was parsed back to the source (see [`build`]).
+    pub parse_back_checked: bool,
     pub argv: Vec<String>,
     pub tools: Vec<PeacemakerTool>,
 }
@@ -399,8 +419,11 @@ fn wait_arch(arch: &str) -> Result<crate::Arch> {
 }
 /// The production build: the native writer (`crate::native`) emits the code
 /// object (`<output stem>.co`) and its HIP bundle (`output`) — no ROCm
-/// assembler, linker or bundler — then the linked object's disassembly must
-/// parse back to the source.
+/// assembler, linker or bundler. The linked object's `llvm-objdump`
+/// disassembly then must parse back to the source; if `toolchain.objdump` is
+/// not an installed file and `toolchain.require_objdump` is false, that check
+/// is skipped with one `eprintln!` line (`parse_back_checked` is false and
+/// `disassembly` empty). With `require_objdump` an absent objdump is an error.
 pub fn build(toolchain: &Toolchain, source: &Path, output: &Path, arch: &str) -> Result<BuildOutput> {
     let target: crate::Arch = arch.parse().map_err(|_| format!("unsupported AMDGPU architecture: {arch}"))?;
     let elf = output.with_extension("").with_extension("co");
@@ -414,16 +437,23 @@ pub fn build(toolchain: &Toolchain, source: &Path, output: &Path, arch: &str) ->
         format!("--co={}", elf.display()), format!("--bundle={}", output.display()), format!("--host-target={}", toolchain.host_target)];
     let tools = vec![PeacemakerTool { role: PeacemakerToolRole::Native, path: exe.clone(), version: crate::native::VERSION.into(),
         argv: argv.clone(), sha256: file_digest(&exe)? }];
-    let disassembly = invoke(&toolchain.objdump,
-        &["--disassemble".into(), format!("--mcpu={arch}"), elf.display().to_string()])?;
-    parse_back(&source_text, &disassembly)?;
-    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, argv, tools })
+    let (disassembly, parse_back_checked) = if toolchain.require_objdump || toolchain.objdump.is_file() {
+        let disassembly = invoke(&toolchain.objdump,
+            &["--disassemble".into(), format!("--mcpu={arch}"), elf.display().to_string()])?;
+        parse_back(&source_text, &disassembly)?;
+        (disassembly, true)
+    } else {
+        eprintln!("peacemaker: parse-back skipped: {} not found", toolchain.objdump.display());
+        (String::new(), false)
+    };
+    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, parse_back_checked, argv, tools })
 }
 
 /// TEST ORACLE ONLY: the ROCm path the native writer replaces (`llvm-mc`,
 /// `ld.lld -shared`, `clang-offload-bundler -bundle-align=4096`; no HIP
-/// compilation or compression). The intermediate object is `<stem>.o`; no
-/// parse-back (that is [`build`]'s certification step).
+/// compilation or compression). The intermediate object is `<stem>.o`.
+/// `llvm-objdump` and the parse-back are mandatory here, whatever
+/// `toolchain.require_objdump` says.
 pub fn oracle_assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
     arch: &str) -> Result<BuildOutput> {
     if !matches!(arch, "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151") {
@@ -449,7 +479,9 @@ pub fn oracle_assemble_link_bundle(toolchain: &Toolchain, source: &Path, output:
     invoke(&toolchain.bundler, &bundle_args)?;
     let disassembly = invoke(&toolchain.objdump,
         &["--disassemble".into(), format!("--mcpu={arch}"), elf.display().to_string()])?;
-    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, argv, tools })
+    let source_text = fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+    parse_back(&source_text, &disassembly)?;
+    Ok(BuildOutput { hsaco: output.into(), elf, disassembly, parse_back_checked: true, argv, tools })
 }
 
 /// Bind the final HIP bundle and optional shape evidence to schema-5 radiowave.
@@ -459,6 +491,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
     let mut request = ExistingCodeObjectRequest::new(source, &build.hsaco, arch)
         .hipcc(&toolchain.hipcc).manifest(manifest).command(build.argv.clone());
     if let Some(contract) = contract {
+        if build.disassembly.is_empty() {
+            return Err(format!("shape contract for {} needs the llvm-objdump disassembly, which this build skipped ({} absent)",
+                contract.symbol, toolchain.objdump.display()));
+        }
         let inspection = radiowave::Inspector::from_hipcc(&toolchain.hipcc)
             .inspect(&build.hsaco, arch).map_err(|e| e.to_string())?;
         let report = inspection.kernels.iter().find(|kernel| kernel.name == contract.symbol)
@@ -622,6 +658,15 @@ mod tests {
         assert!(parse_back(source, &decoded("[1,0]")).is_ok());
         // A dst-high select the source never spelled must not be hidden.
         assert!(parse_back(source, &decoded("[1,1]")).is_err());
+    }
+    #[test]
+    fn parse_back_accepts_source_spelling_redundant_op_sel() {
+        let source = "v_cvt_f16_f32_e64 v128.h, v41 op_sel:[0,1]\ns_endpgm";
+        let decoded = |sel: &str| format!("000000 <k>:\n v_cvt_f16_f32_e64 v128.h, v41 op_sel:{sel} // 0\n s_endpgm // 0");
+        assert!(parse_back(source, &decoded("[0,1]")).is_ok());
+        // A select contradicting the `.h` spelling must still be reported.
+        assert!(parse_back(source, &decoded("[1,1]")).is_err());
+        assert!(parse_back(source, &decoded("[0,0]")).is_err());
     }
     #[test]
     fn shape_counts_packets_not_wmma_as_valu() {
