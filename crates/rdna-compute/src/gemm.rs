@@ -44645,26 +44645,21 @@ const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
 const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 
-/// `HIPFIRE_QWEN4_TRUNK_IU4=1` opts gfx1151 Qwen4 prefill into the dense IU4
-/// route for a symmetric MQ4G256V2 trunk (the linear_attn / self_attn
-/// projections): A4 activations from the dense producers and the dense SET
-/// GEMMs (V2B / PeaceMaker `pm_v2b` where eligible, X5 / symfold otherwise).
-/// Applies only once the Qwen4 forward verified every trunk header
-/// ([`Gpu::qwen4_trunk_iu4`]). Unset or `0` keeps exact activations. Read once.
-static QWEN4_TRUNK_IU4: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_TRUNK_IU4", false));
-
 /// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
 /// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
 impl Gpu {
-    /// The trunk route is requested and possible: the flag, exact gfx1151 and
-    /// the IU4 prefill / symmetric-fold switches the dense SET kernels need.
-    /// The artifact's `mq4v2.symmetric` marker is not required (Qwen4
-    /// artifacts record expert symmetry separately): the forward verifies
-    /// every trunk header on the device and only then claims the symmetric
-    /// contract (`mq4v2_symmetric`) the dense SET kernels read.
+    /// The trunk route is requested and possible: `HIPFIRE_QWEN4_TRUNK_IU4`
+    /// selects at least one projection family
+    /// ([`crate::trunk_mask::qwen4_trunk_iu4_mask`]; an unparsable value is
+    /// an error the Qwen4 forward reports at load, here it reads as off),
+    /// exact gfx1151 and the IU4 prefill / symmetric-fold switches the dense
+    /// SET kernels need. The artifact's `mq4v2.symmetric` marker is not
+    /// required (Qwen4 artifacts record expert symmetry separately): the
+    /// forward verifies every MQ4 trunk header on the device and only then
+    /// claims the symmetric contract (`mq4v2_symmetric`) the dense SET
+    /// kernels read.
     pub fn qwen4_trunk_iu4_requested(&self) -> bool {
-        *QWEN4_TRUNK_IU4
+        crate::trunk_mask::qwen4_trunk_iu4_mask().is_ok_and(|mask| !mask.is_empty())
             && self.arch == "gfx1151"
             && self.flags.iu4_prefill_enabled()
             && self.flags.gfx11_iu4_symfold

@@ -51,6 +51,11 @@ pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
 pub mod vae;
+pub mod trunk_mask;
+pub use trunk_mask::{
+    qwen4_trunk_iu4_mask, Qwen4TrunkMask, TrunkFamily, TRUNK_ALL_BITS, TRUNK_GDN_BITS,
+    TRUNK_QSA_BITS,
+};
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
