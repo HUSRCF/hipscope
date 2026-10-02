@@ -8,7 +8,7 @@
 //!
 //! ```sh
 //! ROCR_VISIBLE_DEVICES=GPU-e475645fe0200397 \
-//!   cargo run --release -p railgun --example mc_g2 -- --out DIR
+//!   cargo run --release -p railgun --features mc-g2 --example mc_g2 -- --out DIR
 //! ```
 //!
 //! Every device image is compared byte for byte over whole allocations
