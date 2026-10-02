@@ -2377,11 +2377,12 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
-/// Native Qwen4 MTP has no validated exact-prefix rehydrate path yet. Keep
-/// those requests on a cold full-prefix replay, including transitions from an
-/// AR turn whose host conversation cache still looks like a strict extension.
-/// Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the loaded model's
-/// family decides, never the speculator's name.
+/// Native Qwen4 MTP never uses the shared conversation-LCP planner: generated
+/// history is not canonical prefill state. Its cache is the bundle's
+/// whole-chunk checkpoint (`Qwen4Bundle::plan_prefix`), planned separately,
+/// including for transitions from an AR turn. Qwen3.5/3.6/3.8 MTP and
+/// DFlash keep the prompt cache: the loaded model's family decides, never
+/// the speculator's name.
 pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
     env_disabled || native_qwen4_mtp
 }
@@ -3074,6 +3075,30 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
+    // Native Qwen4 MTP keeps the shared conversation-LCP planner off
+    // (`spec_cache_disabled_for`): its only reusable prefix is the bundle's
+    // whole-chunk checkpoint, planned against this same canonical render.
+    // The drafter's prefill restores it (or resets) and replays the suffix.
+    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash) =
+        match m.qwen4().filter(|_| spec_name == "mtp") {
+            Some(bundle) => {
+                let start = bundle
+                    .plan_prefix(
+                        &prompt_tokens,
+                        hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp,
+                    )
+                    .start_pos;
+                if start > 0 {
+                    m.seq_pos = start;
+                    m.conversation_tokens.clear();
+                    m.conversation_tokens.extend_from_slice(&prompt_tokens[..start]);
+                    (prompt_tokens[start..].to_vec(), start, true, start)
+                } else {
+                    (prompt_tokens.clone(), 0, false, 0)
+                }
+            }
+            None => (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash),
+        };
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
@@ -3379,6 +3404,9 @@ pub fn generate_dflash(
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
+                if let Some(bundle) = m.qwen4_mut() {
+                    bundle.commit_prefix();
+                }
                 // No post-commit tool_calls event; calls live on staged terminal.
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
@@ -3570,6 +3598,9 @@ pub fn generate_dflash(
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
+        }
+        if let Some(bundle) = m.qwen4_mut() {
+            bundle.commit_prefix();
         }
         // Safe stop/tool_calls only — length never stores; Abort suppressed above.
         if effects.store_cache {
@@ -4441,7 +4472,8 @@ pub fn generate_spec(
         if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
             // Prefer a window-local repair: restore the pre-window target/drafter
             // snapshot and replay only the consumed prefix. Speculators without
-            // that capability retain the conservative reset + cache invalidation.
+            // that capability drop live state via the target's terminal reset
+            // (Qwen4: rewind to its durable prefix checkpoint) + cache invalidation.
             let repaired = match spec.repair_terminal_prefix(
                 gpu,
                 slot,
@@ -4487,9 +4519,9 @@ pub fn generate_spec(
             let reset_error = if repaired {
                 None
             } else {
-                slot.reset_recurrent(gpu)
+                slot.reset_after_unrepaired_terminal(gpu)
                     .err()
-                    .map(|e| format!("reset_recurrent: {e}"))
+                    .map(|e| format!("reset_after_unrepaired_terminal: {e}"))
                     .or_else(|| {
                         spec.reset_for_realign(gpu)
                             .err()
@@ -7581,8 +7613,8 @@ mod pp_forward_order_tests {
 /// `forward_scratch` bundle.  Keep this body behind the existing AR route
 /// scheduler and semantic producer: the only architecture-specific operation
 /// here is the carrier-owned [`Qwen4Bundle::forward_chunk`]/
-/// [`Qwen4Bundle::forward_token`] call.  Prompt state is reset at the start of
-/// every turn until a verified prompt-cache contract exists for Qwen4.
+/// [`Qwen4Bundle::forward_token`] call.  Prompt state is restored from the
+/// bundle's whole-chunk prefix checkpoint when one matches, else reset.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_qwen4_ar(
     m: &mut LoadedModel,
@@ -7771,29 +7803,19 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // Qwen4 state has no validated prefix-cache splice yet.  Reset before
-    // replaying the canonical rendered prompt so retry and multi-turn paths
-    // cannot mix old QSA/GDN/PLE state with a new prompt.
-    if m.seq_pos != 0 || !m.conversation_tokens.is_empty() {
-        let reset = m
-            .qwen4_mut()
-            .ok_or_else(|| "qwen4 AR state disappeared before reset".to_string())
-            .and_then(|bundle| bundle.reset(gpu).map_err(|error| error.to_string()));
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        if let Err(error) = reset {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!("qwen4 pre-generation reset failed: {error}"),
-                "gpu",
-                false,
-                &ep,
-            );
-            return;
-        }
-    }
+    // Plan against the bundle's durable whole-chunk checkpoint (pure; no
+    // state touched). The prefill callback then resets on a miss or restores
+    // it on a hit and replays `prompt_tokens[start_pos..]` in the cold
+    // schedule's global chunks. Host mirrors are rebuilt from the full
+    // prompt after a successful prefill.
+    let prefix_plan = m
+        .qwen4()
+        .map(|bundle| {
+            bundle.plan_prefix(&prompt_tokens, hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar)
+        })
+        .unwrap_or_default();
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
 
     crate::ar::generate_ar_with_forward(
         m,
@@ -7817,6 +7839,7 @@ pub fn generate_qwen4_ar(
         started_in_think,
         stop,
         true,
+        prefix_plan.start_pos,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
@@ -7827,7 +7850,7 @@ pub fn generate_qwen4_ar(
                 .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
                 .and_then(|bundle| {
                     bundle
-                        .forward_chunk_final(device, tokens, logits, None)
+                        .prefill_final(device, tokens, prefix_plan, logits)
                         .map_err(|error| error.to_string())
                 })
         },
@@ -7840,6 +7863,11 @@ pub fn generate_qwen4_ar(
                         .forward_token_or_argmax(device, token, logits)
                         .map_err(|error| error.to_string())
                 })
+        },
+        |model| {
+            if let Some(bundle) = model.qwen4_mut() {
+                bundle.commit_prefix();
+            }
         },
     );
 }

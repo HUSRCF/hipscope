@@ -211,6 +211,16 @@ pub trait SpecTarget {
     /// so production rollback can attest `rolled_back:false`.
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Discard live decode state after a terminal stop inside a speculative
+    /// window that [`Speculator::repair_terminal_prefix`] could not repair.
+    /// The caller drops its host history and never extends this state; the
+    /// next request prefills anew. Default: [`Self::reset_recurrent`]. A
+    /// target whose prompt cache is a durable checkpoint that live decode
+    /// rows never overwrite may rewind to it instead, so it survives the stop.
+    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset_recurrent(gpu)
+    }
+
     /// Whether this target's architecture reset-core is complete enough for
     /// serve-hardening retry. Default `false` (explicitly ineligible). Retry
     /// candidates override to `true` only when recurrent/EF/KV/cache/graph/
