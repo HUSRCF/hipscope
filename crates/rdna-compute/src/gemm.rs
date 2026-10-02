@@ -44639,6 +44639,22 @@ const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
     ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4"],
     ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"],
 ];
+/// gfx1151 builder down entries with a row repeat of 2 and 4 (NT4 expert-run
+/// tiles, `rr` contiguous 64-row blocks per workgroup), `[rr2, rr4]`. Same
+/// bytes as the rr1 entry above; the VRAM-resident and host-mapped residency
+/// share them (gfx1151 has one NT4 width).
+const QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR: [&str; 2] =
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r2", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4"];
+/// `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4; unset = 1): down-GEMM row
+/// repeat on the gfx1151 builder entries, see [`Gpu::qwen4_moe_sym_down_rr`].
+/// `Err` holds a rejected value. Read once.
+static QWEN4_MOE_SYM_DOWN_RR: LazyLock<Result<usize, String>> =
+    LazyLock::new(|| match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_DOWN_RR").ok().as_deref() {
+        None | Some("1") => Ok(1),
+        Some("2") => Ok(2),
+        Some("4") => Ok(4),
+        Some(bad) => Err(bad.to_string()),
+    });
 /// Builder GEMMs divide `slot / x_row_div` through an f32 reciprocal that is
 /// exact (after two integer corrections) only for slots below 2^22.
 const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
@@ -44694,15 +44710,36 @@ impl Gpu {
     /// `[gate/up, down]` entry names the route's GEMM launchers run on this
     /// device for experts in VRAM or (`host_mapped`) in host-mapped memory:
     /// the builder entries, or the gfx1151 hipcc entries under
-    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. `None` off gfx1151/gfx1201.
+    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. The down entry carries the row repeat of
+    /// [`Gpu::qwen4_moe_sym_down_rr`]; the launcher's `m % (64 * rr)` check
+    /// is what keeps its grid covering every row. `None` off gfx1151/gfx1201.
     pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
         let arch = self.qwen4_moe_sym_arch_index()?;
         let h = host_mapped as usize;
         Some(if arch == 1 || *QWEN4_MOE_SYM_PM {
-            [QWEN4_MOE_SYM_PM_GATE_UP[arch][h], QWEN4_MOE_SYM_PM_DOWN[arch][h]]
+            let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
+                2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
+                4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
+                _ => QWEN4_MOE_SYM_PM_DOWN[arch][h],
+            };
+            [QWEN4_MOE_SYM_PM_GATE_UP[arch][h], down]
         } else {
             [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
         })
+    }
+
+    /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
+    /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
+    /// applies on the gfx1151 builder (PM) entries only; every other path,
+    /// gfx1201 and `HIPFIRE_QWEN4_MOE_SYM_PM=0` included, is 1. A value other
+    /// than 1/2/4 is an error where it would apply.
+    pub fn qwen4_moe_sym_down_rr(&self) -> HipResult<usize> {
+        if self.arch != "gfx1151" || !*QWEN4_MOE_SYM_PM {
+            return Ok(1);
+        }
+        QWEN4_MOE_SYM_DOWN_RR
+            .clone()
+            .map_err(|bad| hip_bridge::HipError::new(0, &format!("HIPFIRE_QWEN4_MOE_SYM_DOWN_RR={bad}: expected 1, 2 or 4")))
     }
 
     /// Loads entry `func` of this arch's embedded builder module (the route's
@@ -45135,7 +45172,7 @@ impl Gpu {
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
             [false, host_mapped],
-            [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            grouped_rows.div_ceil(16) as u32,
             128,
             [ptrs, tiles, sorted, y],
             xp,
@@ -45172,7 +45209,7 @@ impl Gpu {
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
             [true, host_mapped],
-            [(m / 64) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            grouped_rows.div_ceil(16) as u32,
             128,
             [ptrs, tiles, sorted, y],
             xp,
@@ -45186,7 +45223,7 @@ impl Gpu {
     fn qwen4_moe_sym_gemm(
         &mut self,
         [down, host_mapped]: [bool; 2],
-        grid: [u32; 3],
+        tiles_y: u32,
         block: u32,
         [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
         xp: *mut c_void,
@@ -45195,10 +45232,20 @@ impl Gpu {
         let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
         let arch = self.qwen4_moe_sym_arch(what)?;
         let pm = arch == 1 || *QWEN4_MOE_SYM_PM;
+        // Row blocks per workgroup: the down symbol and grid.x both come from
+        // this one value, so a launch never covers fewer rows than `m`.
+        let rr = if down { self.qwen4_moe_sym_down_rr()? } else { 1 };
         let func = self
             .qwen4_moe_sym_gemm_symbols(host_mapped)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
             .unwrap_or(what);
+        if dims[0] % (64 * rr) != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: need m % {} == 0 (HIPFIRE_QWEN4_MOE_SYM_DOWN_RR={rr})", 64 * rr),
+            ));
+        }
+        let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
             dims.map(|value| i32::try_from(value).ok())
         else {

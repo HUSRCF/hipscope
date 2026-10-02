@@ -31,6 +31,12 @@
 //! row its broadcast partner needs (gfx11 C rows `2j + hi`, gfx12 `8hi + j`).
 //! BF16 rounding is RNE with non-finite values passed through; the SiLU is
 //! the hipcc `g / (1 + expf(-g)) * u` DAG ([`crate::kernels::gemm_uk::Epilogue::silu_dense`]).
+//!
+//! The gfx1151 down NT4 entry also builds row-repeat variants `..._nt4r2` and
+//! `..._nt4r4` (`Spec::rr` = 2 or 4; see `nt`): one CTA folds `rr` contiguous
+//! 64-row blocks of the same expert run, so the grid is `(M/(64*rr), m_total/16)`
+//! and CTA `x` owns rows `64*rr*x + 64*blk + 16*wave`. `rr = 1` is the frozen
+//! entry, byte for byte.
 use super::bf16::Bf16;
 use super::common::{self, GatherTemps, add64, add64_imm, bload, bstore_b128, lit, op, s, s_add_i32, smem, sop, srd_tail, v, SRD_WORD3};
 use super::iu4_fold::{self, MAGIC, REBIAS};
@@ -81,16 +87,33 @@ impl std::str::FromStr for Kind {
     }
 }
 
-/// One entry: arch, GEMM kind and expert-run tile width `nt` (16-slot tiles
-/// per weight stream). `nt == 1` is the frozen 16-slot entry, the byte anchor
-/// of every wider tile.
+/// One entry: arch, GEMM kind, expert-run tile width `nt` (16-slot tiles
+/// per weight stream) and row repeat `rr` (contiguous 64-row blocks folded
+/// per CTA, gfx1151 down NT4 only). `nt == 1` is the frozen 16-slot entry,
+/// the byte anchor of every wider tile; `rr == 1` is the anchor of every
+/// row repeat.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8 }
+pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8, pub rr: u8 }
 
 /// Tile widths built per arch: the anchor and the shipped expert-run tiles
 /// (gfx1151 NT4; gfx1201 NT4 for VRAM-resident, NT8 for host-mapped experts).
 pub fn tile_widths(arch: Arch) -> &'static [u8] {
     match arch { Arch::Gfx1201 => &[1, 4, 8], _ => &[1, 4] }
+}
+
+/// Row repeats of the down NT4 entry built per arch, after every
+/// [`tile_widths`] entry (gfx1151 only).
+pub fn row_repeats(arch: Arch) -> &'static [u8] {
+    match arch { Arch::Gfx1151 => &[2, 4], _ => &[] }
+}
+
+/// Every entry of one architecture's module, in emission order: both kinds at
+/// every tile width, then the down NT4 row repeats.
+pub fn module_specs(arch: Arch) -> Vec<Spec> {
+    tile_widths(arch).iter()
+        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt, rr: 1 }))
+        .chain(row_repeats(arch).iter().map(|&rr| Spec { arch, kind: Kind::Down, nt: 4, rr }))
+        .collect()
 }
 
 impl Spec {
@@ -99,7 +122,11 @@ impl Spec {
             Kind::GateUp => format!("qwen4_moe_gate_up_silu_iu4_sym_pm_{}", self.arch.name()),
             Kind::Down => format!("qwen4_moe_down_iu4_sym_pm_{}", self.arch.name()),
         };
-        if self.nt == 1 { base } else { format!("{base}_nt{}", self.nt) }
+        if self.nt == 1 { base } else if self.rr == 1 { format!("{base}_nt{}", self.nt) } else { format!("{base}_nt{}r{}", self.nt, self.rr) }
+    }
+    /// Contract/variant tag: `gate_up`, `down_nt4`, `down_nt4r2`.
+    pub fn variant(self) -> String {
+        if self.nt == 1 { self.kind.tag().into() } else if self.rr == 1 { format!("{}_nt{}", self.kind.tag(), self.nt) } else { format!("{}_nt{}r{}", self.kind.tag(), self.nt, self.rr) }
     }
     pub fn module(arch: Arch) -> String { format!("qwen4_moe_iu4_sym_pm_{}", arch.name()) }
     pub fn validate(self) -> Result<(), String> {
@@ -107,6 +134,10 @@ impl Spec {
         // gfx11 operands are twice gfx12's per lane: NT8 exceeds the VGPR file.
         let max_nt = if self.arch.gfx12() { 8 } else { 4 };
         if !matches!(self.nt, 1 | 2 | 4 | 8) || self.nt > max_nt { return Err(format!("qwen4_moe_sym: tile width {} (1, 2, 4{})", self.nt, if max_nt == 8 { " or 8" } else { "" })) }
+        if !matches!(self.rr, 1 | 2 | 4) { return Err(format!("qwen4_moe_sym: row repeat {} (1, 2 or 4)", self.rr)) }
+        if self.rr > 1 && (self.kind != Kind::Down || self.nt != 4 || self.arch.gfx12()) {
+            return Err(format!("qwen4_moe_sym: row repeat {} is built for the gfx1151 down NT4 entry only", self.rr))
+        }
         Ok(())
     }
     /// Waves per CTA: the 16-slot gate/up pairs gate and up rows in one wave
@@ -532,12 +563,10 @@ fn body<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
     wg.end(end)
 }
 
-/// Every entry of one architecture (both kinds at every [`tile_widths`]
-/// width) as one code object.
+/// Every entry of one architecture ([`module_specs`]: both kinds at every
+/// [`tile_widths`] width, then the [`row_repeats`]) as one code object.
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = tile_widths(arch).iter()
-        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt }))
-        .map(emit).collect::<Result<Vec<_>, _>>()?;
+    let emitted = module_specs(arch).into_iter().map(emit).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
     Ok((emitted, text, proof))
 }
@@ -566,6 +595,32 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// one barrier, read their pair's gate values in the same lane layout and
 /// store `rt(silu(rt(g)) * rt(u))`. Down waves own rows `64x + 16w` as in
 /// the 16-slot entry.
+///
+/// Row repeat (`rr` = 2 or 4, gfx1151 down NT4): the grid is
+/// `(M/(64*rr), m_total/16)` and CTA `x` folds `rr` contiguous 64-row blocks
+/// of its run, block `b` owning rows `64*rr*x + 64*b + 16w ..+16` of wave
+/// `w`; adjacent blocks therefore stream adjacent weight rows. The prologue
+/// (run walk, leader test, `cnt`, slots, activation offsets, magic) runs
+/// once. The blocks are unrolled statically, each with its own labels, and
+/// each block resets the activation descriptors, the K trip count and the
+/// weight descriptor (`w_ptr + row_base * row_bytes`) and zeroes its sums.
+/// Each block's output is the 16-slot-entry fold of those rows, so every
+/// output byte equals the `rr = 1` entry's. Block `b` stores at `Y` offset
+/// `+128*b` bytes (store immediate), and a dead tile skips its store
+/// instead of leaving the kernel, so later blocks still run.
+///
+/// Between blocks the next block's first-epoch weights are issued before
+/// the current block's stores, into the weight set the current block loaded
+/// second (`rr = 1` parity swaps every block: block `b` reads logical set
+/// `p` from physical set `p ^ (b & 1)`), so no copy is needed and the
+/// stores and the next epoch's activation reload (issued after them) overlap
+/// the weight latency. The store temporaries (`rt_tmp`, `own`, `send`,
+/// `recv`, `sel`, `out`) move onto the dead fold registers (`scale_rows`,
+/// `cacc`, `fold_t`) so no live weight set is overwritten, and the
+/// gfx11 `pack` words alias the dead tile 0 activations `x(0)[0..4]`
+/// until the reload. Pending stores are drained (`vscnt`) before the K loop
+/// so its entry and exit ledgers agree. The register plan gives every block
+/// its own adjacent body/epilogue intervals on the aliased registers.
 mod nt {
     use super::*;
     use peacemaker_author::{End, Free, LdsRegion, Wave};
@@ -602,39 +657,66 @@ mod nt {
     const SRD_Y: u8 = 76; const PSEL: u8 = 80;
     const SILU_MASK: u8 = 24;
 
-    struct G { spec: Spec }
+    #[derive(Clone, Copy)]
+    struct G { spec: Spec, blk: u8 }
     impl G {
         fn arch(&self) -> Arch { self.spec.arch }
         fn nt(&self) -> u8 { self.spec.nt }
         fn aw(&self) -> u8 { self.spec.aw() }
         fn gate_up(&self) -> bool { self.spec.kind == Kind::GateUp }
-        fn label(&self, name: &str) -> String { format!(".Lq4s_{}_nt{}_{name}", self.spec.kind.tag(), self.nt()) }
+        fn rr(&self) -> u8 { self.spec.rr }
+        /// Row block `blk` of the same entry.
+        fn at(&self, blk: u8) -> G { G { blk, ..*self } }
+        /// Block-local label; `rr = 1` keeps the frozen entry's names.
+        fn label(&self, name: &str) -> String {
+            if self.rr() == 1 { format!(".Lq4s_{}_nt{}_{name}", self.spec.kind.tag(), self.nt()) } else { format!(".Lq4s_{}_nt{}r{}b{}_{name}", self.spec.kind.tag(), self.nt(), self.rr(), self.blk) }
+        }
+        fn exit_label(&self) -> String {
+            if self.rr() == 1 { self.label("end") } else { format!(".Lq4s_{}_nt{}r{}_end", self.spec.kind.tag(), self.nt(), self.rr()) }
+        }
         fn sum(&self, j: u8) -> u8 { SUM0 + 8 * j }
         fn sums_end(&self) -> u8 { SUM0 + 8 * self.nt() }
-        /// Weight nibbles of set `p` (epoch parity).
-        fn wa(&self, p: usize) -> u8 { self.sums_end() + self.aw() * p as u8 }
-        fn wh(&self, p: usize) -> u8 { self.sums_end() + 2 * self.aw() + p as u8 }
+        /// Parity of the physical weight sets: odd row blocks swap them.
+        fn flip(&self) -> usize { usize::from(self.blk & 1) }
+        /// Physical weight nibble set / header word `set`.
+        fn wa_set(&self, set: usize) -> u8 { self.sums_end() + self.aw() * set as u8 }
+        fn wh_set(&self, set: usize) -> u8 { self.sums_end() + 2 * self.aw() + set as u8 }
+        /// Weight nibbles / header of epoch parity `p` in this block: odd
+        /// row blocks swap the physical sets (see the module note).
+        fn wa(&self, p: usize) -> u8 { self.wa_set(p ^ self.flip()) }
+        fn wh(&self, p: usize) -> u8 { self.wh_set(p ^ self.flip()) }
         fn d(&self, j: u8) -> u8 { self.sums_end() + 2 * self.aw() + 2 + j }
         fn x(&self, j: u8) -> u8 { (self.d(self.nt())).div_ceil(8) * 8 + self.aw() * j }
         fn live(&self, j: u8) -> u8 { LIVE0 + 2 * j }
         // Epilogue temporaries: gate values over tile 0's activations, the
         // gfx11 lane exchange over the weight sets.
         fn gval(&self) -> u8 { self.x(0) }
-        fn own(&self) -> u8 { self.wa(0) }
-        fn send(&self) -> u8 { self.wa(0) + 4 }
-        fn recv(&self) -> u8 { self.wa(0) + 6 }
-        fn sel(&self) -> u8 { self.wa(0) + 8 }
-        fn out(&self) -> u8 { self.wa(0) + 12 }
-        fn pack(&self) -> u8 { self.wa(0) + 16 }
+        // Row repeats keep every weight set live across the transition, so
+        // their store temporaries sit on the dead fold registers instead.
+        fn own(&self) -> u8 { if self.rr() > 1 { CACC } else { self.wa(0) } }
+        fn send(&self) -> u8 { if self.rr() > 1 { CACC + 4 } else { self.wa(0) + 4 } }
+        fn recv(&self) -> u8 { if self.rr() > 1 { CACC + 6 } else { self.wa(0) + 6 } }
+        fn sel(&self) -> u8 { if self.rr() > 1 { TPROD } else { self.wa(0) + 8 } }
+        fn out(&self) -> u8 { if self.rr() > 1 { TPROD + 4 } else { self.wa(0) + 12 } }
+        fn pack(&self) -> u8 { if self.rr() > 1 { self.x(0) } else { self.wa(0) + 16 } }
         fn header_off(&self, p: usize) -> u32 { match self.spec.kind { Kind::GateUp => 4 * p as u32, Kind::Down => 68 * p as u32 } }
         fn nibble_off(&self, p: usize) -> u32 { match self.spec.kind { Kind::GateUp => 8 + 64 * p as u32, Kind::Down => 4 + 68 * p as u32 } }
 
         fn plan(&self) -> Result<RegPlan, String> {
             let mut p = RegPlan::new(VGPR_CEILING, 104)?;
-            let l = |n: &str| self.label(n);
-            let kernel = || Live::Between("entry".into(), l("epilogue"));
+            let rr = self.rr();
+            let blk = |b: u8| self.at(b);
+            let l = |n: &str| blk(0).label(n);
+            let exit = self.exit_label();
+            // Whole-run registers: live to the last block's epilogue.
+            let kernel = || Live::Between("entry".into(), blk(rr - 1).label("epilogue"));
             let pro = || Live::Between("entry".into(), l("k_begin"));
-            let epi = || Live::Between(l("epilogue"), l("end"));
+            // Registers the store temporaries alias: block `b`'s body runs
+            // from the previous block's reload (entry for block 0) to its
+            // epilogue, and its temporaries from there to its own reload
+            // (the exit for the last block). `rr = 1` is `kernel`/`epi`.
+            let body = |b: u8| Live::Between(if b == 0 { "entry".to_string() } else { blk(b - 1).label("xreload") }, blk(b).label("epilogue"));
+            let epi = |b: u8| Live::Between(blk(b).label("epilogue"), if b + 1 == rr { exit.clone() } else { blk(b).label("xreload") });
             let gfx12 = self.arch().gfx12();
             p.v::<1>("tid", 0, pro())?;
             for i in 1..16u8 { p.v::<1>("prologue_tmp", i, pro())?; }
@@ -643,36 +725,42 @@ mod nt {
                 if gfx12 { p.v::<1>("xq_off", XQOFF + j, kernel())?; }
                 p.v::<8>("sum", self.sum(j), Live::Whole)?;
                 p.v::<1>("d", self.d(j), kernel())?;
-                for c in 0..4u8 { if gfx12 { p.v::<2>("x", self.x(j) + 2 * c, kernel())?; } else { p.v::<4>("x", self.x(j) + 4 * c, kernel())?; } }
+                for c in 0..4u8 {
+                    if gfx12 { p.v::<2>("x", self.x(j) + 2 * c, kernel())?; }
+                    else if j == 0 && c == 0 { for b in 0..rr { p.v::<4>("x", self.x(0), body(b))?; } }
+                    else { p.v::<4>("x", self.x(j) + 4 * c, kernel())?; }
+                }
                 p.s::<2>("live", self.live(j), Live::Whole)?;
             }
             for (name, r) in [("w_off", WOFF), ("h_off", HOFF), ("scale_f32", HF)] { p.v::<1>(name, r, kernel())?; }
             p.v::<1>("y_off", YOFF, Live::Whole)?;
             if self.gate_up() { p.v::<1>("lds_addr", LDSA, Live::Whole)?; }
             p.v::<8>("magic8", MAGIC8, kernel())?;
-            p.v::<8>("cacc", CACC, kernel())?;
-            p.v::<8>("fold_t", TPROD, kernel())?;
-            p.v::<8>("scale_rows", SCF, kernel())?;
+            for b in 0..rr { p.v::<8>("cacc", CACC, body(b))?; }
+            for b in 0..rr { p.v::<8>("fold_t", TPROD, body(b))?; }
+            for b in 0..rr { p.v::<8>("scale_rows", SCF, body(b))?; }
             for set in 0..2 {
-                for c in 0..4u8 { if gfx12 { p.v::<2>("w", self.wa(set) + 2 * c, kernel())?; } else { p.v::<4>("w", self.wa(set) + 4 * c, kernel())?; } }
-                p.v::<1>("header", self.wh(set), kernel())?;
+                for c in 0..4u8 { if gfx12 { p.v::<2>("w", self.wa_set(set) + 2 * c, kernel())?; } else { p.v::<4>("w", self.wa_set(set) + 4 * c, kernel())?; } }
+                p.v::<1>("header", self.wh_set(set), kernel())?;
             }
-            for i in 0..8u8 { p.v::<1>("rt_tmp", RT_TMP + i, epi())?; }
-            p.v::<4>("out", self.out(), epi())?;
-            if self.gate_up() {
-                p.v::<8>("gate", self.gval(), epi())?;
-                for i in 0..(6 * SILU_N) { p.v::<1>("silu_tmp", SILU_TMP + i, epi())?; }
-                for i in 0..(3 * SILU_N) { p.s::<2>("silu_mask", SILU_MASK + 2 * i, epi())?; }
+            for b in 0..rr {
+                for i in 0..8u8 { p.v::<1>("rt_tmp", RT_TMP + i, epi(b))?; }
+                p.v::<4>("out", self.out(), epi(b))?;
+                if self.gate_up() {
+                    p.v::<8>("gate", self.gval(), epi(b))?;
+                    for i in 0..(6 * SILU_N) { p.v::<1>("silu_tmp", SILU_TMP + i, epi(b))?; }
+                    for i in 0..(3 * SILU_N) { p.s::<2>("silu_mask", SILU_MASK + 2 * i, epi(b))?; }
+                }
+                if !gfx12 {
+                    for i in 0..4u8 { p.v::<1>("own", self.own() + i, epi(b))?; p.v::<1>("pack", self.pack() + i, epi(b))?; }
+                    for i in 0..2u8 { p.v::<1>("send", self.send() + i, epi(b))?; p.v::<1>("recv", self.recv() + i, epi(b))?; p.v::<1>("sel", self.sel() + i, epi(b))?; }
+                    p.s::<2>("hi_mask", MASKA, epi(b))?;
+                    p.s::<1>("permlane_sel", PSEL, epi(b))?;
+                }
             }
-            if !gfx12 {
-                for i in 0..4u8 { p.v::<1>("own", self.own() + i, epi())?; p.v::<1>("pack", self.pack() + i, epi())?; }
-                for i in 0..2u8 { p.v::<1>("send", self.send() + i, epi())?; p.v::<1>("recv", self.recv() + i, epi())?; p.v::<1>("sel", self.sel() + i, epi())?; }
-                p.s::<2>("hi_mask", MASKA, epi())?;
-                p.s::<1>("permlane_sel", PSEL, epi())?;
-                p.s::<1>("wg_x_in", 2, Live::Whole)?; p.s::<1>("wg_y_in", 3, Live::Whole)?;
-            }
+            if !gfx12 { p.s::<1>("wg_x_in", 2, Live::Whole)?; p.s::<1>("wg_y_in", 3, Live::Whole)?; }
             p.s::<2>("kernarg_ptr", 0, Live::Whole)?;
-            p.s::<4>("srd_y", SRD_Y, epi())?;
+            for b in 0..rr { p.s::<4>("srd_y", SRD_Y, epi(b))?; }
             p.s::<1>("s_tmp0", 4, kernel())?;
             p.s::<1>("s_tmp1", 5, kernel())?;
             p.s::<2>("s_tmp64", 6, kernel())?;
@@ -707,6 +795,32 @@ mod nt {
     /// Lane mask `m` (a pair; the high word is unused in wave32) |= `n`.
     fn or_mask(b: &mut Builder, m: u8, n: u8) -> Result<(), String> {
         sop(b, format!("s_or_b32 s{m}, s{m}, s{n}"), &[m], &[m, n])
+    }
+
+    /// Words 0..3 of both activation descriptors (epoch 0, then epoch 1)
+    /// from the kernel arguments; leaves `s4 = x_src_rows * 72`.
+    fn x_descriptors(b: &mut Builder) -> Result<(), String> {
+        sop(b, "s_mul_i32 s4, s22, 0x48", &[4], &[22])?;
+        sop(b, format!("s_mov_b32 s{}, s14", SRD_X[0]), &[SRD_X[0]], &[14])?;
+        sop(b, format!("s_mov_b32 s{}, s15", SRD_X[0] + 1), &[SRD_X[0] + 1], &[15])?;
+        srd_tail(b, SRD_X[0], Some(4))?;
+        add64(b, SRD_X[1], 14, 4)?;
+        srd_tail(b, SRD_X[1], Some(4))
+    }
+
+    /// The weight descriptor at rows `row_base..` of the expert; leaves `s4 = row_base * row_bytes`.
+    fn w_descriptor(b: &mut Builder) -> Result<(), String> {
+        sop(b, format!("s_mul_i32 s4, s{RBASE}, s{ROWB}"), &[4], &[RBASE, ROWB])?;
+        add64(b, SRD_W, WPTR, 4)?;
+        srd_tail(b, SRD_W, None)
+    }
+
+    /// Two-epoch trips before the tail: (K/128 - 1) / 2.
+    fn set_trips(b: &mut Builder, a: Arch) -> Result<(), String> {
+        let k = 19;
+        sop(b, format!("s_lshr_b32 s{TRIPS}, s{k}, 7"), &[TRIPS], &[k])?;
+        sop(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(a)), &[TRIPS], &[TRIPS])?;
+        sop(b, format!("s_lshr_b32 s{TRIPS}, s{TRIPS}, 1"), &[TRIPS], &[TRIPS])
     }
 
     fn prologue<T: Target>(wg: &mut Wg<T>, g: &G, end: &End) -> Result<(), String> {
@@ -804,9 +918,7 @@ mod nt {
             Kind::GateUp => { sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 8"), &[ROWB], &[k])?; sop(b, format!("s_mulk_i32 s{ROWB}, 0x88"), &[ROWB], &[ROWB])?; }
             Kind::Down => { sop(b, format!("s_lshr_b32 s{ROWB}, s{k}, 7"), &[ROWB], &[k])?; sop(b, format!("s_mulk_i32 s{ROWB}, 0x44"), &[ROWB], &[ROWB])?; }
         }
-        sop(b, format!("s_lshr_b32 s{TRIPS}, s{k}, 7"), &[TRIPS], &[k])?;
-        sop(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(a)), &[TRIPS], &[TRIPS])?;
-        sop(b, format!("s_lshr_b32 s{TRIPS}, s{TRIPS}, 1"), &[TRIPS], &[TRIPS])?;
+        set_trips(b, a)?;
         // Output column base: gate/up 32x + 16*(w&1), down 64x + 16w. The
         // weight rows of an up wave are M/2 further.
         match kind {
@@ -815,7 +927,7 @@ mod nt {
                 sop(b, format!("s_and_b32 s4, s{WAVE}, 1"), &[4], &[WAVE])?;
             }
             Kind::Down => {
-                sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, 6"), &[RBASE], &[WGX])?;
+                sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, {}", 6 + g.rr().trailing_zeros()), &[RBASE], &[WGX])?;
                 sop(b, format!("s_mov_b32 s4, s{WAVE}"), &[4], &[WAVE])?;
             }
         }
@@ -847,17 +959,10 @@ mod nt {
         op(b, "v_lshlrev_b32_e32 v5, 2, v3", &[v(5)], &[v(3)])?;
         for j in 0..nt { bload(b, 1, 6 + j, 5, SRD_S, 64 * u32::from(j))?; }
         // Activation descriptors: epoch 0 (X0) and 1 (X1), x_src_rows*72 records.
-        sop(b, "s_mul_i32 s4, s22, 0x48", &[4], &[22])?;
-        sop(b, format!("s_mov_b32 s{}, s14", SRD_X[0]), &[SRD_X[0]], &[14])?;
-        sop(b, format!("s_mov_b32 s{}, s15", SRD_X[0] + 1), &[SRD_X[0] + 1], &[15])?;
-        srd_tail(b, SRD_X[0], Some(4))?;
-        add64(b, SRD_X[1], 14, 4)?;
-        srd_tail(b, SRD_X[1], Some(4))?;
+        x_descriptors(b)?;
         sop(b, format!("s_lshl_b32 s{XS2}, s4, 1"), &[XS2], &[4])?;
         // Weight descriptor: rows rbase.. of the expert.
-        sop(b, format!("s_mul_i32 s4, s{RBASE}, s{ROWB}"), &[4], &[RBASE, ROWB])?;
-        add64(b, SRD_W, WPTR, 4)?;
-        srd_tail(b, SRD_W, None)?;
+        w_descriptor(b)?;
         op(b, format!("v_mul_u32_u24_e32 v{WOFF}, s{ROWB}, v3"), &[v(WOFF)], &[s(ROWB), v(3)])?;
         if a.gfx12() { op(b, format!("v_lshl_add_u32 v{WOFF}, v4, 3, v{WOFF}"), &[v(WOFF)], &[v(4), v(WOFF)])?; }
         if a.gfx12() {
@@ -1028,7 +1133,7 @@ mod nt {
             }
             for k in 0..4u8 { perm(b, out + k, recv + k / 2, own + k, format!("v{}", sel + k % 2))?; }
         }
-        bstore_b128(b, out, YOFF, SRD_Y, 0)
+        bstore_b128(b, out, YOFF, SRD_Y, 128 * u32::from(g.blk))
     }
 
     /// Stores of every live tile: tile 0 always, tile j while j < cnt; the
@@ -1053,6 +1158,53 @@ mod nt {
             store_rows(w.isa(), g, r, g.live(j))?;
         }
         Ok(())
+    }
+
+    /// Stores of a non-final row block: `store_tiles` with a dead tile
+    /// skipping its store (the wave goes on to the next block) in place of
+    /// leaving the kernel. Gfx11 only.
+    fn store_tiles_mid<T: Target>(w: &mut Wave<'_, T, Builder>, g: &G) -> Result<(), String> {
+        let b = w.isa();
+        sop(b, format!("s_mov_b32 s{SRD_Y}, s16"), &[SRD_Y], &[16])?;
+        sop(b, format!("s_mov_b32 s{}, s17", SRD_Y + 1), &[SRD_Y + 1], &[17])?;
+        srd_tail(b, SRD_Y, None)?;
+        op(b, format!("s_mov_b32 s{MASKA}, 0xffff0000"), &[s(MASKA)], &[])?;
+        op(b, format!("s_mov_b32 s{}, 0", MASKA + 1), &[s(MASKA + 1)], &[])?;
+        op(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[s(PSEL)], &[])?;
+        for j in 0..g.nt() {
+            if j == 0 {
+                store_rows(w.isa(), g, g.sum(0), g.live(0))?;
+                continue;
+            }
+            let live = w.scmp(Instruction::new(format!("s_cmp_gt_u32 s{CNT}, {j}"), vec![], vec![s(CNT)]))?;
+            w.skip_unless(live, &g.label(&format!("store_dead{j}")), (), |w: &mut Wave<'_, T, Builder>, ()| {
+                add64(w.isa(), SRD_Y, SRD_Y, YSTEP)?;
+                store_rows(w.isa(), g, g.sum(j), g.live(j))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Row block `g` to block `g + 1`: reset the descriptors and the trip
+    /// count, issue the next block's first-epoch weights, store this
+    /// block's tiles, then reload the next block's first-epoch activations
+    /// and zero the sums. Pending stores are drained so the next K loop
+    /// enters with the ledger shape its back edge leaves.
+    fn transition<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
+        let nx = g.at(g.blk + 1);
+        wg.label(&g.label("epilogue"))?;
+        let b = wg.isa();
+        x_descriptors(b)?;
+        sop(b, format!("{} s{RBASE}, s{RBASE}, 64", s_add_i32(g.arch())), &[RBASE], &[RBASE])?;
+        w_descriptor(b)?;
+        set_trips(b, g.arch())?;
+        load_w(b, &nx, 0)?;
+        store_tiles_mid(wg, g)?;
+        wg.label(&g.label("xreload"))?;
+        let b = wg.isa();
+        for j in 0..g.nt() { load_x(b, g, j, SRD_X[0])?; }
+        for t in 0..g.nt() { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", g.sum(t) + j), &[v(g.sum(t) + j)], &[])?; } }
+        b.wait(crate::ledger::Counter::Vs, 0)
     }
 
     fn epilogue<T: Target>(wg: &mut Wg<T>, g: &G, end: End, gate: Option<LdsRegion<Gate, Free>>) -> Result<(), String> {
@@ -1093,9 +1245,9 @@ mod nt {
     }
 
     pub(super) fn emit(spec: Spec) -> Result<Emitted, String> {
-        let g = G { spec };
+        let g = G { spec, blk: 0 };
         let kspec = KernelSpec {
-            kernel_id: "qwen4_moe_sym".into(), variant: format!("{}_nt{}", spec.kind.tag(), spec.nt), arch: spec.arch, symbol: spec.symbol(),
+            kernel_id: "qwen4_moe_sym".into(), variant: spec.variant(), arch: spec.arch, symbol: spec.symbol(),
             kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
             workgroup_size: spec.threads() as u16, group_segment_fixed_size: spec.lds_bytes(), wave32: true, cu_mode: false,
         };
@@ -1107,9 +1259,15 @@ mod nt {
 
     fn body<T: Target>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
         let gate = if g.gate_up() { Some(wg.lds::<Gate>("swiglu_gate", 0, g.spec.lds_bytes())?) } else { None };
-        let end = wg.exit(&g.label("end"))?;
+        let end = wg.exit(&g.exit_label())?;
         prologue(wg, g, &end)?;
-        kloop(wg, g)?;
-        epilogue(wg, g, end, gate)
+        for blk in 0..g.rr() - 1 {
+            let gb = g.at(blk);
+            kloop(wg, &gb)?;
+            transition(wg, &gb)?;
+        }
+        let last = g.at(g.rr() - 1);
+        kloop(wg, &last)?;
+        epilogue(wg, &last, end, gate)
     }
 }

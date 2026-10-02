@@ -45,12 +45,17 @@ fn iu4_v2b(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// `--epi all` emits every entry of the arch as one module; `gate_up`/`down`
-/// one 16-slot entry, `gate_up_ntN`/`down_ntN` one expert-run entry.
+/// one 16-slot entry, `gate_up_ntN`/`down_ntN` one expert-run entry,
+/// `down_nt4rR` one expert-run down entry with R contiguous 64-row blocks per CTA.
 fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::qwen4_moe_sym::{self,Spec};
  if epi=="all"{let (_,text,proof)=qwen4_moe_sym::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
- let (kind,nt)=match epi.rsplit_once("_nt"){Some((k,n))=>(k,n.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?),None=>(epi,1)};
- let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt})?;
+ let (kind,tile)=match epi.rsplit_once("_nt"){Some((k,n))=>(k,Some(n)),None=>(epi,None)};
+ let (nt,rr)=match tile{
+  Some(t)=>{let (n,r)=t.split_once('r').map_or((t,None),|(n,r)|(n,Some(r)));
+   (n.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?,match r{Some(r)=>r.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?,None=>1})}
+  None=>(1,1)};
+ let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt,rr})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
