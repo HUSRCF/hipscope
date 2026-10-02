@@ -41,6 +41,16 @@ The later `wmma-capture-gfx1201-v2.{f16,bf16,fp8}.v0.*` raw artifacts remain und
 
 The FP8 capture contains **382,024** tuples (**97,798,144** destination words). Every one of 54 experimental traversal/arithmetic candidates was compared against all words; none had zero differences (`edge-wmma-fp8-candidates-gfx1201-54.json`). FP8 is **UNQUALIFIED** and has no production value API. BF16/FP8 WMMA are outside the QSA/sym-NT4 fold; the emulator rejects them rather than using these unqualified models.
 
+## Exhaustive gfx1201 exp qualification
+
+Outside the core archive, `gfx1201-sfu-exp-from00.range.json` records one completed comparison of **all 4,294,967,296** input bit patterns against the production Rust `exp_f32`: **zero mismatches**. Own full-cover/mask-CRC/popcount certification passed in `gfx1201-exp-full-own-cert.json`; the 536,870,912-byte decompressed mask has CRC32 `1840808736` and zero set bits.
+
+The exact compiled-model chain is frozen in `sfu-build-final/gfx1201/sfu_build.json`: native SHA256 `50bf70f7a6a5144370d45b1dfc36c0b36467989c4e583cece04a55cf8f204069`, MD5 `1a023f97747c028cb0ccc409143ec902`, plus source/bridge/tables, compiler flags/hashes, static library, and the linked device ELF embedded in that native executable. Historical partial ranges are **excluded** because their compiled-library/executable lineage was not reproduced byte-identically.
+
+This is an online GPU-versus-model comparison with retained mismatch mask and sparse samples, **not** an offline recomparison of a retained full GPU-output stream. The measured context is the pinned Wave32 probe descriptor (round32/16_64=0, denorm32/16_64=3); arbitrary MODE states are not qualified.
+
+At the hard drain, gfx1201 rcp/rcp_iflag and all three gfx1151 SFU full-domain gates remain pending, as do randomized F16/IU4 qualification on both architectures and Halo DIV_FMAS discriminators. Their queued holds were cancelled; no completion is inferred from prepared binaries or the captured WMMA census.
+
 ## Qualification limits
 
 The scalar F32 set does **not** contain DIV_FMAS scaled-rounding discriminator words `0x14800000` and `0x88800000`, or the `2^80` overflow discriminator `0x67800000`. Do not infer generic VCC=1 DIV_FMAS rounding semantics from these captures. Ordinary ABS/CLAMP/OMOD variants absent from the audited census are not claimed measured.
