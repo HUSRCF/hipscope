@@ -327,6 +327,8 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_UNSAFE_WSL_VMM_KV` | **Unsafe until certified.** `memory.unsafe_wsl_vmm_kv`, default off. Under WSL2/ROCDXG automatic KV selects `legacy` (reason in `kv_backend_reason`) and an explicit `kv_backend = "vmm"` is refused, because WDDM VA growth may alias earlier KV segments as it does on native Windows. `1` lifts it. Native Windows stays legacy-only. |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
+| `HIPFIRE_REDLINE_GAP_TIMING` | Developer-only diagnostic: `1` = per-token host breakdown of the Qwen3.5 plain-AR decode step (embedding, position copy, retained-PM4 patch, submit+wait with its in-IB GPU span, or the HIP-graph launch, and the host time between consecutive steps), one `[gap-timing]` stderr summary per run of consecutive decode positions. Unset reads no clocks. |
+| `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | Developer-only diagnostic: `1` lets the gfx1151 `HIPFIRE_GFX1151_PM4_INITIATOR` / `_INTERLEAVE` / `_RESOURCE_LIMITS` knobs apply to gfx1100 too. Unset, gfx1100 keeps its legacy encoding byte for byte. |
 | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the daemon emits one post-generate retained-route proof marker per successful request: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n> request_id=<id> replays=<count>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
 
 ### Chat template
@@ -475,7 +477,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1376
+**Count:** 1378
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1023,6 +1025,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8` | crates/hipfire-runtime/examples/mq4v2_fused_parity.rs | harness |
 | `HIPFIRE_GFX1100_MQ4_WIDE_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_GFX1100_PACKED_MQ4_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_PM_GEMM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
@@ -1628,6 +1631,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RDNA3_SIGMOID_ROWS4` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_REAP_PLAN` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-lfm2moe/src/config.rs | developer |
 | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
+| `HIPFIRE_REDLINE_GAP_TIMING` | crates/rdna-compute/src/gap_timing.rs | developer |
 | `HIPFIRE_REDLINE_IB_POOL` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_REDLINE_PM4_PROGRESS` | crates/redline-dispatch/src/aql/replay.rs | developer |
 | `HIPFIRE_REDLINE_POOL_DEBUG` | crates/hipfire-config/src/lib.rs, crates/redline-rocr/src/runtime.rs | experimental |

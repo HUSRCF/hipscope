@@ -151,6 +151,7 @@
   - The recording inventory was re-audited against beta. The 27 new recording-dependent sites now have rows, and six new decisions are recorded. One of them, the gfx1201 DFlash multi-layer GDN replay, checks only `!is_recording()`; it is `NotEquivalent`, so DFlash on gfx1201 is refused as a railgun default.
   - On beta, the modules `gemv_mq4g256` and `mq_rotate_x` compile to the same object. The corpus reader now accepts duplicate rows for one object when they carry the same receipt.
   - The `mc_g2` GPU example stays on `railgun/m1p`, because it needs the runtime hip-bridge API.
+- **gfx11 PM4 diagnostics, default off.** `HIPFIRE_REDLINE_GAP_TIMING=1` prints a per-token host breakdown of the plain-AR decode step. `redline_dispatch_profile` now runs on gfx11, with a timestamp after every dispatch and every compute-idle boundary. `HIPFIRE_REDLINE_IB_POOL=vmem` also applies on gfx11. `HIPFIRE_GFX1100_PM4_EXPERIMENTS=1` lets the gfx1151 initiator, interleave and resource-limit knobs apply to gfx1100.
 
 ### Internal & CI
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
