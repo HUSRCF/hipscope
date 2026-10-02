@@ -44670,11 +44670,15 @@ impl Gpu {
     }
 
     /// Whether a `rows`-row trunk projection takes the IU4 route: verified
-    /// trunk, prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows, eager
-    /// (no replay recording or graph capture).
+    /// trunk, prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows in whole
+    /// 128-row tiles, eager (no replay recording or graph capture). A partial
+    /// N tile would reach the IU4 tail entry, whose fold differs from the
+    /// symmetric one (measured: tail outputs off by up to 4e-6 vs the dense
+    /// fold at N=1131); such chunks keep exact activations instead.
     pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
         self.qwen4_trunk_iu4
             && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && rows % 128 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
     }

@@ -303,7 +303,7 @@ fn main() {
     let wdir = arg("--w");
     let layer: usize = arg("--layer").map_or(0, |v| v.parse().unwrap());
     let tokens: Vec<usize> = arg("--tokens")
-        .map_or(vec![1536, 512, 1131], |v| v.split(',').map(|s| s.parse().unwrap()).collect());
+        .map_or(vec![1536, 512, 1280], |v| v.split(',').map(|s| s.parse().unwrap()).collect());
     let mut gpu = Gpu::init().expect("gpu init");
     gpu.mq4v2_symmetric = true;
     assert_eq!(gpu.arch, "gfx1151", "fn-trunk-iu4 oracle targets gfx1151");
