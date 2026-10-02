@@ -67,7 +67,7 @@ use hipfire_generate::batch::{
 };
 use hipfire_generate::redline::{
     handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4, handle_redline_pm4_prefix_profile,
+    handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace, handle_redline_pm4_prefix_profile,
     handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
     redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
     redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
@@ -4785,6 +4785,13 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
+                // Railgun G0: both arms author the same forward, so both prime
+                // from the same GDN requant frame (a host word the forward
+                // consumes: kernarg +76 of gated_delta_net_*). Without this the
+                // arms differ only by how many forwards ran before them.
+                if g0.is_some() {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
@@ -5012,6 +5019,10 @@ fn main() {
 
             "redline_shadow_aql" | "redline_shadow_pm4" => {
                 handle_redline_shadow(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
+            "redline_greedy_trace" => {
+                handle_redline_greedy_trace(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
             "redline_dispatch_profile" => {

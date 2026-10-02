@@ -453,23 +453,43 @@ def g0_attribute(kernel, kind, by_kernel):
     return [d for d in found if d.get("effect") in G0_EFFECTS[kind]]
 
 
-def g0_compare(observe, record, inventory):
+def g0_pre_program_launches(inventory, program):
+    """Declared pre-program launches of `program` (inventory
+    `pre_program_launches`): host-input launches issued outside the recorder
+    funnels before the program in every lowering. Empty without a program."""
+    if program is None:
+        return []
+    return [
+        launch for launch in inventory.get("pre_program_launches") or []
+        if program in (launch.get("programs") or [])
+    ]
+
+
+def g0_compare(observe, record, inventory, program=None):
     """Compare one G0 observe arm with one record arm. Returns a verdict dict.
 
     A difference passes only when every kernel involved is attributed to an
     inventory decision and all attributed decisions are `byte_exact`; the
-    byte-exactness itself is then G2 arm 3's to confirm on silicon.
+    byte-exactness itself is then G2 arm 3's to confirm on silicon. An arm's
+    HIP launches outside the recorder funnels pass only when they equal the
+    `per_forward` sum of `program`'s declared pre-program launches.
     """
     import difflib
 
     by_kernel = g0_decisions_by_kernel(inventory)
+    declared = g0_pre_program_launches(inventory, program)
+    allowed = sum(int(launch["per_forward"]) for launch in declared)
     failures = []
+    outside = {}
     for arm in (observe, record):
         hip = arm.get("hip") or {}
-        if int(hip.get("launch_kernel", -1)) != int(arm.get("launches", -2)):
+        extra = int(hip.get("launch_kernel", -1)) - int(arm.get("launches", -2))
+        outside[arm.get("arm")] = extra
+        if extra != allowed:
             failures.append(
                 f"{arm.get('arm')}: {hip.get('launch_kernel')} HIP launches but "
-                f"{arm.get('launches')} reached the recorder funnels (a launch bypassed them)"
+                f"{arm.get('launches')} reached the recorder funnels; {allowed} declared "
+                f"pre-program launch(es) for {program} (a launch bypassed them)"
             )
     for counter in ("memcpy_dtod", "memcpy_htod", "memset"):
         a = (observe.get("hip") or {}).get(counter)
@@ -520,6 +540,15 @@ def g0_compare(observe, record, inventory):
         "record_launches": len(rec),
         "identical": identical,
         "differences": differences,
+        "program": program,
+        "pre_program_launches": {
+            "declared": [
+                {"id": launch["id"], "kernel": launch["kernel"], "per_forward": launch["per_forward"],
+                 "site": launch["site"]}
+                for launch in declared
+            ],
+            "outside_funnels": outside,
+        },
         "failures": failures,
         "pass": not failures,
     }
@@ -529,7 +558,9 @@ def run_g0(daemon, args, report):
     inventory = json.loads(Path(args.inventory).read_text())
     if inventory.get("schema") != "railgun-recording-inventory":
         sys.exit(f"{args.inventory} is not a railgun-cert recording inventory")
-    report["g0"] = {"inventory": str(args.inventory), "contexts": {}}
+    if args.g0_program is not None and args.g0_program not in (inventory.get("programs") or {}):
+        sys.exit(f"--g0-program {args.g0_program} is not an inventory program")
+    report["g0"] = {"inventory": str(args.inventory), "program": args.g0_program, "contexts": {}}
     ok = True
     for context in args.g0_contexts:
         if args.dflash_cycle:
@@ -546,7 +577,7 @@ def run_g0(daemon, args, report):
         arm("observe")
         observe = arm("observe")
         record = arm("record")
-        verdict = g0_compare(observe, record, inventory)
+        verdict = g0_compare(observe, record, inventory, args.g0_program)
         if args.dflash_cycle and observe.get("window") != record.get("window"):
             verdict["failures"].append(
                 f"acceptance windows differ: observe={observe.get('window')} record={record.get('window')}"
@@ -585,7 +616,7 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4", "bf16"),
+        choices=("q8", "fp8", "fwht2", "fwht3", "fwht4", "bf16"),
         help=(
             "KV layout used by capture, shadow replay, and the HIP oracle "
             "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
@@ -711,6 +742,14 @@ def main():
     parser.add_argument(
         "--inventory",
         help="railgun-cert recording-inventory json output (required by --g0)",
+    )
+    parser.add_argument(
+        "--g0-program",
+        help=(
+            "inventory program under test (e.g. h2_gfx1201); its declared pre-program "
+            "launches are the only HIP launches allowed outside the recorder funnels. "
+            "Omitted: none are allowed"
+        ),
     )
     parser.add_argument(
         "--verify-batch",

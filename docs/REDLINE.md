@@ -491,13 +491,22 @@ process and compares the launch sequences:
 cargo run --release -p railgun-cert -- recording-inventory json > .redline-work/g0/inventory.json
 HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
 python3 scripts/redline_daemon_harness.py --model "$MODEL" --max-seq 16384 \
-  --g0 --inventory .redline-work/g0/inventory.json --out .redline-work/g0/decode.json
+  --g0 --g0-program h2_gfx1201 --inventory .redline-work/g0/inventory.json \
+  --out .redline-work/g0/decode.json
 ```
 
 Add `--dflash-cycle --draft "$DRAFT"` for the DFlash cycle. A difference passes
 only when every kernel involved is attributed to a `byte_exact` inventory
 decision of the matching effect; G0 is diagnostic evidence, and G2 arm 3
-remains the byte-exactness proof.
+remains the byte-exactness proof. Both `bench_decode` arms prime from GDN
+requant frame 0, so the `gated_delta_net_*` frame word is the same forward's.
+
+HIP launches outside the recorder funnels (HIP launch counter minus funnel
+launches) fail the arm unless they equal the program's declared pre-program
+launches (`--g0-program`; inventory `pre_program_launches`): host-input
+launches that run before the program in every lowering. The only one declared
+is the Qwen3.5 token embedding (`embedding_q8`, `Gpu::embedding_lookup_q8`,
+one per forward) for `h2_gfx1201`. Without `--g0-program` none are allowed.
 
 ### railgun shadow diff (M1, G7 diagnostic)
 
