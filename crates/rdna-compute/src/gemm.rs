@@ -44657,13 +44657,15 @@ static QWEN4_TRUNK_IU4: LazyLock<bool> =
 /// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
 /// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
 impl Gpu {
-    /// The trunk route is requested and possible: the flag, exact gfx1151, a
-    /// symmetric artifact and the IU4 prefill / symmetric-fold switches the
-    /// dense SET kernels need. Verified headers are checked separately.
+    /// The trunk route is requested and possible: the flag, exact gfx1151 and
+    /// the IU4 prefill / symmetric-fold switches the dense SET kernels need.
+    /// The artifact's `mq4v2.symmetric` marker is not required (Qwen4
+    /// artifacts record expert symmetry separately): the forward verifies
+    /// every trunk header on the device and only then claims the symmetric
+    /// contract (`mq4v2_symmetric`) the dense SET kernels read.
     pub fn qwen4_trunk_iu4_requested(&self) -> bool {
         *QWEN4_TRUNK_IU4
             && self.arch == "gfx1151"
-            && self.mq4v2_symmetric
             && self.flags.iu4_prefill_enabled()
             && self.flags.gfx11_iu4_symfold
             && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")

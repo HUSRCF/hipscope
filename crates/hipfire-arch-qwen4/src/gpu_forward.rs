@@ -2037,6 +2037,12 @@ fn prepare_trunk_iu4(
         }
         return Err(error);
     }
+    // Every MQ4V2 matrix the Qwen4 forward hands the dense IU4 GEMMs is a
+    // trunk projection verified above (routed experts take their own verified
+    // route), so the symmetric-grid contract those SET kernels read
+    // (`mq4v2_symmetric`: V2B / X5 / symfold) holds even though Qwen4
+    // artifacts record expert symmetry under their own metadata key.
+    gpu.mq4v2_symmetric = true;
     gpu.qwen4_trunk_iu4 = true;
     Ok(folds)
 }
