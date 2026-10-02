@@ -8,4 +8,4 @@ pub mod sched;
 pub use tile::{Tile, FragmentLayout, RegisterDirect, Lds};
 pub use chain::{Chain, Iu4, Iu8, MmaKind};
 pub use prefetch::Prefetch;
-pub use epilogue::Epilogue;
+pub use epilogue::{DENSE_SILU_TEMPS, Epilogue};
