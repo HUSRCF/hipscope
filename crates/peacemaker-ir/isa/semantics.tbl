@@ -1,4 +1,8 @@
 # opcode	semantic class; no unsupported opcode silently completes
+# This table is interpreter dispatch, not a full-domain numerical certificate.
+# The bounded replay gate is QSA convert/attend and sym NT4 gate_up/down.
+# BF16 and FP8 WMMA are unqualified and intentionally have no semantics rows:
+# decoded programs using either hard-error rather than invoke provisional math.
 buffer_load_b128	memory
 buffer_load_b32	memory
 buffer_load_b64	memory
