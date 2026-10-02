@@ -138,7 +138,7 @@ impl<'a> Emulator<'a> {
         let mut executed=0u64;
         while states.iter().any(|s|!s.ended) {
             let mut progress=false;
-            for st in &mut states {
+            for (wave,st) in states.iter_mut().enumerate() {
                 if st.ended || st.barrier.is_some() {continue;}
                 let step=self.steps.get(st.pc).ok_or("PC ran past kernel end")?;
                 let inst=step.inst;let name=step.name;
@@ -149,7 +149,7 @@ impl<'a> Emulator<'a> {
                     Class::Memory=>memory::execute(name,inst,st,mem,&mut lds),
                     Class::Alu=>alu::execute(self.arch,name,inst,st),
                 };
-                result.map_err(|e|format!("{symbol} wg={:?} inst={} {name}: {e}",launch.workgroup,st.pc.saturating_sub(1)))?;
+                result.map_err(|e|format!("{symbol} wg={:?} inst={} {name}: {e}{}",launch.workgroup,st.pc.saturating_sub(1),failure_bits(self.arch,wave,st,inst)))?;
             }
             // A gfx12 signal is an arrival, not a wait. A wave may continue
             // executing after its arrival while peers' waits already retire.
@@ -163,6 +163,43 @@ impl<'a> Emulator<'a> {
         Ok(())
     }
 }
+/// Err-path only: exact architectural bits of the failing wave state and every
+/// operand (destinations included, so implicit accumulators are visible).
+/// Reads are guarded so diagnostics can never mask the original error.
+fn failure_bits(arch:Arch,wave:usize,st:&State,inst:&Inst)->String {
+    use std::fmt::Write as _;
+    let mut out=String::new();
+    let _=write!(out," | arch={arch:?} wave={wave} exec={:#010x} vcc={:#010x} scc={} m0={:#010x} mods={:?} fields={:?} literal={:?}",st.exec,st.vcc,u8::from(st.scc),st.m0,inst.mods,inst.fields,inst.literal.map(|n|format!("{n:#010x}")));
+    for (i,op) in inst.operands.iter().enumerate() {
+        let _=write!(out," | op{i} {op} {op:?}:");
+        if let Err(e)=op.validate() {let _=write!(out," invalid({e})");continue;}
+        match op {
+            Operand::Reg(r)=>for word in 0..usize::from(r.len) {
+                if r.kind==Kind::V {
+                    let _=write!(out," w{word}=[");
+                    for lane in 0..32 {
+                        if lane!=0 {out.push(' ');}
+                        match st.read(op,lane,word) {Ok(v)=>{let _=write!(out,"{v:#010x}");},Err(e)=>{let _=write!(out,"unreadable({e})");}}
+                    }
+                    out.push(']');
+                } else {
+                    match st.read(op,0,word) {Ok(v)=>{let _=write!(out," w{word}={v:#010x}");},Err(e)=>{let _=write!(out," w{word}=unreadable({e})");}}
+                }
+            },
+            Operand::Half(r,_) if r.kind==Kind::V=>{
+                out.push_str(" h=[");
+                for lane in 0..32 {
+                    if lane!=0 {out.push(' ');}
+                    match st.read(op,lane,0) {Ok(v)=>{let _=write!(out,"{v:#06x}");},Err(e)=>{let _=write!(out,"unreadable({e})");}}
+                }
+                out.push(']');
+            },
+            Operand::Special(Special::Ttmp(n)) if usize::from(*n)>=st.t.len()=>{let _=write!(out," unreadable(ttmp{n} out of range)");},
+            _=>match st.read(op,0,0) {Ok(v)=>{let _=write!(out," {v:#010x}");},Err(e)=>{let _=write!(out," unreadable({e})");}},
+        }
+    }
+    out
+}
 fn control(name:&str,i:&Inst,s:&mut State,k:&Kernel)->Result<()> {
     match name {
         "s_endpgm"=>s.ended=true,
@@ -172,7 +209,12 @@ fn control(name:&str,i:&Inst,s:&mut State,k:&Kernel)->Result<()> {
             s.signals+=1;
         },
         "s_barrier_wait"=>{
-            if s.read(&i.operands[0],0,0)?!=0xffff {return Err("named barrier wait is not modeled".into());}
+            // SOPP is a 16-bit field: decoded 0xffff is represented as signed -1.
+            let id=match &i.operands[0] {
+                Operand::Imm(ImmField::Sopp(value))=>*value as u16,
+                op=>u16::try_from(s.read(op,0,0)?).map_err(|_|"barrier ID exceeds its 16-bit field")?,
+            };
+            if id!=u16::MAX {return Err("named barrier wait is not modeled".into());}
             if s.signals==0 {return Err("barrier wait without signal".into());}
             s.barrier=Some(s.signals-1);
         },
@@ -217,7 +259,7 @@ fn control(name:&str,i:&Inst,s:&mut State,k:&Kernel)->Result<()> {
         add("s_cbranch_scc1",vec![Operand::Label(BlockId(2))]);
         add("ds_store_b32",vec![v(1),v(0)]);
         add("s_barrier_signal",vec![Operand::Imm(ImmField::Sopp(-1))]);
-        add("s_barrier_wait",vec![Operand::Imm(ImmField::Unsigned(0xffff))]);
+        add("s_barrier_wait",vec![Operand::Imm(ImmField::Sopp(-1))]);
         add("v_xor_b32_e32",vec![v(2),v(1),Operand::Literal(128)]);
         add("ds_load_b32",vec![v(3),v(2)]);
         add("buffer_store_b32",vec![v(3),v(1),reg(Kind::S,4,4),Operand::Special(Special::Null),Operand::Vmem(crate::operand::VmemToken::Offen)]);
