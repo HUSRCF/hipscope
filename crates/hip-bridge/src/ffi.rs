@@ -511,6 +511,7 @@ pub struct HipRuntime {
     // Graph capture & replay
     fn_stream_begin_capture: unsafe extern "C" fn(HipStream, c_uint) -> u32,
     fn_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
+    fn_stream_is_capturing: unsafe extern "C" fn(HipStream, *mut c_uint) -> u32,
     fn_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
     fn_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
@@ -1036,6 +1037,12 @@ impl HipRuntime {
                     lib,
                     "hipStreamEndCapture",
                     unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_is_capturing: unsafe { load_fn!(
+                    lib,
+                    "hipStreamIsCapturing",
+                    unsafe extern "C" fn(HipStream, *mut c_uint) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_graph_instantiate: unsafe { load_fn!(
@@ -2387,6 +2394,18 @@ impl HipRuntime {
         let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
         self.check(code, "hipStreamEndCapture")?;
         Ok(Graph(graph))
+    }
+
+    /// Whether `stream` is inside a `hipStreamBeginCapture` window. An
+    /// invalidated capture still counts: work issued to it is not executed.
+    pub fn stream_is_capturing(&self, stream: &Stream) -> HipResult<bool> {
+        let mut status: c_uint = 0;
+        // SAFETY: `stream` is a live opaque HIP handle owned by the wrapper;
+        // `status` is a stack out-param.
+        let code = unsafe { (self.fn_stream_is_capturing)(stream.0, &mut status) };
+        self.check(code, "hipStreamIsCapturing")?;
+        // hipStreamCaptureStatusNone = 0; Active = 1, Invalidated = 2.
+        Ok(status != 0)
     }
 
     /// Instantiate an executable graph from a captured graph.
