@@ -43,6 +43,13 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
+/// `HIPFIRE_QWEN4_QSA_PM=1` runs the gathered route's producer and attention
+/// from the certified builder module (`kernels::QSA_GATHER_PM_*`, same ABI,
+/// grid, LDS and output bytes as the hipcc kernels) instead of the JIT
+/// source.  Unset or `0` keeps the hipcc kernels.  Read once.
+static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", false)
+});
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
 /// ranks; selected indices and mirror byte-identical) for complete <= 2048
@@ -3869,6 +3876,26 @@ pub fn indexed_attention_attention_batch_exact(
     indexed_attention_attention_batch_impl(gpu, p, false)
 }
 
+/// The gathered route's launches for `p` on the hipcc kernels or, with `pm`,
+/// the builder module (`HIPFIRE_QWEN4_QSA_PM`), whatever the route flags say.
+/// Byte-equality and timing harness only (`examples/qsa_pm_check.rs`).
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_gathered_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    pm: bool,
+) -> HipResult<()> {
+    let end_position = p.position_start + p.rows;
+    let max_selected = end_position
+        .min(p.capacity)
+        .min(p.budget_blocks * p.compress + p.compress - 1);
+    if pm && !qsa_gathered_pm_fits(p) {
+        return Err(HipError::new(0, "QSA PM gathered route does not cover this shape"));
+    }
+    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+}
+
 /// `allow_fast` admits the grouped hg4 kernel and the dense F16 WMMA route;
 /// without it the per-head kernels run (the exact reference).
 fn indexed_attention_attention_batch_impl(
@@ -4235,18 +4262,56 @@ fn qsa_gathered_wmma(
     end_position: usize,
     max_selected: usize,
 ) -> HipResult<()> {
-    let (module, src, convert, attend) = match p.format {
-        QsaKvFormat::F32 => (
+    let pm = *QWEN4_QSA_PM && qsa_gathered_pm_fits(p);
+    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+}
+
+/// Whether the builder module covers `p`: its raw buffer offsets are 32-bit,
+/// so the F16 K/V scratch over the whole cache capacity and the query row
+/// stay below its out-of-range offset.
+fn qsa_gathered_pm_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    const PM_OOB_OFFSET: usize = 0x7fff_ff00;
+    let scratch = p.full_capacity.div_ceil(4).checked_mul(4).and_then(|t| t.checked_mul(p.n_kv_heads * 512));
+    scratch.is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        && p.n_heads.checked_mul(2048).is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        // `v_mad_u32_u24` token and stride operands.
+        && p.full_capacity < 1 << 24
+        && p.n_kv_heads * 2048 < 1 << 24
+}
+
+/// The gathered route's producer and attention launches: the hipcc kernels,
+/// or with `pm` the certified builder module (`kernels::QSA_GATHER_PM_*`).
+fn qsa_gathered_wmma_launch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+    max_selected: usize,
+    pm: bool,
+) -> HipResult<()> {
+    let (module, src, convert, attend) = match (p.format, pm) {
+        (QsaKvFormat::F32, false) => (
             "indexed_attention_gathered_wmma",
             INDEXED_ATTENTION_GATHERED_WMMA_SRC,
             "indexed_attention_kv_f16vb",
             "indexed_attention_gathered_wmma_f16",
         ),
-        QsaKvFormat::Fp8 => (
+        (QsaKvFormat::Fp8, false) => (
             "indexed_attention_gathered_wmma_gfx1201",
             INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
             "indexed_attention_kv_f16vb_fp8_gfx1201",
             "indexed_attention_gathered_wmma_f16_gfx1201",
+        ),
+        (QsaKvFormat::F32, true) => (
+            "qsa_gather_pm_gfx1151",
+            "",
+            "indexed_attention_kv_f16vb_pm_gfx1151",
+            "indexed_attention_gathered_wmma_f16_pm_gfx1151",
+        ),
+        (QsaKvFormat::Fp8, true) => (
+            "qsa_gather_pm_gfx1201",
+            "",
+            "indexed_attention_kv_f16vb_fp8_pm_gfx1201",
+            "indexed_attention_gathered_wmma_f16_pm_gfx1201",
         ),
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
@@ -4259,7 +4324,15 @@ fn qsa_gathered_wmma(
     let tokens = checked_i32(end_position, "QSA gathered tokens")?;
     let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
     for kernel in [convert, attend] {
-        gpu.ensure_kernel_public(module, src, kernel)?;
+        if pm {
+            let image = match p.format {
+                QsaKvFormat::F32 => crate::kernels::QSA_GATHER_PM_GFX1151,
+                QsaKvFormat::Fp8 => crate::kernels::QSA_GATHER_PM_GFX1201,
+            };
+            gpu.ensure_embedded_kernel(module, image, kernel)?;
+        } else {
+            gpu.ensure_kernel_public(module, src, kernel)?;
+        }
     }
     let mut args = KernargBlob::new();
     args.push_ptr(p.full_keys.buf.as_ptr());

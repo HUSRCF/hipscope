@@ -53,6 +53,14 @@ fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
+fn qsa_gather(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qsa_gather::{self,Kind,Spec};
+ if epi=="all"{let (_,text,proof)=qsa_gather::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let kind=match epi{"convert"=>Kind::Convert,"attend"=>Kind::Attend,_=>return Err(format!("qsa_gather --epi {epi} (convert|attend|all)"))};
+ let e=qsa_gather::emit(Spec{arch,kind})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::fp8_gemm::{self,Spec,ActScale,Epi};
  if scale=="both" {
@@ -142,6 +150,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "iu4_v2c"=>iu4_v2c(epi.as_deref().unwrap_or("set"),arch)?,
   "iu4_v2b"=>iu4_v2b(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "qwen4_moe_sym"=>qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?,arch)?,
+  "qsa_gather"=>qsa_gather(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
  fs::write(out.ok_or("missing --out")?,text).map_err(|e|e.to_string())?;fs::write(proof.ok_or("missing --proof")?,proof_json).map_err(|e|e.to_string())?;Ok(())}

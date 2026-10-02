@@ -391,3 +391,5 @@ v_fmac_f16_e64	vop3	0x136	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1,VDST	-	-	v_fmac
 v_cvt_f16_u16_e64	vop3	0x1d0	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_u16_e64 v149.l, v149.l	D5D00095 02010195	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_min3_i32	vop3	0x21a	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_min3_i32 v1, s4, s5, v1	D61A0001 04040A04	-
 v_cmpx_eq_f32_e32	vopc	0x92	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_f32_e32 0xff800000, v66	7D2484FF FF800000	-
+# feat/qsa-pm (2026-10-02): the QSA PM convert kernel's F16 store; sample = pinned llvm-mc -mcpu=gfx1151 encoding.
+buffer_store_b16	buffer	0x19	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	-	VDATA,VADDR,RSRC,SOFFSET	-	Vs:1	buffer_store_b16 v5, v6, s[40:43], 0 offen offset:8	E0640008 804A0506	-
