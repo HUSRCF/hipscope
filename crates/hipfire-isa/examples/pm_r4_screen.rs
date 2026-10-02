@@ -26,7 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let name = format!("{}_{}_nt{nt}_c{chains}_p{}_g{}", arch.name(), kind.tag(), u8::from(prefetch), u8::from(grouped));
                         let mut row = json!({"name":name,"arch":arch.name(),"kind":kind.tag(),"nt":nt,"chains":chains,"prefetch":prefetch,"grouped":grouped,"ring_depth":0,"padding":"pad16"});
                         match qwen4_moe_sym::emit_r4(R4Spec {base:Spec {arch,kind,nt}, chains,prefetch,grouped}) {
-                            Err(e) => row["rejected"] = json!(e),
+                            Err(e) => {
+                                if !e.starts_with("qwen4_moe_sym: tile width ") && !e.contains(" VGPR exceeds ") {
+                                    return Err(format!("{name}: emission failed: {e}").into());
+                                }
+                                row["rejected"] = json!(e);
+                            }
                             Ok(e) => {
                                 let source = root.join(format!("{name}.s"));
                                 fs::write(&source, &e.s_text)?;
