@@ -4743,6 +4743,19 @@ pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
+/// gfx1151 A4 fusion: builder V2B gate/up SiLU on the M512 x N128 tile
+/// (`hipfire-isa` `iu4_v2b_a4`, native writer). Two entries: the fused
+/// `gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151`, whose epilogue writes
+/// the down projection's 72-byte `block_i4_128` records byte-identical to
+/// `fused_silu_hin_rotate_mq_i4_batched` on its own h, and the stage-1 retile
+/// twin `gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151` (same ABI and h
+/// bits as the V2B SiLU entry). Selected on exact gfx1151 V2B admission only
+/// via `HIPFIRE_V2B_A4_EPI` (`retile` / `1`; default off);
+/// `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads another bundle instead.
+/// SHA-256 948e84aec58728d76ecb1390ce54b2049700d3a44e4b726c26d448a38feb5a42.
+pub const GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151.hxaco");
+
 /// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
