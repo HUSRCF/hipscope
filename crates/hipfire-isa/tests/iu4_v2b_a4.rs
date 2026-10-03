@@ -1,6 +1,7 @@
-//! The gfx1151 M512 x N128 V2B gate/up twin (`iu4_v2b_a4`, A4-fusion stage
-//! 1): determinism, the per-K256 census of the retiled K loop, assembly,
-//! byte identity of the committed bundle and gfx11 certification.
+//! The gfx1151 M512 x N128 V2B gate/up entries (`iu4_v2b_a4`, A4 fusion:
+//! the stage-1 h twin and the stage-2 fused A4 epilogue): determinism, the
+//! per-K256 census of the retiled K loop, assembly, byte identity of the
+//! committed bundle and gfx11 certification.
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::iu4_v2b_a4::{self, Epi, Spec};
 use std::io::Write;
@@ -77,9 +78,11 @@ mod toolchain {
         let build = build(&Toolchain::oracle(), &s, &dir.join("v2b_a4.hsaco"), "gfx1151").unwrap();
         for epi in Epi::ALL {
             let symbol = Spec { arch: Arch::Gfx1151, epi }.symbol();
-            // Three 20 KiB K64 slots: the highest access ends at 60 KiB.
-            assert_eq!(pm_check::lds_bounds(&text, &symbol, iu4_v2b_a4::WAVES, iu4_v2b_a4::LDS_BYTES).unwrap(), 3 * iu4_v2b_a4::SLOT_BYTES);
-            assert!(pm_check::lds_bounds(&text, &symbol, iu4_v2b_a4::WAVES, 3 * iu4_v2b_a4::SLOT_BYTES - 8).is_err());
+            // The K loop's three 20 KiB K64 slots end at 60 KiB; the A4
+            // epilogue's two 32 KiB token panels fill the allocation.
+            let end = if epi == Epi::SiluA4 { iu4_v2b_a4::LDS_BYTES } else { 3 * iu4_v2b_a4::SLOT_BYTES };
+            assert_eq!(pm_check::lds_bounds(&text, &symbol, iu4_v2b_a4::WAVES, iu4_v2b_a4::LDS_BYTES).unwrap(), end);
+            assert!(pm_check::lds_bounds(&text, &symbol, iu4_v2b_a4::WAVES, end - 8).is_err());
             let m7 = pm_check::m7(&build.elf, "gfx1151", &symbol).unwrap();
             assert_eq!(m7["lift"], "byte-exact", "{symbol}");
             assert_eq!(m7["obligations"], serde_json::json!({}), "{symbol}");

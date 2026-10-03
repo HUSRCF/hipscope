@@ -1,9 +1,10 @@
 //! Builder-emitted gfx1151 (RDNA3.5, wave32) MQ4V2 x block_i4_128 gate/up
 //! SiLU GEMM on an M512 x N128 tile: the retile of the certified V2B SiLU
 //! entry (`iu4_v2b.rs`) that puts one whole 256-feature `h` group of each
-//! token in one CTA (stage 1 of the A4 epilogue fusion,
-//! `a4-fusion/design.md` §3). Same `G, U, Xq, Y, M, K, N` ABI and the same
-//! `h` bits as the V2B entry.
+//! token in one CTA (the A4 epilogue fusion, `a4-fusion/design.md` §3).
+//! Two entries share the K loop: `SiluM512` stores the same `h` bits as the
+//! V2B entry (stage 1), `SiluA4` turns them into the down projection's A4
+//! input in the epilogue instead (stage 2).
 //!
 //! Tile: 512 virtual rows (gate/up interleaved at 16 rows: 256 h features)
 //! x 128 tokens, 16 waves, one CTA per WGP. Wave `w = 2*wr + wc` owns
@@ -32,9 +33,29 @@
 //! `Epilogue::silu_dense` on the same register pairs. Hence `h` is
 //! bit-identical to V2B's.
 //!
-//! Launch contract (block `[512,1,1]`, dynamic LDS 65536; `M % 256 == 0`
-//! (M = h rows), `N % 128 == 0`, `K % 256 == 0`; Y = h token-major
-//! `[N][M]` f32): `G, U, Xq, Y, M, K, N`, grid `[N/128, 2M/512]`.
+//! Launch contract (block `[512,1,1]`, dynamic LDS 65536, grid
+//! `[N/128, 2M/512]`; `M % 256 == 0` (M = h rows), `N % 128 == 0`,
+//! `K % 256 == 0`):
+//! - `SiluM512`: `G, U, Xq, Y, M, K, N`; Y = h token-major `[N][M]` f32.
+//! - `SiluA4`: `G, U, Xq, AWQ, S1, S2, Y4, M, K, N`; Y4 = the down
+//!   projection's `block_i4_128` input, AoS `[M/128][N]` (72 B records,
+//!   record `(2*group + half)*N + token`), byte-identical to
+//!   `fused_silu_mul_mq_rotate_awq_i4_hin` (`HIPFIRE_SILU_HIN`,
+//!   `HIPFIRE_IU4_SIDECAR`, the gfx11 `{5,7}` candidate pair) run on the
+//!   `SiluM512` h with `awq_scale = AWQ`, `signs1/2 = S1/S2`.
+//!
+//! `SiluA4` epilogue (`a4-fusion/design.md` §1-2): after the SiLU the K
+//! loop's LDS is re-carved as two 32 KiB token panels (32 tokens x 256 f32
+//! features each); in two rounds every wave stores its h fragments and
+//! reads back two whole tokens of each panel in producer ownership (lane l
+//! holds features 8l..8l+7), then runs, per token, the producer's stages
+//! in its order: `(h / awq) * signs1` (IEEE divide), the register FWHT
+//! strides 1, 2, 4 and the `ds_swizzle` strides 1..16 (`p - v` on lanes
+//! with the stride bit, as `fma(-1, v, p)`), `(v * 0.0625) * signs2`, and
+//! the one-pass `{5,7}` `block_i4_128` emit (`emit_iu4_sidecar_c2_gfx12`:
+//! DPP `row_xmask` reductions, rcp + Newton codes with the wave-uniform
+//! reference-divide fallback), proven bit-identical to the remap +
+//! `quantize_block_i4_128_wave<true>` search the gfx11 hin runs.
 use super::common::{add64, add64_imm, lit, mem, op, s, sop, sr, v, vr};
 use super::iu4_fold::{GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
 use super::iu4_gemm::ds_offsets;
@@ -42,9 +63,9 @@ use super::iu4_v2c::off;
 use super::gemm_uk::{Chain, DENSE_SILU_TEMPS, Epilogue, Iu4};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
     insn::{Instruction, MemoryClass, Sop},
-    reg::Live};
+    reg::{Live, RegRef}};
 use peacemaker_author::{Free, Gfx1151, Gfx11Waits, LdsRegion, LdsWrite, MmaIu4, Pending, Published, Ring, Scc, Wave, WgUniform,
-    Workgroup, Writing, prime, ready, retire, rotate};
+    Workgroup, Writing, prime, ready, retire, retire_cur, rotate};
 
 pub const TILE_M: u32 = 512;
 pub const TILE_N: u32 = 128;
@@ -62,15 +83,15 @@ const SLOT_BASE: [u32; 3] = [0, SLOT_BYTES, 2 * SLOT_BYTES];
 pub const MODULE: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { SiluM512 }
+pub enum Epi { SiluM512, SiluA4 }
 impl Epi {
-    pub const ALL: [Epi; 1] = [Epi::SiluM512];
-    pub fn tag(self) -> &'static str { match self { Self::SiluM512 => "m512" } }
+    pub const ALL: [Epi; 2] = [Epi::SiluM512, Epi::SiluA4];
+    pub fn tag(self) -> &'static str { match self { Self::SiluM512 => "m512", Self::SiluA4 => "a4" } }
 }
 impl std::str::FromStr for Epi {
     type Err = String;
     fn from_str(t: &str) -> Result<Self, String> {
-        match t { "m512" => Ok(Self::SiluM512), _ => Err(format!("iu4_v2b_a4 epilogue {t} (m512)")) }
+        match t { "m512" => Ok(Self::SiluM512), "a4" => Ok(Self::SiluA4), _ => Err(format!("iu4_v2b_a4 epilogue {t} (m512|a4)")) }
     }
 }
 
@@ -81,6 +102,7 @@ impl Spec {
     pub fn symbol(self) -> String {
         match self.epi {
             Epi::SiluM512 => format!("gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_{}", self.arch.name()),
+            Epi::SiluA4 => format!("gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_{}", self.arch.name()),
         }
     }
     pub fn validate(self) -> Result<(), String> {
@@ -91,6 +113,9 @@ impl Spec {
         match self.epi {
             Epi::SiluM512 => KernargLayout::new(44).pointer("G", 0).pointer("U", 8).pointer("Xq", 16).pointer("Y", 24)
                 .hidden("M", 32, 4, "by_value").hidden("K", 36, 4, "by_value").hidden("N", 40, 4, "by_value"),
+            Epi::SiluA4 => KernargLayout::new(72).pointer("G", 0).pointer("U", 8).pointer("Xq", 16).pointer("AWQ", 24)
+                .pointer("S1", 32).pointer("S2", 40).pointer("Y4", 48)
+                .hidden("M", 56, 4, "by_value").hidden("K", 60, 4, "by_value").hidden("N", 64, 4, "by_value"),
         }
     }
 }
@@ -136,6 +161,51 @@ impl Regs {
     const MASK: u8 = 48;
 }
 
+/// `SiluA4` registers. The panel store / read addresses are derived in the
+/// entry block (the LDS bound check evaluates them there) and are the only
+/// VGPRs the A4 epilogue adds to the K loop (v218/v219 are free there).
+struct A4;
+impl A4 {
+    const LST: u8 = 218;      // panel store address
+    const LRD: u8 = 219;      // panel read address
+    const VO: u8 = 216;       // Y4 offset of this lane's qs word (token 2w)
+    const VD: u8 = 217;       // Y4 offset of the record (token 2w)
+    const LDOFF: u8 = 220;    // 32 * lane: AWQ / signs load offset
+    const TMP: u8 = 221;
+    const AWQ: u8 = 224;      // awq[256*by + 8l + e]
+    const S1: u8 = 232;       // signs1[8l + e]
+    const S2: u8 = 240;       // signs2[8l + e]
+    const SGN: u8 = 248;      // FWHT lane-stage signs (lane & stride ? -1 : 1), strides 1..16
+    const LANE: u8 = 253;
+    /// Panel read destinations of rounds 0 and 1: four tokens x 8 features.
+    const IN: [u8; 2] = [0, 64];
+    // Per-token scratch (acc VGPRs are free once the h fragments are in LDS).
+    const DIVT: u8 = 96;      // 8 x 5 divide temporaries
+    const FW: u8 = 136;       // 8 register-butterfly spares
+    const P: u8 = 144;        // 8 lane-butterfly partners
+    const Q0: u8 = 152; const Q1: u8 = 160; const Y0: u8 = 168; const Y1: u8 = 176;
+    const AMAX: u8 = 184; const T: u8 = 185; const BASE: u8 = 186; const D0: u8 = 187; const D1: u8 = 188;
+    const R0: u8 = 189; const R1: u8 = 190; const T2: u8 = 191; const FRAC: u8 = 192;
+    const ACC: u8 = 193;      // acc0[0], acc0[1], acc1[0], acc1[1]
+    const MSE0: u8 = 197; const MSE1: u8 = 198; const THR: u8 = 199;
+    const QI: u8 = 200;       // integer codes
+    const WORD: u8 = 208;
+    const DS: u8 = 209;       // (d, s) of the record
+    // SGPRs
+    const AWQB: u8 = 40;      // AWQ + 1024*by
+    const YB: [u8; 2] = [44, 46]; // Y4 + 72*(2*by*N + 128*bx) (+ 72*64 for panel 1's tokens)
+    const C7: u8 = 19;        // 7.0f
+    const CM8: u8 = 27;       // -8.0f
+    const SARGS: u8 = 96;     // S1, S2
+    const Y4: u8 = 100;
+    const DIVM: u8 = 48;      // 8 divide carries (pairs)
+    const ZERO: u8 = 64; const MA: u8 = 66; const MB: u8 = 68; const MC: u8 = 70;
+    const TAKE0: u8 = 72; const USE1: u8 = 74; const UNIT: u8 = 76; const MT: u8 = 78;
+}
+
+/// Bytes of one token panel: 32 tokens x 256 f32 features.
+pub const PANEL_BYTES: u32 = 32768;
+
 /// Kernel-argument SGPRs: `G, U, Xq, Y, M, K, N`.
 const ARG_G: u8 = 8; const ARG_U: u8 = 10; const ARG_XQ: u8 = 12; const ARG_Y: u8 = 14;
 const ARG_M: u8 = 16; const ARG_K: u8 = 17; const ARG_N: u8 = 18;
@@ -162,9 +232,18 @@ impl Gen {
         let pro = || Live::Between("entry".into(), l("k_begin"));
         let epi = || Live::Between(l("epilogue"), l("end"));
         let body = || Live::Between(l("epi_body"), l("end"));
+        let a4 = self.spec.epi == Epi::SiluA4;
+        // SiluA4 phases: SiLU (epi_body), panel exchange (a4_lds), per-token A4 (a4_proc).
+        let (silu, lds, proc) = (|| Live::Between(l("epi_body"), l("a4_lds")), || Live::Between(l("a4_lds"), l("end")),
+            || Live::Between(l("a4_proc"), l("end")));
+        let setup = || Live::Between(l("epilogue"), l("epi_body"));
         for c in 0..4u8 { p.v::<8>("C", Regs::C + 8 * c, kl())?; }
         for i in 0..32u8 { p.v::<1>(if i == 0 { "tid" } else { "prologue_tmp" }, Regs::C + i, pro())?; }
-        for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epi())?; }
+        if a4 {
+            for i in 0..4u8 { p.v::<8>("panel_in", A4::IN[0] + 8 * i, lds())?; }
+        } else {
+            for i in 0..4u8 { p.v::<1>("y_off_c", Regs::C + i, epi())?; }
+        }
         for k in 0..16u8 { p.v::<8>("acc", Regs::ACC + 8 * k, Live::Whole)?; }
         p.v::<8>("magic8", Regs::MAGIC, kernel())?;
         for r in Regs::AV { p.v::<4>("a_frag_pair", r, kernel())?; }
@@ -174,7 +253,7 @@ impl Gen {
         for r in Regs::DC { p.v::<4>("d_x", r, kernel())?; }
         for r in Regs::WSF { p.v::<1>("scale_f32", r, kl())?; }
         for r in Regs::WS { p.v::<1>("scale_f16", r, kernel())?; }
-        p.v::<1>("y_off", Regs::YOFF, Live::Between("entry".into(), l("epi_body")))?;
+        if !a4 { p.v::<1>("y_off", Regs::YOFF, Live::Between("entry".into(), l("epi_body")))?; }
         for h in 0..2usize {
             for i in 0..4u8 { p.v::<2>("stage_a", Regs::STA[h] + 2 * i, kernel())?; }
             p.v::<2>("stage_x", Regs::STX[h], kernel())?;
@@ -183,8 +262,27 @@ impl Gen {
             ("ab0", Regs::AB[0]), ("ab1", Regs::AB[1]), ("ab2", Regs::AB[2]), ("xb0", Regs::XB[0]), ("xb1", Regs::XB[1]), ("xb2", Regs::XB[2])] {
             p.v::<1>(name, r, kernel())?;
         }
-        for i in 0..(SILU_GROUP * DENSE_SILU_TEMPS / 8) { p.v::<8>("silu_tmp", 160 + 8 * i, body())?; }
-        for i in 0..(3 * SILU_GROUP) { p.s::<2>("silu_mask", Regs::MASK + 2 * i, body())?; }
+        if a4 {
+            for i in 0..(SILU_GROUP * DENSE_SILU_TEMPS / 8) { p.v::<8>("silu_tmp", 160 + 8 * i, silu())?; }
+            for i in 0..(3 * SILU_GROUP) { p.s::<2>("silu_mask", Regs::MASK + 2 * i, silu())?; }
+            // v160..v215: per-token scratch (Q1, Y0, Y1, scalars, codes).
+            for i in 0..7u8 { p.v::<8>("a4_tmp", 160 + 8 * i, proc())?; }
+            for i in 0..16u8 { p.s::<2>("a4_mask", A4::DIVM + 2 * i, proc())?; }
+            for (name, r) in [("panel_st", A4::LST), ("panel_rd", A4::LRD)] { p.v::<1>(name, r, Live::Between("entry".into(), l("end")))?; }
+            for (name, r) in [("y4_qs_off", A4::VO), ("y4_rec_off", A4::VD), ("lane", A4::LANE)] { p.v::<1>(name, r, epi())?; }
+            for (name, r) in [("ld_off", A4::LDOFF), ("a4_setup_tmp", A4::TMP)] { p.v::<1>(name, r, setup())?; }
+            for (name, r) in [("awq", A4::AWQ), ("signs1", A4::S1), ("signs2", A4::S2)] { p.v::<8>(name, r, epi())?; }
+            for i in 0..5u8 { p.v::<1>("fwht_sign", A4::SGN + i, epi())?; }
+            p.s::<4>("kernargs_signs", A4::SARGS, Live::Whole)?;
+            p.s::<2>("kernargs_y4", A4::Y4, Live::Whole)?;
+            p.s::<2>("awq_base", A4::AWQB, setup())?;
+            for r in A4::YB { p.s::<2>("y4_base", r, epi())?; }
+            p.s::<1>("c_7", A4::C7, epi())?;
+            p.s::<1>("c_m8", A4::CM8, epi())?;
+        } else {
+            for i in 0..(SILU_GROUP * DENSE_SILU_TEMPS / 8) { p.v::<8>("silu_tmp", 160 + 8 * i, body())?; }
+            for i in 0..(3 * SILU_GROUP) { p.s::<2>("silu_mask", Regs::MASK + 2 * i, body())?; }
+        }
         p.s::<2>("kernarg_ptr", Regs::KARG, Live::Whole)?;
         p.s::<1>("wg_x", Regs::WGX, Live::Whole)?;
         p.s::<1>("wg_y", Regs::WGY, Live::Whole)?;
@@ -240,14 +338,20 @@ fn mul_add64(b: &mut Builder, dst: u8, base: u8, x: u8, y: u8) -> Result<(), Str
 
 /// Kernel arguments, tile bases and every lane-invariant offset; stages
 /// period 0 (both halves) and issues period 0's head.
-fn prologue(wg: &mut Wg, (ra, rx, ah, xh): (Ring<A, Free, Free>, Ring<X, Free, Free>, LdsRegion<AH, Free>, LdsRegion<XH, Free>)) -> Result<Rings, String> {
+fn prologue(wg: &mut Wg, epi: Epi, (ra, rx, ah, xh): (Ring<A, Free, Free>, Ring<X, Free, Free>, LdsRegion<AH, Free>, LdsRegion<XH, Free>)) -> Result<Rings, String> {
     let b = wg.isa();
     let (t0, t1) = (Regs::T0, Regs::T1);
     let (by, bx) = (Regs::WGY, Regs::WGX);
     // gfx11 llvm-objdump spells a zero SMEM offset `null`; parse-back compares canonical text.
     mem(b, format!("s_load_b256 s[{}:{}], s[0:1], null", Regs::ARGS, Regs::ARGS + 7), &[sr(Regs::ARGS, 8)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
-    mem(b, format!("s_load_b64 s[{}:{}], s[0:1], 0x20", Regs::ARGS2, Regs::ARGS2 + 1), &[sr(Regs::ARGS2, 2)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
-    mem(b, format!("s_load_b32 s{}, s[0:1], 0x28", Regs::ARGS3), &[s(Regs::ARGS3)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    // M, K, N (and SiluA4's S1, S2, Y4 behind the four pointers it shares).
+    let (mk, n) = if epi == Epi::SiluA4 { (0x38, 0x40) } else { (0x20, 0x28) };
+    mem(b, format!("s_load_b64 s[{}:{}], s[0:1], {mk:#x}", Regs::ARGS2, Regs::ARGS2 + 1), &[sr(Regs::ARGS2, 2)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    mem(b, format!("s_load_b32 s{}, s[0:1], {n:#x}", Regs::ARGS3), &[s(Regs::ARGS3)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    if epi == Epi::SiluA4 {
+        mem(b, format!("s_load_b128 s[{}:{}], s[0:1], 0x20", A4::SARGS, A4::SARGS + 3), &[sr(A4::SARGS, 4)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+        mem(b, format!("s_load_b64 s[{}:{}], s[0:1], 0x30", A4::Y4, A4::Y4 + 1), &[sr(A4::Y4, 2)], &[sr(Regs::KARG, 2)], MemoryClass::SmemLoad)?;
+    }
     // v0 = tid; v1 = wave; v2 = lane; v3 = lr; v4 = hi.
     op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(0)])?;
     op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(0)])?;
@@ -278,16 +382,18 @@ fn prologue(wg: &mut Wg, (ra, rx, ah, xh): (Ring<A, Free, Free>, Ring<X, Free, F
     sop(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, ARG_XQ + 1), &[Regs::SX + 1], &[ARG_XQ + 1])?;
     sop(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, ARG_N, lit(XBLK_BYTES)), &[Regs::N72], &[ARG_N])?;
     sop(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, ARG_M), &[Regs::M64], &[ARG_M])?;
-    // Y base: Y + 4*(128*bx*M + t0), 64-bit.
-    let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
-    sop(b, format!("s_lshl_b32 s{t1}, s{bx}, 7"), &[t1], &[bx])?;
-    sop(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{ARG_M}"), &[hi], &[t1, ARG_M])?;
-    sop(b, format!("s_mul_i32 s{lo}, s{t1}, s{ARG_M}"), &[lo], &[t1, ARG_M])?;
-    sop(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
-    sop(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
-    op(b, format!("s_lshl_b64 s[{lo}:{hi}], s[{lo}:{hi}], 2"), &[sr(lo, 2)], &[sr(lo, 2)])?;
-    sop(b, format!("s_add_u32 s{}, s{ARG_Y}, s{lo}", Regs::SY), &[Regs::SY], &[ARG_Y, lo])?;
-    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, ARG_Y + 1), &[Regs::SY + 1], &[ARG_Y + 1, hi])?;
+    if epi == Epi::SiluM512 {
+        // Y base: Y + 4*(128*bx*M + t0), 64-bit.
+        let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
+        sop(b, format!("s_lshl_b32 s{t1}, s{bx}, 7"), &[t1], &[bx])?;
+        sop(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{ARG_M}"), &[hi], &[t1, ARG_M])?;
+        sop(b, format!("s_mul_i32 s{lo}, s{t1}, s{ARG_M}"), &[lo], &[t1, ARG_M])?;
+        sop(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
+        sop(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
+        op(b, format!("s_lshl_b64 s[{lo}:{hi}], s[{lo}:{hi}], 2"), &[sr(lo, 2)], &[sr(lo, 2)])?;
+        sop(b, format!("s_add_u32 s{}, s{ARG_Y}, s{lo}", Regs::SY), &[Regs::SY], &[ARG_Y, lo])?;
+        sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, ARG_Y + 1), &[Regs::SY + 1], &[ARG_Y + 1, hi])?;
+    }
 
     // A staging: lane (hi, lr) loads row lr's K16 slices (hi, 2+hi) of the
     // K64 half at +8 (header) + 8*hi + 16*i.
@@ -332,11 +438,15 @@ fn prologue(wg: &mut Wg, (ra, rx, ah, xh): (Ring<A, Free, Free>, Ring<X, Free, F
     // d of token wc*64 + lr (+16c): (wc*64 + lr)*72.
     op(b, format!("v_lshl_add_u32 v14, s{}, 6, v3", Regs::WC), &[v(14)], &[s(Regs::WC), v(3)])?;
     op(b, format!("v_mul_u32_u24_e32 v{}, {}, v14", Regs::LXS, lit(XBLK_BYTES)), &[v(Regs::LXS)], &[v(14)])?;
-    // Y offset of (token wc*64 + lr, h row wr*32 + 8*hi), bytes.
-    op(b, "v_lshlrev_b32_e32 v15, 3, v4", &[v(15)], &[v(4)])?;
-    op(b, format!("v_lshl_add_u32 v15, s{}, 5, v15", Regs::WR), &[v(15)], &[s(Regs::WR), v(15)])?;
-    op(b, format!("v_mad_u32_u24 v15, v14, s{ARG_M}, v15"), &[v(15)], &[v(14), s(ARG_M), v(15)])?;
-    op(b, format!("v_lshlrev_b32_e32 v{}, 2, v15", Regs::YOFF), &[v(Regs::YOFF)], &[v(15)])?;
+    if epi == Epi::SiluM512 {
+        // Y offset of (token wc*64 + lr, h row wr*32 + 8*hi), bytes.
+        op(b, "v_lshlrev_b32_e32 v15, 3, v4", &[v(15)], &[v(4)])?;
+        op(b, format!("v_lshl_add_u32 v15, s{}, 5, v15", Regs::WR), &[v(15)], &[s(Regs::WR), v(15)])?;
+        op(b, format!("v_mad_u32_u24 v15, v14, s{ARG_M}, v15"), &[v(15)], &[v(14), s(ARG_M), v(15)])?;
+        op(b, format!("v_lshlrev_b32_e32 v{}, 2, v15", Regs::YOFF), &[v(Regs::YOFF)], &[v(15)])?;
+    } else {
+        panel_addresses(b)?;
+    }
 
     // Stage period 0 (both halves; ring slot 0 and the fixed slot), and seed
     // the chain constant and the sums while the loads are in flight.
@@ -628,6 +738,370 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
+/// The SiluA4 token panels (re-carved over the K loop's slots).
+pub enum Panel {}
+
+/// SiluA4 panel addresses, derived in the entry block. A panel holds token
+/// t's feature chunk ch (8 f32) at `1024*t + 32*(ch ^ hp(t))` with
+/// `hp(t) = ((t >> 1) & 1) | (t & 12)`: bit 1 of the permuted chunk is
+/// that of ch, so a lane's chunk `+2` is `+64` bytes, and hp ignores bits 0
+/// and 4 of t, so tokens `+1` and `+16` are fixed offsets (`+1024`,
+/// `+16384`). Store: lane (hi, lr) of wave (wr, wc) holds chunks
+/// `4wr + 2p + hi` of tokens `16c' + lr` of panel wc, at
+/// `S = 32768*wc + 1024*lr + 32*((4wr + hi) ^ hp(lr))`; the 16 lanes of a
+/// half spread over four 32 B bank groups. Read: wave w takes tokens 2w and
+/// 2w+1 of both panels, lane l chunk l, at `R = 2048*w + 32*(l ^ hp(2w))`,
+/// `hp(2w) = (w & 1) | ((w & 6) << 1)`: one whole 1 KiB token per load.
+fn panel_addresses(b: &mut Builder) -> Result<(), String> {
+    let (wr, wc, w) = (Regs::WR, Regs::WC, Regs::WAVE);
+    op(b, "v_and_b32_e32 v18, 12, v3", &[v(18)], &[v(3)])?;
+    op(b, "v_lshrrev_b32_e32 v19, 1, v3", &[v(19)], &[v(3)])?;
+    op(b, "v_and_b32_e32 v19, 1, v19", &[v(19)], &[v(19)])?;
+    op(b, "v_or_b32_e32 v18, v18, v19", &[v(18)], &[v(18), v(19)])?;
+    op(b, format!("v_lshl_add_u32 v19, s{wr}, 2, v4"), &[v(19)], &[s(wr), v(4)])?;
+    op(b, "v_xor_b32_e32 v18, v18, v19", &[v(18)], &[v(18), v(19)])?;
+    op(b, "v_lshlrev_b32_e32 v18, 5, v18", &[v(18)], &[v(18)])?;
+    op(b, "v_lshl_add_u32 v18, v3, 10, v18", &[v(18)], &[v(3), v(18)])?;
+    op(b, format!("v_lshl_add_u32 v{}, s{wc}, 15, v18", A4::LST), &[v(A4::LST)], &[s(wc), v(18)])?;
+    let (m0, m1) = (Regs::MUL, Regs::MUL + 1);
+    sop(b, format!("s_and_b32 s{m0}, s{w}, 6"), &[m0], &[w])?;
+    sop(b, format!("s_lshl_b32 s{m0}, s{m0}, 1"), &[m0], &[m0])?;
+    sop(b, format!("s_and_b32 s{m1}, s{w}, 1"), &[m1], &[w])?;
+    sop(b, format!("s_add_i32 s{m0}, s{m0}, s{m1}"), &[m0], &[m0, m1])?;
+    op(b, format!("v_xor_b32_e32 v20, s{m0}, v2"), &[v(20)], &[s(m0), v(2)])?;
+    op(b, "v_lshlrev_b32_e32 v20, 5, v20", &[v(20)], &[v(20)])?;
+    op(b, format!("v_lshl_add_u32 v{}, s{w}, 11, v20", A4::LRD), &[v(A4::LRD)], &[s(w), v(20)])
+}
+
+fn ds_off(o: u32) -> String { if o == 0 { String::new() } else { format!(" offset:{o}") } }
+
+/// Lane id, the AWQ / signs loads of this CTA's 256-group, the FWHT lane
+/// signs, the Y4 record bases and offsets, and the quant constants.
+fn a4_setup(b: &mut Builder) -> Result<(), String> {
+    let (lane, t, t0, t1) = (A4::LANE, A4::TMP, Regs::T0, Regs::T1);
+    op(b, format!("v_mbcnt_lo_u32_b32 v{lane}, -1, 0"), &[v(lane)], &[])?;
+    // awq + 4*(256*by): the CTA's h rows are features 256*by..+256.
+    sop(b, format!("s_lshl_b32 s{t0}, s{}, 10", Regs::WGY), &[t0], &[Regs::WGY])?;
+    sop(b, format!("s_add_u32 s{}, s{ARG_Y}, s{t0}", A4::AWQB), &[A4::AWQB], &[ARG_Y, t0])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", A4::AWQB + 1, ARG_Y + 1), &[A4::AWQB + 1], &[ARG_Y + 1])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 5, v{lane}", A4::LDOFF), &[v(A4::LDOFF)], &[v(lane)])?;
+    for (dst, base) in [(A4::AWQ, A4::AWQB), (A4::S1, A4::SARGS), (A4::S2, A4::SARGS + 2)] {
+        for h in 0..2u8 {
+            let d = vr(dst + 4 * h, 4);
+            mem(b, format!("global_load_b128 {d}, v{}, s[{base}:{}]{}", A4::LDOFF, base + 1, off(16 * u32::from(h))?),
+                &[d], &[v(A4::LDOFF), sr(base, 2)], MemoryClass::VmemLoad)?;
+        }
+    }
+    // Lane-stage sign of stride 2^i: -1.0 where lane bit i is set.
+    for i in 0..5u8 {
+        op(b, format!("v_bfe_u32 v{t}, v{lane}, {i}, 1"), &[v(t)], &[v(lane)])?;
+        op(b, format!("v_lshl_or_b32 v{}, v{t}, 31, 1.0", A4::SGN + i), &[v(A4::SGN + i)], &[v(t)])?;
+    }
+    // Y4 + 72*(2*by*N + 128*bx); panel 1's tokens are 64 records further.
+    let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
+    sop(b, format!("s_mul_i32 s{t0}, s{}, s{ARG_N}", Regs::WGY), &[t0], &[Regs::WGY, ARG_N])?;
+    sop(b, format!("s_lshl_b32 s{t0}, s{t0}, 1"), &[t0], &[t0])?;
+    sop(b, format!("s_lshl_b32 s{t1}, s{}, 7", Regs::WGX), &[t1], &[Regs::WGX])?;
+    sop(b, format!("s_add_i32 s{t0}, s{t0}, s{t1}"), &[t0], &[t0, t1])?;
+    sop(b, format!("s_mul_i32 s{lo}, s{t0}, {}", lit(XBLK_BYTES)), &[lo], &[t0])?;
+    sop(b, format!("s_mul_hi_u32 s{hi}, s{t0}, {}", lit(XBLK_BYTES)), &[hi], &[t0])?;
+    let [y0, y1] = A4::YB;
+    sop(b, format!("s_add_u32 s{y0}, s{}, s{lo}", A4::Y4), &[y0], &[A4::Y4, lo])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", y0 + 1, A4::Y4 + 1), &[y0 + 1], &[A4::Y4 + 1, hi])?;
+    sop(b, format!("s_add_u32 s{y1}, s{y0}, {}", lit(64 * XBLK_BYTES)), &[y1], &[y0])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", y1 + 1, y0 + 1), &[y1 + 1], &[y0 + 1])?;
+    // Record of (half lane>>4, token 2w): 72*((lane>>4)*N + 2w); qs word 8 + 4*(lane&15) into it.
+    op(b, format!("v_lshrrev_b32_e32 v{t}, 4, v{lane}"), &[v(t)], &[v(lane)])?;
+    op(b, format!("v_mul_u32_u24_e32 v{t}, s{ARG_N}, v{t}"), &[v(t)], &[s(ARG_N), v(t)])?;
+    sop(b, format!("s_lshl_b32 s{t0}, s{}, 1", Regs::WAVE), &[t0], &[Regs::WAVE])?;
+    op(b, format!("v_add_nc_u32_e32 v{t}, s{t0}, v{t}"), &[v(t)], &[s(t0), v(t)])?;
+    op(b, format!("v_mul_u32_u24_e32 v{}, {}, v{t}", A4::VD, lit(XBLK_BYTES)), &[v(A4::VD)], &[v(t)])?;
+    op(b, format!("v_and_b32_e32 v{t}, 15, v{lane}"), &[v(t)], &[v(lane)])?;
+    op(b, format!("v_lshl_add_u32 v{}, v{t}, 2, v{}", A4::VO, A4::VD), &[v(A4::VO)], &[v(t), v(A4::VD)])?;
+    op(b, format!("v_add_nc_u32_e32 v{0}, 8, v{0}", A4::VO), &[v(A4::VO)], &[v(A4::VO)])?;
+    sop(b, format!("s_mov_b32 s{}, {}", A4::C7, lit(7.0f32.to_bits())), &[A4::C7], &[])?;
+    sop(b, format!("s_mov_b32 s{}, {}", A4::CM8, lit((-8.0f32).to_bits())), &[A4::CM8], &[])
+}
+
+/// One panel round: store this wave's h of token fragments c = 2r, 2r+1
+/// (panel wc), publish, and load tokens 2w, 2w+1 of both panels into
+/// `A4::IN[r]` (token (panel b, +s) at `IN[r] + 8*(2b + s)`).
+fn panel_round(wg: &mut Wg, panel: LdsRegion<Panel, Free>, r: u8) -> Result<LdsRegion<Panel, Published>, String> {
+    let mut w = wg.begin_write(panel);
+    for c2 in 0..2u8 { for p in 0..2u8 { for q in 0..2u8 {
+        let data = vr(acc(2 * p, 2 * r + c2) + 4 * q, 4);
+        let o = 16384 * u32::from(c2) + 64 * u32::from(p) + 16 * u32::from(q);
+        let text = format!("ds_store_b128 v{}, {data}{}", A4::LST, ds_off(o));
+        w = wg.ds_store(w, Instruction::new(text, vec![], vec![v(A4::LST), data]).memory(MemoryClass::DsStore))?;
+    } } }
+    let (region, pending) = w;
+    let drained = wg.wait(pending)?;
+    let (panel,) = wg.barrier((ready(region, drained),))?;
+    for pb in 0..2u8 { for s_ in 0..2u8 { for q in 0..2u8 {
+        let dst = vr(A4::IN[usize::from(r)] + 8 * (2 * pb + s_) + 4 * q, 4);
+        let o = PANEL_BYTES * u32::from(pb) + 1024 * u32::from(s_) + 16 * u32::from(q);
+        let text = format!("ds_load_b128 {dst}, v{}{}", A4::LRD, ds_off(o));
+        wg.ds_load(&panel, Instruction::new(text, vec![dst], vec![v(A4::LRD)]).memory(MemoryClass::DsLoad))?;
+    } } }
+    Ok(panel)
+}
+
+/// SiluA4 epilogue: SiLU, two panel rounds, then the producer's stages and
+/// the A4 emit for the eight tokens each wave now owns.
+fn epilogue_a4(wg: &mut Wg, g: &Gen, (ra, rx, ah, xh): Rings) -> Result<(), String> {
+    let b = wg.isa();
+    b.label(&g.label("epilogue"))?;
+    a4_setup(b)?;
+    b.label(&g.label("epi_body"))?;
+    for p in 0..2u8 { for c in 0..4u8 {
+        Epilogue::silu_dense(b, acc(2 * p, c), acc(2 * p + 1, c), 160, Regs::MASK, SILU_GROUP)?;
+    } }
+    b.label(&g.label("a4_lds"))?;
+    let (ra, rx, ah, xh) = wg.barrier((retire_cur(ra), retire_cur(rx), retire(ah), retire(xh)))?;
+    wg.relayout((ra, rx, ah, xh))?;
+    let panel = wg.lds::<Panel>("PANEL", 0, LDS_BYTES)?;
+    let panel = panel_round(wg, panel, 0)?;
+    let (panel,) = wg.barrier((retire(panel),))?;
+    let _published = panel_round(wg, panel, 1)?;
+    wg.isa().label(&g.label("a4_proc"))?;
+    for r in 0..2u8 { for pb in 0..2u8 { for s_ in 0..2u8 {
+        let token = 4 * r + 2 * pb + s_;
+        a4_token(wg, g, token, A4::IN[usize::from(r)] + 8 * (2 * pb + s_), A4::YB[usize::from(pb)], XBLK_BYTES * (32 * u32::from(r) + u32::from(s_)))?;
+    } } }
+    Ok(())
+}
+
+/// A divide operand: per-element VGPR or one SGPR for every element.
+#[derive(Clone, Copy)]
+enum Opd { V(u8), S(u8) }
+impl Opd {
+    fn text(self) -> String { match self { Self::V(n) => format!("v{n}"), Self::S(n) => format!("s{n}") } }
+    fn reg(self) -> RegRef { match self { Self::V(n) => v(n), Self::S(n) => s(n) } }
+}
+
+/// IEEE f32 `dst[k] = num[k] / den[k]`: hipcc's `v_div_scale` / `v_rcp` /
+/// three fma refinements / `v_div_fmas` / `v_div_fixup` expansion with f32
+/// denormals on (the steps of `Epilogue::silu_dense`), elements interleaved
+/// op by op. Element k uses VGPRs `tmp + 5k ..+5` and the carry SGPR
+/// `mask + 2k`; `dst` may alias `num`.
+fn fdiv(b: &mut Builder, dst: &[u8], num: &[u8], den: &[Opd], tmp: u8, mask: u8) -> Result<(), String> {
+    let n = dst.len();
+    let t = |k: usize, i: u8| tmp + 5 * k as u8 + i;
+    let m = |k: usize| mask + 2 * k as u8;
+    for k in 0..n {
+        op(b, format!("v_div_scale_f32 v{}, null, {1}, {1}, v{2}", t(k, 0), den[k].text(), num[k]), &[v(t(k, 0))], &[den[k].reg(), v(num[k])])?;
+    }
+    for k in 0..n {
+        op(b, format!("v_div_scale_f32 v{}, s{}, v{2}, {3}, v{2}", t(k, 1), m(k), num[k], den[k].text()), &[v(t(k, 1)), s(m(k))], &[den[k].reg(), v(num[k])])?;
+    }
+    for k in 0..n { op(b, format!("v_rcp_f32_e32 v{}, v{}", t(k, 2), t(k, 0)), &[v(t(k, 2))], &[v(t(k, 0))])?; }
+    for k in 0..n { op(b, format!("v_fma_f32 v{}, -v{}, v{}, 1.0", t(k, 3), t(k, 0), t(k, 2)), &[v(t(k, 3))], &[v(t(k, 0)), v(t(k, 2))])?; }
+    for k in 0..n { op(b, format!("v_fmac_f32_e32 v{0}, v{1}, v{0}", t(k, 2), t(k, 3)), &[v(t(k, 2))], &[v(t(k, 2)), v(t(k, 3))])?; }
+    for k in 0..n { op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", t(k, 3), t(k, 1), t(k, 2)), &[v(t(k, 3))], &[v(t(k, 1)), v(t(k, 2))])?; }
+    for k in 0..n {
+        op(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", t(k, 4), t(k, 0), t(k, 3), t(k, 1)), &[v(t(k, 4))], &[v(t(k, 0)), v(t(k, 3)), v(t(k, 1))])?;
+    }
+    for k in 0..n {
+        op(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", t(k, 3), t(k, 4), t(k, 2)), &[v(t(k, 3))], &[v(t(k, 3)), v(t(k, 4)), v(t(k, 2))])?;
+    }
+    for k in 0..n {
+        op(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", t(k, 4), t(k, 0), t(k, 3), t(k, 1)), &[v(t(k, 4))], &[v(t(k, 0)), v(t(k, 3)), v(t(k, 1))])?;
+    }
+    for k in 0..n {
+        op(b, format!("s_mov_b32 vcc_lo, s{}", m(k)), &[], &[s(m(k))])?;
+        op(b, format!("v_div_fmas_f32 v{0}, v{0}, v{1}, v{2}", t(k, 4), t(k, 2), t(k, 3)), &[v(t(k, 4))], &[v(t(k, 4)), v(t(k, 2)), v(t(k, 3))])?;
+    }
+    for k in 0..n {
+        op(b, format!("v_div_fixup_f32 v{}, v{}, {}, v{}", dst[k], t(k, 4), den[k].text(), num[k]), &[v(dst[k])], &[v(t(k, 4)), den[k].reg(), v(num[k])])?;
+    }
+    Ok(())
+}
+
+/// `v_mov_b32_dpp` / DPP-source text of `row_xmask:m` over all rows and banks.
+fn xmask(m: u8) -> String { format!("row_xmask:{m} row_mask:0xf bank_mask:0xf") }
+
+/// Both candidates' block mse exactly as `iu4_c2_mse`: clamp q0 (and q1 on
+/// the reference-divide path), the per-element error fma and the two
+/// per-half fma chains in element order, the row_xmask 8, 4, 2, 1 sums,
+/// then `acc[0] + acc[1]`.
+fn c2_mse(b: &mut Builder, e: &[u8; 8], clamp_q1: bool) -> Result<(), String> {
+    let clamp = |b: &mut Builder, q: u8| op(b, format!("v_maxmin_f32 v{q}, v{q}, s{}, s{}", A4::CM8, A4::C7), &[v(q)], &[v(q), s(A4::CM8), s(A4::C7)]);
+    if clamp_q1 { for k in 0..8u8 { clamp(b, A4::Q1 + k)?; } }
+    for k in 0..8u8 { clamp(b, A4::Q0 + k)?; }
+    for k in 0..8u8 {
+        let x = e[usize::from(k)];
+        for (err, q, d) in [(A4::Y0 + k, A4::Q0 + k, A4::D0), (A4::Y1 + k, A4::Q1 + k, A4::D1)] {
+            op(b, format!("v_fma_f32 v{err}, -v{q}, v{d}, v{x}"), &[v(err)], &[v(q), v(d), v(x)])?;
+        }
+    }
+    // acc[j]: j = 0, 1 candidate 0 halves 0..3 / 4..7; j = 2, 3 candidate 1.
+    for (j, ebase) in [(0u8, A4::Y0), (1, A4::Y0 + 4), (2, A4::Y1), (3, A4::Y1 + 4)] {
+        let a = A4::ACC + j;
+        op(b, format!("v_mul_f32_e32 v{a}, v{ebase}, v{ebase}"), &[v(a)], &[v(ebase)])?;
+        for i in 1..4u8 { op(b, format!("v_fmac_f32_e32 v{a}, v{0}, v{0}", ebase + i), &[v(a)], &[v(a), v(ebase + i)])?; }
+    }
+    for m in [8u8, 4, 2, 1] {
+        for j in 0..4u8 {
+            let a = A4::ACC + j;
+            op(b, format!("v_add_f32_dpp v{a}, v{a}, v{a} {}", xmask(m)), &[v(a)], &[v(a)])?;
+        }
+    }
+    op(b, format!("v_add_f32_e32 v{}, v{}, v{}", A4::MSE0, A4::ACC, A4::ACC + 1), &[v(A4::MSE0)], &[v(A4::ACC), v(A4::ACC + 1)])?;
+    op(b, format!("v_add_f32_e32 v{}, v{}, v{}", A4::MSE1, A4::ACC + 2, A4::ACC + 3), &[v(A4::MSE1)], &[v(A4::ACC + 2), v(A4::ACC + 3)])
+}
+
+/// One token's 256-group in producer ownership (lane l: features 8l..8l+7
+/// at `x..x+8`): the hin's stages 2-5 and the one-pass `{5,7}` emit of its
+/// two `block_i4_128` records to `s[yb] + imm` (+ the lane's record and qs
+/// offsets).
+fn a4_token(wg: &mut Wg, g: &Gen, token: u8, x: u8, yb: u8, imm: u32) -> Result<(), String> {
+    let b = wg.isa();
+    let xs: [u8; 8] = std::array::from_fn(|k| x + k as u8);
+    // v = (h / awq) * signs1.
+    let awq: [Opd; 8] = std::array::from_fn(|k| Opd::V(A4::AWQ + k as u8));
+    fdiv(b, &xs, &xs, &awq, A4::DIVT, A4::DIVM)?;
+    for k in 0..8u8 { op(b, format!("v_mul_f32_e32 v{0}, v{0}, v{1}", x + k, A4::S1 + k), &[v(x + k)], &[v(x + k), v(A4::S1 + k)])?; }
+    // Register butterflies, strides 1, 2, 4: lo' = lo + hi, hi' = lo - hi
+    // (the difference lands in a spare, which becomes the element).
+    let mut e = xs;
+    let mut spare: Vec<u8> = (0..8).map(|i| A4::FW + i).collect();
+    for stride in [1usize, 2, 4] {
+        for lo in (0..8).filter(|i| i & stride == 0) {
+            let (hi, t) = (lo + stride, spare.pop().ok_or("butterfly spares")?);
+            op(b, format!("v_sub_f32_e32 v{t}, v{}, v{}", e[lo], e[hi]), &[v(t)], &[v(e[lo]), v(e[hi])])?;
+            op(b, format!("v_add_f32_e32 v{0}, v{0}, v{1}", e[lo], e[hi]), &[v(e[lo])], &[v(e[lo]), v(e[hi])])?;
+            spare.push(e[hi]);
+            e[hi] = t;
+        }
+    }
+    // Lane butterflies, strides 1..16: v = fma(sign, v, partner), i.e.
+    // partner - v on lanes with the stride bit, v + partner elsewhere.
+    for (i, size) in [1u8, 2, 4, 8, 16].into_iter().enumerate() {
+        for k in 0..8u8 {
+            let text = format!("ds_swizzle_b32 v{}, v{} offset:swizzle(SWAP,{size})", A4::P + k, e[usize::from(k)]);
+            b.ds_crosslane(Instruction::new(text, vec![v(A4::P + k)], vec![v(e[usize::from(k)])]).memory(MemoryClass::DsLoad))?;
+        }
+        let sign = A4::SGN + i as u8;
+        for k in 0..8u8 {
+            let x = e[usize::from(k)];
+            op(b, format!("v_fma_f32 v{x}, v{sign}, v{x}, v{}", A4::P + k), &[v(x)], &[v(sign), v(x), v(A4::P + k)])?;
+        }
+    }
+    // f = (v * 0.0625) * signs2.
+    for k in 0..8u8 { let x = e[usize::from(k)]; op(b, format!("v_mul_f32_e32 v{x}, {}, v{x}", lit(0.0625f32.to_bits())), &[v(x)], &[v(x)])?; }
+    for k in 0..8u8 { let x = e[usize::from(k)]; op(b, format!("v_mul_f32_e32 v{x}, v{x}, v{}", A4::S2 + k), &[v(x)], &[v(x), v(A4::S2 + k)])?; }
+
+    // amax over the lane's 8 values, then its 16-lane row (one 128-block).
+    let (amax, t) = (A4::AMAX, A4::T);
+    for i in 0..4u8 {
+        op(b, format!("v_max_f32_e64 v{}, |v{}|, |v{}|", A4::Y0 + i, e[usize::from(2 * i)], e[usize::from(2 * i + 1)]),
+            &[v(A4::Y0 + i)], &[v(e[usize::from(2 * i)]), v(e[usize::from(2 * i + 1)])])?;
+    }
+    for (d, a, c) in [(A4::Y0, A4::Y0, A4::Y0 + 1), (A4::Y0 + 2, A4::Y0 + 2, A4::Y0 + 3), (amax, A4::Y0, A4::Y0 + 2)] {
+        op(b, format!("v_max_f32_e32 v{d}, v{a}, v{c}"), &[v(d)], &[v(a), v(c)])?;
+    }
+    for m in [8u8, 4, 2, 1] {
+        op(b, format!("v_mov_b32_dpp v{t}, v{amax} {}", xmask(m)), &[v(t)], &[v(amax)])?;
+        op(b, format!("v_max_f32_e32 v{amax}, v{amax}, v{t}"), &[v(amax)], &[v(amax), v(t)])?;
+    }
+    op(b, format!("v_cmp_eq_f32_e64 s{}, 0, v{amax}", A4::ZERO), &[s(A4::ZERO)], &[v(amax)])?;
+    // d0 = ((amax / 7) * 0.5) * 0x1.b6db6ep+0, d1 = ((amax / 7) * 0.5) * 2.
+    fdiv(b, &[A4::BASE], &[amax], &[Opd::S(A4::C7)], A4::DIVT, A4::DIVM)?;
+    op(b, format!("v_mul_f32_e32 v{0}, 0.5, v{0}", A4::BASE), &[v(A4::BASE)], &[v(A4::BASE)])?;
+    op(b, format!("v_mul_f32_e32 v{}, 0x3fdb6db7, v{}", A4::D0, A4::BASE), &[v(A4::D0)], &[v(A4::BASE)])?;
+    op(b, format!("v_mul_f32_e32 v{}, 2.0, v{}", A4::D1, A4::BASE), &[v(A4::D1)], &[v(A4::BASE)])?;
+    // r = rcp(d) refined once: r = fma(r, fma(-d, r, 1), r).
+    for (r, d, tt) in [(A4::R0, A4::D0, t), (A4::R1, A4::D1, A4::T2)] {
+        op(b, format!("v_rcp_f32_e32 v{r}, v{d}"), &[v(r)], &[v(d)])?;
+        op(b, format!("v_fma_f32 v{tt}, -v{d}, v{r}, 1.0"), &[v(tt)], &[v(d), v(r)])?;
+        op(b, format!("v_fmac_f32_e32 v{r}, v{tt}, v{r}"), &[v(r)], &[v(r), v(tt)])?;
+    }
+    // Codes from y = x*r; frac = max |y - rint(y)|.
+    for k in 0..8u8 {
+        let x = e[usize::from(k)];
+        for (y, r) in [(A4::Y0 + k, A4::R0), (A4::Y1 + k, A4::R1)] { op(b, format!("v_mul_f32_e32 v{y}, v{x}, v{r}"), &[v(y)], &[v(x), v(r)])?; }
+    }
+    for k in 0..8u8 {
+        for (q, y) in [(A4::Q0 + k, A4::Y0 + k), (A4::Q1 + k, A4::Y1 + k)] { op(b, format!("v_rndne_f32_e32 v{q}, v{y}"), &[v(q)], &[v(y)])?; }
+    }
+    for k in 0..8u8 {
+        for (q, y) in [(A4::Q0 + k, A4::Y0 + k), (A4::Q1 + k, A4::Y1 + k)] { op(b, format!("v_sub_f32_e32 v{y}, v{y}, v{q}"), &[v(y)], &[v(y), v(q)])?; }
+    }
+    for k in 0..8u8 { op(b, format!("v_max_f32_e64 v{0}, |v{0}|, |v{1}|", A4::Y0 + k, A4::Y1 + k), &[v(A4::Y0 + k)], &[v(A4::Y0 + k), v(A4::Y1 + k)])?; }
+    for (d, a, c) in [(0u8, 0u8, 1u8), (2, 2, 3), (4, 4, 5), (6, 6, 7), (0, 0, 2), (4, 4, 6)] {
+        op(b, format!("v_max_f32_e32 v{}, v{}, v{}", A4::Y0 + d, A4::Y0 + a, A4::Y0 + c), &[v(A4::Y0 + d)], &[v(A4::Y0 + a), v(A4::Y0 + c)])?;
+    }
+    op(b, format!("v_max_f32_e32 v{}, v{}, v{}", A4::FRAC, A4::Y0, A4::Y0 + 4), &[v(A4::FRAC)], &[v(A4::Y0), v(A4::Y0 + 4)])?;
+    c2_mse(b, &e, false)?;
+    // exact = zero || (2^-100 <= amax <= FLT_MAX && frac <= 0.5 - 2^-18); any
+    // inexact lane sends the whole wave through the reference divides.
+    let (ma, mb, mc) = (A4::MA, A4::MB, A4::MC);
+    op(b, format!("v_cmp_le_f32_e64 s{ma}, {}, v{amax}", lit(2f32.powi(-100).to_bits())), &[s(ma)], &[v(amax)])?;
+    op(b, format!("v_cmp_ge_f32_e64 s{mb}, {}, v{amax}", lit(f32::MAX.to_bits())), &[s(mb)], &[v(amax)])?;
+    op(b, format!("v_cmp_ge_f32_e64 s{mc}, {}, v{}", lit((0.5f32 - 2f32.powi(-18)).to_bits()), A4::FRAC), &[s(mc)], &[v(A4::FRAC)])?;
+    sop(b, format!("s_and_b32 s{ma}, s{ma}, s{mb}"), &[ma], &[ma, mb])?;
+    sop(b, format!("s_and_b32 s{ma}, s{ma}, s{mc}"), &[ma], &[ma, mc])?;
+    sop(b, format!("s_or_b32 s{ma}, s{ma}, s{}", A4::ZERO), &[ma], &[ma, A4::ZERO])?;
+    let exact = wg.scmp(Instruction::new(format!("s_cmp_eq_u32 s{ma}, -1"), vec![], vec![s(ma)]))?;
+    wg.skip_if(exact, &g.label(&format!("ref{token}")), (), |w, ()| {
+        let b = w.isa();
+        let q0: [u8; 8] = std::array::from_fn(|k| A4::Q0 + k as u8);
+        let q1: [u8; 8] = std::array::from_fn(|k| A4::Q1 + k as u8);
+        fdiv(b, &q0, &e, &[Opd::V(A4::D0); 8], A4::DIVT, A4::DIVM)?;
+        for q in q0 { op(b, format!("v_rndne_f32_e32 v{q}, v{q}"), &[v(q)], &[v(q)])?; }
+        fdiv(b, &q1, &e, &[Opd::V(A4::D1); 8], A4::DIVT, A4::DIVM)?;
+        for q in q1 { op(b, format!("v_rndne_f32_e32 v{q}, v{q}"), &[v(q)], &[v(q)])?; }
+        c2_mse(b, &e, true)
+    })?;
+    // best: strict < against 1e30, then d1 against the d0 result.
+    let b = wg.isa();
+    let big = lit(1.0e30f32.to_bits());
+    let (take0, use1, unit, mt, zero) = (A4::TAKE0, A4::USE1, A4::UNIT, A4::MT, A4::ZERO);
+    op(b, format!("v_cmp_gt_f32_e64 s{take0}, {big}, v{}", A4::MSE0), &[s(take0)], &[v(A4::MSE0)])?;
+    op(b, format!("v_cndmask_b32_e64 v{}, {big}, v{}, s{take0}", A4::THR, A4::MSE0), &[v(A4::THR)], &[v(A4::MSE0), s(take0)])?;
+    op(b, format!("v_cmp_gt_f32_e64 s{use1}, v{}, v{}", A4::THR, A4::MSE1), &[s(use1)], &[v(A4::THR), v(A4::MSE1)])?;
+    sop(b, format!("s_or_b32 s{mt}, s{take0}, s{use1}"), &[mt], &[take0, use1])?;
+    sop(b, format!("s_not_b32 s{mt}, s{mt}"), &[mt], &[mt])?;
+    sop(b, format!("s_or_b32 s{unit}, s{zero}, s{mt}"), &[unit], &[zero, mt])?;
+    for k in 0..8u8 {
+        let q = A4::Q0 + k;
+        op(b, format!("v_cndmask_b32_e64 v{q}, v{q}, v{}, s{use1}", A4::Q1 + k), &[v(q)], &[v(q), v(A4::Q1 + k), s(use1)])?;
+    }
+    // unit (amax == 0, or no candidate below 1e30): q = zero ? 0 : clamp(rint(x / 1)).
+    let none = wg.scmp(Instruction::new(format!("s_cmp_eq_u32 s{unit}, 0"), vec![], vec![s(unit)]))?;
+    wg.skip_if(none, &g.label(&format!("unit{token}")), (), |w, ()| {
+        let b = w.isa();
+        for k in 0..8u8 {
+            let (u, q, x) = (A4::Y0 + k, A4::Q0 + k, e[usize::from(k)]);
+            op(b, format!("v_rndne_f32_e32 v{u}, v{x}"), &[v(u)], &[v(x)])?;
+            op(b, format!("v_maxmin_f32 v{u}, v{u}, s{}, s{}", A4::CM8, A4::C7), &[v(u)], &[v(u), s(A4::CM8), s(A4::C7)])?;
+            op(b, format!("v_cndmask_b32_e64 v{u}, v{u}, 0, s{zero}"), &[v(u)], &[v(u), s(zero)])?;
+            op(b, format!("v_cndmask_b32_e64 v{q}, v{q}, v{u}, s{unit}"), &[v(q)], &[v(q), v(u), s(unit)])?;
+        }
+        Ok(())
+    })?;
+    // Codes, their exact row sum s, the packed qs word and d.
+    let b = wg.isa();
+    let (word, sum) = (A4::WORD, A4::DS + 1);
+    for k in 0..8u8 { op(b, format!("v_cvt_i32_f32_e32 v{}, v{}", A4::QI + k, A4::Q0 + k), &[v(A4::QI + k)], &[v(A4::Q0 + k)])?; }
+    op(b, format!("v_add_nc_u32_e32 v{sum}, v{}, v{}", A4::QI, A4::QI + 1), &[v(sum)], &[v(A4::QI), v(A4::QI + 1)])?;
+    for k in 2..8u8 { op(b, format!("v_add_nc_u32_e32 v{sum}, v{}, v{sum}", A4::QI + k), &[v(sum)], &[v(A4::QI + k), v(sum)])?; }
+    for m in [8u8, 4, 2, 1] {
+        op(b, format!("v_mov_b32_dpp v{t}, v{sum} {}", xmask(m)), &[v(t)], &[v(sum)])?;
+        op(b, format!("v_add_nc_u32_e32 v{sum}, v{sum}, v{t}"), &[v(sum)], &[v(sum), v(t)])?;
+    }
+    op(b, format!("v_and_b32_e32 v{word}, 15, v{}", A4::QI), &[v(word)], &[v(A4::QI)])?;
+    for k in 1..8u8 {
+        op(b, format!("v_lshlrev_b32_e32 v{t}, {}, v{}", 4 * k, A4::QI + k), &[v(t)], &[v(A4::QI + k)])?;
+        op(b, format!("v_and_or_b32 v{word}, v{t}, {}, v{word}", lit(0xf << (4 * k))), &[v(word)], &[v(t), v(word)])?;
+    }
+    op(b, format!("v_cndmask_b32_e64 v{}, v{}, v{}, s{use1}", A4::DS, A4::D0, A4::D1), &[v(A4::DS)], &[v(A4::D0), v(A4::D1), s(use1)])?;
+    op(b, format!("v_cndmask_b32_e64 v{0}, v{0}, 1.0, s{unit}", A4::DS), &[v(A4::DS)], &[v(A4::DS), s(unit)])?;
+    mem(b, format!("global_store_b32 v{}, v{word}, s[{yb}:{}]{}", A4::VO, yb + 1, off(imm)?), &[], &[v(A4::VO), v(word), sr(yb, 2)], MemoryClass::VmemStore)?;
+    let ds = vr(A4::DS, 2);
+    mem(b, format!("global_store_b64 v{}, {ds}, s[{yb}:{}]{}", A4::VD, yb + 1, off(imm)?), &[], &[v(A4::VD), ds, sr(yb, 2)], MemoryClass::VmemStore)
+}
+
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     let g = Gen { spec };
@@ -641,10 +1115,13 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     let mut wg = Wg::new(&mut b)?;
     let lds = declare_lds(&mut wg)?;
     let end = wg.exit(&g.label("end"))?;
-    let rings = prologue(&mut wg, lds)?;
-    // The last period's slots stay published: nothing writes LDS after it.
-    let _published = kloop(&mut wg, &g, rings)?;
-    epilogue(wg.isa(), &g)?;
+    let rings = prologue(&mut wg, spec.epi, lds)?;
+    let rings = kloop(&mut wg, &g, rings)?;
+    match spec.epi {
+        // The last period's slots stay published: nothing writes LDS after it.
+        Epi::SiluM512 => epilogue(wg.isa(), &g)?,
+        Epi::SiluA4 => epilogue_a4(&mut wg, &g, rings)?,
+    }
     // One CTA per WGP: release the VGPRs before the epilogue's stores drain
     // so the next CTA's waves launch (V2B and hipcc emit the same message).
     // M7 models `s_sendmsg` as reading M0; the message carries no data.
@@ -655,7 +1132,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// The module's entries as one code object (stage 1: the M512 SiLU twin).
+/// The module's entries (the M512 h twin and the fused A4 entry) as one code object.
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
     let emitted = Epi::ALL.into_iter().map(|epi| emit(Spec { arch, epi })).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, MODULE)?;
