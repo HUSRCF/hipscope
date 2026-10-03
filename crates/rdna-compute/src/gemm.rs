@@ -761,17 +761,19 @@ enum A4Mode {
     /// `retile`: the stage-1 m512 twin replaces the V2B SiLU launch; `h`
     /// is written exactly as before.
     Retile,
-    /// `1`: the fused kernel also writes the down-proj A4 sidecar.
+    /// Unset, `1` or any other value (default): the fused kernel also writes
+    /// the down-proj A4 sidecar.
     Fused,
 }
 
 /// Current `HIPFIRE_V2B_A4_EPI` arm. Read on every call (not cached) so one
-/// process can switch arms; unset, `0` and any other value mean off.
+/// process can switch arms; `0` is the opt-out (unfused V2B SiLU + hin).
+/// Only exact gfx1151 V2B shapes are admitted (`Gpu::a4_epi_admitted`).
 fn v2b_a4_mode() -> Option<A4Mode> {
     match hipfire_config::developer_var("HIPFIRE_V2B_A4_EPI").as_deref() {
+        Ok("0") => None,
         Ok("retile") => Some(A4Mode::Retile),
-        Ok("1") => Some(A4Mode::Fused),
-        _ => None,
+        _ => Some(A4Mode::Fused),
     }
 }
 
@@ -34091,7 +34093,7 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() != Ok("0")
     }
 
-    /// A4-fusion stage 2 (`HIPFIRE_V2B_A4_EPI=1`, default off): the certified
+    /// A4-fusion stage 2 (`HIPFIRE_V2B_A4_EPI`, default on; `=0` opts out): the certified
     /// V2B gate/up + SiLU GEMM that also writes the w_down A4 sidecar. The
     /// kernel applies the `fused_silu_hin_rotate_mq_i4_batched` producer to its
     /// own SiLU output and stores the byte-identical 72-byte `block_i4_128`
