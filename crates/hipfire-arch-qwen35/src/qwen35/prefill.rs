@@ -314,7 +314,7 @@ fn try_iu4_silu_prepared(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FfnGateOutput {
     Separate,
-    /// `HIPFIRE_V2B_A4_EPI=1`: the gate/up epilogue wrote the w_down A4
+    /// A4 fusion (`HIPFIRE_V2B_A4_EPI`, default on gfx1151; `=0` opts out): the gate/up epilogue wrote the w_down A4
     /// sidecar itself; `gate_ffn_batch` (h) was not written.
     Iu4A4(rdna_compute::Int4MmqDownPrepared),
     Iu4H,
@@ -7430,7 +7430,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::A8H);
     } else if let Some(prep) = &iu4_prep {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
-        // A4 fusion (`HIPFIRE_V2B_A4_EPI=1`, gfx1151 V2B only): the epilogue
+        // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
         // also writes the w_down sidecar, so no h and no hin producer.
         if f1lite {
             if let Some(awq) = layer.w_down.awq_scale.as_ref() {
@@ -9689,7 +9689,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
         )?;
         return Ok(FfnGateOutput::A8H);
     } else if let Some(prep) = &iu4_prep {
-        // A4 fusion (`HIPFIRE_V2B_A4_EPI=1`, gfx1151 V2B only): the epilogue
+        // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
         // also writes the w_down sidecar, so no h and no hin producer.
         if f1lite {
             if let Some(awq) = layer.w_down.awq_scale.as_ref() {
