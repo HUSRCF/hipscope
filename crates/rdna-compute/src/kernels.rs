@@ -1156,8 +1156,8 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC: &str = concat!(
 /// `HIPFIRE_RMSNORM_P1A_MAX8`, the gfx1201 fp8 SHORT recipe): same elements,
 /// same strictly sequential `fma(v, v, acc)` chain from +0 as the incumbent
 /// loop's contraction, same reduction tree — bit-identical rms and outputs.
-/// gfx1151 keeps the incumbent symbols; `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps
-/// them on gfx1100 too.
+/// gfx1151 runs its own `_b8_gfx1151` twins below; `HIPFIRE_RMSNORM_P1A_BATCHED=0`
+/// keeps the incumbents on both.
 pub const FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1173,6 +1173,53 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_AWQ 1\n",
     "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_b8\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// gfx1151 `_b8_gfx1151` twins of the `_b8` producers above, also emitting
+/// through the one-pass {5,7} `block_i4_128` emit (`HIPFIRE_IU4_ONEPASS`,
+/// the gfx1201 A4C2 emit: DPP reductions, rcp + Newton codes, wave-uniform
+/// divide fallback). Both changes are bit-identical to the incumbent; the
+/// sidecar bytes equal `fused_rmsnorm_mq_rotate[_awq]_i4`.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_B8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_b8_gfx1151\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// gfx1151 `_fold_b8` twins of the ADD-epilogue fold producers: the `_b8`
+/// batched Phase-1a over x and delta pairs, each element RN(x + delta) after
+/// the drain as in the incumbent loop — bit-identical rms, x write-back and
+/// sidecar. `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the incumbents.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_B8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_fold_b8\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_fold_b8\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
 /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
@@ -1833,8 +1880,9 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC: &str = concat!(
 /// whole 256-group and issues all of its x/z/awq/weight loads before any
 /// arithmetic, instead of two waves each waiting on four serialized loads.
 /// Same per-lane fma chain, XOR tree, rsqrt and per-element expressions —
-/// bit-identical. Grid [ceil((K/256)/2), N], block 64. gfx1151 keeps the
-/// incumbents; `HIPFIRE_GFX1100_GATED_NORM_V2=0` keeps them on gfx1100 too.
+/// bit-identical. Grid [ceil((K/256)/2), N], block 64. gfx1151 runs the
+/// `_gfx1151_v2` twins below; `HIPFIRE_GFX1100_GATED_NORM_V2=0` keeps the
+/// incumbents on gfx1100.
 pub const GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1848,6 +1896,27 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx1100_v2\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx1151 `_gfx1151_v2` twins of the `_gfx1100_v2` producers above, also
+/// emitting through the one-pass {5,7} `block_i4_128` emit
+/// (`HIPFIRE_IU4_ONEPASS`). Bit-identical to `gated_norm_mq_rotate[_awq]_i4_gfx11`.
+/// Same grid and arguments as the `_gfx1100_v2` twins.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx1151_v2\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx1151_v2\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
