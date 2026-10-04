@@ -16,16 +16,16 @@ pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
-const HYPER_READ_UP_WMMA_SRC: &str =
+pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
 const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
-const GATED_DELTA_CHUNK_WMMA_SRC: &str =
+pub(crate) const GATED_DELTA_CHUNK_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
 pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_q8_wmma.gfx1151.hip");
 
-const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
+pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
