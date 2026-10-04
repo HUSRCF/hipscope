@@ -3440,24 +3440,12 @@ pub fn generate_dflash(
                             action.fingerprint_text.chars().take(60).collect::<String>(),
                         );
                     }
-                    // Whole-envelope store: FULL generated body verbatim plus
-                    // producer reasoning text when the turn thought. Splice
-                    // replays R...A as one span; primer stays lookup-side.
+                    // Shared AR/spec value contract (`qwen_cached_turn_entry`);
+                    // primer stays lookup-side.
                     let tok = m.tokenizer.as_ref().unwrap();
                     let _ = qwen_dflash_apply_cache_action(
                         |fp, seq| {
-                            let reasoning =
-                                hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
-                                    tok,
-                                    &seq,
-                                    started_in_think,
-                                )
-                                .map(|text| {
-                                    hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                        token_ids: Vec::new(),
-                                        text,
-                                    }
-                                });
+                            let entry = qwen_cached_turn_entry(tok, seq, started_in_think);
                             if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
                                 .ok()
                                 .as_deref()
@@ -3466,23 +3454,11 @@ pub fn generate_dflash(
                                 eprintln!(
                                     "[qwen-cache store dflash] fp={:#018x} cached_seq={} span={}",
                                     fp,
-                                    seq.len(),
-                                    reasoning.is_some(),
+                                    entry.content.as_ref().map_or(0, |c| c.token_ids.len()),
+                                    entry.reasoning.is_some(),
                                 );
                             }
-                            m.asst_turn_cache.insert(
-                                fp,
-                                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning,
-                                    tools: Vec::new(),
-                                    content: Some(
-                                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                            token_ids: seq,
-                                            text: String::new(),
-                                        },
-                                    ),
-                                },
-                            );
+                            m.asst_turn_cache.insert(fp, entry);
                         },
                         &action,
                         cached_seq,
@@ -4490,7 +4466,8 @@ pub fn generate_spec(
             // Prefer a window-local repair: restore the pre-window target/drafter
             // snapshot and replay only the consumed prefix. Speculators without
             // that capability drop live state via the target's terminal reset
-            // (Qwen4: rewind to its durable prefix checkpoint) + cache invalidation.
+            // (Qwen4: rewind to its durable prefix checkpoint) + conversation-LCP
+            // invalidation at turn end.
             let repaired = match spec.repair_terminal_prefix(
                 gpu,
                 slot,
@@ -4933,10 +4910,14 @@ pub fn generate_spec(
     // only the decoded portion (`emitted`), making the next non-dflash turn
     // full-reset because no system/user prefix was present.
     // Host raw/conversation stay exact even when client events were held.
+    // An unrepaired terminal invalidates only the live KV/recurrent state, so
+    // only the KV mirrors (conversation LCP + checkpoints) drop. The
+    // assistant-turn cache is keyed by emitted content, not KV state: its
+    // verbatim IDs stay valid, and keeping them keeps this route's next-turn
+    // splice identical to the AR route's (which never clears it per turn).
     m.conversation_tokens = if terminal_cache_invalidated {
         free_checkpoints(&mut m.prefill_checkpoints, gpu);
         free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        m.asst_turn_cache.clear();
         Vec::new()
     } else {
         let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
@@ -6511,6 +6492,35 @@ where
     Some(fp)
 }
 
+/// The one `asst_turn_cache` value contract for an emitted Qwen assistant turn,
+/// shared by the AR route and the spec (MTP/DFlash) route: the FULL generated
+/// body verbatim plus, when the turn thought, the producer reasoning text.
+/// The jinja lookup ([`qwen_jinja_lookup_turn`]) replays it identically for
+/// either producer, so both routes splice byte-identical history.
+pub fn qwen_cached_turn_entry(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    seq: Vec<u32>,
+    started_in_think: bool,
+) -> hipfire_runtime::prompt_frame::CachedAssistantTurn {
+    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+        tokenizer,
+        &seq,
+        started_in_think,
+    )
+    .map(|text| hipfire_runtime::prompt_frame::CachedAssistantBody {
+        token_ids: Vec::new(),
+        text,
+    });
+    hipfire_runtime::prompt_frame::CachedAssistantTurn {
+        reasoning,
+        tools: Vec::new(),
+        content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+            token_ids: seq,
+            text: String::new(),
+        }),
+    }
+}
+
 /// Decode whether the last streamed token is a terminator for EOT-vs-length.
 pub fn qwen_dflash_decoded_eot_from_tokens(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
@@ -7593,6 +7603,252 @@ mod qwen_lookup_primer_tests {
         );
         assert!(full.reasoning.is_none());
         assert!(qwen_jinja_lookup_turn(&mut cache, &assistant_msg("missing"), &[90]).is_none());
+    }
+}
+
+/// Multi-turn history contract shared by the Qwen spec (MTP) and AR routes:
+/// each route stores its emitted turn through its own terminal → cache-action
+/// seam into the shared `qwen_cached_turn_entry`, and both render the next turn
+/// through `qwen_jinja_cached_history_tokens`. Over a 5-turn chat every earlier
+/// assistant turn must hit (splice its emitted IDs, not a re-encode) and both
+/// routes must build byte-identical prompts.
+#[cfg(test)]
+mod qwen_history_chain_tests {
+    use super::{
+        qwen_cached_turn_entry, qwen_dflash_apply_cache_action, qwen_dflash_cache_action,
+        qwen_dflash_cache_seq, qwen_dflash_wire_terminal, qwen_jinja_cached_history_tokens,
+        qwen_jinja_lookup_turn,
+    };
+    use crate::ar::{
+        qwen_ar_apply_cache_action, qwen_ar_cache_action, QwenArRouteFinish, QwenArTerminalCause,
+    };
+    use hipfire_loader::AsstTurnCache;
+    use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
+    use hipfire_runtime::spec::FinishSummary;
+    use hipfire_runtime::tokenizer::Tokenizer;
+
+    const IM_END: u32 = 1;
+    const BYTE_BASE: u32 = 100;
+
+    fn byte_char(b: u8) -> char {
+        let mut bs: Vec<u32> = ((b'!' as u32)..=(b'~' as u32)).collect();
+        bs.extend(0xA1u32..=0xACu32);
+        bs.extend(0xAEu32..=0xFFu32);
+        let mut cs = bs.clone();
+        let mut n = 0u32;
+        for byte in 0u32..=255 {
+            if !bs.contains(&byte) {
+                bs.push(byte);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        let i = bs.iter().position(|&x| x == b as u32).unwrap();
+        char::from_u32(cs[i]).unwrap()
+    }
+
+    /// GPT-2 byte-level BPE with one merge (`h e`), so the canonical encode of
+    /// "he" is one token while a producer may emit it as two byte tokens: a
+    /// re-encoded (missed) history turn is then observably different from the
+    /// spliced emitted IDs.
+    fn tokenizer() -> Tokenizer {
+        let mut entries = vec![
+            r#""<|im_start|>": 0"#.to_string(),
+            r#""<|im_end|>": 1"#.to_string(),
+            r#""<think>": 2"#.to_string(),
+            r#""</think>": 3"#.to_string(),
+            r#""<|reserved_0|>": 4"#.to_string(),
+            r#""<|reserved_1|>": 5"#.to_string(),
+            r#""<|reserved_2|>": 6"#.to_string(),
+            r#""he": 50"#.to_string(),
+        ];
+        for b in 0u32..=255 {
+            let ch = byte_char(b as u8).to_string();
+            let escaped = serde_json::to_string(&ch).unwrap();
+            entries.push(format!("{escaped}: {}", BYTE_BASE + b));
+        }
+        let json = format!(
+            r#"{{"model": {{"type": "BPE", "vocab": {{ {} }}, "merges": ["h e"]}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}},
+                    {{"id": 2, "content": "<think>", "special": true}},
+                    {{"id": 3, "content": "</think>", "special": true}},
+                    {{"id": 4, "content": "<|reserved_0|>", "special": true}},
+                    {{"id": 5, "content": "<|reserved_1|>", "special": true}},
+                    {{"id": 6, "content": "<|reserved_2|>", "special": true}}
+                ]}}"#,
+            entries.join(", ")
+        );
+        Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Route {
+        Mtp,
+        Ar,
+    }
+
+    /// Store one emitted turn through the route's production terminal →
+    /// cache-action seam into the shared value contract.
+    fn store_turn(
+        route: Route,
+        tok: &Tokenizer,
+        cache: &mut AsstTurnCache,
+        visible: &str,
+        streamed: &[u32],
+    ) {
+        let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let cached_seq = qwen_dflash_cache_seq(streamed, Some(IM_END), &nl);
+        let mut insert = |fp: u64, seq: Vec<u32>| {
+            cache.insert(fp, qwen_cached_turn_entry(tok, seq, false));
+        };
+        let stored = match route {
+            Route::Mtp => {
+                let finish = FinishSummary {
+                    finish_reason: "stop",
+                    visible_text: visible.to_string(),
+                    decoded_eot: true,
+                    ..FinishSummary::default()
+                };
+                let terminal = qwen_dflash_wire_terminal(&finish, false, false, visible, false);
+                qwen_dflash_apply_cache_action(
+                    &mut insert,
+                    &qwen_dflash_cache_action(&terminal),
+                    cached_seq,
+                )
+            }
+            Route::Ar => {
+                let finish = QwenArRouteFinish {
+                    finish_reason: "stop",
+                    wire_tool_calls: Vec::new(),
+                    store_cache: true,
+                    trailing_visible: Vec::new(),
+                    cause: QwenArTerminalCause::DecodedEot,
+                };
+                qwen_ar_apply_cache_action(
+                    &mut insert,
+                    &qwen_ar_cache_action(&finish, visible),
+                    cached_seq,
+                )
+            }
+        };
+        assert!(
+            stored.is_some(),
+            "{route:?}: a clean stop must store its turn"
+        );
+    }
+
+    /// The reply as the producer emitted it: one byte-level token per byte.
+    fn emitted_body(reply: &str) -> Vec<u32> {
+        reply.bytes().map(|b| BYTE_BASE + b as u32).collect()
+    }
+
+    /// Run a 5-turn chat on one route; returns each turn's prompt IDs.
+    fn run_chat(route: Route, tok: &Tokenizer, template: &str) -> Vec<Vec<u32>> {
+        let frame = JinjaChatFrame {
+            tokenizer: tok,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let label = match route {
+            Route::Mtp => "dflash",
+            Route::Ar => "qwen4-ar",
+        };
+        let users = [
+            "write code",
+            "solve math",
+            "explain seasons",
+            "tell a story",
+            "give tips",
+        ];
+        let replies = [
+            "the helper merges them",
+            "he drove; the sum is 210",
+            "the tilt, hence the heat",
+            "the keeper held the helm",
+            "use the help; then rest",
+        ];
+        let mut cache = AsstTurnCache::new_from_env();
+        let mut history = vec![msg(Role::System, "be helpful")];
+        let mut prompts = Vec::new();
+        for (turn, (user, reply)) in users.iter().zip(replies).enumerate() {
+            history.push(msg(Role::User, user));
+            let cold = tok.encode(&frame.render_messages(&history, None, None).unwrap());
+            let prompt =
+                qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, &history, None, label)
+                    .unwrap();
+            // Every earlier turn hits: its entry is still cached AND its
+            // emitted byte-level IDs (absent from any canonical re-encode,
+            // which merges `he`) appear verbatim in the prompt.
+            for (earlier, emitted) in history
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .zip(replies.iter().map(|r| emitted_body(r)))
+            {
+                assert!(
+                    qwen_jinja_lookup_turn(&mut cache, earlier, &[]).is_some(),
+                    "{route:?} turn {turn}: earlier assistant turn {:?} must stay cached",
+                    earlier.content
+                );
+                assert!(
+                    prompt.windows(emitted.len()).any(|w| w == emitted.as_slice()),
+                    "{route:?} turn {turn}: earlier assistant turn {:?} must splice its emitted IDs",
+                    earlier.content
+                );
+            }
+            prompts.push(prompt);
+            // The producer emitted the reply byte-by-byte (non-canonical vs the
+            // `he` merge) and then `<|im_end|>`; the client echoes the text.
+            let mut streamed = emitted_body(reply);
+            streamed.push(IM_END);
+            store_turn(route, tok, &mut cache, reply, &streamed);
+            history.push(msg(Role::Assistant, reply));
+        }
+        prompts
+    }
+
+    #[test]
+    fn five_turn_chat_mtp_and_ar_build_identical_prompts_and_every_turn_hits() {
+        let tok = tokenizer();
+        assert_eq!(
+            tok.encode("he"),
+            vec![50],
+            "fixture: `he` must merge canonically"
+        );
+        // Qwen3.5-style (bare history turns: primer prepended at lookup) and
+        // Qwen3.8-style (history turns re-emit the closed-think primer).
+        let bare = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}";
+        let primed = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' %}<think>\n\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}";
+        for template in [bare, primed] {
+            let mtp = run_chat(Route::Mtp, &tok, template);
+            let ar = run_chat(Route::Ar, &tok, template);
+            assert_eq!(mtp.len(), 5);
+            for (turn, (m, a)) in mtp.iter().zip(&ar).enumerate() {
+                assert_eq!(
+                    m, a,
+                    "turn {turn}: MTP and AR prompts must be byte-identical"
+                );
+            }
+        }
     }
 }
 #[cfg(test)]
