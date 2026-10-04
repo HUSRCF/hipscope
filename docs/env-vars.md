@@ -450,6 +450,22 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 
 ---
 
+## Manual — NPU research stack (dark, not `HIPFIRE_*`)
+
+Read only by `pm-npu`, `railgun` (feature `npu`) and `npu-tools`; nothing on the daemon/engine path reads them. See [`npu/README.md`](npu/README.md).
+
+| Variable | Reader | Meaning |
+|---|---|---|
+| `NPU_FCLK_GUARD` | `railgun::npu::fclk` (npu-coop, coop27) | `require` (unset; refuse concurrent GPU+NPU work unless the Halo iGPU fabric clock is pinned), `pin` (pin for the process, restore on exit), `off` (skip, loud warning) |
+| `NPU_M4_CMD`, `NPU_M4_ALONE_CMD` | `npu-tools m4` | NPU loop command run concurrently with the GPU prefills (required) and alone (defaults to `NPU_M4_CMD`) in the M4 derate measurement |
+| `AIE2P_VENDOR_CORPUS` | `pm-npu` tests | Vendor `vendor-artifacts` directory for byte-oracle cross-checks; tests skip when unset |
+| `AIE2P_OBJDUMP` | `pm-npu` `isa_decode` (ignored test) | llvm-aie `llvm-objdump` used as the decode oracle (default `/tmp/aie2p-llvm-objdump`) |
+| `NPU_HELLO_ARTIFACT_DIR`, `NPU_HELLO_PROGRAM` | `pm-npu` sim tests | Dumped `npu-hello` artifacts for the exact-PDI hello gates; skipped when unset |
+| `GOLDEN_PRINT`, `IEF15_PROBE_DUMP` | `pm-npu` `golden_bytes` / `ief15_probe` tests | `GOLDEN_PRINT`: also print the computed golden rows; `IEF15_PROBE_DUMP=<path>`: write the expected probe blob |
+| `NPU_WINDOW_TIMEOUT`, `NPU_WINDOW_LOG`, `NPU_FCLK_TOOL`, `NPU_PROBE_OUT`, `NPU_BATCH_BASIC`, `NPU_METRICS_OUT`, `NPU_BISECT_OUT`, `NPU_BISECT2_OUT`, `NPU_RAILGUN_PHASE`, `NPU_RING_PHASE`, `NPU_EXPERTS_*`, `NPU_M3_*`, `NPU_V8_OUT`, `NPU_LEVELS`, `NPU_LOOP_S` | `tools/npu/*.sh` | Silicon-window harness knobs (timeouts, log/output dirs, phases); documented in each script header |
+
+---
+
 ## Manual — Cargo features (not env)
 
 `crates/hipfire-runtime/Cargo.toml` default features (checked 2026-07-19):

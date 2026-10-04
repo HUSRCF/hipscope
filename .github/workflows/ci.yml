@@ -57,6 +57,8 @@ jobs:
         run: cargo build --release --workspace --all-targets --locked
       - name: Build daemon (real shipped binary, all architectures in)
         run: cargo build --release --locked -p hipfire-daemon
+      - name: Build the dark NPU stack (railgun `npu`, npu-tools `lab`) so it cannot rot
+        run: cargo build --release --locked -p railgun --features npu && cargo build --release --locked -p npu-tools --features lab
 
   test:
     name: unit + integration tests (no GPU)
