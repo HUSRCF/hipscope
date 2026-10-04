@@ -94,6 +94,7 @@ impl Model {
             &gpu,
             &receipt.config,
         )?;
+        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
         let mut bundle = Qwen4Bundle::assemble_with_metadata(
             receipt.config,
             transaction,
@@ -102,6 +103,7 @@ impl Model {
             n_ctx,
             receipt.ple,
             state_format,
+            backend,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle

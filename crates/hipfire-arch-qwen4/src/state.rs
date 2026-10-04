@@ -1301,6 +1301,11 @@ impl Qwen4State {
     pub fn mapped_context_tokens(&self) -> usize {
         self.qsa_mapped_tokens
     }
+
+    /// Storage of the QSA context arenas, fixed at construction.
+    pub fn qsa_backend(&self) -> Qwen4KvBackend {
+        self.qsa_backend
+    }
     /// Bind rollback tickets to the owning runtime transaction generation.
     pub(crate) fn bind_transaction_generation(&mut self, generation: u64) {
         self.transaction_generation = generation;

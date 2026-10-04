@@ -1373,36 +1373,36 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
         && config.linear_conv_kernel_dim == 4
 }
 
-/// Device bytes native MTP adds to a load at `max_seq` with a `chunk_rows`
-/// prefill chunk, drafts of up to `max_k` tokens and the language head
-/// stored as `head_dtype`: what the attached head (`Qwen4MtpGpu`) keeps,
-/// plus the larger of its build scratch (released at attach) and what the
-/// first speculative request allocates after it — the verify hidden rows
-/// (`max_k + 1` rows or one forward chunk, whichever is larger), the pending
-/// and row hidden carries, and, where [`native_mtp_row_capture`], the
-/// `max_k + 1`-row GDN capture.
+/// Device bytes native MTP adds to a load whose QSA context storage is
+/// `context` (its admitted `max_seq` and committed part) with a
+/// `chunk_rows` prefill chunk, drafts of up to `max_k` tokens and the
+/// language head stored as `head_dtype`: what the attached head
+/// (`Qwen4MtpGpu`) commits, plus the larger of its build scratch (released
+/// at attach) and what the first speculative request allocates after it —
+/// the verify hidden rows (`max_k + 1` rows or one forward chunk, whichever
+/// is larger), the pending and row hidden carries, and, with `row_capture`
+/// (the GDN state format, where [`native_mtp_row_capture`]), the
+/// `max_k + 1`-row GDN capture in that format.
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
-    max_seq: usize,
+    context: &crate::Qwen4ContextCommit,
     chunk_rows: usize,
     max_k: usize,
     head_dtype: rdna_compute::DType,
-    row_capture: bool,
+    row_capture: Option<crate::GdnStateFormat>,
 ) -> Option<u64> {
     let rows = max_k.clamp(1, 10) + 1;
     let hidden_row = config
         .hc_count
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
-    let verify_rows = rows.max(max_seq.min(chunk_rows));
-    let capture = if row_capture {
-        // S3: thread the real GDN format
-        crate::state::Qwen4State::row_capture_bytes(config, crate::GdnStateFormat::F32, rows)?
-    } else {
-        0
+    let verify_rows = rows.max(context.max_seq.min(chunk_rows));
+    let capture = match row_capture {
+        Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
+        None => 0,
     };
     let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, max_seq, head_dtype)?;
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
     let request = verify_rows
         .checked_add(2)?
         .checked_mul(hidden_row)?

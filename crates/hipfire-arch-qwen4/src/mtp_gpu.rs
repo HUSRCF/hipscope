@@ -14,7 +14,7 @@ use crate::gpu_forward::{
     dense_ref, hyper_desc, hyper_read_desc, qsa_desc, seal_moe_decode, Qwen4GpuForwardError,
     Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::kv_backend::Qwen4KvBackend;
+use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
@@ -689,10 +689,12 @@ impl MtpGpuState {
             step_index: self.step_index,
         }
     }
-    /// Device bytes [`Self::new`] allocates: the context-sized QSA arenas,
-    /// then the selection and wide-hidden carry, twice with their snapshot
-    /// backups.
-    fn device_bytes(config: &Qwen4Config, max_seq: usize) -> Option<usize> {
+    /// Device bytes [`Self::new_with_backend`] commits: the context-sized
+    /// QSA arenas as `context` commits them (legacy: all of them; VMM: the
+    /// first chunk's mapped pages, the rest being virtual until forwards
+    /// map it), then the selection and wide-hidden carry, twice with their
+    /// snapshot backups.
+    fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
@@ -702,8 +704,8 @@ impl MtpGpuState {
                     .checked_mul(config.hidden_size)?
                     .checked_mul(std::mem::size_of::<f32>())?,
             )?;
-        config
-            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)?
+        context
+            .committed_layer_bytes(config, QsaKvFormat::F32)?
             .checked_add(carry.checked_mul(2)?)
     }
     /// Legacy full-capacity state; see [`Self::new_with_backend`].
@@ -1328,33 +1330,24 @@ fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout)
 }
 
 impl Qwen4MtpGpu {
-    /// `(resident, load scratch)` device bytes [`Self::new`] takes at
-    /// `max_seq` for a language head stored as `head_dtype`: what the
-    /// attached head keeps, and the draft head's build scratch on top of it
-    /// (`DraftHead::device_bytes`), released before `new` returns.
+    /// `(resident, load scratch)` device bytes [`Self::new_with_backend`]
+    /// commits for QSA context storage `context` and a language head stored
+    /// as `head_dtype`: what the attached head keeps, and the draft head's
+    /// build scratch on top of it (`DraftHead::device_bytes`), released
+    /// before construction returns.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
-        max_seq: usize,
+        context: &Qwen4ContextCommit,
         head_dtype: DType,
     ) -> Option<(usize, usize)> {
         let (policy, layout) = draft_head_config(config);
         let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
         let resident = MtpGpuScratch::device_bytes(config)
             .ok()?
-            .checked_add(MtpGpuState::device_bytes(config, max_seq)?)?
+            .checked_add(MtpGpuState::device_bytes(config, context)?)?
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(draft)?;
         Some((resident, scratch))
-    }
-
-    /// Legacy full-capacity MTP state; see [`Self::new_with_backend`].
-    pub(crate) fn new(
-        gpu: &mut Gpu,
-        weights: &Qwen4Weights,
-        config: &Qwen4Config,
-        max_seq: usize,
-    ) -> Result<Self, MtpGpuError> {
-        Self::new_with_backend(gpu, weights, config, max_seq, Qwen4KvBackend::Legacy)
     }
 
     /// MTP head whose QSA context arenas are `backend` storage (admission

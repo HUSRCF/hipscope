@@ -171,31 +171,38 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
         .map(|entry| entry.dtype)
 }
 
-/// VRAM `auto` leaves free beyond the non-expert weights for a load at
-/// `max_seq` with a `chunk_rows` prefill chunk: [`AUTO_VRAM_RESERVE_BYTES`],
-/// the trunk QSA arenas' growth in `qsa_format` past
-/// [`AUTO_VRAM_RESERVE_MAX_SEQ`], the chunk-sized forward resources' change
-/// from the measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, `mtp_bytes` when a
-/// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
-/// `gather_bytes` when the gathered QSA prefill attention reserves its
-/// context-sized scratch at load
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`).
+/// VRAM `auto` leaves free beyond the non-expert weights for a load whose
+/// trunk QSA context storage is `context` with a `chunk_rows` prefill chunk:
+/// [`AUTO_VRAM_RESERVE_BYTES`], the trunk QSA arenas' committed bytes in
+/// `qsa_format` past those of [`AUTO_VRAM_RESERVE_MAX_SEQ`] legacy tokens
+/// (the measured layout), the chunk-sized forward resources' change from the
+/// measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, `mtp_bytes` when a native MTP
+/// speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
+/// `gather_bytes` for the gathered QSA prefill attention's workspace
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). Only
+/// committed bytes are charged: VMM context arenas commit the first chunk's
+/// pages (inside the measured layout), their virtual extent nothing, so the
+/// admitted context does not size the VMM reserve; legacy arenas commit all
+/// of `max_seq`.
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
-    max_seq: usize,
+    context: &crate::Qwen4ContextCommit,
     chunk_rows: usize,
     qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
 ) -> Result<u64, String> {
-    let arena = |seq| {
-        config
-            .qsa_context_arena_bytes(seq, qsa_format)
+    let overflow = |seq| format!("QSA context state for max_seq {seq} overflows");
+    let trunk = |bytes: Option<usize>| {
+        bytes
             .and_then(|bytes| bytes.checked_mul(config.n_full_layers()))
             .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| format!("QSA context state for max_seq {seq} overflows"))
     };
-    let context = arena(max_seq)?.saturating_sub(arena(AUTO_VRAM_RESERVE_MAX_SEQ)?);
+    let committed = trunk(context.committed_layer_bytes(config, qsa_format))
+        .ok_or_else(|| overflow(context.max_seq))?;
+    let measured_context = trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
+        .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
+    let context = committed.saturating_sub(measured_context);
     let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
     let measured =
         crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(config, AUTO_VRAM_RESERVE_CHUNK)
@@ -508,9 +515,9 @@ mod tests {
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
-        let reserve = |chunk| {
-            auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, chunk, F32, None, None).unwrap()
-        };
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let reserve =
+            |chunk| auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
@@ -541,27 +548,24 @@ mod tests {
     #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
-        let base = auto_vram_reserve(
-            &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
-            AUTO_VRAM_RESERVE_CHUNK,
-            F32,
-            None,
-            None,
-        )
-        .unwrap();
-        let mtp = crate::mtp_spec::native_mtp_device_bytes(
-            &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
-            AUTO_VRAM_RESERVE_CHUNK,
-            3,
-            DType::MQ6G256V2,
-            true,
-        )
-        .unwrap();
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let base =
+            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, F32, None, None).unwrap();
+        let native = |context: &crate::Qwen4ContextCommit, max_k, row_capture| {
+            crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                context,
+                AUTO_VRAM_RESERVE_CHUNK,
+                max_k,
+                DType::MQ6G256V2,
+                row_capture,
+            )
+            .unwrap()
+        };
+        let mtp = native(&measured, 3, Some(crate::GdnStateFormat::Q8));
         let with_mtp = auto_vram_reserve(
             &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
+            &measured,
             AUTO_VRAM_RESERVE_CHUNK,
             F32,
             Some(mtp),
@@ -569,8 +573,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(with_mtp - base, mtp);
-        // The gathered QSA attention's context-sized scratch is charged on
-        // top when that route reserves it at load.
+        // The gathered QSA attention's workspace is charged on top.
         let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
             config.num_key_value_heads,
             AUTO_VRAM_RESERVE_MAX_SEQ,
@@ -578,7 +581,7 @@ mod tests {
         .unwrap() as u64;
         let with_gather = auto_vram_reserve(
             &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
+            &measured,
             AUTO_VRAM_RESERVE_CHUNK,
             F32,
             None,
@@ -590,31 +593,23 @@ mod tests {
         // to the device at attach, before the first request allocates its
         // verify rows and GDN capture: the reserve holds the larger phase on
         // top of what the head keeps, not both.
-        let (resident, scratch) = crate::mtp_gpu::Qwen4MtpGpu::device_bytes(
-            &config,
-            AUTO_VRAM_RESERVE_MAX_SEQ,
-            DType::MQ6G256V2,
-        )
-        .unwrap();
+        let (resident, scratch) =
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, &measured, DType::MQ6G256V2)
+                .unwrap();
         let (resident, scratch) = (resident as u64, scratch as u64);
         assert_eq!(scratch, (config.vocab_size * config.hidden_size * 4) as u64);
-        let native = |max_k, row_capture| {
-            crate::mtp_spec::native_mtp_device_bytes(
-                &config,
-                AUTO_VRAM_RESERVE_MAX_SEQ,
-                AUTO_VRAM_RESERVE_CHUNK,
-                max_k,
-                DType::MQ6G256V2,
-                row_capture,
-            )
-            .unwrap()
-        };
         // At K = 3 the scratch outweighs the request, row capture included.
         assert_eq!(mtp, resident + scratch);
-        assert_eq!(native(3, false), mtp);
-        // At K = 10 the 11-row GDN capture outweighs the scratch.
-        assert!(native(10, true) > resident + scratch);
-        assert_eq!(native(10, false), resident + scratch);
+        assert_eq!(native(&measured, 3, None), mtp);
+        assert_eq!(native(&measured, 10, None), resident + scratch);
+        // The 11-row GDN capture is charged in the state's real GDN format.
+        let hidden_row = (config.hc_count * config.hidden_size * 4) as u64;
+        for gdn in [crate::GdnStateFormat::Q8, crate::GdnStateFormat::F32] {
+            let capture =
+                crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
+            let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
+            assert_eq!(native(&measured, 10, Some(gdn)), resident + scratch.max(request));
+        }
         // On the measured R9700 the MTP bytes fit beside the chosen layers,
         // and one layer more would not have left them.
         let free = 32548u64 << 20;
@@ -623,21 +618,20 @@ mod tests {
         assert!(with < auto_vram_layers(free, weights, layer, 48, base) as u64);
         assert!(free - weights - with * layer >= with_mtp);
         assert!(free - weights - (with + 1) * layer < with_mtp);
-        // A context past the measured one adds the trunk QSA arenas' growth
-        // in the load's QSA format: fp8 K/V grows less than the F32 state.
+        // A legacy context past the measured one adds the trunk QSA arenas'
+        // growth in the load's QSA format: fp8 K/V grows less than F32.
+        let long_seq = 4 * AUTO_VRAM_RESERVE_MAX_SEQ;
         let growth = |format| {
             let long = auto_vram_reserve(
                 &config,
-                4 * AUTO_VRAM_RESERVE_MAX_SEQ,
+                &crate::Qwen4ContextCommit::legacy(long_seq),
                 AUTO_VRAM_RESERVE_CHUNK,
                 format,
                 None,
                 None,
             )
             .unwrap();
-            let arena = (config
-                .qsa_context_arena_bytes(4 * AUTO_VRAM_RESERVE_MAX_SEQ, format)
-                .unwrap()
+            let arena = (config.qsa_context_arena_bytes(long_seq, format).unwrap()
                 - config
                     .qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format)
                     .unwrap())
@@ -649,13 +643,53 @@ mod tests {
         // A shorter context keeps the measured reserve.
         let short = auto_vram_reserve(
             &config,
-            2048,
+            &crate::Qwen4ContextCommit::legacy(2048),
             AUTO_VRAM_RESERVE_CHUNK,
             QsaKvFormat::Fp8,
             None,
             None,
         );
         assert_eq!(short.unwrap(), base);
+    }
+
+    #[test]
+    fn vmm_context_charges_only_committed_pages() {
+        let config = crate::config::compact_test_config();
+        let chunk = AUTO_VRAM_RESERVE_CHUNK;
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let base = auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
+        let vmm = |max_seq| {
+            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20)
+        };
+        // The native logical context, virtual under VMM, does not size the
+        // reserve; legacy storage at that context commits every arena.
+        let native = crate::QWEN4_MAX_CONTEXT;
+        let vmm_native = auto_vram_reserve(&config, &vmm(native), chunk, F32, None, None).unwrap();
+        assert_eq!(vmm_native, base);
+        let legacy_native = auto_vram_reserve(
+            &config,
+            &crate::Qwen4ContextCommit::legacy(native),
+            chunk,
+            F32,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(legacy_native > vmm_native);
+        // Native MTP's one F32 QSA layer: the VMM head charges its first
+        // chunk's pages instead of the full legacy arenas.
+        let mtp = |context: &crate::Qwen4ContextCommit| {
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2)
+                .unwrap()
+                .0
+        };
+        let legacy_mtp = mtp(&crate::Qwen4ContextCommit::legacy(native));
+        let vmm_mtp = mtp(&vmm(native));
+        assert_eq!(
+            legacy_mtp - vmm_mtp,
+            config.qsa_context_arena_bytes(native, F32).unwrap()
+                - vmm(native).committed_layer_bytes(&config, F32).unwrap()
+        );
     }
 
     #[test]

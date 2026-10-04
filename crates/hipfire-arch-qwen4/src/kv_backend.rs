@@ -4,13 +4,18 @@
 
 //! Qwen4 QSA context storage backend: stable-VA VMM owners with demand-mapped
 //! pages, or legacy full-capacity allocations. Load admission resolves the
-//! backend; state owners only receive it.
+//! backend ([`qwen4_vmm_refusal`]); state owners only receive it.
 
+use crate::config::Qwen4Config;
+use hipfire_runtime::kv_backend::{
+    KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+};
+use rdna_compute::tensor_ops::QsaKvFormat;
 use rdna_compute::Gpu;
 
 /// Storage of Qwen4 QSA context arenas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Qwen4KvBackend {
+pub enum Qwen4KvBackend {
     /// Full admitted-capacity physical allocations, zeroed at construction.
     Legacy,
     /// Registered VMM owners reserving the admitted capacity; pages are
@@ -18,18 +23,192 @@ pub(crate) enum Qwen4KvBackend {
     Vmm,
 }
 
+impl Qwen4KvBackend {
+    /// The automatic selection: VMM wherever [`qwen4_vmm_supported`].
+    pub fn automatic(gpu: &Gpu) -> Self {
+        if qwen4_vmm_supported(gpu) {
+            Self::Vmm
+        } else {
+            Self::Legacy
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Vmm => "vmm",
+        }
+    }
+}
+
+impl From<KvBackend> for Qwen4KvBackend {
+    fn from(backend: KvBackend) -> Self {
+        match backend {
+            KvBackend::Legacy => Self::Legacy,
+            KvBackend::Vmm => Self::Vmm,
+        }
+    }
+}
+
 /// The only architecture whose Qwen4 QSA allocator smoke is proven.
 const VMM_ARCH: &str = "gfx1151";
 
+/// Why Qwen4 QSA context arenas on a `gpu_arch` device cannot be VMM owners,
+/// or `None` when they can: exactly gfx1151, not Windows (whose driver needs
+/// the full-map workaround), the platform VMM KV refusal
+/// ([`hipfire_config::devices::vmm_kv_platform_refusal`]) clear, and a HIP
+/// VMM runtime that reports an allocation granularity
+/// (`vmm_runtime_available`). Load admission resolves the backend from this.
+pub fn qwen4_vmm_refusal(gpu_arch: &str, vmm_runtime_available: bool) -> Option<String> {
+    if cfg!(windows) {
+        Some("Windows maps whole VMM reservations; Qwen4 QSA keeps legacy storage".to_string())
+    } else if gpu_arch != VMM_ARCH {
+        Some(format!(
+            "Qwen4 VMM QSA state is certified only on {VMM_ARCH}, not {gpu_arch}"
+        ))
+    } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
+        Some(reason)
+    } else if !vmm_runtime_available {
+        Some("HIP VMM symbols/granularity unavailable".to_string())
+    } else {
+        None
+    }
+}
+
 /// Capability check only: whether Qwen4 QSA context arenas on `gpu` may be
-/// VMM owners. Exactly gfx1151, not Windows (whose driver needs the full-map
-/// workaround), the platform VMM KV refusal
-/// ([`hipfire_config::devices::vmm_kv_platform_refusal`], the one load
-/// admission applies) is clear, and the HIP VMM runtime reports an allocation
-/// granularity (admission's `vmm_runtime_available`).
-pub(crate) fn qwen4_vmm_supported(gpu: &Gpu) -> bool {
-    !cfg!(windows)
-        && gpu.arch == VMM_ARCH
-        && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
-        && gpu.vmm_recommended_granularity().is_ok()
+/// VMM owners ([`qwen4_vmm_refusal`] on this device).
+pub fn qwen4_vmm_supported(gpu: &Gpu) -> bool {
+    qwen4_vmm_refusal(&gpu.arch, gpu.vmm_recommended_granularity().is_ok()).is_none()
+}
+
+/// What a load's QSA context arenas commit, for the VRAM reserve and the
+/// load census. Every arena reserves `max_seq` tokens of address space
+/// (virtual); the committed part is all of it for legacy storage (allocated
+/// at construction) and, for VMM owners, the pages the first forward chunk of
+/// `tokens` rows maps (the shared KV chunk plan at `granularity`). Later
+/// growth maps more at forward time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4ContextCommit {
+    pub backend: Qwen4KvBackend,
+    /// Admitted (logical) context: every arena's virtual extent.
+    pub max_seq: usize,
+    /// Tokens charged as committed.
+    pub tokens: usize,
+    /// VMM driver page granularity (unused by legacy storage).
+    pub granularity: usize,
+}
+
+impl Qwen4ContextCommit {
+    /// Legacy storage of `max_seq` tokens.
+    pub fn legacy(max_seq: usize) -> Self {
+        Self {
+            backend: Qwen4KvBackend::Legacy,
+            max_seq,
+            tokens: max_seq,
+            granularity: 1,
+        }
+    }
+
+    /// `backend` storage of `max_seq` tokens whose first forward runs a
+    /// `chunk_rows`-row prefill chunk.
+    pub fn new(
+        backend: Qwen4KvBackend,
+        max_seq: usize,
+        chunk_rows: usize,
+        granularity: usize,
+    ) -> Self {
+        match backend {
+            Qwen4KvBackend::Legacy => Self::legacy(max_seq),
+            Qwen4KvBackend::Vmm => Self {
+                backend,
+                max_seq,
+                tokens: chunk_rows.min(max_seq),
+                granularity,
+            },
+        }
+    }
+
+    /// Virtual bytes of one layer's context arenas in `format`.
+    pub fn virtual_layer_bytes(&self, config: &Qwen4Config, format: QsaKvFormat) -> Option<usize> {
+        config.qsa_context_arena_bytes(self.max_seq, format)
+    }
+
+    /// Committed bytes of one layer's context arenas in `format`: the whole
+    /// allocation (legacy) or each arena's mapped growth pages covering
+    /// [`Self::tokens`] (VMM; pooled keys by `ceil(tokens / compress)` rows),
+    /// as `ensure_mapped_capacity` maps them.
+    pub fn committed_layer_bytes(
+        &self,
+        config: &Qwen4Config,
+        format: QsaKvFormat,
+    ) -> Option<usize> {
+        if self.backend == Qwen4KvBackend::Legacy {
+            return self.virtual_layer_bytes(config, format);
+        }
+        let kv_row = format.kv_row_bytes(config.num_key_value_heads, config.head_dim);
+        let index_row = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?
+            .checked_mul(format.index_dtype().size())?;
+        let compress = config.indexer_compress_ratio;
+        let pooled_capacity = self.max_seq.div_ceil(compress);
+        let pooled_tokens = self.tokens.div_ceil(compress);
+        let mapped = |row_bytes: usize, rows: usize, tokens: usize| {
+            KvChunkPlan::new(
+                row_bytes,
+                rows,
+                DEFAULT_KV_CHUNK_TOKENS,
+                self.granularity,
+                DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+            )
+            .and_then(|plan| plan.mapped_bytes_for_tokens(tokens))
+            .ok()
+        };
+        mapped(kv_row, self.max_seq, self.tokens)?
+            .checked_mul(2)?
+            .checked_add(mapped(index_row, self.max_seq, self.tokens)?)?
+            .checked_add(mapped(index_row, pooled_capacity, pooled_tokens)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vmm_is_refused_off_gfx1151_and_without_the_runtime() {
+        assert!(qwen4_vmm_refusal("gfx1201", true)
+            .is_some_and(|reason| reason.contains("gfx1151") && reason.contains("gfx1201")));
+        assert!(qwen4_vmm_refusal("gfx1100", true).is_some());
+        if cfg!(windows) || hipfire_config::devices::vmm_kv_platform_refusal().is_some() {
+            assert!(qwen4_vmm_refusal("gfx1151", true).is_some());
+        } else {
+            assert_eq!(qwen4_vmm_refusal("gfx1151", true), None);
+            assert!(qwen4_vmm_refusal("gfx1151", false)
+                .is_some_and(|reason| reason.contains("granularity")));
+        }
+    }
+
+    #[test]
+    fn vmm_commit_charges_the_first_chunk_not_the_logical_context() {
+        let config = crate::config::compact_test_config();
+        let format = QsaKvFormat::F32;
+        let max_seq = 262_144;
+        let legacy = Qwen4ContextCommit::new(Qwen4KvBackend::Legacy, max_seq, 8192, 1 << 21);
+        let full = config.qsa_context_arena_bytes(max_seq, format).unwrap();
+        assert_eq!(legacy.tokens, max_seq);
+        assert_eq!(legacy.committed_layer_bytes(&config, format), Some(full));
+
+        let vmm = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, 8192, 1 << 21);
+        assert_eq!(vmm.virtual_layer_bytes(&config, format), Some(full));
+        let committed = vmm.committed_layer_bytes(&config, format).unwrap();
+        let touched = config.qsa_context_arena_bytes(8192, format).unwrap();
+        // Whole growth pages covering the chunk: at least the touched rows,
+        // at most one extra 2 MiB growth step per arena.
+        assert!(committed >= touched && committed <= touched + 4 * (2 << 20));
+        assert!(committed < full / 16);
+        // The chunk never charges past the admitted context.
+        let short = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 100, 8192, 1 << 21);
+        assert_eq!(short.tokens, 100);
+    }
 }
