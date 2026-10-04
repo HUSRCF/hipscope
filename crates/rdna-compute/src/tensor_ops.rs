@@ -4202,9 +4202,14 @@ pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
         }
 }
 
-/// Bytes of the gathered route's F16 scratch for a QSA cache of `tokens`
-/// rows with `n_kv_heads` heads of 256 channels: F16 K plus block-transposed
-/// V (whole four-token blocks), 2 bytes per KV channel each.
+/// Bytes of the gathered route's F16 workspace a forward ending at `tokens`
+/// touches, with `n_kv_heads` heads of 256 channels: F16 K of the rows
+/// `[0, tokens)` followed by block-transposed V of their whole four-token
+/// (pooled) blocks, 2 bytes per KV channel each. Every producer write and
+/// attention read of that forward lies in this prefix (selected tokens are
+/// validated below the row's visible end, and a whole-block V load needs all
+/// four tokens visible); at `tokens` = the cache capacity it is the whole
+/// reservation.
 pub fn qsa_gathered_wmma_scratch_bytes(n_kv_heads: usize, tokens: usize) -> Option<usize> {
     let width = n_kv_heads.checked_mul(256)?;
     tokens
@@ -4213,13 +4218,20 @@ pub fn qsa_gathered_wmma_scratch_bytes(n_kv_heads: usize, tokens: usize) -> Opti
         .checked_mul(2)
 }
 
-/// Reserve the gathered route's scratch for a QSA cache of `tokens` rows
-/// when the route is enabled for `format`; returns the bytes reserved (0 when
-/// it is not enabled, and nothing is allocated).  Call at load, before any
-/// graph capture or Redline record: a forward only needs the rows below its
-/// end position, which never exceed the cache capacity, so the scratch then
-/// never grows under a captured graph or tape.
-pub fn reserve_qsa_gathered_wmma_scratch(
+fn qsa_gathered_wmma_bytes(n_kv_heads: usize, tokens: usize) -> HipResult<usize> {
+    qsa_gathered_wmma_scratch_bytes(n_kv_heads, tokens)
+        .ok_or_else(|| HipError::new(0, "QSA gathered scratch size overflows"))
+}
+
+/// Reserve the gathered route's per-GPU workspace for a QSA cache of
+/// `tokens` rows when the route is enabled for `format`: a stable-VA VMM
+/// reservation that commits no pages (Windows maps VMM reservations whole).
+/// Returns the reserved bytes, 0 when the route is off (nothing reserved).
+/// Call at attach, before any graph capture or Redline record, so the
+/// workspace address never moves; map each forward's prefix with
+/// [`ensure_qsa_gathered_wmma_workspace`]. The workspace is released by
+/// `Gpu::invalidate_weight_caches` (model unload).
+pub fn reserve_qsa_gathered_wmma_workspace(
     gpu: &mut Gpu,
     format: QsaKvFormat,
     n_kv_heads: usize,
@@ -4228,9 +4240,48 @@ pub fn reserve_qsa_gathered_wmma_scratch(
     if !qsa_gathered_wmma_enabled(gpu, format) {
         return Ok(0);
     }
-    let bytes = qsa_gathered_wmma_scratch_bytes(n_kv_heads, tokens)
-        .ok_or_else(|| HipError::new(0, "QSA gathered scratch size overflows"))?;
-    gpu.qsa_gather_scratch(bytes)?;
+    let bytes = qsa_gathered_wmma_bytes(n_kv_heads, tokens)?;
+    gpu.qsa_gather_reserve(bytes)?;
+    Ok(bytes)
+}
+
+/// Map the gathered route's workspace over everything a forward ending at
+/// `end_tokens` touches ([`qsa_gathered_wmma_scratch_bytes`]), in place at
+/// its reserved address (reserving at least that much first when nothing
+/// is reserved). Call before capture or record: growth while either is
+/// armed is refused. Returns the mapped bytes (granularity-rounded), 0 when
+/// the route is off.
+pub fn ensure_qsa_gathered_wmma_workspace(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    end_tokens: usize,
+) -> HipResult<usize> {
+    if !qsa_gathered_wmma_enabled(gpu, format) {
+        return Ok(0);
+    }
+    let bytes = qsa_gathered_wmma_bytes(n_kv_heads, end_tokens)?;
+    gpu.qsa_gather_scratch(bytes, bytes)?;
+    Ok(gpu.qsa_gather_scratch_bytes())
+}
+
+/// Reserve the gathered route's workspace for a QSA cache of `tokens` rows
+/// and commit all of it when the route is enabled for `format`; returns the
+/// bytes reserved (0 when it is not enabled, and nothing is allocated).
+/// The whole-context commit of the attach-time contract, kept until the
+/// caller moves to [`reserve_qsa_gathered_wmma_workspace`] +
+/// [`ensure_qsa_gathered_wmma_workspace`]: call at load, before any graph
+/// capture or Redline record, so a forward never maps more.
+pub fn reserve_qsa_gathered_wmma_scratch(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    tokens: usize,
+) -> HipResult<usize> {
+    let bytes = reserve_qsa_gathered_wmma_workspace(gpu, format, n_kv_heads, tokens)?;
+    if bytes > 0 {
+        gpu.qsa_gather_scratch(bytes, bytes)?;
+    }
     Ok(bytes)
 }
 
@@ -4254,9 +4305,9 @@ fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) 
 /// QSA attention over each row's selection in F16 WMMA
 /// (kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip).  The
 /// cache rows `[0, end_position)` are first written as F16 K and
-/// block-transposed V into the route's own scratch
-/// ([`reserve_qsa_gathered_wmma_scratch`]; 2 KiB per token at 2 x 256 KV
-/// channels).
+/// block-transposed V into the route's own workspace
+/// ([`reserve_qsa_gathered_wmma_workspace`]; 2 KiB per token at 2 x 256 KV
+/// channels), mapped over that prefix before the launches.
 fn qsa_gathered_wmma(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -4319,7 +4370,11 @@ fn qsa_gathered_wmma_launch(
     let k_elements = checked_product(end_position, width, "QSA gathered K")?;
     let bytes = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, end_position)
         .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
-    let k16 = gpu.qsa_gather_scratch(bytes)?;
+    // Reserved for the whole cache (one stable address per model), mapped
+    // over this forward's prefix.
+    let reserve = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, p.full_capacity.max(end_position))
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let k16 = gpu.qsa_gather_scratch(bytes, reserve)?;
     // V follows K: whole four-token blocks, the last one padded.
     let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
     let tokens = checked_i32(end_position, "QSA gathered tokens")?;
@@ -7108,126 +7163,269 @@ mod tests {
         }
     }
 
+    /// Device tensors of one gathered-route QSA case: `rows` query rows from
+    /// `position_start` over a `full_capacity`-row cache, 24 heads over 2
+    /// KV heads of 256, a 512-block budget of compress-4 blocks. Rows before
+    /// and past the budget, causal tails, a `-1` slot per row, and rows whose
+    /// blocks are emitted in descending token order (the per-token V path).
+    /// The query is scaled so the softmax is peaked: with the flat LCG query
+    /// a mis-paired key and value barely moves the output.
+    struct GatheredCase {
+        q: GpuTensor,
+        k: GpuTensor,
+        v: GpuTensor,
+        selected: GpuTensor,
+        output: GpuTensor,
+        rows: usize,
+        position_start: usize,
+        full_capacity: usize,
+        format: QsaKvFormat,
+    }
+
+    const GATHERED_BUDGET_BLOCKS: usize = 512;
+    const GATHERED_CAPACITY: usize = GATHERED_BUDGET_BLOCKS * 4 + 4 - 1;
+
+    impl GatheredCase {
+        fn new(
+            gpu: &mut Gpu,
+            format: QsaKvFormat,
+            rows: usize,
+            position_start: usize,
+            full_capacity: usize,
+        ) -> Self {
+            let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+            let (budget_blocks, capacity) = (GATHERED_BUDGET_BLOCKS, GATHERED_CAPACITY);
+            let mut q = qsa_lcg(1, rows * n_heads * 2 * head_dim);
+            for head_row in q.chunks_mut(2 * head_dim) {
+                head_row[..head_dim].iter_mut().for_each(|v| *v *= 8.0);
+            }
+            let keys = qsa_lcg(7, full_capacity * n_kv_heads * head_dim);
+            let values = qsa_lcg(13, full_capacity * n_kv_heads * head_dim);
+            let mut selected = vec![-1i32; rows * capacity];
+            for row in 0..rows {
+                let visible = position_start + row + 1;
+                let blocks = visible / compress;
+                let chosen = budget_blocks.min(blocks);
+                for slot in 0..chosen {
+                    let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                    for r in 0..compress {
+                        // Odd rows list each block's tokens in descending order.
+                        let token = if row % 2 == 1 { compress - 1 - r } else { r };
+                        selected[row * capacity + slot * compress + r] =
+                            block * compress as i32 + token as i32;
+                    }
+                }
+                let mut offset = chosen * compress;
+                for token in blocks * compress..visible {
+                    selected[row * capacity + offset] = token as i32;
+                    offset += 1;
+                }
+                selected[row * capacity + 3] = -1;
+            }
+            let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+            let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+            let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+            let (k, v) = if format == QsaKvFormat::F32 {
+                (keys_gpu, values_gpu)
+            } else {
+                let units = format.kv_row_units(n_kv_heads, head_dim);
+                let k = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("K");
+                let v = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("V");
+                indexed_attention_cache_append_batch(
+                    gpu,
+                    &IndexedAttentionCacheAppendBatch {
+                        key: &keys_gpu,
+                        value: &values_gpu,
+                        full_keys: &k,
+                        full_values: &v,
+                        rows: full_capacity,
+                        position_start: 0,
+                        kv_heads: n_kv_heads,
+                        head_dim,
+                        format,
+                    },
+                )
+                .expect("QSA append");
+                gpu.free_tensor(keys_gpu).expect("free");
+                gpu.free_tensor(values_gpu).expect("free");
+                (k, v)
+            };
+            let selected_gpu = gpu
+                .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+                .expect("selected allocation");
+            let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
+            gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("output allocation");
+            Self {
+                q: q_gpu,
+                k,
+                v,
+                selected: selected_gpu,
+                output,
+                rows,
+                position_start,
+                full_capacity,
+                format,
+            }
+        }
+
+        fn params(&self) -> IndexedAttentionAttentionBatch<'_> {
+            IndexedAttentionAttentionBatch {
+                q_with_gate: &self.q,
+                full_keys: &self.k,
+                full_values: &self.v,
+                selected: &self.selected,
+                output: &self.output,
+                rows: self.rows,
+                position_start: self.position_start,
+                n_heads: 24,
+                n_kv_heads: 2,
+                head_dim: 256,
+                budget_blocks: GATHERED_BUDGET_BLOCKS,
+                compress: 4,
+                capacity: GATHERED_CAPACITY,
+                full_capacity: self.full_capacity,
+                format: self.format,
+                shape_selected: GATHERED_CAPACITY,
+            }
+        }
+
+        /// Output bytes of the gathered launches (hipcc, or the `pm`
+        /// module) over a poisoned output.
+        fn gathered(&self, gpu: &mut Gpu, pm: bool) -> Vec<u8> {
+            gpu.hip.memset(&self.output.buf, 0x7f, self.output.byte_size()).expect("poison");
+            let end = self.position_start + self.rows;
+            qsa_gathered_wmma_launch(gpu, &self.params(), end, GATHERED_CAPACITY, pm)
+                .expect("gathered QSA");
+            gpu.hip.device_synchronize().expect("sync");
+            let mut bytes = vec![0u8; self.output.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &self.output.buf).expect("download");
+            bytes
+        }
+
+        fn free(self, gpu: &mut Gpu) {
+            for tensor in [self.q, self.k, self.v, self.selected, self.output] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+    }
+
+    fn gathered_format(gpu: &Gpu) -> Option<QsaKvFormat> {
+        if gpu.arch_caps.is_gfx1151() {
+            Some(QsaKvFormat::F32)
+        } else if gpu.arch_caps.is_gfx1201() {
+            Some(QsaKvFormat::Fp8)
+        } else {
+            None
+        }
+    }
+
     /// The gathered F16 WMMA route must match the exact per-head kernel of
-    /// the same state format to F16-rounding accuracy: rows before and past
-    /// the budget, causal tails, a `-1` slot per row, and rows whose blocks
-    /// are emitted in descending token order (the per-token V path).  The
-    /// query is scaled so the softmax is peaked: with the flat LCG query a
-    /// mis-paired key and value barely moves the output.
+    /// the same state format to F16-rounding accuracy ([`GatheredCase`]).
     #[test]
     fn qsa_gathered_wmma_matches_per_head_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
-        let format = if gpu.arch_caps.is_gfx1151() {
-            QsaKvFormat::F32
-        } else if gpu.arch_caps.is_gfx1201() {
-            QsaKvFormat::Fp8
-        } else {
+        let Some(format) = gathered_format(&gpu) else {
             eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
             return;
         };
-        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
         // Visible 1901..2420 against a 512-block budget: 475..605 blocks.
-        let (rows, position_start, full_capacity) = (520usize, 1900usize, 2432usize);
-        let budget_blocks = 512usize;
-        let capacity = budget_blocks * compress + compress - 1;
-        let mut q = qsa_lcg(1, rows * n_heads * 2 * head_dim);
-        for head_row in q.chunks_mut(2 * head_dim) {
-            head_row[..head_dim].iter_mut().for_each(|v| *v *= 8.0);
-        }
-        let keys = qsa_lcg(7, full_capacity * n_kv_heads * head_dim);
-        let values = qsa_lcg(13, full_capacity * n_kv_heads * head_dim);
-        let mut selected = vec![-1i32; rows * capacity];
-        for row in 0..rows {
-            let visible = position_start + row + 1;
-            let blocks = visible / compress;
-            let chosen = budget_blocks.min(blocks);
-            for slot in 0..chosen {
-                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
-                for r in 0..compress {
-                    // Odd rows list each block's tokens in descending order.
-                    let token = if row % 2 == 1 { compress - 1 - r } else { r };
-                    selected[row * capacity + slot * compress + r] =
-                        block * compress as i32 + token as i32;
-                }
-            }
-            let mut offset = chosen * compress;
-            for token in blocks * compress..visible {
-                selected[row * capacity + offset] = token as i32;
-                offset += 1;
-            }
-            selected[row * capacity + 3] = -1;
-        }
-        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
-        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
-        let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
-        let (k, v) = if format == QsaKvFormat::F32 {
-            (keys_gpu, values_gpu)
-        } else {
-            let units = format.kv_row_units(n_kv_heads, head_dim);
-            let k = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("K");
-            let v = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("V");
-            indexed_attention_cache_append_batch(
-                &mut gpu,
-                &IndexedAttentionCacheAppendBatch {
-                    key: &keys_gpu,
-                    value: &values_gpu,
-                    full_keys: &k,
-                    full_values: &v,
-                    rows: full_capacity,
-                    position_start: 0,
-                    kv_heads: n_kv_heads,
-                    head_dim,
-                    format,
-                },
-            )
-            .expect("QSA append");
-            gpu.free_tensor(keys_gpu).expect("free");
-            gpu.free_tensor(values_gpu).expect("free");
-            (k, v)
-        };
-        let selected_gpu = gpu
-            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
-            .expect("selected allocation");
-        let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
-        gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
-        let output = gpu
-            .zeros(&[rows * n_heads * head_dim], DType::F32)
-            .expect("output allocation");
-        let p = IndexedAttentionAttentionBatch {
-            q_with_gate: &q_gpu,
-            full_keys: &k,
-            full_values: &v,
-            selected: &selected_gpu,
-            output: &output,
-            rows,
-            position_start,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            budget_blocks,
-            compress,
-            capacity,
-            full_capacity,
-            format,
-            shape_selected: capacity,
-        };
+        let case = GatheredCase::new(&mut gpu, format, 520, 1900, 2432);
+        let p = case.params();
         indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
-        let reference = gpu.download_f32(&output).expect("reference download");
-        let end_position = position_start + rows;
-        qsa_gathered_wmma(&mut gpu, &p, end_position, capacity).expect("gathered QSA");
-        let gathered = gpu.download_f32(&output).expect("gathered download");
+        let reference = gpu.download_f32(&case.output).expect("reference download");
+        qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity).expect("gathered QSA");
+        let gathered = gpu.download_f32(&case.output).expect("gathered download");
         let rel = rel_l2(&reference, &gathered);
         eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
         // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
         // dim or key/value pairing lands near 1e-1 or above.
         assert!(rel < 5e-3, "gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
         assert!(rel > 0.0, "gathered QSA WMMA route did not run");
-        for tensor in [q_gpu, k, v, selected_gpu, output] {
-            gpu.free_tensor(tensor).expect("free");
+        case.free(&mut gpu);
+    }
+
+    /// The gathered workspace is one stable-VA reservation per cache,
+    /// demand-mapped: each forward maps exactly the granularity-rounded
+    /// prefix it touches (K rows plus whole V blocks to its end) at an
+    /// unchanged address, hipcc and the PM module stay byte-identical on it
+    /// across growth, the output equals a whole-context commit's, growth is
+    /// refused while a capture is armed, and weight-cache invalidation
+    /// releases the reservation.
+    #[test]
+    fn qsa_gathered_workspace_demand_maps_one_stable_reservation() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let Some(format) = gathered_format(&gpu) else {
+            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            return;
+        };
+        if !qsa_gathered_wmma_enabled(&gpu, format) {
+            eprintln!("skip: the gathered route is disabled");
+            return;
         }
+        let (heads, capacity) = (2usize, 8192usize);
+        let bytes = |end: usize| qsa_gathered_wmma_scratch_bytes(heads, end).unwrap();
+        gpu.invalidate_weight_caches();
+        let owners = gpu.vmm_allocation_count();
+        let reserved = reserve_qsa_gathered_wmma_workspace(&mut gpu, format, heads, capacity)
+            .expect("reserve");
+        assert_eq!(reserved, bytes(capacity));
+        assert_eq!(gpu.qsa_gather_reserved_bytes(), reserved);
+        assert_eq!(gpu.vmm_allocation_count(), owners + 1);
+        let workspace = gpu.scratch.qsa_gather_f16.as_ref().unwrap();
+        let (base, granularity) = (workspace.buf.as_ptr(), gpu.vmm_granularity(workspace).unwrap());
+        if !cfg!(windows) {
+            assert_eq!(gpu.qsa_gather_scratch_bytes(), 0, "a reservation commits nothing");
+        }
+        // Chunk 1 ends at 523 (a partial V block), chunk 2 at 5003: several
+        // pages more, mapped in place.
+        let mut demand_output = Vec::new();
+        for (rows, start) in [(520usize, 3usize), (2480, 2523)] {
+            let end = start + rows;
+            let case = GatheredCase::new(&mut gpu, format, rows, start, capacity);
+            let hip = case.gathered(&mut gpu, false);
+            let pm = case.gathered(&mut gpu, true);
+            assert!(hip == pm, "PM vs hipcc gathered bytes differ at end {end}");
+            if !cfg!(windows) {
+                assert_eq!(gpu.qsa_gather_scratch_bytes(), bytes(end).next_multiple_of(granularity));
+            }
+            assert_eq!(gpu.scratch.qsa_gather_f16.as_ref().unwrap().buf.as_ptr(), base, "address moved");
+            assert_eq!(gpu.vmm_allocation_count(), owners + 1);
+            demand_output = hip;
+            case.free(&mut gpu);
+        }
+        // Armed: a covered prefix is fine, any growth is refused.
+        let mapped = gpu.qsa_gather_scratch_bytes();
+        gpu.graphs.capture_mode = true;
+        let covered = ensure_qsa_gathered_wmma_workspace(&mut gpu, format, heads, 5003);
+        let grown = ensure_qsa_gathered_wmma_workspace(&mut gpu, format, heads, capacity);
+        gpu.graphs.capture_mode = false;
+        assert_eq!(covered.expect("covered while armed"), mapped);
+        assert!(cfg!(windows) || grown.is_err(), "growth while armed must be refused");
+        assert_eq!(gpu.qsa_gather_scratch_bytes(), mapped);
+        // Invalidation releases it; the whole-context commit gives the same
+        // output bytes.
+        gpu.invalidate_weight_caches();
+        assert_eq!(gpu.qsa_gather_reserved_bytes(), 0);
+        assert_eq!(gpu.vmm_allocation_count(), owners);
+        assert_eq!(
+            reserve_qsa_gathered_wmma_scratch(&mut gpu, format, heads, capacity).expect("commit"),
+            reserved
+        );
+        assert!(gpu.qsa_gather_scratch_bytes() >= reserved);
+        let case = GatheredCase::new(&mut gpu, format, 2480, 2523, capacity);
+        assert!(case.gathered(&mut gpu, false) == demand_output, "demand-mapped output differs from whole commit");
+        case.free(&mut gpu);
+        gpu.invalidate_weight_caches();
+        assert_eq!(gpu.vmm_allocation_count(), owners);
     }
 
     struct SelectCase {
