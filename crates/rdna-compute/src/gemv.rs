@@ -18314,6 +18314,47 @@ impl Gpu {
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
     }
 
+    /// [`Gpu::gemv_bf16_xf32_k4`] of `rows` activation rows (x row stride K,
+    /// y row stride M) in one launch; each row bitwise the single-row kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_bf16_xf32_k4_rows_r2",
+            "gemv_bf16_xf32_k4_rows_r3",
+            "gemv_bf16_xf32_k4_rows_r4",
+            "gemv_bf16_xf32_k4_rows_r5",
+            "gemv_bf16_xf32_k4_rows_r6",
+            "gemv_bf16_xf32_k4_rows_r7",
+            "gemv_bf16_xf32_k4_rows_r8",
+        ];
+        if rows == 1 {
+            return self.gemv_bf16_xf32_k4(weight, x, y, m, k, hc_act_scale);
+        }
+        if !k.is_multiple_of(32) || !(2..=8).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_k4_rows needs K % 32 == 0 and 1..=8 rows",
+            ));
+        }
+        self.bind_thread()?;
+        let func = FUNCS[rows - 2];
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            func,
+        )?;
+        self.launch_gemv_split(func, 128, weight, x, y, m, k, hc_act_scale)
+    }
+
     /// [`Gpu::gemv_bf16_xf32_k4`] over a Q8_0 weight with each row split
     /// across eight waves (same epilogue). Requires `k % 256 == 0`.
     pub fn gemv_q8_0_k8(
