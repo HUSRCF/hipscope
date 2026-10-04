@@ -701,16 +701,20 @@ Caveats that are part of the fixture, not trivia:
   row per draft, stop at the first rejection) when no depth pays.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
   interleaved. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
-  AR target's single-row route. Do not assume batched verification is
-  token-identical when GDN recurrent state is Q8: the current persistent
-  verify/rollback kernel quantizes once per window, whereas AR quantizes
-  after every token. On the canonical GPTQ3 MQ4 Flash-Next artifact on
-  gfx1151, p1 greedy batched MTP diverges from AR (first generated token
-  difference at index 112 with forced batching; adaptive at 130), while
-  interleaved matches all 1200 IDs in three fresh-process runs. The old
-  blanket bit-exactness claim is false for this Q8 path. A per-token
-  Q8-boundary repair must pass the real-prompt and recurrence oracle before
-  that claim is reinstated. On GPUs whose GDN route captures per-row states
+  AR target's single-row route. With Q8 GDN recurrent state, the row-capture
+  verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
+  per-token Q8 boundary at each row's absolute position, so every captured
+  verify row, the final slot and every rollback keep-prefix equal sequential
+  single-row decode. Oracles: `gdn_q8_verify_matches_single_row`
+  (rdna-compute) and the ignored
+  `crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs` (canonical
+  GPTQ3 MQ4 Flash-Next, p1, 1200 greedy IDs): on gfx1151 forced batched,
+  forced interleaved, adaptive and full-head batched MTP all match AR in
+  three fresh-process runs (before the repair, batched first differed at
+  index 112 and adaptive at 130). This guarantee covers only that capture
+  path: it is not a claim for the unarmed few-row Q8 prefill/replay route
+  (used where rows are not captured) or for architectures the oracle has not
+  run on. On GPUs whose GDN route captures per-row states
   (gfx11+ SIMT) a rejected suffix rolls back without re-running the accepted
   rows; elsewhere the batched route restores and replays. Drafts rank the
   vocabulary with an MQ2 copy of the LM head and re-score its top 8 exactly
