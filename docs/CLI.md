@@ -79,7 +79,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
 | `--kv-mode` | `auto` (default when unset), `q8`, `fp8`, `bf16`, `fwht2`/`3`/`4`; legacy spellings `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`; … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. `fwhtN` is an optional headroom mode, not a default. |
 | `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites the legacy spellings `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the legacy Givens asym K. `asymN`, `turboN` and `legacy-asymN` are deprecated since 0.4.0 (removal in 0.5.0) and warn at load. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
-| `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. |
+| `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. `bench` sizes its own load instead ([below](#bench-context-max_seq)). |
 
 **Qwen `auto` / unset mode:** native `fp8` (both K and V) on exact `gfx1201` when the load is native-eligible — H24/Hkv4/D256 attention, single GPU (no PP/TP/EP), no `kv_adaptive`, no CASK sidecar; `q8`/`q8` everywhere else, including gfx1100 and gfx1151. Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
 
@@ -170,8 +170,8 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 
 | Command | Purpose |
 |---|---|
-| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead) and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
-| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
+| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
+| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
@@ -181,6 +181,28 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
+
+### Bench context (`max_seq`)
+
+`--max-seq N` sets the benchmark load's KV context, within the `memory.max_seq` bounds (512–1048576), and replaces any configured `memory.max_seq`.
+
+Without it, `--matrix` and `--redline` size the load to the run instead of using the configured or automatic context. The run needs the largest `--pp`, or the largest `--ctx` plus `--tg` (and `--sustained-ctx` plus `--sustained-tg` when sustained rows run), whichever is larger, plus the 32 positions of headroom the daemon's probes keep. That is raised to the `memory.max_seq` minimum of 512 and capped at the model's declared context (`max_position_embeddings` in its metadata). `--pp 8192 --ctx 128 --tg 32` loads `max_seq` 8224.
+
+- A shape past the model's declared context fails before the daemon starts, naming the run's need and the model's limit. This applies with or without `--max-seq`.
+- A `--max-seq` below a matrix run's need fails the same way, naming both numbers.
+- Past the declared context, a `--max-seq` that holds the run is sent as given, and the daemon's admission is the bound. For example, Qwen4 refuses anything above its admitted 262144.
+
+The standard, `--ttft`, `--exp` and `--concurrency` paths have no fixed shape, because the prompt is tokenized by the daemon. Without `--max-seq` they keep the configured or automatic context.
+
+Every JSON report has a `max_seq` object:
+
+- `effective`: what the daemon loaded.
+- `requested`: the value sent, or `null`.
+- `source`: `flag`, `run_shape`, `config` (an authored `memory.max_seq`) or `automatic`.
+- `run_need`: the matrix need, or `null`.
+- `model_limit`: the declared context, or `null`.
+
+The bench also prints a `max_seq:` line.
 
 ### Bench power and memory state
 

@@ -738,11 +738,21 @@ Caveats that are part of the fixture, not trivia:
   was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
   with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
   [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
-- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
-  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
-  `memory.max_seq` forced to 2048), so it fails closed at load and never
-  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
-  bench-side `max_seq` knob — not an MTP change.
+- `hipfire bench` measures this model. The old fail-closed load had two
+  causes, both gone. The qwen4 contract admitted exactly `max_seq` 2048
+  (lifted in `432fa5c68`; the limit is now 262144, and an omitted value gets
+  32768). Bench's `load_params` also sent
+  `max(memory.max_seq, generation.max_tokens + 1024)` — the configured 32768,
+  or 4096 + 1024 = 5120 with `memory.max_seq` forced to 2048
+  (`822b48fb5:crates/hipfire-cli/src/main.rs:3000-3001`, removed in
+  `294c4ad9d`). `--matrix` now sizes the load to the run (largest `--pp`, or
+  `--ctx` + `--tg`, plus 32), and `--max-seq N` overrides it
+  ([CLI.md](docs/CLI.md#bench-context-max_seq)). Measured on 2026-10-04 on
+  hipx (Strix Halo, card `bf:00.0`, `qwen3.8-flash-next-gptq3.mq4`
+  `8b15b6fe…00972`): `--matrix --pp 8192 --tg 32 --runs 3 --warmups 1` loads
+  `max_seq` 20064 (the default `--ctx` tops out at 20000). pp8192 was
+  1927.3 / 1921.8 / 1918.3 tok/s, fast-PPT-limited for 48–55 % of each run.
+  The standard path keeps the automatic 32768.
 - Decode numbers are not comparable across instruments: the raw decode probe
   measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
   Same model, different measurement; never average or compare them across.
