@@ -14,6 +14,7 @@ use crate::gpu_forward::{
     dense_ref, hyper_desc, hyper_read_desc, qsa_desc, seal_moe_decode, Qwen4GpuForwardError,
     Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
+use crate::kv_backend::Qwen4KvBackend;
 use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
@@ -24,6 +25,9 @@ use hipfire_dispatch::pipeline::{
     IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::kv_backend::{
+    KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::QsaKvFormat;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -31,6 +35,8 @@ use smallvec::SmallVec;
 use std::fmt;
 
 const MTP_BRANCHES: usize = 4;
+/// Rows of every MTP HC read and write: one token.
+const MTP_HC_ROWS: usize = 1;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -60,7 +66,7 @@ fn hc_read<'a>(
         up: &scratch.hc_up,
         mixed: &scratch.hc_mixed,
         bf16_scratch: &scratch.hc_bf16,
-        rows: 1,
+        rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
         low_rank: config.hc_lowrank,
@@ -84,7 +90,7 @@ fn hc_write<'a>(
         mixed,
         gates: &scratch.hc_gates,
         output: &scratch.wide,
-        rows: 1,
+        rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
         rotation: &scratch.rotation,
@@ -204,8 +210,7 @@ impl MtpGpuScratch {
         let index_width = (config.indexer_n_heads + config.indexer_kv_heads)
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| invalid("MTP index width overflow"))?;
-        let hc_up = wide
-            .checked_mul(config.hc_lowrank)
+        let hc_up = hc_up_elements(MTP_HC_ROWS, wide, config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
         let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
         let routed = config.num_experts_per_tok * config.moe_intermediate_size;
@@ -370,6 +375,31 @@ impl MtpGpuScratch {
         }
         first
     }
+}
+
+/// F32 elements of every subview the shared HC read takes from its `up`
+/// buffer for `rows` rows: the F32 up projection (`rows × wide`), and on the
+/// WMMA read route the packed BF16 `low`, staged as a `rows × rank` view of
+/// the same F32 tensor before its dtype is relabelled (`layer_ops.rs`
+/// `execute_hyper_read_inner`). The up weight itself is never staged here.
+fn hc_up_elements(rows: usize, wide: usize, rank: usize) -> Option<usize> {
+    Some(rows.checked_mul(wide)?.max(rows.checked_mul(rank)?))
+}
+
+/// Refuse an HC read whose `up` subviews exceed the allocated scratch.
+fn require_hc_up(up: &GpuTensor, rows: usize, wide: usize, rank: usize) -> Result<(), MtpGpuError> {
+    let needed =
+        hc_up_elements(rows, wide, rank).ok_or_else(|| invalid("MTP HC up extent overflow"))?;
+    let needed_bytes = needed
+        .checked_mul(DType::F32.size())
+        .ok_or_else(|| invalid("MTP HC up extent overflow"))?;
+    if up.dtype != DType::F32 || up.numel() < needed || up.buf.size() < needed_bytes {
+        return Err(invalid(format!(
+            "MTP HC up scratch holds {} F32 elements; {rows} HC rows use {needed}",
+            up.numel()
+        )));
+    }
+    Ok(())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MtpSnapshotDimensions {
@@ -536,6 +566,51 @@ fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), Mtp
     Ok(())
 }
 
+/// Map more of one VMM context arena so it covers `rows` rows of a
+/// `capacity`-row tensor (byte stride = reserved size / capacity), by the
+/// shared [`KvChunkPlan`] policy, and zero the newly mapped bytes.
+fn grow_context_arena(
+    gpu: &mut Gpu,
+    tensor: &mut GpuTensor,
+    capacity: usize,
+    rows: usize,
+) -> Result<(), MtpGpuError> {
+    let mapped = gpu
+        .vmm_mapped_bytes(tensor)
+        .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?;
+    let granularity = gpu
+        .vmm_granularity(tensor)
+        .ok_or_else(|| invalid("MTP QSA arena has no VMM granularity"))?;
+    let plan = KvChunkPlan::new(
+        tensor.byte_size() / capacity,
+        capacity,
+        DEFAULT_KV_CHUNK_TOKENS,
+        granularity,
+        DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+    )
+    .map_err(|error| invalid(format!("MTP QSA chunk plan: {error}")))?;
+    let Some(growth) = plan
+        .growth(mapped, rows)
+        .map_err(|error| invalid(format!("MTP QSA growth: {error}")))?
+    else {
+        return Ok(());
+    };
+    let device_id = gpu.device_id;
+    gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
+    // The accessible prefix stops at the logical size even when the last
+    // page maps past it.
+    let end = (growth.offset_bytes + growth.size_bytes).min(tensor.buf.size());
+    if end > growth.offset_bytes {
+        let element = tensor.dtype.size();
+        let fresh = tensor.sub_offset(
+            growth.offset_bytes / element,
+            (end - growth.offset_bytes) / element,
+        );
+        gpu.hip.memset(&fresh.buf, 0, fresh.buf.size())?;
+    }
+    Ok(())
+}
+
 /// Device-resident bounded QSA state for the one MTP attention layer.
 pub struct MtpGpuState {
     full_keys: GpuTensor,
@@ -549,6 +624,12 @@ pub struct MtpGpuState {
     raw_capacity: usize,
     pooled_capacity: usize,
     selected_capacity: usize,
+    /// Index compression ratio: one pooled row per `compress` tokens.
+    compress: usize,
+    backend: Qwen4KvBackend,
+    /// Tokens every context arena's mapped prefix covers (the fast no-growth
+    /// gate); legacy storage covers its full capacity.
+    mapped_tokens: usize,
     position: usize,
     full_len: usize,
     raw_len: usize,
@@ -625,74 +706,70 @@ impl MtpGpuState {
             .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)?
             .checked_add(carry.checked_mul(2)?)
     }
+    /// Legacy full-capacity state; see [`Self::new_with_backend`].
     pub(crate) fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_seq: usize,
     ) -> Result<Self, MtpGpuError> {
+        Self::new_with_backend(gpu, config, max_seq, Qwen4KvBackend::Legacy)
+    }
+
+    /// State whose context arenas (full K/V, raw and pooled index keys) are
+    /// `backend` storage of `max_seq` logical tokens: legacy arenas are full
+    /// zeroed allocations; VMM arenas reserve that VA and map nothing until
+    /// [`Self::ensure_mapped_capacity`]. The fixed carry is always allocated.
+    pub(crate) fn new_with_backend(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq: usize,
+        backend: Qwen4KvBackend,
+    ) -> Result<Self, MtpGpuError> {
         let full_width = config.num_key_value_heads * config.head_dim;
         let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
-        let pooled_capacity = max_seq.div_ceil(config.indexer_compress_ratio);
+        let compress = config.indexer_compress_ratio;
+        let pooled_capacity = max_seq.div_ceil(compress);
         let selected_capacity = config.qsa_selected_capacity();
-        let full_keys = gpu.zeros(&[max_seq * full_width], DType::F32)?;
-        let full_values = match gpu.zeros(&[max_seq * full_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                return Err(error.into());
+        let device_id = gpu.device_id;
+        let shapes = [
+            (max_seq * full_width, DType::F32, true),
+            (max_seq * full_width, DType::F32, true),
+            (max_seq * raw_width, DType::F32, true),
+            (pooled_capacity * raw_width, DType::F32, true),
+            (
+                selected_capacity * std::mem::size_of::<i32>(),
+                DType::Raw,
+                false,
+            ),
+            (std::mem::size_of::<i32>(), DType::Raw, false),
+            (MTP_BRANCHES * config.hidden_size, DType::F32, false),
+        ];
+        let mut allocated = Vec::with_capacity(shapes.len());
+        for (elements, dtype, context) in shapes {
+            let tensor = match (context, backend) {
+                // SAFETY: every access to a VMM context arena is bounded by
+                // `mapped_tokens`, which `ensure_mapped_capacity` raises only
+                // after mapping and zeroing the covering pages.
+                (true, Qwen4KvBackend::Vmm) => unsafe {
+                    gpu.alloc_vmm_tensor(&[elements], dtype, 0, &[device_id])
+                },
+                _ => gpu.zeros(&[elements], dtype),
+            };
+            match tensor {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
             }
-        };
-        let raw_index_keys = match gpu.zeros(&[max_seq * raw_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                return Err(error.into());
-            }
-        };
-        let pooled_keys = match gpu.zeros(&[pooled_capacity * raw_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                return Err(error.into());
-            }
-        };
-        let selected_bytes = selected_capacity * std::mem::size_of::<i32>();
-        let selected_indices = match gpu.zeros(&[selected_bytes], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                return Err(error.into());
-            }
-        };
-        let selected_len_out = match gpu.zeros(&[std::mem::size_of::<i32>()], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                return Err(error.into());
-            }
-        };
-        let wide_hidden = match gpu.zeros(&[MTP_BRANCHES * config.hidden_size], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                let _ = gpu.free_tensor(selected_len_out);
-                return Err(error.into());
-            }
-        };
+        }
+        let mut tensors = allocated.into_iter();
+        let mut next = || tensors.next().expect("one tensor per MTP state shape");
+        let (full_keys, full_values, raw_index_keys, pooled_keys) =
+            (next(), next(), next(), next());
+        let (selected_indices, selected_len_out, wide_hidden) = (next(), next(), next());
         let model_id = next_mtp_model_id();
         let snapshot_arena = match MtpGpuStateSnapshotArena::new(
             gpu,
@@ -711,13 +788,17 @@ impl MtpGpuState {
         ) {
             Ok(arena) => arena,
             Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                let _ = gpu.free_tensor(selected_len_out);
-                let _ = gpu.free_tensor(wide_hidden);
+                for tensor in [
+                    full_keys,
+                    full_values,
+                    raw_index_keys,
+                    pooled_keys,
+                    selected_indices,
+                    selected_len_out,
+                    wide_hidden,
+                ] {
+                    let _ = gpu.free_tensor(tensor);
+                }
                 return Err(error);
             }
         };
@@ -733,6 +814,12 @@ impl MtpGpuState {
             raw_capacity: max_seq,
             pooled_capacity,
             selected_capacity,
+            compress,
+            backend,
+            mapped_tokens: match backend {
+                Qwen4KvBackend::Legacy => max_seq,
+                Qwen4KvBackend::Vmm => 0,
+            },
             position: 0,
             full_len: 0,
             raw_len: 0,
@@ -747,6 +834,97 @@ impl MtpGpuState {
         })
     }
 
+    /// Map (VMM) the context arenas to cover tokens `0..required_tokens`
+    /// before any access to them: full K/V and raw index keys by token,
+    /// pooled keys by `ceil(required_tokens / compress)` blocks, each with its
+    /// own byte stride and the shared [`KvChunkPlan`] growth policy. Newly
+    /// mapped pages are zeroed, as legacy arenas are. A request beyond the
+    /// admitted capacity is refused before any mapping; legacy storage only
+    /// checks that bound. Never maps during graph capture. After a failed
+    /// map the completed arenas stay mapped and the coverage is unchanged.
+    pub(crate) fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> Result<(), MtpGpuError> {
+        if required_tokens > self.full_capacity {
+            return Err(invalid(format!(
+                "MTP QSA requires {required_tokens} tokens; admitted capacity is {}",
+                self.full_capacity
+            )));
+        }
+        if required_tokens <= self.mapped_tokens {
+            return Ok(());
+        }
+        // Legacy coverage is the full capacity, so only VMM reaches here.
+        if gpu.graphs.capture_mode {
+            return Err(invalid("MTP QSA growth requested during graph capture"));
+        }
+        let pooled_required = required_tokens.div_ceil(self.compress);
+        let (full, raw, pooled) = (self.full_capacity, self.raw_capacity, self.pooled_capacity);
+        for (tensor, capacity, rows) in [
+            (&mut self.full_keys, full, required_tokens),
+            (&mut self.full_values, full, required_tokens),
+            (&mut self.raw_index_keys, raw, required_tokens),
+            (&mut self.pooled_keys, pooled, pooled_required),
+        ] {
+            grow_context_arena(gpu, tensor, capacity, rows)?;
+        }
+        self.mapped_tokens = self.mapped_token_coverage(gpu)?;
+        debug_assert!(self.mapped_tokens >= required_tokens);
+        Ok(())
+    }
+
+    /// Tokens every context arena's mapped prefix covers.
+    fn mapped_token_coverage(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        let rows = |tensor: &GpuTensor, capacity: usize| -> Result<usize, MtpGpuError> {
+            let mapped = gpu
+                .vmm_mapped_bytes(tensor)
+                .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?;
+            Ok((mapped / (tensor.byte_size() / capacity)).min(capacity))
+        };
+        let full = rows(&self.full_keys, self.full_capacity)?
+            .min(rows(&self.full_values, self.full_capacity)?)
+            .min(rows(&self.raw_index_keys, self.raw_capacity)?);
+        let pooled = rows(&self.pooled_keys, self.pooled_capacity)?
+            .saturating_mul(self.compress)
+            .min(self.full_capacity);
+        Ok(full.min(pooled))
+    }
+
+    /// Physical bytes committed to the context arenas: the mapped prefixes
+    /// (VMM), or the full allocations (legacy).
+    pub(crate) fn mapped_context_bytes(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        let arenas = [
+            &self.full_keys,
+            &self.full_values,
+            &self.raw_index_keys,
+            &self.pooled_keys,
+        ];
+        let mut bytes = 0usize;
+        for tensor in arenas {
+            let committed = match self.backend {
+                Qwen4KvBackend::Legacy => tensor.byte_size(),
+                Qwen4KvBackend::Vmm => gpu
+                    .vmm_mapped_bytes(tensor)
+                    .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?,
+            };
+            bytes = bytes
+                .checked_add(committed)
+                .ok_or_else(|| invalid("MTP QSA mapped bytes overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Tokens the context arenas may currently be accessed for.
+    pub(crate) fn mapped_tokens(&self) -> usize {
+        self.mapped_tokens
+    }
+
+    pub(crate) fn backend(&self) -> Qwen4KvBackend {
+        self.backend
+    }
+
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         self.invalidate_prefix();
@@ -759,7 +937,10 @@ impl MtpGpuState {
             &self.selected_len_out,
             &self.wide_hidden,
         ] {
-            gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+            // An unmapped VMM arena has an empty accessible prefix.
+            if tensor.buf.size() > 0 {
+                gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+            }
         }
         self.position = 0;
         self.full_len = 0;
@@ -1166,18 +1347,31 @@ impl Qwen4MtpGpu {
         Some((resident, scratch))
     }
 
+    /// Legacy full-capacity MTP state; see [`Self::new_with_backend`].
     pub(crate) fn new(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
         max_seq: usize,
     ) -> Result<Self, MtpGpuError> {
+        Self::new_with_backend(gpu, weights, config, max_seq, Qwen4KvBackend::Legacy)
+    }
+
+    /// MTP head whose QSA context arenas are `backend` storage (admission
+    /// resolves it); see [`MtpGpuState::new_with_backend`].
+    pub(crate) fn new_with_backend(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        max_seq: usize,
+        backend: Qwen4KvBackend,
+    ) -> Result<Self, MtpGpuError> {
         config.mtp.validate().map_err(MtpGpuError::Invalid)?;
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
         let scratch = MtpGpuScratch::new(gpu, config)?;
-        let state = match MtpGpuState::new(gpu, config, max_seq) {
+        let state = match MtpGpuState::new_with_backend(gpu, config, max_seq, backend) {
             Ok(state) => state,
             Err(error) => {
                 let _ = scratch.free_gpu(gpu);
@@ -1265,6 +1459,20 @@ impl Qwen4MtpGpu {
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.draft.reset_request_state();
         self.state.reset(gpu)
+    }
+
+    /// See [`MtpGpuState::ensure_mapped_capacity`].
+    pub(crate) fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.state.ensure_mapped_capacity(gpu, required_tokens)
+    }
+
+    /// See [`MtpGpuState::mapped_context_bytes`].
+    pub(crate) fn mapped_context_bytes(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        self.state.mapped_context_bytes(gpu)
     }
 
     pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
@@ -1402,6 +1610,14 @@ impl Qwen4MtpGpu {
         if position >= self.max_seq {
             return Err(invalid("MTP position exceeds QSA capacity"));
         }
+        // Mapping is the caller's (`ensure_mapped_capacity`), never here.
+        if position >= self.state.mapped_tokens {
+            return Err(invalid(format!(
+                "MTP position {position} is past the mapped QSA coverage of {} tokens",
+                self.state.mapped_tokens
+            )));
+        }
+        require_hc_up(&self.scratch.hc_up, MTP_HC_ROWS, wide, config.hc_lowrank)?;
         self.draft.observe(token);
         self.scratch
             .host_token_bytes
@@ -1800,6 +2016,289 @@ mod tests {
         if let Some(error) = mtp.free_gpu(&mut gpu) {
             panic!("free MTP state: {error:?}");
         }
+    }
+
+    /// Non-owning F32/BF16 descriptor of `elements` for host-side bound
+    /// checks; never dereferenced.
+    fn descriptor(elements: usize, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    std::ptr::null_mut::<std::ffi::c_void>(),
+                    elements * dtype.size(),
+                )
+            },
+            shape: vec![elements],
+            dtype,
+        }
+    }
+
+    /// One-token scratch census at canonical geometry (H 2560, W 10240,
+    /// rank 320): `hc_up` is one W-wide F32 row, the 36-tensor total is
+    /// 659,824 bytes, and the shrink saves (W×320 − W)×4 = 13,066,240 bytes
+    /// (12.4609375 MiB) from the former 13,726,064-byte (13.0902 MiB) set.
+    #[test]
+    fn mtp_scratch_hc_up_is_one_row_census() {
+        let config = compact_test_config();
+        let shapes = MtpGpuScratch::shapes(&config).expect("canonical scratch shapes");
+        let wide = MTP_BRANCHES * config.hidden_size;
+        assert_eq!(shapes[11], (wide, DType::F32), "hc_up is rows x W F32");
+        let bytes = MtpGpuScratch::device_bytes(&config).expect("scratch bytes");
+        assert_eq!(bytes, 659_824);
+        let former = 13_726_064usize;
+        assert_eq!(former - bytes, 13_066_240);
+        assert_eq!((former - bytes) as f64 / (1u64 << 20) as f64, 12.4609375);
+    }
+
+    /// Every subview the shared HC read takes from `up` must fit the
+    /// scratch: a second row (either the F32 projection or the BF16 packing
+    /// view), a rank wider than the row, or a non-F32 buffer is refused.
+    #[test]
+    fn hc_up_subview_larger_than_scratch_is_rejected() {
+        let config = compact_test_config();
+        let wide = MTP_BRANCHES * config.hidden_size;
+        let rank = config.hc_lowrank;
+        let up = descriptor(
+            hc_up_elements(MTP_HC_ROWS, wide, rank).expect("one-row extent"),
+            DType::F32,
+        );
+        require_hc_up(&up, MTP_HC_ROWS, wide, rank).expect("one-row read fits");
+        assert!(invalid_contains(
+            require_hc_up(&up, 2, wide, rank),
+            "2 HC rows use"
+        ));
+        // BF16 packing view (`rows × rank` of the F32 tensor) wider than a row.
+        assert!(invalid_contains(
+            require_hc_up(&up, 1, wide, wide + 1),
+            "1 HC rows use"
+        ));
+        let short = descriptor(wide - 1, DType::F32);
+        assert!(invalid_contains(
+            require_hc_up(&short, 1, wide, rank),
+            "HC rows use"
+        ));
+        let bf16 = descriptor(2 * wide, DType::BF16);
+        assert!(invalid_contains(
+            require_hc_up(&bf16, 1, wide, rank),
+            "HC rows use"
+        ));
+        // The prior W×rank allocation is far above every one-row subview.
+        assert!(hc_up_elements(MTP_HC_ROWS, wide, rank).unwrap() < wide * rank);
+    }
+
+    /// Readback census of the allocated one-token scratch on the device.
+    #[test]
+    fn mtp_scratch_allocation_matches_census() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        let config = compact_test_config();
+        let scratch = MtpGpuScratch::new(&mut gpu, &config).expect("canonical MTP scratch");
+        let wide = MTP_BRANCHES * config.hidden_size;
+        assert_eq!(scratch.hc_up.numel(), wide);
+        assert_eq!(scratch.hc_up.buf.size(), wide * 4);
+        let shapes = MtpGpuScratch::shapes(&config).expect("shapes");
+        let tensors = [
+            &scratch.token_ids,
+            &scratch.embedding_rot,
+            &scratch.token_embedding,
+            &scratch.embedding_norm,
+            &scratch.hidden_norm,
+            &scratch.projected_embedding,
+            &scratch.projected_hidden,
+            &scratch.wide,
+            &scratch.backbone_hidden,
+            &scratch.hc_normalized,
+            &scratch.hc_low,
+            &scratch.hc_up,
+            &scratch.hc_mixed,
+            &scratch.hc_gates,
+            &scratch.hc_bf16,
+            &scratch.rotation,
+            &scratch.index,
+            &scratch.q_and_gate,
+            &scratch.qsa_k,
+            &scratch.qsa_v,
+            &scratch.qsa_output,
+            &scratch.qsa_selected,
+            &scratch.router_logits,
+            &scratch.moe_x_rot,
+            &scratch.moe_gate_up,
+            &scratch.moe_gate,
+            &scratch.moe_up,
+            &scratch.moe_hidden,
+            &scratch.moe_output,
+            &scratch.moe_gate_batch,
+            &scratch.moe_up_batch,
+            &scratch.moe_rot_batch,
+            &scratch.moe_topk_indices,
+            &scratch.moe_topk_weights,
+            &scratch.moe_down_expanded,
+            &scratch.moe_scalar,
+        ];
+        let mut allocated = 0usize;
+        for (tensor, (elements, dtype)) in tensors.iter().zip(shapes) {
+            assert_eq!((tensor.numel(), tensor.dtype), (elements, dtype));
+            assert!(tensor.buf.size() >= tensor.byte_size());
+            allocated += tensor.byte_size();
+        }
+        assert_eq!(allocated, MtpGpuScratch::device_bytes(&config).unwrap());
+        assert_eq!(allocated, 659_824);
+        if let Some(error) = scratch.free_gpu(&mut gpu) {
+            panic!("free MTP scratch: {error:?}");
+        }
+    }
+
+    fn read_bytes(gpu: &mut Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Vec<u8> {
+        let view = tensor.sub_offset(offset / tensor.dtype.size(), len / tensor.dtype.size());
+        let mut bytes = vec![0u8; len];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &view.buf)
+            .expect("download");
+        bytes
+    }
+
+    /// Legacy: full allocation, ensure is only the admitted-capacity bound.
+    #[test]
+    fn legacy_mtp_state_ensure_is_a_bounds_check() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        let config = compact_test_config();
+        let max_seq = 4096;
+        let mut state =
+            MtpGpuState::new_with_backend(&mut gpu, &config, max_seq, Qwen4KvBackend::Legacy)
+                .expect("legacy MTP state");
+        let full = config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)
+            .unwrap();
+        assert_eq!(state.mapped_tokens(), max_seq);
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), full);
+        state
+            .ensure_mapped_capacity(&mut gpu, max_seq)
+            .expect("within capacity");
+        assert!(invalid_contains(
+            state.ensure_mapped_capacity(&mut gpu, max_seq + 1),
+            "admitted capacity"
+        ));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), full);
+        if let Some(error) = state.free_gpu(&mut gpu) {
+            panic!("free MTP state: {error:?}");
+        }
+    }
+
+    /// VMM: nothing mapped at construction; each arena grows by its own
+    /// stride (pooled by ceil(tokens / compress)) through the shared chunk
+    /// plan, earlier rows survive growth, fresh pages read zero, and a
+    /// request past the admitted capacity maps nothing.
+    #[test]
+    fn vmm_mtp_state_maps_on_demand() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        if !crate::kv_backend::qwen4_vmm_supported(&gpu) {
+            eprintln!("skip: Qwen4 VMM unsupported on {}", gpu.arch);
+            return;
+        }
+        let config = compact_test_config();
+        let max_seq = 16384;
+        let mut state =
+            MtpGpuState::new_with_backend(&mut gpu, &config, max_seq, Qwen4KvBackend::Vmm)
+                .expect("VMM MTP state");
+        assert_eq!(state.backend(), Qwen4KvBackend::Vmm);
+        assert_eq!(state.mapped_tokens(), 0);
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), 0);
+        // Reset of an unmapped state touches no context page.
+        state.reset(&mut gpu).expect("reset unmapped state");
+
+        state
+            .ensure_mapped_capacity(&mut gpu, 1)
+            .expect("first token");
+        let arenas = |state: &MtpGpuState| {
+            [
+                (&state.full_keys, state.full_capacity, 1usize),
+                (&state.full_values, state.full_capacity, 1),
+                (&state.raw_index_keys, state.raw_capacity, 1),
+                (&state.pooled_keys, state.pooled_capacity, state.compress),
+            ]
+            .map(|(tensor, capacity, per_row)| {
+                let plan = KvChunkPlan::new(
+                    tensor.byte_size() / capacity,
+                    capacity,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    gpu.vmm_granularity(tensor).expect("VMM granularity"),
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .expect("chunk plan");
+                (plan, per_row, gpu.vmm_mapped_bytes(tensor).expect("mapped"))
+            })
+        };
+        let first = arenas(&state);
+        let mut sum = 0;
+        let mut coverage = usize::MAX;
+        for (plan, per_row, mapped) in first {
+            let rows = 1usize.div_ceil(per_row);
+            assert_eq!(mapped, plan.mapped_bytes_for_tokens(rows).unwrap());
+            sum += mapped;
+            coverage = coverage.min(plan.token_capacity(mapped) * per_row);
+        }
+        assert_eq!(state.mapped_tokens(), coverage.min(max_seq));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), sum);
+        let full = config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)
+            .unwrap();
+        assert!(
+            sum < full,
+            "first map {sum} must stay below the full {full}"
+        );
+
+        // A growth boundary: pattern the full-key rows below it, grow past it.
+        let boundary = state.mapped_tokens();
+        assert!(boundary < max_seq);
+        let row = state.full_keys.byte_size() / state.full_capacity;
+        let pattern: Vec<u8> = (0..boundary * row).map(|i| (i % 251) as u8 + 1).collect();
+        gpu.hip
+            .memcpy_htod(&state.full_keys.buf, &pattern)
+            .expect("pattern mapped rows");
+        let unchanged = state.mapped_context_bytes(&gpu).unwrap();
+        assert!(invalid_contains(
+            state.ensure_mapped_capacity(&mut gpu, max_seq + 1),
+            "admitted capacity"
+        ));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), unchanged);
+        state
+            .ensure_mapped_capacity(&mut gpu, boundary)
+            .expect("no growth");
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), unchanged);
+        state
+            .ensure_mapped_capacity(&mut gpu, boundary + 1)
+            .expect("grow");
+        assert!(state.mapped_tokens() > boundary);
+        assert!(state.mapped_context_bytes(&gpu).unwrap() > unchanged);
+        assert_eq!(
+            read_bytes(&mut gpu, &state.full_keys, 0, pattern.len()),
+            pattern
+        );
+        let fresh = read_bytes(&mut gpu, &state.full_keys, boundary * row, row);
+        assert!(fresh.iter().all(|&byte| byte == 0), "fresh page is zeroed");
+
+        // Reset zeroes the mapped prefix and keeps the mapping.
+        let mapped = state.mapped_context_bytes(&gpu).unwrap();
+        state.reset(&mut gpu).expect("reset mapped state");
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), mapped);
+        let cleared = read_bytes(&mut gpu, &state.full_keys, 0, pattern.len());
+        assert!(cleared.iter().all(|&byte| byte == 0));
+
+        state
+            .ensure_mapped_capacity(&mut gpu, max_seq)
+            .expect("full map");
+        assert_eq!(state.mapped_tokens(), max_seq);
+        let mapped_full = state.mapped_context_bytes(&gpu).unwrap();
+        assert!(mapped_full >= full);
+        if let Some(error) = state.free_gpu(&mut gpu) {
+            panic!("free MTP state: {error:?}");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), 0, "VMM owners released");
     }
 }
 
