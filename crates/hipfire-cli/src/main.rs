@@ -4966,6 +4966,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         let mut prompt_tokens: Option<u64> = None;
+        let mut spec_routes: Vec<Option<String>> = Vec::new();
+        let mut spec_tau: Vec<Option<f64>> = Vec::new();
         let mut power_runs = Vec::new();
         for _ in 0..args.runs {
             let sampler = power.start_run();
@@ -4984,6 +4986,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             if prompt_tokens.is_none() {
                 prompt_tokens = bench_prompt_tokens_from_done(&done);
             }
+            let route = bench_spec_route(&done);
+            spec_tau.push(
+                route
+                    .as_ref()
+                    .and_then(|_| done.get("tau").and_then(serde_json::Value::as_f64)),
+            );
+            spec_routes.push(route);
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -5010,6 +5019,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .and_then(bench_prompt_warning)
             .into_iter()
             .chain(bench_power::throttle_warning(&power_runs))
+            .chain(bench_spec_warning(args.speculation.as_deref(), &spec_routes))
             .collect();
         if let Some(tokens) = prompt_tokens {
             eprintln!("  prompt_tokens: {tokens}");
@@ -5038,6 +5048,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "prefill_tok_s": sample_stats(&prefill),
                 "wall_tok_s": sample_stats(&wall),
                 "ttft_ms": sample_stats(&ttft),
+                "spec_requested": args.speculation,
+                "spec_route": spec_routes,
+                "spec_tau": spec_tau,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
             }),
             &loaded,
@@ -5601,7 +5614,10 @@ fn bench_generate_request_reasoning(
         "prompt": prompt,
         "temperature": 0.0,
         "top_p": 1.0,
-        "repeat_penalty": 1.1,
+        // Neutral on every path: any non-neutral penalty routes the daemon to
+        // the plain AR decoder, which made `--spec` silently measure AR, and a
+        // shared value keeps `--spec off` and speculative runs the same workload.
+        "repeat_penalty": 1.0,
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });
@@ -5611,6 +5627,44 @@ fn bench_generate_request_reasoning(
         request["reasoning_effort"] = serde_json::json!("none");
     }
     request
+}
+
+/// The speculation route a generate `done` event reports, or `None` when the
+/// plain AR decoder ran (no `tau` stats, or zero speculative cycles).
+fn bench_spec_route(done: &serde_json::Value) -> Option<String> {
+    let cycles = done
+        .get("cycles")
+        .or_else(|| done.get("rounds"))
+        .and_then(serde_json::Value::as_u64);
+    if done.get("tau").is_none() || cycles == Some(0) {
+        return None;
+    }
+    if let Some(spec) = done.get("spec").and_then(serde_json::Value::as_str) {
+        return Some(spec.to_string());
+    }
+    let flag = |key: &str| done.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let route = if flag("mtp_ngram") {
+        "mtp+ngram"
+    } else if flag("mtp") {
+        "mtp"
+    } else if flag("dflash") {
+        "dflash"
+    } else {
+        "speculative"
+    };
+    Some(route.to_string())
+}
+
+/// Warning when a speculative selector was requested but every measured run
+/// went through AR.
+fn bench_spec_warning(selector: Option<&str>, routes: &[Option<String>]) -> Option<String> {
+    let selector = selector?;
+    if selector == "off" || routes.is_empty() || routes.iter().any(Option::is_some) {
+        return None;
+    }
+    Some(format!(
+        "--spec {selector} requested but no speculation ran; these numbers measure AR decode"
+    ))
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
@@ -13061,6 +13115,42 @@ mod tests {
         assert!(req.get("reasoning_effort").is_none());
         // Still an ordinary benchmark generate otherwise.
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
+    }
+
+    /// Any non-neutral repeat penalty routes the daemon to the plain AR
+    /// decoder, so every bench generate must carry exactly 1.0.
+    #[test]
+    fn bench_generate_request_uses_neutral_repeat_penalty() {
+        for req in [
+            bench_generate_request("p", 1),
+            bench_generate_request_reasoning("p", 128, false),
+            bench_generate_request_reasoning("p", 128, true),
+        ] {
+            assert_eq!(req.get("repeat_penalty").and_then(|v| v.as_f64()), Some(1.0));
+        }
+    }
+
+    #[test]
+    fn bench_spec_route_reads_done_stats() {
+        let ar = serde_json::json!({"type": "done", "decode_tok_s": 35.0});
+        assert_eq!(bench_spec_route(&ar), None);
+        let mtp = serde_json::json!({"mtp": true, "tau": 2.4, "cycles": 40});
+        assert_eq!(bench_spec_route(&mtp).as_deref(), Some("mtp"));
+        let dflash = serde_json::json!({"dflash": true, "tau": 3.1, "cycles": 9});
+        assert_eq!(bench_spec_route(&dflash).as_deref(), Some("dflash"));
+        let idle = serde_json::json!({"dflash": true, "tau": 0.0, "cycles": 0});
+        assert_eq!(bench_spec_route(&idle), None);
+        let eagle = serde_json::json!({"spec": "gemma4_eagle", "tau": 1.8, "rounds": 7});
+        assert_eq!(bench_spec_route(&eagle).as_deref(), Some("gemma4_eagle"));
+    }
+
+    #[test]
+    fn bench_spec_warning_only_when_spec_requested_and_never_ran() {
+        let ar = vec![None, None];
+        assert!(bench_spec_warning(Some("mtp"), &ar).is_some());
+        assert!(bench_spec_warning(Some("off"), &ar).is_none());
+        assert!(bench_spec_warning(None, &ar).is_none());
+        assert!(bench_spec_warning(Some("auto"), &[None, Some("mtp".into())]).is_none());
     }
 
     fn bench_args_for_test(prompt: Vec<String>, prompt_file: Option<PathBuf>) -> BenchArgs {
