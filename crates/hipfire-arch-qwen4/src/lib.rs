@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod config;
 pub mod expert_residency;
 pub mod gpu_forward;
+pub(crate) mod kv_backend;
 pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;
