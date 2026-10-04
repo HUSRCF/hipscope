@@ -2574,6 +2574,60 @@ pub fn qwen_jinja_lookup_turn(
     })
 }
 
+/// Render the multi-turn Jinja history with the verbatim assistant-turn token
+/// splice (item-#37 machinery), shared by the MTP/DFlash route and the Qwen4
+/// AR route so both build byte-identical turn-N prompts from one
+/// `asst_turn_cache`.
+///
+/// `cold_prompt_tokens` is THIS turn's plain Jinja render; the assistant-opener
+/// primer is everything after its last `<|im_start|>assistant\n`. The replay
+/// prepends the primer only when the template does not already re-emit it on
+/// history assistant turns (Qwen3.5 does not, Qwen3.8 does).
+pub fn qwen_jinja_cached_history_tokens(
+    frame: &hipfire_runtime::prompt_frame::JinjaChatFrame,
+    asst_turn_cache: &mut AsstTurnCache,
+    cold_prompt_tokens: &[u32],
+    hist: &[hipfire_runtime::prompt_frame::Message],
+    tools: Option<&[serde_json::Value]>,
+    trace_label: &str,
+) -> Result<Vec<u32>, String> {
+    let tok = frame.tokenizer;
+    let im_start = tok.special_token_id("<|im_start|>");
+    let opener_len = tok.encode("<|im_start|>assistant\n").len();
+    let primer: Vec<u32> =
+        match im_start.and_then(|id| cold_prompt_tokens.iter().rposition(|&t| t == id)) {
+            Some(q) if q + opener_len <= cold_prompt_tokens.len() => {
+                cold_prompt_tokens[q + opener_len..].to_vec()
+            }
+            _ => Vec::new(),
+        };
+    let primer: Vec<u32> =
+        if hipfire_runtime::prompt_frame::template_emits_history_primer(frame, &primer) {
+            Vec::new()
+        } else {
+            primer
+        };
+    let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    hipfire_runtime::prompt_frame::build_cached_history_jinja(frame, hist, tools, |msg| {
+        let hit = qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer);
+        if trace_cache {
+            let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
+            let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+            eprintln!(
+                "[qwen-cache jinja lookup {trace_label}] fp={:#018x} role={:?} primer={} hit={}",
+                fp,
+                msg.role,
+                primer.len(),
+                hit.is_some()
+            );
+        }
+        hit
+    })
+}
+
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
 /// token-streaming output but replaces the AR sample loop with
 /// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
@@ -2942,21 +2996,7 @@ pub fn generate_dflash(
         && !m.conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if try_jinja {
         if let Some(hist) = messages_history {
-            // Assistant-opener primer from THIS turn's cold jinja render
-            // (everything after the last `<|im_start|>assistant\n`). The
-            // replay prepends it only when the template does not already
-            // re-emit it on history assistant turns (Qwen3.5 does not,
-            // Qwen3.8 does) — mirrors generate()'s item-#37 primer.
             let tok = m.tokenizer.as_ref().unwrap();
-            let im_start = tok.special_token_id("<|im_start|>");
-            let opener_len = tok.encode("<|im_start|>assistant\n").len();
-            let primer: Vec<u32> =
-                match im_start.and_then(|id| prompt_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= prompt_tokens.len() => {
-                        prompt_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                };
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer: tok,
@@ -2968,36 +3008,13 @@ pub fn generate_dflash(
                 reasoning_strength: None,
                 reasoning_effort,
             };
-            let primer: Vec<u32> =
-                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
-                    Vec::new()
-                } else {
-                    primer
-                };
-            let cache_ref = &mut m.asst_turn_cache;
-            let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1");
-            let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            let rendered = match qwen_jinja_cached_history_tokens(
                 &frame,
+                &mut m.asst_turn_cache,
+                &prompt_tokens,
                 hist,
                 tools,
-                |msg| {
-                    let hit = qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
-                    if trace_cache {
-                        let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                        let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                        eprintln!(
-                            "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
-                            fp,
-                            msg.role,
-                            primer.len(),
-                            hit.is_some()
-                        );
-                    }
-                    hit
-                },
+                "dflash",
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -7735,7 +7752,41 @@ pub fn generate_qwen4_ar(
                 match rendered {
                     Ok(rendered) => {
                         started_in_think = render_tail_opens_think(&rendered);
-                        tokenizer.encode(&rendered)
+                        let cold = tokenizer.encode(&rendered);
+                        // Multi-turn: splice the emitted assistant token IDs
+                        // (same machinery + cache as the MTP route) instead of
+                        // re-encoding the decoded history text, so both Qwen4
+                        // modes build byte-identical turn-N prompts.
+                        match messages_history {
+                            Some(hist) => match qwen_jinja_cached_history_tokens(
+                                &frame,
+                                &mut m.asst_turn_cache,
+                                &cold,
+                                hist,
+                                tools,
+                                "qwen4-ar",
+                            ) {
+                                Ok(spliced) => spliced,
+                                Err(e) => {
+                                    if reasoning_effort.is_some() {
+                                        emit_active_attempt_error(
+                                            stdout,
+                                            Some(id),
+                                            &format!("qwen4 AR qwen-cache jinja build: {e}"),
+                                            "validation",
+                                            false,
+                                            false,
+                                        );
+                                        return;
+                                    }
+                                    eprintln!(
+                                        "[qwen-cache] qwen4 AR jinja cached-history build failed ({e}) — cold render"
+                                    );
+                                    cold
+                                }
+                            },
+                            None => cold,
+                        }
                     }
                     Err(error) => {
                         emit_active_attempt_error(

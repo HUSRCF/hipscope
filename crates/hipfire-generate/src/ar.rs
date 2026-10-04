@@ -2134,7 +2134,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     }
 
     let hit_length_cap = generated >= max_tokens && !natural_stop;
-    let (finish, _) = match semantic.finish(stdout, hit_length_cap) {
+    let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
         Ok(result) => result,
         Err(error) => {
             let _ = gpu.free_tensor(decode_logits);
@@ -2201,6 +2201,51 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         return;
     }
     on_commit(m);
+    // Store the verbatim emitted assistant token span under the same
+    // fingerprint / trailer trim / whole-envelope shape the MTP route stores
+    // (`generate_dflash`: `qwen_dflash_cache_seq` + `qwen_dflash_apply_cache_action`),
+    // so the next turn of EITHER route splices these exact IDs instead of
+    // re-encoding the decoded text. `finish.store_cache` already excludes
+    // length-capped, stop-sequence, malformed and open-think terminals; a
+    // client abort returned above.
+    let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
+    if cache_action.store {
+        let tok = m.tokenizer.as_ref().unwrap();
+        let im_end = tok.encode("<|im_end|>");
+        let im_end_token = if im_end.len() == 1 {
+            Some(im_end[0])
+        } else {
+            None
+        };
+        let nl_set: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let cached_seq = crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+        let _ = qwen_ar_apply_cache_action(
+            |fp, seq| {
+                let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                    tok,
+                    &seq,
+                    started_in_think,
+                )
+                .map(|text| hipfire_runtime::prompt_frame::CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text,
+                });
+                m.asst_turn_cache.insert(
+                    fp,
+                    hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                        reasoning,
+                        tools: Vec::new(),
+                        content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: seq,
+                            text: String::new(),
+                        }),
+                    },
+                );
+            },
+            &cache_action,
+            cached_seq,
+        );
+    }
     let _ = gpu.free_tensor(decode_logits);
     emit_active_route_done_value(stdout, &pending_done);
 }

@@ -207,6 +207,115 @@ extern "C" __global__ void gemv_bf16_xf32_k4(
     y[row] = value;
 }
 
+// gemv_bf16_xf32_row over R activation rows (x row stride `x_stride`): each
+// dwordx4 of weights is loaded once and folded into every row's four chains
+// in gemv_bf16_xf32_row's per-chain order (the gfx1151 eight-step unroll
+// keeps that order too), then each row takes the same fold and shuffle tree,
+// so every row's sum is bitwise the single-row body's.
+template <int R>
+static __device__ __forceinline__ void gemv_bf16_xf32_row_multi(
+    const unsigned short* __restrict__ w_row,
+    const float*          __restrict__ x,
+    int x_stride,
+    int K,
+    int tid,
+    float (&sum)[R]
+) {
+    float a0[R], a1[R], a2[R], a3[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) a0[r] = a1[r] = a2[r] = a3[r] = 0.0f;
+    if ((K & 7) == 0) {
+        for (int i = tid * 8; i + 8 <= K; i += 32 * 8) {
+            const uint4 wv = *(const uint4*)(w_row + i);
+            const float w0 = HF_BF16_LO(wv.x), w1 = HF_BF16_HI(wv.x);
+            const float w2 = HF_BF16_LO(wv.y), w3 = HF_BF16_HI(wv.y);
+            const float w4 = HF_BF16_LO(wv.z), w5 = HF_BF16_HI(wv.z);
+            const float w6 = HF_BF16_LO(wv.w), w7 = HF_BF16_HI(wv.w);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float4 xa = *(const float4*)(x + (size_t)r * x_stride + i);
+                const float4 xb = *(const float4*)(x + (size_t)r * x_stride + i + 4);
+                a0[r] += w0 * xa.x;
+                a1[r] += w1 * xa.y;
+                a2[r] += w2 * xa.z;
+                a3[r] += w3 * xa.w;
+                a0[r] += w4 * xb.x;
+                a1[r] += w5 * xb.y;
+                a2[r] += w6 * xb.z;
+                a3[r] += w7 * xb.w;
+            }
+        }
+    }
+    for (int i = ((K & 7) == 0 ? (K & ~7) : 0) + tid; i < K; i += 32) {
+        const float w = __uint_as_float(((unsigned int)w_row[i]) << 16);
+#pragma unroll
+        for (int r = 0; r < R; ++r) a0[r] += w * x[(size_t)r * x_stride + i];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float s = (a0[r] + a1[r]) + (a2[r] + a3[r]);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            s += __shfl_down(s, offset);
+        }
+        sum[r] = s;
+    }
+}
+
+// gemv_bf16_xf32_k4 of R activation rows (x row stride K, y row stride M) in
+// one launch: each weight quarter is read once for all rows, and every row's
+// value (quarter sums, fold, `hc_act` epilogue) is bitwise the single-row
+// kernel's, so a few-row verify matches the decode it replaces. Grid [M],
+// block 128, K % 32 == 0, 2 <= R <= 8.
+template <int R>
+static __device__ __forceinline__ void gemv_bf16_xf32_k4_rows_body(
+    const unsigned short* __restrict__ W,
+    const float*          __restrict__ x,
+    float*                __restrict__ y,
+    int M, int K,
+    float scale,
+    int hc_act
+) {
+    __shared__ float quarter[R][4];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int wave = threadIdx.x >> 5;
+    const int part = K / 4;
+    float s[R];
+    gemv_bf16_xf32_row_multi<R>(
+        W + (size_t)row * K + wave * part, x + wave * part, K, part, threadIdx.x & 31, s);
+    if ((threadIdx.x & 31) == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) quarter[r][wave] = s[r];
+    }
+    __syncthreads();
+    const int r = threadIdx.x;
+    if (r >= R) return;
+    float value = (quarter[r][0] + quarter[r][1]) + (quarter[r][2] + quarter[r][3]);
+    if (hc_act) {
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value *= scale;
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = value / (1.0f + expf(-value));
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+    }
+    y[(size_t)r * M + row] = value;
+}
+
+#define GEMV_BF16_XF32_K4_ROWS(R)                                                   \
+    __launch_bounds__(128) extern "C" __global__ void gemv_bf16_xf32_k4_rows_r##R(  \
+        const unsigned short* __restrict__ W, const float* __restrict__ x,          \
+        float* __restrict__ y, int M, int K, float scale, int hc_act) {             \
+        gemv_bf16_xf32_k4_rows_body<R>(W, x, y, M, K, scale, hc_act);               \
+    }
+GEMV_BF16_XF32_K4_ROWS(2)
+GEMV_BF16_XF32_K4_ROWS(3)
+GEMV_BF16_XF32_K4_ROWS(4)
+GEMV_BF16_XF32_K4_ROWS(5)
+GEMV_BF16_XF32_K4_ROWS(6)
+GEMV_BF16_XF32_K4_ROWS(7)
+GEMV_BF16_XF32_K4_ROWS(8)
+#undef GEMV_BF16_XF32_K4_ROWS
+
 // Decode HC write + next HC read norm (tensor_ops.hip's hyper_write_f32 and
 // hyper_norm_f32 on one F32 row, bitwise): one block per branch; each thread
 // writes its ten columns of the new streams, keeps them, and normalizes them

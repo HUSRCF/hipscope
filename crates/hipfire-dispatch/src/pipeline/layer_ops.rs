@@ -854,26 +854,23 @@ fn execute_hyper_read_inner(
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && ((op.rows == 1
-            && op.input_mix_down.dtype == DType::BF16
-            && op.input_mix_down.k.is_multiple_of(32))
-            || (op.rows <= 8
-                && op.input_mix_down.dtype == DType::Q8_0
+        && op.rows <= 8
+        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
+            || (op.input_mix_down.dtype == DType::Q8_0
                 && op.input_mix_down.k.is_multiple_of(256)))
     {
-        // Decode: the long-K down GEMV splits each row across four waves and
-        // applies the activation below in its epilogue.
+        // Decode and few-row verify: the long-K down GEMV splits each row
+        // across four (BF16) or eight (Q8_0) waves and applies the activation
+        // below in its epilogue; a verify row is bitwise its decode row.
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
         let down = &op.input_mix_down;
         let act = Some(1.0 / op.branches as f32);
-        hip(if down.dtype == DType::Q8_0 && op.rows > 1 {
+        hip(if down.dtype == DType::Q8_0 {
             gpu.gemv_q8_0_k8_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
-        } else if down.dtype == DType::Q8_0 {
-            gpu.gemv_q8_0_k8(down.buf, &normalized, &low, down.m, down.k, act)
         } else {
-            gpu.gemv_bf16_xf32_k4(down.buf, &normalized, &low, down.m, down.k, act)
+            gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
         })?;
         activated = true;
     } else {
@@ -1283,11 +1280,19 @@ fn hyper_write_gates(
     gates: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
+    // Decode and few-row verify (<= 8 rows): the gate GEMV splits each row's
+    // K across four waves, and a verify row is bitwise the decode row it
+    // replaces (greedy MTP == AR depends on it).
+    let k4 = gpu.arch_caps.has_gfx11_plus_simt()
+        && op.rows <= 8
+        && op.block_inject.dtype == DType::BF16
+        && op.block_inject.k.is_multiple_of(32);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
     let fused = gpu.arch_caps.has_gfx11_plus_simt()
         && op.rows > 1
+        && !k4
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
         && op.block_inject.k == wide
@@ -1318,20 +1323,17 @@ fn hyper_write_gates(
                 state_bf16: op.state_bf16,
             },
         ))?;
-        if op.rows == 1
-            && gpu.arch_caps.has_gfx11_plus_simt()
-            && op.block_inject.dtype == DType::BF16
-            && op.block_inject.k.is_multiple_of(32)
-        {
-            // Decode: four gate rows of K = branches * hidden; four waves per
-            // row instead of one.
-            hip(gpu.gemv_bf16_xf32_k4(
+        if k4 {
+            // Four gate rows of K = branches * hidden; four waves per row
+            // instead of one.
+            hip(gpu.gemv_bf16_xf32_k4_rows(
                 op.block_inject.buf,
                 normalized,
                 gates,
                 op.block_inject.m,
                 op.block_inject.k,
                 None,
+                op.rows,
             ))?;
         } else {
             project_weight(

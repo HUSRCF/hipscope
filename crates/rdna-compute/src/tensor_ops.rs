@@ -5312,6 +5312,74 @@ mod tests {
         }
     }
 
+    /// The few-row BF16 K4 GEMV (Qwen4 HC write gates and read down in a
+    /// 2..=8-row MTP verify) must give every row bitwise the single-row decode
+    /// kernel's value, with and without the HC activation epilogue: greedy
+    /// MTP == AR rests on a verify row reproducing its decode row.
+    #[test]
+    fn gemv_bf16_k4_rows_are_bit_identical_to_single_row() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        // (M, K): HC write gates (4 x 4*2560) and an HC read down (320 x 4*2560).
+        for (m, k) in [(4usize, 10240usize), (320, 10240)] {
+            let bytes: Vec<u8> = wave(1, m * k, 0.05)
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut weight = gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight");
+            weight.dtype = DType::BF16;
+            weight.shape = vec![m * k];
+            let x = gpu.upload_f32(&wave(2, 8 * k, 1.5), &[8 * k]).expect("x");
+            for act in [None, Some(0.25f32)] {
+                let single = gpu.zeros(&[8 * m], DType::F32).expect("single");
+                for row in 0..8 {
+                    gpu.gemv_bf16_xf32_k4(
+                        &weight,
+                        &x.sub_offset(row * k, k),
+                        &single.sub_offset(row * m, m),
+                        m,
+                        k,
+                        act,
+                    )
+                    .expect("k4");
+                }
+                let expected = bits(&gpu, &single);
+                assert!(expected.iter().any(|v| *v != 0), "single-row output is all zero");
+                for rows in 2..=8usize {
+                    let multi = gpu.zeros(&[rows * m], DType::F32).expect("multi");
+                    gpu.gemv_bf16_xf32_k4_rows(&weight, &x, &multi, m, k, act, rows)
+                        .expect("k4 rows");
+                    assert_eq!(
+                        bits(&gpu, &multi),
+                        expected[..rows * m],
+                        "M={m} K={k} rows={rows} act={act:?}"
+                    );
+                    gpu.free_tensor(multi).expect("free");
+                }
+                gpu.free_tensor(single).expect("free");
+            }
+            gpu.free_tensor(x).expect("free");
+            gpu.free_tensor(weight).expect("free");
+        }
+    }
+
     /// The persistent row-batched GDN recurrence must equal the per-row step
     /// kernel bit for bit (outputs and final state), including across the
     /// kernel's 256-row prologue block boundary.
