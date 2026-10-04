@@ -1638,6 +1638,8 @@ impl Gpu {
                 gdn_state_f32_bytes: 0,
                 qsa_gather_f16: None,
                 qsa_gather_f16_bytes: 0,
+                qsa_gather_vmm: None,
+                qsa_gather_vmm_mapped: 0,
                 fp16_x_source_ptr: std::ptr::null_mut(),
                 fp8_x_scratch: None,
                 fp8_x_scratch_bytes: 0,
@@ -3180,12 +3182,91 @@ impl Gpu {
         Ok(self.scratch.gdn_state_f32.as_ref().unwrap().as_ptr())
     }
 
-    /// The gathered QSA attention's F16 K / V scratch
-    /// ([`crate::scratch::ScratchState::qsa_gather_f16`]), at least `bytes`.
-    /// Grows like the other scratch slots (captured state is invalidated
-    /// before the old buffer is freed); Qwen4 reserves the whole context at
-    /// load, so a forward never grows it.
-    pub(crate) fn qsa_gather_scratch(&mut self, bytes: usize) -> HipResult<*mut c_void> {
+    /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
+    /// VMM owner: gfx1151 (the only arch with evidence for it), a platform
+    /// the VMM KV backend is certified on (not native Windows, not WSL
+    /// without its unsafe override), and a runtime answering the VMM
+    /// granularity query. Everything else keeps the legacy contiguous slot.
+    pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
+        self.arch_caps.is_gfx1151()
+            && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
+            && self.vmm_recommended_granularity().is_ok()
+    }
+
+    /// The backing in use, decided once per reservation: a live slot keeps
+    /// its kind, an empty Gpu asks [`Self::qsa_gather_vmm_capable`].
+    fn qsa_gather_uses_vmm(&self) -> bool {
+        match (&self.scratch.qsa_gather_vmm, &self.scratch.qsa_gather_f16) {
+            (Some(_), _) => true,
+            (None, Some(_)) => false,
+            (None, None) => self.qsa_gather_vmm_capable(),
+        }
+    }
+
+    /// Reserve the gathered QSA attention's workspace for at least
+    /// `reserve_bytes`. VMM ([`crate::scratch::ScratchState::qsa_gather_vmm`]):
+    /// a stable virtual extent, committing no new pages; a reservation at
+    /// least that large is kept, and replacing a smaller one (an address
+    /// move) is refused while a capture or record is armed. Legacy
+    /// ([`crate::scratch::ScratchState::qsa_gather_f16`]): the whole extent
+    /// allocated, as before.
+    pub(crate) fn qsa_gather_reserve(&mut self, reserve_bytes: usize) -> HipResult<()> {
+        if !self.qsa_gather_uses_vmm() {
+            return self.qsa_gather_legacy(reserve_bytes).map(drop);
+        }
+        let reserve_bytes = reserve_bytes.max(1);
+        if self
+            .scratch
+            .qsa_gather_vmm
+            .as_ref()
+            .is_some_and(|workspace| workspace.byte_size() >= reserve_bytes)
+        {
+            return Ok(());
+        }
+        self.refuse_qsa_gather_growth_while_armed(reserve_bytes)?;
+        if self.scratch.qsa_gather_vmm.is_some() {
+            self.invalidate_for_scratch_growth();
+            self.release_qsa_gather_workspace()?;
+        }
+        // SAFETY: launches touch only the mapped prefix; `qsa_gather_scratch`
+        // maps every byte a launch reads or writes before returning its base.
+        let workspace = unsafe { self.alloc_vmm_tensor(&[reserve_bytes], DType::Raw, 0, &[])? };
+        self.scratch.qsa_gather_vmm_mapped = self.vmm_mapped_bytes(&workspace).unwrap_or(0);
+        self.scratch.qsa_gather_vmm = Some(workspace);
+        Ok(())
+    }
+
+    /// The gathered QSA workspace's base, covering at least its first
+    /// `bytes`. VMM: reserved for at least `reserve_bytes`
+    /// ([`Self::qsa_gather_reserve`]) and mapped in place at the stable
+    /// address, rounded to the driver granularity; mapping more is refused
+    /// while a capture or record is armed, so a captured graph or tape never
+    /// sees the workspace change. Legacy: grown to `bytes` like the other
+    /// scratch slots.
+    pub(crate) fn qsa_gather_scratch(
+        &mut self,
+        bytes: usize,
+        reserve_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        if !self.qsa_gather_uses_vmm() {
+            return self.qsa_gather_legacy(bytes);
+        }
+        self.qsa_gather_reserve(reserve_bytes.max(bytes))?;
+        if bytes > self.scratch.qsa_gather_vmm_mapped {
+            self.refuse_qsa_gather_growth_while_armed(bytes)?;
+            let mut workspace = self.scratch.qsa_gather_vmm.take().expect("reserved above");
+            let grown = self.map_qsa_gather_prefix(&mut workspace, bytes);
+            self.scratch.qsa_gather_vmm_mapped = self.vmm_mapped_bytes(&workspace).unwrap_or(0);
+            self.scratch.qsa_gather_vmm = Some(workspace);
+            grown?;
+        }
+        Ok(self.scratch.qsa_gather_vmm.as_ref().unwrap().buf.as_ptr())
+    }
+
+    /// The legacy slot, at least `bytes`. Grows like the other scratch slots
+    /// (captured state is invalidated before the old buffer is freed); Qwen4
+    /// reserves the whole context at load, so a forward never grows it.
+    fn qsa_gather_legacy(&mut self, bytes: usize) -> HipResult<*mut c_void> {
         if crate::scratch::scratch_will_grow(
             self.scratch.qsa_gather_f16_bytes,
             self.scratch.qsa_gather_f16.is_some(),
@@ -3202,13 +3283,70 @@ impl Gpu {
         Ok(self.scratch.qsa_gather_f16.as_ref().unwrap().as_ptr())
     }
 
-    /// Bytes currently allocated for the gathered QSA attention's scratch
-    /// (0 before the first reservation).
+    fn map_qsa_gather_prefix(&mut self, workspace: &mut GpuTensor, bytes: usize) -> HipResult<()> {
+        let mapped = self.vmm_mapped_bytes(workspace).unwrap_or(0);
+        let granularity = self.vmm_granularity(workspace).unwrap_or(0);
+        let grow = crate::scratch::vmm_prefix_growth(mapped, workspace.byte_size(), granularity, bytes)
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "QSA gather workspace cannot map {bytes} bytes of a {}-byte reservation",
+                        workspace.byte_size()
+                    ),
+                )
+            })?;
+        if grow > 0 {
+            self.grow_vmm_tensor(workspace, grow, &[])?;
+        }
+        Ok(())
+    }
+
+    fn refuse_qsa_gather_growth_while_armed(&self, bytes: usize) -> HipResult<()> {
+        if self.graphs.capture_mode || self.replay.is_recording() {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "QSA gather workspace growth to {bytes} bytes refused while a capture or record is armed; map it before capture"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release the VMM gathered QSA workspace (the legacy slot is kept for
+    /// the process, as before). It is this Gpu's own scratch, not a model
+    /// owner, and its address never enters captured or recorded state (the
+    /// route is eager-only and growth refuses while armed); a later launch
+    /// reserves afresh. A failed release is retained in the VMM pending table
+    /// for [`Self::ensure_vmm_cleaned`] to retry.
+    pub(crate) fn release_qsa_gather_workspace(&mut self) -> HipResult<()> {
+        self.scratch.qsa_gather_vmm_mapped = 0;
+        match self.scratch.qsa_gather_vmm.take() {
+            Some(workspace) => self.free_tensor(workspace),
+            None => Ok(()),
+        }
+    }
+
+    /// Physically committed bytes of the gathered QSA attention's workspace
+    /// (0 before the first reservation): the VMM mapped prefix, rounded to
+    /// the driver granularity, or the legacy allocation.
     pub fn qsa_gather_scratch_bytes(&self) -> usize {
-        if self.scratch.qsa_gather_f16.is_some() {
+        if self.scratch.qsa_gather_vmm.is_some() {
+            self.scratch.qsa_gather_vmm_mapped
+        } else if self.scratch.qsa_gather_f16.is_some() {
             self.scratch.qsa_gather_f16_bytes
         } else {
             0
+        }
+    }
+
+    /// Reserved bytes of the gathered QSA attention's workspace (0 before the
+    /// first reservation): the VMM virtual extent, or the legacy allocation.
+    pub fn qsa_gather_reserved_bytes(&self) -> usize {
+        match &self.scratch.qsa_gather_vmm {
+            Some(workspace) => workspace.byte_size(),
+            None => self.qsa_gather_scratch_bytes(),
         }
     }
 
@@ -4369,7 +4507,13 @@ impl Gpu {
                 ),
             ));
         }
-        let live = self.vmm_arenas.len();
+        // The VMM gathered QSA workspace is this Gpu's own scratch, not a
+        // model owner. Only once no host-mapped (above) and no other VMM
+        // owner remains, retire it so a load whose construction failed after
+        // reserving it cannot wedge this gate; a failed release lands in the
+        // pending table retried below.
+        let workspace = usize::from(self.scratch.qsa_gather_vmm.is_some());
+        let live = self.vmm_arenas.len().saturating_sub(workspace);
         if live != 0 {
             return Err(HipError::new(
                 0,
@@ -4377,6 +4521,9 @@ impl Gpu {
                     "refusing VMM cleanup while {live} live VMM tensor owner(s) remain; unload the active model first"
                 ),
             ));
+        }
+        if workspace != 0 {
+            let _ = self.release_qsa_gather_workspace();
         }
         match self.retry_vmm_cleanup() {
             Ok(0) => Ok(()),
@@ -5106,6 +5253,10 @@ impl Gpu {
     ///   * fp16_shadow_cache: lazily-built FP16 dequant of HFQ4 weights for
     ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
     ///     entries are released back to the pool here.
+    ///   * the gathered QSA attention's VMM workspace
+    ///     (`ScratchState::qsa_gather_vmm`): released, so the next model
+    ///     reserves its own context and unload's VMM gate sees no Gpu-held
+    ///     owner. The legacy slot (`qsa_gather_f16`) is kept, as before.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
@@ -5113,6 +5264,9 @@ impl Gpu {
         for t in shadows {
             let _ = self.free_tensor(t);
         }
+        // A failed release is retained for `ensure_vmm_cleaned` to retry
+        // and report.
+        let _ = self.release_qsa_gather_workspace();
     }
 
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called
