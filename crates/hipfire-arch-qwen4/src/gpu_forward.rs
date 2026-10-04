@@ -2658,6 +2658,42 @@ impl Qwen4GpuForward {
                 )));
             }
         }
+        // Map the QSA context rows this forward writes and reads (every
+        // arena through `end_position`) and, for a chunk the gathered prefill
+        // attention takes, its F16 workspace over the same prefix: here,
+        // before any view, capture or record exists. Neither grows while a
+        // capture or record is armed; a failure leaves the position
+        // unpublished and already mapped pages owned.
+        let mapped_before = bundle.state.mapped_context_tokens();
+        bundle
+            .state
+            .ensure_mapped_capacity(gpu, end_position)
+            .map_err(|error| {
+                invalid(format!(
+                    "map Qwen4 QSA context through {end_position} tokens: {error}"
+                ))
+            })?;
+        if n >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+            if let Some(qsa) = bundle.state.qsa.first() {
+                rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
+                    gpu,
+                    qsa.format,
+                    config.num_key_value_heads,
+                    end_position,
+                )?;
+            }
+        }
+        if bundle.state.mapped_context_tokens() != mapped_before {
+            if let Ok((target, mtp)) = bundle.qsa_context_committed_bytes(gpu) {
+                eprintln!(
+                    "  qwen4 QSA context mapped for {} tokens: {} MiB target + {} MiB MTP committed, {} MiB gather workspace",
+                    bundle.state.mapped_context_tokens(),
+                    target >> 20,
+                    mtp >> 20,
+                    gpu.qsa_gather_scratch_bytes() >> 20
+                );
+            }
+        }
         let ple_layer_index = config
             .ple_layer_ids
             .first()

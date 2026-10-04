@@ -16,7 +16,7 @@ pub mod bundle;
 pub mod config;
 pub mod expert_residency;
 pub mod gpu_forward;
-pub(crate) mod kv_backend;
+pub mod kv_backend;
 pub mod mtp_gpu;
 pub mod mtp_spec;
 pub mod ops;
@@ -50,3 +50,4 @@ pub use ple::{
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
 pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
+pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};

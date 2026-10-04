@@ -14,6 +14,7 @@ use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
 };
+use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -175,7 +176,9 @@ struct Qwen4PrefixCache {
 impl Qwen4Bundle {
     /// Assemble a complete Single bundle using metadata parsed from the
     /// artifact's canonical `qwen4_ple` object. `state_format` is the request
-    /// state's storage ([`crate::resolve_state_format`]).
+    /// state's storage ([`crate::resolve_state_format`]); `backend` the QSA
+    /// context storage load admission resolved, shared by target and MTP.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         config: Qwen4Config,
         transaction: WeightLoadTransaction,
@@ -184,6 +187,7 @@ impl Qwen4Bundle {
         max_seq_len: usize,
         metadata: PleHashMetadata,
         state_format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
         Self::assemble_with_metadata(
             config,
@@ -193,12 +197,14 @@ impl Qwen4Bundle {
             max_seq_len,
             metadata,
             state_format,
+            backend,
         )
     }
 
     /// Assemble with validated metadata read from the artifact's exact I64
     /// arrays.  The transaction is consumed so no load-side owner can remain
     /// live after this method publishes the bundle.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_metadata(
         config: Qwen4Config,
         mut transaction: WeightLoadTransaction,
@@ -207,6 +213,7 @@ impl Qwen4Bundle {
         max_seq_len: usize,
         metadata: PleHashMetadata,
         state_format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
         let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
             Ok(weights) => weights,
@@ -246,7 +253,13 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let mut state = match Qwen4State::new(gpu, &config, max_seq_len, state_format) {
+        let mut state = match Qwen4State::new_with_backend(
+            gpu,
+            &config,
+            max_seq_len,
+            state_format,
+            backend,
+        ) {
             Ok(state) => state,
             Err(error) => {
                 // `unload` consumes the reader and joins its worker even on a
@@ -347,23 +360,36 @@ impl Qwen4Bundle {
             ));
         }
         // The gathered QSA prefill attention (HIPFIRE_QWEN4_QSA_WMMA_GATHER)
-        // converts the cache rows it reads into its own scratch: reserve it
-        // for the whole context now, before any capture or record, so a
-        // later longer prefill never grows (and frees) it. A no-op when the
-        // route is off for this arch and state format.
+        // converts the cache rows it reads into its own workspace. Reserve
+        // its address for the whole context now, before any capture or
+        // record, so a later longer prefill never moves it. With VMM QSA
+        // state only the reservation is made and each forward maps the
+        // prefix it reads (`Qwen4GpuForward`); legacy state commits all of
+        // it here, as before. A no-op when the route is off for this arch
+        // and state format.
         if let Some(qsa) = self.state.qsa.first() {
-            let reserved = rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
-                gpu,
-                qsa.format,
-                self.config.num_key_value_heads,
-                qsa.full_capacity,
-            )
+            let heads = self.config.num_key_value_heads;
+            let reserved = match self.state.qsa_backend() {
+                Qwen4KvBackend::Legacy => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                    gpu,
+                    qsa.format,
+                    heads,
+                    qsa.full_capacity,
+                ),
+                Qwen4KvBackend::Vmm => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
+                    gpu,
+                    qsa.format,
+                    heads,
+                    qsa.full_capacity,
+                ),
+            }
             .map_err(BundleError::Hip)?;
             if reserved > 0 {
                 eprintln!(
-                    "  qwen4 QSA gather scratch: {} MiB reserved for {} context tokens",
+                    "  qwen4 QSA gather workspace: {} MiB reserved for {} context tokens, {} MiB committed",
                     reserved >> 20,
-                    qsa.full_capacity
+                    qsa.full_capacity,
+                    gpu.qsa_gather_scratch_bytes() >> 20
                 );
             }
         }
@@ -426,8 +452,14 @@ impl Qwen4Bundle {
                 "Qwen4 MTP resources are already attached".to_string(),
             ));
         }
-        let mtp = Qwen4MtpGpu::new(gpu, &self.weights, &self.config, max_seq)
-            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let mtp = Qwen4MtpGpu::new_with_backend(
+            gpu,
+            &self.weights,
+            &self.config,
+            max_seq,
+            self.state.qsa_backend(),
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
         Ok(())
     }
@@ -731,9 +763,7 @@ impl Qwen4Bundle {
         position: usize,
         fresh_qsa_selection: bool,
     ) -> Result<u32, BundleError> {
-        let mtp = self.mtp.as_mut().ok_or_else(|| {
-            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
-        })?;
+        let mtp = mapped_mtp(self.mtp.as_mut(), gpu, position)?;
         mtp.forward_token(
             gpu,
             &self.weights,
@@ -765,9 +795,7 @@ impl Qwen4Bundle {
         position: usize,
         fresh_qsa_selection: bool,
     ) -> Result<(), BundleError> {
-        self.mtp
-            .as_mut()
-            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+        mapped_mtp(self.mtp.as_mut(), gpu, position)?
             .forward_token(
                 gpu,
                 &self.weights,
@@ -792,9 +820,7 @@ impl Qwen4Bundle {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
-        self.mtp
-            .as_mut()
-            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+        mapped_mtp(self.mtp.as_mut(), gpu, position)?
             .forward_token(
                 gpu,
                 &self.weights,
@@ -819,9 +845,7 @@ impl Qwen4Bundle {
         fresh_qsa_selection: bool,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
-        let mtp = self.mtp.as_mut().ok_or_else(|| {
-            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
-        })?;
+        let mtp = mapped_mtp(self.mtp.as_mut(), gpu, position)?;
         mtp.forward_token_with_logits(
             gpu,
             &self.weights,
@@ -1068,6 +1092,22 @@ impl Qwen4Bundle {
         self.prefix.is_some()
     }
 
+    /// Device bytes the QSA context arenas commit now, `(target, MTP head)`:
+    /// mapped pages of VMM owners, full allocations of legacy ones.
+    pub fn qsa_context_committed_bytes(&self, gpu: &Gpu) -> Result<(usize, usize), BundleError> {
+        let target = self
+            .state
+            .mapped_context_bytes(gpu)
+            .map_err(BundleError::State)?;
+        let mtp = match self.mtp.as_ref() {
+            Some(mtp) => mtp
+                .mapped_context_bytes(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?,
+            None => 0,
+        };
+        Ok((target, mtp))
+    }
+
     /// Pure plan for `prompt` (the full canonical token ids) under `mode`:
     /// restore the published checkpoint `p` when `prompt[..p]` equals its
     /// tokens, `p < prompt.len()`, and mode, admitted chunk and device
@@ -1183,6 +1223,20 @@ impl Qwen4Bundle {
         mode: Qwen4PrefixMode,
     ) -> Result<(), BundleError> {
         self.invalidate_ple_epoch()?;
+        // Context rows stay mapped until unload, so the checkpoint's rows
+        // are covered; mapping through its position first keeps every
+        // restored access inside the mapped prefix regardless.
+        if let Some(position) = self.state.prefix_position() {
+            self.state
+                .ensure_mapped_capacity(gpu, position)
+                .map_err(BundleError::State)?;
+        }
+        if let (Qwen4PrefixMode::NativeMtp, Some(mtp)) = (mode, self.mtp.as_mut()) {
+            if let Some(position) = mtp.prefix_position() {
+                mtp.ensure_mapped_capacity(gpu, position)
+                    .map_err(|error| BundleError::Forward(error.to_string()))?;
+            }
+        }
         self.state
             .restore_prefix(gpu)
             .map_err(BundleError::State)?;
@@ -1610,6 +1664,24 @@ fn ple_descriptors(
         )));
     }
     Ok(descriptors)
+}
+
+/// The attached MTP head with its QSA context mapped through `position`,
+/// the row the next step writes. Mapping happens here, outside any capture
+/// or record (MTP steps never run under either), never inside the step.
+fn mapped_mtp<'a>(
+    mtp: Option<&'a mut Qwen4MtpGpu>,
+    gpu: &mut Gpu,
+    position: usize,
+) -> Result<&'a mut Qwen4MtpGpu, BundleError> {
+    let mtp = mtp
+        .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".to_string()))?;
+    let required = position
+        .checked_add(1)
+        .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
+    mtp.ensure_mapped_capacity(gpu, required)
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
+    Ok(mtp)
 }
 
 fn cleanup_transaction(primary: BundleError, rollback: hip_bridge::HipResult<()>) -> BundleError {

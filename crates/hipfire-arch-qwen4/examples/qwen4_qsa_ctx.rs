@@ -691,7 +691,14 @@ fn main() -> Result<()> {
     )
     .map_err(err)?;
     let qsa_format = state_format.qsa;
-    eprintln!("state format qsa={} gdn={}", qsa_format.name(), state_format.gdn.name());
+    // The product's automatic QSA context storage (VMM where supported).
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
+    eprintln!(
+        "state format qsa={} gdn={} backend={}",
+        qsa_format.name(),
+        state_format.gdn.name(),
+        backend.name()
+    );
     #[allow(unused_mut)]
     let mut weights = receipt.manifest.weights.clone();
     use hipfire_arch_qwen4::expert_residency as residency;
@@ -703,11 +710,14 @@ fn main() -> Result<()> {
                 let (free, _) = gpu.hip.get_vram_info().map_err(err)?;
                 let (non_expert, per_layer) = residency::resident_split(&weights, |entry|
                     hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)).map_err(err)?;
+                let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx);
+                let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+                    backend, n_ctx, chunk, gpu.vmm_recommended_granularity().unwrap_or(1));
                 let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format)
-                    .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, n_ctx))
+                    .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, context.tokens))
                     .flatten().map(|bytes| bytes as u64);
-                let reserve = residency::auto_vram_reserve(&receipt.config, n_ctx,
-                    hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx), qsa_format, None, gather).map_err(err)?;
+                let reserve = residency::auto_vram_reserve(&receipt.config, &context,
+                    chunk, qsa_format, None, gather).map_err(err)?;
                 if (free as u64) < non_expert.saturating_add(reserve) {
                     return Err("not enough free VRAM for non-expert weights plus auto reserve".into());
                 }
@@ -753,9 +763,16 @@ fn main() -> Result<()> {
         n_ctx,
         receipt.ple,
         state_format,
+        backend,
     )
     .map_err(err)?;
     bundle.attach_forward(&mut gpu, n_ctx).map_err(err)?;
+    // The tap reads every arena over its whole capacity, so map all of it
+    // (VMM storage maps nothing at construction).
+    bundle
+        .state
+        .ensure_mapped_capacity(&mut gpu, n_ctx)
+        .map_err(|error| format!("map QSA context: {error}"))?;
     let logits = gpu.zeros(&[vocab], DType::F32).map_err(err)?;
     let tokens = tokenizer.encode(&text);
     eprintln!("text: {} tokens", tokens.len());

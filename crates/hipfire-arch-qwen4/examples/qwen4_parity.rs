@@ -3877,6 +3877,7 @@ fn run_quality_candidate(
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let placements = placements;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
         transaction,
@@ -3885,6 +3886,7 @@ fn run_quality_candidate(
         2048,
         metadata,
         hipfire_arch_qwen4::Qwen4StateFormat::F32,
+        backend,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));

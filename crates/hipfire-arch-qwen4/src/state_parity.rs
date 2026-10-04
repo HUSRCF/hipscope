@@ -14,6 +14,7 @@ use crate::gpu_forward::{
     qwen4_profile_enable, qwen4_profile_reset, qwen4_profile_snapshot, Qwen4GpuForwardScratch,
     Qwen4ProfilePhase, Qwen4ProfileStats,
 };
+use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::state::Qwen4State;
@@ -71,16 +72,20 @@ type Families = BTreeMap<String, Value>;
 
 pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
     let config = compact_test_config();
-    let mut ar = Qwen4State::new(gpu, &config, MAX_SEQ, crate::state::Qwen4StateFormat::F32)
+    // The product's automatic QSA storage (VMM where supported), mapped for
+    // the whole parity context: the oracle writes and reads whole arenas.
+    let backend = Qwen4KvBackend::automatic(gpu);
+    let format = crate::state::Qwen4StateFormat::F32;
+    let mut ar = Qwen4State::new_with_backend(gpu, &config, MAX_SEQ, format, backend)
         .map_err(|error| format!("allocate compact AR state: {error}"))?;
-    let mut native = match Qwen4State::new(gpu, &config, MAX_SEQ, crate::state::Qwen4StateFormat::F32) {
+    let mut native = match Qwen4State::new_with_backend(gpu, &config, MAX_SEQ, format, backend) {
         Ok(state) => state,
         Err(error) => {
             let _ = ar.free_gpu(gpu);
             return Err(format!("allocate compact native target state: {error}"));
         }
     };
-    let mut direct = match MtpGpuState::new(gpu, &config, MAX_SEQ) {
+    let mut direct = match MtpGpuState::new_with_backend(gpu, &config, MAX_SEQ, backend) {
         Ok(state) => state,
         Err(error) => {
             let _ = ar.free_gpu(gpu);
@@ -88,7 +93,7 @@ pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
             return Err(format!("allocate compact direct MTP state: {error}"));
         }
     };
-    let mut mtp = match MtpGpuState::new(gpu, &config, MAX_SEQ) {
+    let mut mtp = match MtpGpuState::new_with_backend(gpu, &config, MAX_SEQ, backend) {
         Ok(state) => state,
         Err(error) => {
             let _ = ar.free_gpu(gpu);
@@ -97,7 +102,26 @@ pub fn run_compact(gpu: &mut Gpu) -> Result<Value, String> {
             return Err(format!("allocate compact native MTP state: {error}"));
         }
     };
-    let result = run_inner(gpu, &config, &mut ar, &mut native, &mut direct, &mut mtp);
+    let mapped = (|| -> Result<(), String> {
+        for state in [&mut ar, &mut native] {
+            state
+                .ensure_mapped_capacity(gpu, MAX_SEQ)
+                .map_err(|error| error.to_string())?;
+        }
+        for state in [&mut direct, &mut mtp] {
+            state
+                .ensure_mapped_capacity(gpu, MAX_SEQ)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })()
+    .map_err(|error| format!("map compact {} QSA context: {error}", backend.name()));
+    let result = mapped
+        .and_then(|()| run_inner(gpu, &config, &mut ar, &mut native, &mut direct, &mut mtp))
+        .map(|mut value| {
+            value["qsa_backend"] = json!(backend.name());
+            value
+        });
     let cleanup = [
         ar.free_gpu(gpu).err().map(|error| error.to_string()),
         native.free_gpu(gpu).err().map(|error| error.to_string()),
@@ -1358,6 +1382,25 @@ fn target_layer_families_json(config: &crate::config::Qwen4Config) -> Value {
     })
 }
 
+/// Map the bundle's target and MTP QSA context arenas for all `tokens` of
+/// the (small) parity context: the probes read whole arenas, not only the
+/// rows a forward has mapped.
+fn map_bundle_context(
+    gpu: &mut Gpu,
+    bundle: &mut crate::bundle::Qwen4Bundle,
+    tokens: usize,
+) -> Result<(), String> {
+    bundle
+        .state
+        .ensure_mapped_capacity(gpu, tokens)
+        .map_err(|error| format!("map qwen4 target QSA context: {error}"))?;
+    if let Some(mtp) = bundle.mtp.as_mut() {
+        mtp.ensure_mapped_capacity(gpu, tokens)
+            .map_err(|error| format!("map qwen4 MTP QSA context: {error}"))?;
+    }
+    Ok(())
+}
+
 fn cleanup_profile_resources(
     gpu: &mut Gpu,
     bundle: crate::bundle::Qwen4Bundle,
@@ -1502,6 +1545,7 @@ fn run_profile_inner(
     emit_profile_load_checkpoint("manifest_fulfillment", manifest_ns);
 
     let assemble_started = Instant::now();
+    let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
         transaction,
@@ -1510,6 +1554,7 @@ fn run_profile_inner(
         1,
         metadata,
         crate::state::Qwen4StateFormat::F32,
+        backend,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
@@ -1547,9 +1592,11 @@ fn run_profile_inner(
     }
 
     let setup_started = Instant::now();
-    let setup_result = bundle
-        .ensure_spec_hidden(&mut gpu, 1)
-        .map_err(|error| format!("qwen4 profile hidden setup failed: {error}"));
+    let setup_result = map_bundle_context(&mut gpu, &mut bundle, 1).and_then(|()| {
+        bundle
+            .ensure_spec_hidden(&mut gpu, 1)
+            .map_err(|error| format!("qwen4 profile hidden setup failed: {error}"))
+    });
     if let Err(error) = setup_result {
         let cleanup = cleanup_profile_resources(&mut gpu, bundle, None);
         return Err(match cleanup {
@@ -1782,6 +1829,7 @@ pub fn run_state_parity(
         |entry| qwen4_range_payload(&source, entry),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
         transaction,
@@ -1790,6 +1838,7 @@ pub fn run_state_parity(
         2048,
         metadata,
         crate::state::Qwen4StateFormat::F32,
+        backend,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {
@@ -1799,6 +1848,7 @@ pub fn run_state_parity(
         bundle
             .attach_mtp(&mut gpu, 2048)
             .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+        map_bundle_context(&mut gpu, &mut bundle, 2048)?;
         real_model_probe(&mut gpu, &mut bundle, &tokens, &corpus)
     })();
     let bundle_cleanup = bundle

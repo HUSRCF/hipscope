@@ -202,7 +202,7 @@ static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
 });
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
-pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
+pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).

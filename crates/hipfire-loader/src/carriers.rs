@@ -361,12 +361,26 @@ impl Carrier for Qwen4Carrier {
             ctx.pp,
             ctx.kv_backend,
         )?;
-        if ctx.kv_backend != KvBackend::Legacy {
-            return Err(format!(
-                "qwen4: KV backend '{}' is unsupported; only legacy is admitted",
-                ctx.kv_backend.as_str()
-            ));
+        // Admission resolved the QSA context storage (automatic: VMM where
+        // `qwen4_vmm_refusal` is clear); the device must still agree.
+        let backend = hipfire_arch_qwen4::Qwen4KvBackend::from(ctx.kv_backend);
+        if backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm {
+            if let Some(reason) = hipfire_arch_qwen4::qwen4_vmm_refusal(
+                &ctx.gpu.arch,
+                ctx.gpu.vmm_recommended_granularity().is_ok(),
+            ) {
+                return Err(format!(
+                    "qwen4: KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy"
+                ));
+            }
         }
+        let vmm_granularity = match backend {
+            hipfire_arch_qwen4::Qwen4KvBackend::Vmm => ctx
+                .gpu
+                .vmm_recommended_granularity()
+                .map_err(|error| format!("qwen4: VMM granularity: {error}"))?,
+            hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
+        };
         if ctx.max_seq == 0 || ctx.max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
             return Err(format!(
                 "qwen4: max_seq {} is outside the admitted context range 1..={}",
@@ -425,11 +439,12 @@ impl Carrier for Qwen4Carrier {
         )?;
         let qsa_format = state_format.qsa;
         eprintln!(
-            "  qwen4 state: QSA {} K/V, GDN {} recurrent",
+            "  qwen4 state: QSA {} K/V ({} context storage), GDN {} recurrent",
             match qsa_format {
                 hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
                 hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
             },
+            backend.name(),
             state_format.gdn.name()
         );
         use hipfire_arch_qwen4::expert_residency as residency;
@@ -439,7 +454,9 @@ impl Carrier for Qwen4Carrier {
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
         // per-layer expert bytes, and the reserve (with its native MTP and
-        // QSA gather parts).
+        // QSA gather parts). Context arenas are charged as committed (VMM:
+        // the first chunk's pages; legacy: all of `max_seq`), never their
+        // virtual extent.
         let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
             let (free, _) = ctx
                 .gpu
@@ -450,6 +467,12 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: {error}"))?;
             let chunk_rows =
                 hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
+            let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+                backend,
+                ctx.max_seq,
+                chunk_rows,
+                vmm_granularity,
+            );
             // Every placement host-maps at least the MTP layer's routed
             // experts, so the head is still attached after it only where the
             // host-mapped policy keeps it (an explicit `--spec mtp`); only
@@ -458,11 +481,12 @@ impl Carrier for Qwen4Carrier {
             let mtp_bytes = if mtp_kept {
                 let head = residency::language_head_dtype(&manifest.weights)
                     .ok_or("qwen4: manifest has no language head")?;
-                let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config);
+                let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config)
+                    .then_some(state_format.gdn);
                 Some(
                     hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                         &config,
-                        ctx.max_seq,
+                        &context,
                         chunk_rows,
                         max_k,
                         head,
@@ -473,15 +497,15 @@ impl Carrier for Qwen4Carrier {
             } else {
                 None
             };
-            // The gathered QSA prefill attention reserves its context-sized
-            // scratch at attach (none when the route is off: the reserve is
-            // then unchanged). A slot already reserved by an earlier load in
-            // this process is out of `free` and only its growth is charged.
+            // The gathered QSA prefill attention's workspace, committed as
+            // the context is (none when the route is off: the reserve is then
+            // unchanged). Bytes already committed by an earlier load in this
+            // process are out of `free` and only growth past them is charged.
             let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
                 .then(|| {
                     rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
                         config.num_key_value_heads,
-                        ctx.max_seq,
+                        context.tokens,
                     )
                     .map(|bytes| (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64))
                     .ok_or("qwen4: QSA gather scratch size overflows")
@@ -496,7 +520,7 @@ impl Carrier for Qwen4Carrier {
                 0
             };
             let reserve =
-                residency::auto_vram_reserve(&config, ctx.max_seq, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
+                residency::auto_vram_reserve(&config, &context, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
                     .map_err(|error| format!("qwen4: {error}"))?
                     .checked_add(prefix_bytes)
                     .ok_or("qwen4: auto expert VRAM reserve overflows")?;
@@ -628,7 +652,9 @@ impl Carrier for Qwen4Carrier {
             }
         }
         // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
-        // head's, which stays F32), named in the refusal when they do not fit.
+        // head's, which stays F32): what legacy storage allocates at assembly
+        // (named in the refusal when it does not fit), and VMM storage only
+        // reserves as address space.
         let context_state_mib = config
             .qsa_context_arena_bytes(ctx.max_seq, qsa_format)
             .and_then(|trunk| trunk.checked_mul(config.n_full_layers()))
@@ -677,12 +703,17 @@ impl Carrier for Qwen4Carrier {
             ctx.max_seq,
             metadata,
             state_format,
+            backend,
         )
-        .map_err(|error| {
-            format!(
+        .map_err(|error| match backend {
+            hipfire_arch_qwen4::Qwen4KvBackend::Legacy => format!(
                 "qwen4: bundle assembly failed: {error} (max_seq {} needs {context_state_mib} MiB of QSA context state; lower memory.max_seq)",
                 ctx.max_seq
-            )
+            ),
+            hipfire_arch_qwen4::Qwen4KvBackend::Vmm => format!(
+                "qwen4: bundle assembly failed: {error} (VMM QSA context reserves {context_state_mib} MiB of address space for max_seq {})",
+                ctx.max_seq
+            ),
         })?;
         // The target checkpoint is allocated before the forward so the
         // admitted chunk rung is chosen from the VRAM left after it; the
@@ -729,6 +760,20 @@ impl Carrier for Qwen4Carrier {
                 "  qwen4 prefix cache: one whole-chunk checkpoint ({} KiB)",
                 bytes / 1024
             );
+        }
+        match bundle.qsa_context_committed_bytes(ctx.gpu) {
+            Ok((target, mtp)) => eprintln!(
+                "  qwen4 QSA context: {} storage, {context_state_mib} MiB virtual for {} tokens, {} MiB target + {} MiB MTP committed at load",
+                backend.name(),
+                ctx.max_seq,
+                target >> 20,
+                mtp >> 20
+            ),
+            Err(error) => {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: QSA context census failed: {detail}"));
+            }
         }
         let mut model = LoadedModel {
             state: Some(Box::new(bundle)),

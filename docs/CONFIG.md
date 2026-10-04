@@ -422,6 +422,20 @@ the same source/mode/topology; registry cards set neither backend nor
 gfx1100/gfx1151 the certified Qwen VMM route is q8 only; unvalidated modes
 retain the existing legacy fallback.
 
+Qwen4 (Flash-Next, arch 16) owns its own QSA context layout. Automatic
+selects **vmm** exactly on gfx1151 with a certified platform (not Windows,
+not WSL without its unsafe override) and a HIP VMM runtime; elsewhere it
+selects legacy and logs the reason. Explicit `legacy` is always honoured, and
+explicit `vmm` is refused only where that capability check fails. Under VMM,
+the target and MTP QSA arenas (full K/V, raw and pooled index keys) and the
+gathered-attention workspace reserve address space for `max_seq` and map
+pages as forwards touch rows, before any capture or Redline record. Committed
+context then tracks the tokens touched, not `max_seq`: the load logs
+`qwen4 QSA context: … MiB virtual …, … MiB committed at load`, and each
+growth logs `qwen4 QSA context mapped for N tokens`. The `auto` expert reserve
+charges only committed bytes. Mapped pages stay owned until unload, and VMM is
+not eviction.
+
 For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
 preflights projected model fit before tearing down a resident model. After
 weights actually load, the Qwen carrier measures free VRAM immediately before
