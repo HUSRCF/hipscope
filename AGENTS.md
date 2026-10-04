@@ -700,13 +700,26 @@ Caveats that are part of the fixture, not trivia:
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
-  interleaved. The few-row (2..8) verify forward is bitwise the single-row
-  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
-  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
-  rolls back without re-running the accepted rows; elsewhere the batched
-  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
-  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
-  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  interleaved. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  AR target's single-row route. With Q8 GDN recurrent state, the row-capture
+  verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
+  per-token Q8 boundary at each row's absolute position, so every captured
+  verify row, the final slot and every rollback keep-prefix equal sequential
+  single-row decode. Oracles: `gdn_q8_verify_matches_single_row`
+  (rdna-compute) and the ignored
+  `crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs` (canonical
+  GPTQ3 MQ4 Flash-Next, p1, 1200 greedy IDs): on gfx1151 forced batched,
+  forced interleaved, adaptive and full-head batched MTP all match AR in
+  three fresh-process runs (before the repair, batched first differed at
+  index 112 and adaptive at 130). This guarantee covers only that capture
+  path: it is not a claim for the unarmed few-row Q8 prefill/replay route
+  (used where rows are not captured) or for architectures the oracle has not
+  run on. On GPUs whose GDN route captures per-row states
+  (gfx11+ SIMT) a rejected suffix rolls back without re-running the accepted
+  rows; elsewhere the batched route restores and replays. Drafts rank the
+  vocabulary with an MQ2 copy of the LM head and re-score its top 8 exactly
+  against the head's own Q8_0 or MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`,
+  default `mq2r`).
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
