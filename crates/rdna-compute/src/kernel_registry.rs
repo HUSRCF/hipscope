@@ -59,6 +59,11 @@ mod kernels {
         "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
         include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
     );
+    #[cfg(not(feature = "deltanet"))]
+    pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+        "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
+        include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+    );
     /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
     pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
 }
@@ -455,6 +460,473 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
         add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
     }
+    // Qwen3.8-Flash-Next (Qwen4) load, AR prefill/decode and native MTP:
+    // every module a kernel-load trace (tests/fixtures/kernel-trace-qwen4-
+    // flash-next.tsv) JIT-compiled on gfx1151 and gfx1201 beyond the
+    // inventory above. gfx1100 cannot hold Flash-Next on the trace hosts; its
+    // rows are the same callsites resolved through gfx1100's arch predicates
+    // (no sym-IU4 MoE, F16 WMMA MoE at >= 512 rows, `_rdna3` GEMV modules,
+    // `qwen4_gemm_wmma_lds256` beside the shipped LDS256 source). Sources are
+    // the exact expressions the callsites pass to `ensure_kernel`; symbols are
+    // every kernel the arch's object defines.
+    if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
+        add!("copy_f32_buffer", kernels::COPY_F32_BUFFER_SRC, ["copy_f32_buffer", "copy_f32_strided_slot_buffer"]);
+        add!("gemm_bf16_xf32_multirow", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
+            "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
+        ]);
+        add!("gemm_bf16_xf32_multirow_r16w4_gfx1151", kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC, [
+            "gemm_bf16_xf32_multirow_r16_gfx1151", "gemm_bf16_xf32_multirow_r16w4_gfx1151", "gemm_bf16_xf32_multirow_r16w4t_gfx1151",
+        ]);
+        add!("gemm_bf16_xf32_multirow_r16w4t_gfx1151", kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC, [
+            "gemm_bf16_xf32_multirow_r16_gfx1151", "gemm_bf16_xf32_multirow_r16w4_gfx1151", "gemm_bf16_xf32_multirow_r16w4t_gfx1151",
+        ]);
+        add!("gemm_bf16_xf32_multirow_rows3", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
+            "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
+        ]);
+        add!("gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC, [
+            "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
+        ]);
+        add!("gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4", kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC, [
+            "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
+        ]);
+        add!("gemm_mq6g256v2_f32_rows", kernels::GEMM_MQ6G256V2_F32_ROWS_SRC, [
+            "gemm_mq6g256v2_f32_rows_r2", "gemm_mq6g256v2_f32_rows_r3", "gemm_mq6g256v2_f32_rows_r4", "gemm_mq6g256v2_f32_rows_r5",
+            "gemm_mq6g256v2_f32_rows_r6", "gemm_mq6g256v2_f32_rows_r7", "gemm_mq6g256v2_f32_rows_r8", "gemm_mq6g256v2_f32_rows_x4_r2",
+            "gemm_mq6g256v2_f32_rows_x4_r3", "gemm_mq6g256v2_f32_rows_x4_r4", "gemm_mq6g256v2_f32_rows_x4_r5", "gemm_mq6g256v2_f32_rows_x4_r6",
+            "gemm_mq6g256v2_f32_rows_x4_r7", "gemm_mq6g256v2_f32_rows_x4_r8",
+        ]);
+        add!("gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded", kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC, [
+            "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+        ]);
+        add!("gemv_mq4g256v2_moe_gate_up_top10_indexed_batched", kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC, [
+            "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched", "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
+        ]);
+        add!("grouped_ops", crate::grouped_ops::GROUPED_KERNEL_SRC, [
+            "grouped_depthwise_conv_silu_add_bf16", "grouped_depthwise_conv_silu_add_f32", "grouped_gate_bf16", "grouped_gate_f32",
+            "grouped_gather_convert_bf16", "grouped_gather_convert_bf16_f16", "grouped_linear_f32", "grouped_norm_bf16", "grouped_norm_f32",
+            "ple_conv_add_bf16s", "ple_conv_add_bf16s_k4d3", "ple_gate_rows_bf16s", "ple_norm_inv",
+        ]);
+        add!("hc_streams_init_from_embed_batched", kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC, ["hc_streams_init_from_embed_batched"]);
+        add!("moe_down_combine_grouped_top10", kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, [
+            "moe_combine_order_top10", "moe_down_combine_grouped_top10", "moe_down_combine_grouped_top10_bf16in",
+            "moe_down_combine_grouped_top10_bf16in_zinit",
+        ]);
+        add!("moe_down_combine_top10_batched", kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC, ["moe_down_combine_top10_batched"]);
+        add!("moe_gate_up_unscatter_silu_top10", kernels::MOE_GATE_UP_UNSCATTER_SILU_TOP10_SRC, [
+            "moe_gate_up_unscatter_silu_rotate128_top10", "moe_gate_up_unscatter_silu_top10", "moe_gate_up_unscatter_silu_top10_bf16in",
+            "moe_unscatter_rotate128_f16",
+        ]);
+        add!("moe_router_softmax_top10_f32", kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_SRC, ["moe_router_softmax_top10_f32"]);
+        add!("moe_scatter_fused_top10", kernels::MOE_SCATTER_FUSED_TOP10_SRC, ["moe_scatter_fused_top10"]);
+        add!("mq_rotate_x_128_v2", kernels::MQ_ROTATE_X_128_V2_SRC, ["mq_rotate_x_128_v2", "mq_rotate_x_128_v2_f16", "mq_rotate_x_128_v2_silu_bf16"]);
+        add!("qwen4_gemv_bf16_xf32", kernels::QWEN4_GEMV_BF16_XF32_SRC, [
+            "gemv_bf16_xf32", "gemv_bf16_xf32_bf16_scaled_add", "gemv_bf16_xf32_k4", "gemv_bf16_xf32_k4_rows_r2", "gemv_bf16_xf32_k4_rows_r3",
+            "gemv_bf16_xf32_k4_rows_r4", "gemv_bf16_xf32_k4_rows_r5", "gemv_bf16_xf32_k4_rows_r6", "gemv_bf16_xf32_k4_rows_r7",
+            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2", "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
+            "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
+        ]);
+        add!("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, ["hyper_read_projected_rotate_f32", "mq_rotate_x_bf16_f16", "mq_rotate_x_f16"]);
+        add!("qwen4_gemv_mq6g256v2", kernels::QWEN4_GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4"]);
+        add!("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, [
+            "gemv_q8_0_k2560_staged", "gemv_q8_0_k2560_staged_pair", "gemv_q8_0_k2560_staged_rows", "gemv_q8_0_k320_staged",
+            "gemv_q8_0_k320_staged_rows", "gemv_q8_0_k8", "gemv_q8_0_k8_rows_r2", "gemv_q8_0_k8_rows_r3", "gemv_q8_0_k8_rows_r4",
+            "gemv_q8_0_k8_rows_r5", "gemv_q8_0_k8_rows_r6", "gemv_q8_0_k8_rows_r7", "gemv_q8_0_k8_rows_r8", "quantize_bf16_q8_0",
+            "topk8_partial_f32", "topk8_rescore_q8_0_k2560",
+        ]);
+        add!("qwen4_hc_streams_init_from_embed_batched", kernels::QWEN4_HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC, ["hc_streams_init_from_embed_batched_bf16"]);
+        add!("requant_g256", kernels::REQUANT_G256_SRC, ["requant_bf16_to_f32", "requant_mqg256v2_to_f32", "requant_pack_mqg256v2", "requant_q8_0_to_f32"]);
+        add!("topk8_rescore_mq6g256v2", kernels::TOPK8_RESCORE_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4", "topk8_rescore_mq6g256v2_k2560"]);
+        add!("zero_f32", kernels::ZERO_F32_SRC, ["zero_f32"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1100") {
+        add!("gemv_bf16_xf32", kernels::gemv_bf16_xf32_src(arch == "gfx1151"), ["gemv_bf16_xf32"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1151") {
+        add!("gemv_mq2g256v2", kernels::GEMV_MQ2G256V2_SRC, ["gemv_mq2g256v2"]);
+        add!("gemv_mq6g256v2_mq6v2", kernels::GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2"]);
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!("copy_rows_strided_f32", kernels::COPY_ROWS_STRIDED_F32_SRC, ["copy_rows_strided_f32"]);
+        add!("gated_delta_chunk_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_WMMA_SRC, ["gated_delta_chunk_gate_wmma"]);
+        add!("gemm_mq4g128v2_moe_grouped_wmma_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC, [
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151", "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out",
+        ]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mq6g256v2_residual_wmma", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_SRC, ["gemm_mq6g256v2_residual_wmma"]);
+        add!("hyper_read_up_wmma", crate::tensor_ops::HYPER_READ_UP_WMMA_SRC, ["hyper_read_up_wmma_bf16", "hyper_read_up_wmma_bf16_swap"]);
+        add!("indexed_attention_dense_wmma", crate::tensor_ops::INDEXED_ATTENTION_DENSE_WMMA_SRC, [
+            "indexed_attention_dense_wmma_f16", "indexed_attention_kv_f16",
+        ]);
+        add!("qwen4_bf16_round_trip", kernels::QWEN4_BF16_ROUND_TRIP_SRC, ["bf16_round_trip_f32_strided"]);
+        add!("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC, [
+            "gemm_gate_up_mq2g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq3g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq3g256v2_wmma_gfx11_bt6",
+            "gemm_gate_up_mq5g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq5g256v2_wmma_gfx11_bt6", "gemm_gate_up_mq6g256v2_wmma_gfx11_bt12",
+            "gemm_gate_up_mq6g256v2_wmma_gfx11_bt6", "gemm_mq2g256v2_residual_wmma_gfx11_bt4", "gemm_mq3g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq3g256v2_residual_wmma_gfx11_bt6", "gemm_mq3g256v2_residual_wmma_gfx11_bt8", "gemm_mq5g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq5g256v2_residual_wmma_gfx11_bt6", "gemm_mq5g256v2_residual_wmma_gfx11_bt8", "gemm_mq6g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq6g256v2_residual_wmma_gfx11_bt6", "gemm_mq6g256v2_residual_wmma_gfx11_bt8", "gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4",
+            "gemm_mq6g256v2_wmma_gfx11_bt8_x4", "gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out", "gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b12_r4_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b12_r4_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b12_r4_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b12_r4_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b12_r8_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b12_r8_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b12_r8_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b12_r8_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p1_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p1_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p2_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r4_p2_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p1_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p1_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p2_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b16_r8_p2_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2_dq",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2_dq_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p2_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1_dq",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1_dq_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p1_regions", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2_dq",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2_dq_bf16out", "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2_hcw",
+            "gemm_mq6g256v2_wmma_gfx11_u3_b8_r8_p2_regions", "gemm_qkv_mq2g256v2_wmma_gfx11_bt4", "gemm_qkv_mq3g256v2_wmma_gfx11_bt12",
+            "gemm_qkv_mq3g256v2_wmma_gfx11_bt4", "gemm_qkv_mq5g256v2_wmma_gfx11_bt12", "gemm_qkv_mq5g256v2_wmma_gfx11_bt4",
+            "gemm_qkv_mq6g256v2_wmma_gfx11_bt12", "gemm_qkv_mq6g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq2g256v2_wmma_gfx11_bt4",
+            "gemm_qkvza_mq3g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq3g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq5g256v2_wmma_gfx11_bt12",
+            "gemm_qkvza_mq5g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq6g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq6g256v2_wmma_gfx11_bt4",
+        ]);
+        add!("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, ["shared_expert_activation_bf16_f32", "silu_mul_bf16_rt_f32"]);
+        add!("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, [
+            "argmax_f32", "bf16_roundtrip_f32", "bf16_scaled_add_batched_f32", "bf16_scaled_add_f32", "copy_regions_u32",
+            "gated_delta_conv_bf16_f32", "gated_delta_conv_bf16_f32_batched_k4", "gated_delta_conv_params_bf16_f32",
+            "gated_delta_conv_qknorm_bf16_f32_batched_k4", "gated_delta_gate_bf16_f32", "gated_delta_gate_bf16_f32_batched",
+            "gated_delta_gate_rotate_bf16_f32_batched", "gated_delta_params_bf16_f32", "gated_delta_params_bf16_f32_batched",
+            "gated_delta_params_f32", "gated_delta_qk_norm_bf16_batched", "gated_delta_rollback_layers_f32", "gated_delta_rollback_layers_q8",
+            "gated_delta_step_f32", "gated_delta_step_gate_norm128_gfx1151", "gated_delta_step_gate_norm128_q8",
+            "gated_delta_step_halves_state128_persistent256_capture_f32", "gated_delta_step_halves_state128_persistent256_capture_q8",
+            "gated_delta_step_halves_state128_persistent256_f32", "gated_delta_step_halves_state128_persistent256_q8",
+            "gated_delta_step_norm128_q8", "gated_delta_step_shared_norm128_gfx1151", "gdn_state_f32_to_q8", "gdn_state_q8_to_f32",
+            "hc_activation_fused_f32", "hc_state_bf16_add_f32", "hc_state_bf16_to_f32", "hyper_norm_f32", "hyper_norm_gate_f32",
+            "hyper_norm_gate_outputs", "hyper_norm_gate_outputs_f32", "hyper_read_f32", "hyper_read_projected_f32", "hyper_read_up_fused_f32",
+            "hyper_write_bf16x2", "hyper_write_f32", "indexed_attention_attention_f32", "indexed_attention_attention_f32_batched",
+            "indexed_attention_attention_f32_batched_hg4", "indexed_attention_attention_f32_batched_serial",
+            "indexed_attention_attention_f32_serial", "indexed_attention_cache_append_f32", "indexed_attention_cache_append_f32_batched",
+            "indexed_attention_decode_prologue_f32", "indexed_attention_index_key_append_bf16_batched", "indexed_attention_norm_rope_f32",
+            "indexed_attention_norm_rope_f32_batched", "indexed_attention_pool_rope_bf16", "indexed_attention_pool_rope_f32",
+            "indexed_attention_reuse_selection", "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial",
+            "indexed_attention_select_f32", "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial",
+            "indexed_attention_select_f32_serial", "scale_f32",
+        ]);
+    }
+    if arch == "gfx1201" {
+        add!("gemm_mq4g256v2_moe_grouped_wmma_gfx12", kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC, ["gemm_mq4g256v2_moe_grouped_wmma_gfx12"]);
+        add!("gemm_mq6g256v2_residual_wmma_gfx12_bt12_mq5v2", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC, [
+            "gemm_mq6g256v2_residual_wmma_gfx12_bt12", "gemm_mq6g256v2_residual_wmma_gfx12_bt4", "gemm_mq6g256v2_residual_wmma_gfx12_bt8",
+            "gemm_mq6g256v2_wmma_gfx12_bt12_hcw", "gemm_mq6g256v2_wmma_gfx12_bt4_hcw", "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+        ]);
+        add!("gemm_mq6g256v2_residual_wmma_gfx12_bt4_mq5v2", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC, [
+            "gemm_mq6g256v2_residual_wmma_gfx12_bt12", "gemm_mq6g256v2_residual_wmma_gfx12_bt4", "gemm_mq6g256v2_residual_wmma_gfx12_bt8",
+            "gemm_mq6g256v2_wmma_gfx12_bt12_hcw", "gemm_mq6g256v2_wmma_gfx12_bt4_hcw", "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+        ]);
+        add!("gemm_mq6g256v2_residual_wmma_gfx12_bt8_mq5v2", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC, [
+            "gemm_mq6g256v2_residual_wmma_gfx12_bt12", "gemm_mq6g256v2_residual_wmma_gfx12_bt4", "gemm_mq6g256v2_residual_wmma_gfx12_bt8",
+            "gemm_mq6g256v2_wmma_gfx12_bt12_hcw", "gemm_mq6g256v2_wmma_gfx12_bt4_hcw", "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+        ]);
+        add!("gemm_mq6g256v2_residual_wmma_gfx12_mq5v2", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC, ["gemm_mq6g256v2_residual_wmma_gfx12"]);
+        add!("qwen4_gemm_mq6g256v2_wmma_gfx12_x4", kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC, [
+            "gemm_mq6g256v2_residual_wmma_gfx12_bt8_x4", "gemm_mq6g256v2_wmma_gfx12_bt8_x4", "gemm_mq6g256v2_wmma_gfx12_bt8_x4_bf16out",
+            "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions",
+        ]);
+        add!("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, [
+            "argmax_f32", "bf16_roundtrip_f32", "bf16_scaled_add_batched_f32", "bf16_scaled_add_f32", "copy_regions_u32",
+            "gated_delta_conv_bf16_f32", "gated_delta_conv_bf16_f32_batched_k4", "gated_delta_conv_params_bf16_f32",
+            "gated_delta_conv_qknorm_bf16_f32_batched_k4", "gated_delta_gate_bf16_f32", "gated_delta_gate_bf16_f32_batched",
+            "gated_delta_gate_rotate_bf16_f32_batched", "gated_delta_params_bf16_f32", "gated_delta_params_bf16_f32_batched",
+            "gated_delta_params_f32", "gated_delta_qk_norm_bf16_batched", "gated_delta_rollback_layers_f32", "gated_delta_rollback_layers_q8",
+            "gated_delta_step_f32", "gated_delta_step_gate_norm128_gfx1151", "gated_delta_step_gate_norm128_q8",
+            "gated_delta_step_halves_state128_persistent256_capture_f32", "gated_delta_step_halves_state128_persistent256_capture_q8",
+            "gated_delta_step_halves_state128_persistent256_f32", "gated_delta_step_halves_state128_persistent256_q8",
+            "gated_delta_step_norm128_q8", "gated_delta_step_shared_norm128_gfx1151", "gdn_state_f32_to_q8", "gdn_state_q8_to_f32",
+            "hc_activation_fused_f32", "hc_state_bf16_add_f32", "hc_state_bf16_to_f32", "hyper_norm_f32", "hyper_norm_gate_f32",
+            "hyper_norm_gate_outputs", "hyper_norm_gate_outputs_f32", "hyper_read_f32", "hyper_read_projected_f32", "hyper_read_up_fused_f32",
+            "hyper_write_bf16x2", "hyper_write_f32", "indexed_attention_attention_f32", "indexed_attention_attention_f32_batched",
+            "indexed_attention_attention_f32_batched_hg4", "indexed_attention_attention_f32_batched_serial",
+            "indexed_attention_attention_f32_serial", "indexed_attention_attention_fp8", "indexed_attention_attention_fp8_batched",
+            "indexed_attention_attention_fp8_batched_hg4", "indexed_attention_attention_fp8_batched_serial",
+            "indexed_attention_attention_fp8_serial", "indexed_attention_cache_append_f32", "indexed_attention_cache_append_f32_batched",
+            "indexed_attention_cache_append_fp8_batched", "indexed_attention_decode_prologue_f32", "indexed_attention_decode_prologue_fp8",
+            "indexed_attention_index_key_append_bf16_batched", "indexed_attention_norm_rope_f32", "indexed_attention_norm_rope_f32_batched",
+            "indexed_attention_pool_rope_bf16", "indexed_attention_pool_rope_f32", "indexed_attention_reuse_selection",
+            "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial", "indexed_attention_select_f32",
+            "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial", "indexed_attention_select_f32_serial",
+            "scale_f32",
+        ]);
+    }
+    if arch == "gfx1100" {
+        add!("add", kernels::ADD_SRC, ["add_f32"]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mqv2_wmma_gfx1100_bt", kernels::gemm_mqv2_wmma_gfx11_bt_src(arch == "gfx1151"), [
+            "gemm_gate_up_mq2g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq3g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq3g256v2_wmma_gfx11_bt6",
+            "gemm_gate_up_mq5g256v2_wmma_gfx11_bt12", "gemm_gate_up_mq5g256v2_wmma_gfx11_bt6", "gemm_gate_up_mq6g256v2_wmma_gfx11_bt12",
+            "gemm_gate_up_mq6g256v2_wmma_gfx11_bt6", "gemm_mq2g256v2_residual_wmma_gfx11_bt4", "gemm_mq3g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq3g256v2_residual_wmma_gfx11_bt6", "gemm_mq3g256v2_residual_wmma_gfx11_bt8", "gemm_mq5g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq5g256v2_residual_wmma_gfx11_bt6", "gemm_mq5g256v2_residual_wmma_gfx11_bt8", "gemm_mq6g256v2_residual_wmma_gfx11_bt4",
+            "gemm_mq6g256v2_residual_wmma_gfx11_bt6", "gemm_mq6g256v2_residual_wmma_gfx11_bt8", "gemm_qkv_mq2g256v2_wmma_gfx11_bt4",
+            "gemm_qkv_mq3g256v2_wmma_gfx11_bt12", "gemm_qkv_mq3g256v2_wmma_gfx11_bt4", "gemm_qkv_mq5g256v2_wmma_gfx11_bt12",
+            "gemm_qkv_mq5g256v2_wmma_gfx11_bt4", "gemm_qkv_mq6g256v2_wmma_gfx11_bt12", "gemm_qkv_mq6g256v2_wmma_gfx11_bt4",
+            "gemm_qkvza_mq2g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq3g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq3g256v2_wmma_gfx11_bt4",
+            "gemm_qkvza_mq5g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq5g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq6g256v2_wmma_gfx11_bt12",
+            "gemm_qkvza_mq6g256v2_wmma_gfx11_bt4",
+        ]);
+        add!("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(arch == "gfx1151"), [
+            "gemm_wmma_lds_128_128_32_64_k64", "gemm_wmma_lds_128_128_32_64_k64_a", "gemm_wmma_lds_128_128_32_64_k64_gr",
+            "gemm_wmma_lds_128_128_32_64_k64_gra", "gemm_wmma_lds_128_128_32_64_k64_o16", "gemm_wmma_lds_128_128_32_64_k64_o16g",
+            "gemm_wmma_lds_128_128_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64_p_a", "gemm_wmma_lds_128_128_32_64_k64_p_gr",
+            "gemm_wmma_lds_128_128_32_64_k64_p_gra", "gemm_wmma_lds_128_128_32_64_k64_p_o16", "gemm_wmma_lds_128_128_32_64_k64_p_o16g",
+            "gemm_wmma_lds_128_128_64_64_k64", "gemm_wmma_lds_128_128_64_64_k64_a", "gemm_wmma_lds_128_128_64_64_k64_gr",
+            "gemm_wmma_lds_128_128_64_64_k64_gra", "gemm_wmma_lds_128_128_64_64_k64_o16", "gemm_wmma_lds_128_128_64_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64", "gemm_wmma_lds_128_256_32_64_k64_a", "gemm_wmma_lds_128_256_32_64_k64_gr",
+            "gemm_wmma_lds_128_256_32_64_k64_gra", "gemm_wmma_lds_128_256_32_64_k64_o16", "gemm_wmma_lds_128_256_32_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64_p", "gemm_wmma_lds_128_256_32_64_k64_p_a", "gemm_wmma_lds_128_256_32_64_k64_p_gr",
+            "gemm_wmma_lds_128_256_32_64_k64_p_gra", "gemm_wmma_lds_128_256_32_64_k64_p_o16", "gemm_wmma_lds_128_256_32_64_k64_p_o16g",
+            "gemm_wmma_lds_128_256_64_64_k32", "gemm_wmma_lds_128_256_64_64_k32_a", "gemm_wmma_lds_128_256_64_64_k32_gr",
+            "gemm_wmma_lds_128_256_64_64_k32_gra", "gemm_wmma_lds_128_256_64_64_k32_o16", "gemm_wmma_lds_128_256_64_64_k32_o16g",
+            "gemm_wmma_lds_128_256_64_64_k32_p", "gemm_wmma_lds_128_256_64_64_k32_p_a", "gemm_wmma_lds_128_256_64_64_k32_p_gr",
+            "gemm_wmma_lds_128_256_64_64_k32_p_gra", "gemm_wmma_lds_128_256_64_64_k32_p_o16", "gemm_wmma_lds_128_256_64_64_k32_p_o16g",
+            "gemm_wmma_lds_128_256_64_64_k64", "gemm_wmma_lds_128_256_64_64_k64_sw", "gemm_wmma_lds_128_512_32_64_k32",
+            "gemm_wmma_lds_128_512_64_64_k32", "gemm_wmma_lds_128_512_64_64_k32_sw", "gemm_wmma_lds_256_128_32_64_k64",
+            "gemm_wmma_lds_256_128_64_64_k64", "gemm_wmma_lds_256_128_64_64_k64_sw", "gemm_wmma_lds_256_256_32_64_k64",
+            "gemm_wmma_lds_256_256_64_64_k64", "gemm_wmma_lds_256_256_64_64_k64_a", "gemm_wmma_lds_256_256_64_64_k64_gr",
+            "gemm_wmma_lds_256_256_64_64_k64_gra", "gemm_wmma_lds_256_256_64_64_k64_o16", "gemm_wmma_lds_256_256_64_64_k64_o16g",
+            "gemm_wmma_lds_256_256_64_64_k64_p", "gemm_wmma_lds_256_256_64_64_k64_p_a", "gemm_wmma_lds_256_256_64_64_k64_p_gr",
+            "gemm_wmma_lds_256_256_64_64_k64_p_gra", "gemm_wmma_lds_256_256_64_64_k64_p_o16", "gemm_wmma_lds_256_256_64_64_k64_p_o16g",
+            "gemm_wmma_lds_64_512_64_64_k32",
+        ]);
+        add!("gemv_mq2g256v2_rdna3", kernels::GEMV_MQ2G256V2_SRC, ["gemv_mq2g256v2"]);
+        add!("gemv_mq6g256v2_rdna3_mq6v2", kernels::GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2"]);
+        add!("qwen4_gemm_wmma_lds256", kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC, [
+            "gemm_f16_x_f16_wmma_lds_regions_128_128_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64", "gemm_wmma_lds_128_128_32_64_k64_a",
+            "gemm_wmma_lds_128_128_32_64_k64_bsr", "gemm_wmma_lds_128_128_32_64_k64_gr", "gemm_wmma_lds_128_128_32_64_k64_gra",
+            "gemm_wmma_lds_128_128_32_64_k64_hcsd", "gemm_wmma_lds_128_128_32_64_k64_o16", "gemm_wmma_lds_128_128_32_64_k64_o16g",
+            "gemm_wmma_lds_128_128_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64_p_a", "gemm_wmma_lds_128_128_32_64_k64_p_bsr",
+            "gemm_wmma_lds_128_128_32_64_k64_p_gr", "gemm_wmma_lds_128_128_32_64_k64_p_gra", "gemm_wmma_lds_128_128_32_64_k64_p_hcsd",
+            "gemm_wmma_lds_128_128_32_64_k64_p_o16", "gemm_wmma_lds_128_128_32_64_k64_p_o16g", "gemm_wmma_lds_128_128_64_64_k64",
+            "gemm_wmma_lds_128_128_64_64_k64_a", "gemm_wmma_lds_128_128_64_64_k64_bsr", "gemm_wmma_lds_128_128_64_64_k64_gr",
+            "gemm_wmma_lds_128_128_64_64_k64_gra", "gemm_wmma_lds_128_128_64_64_k64_o16", "gemm_wmma_lds_128_128_64_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64", "gemm_wmma_lds_128_256_32_64_k64_a", "gemm_wmma_lds_128_256_32_64_k64_bf16st",
+            "gemm_wmma_lds_128_256_32_64_k64_bsr", "gemm_wmma_lds_128_256_32_64_k64_gr", "gemm_wmma_lds_128_256_32_64_k64_gra",
+            "gemm_wmma_lds_128_256_32_64_k64_hcsd", "gemm_wmma_lds_128_256_32_64_k64_o16", "gemm_wmma_lds_128_256_32_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64_p", "gemm_wmma_lds_128_256_32_64_k64_p_a", "gemm_wmma_lds_128_256_32_64_k64_p_bsr",
+            "gemm_wmma_lds_128_256_32_64_k64_p_gr", "gemm_wmma_lds_128_256_32_64_k64_p_gra", "gemm_wmma_lds_128_256_32_64_k64_p_hcsd",
+            "gemm_wmma_lds_128_256_32_64_k64_p_o16", "gemm_wmma_lds_128_256_32_64_k64_p_o16g", "gemm_wmma_lds_128_256_64_64_k32",
+            "gemm_wmma_lds_128_256_64_64_k32_a", "gemm_wmma_lds_128_256_64_64_k32_bsr", "gemm_wmma_lds_128_256_64_64_k32_gr",
+            "gemm_wmma_lds_128_256_64_64_k32_gra", "gemm_wmma_lds_128_256_64_64_k32_o16", "gemm_wmma_lds_128_256_64_64_k32_o16g",
+            "gemm_wmma_lds_128_256_64_64_k32_p", "gemm_wmma_lds_128_256_64_64_k32_p_a", "gemm_wmma_lds_128_256_64_64_k32_p_bsr",
+            "gemm_wmma_lds_128_256_64_64_k32_p_gr", "gemm_wmma_lds_128_256_64_64_k32_p_gra", "gemm_wmma_lds_128_256_64_64_k32_p_o16",
+            "gemm_wmma_lds_128_256_64_64_k32_p_o16g", "gemm_wmma_lds_128_256_64_64_k64", "gemm_wmma_lds_128_256_64_64_k64_sw",
+            "gemm_wmma_lds_128_512_32_64_k32", "gemm_wmma_lds_128_512_64_64_k32", "gemm_wmma_lds_128_512_64_64_k32_sw",
+            "gemm_wmma_lds_160_64_32_64_k64", "gemm_wmma_lds_160_64_32_64_k64_p", "gemm_wmma_lds_256_128_32_64_k64",
+            "gemm_wmma_lds_256_128_64_64_k64", "gemm_wmma_lds_256_128_64_64_k64_sw", "gemm_wmma_lds_256_256_32_64_k64",
+            "gemm_wmma_lds_256_256_64_64_k64", "gemm_wmma_lds_256_256_64_64_k64_a", "gemm_wmma_lds_256_256_64_64_k64_bsr",
+            "gemm_wmma_lds_256_256_64_64_k64_gr", "gemm_wmma_lds_256_256_64_64_k64_gra", "gemm_wmma_lds_256_256_64_64_k64_hcsd",
+            "gemm_wmma_lds_256_256_64_64_k64_o16", "gemm_wmma_lds_256_256_64_64_k64_o16g", "gemm_wmma_lds_256_256_64_64_k64_p",
+            "gemm_wmma_lds_256_256_64_64_k64_p_a", "gemm_wmma_lds_256_256_64_64_k64_p_bsr", "gemm_wmma_lds_256_256_64_64_k64_p_gr",
+            "gemm_wmma_lds_256_256_64_64_k64_p_gra", "gemm_wmma_lds_256_256_64_64_k64_p_hcsd", "gemm_wmma_lds_256_256_64_64_k64_p_o16",
+            "gemm_wmma_lds_256_256_64_64_k64_p_o16g", "gemm_wmma_lds_64_512_64_64_k32", "gemm_wmma_lds_64_64_32_64_k64",
+            "gemm_wmma_lds_64_64_32_64_k64_p",
+        ]);
+    }
+    if arch == "gfx1151" {
+        add!("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(arch == "gfx1151"), [
+            "gemm_f16_x_f16_wmma_lds_regions_128_128_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64", "gemm_wmma_lds_128_128_32_64_k64_a",
+            "gemm_wmma_lds_128_128_32_64_k64_bsr", "gemm_wmma_lds_128_128_32_64_k64_gr", "gemm_wmma_lds_128_128_32_64_k64_gra",
+            "gemm_wmma_lds_128_128_32_64_k64_hcsd", "gemm_wmma_lds_128_128_32_64_k64_o16", "gemm_wmma_lds_128_128_32_64_k64_o16g",
+            "gemm_wmma_lds_128_128_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64_p_a", "gemm_wmma_lds_128_128_32_64_k64_p_bsr",
+            "gemm_wmma_lds_128_128_32_64_k64_p_gr", "gemm_wmma_lds_128_128_32_64_k64_p_gra", "gemm_wmma_lds_128_128_32_64_k64_p_hcsd",
+            "gemm_wmma_lds_128_128_32_64_k64_p_o16", "gemm_wmma_lds_128_128_32_64_k64_p_o16g", "gemm_wmma_lds_128_128_64_64_k64",
+            "gemm_wmma_lds_128_128_64_64_k64_a", "gemm_wmma_lds_128_128_64_64_k64_bsr", "gemm_wmma_lds_128_128_64_64_k64_gr",
+            "gemm_wmma_lds_128_128_64_64_k64_gra", "gemm_wmma_lds_128_128_64_64_k64_o16", "gemm_wmma_lds_128_128_64_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64", "gemm_wmma_lds_128_256_32_64_k64_a", "gemm_wmma_lds_128_256_32_64_k64_bf16st",
+            "gemm_wmma_lds_128_256_32_64_k64_bsr", "gemm_wmma_lds_128_256_32_64_k64_gr", "gemm_wmma_lds_128_256_32_64_k64_gra",
+            "gemm_wmma_lds_128_256_32_64_k64_hcsd", "gemm_wmma_lds_128_256_32_64_k64_o16", "gemm_wmma_lds_128_256_32_64_k64_o16g",
+            "gemm_wmma_lds_128_256_32_64_k64_p", "gemm_wmma_lds_128_256_32_64_k64_p_a", "gemm_wmma_lds_128_256_32_64_k64_p_bsr",
+            "gemm_wmma_lds_128_256_32_64_k64_p_gr", "gemm_wmma_lds_128_256_32_64_k64_p_gra", "gemm_wmma_lds_128_256_32_64_k64_p_hcsd",
+            "gemm_wmma_lds_128_256_32_64_k64_p_o16", "gemm_wmma_lds_128_256_32_64_k64_p_o16g", "gemm_wmma_lds_128_256_64_64_k32",
+            "gemm_wmma_lds_128_256_64_64_k32_a", "gemm_wmma_lds_128_256_64_64_k32_bsr", "gemm_wmma_lds_128_256_64_64_k32_gr",
+            "gemm_wmma_lds_128_256_64_64_k32_gra", "gemm_wmma_lds_128_256_64_64_k32_o16", "gemm_wmma_lds_128_256_64_64_k32_o16g",
+            "gemm_wmma_lds_128_256_64_64_k32_p", "gemm_wmma_lds_128_256_64_64_k32_p_a", "gemm_wmma_lds_128_256_64_64_k32_p_bsr",
+            "gemm_wmma_lds_128_256_64_64_k32_p_gr", "gemm_wmma_lds_128_256_64_64_k32_p_gra", "gemm_wmma_lds_128_256_64_64_k32_p_o16",
+            "gemm_wmma_lds_128_256_64_64_k32_p_o16g", "gemm_wmma_lds_128_256_64_64_k64", "gemm_wmma_lds_128_256_64_64_k64_sw",
+            "gemm_wmma_lds_128_512_32_64_k32", "gemm_wmma_lds_128_512_64_64_k32", "gemm_wmma_lds_128_512_64_64_k32_sw",
+            "gemm_wmma_lds_160_64_32_64_k64", "gemm_wmma_lds_160_64_32_64_k64_p", "gemm_wmma_lds_256_128_32_64_k64",
+            "gemm_wmma_lds_256_128_64_64_k64", "gemm_wmma_lds_256_128_64_64_k64_sw", "gemm_wmma_lds_256_256_32_64_k64",
+            "gemm_wmma_lds_256_256_64_64_k64", "gemm_wmma_lds_256_256_64_64_k64_a", "gemm_wmma_lds_256_256_64_64_k64_bsr",
+            "gemm_wmma_lds_256_256_64_64_k64_gr", "gemm_wmma_lds_256_256_64_64_k64_gra", "gemm_wmma_lds_256_256_64_64_k64_hcsd",
+            "gemm_wmma_lds_256_256_64_64_k64_o16", "gemm_wmma_lds_256_256_64_64_k64_o16g", "gemm_wmma_lds_256_256_64_64_k64_p",
+            "gemm_wmma_lds_256_256_64_64_k64_p_a", "gemm_wmma_lds_256_256_64_64_k64_p_bsr", "gemm_wmma_lds_256_256_64_64_k64_p_gr",
+            "gemm_wmma_lds_256_256_64_64_k64_p_gra", "gemm_wmma_lds_256_256_64_64_k64_p_hcsd", "gemm_wmma_lds_256_256_64_64_k64_p_o16",
+            "gemm_wmma_lds_256_256_64_64_k64_p_o16g", "gemm_wmma_lds_64_512_64_64_k32", "gemm_wmma_lds_64_64_32_64_k64",
+            "gemm_wmma_lds_64_64_32_64_k64_p",
+        ]);
+        add!("gemv_bf16_xf32", kernels::gemv_bf16_xf32_src(arch == "gfx1151"), [
+            "gemv_bf16_xf32", "gemv_bf16_xf32_bf16_scaled_add", "gemv_bf16_xf32_k4", "gemv_bf16_xf32_k4_rows_r2", "gemv_bf16_xf32_k4_rows_r3",
+            "gemv_bf16_xf32_k4_rows_r4", "gemv_bf16_xf32_k4_rows_r5", "gemv_bf16_xf32_k4_rows_r6", "gemv_bf16_xf32_k4_rows_r7",
+            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2", "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
+            "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
+        ]);
+        add!("mq_rotate_x_i4", kernels::MQ_ROTATE_X_I4_SRC, ["mq_rotate_x_i4"]);
+        add!("qwen4_gemv_q8_0_wide", kernels::QWEN4_GEMV_Q8_0_WIDE_SRC, ["gemv_q8_0_wide_k640_staged", "gemv_q8_0_wide_rows"]);
+        add!("qwen4_moe_iu4_sym_gfx1151", kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC, [
+            "qwen4_moe_down_iu4_sym_gfx1151", "qwen4_moe_down_iu4_sym_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151",
+            "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4", "qwen4_moe_sym_check_gfx1151",
+        ]);
+        add!("qwen4_moe_rotate128_i4", kernels::QWEN4_MOE_ROTATE128_I4_SRC, ["qwen4_moe_rotate128_i4"]);
+        add!("qwen4_moe_scatter_stable_top10", kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC, [
+            "qwen4_moe_group_prefix", "qwen4_moe_group_ranks", "qwen4_moe_group_scatter",
+        ]);
+    }
+    // Qwen3.5-MoE (ornith-1.5-35b-a3b) load, AR prefill/decode and native MTP,
+    // plus Qwen3.5 dense (H2): every module a kernel-load trace
+    // (tests/fixtures/kernel-trace-qwen35.tsv) JIT-compiled on gfx1100,
+    // gfx1151 and gfx1201 beyond the inventory above. Sources are the exact
+    // expressions the callsites pass to `ensure_kernel`; symbols are every
+    // kernel the arch's object defines.
+    if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
+        add!("gated_delta_net_q8_compact2_b2", kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC, [
+            "gated_delta_net_q8_compact2_b2", "gated_delta_net_q8_fast_independent_masked",
+        ]);
+        add!("gemm_qkv_hfq6g256", kernels::GEMM_QKV_HFQ6G256_SRC, ["gemm_qkv_hfq6g256"]);
+        add!("gemm_qkvza_hfq6g256", kernels::GEMM_QKVZA_HFQ6G256_SRC, ["gemm_qkvza_hfq6g256"]);
+        add!("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, ["gemv_hfq6g256_residual"]);
+        add!("gemv_hfq6g256_residual_sigmoid_scaled", kernels::GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC, [
+            "gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched",
+        ]);
+        add!("gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded", kernels::GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC, [
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+        ]);
+        add!("moe_down_combine_grouped_k8", kernels::MOE_DOWN_COMBINE_GROUPED_K8_SRC, ["moe_down_combine_grouped_k8"]);
+        add!("moe_down_combine_k8_batched", kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC, ["moe_down_combine_k8_batched"]);
+        add!("moe_gate_up_unscatter_k8", kernels::MOE_GATE_UP_UNSCATTER_K8_SRC, ["moe_gate_up_unscatter_k8"]);
+        add!("moe_scatter_fused_k8", kernels::moe_scatter_fused_k8_src(arch == "gfx1151"), ["moe_scatter_fused_k8"]);
+        add!("moe_topk_renorm_k8", kernels::MOE_TOPK_RENORM_K8_SRC, ["moe_topk_renorm_k8"]);
+        add!("moe_topk_renorm_k8_batched", kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC, ["moe_topk_renorm_k8_batched"]);
+        add!("scaled_add_inplace", kernels::SCALED_ADD_INPLACE_SRC, ["scaled_add_inplace_cpu_scalar_f32", "scaled_add_inplace_gpu_scalar_f32"]);
+        add!("sigmoid_scaled_residual_add_batched", kernels::SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC, ["sigmoid_scaled_residual_add_batched_f32"]);
+        add!("softmax", kernels::SOFTMAX_SRC, ["softmax_f32"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1100") {
+        add!("gemv_mq4g256v2_residual_sigmoid_scaled_k512", kernels::GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC, [
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+        ]);
+        add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1151") {
+        add!("gemv_mq4g256v2_moe_gate_up_k8_indexed", kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC, ["gemv_mq4g256v2_moe_gate_up_k8_indexed"]);
+        add!("gemv_mq4g256v2_moe_ninepath_d4", kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC, ["gemv_mq4g256v2_moe_ninepath_d4"]);
+        add!("kv_cache_write_q8_0_pair", kernels::KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC, ["kv_cache_write_q8_0_pair"]);
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!("fused_rmsnorm_mq_rotate_vecsum", kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC, ["fused_rmsnorm_mq_rotate_vecsum"]);
+        add!("gemm_gate_up_hfq6g256_wmma", kernels::GEMM_GATE_UP_HFQ6G256_WMMA_SRC, ["gemm_gate_up_hfq6g256_wmma"]);
+        add!("gemm_hfq6g256_residual_wmma_k2", kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC, ["gemm_hfq6g256_residual_wmma_k2"]);
+        add!("gemm_q8_0_wmma", kernels::GEMM_Q8_0_WMMA_SRC, ["gemm_q8_0_wmma"]);
+        add!("gemm_qkv_hfq6g256_wmma", kernels::GEMM_QKV_HFQ6G256_WMMA_SRC, ["gemm_qkv_hfq6g256_wmma"]);
+        add!("gemm_qkvza_hfq6g256_wmma", kernels::GEMM_QKVZA_HFQ6G256_WMMA_SRC, ["gemm_qkvza_hfq6g256_wmma"]);
+        add!("moe_router_softmax_topk_k8_wave64_exact", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SRC, ["moe_router_softmax_topk_k8_wave64_exact"]);
+    }
+    if arch == "gfx1201" {
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+        ]);
+        add!("attention_q8_0_flash_prefill_wmma_gfx12_hd256", format!("#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}", kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC, false)), [
+            "attention_q8_0_flash_prefill_wmma",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1201", kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC, ["gated_norm_mq_rotate_gfx1201"]);
+        add!("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC, ["gated_norm_mq_rotate_i4_gfx12_v2"]);
+        add!("gemm_gate_up_hfq6g256_wmma_gfx12", kernels::GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC, ["gemm_gate_up_hfq6g256_wmma_gfx12"]);
+        add!("gemm_hfq6g256_residual_wmma_gfx12", kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_GFX12_SRC, ["gemm_hfq6g256_residual_wmma_gfx12"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC, [
+            "gemm_mq4g256v2_gate_up_silu_mmq_iu4_g12r", "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r", "gemm_mq4g256v2_residual_mmq_iu4_g12r", "quantize_int4_mmq_ds128",
+        ]);
+        add!("gemm_q8_0_wmma_gfx12", kernels::GEMM_Q8_0_WMMA_GFX12_SRC, ["gemm_q8_0_wmma_gfx12"]);
+        add!("gemm_qkv_hfq6g256_wmma_gfx12", kernels::GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC, ["gemm_qkv_hfq6g256_wmma_gfx12"]);
+        add!("gemm_qkvza_hfq6g256_wmma_gfx12", kernels::GEMM_QKVZA_HFQ6G256_WMMA_GFX12_SRC, ["gemm_qkvza_hfq6g256_wmma_gfx12"]);
+        add!("moe_router_softmax_topk_k8_wave64", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC, ["moe_router_softmax_topk_k8_wave64"]);
+        add!("qwen35_fa_prep_gfx1201", kernels::QWEN35_FA_PREP_GFX1201_SRC, ["qwen35_fa_prep_gfx1201"]);
+    }
+    if arch == "gfx1100" {
+        add!("argmax_token_chain", kernels::ARGMAX_TOKEN_CHAIN_SRC, ["argmax_token_chain_f32"]);
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100",
+        ]);
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+        ]);
+        add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
+        add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
+        add!("fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100", kernels::FUSED_QKV_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC, [
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ]);
+        add!("fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100", kernels::FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC, [
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1100", kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC, ["gated_norm_mq_rotate_gfx1100"]);
+        add!("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC, ["gated_norm_mq_rotate_i4_gfx1100_v2"]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, ["gemm_mq4g256v2_moe_grouped_wmma_k2"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
+            "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+            "quantize_int4_mmq_ds128",
+        ]);
+        add!("gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100", kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC, [
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+        ]);
+        add!("gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100", kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC, ["gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"]);
+        add!("gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch", kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC, [
+            "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
+        ]);
+        add!("greedy_accept", kernels::GREEDY_ACCEPT_SRC, ["greedy_accept_from_argmax_i32"]);
+        add!("mq_rotate_x_i4", kernels::MQ_ROTATE_X_I4_SRC, ["mq_rotate_x_i4"]);
+        add!("qwen35_fa_prep_gfx1100", kernels::QWEN35_FA_PREP_GFX1100_SRC, ["qwen35_fa_prep_gfx1100"]);
+    }
+    if arch == "gfx1151" {
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+        ]);
+        add!("attention_verify_wmma_gfx1151", kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC, [
+            "attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151", "attention_verify_wmma_qk_gfx1151",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1151", kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC, ["gated_norm_mq_rotate_gfx1151"]);
+        add!("gated_norm_mq_rotate_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC, ["gated_norm_mq_rotate_i4_gfx1151_v2"]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
+            "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+            "quantize_int4_mmq_ds128",
+        ]);
+        add!("qwen35_fa_prep_gfx1151", kernels::QWEN35_FA_PREP_GFX1151_SRC, ["qwen35_fa_prep_gfx1151"]);
+    }
     Ok(entries)
 }
 
@@ -654,10 +1126,13 @@ mod tests {
         // The installer trace predates the scalar-prefill runtime's BR/BC
         // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins (fused
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid), the
-        // five multi-slot `*_paged` modules of the q8/asym3 routes and the
+        // five multi-slot `*_paged` modules of the q8/asym3 routes, the
         // 36 H2 decode, prefill, MTP and DFlash modules added for
-        // compiler-free packs. Those 45 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 45, "unexpected gfx1201 inventory size");
+        // compiler-free packs, the 36 Qwen3.8-Flash-Next modules
+        // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv) and the 32
+        // Qwen3.5-MoE modules (tests/fixtures/kernel-trace-qwen35.tsv). Those
+        // 113 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 113, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -780,5 +1255,38 @@ mod tests {
                 "{arch} must not inventory the gfx1151 module"
             );
         }
+    }
+
+    /// Every module a kernel-load trace loaded (rows: arch, module, symbols the
+    /// run resolved) is in that arch's installer inventory and exports every
+    /// resolved symbol, so a compiler-free pack serves the whole traced run.
+    fn assert_trace_packaged(fixture: &str) {
+        let mut by_arch: HashMap<&str, Vec<KernelEntry>> = HashMap::new();
+        let mut rows = 0;
+        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+            let [arch, module, symbols] = line.split('\t').collect::<Vec<_>>()[..] else {
+                panic!("malformed trace row {line:?}");
+            };
+            let inventory = by_arch.entry(arch).or_insert_with(|| entries(arch, "").unwrap());
+            let entry = inventory
+                .iter()
+                .find(|entry| entry.module == module)
+                .unwrap_or_else(|| panic!("{arch}: traced module {module} is not packaged"));
+            for symbol in symbols.split(',') {
+                assert!(entry.symbols.contains(&symbol), "{arch} {module}: packaged symbols lack {symbol}");
+            }
+            rows += 1;
+        }
+        assert!(rows > 0, "empty trace fixture");
+    }
+
+    #[test]
+    fn qwen4_flash_next_trace_is_packaged() {
+        assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv"));
+    }
+
+    #[test]
+    fn qwen35_trace_is_packaged() {
+        assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
     }
 }
