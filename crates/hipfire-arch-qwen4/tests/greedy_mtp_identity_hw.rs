@@ -27,6 +27,13 @@
 //! `"baseline":true`), so a silent fallback cannot pass as coverage.
 //! Per-arm IDs, decoded text and logs go to `HIPFIRE_MTP_IDENTITY_OUT`
 //! (default: a fresh directory under the system temp dir).
+//!
+//! A second case, `seasons`, renders the serve battery's factual prompt
+//! exactly as `hipfire serve` does for a single user message with thinking
+//! disabled (`render_messages`, no system block; the token IDs are pinned to
+//! the serve-captured ones) and generates 256 tokens. Its short context
+//! exercises the 2..=8-row HC projections whose summation order once
+//! differed from the single-row decode (Gate041z seasons divergence).
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::mtp_spec::{native_mtp_row_capture, Qwen4MtpDrafter};
@@ -35,7 +42,7 @@ use hipfire_dispatch::pipeline::DraftHeadPolicy;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
-use hipfire_runtime::prompt_frame::JinjaChatFrame;
+use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::spec::MtpDrafter;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
@@ -48,6 +55,7 @@ use std::process::{Command, Stdio};
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
 const OUT_ENV: &str = "HIPFIRE_MTP_IDENTITY_OUT";
 const ARM_ENV: &str = "HIPFIRE_MTP_IDENTITY_ARM";
+const CASE_ENV: &str = "HIPFIRE_MTP_IDENTITY_CASE";
 const ARM_TEST: &str = "greedy_mtp_identity_arm";
 
 const PROMPT: &[u8] = include_bytes!("fixtures/qwen4_mtp_identity_p1.txt");
@@ -56,7 +64,36 @@ const PROMPT_SHA256: &str = "4ba1d4d971b99ace1fd294e1cdb087c432d87a155c203bddef8
 const PROMPT_TOKENS: usize = 1047;
 const MAX_SEQ: usize = 16384;
 const MTP_K: usize = 3;
-const GENERATED: usize = 1200;
+
+/// The serve battery's factual prompt (`scripts/serve_harness.py`).
+const SEASONS: &str = "What causes the seasons on Earth? Answer in exactly three sentences.";
+/// Prompt IDs `hipfire serve` prefilled for SEASONS (Gate041z, daemon diag dump).
+const SEASONS_IDS: [u32; 25] = [
+    248045, 846, 198, 3710, 10814, 279, 15127, 383, 8964, 30, 21134, 303, 6681, 2250, 22157, 13,
+    248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Case {
+    P1,
+    Seasons,
+}
+
+impl Case {
+    fn name(self) -> &'static str {
+        match self {
+            Case::P1 => "p1",
+            Case::Seasons => "seasons",
+        }
+    }
+
+    fn generated(self) -> usize {
+        match self {
+            Case::P1 => 1200,
+            Case::Seasons => 256,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Arm {
@@ -153,8 +190,19 @@ fn first_difference(ar: &[u32], mtp: &[u32]) -> Option<usize> {
 #[test]
 #[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
 fn greedy_mtp_matches_ar_on_flash_next_p1() {
+    run_case(Case::P1);
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn greedy_mtp_matches_ar_on_flash_next_seasons() {
+    run_case(Case::Seasons);
+}
+
+fn run_case(case: Case) {
     let model = model_path();
-    let dir = out_dir();
+    let dir = out_dir().join(case.name());
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     let exe = std::env::current_exe().expect("test binary path");
     let mut ids: Vec<(Arm, Vec<u32>)> = Vec::new();
     let mut failures = Vec::new();
@@ -170,6 +218,7 @@ fn greedy_mtp_matches_ar_on_flash_next_p1() {
                 "--test-threads=1",
             ])
             .env(ARM_ENV, arm.name)
+            .env(CASE_ENV, case.name())
             .env(MODEL_ENV, &model)
             .env(OUT_ENV, &dir)
             .env_remove("HIPFIRE_MTP_INCREMENTAL")
@@ -202,7 +251,7 @@ fn greedy_mtp_matches_ar_on_flash_next_p1() {
             &fs::read(dir.join(format!("{}.ids.json", arm.name))).expect("arm ids"),
         )
         .expect("arm ids json");
-        assert_eq!(arm_ids.len(), GENERATED, "{} arm id count", arm.name);
+        assert_eq!(arm_ids.len(), case.generated(), "{} arm id count", arm.name);
         let (batched, incremental) = window_routes(&stderr);
         let route_ok = match arm.route {
             Route::Ar => batched == 0 && incremental == 0,
@@ -245,9 +294,9 @@ fn greedy_mtp_matches_ar_on_flash_next_p1() {
     );
 }
 
-/// One arm in a fresh process; spawned by `greedy_mtp_matches_ar_on_flash_next_p1`.
+/// One arm in a fresh process; spawned by `run_case`.
 #[test]
-#[ignore = "child process of greedy_mtp_matches_ar_on_flash_next_p1"]
+#[ignore = "child process of the greedy_mtp_matches_ar_on_flash_next_* tests"]
 fn greedy_mtp_identity_arm() {
     let Ok(name) = std::env::var(ARM_ENV) else {
         return;
@@ -257,41 +306,73 @@ fn greedy_mtp_identity_arm() {
         .copied()
         .find(|arm| arm.name == name)
         .unwrap_or_else(|| panic!("unknown {ARM_ENV}={name}"));
-    if let Err(error) = run_arm(arm, &model_path(), &out_dir()) {
+    let case = match std::env::var(CASE_ENV).as_deref() {
+        Ok("p1") => Case::P1,
+        Ok("seasons") => Case::Seasons,
+        other => panic!("unknown {CASE_ENV}={other:?}"),
+    };
+    let dir = out_dir();
+    if let Err(error) = run_arm(arm, case, &model_path(), &dir) {
         panic!("{} arm: {error}", arm.name);
     }
 }
 
-fn run_arm(arm: Arm, model: &Path, dir: &Path) -> Result<(), String> {
-    let digest = Sha256::digest(PROMPT);
-    let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    if digest != PROMPT_SHA256 {
-        return Err(format!(
-            "prompt fixture sha256 {digest}, expected {PROMPT_SHA256}"
-        ));
-    }
-    let prompt = std::str::from_utf8(PROMPT).map_err(|e| e.to_string())?;
+fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String> {
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
-    let rendered = JinjaChatFrame {
+    let frame = |user: &'static str, system: Option<&'static str>| JinjaChatFrame {
         tokenizer: &tokenizer,
         template: &template,
-        system: Some(""),
-        user: prompt,
+        system,
+        user,
         enable_thinking: false,
         bos_token: None,
         reasoning_strength: None,
         reasoning_effort: None,
-    }
-    .render()?;
-    let tokens = tokenizer.encode(&rendered);
-    if tokens.len() != PROMPT_TOKENS {
-        return Err(format!(
-            "rendered prompt is {} tokens, expected {PROMPT_TOKENS}",
-            tokens.len()
-        ));
-    }
+    };
+    let tokens = match case {
+        Case::P1 => {
+            let digest = Sha256::digest(PROMPT);
+            let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            if digest != PROMPT_SHA256 {
+                return Err(format!(
+                    "prompt fixture sha256 {digest}, expected {PROMPT_SHA256}"
+                ));
+            }
+            let prompt: &'static str = std::str::from_utf8(PROMPT).map_err(|e| e.to_string())?;
+            let tokens = tokenizer.encode(&frame(prompt, Some("")).render()?);
+            if tokens.len() != PROMPT_TOKENS {
+                return Err(format!(
+                    "rendered prompt is {} tokens, expected {PROMPT_TOKENS}",
+                    tokens.len()
+                ));
+            }
+            tokens
+        }
+        Case::Seasons => {
+            // `hipfire serve` renders an OpenAI messages request through
+            // `render_messages` (no system block when none is sent).
+            let user = Message {
+                role: Role::User,
+                content: SEASONS.to_string(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            };
+            let rendered = frame(SEASONS, None).render_messages(&[user], None, None)?;
+            let tokens = tokenizer.encode(&rendered);
+            if tokens != SEASONS_IDS {
+                return Err(format!(
+                    "rendered seasons prompt {tokens:?} is not the serve prompt {SEASONS_IDS:?}"
+                ));
+            }
+            tokens
+        }
+    };
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     if gpu.is_uma() {
@@ -359,13 +440,13 @@ fn run_arm(arm: Arm, model: &Path, dir: &Path) -> Result<(), String> {
         tokens.len(),
         backend.name()
     );
-    let mut ids = Vec::with_capacity(GENERATED + MTP_K);
+    let mut ids = Vec::with_capacity(case.generated() + MTP_K);
     if arm.route == Route::Ar {
         let logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
         bundle
             .forward_chunk_final(&mut gpu, &tokens, &logits, None)
             .map_err(|e| e.to_string())?;
-        while ids.len() < GENERATED {
+        while ids.len() < case.generated() {
             ids.push(
                 bundle
                     .forward_token_or_argmax(&mut gpu, None, &logits)
@@ -385,7 +466,7 @@ fn run_arm(arm: Arm, model: &Path, dir: &Path) -> Result<(), String> {
             drafter.mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?;
         ids.push(seed);
         let eos = bundle.config.eos_token_id;
-        while ids.len() < GENERATED {
+        while ids.len() < case.generated() {
             let position = bundle.state.position;
             let window = drafter.mtp_step(
                 &mut gpu,
@@ -400,7 +481,7 @@ fn run_arm(arm: Arm, model: &Path, dir: &Path) -> Result<(), String> {
             seed = *window.committed.last().ok_or("empty MTP window")?;
             ids.extend_from_slice(&window.committed);
         }
-        ids.truncate(GENERATED);
+        ids.truncate(case.generated());
         Box::new(drafter).mtp_free(&mut gpu);
     }
     fs::write(
