@@ -602,6 +602,12 @@ pub(crate) struct BenchArgs {
     #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     /// KV storage backend override (`legacy` or `vmm`).
     kv_backend: Option<String>,
+    /// KV context (`max_seq`) for the benchmark load, within the
+    /// `memory.max_seq` bounds. Omitted, `--matrix`/`--redline` size the load
+    /// to the run (largest `--pp`, or `--ctx` + `--tg`, plus 32) and every
+    /// other path keeps the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     #[arg(long)]
     redline: bool,
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
@@ -3215,6 +3221,21 @@ fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
+/// Clap value parser for `bench --max-seq`: the `memory.max_seq` schema field
+/// parses and bounds it, so the flag and the config key accept the same values.
+fn parse_max_seq_arg(raw: &str) -> std::result::Result<u64, String> {
+    match field("memory.max_seq")
+        .expect("schema field")
+        .parse_cli(raw)
+        .map_err(|err| err.to_string())?
+    {
+        hipfire_config::ConfigValue::Integer(value) => {
+            u64::try_from(value).map_err(|_| format!("max_seq {value} is negative"))
+        }
+        other => Err(format!("max_seq must be an integer, got {other:?}")),
+    }
+}
+
 /// Layer an authored typed K/V axis from resolved config. Built-in empty defaults
 /// and registry pins are omitted; user/one-shot/env sources emit non-empty values.
 fn authored_kv_axis(
@@ -4885,8 +4906,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag, devices_spec) =
+    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq) =
         open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let max_seq_json = max_seq.json(&loaded);
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -4910,9 +4932,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  max_tokens: {}", args.max_tokens);
     eprintln!("  prompt_md5: {prompt_md5}");
     eprintln!("  prompt_chars: {prompt_chars}");
+    print_bench_max_seq(&max_seq, &loaded);
     let power = bench_power_probe(devices_spec.as_deref(), &post_diag);
     if args.matrix || args.redline {
-        bench_matrix(&mut engine, &args, &loaded, &post_diag, &power)
+        bench_matrix(
+            &mut engine,
+            &args,
+            &loaded,
+            &post_diag,
+            &power,
+            &max_seq_json,
+        )
     } else if args.ttft {
         bench_ttft(
             &mut engine,
@@ -4923,6 +4953,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             &loaded,
             &post_diag,
             &power,
+            &max_seq_json,
         )
     } else {
         // The warmup exists to populate kernel caches and its output is
@@ -4993,6 +5024,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "loaded": loaded,
                 "gpu": post_diag,
                 "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+                "max_seq": max_seq_json,
                 "max_tokens": args.max_tokens,
                 "runs": args.runs,
                 "batch": 1,
@@ -5066,7 +5098,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         // 2048-token slots, not the serve default of 8192: the sweep's prompts
         // are one short turn and --max-tokens is small, so a larger arena buys
         // nothing and multiplies per-slot KV by four.
-        let (engine, loaded, _, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let (engine, loaded, _, _, _, max_seq) =
+            open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
             .get("experimental_multi_slot")
             .and_then(serde_json::Value::as_bool)
@@ -5099,7 +5133,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        let (engine, loaded, _, _, _, max_seq) =
+            open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        print_bench_max_seq(&max_seq, &loaded);
         let mut d = SequentialDriver::start(engine, max_k)?;
         eprintln!("  noslots backend up (sequential daemon path)");
         let r = sweep_backend(
@@ -5118,7 +5154,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
-        let (engine, loaded, _, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let (engine, loaded, _, _, _, max_seq) =
+            open_bench_engine_batched(paths, &batch_args, max_k)?;
+        print_bench_max_seq(&max_seq, &loaded);
         let capable = loaded
             .get("continuous_batch_capable")
             .and_then(serde_json::Value::as_bool)
@@ -5234,15 +5272,180 @@ fn open_bench_engine_slots(
 }
 
 /// `open_bench_engine`'s result: the engine, its `loaded` reply, `diag`
-/// before and after the load, and the `hardware.devices` selector the daemon
-/// was configured with (the bench's power sampler resolves the same card).
+/// before and after the load, the `hardware.devices` selector the daemon
+/// was configured with (the bench's power sampler resolves the same card),
+/// and how the load's `max_seq` was chosen.
 type BenchEngine = (
     Engine,
     serde_json::Value,
     serde_json::Value,
     serde_json::Value,
     Option<String>,
+    BenchMaxSeq,
 );
+
+/// Positions past the measured ones that the daemon's `bench_prefill` and
+/// `bench_decode` guards require (`tokens + 32 <= physical_cap`).
+const BENCH_SEQ_HEADROOM: u64 = 32;
+
+/// Where a bench load's `max_seq` came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchMaxSeqSource {
+    /// `--max-seq N`.
+    Flag,
+    /// Sized to the `--matrix`/`--redline` shape.
+    RunShape,
+    /// An authored `memory.max_seq` forwarded by `load_params`.
+    Config,
+    /// Not sent; the daemon's admission chooses the context.
+    Automatic,
+}
+
+impl BenchMaxSeqSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::RunShape => "run_shape",
+            Self::Config => "config",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+/// How a bench load's `max_seq` was chosen; reported beside the effective
+/// value the daemon loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BenchMaxSeq {
+    /// The value sent with the load; `None` leaves it to admission.
+    requested: Option<u64>,
+    source: BenchMaxSeqSource,
+    /// Positions the matrix touches plus headroom; `None` off the matrix.
+    run_need: Option<u64>,
+    /// The model's declared context, when it was read.
+    model_limit: Option<u64>,
+}
+
+impl BenchMaxSeq {
+    /// The report's `max_seq` object. `effective` is what the daemon loaded.
+    fn json(&self, loaded: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "effective": loaded.get("max_seq"),
+            "requested": self.requested,
+            "source": self.source.as_str(),
+            "run_need": self.run_need,
+            "model_limit": self.model_limit,
+        })
+    }
+}
+
+/// Context the `--matrix`/`--redline` run touches: the largest prefill, the
+/// largest decode context plus its decode length (sustained rows only when
+/// `--sustained-tg` runs them), plus the daemon's probe headroom.
+fn bench_matrix_seq_need(
+    pp: &[usize],
+    ctx: &[usize],
+    tg: usize,
+    sustained: Option<(usize, &[usize])>,
+) -> u64 {
+    let longest = |values: &[usize], decode: usize| {
+        values
+            .iter()
+            .map(|&value| value as u64 + decode as u64)
+            .max()
+            .unwrap_or(0)
+    };
+    let sustained = sustained.map_or(0, |(tg, ctx)| longest(ctx, tg));
+    longest(pp, 0)
+        .max(longest(ctx, tg))
+        .max(sustained)
+        .saturating_add(BENCH_SEQ_HEADROOM)
+}
+
+/// The model's declared context window: `max_position_embeddings` under
+/// `config.text_config`, `config`, or the top level of the source metadata,
+/// the same lookup admission uses for a model's trained context.
+fn declared_context_from_metadata(metadata_json: &str) -> Option<u64> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let config = meta.get("config").unwrap_or(&meta);
+    config
+        .get("text_config")
+        .unwrap_or(config)
+        .get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&context| context > 0)
+}
+
+/// [`declared_context_from_metadata`] for a model file or directory. `None`
+/// when the source cannot be opened or declares no context; the daemon's
+/// admission is then the only bound.
+fn bench_declared_context(path: &Path) -> Option<u64> {
+    let source = hipfire_runtime::model_source::open_model(path).ok()?;
+    declared_context_from_metadata(source.metadata_json())
+}
+
+/// Choose the bench load's `max_seq` before the daemon starts.
+///
+/// `--max-seq` wins but must hold the run. Without it a matrix run is sized
+/// to `run_need` (raised to the `memory.max_seq` minimum, never above the
+/// model's declared context) instead of the configured global value; any other
+/// path stays automatic. A matrix shape past the model's declared context
+/// fails here, naming both numbers, instead of at load or mid-run.
+fn plan_bench_max_seq(
+    flag: Option<u64>,
+    run_need: Option<u64>,
+    model_limit: Option<u64>,
+    model: &str,
+) -> Result<BenchMaxSeq> {
+    if let (Some(need), Some(limit)) = (run_need, model_limit) {
+        if need > limit {
+            bail!(
+                "bench run needs max_seq {need} (largest --pp, or --ctx + --tg, plus \
+                 {BENCH_SEQ_HEADROOM} headroom) but {model} declares a maximum context of \
+                 {limit}; shrink --pp/--ctx/--tg"
+            );
+        }
+    }
+    let (requested, source) = match (flag, run_need) {
+        (Some(value), Some(need)) if value < need => bail!(
+            "--max-seq {value} is below this run's need of {need} (largest --pp, or --ctx + \
+             --tg, plus {BENCH_SEQ_HEADROOM} headroom); raise --max-seq or shrink the matrix"
+        ),
+        (Some(value), _) => (Some(value), BenchMaxSeqSource::Flag),
+        (None, Some(need)) => {
+            let ValueRule::Integer { min, .. } =
+                field("memory.max_seq").expect("schema field").rule
+            else {
+                unreachable!("memory.max_seq is an integer field");
+            };
+            let sized = need.max(min as u64);
+            let sized = model_limit.map_or(sized, |limit| sized.min(limit));
+            (Some(sized), BenchMaxSeqSource::RunShape)
+        }
+        (None, None) => (None, BenchMaxSeqSource::Automatic),
+    };
+    Ok(BenchMaxSeq {
+        requested,
+        source,
+        run_need,
+        model_limit,
+    })
+}
+
+/// Print the effective `max_seq` and how it was chosen.
+fn print_bench_max_seq(max_seq: &BenchMaxSeq, loaded: &serde_json::Value) {
+    let effective = loaded
+        .get("max_seq")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let mut detail = max_seq.source.as_str().to_owned();
+    if let Some(need) = max_seq.run_need {
+        detail.push_str(&format!("; run needs {need}"));
+    }
+    if let Some(limit) = max_seq.model_limit {
+        detail.push_str(&format!("; model declares {limit}"));
+    }
+    eprintln!("  max_seq: {effective} ({detail})");
+}
 
 /// Optional load-time knobs for `open_bench_engine`, threaded explicitly
 /// rather than via `std::env::set_var` — `hipfire_config::developer_var`
@@ -5277,6 +5480,17 @@ fn open_bench_engine(
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    let run_need = (args.matrix || args.redline).then(|| {
+        bench_matrix_seq_need(
+            &args.pp,
+            &args.ctx,
+            args.tg,
+            args.sustained_tg
+                .map(|tg| (tg, args.sustained_ctx.as_slice())),
+        )
+    });
+    let model_limit = run_need.and_then(|_| bench_declared_context(&path));
+    let mut max_seq = plan_bench_max_seq(args.max_seq, run_need, model_limit, &args.model)?;
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
@@ -5298,15 +5512,6 @@ fn open_bench_engine(
     let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
-    let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
-    let longest_decode = args
-        .ctx
-        .iter()
-        .chain(args.sustained_ctx.iter())
-        .copied()
-        .max()
-        .unwrap_or(0) as u64
-        + args.sustained_tg.unwrap_or(args.tg) as u64;
     let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let mut params = load_params(
         &resolved,
@@ -5342,16 +5547,13 @@ fn open_bench_engine(
         &args.model,
         tag.as_deref(),
     );
-    if args.matrix || args.redline {
-        let requested = longest_prefill.max(longest_decode).saturating_add(32);
-        // Automatic max_seq stays omitted so admission can derive the bound.
-        // An explicit user value is never silently inflated — refuse if too small.
-        if let Some(configured) = params.get("max_seq").and_then(|v| v.as_u64()) {
-            if configured < requested {
-                bail!(
-                    "memory.max_seq={configured} is below bench requirement {requested} \
-                     (longest prefill/decode + 32); raise max_seq or shrink the matrix"
-                );
+    match max_seq.requested {
+        // The flag and the matrix sizing replace any configured value.
+        Some(value) => params["max_seq"] = serde_json::json!(value),
+        None => {
+            max_seq.requested = params.get("max_seq").and_then(serde_json::Value::as_u64);
+            if max_seq.requested.is_some() {
+                max_seq.source = BenchMaxSeqSource::Config;
             }
         }
     }
@@ -5369,7 +5571,7 @@ fn open_bench_engine(
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
-    Ok((engine, loaded, pre_diag, post_diag, devices_spec))
+    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -5486,6 +5688,7 @@ fn bench_power_probe(
 /// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
 /// and are discarded. `--reasoning-on` is intentionally ignored here: the
 /// metric is defined with thinking off.
+#[allow(clippy::too_many_arguments)]
 fn bench_ttft(
     engine: &mut Engine,
     args: &BenchArgs,
@@ -5495,6 +5698,7 @@ fn bench_ttft(
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
     power: &bench_power::PowerProbe,
+    max_seq: &serde_json::Value,
 ) -> Result<()> {
     // The shared bench banner prints args.max_tokens; the ttft path always
     // generates exactly one token with thinking off, so say so explicitly.
@@ -5554,6 +5758,7 @@ fn bench_ttft(
             "model": args.model,
             "loaded": loaded,
             "gpu": diag,
+            "max_seq": max_seq,
             "max_tokens": 1,
             "runs": args.runs,
             "warmups": args.warmups,
@@ -5591,6 +5796,7 @@ fn bench_matrix(
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
     power: &bench_power::PowerProbe,
+    max_seq: &serde_json::Value,
 ) -> Result<()> {
     for size in &args.pp {
         let _ = bench_probe(
@@ -5712,6 +5918,7 @@ fn bench_matrix(
             "model": args.model,
             "loaded": loaded,
             "gpu": diag,
+            "max_seq": max_seq,
             "redline_pm4": args.redline,
             "kv_mode": args.kv_mode,
             "runs": args.runs,
@@ -5732,7 +5939,8 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag, _) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
+        let (mut engine, _, _, diag, _, _) =
+            open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5794,6 +6002,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            max_seq: None,
             redline: false,
             speculation: None,
             reasoning_on: false,
@@ -5803,7 +6012,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
+        let (mut engine, _, _, _, _, _) =
+            open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
@@ -12873,6 +13083,7 @@ mod tests {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            max_seq: None,
             redline: false,
             speculation: None,
             reasoning_on: false,
@@ -12899,6 +13110,134 @@ mod tests {
             err.to_string().contains("--prompt-file"),
             "conflict error should name the flag: {err}"
         );
+    }
+
+    #[test]
+    fn bench_max_seq_flag_takes_the_memory_max_seq_bounds() {
+        let parse = |value: &str| -> std::result::Result<Option<u64>, clap::Error> {
+            let cli = Cli::try_parse_from(["hipfire", "bench", "qwen:test", "--max-seq", value])?;
+            match cli.command {
+                Some(Commands::Bench(args)) => Ok(args.max_seq),
+                other => panic!("expected bench, got {other:?}"),
+            }
+        };
+        assert_eq!(parse("512").unwrap(), Some(512));
+        assert_eq!(parse("1048576").unwrap(), Some(1_048_576));
+        assert!(parse("511").is_err(), "below the memory.max_seq minimum");
+        assert!(
+            parse("1048577").is_err(),
+            "above the memory.max_seq maximum"
+        );
+        assert!(parse("8k").is_err());
+    }
+
+    #[test]
+    fn bench_matrix_seq_need_is_the_longest_probe_plus_headroom() {
+        // Decode rows dominate the default-like shape: 20000 + 128 + 32.
+        assert_eq!(
+            bench_matrix_seq_need(&[128, 8192], &[128, 20000], 128, None),
+            20_160
+        );
+        // A long prefill dominates a short decode row.
+        assert_eq!(bench_matrix_seq_need(&[8192], &[128], 32, None), 8_224);
+        // Sustained rows count with their own decode length...
+        assert_eq!(
+            bench_matrix_seq_need(&[512], &[128], 32, Some((256, &[8192, 30000]))),
+            30_288
+        );
+        // ...and not at all when `--sustained-tg` does not run them.
+        assert_eq!(bench_matrix_seq_need(&[512], &[128], 32, None), 544);
+    }
+
+    #[test]
+    fn bench_max_seq_sizes_a_matrix_run_within_the_model_limit() {
+        let plan = plan_bench_max_seq(None, Some(8_224), Some(262_144), "m").unwrap();
+        assert_eq!(
+            plan,
+            BenchMaxSeq {
+                requested: Some(8_224),
+                source: BenchMaxSeqSource::RunShape,
+                run_need: Some(8_224),
+                model_limit: Some(262_144),
+            }
+        );
+        // A tiny matrix is raised to the memory.max_seq minimum...
+        let plan = plan_bench_max_seq(None, Some(160), None, "m").unwrap();
+        assert_eq!(plan.requested, Some(512));
+        // ...but never past what the model declares.
+        let plan = plan_bench_max_seq(None, Some(160), Some(400), "m").unwrap();
+        assert_eq!(plan.requested, Some(400));
+        // The need itself may sit exactly at the limit.
+        let plan = plan_bench_max_seq(None, Some(4_096), Some(4_096), "m").unwrap();
+        assert_eq!(plan.requested, Some(4_096));
+    }
+
+    #[test]
+    fn bench_max_seq_refuses_a_shape_past_the_model_limit() {
+        for flag in [None, Some(1_048_576)] {
+            let err = plan_bench_max_seq(flag, Some(262_177), Some(262_144), "flash")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("262177") && err.contains("262144") && err.contains("flash"),
+                "must name the need, the limit and the model: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_max_seq_flag_wins_but_must_hold_the_run() {
+        let err = plan_bench_max_seq(Some(8_192), Some(8_224), Some(262_144), "m")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("8192") && err.contains("8224"),
+            "must name the flag and the need: {err}"
+        );
+        let plan = plan_bench_max_seq(Some(8_224), Some(8_224), None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (Some(8_224), BenchMaxSeqSource::Flag)
+        );
+        // The declared context bounds the run shape, not the flag: past it,
+        // the daemon's admission decides.
+        let plan = plan_bench_max_seq(Some(300_000), Some(8_224), Some(262_144), "m").unwrap();
+        assert_eq!(plan.requested, Some(300_000));
+        // Off the matrix the flag is sent as given.
+        let plan = plan_bench_max_seq(Some(4_096), None, None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (Some(4_096), BenchMaxSeqSource::Flag)
+        );
+    }
+
+    #[test]
+    fn bench_max_seq_stays_automatic_off_the_matrix_without_a_flag() {
+        let plan = plan_bench_max_seq(None, None, None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (None, BenchMaxSeqSource::Automatic)
+        );
+    }
+
+    #[test]
+    fn declared_context_reads_max_position_embeddings_like_admission() {
+        let read = |json: &str| declared_context_from_metadata(json);
+        assert_eq!(
+            read(
+                r#"{"config":{"max_position_embeddings":4096,"text_config":{"max_position_embeddings":262144}}}"#
+            ),
+            Some(262_144),
+            "text_config wins over the outer config"
+        );
+        assert_eq!(
+            read(r#"{"config":{"max_position_embeddings":131072}}"#),
+            Some(131_072)
+        );
+        assert_eq!(read(r#"{"max_position_embeddings":40960}"#), Some(40_960));
+        assert_eq!(read(r#"{"config":{"max_position_embeddings":0}}"#), None);
+        assert_eq!(read(r#"{"config":{}}"#), None);
+        assert_eq!(read("not json"), None);
     }
 
     #[test]
