@@ -316,20 +316,27 @@ pub struct ScratchState {
     pub gdn_state_f32: Option<DeviceBuffer>,
     pub gdn_state_f32_bytes: usize,
     /// F16 K and block-transposed V of the QSA cache rows the gathered WMMA
-    /// attention reads (`tensor_ops::qsa_gathered_wmma`). Its own slot, not
-    /// the shared FP16 X scratch: a registered VMM owner whose stable virtual
-    /// reservation covers the whole context
-    /// (`tensor_ops::reserve_qsa_gathered_wmma_workspace`), with physical pages
-    /// mapped on demand over the prefix a forward ending at `end` touches
-    /// (`tensor_ops::qsa_gathered_wmma_scratch_bytes(heads, end)`). Mapping
-    /// grows in place, so no captured graph or recorded tape ever sees it
-    /// move; growth is refused while a capture or record is armed. Gpu-owned,
-    /// not model-owned: released by `Gpu::invalidate_weight_caches` and the
-    /// `Gpu::ensure_vmm_cleaned` load/unload gate.
-    pub qsa_gather_f16: Option<GpuTensor>,
-    /// Mapped bytes of `qsa_gather_f16` (the prefix a launch may touch); 0
-    /// when unreserved. Its reserved virtual extent is the tensor's byte size.
+    /// attention reads (`tensor_ops::qsa_gathered_wmma`), legacy backing.
+    /// Its own slot, not the shared FP16 X scratch: Qwen4 reserves it for the
+    /// whole context at load (`tensor_ops::reserve_qsa_gathered_wmma_scratch`),
+    /// so no captured graph or recorded tape ever sees it move. Used where
+    /// the VMM workspace is not admitted (`Gpu::qsa_gather_vmm_capable`:
+    /// everything but gfx1151 on a VMM-certified platform); kept for the
+    /// process.
+    pub qsa_gather_f16: Option<DeviceBuffer>,
     pub qsa_gather_f16_bytes: usize,
+    /// The same workspace as a registered VMM owner (gfx1151 on a certified
+    /// platform): one stable virtual reservation for the whole context
+    /// (`tensor_ops::reserve_qsa_gathered_wmma_workspace`), physical pages
+    /// mapped in place over the prefix a forward ending at `end` touches
+    /// (`tensor_ops::qsa_gathered_wmma_scratch_bytes(heads, end)`). Growth is
+    /// refused while a capture or record is armed. Gpu-owned, not
+    /// model-owned: released by `Gpu::invalidate_weight_caches` and the
+    /// `Gpu::ensure_vmm_cleaned` gate. At most one of the two slots is set.
+    pub qsa_gather_vmm: Option<GpuTensor>,
+    /// Mapped bytes of `qsa_gather_vmm`; its reserved virtual extent is the
+    /// tensor's byte size.
+    pub qsa_gather_vmm_mapped: usize,
     pub fp16_x_source_ptr: *mut c_void,
     pub fp8_x_scratch: Option<DeviceBuffer>,
     pub fp8_x_scratch_bytes: usize,

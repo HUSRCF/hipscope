@@ -4224,13 +4224,14 @@ fn qsa_gathered_wmma_bytes(n_kv_heads: usize, tokens: usize) -> HipResult<usize>
 }
 
 /// Reserve the gathered route's per-GPU workspace for a QSA cache of
-/// `tokens` rows when the route is enabled for `format`: a stable-VA VMM
-/// reservation that commits no pages (Windows maps VMM reservations whole).
-/// Returns the reserved bytes, 0 when the route is off (nothing reserved).
-/// Call at attach, before any graph capture or Redline record, so the
-/// workspace address never moves; map each forward's prefix with
-/// [`ensure_qsa_gathered_wmma_workspace`]. The workspace is released by
-/// `Gpu::invalidate_weight_caches` (model unload).
+/// `tokens` rows when the route is enabled for `format`. Where the VMM
+/// workspace is admitted (gfx1151 on a VMM-certified platform) this is a
+/// stable-VA reservation that commits no pages, released by
+/// `Gpu::invalidate_weight_caches` (model unload); elsewhere the legacy
+/// slot is allocated whole, as before. Returns the reserved bytes, 0 when
+/// the route is off (nothing reserved). Call at attach, before any graph
+/// capture or Redline record, so the workspace address never moves; map
+/// each forward's prefix with [`ensure_qsa_gathered_wmma_workspace`].
 pub fn reserve_qsa_gathered_wmma_workspace(
     gpu: &mut Gpu,
     format: QsaKvFormat,
@@ -4248,9 +4249,9 @@ pub fn reserve_qsa_gathered_wmma_workspace(
 /// Map the gathered route's workspace over everything a forward ending at
 /// `end_tokens` touches ([`qsa_gathered_wmma_scratch_bytes`]), in place at
 /// its reserved address (reserving at least that much first when nothing
-/// is reserved). Call before capture or record: growth while either is
-/// armed is refused. Returns the mapped bytes (granularity-rounded), 0 when
-/// the route is off.
+/// is reserved; the legacy slot grows to it). Call before capture or
+/// record: VMM growth while either is armed is refused. Returns the
+/// committed bytes (VMM: granularity-rounded), 0 when the route is off.
 pub fn ensure_qsa_gathered_wmma_workspace(
     gpu: &mut Gpu,
     format: QsaKvFormat,
@@ -7350,8 +7351,9 @@ mod tests {
         case.free(&mut gpu);
     }
 
-    /// The gathered workspace is one stable-VA reservation per cache,
-    /// demand-mapped: each forward maps exactly the granularity-rounded
+    /// Where admitted (`Gpu::qsa_gather_vmm_capable`), the gathered workspace
+    /// is one stable-VA reservation per cache, demand-mapped: each forward
+    /// maps exactly the granularity-rounded
     /// prefix it touches (K rows plus whole V blocks to its end) at an
     /// unchanged address, hipcc and the PM module stay byte-identical on it
     /// across growth, the output equals a whole-context commit's, growth is
@@ -7371,6 +7373,10 @@ mod tests {
             eprintln!("skip: the gathered route is disabled");
             return;
         }
+        if !gpu.qsa_gather_vmm_capable() {
+            eprintln!("skip: the gathered workspace keeps its legacy slot here");
+            return;
+        }
         let (heads, capacity) = (2usize, 8192usize);
         let bytes = |end: usize| qsa_gathered_wmma_scratch_bytes(heads, end).unwrap();
         gpu.invalidate_weight_caches();
@@ -7380,11 +7386,10 @@ mod tests {
         assert_eq!(reserved, bytes(capacity));
         assert_eq!(gpu.qsa_gather_reserved_bytes(), reserved);
         assert_eq!(gpu.vmm_allocation_count(), owners + 1);
-        let workspace = gpu.scratch.qsa_gather_f16.as_ref().unwrap();
+        assert!(gpu.scratch.qsa_gather_f16.is_none(), "legacy slot allocated on a VMM Gpu");
+        let workspace = gpu.scratch.qsa_gather_vmm.as_ref().unwrap();
         let (base, granularity) = (workspace.buf.as_ptr(), gpu.vmm_granularity(workspace).unwrap());
-        if !cfg!(windows) {
-            assert_eq!(gpu.qsa_gather_scratch_bytes(), 0, "a reservation commits nothing");
-        }
+        assert_eq!(gpu.qsa_gather_scratch_bytes(), 0, "a reservation commits nothing");
         // Chunk 1 ends at 523 (a partial V block), chunk 2 at 5003: several
         // pages more, mapped in place.
         let mut demand_output = Vec::new();
@@ -7394,10 +7399,8 @@ mod tests {
             let hip = case.gathered(&mut gpu, false);
             let pm = case.gathered(&mut gpu, true);
             assert!(hip == pm, "PM vs hipcc gathered bytes differ at end {end}");
-            if !cfg!(windows) {
-                assert_eq!(gpu.qsa_gather_scratch_bytes(), bytes(end).next_multiple_of(granularity));
-            }
-            assert_eq!(gpu.scratch.qsa_gather_f16.as_ref().unwrap().buf.as_ptr(), base, "address moved");
+            assert_eq!(gpu.qsa_gather_scratch_bytes(), bytes(end).next_multiple_of(granularity));
+            assert_eq!(gpu.scratch.qsa_gather_vmm.as_ref().unwrap().buf.as_ptr(), base, "address moved");
             assert_eq!(gpu.vmm_allocation_count(), owners + 1);
             demand_output = hip;
             case.free(&mut gpu);
@@ -7409,7 +7412,7 @@ mod tests {
         let grown = ensure_qsa_gathered_wmma_workspace(&mut gpu, format, heads, capacity);
         gpu.graphs.capture_mode = false;
         assert_eq!(covered.expect("covered while armed"), mapped);
-        assert!(cfg!(windows) || grown.is_err(), "growth while armed must be refused");
+        assert!(grown.is_err(), "growth while armed must be refused");
         assert_eq!(gpu.qsa_gather_scratch_bytes(), mapped);
         // Invalidation releases it; the whole-context commit gives the same
         // output bytes.
