@@ -2386,26 +2386,27 @@ mod tests {
 
     /// Hardware smoke at the canonical geometry (Halo): grow a VMM state
     /// across chunk boundaries to native context and compare with a legacy
-    /// state. `HIPFIRE_QWEN4_STATE_SMOKE_MODEL` reads the config from an
-    /// artifact; `HIPFIRE_QWEN4_STATE_SMOKE_VRAM` names a sysfs
-    /// `mem_info_vram_used` file to census.
+    /// state. Reads the config from `$HIPFIRE_MODELS_DIR/qwen3.8-flash-next-gptq3.mq4`
+    /// when present (compact test config otherwise) and censuses device memory
+    /// via `hipMemGetInfo`.
     #[test]
     #[ignore = "hardware smoke: commits up to ~14 GiB of device memory"]
     fn flash_next_vmm_state_smoke() {
         let mut gpu = Gpu::init().expect("GPU");
-        let config = match std::env::var("HIPFIRE_QWEN4_STATE_SMOKE_MODEL") {
-            Ok(path) => {
-                let hfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(&path))
-                    .expect("open artifact");
-                Qwen4Config::from_metadata_json(&hfq.metadata_json).expect("artifact config")
-            }
-            Err(_) => crate::config::compact_test_config(),
+        // production HIPFIRE_* reads must stay config-owned (check-env-docs).
+        let models_dir = std::env::var("HIPFIRE_MODELS_DIR")
+            .unwrap_or_else(|_| "/home/kaden/.hipfire/models".to_string());
+        let artifact = std::path::Path::new(&models_dir).join("qwen3.8-flash-next-gptq3.mq4");
+        let config = if artifact.exists() {
+            let hfq = hipfire_runtime::hfq::HfqFile::open(&artifact).expect("open artifact");
+            Qwen4Config::from_metadata_json(&hfq.metadata_json).expect("artifact config")
+        } else {
+            crate::config::compact_test_config()
         };
-        let vram = || {
-            std::env::var("HIPFIRE_QWEN4_STATE_SMOKE_VRAM")
-                .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .and_then(|text| text.trim().parse::<usize>().ok())
+        let vram = |gpu: &Gpu| {
+            gpu.hip
+                .get_vram_info()
+                .map(|(free, total)| total.saturating_sub(free))
                 .unwrap_or(0)
         };
         let format = Qwen4StateFormat {
@@ -2420,7 +2421,7 @@ mod tests {
             crate::kv_backend::qwen4_vmm_supported(&gpu)
         );
         for backend in [Qwen4KvBackend::Vmm, Qwen4KvBackend::Legacy] {
-            let before = vram();
+            let before = vram(&gpu);
             let start = std::time::Instant::now();
             let mut state = Qwen4State::new_with_backend(&mut gpu, &config, s, format, backend)
                 .expect("state");
@@ -2428,7 +2429,7 @@ mod tests {
             eprintln!(
                 "{backend:?} new: {:.1} ms vram_delta={} MiB context_committed={} MiB covered={}",
                 built.as_secs_f64() * 1e3,
-                (vram().saturating_sub(before)) / MIB,
+                (vram(&gpu).saturating_sub(before)) / MIB,
                 state.mapped_context_bytes(&gpu).unwrap() / MIB,
                 state.mapped_context_tokens()
             );
@@ -2466,7 +2467,7 @@ mod tests {
                     state.mapped_context_tokens(),
                     state.mapped_context_bytes(&gpu).unwrap() / MIB,
                     touched as f64 / MIB as f64,
-                    vram() / MIB,
+                    vram(&gpu) / MIB,
                     took.as_secs_f64() * 1e3
                 );
             }
