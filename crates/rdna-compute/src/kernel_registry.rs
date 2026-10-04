@@ -59,6 +59,11 @@ mod kernels {
         "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
         include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
     );
+    #[cfg(not(feature = "deltanet"))]
+    pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+        "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
+        include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+    );
     /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
     pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
 }
@@ -790,6 +795,138 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen4_moe_group_prefix", "qwen4_moe_group_ranks", "qwen4_moe_group_scatter",
         ]);
     }
+    // Qwen3.5-MoE (ornith-1.5-35b-a3b) load, AR prefill/decode and native MTP,
+    // plus Qwen3.5 dense (H2): every module a kernel-load trace
+    // (tests/fixtures/kernel-trace-qwen35.tsv) JIT-compiled on gfx1100,
+    // gfx1151 and gfx1201 beyond the inventory above. Sources are the exact
+    // expressions the callsites pass to `ensure_kernel`; symbols are every
+    // kernel the arch's object defines.
+    if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
+        add!("gated_delta_net_q8_compact2_b2", kernels::GATED_DELTA_NET_Q8_COMPACT2_B2_SRC, [
+            "gated_delta_net_q8_compact2_b2", "gated_delta_net_q8_fast_independent_masked",
+        ]);
+        add!("gemm_qkv_hfq6g256", kernels::GEMM_QKV_HFQ6G256_SRC, ["gemm_qkv_hfq6g256"]);
+        add!("gemm_qkvza_hfq6g256", kernels::GEMM_QKVZA_HFQ6G256_SRC, ["gemm_qkvza_hfq6g256"]);
+        add!("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, ["gemv_hfq6g256_residual"]);
+        add!("gemv_hfq6g256_residual_sigmoid_scaled", kernels::GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC, [
+            "gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched",
+        ]);
+        add!("gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded", kernels::GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC, [
+            "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
+        ]);
+        add!("moe_down_combine_grouped_k8", kernels::MOE_DOWN_COMBINE_GROUPED_K8_SRC, ["moe_down_combine_grouped_k8"]);
+        add!("moe_down_combine_k8_batched", kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC, ["moe_down_combine_k8_batched"]);
+        add!("moe_gate_up_unscatter_k8", kernels::MOE_GATE_UP_UNSCATTER_K8_SRC, ["moe_gate_up_unscatter_k8"]);
+        add!("moe_scatter_fused_k8", kernels::moe_scatter_fused_k8_src(arch == "gfx1151"), ["moe_scatter_fused_k8"]);
+        add!("moe_topk_renorm_k8", kernels::MOE_TOPK_RENORM_K8_SRC, ["moe_topk_renorm_k8"]);
+        add!("moe_topk_renorm_k8_batched", kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC, ["moe_topk_renorm_k8_batched"]);
+        add!("scaled_add_inplace", kernels::SCALED_ADD_INPLACE_SRC, ["scaled_add_inplace_cpu_scalar_f32", "scaled_add_inplace_gpu_scalar_f32"]);
+        add!("sigmoid_scaled_residual_add_batched", kernels::SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC, ["sigmoid_scaled_residual_add_batched_f32"]);
+        add!("softmax", kernels::SOFTMAX_SRC, ["softmax_f32"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1100") {
+        add!("gemv_mq4g256v2_residual_sigmoid_scaled_k512", kernels::GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_SRC, [
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512",
+        ]);
+        add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
+    }
+    if matches!(arch, "gfx1201" | "gfx1151") {
+        add!("gemv_mq4g256v2_moe_gate_up_k8_indexed", kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_SRC, ["gemv_mq4g256v2_moe_gate_up_k8_indexed"]);
+        add!("gemv_mq4g256v2_moe_ninepath_d4", kernels::GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC, ["gemv_mq4g256v2_moe_ninepath_d4"]);
+        add!("kv_cache_write_q8_0_pair", kernels::KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC, ["kv_cache_write_q8_0_pair"]);
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!("fused_rmsnorm_mq_rotate_vecsum", kernels::FUSED_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC, ["fused_rmsnorm_mq_rotate_vecsum"]);
+        add!("gemm_gate_up_hfq6g256_wmma", kernels::GEMM_GATE_UP_HFQ6G256_WMMA_SRC, ["gemm_gate_up_hfq6g256_wmma"]);
+        add!("gemm_hfq6g256_residual_wmma_k2", kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC, ["gemm_hfq6g256_residual_wmma_k2"]);
+        add!("gemm_q8_0_wmma", kernels::GEMM_Q8_0_WMMA_SRC, ["gemm_q8_0_wmma"]);
+        add!("gemm_qkv_hfq6g256_wmma", kernels::GEMM_QKV_HFQ6G256_WMMA_SRC, ["gemm_qkv_hfq6g256_wmma"]);
+        add!("gemm_qkvza_hfq6g256_wmma", kernels::GEMM_QKVZA_HFQ6G256_WMMA_SRC, ["gemm_qkvza_hfq6g256_wmma"]);
+        add!("moe_router_softmax_topk_k8_wave64_exact", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_EXACT_SRC, ["moe_router_softmax_topk_k8_wave64_exact"]);
+    }
+    if arch == "gfx1201" {
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+        ]);
+        add!("attention_q8_0_flash_prefill_wmma_gfx12_hd256", format!("#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}", kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC, false)), [
+            "attention_q8_0_flash_prefill_wmma",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1201", kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC, ["gated_norm_mq_rotate_gfx1201"]);
+        add!("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC, ["gated_norm_mq_rotate_i4_gfx12_v2"]);
+        add!("gemm_gate_up_hfq6g256_wmma_gfx12", kernels::GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC, ["gemm_gate_up_hfq6g256_wmma_gfx12"]);
+        add!("gemm_hfq6g256_residual_wmma_gfx12", kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_GFX12_SRC, ["gemm_hfq6g256_residual_wmma_gfx12"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC, [
+            "gemm_mq4g256v2_gate_up_silu_mmq_iu4_g12r", "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r", "gemm_mq4g256v2_residual_mmq_iu4_g12r", "quantize_int4_mmq_ds128",
+        ]);
+        add!("gemm_q8_0_wmma_gfx12", kernels::GEMM_Q8_0_WMMA_GFX12_SRC, ["gemm_q8_0_wmma_gfx12"]);
+        add!("gemm_qkv_hfq6g256_wmma_gfx12", kernels::GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC, ["gemm_qkv_hfq6g256_wmma_gfx12"]);
+        add!("gemm_qkvza_hfq6g256_wmma_gfx12", kernels::GEMM_QKVZA_HFQ6G256_WMMA_GFX12_SRC, ["gemm_qkvza_hfq6g256_wmma_gfx12"]);
+        add!("moe_router_softmax_topk_k8_wave64", kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC, ["moe_router_softmax_topk_k8_wave64"]);
+        add!("qwen35_fa_prep_gfx1201", kernels::QWEN35_FA_PREP_GFX1201_SRC, ["qwen35_fa_prep_gfx1201"]);
+    }
+    if arch == "gfx1100" {
+        add!("argmax_token_chain", kernels::ARGMAX_TOKEN_CHAIN_SRC, ["argmax_token_chain_f32"]);
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100",
+        ]);
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+        ]);
+        add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
+        add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
+        add!("fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100", kernels::FUSED_QKV_MQ4G256V2_K2048_X_BUFFER_GFX1100_SRC, [
+            "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        ]);
+        add!("fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100", kernels::FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC, [
+            "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1100", kernels::GATED_NORM_MQ_ROTATE_GFX1100_SRC, ["gated_norm_mq_rotate_gfx1100"]);
+        add!("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC, ["gated_norm_mq_rotate_i4_gfx1100_v2"]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, ["gemm_mq4g256v2_moe_grouped_wmma_k2"]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
+            "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+            "quantize_int4_mmq_ds128",
+        ]);
+        add!("gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100", kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC, [
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+        ]);
+        add!("gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100", kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC, ["gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"]);
+        add!("gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch", kernels::GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC, [
+            "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",
+        ]);
+        add!("greedy_accept", kernels::GREEDY_ACCEPT_SRC, ["greedy_accept_from_argmax_i32"]);
+        add!("mq_rotate_x_i4", kernels::MQ_ROTATE_X_I4_SRC, ["mq_rotate_x_i4"]);
+        add!("qwen35_fa_prep_gfx1100", kernels::QWEN35_FA_PREP_GFX1100_SRC, ["qwen35_fa_prep_gfx1100"]);
+    }
+    if arch == "gfx1151" {
+        add!("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC, [
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+        ]);
+        add!("attention_verify_wmma_gfx1151", kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC, [
+            "attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151", "attention_verify_wmma_qk_gfx1151",
+        ]);
+        add!("gated_norm_mq_rotate_gfx1151", kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC, ["gated_norm_mq_rotate_gfx1151"]);
+        add!("gated_norm_mq_rotate_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC, ["gated_norm_mq_rotate_i4_gfx1151_v2"]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
+            "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+            "quantize_int4_mmq_ds128",
+        ]);
+        add!("qwen35_fa_prep_gfx1151", kernels::QWEN35_FA_PREP_GFX1151_SRC, ["qwen35_fa_prep_gfx1151"]);
+    }
     Ok(entries)
 }
 
@@ -991,10 +1128,11 @@ mod tests {
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid), the
         // five multi-slot `*_paged` modules of the q8/asym3 routes, the
         // 36 H2 decode, prefill, MTP and DFlash modules added for
-        // compiler-free packs and the 36 Qwen3.8-Flash-Next modules
-        // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv). Those 81 keys
-        // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 81, "unexpected gfx1201 inventory size");
+        // compiler-free packs, the 36 Qwen3.8-Flash-Next modules
+        // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv) and the 32
+        // Qwen3.5-MoE modules (tests/fixtures/kernel-trace-qwen35.tsv). Those
+        // 113 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 113, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -1145,5 +1283,10 @@ mod tests {
     #[test]
     fn qwen4_flash_next_trace_is_packaged() {
         assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv"));
+    }
+
+    #[test]
+    fn qwen35_trace_is_packaged() {
+        assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
     }
 }

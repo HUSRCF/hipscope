@@ -21092,13 +21092,6 @@ impl Gpu {
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         const GRIDSPEC_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec";
         const GRIDSPEC_TAIL: &str = "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec";
-        const GRIDSPEC_SRC: &str = concat!(
-            include_str!("../../../kernels/src/block_i4_128_quant.hip"),
-            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
-            include_str!(
-                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
-            )
-        );
         const SYMFOLD_MODULE: &str =
             "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
         const GRIDSPEC_SYMFOLD_MODULE: &str =
@@ -21114,7 +21107,7 @@ impl Gpu {
                     GRIDSPEC_SYMFOLD_MODULE,
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC,
                 ),
-                (true, false) => (GRIDSPEC_MODULE, GRIDSPEC_SRC),
+                (true, false) => (GRIDSPEC_MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC),
                 (false, true) => (
                     SYMFOLD_MODULE,
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
