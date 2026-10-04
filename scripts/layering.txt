@@ -21,6 +21,7 @@
  0 hipfire-detect
  0 hipfire-xdna
  0 peacemaker-ir
+ 0 pm-npu
  0 radiowave
  0 redline
  0 railgun-corpus
@@ -37,6 +38,7 @@
  2 hipfire-tui
  2 redline-dispatch
  2 railgun-cert
+ 2 npu-tools
  3 hipfire-cpu
  3 rdna-compute
  3 hipfire-rip

@@ -57,6 +57,8 @@ members = [
     "crates/hipfire-daemon",
     "crates/saddle-lab",
     "crates/hipfire-xdna",
+    "crates/pm-npu",
+    "crates/npu-tools",
 ]
 
 [workspace.package]

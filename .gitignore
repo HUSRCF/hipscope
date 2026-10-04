@@ -188,3 +188,6 @@ dist_test/
 # messages
 /scratch-*/
 scs_suite_report.json
+npu-bisect-out/
+npu-bisect2-out/
+npu-probe-out/

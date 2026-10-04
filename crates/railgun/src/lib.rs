@@ -27,6 +27,8 @@ pub mod copy;
 pub mod kernel;
 pub mod plan;
 pub mod shadow;
+#[cfg(feature = "npu")]
+pub mod npu;
 
 use std::ops::RangeInclusive;
 
