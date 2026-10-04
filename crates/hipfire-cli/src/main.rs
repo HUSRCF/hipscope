@@ -49,6 +49,7 @@ use std::{
 };
 
 mod bench_concurrency;
+mod bench_power;
 mod serve;
 mod kernel_pack;
 mod setup;
@@ -4884,7 +4885,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let (mut engine, loaded, pre_diag, post_diag, devices_spec) =
+        open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -4908,8 +4910,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  max_tokens: {}", args.max_tokens);
     eprintln!("  prompt_md5: {prompt_md5}");
     eprintln!("  prompt_chars: {prompt_chars}");
+    let power = bench_power_probe(devices_spec.as_deref(), &post_diag);
     if args.matrix || args.redline {
-        bench_matrix(&mut engine, &args, &loaded, &post_diag)
+        bench_matrix(&mut engine, &args, &loaded, &post_diag, &power)
     } else if args.ttft {
         bench_ttft(
             &mut engine,
@@ -4919,6 +4922,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             prompt_chars,
             &loaded,
             &post_diag,
+            &power,
         )
     } else {
         // The warmup exists to populate kernel caches and its output is
@@ -4931,13 +4935,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         let mut prompt_tokens: Option<u64> = None;
+        let mut power_runs = Vec::new();
         for _ in 0..args.runs {
+            let sampler = power.start_run();
             let done = bench_generate_with_reasoning(
                 &mut engine,
                 &prompt,
                 args.max_tokens as u64,
                 args.reasoning_on,
             )?;
+            power_runs.push(sampler.finish());
             // Every run uses the same prompt, so the daemon's tokenized
             // prompt length is run-invariant; keep the first report. The
             // done event reports the prompt as `prefill_tokens` (rows the
@@ -4971,6 +4978,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let warnings: Vec<String> = prompt_tokens
             .and_then(bench_prompt_warning)
             .into_iter()
+            .chain(bench_power::throttle_warning(&power_runs))
             .collect();
         if let Some(tokens) = prompt_tokens {
             eprintln!("  prompt_tokens: {tokens}");
@@ -4992,6 +5000,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "prompt_md5": prompt_md5,
                 "prompt_chars": prompt_chars,
                 "warnings": warnings,
+                "power_device": power.device_json(),
+                "power": bench_power::runs_json(&power_runs),
                 "decode_tok_s": sample_stats(&decode),
                 "prefill_tok_s": sample_stats(&prefill),
                 "wall_tok_s": sample_stats(&wall),
@@ -5056,7 +5066,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         // 2048-token slots, not the serve default of 8192: the sweep's prompts
         // are one short turn and --max-tokens is small, so a larger arena buys
         // nothing and multiplies per-slot KV by four.
-        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let (engine, loaded, _, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
         let slot_capable = loaded
             .get("experimental_multi_slot")
             .and_then(serde_json::Value::as_bool)
@@ -5089,7 +5099,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        let (engine, _, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         let mut d = SequentialDriver::start(engine, max_k)?;
         eprintln!("  noslots backend up (sequential daemon path)");
         let r = sweep_backend(
@@ -5108,7 +5118,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
-        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let (engine, loaded, _, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
         let capable = loaded
             .get("continuous_batch_capable")
             .and_then(serde_json::Value::as_bool)
@@ -5191,12 +5201,7 @@ fn open_bench_engine_batched(
     paths: &Paths,
     args: &BenchArgs,
     batch_size: usize,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
@@ -5216,12 +5221,7 @@ fn open_bench_engine_slots(
     args: &BenchArgs,
     slots: usize,
     ctx: usize,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
@@ -5232,6 +5232,17 @@ fn open_bench_engine_slots(
         },
     )
 }
+
+/// `open_bench_engine`'s result: the engine, its `loaded` reply, `diag`
+/// before and after the load, and the `hardware.devices` selector the daemon
+/// was configured with (the bench's power sampler resolves the same card).
+type BenchEngine = (
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    Option<String>,
+);
 
 /// Optional load-time knobs for `open_bench_engine`, threaded explicitly
 /// rather than via `std::env::set_var` — `hipfire_config::developer_var`
@@ -5248,12 +5259,7 @@ fn open_bench_engine(
     args: &BenchArgs,
     rdna2_variant: Option<u8>,
     load_opts: &BenchLoadOpts,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+) -> Result<BenchEngine> {
     let registry = load_registry(&paths.registry).registry;
     let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
@@ -5362,7 +5368,8 @@ fn open_bench_engine(
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
-    Ok((engine, loaded, pre_diag, post_diag))
+    let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
+    Ok((engine, loaded, pre_diag, post_diag, devices_spec))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -5440,6 +5447,38 @@ fn bench_probe(
     }
 }
 
+/// [`bench_probe`] for one measured run, sampling the GPU power state across
+/// it into `runs`.
+fn bench_probe_sampled(
+    engine: &mut Engine,
+    power: &bench_power::PowerProbe,
+    runs: &mut Vec<bench_power::RunPower>,
+    message: serde_json::Value,
+    expected: &str,
+) -> Result<serde_json::Value> {
+    let sampler = power.start_run();
+    let response = bench_probe(engine, message, expected)?;
+    runs.push(sampler.finish());
+    Ok(response)
+}
+
+/// The bench's power sampler, aimed at the card the daemon was given:
+/// `hardware.devices`, else the inherited `ROCR_VISIBLE_DEVICES` the daemon
+/// also sees, else the first ROCr agent of the daemon's reported arch.
+fn bench_power_probe(
+    devices_spec: Option<&str>,
+    diag: &serde_json::Value,
+) -> bench_power::PowerProbe {
+    let rocr_visible = env::var("ROCR_VISIBLE_DEVICES").ok();
+    let probe = bench_power::PowerProbe::new(
+        devices_spec,
+        rocr_visible.as_deref(),
+        diag.get("arch").and_then(serde_json::Value::as_str),
+    );
+    eprintln!("  power:  {}", probe.describe());
+    probe
+}
+
 /// Client-side TTFT on the standard generate path: per run, generate a
 /// single token with thinking off and time wall clock from request send to
 /// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
@@ -5455,6 +5494,7 @@ fn bench_ttft(
     prompt_chars: u64,
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
+    power: &bench_power::PowerProbe,
 ) -> Result<()> {
     // The shared bench banner prints args.max_tokens; the ttft path always
     // generates exactly one token with thinking off, so say so explicitly.
@@ -5464,10 +5504,12 @@ fn bench_ttft(
     }
     let mut ttft_ms_samples = Vec::new();
     let mut prompt_tokens: Option<u64> = None;
+    let mut power_runs = Vec::new();
     for _ in 0..args.runs {
         let start = Instant::now();
         let mut first: Option<Duration> = None;
         let request = bench_generate_request(prompt, 1);
+        let sampler = power.start_run();
         let done = engine.generate(&request, |event| {
             if first.is_none()
                 && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
@@ -5479,6 +5521,7 @@ fn bench_ttft(
         let elapsed = first.ok_or_else(|| {
             anyhow!("no streamed token observed; cannot measure client-side TTFT")
         })?;
+        power_runs.push(sampler.finish());
         ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
         if prompt_tokens.is_none() {
             prompt_tokens = bench_prompt_tokens_from_done(&done);
@@ -5489,6 +5532,12 @@ fn bench_ttft(
     eprintln!();
     if let Some(tokens) = prompt_tokens {
         eprintln!("  prompt_tokens: {tokens}");
+    }
+    let warnings: Vec<String> = bench_power::throttle_warning(&power_runs)
+        .into_iter()
+        .collect();
+    for warning in &warnings {
+        eprintln!("  warning: {warning}");
     }
     let pp_samples: Vec<f64> = match prompt_tokens {
         Some(tokens) if tokens > 0 => ttft_ms_samples
@@ -5521,6 +5570,9 @@ fn bench_ttft(
             },
             "pp_tok_s": pp_stats,
             "pp_tok_s_samples": pp_samples,
+            "warnings": warnings,
+            "power_device": power.device_json(),
+            "power": bench_power::runs_json(&power_runs),
         }),
         loaded,
     );
@@ -5538,6 +5590,7 @@ fn bench_matrix(
     args: &BenchArgs,
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
+    power: &bench_power::PowerProbe,
 ) -> Result<()> {
     for size in &args.pp {
         let _ = bench_probe(
@@ -5555,11 +5608,15 @@ fn bench_matrix(
         )?;
     }
     let mut pp_rows = Vec::new();
+    let mut all_power = Vec::new();
     for size in &args.pp {
         let mut samples = Vec::new();
+        let mut row_power = Vec::new();
         for _ in 0..args.runs {
-            let result = bench_probe(
+            let result = bench_probe_sampled(
                 engine,
+                power,
+                &mut row_power,
                 serde_json::json!({ "type": "bench_prefill", "tokens": size }),
                 "prefill_result",
             )?;
@@ -5574,7 +5631,8 @@ fn bench_matrix(
             "  pp{size}: {:.2} tok/s median",
             sample_stats(&samples).unwrap().median
         );
-        pp_rows.push(serde_json::json!({ "tokens": size, "stats": sample_stats(&samples), "samples": samples }));
+        pp_rows.push(serde_json::json!({ "tokens": size, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+        all_power.extend(row_power);
     }
     let mut decode_rows = Vec::new();
     for context in &args.ctx {
@@ -5584,9 +5642,12 @@ fn bench_matrix(
             "decode_result",
         )?;
         let mut samples = Vec::new();
+        let mut row_power = Vec::new();
         for _ in 0..args.runs {
-            let result = bench_probe(
+            let result = bench_probe_sampled(
                 engine,
+                power,
+                &mut row_power,
                 serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
                 "decode_result",
             )?;
@@ -5603,7 +5664,8 @@ fn bench_matrix(
             context,
             sample_stats(&samples).unwrap().median
         );
-        decode_rows.push(serde_json::json!({ "context": context, "tokens": args.tg, "stats": sample_stats(&samples), "samples": samples }));
+        decode_rows.push(serde_json::json!({ "context": context, "tokens": args.tg, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+        all_power.extend(row_power);
     }
     let mut sustained_rows = Vec::new();
     if let Some(tg) = args.sustained_tg {
@@ -5614,9 +5676,12 @@ fn bench_matrix(
                 "decode_result",
             )?;
             let mut samples = Vec::new();
+            let mut row_power = Vec::new();
             for _ in 0..args.runs {
-                let result = bench_probe(
+                let result = bench_probe_sampled(
                     engine,
+                    power,
+                    &mut row_power,
                     serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
                     "decode_result",
                 )?;
@@ -5631,8 +5696,15 @@ fn bench_matrix(
                 "  tg{tg}@{context}: {:.2} tok/s median",
                 sample_stats(&samples).unwrap().median
             );
-            sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples }));
+            sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+            all_power.extend(row_power);
         }
+    }
+    let warnings: Vec<String> = bench_power::throttle_warning(&all_power)
+        .into_iter()
+        .collect();
+    for warning in &warnings {
+        eprintln!("  warning: {warning}");
     }
     let report = with_loaded_kv_backend_fields(
         serde_json::json!({
@@ -5643,6 +5715,8 @@ fn bench_matrix(
             "redline_pm4": args.redline,
             "kv_mode": args.kv_mode,
             "runs": args.runs,
+            "warnings": warnings,
+            "power_device": power.device_json(),
             "prefill": pp_rows,
             "decode": decode_rows,
             "sustained": sustained_rows,
@@ -5658,7 +5732,7 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
+        let (mut engine, _, _, diag, _) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5729,7 +5803,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
+        let (mut engine, _, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
