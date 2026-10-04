@@ -170,8 +170,8 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 
 | Command | Purpose |
 |---|---|
-| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead). |
-| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces the effective loaded `kv_mode` and backend fields. |
+| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead) and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
+| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
@@ -181,6 +181,35 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
+
+### Bench power and memory state
+
+`hipfire bench` samples the GPU every 0.5 s during each measured run (`--ttft` and `--matrix` too; not `--exp` or `--concurrency`). It reads only world-readable sysfs, so it needs no root, and it never fails a bench: whatever it cannot read is reported as the string `"unavailable"`.
+
+- **`power_device`** (once per report): the card sampled, `card` (`/sys/class/drm/cardN`), `pci`, `arch`, `selected_by` and `sample_period_ms`. It is the daemon's logical device 0: the card named by `hardware.devices` (`HIPFIRE_DEVICES`), else the first entry of an inherited `ROCR_VISIBLE_DEVICES`, else the first ROCr agent of the daemon's arch. With `--tp` above 1 only that first card is sampled. If no card resolves, it holds `status: "unavailable"` and a `reason`.
+- **`power`**: one object per measured run, in the order of the `samples` arrays (top level for the standard and `--ttft` paths, per row for `--matrix`):
+
+| Field | Source | Meaning |
+|---|---|---|
+| `samples`, `duration_s` | — | Samples taken (one at run start, every 0.5 s, one at run end) and the span they cover. |
+| `gpu_metrics_format` | `gpu_metrics` header | `"3.0"` is decoded (Strix Halo and other `gpu_metrics_v3_0` APUs). Any other `format.content` (e.g. `"1.3"` on RDNA dGPUs), `"malformed"`, or `"unavailable"` (no file) leaves every `gpu_metrics` field below `"unavailable"`. |
+| `gfxclk_mhz` `{avg,min,max}` | `gpu_metrics` | `average_gfxclk_frequency`. |
+| `gfx_maxfreq_mhz_min` | `gpu_metrics` | Lowest `current_gfx_maxfreq` the SMU allowed during the run. |
+| `socket_power_w`, `gfx_power_w` `{avg,max}` | `gpu_metrics` | `average_socket_power`, `average_gfx_power`. |
+| `gfx_temp_c_max` | `gpu_metrics` | Highest `temperature_gfx`. |
+| `fclk_mhz_avg` | `gpu_metrics` | Mean `average_fclk_frequency`. |
+| `throttle_pct` | `gpu_metrics` | Percent of the run's wall time at each limiter: `fast_ppt`, `slow_ppt`, `stapm` (the SMU's SPL counter), `thm_gfx`, `thm_core`, `thm_soc`, `prochot`. The SMU counters are cumulative milliseconds; the percentage is their increase between the first and last sample over the time between them, capped at 100. |
+| `tctl_c_max` | k10temp hwmon | Highest CPU package `Tctl` (meaningful on APUs, where the GPU shares the package). |
+| `perf_level` | `power_dpm_force_performance_level` | Read at run start. |
+| `od_sclk` `{min_mhz,max_mhz,range_min_mhz,range_max_mhz}` | `pp_od_clk_voltage` | The `OD_SCLK` levels and the `OD_RANGE` SCLK bounds, at run start. |
+| `hwmon` | the card's amdgpu hwmon | Every labelled input, keyed by its label: `temp_c` (max; e.g. `edge`, `junction`, `mem`), `power_w` (`powerN_average`, else `powerN_input`; e.g. `ppt`) and `freq_mhz` (e.g. `sclk`, `mclk`), with avg/min/max. This is all that remains on a card whose `gpu_metrics` format is not decoded. |
+| `memory` | `mem_info_{vram,gtt}_{total,used}`, `/proc/meminfo` | At run start, in MiB: `vram_total_mib` (the UMA carve-out on an APU), `vram_used_mib`, `vram_free_mib`, the same three for `gtt`, and the host's `mem_total_mib` and `mem_available_mib`. Shrinking the BIOS carve-out and serving from GTT changes these, so tag baselines with them. |
+
+`gpu_metrics` values are the SMU's time-filtered averages, so the first second of a run lags the load.
+
+When any limiter's residency exceeds 10 % of a measured run, the bench prints one `warning:` line naming the worst residency per limiter, and adds it to the JSON `warnings`. The number is then power- or thermal-limited and is comparable only with runs whose power fields match.
+
+**Strix Halo host note.** At stock limits, pp8192 prefill on a high-TDP Strix Halo box (measured on a Minisforum MS-S1 MAX: STAPM 130 W, fast PPT 160 W, slow PPT 130 W, APU 130 W) is limited first by fast PPT, held at the limit 88 % of the time, and then by GPU temperature, which reaches the thermal point within 0.5–5.5 s of prefill start. Capping all four limits at about 130 W (`ryzenadj --stapm-limit=130000 --fast-limit=130000 --slow-limit=130000 --apu-slow-limit=130000`, or the BIOS power mode) costs about 5 % of burst prefill (1186.7 vs 1247.9 tok/s) and held the GPU at or below 91.5 °C with no thermal throttling. 85 W costs about 17 % of prefill for +49 % tok/J (12.3 vs 8.2). The power limits need root and are not visible to the bench, so record them with the result. Source: the HaloPower study of 2026-10-03, dense 27B pp8192 on hipx (`qcal/release-0.4.1/power/report.md`, §2 and §4).
 
 ## Where files live
 
