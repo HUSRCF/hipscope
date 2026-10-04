@@ -449,7 +449,8 @@ pub struct GatedDeltaStepBatched<'a> {
     pub key_dim: usize,
     pub value_dim: usize,
     /// The first row's position; a Q8 state's requantization is seeded by
-    /// the last row's.
+    /// the last row's. With `row_states` (verify capture) each row also
+    /// requantizes at its own position, token-exact with [`gated_delta_step`].
     pub position: usize,
 }
 
@@ -550,7 +551,8 @@ pub struct GatedDeltaRollbackLayers<'a> {
     pub qkv_width: usize,
     pub key_heads: usize,
     pub value_heads: usize,
-    /// Position of the last kept row: seeds a Q8 state's requantization.
+    /// Position of the last kept row: a Q8 state's kept row `r` requantizes
+    /// at `position - (keep - 1) + r`, token-exact with [`gated_delta_step`].
     pub position: usize,
 }
 
@@ -5808,10 +5810,12 @@ mod tests {
 
     /// Q8 GDN state (Qwen3.5's DeltaNet Q8 format): every route tracks its
     /// F32 twin (decode steps, the persistent batch, the chunked prefill),
-    /// the verify capture writes exactly the plain batch's final state into
-    /// its ring slot, and a rollback re-run of the kept rows writes exactly
-    /// the state a plain batch over those rows does. A transposed row, a
-    /// wrong scale or a slot offset lands near 1.
+    /// and the verify capture and a rollback re-run of its kept rows are
+    /// token-exact with single-row decode (AR): the captured output and ring
+    /// slot, and the rollback slot, equal decode steps from the same state at
+    /// the same positions, bit for bit (the unarmed batch requantizes once,
+    /// so it is not their oracle). A transposed row, a wrong scale or a slot
+    /// offset lands near 1.
     #[test]
     fn gdn_q8_state_tracks_f32_on_every_route() {
         let Some(mut gpu) = try_gpu() else {
@@ -5969,19 +5973,30 @@ mod tests {
             );
             fold(&bytes(&gpu, &q8_batch_state));
 
+            // Verify capture: AR's tokens, not the unarmed batch. Its output
+            // and ring slot are `n` single-row decode steps from the same
+            // state at the same positions, bit for bit.
+            let oracle_slot = fresh_slot(&mut gpu);
+            let (seq_out, seq_states) = gdn_q8_sequential(
+                &mut gpu, &proj_gpu, &gate_gpu, &beta_gpu, &oracle_slot, n, 0, key_heads,
+                value_heads,
+            );
             let captured_state = fresh_slot(&mut gpu);
             let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
             let captured_out = batch(&mut gpu, &captured_state, Some(&ring), n);
-            assert_eq!(captured_out, q8_batch_out, "{n} rows: captured verify output differs");
+            assert!(
+                captured_out.iter().zip(&seq_out).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{n} rows: captured verify output is not single-row decode's"
+            );
             assert_eq!(
                 bytes(&gpu, &captured_state),
                 bytes(&gpu, &slot0),
                 "{n} rows: capture wrote the live state"
             );
-            assert_eq!(
-                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes)),
-                bytes(&gpu, &q8_batch_state),
-                "{n} rows: captured slot is not the plain batch's final state"
+            assert!(
+                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes))
+                    == seq_states[n - 1],
+                "{n} rows: captured slot is not single-row decode's state"
             );
 
             // Rollback: `keep` rows re-run from ring slot 0 into slot `n`. Its
@@ -6019,17 +6034,15 @@ mod tests {
                 },
             )
             .expect("rollback");
-            let kept_state = fresh_slot(&mut gpu);
-            batch(&mut gpu, &kept_state, None, keep);
-            assert_eq!(
-                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes)),
-                bytes(&gpu, &kept_state),
-                "{n} rows: rollback slot is not the kept rows' state"
+            assert!(
+                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes))
+                    == seq_states[keep - 1],
+                "{n} rows: rollback slot is not single-row decode's state after {keep} rows"
             );
-            fold(&bytes(&gpu, &kept_state));
+            fold(&seq_states[keep - 1]);
             for tensor in [
-                f32_batch_state, q8_batch_state, captured_state, ring, recurrence_gpu, table,
-                discard, kept_state,
+                f32_batch_state, q8_batch_state, oracle_slot, captured_state, ring,
+                recurrence_gpu, table, discard,
             ] {
                 gpu.free_tensor(tensor).expect("free");
             }

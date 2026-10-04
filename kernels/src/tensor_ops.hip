@@ -32,10 +32,11 @@ static __device__ __forceinline__ __hip_bfloat16 bf16_add(
 // (gated_delta_net_q8_fast.hip). Per value head, 128 rows of 128 signed
 // bytes (row = value channel, byte = key channel), then, after every head's
 // codes, one F32 scale per row (`value_heads * 128`). A row dequantizes as
-// scale * code. A launch requantizes each row once, after its last token, by
-// the row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
+// scale * code. A token requantizes each row once, after its output, by the
+// row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
 // + u), u uniform in [0, 1) from an LCG seeded by head, row, key channel and
-// frame), so repeated decay does not bias the stored state.
+// the token's frame), so repeated decay does not bias the stored state. The
+// unarmed persistent batch requantizes only after its last row.
 static __device__ __forceinline__ signed char* gdn_q8_row(void* slot, int head, int row) {
     return reinterpret_cast<signed char*>(slot) + ((size_t)head * 128 + row) * 128;
 }
@@ -378,6 +379,21 @@ __device__ __forceinline__ void gdn_lds_barrier() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
+// The absmax of a Q8 state row the persistent GDN body holds as two 64-key
+// halves (threads t and t + 128): each half's peak is exchanged through LDS,
+// then both take the max of the two, so both halves see the same row peak.
+// fmaxf is exact, so the result equals a serial absmax over all 128 keys.
+static __device__ __forceinline__ float gdn_q8_halves_peak(
+    const float (&state_half)[64], int half, int value_index) {
+    __shared__ float peak_half[2][128];
+    float peak = 0.0f;
+    #pragma unroll
+    for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
+    peak_half[half][value_index] = peak;
+    gdn_lds_barrier();
+    return fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+}
+
 // Wave-size-independent persistent row-batched path for exact 128x128 geometry.
 // A block owns one value head and 256 threads.  tid%128 is the output channel
 // and tid/128 selects the half; each thread retains 64 state values in
@@ -397,8 +413,11 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // it); a separate instantiation so the plain route's register allocation is
 // unchanged.
 // `kQ8`: `state` and the `row_states` slots are Q8 GDN state slots (see
-// gdn_q8_row) and `frame` seeds the final requantization; the recurrence
-// runs on the dequantized F32 values.
+// gdn_q8_row) and `frame` (the last row's position) seeds the final
+// requantization; the recurrence runs on the dequantized F32 values. With
+// `kCapture` too (verify and its rollback), every earlier row also
+// requantizes at its own position, as single-row decode does, so the window
+// is token-exact with AR; the unarmed batch keeps one requantization.
 template <bool kCapture, bool kQ8 = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
@@ -607,18 +626,30 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
+            // Verify capture on a Q8 state: gated_delta_step_norm128_body<true>'s
+            // per-token boundary. The row's output above used its updated F32
+            // state; the next row runs on that state requantized at the row's
+            // own frame and dequantized (scale * code, the next decode's read).
+            // The last row's requantization is the final store below.
+            if constexpr (kCapture && kQ8) {
+                if (row + 1 < rows) {
+                    const float peak = gdn_q8_halves_peak(state_half, half, value_index);
+                    const float inv = gdn_q8_inv(peak);
+                    const float scale = gdn_q8_scale(peak);
+                    const unsigned int row_frame = frame - (unsigned int)(rows - 1 - row);
+                    #pragma unroll
+                    for (int kd = 0; kd < 64; ++kd) {
+                        state_half[kd] = scale * (float)gdn_q8_round(
+                            state_half[kd], inv, value_head, value_index, kd_base + kd,
+                            row_frame);
+                    }
+                }
+            }
         }
     }
 
     if constexpr (kQ8) {
-        // The row's absmax spans both halves: exchange the half peaks.
-        __shared__ float peak_half[2][128];
-        float peak = 0.0f;
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
-        peak_half[half][value_index] = peak;
-        gdn_lds_barrier();
-        peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+        const float peak = gdn_q8_halves_peak(state_half, half, value_index);
         const float inv = gdn_q8_inv(peak);
         void* const final_slot = kCapture
             ? reinterpret_cast<signed char*>(row_states)
@@ -670,7 +701,9 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
 }
 
 // The two persistent kernels above on Q8 GDN state slots (`row_states`: a
-// ring of slots); `frame` seeds the final requantization.
+// ring of slots); `frame`, the last row's position, seeds the final
+// requantization, and the capture's row `r` of `rows` requantizes at
+// `frame - (rows - 1) + r` (single-row decode's per-token boundary).
 __launch_bounds__(256)
 extern "C" __global__ void gated_delta_step_halves_state128_persistent256_q8(
     const float* projection, const float* gate, const float* beta, signed char* state,
@@ -712,7 +745,9 @@ extern "C" __global__ void gated_delta_rollback_layers_f32(
         ring + to * state, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale);
 }
 
-// gated_delta_rollback_layers_f32 over rings of Q8 GDN state slots.
+// gated_delta_rollback_layers_f32 over rings of Q8 GDN state slots; `frame`
+// is the last kept row's position, so each kept row requantizes at its own
+// position and slot `to + keep - 1` is single-row decode's state.
 __launch_bounds__(256)
 extern "C" __global__ void gated_delta_rollback_layers_q8(
     const unsigned long long* table, float* discard, int rows, int keep, int from, int to,
