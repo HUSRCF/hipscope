@@ -277,6 +277,8 @@ pub struct FeatureFlags {
     /// exact-gfx1100-only. Capture/replay keep the historical base. Set
     /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
     pub gate_up_ldsstage: bool,
+    /// Default-off exact-K5120 MQ4V2 gate/up decode experiment on gfx1100.
+    pub mq4v2_gateup_k5120: bool,
     /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0` opts out of the gfx1201 FP8-WMMA MQ4v2
     /// gate_up prefill candidate (N=384, eager HIP only). Default ON on exact
     /// gfx1201; `=1` forces it on other arches (launchers stay gfx1201-only).
@@ -852,6 +854,7 @@ impl FeatureFlags {
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(false),
             gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
@@ -1149,6 +1152,11 @@ impl FeatureFlags {
     pub fn dec_norm_grids_enabled(&self) -> bool {
         self.g12_dec_norm_enabled() || self.gfx1100_dec_norm_enabled()
     }
+    pub fn mq4v2_gateup_k5120_enabled(&self, gate_m: usize, up_m: usize, k: usize) -> bool {
+        self.mq4v2_gateup_k5120
+            && self.arch == "gfx1100"
+            && (gate_m, up_m, k) == (17408, 17408, 5120)
+    }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
     /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
     /// so output is bit-identical to the standalone
@@ -1329,6 +1337,7 @@ impl FeatureFlags {
             gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
+            mq4v2_gateup_k5120: false,
             gfx12_mq4v2_fp8_gateup: false,
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
@@ -1398,6 +1407,32 @@ impl FeatureFlags {
 mod tests {
     use super::*;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn mq4v2_gateup_k5120_is_opt_in_exact_arch_and_shape() {
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx906"] {
+            let off = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(!off.mq4v2_gateup_k5120_enabled(17408, 17408, 5120));
+            let on = FeatureFlags::from_lookup(arch, |name| {
+                if name == "HIPFIRE_MQ4V2_GATEUP_K5120" {
+                    Ok("1".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(
+                on.mq4v2_gateup_k5120_enabled(17408, 17408, 5120),
+                arch == "gfx1100"
+            );
+            for (gate_m, up_m, k) in [
+                (17408, 17408, 2816),
+                (17407, 17408, 5120),
+                (17408, 17409, 5120),
+            ] {
+                assert!(!on.mq4v2_gateup_k5120_enabled(gate_m, up_m, k));
+            }
+        }
+    }
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
