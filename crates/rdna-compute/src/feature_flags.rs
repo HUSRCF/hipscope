@@ -1420,6 +1420,41 @@ mod tests {
     }
 
     #[test]
+    fn mq4v2_gateup_k5120_process_config_roundtrip() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1100", &defaults)
+            .mq4v2_gateup_k5120_enabled(17408, 17408, 5120));
+
+        for key in ["kernel.mq4v2_gateup_k5120", "mq4v2_gateup_k5120"] {
+            for (value, expected) in [("true", true), ("false", false)] {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli(key, value).unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser {
+                        path: "config.toml".into(),
+                    },
+                    layer,
+                }])
+                .unwrap();
+                let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                let wire = serde_json::to_string(&process).unwrap();
+                let decoded: ProcessConfig = serde_json::from_str(&wire).unwrap();
+                assert_eq!(
+                    decoded.legacy_value("HIPFIRE_MQ4V2_GATEUP_K5120"),
+                    Some(if expected { "1" } else { "0" }.to_string())
+                );
+                for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201"] {
+                    let flags = FeatureFlags::from_process_config(arch, &decoded);
+                    assert_eq!(
+                        flags.mq4v2_gateup_k5120_enabled(17408, 17408, 5120),
+                        expected && arch == "gfx1100"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1151");
         assert!(!f.force_unfused);
