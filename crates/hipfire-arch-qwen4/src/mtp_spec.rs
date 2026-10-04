@@ -1396,7 +1396,8 @@ pub fn native_mtp_device_bytes(
         .checked_mul(std::mem::size_of::<f32>())?;
     let verify_rows = rows.max(max_seq.min(chunk_rows));
     let capture = if row_capture {
-        crate::state::Qwen4State::row_capture_bytes(config, rows)?
+        // S3: thread the real GDN format
+        crate::state::Qwen4State::row_capture_bytes(config, crate::GdnStateFormat::F32, rows)?
     } else {
         0
     };
