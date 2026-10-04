@@ -700,13 +700,22 @@ Caveats that are part of the fixture, not trivia:
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
-  interleaved. The few-row (2..8) verify forward is bitwise the single-row
-  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
-  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
-  rolls back without re-running the accepted rows; elsewhere the batched
-  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
-  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
-  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  interleaved. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  AR target's single-row route. Do not assume batched verification is
+  token-identical when GDN recurrent state is Q8: the current persistent
+  verify/rollback kernel quantizes once per window, whereas AR quantizes
+  after every token. On the canonical GPTQ3 MQ4 Flash-Next artifact on
+  gfx1151, p1 greedy batched MTP diverges from AR (first generated token
+  difference at index 112 with forced batching; adaptive at 130), while
+  interleaved matches all 1200 IDs in three fresh-process runs. The old
+  blanket bit-exactness claim is false for this Q8 path. A per-token
+  Q8-boundary repair must pass the real-prompt and recurrence oracle before
+  that claim is reinstated. On GPUs whose GDN route captures per-row states
+  (gfx11+ SIMT) a rejected suffix rolls back without re-running the accepted
+  rows; elsewhere the batched route restores and replays. Drafts rank the
+  vocabulary with an MQ2 copy of the LM head and re-score its top 8 exactly
+  against the head's own Q8_0 or MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`,
+  default `mq2r`).
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
