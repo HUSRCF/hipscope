@@ -5555,6 +5555,257 @@ mod tests {
         }
     }
 
+    /// Repeated single-row Q8 decode ([`gated_delta_step`], AR's route) of
+    /// the first `n` rows of a packed `[rows, qkv]` projection on `slot`, row
+    /// `r` at absolute position `start + r`: every row's recurrence output,
+    /// and the slot's bytes after every row. The token-exact oracle for the
+    /// verify capture and its rollback.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_q8_sequential(
+        gpu: &mut Gpu,
+        projection: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        slot: &GpuTensor,
+        n: usize,
+        start: usize,
+        key_heads: usize,
+        value_heads: usize,
+    ) -> (Vec<f32>, Vec<Vec<u8>>) {
+        let (qk, value) = (key_heads * 128, value_heads * 128);
+        let qkv = 2 * qk + value;
+        let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+        let mut states = Vec::with_capacity(n);
+        for row in 0..n {
+            gated_delta_step(
+                gpu,
+                &GatedDeltaStep {
+                    q: &projection.sub_offset(row * qkv, qk),
+                    k: &projection.sub_offset(row * qkv + qk, qk),
+                    v: &projection.sub_offset(row * qkv + 2 * qk, value),
+                    gate: &gate.sub_offset(row * value_heads, value_heads),
+                    beta: &beta.sub_offset(row * value_heads, value_heads),
+                    state: slot,
+                    output: &out.sub_offset(row * value, value),
+                    key_heads,
+                    value_heads,
+                    key_dim: 128,
+                    value_dim: 128,
+                    position: start + row,
+                },
+            )
+            .expect("GDN step");
+            gpu.hip.device_synchronize().expect("sync");
+            let mut bytes = vec![0u8; slot.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &slot.buf).expect("download");
+            states.push(bytes);
+        }
+        let values = gpu.download_f32(&out).expect("download");
+        gpu.free_tensor(out).expect("free");
+        (values, states)
+    }
+
+    /// Verify capture and rollback on a Q8 state are token-exact: from a
+    /// nonzero seed state at a nonzero absolute position, a 2..8-row captured
+    /// window's recurrence output and its ring slot, and every kept prefix's
+    /// rollback state and output, equal repeated single-row decode (AR) at
+    /// the same positions bit for bit; the live state and the rollback's
+    /// source slot stay untouched. A HIP-graph replay of the same launches
+    /// meets the same sequential oracle.
+    #[test]
+    fn gdn_q8_verify_matches_single_row() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 8usize);
+        // Nonzero: every Q8 rounding is seeded by the absolute position.
+        let start = 1157usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let slot_bytes = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(11, max_rows * qkv, 1.5);
+        let gate: Vec<f32> =
+            wave(12, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> =
+            wave(13, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(14, value * dim, 0.2);
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), slot0.buf.as_ptr(), value_heads, Some(start as u32 - 1))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            gpu.hip.device_synchronize().expect("sync");
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        let seed_bytes = bytes(&gpu, &slot0);
+        assert!(seed_bytes.iter().any(|b| *b != 0), "seed state is zero");
+        let fresh_slot = |gpu: &mut Gpu| -> GpuTensor {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+            slot
+        };
+        gpu.ensure_capture_stream().expect("stream");
+
+        // Every mismatch is collected, then asserted, so one run reports
+        // exactly which rows and prefixes leave the sequential oracle.
+        let mut failures: Vec<String> = Vec::new();
+        for graph in [false, true] {
+            for n in 2..=max_rows {
+                let oracle_slot = fresh_slot(&mut gpu);
+                let (seq_out, seq_states) = gdn_q8_sequential(
+                    &mut gpu, &proj_gpu, &gate_gpu, &beta_gpu, &oracle_slot, n, start, key_heads,
+                    value_heads,
+                );
+
+                let live = fresh_slot(&mut gpu);
+                let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+                // Ring: slot 0 the rollback source (the pre-verify state), the
+                // capture lands in slot n - 1, rollback `keep` in n + keep - 1.
+                let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
+                gpu.copy_d2d(&slot0, &ring, slot_bytes).expect("seed ring");
+                let recurrence: Vec<f32> = projection[..n * qkv]
+                    .iter()
+                    .chain(&gate[..n * value_heads])
+                    .chain(&beta[..n * value_heads])
+                    .copied()
+                    .collect();
+                let recurrence_gpu =
+                    gpu.upload_f32(&recurrence, &[recurrence.len()]).expect("recurrence");
+                let pointers: Vec<u8> = [recurrence_gpu.buf.as_ptr(), ring.buf.as_ptr()]
+                    .iter()
+                    .flat_map(|p| (*p as u64).to_ne_bytes())
+                    .collect();
+                let table = gpu.upload_raw(&pointers, &[pointers.len()]).expect("table");
+                // One `[keep, value]` output region per kept prefix.
+                let discard = gpu.zeros(&[n * n * value], DType::F32).expect("discard");
+                let launch = |gpu: &mut Gpu| {
+                    gated_delta_step_batched(
+                        gpu,
+                        &GatedDeltaStepBatched {
+                            projection: &proj_gpu.sub_offset(0, n * qkv),
+                            gate: &gate_gpu.sub_offset(0, n * value_heads),
+                            beta: &beta_gpu.sub_offset(0, n * value_heads),
+                            state: &live,
+                            output: &out,
+                            row_states: Some(&ring),
+                            rows: n,
+                            qkv_width: qkv,
+                            key_heads,
+                            value_heads,
+                            key_dim: dim,
+                            value_dim: dim,
+                            position: start,
+                        },
+                    )
+                    .expect("captured verify");
+                    for keep in 1..=n {
+                        gated_delta_rollback_layers(
+                            gpu,
+                            &GatedDeltaRollbackLayers {
+                                table: &table,
+                                discard: &discard.sub_offset((keep - 1) * n * value, keep * value),
+                                format,
+                                layers: 1,
+                                rows: n,
+                                keep,
+                                from: 0,
+                                to: n,
+                                qkv_width: qkv,
+                                key_heads,
+                                value_heads,
+                                position: start + keep - 1,
+                            },
+                        )
+                        .expect("rollback");
+                    }
+                };
+                if graph {
+                    // Kernels are warm from the direct pass; the capture only
+                    // records, so the buffers above are what the replay sees.
+                    let stream = gpu.active_stream.take().expect("stream");
+                    gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream).expect("begin capture");
+                    gpu.active_stream = Some(stream);
+                    launch(&mut gpu);
+                    let stream = gpu.active_stream.take().expect("stream");
+                    gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream).expect("end capture");
+                    gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, &stream).expect("replay");
+                    gpu.active_stream = Some(stream);
+                    gpu.hip.device_synchronize().expect("sync");
+                    gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+                } else {
+                    launch(&mut gpu);
+                }
+
+                let tag = format!("{} n={n}", if graph { "graph" } else { "direct" });
+                gpu.hip.device_synchronize().expect("sync");
+                let verify_out = gpu.download_f32(&out).expect("download");
+                let row_diff = |a: &[f32], b: &[f32]| -> Vec<(usize, usize)> {
+                    (0..a.len() / value)
+                        .map(|r| {
+                            let (x, y) = (&a[r * value..][..value], &b[r * value..][..value]);
+                            (r, x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count())
+                        })
+                        .filter(|(_, d)| *d > 0)
+                        .collect()
+                };
+                let diff = row_diff(&verify_out, &seq_out);
+                if !diff.is_empty() {
+                    failures.push(format!("{tag}: verify output (row, differing f32s) {diff:?}"));
+                }
+                let slot_diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(p, q)| p != q).count();
+                let captured = bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes));
+                let d = slot_diff(&captured, &seq_states[n - 1]);
+                if d > 0 {
+                    failures.push(format!("{tag}: captured slot differs from AR in {d} bytes"));
+                }
+                if bytes(&gpu, &live) != seed_bytes {
+                    failures.push(format!("{tag}: capture wrote the live state"));
+                }
+                if bytes(&gpu, &ring.sub_offset(0, slot_bytes)) != seed_bytes {
+                    failures.push(format!("{tag}: rollback wrote its source slot"));
+                }
+                let rollback_out = gpu.download_f32(&discard).expect("download");
+                for keep in 1..=n {
+                    let kept = bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes));
+                    let d = slot_diff(&kept, &seq_states[keep - 1]);
+                    if d > 0 {
+                        failures.push(format!("{tag} keep={keep}: rollback slot differs from AR in {d} bytes"));
+                    }
+                    let diff = row_diff(&rollback_out[(keep - 1) * n * value..][..keep * value], &seq_out[..keep * value]);
+                    if !diff.is_empty() {
+                        failures.push(format!("{tag} keep={keep}: rollback output (row, differing f32s) {diff:?}"));
+                    }
+                }
+                for tensor in [oracle_slot, live, out, ring, recurrence_gpu, table, discard] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        for failure in &failures {
+            eprintln!("GDN_Q8_SEAM {failure}");
+        }
+        assert!(failures.is_empty(), "{} Q8 verify/rollback seams leave AR", failures.len());
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
     /// Q8 GDN state (Qwen3.5's DeltaNet Q8 format): every route tracks its
     /// F32 twin (decode steps, the persistent batch, the chunked prefill),
     /// the verify capture writes exactly the plain batch's final state into
