@@ -97,7 +97,8 @@ pub(crate) fn decode_gpu_metrics(blob: &[u8]) -> Metrics {
         return Metrics::Unsupported("malformed".into());
     }
     match (format, content) {
-        (3, 0) if size == v3_0::SIZE => {
+        (3, 0) if size != v3_0::SIZE => Metrics::Unsupported("malformed".into()),
+        (3, 0) => {
             let u16_at = |at: usize| {
                 let value = u16::from_le_bytes([blob[at], blob[at + 1]]);
                 (value != u16::MAX).then_some(f64::from(value))
@@ -818,4 +819,363 @@ pub(crate) fn throttle_warning(runs: &[RunPower]) -> Option<String> {
 /// Per-run `power` array for a report.
 pub(crate) fn runs_json(runs: &[RunPower]) -> Value {
     Value::Array(runs.iter().map(|run| run.json.clone()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Real blobs from hipx (Strix Halo, gfx1151, kernel 7.0.0-38), read from
+    /// `/sys/class/drm/card*/device/gpu_metrics` on 2026-10-04: idle, and two
+    /// reads 2.047 s apart inside a dense-27B pp8192 prefill; plus the
+    /// gfx1100 dGPU in the same host, which reports format 1.3.
+    const HALO_IDLE: &[u8] = include_bytes!("../testdata/gpu_metrics/halo-gfx1151-v3.0-idle.bin");
+    const HALO_PP8192_A: &[u8] =
+        include_bytes!("../testdata/gpu_metrics/halo-gfx1151-v3.0-pp8192-a.bin");
+    const HALO_PP8192_B: &[u8] =
+        include_bytes!("../testdata/gpu_metrics/halo-gfx1151-v3.0-pp8192-b.bin");
+    /// Wall-clock gap between the two pp8192 reads (`date +%s.%N`).
+    const PP8192_GAP: Duration = Duration::from_nanos(2_047_438_726);
+    const GFX1100_V1_3: &[u8] = include_bytes!("../testdata/gpu_metrics/gfx1100-v1.3.bin");
+
+    fn v3(blob: &[u8]) -> MetricsV3 {
+        match decode_gpu_metrics(blob) {
+            Metrics::V3_0(metrics) => metrics,
+            other => panic!("expected a v3.0 decode, got {other:?}"),
+        }
+    }
+
+    fn sample(at: Instant, blob: &[u8]) -> Sample {
+        Sample {
+            at,
+            metrics: decode_gpu_metrics(blob),
+            hwmon: Vec::new(),
+            tctl_c: None,
+        }
+    }
+
+    #[test]
+    fn decodes_real_halo_v3_0_blobs() {
+        let load = v3(HALO_PP8192_A);
+        assert_eq!(load.gfx_temp_c, Some(86.88));
+        assert_eq!(load.socket_power_w, Some(155.296));
+        assert_eq!(load.gfx_power_w, Some(57.509));
+        assert_eq!(load.gfxclk_mhz, Some(2837.0));
+        assert_eq!(load.fclk_mhz, Some(1626.0));
+        assert_eq!(load.gfx_maxfreq_mhz, Some(2779.0));
+        assert_eq!(
+            load.throttle_ms,
+            [0, 187, 1_170_403, 116_278, 14_332, 911_199, 0].map(Some)
+        );
+
+        let idle = v3(HALO_IDLE);
+        assert_eq!(idle.gfx_temp_c, Some(38.38));
+        assert_eq!(idle.gfxclk_mhz, Some(601.0));
+        assert_eq!(idle.gfx_maxfreq_mhz, Some(2900.0));
+    }
+
+    #[test]
+    fn other_formats_and_bad_headers_are_not_decoded() {
+        assert_eq!(
+            decode_gpu_metrics(GFX1100_V1_3),
+            Metrics::Unsupported("1.3".into())
+        );
+
+        let mut unknown_content = HALO_PP8192_A.to_vec();
+        unknown_content[3] = 9;
+        assert_eq!(
+            decode_gpu_metrics(&unknown_content),
+            Metrics::Unsupported("3.9".into())
+        );
+
+        let mut unknown_format = HALO_PP8192_A.to_vec();
+        unknown_format[2] = 9;
+        assert_eq!(
+            decode_gpu_metrics(&unknown_format),
+            Metrics::Unsupported("9.0".into())
+        );
+
+        // A v3.0 header whose size is not the v3.0 struct, a blob shorter
+        // than its header claims, and one too short for a header.
+        let mut resized = HALO_PP8192_A.to_vec();
+        resized[0..2].copy_from_slice(&256u16.to_le_bytes());
+        for blob in [&resized[..], &HALO_PP8192_A[..200], &HALO_PP8192_A[..3]] {
+            assert_eq!(
+                decode_gpu_metrics(blob),
+                Metrics::Unsupported("malformed".into())
+            );
+        }
+    }
+
+    #[test]
+    fn all_ones_fields_are_unavailable() {
+        let mut blob = HALO_PP8192_A.to_vec();
+        blob[v3_0::TEMPERATURE_GFX..v3_0::TEMPERATURE_GFX + 2].fill(0xff);
+        let fppt = v3_0::THROTTLE_RESIDENCY + 8;
+        blob[fppt..fppt + 4].fill(0xff);
+        let metrics = v3(&blob);
+        assert_eq!(metrics.gfx_temp_c, None);
+        assert_eq!(metrics.throttle_ms[2], None);
+        assert_eq!(metrics.throttle_ms[1], Some(187));
+
+        let t0 = Instant::now();
+        let run = summarize(
+            &[sample(t0, &blob), sample(t0 + PP8192_GAP, &blob)],
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(run.json["gfx_temp_c_max"], UNAVAILABLE);
+        assert_eq!(run.json["throttle_pct"]["fast_ppt"], UNAVAILABLE);
+        assert_eq!(run.json["throttle_pct"]["stapm"], 0.0);
+    }
+
+    #[test]
+    fn residency_is_counter_increase_over_wall_time() {
+        let t0 = Instant::now();
+        let run = summarize(
+            &[
+                sample(t0, HALO_PP8192_A),
+                sample(t0 + PP8192_GAP, HALO_PP8192_B),
+            ],
+            Some("auto".into()),
+            None,
+            &[],
+        );
+        // 1_172_170 - 1_170_403 = 1767 ms of fast PPT in 2047.4 ms.
+        assert_eq!(run.json["throttle_pct"]["fast_ppt"], 86.3);
+        assert_eq!(run.json["throttle_pct"]["thm_gfx"], 0.0);
+        assert_eq!(run.json["gpu_metrics_format"], "3.0");
+        assert_eq!(run.json["gfx_temp_c_max"], 86.9);
+        assert_eq!(run.json["socket_power_w"]["avg"], 155.4);
+        assert_eq!(run.json["perf_level"], "auto");
+        assert_eq!(run.json["od_sclk"], UNAVAILABLE);
+        let warning = throttle_warning(std::slice::from_ref(&run)).expect("86% fast PPT warns");
+        assert!(warning.contains("1/1 measured runs"), "{warning}");
+        assert!(warning.contains("fast_ppt 86%"), "{warning}");
+
+        // A counter that wraps past u32::MAX still yields its increase.
+        let mut before = HALO_PP8192_A.to_vec();
+        let mut after = HALO_PP8192_A.to_vec();
+        let thm_gfx = v3_0::THROTTLE_RESIDENCY + 20;
+        before[thm_gfx..thm_gfx + 4].copy_from_slice(&(u32::MAX - 100).to_le_bytes());
+        after[thm_gfx..thm_gfx + 4].copy_from_slice(&400u32.to_le_bytes());
+        let wrapped = summarize(
+            &[
+                sample(t0, &before),
+                sample(t0 + Duration::from_secs(1), &after),
+            ],
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(wrapped.json["throttle_pct"]["thm_gfx"], 50.1);
+    }
+
+    #[test]
+    fn residency_at_or_below_threshold_does_not_warn() {
+        let t0 = Instant::now();
+        let mut later = HALO_PP8192_A.to_vec();
+        let fppt = v3_0::THROTTLE_RESIDENCY + 8;
+        let counter = 1_170_403u32 + 100; // 100 ms in 1 s: exactly 10 %.
+        later[fppt..fppt + 4].copy_from_slice(&counter.to_le_bytes());
+        let run = summarize(
+            &[
+                sample(t0, HALO_PP8192_A),
+                sample(t0 + Duration::from_secs(1), &later),
+            ],
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(run.json["throttle_pct"]["fast_ppt"], 10.0);
+        assert_eq!(throttle_warning(&[run]), None);
+        // One sample, or none, gives no residency and no warning.
+        let single = summarize(&[sample(t0, HALO_PP8192_A)], None, None, &[]);
+        assert_eq!(single.json["throttle_pct"], UNAVAILABLE);
+        assert_eq!(throttle_warning(&[single]), None);
+    }
+
+    #[test]
+    fn parses_od_sclk_levels_and_range() {
+        // Verbatim from hipx card1.
+        let text = "OD_SCLK:\n0:        600Mhz\n1:       2900Mhz\nOD_RANGE:\nSCLK:     600Mhz       2900Mhz\n";
+        assert_eq!(
+            parse_od_sclk(text),
+            Some(OdSclk {
+                min_mhz: Some(600.0),
+                max_mhz: Some(2900.0),
+                range_min_mhz: Some(600.0),
+                range_max_mhz: Some(2900.0),
+            })
+        );
+        assert_eq!(parse_od_sclk("OD_MCLK:\n0: 96Mhz\n"), None);
+    }
+
+    /// A sysfs/procfs tree under a temp dir: a CPU node, a gfx1100 dGPU at
+    /// 66:00.0 (card0) and a gfx1151 APU at bf:00.0 (card1).
+    struct FakeHost {
+        root: PathBuf,
+        apu: PathBuf,
+    }
+
+    impl FakeHost {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "hipfire-bench-power-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            let nodes = root.join("sys/class/kfd/kfd/topology/nodes");
+            for (node, properties) in [
+                ("0", "cpu_cores_count 16\nsimd_count 0\n"),
+                ("1", "simd_count 192\nlocation_id 26112\ndomain 0\ngfx_target_version 110000\nunique_id 4660\n"),
+                ("2", "simd_count 80\nlocation_id 48896\ndomain 0\ngfx_target_version 110501\nunique_id 0\n"),
+            ] {
+                fs::create_dir_all(nodes.join(node)).unwrap();
+                fs::write(nodes.join(node).join("properties"), properties).unwrap();
+            }
+            let pci = root.join("sys/devices/pci0000:00");
+            for (card, bdf) in [("card0", "0000:66:00.0"), ("card1", "0000:bf:00.0")] {
+                fs::create_dir_all(pci.join(bdf)).unwrap();
+                let drm = root.join("sys/class/drm").join(card);
+                fs::create_dir_all(&drm).unwrap();
+                std::os::unix::fs::symlink(pci.join(bdf), drm.join("device")).unwrap();
+            }
+            let apu = pci.join("0000:bf:00.0");
+            for (file, text) in [
+                ("power_dpm_force_performance_level", "auto\n"),
+                (
+                    "pp_od_clk_voltage",
+                    "OD_SCLK:\n0:        600Mhz\n1:       2900Mhz\nOD_RANGE:\nSCLK:     600Mhz       2900Mhz\n",
+                ),
+                ("mem_info_vram_total", "103079215104\n"),
+                ("mem_info_vram_used", "21563965440\n"),
+                ("mem_info_gtt_total", "16363954176\n"),
+            ] {
+                fs::write(apu.join(file), text).unwrap();
+            }
+            let hwmon = apu.join("hwmon/hwmon5");
+            fs::create_dir_all(&hwmon).unwrap();
+            for (file, text) in [
+                ("name", "amdgpu\n"),
+                ("temp1_input", "61000\n"),
+                ("temp1_label", "edge\n"),
+                ("power1_average", "98000000\n"),
+                ("power1_input", "1\n"),
+                ("power1_label", "PPT\n"),
+                ("freq1_input", "2900000000\n"),
+                ("freq1_label", "sclk\n"),
+            ] {
+                fs::write(hwmon.join(file), text).unwrap();
+            }
+            let k10 = root.join("sys/class/hwmon/hwmon3");
+            fs::create_dir_all(&k10).unwrap();
+            fs::write(k10.join("name"), "k10temp\n").unwrap();
+            fs::write(k10.join("temp1_input"), "70250\n").unwrap();
+            fs::write(k10.join("temp1_label"), "Tctl\n").unwrap();
+            fs::create_dir_all(root.join("proc")).unwrap();
+            fs::write(
+                root.join("proc/meminfo"),
+                "MemTotal:       31960776 kB\nMemFree:         4000000 kB\nMemAvailable:   27705600 kB\n",
+            )
+            .unwrap();
+            Self { root, apu }
+        }
+
+        fn run(&self) -> Value {
+            let probe = PowerProbe::at(&self.root, Some("0000:bf:00.0"), None, Some("gfx1151"));
+            probe.start_run().finish().json
+        }
+    }
+
+    impl Drop for FakeHost {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn resolves_the_daemons_card() {
+        let host = FakeHost::new("resolve");
+        let by_spec = resolve_device(&host.root, Some("gfx1151"), Some("0"), None).unwrap();
+        assert_eq!(
+            (by_spec.card.as_deref(), by_spec.pci.as_str()),
+            (Some("card1"), "0000:bf:00.0")
+        );
+        assert_eq!(by_spec.selected_by, "hardware.devices=gfx1151");
+
+        // hardware.devices wins over ROCR_VISIBLE_DEVICES; without it the
+        // first ROCr entry (ordinal or UUID) names the card.
+        let by_ordinal = resolve_device(&host.root, None, Some("1,0"), None).unwrap();
+        assert_eq!(by_ordinal.card.as_deref(), Some("card1"));
+        let by_uuid = resolve_device(&host.root, None, Some("GPU-0000000000001234"), None).unwrap();
+        assert_eq!(by_uuid.card.as_deref(), Some("card0"));
+
+        let unfiltered = resolve_device(&host.root, None, None, Some("gfx1151")).unwrap();
+        assert_eq!(unfiltered.pci, "0000:bf:00.0");
+        assert!(resolve_device(&host.root, None, None, Some("gfx1201")).is_err());
+        assert!(resolve_device(&host.root, None, Some("7"), None).is_err());
+    }
+
+    #[test]
+    fn missing_or_unknown_gpu_metrics_keeps_hwmon_and_sysfs() {
+        let host = FakeHost::new("degrade");
+        let missing = host.run();
+        assert_eq!(missing["gpu_metrics_format"], UNAVAILABLE);
+        for field in [
+            "gfxclk_mhz",
+            "socket_power_w",
+            "gfx_temp_c_max",
+            "fclk_mhz_avg",
+            "throttle_pct",
+        ] {
+            assert_eq!(missing[field], UNAVAILABLE, "{field}");
+        }
+        assert_eq!(missing["hwmon"]["power_w"]["ppt"]["avg"], 98.0);
+        assert_eq!(missing["hwmon"]["temp_c"]["edge"]["max"], 61.0);
+        assert_eq!(missing["hwmon"]["freq_mhz"]["sclk"]["max"], 2900.0);
+        assert_eq!(missing["tctl_c_max"], 70.3);
+        assert_eq!(missing["perf_level"], "auto");
+        assert_eq!(missing["od_sclk"]["max_mhz"], 2900.0);
+        assert_eq!(missing["memory"]["vram_total_mib"], 98304.0);
+        assert_eq!(missing["memory"]["vram_free_mib"], 77739.0);
+        assert_eq!(missing["memory"]["gtt_total_mib"], 15605.9);
+        assert_eq!(missing["memory"]["gtt_used_mib"], UNAVAILABLE);
+        assert_eq!(missing["memory"]["gtt_free_mib"], UNAVAILABLE);
+        assert_eq!(missing["memory"]["mem_available_mib"], 27056.3);
+
+        fs::write(host.apu.join("gpu_metrics"), GFX1100_V1_3).unwrap();
+        let unknown = host.run();
+        assert_eq!(unknown["gpu_metrics_format"], "1.3");
+        assert_eq!(unknown["gfxclk_mhz"], UNAVAILABLE);
+        assert_eq!(unknown["hwmon"]["power_w"]["ppt"]["avg"], 98.0);
+
+        fs::write(host.apu.join("gpu_metrics"), HALO_PP8192_A).unwrap();
+        let decoded = host.run();
+        assert_eq!(decoded["gpu_metrics_format"], "3.0");
+        assert_eq!(decoded["gfxclk_mhz"]["max"], 2837.0);
+    }
+
+    #[test]
+    fn unresolvable_device_reports_why() {
+        let host = FakeHost::new("nodevice");
+        let probe = PowerProbe::at(&host.root, Some("0000:01:00.0"), None, None);
+        let device = probe.device_json();
+        assert_eq!(device["status"], UNAVAILABLE);
+        assert!(device["reason"]
+            .as_str()
+            .unwrap()
+            .contains("matches no GPU"));
+        let run = probe.start_run().finish().json;
+        assert_eq!(run["gpu_metrics_format"], UNAVAILABLE);
+        assert_eq!(run["hwmon"], UNAVAILABLE);
+        assert_eq!(run["memory"]["vram_total_mib"], UNAVAILABLE);
+        assert_eq!(run["memory"]["mem_total_mib"], 31211.7);
+        assert_eq!(run["tctl_c_max"], 70.3);
+    }
 }
