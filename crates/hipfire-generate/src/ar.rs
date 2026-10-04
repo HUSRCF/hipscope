@@ -2202,12 +2202,11 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     }
     on_commit(m);
     // Store the verbatim emitted assistant token span under the same
-    // fingerprint / trailer trim / whole-envelope shape the MTP route stores
-    // (`generate_dflash`: `qwen_dflash_cache_seq` + `qwen_dflash_apply_cache_action`),
-    // so the next turn of EITHER route splices these exact IDs instead of
-    // re-encoding the decoded text. `finish.store_cache` already excludes
-    // length-capped, stop-sequence, malformed and open-think terminals; a
-    // client abort returned above.
+    // fingerprint / trailer trim / value contract (`qwen_cached_turn_entry`) the
+    // MTP route stores, so the next turn of EITHER route splices these exact
+    // IDs instead of re-encoding the decoded text. `finish.store_cache` already
+    // excludes length-capped, stop-sequence, malformed and open-think
+    // terminals; a client abort returned above.
     let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
     if cache_action.store {
         let tok = m.tokenizer.as_ref().unwrap();
@@ -2221,25 +2220,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         let cached_seq = crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
         let _ = qwen_ar_apply_cache_action(
             |fp, seq| {
-                let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
-                    tok,
-                    &seq,
-                    started_in_think,
-                )
-                .map(|text| hipfire_runtime::prompt_frame::CachedAssistantBody {
-                    token_ids: Vec::new(),
-                    text,
-                });
                 m.asst_turn_cache.insert(
                     fp,
-                    hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                        reasoning,
-                        tools: Vec::new(),
-                        content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: seq,
-                            text: String::new(),
-                        }),
-                    },
+                    crate::qwen::qwen_cached_turn_entry(tok, seq, started_in_think),
                 );
             },
             &cache_action,
@@ -5727,34 +5710,14 @@ pub fn generate(
                         .collect::<String>(),
                 );
             }
-            // Whole-envelope store (Qwen branch only): FULL generated body
-            // verbatim plus the producer reasoning text. The shared lookup
-            // replays R...A as one span on think-envelope templates;
-            // no-reasoning turns keep the primer-prepended single-slot path.
+            // Shared AR/spec value contract (`qwen_cached_turn_entry`): FULL
+            // generated body verbatim plus the producer reasoning text.
             let tok = m.tokenizer.as_ref().unwrap();
             let _ = qwen_ar_apply_cache_action(
                 |fp, seq| {
-                    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
-                        tok,
-                        &seq,
-                        started_in_think,
-                    )
-                    .map(|text| {
-                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: Vec::new(),
-                            text,
-                        }
-                    });
                     m.asst_turn_cache.insert(
                         fp,
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning,
-                            tools: Vec::new(),
-                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                token_ids: seq,
-                                text: String::new(),
-                            }),
-                        },
+                        crate::qwen::qwen_cached_turn_entry(tok, seq, started_in_think),
                     )
                 },
                 &cache_action,
