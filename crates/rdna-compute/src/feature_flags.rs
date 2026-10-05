@@ -68,10 +68,10 @@ pub struct FeatureFlags {
     pub qwen4_gdn_q8_inline: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
-    /// 3 on gfx1151, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
+    /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
     pub qwen4_hc_fuse: u8,
     /// Retiled HC up+mix read tail (`HIPFIRE_QWEN4_HC_UP_TILE`), default on
-    /// for gfx1151, off elsewhere.
+    /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_hc_up_tile: bool,
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
@@ -593,13 +593,15 @@ impl FeatureFlags {
         let is_gfx906 = arch == "gfx906";
         // The bytewise-identical Halo hyper units (H5 GDN conv+Q/K norm, H4
         // HC fusion level 3, H3 HC up tile, H8a combine zero-init) default on
-        // for exact gfx1151 only; gfx1201 keeps the ones that hook into its
-        // opt-in F16 WMMA route opt-in.
+        // for exact gfx1151 only; gfx1201 takes its own subset below.
         let halo_hyper_default = arch == "gfx1151";
         // The exact units that do not need the F16 WMMA route (H8a combine
         // zero-init, wave-per-token router, fused PLE tail) default on for
         // exact gfx1151 and gfx1201.
         let exact_unit_default = matches!(arch, "gfx1151" | "gfx1201");
+        // gfx1201 takes the H1 pairing and the retiled HC up+mix on its
+        // default F16 WMMA HC read (levels 2/3 measured slower there).
+        let is_gfx1201 = arch == "gfx1201";
 
         let mmq_screen_default: bool = false;
         let mmq_screen_threshold_default: f32 = if is_gfx906 { 0.50 } else { 0.10 };
@@ -692,8 +694,9 @@ impl FeatureFlags {
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
-                .unwrap_or(if halo_hyper_default { 3 } else { 0 }),
-            qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE").unwrap_or(halo_hyper_default),
+                .unwrap_or(if halo_hyper_default { 3 } else if is_gfx1201 { 1 } else { 0 }),
+            qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE")
+                .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),

@@ -179,14 +179,15 @@ fn gfx12_bt_tile(batch_size: usize) -> usize {
 pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
-/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` opts gfx1201 into its gfx12 WMMA
-/// kernels for the F16 WMMA route (the BF16 projections and the HC read).
-/// Default off: real-activation G1-F16 accumulation bounds are not met.
+/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201` runs gfx1201's F16 WMMA route on its
+/// gfx12 WMMA kernels (the BF16 projections and the HC read). Default on:
+/// not bit-exact, admitted by the Flash-Next KLD check against the BF16
+/// teacher; `0` keeps the multirow/SIMT arms.
 /// The M=1 shared selector remains on exact multirow; U1a owns its fusion.
 /// Capture/retained recording and other arches keep their existing routes.
 pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", false)
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
 /// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
 static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
@@ -27832,7 +27833,7 @@ impl Gpu {
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
     /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
-    /// only with `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` (opt-in, default off).
+    /// unless `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0` (default on).
     /// Exact arch: gfx1200 and every other RDNA4 part stay on the multirow arms.
     pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
         self.arch_caps.is_gfx1201() && *QWEN4_F16_WMMA_GFX1201
