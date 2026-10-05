@@ -1086,9 +1086,21 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         .checked_add(base)
                         .and_then(|value| value.checked_add(off))
                         .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                    Self::bundle(target)?
-                        .mtp_append_rows(gpu, scratch, &chunk[off..off + n], off, position)
-                        .map_err(|error| error.to_string())?;
+                    if n == 1 {
+                        // The multirow projections need two rows or more; a
+                        // lone row is exactly the per-row Append.
+                        let bundle = Self::bundle(target)?;
+                        bundle
+                            .copy_spec_hidden_row_to(gpu, off, pending)
+                            .map_err(|error| error.to_string())?;
+                        bundle
+                            .mtp_append_token(gpu, chunk[off], Some(pending), position)
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        Self::bundle(target)?
+                            .mtp_append_rows(gpu, scratch, &chunk[off..off + n], off, position)
+                            .map_err(|error| error.to_string())?;
+                    }
                     off += n;
                 }
                 // The per-row loop leaves `pending` on the chunk's last row: the
