@@ -20,31 +20,40 @@
 //! NPU mapping) must pass. B (weights) is an NPU shmem BO; GPU-only buffers (A sources, C readback, publish records)
 //! are `hipMalloc` device memory.
 //!
-//! NPU: ONE persistent command of `S` runs (`persistent_v9_lean`, run 0 full, runs 1.. lean; `--mode empty`:
-//! `empty_persistent`, poll + done only), run `j` on slot `j % R` with fixed slot arenas; seq of (round r, run j) is
-//! `1 + r*S + j`; rounds re-arm with `patch_seq` (needs `S % R == 0`).
+//! NPU: ONE persistent command of `S` runs of G80 where the shape fits (N = 1280, K <= 2560), else of the A-repeat V9
+//! (`ArrayDesign::with_a_repeat`: the A arena holds each run's A once, the shim replays it per N-wave) (`persistent_with`, `Bodies::Lean`: run 0 full, runs 1.. lean; rounds
+//! after the first `Bodies::LeanFirst`, every run lean; `--mode empty`: `empty_persistent`, poll + done only), run `j`
+//! on slot `j % R` with fixed slot arenas; seq of (round r, run j) is `1 + r*S + j`; rounds re-arm with `patch_seq`
+//! (needs `S % R == 0`). Rounds are queued one ahead (`docs/npu/railgun-npu.md` 3.3): round r+1's command and GPU work
+//! are issued (two retained command / insts copies) before the CPU waits for round r, so the next command's start-up
+//! overlaps the current one. A round's wall time is the interval between consecutive round completions (NPU command
+//! done and the consumer's last C read); every check below runs after the last round.
 //!
-//! GPU stream per run j, all enqueued before the round's wait (null stream, in order):
-//! 1. gemm: `coop_copy` A source (operand set `((r*S + j) / R) % 2`, device memory) -> A arena slot (GPU-produced A;
-//!    every reuse of a slot gets the other set, so a stale A cannot pass);
-//! 2. `coop_publish`: wait done(slot) == seq - R (slot free; skipped while seq <= R), store seq (store glc slc dlc +
-//!    vscnt 0, the WRITE_DATA-with-confirm equivalent), poll done(slot) == seq with a realtime stamp before every load;
-//! 3. gemm: `coop_copy` C arena slot -> device readback (the GPU reads the NPU's C).
+//! GPU work per run j, on two in-order streams (`coop_publish` doubles as a wait,
+//! `v` stored to a scratch line while polling `addr == v`, and as a store, polling its own line):
+//! * producer: wait consumed(slot) == seq - R (slot released; skipped while seq <= R); gemm: `coop_copy` A source
+//!   (operand set `((r*S + j) / R) % 2`, device memory) -> A arena slot (GPU-produced A; every reuse of a slot gets the
+//!   other set, so a stale A cannot pass); store seq to the slot line (glc slc dlc + vscnt 0, the
+//!   WRITE_DATA-with-confirm equivalent). It runs up to R runs ahead, so the next seq is ready while the NPU computes.
+//! * consumer: poll done(slot) == seq (realtime stamp before every load); gemm: `coop_copy` C arena slot -> device
+//!   readback (the GPU reads the NPU's C); store seq to consumed(slot) (device memory).
 //!
-//! Latencies, GPU realtime clock (`hipDeviceAttributeWallClockRate`), p50 / min / max over all runs of all rounds:
-//! * `pub_to_done_gpu_us`: seq store complete -> done line seen by the GPU (empty mode: the whole ring mechanism,
-//!   GPU store -> NPU shim poll -> NPU done DMA -> GPU poll; gemm: includes the GEMM);
+//! Latencies, GPU realtime clock (`hipDeviceAttributeWallClockRate`), p50 / min / max over all runs of all rounds, from
+//! the consumer's done wait (it starts when the previous run's C is read, so with the producer ahead these are
+//! consumer-side wait times, not the ring round trip):
+//! * `pub_to_done_gpu_us`: consumer wait start -> done line seen by the GPU;
 //! * `done_to_gpu_obs_upper_us`: t_obs - issue time of the last poll load that missed; the done line became visible
 //!   in that window, so this bounds done -> GPU observe from above;
 //! * `poll_load_us`: issue -> return of the load that hit (one uncached load round trip, the observe floor);
-//! * `publish_store_us`: seq store issue -> store complete;
+//! * `publish_store_us`: scratch store issue -> store complete;
 //! * per-run wall time (CPU, round / S) and, gemm, useful TOPS of the whole CPU-free pipeline.
 //!
-//! Exactness (gemm): two eager `design_v9` submits (one per operand set, shared B) on the same context first, each
+//! Exactness (gemm): two eager submits of the same design (one per operand set, shared B) on the same context first, each
 //! compared with the exact closed-form CPU reference; then every run's GPU-read C (device readback) must be byte-equal
-//! to the eager C of its set, every slot of the A arena must hold the GPU-copied A bytes of the last run that used it,
-//! and round 0 / the final round are also unpacked and compared with the CPU reference directly. Every publish record
-//! must carry status ok and its seq, and every final done line seq, slot and 'DONE'. If the NPU command does not
+//! to the eager C of its set, every slot of the A arena must finally hold the GPU-copied A bytes of its last run,
+//! and round 0 / the final round are also unpacked and compared with the CPU reference directly. Every consumer record
+//! must carry status ok and its seq, every producer wait / publish / release kernel status ok and its value, and every
+//! final done line seq, slot and 'DONE'. If the NPU command does not
 //! complete, the CPU rescues it (publishes the missing seqs on free slots) so the array is never
 //! left waiting, and the run FAILS. Exit 0 = PASS, 1 = FAIL, 2 = usage.
 //!
@@ -55,12 +64,12 @@ use npu_tools::coop_gpu::{self, PublishRecord};
 use railgun::npu::hip_runtime::{HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
 use pm_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
 use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9_lean, RingLayout, SlotPlan, DONE_MAGIC};
+use pm_npu::kernels::gemm_g80::design_g80;
+use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_with, Bodies, RingLayout, SlotPlan, DONE_MAGIC};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: npu-coop [--mode empty|gemm|alias] [--shape M N K] [--slots S] [--nslots R] [--rounds N] [--timeout-ms T]";
-const PCI_BUS_ID: &str = "0000:bf:00.0";
 const MAX_OPC: u32 = 2048;
 const POISON: u8 = 0xA5;
 const SETS: usize = 2;
@@ -277,7 +286,15 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let (m, n, k) = if gemm { (cfg.m, cfg.n, cfg.k) } else { (512, 512, 64) };
     let (s_runs, r_slots) = (cfg.slots, cfg.nslots);
     let layout = RingLayout { nslots: r_slots };
-    let d = design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast);
+    // NPU design: G80 (128x80 core, N = 1280 exactly, K <= 2560; the faster exact gate_up design) where the shape fits,
+    // else the A-repeat V9: the GPU writes each run's A once and the shim replays it per N-wave (gemm_array
+    // `with_a_repeat`), instead of the default packing that replicates A NW times in the shared arena.
+    // Every run multiplies the same B (shared weights, as in chunked prefill through one layer): on G80 the lean runs
+    // keep it resident in the memtile instead of refilling it from DDR (ring `b_shared`).
+    let g80 = n == 1280 && k % 64 == 0 && k <= 2560;
+    let v9 = || if g80 { design_g80(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast) }
+        else { design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast).with_a_repeat() };
+    let d = v9();
     let (a_bytes, c_bytes) = (d.args[0].bytes, d.args[2].bytes);
     let a_stride = a_bytes.div_ceil(4096) * 4096;
     let c_stride = c_bytes.div_ceil(4096) * 4096;
@@ -285,15 +302,16 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
         let s = j % r_slots;
         if gemm { SlotPlan { slot: s, a_off: (s * a_stride) as u64, b_off: 0, c_off: (s * c_stride) as u64 } } else { SlotPlan { slot: s, a_off: 0, b_off: 0, c_off: 0 } }
     }).collect();
-    let pd = if gemm { persistent_v9_lean(m, n, k, layout, &plans, 1, None) } else { empty_persistent(layout, &plans, 1) };
+    let pd = if gemm { persistent_with(v9(), layout, &plans, 1, Bodies::Lean, g80) } else { empty_persistent(layout, &plans, 1) };
     if pd.patch_sites.len() != 2 * s_runs { return Err(format!("{} patch sites, expected {}", pd.patch_sites.len(), 2 * s_runs)); }
-    if gemm && pd.pdi != d.pdi { return Err("persistent PDI != design_v9 PDI".into()); }
+    if gemm && pd.pdi != d.pdi { return Err("persistent PDI != eager design PDI".into()); }
     let set_of = |r: usize, j: usize| ((r * s_runs + j) / r_slots) % SETS;
 
     // ---- GPU ----
-    let rt = HipRuntime::load_for_pci(PCI_BUS_ID)?;
+    let pci = railgun::npu::fclk::igpu_pci();
+    let rt = HipRuntime::load_for_pci(&pci)?;
     let arch = rt.device_arch()?;
-    if arch != coop_gpu::ARCH { return Err(format!("device {PCI_BUS_ID} is {arch}, kernels are {}-only", coop_gpu::ARCH)); }
+    if arch != coop_gpu::ARCH { return Err(format!("device {pci} is {arch}, kernels are {}-only", coop_gpu::ARCH)); }
     let khz = rt.wall_clock_khz()?;
     let us_per_tick = 1e3 / khz as f64;
     let module = rt.load_module(coop_gpu::CODE_OBJECT)?;
@@ -314,10 +332,12 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let ring_sh = SharedMem::new(&rt, &dev, layout.bytes())?;
     let a_sh = SharedMem::new(&rt, &dev, if gemm { r_slots * a_stride } else { 4096 })?;
     let c_sh = SharedMem::new(&rt, &dev, if gemm { r_slots * c_stride } else { 4096 })?;
-    let stats = rt.allocate(s_runs * coop_gpu::PUBLISH_RECORD_BYTES, None)?;
+    // Records and C readback for every run of every round: checked after the last round, so no check runs (or is
+    // timed) between queued rounds.
+    let stats = rt.allocate(cfg.rounds * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, None)?;
     let src_a = rt.allocate(if gemm { SETS * a_bytes } else { 16 }, None)?;
-    let readback = rt.allocate(if gemm { s_runs * c_bytes } else { 16 }, None)?;
-    println!("gpu: arch={arch} pci={PCI_BUS_ID} CUs={} wall_clock={khz} kHz; ring/A/C = anon host pages {} / {} / {} B (NPU userptr BO, hipHostRegister)",
+    let readback = rt.allocate(if gemm { cfg.rounds * s_runs * c_bytes } else { 16 }, None)?;
+    println!("gpu: arch={arch} pci={pci} CUs={} wall_clock={khz} kHz; ring/A/C = anon host pages {} / {} / {} B (NPU userptr BO, hipHostRegister)",
         rt.compute_units()?, ring_sh.len, a_sh.len, c_sh.len);
     let mut b_bo = dev.shmem_bo(d.args[1].bytes.max(4096))?;
     let sets: Vec<([Vec<u8>; 2], Vec<i32>)> = if gemm { (0..SETS).map(|s| operand_set(&d, m, n, k, s)).collect() } else { Vec::new() };
@@ -351,58 +371,110 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     let mut img = vec![0u8; layout.bytes()];
     layout.initialize(&mut img);
     ring_sh.write(0, &img);
-    let mut insts = dev.dev_bo(&pd.insts)?;
-    let mut insts_host = pd.insts.clone();
-    let mut cmd = dev.cmd_bo()?;
+    let insts = dev.dev_bo(&pd.insts)?;
+    // Rounds after the first: gemm the lean-first stream (the array is still configured by the previous round), empty
+    // the same protocol stream. Two retained copies, so round r+1 is re-armed and queued while round r runs.
+    let rearm = gemm.then(|| persistent_with(v9(), layout, &plans, 1, Bodies::LeanFirst, g80));
+    let rearm_src = rearm.as_ref().unwrap_or(&pd);
+    let mut rearm_bos = [(dev.dev_bo(&rearm_src.insts)?, rearm_src.insts.clone()), (dev.dev_bo(&rearm_src.insts)?, rearm_src.insts.clone())];
+    let mut cmds = [dev.cmd_bo()?, dev.cmd_bo()?];
     let ring_gpu = ring_sh.gpu();
+    // Two in-order streams. Producer: wait until the consumer released the slot (consumed[slot] == seq - R), copy A,
+    // publish seq. Consumer: wait done == seq, read C, release the slot. The producer runs up to R runs ahead, so the
+    // next seq is published while the NPU computes the current one. Both use `coop_publish`: a wait is a publish of
+    // `v` to a scratch line polling `addr == v`; a store is a publish to `addr` polling the same line (one load).
+    let (prod, cons) = (rt.stream()?, rt.stream()?);
+    let consumed = rt.allocate(r_slots * 64, None)?;
+    rt.memset(&consumed, 0)?;
+    let scratch = rt.allocate(64, None)?;
+    let aux = rt.allocate(cfg.rounds * 3 * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, None)?;
+    let aux_rec = |r: usize, kind: usize, j: usize| aux.ptr() + (((r * 3 + kind) * s_runs + j) * coop_gpu::PUBLISH_RECORD_BYTES) as u64;
+    rt.memset(&stats, 0)?;
+    rt.memset(&aux, 0)?;
+    if gemm { c_sh.write(0, &vec![POISON; c_sh.len]); }
+    rt.synchronize()?;
+    let round_done = [rt.event()?, rt.event()?];
+    let mut npu_seqs = [0u64; 2];
     // Poll cap per publish kernel (>= ~1 us per uncached load): a stalled round's S kernels x (free wait + done poll)
     // stay within about half the timeout, so the CPU rescue still runs inside it.
     let max_iters = (cfg.timeout_ms * 1000 / (4 * s_runs as u64)).clamp(1000, u32::MAX as u64) as u32;
+    let publish = |st, seq_addr: u64, done_addr: u64, rec: u64, v: u32| -> Result<(), String> {
+        let mut a = coop_gpu::publish_args(seq_addr, done_addr, rec, v, 0, max_iters, false);
+        rt.launch_on(Some(st), &f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)
+    };
 
     let mut all_ok = true;
     let (mut pub_done, mut obs_upper, mut load_us, mut store_us, mut round_us, mut interval) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut c_ok, mut c_total, mut a_ok, mut a_total, mut cpu_ok, mut cpu_total, mut rec_ok, mut done_ok_n) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-    for r in 0..cfg.rounds {
+    // Rounds are queued one ahead (docs/npu/railgun-npu.md 3.3): step t issues round t (re-arm, NPU submit, GPU stream)
+    // and then completes round t-1 (NPU wait, GPU event, checks). A round's wall is the interval between consecutive
+    // round completions; the first includes the pipeline start.
+    let mut t_prev = Instant::now();
+    for step in 0..=cfg.rounds {
+        if step < cfg.rounds {
+            let (r, b) = (step, step % 2);
+            let seq0 = 1 + (r * s_runs) as u32;
+            if r > 0 {
+                // Re-arm: only the declared seq words change; this copy's previous round (r-2) has completed.
+                let (bo, host) = &mut rearm_bos[b];
+                patch_seq(host, &rearm_src.patch_sites, seq0);
+                bo.as_mut_slice()[..host.len()].copy_from_slice(host);
+                bo.flush();
+            }
+            let cur = if r == 0 { &insts } else { &rearm_bos[b].0 };
+            npu_seqs[b] = ctx.submit(&mut cmds[b], cur, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
+            for (j, p) in plans.iter().enumerate() {
+                let seq = seq0 + j as u32;
+                let release = consumed.ptr() + (p.slot * 64) as u64;
+                if seq as usize > r_slots { publish(&prod, scratch.ptr(), release, aux_rec(r, 0, j), seq - r_slots as u32)?; }
+                if gemm {
+                    let mut a = coop_gpu::copy_args(a_sh.gpu() + p.a_off, src_a.ptr() + (set_of(r, j) * a_bytes) as u64, (a_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
+                    rt.launch_on(Some(&prod), &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                }
+                let slot_line = ring_gpu + layout.slot_line(p.slot) as u64;
+                publish(&prod, slot_line, slot_line, aux_rec(r, 1, j), seq)?;
+                publish(&cons, scratch.ptr(), ring_gpu + layout.done_line(p.slot) as u64, stats.ptr() + ((r * s_runs + j) * coop_gpu::PUBLISH_RECORD_BYTES) as u64, seq)?;
+                if gemm {
+                    let mut a = coop_gpu::copy_args(readback.ptr() + ((r * s_runs + j) * c_bytes) as u64, c_sh.gpu() + p.c_off, (c_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
+                    rt.launch_on(Some(&cons), &f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
+                }
+                publish(&cons, release, release, aux_rec(r, 2, j), seq)?;
+            }
+            rt.record_on(&round_done[b], Some(&cons))?;
+        }
+        if step == 0 { continue; }
+        let (r, b) = (step - 1, (step - 1) % 2);
         let seq0 = 1 + (r * s_runs) as u32;
-        if r > 0 {
-            // Re-arm: only the declared seq words change; the retained BO is rewritten and flushed (untimed).
-            patch_seq(&mut insts_host, &pd.patch_sites, seq0);
-            insts.as_mut_slice()[..insts_host.len()].copy_from_slice(&insts_host);
-            insts.flush();
-        }
-        if gemm { c_sh.write(0, &vec![POISON; c_sh.len]); }
-        rt.memset(&stats, 0)?;
-        rt.synchronize()?;
-        let t_round = Instant::now();
-        let npu_seq = ctx.submit(&mut cmd, &insts, &[a_sh.bo(), &b_bo, c_sh.bo(), ring_sh.bo()])?;
-        for (j, p) in plans.iter().enumerate() {
-            let seq = seq0 + j as u32;
-            if gemm {
-                let mut a = coop_gpu::copy_args(a_sh.gpu() + p.a_off, src_a.ptr() + (set_of(r, j) * a_bytes) as u64, (a_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch(&f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
-            }
-            let wait_free = seq as usize > r_slots;
-            let mut a = coop_gpu::publish_args(ring_gpu + layout.slot_line(p.slot) as u64, ring_gpu + layout.done_line(p.slot) as u64,
-                stats.ptr() + (j * coop_gpu::PUBLISH_RECORD_BYTES) as u64, seq, if wait_free { seq - r_slots as u32 } else { 0 }, max_iters, wait_free);
-            rt.launch(&f_pub, 1, coop_gpu::LANE_BLOCK, &mut a)?;
-            if gemm {
-                let mut a = coop_gpu::copy_args(readback.ptr() + (j * c_bytes) as u64, c_sh.gpu() + p.c_off, (c_bytes / 16) as u64, (COPY_BLOCKS * coop_gpu::COPY_BLOCK) as u64);
-                rt.launch(&f_copy, COPY_BLOCKS, coop_gpu::COPY_BLOCK, &mut a)?;
-            }
-        }
-        rt.synchronize()?;
-        let st = ctx.wait(&cmd, npu_seq, cfg.timeout_ms);
-        let wall = Instant::now() - t_round;
+        let st = ctx.wait(&cmds[b], npu_seqs[b], cfg.timeout_ms);
         if !matches!(st, Ok(s) if s == ERT_STATE_COMPLETED) {
             println!("round {r}: NPU command NOT completed ({st:?}); CPU rescue publishes the missing seqs; this run FAILS");
             rescue(&ring_sh, layout, seq0, s_runs, Duration::from_millis(cfg.timeout_ms));
-            println!("round {r}: after rescue {:?}", ctx.wait(&cmd, npu_seq, cfg.timeout_ms));
+            println!("round {r}: after rescue {:?}", ctx.wait(&cmds[b], npu_seqs[b], cfg.timeout_ms));
             return Ok(false);
         }
-        round_us.push(wall.as_secs_f64() * 1e6);
+        rt.sync_event(&round_done[b])?;
+        let now = Instant::now();
+        round_us.push((now - t_prev).as_secs_f64() * 1e6);
+        t_prev = now;
+    }
+    rt.synchronize()?;
+    for (r, &wall_us) in round_us.iter().enumerate() {
+        let seq0 = 1 + (r * s_runs) as u32;
         let mut raw = vec![0u8; s_runs * coop_gpu::PUBLISH_RECORD_BYTES];
-        rt.download(&stats, &mut raw)?;
+        rt.download_at(&stats, r * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, &mut raw)?;
         let recs: Vec<PublishRecord> = (0..s_runs).map(|j| PublishRecord::parse(&raw[j * coop_gpu::PUBLISH_RECORD_BYTES..])).collect();
+        let mut raw_aux = vec![0u8; 3 * s_runs * coop_gpu::PUBLISH_RECORD_BYTES];
+        rt.download_at(&aux, r * 3 * s_runs * coop_gpu::PUBLISH_RECORD_BYTES, &mut raw_aux)?;
+        for kind in 0..3 {
+            for j in 0..s_runs {
+                if kind == 0 && seq0 as usize + j <= r_slots { continue; }
+                let rec = PublishRecord::parse(&raw_aux[(kind * s_runs + j) * coop_gpu::PUBLISH_RECORD_BYTES..]);
+                if rec.status != coop_gpu::STATUS_OK || rec.seq != if kind == 0 { seq0 + j as u32 - r_slots as u32 } else { seq0 + j as u32 } {
+                    println!("round {r} run {j}: {} kernel status {} seq {}", ["slot-free wait", "publish", "release"][kind], rec.status, rec.seq);
+                    all_ok = false;
+                }
+            }
+        }
         for (j, rec) in recs.iter().enumerate() {
             let seq = seq0 + j as u32;
             if rec.status != coop_gpu::STATUS_OK || rec.seq != seq || rec.last_done != seq || rec.t_obs < rec.t_pub {
@@ -417,18 +489,9 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
             store_us.push((rec.t_pub - rec.t_start) as f64 * us_per_tick);
             if j > 0 && recs[j - 1].status == coop_gpu::STATUS_OK { interval.push((rec.t_start - recs[j - 1].t_start) as f64 * us_per_tick); }
         }
-        img = ring_sh.read(0, layout.bytes());
-        for s in 0..r_slots {
-            let want = (0..s_runs).rev().find(|&j| plans[j].slot == s).map(|j| seq0 + j as u32).unwrap();
-            let at = layout.done_line(s);
-            if u32_at(&img, at) == want && u32_at(&img, at + 4) == s as u32 && u32_at(&img, at + 8) == DONE_MAGIC { done_ok_n += 1 } else {
-                println!("round {r} slot {s}: done line {:#x} {:#x} {:#x}, want seq {want:#x}", u32_at(&img, at), u32_at(&img, at + 4), u32_at(&img, at + 8));
-                all_ok = false;
-            }
-        }
         if gemm {
             let mut rb = vec![0u8; s_runs * c_bytes];
-            rt.download(&readback, &mut rb)?;
+            rt.download_at(&readback, r * s_runs * c_bytes, &mut rb)?;
             for j in 0..s_runs {
                 let set = set_of(r, j);
                 let got = &rb[j * c_bytes..(j + 1) * c_bytes];
@@ -444,19 +507,32 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
                     if bad == 0 { cpu_ok += 1 } else { println!("round {r} run {j}: {bad} mismatches vs CPU"); all_ok = false; }
                 }
             }
-            let a_now = a_sh.read(0, a_sh.len);
-            for s in 0..r_slots {
-                let last = (0..s_runs).rev().find(|&j| plans[j].slot == s).unwrap();
-                let set = set_of(r, last);
-                a_total += 1;
-                if a_now[s * a_stride..s * a_stride + a_bytes] == *sets[set].0[0] { a_ok += 1 } else {
-                    println!("round {r} slot {s}: A arena != GPU-copied A of set {set}");
-                    all_ok = false;
-                }
+        }
+        println!("round {r}: seq0={seq0} wall_us={wall_us:.1} per_run_us={:.2} records_ok={}/{s_runs}",
+            wall_us / s_runs as f64, recs.iter().filter(|x| x.status == coop_gpu::STATUS_OK).count());
+    }
+    // Final state: every done line carries the last round's last seq of its slot, every A slot the last copied set.
+    let last = cfg.rounds - 1;
+    let seq0 = 1 + (last * s_runs) as u32;
+    let img = ring_sh.read(0, layout.bytes());
+    for s in 0..r_slots {
+        let want = (0..s_runs).rev().find(|&j| plans[j].slot == s).map(|j| seq0 + j as u32).unwrap();
+        let at = layout.done_line(s);
+        if u32_at(&img, at) == want && u32_at(&img, at + 4) == s as u32 && u32_at(&img, at + 8) == DONE_MAGIC { done_ok_n += 1 } else {
+            println!("slot {s}: final done line {:#x} {:#x} {:#x}, want seq {want:#x}", u32_at(&img, at), u32_at(&img, at + 4), u32_at(&img, at + 8));
+            all_ok = false;
+        }
+    }
+    if gemm {
+        let a_now = a_sh.read(0, a_sh.len);
+        for s in 0..r_slots {
+            let set = set_of(last, (0..s_runs).rev().find(|&j| plans[j].slot == s).unwrap());
+            a_total += 1;
+            if a_now[s * a_stride..s * a_stride + a_bytes] == *sets[set].0[0] { a_ok += 1 } else {
+                println!("slot {s}: final A arena != GPU-copied A of set {set}");
+                all_ok = false;
             }
         }
-        println!("round {r}: seq0={seq0} wall_us={:.1} per_run_us={:.2} records_ok={}/{s_runs}", wall.as_secs_f64() * 1e6,
-            wall.as_secs_f64() * 1e6 / s_runs as f64, recs.iter().filter(|x| x.status == coop_gpu::STATUS_OK).count());
     }
 
     let runs = cfg.rounds * s_runs;
@@ -475,9 +551,9 @@ fn run(cfg: &Cfg) -> Result<bool, String> {
     } else {
         println!("pipeline: empty ring per_run_wall_us {}", pmm(&per_run));
     }
-    println!("coop: mode={} slots={s_runs} nslots={r_slots} rounds={} records_ok={rec_ok}/{runs} done_lines_ok={done_ok_n}/{} rescue=none",
-        if gemm { "gemm" } else { "empty" }, cfg.rounds, cfg.rounds * r_slots);
-    all_ok &= rec_ok == runs && done_ok_n == cfg.rounds * r_slots;
+    println!("coop: mode={} slots={s_runs} nslots={r_slots} rounds={} records_ok={rec_ok}/{runs} done_lines_ok={done_ok_n}/{r_slots} rescue=none",
+        if gemm { "gemm" } else { "empty" }, cfg.rounds);
+    all_ok &= rec_ok == runs && done_ok_n == r_slots;
     let _ = &pdi;
     Ok(all_ok)
 }

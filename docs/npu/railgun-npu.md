@@ -131,6 +131,18 @@ Ordering guarantees from the NPU side: the done line is written only after the f
 task-complete token, so every C byte was handed to DDR before the done write is issued; the done line itself is a
 single 64-byte DMA write.
 
+Schedule (`npu-coop`, measured): producer and consumer are two in-order GPU queues, not one. The consumer, after
+reading C of run k, stores `seq` to a GPU-only `consumed[s]` line; the producer's slot-free wait is
+`consumed[s] == seq − nslots` (stricter than step 1: it also covers the C arena) and then runs up to `nslots` runs
+ahead, so seq(k+1) is published while the NPU computes run k. On one queue the copy / publish of run k+1 waited for
+the C read of run k and the NPU idled between runs (gemm 512×1280×2560: 271 → 230 µs per run).
+
+Rounds are queued one ahead in `npu-coop`: round r+1's re-armed command (`Bodies::LeanFirst`, two retained command /
+insts copies) and its GPU work are issued before the CPU waits for round r, so each command's ~45–50 µs start-up
+(measured on the empty ring, independent of TXN and BO size) overlaps the previous round. With one shared B on G80
+(`persistent_with(.., b_shared = true)`), lean runs keep the whole-K B resident in the memtile: no shim B stream, no
+memtile fill, the B ready locks are written with the `kc` credits the fill would have released.
+
 ## 5. Hash-keyed program cache and step tape (`crates/railgun/src/npu/tape.rs`)
 Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 - `ProgramKey` = FNV-1a64 over `'P' ‖ len ‖ PDI ‖ 'T' ‖ len ‖ TXN template ‖ 'D' ‖ count ‖ {word index u64 ‖ kind tag}`.
