@@ -30,8 +30,8 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Strix Halo iGPU sysfs device directory.
-pub const IGPU_SYSFS: &str = "/sys/bus/pci/devices/0000:bf:00.0";
+/// Strix Halo iGPU PCI bus id: `NPU_IGPU_PCI`, default `0000:bf:00.0` (hipx). Halo boxes enumerate it differently.
+pub fn igpu_pci() -> String { std::env::var("NPU_IGPU_PCI").unwrap_or_else(|_| "0000:bf:00.0".into()) }
 /// Guard mode variable: `require` (default) | `pin` | `off`.
 pub const ENV: &str = "NPU_FCLK_GUARD";
 pub const PERF: &str = "power_dpm_force_performance_level";
@@ -130,7 +130,7 @@ pub struct Sysfs { dir: PathBuf, write: WriteFn, settle: Duration }
 
 impl Sysfs {
     /// The Halo iGPU, real writes, 30 s settle.
-    pub fn igpu() -> Sysfs { Sysfs::at(IGPU_SYSFS, write_attr, PIN_SETTLE) }
+    pub fn igpu() -> Sysfs { Sysfs::at(format!("/sys/bus/pci/devices/{}", igpu_pci()), write_attr, PIN_SETTLE) }
 
     pub fn at(dir: impl Into<PathBuf>, write: WriteFn, settle: Duration) -> Sysfs { Sysfs { dir: dir.into(), write, settle } }
 
