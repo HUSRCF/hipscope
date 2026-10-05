@@ -1925,6 +1925,11 @@ pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
     host_token_bytes: Vec<u8>,
     host_ple_bytes: Vec<u8>,
+    /// Tokens of the prefill chunk that follows the next forward. A
+    /// successful forward warms their PLE rows into the row store's page
+    /// cache once its own rows are consumed, so the next chunk's SSD reads
+    /// overlap this chunk's GPU work. Consumed (cleared) by every forward.
+    ple_lookahead: Vec<u32>,
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
@@ -2207,6 +2212,7 @@ impl Qwen4GpuForward {
             scratch,
             host_token_bytes,
             host_ple_bytes,
+            ple_lookahead: Vec::new(),
             token_readback: None,
             moe,
             decode_q8,
@@ -2215,6 +2221,14 @@ impl Qwen4GpuForward {
             trunk_a4,
             qsa_tap: None,
         })
+    }
+
+    /// Name the tokens that follow the next forward (at most one chunk is
+    /// kept); see the `ple_lookahead` field.
+    pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
+        self.ple_lookahead.clear();
+        self.ple_lookahead
+            .extend_from_slice(&tokens[..tokens.len().min(self.scratch.max_chunk)]);
     }
 
     /// Teardown only: free the forward right before the bundle weights it
@@ -2460,6 +2474,9 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_rows: Qwen4OutputRows,
     ) -> Result<(), Qwen4GpuForwardError> {
+        // The caller's lookahead names what follows this whole request, so it
+        // belongs to the final tile; earlier tiles look ahead to the next tile.
+        let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
         self.validate_request(
             bundle,
             tokens,
@@ -2488,6 +2505,14 @@ impl Qwen4GpuForward {
         while offset < tokens.len() {
             let rows = (tokens.len() - offset).min(max_chunk);
             let final_chunk = offset + rows == tokens.len();
+            if final_chunk {
+                self.ple_lookahead = caller_lookahead.take().unwrap_or_default();
+            } else {
+                let next = offset + rows;
+                self.ple_lookahead.clear();
+                self.ple_lookahead
+                    .extend_from_slice(&tokens[next..(next + max_chunk).min(tokens.len())]);
+            }
             let selected_rows = output_rows.count(rows);
             let logits_offset = if output_rows == Qwen4OutputRows::All {
                 offset
@@ -2587,6 +2612,7 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        let ple_lookahead = std::mem::take(&mut self.ple_lookahead);
         if argmax_of.is_some() && tokens.len() != 1 {
             return Err(invalid("an argmax-token Qwen4 forward carries one token"));
         }
@@ -3630,6 +3656,17 @@ impl Qwen4GpuForward {
                     next_history.push(token);
                 }
                 bundle.state.ple_history = next_history;
+                // This forward's lease is released, so the reader is free: warm
+                // the next chunk's rows, hashed from the history just committed,
+                // while the GPU runs this chunk. Best effort, and the bytes are
+                // unchanged: the next forward reads the same pages from the cache.
+                if !ple_lookahead.is_empty() {
+                    let fit = bundle.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
+                    let ahead = &ple_lookahead[..ple_lookahead.len().min(fit)];
+                    let _ = bundle
+                        .ple_rows
+                        .warm(next_history.row_ids(&bundle.ple_metadata, ahead));
+                }
                 bundle.state.commit_row_capture(n);
                 bundle.state.position = next_position
                     .checked_add(n)

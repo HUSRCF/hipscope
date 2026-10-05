@@ -1094,6 +1094,14 @@ impl Qwen4Bundle {
         result
     }
 
+    /// Name the tokens the next prefill forward is followed by, so it warms
+    /// their PLE rows while its own chunk runs. Best effort; bytes unchanged.
+    pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
+        if let Some(forward) = self.execution.as_mut() {
+            forward.set_ple_lookahead(tokens);
+        }
+    }
+
     fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
         self.ple_rows
             .reset_epoch(PLE_RESET_TIMEOUT)
@@ -1250,6 +1258,8 @@ impl Qwen4Bundle {
         plan: Qwen4PrefixPlan,
         mode: Qwen4PrefixMode,
     ) -> Result<(), BundleError> {
+        // A lookahead left by an aborted request names another prompt's rows.
+        self.set_ple_lookahead(&[]);
         if plan.start_pos == 0 {
             self.reset(gpu)?;
         } else {
@@ -1420,6 +1430,7 @@ impl Qwen4Bundle {
         let start = plan.start_pos;
         match self.prefix_capture_at() {
             Some(at) => {
+                self.set_ple_lookahead(&prompt[at..]);
                 self.forward_chunk_final(gpu, &prompt[start..at], logits, None)?;
                 self.stage_prefix(gpu, &prompt[..at])?;
                 if at < prompt.len() {

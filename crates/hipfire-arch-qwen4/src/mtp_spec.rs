@@ -360,6 +360,7 @@ impl SpecTarget for Qwen4Bundle {
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (offset + max_chunk).min(tokens.len());
+            self.set_ple_lookahead(&tokens[end..]);
             // Only the final row's argmax is returned, so each chunk writes
             // one logit row instead of one per chunk row.
             let pick = self
@@ -1037,6 +1038,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
             let base = chunk_index * chunk_rows;
+            Self::bundle(target)?.set_ple_lookahead(&fill_tokens[base + chunk.len()..]);
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk, true)
                 .map_err(|error| error.to_string())?;
