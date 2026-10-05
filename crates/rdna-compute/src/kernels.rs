@@ -7390,7 +7390,7 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
 /// gfx1201-only GQA-fused FA2 prefill (research opt-in). One workgroup per
 /// KV head x 8 positions; K/V dequantized once per KT64 tile into 64 KiB
 /// swizzled LDS. Four symbols: `attention_q8_0_fa2_gqa_gfx1201` (direct),
-/// `attention_q8_0_fa2_gqa_partial_gfx1201` (split-KV records, stride 258),
+/// `attention_q8_0_fa2_gqa_partial_gfx1201` (split-KV LSE + Oacc planes),
 /// `attention_q8_0_fa2_gqa_merge_gfx1201` (stable LSE merge), plus
 /// `attention_fa2_q_preconvert_gfx1201` (F4b: f32 Q -> f16 scratch ahead of
 /// the body, same file). JIT-only via

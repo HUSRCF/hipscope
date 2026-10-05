@@ -264,9 +264,9 @@ fn run_split(
     let d_pos = gpu.upload_raw(&pos_bytes(&pos), &[batch * 4]).unwrap();
     let d_out = gpu.zeros(&[batch * NH * HD], DType::F32).unwrap();
     let d_part = gpu
-        .zeros(&[splits * batch * NH * (HD + 2)], DType::F32)
+        .zeros(&[splits * batch * NH * (HD + 1)], DType::F32)
         .unwrap();
-    gpu.attention_q8_0_fa2_gqa_split_gfx1201_bench(
+    gpu.attention_q8_0_fa2_gqa_split_gfx1201(
         &d_q, &d_k, &d_v, &d_out, &d_pos, &d_part, NH, NKV, HD, batch, splits,
     )
     .unwrap();

@@ -8888,6 +8888,30 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
     }
 }
 
+/// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
+/// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
+/// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
+/// the existing rows route). Default off. Read once per process.
+fn gfx12_fa2_split_verify_splits() -> Option<usize> {
+    static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        let on = matches!(
+            hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("on") | Some("true")
+        );
+        if !on {
+            return None;
+        }
+        let splits = hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        matches!(splits, 2 | 4 | 8).then_some(splits)
+    });
+    *SPLITS
+}
+
 #[allow(clippy::too_many_arguments)]
 fn q8_multirow_attn_admitted(
     arch: &str,
@@ -9138,6 +9162,36 @@ fn batch_chunk_fa_attend(
             config.head_dim,
             n,
         )?;
+        // Experimental gfx1201 verifier arm: retain the FA2 packed-Q8/LDS
+        // front end, split the live KV tile range to restore occupancy at
+        // small verifier batches, then combine CK-style LSE/Oacc partials.
+        // Fail closed to the exact measured shape and eager sequential route;
+        // `multirow` admission above already excludes tree, independent,
+        // graph-capture, and retained/PM4 recording paths.
+        match gfx12_fa2_split_verify_splits() {
+            Some(fa2_splits)
+                if gpu.arch_caps.is_gfx1201()
+                    && config.n_heads == 24
+                    && config.n_kv_heads == 4
+                    && config.head_dim == 256 =>
+            {
+                gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                    &pbs.fa_q_batch,
+                    &kv_cache.k_gpu[layer_idx],
+                    &kv_cache.v_gpu[layer_idx],
+                    &pbs.fa_attn_out_batch,
+                    &pbs.positions,
+                    &s.flash_partials,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n,
+                    fa2_splits,
+                )?;
+                return Ok(());
+            }
+            _ => {}
+        }
         if gpu.attention_flash_q8_0_rows_masked(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
