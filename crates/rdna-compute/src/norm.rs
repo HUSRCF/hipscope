@@ -426,6 +426,77 @@ impl Gpu {
         )
     }
 
+    /// `c[i] = a[i] + b[(i / (branches * hidden)) * hidden + i % hidden]` over
+    /// `rows * branches * hidden` elements: each row of `b` (`hidden` wide) is
+    /// added to the `branches` branch rows of the matching row of `a` (what
+    /// `branches` [`Gpu::add_f32`] launches over one row do, for every row at
+    /// once). Same funnel launch as [`Gpu::add_f32`].
+    pub fn broadcast_add_rows_f32(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        branches: usize,
+        hidden: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let total = branches
+            .checked_mul(hidden)
+            .and_then(|wide| wide.checked_mul(rows));
+        let block = 256u32;
+        let grid = match total {
+            Some(total) if total > 0 => u32::try_from(total.div_ceil(block as usize)).ok(),
+            _ => None,
+        };
+        let (Some(grid), true) = (
+            grid,
+            i32::try_from(branches).is_ok()
+                && i32::try_from(hidden).is_ok()
+                && i32::try_from(rows).is_ok(),
+        ) else {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "broadcast_add_rows_f32 needs non-zero branches/hidden/rows within i32",
+            ));
+        };
+        self.bind_thread()?;
+        self.ensure_kernel("add", kernels::ADD_SRC, "broadcast_add_rows_f32")?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b.buf.as_ptr();
+        let mut c_ptr = c.buf.as_ptr();
+        let mut branches_val = branches as i32;
+        let mut hidden_val = hidden as i32;
+        let mut rows_val = rows as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut branches_val as *mut _ as *mut c_void,
+            &mut hidden_val as *mut _ as *mut c_void,
+            &mut rows_val as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "broadcast_add_rows_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(c_ptr);
+                blob.push_i32(branches_val);
+                blob.push_i32(hidden_val);
+                blob.push_i32(rows_val);
+                blob
+            },
+        )
+    }
+
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
         self.add_inplace_f32_raw(a.buf.as_ptr(), b.buf.as_ptr(), a.numel())

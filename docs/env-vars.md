@@ -181,6 +181,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_MTP_DRAFT_HEAD` | `mq2r` | Draft ranking head: an `mq2`..`mq6` copy of the LM head (`r` suffix = re-score its top 8 exactly against the head's own Q8_0 or MQ6G256V2 rows). |
 | `HIPFIRE_MTP_PAIRING` | head state | Draft-step conditioning experiment: `aligned-head` or `aligned`. |
 | `HIPFIRE_MTP_TRACE` / `HIPFIRE_MTP_PHASE_TIMING` | off; `1` enables | Per-window MTP trace / per-phase `hipEvent` timing to stderr (diagnostic). |
+| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | gfx1151: on unless `0`; ignored elsewhere | Exact gfx1151 only, Qwen4 native MTP prompt fill (`mtp_prefill`): runs the head's KV-only Append step over each prefill chunk as one row-batched pass (sub-chunks of up to 1024 rows, about 17 launches each) instead of one ~20-launch single-row `forward_token` per prompt row. Every operator is the single-row kernel with a rows grid, or a multi-row kernel whose per-row reduction order is the single-row kernel's, and never the F16 WMMA route, so the head's QSA state (`full_keys`, `full_values`, `raw_index_keys`, `pooled_keys`, lengths), the draft request state and the pending hidden row are built to match the per-row fill byte for byte; the (token p, hidden p) pairing is unchanged. Read at each `mtp_prefill`. Allocates about 260 MB of row-batched scratch per drafter at the first fill (counted in `native_mtp_device_bytes`). `0` keeps the per-row loop and allocates nothing; other arches always take the per-row loop. |
 | `HIPFIRE_QWEN4_TRUNK_TIER` | Q8F16 declaration | `mq6` declares the rank-2 trunk attention/GDN matrices at MQ6G256V2 for the quantizer; the loader admits both tiers from the file. |
 | `HIPFIRE_QWEN4_MTP_TIER` | recipe tier | `source` keeps the rank-2 MTP matrices at BF16 (quantizer and loader comparison knob). |
 | `HIPFIRE_QWEN4_REQUANT` | unset | Load-time precision experiment: `pat=fmt;...` requantizes resident rank-2 weights whose name contains `pat` to `mq2`..`mq6` or `q8`, or (`qt44:DIR`) replaces each with the pre-encoded QT44 bytes of `DIR/<tensor name>.bin` where that file exists (an offline GPTQ solve; the file must hold exactly the matrix). |
@@ -507,7 +508,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1402
+**Count:** 1403
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1600,6 +1601,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MQ6_X4_GFX1201` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_REGIONS` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_ORACLE_CACHE` | crates/hipfire-arch-qwen4/reference_oracle/upstream.py | harness |
 | `HIPFIRE_QWEN4_PLE_FUSE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |

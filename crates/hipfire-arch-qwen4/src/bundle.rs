@@ -15,7 +15,7 @@ use crate::gpu_forward::{
     qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
+use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
@@ -899,6 +899,69 @@ impl Qwen4Bundle {
                 MtpStep::Append,
             )
             .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Whether [`Self::mtp_append_rows`] can run on this GPU for this model.
+    pub(crate) fn mtp_append_rows_supported(&self, gpu: &Gpu) -> bool {
+        self.mtp.is_some()
+            && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
+    }
+
+    /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
+    /// `position..position + tokens.len()`, row `i` paired with captured spec
+    /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
+    /// calling [`Self::mtp_append_token`] per row after `copy_spec_hidden_row_to`.
+    pub(crate) fn mtp_append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut MtpAppendScratch,
+        tokens: &[u32],
+        hidden_row0: usize,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        if tokens.is_empty() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP batched append has no rows".to_string(),
+            ));
+        }
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let offset = hidden_row0
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
+        let len = tokens
+            .len()
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row overflow".to_string()))?;
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > source.numel())
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden rows are outside capture".to_string(),
+            ));
+        }
+        let hidden = source.sub_offset(offset, len);
+        let last = position
+            .checked_add(tokens.len() - 1)
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
+        mapped_mtp(self.mtp.as_mut(), gpu, last)?
+            .append_rows(
+                gpu,
+                &self.weights,
+                &self.config,
+                scratch,
+                tokens,
+                &hidden,
+                position,
+            )
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 

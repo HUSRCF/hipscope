@@ -347,7 +347,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("rope_batched", kernels::ROPE_BATCHED_SRC, ["rope_batched_f32"]);
     }
     if matches!(arch, "gfx1201" | "gfx1151") {
-        add!("add", kernels::ADD_SRC, ["add_f32"]);
+        add!("add", kernels::ADD_SRC, ["add_f32", "broadcast_add_rows_f32"]);
         add!("argmax_token_chain", kernels::ARGMAX_TOKEN_CHAIN_SRC, ["argmax_token_chain_f32"]);
         add!("gdn_chunk_kkt_solve", kernels::GDN_CHUNK_KKT_SOLVE_SRC, ["gdn_chunk_kkt_solve"]);
         add!("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC, ["gemv_hfq4g256_multirow_r2", "gemv_hfq4g256_multirow_r4", "gemv_hfq4g256_multirow_r8"]);
@@ -522,14 +522,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen4_gemv_bf16_xf32", kernels::QWEN4_GEMV_BF16_XF32_SRC, [
             "gemv_bf16_xf32", "gemv_bf16_xf32_bf16_scaled_add", "gemv_bf16_xf32_k4", "gemv_bf16_xf32_k4_rows_r2", "gemv_bf16_xf32_k4_rows_r3",
             "gemv_bf16_xf32_k4_rows_r4", "gemv_bf16_xf32_k4_rows_r5", "gemv_bf16_xf32_k4_rows_r6", "gemv_bf16_xf32_k4_rows_r7",
-            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2", "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_k4_rows_tiled_r2", "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4", "gemv_bf16_xf32_k4_rows_tiled_r5", "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7", "gemv_bf16_xf32_k4_rows_tiled_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2",
+            "gemv_bf16_xf32_x4_rows_r3",
             "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
             "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
         ]);
         add!("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, ["hyper_read_projected_rotate_f32", "mq_rotate_x_bf16_f16", "mq_rotate_x_f16"]);
         add!("qwen4_gemv_mq6g256v2", kernels::QWEN4_GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4"]);
         add!("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, [
-            "gemv_q8_0_k2560_staged", "gemv_q8_0_k2560_staged_pair", "gemv_q8_0_k2560_staged_rows", "gemv_q8_0_k320_staged",
+            "gemv_q8_0_k2560_staged", "gemv_q8_0_k2560_staged_pair", "gemv_q8_0_k2560_staged_rows", "gemv_q8_0_k2560_staged_rows_tiled",
+            "gemv_q8_0_k320_staged",
             "gemv_q8_0_k320_staged_rows", "gemv_q8_0_k8", "gemv_q8_0_k8_rows_r2", "gemv_q8_0_k8_rows_r3", "gemv_q8_0_k8_rows_r4",
             "gemv_q8_0_k8_rows_r5", "gemv_q8_0_k8_rows_r6", "gemv_q8_0_k8_rows_r7", "gemv_q8_0_k8_rows_r8", "quantize_bf16_q8_0",
             "topk8_partial_f32", "topk8_rescore_q8_0_k2560",
@@ -670,7 +674,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ]);
     }
     if arch == "gfx1100" {
-        add!("add", kernels::ADD_SRC, ["add_f32"]);
+        add!("add", kernels::ADD_SRC, ["add_f32", "broadcast_add_rows_f32"]);
         add!("gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
             "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
             "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
@@ -781,7 +785,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemv_bf16_xf32", kernels::gemv_bf16_xf32_src(arch == "gfx1151"), [
             "gemv_bf16_xf32", "gemv_bf16_xf32_bf16_scaled_add", "gemv_bf16_xf32_k4", "gemv_bf16_xf32_k4_rows_r2", "gemv_bf16_xf32_k4_rows_r3",
             "gemv_bf16_xf32_k4_rows_r4", "gemv_bf16_xf32_k4_rows_r5", "gemv_bf16_xf32_k4_rows_r6", "gemv_bf16_xf32_k4_rows_r7",
-            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2", "gemv_bf16_xf32_x4_rows_r3",
+            "gemv_bf16_xf32_k4_rows_r8", "gemv_bf16_xf32_k4_rows_tiled_r2", "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4", "gemv_bf16_xf32_k4_rows_tiled_r5", "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7", "gemv_bf16_xf32_k4_rows_tiled_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2",
+            "gemv_bf16_xf32_x4_rows_r3",
             "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
             "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
         ]);

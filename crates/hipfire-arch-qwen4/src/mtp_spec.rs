@@ -14,6 +14,7 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan};
+use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
@@ -669,6 +670,10 @@ pub struct Qwen4MtpDrafter {
     sampled_enabled: bool,
     /// The current request's sampled verification; `None` for greedy.
     sampled: Option<SampledVerify>,
+    /// Row-batched operator buffers of the batched prompt-fill Append pass
+    /// (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`); `None` where the pass cannot run
+    /// (see `Qwen4MtpGpu::append_rows_supported`) or has not been enabled yet.
+    append_scratch: Option<MtpAppendScratch>,
 }
 
 impl Qwen4MtpDrafter {
@@ -684,6 +689,7 @@ impl Qwen4MtpDrafter {
             agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
             sampled_enabled: hipfire_config::mtp_sampled_enabled(),
             sampled: None,
+            append_scratch: None,
         }
     }
 
@@ -744,6 +750,15 @@ impl Qwen4MtpDrafter {
                 gpu.zeros(&[width], rdna_compute::DType::F32)
                     .map_err(|error| format!("Qwen4 MTP row hidden allocation: {error}"))?,
             );
+        }
+        if self.append_scratch.is_none() && mtp_batched_fill_enabled() {
+            let bundle = Self::bundle(target)?;
+            if bundle.mtp_append_rows_supported(gpu) {
+                let rows = MTP_FILL_ROWS.min(prefill_rows);
+                let scratch = MtpAppendScratch::new(gpu, &bundle.config, rows)
+                    .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
+                self.append_scratch = Some(scratch);
+            }
         }
         Ok(())
     }
@@ -985,6 +1000,11 @@ impl Qwen4MtpDrafter {
             .as_ref()
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
     }
+
+    /// The pending target-hidden row, for the parity harnesses.
+    pub(crate) fn pending_hidden_for_parity(&self) -> Result<&GpuTensor, String> {
+        self.pending_hidden()
+    }
 }
 
 impl MtpDrafter for Qwen4MtpDrafter {
@@ -1022,7 +1042,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             bundle.prefix_capture_at()
         };
-        let pending = self.pending_hidden()?;
+        // Field borrows (not `pending_hidden()`): the batched fill below also
+        // borrows `append_scratch` mutably.
+        let pending = self
+            .pending_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+        let mut batched_scratch = if mtp_batched_fill_enabled() {
+            self.append_scratch.as_mut()
+        } else {
+            None
+        };
         let mut first_token = None;
         // One chunked target forward per chunk instead of one single-row forward
         // per prompt token: the shared forward already captures the whole
@@ -1042,22 +1072,48 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk, true)
                 .map_err(|error| error.to_string())?;
-            for (index, &token) in chunk.iter().enumerate() {
-                if abort() {
-                    target.reset_recurrent(gpu)?;
-                    return Err("Qwen4 native MTP prefill aborted".to_string());
+            if let Some(scratch) = batched_scratch.as_deref_mut() {
+                // One batched Append pass per sub-chunk of at most `scratch.rows()`
+                // rows; row `i` is still paired with spec hidden row `i`.
+                let mut off = 0;
+                while off < chunk.len() {
+                    if abort() {
+                        target.reset_recurrent(gpu)?;
+                        return Err("Qwen4 native MTP prefill aborted".to_string());
+                    }
+                    let n = (chunk.len() - off).min(scratch.rows());
+                    let position = start_pos
+                        .checked_add(base)
+                        .and_then(|value| value.checked_add(off))
+                        .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+                    Self::bundle(target)?
+                        .mtp_append_rows(gpu, scratch, &chunk[off..off + n], off, position)
+                        .map_err(|error| error.to_string())?;
+                    off += n;
                 }
-                let position = start_pos
-                    .checked_add(base)
-                    .and_then(|value| value.checked_add(index))
-                    .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                let bundle = Self::bundle(target)?;
-                bundle
-                    .copy_spec_hidden_row_to(gpu, index, pending)
+                // The per-row loop leaves `pending` on the chunk's last row: the
+                // next draft step's row-0 hidden.
+                Self::bundle(target)?
+                    .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
                     .map_err(|error| error.to_string())?;
-                bundle
-                    .mtp_append_token(gpu, token, Some(pending), position)
-                    .map_err(|error| error.to_string())?;
+            } else {
+                for (index, &token) in chunk.iter().enumerate() {
+                    if abort() {
+                        target.reset_recurrent(gpu)?;
+                        return Err("Qwen4 native MTP prefill aborted".to_string());
+                    }
+                    let position = start_pos
+                        .checked_add(base)
+                        .and_then(|value| value.checked_add(index))
+                        .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+                    let bundle = Self::bundle(target)?;
+                    bundle
+                        .copy_spec_hidden_row_to(gpu, index, pending)
+                        .map_err(|error| error.to_string())?;
+                    bundle
+                        .mtp_append_token(gpu, token, Some(pending), position)
+                        .map_err(|error| error.to_string())?;
+                }
             }
             // The head has caught up with the target: the only point a
             // whole-chunk checkpoint of both owners is canonical.
@@ -1494,6 +1550,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let Self {
             scratch,
             pending_hidden,
+            append_scratch,
             ..
         } = *self;
         if let Some(scratch) = scratch {
@@ -1501,6 +1558,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         if let Some(hidden) = pending_hidden {
             let _ = gpu.free_tensor(hidden);
+        }
+        if let Some(scratch) = append_scratch {
+            let _ = scratch.free_gpu(gpu);
         }
     }
 
@@ -1539,6 +1599,12 @@ pub fn build_qwen4_mtp_speculator(max_k: usize, ctx_capacity: usize) -> Box<dyn 
         max_k,
         ctx_capacity,
     )))
+}
+
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`: the batched prompt-fill Append pass is on
+/// unless set to `0`; read at every `mtp_prefill`.
+fn mtp_batched_fill_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true)
 }
 
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
@@ -1580,10 +1646,12 @@ pub fn native_mtp_device_bytes(
     };
     let (resident, scratch) =
         crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
+    let fill_rows = MTP_FILL_ROWS.min(chunk_rows).max(1);
     let request = verify_rows
         .checked_add(2)?
         .checked_mul(hidden_row)?
-        .checked_add(capture)?;
+        .checked_add(capture)?
+        .checked_add(MtpAppendScratch::device_bytes(config, fill_rows)?)?;
     u64::try_from(resident.checked_add(scratch.max(request))?).ok()
 }
 

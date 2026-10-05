@@ -188,8 +188,7 @@ extern "C" __global__ void gemv_q8_0_k8(
 // Multi-row variants of the staged / split decode kernels above: each weight
 // row is loaded once and dotted with `rows` activation rows (x row stride K,
 // y row stride M). Every row's value is bitwise the single-row kernel's.
-__launch_bounds__(32, 20)
-extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
+static __device__ __forceinline__ void gemv_q8_0_k2560_staged_rows_body(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -214,6 +213,37 @@ extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
             reinterpret_cast<const unsigned char*>(staged_row), x + (size_t)r * 2560, 2560, tid);
         if (tid == 0) y[(size_t)r * M + row] = sum;
     }
+}
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows
+) {
+    gemv_q8_0_k2560_staged_rows_body(A_q8, x, y, M, rows);
+}
+
+// gemv_q8_0_k2560_staged_rows over many `tile`-row tiles in one launch (prompt
+// fill): grid [M, ceil(rows / tile)], blockIdx.y selects the tile of `tile`
+// activation rows (x row stride 2560, y row stride M); the last tile holds
+// the remaining rows. Same body, so every row is bitwise the single-row
+// kernel's.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_rows_tiled(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int rows,
+    int tile
+) {
+    const int first = (int)blockIdx.y * tile;
+    const int n = rows - first < tile ? rows - first : tile;
+    gemv_q8_0_k2560_staged_rows_body(
+        A_q8, x + (size_t)first * 2560, y + (size_t)first * M, M, n);
 }
 
 __launch_bounds__(64)

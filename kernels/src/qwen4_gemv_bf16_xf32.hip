@@ -316,6 +316,28 @@ GEMV_BF16_XF32_K4_ROWS(7)
 GEMV_BF16_XF32_K4_ROWS(8)
 #undef GEMV_BF16_XF32_K4_ROWS
 
+// gemv_bf16_xf32_k4_rows_r<R> over many R-row tiles in one launch (prompt
+// fill): grid [M, tiles], blockIdx.y selects the tile, whose R activation rows
+// (x row stride K) and output rows (y row stride M) start R * blockIdx.y rows
+// in. Same body as the non-tiled kernel, so every row is bitwise its value.
+#define GEMV_BF16_XF32_K4_ROWS_TILED(R)                                             \
+    __launch_bounds__(128) extern "C" __global__ void                               \
+    gemv_bf16_xf32_k4_rows_tiled_r##R(                                              \
+        const unsigned short* __restrict__ W, const float* __restrict__ x,          \
+        float* __restrict__ y, int M, int K, float scale, int hc_act) {             \
+        gemv_bf16_xf32_k4_rows_body<R>(                                             \
+            W, x + (size_t)blockIdx.y * R * K, y + (size_t)blockIdx.y * R * M,      \
+            M, K, scale, hc_act);                                                   \
+    }
+GEMV_BF16_XF32_K4_ROWS_TILED(2)
+GEMV_BF16_XF32_K4_ROWS_TILED(3)
+GEMV_BF16_XF32_K4_ROWS_TILED(4)
+GEMV_BF16_XF32_K4_ROWS_TILED(5)
+GEMV_BF16_XF32_K4_ROWS_TILED(6)
+GEMV_BF16_XF32_K4_ROWS_TILED(7)
+GEMV_BF16_XF32_K4_ROWS_TILED(8)
+#undef GEMV_BF16_XF32_K4_ROWS_TILED
+
 // Decode HC write + next HC read norm (tensor_ops.hip's hyper_write_f32 and
 // hyper_norm_f32 on one F32 row, bitwise): one block per branch; each thread
 // writes its ten columns of the new streams, keeps them, and normalizes them

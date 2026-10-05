@@ -34,6 +34,10 @@ name = "qwen4_qsa_ctx"
 required-features = ["reference-parity"]
 
 [[example]]
+name = "qwen4_mtp_fill"
+required-features = ["reference-parity"]
+
+[[example]]
 name = "qwen4_kld"
 required-features = ["lab"]
 

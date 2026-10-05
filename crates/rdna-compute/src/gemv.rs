@@ -18355,6 +18355,122 @@ impl Gpu {
         self.launch_gemv_split(func, 128, weight, x, y, m, k, hc_act_scale)
     }
 
+    /// [`Gpu::gemv_bf16_xf32_k4`] of any `rows >= 1` activation rows (x row
+    /// stride K, y row stride M): full tiles of eight rows in one
+    /// `gemv_bf16_xf32_k4_rows_tiled_r8` launch (grid `[m, rows / 8]`) plus one
+    /// launch for the `rows % 8` remainder; each row bitwise the single-row
+    /// kernel's. Requires `k % 32 == 0`. Prompt fill: the weight is read once
+    /// per eight rows instead of once per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows_tiled(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        const TILED: [&str; 7] = [
+            "gemv_bf16_xf32_k4_rows_tiled_r2",
+            "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4",
+            "gemv_bf16_xf32_k4_rows_tiled_r5",
+            "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7",
+            "gemv_bf16_xf32_k4_rows_tiled_r8",
+        ];
+        let tiles = rows / 8;
+        let tail = rows % 8;
+        if rows == 0 || !k.is_multiple_of(32) || tiles > 65_535 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_k4_rows_tiled needs K % 32 == 0 and 1..=524280 rows",
+            ));
+        }
+        self.bind_thread()?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_base = x.buf.as_ptr();
+        let y_base = y.buf.as_ptr();
+        if tiles > 0 {
+            let func = TILED[6];
+            self.ensure_kernel(
+                "qwen4_gemv_bf16_xf32",
+                kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                func,
+            )?;
+            self.launch_gemv_k4_raw(
+                func, tiles as u32, w_ptr, x_base, y_base, m, k, hc_act_scale,
+            )?;
+        }
+        if tail > 0 {
+            let done = tiles * 8;
+            // F32 activations and outputs: skip the rows the tiles covered.
+            let x_ptr = unsafe { (x_base as *mut u8).add(done * k * 4) as *mut c_void };
+            let y_ptr = unsafe { (y_base as *mut u8).add(done * m * 4) as *mut c_void };
+            let func = if tail == 1 {
+                "gemv_bf16_xf32_k4"
+            } else {
+                TILED[tail - 2]
+            };
+            self.ensure_kernel(
+                "qwen4_gemv_bf16_xf32",
+                kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                func,
+            )?;
+            self.launch_gemv_k4_raw(func, 1, w_ptr, x_ptr, y_ptr, m, k, hc_act_scale)?;
+        }
+        Ok(())
+    }
+
+    /// One launch of a `gemv_bf16_xf32_k4*` kernel (block 128, grid
+    /// `[m, grid_y]`) over raw device pointers.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gemv_k4_raw(
+        &mut self,
+        func: &str,
+        grid_y: u32,
+        w_ptr: *mut c_void,
+        x_ptr: *mut c_void,
+        y_ptr: *mut c_void,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+    ) -> HipResult<()> {
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            func,
+            [m as u32, grid_y, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b
+            },
+        )
+    }
+
     /// [`Gpu::gemv_bf16_xf32_k4`] over a Q8_0 weight with each row split
     /// across eight waves (same epilogue). Requires `k % 256 == 0`.
     pub fn gemv_q8_0_k8(
@@ -18655,6 +18771,64 @@ impl Gpu {
             b.push_i32(rows_val);
             b
         })
+    }
+
+    /// [`Gpu::gemv_q8_0_staged_rows`]'s K = 2560 kernel over any `rows >= 1`
+    /// activation rows (x row stride 2560, y row stride M) in one launch of
+    /// grid `[m, ceil(rows / 8)]`: each block stages its weight row once and
+    /// dots it with its tile of eight rows (the last tile holds the rest);
+    /// each output row is bitwise the single-row staged kernel's. gfx1151
+    /// only, like the single-row path. Prompt fill.
+    pub fn gemv_q8_0_k2560_staged_rows_tiled(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "gemv_q8_0_k2560_staged_rows_tiled";
+        const TILE: usize = 8;
+        let tiles = rows.div_ceil(TILE);
+        if !self.arch_caps.is_gfx1151() || rows == 0 || tiles > 65_535 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_k2560_staged_rows_tiled shape",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let rows_val = rows as i32;
+        let tile_val = TILE as i32;
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &tile_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [m as u32, tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(rows_val);
+                b.push_i32(tile_val);
+                b
+            },
+        )
     }
 
     /// Requantize a row-major BF16 `[m, k]` weight to a new Q8_0 tensor

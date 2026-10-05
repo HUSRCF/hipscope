@@ -2118,6 +2118,125 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
     ))
 }
 
+/// Native-MTP prompt fill digests for each prompt length: the MTP head and
+/// target state families after a cold `mtp_prefill`, the pending hidden row,
+/// the seed, and one following draft window. Run once per
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` setting and compare the two outputs; the
+/// route is read once per process.
+pub fn run_mtp_fill_digest(
+    model_path: &Path,
+    lengths: &[usize],
+    max_seq: usize,
+) -> Result<Value, String> {
+    use hipfire_runtime::spec::MtpDrafter;
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let receipt = crate::admit_hfqm_artifact(&hfq)
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let config = receipt.config.clone();
+    let manifest = receipt.manifest.clone();
+    let metadata = receipt.ple.clone();
+    let placements = receipt.placements.clone();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
+        .map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| qwen4_range_payload(&source, entry),
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let backend = Qwen4KvBackend::automatic(&gpu);
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+        config.clone(),
+        transaction,
+        &placements,
+        &mut gpu,
+        max_seq,
+        metadata,
+        crate::state::Qwen4StateFormat::F32,
+        backend,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    let run = (|| -> Result<Value, String> {
+        bundle
+            .attach_forward(&mut gpu, max_seq)
+            .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+        bundle
+            .attach_mtp(&mut gpu, max_seq)
+            .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+        map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
+        let vocab = config.vocab_size as u64;
+        let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(3, max_seq);
+        let mut rows = Vec::new();
+        for &length in lengths {
+            // A deterministic spread over the real vocabulary.
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ length as u64;
+            let prompt: Vec<u32> = (0..length)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (10 + (state >> 33) % (vocab - 10)) as u32
+                })
+                .collect();
+            let seed = drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?;
+            let after_fill = bundle_family_json(&gpu, &bundle)?;
+            let mut pending = Family::new();
+            append_f32(
+                &gpu,
+                &mut pending,
+                drafter.pending_hidden_for_parity()?,
+                drafter.pending_hidden_for_parity()?.numel(),
+            )?;
+            let position = bundle.state.position;
+            let eos = bundle.config.eos_token_id;
+            let window = drafter.mtp_step(
+                &mut gpu,
+                &mut bundle,
+                position,
+                seed,
+                &[seed],
+                3,
+                eos,
+                None,
+            )?;
+            let after_window = bundle_family_json(&gpu, &bundle)?;
+            rows.push(json!({
+                "length": length,
+                "seed": seed,
+                "pending_hidden": pending.finish(),
+                "families_after_fill": after_fill,
+                "window_committed": window.committed,
+                "families_after_window": after_window,
+            }));
+            eprintln!("mtp-fill digest: length {length} seed {seed}");
+        }
+        Ok(json!({
+            "batched_fill": hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true),
+            "max_seq": max_seq,
+            "rows": rows,
+        }))
+    })();
+    let cleanup = bundle
+        .free_gpu(&mut gpu)
+        .err()
+        .map(|error| format!("qwen4 bundle teardown failed: {error}"));
+    let value = run?;
+    if let Some(error) = cleanup {
+        return Err(error);
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

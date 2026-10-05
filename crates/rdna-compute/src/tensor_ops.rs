@@ -2688,6 +2688,132 @@ pub fn indexed_attention_decode_prologue(
     )
 }
 
+/// QSA prologue of the `MtpStep::Append`-style key-value-only fill of `rows`
+/// consecutive prompt rows: the decode prologue kernel launched with
+/// `heads == 0`, so the query/gate branch is dead and only the index-query,
+/// key norm+RoPE, K/V cache append and index-key BF16 round trip + raw-key copy
+/// run (same kernel, same per-element operations as `rows` decode-prologue
+/// launches). Row buffers are row-major at their natural row widths; row `r`
+/// sits at cache position `position + r`.
+pub struct IndexedAttentionAppendPrologue<'a> {
+    /// `rows x [index q (index_heads * index_dim) | index k (index_kv_width)]`.
+    pub index_row: &'a GpuTensor,
+    /// `rows x [kv_heads * head_dim]`, normed + roped in place.
+    pub keys: &'a GpuTensor,
+    /// `rows x [kv_heads * head_dim]`.
+    pub values: &'a GpuTensor,
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub raw_index_keys: &'a GpuTensor,
+    pub index_q_norm: &'a GpuTensor,
+    pub k_norm: &'a GpuTensor,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    pub index_kv_width: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub position: usize,
+    pub rows: usize,
+    pub format: QsaKvFormat,
+}
+
+pub fn indexed_attention_append_prologue(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAppendPrologue<'_>,
+) -> HipResult<()> {
+    for tensor in [p.index_row, p.keys, p.values] {
+        ensure_f32(tensor)?;
+    }
+    check_qsa_format(gpu, p.format, p.kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
+    if p.raw_index_keys.dtype != p.format.index_dtype() {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let row_units = p.format.kv_row_units(p.kv_heads, p.head_dim);
+    let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA append prologue KV width")?;
+    let end = checked_add(p.position, p.rows, "QSA append prologue position")?;
+    let index_width =
+        checked_product(p.index_heads, p.index_dim, "QSA append prologue index")? + p.index_kv_width;
+    let bad = [p.index_q_norm, p.k_norm]
+        .iter()
+        .any(|n| n.dtype != DType::BF16)
+        || p.rows == 0
+        || p.index_heads == 0
+        || p.kv_heads == 0
+        || p.index_dim == 0
+        || p.index_dim > 256
+        || p.head_dim == 0
+        || p.head_dim > 256
+        || p.index_q_norm.numel() != p.index_dim
+        || p.k_norm.numel() != p.head_dim
+        || p.index_row.numel() < checked_product(p.rows, index_width, "QSA append prologue index")?
+        || p.keys.numel() < checked_product(p.rows, kv_width, "QSA append prologue keys")?
+        || p.values.numel() < checked_product(p.rows, kv_width, "QSA append prologue values")?
+        || p.full_keys.numel() < checked_product(end, row_units, "QSA append prologue cache")?
+        || p.full_values.numel() < checked_product(end, row_units, "QSA append prologue cache")?
+        || p.raw_index_keys.numel()
+            < checked_product(end, p.index_kv_width, "QSA append prologue raw keys")?;
+    if bad {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let blocks_x = checked_u32(
+        p.index_heads + p.kv_heads + 1,
+        "QSA append prologue block count",
+    )?;
+    let kernel = p.format.kernel([
+        "indexed_attention_decode_prologue_f32",
+        "indexed_attention_decode_prologue_fp8",
+    ]);
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let mut args = KernargBlob::new();
+    // heads == 0: the kernel never dereferences `qgate` (its row offset is
+    // `r * 2 * 0 * head_dim`, and `block < heads` is never true) nor `q_norm`,
+    // so they alias live buffers of the right dtype.
+    for tensor in [
+        p.index_row,
+        p.keys,
+        p.keys,
+        p.values,
+        p.full_keys,
+        p.full_values,
+        p.raw_index_keys,
+        p.index_q_norm,
+        p.k_norm,
+        p.k_norm,
+    ] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for (value, label) in [
+        (p.index_heads, "QSA append prologue index heads"),
+        (p.index_dim, "QSA append prologue index width"),
+        (p.index_kv_width, "QSA append prologue index KV width"),
+        (0, "QSA append prologue heads"),
+        (p.kv_heads, "QSA append prologue KV heads"),
+        (p.head_dim, "QSA append prologue head width"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_i32(checked_i32(p.position, "QSA append prologue position")?);
+    // Declared dynamic field: replay re-derives the position (angles and
+    // both cache rows follow it).
+    let position_offset = args.len() - 4;
+    args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
+    gpu.launch_blob_recorded(
+        kernel,
+        [blocks_x, checked_u32(p.rows, "QSA append prologue rows")?, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
+    )
+}
+
 pub fn indexed_attention_norm_rope_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRopeBatch<'_>,

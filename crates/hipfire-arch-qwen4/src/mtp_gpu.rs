@@ -15,9 +15,10 @@ use crate::gpu_forward::{
     Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
-use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights};
+use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
     DraftHeadRequestState,
@@ -29,7 +30,11 @@ use hipfire_runtime::kv_backend::{
     KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use hipfire_runtime::spec::SpecGrammar;
-use rdna_compute::tensor_ops::QsaKvFormat;
+use rdna_compute::tensor_ops::{
+    hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
+    indexed_attention_pool_rope_incremental, HyperNorm, HyperReadProjected,
+    IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
@@ -37,6 +42,9 @@ use std::fmt;
 const MTP_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
+/// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
+/// launch sequence: the capacity of [`MtpAppendScratch`].
+pub(crate) const MTP_FILL_ROWS: usize = 1024;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -374,6 +382,245 @@ impl MtpGpuScratch {
             }
         }
         first
+    }
+}
+
+/// Row widths shared by [`MtpAppendScratch`] and `Qwen4MtpGpu::append_rows`.
+#[derive(Clone, Copy)]
+struct AppendWidths {
+    hidden: usize,
+    /// `MTP_BRANCHES * hidden`: one row of the HC streams.
+    wide: usize,
+    /// Index query heads then index key: `(indexer_n_heads + indexer_kv_heads) * indexer_head_dim`.
+    index_width: usize,
+    index_kv_width: usize,
+    kv_width: usize,
+}
+
+impl AppendWidths {
+    fn new(config: &Qwen4Config) -> Option<Self> {
+        let index_kv_width = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?;
+        Some(Self {
+            hidden: config.hidden_size,
+            wide: MTP_BRANCHES.checked_mul(config.hidden_size)?,
+            index_width: config
+                .indexer_n_heads
+                .checked_mul(config.indexer_head_dim)?
+                .checked_add(index_kv_width)?,
+            index_kv_width,
+            kv_width: config
+                .num_key_value_heads
+                .checked_mul(config.head_dim)?,
+        })
+    }
+}
+
+/// Allocations of one [`MtpAppendScratch`], in field order.
+const MTP_APPEND_TENSORS: usize = 14;
+
+/// Row-batched operator buffers of the prompt-fill Append pass
+/// (`Qwen4MtpGpu::append_rows`): the per-row [`MtpGpuScratch`] tensors that an
+/// Append step touches, each with `rows` rows. Never aliases the per-row scratch.
+pub(crate) struct MtpAppendScratch {
+    /// Row capacity.
+    rows: usize,
+    /// `rows` i32 token ids, as raw bytes.
+    token_ids: GpuTensor,
+    token_embedding: GpuTensor,
+    embedding_norm: GpuTensor,
+    projected_embedding: GpuTensor,
+    hidden_norm: GpuTensor,
+    projected_hidden: GpuTensor,
+    wide: GpuTensor,
+    hc_normalized: GpuTensor,
+    hc_low: GpuTensor,
+    hc_up: GpuTensor,
+    hc_mixed: GpuTensor,
+    index: GpuTensor,
+    qsa_k: GpuTensor,
+    qsa_v: GpuTensor,
+    host_token_bytes: Vec<u8>,
+}
+
+impl MtpAppendScratch {
+    /// Row capacity: the most rows one `append_rows` call takes.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Element count and dtype of each scratch tensor, in field order.
+    fn shapes(config: &Qwen4Config, rows: usize) -> Option<[(usize, DType); MTP_APPEND_TENSORS]> {
+        let w = AppendWidths::new(config)?;
+        let per = |width: usize| rows.checked_mul(width);
+        Some([
+            (rows.checked_mul(std::mem::size_of::<i32>())?, DType::Raw),
+            (per(w.hidden)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(config.hc_lowrank)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.index_width)?, DType::F32),
+            (per(w.kv_width)?, DType::F32),
+            (per(w.kv_width)?, DType::F32),
+        ])
+    }
+
+    /// Device bytes [`Self::new`] allocates for `rows` rows.
+    pub(crate) fn device_bytes(config: &Qwen4Config, rows: usize) -> Option<usize> {
+        Self::shapes(config, rows)?
+            .iter()
+            .try_fold(0usize, |total, &(elements, dtype)| {
+                total.checked_add(elements.checked_mul(dtype.size())?)
+            })
+    }
+
+    pub(crate) fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        rows: usize,
+    ) -> Result<Self, MtpGpuError> {
+        if rows == 0 {
+            return Err(invalid("MTP append scratch needs at least one row"));
+        }
+        let shapes = Self::shapes(config, rows)
+            .ok_or_else(|| invalid("MTP append scratch extent overflow"))?;
+        let mut allocated = Vec::with_capacity(MTP_APPEND_TENSORS);
+        for (elements, dtype) in shapes {
+            match gpu.zeros(&[elements], dtype) {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        let mut tensors = allocated.into_iter();
+        let mut next = || tensors.next().expect("append scratch tensor count");
+        Ok(Self {
+            rows,
+            token_ids: next(),
+            token_embedding: next(),
+            embedding_norm: next(),
+            projected_embedding: next(),
+            hidden_norm: next(),
+            projected_hidden: next(),
+            wide: next(),
+            hc_normalized: next(),
+            hc_low: next(),
+            hc_up: next(),
+            hc_mixed: next(),
+            index: next(),
+            qsa_k: next(),
+            qsa_v: next(),
+            host_token_bytes: vec![0; rows * std::mem::size_of::<i32>()],
+        })
+    }
+
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        let tensors = [
+            self.token_ids,
+            self.token_embedding,
+            self.embedding_norm,
+            self.projected_embedding,
+            self.hidden_norm,
+            self.projected_hidden,
+            self.wide,
+            self.hc_normalized,
+            self.hc_low,
+            self.hc_up,
+            self.hc_mixed,
+            self.index,
+            self.qsa_k,
+            self.qsa_v,
+        ];
+        let mut first = None;
+        for tensor in tensors {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+/// The MTP weights an Append step reads, resolved and shape-checked once for
+/// the batched pass (the per-row path resolves the same handles through its
+/// `Step` descriptors, `forward_token`).
+struct AppendWeights<'a> {
+    embedding: &'a GpuTensor,
+    norm_embedding: &'a GpuTensor,
+    norm_hidden: &'a GpuTensor,
+    fc_embedding: WeightRef<'a>,
+    fc_hidden: WeightRef<'a>,
+    /// Attention-side HC read: its norm, down (`wide -> hc_lowrank`) and up
+    /// (`hc_lowrank -> wide`) projections.
+    hc: Qwen4HyperReadWeights<'a>,
+    qsa: Qwen4QsaWeights<'a>,
+}
+
+impl<'a> AppendWeights<'a> {
+    fn resolve(
+        weights: &'a Qwen4Weights,
+        config: &Qwen4Config,
+        w: &AppendWidths,
+    ) -> Result<Self, MtpGpuError> {
+        if config.hc_count != MTP_BRANCHES {
+            return Err(invalid("MTP batched append needs four HC branches"));
+        }
+        let check = |label: &str,
+                     weight: &WeightRef<'_>,
+                     dtype: DType,
+                     m: usize,
+                     k: usize|
+         -> Result<(), MtpGpuError> {
+            if weight.dtype != dtype || weight.m != m || weight.k != k {
+                return Err(invalid(format!(
+                    "MTP batched append {label} is {:?} [{}x{}], expected {dtype:?} [{m}x{k}]",
+                    weight.dtype, weight.m, weight.k
+                )));
+            }
+            Ok(())
+        };
+        let embedding = weights.resident(&weights.root.embedding)?;
+        if embedding.dtype != DType::Q8_0 {
+            return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
+        }
+        let fc_embedding = dense_ref(weights, &weights.mtp.fc_embedding)?;
+        check("fc_embedding", &fc_embedding, DType::BF16, w.hidden, w.hidden)?;
+        let fc_hidden = dense_ref(weights, &weights.mtp.fc_hidden)?;
+        check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
+        let hc = hyper_desc(weights, &weights.mtp.attn_hyper)?.read;
+        if !w.wide.is_multiple_of(32) {
+            return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
+        }
+        check("HC down", &hc.input_mix_down, DType::BF16, config.hc_lowrank, w.wide)?;
+        check("HC up", &hc.input_mix_up, DType::BF16, w.wide, config.hc_lowrank)?;
+        let qsa = qsa_desc(weights, &weights.mtp.attention)?;
+        // The tiled Q8_0 projection is the K = 2560 staged kernel.
+        if w.hidden != 2560 {
+            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
+        }
+        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
+        check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
+        check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
+        Ok(Self {
+            embedding,
+            norm_embedding: weights.resident(&weights.mtp.pre_fc_norm_embedding)?,
+            norm_hidden: weights.resident(&weights.mtp.pre_fc_norm_hidden)?,
+            fc_embedding,
+            fc_hidden,
+            hc,
+            qsa,
+        })
     }
 }
 
@@ -1815,6 +2062,298 @@ impl Qwen4MtpGpu {
         state.selected_len = selected_len;
         state.step_index = state.step_index.wrapping_add(1);
         Ok(next_token)
+    }
+
+    /// Whether [`Self::append_rows`] can run for this model on this GPU:
+    /// gfx1151 only (the tiled Q8_0 projection is the K = 2560 staged GEMV
+    /// the per-row path takes there; other arches run `gemv_q8_0` and have no
+    /// batched twin) and the shipped weight formats and shapes.
+    pub(crate) fn append_rows_supported(
+        gpu: &Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+    ) -> bool {
+        gpu.arch_caps.is_gfx1151()
+            && AppendWidths::new(config)
+                .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
+    }
+
+    /// [`MtpStep::Append`] for `tokens.len()` consecutive prompt rows starting
+    /// at `position`, row `i` paired with `hidden` row `i` (the per-row loop's
+    /// (token p, hidden p) pairing). Runs the per-row `forward_token` Append
+    /// op sequence once over all rows, calling the rdna-compute entry points
+    /// directly (never the `Step` dispatcher or `project_weight`, whose
+    /// multi-row routes change the arithmetic): each op is the single-row
+    /// kernel with a rows grid, or a multi-row kernel whose per-row
+    /// reduction order is the single-row kernel's.
+    ///
+    /// `hidden` holds at least `tokens.len()` rows of `MTP_BRANCHES * hidden`
+    /// F32. Draft request state sees every token in order, as `forward_token`
+    /// observes each; the QSA state commits `position + tokens.len()` rows.
+    /// `wide_hidden`, the selection and its length are not touched (the
+    /// per-row Append leaves them alone too).
+    pub(crate) fn append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        scratch: &mut MtpAppendScratch,
+        tokens: &[u32],
+        hidden: &GpuTensor,
+        position: usize,
+    ) -> Result<(), MtpGpuError> {
+        let rows = tokens.len();
+        let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
+        if rows == 0 || rows > scratch.rows {
+            return Err(invalid(format!(
+                "MTP batched append of {rows} rows needs 1..={} (scratch capacity)",
+                scratch.rows
+            )));
+        }
+        let hidden_elements = rows
+            .checked_mul(w.wide)
+            .ok_or_else(|| invalid("MTP batched append hidden extent overflow"))?;
+        if hidden.dtype != DType::F32 || hidden.numel() < hidden_elements {
+            return Err(invalid(format!(
+                "MTP batched append hidden must be F32 with at least {hidden_elements} elements"
+            )));
+        }
+        if !gpu.arch_caps.is_gfx1151() {
+            return Err(invalid("MTP batched append is gfx1151 only"));
+        }
+        if position != self.state.position {
+            return Err(invalid(format!(
+                "MTP position mismatch: expected {}, got {position}",
+                self.state.position
+            )));
+        }
+        let end = position
+            .checked_add(rows)
+            .ok_or_else(|| invalid("MTP batched append position overflow"))?;
+        if end > self.max_seq {
+            return Err(invalid("MTP position exceeds QSA capacity"));
+        }
+        // Mapping is the caller's (`ensure_mapped_capacity`), never here.
+        if end > self.state.mapped_tokens {
+            return Err(invalid(format!(
+                "MTP rows through position {} are past the mapped QSA coverage of {} tokens",
+                end - 1,
+                self.state.mapped_tokens
+            )));
+        }
+        let compress = config.indexer_compress_ratio;
+        if compress == 0 {
+            return Err(invalid("MTP indexer compress ratio is zero"));
+        }
+        let mw = AppendWeights::resolve(weights, config, &w)?;
+        for &token in tokens {
+            self.draft.observe(token);
+        }
+        for (bytes, &token) in scratch.host_token_bytes.chunks_exact_mut(4).zip(tokens) {
+            bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+        }
+        gpu.memcpy_htod_auto(
+            &scratch.token_ids.buf,
+            &scratch.host_token_bytes[..rows * std::mem::size_of::<i32>()],
+        )?;
+
+        // Exactly-`rows` views: HC norm and read derive their row count from
+        // the tensor extent.
+        let view = |tensor: &GpuTensor, width: usize| tensor.sub_offset(0, rows * width);
+        let backbone = view(hidden, w.wide);
+        let token_embedding = view(&scratch.token_embedding, w.hidden);
+        let embedding_norm = view(&scratch.embedding_norm, w.hidden);
+        let projected_embedding = view(&scratch.projected_embedding, w.hidden);
+        let hidden_norm = view(&scratch.hidden_norm, w.wide);
+        let projected_hidden = view(&scratch.projected_hidden, w.wide);
+        let wide = view(&scratch.wide, w.wide);
+        let hc_normalized = view(&scratch.hc_normalized, w.wide);
+        let hc_low = view(&scratch.hc_low, config.hc_lowrank);
+        let hc_up = view(&scratch.hc_up, w.wide);
+        let hc_mixed = view(&scratch.hc_mixed, w.hidden);
+        let index = view(&scratch.index, w.index_width);
+        let qsa_k = view(&scratch.qsa_k, w.kv_width);
+        let qsa_v = view(&scratch.qsa_v, w.kv_width);
+
+        // Embed (`Step::Embed`): the Q8_0 table, one grid row per token.
+        gpu.embedding_lookup_q8_batched(
+            mw.embedding,
+            &token_embedding,
+            &scratch.token_ids,
+            rows,
+            w.hidden,
+        )?;
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &token_embedding,
+                norm_weight: mw.norm_embedding,
+                normalized: &embedding_norm,
+                branches: 1,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        // G1 (byte identity vs the per-row `gemv_bf16_xf32`) governs every
+        // `gemm_bf16_xf32_multirow` below. On gfx1151 `gemm.rs` selects by
+        // (m, k, batch): (2560, 2560) is on the r16 allowlist for batch >= 64
+        // (`r16w4t` / `r16w4` / `r16`, documented bitwise to the four-row
+        // kernel) and the base four-row kernel below that; (10240, 320) is
+        // not on the allowlist and K = 320 takes the `pto2` tile
+        // (257..=512, LDS weights, also documented bitwise to the four-row
+        // kernel). If G1 shows any difference for a pair, replace that call
+        // with a rows-grid twin of the single-row kernel (`blockIdx.y`
+        // token tile over `gemv_bf16_xf32_rows_body`) before tuning
+        // anything. Never route these through `project_weight` /
+        // `gemm_bf16_xf32_f16_wmma_qwen4` (F16 WMMA from 512 rows).
+        gpu.gemm_bf16_xf32_multirow(
+            mw.fc_embedding.buf,
+            &embedding_norm,
+            &projected_embedding,
+            mw.fc_embedding.m,
+            mw.fc_embedding.k,
+            rows,
+        )?;
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &backbone,
+                norm_weight: mw.norm_hidden,
+                normalized: &hidden_norm,
+                branches: MTP_BRANCHES,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        // The four branch rows of a token are four projection rows
+        // (per-row: `gemv_bf16_xf32_x4_rows` over rows = MTP_BRANCHES).
+        gpu.gemm_bf16_xf32_multirow(
+            mw.fc_hidden.buf,
+            &hidden_norm,
+            &projected_hidden,
+            mw.fc_hidden.m,
+            mw.fc_hidden.k,
+            rows * MTP_BRANCHES,
+        )?;
+        gpu.broadcast_add_rows_f32(
+            &projected_hidden,
+            &projected_embedding,
+            &wide,
+            MTP_BRANCHES,
+            w.hidden,
+            rows,
+        )?;
+
+        // Attention-side HC read (`execute_hyper_read_inner`, rows = 1 route).
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &wide,
+                norm_weight: mw.hc.norm,
+                normalized: &hc_normalized,
+                branches: config.hc_count,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        // The long-K down projection keeps the K4 quarter fold and applies the
+        // 1/branches activation in its epilogue, as the per-row route does.
+        gpu.gemv_bf16_xf32_k4_rows_tiled(
+            mw.hc.input_mix_down.buf,
+            &hc_normalized,
+            &hc_low,
+            mw.hc.input_mix_down.m,
+            mw.hc.input_mix_down.k,
+            Some(1.0 / config.hc_count as f32),
+            rows,
+        )?;
+        gpu.gemm_bf16_xf32_multirow(
+            mw.hc.input_mix_up.buf,
+            &hc_low,
+            &hc_up,
+            mw.hc.input_mix_up.m,
+            mw.hc.input_mix_up.k,
+            rows,
+        )?;
+        hyper_read_projected(
+            gpu,
+            &HyperReadProjected {
+                input: &wide,
+                norm_weight: mw.hc.norm,
+                up: &hc_up,
+                normalized: &hc_normalized,
+                mixed: &hc_mixed,
+                branches: config.hc_count,
+                hidden: w.hidden,
+            },
+        )?;
+
+        // QSA append-only: index, K and V projections of the mixed row.
+        gpu.gemv_q8_0_k2560_staged_rows_tiled(
+            mw.qsa.indexer_qk.buf,
+            &hc_mixed,
+            &index,
+            mw.qsa.indexer_qk.m,
+            rows,
+        )?;
+        gpu.gemv_q8_0_k2560_staged_rows_tiled(mw.qsa.k.buf, &hc_mixed, &qsa_k, mw.qsa.k.m, rows)?;
+        gpu.gemv_q8_0_k2560_staged_rows_tiled(mw.qsa.v.buf, &hc_mixed, &qsa_v, mw.qsa.v.m, rows)?;
+        {
+            let state = &self.state;
+            indexed_attention_append_prologue(
+                gpu,
+                &IndexedAttentionAppendPrologue {
+                    index_row: &index,
+                    keys: &qsa_k,
+                    values: &qsa_v,
+                    full_keys: &state.full_keys,
+                    full_values: &state.full_values,
+                    raw_index_keys: &state.raw_index_keys,
+                    index_q_norm: mw.qsa.indexer_q_norm,
+                    k_norm: mw.qsa.k_norm,
+                    index_heads: config.indexer_n_heads,
+                    index_dim: config.indexer_head_dim,
+                    index_kv_width: w.index_kv_width,
+                    kv_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    position,
+                    rows,
+                    // The one MTP layer keeps the exact F32 QSA state.
+                    format: QsaKvFormat::F32,
+                },
+            )?;
+            // Pool exactly the blocks these rows complete, from raw keys the
+            // prologue just wrote (a block straddling `end` waits for the next
+            // call, whose first block is `position / compress`).
+            let complete = end / compress;
+            if complete > 0 {
+                indexed_attention_pool_rope_incremental(
+                    gpu,
+                    &IndexedAttentionPoolRope {
+                        raw_keys: &state.raw_index_keys,
+                        pooled: &state.pooled_keys,
+                        norm: Some(mw.qsa.indexer_k_norm),
+                        block_count: complete,
+                        compress,
+                        index_dim: w.index_kv_width,
+                        position: Some(QsaPositionBinding {
+                            position_start: position,
+                            rows,
+                        }),
+                        grid_bound: state.pooled_capacity,
+                    },
+                )?;
+            }
+        }
+
+        let state = &mut self.state;
+        state.position = end;
+        state.full_len = end;
+        state.raw_len = end;
+        state.pooled_len = end / compress;
+        state.selected_len = 0;
+        state.step_index = state.step_index.wrapping_add(rows);
+        Ok(())
     }
 }
 
