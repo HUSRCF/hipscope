@@ -909,13 +909,13 @@ fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     }
 }
 
-// Regions (a/b/z fold, first region m) and HC-write twins: cold-cache three-process
-// sweep at the FN shapes, BF16 HC streams (qcal/release-0.4.1/pm-perf-fn/mq6timing).
+// Regions (a/b/z fold, keyed on its total rows 48 + 48 + 6144) and HC-write twins: cold-cache
+// three-process sweep at the FN shapes, BF16 HC streams (qcal/release-0.4.1/pm-perf-fn/mq6timing).
 // N=8192: regions 7.18 -> 6.97 ms, HC-write 10.50 -> 10.10 ms. N=2048 HC-write keeps BT8/RW4.
 fn mq6_x4_halo_twin_policy(kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     match (kind, m, k, n) {
-        (Mq6X4Kind::Regions, 6144, 2560, 8192) => Some([8, 8, 2]),
-        (Mq6X4Kind::Regions, 6144, 2560, 2048) => Some([8, 8, 1]),
+        (Mq6X4Kind::Regions, 6240, 2560, 8192) => Some([8, 8, 2]),
+        (Mq6X4Kind::Regions, 6240, 2560, 2048) => Some([8, 8, 1]),
         (Mq6X4Kind::Hcw, 2560, 6144, 8192) => Some([8, 8, 2]),
         _ => None,
     }
@@ -40772,7 +40772,7 @@ impl Gpu {
                 "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 8)
         } else {
             let (name, rows, block, bv) =
-                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, regions[0].2, k, batch_size) {
+                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, regions.iter().map(|r| r.2).sum(), k, batch_size) {
                     Some(tile) => {
                         let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Regions);
                         (name, rows, block, tile[0] as usize)
