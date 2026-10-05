@@ -724,6 +724,405 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
         frame);
 }
 
+#if defined(__GFX12__)
+// Per-row norm factors, decay and beta of the persistent GDN recurrence: the
+// exact expression sequence of gated_delta_step_persistent256_body's
+// parameter pass (one row, the serial kd-order sums the per-row path uses).
+static __device__ __forceinline__ void gdn_pipe128_row_params(
+    const float* projection, const float* gate, const float* beta, int row, int qkv_width,
+    int q_offset, int k_offset, int value_heads, int value_head,
+    __hip_bfloat16& q_inv, __hip_bfloat16& k_inv, float& decay, float& beta_value) {
+    const int row_base = row * qkv_width;
+    float q_sum_f32 = 0.0f;
+    float k_sum_f32 = 0.0f;
+    const __hip_bfloat16 eps = bf16_round(1.0e-6f);
+    const float4* q_row = reinterpret_cast<const float4*>(projection + row_base + q_offset);
+    const float4* k_row = reinterpret_cast<const float4*>(projection + row_base + k_offset);
+    float4 qn = q_row[0], kn = k_row[0];
+    for (int c = 0; c < 32; ++c) {
+        const float4 qc = qn, kc = kn;
+        if (c + 1 < 32) { qn = q_row[c + 1]; kn = k_row[c + 1]; }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float q_float = bf16_to_f32(bf16_round((&qc.x)[u]));
+            const float k_float = bf16_to_f32(bf16_round((&kc.x)[u]));
+            q_sum_f32 += bf16_to_f32(bf16_round(q_float * q_float));
+            k_sum_f32 += bf16_to_f32(bf16_round(k_float * k_float));
+        }
+    }
+    const __hip_bfloat16 q_sum = bf16_round(q_sum_f32);
+    const __hip_bfloat16 k_sum = bf16_round(k_sum_f32);
+    q_inv = bf16_round(rsqrtf(bf16_to_f32(q_sum) + bf16_to_f32(eps)));
+    k_inv = bf16_round(rsqrtf(bf16_to_f32(k_sum) + bf16_to_f32(eps)));
+    decay = expf(gate[row * value_heads + value_head]);
+    beta_value = beta[row * value_heads + value_head];
+}
+
+// A per-lane zero the compiler cannot see through.  The q/k slots are read at
+// a wave-uniform address, so the compiler would treat the loaded LDS data as
+// uniform and move it through v_readfirstlane into SALU math (a VALU -> SALU
+// -> VALU round trip per kd step).  Adding this to the slot address makes the
+// loads divergent, so they stay ds_load_b128 into VGPRs feeding v_fmac.
+static __device__ __forceinline__ int gdn_pipe128_lane_zero() {
+    int zero;
+    __asm__ volatile("v_mov_b32 %0, 0" : "=v"(zero));
+    return zero;
+}
+
+// The kd loops of the pipe128 body.  A slot holds 128 floats read as float4,
+// consumed in groups of kGdnPipeGroup float4 with the next group's loads
+// issued before the current group's FMAs.  Left alone, the compiler hoists
+// the whole row's loads and the decay multiplies of the fused loop above the
+// out chain (the longest dependence chain), which keeps the old and the new
+// state live together and spills.  The empty volatile asm statements carry
+// the chain values through each element, so loads and arithmetic stay in
+// source order and the window of live loads stays one group; they emit no
+// instruction and change no value.  Per-element expressions and chain order
+// are exactly the scalar kd = 0..127 loops of the original.
+constexpr int kGdnPipeGroup = 4;
+constexpr int kGdnPipeGroups = 32 / kGdnPipeGroup;
+
+// out += s[kd] * slot[kd] over kd = 0..127.
+static __device__ __forceinline__ void gdn_pipe128_dot(
+    const float (&s)[128], const float* slot, int lane_zero, float& out) {
+    const float4* p = reinterpret_cast<const float4*>(slot + lane_zero);
+    float4 cur[kGdnPipeGroup];
+    #pragma unroll
+    for (int e = 0; e < kGdnPipeGroup; ++e) cur[e] = p[e];
+    #pragma unroll
+    for (int g = 0; g < kGdnPipeGroups; ++g) {
+        float4 next[kGdnPipeGroup];
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) next[e] = p[(g + 1) * kGdnPipeGroup + e];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (int e = 0; e < kGdnPipeGroup; ++e) {
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                out += s[4 * (g * kGdnPipeGroup + e) + u] * (&cur[e].x)[u];
+            }
+            __asm__ volatile("" : "+v"(out));
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) cur[e] = next[e];
+        }
+    }
+}
+
+// s[kd] += slot[kd] * delta over kd = 0..127.
+static __device__ __forceinline__ void gdn_pipe128_update(
+    float (&s)[128], const float* slot, int lane_zero, float delta) {
+    const float4* p = reinterpret_cast<const float4*>(slot + lane_zero);
+    float4 cur[kGdnPipeGroup];
+    #pragma unroll
+    for (int e = 0; e < kGdnPipeGroup; ++e) cur[e] = p[e];
+    #pragma unroll
+    for (int g = 0; g < kGdnPipeGroups; ++g) {
+        float4 next[kGdnPipeGroup];
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) next[e] = p[(g + 1) * kGdnPipeGroup + e];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (int e = 0; e < kGdnPipeGroup; ++e) {
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                s[4 * (g * kGdnPipeGroup + e) + u] += (&cur[e].x)[u] * delta;
+                __asm__ volatile("" : "+v"(s[4 * (g * kGdnPipeGroup + e) + u]));
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) cur[e] = next[e];
+        }
+    }
+}
+
+// One pass over kd = 0..127: out += s[kd] * q[kd]; s[kd] *= decay;
+// kv += s[kd] * k[kd]  (the out chain of row i, decay and the kv chain of row i + 1).
+static __device__ __forceinline__ void gdn_pipe128_out_decay_kv(
+    float (&s)[128], const float* qslot, const float* kslot, int lane_zero, float decay,
+    float& out, float& kv_mem) {
+    const float4* qp = reinterpret_cast<const float4*>(qslot + lane_zero);
+    const float4* kp = reinterpret_cast<const float4*>(kslot + lane_zero);
+    float4 qcur[kGdnPipeGroup], kcur[kGdnPipeGroup];
+    #pragma unroll
+    for (int e = 0; e < kGdnPipeGroup; ++e) {
+        qcur[e] = qp[e];
+        kcur[e] = kp[e];
+    }
+    #pragma unroll
+    for (int g = 0; g < kGdnPipeGroups; ++g) {
+        float4 qnext[kGdnPipeGroup], knext[kGdnPipeGroup];
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) {
+                qnext[e] = qp[(g + 1) * kGdnPipeGroup + e];
+                knext[e] = kp[(g + 1) * kGdnPipeGroup + e];
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (int e = 0; e < kGdnPipeGroup; ++e) {
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int kd = 4 * (g * kGdnPipeGroup + e) + u;
+                out += s[kd] * (&qcur[e].x)[u];
+                s[kd] *= decay;
+                kv_mem += s[kd] * (&kcur[e].x)[u];
+                // Orders out(kd) -> decay(kd) -> kv(kd) -> kd + 1 (see above).
+                __asm__ volatile("" : "+v"(s[kd]), "+v"(out), "+v"(kv_mem));
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (g + 1 < kGdnPipeGroups) {
+            #pragma unroll
+            for (int e = 0; e < kGdnPipeGroup; ++e) {
+                qcur[e] = qnext[e];
+                kcur[e] = knext[e];
+            }
+        }
+    }
+}
+
+// gfx12 prefill GDN recurrence, exact 128x128 geometry: one value head per
+// 128-thread block, thread c owns value column c and keeps all 128 state
+// values in registers, so a row needs no cross-thread handoff of kv, delta or
+// out.  The per-row chains are the same serial kd = 0..127 chains as
+// gated_delta_step_persistent256_body (that kernel splits them over two
+// 64-key halves and passes the accumulator between the halves; here one
+// thread runs the whole chain).  The recurrence is software-pipelined: the
+// loop body for row i computes row i's output chain together with row i+1's
+// decay and kv chain (they are independent serial chains, interleaved per kd
+// for ILP), then row i+1's delta and state update.  Every per-element
+// expression and its operand order is the original's, so state and outputs
+// are bitwise identical.
+template <bool kQ8>
+__device__ __forceinline__ void gated_delta_step_pipe128_body(
+    const float* projection,
+    const float* gate,
+    const float* beta,
+    void* state,
+    float* output,
+    int rows,
+    int qkv_width,
+    int key_heads,
+    int value_heads,
+    int key_dim,
+    int value_dim,
+    float query_scale,
+    unsigned int frame = 0u) {
+    const int value_head = (int)blockIdx.x;
+    const int c = (int)threadIdx.x;
+    const int lane_zero = gdn_pipe128_lane_zero();
+    const bool exact_shape = key_dim == 128 && value_dim == 128;
+    if (!exact_shape || value_head >= value_heads) return;
+
+    const int qk_width = key_heads * 128;
+    const int value_width = value_heads * 128;
+    const int repeat = value_heads / key_heads;
+    const int key_head = value_head / repeat;
+    const int state_base = value_head * 128 * 128;
+    const int q_offset = key_head * 128;
+    const int k_offset = qk_width + key_head * 128;
+    const int v_offset = 2 * qk_width + value_head * 128;
+
+    // Per-row parameters of 256-row blocks, double-buffered by block parity.
+    __shared__ __hip_bfloat16 q_inv_rows[2][256];
+    __shared__ __hip_bfloat16 k_inv_rows[2][256];
+    __shared__ float decay_rows[2][256];
+    __shared__ float beta_rows[2][256];
+    // Normalized, widened q (already times query_scale) and k of the rows in
+    // flight: a 3-slot ring (see the loop).  Float slots: the kd loops read
+    // them as float4, with no per-element bf16 widening or scaling.
+    __shared__ __attribute__((aligned(16))) float qs[3][128];
+    __shared__ __attribute__((aligned(16))) float kf[3][128];
+
+    float s[128];
+    if constexpr (kQ8) {
+        const int4* codes4 =
+            reinterpret_cast<const int4*>(gdn_q8_row(state, value_head, c));
+        const float scale = gdn_q8_scales(state, value_heads)[value_head * 128 + c];
+        int4 packed[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) packed[i] = codes4[i];
+        const signed char* codes = reinterpret_cast<const signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 128; ++kd) s[kd] = scale * (float)codes[kd];
+    } else {
+        #pragma unroll
+        for (int kd = 0; kd < 128; ++kd) {
+            s[kd] = reinterpret_cast<const float*>(state)[state_base + kd * 128 + c];
+        }
+    }
+
+    // Raw q/k/v of this thread's channel c for the row about to be staged.
+    float raw_q = projection[q_offset + c];
+    float raw_k = projection[k_offset + c];
+    float raw_v = projection[v_offset + c];
+
+    // Parameters of block 0: thread c takes rows c and c + 128.
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int row = c + h * 128;
+        if (row < rows) {
+            __hip_bfloat16 q_inv, k_inv;
+            float decay, beta_value;
+            gdn_pipe128_row_params(projection, gate, beta, row, qkv_width, q_offset, k_offset,
+                                   value_heads, value_head, q_inv, k_inv, decay, beta_value);
+            q_inv_rows[0][row] = q_inv;
+            k_inv_rows[0][row] = k_inv;
+            decay_rows[0][row] = decay;
+            beta_rows[0][row] = beta_value;
+        }
+    }
+    gdn_lds_barrier();
+
+    // Row 0: stage, then decay + kv + delta + update on the loaded state.
+    qs[0][c] = bf16_to_f32(bf16_round(
+        bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[0][0]))) * query_scale;
+    kf[0][c] = bf16_to_f32(bf16_round(
+        bf16_to_f32(bf16_round(raw_k)) * bf16_to_f32(k_inv_rows[0][0])));
+    const float v0 = raw_v;
+    if (rows > 1) {
+        const int next_base = qkv_width;
+        raw_q = projection[next_base + q_offset + c];
+        raw_k = projection[next_base + k_offset + c];
+        raw_v = projection[next_base + v_offset + c];
+    }
+    gdn_lds_barrier();
+    {
+        const float decay = decay_rows[0][0];
+        const float beta_value = beta_rows[0][0];
+        #pragma unroll
+        for (int kd = 0; kd < 128; ++kd) s[kd] *= decay;
+        float kv_mem = 0.0f;
+        gdn_pipe128_dot(s, &kf[0][0], lane_zero, kv_mem);
+        const float delta = (bf16_to_f32(bf16_round(v0)) - kv_mem) * beta_value;
+        gdn_pipe128_update(s, &kf[0][0], lane_zero, delta);
+    }
+
+    // Slot ring: row i's q is in qs[cur], row i+1's q/k are staged into
+    // qs/kf[nxt] at the top of iteration i.  Iteration i reads qs[cur] and
+    // kf[nxt] after its one barrier and writes qs/kf[nxt] before it.  A wave
+    // that has crossed iteration i's barrier knows every wave has finished
+    // iteration i-1's pre-barrier work, and its own iteration-i writes land
+    // in slot (i+1)%3.  The slowest wave can still be reading iteration
+    // i-1's slots (qs[(i-1)%3], kf[i%3]) or iteration i's, which differ
+    // from (i+1)%3; with only two slots (i+1)%2 == (i-1)%2 and a fast wave
+    // would overwrite q still being read.  The slots iteration i reads were
+    // written before its barrier (qs[cur] in iteration i-1, before that
+    // iteration's barrier; kf[nxt] in this iteration).
+    int cur = 0;
+    int nxt = 1;
+    for (int i = 0; i + 1 < rows; ++i) {
+        const int row = i + 1;
+        const int pbuf = (row >> 8) & 1;
+        const int pidx = row & 255;
+        qs[nxt][c] = bf16_to_f32(bf16_round(
+            bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[pbuf][pidx])))
+            * query_scale;
+        kf[nxt][c] = bf16_to_f32(bf16_round(
+            bf16_to_f32(bf16_round(raw_k)) * bf16_to_f32(k_inv_rows[pbuf][pidx])));
+        const float cur_v = raw_v;
+        if (row + 1 < rows) {
+            const int next_base = (row + 1) * qkv_width;
+            raw_q = projection[next_base + q_offset + c];
+            raw_k = projection[next_base + k_offset + c];
+            raw_v = projection[next_base + v_offset + c];
+        }
+        // Parameters of the next 256-row block, into the buffer of the block
+        // before the current one (whose last row's parameters were read two
+        // iterations ago, before the previous barrier).  Their first reader
+        // is 255 iterations away, past many per-row barriers.
+        if ((i & 255) == 0 && i + 256 < rows) {
+            const int nbuf = ((i >> 8) + 1) & 1;
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int prow = i + 256 + c + h * 128;
+                if (prow < rows) {
+                    __hip_bfloat16 q_inv, k_inv;
+                    float decay, beta_value;
+                    gdn_pipe128_row_params(projection, gate, beta, prow, qkv_width, q_offset,
+                                           k_offset, value_heads, value_head, q_inv, k_inv,
+                                           decay, beta_value);
+                    q_inv_rows[nbuf][prow & 255] = q_inv;
+                    k_inv_rows[nbuf][prow & 255] = k_inv;
+                    decay_rows[nbuf][prow & 255] = decay;
+                    beta_rows[nbuf][prow & 255] = beta_value;
+                }
+            }
+        }
+        gdn_lds_barrier();
+
+        const float decay = decay_rows[pbuf][pidx];
+        const float beta_value = beta_rows[pbuf][pidx];
+        float out = 0.0f;
+        float kv_mem = 0.0f;
+        gdn_pipe128_out_decay_kv(s, &qs[cur][0], &kf[nxt][0], lane_zero, decay, out, kv_mem);
+        output[i * value_width + value_head * 128 + c] = out;
+        const float delta = (bf16_to_f32(bf16_round(cur_v)) - kv_mem) * beta_value;
+        gdn_pipe128_update(s, &kf[nxt][0], lane_zero, delta);
+        cur = nxt;
+        nxt = nxt == 2 ? 0 : nxt + 1;
+    }
+
+    // Last row's output chain; its q was staged before the last barrier.
+    {
+        float out = 0.0f;
+        gdn_pipe128_dot(s, &qs[cur][0], lane_zero, out);
+        output[(rows - 1) * value_width + value_head * 128 + c] = out;
+    }
+
+    if constexpr (kQ8) {
+        float peak = 0.0f;
+        #pragma unroll
+        for (int kd = 0; kd < 128; ++kd) peak = fmaxf(peak, fabsf(s[kd]));
+        const float inv = gdn_q8_inv(peak);
+        int4 packed[8];
+        signed char* codes = reinterpret_cast<signed char*>(packed);
+        #pragma unroll
+        for (int kd = 0; kd < 128; ++kd) {
+            codes[kd] = gdn_q8_round(s[kd], inv, value_head, c, kd, frame);
+        }
+        int4* dst = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, c));
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) dst[i] = packed[i];
+        gdn_q8_scales(state, value_heads)[value_head * 128 + c] = gdn_q8_scale(peak);
+        return;
+    }
+    float* const final_state = reinterpret_cast<float*>(state);
+    #pragma unroll
+    for (int kd = 0; kd < 128; ++kd) {
+        final_state[state_base + kd * 128 + c] = s[kd];
+    }
+}
+
+__launch_bounds__(128)
+extern "C" __global__ void gated_delta_step_pipe128_f32(
+    const float* projection, const float* gate, const float* beta, float* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_pipe128_body<false>(projection, gate, beta, state, output, rows,
+        qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
+}
+
+__launch_bounds__(128)
+extern "C" __global__ void gated_delta_step_pipe128_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_pipe128_body<true>(projection, gate, beta, state, output, rows,
+        qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale, frame);
+}
+#endif
+
 // Few-row verify rollback: re-run the `keep` kept rows of every GDN layer in
 // one launch (blockIdx.y = layer; the layers' recurrences are independent).
 // `table[2 * layer]` is the layer's captured recurrence input (the verify's
