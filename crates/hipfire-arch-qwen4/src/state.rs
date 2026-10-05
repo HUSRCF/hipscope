@@ -438,7 +438,8 @@ fn grow_context_arena(
 /// The QSA state format for a `memory.kv_cache` request on `gpu`
 /// ([`hipfire_runtime::kv_mode::resolve_qwen4`]): `bf16` is the exact
 /// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 and a head
-/// geometry its kernels implement (head_dim 256, an even KV-head count).
+/// geometry its kernels implement (head_dim 256, an even KV-head count);
+/// `q8` ([`QsaKvFormat::Q8`], opt-in) needs gfx11/gfx12 and head_dim 256.
 /// `auto` is fp8 where both hold and the reference state elsewhere; an
 /// explicit request the device or model cannot serve is refused, never
 /// rewritten.
@@ -457,6 +458,10 @@ pub fn resolve_qsa_format(
         KvMode::Fp8 => Err(format!(
             "qwen4: fp8 QSA K/V needs head_dim 256 and an even KV-head count \
              (have {kv_heads} x {head_dim}); use bf16"
+        )),
+        KvMode::Q8 if QsaKvFormat::Q8.supports(kv_heads, head_dim) => Ok(QsaKvFormat::Q8),
+        KvMode::Q8 => Err(format!(
+            "qwen4: q8 QSA K/V needs head_dim 256 (have {kv_heads} x {head_dim}); use bf16"
         )),
         _ => Ok(QsaKvFormat::F32),
     }

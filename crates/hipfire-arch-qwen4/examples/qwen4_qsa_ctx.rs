@@ -132,6 +132,13 @@ fn read_kv_rows(
                     out.extend(codes[head * head_dim..(head + 1) * head_dim].iter().map(|&c| e4m3_to_f32(c) * scale));
                 }
             }
+            QsaKvFormat::Q8 => {
+                // Q8_0 blocks: f16 scale + 32 int8 codes, head-major.
+                for block in row.chunks_exact(34) {
+                    let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                    out.extend(block[2..].iter().map(|&c| c as i8 as f32 * scale));
+                }
+            }
         }
     }
     Ok(out)
@@ -345,6 +352,9 @@ impl Probe {
 
     fn full_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
+        if op.state.format == QsaKvFormat::Q8 {
+            return Err("qsa evidence dumps cover the f32 and fp8 states only".into());
+        }
         let g = evidence::Geometry {
             rows: op.rows, position_start: op.state.position, heads: op.heads,
             kv_heads: op.kv_heads, dim: op.head_dim, budget_blocks: op.budget / op.compress,

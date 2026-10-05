@@ -55,6 +55,27 @@ extern "C" __global__ void indexed_attention_kv_f16vb(
     vb16[((size_t)(tok >> 2) * width + c) * 4 + (tok & 3)] = (_Float16)v[(size_t)tok * width + c];
 }
 
+// Q8 twin of indexed_attention_kv_f16vb: the cache rows are Q8_0 blocks (f16
+// scale + 32 int8 codes, 34 bytes; kv_heads * 8 blocks per row, head-major),
+// each element dequantized as code * scale before the F16 rounding.  Grid
+// [tokens, kv_heads], block 256 (head_dim 256).
+extern "C" __global__ void indexed_attention_kv_f16vb_q8(
+    const unsigned char* __restrict__ k, const unsigned char* __restrict__ v,
+    _Float16* __restrict__ k16, _Float16* __restrict__ vb16, int tokens, int kv_heads) {
+    const int tok = blockIdx.x;
+    const int head = blockIdx.y;
+    const int d = threadIdx.x;
+    const int width = kv_heads * 256;
+    if (tok >= tokens || head >= kv_heads) return;
+    const size_t block = (size_t)tok * kv_heads * 8 * 34 + (size_t)(head * 8 + (d >> 5)) * 34;
+    const float ks = (float)*reinterpret_cast<const _Float16*>(k + block);
+    const float vs = (float)*reinterpret_cast<const _Float16*>(v + block);
+    const int c = head * 256 + d;
+    k16[(size_t)tok * width + c] = (_Float16)((float)(signed char)k[block + 2 + (d & 31)] * ks);
+    vb16[((size_t)(tok >> 2) * width + c) * 4 + (tok & 3)] =
+        (_Float16)((float)(signed char)v[block + 2 + (d & 31)] * vs);
+}
+
 #define QG_TILE 128
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_gathered_wmma_f16(
     const float* __restrict__ q_with_gate, const _Float16* __restrict__ k16,

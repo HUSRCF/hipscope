@@ -443,6 +443,7 @@ impl Carrier for Qwen4Carrier {
             "  qwen4 state: QSA {} K/V ({} context storage), GDN {} recurrent",
             match qsa_format {
                 hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
+                hipfire_arch_qwen4::QsaKvFormat::Q8 => "q8 (Q8_0 blocks of 32)",
                 hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
             },
             backend.name(),
