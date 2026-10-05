@@ -764,6 +764,10 @@ impl FeatureFlags {
                 Some("12x4x2") => Some(Some([12, 4, 2])),
                 Some("12x8x1") => Some(Some([12, 8, 1])),
                 Some("12x8x2") => Some(Some([12, 8, 2])),
+                Some("16x4x1") => Some(Some([16, 4, 1])),
+                Some("16x4x2") => Some(Some([16, 4, 2])),
+                Some("16x8x1") => Some(Some([16, 8, 1])),
+                Some("16x8x2") => Some(Some([16, 8, 2])),
                 Some(_) => Some(None),
             },
             qwen4_mq6_x4_regions: match value("HIPFIRE_QWEN4_MQ6_X4_REGIONS").as_deref() {
