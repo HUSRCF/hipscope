@@ -946,8 +946,11 @@ pub struct SpecRequestConfig {
     pub temp: f32,
     /// Nucleus (top-p) mass. `1.0` disables nucleus truncation.
     pub top_p: f32,
-    /// Top-k truncation. `0` disables top-k.
-    pub top_k: usize,
+    /// Request top-k as sent; `None` = absent. The host AR sampler
+    /// distinguishes absent (20 candidates) from `Some(0)` (its 64-wide
+    /// pool), so a verifier that reproduces it reads this directly; chain
+    /// verifiers take [`Self::top_k_cut`].
+    pub top_k: Option<u32>,
     /// Min-p truncation floor. `0.0` disables.
     pub min_p: f32,
     /// CACTUS acceptance-boost δ. `0.0` = lossless rejection sampling.
@@ -965,12 +968,20 @@ impl Default for SpecRequestConfig {
         Self {
             temp: 0.0,
             top_p: 1.0,
-            top_k: 0,
+            top_k: None,
             min_p: 0.0,
             cactus_delta: 0.0,
             rng_seed: 0x1357_9BDF,
             allow_ngram_modifier: false,
         }
+    }
+}
+
+impl SpecRequestConfig {
+    /// Top-k truncation for verifiers where `0` disables it: absent and
+    /// `Some(0)` both disable.
+    pub fn top_k_cut(&self) -> usize {
+        self.top_k.map_or(0, |k| k as usize)
     }
 }
 

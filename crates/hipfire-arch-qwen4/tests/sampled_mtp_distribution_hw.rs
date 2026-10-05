@@ -26,9 +26,14 @@
 //! with AR's by a two-sample chi-square homogeneity test (cells with fewer
 //! than 5 expected draws pooled); every p-value must exceed `ALPHA`. Each MTP
 //! arm also replays its first `REPLAYS` seeds and must emit the same IDs.
-//! Temperature / top_p come from `HIPFIRE_SAMPLED_MTP_TEMP` /
-//! `HIPFIRE_SAMPLED_MTP_TOP_P` (default 1.0 / 0.95). Per-arm IDs and the
-//! report go to `HIPFIRE_SAMPLED_MTP_OUT`.
+//! Temperature / top_p / top_k / min_p come from `HIPFIRE_SAMPLED_MTP_TEMP` /
+//! `HIPFIRE_SAMPLED_MTP_TOP_P` / `HIPFIRE_SAMPLED_MTP_TOP_K` (unset = absent)
+//! / `HIPFIRE_SAMPLED_MTP_MIN_P` (default 1.0 / 0.95 / absent / 0); both arms
+//! receive them as a request would. Per-arm IDs and the report go to
+//! `HIPFIRE_SAMPLED_MTP_OUT`; an arm whose `<arm>.ids.json` is already there
+//! is reused, so the arms can run first as separate time-boxed invocations of
+//! `sampled_mtp_distribution_arm` (set `HIPFIRE_SAMPLED_MTP_ARM`,
+//! `HIPFIRE_MTP_SAMPLED=1` and the arm's `HIPFIRE_MTP_INCREMENTAL` yourself).
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -53,6 +58,8 @@ const ARM_ENV: &str = "HIPFIRE_SAMPLED_MTP_ARM";
 const TRIALS_ENV: &str = "HIPFIRE_SAMPLED_MTP_TRIALS";
 const TEMP_ENV: &str = "HIPFIRE_SAMPLED_MTP_TEMP";
 const TOP_P_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOP_P";
+const TOP_K_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOP_K";
+const MIN_P_ENV: &str = "HIPFIRE_SAMPLED_MTP_MIN_P";
 const ARM_TEST: &str = "sampled_mtp_distribution_arm";
 
 /// The serve battery's prose prompt (`scripts/serve_harness.py`).
@@ -213,6 +220,13 @@ fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let exe = std::env::current_exe().expect("test binary path");
     let mut samples: Vec<Vec<Vec<u32>>> = Vec::new();
     for arm in ARMS {
+        let ids_path = dir.join(format!("{arm}.ids.json"));
+        if ids_path.exists() {
+            eprintln!("reusing {}", ids_path.display());
+            samples
+                .push(serde_json::from_slice(&fs::read(&ids_path).unwrap()).expect("arm ids json"));
+            continue;
+        }
         let mut child = Command::new(&exe);
         child
             .args([
@@ -248,10 +262,8 @@ fn sampled_mtp_matches_ar_distribution_on_flash_next() {
             output.status,
             dir.display()
         );
-        let arm_samples: Vec<Vec<u32>> = serde_json::from_slice(
-            &fs::read(dir.join(format!("{arm}.ids.json"))).expect("arm ids"),
-        )
-        .expect("arm ids json");
+        let arm_samples: Vec<Vec<u32>> =
+            serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
         samples.push(arm_samples);
     }
     let mut report = String::new();
@@ -308,6 +320,11 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     let trials: usize = env_or(TRIALS_ENV, 2000);
     let temp: f32 = env_or(TEMP_ENV, 1.0);
     let top_p: f32 = env_or(TOP_P_ENV, 0.95);
+    let top_k: Option<u32> = std::env::var(TOP_K_ENV)
+        .ok()
+        .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
+        .transpose()?;
+    let min_p: f32 = env_or(MIN_P_ENV, 0.0);
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
@@ -379,7 +396,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         .attach_forward(&mut gpu, MAX_SEQ)
         .map_err(|e| e.to_string())?;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} state={state_format:?}",
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} state={state_format:?}",
         gpu.arch,
         prompt.len()
     );
@@ -395,8 +412,8 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
-            top_k: None,
-            min_p: None,
+            top_k,
+            min_p: (min_p > 0.0).then_some(min_p),
         };
         let mut history = prompt.clone();
         for trial in 0..trials {
@@ -435,8 +452,8 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             drafter.configure_request(SpecRequestConfig {
                 temp,
                 top_p,
-                top_k: 20,
-                min_p: 0.0,
+                top_k,
+                min_p,
                 cactus_delta: 0.0,
                 rng_seed: seed,
                 allow_ngram_modifier: false,

@@ -477,7 +477,8 @@ fn qwen4_sampled_mtp_route_needs_temp_verify_and_neutral_penalties() {
         select_generation_route(&sampled),
         GenerationRoute::Qwen4Spec
     );
-    // min_p is ignored by the Qwen4 AR sampler, so it does not demote.
+    // The verifier's target applies min_p as the AR sampler does, so it does
+    // not demote.
     assert_eq!(
         select_generation_route(&GenerationRouteInputs {
             min_p: Some(0.05),

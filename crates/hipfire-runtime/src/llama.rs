@@ -7706,10 +7706,10 @@ pub fn apply_unclosed_attractor_block(
 
 /// Legacy CPU candidate gather: the top-20 nucleus every sampler used before
 /// request `top_k` was honoured. `top_k` absent (or `<= 20`) keeps this pool.
-const CPU_SAMPLE_LEGACY_POOL: usize = 20;
+pub(crate) const CPU_SAMPLE_LEGACY_POOL: usize = 20;
 /// Wide gather for `top_k > 20` (or `0` = no extra cut). Matches the GPU
 /// `sample_top_p` kernel's gather budget, so CPU and GPU honour the same range.
-const CPU_SAMPLE_WIDE_POOL: usize = 64;
+pub(crate) const CPU_SAMPLE_WIDE_POOL: usize = 64;
 
 /// Top-20 nucleus sampler (temperature + top_p). Byte-identical to
 /// [`sample_top_k_p`] with `top_k = None, min_p = None`.

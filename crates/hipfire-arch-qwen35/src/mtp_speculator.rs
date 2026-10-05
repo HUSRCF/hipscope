@@ -193,7 +193,7 @@ impl Qwen35MtpDrafter {
         state.set_sampling(
             MtpSamplingConfig {
                 temp: cfg.temp,
-                top_k: cfg.top_k,
+                top_k: cfg.top_k_cut(),
                 top_p,
                 min_p: cfg.min_p,
             },

@@ -1208,7 +1208,7 @@ impl Speculator for DflashSpeculator {
         // its draw sequence exactly).
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
-        self.sample_top_k = cfg.top_k;
+        self.sample_top_k = cfg.top_k_cut();
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
         self.last_window = None;

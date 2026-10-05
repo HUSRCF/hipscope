@@ -11,42 +11,79 @@
 //! emits its bonus from `p`. Every emitted token is then distributed exactly
 //! as `p`, whatever `q` is, as long as `x` really was drawn from `q`.
 //!
-//! Both sides are [`SparseDist`]s built by the same truncation
-//! ([`SampleSpec`]): each side keeps its own nucleus (the DFlash convention,
+//! Both sides are [`SparseDist`]s truncated by one [`SampleSpec`]: `p` from a
+//! full target logit row with exactly the arithmetic of the host AR sampler
+//! ([`crate::llama::sample_top_k_p`]), `q` from the draft's candidates. Each
+//! side keeps its own nucleus (the DFlash convention,
 //! `docs/plans/mtp-sampled-tighten-design-2026-06-23.md` §(a)), and the
 //! residual is taken across the two supports. `p` is the distribution the
 //! autoregressive producer samples, so the speculative stream is the AR
 //! stream in distribution.
 
+use crate::llama::{CPU_SAMPLE_LEGACY_POOL, CPU_SAMPLE_WIDE_POOL};
 use crate::spec::{request_rng_state, GreedyAccept};
 
-/// Truncation of a temperature-scaled softmax: top-k by logit, then min-p
-/// relative to the most probable kept token, then the smallest probability
-/// prefix whose mass reaches `top_p` of what is left (the boundary token is
-/// kept). `top_k == 0` keeps every finite logit; `min_p == 0` and
-/// `top_p >= 1` disable those cuts.
+/// A request's truncation, resolved as the host AR sampler
+/// (`sampler::sample_cpu` → [`crate::llama::sample_top_k_p`]) resolves it:
+///
+/// 1. `pool`: the highest finite logits gathered first — 20 when `top_k` is
+///    absent or `1..=20`, 64 otherwise.
+/// 2. `cap`: candidates kept — 20 when `top_k` is absent, `k` for `1..=64`,
+///    64 for `0` or above 64 (`top_k = 0` is the 64-wide pool, not the whole
+///    vocabulary).
+/// 3. `min_p` (`0` disables): the cap shrinks to the first rank whose
+///    probability is below `min_p` times the most probable token's.
+/// 4. Nucleus at `top_p` over the capped candidates, boundary token kept.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SampleSpec {
     pub temperature: f32,
+    /// Clamped to `[0, 1]`.
     pub top_p: f32,
-    pub top_k: usize,
+    pub pool: usize,
+    /// In `1..=pool`.
+    pub cap: usize,
+    /// In `[0, 1]`.
     pub min_p: f32,
 }
 
 impl SampleSpec {
-    /// Candidates `llama::sample_top_p` keeps before its nucleus cut.
-    pub const CPU_AR_TOP_K: usize = 20;
+    /// Widest candidate pool any request gathers.
+    pub const MAX_POOL: usize = CPU_SAMPLE_WIDE_POOL;
 
-    /// The distribution the host AR sampler (`sampler::sample_cpu` →
-    /// `llama::sample_top_p`) draws from: the top 20 raw logits, softmax at
-    /// `temperature`, nucleus at `top_p`. That sampler ignores a request's
-    /// `top_k` and `min_p`, so this does too.
-    pub fn cpu_ar(temperature: f32, top_p: f32) -> Self {
+    /// The distribution the host AR sampler draws from for these request
+    /// controls. `top_k` is the request's value as sent: `None` (20
+    /// candidates) and `Some(0)` (64) differ. A non-finite or non-positive
+    /// `min_p` disables the cut, as in the AR sampler.
+    pub fn cpu_ar(temperature: f32, top_p: f32, top_k: Option<u32>, min_p: f32) -> Self {
+        let (pool, cap) = match top_k {
+            None => (CPU_SAMPLE_LEGACY_POOL, CPU_SAMPLE_LEGACY_POOL),
+            Some(k) if (1..=CPU_SAMPLE_LEGACY_POOL as u32).contains(&k) => {
+                (CPU_SAMPLE_LEGACY_POOL, k as usize)
+            }
+            Some(0) => (CPU_SAMPLE_WIDE_POOL, CPU_SAMPLE_WIDE_POOL),
+            Some(k) => (CPU_SAMPLE_WIDE_POOL, (k as usize).min(CPU_SAMPLE_WIDE_POOL)),
+        };
         Self {
             temperature,
             top_p: top_p.clamp(0.0, 1.0),
-            top_k: Self::CPU_AR_TOP_K,
-            min_p: 0.0,
+            pool,
+            cap,
+            min_p: if min_p.is_finite() && min_p > 0.0 {
+                min_p.min(1.0)
+            } else {
+                0.0
+            },
+        }
+    }
+
+    fn check_temperature(self) -> Result<(), String> {
+        if self.temperature > 0.0 && self.temperature.is_finite() {
+            Ok(())
+        } else {
+            Err(format!(
+                "sampled verification needs a positive temperature, got {}",
+                self.temperature
+            ))
         }
     }
 }
@@ -84,65 +121,142 @@ impl SparseDist {
         self.entries.last().map_or(0, |&(token, _)| token)
     }
 
-    /// Build from a full logit row (row index = token id). `scratch` holds
-    /// the kept candidates between calls. Fails when no finite mass is left.
+    /// Build the target distribution `p` from a full logit row (row index =
+    /// token id) with exactly the arithmetic of `llama::sample_top_k_p`: the
+    /// same pool gather (and tie order), f32 softmax against the row maximum,
+    /// stable descending sort, cap and min-p cut, summation order and nucleus
+    /// boundary. Its two-pass draw (over the cut mass, then again within the
+    /// nucleus) picks nucleus token `k` with probability `p_k / mass`, which
+    /// is what this stores. A row with no finite mass is the AR sampler's
+    /// argmax fallback, a point mass. `scratch` holds the pool between calls.
     pub fn build_from_logits(
         &mut self,
         logits: &[f32],
         spec: SampleSpec,
         scratch: &mut Vec<(u32, f32)>,
     ) -> Result<(), String> {
+        spec.check_temperature()?;
+        let pool = spec.pool.max(1);
+        // `sample_pool`'s fixed slots: each finite logit above the current
+        // minimum replaces it, then the minimum is rescanned.
         scratch.clear();
-        let k = spec.top_k;
-        if k == 0 || k >= logits.len() {
-            scratch.extend(
-                logits
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.is_finite())
-                    .map(|(i, &l)| (i as u32, l)),
-            );
-        } else {
-            // Kept sorted by (logit desc, id asc): a later id enters only
-            // with a strictly larger logit, so ties keep the lower id.
-            for (i, &l) in logits.iter().enumerate() {
-                if !l.is_finite() || (scratch.len() == k && l <= scratch[k - 1].1) {
-                    continue;
+        scratch.resize(pool, (0, f32::NEG_INFINITY));
+        let mut min_pos = 0usize;
+        let mut min_val = f32::NEG_INFINITY;
+        let mut max_logit = f32::NEG_INFINITY;
+        for (i, &l) in logits.iter().enumerate() {
+            if !l.is_finite() {
+                continue;
+            }
+            if l > max_logit {
+                max_logit = l;
+            }
+            if l > min_val {
+                scratch[min_pos] = (i as u32, l);
+                min_val = f32::INFINITY;
+                for (j, &(_, v)) in scratch.iter().enumerate() {
+                    if v < min_val {
+                        min_val = v;
+                        min_pos = j;
+                    }
                 }
-                if scratch.len() == k {
-                    scratch.pop();
-                }
-                let at = scratch.partition_point(|&(_, v)| v >= l);
-                scratch.insert(at, (i as u32, l));
             }
         }
-        self.build_from_candidates(scratch, spec)
+        let inv_temp = 1.0 / spec.temperature;
+        let entries = &mut self.entries;
+        entries.clear();
+        let mut sum = 0.0f32;
+        for &(token, l) in scratch.iter() {
+            let p = if l.is_finite() {
+                let p = ((l - max_logit) * inv_temp).exp();
+                if p.is_finite() {
+                    p
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            entries.push((token, p));
+            sum += p;
+        }
+        if sum <= 0.0 || !sum.is_finite() {
+            entries.clear();
+            entries.push((crate::llama::argmax(logits), 1.0));
+            return Ok(());
+        }
+        // Stable insertion sort, descending: equal probabilities keep slot
+        // order, as in the AR sampler.
+        for i in 1..pool {
+            let mut j = i;
+            while j > 0 && entries[j].1 > entries[j - 1].1 {
+                entries.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        let mut cap = spec.cap.clamp(1, pool);
+        if spec.min_p > 0.0 {
+            let floor = spec.min_p * entries[0].1;
+            if let Some(cut) = (1..cap).find(|&i| entries[i].1 < floor) {
+                cap = cut;
+            }
+        }
+        // The uncut pool keeps the slot-order sum; a cut sums the kept prefix.
+        if cap < pool {
+            sum = entries[..cap].iter().map(|&(_, p)| p).sum();
+        }
+        let threshold = spec.top_p * sum;
+        let mut cumulative = 0.0f32;
+        let mut boundary = None;
+        for (i, &(_, p)) in entries[..cap].iter().enumerate() {
+            cumulative += p;
+            if cumulative >= threshold {
+                boundary = Some(i + 1);
+                break;
+            }
+        }
+        match boundary {
+            Some(len) => {
+                entries.truncate(len);
+                for entry in entries.iter_mut() {
+                    entry.1 /= cumulative;
+                }
+            }
+            None => {
+                // Rounding left the prefix short of the threshold: the AR
+                // draw is `p_k / sum`, and its fall-through returns the top
+                // token.
+                entries.truncate(cap);
+                for entry in entries.iter_mut() {
+                    entry.1 /= sum;
+                }
+                entries[0].1 += (1.0 - cumulative / sum).max(0.0);
+            }
+        }
+        entries.retain(|&(_, p)| p > 0.0);
+        Ok(())
     }
 
-    /// Build from `(token, logit)` candidates (any order; non-finite logits
-    /// are dropped). `candidates` is reordered.
+    /// Build a draft distribution `q` from `(token, logit)` candidates (any
+    /// order; non-finite logits are dropped; `candidates` is reordered) by
+    /// the same steps over the candidates alone: sort by logit, keep
+    /// `spec.cap`, softmax at the temperature, min-p, nucleus. `q` only has
+    /// to be the distribution the draft is drawn from; exactness rests on `p`.
+    /// Fails when no candidate is finite.
     pub fn build_from_candidates(
         &mut self,
         candidates: &mut Vec<(u32, f32)>,
         spec: SampleSpec,
     ) -> Result<(), String> {
-        if !(spec.temperature > 0.0) || !spec.temperature.is_finite() {
-            return Err(format!(
-                "sampled verification needs a positive temperature, got {}",
-                spec.temperature
-            ));
-        }
+        spec.check_temperature()?;
         candidates.retain(|(_, l)| l.is_finite());
         candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        if spec.top_k > 0 {
-            candidates.truncate(spec.top_k);
-        }
+        candidates.truncate(spec.cap.max(1));
         let Some(&(_, max)) = candidates.first() else {
-            return Err("sampled verification row has no finite logit".to_string());
+            return Err("sampled draft has no finite candidate logit".to_string());
         };
         let inv_temp = 1.0 / spec.temperature;
         self.entries.clear();
-        // Same f32 arithmetic as `llama::sample_top_p`.
         self.entries.extend(
             candidates
                 .iter()
@@ -154,9 +268,9 @@ impl SparseDist {
         }
         let sum: f32 = self.entries.iter().map(|&(_, p)| p).sum();
         if !(sum > 0.0) || !sum.is_finite() {
-            return Err("sampled verification row has no finite mass".to_string());
+            return Err("sampled draft has no finite mass".to_string());
         }
-        let threshold = spec.top_p.clamp(0.0, 1.0) * sum;
+        let threshold = spec.top_p * sum;
         let mut kept = 0.0f32;
         let mut len = self.entries.len();
         for (i, &(_, p)) in self.entries.iter().enumerate() {
@@ -411,38 +525,135 @@ mod tests {
 
     const TRIALS: u64 = 200_000;
 
-    /// One-position exactness: draft from the 8-candidate re-scored `q`,
-    /// verify against `p`, and the emitted token must follow `p` (chi-square
-    /// at alpha = 1e-6 and a total-variation bound) across the truncations
-    /// Qwen4 serves and the ones it does not (top-k < 20, min-p).
+    /// Request `top_k`: absent, inside the legacy 20-wide pool, its edge,
+    /// the 64-wide pool, its edge, and 0 (the 64-wide pool, not the vocab).
+    const TOP_KS: [Option<u32>; 6] = [None, Some(5), Some(20), Some(40), Some(64), Some(0)];
+    const MIN_PS: [f32; 3] = [0.0, 0.05, 0.1];
+
+    struct Case {
+        name: String,
+        row: Vec<f32>,
+        temp: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        min_p: f32,
+    }
+
+    impl Case {
+        fn new(row: Vec<f32>, temp: f32, top_p: f32, top_k: Option<u32>, min_p: f32) -> Self {
+            Self {
+                name: format!("T{temp} top_p {top_p} top_k {top_k:?} min_p {min_p}"),
+                row,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+            }
+        }
+
+        fn spec(&self) -> SampleSpec {
+            SampleSpec::cpu_ar(self.temp, self.top_p, self.top_k, self.min_p)
+        }
+
+        fn target(&self) -> SparseDist {
+            let mut p = SparseDist::default();
+            p.build_from_logits(&self.row, self.spec(), &mut Vec::new())
+                .unwrap();
+            p
+        }
+    }
+
+    /// The full `TOP_KS` x `MIN_PS` grid at T1.0 / top_p 0.95, other
+    /// temperatures and nuclei, and a tied row on which the AR pool evicts a
+    /// non-lowest id (20 equal logits fill the legacy pool, then a larger one
+    /// replaces slot 0, so id 0 drops out while ids 20.. never enter).
+    fn cases() -> Vec<Case> {
+        let vocab = 300;
+        let mut out = Vec::new();
+        for (i, &top_k) in TOP_KS.iter().enumerate() {
+            for (j, &min_p) in MIN_PS.iter().enumerate() {
+                let row = logits(vocab, 1000 + (i * MIN_PS.len() + j) as u64, 2.5);
+                out.push(Case::new(row, 1.0, 0.95, top_k, min_p));
+            }
+        }
+        for (n, (temp, top_p, top_k, min_p)) in [
+            (0.7, 0.8, None, 0.0),
+            (1.0, 1.0, None, 0.0),
+            (1.0, 1.0, Some(0), 0.0),
+            (0.7, 0.9, Some(40), 0.05),
+            (1.3, 1.0, Some(64), 0.1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push(Case::new(
+                logits(vocab, 2000 + n as u64, 2.5),
+                temp,
+                top_p,
+                top_k,
+                min_p,
+            ));
+        }
+        let mut tied = vec![-4.0f32; vocab];
+        tied[..30].fill(1.0);
+        tied[25] = 2.0;
+        for top_k in [None, Some(5)] {
+            let mut case = Case::new(tied.clone(), 1.0, 1.0, top_k, 0.0);
+            case.name.push_str(" (tied row)");
+            out.push(case);
+        }
+        out
+    }
+
+    /// Chi-square (alpha 1e-6) and total-variation check of `counts`
+    /// against `p`.
+    fn assert_follows(name: &str, counts: &[u64], p: &SparseDist) {
+        let expected = dense(p, counts.len());
+        let (stat, df) = chi_square(counts, &expected, TRIALS);
+        let crit = chi_square_critical(df, 4.75);
+        let tv = total_variation(counts, &expected, TRIALS);
+        eprintln!(
+            "{name}: support={} chi2={stat:.1} df={df} crit(1e-6)={crit:.1} tv={tv:.4}",
+            p.entries().len()
+        );
+        assert!(stat < crit, "{name}: chi2 {stat} >= {crit} (df {df})");
+        assert!(tv < 0.01, "{name}: total variation {tv}");
+    }
+
+    /// `p` is the host AR sampler's distribution: 200k
+    /// `llama::sample_top_k_p` draws per case follow it, over every request
+    /// `top_k` (absent and 0 included) and `min_p`.
+    #[test]
+    fn target_is_the_host_ar_sampler_distribution() {
+        for (n, case) in cases().iter().enumerate() {
+            let p = case.target();
+            // Well-spread seeds: the AR xorshift32 maps close seeds to close
+            // first draws.
+            let seed = (SpecRng::new(n as u64 + 1).next_u64() >> 32) as u32;
+            crate::llama::reset_cpu_sampler_rng(seed);
+            let min_p = (case.min_p > 0.0).then_some(case.min_p);
+            let mut counts = vec![0u64; case.row.len()];
+            for _ in 0..TRIALS {
+                let token = crate::llama::sample_top_k_p(
+                    &case.row, case.temp, case.top_p, case.top_k, min_p,
+                );
+                counts[token as usize] += 1;
+            }
+            assert_follows(&format!("ar {}", case.name), &counts, &p);
+        }
+    }
+
+    /// One-position exactness: draft from the 8-candidate re-scored `q`
+    /// (built by the same truncation), verify against `p`, and the emitted
+    /// token must follow `p` for every case; the acceptance rate must be
+    /// its expectation `sum_x min(p, q)`.
     #[test]
     fn single_position_emits_target_distribution() {
-        let vocab = 64;
-        let specs = [
-            SampleSpec::cpu_ar(1.0, 0.95),
-            SampleSpec::cpu_ar(0.7, 0.8),
-            SampleSpec::cpu_ar(1.0, 1.0),
-            SampleSpec {
-                temperature: 1.0,
-                top_p: 1.0,
-                top_k: 5,
-                min_p: 0.0,
-            },
-            SampleSpec {
-                temperature: 0.8,
-                top_p: 0.9,
-                top_k: 0,
-                min_p: 0.1,
-            },
-        ];
-        for (case, &spec) in specs.iter().enumerate() {
-            let target_logits = logits(vocab, 11 + case as u64, 2.5);
-            let mut p = SparseDist::default();
-            p.build_from_logits(&target_logits, spec, &mut Vec::new())
-                .unwrap();
-            let q = rescored_draft(&target_logits, 100 + case as u64, spec);
-            let mut rng = SpecRng::new(7 + case as u64);
-            let mut counts = vec![0u64; vocab];
+        for (n, case) in cases().iter().enumerate() {
+            let p = case.target();
+            let q = rescored_draft(&case.row, 100 + n as u64, case.spec());
+            let mut rng = SpecRng::new(7 + n as u64);
+            let mut counts = vec![0u64; case.row.len()];
             let mut accepted = 0u64;
             for _ in 0..TRIALS {
                 let x = q.sample(rng.next_f32());
@@ -455,25 +666,53 @@ mod tests {
                 };
                 counts[token as usize] += 1;
             }
-            let expected = dense(&p, vocab);
-            let (stat, df) = chi_square(&counts, &expected, TRIALS);
-            let crit = chi_square_critical(df, 4.75);
-            let tv = total_variation(&counts, &expected, TRIALS);
-            // Acceptance must equal sum_x min(p, q) (its exact expectation).
+            assert_follows(&format!("spec {}", case.name), &counts, &p);
             let overlap: f64 = q
                 .entries()
                 .iter()
                 .map(|&(t, qt)| (qt as f64).min(p.prob(t) as f64))
                 .sum();
             let rate = accepted as f64 / TRIALS as f64;
-            eprintln!(
-                "case {case} {spec:?}: chi2={stat:.1} df={df} crit(1e-6)={crit:.1} tv={tv:.4} accept={rate:.4} overlap={overlap:.4}"
-            );
-            assert!(stat < crit, "case {case}: chi2 {stat} >= {crit} (df {df})");
-            assert!(tv < 0.01, "case {case}: total variation {tv}");
+            eprintln!("spec {}: accept={rate:.4} overlap={overlap:.4}", case.name);
             assert!(
                 (rate - overlap).abs() < 0.01,
-                "case {case}: accept {rate} vs {overlap}"
+                "{}: accept {rate} vs {overlap}",
+                case.name
+            );
+        }
+    }
+
+    /// Negative control: the verify of `single_position_emits_target_distribution`
+    /// with the rejection replacement drawn from `p` instead of the residual
+    /// `(p - q)+` must fail the same chi-square.
+    #[test]
+    fn residual_drawn_from_target_is_detected() {
+        for (n, case) in cases().iter().enumerate().step_by(4) {
+            let p = case.target();
+            let q = rescored_draft(&case.row, 100 + n as u64, case.spec());
+            let mut rng = SpecRng::new(7 + n as u64);
+            let mut counts = vec![0u64; case.row.len()];
+            for _ in 0..TRIALS {
+                let x = q.sample(rng.next_f32());
+                let qx = q.prob(x);
+                let token = if qx > 0.0 && rng.next_f32() * qx < p.prob(x) {
+                    x
+                } else {
+                    p.sample(rng.next_f32())
+                };
+                counts[token as usize] += 1;
+            }
+            let expected = dense(&p, counts.len());
+            let (stat, df) = chi_square(&counts, &expected, TRIALS);
+            let crit = chi_square_critical(df, 4.75);
+            eprintln!(
+                "control {}: chi2={stat:.1} df={df} crit(1e-6)={crit:.1}",
+                case.name
+            );
+            assert!(
+                stat > crit,
+                "{}: a residual drawn from p went undetected (chi2 {stat} < {crit})",
+                case.name
             );
         }
     }
@@ -486,7 +725,7 @@ mod tests {
     fn chained_window_emits_target_joint_distribution() {
         let vocab = 8usize;
         let eos = 3u32;
-        let spec = SampleSpec::cpu_ar(1.0, 0.95);
+        let spec = SampleSpec::cpu_ar(1.0, 0.95, None, 0.0);
         let p1_logits = logits(vocab, 21, 1.5);
         let p2_logits: Vec<Vec<f32>> = (0..vocab)
             .map(|t| logits(vocab, 40 + t as u64, 1.5))
@@ -569,41 +808,11 @@ mod tests {
         assert!(tv < 0.01, "joint total variation {tv}");
     }
 
-    /// `SampleSpec::cpu_ar` is the distribution the host AR sampler draws
-    /// from: 200k `llama::sample_top_p` draws match it.
     #[test]
-    fn cpu_ar_spec_matches_host_ar_sampler() {
-        let vocab = 300;
-        for (case, (temp, top_p)) in [(1.0f32, 0.95f32), (0.7, 0.8)].into_iter().enumerate() {
-            let row = logits(vocab, 77 + case as u64, 3.0);
-            let mut p = SparseDist::default();
-            p.build_from_logits(&row, SampleSpec::cpu_ar(temp, top_p), &mut Vec::new())
-                .unwrap();
-            crate::llama::reset_cpu_sampler_rng(1234 + case as u32);
-            let mut counts = vec![0u64; vocab];
-            for _ in 0..TRIALS {
-                counts[crate::llama::sample_top_p(&row, temp, top_p) as usize] += 1;
-            }
-            let expected = dense(&p, vocab);
-            let (stat, df) = chi_square(&counts, &expected, TRIALS);
-            let crit = chi_square_critical(df, 4.75);
-            let tv = total_variation(&counts, &expected, TRIALS);
-            eprintln!("cpu-ar case {case}: chi2={stat:.1} df={df} crit(1e-6)={crit:.1} tv={tv:.4}");
-            assert!(stat < crit, "case {case}: chi2 {stat} >= {crit} (df {df})");
-            assert!(tv < 0.01, "case {case}: total variation {tv}");
-        }
-    }
-
-    #[test]
-    fn truncation_keeps_boundary_and_order() {
+    fn truncation_keeps_boundary_order_and_request_top_k() {
         let logits = [0.0f32, 3.0, f32::NAN, 2.0, 1.0, f32::NEG_INFINITY];
         let mut d = SparseDist::default();
-        let spec = SampleSpec {
-            temperature: 1.0,
-            top_p: 0.7,
-            top_k: 3,
-            min_p: 0.0,
-        };
+        let spec = SampleSpec::cpu_ar(1.0, 0.7, Some(3), 0.0);
         d.build_from_logits(&logits, spec, &mut Vec::new()).unwrap();
         // softmax over {1: 3, 3: 2, 4: 1} = .665/.245/.090; top_p 0.7 keeps
         // token 1 and the boundary token 3.
@@ -612,18 +821,35 @@ mod tests {
         let sum: f32 = d.entries().iter().map(|e| e.1).sum();
         assert!((sum - 1.0).abs() < 1e-6);
         let mut d2 = SparseDist::default();
-        let min_p = SampleSpec {
-            min_p: 0.3,
-            top_p: 1.0,
-            ..spec
-        };
-        d2.build_from_logits(&logits, min_p, &mut Vec::new())
-            .unwrap();
+        d2.build_from_logits(
+            &logits,
+            SampleSpec::cpu_ar(1.0, 1.0, Some(3), 0.3),
+            &mut Vec::new(),
+        )
+        .unwrap();
         // e^-1 = .37 >= .3 keeps token 3; e^-2 = .135 < .3 drops token 4.
         assert_eq!(d2.entries().iter().map(|e| e.0).collect::<Vec<_>>(), [1, 3]);
-        assert!(d
-            .build_from_logits(&[f32::NAN; 4], spec, &mut Vec::new())
-            .is_err());
+        // No finite logit: the AR sampler's argmax fallback, a point mass.
+        let nan = [f32::NAN; 4];
+        d.build_from_logits(&nan, spec, &mut Vec::new()).unwrap();
+        assert_eq!(d.entries(), [(crate::llama::argmax(&nan), 1.0)]);
+        // A flat 100-token row at top_p 1 keeps exactly the request's cap:
+        // absent is 20, 0 is the 64-wide pool, larger values clamp to it.
+        let row: Vec<f32> = (0..100).map(|i| -(i as f32) * 0.01).collect();
+        for (top_k, kept) in [
+            (None, 20),
+            (Some(7), 7),
+            (Some(20), 20),
+            (Some(21), 21),
+            (Some(40), 40),
+            (Some(64), 64),
+            (Some(0), 64),
+            (Some(1000), 64),
+        ] {
+            let spec = SampleSpec::cpu_ar(1.0, 1.0, top_k, 0.0);
+            d.build_from_logits(&row, spec, &mut Vec::new()).unwrap();
+            assert_eq!(d.entries().len(), kept, "top_k {top_k:?}");
+        }
     }
 
     #[test]

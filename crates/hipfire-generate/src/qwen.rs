@@ -2699,10 +2699,11 @@ pub fn generate_dflash(
     // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
     // 1.0 (>= 0.999) disables it. Ignored by the ddtree SWOR arm.
     top_p: f32,
-    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20) for the chain
-    // sampled path, applied to both draft + target softmax rows. 0 = disabled.
-    // Ignored by the ddtree SWOR arm.
-    top_k: usize,
+    // Request top-k as sent (request/card recipe, e.g. qwen3.6 top_k=20).
+    // Chain sampled verify cuts both draft + target softmax rows at it (absent
+    // and 0 disable); sampled Qwen4 MTP resolves it as the AR sampler does
+    // (absent = 20, 0 = 64). Ignored by the ddtree SWOR arm.
+    top_k: Option<u32>,
     // Min-p floor. 0.0 disables. Installed on SpecRequestConfig for MTP;
     // DFlash route selection still sends min_p requests to AR.
     min_p: f32,

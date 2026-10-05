@@ -541,7 +541,7 @@ pub fn generate_deepseek4_spec(
         spec.configure_request(SpecRequestConfig {
             temp,
             top_p,
-            top_k,
+            top_k: u32::try_from(top_k).ok().filter(|&k| k > 0),
             min_p: 0.0,
             cactus_delta,
             rng_seed: request_seed as u64,

@@ -578,14 +578,15 @@ fn draft_accept_estimate(margin: f32) -> f32 {
 /// above zero).
 ///
 /// - `p`, a verify row's target distribution: the full logit row truncated by
-///   [`SampleSpec::cpu_ar`] — exactly what the Qwen4 AR producer samples
-///   (`sampler::sample_cpu`: top 20 logits, softmax at the request
-///   temperature, nucleus at its top_p; the request's top_k and min_p are
-///   ignored there, and so here).
+///   [`SampleSpec::cpu_ar`] with the request's temperature, top_p, top_k and
+///   min_p — exactly what the Qwen4 AR producer samples (`sampler::sample_cpu`
+///   → `llama::sample_top_k_p`: a 20- or 64-wide pool, the top_k cap with
+///   absent = 20 and 0 = 64, min_p, nucleus).
 /// - `q`, a draft step's distribution: the same truncation applied to the
 ///   draft head's 8 re-scored candidates and their exact logits (the whole
 ///   draft row when the head does not re-score). The draft token is drawn
-///   from this `q`, and the verdict reads this `q`.
+///   from this `q`, and the verdict reads this `q`. Tokens of `p` outside
+///   the 8 candidates are reached through the residual or the bonus draw.
 ///
 /// Accept with probability `min(1, p/q)`, otherwise emit a draw from
 /// `(p - q)+`; a window whose drafts are all accepted emits its bonus from
@@ -604,10 +605,10 @@ struct SampledVerify {
 impl SampledVerify {
     fn new(cfg: SpecRequestConfig, max_k: usize) -> Self {
         Self {
-            spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p),
+            spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
             rng: SpecRng::new(cfg.rng_seed),
             host: Vec::new(),
-            scratch: Vec::with_capacity(SampleSpec::CPU_AR_TOP_K),
+            scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
             drafts: vec![SparseDist::default(); max_k],
         }
