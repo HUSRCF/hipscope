@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
-  --> tests/ui/halo_verify_attn_race.rs:15:48
+  --> tests/ui/halo_verify_attn_race.rs:19:48
    |
-15 |         let (ring,) = wg.barrier((rotate(ring, st),))?;
+19 |         let (ring,) = wg.barrier((rotate(ring, st),))?;
    |                                   ------       ^^ expected `Drained<LdsWrite<KTile>>`, found `Pending<Gfx11Waits, LdsWrite<KTile>>`
    |                                   |
    |                                   arguments to this function are incorrect

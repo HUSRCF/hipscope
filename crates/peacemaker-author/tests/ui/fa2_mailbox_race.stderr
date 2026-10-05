@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `LdsRegion<Mailbox, Published>: JoinPart<VPlane, Free>` is not satisfied
-  --> tests/ui/fa2_mailbox_race.rs:19:37
+  --> tests/ui/fa2_mailbox_race.rs:23:37
    |
-19 |     let v_plane = join::<VPlane, _, _>(v_body, mbox)?;
+23 |     let v_plane = join::<VPlane, _, _>(v_body, mbox)?;
    |                                     ^ not a `Free` part
    |
    = note: other waves may still be reading it; only a barrier can retire their reads
