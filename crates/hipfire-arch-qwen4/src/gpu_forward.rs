@@ -2116,7 +2116,7 @@ impl Qwen4GpuForward {
                 )?);
             }
             // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`, default on for
-            // gfx1151, `=1` on gfx1201, `=0` off): verify each layer's final
+            // gfx1151 and gfx1201, `=0` off): verify each layer's final
             // expert headers once, before any capture, and size the route's
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new

@@ -44973,7 +44973,7 @@ impl Gpu {
 /// (fn-moe-sym) for gfx1151 / gfx1201 Qwen4 prefill on layers whose every
 /// routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: `1` requests it,
 /// `0` keeps the whole incumbent route (scatter, producers and GEMMs), and
-/// unset requests it on gfx1151 only (an asymmetric artifact fails the check
+/// unset requests it on both arches (an asymmetric artifact fails the check
 /// and stays on the incumbent). Read once.
 pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
     LazyLock::new(|| match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_IU4").ok().as_deref() {
@@ -45148,7 +45148,7 @@ impl Gpu {
 /// gfx1201 only; every launcher refuses other arches.
 impl Gpu {
     /// The route is requested and possible on this device: the flag (unset =
-    /// gfx1151 only), exact gfx1151 or gfx1201, and the frozen C2 producer
+    /// requested), exact gfx1151 or gfx1201, and the frozen C2 producer
     /// candidate set (`-DIU4_A4_CANDIDATES=2`, the default on both; any other
     /// value keeps the incumbent). Row count and verified headers are checked
     /// separately.
@@ -45159,7 +45159,7 @@ impl Gpu {
             .split_whitespace()
             .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
             .peekable();
-        QWEN4_MOE_SYM_IU4.unwrap_or(self.arch == "gfx1151")
+        QWEN4_MOE_SYM_IU4.unwrap_or(true)
             && self.qwen4_moe_sym_arch_index().is_some()
             && candidates.peek().is_some()
             && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2")
