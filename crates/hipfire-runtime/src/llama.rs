@@ -8260,6 +8260,19 @@ pub fn reset_cpu_sampler_rng(seed: u32) {
 use std::sync::atomic::AtomicU32;
 static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
 
+/// Test-only exclusive hold on `SAMPLER_STATE`. The RNG is process-global and
+/// `cargo test` runs every test in the crate's lib binary on parallel threads,
+/// so ANY test in ANY module that resets or draws from the CPU sampler RNG
+/// must hold this guard for its whole reset→draw→assert span; otherwise a
+/// sibling's `simple_rand` advances the state mid-stream. Poison is ignored:
+/// the guarded value is `()`, and a failing test must not cascade into
+/// `PoisonError`s in every later RNG test.
+#[cfg(test)]
+pub(crate) fn sampler_rng_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
 /// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
 fn simple_rand() -> f32 {
@@ -8287,14 +8300,6 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // The CPU sampler RNG (`SAMPLER_STATE`) is a process-global atomic shared by
-    // every test. Tests that reset+draw from it must not interleave with each
-    // other (a concurrent `simple_rand` from a sibling test would mutate the
-    // state between a reset and the draw, breaking determinism). Serialize all
-    // RNG-touching `sample_full_dist` tests behind this mutex.
-    static RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn qwen3_flash_mode_policy_matches_rdna_generation() {
@@ -8417,7 +8422,7 @@ mod tests {
 
     #[test]
     fn sample_full_dist_min_p_gt_one_no_panic() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         // FIX #3: min_p = 1.5 would empty the candidate set and panic on cand[0]
         // before the clamp. After the clamp + keep-at-least-one guard it must
         // return a valid in-range index without panicking.
@@ -8432,7 +8437,7 @@ mod tests {
 
     #[test]
     fn sample_full_dist_min_p_filters_low_prob() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         // FIX #3 / general: min_p = 0.5 with a sharply peaked distribution must
         // drop the low-prob tails. With temp=1.0 the dominant logit (idx 1 at
         // 10.0) has prob ~1.0; min_p*p_max ~0.5 prunes everything else, so the
@@ -8447,7 +8452,7 @@ mod tests {
 
     #[test]
     fn sample_full_dist_nan_logit_samples_finite() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         // FIX #4: a NaN logit must not poison `total` and force a silent greedy
         // fallback / NaN-indexed token. The NaN index (3) must never be drawn,
         // and the returned token must be a finite-logit index.
@@ -8475,7 +8480,7 @@ mod tests {
         // ds4 card) and top_k=40, plus temp/top_p, must return a valid in-range
         // index. The fixes are guarded on min_p>0 / non-finite / min_p>1, none
         // of which trigger here, so behavior is unchanged.
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         for &top_k in &[None, Some(40u32)] {
             for seed in [1u32, 2, 3, 42] {
                 reset_cpu_sampler_rng(seed);
@@ -8502,7 +8507,7 @@ mod tests {
         // we serialize the two calls inside a single test (no other test runs
         // between them in THIS function) — the standalone single-threaded proof
         // of determinism is racy only across parallel tests, never within one.
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
         for seed in [1u32, 2, 3, 42] {
             reset_cpu_sampler_rng(seed);
@@ -8805,7 +8810,7 @@ mod tests {
 
     #[test]
     fn legacy_sample_top_p_all_nan_returns_in_vocab() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         reset_cpu_sampler_rng(12345);
         let logits = [f32::NAN; 8];
         let idx = sample_top_p(&logits, 0.7, 0.9);
@@ -8817,7 +8822,7 @@ mod tests {
 
     #[test]
     fn legacy_sample_top_p_all_pos_inf_returns_in_vocab() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         reset_cpu_sampler_rng(777);
         // Pre-fix: +Inf max → (Inf - Inf) = NaN softmax → NaN sum → token 0.
         let logits = [f32::INFINITY; 8];
@@ -8830,7 +8835,7 @@ mod tests {
 
     #[test]
     fn legacy_sample_top_p_mixed_finite_nan_picks_finite() {
-        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let _g = sampler_rng_test_guard();
         // The only finite mass is at idx 2 (a sharp peak after temp). The NaN
         // slots (0,1,3,4) must never be drawn, and the +Inf slot (5) must be
         // skipped — the draw is forced onto the finite peak regardless of RNG.
@@ -9182,7 +9187,7 @@ mod tests {
         // Pinned from the pre-`top_k` `sample_top_p` (base 3fb9dec05b): request
         // fields absent must keep today's sampled bytes. `Some(20)` and
         // `min_p == 0` are the registry's spelled-out defaults and must too.
-        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = sampler_rng_test_guard();
         let logits: Vec<f32> = (0..300u32)
             .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1000) as f32 / 125.0)
             .collect();
@@ -9201,7 +9206,7 @@ mod tests {
 
     #[test]
     fn cpu_sampler_top_k_bounds_the_candidates() {
-        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = sampler_rng_test_guard();
         let logits = ranked_logits(200);
         // top_k=1 is argmax at any temperature.
         assert_eq!(drawn(&logits, Some(1), None, 64), vec![0]);
@@ -9223,7 +9228,7 @@ mod tests {
 
     #[test]
     fn cpu_sampler_min_p_drops_candidates_below_the_peak_floor() {
-        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = sampler_rng_test_guard();
         // p(1)/p(0) = e^-0.1 survives min_p=0.5; e^-5 for the tail does not.
         let mut logits = vec![5.0f32; 50];
         logits[0] = 10.0;

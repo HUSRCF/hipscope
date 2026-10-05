@@ -625,6 +625,8 @@ mod tests {
     /// `top_k` (absent and 0 included) and `min_p`.
     #[test]
     fn target_is_the_host_ar_sampler_distribution() {
+        // Draws from the process-global AR RNG; hold it for the whole run.
+        let _rng = crate::llama::sampler_rng_test_guard();
         for (n, case) in cases().iter().enumerate() {
             let p = case.target();
             // Well-spread seeds: the AR xorshift32 maps close seeds to close

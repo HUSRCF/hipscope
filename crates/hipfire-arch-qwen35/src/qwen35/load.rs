@@ -7319,8 +7319,8 @@ mod direct_load_fault_tests {
     /// Serializes the five fault tests below. Each drives multi-GiB loads and
     /// asserts device-global HIP free bytes, so concurrent execution on one
     /// GPU measures its siblings' live loads as its own "leak". Same
-    /// `static TEST_LOCK: Mutex<()>` pattern as
-    /// `hipfire-runtime/src/llama.rs` (`RNG_TEST_LOCK`).
+    /// `static Mutex<()>` test-lock pattern as
+    /// `hipfire-runtime/src/llama.rs` (`sampler_rng_test_guard`).
     static QWEN35_VRAM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Warm-up upload that pays the ROCm first-device-allocation reservation
