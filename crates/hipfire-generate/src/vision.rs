@@ -1462,8 +1462,8 @@ pub fn generate_vl(
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
-        // VL path samples on the CPU (sample_cpu), which does not yet honor
-        // top_k / min_p; keep None so behavior is unchanged.
+        // `sample_cpu` honours top_k / min_p, but `GenerateVLParams` does not
+        // carry the request's values yet, so VL keeps the top-20 default.
         top_k: None,
         min_p: None,
     };

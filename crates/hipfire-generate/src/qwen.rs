@@ -3114,12 +3114,17 @@ pub fn generate_dflash(
     // `enable_grammar=false` (empty schema ⇒ matcher inactive). Tools still
     // reach SpecEmit so ToolOutputRouter parses native XML; withholding them
     // used to leak `<tool_call>` as assistant content (Hermes never executed).
-    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
-            .ok()
-            .as_deref(),
-        &m.model_path,
-    );
+    // Qwen4 native MTP keeps the grammar off unconditionally: its AR producer
+    // (`generate_qwen4_ar`) has no tool-call grammar, and a post-acceptance
+    // reject would end an MTP turn the AR route continues — tools on the two
+    // routes must commit the same greedy stream.
+    let grammar_enabled = m.qwen4().is_none()
+        && hipfire_runtime::prompt_frame::qwen35_grammar_on(
+            hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+                .ok()
+                .as_deref(),
+            &m.model_path,
+        );
     let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
@@ -8149,7 +8154,10 @@ pub fn generate_qwen4_ar(
         max_think_tokens,
         started_in_think,
         stop,
-        true,
+        // Same predicate as the native MTP emitter (`Qwen35Emit::from_ctx`
+        // enables its tool router on `tools.is_some()`), so both Qwen4 routes
+        // classify `<tool_call>` markup identically.
+        tools.is_some(),
         prefix_plan.start_pos,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary

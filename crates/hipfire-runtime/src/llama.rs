@@ -7704,26 +7704,96 @@ pub fn apply_unclosed_attractor_block(
     }
 }
 
+/// Legacy CPU candidate gather: the top-20 nucleus every sampler used before
+/// request `top_k` was honoured. `top_k` absent (or `<= 20`) keeps this pool.
+const CPU_SAMPLE_LEGACY_POOL: usize = 20;
+/// Wide gather for `top_k > 20` (or `0` = no extra cut). Matches the GPU
+/// `sample_top_p` kernel's gather budget, so CPU and GPU honour the same range.
+const CPU_SAMPLE_WIDE_POOL: usize = 64;
+
+/// Top-20 nucleus sampler (temperature + top_p). Byte-identical to
+/// [`sample_top_k_p`] with `top_k = None, min_p = None`.
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
+    sample_top_k_p(logits, temperature, top_p, None, None)
+}
+
+/// CPU sampler honouring request `top_k` and `min_p` with the GPU
+/// `sample_top_p` kernel's semantics:
+///
+/// 1. `temperature <= 0` → [`argmax`].
+/// 2. Gather the highest finite logits into a pool: 20 wide when `top_k` is
+///    `None` or `1..=20`, 64 wide otherwise.
+/// 3. Temperature softmax numerators over the pool, sorted descending.
+/// 4. `cap = top_k` (`None` → 20; `0` or `>= 64` → 64, the pool; values above
+///    64 are clamped to it, as on the GPU).
+/// 5. `min_p` (`> 0`, clamped to 1): `cap` shrinks to the first sorted rank
+///    `i >= 1` whose prob is below `min_p * p_max`.
+/// 6. Nucleus over the first `cap` sorted candidates: keep the shortest
+///    prefix whose mass reaches `top_p * mass(cap)`, then draw from it in
+///    proportion to the probs.
+///
+/// When `cap` keeps the whole pool (`top_k` absent or 20, `min_p` absent/0 or
+/// cutting nothing) the arithmetic is exactly the legacy top-20 code — same
+/// summation order, same RNG draws — so default requests are byte-identical.
+pub fn sample_top_k_p(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
     }
-    let top_p = top_p.clamp(0.0, 1.0);
-    const TOP_K: usize = 20;
+    let min_p = match min_p {
+        Some(p) if p.is_finite() && p > 0.0 => p.min(1.0),
+        _ => 0.0,
+    };
+    match top_k {
+        None => sample_pool::<CPU_SAMPLE_LEGACY_POOL>(
+            logits,
+            temperature,
+            top_p,
+            CPU_SAMPLE_LEGACY_POOL,
+            min_p,
+        ),
+        Some(k) if (1..=CPU_SAMPLE_LEGACY_POOL as u32).contains(&k) => {
+            sample_pool::<CPU_SAMPLE_LEGACY_POOL>(logits, temperature, top_p, k as usize, min_p)
+        }
+        Some(k) => {
+            let cap = if k == 0 {
+                CPU_SAMPLE_WIDE_POOL
+            } else {
+                (k as usize).min(CPU_SAMPLE_WIDE_POOL)
+            };
+            sample_pool::<CPU_SAMPLE_WIDE_POOL>(logits, temperature, top_p, cap, min_p)
+        }
+    }
+}
 
+/// [`sample_top_k_p`] over a fixed `N`-wide candidate pool (no heap
+/// allocation). `cap` is in `1..=N`; `min_p` is in `[0, 1]`.
+fn sample_pool<const N: usize>(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    cap: usize,
+    min_p: f32,
+) -> u32 {
+    let top_p = top_p.clamp(0.0, 1.0);
     let inv_temp = 1.0 / temperature;
 
-    // Single pass: find max AND top-K indices from raw logits simultaneously.
+    // Single pass: find max AND top-N indices from raw logits simultaneously.
     // Uses a fixed-size array (no heap alloc) with manual min-tracking.
     //
     // FINITE GUARD (ported from sample_full_dist, the O1 fix): only finite
-    // logits feed `max_logit` and the top-K set. A `+Inf` logit must not become
+    // logits feed `max_logit` and the top-N set. A `+Inf` logit must not become
     // `max_logit` (then `(l - max)` = Inf - Inf = NaN → exp(NaN) = NaN → NaN sum
     // → degenerate token-0 return), and a NaN logit (already `>`-false) must not
-    // occupy a top-K slot. Slots left at NEG_INFINITY are zeroed in the softmax
+    // occupy a top-N slot. Slots left at NEG_INFINITY are zeroed in the softmax
     // below, and if no finite mass survives we fall back to the NaN-safe argmax.
-    let mut topk_val = [f32::NEG_INFINITY; TOP_K];
-    let mut topk_idx = [0u32; TOP_K];
+    let mut topk_val = [f32::NEG_INFINITY; N];
+    let mut topk_idx = [0u32; N];
     let mut min_pos = 0usize; // index of smallest element in topk
     let mut min_val = f32::NEG_INFINITY;
     let mut max_logit = f32::NEG_INFINITY;
@@ -7740,7 +7810,7 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
             topk_idx[min_pos] = i as u32;
             // Find new min
             min_val = f32::INFINITY;
-            for j in 0..TOP_K {
+            for j in 0..N {
                 if topk_val[j] < min_val {
                     min_val = topk_val[j];
                     min_pos = j;
@@ -7749,12 +7819,12 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
-    // Softmax only the K candidates (temperature-scaled). FINITE GUARD: a slot
-    // still holding NEG_INFINITY (fewer than TOP_K finite logits) or a non-
+    // Softmax only the N candidates (temperature-scaled). FINITE GUARD: a slot
+    // still holding NEG_INFINITY (fewer than N finite logits) or a non-
     // finite computed prob contributes zero mass rather than poisoning `sum`.
-    let mut probs = [0.0f32; TOP_K];
+    let mut probs = [0.0f32; N];
     let mut sum = 0.0f32;
-    for i in 0..TOP_K {
+    for i in 0..N {
         let p = if topk_val[i].is_finite() {
             let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
             if pp.is_finite() {
@@ -7776,9 +7846,9 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         return argmax(logits);
     }
 
-    // Sort descending by probability (insertion sort on 20 elements)
-    let mut order: [usize; TOP_K] = core::array::from_fn(|i| i);
-    for i in 1..TOP_K {
+    // Sort descending by probability (insertion sort on N elements)
+    let mut order: [usize; N] = core::array::from_fn(|i| i);
+    for i in 1..N {
         let mut j = i;
         while j > 0 && probs[order[j]] > probs[order[j - 1]] {
             order.swap(j, j - 1);
@@ -7786,12 +7856,27 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
+    // Request candidate cap: top_k, then the min_p floor relative to the peak.
+    let mut cap = cap.clamp(1, N);
+    if min_p > 0.0 {
+        let floor = min_p * probs[order[0]];
+        if let Some(cut) = (1..cap).find(|&i| probs[order[i]] < floor) {
+            cap = cut;
+        }
+    }
+    // A cut renormalizes over the kept prefix; the uncut pool keeps the legacy
+    // index-order sum so default requests stay byte-identical.
+    if cap < N {
+        sum = order[..cap].iter().map(|&k| probs[k]).sum();
+    }
+    let order = &order[..cap];
+
     // Top-p filtering + sampling in one pass
     let r = simple_rand() * sum; // pre-scale by total sum
     let mut cumulative = 0.0f32;
     let mut sample_acc = 0.0f32;
     let threshold = top_p * sum;
-    for &k in &order {
+    for &k in order {
         cumulative += probs[k];
         sample_acc += probs[k];
         if sample_acc >= r {
@@ -7801,7 +7886,7 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
             // Past top_p — sample from what we have
             let r2 = simple_rand() * cumulative;
             let mut acc2 = 0.0f32;
-            for &k2 in &order {
+            for &k2 in order {
                 acc2 += probs[k2];
                 if acc2 >= r2 {
                     return topk_idx[k2];
@@ -9068,5 +9153,87 @@ mod tests {
         );
         hip_bridge::clear_vmm_faults();
         gpu.ensure_vmm_cleaned().expect("clear");
+    }
+
+    /// `sample_top_p` at base 3fb9dec05b over the test's logits, seed 1234,
+    /// temperatures 0.7..1.8, top_p 0.9: tokens, then the RNG state after.
+    const LEGACY_STREAM: [u32; 12] = [263, 70, 115, 210, 165, 179, 56, 115, 294, 154, 70, 238];
+    const LEGACY_RNG_AFTER: u32 = 674_466_034;
+
+    /// Logits whose rank equals their index: `n` tokens, gently decreasing so
+    /// every rank keeps real mass at temperature 1.
+    fn ranked_logits(n: usize) -> Vec<f32> {
+        (0..n).map(|i| 5.0 - i as f32 * 0.01).collect()
+    }
+
+    /// Distinct tokens drawn by `draws` samples (RNG reseeded once).
+    fn drawn(logits: &[f32], top_k: Option<u32>, min_p: Option<f32>, draws: usize) -> Vec<u32> {
+        reset_cpu_sampler_rng(0x5eed);
+        let mut seen: Vec<u32> = (0..draws)
+            .map(|_| sample_top_k_p(logits, 1.0, 1.0, top_k, min_p))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    }
+
+    #[test]
+    fn cpu_sampler_default_stream_is_the_pinned_legacy_top20_nucleus() {
+        // Pinned from the pre-`top_k` `sample_top_p` (base 3fb9dec05b): request
+        // fields absent must keep today's sampled bytes. `Some(20)` and
+        // `min_p == 0` are the registry's spelled-out defaults and must too.
+        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let logits: Vec<f32> = (0..300u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1000) as f32 / 125.0)
+            .collect();
+        for (top_k, min_p) in [(None, None), (Some(20), Some(0.0)), (Some(20), None)] {
+            reset_cpu_sampler_rng(1234);
+            let stream: Vec<u32> = (0..12)
+                .map(|i| sample_top_k_p(&logits, 0.7 + i as f32 * 0.1, 0.9, top_k, min_p))
+                .collect();
+            assert_eq!(
+                (stream, sampler_rng_snapshot()),
+                (LEGACY_STREAM.to_vec(), LEGACY_RNG_AFTER),
+                "top_k={top_k:?} min_p={min_p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_sampler_top_k_bounds_the_candidates() {
+        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let logits = ranked_logits(200);
+        // top_k=1 is argmax at any temperature.
+        assert_eq!(drawn(&logits, Some(1), None, 64), vec![0]);
+        // A narrow cut keeps exactly the top ranks, all reachable.
+        assert_eq!(drawn(&logits, Some(5), None, 600), vec![0, 1, 2, 3, 4]);
+        // Absent top_k is the legacy 20-wide nucleus.
+        assert_eq!(*drawn(&logits, None, None, 4000).last().unwrap(), 19);
+        // A wide cut reaches past rank 20 (impossible before) and stops at k.
+        let wide = drawn(&logits, Some(40), None, 6000);
+        assert!(wide.iter().any(|&t| t >= 20), "top_k=40 stayed in top 20");
+        assert!(wide.iter().all(|&t| t < 40), "top_k=40 drew {wide:?}");
+        // 0 (no extra cut) and k past the 64-wide gather both use the full pool.
+        for k in [0, 1000] {
+            let pool = drawn(&logits, Some(k), None, 8000);
+            assert!(pool.iter().any(|&t| t >= 40), "top_k={k} stayed narrow");
+            assert!(pool.iter().all(|&t| t < 64), "top_k={k} left the pool");
+        }
+    }
+
+    #[test]
+    fn cpu_sampler_min_p_drops_candidates_below_the_peak_floor() {
+        let _g = RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // p(1)/p(0) = e^-0.1 survives min_p=0.5; e^-5 for the tail does not.
+        let mut logits = vec![5.0f32; 50];
+        logits[0] = 10.0;
+        logits[1] = 9.9;
+        assert_eq!(drawn(&logits, None, Some(0.5), 400), vec![0, 1]);
+        // Without min_p the 48-way tail carries real mass and gets sampled.
+        assert!(drawn(&logits, None, None, 400).len() > 2);
+        // min_p composes with top_k: the tighter cut wins.
+        assert_eq!(drawn(&logits, Some(1), Some(0.5), 64), vec![0]);
+        // min_p=1 keeps only the peak.
+        assert_eq!(drawn(&logits, None, Some(1.0), 64), vec![0]);
     }
 }

@@ -1690,11 +1690,12 @@ pub(crate) struct RequestContract {
     pub conversation_messages: Option<serde_json::Value>,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
-    /// Validated `response_format` (spec §7 G1). `None` when the request
-    /// carries no `response_format` or it is `json_object` (which the
-    /// non-slot path already handles via tool-call grammar). A `json_schema`
-    /// value is parsed, validated against the supported subset, and forwarded
-    /// to the daemon so the slot engine can apply pre-sampling grammar masks.
+    /// Validated `response_format` (spec §7 G1), multi-slot route only. A
+    /// `json_schema` value is parsed, validated against the supported subset,
+    /// and forwarded to the daemon so the slot engine can apply pre-sampling
+    /// grammar masks (`json_object` is refused there). On the standard route
+    /// this is always `None`: `response_format` is neither validated nor
+    /// forwarded, so it is not enforced.
     pub response_format: Option<ResponseFormat>,
 }
 
