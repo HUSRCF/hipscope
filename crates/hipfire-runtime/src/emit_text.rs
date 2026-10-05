@@ -1166,7 +1166,10 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["file_content"], HA12_FILE);
         assert_eq!(calls[0].arguments["action"], "write_file");
-        assert_eq!(calls[0].arguments["file_path"], "scripts/validate_release.py");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "scripts/validate_release.py"
+        );
         // Streaming router: byte-split anywhere, same exact bytes.
         for split in [1, 97, 300, HA12_CALL.len() - 30] {
             let (vis, routed, term) = feed(&[&HA12_CALL[..split], &HA12_CALL[split..]]);

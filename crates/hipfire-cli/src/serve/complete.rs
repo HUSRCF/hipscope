@@ -7177,14 +7177,16 @@ mod tests {
     fn tool_normalize_keeps_structured_value_a_union_accepts() {
         // JSON-format models emit typed values; only a slot that accepts
         // nothing but `string` gets the value's JSON text.
-        let body = tool_body(serde_json::json!([{"type":"function","function":{"name":"f","parameters":{
-            "type":"object",
-            "properties":{
-                "n":{"type":["integer","string"]},
-                "o":{"anyOf":[{"type":"object"},{"type":"string"}]},
-                "s":{"type":"string"}
-            }
-        }}}]));
+        let body = tool_body(
+            serde_json::json!([{"type":"function","function":{"name":"f","parameters":{
+                "type":"object",
+                "properties":{
+                    "n":{"type":["integer","string"]},
+                    "o":{"anyOf":[{"type":"object"},{"type":"string"}]},
+                    "s":{"type":"string"}
+                }
+            }}}]),
+        );
         let mut calls = vec![sample_tc(
             "f",
             serde_json::json!({"n": 5, "o": {"k": 1}, "s": 5}),
