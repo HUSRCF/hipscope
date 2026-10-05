@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::{Builder, kernels::{bf16::Bf16, common::{op, s, v}, iu4_gemm::region::{Binding, Region, emit_interleaved}}};
 
 /// Temporary VGPRs [`Epilogue::silu_dense`] consumes per element.

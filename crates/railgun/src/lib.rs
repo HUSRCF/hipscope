@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! railgun: the certified dispatch program (railgun design §1.1). This is the
 //! milestone MC slice of the program model: what copies need and nothing
 //! else — host words, affine formulas, resources including `PointerTable`,

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Wave-role handoff, joins, loop exits and scope ownership on the reference
 //! backend.
 use peacemaker_author::{ready, retire, trace::Trace, Gfx1100, Gfx1151, Gfx1201, LdsRegion, Published, Target, Workgroup};

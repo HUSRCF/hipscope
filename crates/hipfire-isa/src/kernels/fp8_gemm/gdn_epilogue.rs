@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! GDN preparation fused into the F2 QKVZA epilogue (`Epi::QkvzaGdn`).
 //!
 //! A q/k/v row tile (256 channels = two 128-channel heads) x 128 tokens is

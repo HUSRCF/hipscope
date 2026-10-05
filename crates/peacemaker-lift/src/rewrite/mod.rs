@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! M3: certified rewrites (architecture.md §4, §7 M3).
 //!
 //! A [`Rewrite`] is a script of core [`Edit`]s on one kernel of a lifted object plus the

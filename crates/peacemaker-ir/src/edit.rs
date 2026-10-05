@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C6: checked edit transactions over `Analyzed<Program>` (core.md §6).
 //!
 //! `Analyzed::edit` = validate preconditions → apply to a clone →

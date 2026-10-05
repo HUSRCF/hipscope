@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Check 11 `definedness` (architecture.md §3): every register an instruction reads —
 //! implicit EXEC, VCC, SCC and M0 included — must be defined on every incoming CFG path,
 //! by the code or by the kernel's ABI entry live-ins.

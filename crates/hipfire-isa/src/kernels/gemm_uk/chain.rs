@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::{Arch, Builder, V, insn::{Instruction, Wmma}};
 use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, MmaIu4, Wave};
 use std::marker::PhantomData;

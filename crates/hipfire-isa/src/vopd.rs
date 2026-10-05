@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::{arch::Arch, insn::Instruction, reg::{DistinctBanks,OppositeParity,RegRef,V,Vb,Vp,S}};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum VopdF32 { Add,Sub,Subrev,Mul,Fmac }
 impl VopdF32 { fn name(self)->&'static str {match self {Self::Add=>"v_dual_add_f32",Self::Sub=>"v_dual_sub_f32",Self::Subrev=>"v_dual_subrev_f32",Self::Mul=>"v_dual_mul_f32",Self::Fmac=>"v_dual_fmac_f32"}} }

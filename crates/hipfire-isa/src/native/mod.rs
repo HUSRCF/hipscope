@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Native code-object emission: the builder's `.s` (one kernel or a product
 //! module) → a code object laid out exactly as `llvm-mc` + `ld.lld -shared`
 //! lay it out, and its HIP offload bundle — no ROCm tool in the path. The

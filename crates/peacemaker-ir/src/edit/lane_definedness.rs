@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Conservative lane coverage for partial VGPR writes. The existing half/dword
 //! definite-assignment analysis remains authoritative for fully undefined reads.
 //! Fully undefined reads retain their separate entry-definedness findings.

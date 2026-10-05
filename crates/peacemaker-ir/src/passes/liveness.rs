@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C4: physical-register liveness and locally-free register facts.
 //!
 //! Standard backward may-dataflow over the CFG at dword granularity, per

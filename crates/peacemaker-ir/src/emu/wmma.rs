@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Wave32 WMMA register-fragment gather/scatter. The numerical contract
 //! (accumulation order, rounding, saturation) lives in `super::mma`; this
 //! module only maps ISA fragments to logical matrices, so a mapping error

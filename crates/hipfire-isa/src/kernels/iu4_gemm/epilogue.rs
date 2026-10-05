@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! One masked store path per epilogue family. Lane (m_lane, k_grp) of wave
 //! (wt_pair, tok_half) owns, for column block nb and row group rg, rows
 //! `wt_pair*32 + rg*16 + 8*k_grp + j` (j = 0..7) of token

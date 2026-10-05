@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C2: ELF section, symbol, note and envelope read/write.
 //!
 //! An `Envelope` is every byte of an AMDGPU code object except what its kernels own:

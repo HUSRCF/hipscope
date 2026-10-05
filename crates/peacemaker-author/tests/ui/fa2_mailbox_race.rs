@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // gfx11 FA2 mailbox (non-fill body) `f284a3b8a`: lane 0 publishes gmax/gmin
 // in the V plane's last two dwords (attention_q8_0_fa2_gqa.gfx11.hip:603-611);
 // the tile loop's first V fill (:951) rewrites them while a slow wave may

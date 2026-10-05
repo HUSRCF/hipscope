@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use hipfire_isa::{Arch,RegPlan,reg::{Live,V,Vb,Vp,RegRef,Kind},vopd::{self,VopdOp,VopdF32,Operand},insn::{Instruction,Vbuffer,MemoryClass,Sop,Ds},hazard::{Gfx12Sgpr,Pipeline},ledger::{Ledger,Counter}};
 use std::{io::Write,process::{Command,Stdio}};
 #[test]fn vopd_banks_and_architectural_shared_src1(){let x=VopdOp{op:VopdF32::Mul,dst:0,src0:Operand::V(8),src1:7};let y=VopdOp{op:VopdF32::Mul,dst:1,src0:Operand::V(9),src1:7};assert!(vopd::packet(Arch::Gfx1201,x,y).is_ok());assert!(vopd::packet(Arch::Gfx1100,x,y).is_err());assert!(vopd::packet(Arch::Gfx1151,x,y).is_err());assert!(vopd::packet(Arch::Gfx1201,x,VopdOp{dst:2,..y}).is_err());assert!(vopd::packet(Arch::Gfx1201,x,VopdOp{src0:Operand::V(12),src1:6,..y}).is_err());assert!(vopd::packet(Arch::Gfx1201,x,VopdOp{src1:11,..y}).is_err());assert!(Vb::<0>::checked(1).is_err());assert!(Vp::<0>::checked(1).is_err())}

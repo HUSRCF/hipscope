@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Per-target opcode/encoding rows. Tables are backed by AMD XML and pinned LLVM samples.
 use std::sync::LazyLock;
 use crate::inst::{Arch, Family, Form, Opcode, VmemForm};

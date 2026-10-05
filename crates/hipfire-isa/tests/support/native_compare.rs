@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Shared native-vs-ROCm-oracle comparison for the test crates that check the
 //! native code-object writer (`native_identity`, `hipfire-rip`'s `qsa`),
 //! included by path: `#[path = ".../support/native_compare.rs"] mod native_compare;`.

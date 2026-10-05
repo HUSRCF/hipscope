@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C3b: canonical objdump text (<->) typed instructions.
 //!
 //! The typed codec (`peacemaker-ir`) owns bytes; this module owns the

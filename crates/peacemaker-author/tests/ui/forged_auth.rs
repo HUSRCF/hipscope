@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // An `Auth` cannot be built outside the typed core.
 use peacemaker_author::{Auth, Backend, Gfx1100, Workgroup};
 

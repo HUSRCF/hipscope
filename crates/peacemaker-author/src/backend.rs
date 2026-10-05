@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The lowering seam. The typed core decides *what* happens (which LDS
 //! slots a store touches, which transitions a barrier carries, when a store
 //! is drained); a backend turns each request into instructions and runs the

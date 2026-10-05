@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! ELF, bundle, descriptor and metadata lifter for typed AMDGPU programs.
 //!
 //! [`lift_object`] turns a code object (plain ELF or HIP offload bundle) into a

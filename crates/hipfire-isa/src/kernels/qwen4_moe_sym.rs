@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Builder-emitted Qwen4 grouped symmetric IU4 MoE GEMMs (fn-moe-sym route,
 //! `HIPFIRE_QWEN4_MOE_SYM_IU4=1`): the SwiGLU gate/up and the down projection
 //! over packed `block_i4_128` activations, for gfx1151

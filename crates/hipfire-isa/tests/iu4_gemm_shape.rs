@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Offline gates for the builder-emitted iu4 GEMM (plan §4): the hot-loop
 //! `IsaShapeContract` of every product point, the 192-VGPR occupancy
 //! ceiling, deterministic emission, the loop wait-ledger fix point, the

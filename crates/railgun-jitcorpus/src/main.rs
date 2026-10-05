@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `railgun-jit-corpus` — the offline JIT receipt corpus (railgun design §2.5).
 //!
 //! Every command takes `--work DIR` (default `./railgun-jit-corpus-work`): the

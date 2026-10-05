@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Exact CPU semantics for scalar and vector ALU opcodes (wave32).
 //!
 //! Every opcode is keyed by its exact ISA name; an unknown name is an error, never a

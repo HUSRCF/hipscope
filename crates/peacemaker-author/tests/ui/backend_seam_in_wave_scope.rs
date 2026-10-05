@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // The reviewer's seam counterexample: a wave-only body reaching the
 // backend through `isa` and calling its barrier entry point directly. Every
 // state-changing entry point takes an `Auth` the wave scope never sees.

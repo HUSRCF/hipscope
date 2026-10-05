@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! gfx1201 MQ4V2 E4M3 fragment GEMM, emitted with the checked ISA builder.
 //! The 96-byte ABI and all fragment offsets are frozen by fp8-4k5 §11.4–11.5.
 pub mod spec;

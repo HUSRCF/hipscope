@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! M3 (architecture.md §7): this session's hand edits as edit scripts over the IR,
 //! reproducing their objects byte for byte from the lifted base objects:
 //! the profiler instrumentation (`peacemaker/profile/report.md:327`: `kt48_pmprofile.co`,

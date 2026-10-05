@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Fold wiring for the K-loop: which physical ranges hold the scale rows and
 //! products at fold time, the phase-B placement of the two fold stages, and
 //! the (closed, never emitted into a product module) `K256Pow2` re-seed.

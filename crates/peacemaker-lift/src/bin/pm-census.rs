@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Offline packaged-object census for gfx1100, gfx1151 and gfx1201.
 //! Usage: pm-census <arch> <registry.tsv> <compiled/<arch>> <output-dir>
 //!                  <llvm-objdump> <arch-encodings.tsv> [builder.hxaco ...]

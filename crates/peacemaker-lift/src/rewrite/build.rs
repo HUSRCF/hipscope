@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Typed gfx1201 instructions for edit scripts, built from the opcode table.
 //!
 //! [`inst`] takes a mnemonic and typed operands. Encoding don't-cares come from the

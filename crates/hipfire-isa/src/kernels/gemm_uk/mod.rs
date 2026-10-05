@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Zero-cost, composable WMMA GEMM fragments. Scheduling and register
 //! allocation belong to the caller; these parts preserve per-output order.
 pub mod tile;

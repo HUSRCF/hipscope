@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Replay exact captured device addresses; no pointer relocation or GPU dependency.
 use std::{fs,io::Read,path::{Path,PathBuf}};
 use peacemaker_ir::{emu::{Launch,Memory},inst::Frontend};

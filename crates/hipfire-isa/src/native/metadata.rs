@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `.amdgpu_metadata` YAML → the `NT_AMDGPU_METADATA` MessagePack blob.
 //!
 //! The assembler reads the document into an `llvm::msgpack::Document`

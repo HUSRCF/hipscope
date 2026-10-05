@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C2: 64-byte HSA kernel descriptor codec.
 //!
 //! Layout and bit meanings are LLVM's "Code Object V3 Kernel Descriptor" table

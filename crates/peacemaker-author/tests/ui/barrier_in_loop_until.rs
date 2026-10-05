@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // `loop_until` is wave scope: its break condition may differ between waves,
 // so its body has no barrier.
 use peacemaker_author::{Backend, Gfx1151, Workgroup};

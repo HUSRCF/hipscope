@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Scope escapes as rustc errors: the lowering seam without an `Auth`, a
 //! forged or minted `Auth`, a barrier in the readers-only continuation of a
 //! handoff or in a wave-scope loop. Escapes the types cannot see

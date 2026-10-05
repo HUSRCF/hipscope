@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! A reference backend for tests and documentation: it records instruction
 //! text and runs a strict slot machine. Unlike the production builder it
 //! never inserts a drain on its own: a barrier with an LDS store pending is

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! LDS regions with a workgroup-level ownership state (design §4.5).
 //!
 //! The arena is split into typed regions (`LdsRegion<R, S>`, one backend slot

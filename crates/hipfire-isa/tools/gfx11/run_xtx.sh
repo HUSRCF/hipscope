@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # gfx1100 (XTX) runs for the builder V2C-equivalent SET GEMM.
 #   run_xtx.sh <dir> oracle|time|profile
 # <dir> holds bin/{v2c_runtime.hsaco,v2c_pm.hsaco,v2c_pm_prof.co,v2c_bench,pmprof},

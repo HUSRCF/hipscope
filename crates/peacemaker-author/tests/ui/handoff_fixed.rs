@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // The handoff as the gate/up epilogue uses it: writers publish and leave,
 // readers read and store up to the kernel exit.
 use peacemaker_author::{trace::Trace, Backend, Gfx1201, Workgroup};

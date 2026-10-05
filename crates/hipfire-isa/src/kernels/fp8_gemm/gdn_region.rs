@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Imported hipcc regions of `gdn_chunk_prep` for the F2 QKVZA+GDN epilogue
 //! (and the A4 `_b1` fused projection, `iu4_gemm::gdn_epilogue`).
 //!

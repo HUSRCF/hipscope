@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Offline R4 MoE schedule inventory: emit, assemble, lift and record resources.
 //! Run with --features toolchain and an evidence directory argument.
 use hipfire_isa::{Arch, kernels::qwen4_moe_sym::{self, Kind, Spec, R4Spec}, toolchain::{Toolchain, build}};

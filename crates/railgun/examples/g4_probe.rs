@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! G4 silicon probe (railgun design §5 G4, §7 M2): per arch and per
 //! cache-visibility row, adversarial producer→consumer kernel pairs inside
 //! one retained PM4 IB, swept over the barrier rungs from none to a full

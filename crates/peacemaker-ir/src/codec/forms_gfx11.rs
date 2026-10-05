@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! RDNA3 / RDNA3.5 base fields, from isarefs MR-ISA `amdgpu_isa_rdna3{,_5}.xml`.
 //! The two XMLs agree on bit layouts; opcode legality is selected by target.
 use super::forms::Field;

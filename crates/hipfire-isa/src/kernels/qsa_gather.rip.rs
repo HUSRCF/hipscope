@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Builder-emitted QSA gathered F16 WMMA prefill attention (the gfx1151 /
 //! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route), default on
 //! (`HIPFIRE_QWEN4_QSA_PM=0` opts out). Two symbols per arch, with the ABI, grid,

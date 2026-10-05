@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! GDN preparation fused into the fused A4 input projection
 //! (`Epi::QkvzaGdn`), the `_b1` port of F2's `fp8_gemm::gdn_epilogue`.
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Recording-predicate inventory (railgun design §2.3, §5 G0, milestone MR).
 //!
 //! Authoring a program by recording only sees the kernels chosen while the

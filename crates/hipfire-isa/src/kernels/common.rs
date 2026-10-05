@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Shared builder substrate of the kernel families: register references,
 //! the canonical literal spelling, raw instruction helpers, and the
 //! arch-spelled scalar, SMEM and raw-buffer access helpers. Every helper
