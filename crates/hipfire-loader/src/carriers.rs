@@ -672,6 +672,9 @@ impl Carrier for Qwen4Carrier {
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
         let source = HfqModelSource::from_hfq(hfq);
+        // Every allocation of the weight sweep is immutable model data: railgun
+        // check mode verifies it unchanged instead of snapshotting it (§2.4).
+        let weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
         let transaction = fulfill_manifest_from_payloads(
             &manifest.weights,
             &mesh,
@@ -699,6 +702,7 @@ impl Carrier for Qwen4Carrier {
             },
         )
         .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
+        drop(weights_role);
         let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
             config,
             transaction,

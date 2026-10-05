@@ -236,7 +236,10 @@ serve battery; a serve durability stress (8 lengths up to 8,193 tokens, solo
 and 2/4-way queued) gives byte-equal responses on PM4 and HIP. Decode, 3 fresh processes per arm over 8 prompts:
 median per-prompt +2.3 % over HIP (range −0.3 % to +4.4 %). railgun refuses
 this program (`route=unmatched`, 15 segments), so its lowering is not a
-candidate. Evidence: `/home/kaden/qcal/release-0.4.1/fn-gfx1201-flips/`.
+candidate. `HIPFIRE_RAILGUN_CHECK=always` byte-compares the PM4 lowering
+with its HIP twin on 23 of 23 decode steps (579 `State` surfaces, 5.03 GB per
+step); the Qwen4 loader registers its weights as `Weights` so they are digested
+rather than snapshotted. Evidence: `/home/kaden/qcal/release-0.4.1/fn-gfx1201-flips/`.
 
 Opt-out and fail-closed behavior are as for Qwen3.5 above. gfx1151 Flash-Next
 `.mq4` and every other arch stay on the HIP graph unless the file is `.mq4r`.
