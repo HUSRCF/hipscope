@@ -1411,11 +1411,11 @@ mod tests {
         assert!(f.fuse_qkv_bias);
     }
 
-    /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 (level 3) and
-    /// H3 default on for gfx1151 only and H8a for both, `0` turns each off,
-    /// and the fusion level is clamped to 3.
+    /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 is level 3 on
+    /// gfx1151 and level 1 on gfx1201, H3 and H8a default on for both, `0`
+    /// turns each off, and the fusion level is clamped to 3.
     #[test]
-    fn qwen4_hc_flags_default_on_gfx1151_and_exact_gfx1151_gfx1201() {
+    fn qwen4_hc_flags_default_on_exact_gfx1151_gfx1201() {
         let with = |fuse: &'static str, rest: &'static str| {
             move |name: &str| -> std::result::Result<String, ()> {
                 match name {
@@ -1427,10 +1427,15 @@ mod tests {
         };
         for arch in ["gfx906", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
             let halo = arch == "gfx1151";
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_hc_fuse_level(), if halo { 3 } else { 0 }, "{arch}");
-            assert_eq!(unset.qwen4_hc_up_tile_enabled(), halo, "{arch}");
             let exact = matches!(arch, "gfx1151" | "gfx1201");
+            let default_level = match arch {
+                "gfx1151" => 3,
+                "gfx1201" => 1,
+                _ => 0,
+            };
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc_fuse_level(), default_level, "{arch}");
+            assert_eq!(unset.qwen4_hc_up_tile_enabled(), exact, "{arch}");
             assert_eq!(unset.qwen4_moe_combine_zinit_enabled(), exact, "{arch}");
             assert_eq!(unset.qwen4_hc_row_fold_enabled(), halo, "{arch}");
             let off = FeatureFlags::from_lookup(arch, with("0", "0"));
@@ -1446,7 +1451,7 @@ mod tests {
             );
             assert_eq!(
                 FeatureFlags::from_lookup(arch, with("junk", "1")).qwen4_hc_fuse_level(),
-                if halo { 3 } else { 0 }
+                default_level
             );
         }
     }
