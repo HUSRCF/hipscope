@@ -145,8 +145,8 @@ After a successful model load, the daemon may request Auto via
 `ReplayController::configure_model_default` when `retained_redline_default`
 matches. **Current automatic runtime selection is only** the MQ4R predicate
 `mq4r_redline_default` (single-GPU `.mq4r` on the exact GPU-arch allowlist),
-the gfx1201 Qwen3.5 dense plain-AR predicate below, and the gfx1151 DeepSeek4
-`.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
+the gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, and
+the gfx1151 DeepSeek4 `.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
 auto-selected because it is not `.mq4r` (not because LFM is categorically
 model-family exempt).
 
@@ -214,6 +214,32 @@ can fail preparation, which silently gives the gain back to the HIP graph; 80 of
 H2's 898 boundary waits are elided by the `resource` wait policy, proven
 empirically for this tape; and `ROC_GLOBAL_CU_MASK` does not constrain the
 Redline PM4 queue.
+
+#### gfx1201 Qwen4 (Flash-Next) plain-AR runtime default
+
+The same predicate admits `model_arch` `qwen4` on exact gfx1201, any weight
+format, with PP=1, TP=1 and no drafter. A native MTP head counts as a drafter,
+so a default Flash-Next load (MTP `auto`, attached on gfx1201) keeps its MTP
+path, and only an MTP-off load (`--spec off` / `speculation.mtp = "off"`)
+replays. The load logs `[redline] enabling fail-closed retained default on
+gfx1201 (model_arch=qwen4, drafter=off, transport=pm4)`. The tape is 973
+launches (28 kernels) and runs unpaced; the Qwen3.5 `PostDispatchNop` pacing
+does not apply. The Qwen4 PM4 replay goes through `Gpu::replay_pm4_routed`, which
+is the plain PM4 replay unless `HIPFIRE_RAILGUN_CHECK` is set.
+
+Evidence (R9700, canonical `qwen3.8-flash-next-gptq3.mq4`, `auto` placement):
+`scripts/redline_daemon_harness.py --qwen4 --pm4 --skip-prefill
+--shadow-iterations 5` passes: the capture is stable, and HIP, PM4 and blob are
+bit-exact at positions 129–133 over 42.57 MB of state per position. Greedy
+text equals the HIP graph and the previous binary on 8/8 prompts and on the
+serve battery; a serve durability stress (8 lengths up to 8,193 tokens, solo
+and 2/4-way queued) gives byte-equal responses on PM4 and HIP. Decode, 3 fresh processes per arm over 8 prompts:
+median per-prompt +2.3 % over HIP (range −0.3 % to +4.4 %). railgun refuses
+this program (`route=unmatched`, 15 segments), so its lowering is not a
+candidate. Evidence: `/home/kaden/qcal/release-0.4.1/fn-gfx1201-flips/`.
+
+Opt-out and fail-closed behavior are as for Qwen3.5 above. gfx1151 Flash-Next
+`.mq4` and every other arch stay on the HIP graph unless the file is `.mq4r`.
 
 #### LFM registry evidence (not a runtime default)
 

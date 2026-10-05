@@ -805,7 +805,7 @@ policy and filename/registry discovery.
 
 Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `256` when only env/runtime path is used — CLI load params are the product path for `hipfire run`/`serve`.
 
-Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) and Qwen4 (Flash-Next, `qwen4`; MTP-off loads) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 

@@ -34,7 +34,10 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
 /// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
 /// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
-/// AR graph. `replay.backend = "hip"` opts out. A Qwen3.5 process configured
+/// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
+/// single GPU, no drafter (a native MTP head is a drafter, so only an
+/// MTP-off load replays), byte-identical greedy text to the HIP graph.
+/// `replay.backend = "hip"` opts out. A Qwen3.5 process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
 /// layers' GEMVs run on the host between GPU launches, which a retained tape
@@ -57,7 +60,7 @@ pub fn retained_redline_default(
         return true;
     }
     if gpu_arch.eq_ignore_ascii_case("gfx1201")
-        && model_arch.eq_ignore_ascii_case("qwen3_5")
+        && (model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen4"))
         && pp == 1
         && tp == 1
         && !has_drafter
@@ -511,6 +514,20 @@ mod tests {
             assert!(!retained_redline_default(
                 "gfx1201", model_arch, h2, 1, 1, false
             ));
+        }
+    }
+
+    #[test]
+    fn qwen4_redline_default_requires_gfx1201_single_gpu_without_mtp() {
+        let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
+        assert!(retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, false));
+        // The native MTP head is a drafter: an MTP load keeps its spec path.
+        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, true));
+        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 2, 1, false));
+        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 2, false));
+        // A plain `.mq4` Flash-Next stays on HIP off gfx1201.
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
+            assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
         }
     }
 }

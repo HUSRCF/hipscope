@@ -3393,8 +3393,10 @@ impl Qwen4GpuForward {
             let routed = if pm4_route {
                 // SAFETY: the boundary above staged every host input the tape's
                 // recorded launches read, and every pointer in the tape is owned by
-                // this bundle for the plan's lifetime.
-                match unsafe { gpu.replay.replay_pm4(next_position) } {
+                // this bundle for the plan's lifetime. `replay_pm4_routed` is the
+                // plain PM4 replay unless railgun check mode
+                // (`HIPFIRE_RAILGUN_CHECK`) is on.
+                match unsafe { gpu.replay_pm4_routed(next_position) } {
                     Ok(_) => true,
                     Err(reason) => {
                         gpu.replay.poison(format!("Qwen4 PM4 replay failed: {reason}"));
