@@ -264,6 +264,15 @@ artifact-sweep table and `0` keeps the incumbent (entries are `BV/RW/prefetch`; 
 | 10240,2560 | 12/8/2 | 8/8/2 | 8/8/1 | 8/8/1 | 8/8/1 |
 | 12288,2560 | 12/8/2 | 8/8/1 | 8/8/1 | 8/8/2 | 8/8/1 |
 
+The a/b/z region fold (first region `6144,2560`) and the HC-write epilogue
+launch (`2560,6144`) pick from their own BV8 twins: regions `8/8/2` at
+N=8192 and `8/8/1` at N=2048; HC-write `8/8/2` at N=8192, base at N=2048.
+The cold three-process Halo sweep (BF16 HC streams) measured regions
+`7.177 → 6.972 ms` and HC-write `10.502 → 10.100 ms` at N=8192
+(isolated-kernel medians, not full-prefill savings). The packed-dequant
+(`_dq`) entries measured no gain over the same tile without it and are not
+routed.
+
 Unmeasured shapes and token counts retain the incumbent. The table uses one
 conservative tile for both output dtypes. Explicit overrides use `BVxRWxprefetch`
 with `BV ∈ {8,12,16}`, `RW ∈ {4,8}`, and prefetch depth `∈ {1,2}`;

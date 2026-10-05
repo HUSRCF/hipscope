@@ -908,6 +908,18 @@ fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     }
 }
 
+// Regions (a/b/z fold, first region m) and HC-write twins: cold-cache three-process
+// sweep at the FN shapes, BF16 HC streams (qcal/release-0.4.1/pm-perf-fn/mq6timing).
+// N=8192: regions 7.18 -> 6.97 ms, HC-write 10.50 -> 10.10 ms. N=2048 HC-write keeps BT8/RW4.
+fn mq6_x4_halo_twin_policy(kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+    match (kind, m, k, n) {
+        (Mq6X4Kind::Regions, 6144, 2560, 8192) => Some([8, 8, 2]),
+        (Mq6X4Kind::Regions, 6144, 2560, 2048) => Some([8, 8, 1]),
+        (Mq6X4Kind::Hcw, 2560, 6144, 8192) => Some([8, 8, 2]),
+        _ => None,
+    }
+}
+
 // U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
 fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
     let kind = if bf16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
@@ -40683,8 +40695,7 @@ impl Gpu {
         let tile = match self.qwen4_mq6_x4_tile()? {
             [0, 0, 0] => match kind {
                 Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
-                // No measured regions/HC-write rows yet: the table keeps the incumbent.
-                Mq6X4Kind::Regions | Mq6X4Kind::Hcw => return None,
+                Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, k, n)?,
             },
             explicit => explicit,
         };
