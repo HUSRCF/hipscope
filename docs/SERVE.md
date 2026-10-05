@@ -339,7 +339,9 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 
 `finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`. A
 turn that runs out of `max_tokens` while still reasoning ends with `length`:
-the partial `reasoning_content` is returned and `content` is empty.
+the partial `reasoning_content` is returned and `content` is empty. A turn
+the model ends (end-of-turn token) while still reasoning ends the same way
+with `stop`. Neither turn releases a tool call or is cached.
 
 Streaming error contract: a failure that happens BEFORE the first byte is a
 plain HTTP error status (no SSE body). A failure after the stream has started

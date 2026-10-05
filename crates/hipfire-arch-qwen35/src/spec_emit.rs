@@ -425,15 +425,23 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         let decoded_eot = self.decoded_eot();
 
         if open_think && !self.stop.matched() {
-            // Unsafe terminal: drop pending (already flushed/dropped), no calls,
-            // no safe stop. Daemon emits error-only (no done/cache).
-            let _ = self.router.finish();
+            // The turn ended inside `<think>`: release the drained reasoning and
+            // any held answer prose, never a tool call. The wrapper ends it as
+            // a reasoning-only `stop` (or `length`) with no cache store.
+            if let Ok(evs) = self.router.finish() {
+                for ev in evs {
+                    if let ToolRouteEvent::VisibleText(vt) = ev {
+                        self.visible_acc.push_str(vt.as_str());
+                        events.push(ClientEvent::Token(vt.into_string()));
+                    }
+                }
+            }
             return FinishSummary {
-                events: Vec::new(),
+                events,
                 finish_reason: "open_think",
                 tool_calls: 0,
-                visible_text: String::new(),
-                decoded_eot: false,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
                 open_think: true,
             };
         }

@@ -621,12 +621,10 @@ pub fn generate_deepseek4_spec(
     // on FinishSummary; generate_spec does not render them. Classify length vs
     // stop vs malformed here, then release held calls only when tool-safe.
     // Prefer generate_spec's production epilogue when the turn ended fail-closed
-    // (grammar / open-think / malformed) so rolled_back is truthful.
+    // (grammar / malformed) so rolled_back is truthful.
     if let Some(ep) = run.fail_closed_rollback.as_ref() {
         let detail = if run.grammar_violated {
             "grammar violation during speculative decode"
-        } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
-            "open think span at end of generation (validation)"
         } else if run.finish.finish_reason == "malformed_protocol" {
             "unclosed DSML tool_calls block at end of output"
         } else {
