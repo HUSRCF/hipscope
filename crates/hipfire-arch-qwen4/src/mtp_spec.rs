@@ -6,10 +6,12 @@
 //!
 //! The runtime owns the speculative loop and its pending-seed contract.  This
 //! module records the native MTP count convention and lowers a verified
-//! window (greedy prefix match, or with `speculation.mtp_sampled` the
-//! speculative rejection sampling of [`hipfire_runtime::spec_sampling`]) onto
-//! the canonical runtime types.  In particular, the seed is never copied into
-//! `MtpWindow::committed` or `SpecStep::emit`.
+//! window (greedy prefix match, or with `speculation.mtp_sampled` a sampled
+//! verify from [`hipfire_runtime::spec_sampling`]: speculative rejection
+//! sampling, or SpecInfer naive sampling under
+//! `HIPFIRE_MTP_SAMPLED_MODE=naive`) onto the canonical runtime types.  In
+//! particular, the seed is never copied into `MtpWindow::committed` or
+//! `SpecStep::emit`.
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
@@ -18,12 +20,14 @@ use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
+use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
     SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_sampling::{
-    accept_sampled_prefix, verify_sampled_draft, DraftVerdict, SampleSpec, SparseDist, SpecRng,
+    accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
+    DraftVerdict, SampleSpec, SparseDist, SpecRng,
 };
 use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
 use rdna_compute::{Gpu, GpuTensor};
@@ -576,9 +580,37 @@ fn draft_accept_estimate(margin: f32) -> f32 {
     }
 }
 
+/// Sampled verification algorithm (`HIPFIRE_MTP_SAMPLED_MODE`, resolved once
+/// per drafter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampledMode {
+    /// Speculative rejection sampling (Leviathan et al. 2023, Chen et al.
+    /// 2023): drafts drawn from `q`, emitted stream equals AR in
+    /// distribution. The default.
+    Leviathan,
+    /// SpecInfer naive sampling: argmax drafts, one AR-sampler draw per verify
+    /// row, accept iff equal. The emitted stream is AR's seeded stream.
+    Naive,
+}
+
+impl SampledMode {
+    /// `naive` selects [`SampledMode::Naive`]; unset or `leviathan` the
+    /// default. Any other value is refused rather than silently defaulted.
+    fn from_env() -> Result<Self, String> {
+        match hipfire_config::developer_var("HIPFIRE_MTP_SAMPLED_MODE").as_deref() {
+            Ok("naive") => Ok(Self::Naive),
+            Ok("leviathan") | Err(_) => Ok(Self::Leviathan),
+            Ok(other) => Err(format!(
+                "HIPFIRE_MTP_SAMPLED_MODE={other:?}: expected `leviathan` or `naive`"
+            )),
+        }
+    }
+}
+
 /// Per-request sampled verification (`speculation.mtp_sampled`, temperature
 /// above zero).
 ///
+/// [`SampledMode::Leviathan`]:
 /// - `p`, a verify row's target distribution: the full logit row truncated by
 ///   [`SampleSpec::cpu_ar`] with the request's temperature, top_p, top_k and
 ///   min_p — exactly what the Qwen4 AR producer samples (`sampler::sample_cpu`
@@ -593,27 +625,64 @@ fn draft_accept_estimate(margin: f32) -> f32 {
 /// Accept with probability `min(1, p/q)`, otherwise emit a draw from
 /// `(p - q)+`; a window whose drafts are all accepted emits its bonus from
 /// `p`. One request-seeded stream supplies every draw.
+///
+/// [`SampledMode::Naive`] (`naive` set): drafts stay the head's argmax; each
+/// verify row the verdict reads is drawn with `sampler::sample_cpu` and the
+/// AR producer's sampler config, from the process-wide AR sampler RNG, and a
+/// draft is accepted iff it equals its row's draw
+/// ([`accept_naive_prefix`]). Every emitted token is one draw, in AR's order.
 struct SampledVerify {
     spec: SampleSpec,
     rng: SpecRng,
+    /// The AR producer's sampler in naive mode; `None` in Leviathan mode.
+    naive: Option<SamplerConfig>,
     /// Host copy of one logit row.
     host: Vec<f32>,
     scratch: Vec<(u32, f32)>,
     target: SparseDist,
-    /// `q` of each draft step in the current window.
+    /// `q` of each draft step in the current window (Leviathan only).
     drafts: Vec<SparseDist>,
 }
 
 impl SampledVerify {
-    fn new(cfg: SpecRequestConfig, max_k: usize) -> Self {
+    fn new(cfg: SpecRequestConfig, max_k: usize, mode: SampledMode) -> Self {
+        let naive = (mode == SampledMode::Naive).then(|| {
+            // The AR producer's per-request seeding of the shared sampler
+            // RNG (`generate` already did it with this seed on the daemon
+            // route; repeating it keeps a direct caller replayable).
+            hipfire_runtime::llama::reset_cpu_sampler_rng(cfg.rng_seed as u32);
+            naive_target_sampler(&cfg)
+        });
         Self {
             spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
             rng: SpecRng::new(cfg.rng_seed),
+            drafts: if naive.is_some() {
+                Vec::new()
+            } else {
+                vec![SparseDist::default(); max_k]
+            },
+            naive,
             host: Vec::new(),
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
-            drafts: vec![SparseDist::default(); max_k],
         }
+    }
+
+    /// Leviathan mode draws the drafts from `q`; naive keeps the argmax.
+    fn draws_drafts(&self) -> bool {
+        self.naive.is_none()
+    }
+
+    /// Naive mode: verify row `row`'s target token, one AR-sampler draw.
+    fn naive_draw(&mut self, gpu: &Gpu, bundle: &Qwen4Bundle, row: usize) -> Result<u32, String> {
+        let sampler = self
+            .naive
+            .as_ref()
+            .ok_or("Qwen4 sampled MTP: naive draw outside naive mode")?;
+        bundle
+            .spec_row_logits(gpu, row, &mut self.host)
+            .map_err(|error| error.to_string())?;
+        Ok(sample_cpu(&mut self.host, &[], sampler))
     }
 
     /// Draw the draft token from the last MTP prediction's `q`, kept as the
@@ -668,6 +737,9 @@ pub struct Qwen4MtpDrafter {
     agreement: [(f32, f32); MTP_MAX_DEPTH],
     /// `speculation.mtp_sampled`, resolved at construction.
     sampled_enabled: bool,
+    /// `HIPFIRE_MTP_SAMPLED_MODE`, resolved at construction; an invalid
+    /// value fails sampled requests with its message.
+    sampled_mode: Result<SampledMode, String>,
     /// The current request's sampled verification; `None` for greedy.
     sampled: Option<SampledVerify>,
     /// Row-batched operator buffers of the batched prompt-fill Append pass
@@ -688,15 +760,19 @@ impl Qwen4MtpDrafter {
             prefill_rows: 0,
             agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
             sampled_enabled: hipfire_config::mtp_sampled_enabled(),
+            sampled_mode: SampledMode::from_env(),
             sampled: None,
             append_scratch: None,
         }
     }
 
-    /// A sampled request needs sampled verification enabled.
+    /// A sampled request needs sampled verification enabled (and a valid
+    /// `HIPFIRE_MTP_SAMPLED_MODE`).
     fn require_supported_request(&self) -> Result<(), String> {
         if self.sampled.is_some() {
             Ok(())
+        } else if let (true, Err(error)) = (self.sampled_enabled, &self.sampled_mode) {
+            require_native_greedy(self.request.temp).map_err(|_| error.clone())
         } else {
             require_native_greedy(self.request.temp)
         }
@@ -823,16 +899,21 @@ impl Qwen4MtpDrafter {
                 .checked_add(row)
                 .ok_or_else(|| "Qwen4 MTP incremental position overflow".to_string())?;
             timers.mark(gpu, "target_row");
-            let pick = {
+            let mut pick = {
                 let bundle = Self::bundle(target)?;
                 bundle
                     .spec_capture_token(gpu, token)
                     .map_err(|error| error.to_string())?
             };
-            picks.push(pick);
-            if let Some(s) = sampled.as_deref_mut() {
-                s.load_target(gpu, Self::bundle(target)?, 0)?;
+            match sampled.as_deref_mut() {
+                // Naive: the row's target token is its AR-sampler draw.
+                Some(s) if !s.draws_drafts() => {
+                    pick = s.naive_draw(gpu, Self::bundle(target)?, 0)?
+                }
+                Some(s) => s.load_target(gpu, Self::bundle(target)?, 0)?,
+                None => {}
             }
+            picks.push(pick);
             let row_hidden = self.row_hidden()?;
             {
                 let bundle = Self::bundle(target)?;
@@ -857,8 +938,8 @@ impl Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
                 committed.push(match sampled.as_deref_mut() {
-                    Some(s) => s.target.sample(s.rng.next_f32()),
-                    None => pick,
+                    Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
+                    _ => pick,
                 });
                 break;
             }
@@ -876,12 +957,12 @@ impl Qwen4MtpDrafter {
                     .map_err(|error| error.to_string())?
             };
             let verdict = match sampled.as_deref_mut() {
-                Some(s) => {
+                Some(s) if s.draws_drafts() => {
                     draft = s.sample_draft(gpu, Self::bundle(target)?, 0)?;
                     verify_sampled_draft(&s.target, &s.drafts[0], draft, &mut s.rng)
                 }
-                None if draft == pick => DraftVerdict::Accept,
-                None => DraftVerdict::Reject(pick),
+                _ if draft == pick => DraftVerdict::Accept,
+                _ => DraftVerdict::Reject(pick),
             };
             drafts.push(draft);
             match verdict {
@@ -1139,8 +1220,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
         // The seed is the first emitted token: sampled, it is drawn from the
-        // last prompt row's `p`, exactly as AR draws its first token.
+        // last prompt row's `p` (naive: with the AR sampler itself), exactly
+        // as AR draws its first token.
         match self.sampled.as_mut() {
+            Some(s) if !s.draws_drafts() => s.naive_draw(gpu, Self::bundle(target)?, 0),
             Some(s) => {
                 s.load_target(gpu, Self::bundle(target)?, 0)?;
                 Ok(s.target.sample(s.rng.next_f32()))
@@ -1250,7 +1333,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 input = Self::bundle(target)?
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
-                if let Some(s) = sampled.as_mut() {
+                if let Some(s) = sampled.as_mut().filter(|s| s.draws_drafts()) {
                     input = s.sample_draft(gpu, Self::bundle(target)?, index)?;
                 }
                 steps += 1;
@@ -1285,17 +1368,23 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .scratch
                 .as_mut()
                 .ok_or_else(|| "Qwen4 native MTP verify scratch is not allocated".to_string())?;
-            let target_picks = picks
+            let mut target_picks = picks
                 .verify_block(gpu, &block, position, scratch.as_mut(), None)
                 .map_err(|error| error.to_string())?;
+            if sampled.is_some() && target_picks.len() < k + 1 {
+                return Err(format!(
+                    "Qwen4 sampled MTP verifier returned {} rows for {k} drafts",
+                    target_picks.len()
+                ));
+            }
             let acceptance = match sampled.as_mut() {
+                // Naive: each row the verdict reads is replaced by its draw.
+                Some(s) if !s.draws_drafts() => accept_naive_prefix(&drafts, Some(eos), |row| {
+                    let draw = s.naive_draw(gpu, picks, row)?;
+                    target_picks[row] = draw;
+                    Ok(draw)
+                })?,
                 Some(s) => {
-                    if target_picks.len() < k + 1 {
-                        return Err(format!(
-                            "Qwen4 sampled MTP verifier returned {} rows for {k} drafts",
-                            target_picks.len()
-                        ));
-                    }
                     let SampledVerify {
                         spec,
                         rng,
@@ -1303,6 +1392,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         scratch: candidates,
                         target: target_dist,
                         drafts: draft_dists,
+                        ..
                     } = s;
                     accept_sampled_prefix(
                         &drafts,
@@ -1593,11 +1683,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
     }
 
     /// With `speculation.mtp_sampled`, a sampled request verifies by
-    /// speculative rejection sampling; greedy requests keep the argmax match.
+    /// speculative rejection sampling, or naive sampling under
+    /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
-        self.sampled = (self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6)
-            .then(|| SampledVerify::new(cfg, self.max_k));
+        let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
+        self.sampled = match (sampled, &self.sampled_mode) {
+            (true, Ok(mode)) => Some(SampledVerify::new(cfg, self.max_k, *mode)),
+            _ => None,
+        };
     }
 
     fn supports_temp_verify(&self) -> bool {

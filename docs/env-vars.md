@@ -175,6 +175,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_QWEN4_PLE_FUSE` | gfx1151 / gfx1201: on unless `0`; ignored elsewhere | Exact gfx1151 and gfx1201, Qwen4 PLE block (once per prefill, layer 1) on BF16-stored HC streams: replaces the `hc_state_bf16_to_f32` / `grouped_gate_bf16` / `grouped_norm_bf16` / `grouped_depthwise_conv_silu_add_bf16` / `hc_state_bf16_add_f32` chain with three launches (`ple_gate_rows_bf16s`, `ple_norm_inv`, `ple_conv_add_bf16s` in `grouped_ops.hip`) that keep the incumbent's serial reduction orders and every F32 rounding point, so the HC streams and the convolution state are bytewise the incumbent's for every non-NaN value (where both chains produce NaN, the NaN payload bits may differ). With BF16 key/value weights on the F16 WMMA route the PLE rows are also gathered straight to F16 (`grouped_gather_convert_bf16_f16`), dropping the F32 rows and both F32 -> F16 conversions; the 4-tap dilation-3 PLE convolution runs a register-window kernel (`ple_conv_add_bf16s_k4d3`). The gate scalars and norm inverses live in the `ple_normed` scratch prefix; the F32 widened query, gated, normed and conv-output tensors are not written. Never taken under a recorder, retained tape or graph capture, with F32 streams, more than 4 branches or `hidden % 32 != 0`; those keep the incumbent chain. `0` keeps the incumbent chain; this is the kill switch. (Idea from Gufo upstream, gufo-org/gufo @1071b361, MIT.) |
 | `HIPFIRE_QWEN4_HC_DOWN_TILE` | gfx1151: on unless `0`; ignored elsewhere | Exact gfx1151 only, on the F16 WMMA HC read's down projection (`gemm_bf16_xf16_f16_wmma`, 320×10240, >= 2048 rows, eager, no recorder or graph capture): runs it on the 160×64 pipelined LDS tile `gemm_wmma_lds_160_64_32_64_k64_p` (five 32×64 waves, 256 workgroups) instead of 64×64 (640 workgroups). Every output keeps the 64×64 tile's single ascending 16-element K chain and store, so the F32 `low` is bytewise the baseline's. Smaller batches, other shapes and arches keep the baseline tile. `0` keeps the 64×64 tile; this is the kill switch. |
 | `HIPFIRE_MTP_INCREMENTAL` | **unset**: per-window choice | Native MTP verify route. Unset picks, per window, a batched `(K+1)`-row verify at the depth that maximizes expected tokens per cost, or the interleaved route (one target row per draft, stop at the first rejection). `0` forces batched at the full `mtp_k`; `1` forces interleaved. Both emit AR's greedy tokens. |
+| `HIPFIRE_MTP_SAMPLED_MODE` | `leviathan` | Sampled (temperature > 0) Qwen4 native MTP verifier, with `speculation.mtp_sampled` on. `leviathan`: speculative rejection sampling (drafts drawn from the head's 8 re-scored candidates; output equals AR in distribution). `naive`: SpecInfer naive sampling (argmax drafts, one AR-sampler draw per verify row, accept iff equal); a seeded request emits AR's exact tokens. Any other value fails sampled requests. |
 | `HIPFIRE_MTP_DRAFT_HEAD` | `mq2r` | Draft ranking head: an `mq2`..`mq6` copy of the LM head (`r` suffix = re-score its top 8 exactly against the head's own Q8_0 or MQ6G256V2 rows). |
 | `HIPFIRE_MTP_PAIRING` | head state | Draft-step conditioning experiment: `aligned-head` or `aligned`. |
 | `HIPFIRE_MTP_TRACE` / `HIPFIRE_MTP_PHASE_TIMING` | off; `1` enables | Per-window MTP trace / per-phase `hipEvent` timing to stderr (diagnostic). |
@@ -505,7 +506,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1403
+**Count:** 1404
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1457,6 +1458,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_SAMPLED` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | stable |
+| `HIPFIRE_MTP_SAMPLED_MODE` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | developer |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
@@ -1598,7 +1600,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MQ6_X4_GFX1201` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_REGIONS` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | crates/hipfire-arch-qwen4/examples/qwen4_mtp_fill.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_ORACLE_CACHE` | crates/hipfire-arch-qwen4/reference_oracle/upstream.py | harness |
 | `HIPFIRE_QWEN4_PLE_FUSE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
@@ -1621,7 +1623,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-generate/src/ar.rs | developer |
 | `HIPFIRE_RAILGUN_BACKEND` | crates/rdna-compute/src/replay.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_CACHE_TABLE` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
-| `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/rdna-compute/src/railgun_check.rs | developer |
+| `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_RAILGUN_CHECK_OUT` | crates/rdna-compute/src/railgun_check.rs | developer |
 | `HIPFIRE_RAILGUN_DIGEST` | crates/hip-bridge/src/registry.rs, crates/rdna-compute/src/railgun_check.rs | developer |
 | `HIPFIRE_RAILGUN_INVENTORY` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
