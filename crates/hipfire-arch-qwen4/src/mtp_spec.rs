@@ -674,10 +674,16 @@ pub struct Qwen4MtpDrafter {
     /// (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`); `None` where the pass cannot run
     /// (see `Qwen4MtpGpu::append_rows_supported`) or has not been enabled yet.
     append_scratch: Option<MtpAppendScratch>,
+    /// Chat end-of-turn token (`<|im_end|>`). Windows stop at it instead of
+    /// the config EOS so an accepted end-of-turn stays pending for the
+    /// terminal flush: committing the draft tail past it leaves a
+    /// strict-prefix terminal this drafter cannot repair (the spec terminal
+    /// reset path).
+    end_of_turn: Option<u32>,
 }
 
 impl Qwen4MtpDrafter {
-    pub fn new(max_k: usize, ctx_capacity: usize) -> Self {
+    pub fn new(max_k: usize, ctx_capacity: usize, end_of_turn: Option<u32>) -> Self {
         Self {
             max_k: max_k.clamp(1, 10),
             ctx_capacity,
@@ -690,6 +696,7 @@ impl Qwen4MtpDrafter {
             sampled_enabled: hipfire_config::mtp_sampled_enabled(),
             sampled: None,
             append_scratch: None,
+            end_of_turn,
         }
     }
 
@@ -1160,6 +1167,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
+        let eos = self.end_of_turn.unwrap_or(eos);
         self.require_supported_request()?;
         if k > self.max_k {
             return Err(format!(
@@ -1606,10 +1614,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
 }
 
 /// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
-pub fn build_qwen4_mtp_speculator(max_k: usize, ctx_capacity: usize) -> Box<dyn Speculator> {
+/// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one.
+pub fn build_qwen4_mtp_speculator(
+    max_k: usize,
+    ctx_capacity: usize,
+    end_of_turn: Option<u32>,
+) -> Box<dyn Speculator> {
     Box::new(MtpSpeculator::new(Qwen4MtpDrafter::new(
         max_k,
         ctx_capacity,
+        end_of_turn,
     )))
 }
 

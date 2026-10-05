@@ -461,7 +461,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         bundle
             .attach_mtp(&mut gpu, MAX_SEQ)
             .map_err(|e| e.to_string())?;
-        let mut drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ);
+        let mut drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None);
         let mut seed =
             drafter.mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?;
         ids.push(seed);

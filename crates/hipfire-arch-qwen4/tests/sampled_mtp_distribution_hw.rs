@@ -443,7 +443,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         bundle
             .attach_mtp(&mut gpu, MAX_SEQ)
             .map_err(|e| e.to_string())?;
-        let mut drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ);
+        let mut drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None);
         if !drafter.supports_temp_verify() {
             return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
         }
