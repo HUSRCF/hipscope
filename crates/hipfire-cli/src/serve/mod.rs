@@ -2882,6 +2882,120 @@ mod tests {
         ));
     }
 
+    /// `clear_resident` drops every field that names the resident model, so a
+    /// failed single-shard switch can never leave `current_path` pointing at
+    /// a model the daemon already unloaded, nor `/health` naming it. Builds a
+    /// `ServeRuntime` structurally and exercises only the field reset: the
+    /// engine handle is spawned against the in-repo fake daemon for struct
+    /// shape and never sent a load.
+    #[cfg(unix)]
+    #[test]
+    fn clear_resident_drops_every_resident_field() {
+        use saddle_core::caps::ReasoningContract;
+        use std::os::unix::fs::PermissionsExt;
+        let paths = test_paths("clear-resident");
+        let root = paths.root.clone();
+        fs::create_dir_all(&root).unwrap();
+        let daemon = root.join("fake-daemon-clear-resident.py");
+        fs::write(&daemon, include_str!("fake_daemon.py")).unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        // Bounded ETXTBSY retry: the script was just written and a parallel
+        // test's fork may still hold the write fd.
+        const ETXTBSY: i32 = 26;
+        let mut engine = None;
+        for attempt in 0..8u64 {
+            match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
+                Ok(spawned) => {
+                    engine = Some(spawned);
+                    break;
+                }
+                Err(hipfire_client::ClientError::Spawn { source, .. })
+                    if source.raw_os_error() == Some(ETXTBSY) =>
+                {
+                    thread::sleep(Duration::from_millis(5 * (1 + attempt)));
+                }
+                Err(error) => panic!("fake daemon spawn failed: {error}"),
+            }
+        }
+        let engine = engine.expect("fake daemon spawn exhausted ETXTBSY retries");
+        let mut runtime = ServeRuntime {
+            engine,
+            paths,
+            registry: hipfire_registry::bundled().unwrap(),
+            current_path: Some(PathBuf::from("/models/old.mq4")),
+            current_arch: Some("qwen3".to_owned()),
+            current_reasoning_contract: ReasoningContract::QwenJinja,
+            current_reasoning_effort_native: true,
+            current_reasoning_efforts: vec!["xhigh".to_owned()],
+            continuous_batch_capable: true,
+            current_max_seq: 32768,
+            cache_capable: true,
+            kv_override: Some("q8".to_owned()),
+            kv_k_override: None,
+            kv_v_override: None,
+            kv_backend_override: None,
+            vision_override: None,
+            tp: None,
+            continuous_batch_size: 1,
+            multi_slot_enabled: false,
+            multi_slot_slots: 4,
+            multi_slot_ctx: 8192,
+            multi_slot_prefill_chunk: 1024,
+            spawner: EngineSpawner {
+                daemon: daemon.clone(),
+                process_config,
+                attempts: 3,
+                backoff: Duration::from_millis(10),
+            },
+            resident_model: Some("qwen3.8:27b".to_owned()),
+            request_policy: RequestModelPolicy {
+                allow_pull: false,
+                allow_paths: false,
+                operator_model: None,
+            },
+            max_batch_tokens: 4096,
+        };
+        let meta = Mutex::new(ServeMeta {
+            current_model: Some("qwen3.8:27b".to_owned()),
+            // Deliberately non-default: `clear_resident` must reset the
+            // published load facts too, and a default-constructed fixture
+            // would pass these assertions vacuously.
+            n_ctx: 32768,
+            loaded: LoadedInfo {
+                vision: true,
+                n_embd: 5120,
+                n_vocab: 248320,
+            },
+            ..ServeMeta::new("test".to_owned())
+        });
+        runtime.clear_resident(&meta);
+        assert!(runtime.current_path.is_none());
+        assert!(runtime.current_arch.is_none());
+        assert_eq!(
+            runtime.current_reasoning_contract,
+            ReasoningContract::Unsupported
+        );
+        assert!(!runtime.current_reasoning_effort_native);
+        assert!(runtime.current_reasoning_efforts.is_empty());
+        assert!(!runtime.continuous_batch_capable);
+        assert_eq!(runtime.current_max_seq, 0);
+        assert!(!runtime.cache_capable);
+        assert!(runtime.resident_model.is_none());
+        // Configuration, not resident state, survives the reset.
+        assert_eq!(runtime.kv_override.as_deref(), Some("q8"));
+        assert_eq!(runtime.max_batch_tokens, 4096);
+        assert_eq!(runtime.spawner.daemon, daemon);
+        let meta = meta.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(meta.current_model.is_none());
+        assert_eq!(meta.n_ctx, 0);
+        assert_eq!(meta.loaded, LoadedInfo::default());
+        drop(meta);
+        drop(runtime);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn reasoning_contract_handshake_parsing() {
         use saddle_core::caps::ReasoningContract;
