@@ -9167,13 +9167,24 @@ fn batch_chunk_fa_attend(
         // small verifier batches, then combine CK-style LSE/Oacc partials.
         // Fail closed to the exact measured shape and eager sequential route;
         // `multirow` admission above already excludes tree, independent,
-        // graph-capture, and retained/PM4 recording paths.
+        // graph-capture, and retained/PM4 recording paths. The split records
+        // live in the shared `flash_partials` scratch, whose size follows
+        // `HIPFIRE_FLASH_PARTIALS_BATCH` and the KV capacity; when it is too
+        // small the launcher would return Err (a verify failure), so check
+        // capacity first and fall through to the rows route below instead.
         match gfx12_fa2_split_verify_splits() {
             Some(fa2_splits)
                 if gpu.arch_caps.is_gfx1201()
                     && config.n_heads == 24
                     && config.n_kv_heads == 4
-                    && config.head_dim == 256 =>
+                    && config.head_dim == 256
+                    && s.flash_partials.numel()
+                        >= Gpu::fa2_gqa_split_gfx1201_partials_len(
+                            fa2_splits,
+                            n,
+                            config.n_heads,
+                            config.head_dim,
+                        ) =>
             {
                 gpu.attention_q8_0_fa2_gqa_split_gfx1201(
                     &pbs.fa_q_batch,

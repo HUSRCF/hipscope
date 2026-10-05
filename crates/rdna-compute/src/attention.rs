@@ -7167,6 +7167,22 @@ impl Gpu {
         result
     }
 
+    /// F32 elements of caller-owned scratch that
+    /// [`Self::attention_q8_0_fa2_gqa_split_gfx1201`] needs: one LSE plane
+    /// (`n_splits * batch * n_heads`) plus normalized-O accumulators
+    /// (`head_dim` each). Callers sharing a scratch buffer (the verifier
+    /// reuses `flash_partials`) MUST check capacity against this before
+    /// taking the split route; the launcher returns `Err` when it is too
+    /// small.
+    pub fn fa2_gqa_split_gfx1201_partials_len(
+        n_splits: usize,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> usize {
+        n_splits * batch_size * n_heads * (head_dim + 1)
+    }
+
     /// gfx1201 split-KV FA2 GQA path (S partitions + stable merge), used by
     /// the opt-in DFlash verifier route (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY=1`).
     ///
@@ -7229,7 +7245,8 @@ impl Gpu {
                 ),
             ));
         }
-        let need_partials = n_splits * batch_size * n_heads * (head_dim + 1);
+        let need_partials =
+            Self::fa2_gqa_split_gfx1201_partials_len(n_splits, batch_size, n_heads, head_dim);
         if partials.numel() < need_partials {
             return Err(hip_bridge::HipError::new(
                 0,
