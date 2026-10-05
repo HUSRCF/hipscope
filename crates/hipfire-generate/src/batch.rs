@@ -1228,30 +1228,6 @@ pub fn drive_qwen_continuous_batch(
                         )
                     }
                 };
-                if matches!(finish.cause, QwenArTerminalCause::OpenThink) && !is_eos {
-                    if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
-                        return fail_all(
-                            sched,
-                            gpu,
-                            batch_state,
-                            stdout,
-                            format!("reset lane {idx} on open think: {e}"),
-                        );
-                    }
-                    let ep = crate::common::RollbackEpilogue {
-                        rolled_back: true,
-                        context: None,
-                    };
-                    emit_qwen_ar_open_think_terminal(
-                        stdout,
-                        &key.id,
-                        lane.streamed_tokens.len(),
-                        &ep,
-                    );
-                    let _ = sched.abort_lane(idx, &key, admission);
-                    producers[idx] = None;
-                    continue;
-                }
                 if !finish.wire_tool_calls.is_empty() {
                     return fail_all(
                         sched,
@@ -1261,8 +1237,8 @@ pub fn drive_qwen_continuous_batch(
                         format!("semantic finish lane {idx}: unexpected tool calls"),
                     );
                 }
-                // The producer's semantic reason, unchanged: an open think
-                // that coincides with EOS is "error", not a clean "stop".
+                // The producer's semantic reason, unchanged (an open think
+                // span ends as a reasoning-only "stop" or "length").
                 let finish_reason = finish.finish_reason;
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
@@ -3746,32 +3722,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                         )
                     }
                 };
-                if matches!(finish.cause, QwenArTerminalCause::OpenThink) && !is_eos {
-                    if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
-                        return fail_all(
-                            sched,
-                            gpus,
-                            batch_state,
-                            stdout,
-                            format!("EP reset lane {idx} on open think: {e}"),
-                        );
-                    }
-                    let ep = crate::common::RollbackEpilogue {
-                        rolled_back: true,
-                        context: None,
-                    };
-                    let _scope =
-                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
-                    emit_qwen_ar_open_think_terminal(
-                        stdout,
-                        &key.id,
-                        lane.streamed_tokens.len(),
-                        &ep,
-                    );
-                    let _ = sched.abort_lane(idx, &key, admission);
-                    producers[idx] = None;
-                    continue;
-                }
                 if !finish.wire_tool_calls.is_empty() {
                     return fail_all(
                         sched,

@@ -48,10 +48,9 @@ use hipfire_engine::wire_seed::parse_wire_seed;
 use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
     ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
-    deepseek4_spec_requested_from_policy, emit_qwen_ar_done, emit_qwen_ar_open_think_terminal,
-    generate, llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible,
-    model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
-    qwen_ar_done_value, qwen_ar_drain_pending_into_router,
+    deepseek4_spec_requested_from_policy, emit_qwen_ar_done, generate, llama_prefill_sample_seed,
+    llama_qwen3_batched_prefill_eligible, model_retry_reset_eligible, qwen_ar_apply_cache_action,
+    qwen_ar_cache_action, qwen_ar_done_value, qwen_ar_drain_pending_into_router,
     qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
     qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
     qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
@@ -3191,14 +3190,15 @@ fn main() {
                 // new clients send `thinking_enabled` as authority and keep
                 // `max_think_tokens` independent.
                 //
-                // When the cap is reached the daemon force-emits "</think>\n"
-                // through the same KV-write + sample path as a normal token,
-                // closing the thinking block so the model commits to an
-                // answer with the remaining max_tokens budget. Caught by
-                // Codex stop-time review on 2026-04-28: the field had been
-                // shipping in genParams since cli/index.ts but the daemon
-                // was silently ignoring it, making the new reasoning.effort
-                // / enable_thinking knobs no-ops on the wire.
+                // When the cap is reached the generate path splices a think
+                // close through the same KV-write + commit path as a sampled
+                // token, and the model answers with the remaining max_tokens
+                // budget. Qwen4 (AR and MTP) splices the template's own
+                // "\n</think>\n\n"; the Qwen3.5 AR/DFlash loops splice
+                // `HIPFIRE_THINK_CONTINUATION` (default "</think>\n\n"); the
+                // multi-slot engine masks to the close instead. The Qwen3.5
+                // dense-TP and MoE-EP producers still fail the request
+                // ("think token budget exceeded").
                 let max_think_tokens = msg
                     .get("max_think_tokens")
                     .and_then(|v| v.as_u64())

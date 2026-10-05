@@ -152,16 +152,17 @@ pub enum QwenArTerminalCause {
     /// A user `stop` sequence matched in the answer; the text from the match
     /// on is not emitted, so the turn is never cached.
     StopSequence,
-    /// Think span still open when the model itself ended the turn (decoded
-    /// EOT inside `<think>`) — fail-closed validation (no cache).
+    /// The turn ended inside `<think>` without running out of budget (decoded
+    /// EOT, or a natural stop, inside the span). A graceful `stop`: the
+    /// reasoning already streamed, no answer, no tool calls and no cache.
     OpenThink,
 }
 
 impl QwenArTerminalCause {
     /// Resolve cause. A matched stop sequence ends the answer, so it beats
     /// everything after it. Otherwise decoded EOT beats length on the same
-    /// token, and an open think span is only an error when the model ended the
-    /// turn inside it; running out of budget there is an ordinary length stop.
+    /// token. An open think span is a length stop when the budget ran out
+    /// there, and an `OpenThink` stop when the model ended the turn there.
     pub fn resolve(
         stopped_by_filter: bool,
         stop_sequence: bool,
@@ -184,34 +185,70 @@ impl QwenArTerminalCause {
     }
 }
 
+/// What the AR decode loop does after a committed token under an explicit
+/// `max_think_tokens` budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QwenArThinkBudgetAction {
+    Continue,
+    /// Run these close tokens next, each through the normal decode body.
+    Close(Vec<u32>),
+    /// The model re-opened `<think>` after the forced close and spent the
+    /// budget again: end the turn (a reasoning-only stop).
+    Stop,
+}
+
+/// Count the token just appended to `stream_bytes` against `budget`. Uses the
+/// raw-stream think scan and the template close the Qwen4 MTP emitter
+/// (`Qwen35Emit::from_ctx_template_think_close`) uses, so both splice the same
+/// tokens after the same token.
+pub fn qwen_ar_think_budget_step(
+    budget: &mut hipfire_runtime::emit_text::ThinkBudget,
+    stream_bytes: &[u8],
+    started_in_think: bool,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> QwenArThinkBudgetAction {
+    use hipfire_runtime::emit_text::{currently_in_think, ThinkBudgetStep};
+    if !budget.enabled() {
+        return QwenArThinkBudgetAction::Continue;
+    }
+    let in_think = currently_in_think(
+        std::str::from_utf8(stream_bytes).unwrap_or(""),
+        started_in_think,
+    );
+    match budget.observe(in_think) {
+        ThinkBudgetStep::Continue => QwenArThinkBudgetAction::Continue,
+        ThinkBudgetStep::ForceClose => {
+            let close = tokenizer.encode(hipfire_runtime::emit_text::QWEN_TEMPLATE_THINK_CLOSE);
+            budget.closing(close.len());
+            QwenArThinkBudgetAction::Close(close)
+        }
+        ThinkBudgetStep::Exhausted => QwenArThinkBudgetAction::Stop,
+    }
+}
+
 /// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
 /// or primes asst_turn_cache. Decoded EOT on the final budget token still
 /// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
 /// A stop sequence keeps calls completed before it, drops a call it cut off,
 /// and never primes asst_turn_cache (the KV holds the trimmed stop text).
-/// Open think → non-retryable validation terminal, no cache, no hidden bytes.
+/// Open think → `stop` with the reasoning only: no tool calls and no cache,
+/// because the KV holds an unclosed `<think>` span that no rendered history
+/// reproduces.
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
     cause: QwenArTerminalCause,
     visible_acc: &mut String,
 ) -> Result<QwenArRouteFinish, ToolRouteError> {
-    if matches!(cause, QwenArTerminalCause::OpenThink) {
-        return Ok(QwenArRouteFinish {
-            finish_reason: "error",
-            wire_tool_calls: Vec::new(),
-            store_cache: false,
-            trailing_visible: Vec::new(),
-            cause,
-        });
-    }
     let length_unsafe = matches!(cause, QwenArTerminalCause::LengthCap);
     let stop_sequence = matches!(cause, QwenArTerminalCause::StopSequence);
+    let open_think = matches!(cause, QwenArTerminalCause::OpenThink);
     let buffered_before = router.tool_calls().to_vec();
     match router.finish() {
         Err(err) => {
-            if length_unsafe || stop_sequence {
+            if length_unsafe || stop_sequence || open_think {
                 // Any pure-length terminal is unsafe: no calls, no cache. A
-                // stop sequence that cut a call short leaves no call either.
+                // stop sequence that cut a call short leaves no call either,
+                // and neither does a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
                     finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
@@ -237,11 +274,12 @@ pub fn qwen_ar_finish_route(
                     }
                 }
             }
-            if length_unsafe {
+            if length_unsafe || open_think {
                 // Length is never a tool-safe or cache-safe terminal —
                 // prose-only, complete hidden call, or trailing flush alike.
+                // Neither is a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
-                    finish_reason: "length",
+                    finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
                     store_cache: false,
                     trailing_visible,
@@ -450,26 +488,6 @@ pub fn qwen_ar_done_value(
     envelope
 }
 
-/// Emit open-think fail-closed validation terminal: exactly one correlated
-/// non-retryable validation `error` and **no** `done` (terminal XOR).
-/// Uses the production fail-closed error writer; `rolled_back` must come from
-/// a completed [`crate::common::RollbackEpilogue`] (or false when no GPU reset ran).
-pub fn emit_qwen_ar_open_think_terminal(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    _generated: usize,
-    epilogue: &crate::common::RollbackEpilogue,
-) {
-    crate::common::emit_fail_closed_error(
-        stdout,
-        Some(id),
-        "open think span at end of generation (validation)",
-        "validation",
-        false,
-        epilogue,
-    );
-}
-
 /// Deterministic Qwen AR semantic producer used by production finish
 /// orchestration and unit tests. Owns filter + router state and emits only
 /// through the same helpers the GPU path uses.
@@ -656,19 +674,6 @@ impl QwenArSemanticProducer {
             hit_length_cap,
             open_think,
         );
-        if matches!(cause, QwenArTerminalCause::OpenThink) {
-            // Fail-closed: no calls/cache/done. Caller owns the
-            // production rollback epilogue + single correlated error terminal
-            // (tests call `emit_qwen_ar_open_think_terminal` after finish).
-            let finish = QwenArRouteFinish {
-                finish_reason: "error",
-                wire_tool_calls: Vec::new(),
-                store_cache: false,
-                trailing_visible: Vec::new(),
-                cause,
-            };
-            return Ok((finish, String::new()));
-        }
         let finish = qwen_ar_finish_route(self.router, cause, &mut self.visible_acc)?;
         for trailing in &finish.trailing_visible {
             emit_visible_token(stdout, &self.id, trailing);
@@ -2007,6 +2012,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // Raw bytes of `streamed_tokens`, grown one token at a time.
     let mut stream_bytes: Vec<u8> = Vec::new();
     let mut natural_stop = false;
+    // An explicit `max_think_tokens` budget force-closes the think span with
+    // the template's own close, which the model then answers after. Same
+    // accounting and close as the Qwen4 MTP emitter, so greedy AR and MTP
+    // produce the same text.
+    let mut think_budget = hipfire_runtime::emit_text::ThinkBudget::new(max_think_tokens);
+    // Close tokens still to run; each goes through the decode body below
+    // exactly like a sampled token (KV write, commit, classify, stops).
+    let mut forced_close = std::collections::VecDeque::new();
     let t_decode = Instant::now();
 
     while generated < max_tokens {
@@ -2015,6 +2028,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
+        }
+        if let Some(token) = forced_close.pop_front() {
+            pending = Some(token);
         }
         let next_token = match forward_token(m, gpu, pending.take(), &decode_logits) {
             Ok(token) => token,
@@ -2074,20 +2090,6 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             }
         };
         generated += 1;
-        if max_think_tokens > 0 && semantic.think_router.in_think() && generated >= max_think_tokens
-        {
-            let _ = gpu.free_tensor(decode_logits);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!("{} think token budget exceeded", route.name()),
-                "validation",
-                false,
-                &ep,
-            );
-            return;
-        }
         let custom_stop = stop
             .iter()
             .any(|value| !value.is_empty() && semantic.visible().ends_with(value));
@@ -2101,8 +2103,35 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             natural_stop = true;
             break;
         }
+        match qwen_ar_think_budget_step(
+            &mut think_budget,
+            &stream_bytes,
+            started_in_think,
+            m.tokenizer.as_ref().unwrap(),
+        ) {
+            QwenArThinkBudgetAction::Continue => {}
+            QwenArThinkBudgetAction::Close(close) => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} reached at generated={generated}; closing with tokens {close:?}",
+                    route.name()
+                );
+                forced_close.extend(close);
+            }
+            QwenArThinkBudgetAction::Stop => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} spent again after the forced close; stopping",
+                    route.name()
+                );
+                natural_stop = true;
+                break;
+            }
+        }
         if generated >= max_tokens {
             break;
+        }
+        if !forced_close.is_empty() {
+            // The next forward runs the next close token instead of a sample.
+            continue;
         }
 
         if greedy_on_gpu {
@@ -2150,11 +2179,13 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             return;
         }
     };
-    if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
-        let _ = gpu.free_tensor(decode_logits);
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
-        return;
+    if finish.cause == QwenArTerminalCause::OpenThink {
+        // Tells `<|im_end|>` from `<|endoftext|>` (both EOS) in captures.
+        eprintln!(
+            "[open-think] id={id} route={} model ended the turn inside reasoning; terminal token {:?}",
+            route.name(),
+            streamed_tokens.last()
+        );
     }
     let t_end = Instant::now();
     let total_ms = t_end.duration_since(t0).as_secs_f64() * 1000.0;
@@ -5590,7 +5621,7 @@ pub fn generate(
         // Length-cap never exposes executable calls; malformed without
         // length fails closed (error, no tool_calls, no asst_turn_cache).
         // Decoded EOT on the final budget token beats length.
-        // Open think → validation terminal (no cache) via finish().
+        // Open think → reasoning-only stop (no calls, no cache) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
         let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
@@ -5600,12 +5631,6 @@ pub fn generate(
                 return;
             }
         };
-        // Open-think: production owns epilogue + single correlated error terminal.
-        if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-            emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
-            return;
-        }
         //
         // Timing + pending done are fixed before handshake so commit_ready
         // carries the exact eventual done payload. Abort rolls back + emits

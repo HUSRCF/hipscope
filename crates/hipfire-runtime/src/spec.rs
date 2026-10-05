@@ -1491,7 +1491,8 @@ pub struct FinishSummary {
     /// filter stop_at spanning split byte fragments). Carried into terminal
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
-    /// Unclosed thinking region at finish — nonretryable unsafe terminal.
+    /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
+    /// a reasoning-only `stop` with no tool calls and no cache store.
     pub open_think: bool,
 }
 

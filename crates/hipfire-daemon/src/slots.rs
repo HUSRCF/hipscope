@@ -1564,9 +1564,13 @@ impl SlotBackend {
         // exit, under its previous `malformed_protocol` label.
         let unsafe_reason = match summary.finish_reason {
             "truncated_tool_call" => Some("malformed_protocol"),
-            r @ ("malformed_protocol" | "open_think") => Some(r),
+            r @ "malformed_protocol" => Some(r),
             _ => None,
         };
+        // A turn that ended inside `<think>` is a reasoning-only stop. Its
+        // session is closed at commit instead of kept for reuse: the slot KV
+        // holds an unclosed think span that no rendered history reproduces.
+        let open_think = summary.open_think;
         if let Some(unsafe_reason) = unsafe_reason {
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
@@ -1599,6 +1603,7 @@ impl SlotBackend {
         // Stage normal done payload and await commit via keyed registry.
         let finish_reason = match reason {
             DoneReason::MaxTokens if !summary.decoded_eot => "length",
+            _ if open_think => "stop",
             _ => summary.finish_reason,
         };
         if finish_reason != "tool_calls" {
@@ -1670,10 +1675,14 @@ impl SlotBackend {
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
                 if let Some(session) = accepted_session {
-                    self.pending_tools
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .register(session, convo.clone(), &terminal_tool_calls);
+                    if open_think {
+                        self.close_session(session);
+                    } else {
+                        self.pending_tools
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .register(session, convo.clone(), &terminal_tool_calls);
+                    }
                 }
                 // Emit byte-identical done through the route adapter so the
                 // keyed claim and route-start latch are retired together.

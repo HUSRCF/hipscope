@@ -74,6 +74,7 @@ def scenario_from(req):
         "t11-stop-text",
         "t11-usage",
         "t11-long-nonstream",
+        "t11-open-think-stop",
     )
     for tag in tags:
         if tag in blob:
@@ -443,6 +444,29 @@ def handle_generate(req):
         emit_correlated({
             "type": "done",
             "finish_reason": "length",
+            "prompt_tokens": 2,
+            "tokens": 3,
+            "tok_s": 7.0,
+        }, rid, aid)
+        return
+
+    if scenario == "t11-open-think-stop":
+        # HA-13: the model ended its turn inside <think>. The daemon streams
+        # the reasoning, then a reasoning-only `stop` with no answer.
+        for text in ("Schedule: \"0 8 * * *\"", " — every day at 8 AM.\n\n", "Now let's create the job."):
+            emit_correlated({"type": "reasoning", "text": text}, rid, aid)
+        emit_correlated({
+            "type": "commit_ready",
+            "finish_reason": "stop",
+            "prompt_tokens": 2,
+            "tokens": 3,
+            "tok_s": 7.0,
+        }, rid, aid)
+        if wait_commit(rid, aid) != "commit":
+            return
+        emit_correlated({
+            "type": "done",
+            "finish_reason": "stop",
             "prompt_tokens": 2,
             "tokens": 3,
             "tok_s": 7.0,
