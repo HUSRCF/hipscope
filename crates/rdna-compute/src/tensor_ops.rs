@@ -43,6 +43,13 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
+/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps gfx1201's non-capture batched GDN
+/// recurrence on `gated_delta_step_halves_state128_persistent256_{f32,q8}`
+/// instead of the register-resident `gated_delta_step_pipe128_{f32,q8}`
+/// (bytewise identical results).  Read once.
+static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_GDN_PIPE", true)
+});
 /// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
 /// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
 /// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
@@ -498,10 +505,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    // gfx1201 non-capture: the register-resident one-thread-per-column
+    // recurrence (bitwise the persistent256 kernel's result), 128 threads.
+    let pipe128 = p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+        (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
         (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
         (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
         (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
@@ -526,7 +538,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, 1, 1],
-        [256, 1, 1],
+        [if pipe128 { 128 } else { 256 }, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -5486,6 +5498,154 @@ mod tests {
             row_state,
             row_out,
         ] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// gfx1201's register-resident `gated_delta_step_pipe128_{f32,q8}` must
+    /// equal the persistent256 kernel byte for byte (output, final F32 state,
+    /// and the Q8 codes and scales), across the 256-row parameter-block
+    /// boundary and ragged row counts, on a nonzero random start state at a
+    /// nonzero position.  Both kernels are launched by name, so the
+    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 only.
+    #[test]
+    fn gdn_pipe128_is_bytewise_the_persistent256_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: gfx1201 only (arch {})", gpu.arch);
+            return;
+        }
+        let (key_heads, value_heads, dim) = (16usize, 48usize, 128usize);
+        let row_counts = [1usize, 2, 3, 255, 256, 257, 511, 513, 1000];
+        let max_rows = 1000usize;
+        let position = 37usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut unit = move || -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let projection: Vec<f32> =
+            (0..max_rows * qkv).map(|_| (unit() * 2.0 - 1.0) * 1.5).collect();
+        let gate: Vec<f32> = (0..max_rows * value_heads).map(|_| -3.0 * unit()).collect();
+        let beta: Vec<f32> = (0..max_rows * value_heads).map(|_| unit()).collect();
+        let state0: Vec<f32> = (0..value * dim).map(|_| (unit() * 2.0 - 1.0) * 0.2).collect();
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(
+            &mut gpu,
+            "gdn_state_f32_to_q8",
+            state0_gpu.buf.as_ptr(),
+            slot0.buf.as_ptr(),
+            value_heads,
+            Some(7),
+        )
+        .expect("quantize");
+
+        let launch = |gpu: &mut Gpu,
+                      kernel: &str,
+                      threads: u32,
+                      q8: bool,
+                      state: &GpuTensor,
+                      output: &GpuTensor,
+                      rows: usize| {
+            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel).expect("kernel");
+            let mut args = KernargBlob::new();
+            for tensor in [&proj_gpu, &gate_gpu, &beta_gpu, state, output] {
+                args.push_ptr(tensor.buf.as_ptr());
+            }
+            args.push_i32(rows as i32);
+            args.push_i32(qkv as i32);
+            args.push_i32(key_heads as i32);
+            args.push_i32(value_heads as i32);
+            args.push_i32(dim as i32);
+            args.push_i32(dim as i32);
+            args.push_f32((dim as f32).sqrt().recip());
+            if q8 {
+                args.push_u32((position + rows - 1) as u32);
+            }
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                kernel,
+                [value_heads as u32, 1, 1],
+                [threads, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )
+            .expect("launch");
+        };
+        for &rows in &row_counts {
+            for q8 in [false, true] {
+                let fresh = |gpu: &mut Gpu| -> GpuTensor {
+                    if q8 {
+                        let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+                        gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+                        slot
+                    } else {
+                        gpu.upload_f32(&state0, &[state0.len()]).expect("state")
+                    }
+                };
+                let (old_kernel, new_kernel) = if q8 {
+                    (
+                        "gated_delta_step_halves_state128_persistent256_q8",
+                        "gated_delta_step_pipe128_q8",
+                    )
+                } else {
+                    (
+                        "gated_delta_step_halves_state128_persistent256_f32",
+                        "gated_delta_step_pipe128_f32",
+                    )
+                };
+                let old_state = fresh(&mut gpu);
+                let old_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+                launch(&mut gpu, old_kernel, 256, q8, &old_state, &old_out, rows);
+                let new_state = fresh(&mut gpu);
+                let new_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+                launch(&mut gpu, new_kernel, 128, q8, &new_state, &new_out, rows);
+
+                let old_out_bytes = gpu.download_raw_bytes(&old_out).expect("download");
+                let new_out_bytes = gpu.download_raw_bytes(&new_out).expect("download");
+                let old_state_bytes = gpu.download_raw_bytes(&old_state).expect("download");
+                let new_state_bytes = gpu.download_raw_bytes(&new_state).expect("download");
+                let start_bytes = if q8 {
+                    gpu.download_raw_bytes(&slot0).expect("download")
+                } else {
+                    gpu.download_raw_bytes(&state0_gpu).expect("download")
+                };
+                assert!(
+                    old_out_bytes.iter().any(|b| *b != 0),
+                    "{rows} rows q8={q8}: reference output is all zero"
+                );
+                assert_ne!(
+                    old_state_bytes, start_bytes,
+                    "{rows} rows q8={q8}: reference left the state untouched"
+                );
+                assert!(
+                    old_out_bytes == new_out_bytes,
+                    "{rows} rows q8={q8}: pipe128 output differs from persistent256"
+                );
+                assert!(
+                    old_state_bytes == new_state_bytes,
+                    "{rows} rows q8={q8}: pipe128 final state differs from persistent256"
+                );
+                for tensor in [old_state, old_out, new_state, new_out] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
