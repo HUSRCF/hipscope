@@ -41,7 +41,8 @@ pub use layer_ops::{
     QsaProjectionHook,
 };
 pub use steps::{
-    execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,
+    execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,
+    validate_steps, FusedPattern, GemvInput, MoeStepHooks, Step,
 };
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types

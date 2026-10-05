@@ -37,11 +37,13 @@ use hipfire_dispatch::pipeline::sealed_moe::{
     SealedMoeCall,
 };
 use hipfire_dispatch::pipeline::{
-    execute_embedding, execute_validated_steps, seal_decode, validate_steps, BoundMoeExperts,
-    ClearOp, EmbeddingOp, ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources,
-    ExpertTable, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, Step,
+    execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
+    seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
+    ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
+    GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MoeStepHooks, Step,
 };
+use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::RowFetch;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
@@ -1333,6 +1335,56 @@ impl Qwen4ExpertStage {
             }
         }
         first
+    }
+}
+
+/// The G2 stage's host work around each MoE call of a staged forward, run by
+/// the step interpreter (so the whole layer program stays one interpreter
+/// call): a host layer's compute waits for its staged experts, and after the
+/// call the stage is freed / refilled ([`Qwen4ExpertStage::after_moe`]).
+struct StagedMoeHooks<'s> {
+    stage: &'s Qwen4ExpertStage,
+    bundle: &'s Qwen4Bundle,
+    moe: &'s [Qwen4MoeLayerRuntime],
+    /// The layer of the next MoE call.
+    layer: usize,
+    /// The stage error behind a hook failure, returned instead of the
+    /// interpreter's stringified one.
+    error: Option<Qwen4GpuForwardError>,
+}
+
+impl StagedMoeHooks<'_> {
+    fn fail(&mut self, result: Result<(), Qwen4GpuForwardError>) -> Result<(), DispatchError> {
+        result.map_err(|error| {
+            let message = error.to_string();
+            self.error = Some(error);
+            DispatchError::Hip(message)
+        })
+    }
+}
+
+impl MoeStepHooks for StagedMoeHooks<'_> {
+    fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let result = match self.moe.get(self.layer) {
+            None => Err(invalid("G2 staged forward ran more MoE calls than layers")),
+            Some(moe) if !moe.host_mapped() => Ok(()),
+            Some(_) => match gpu.active_stream.as_ref() {
+                None => Err(invalid("G2 compute stream missing")),
+                Some(compute) => gpu
+                    .hip
+                    .stream_wait_event(compute, &self.stage.ready[self.layer % 2])
+                    .map_err(Qwen4GpuForwardError::from),
+            },
+        };
+        self.fail(result)
+    }
+
+    fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        // Down recorded free before combine. Refill this parity for L+2 or
+        // restore its donor; no routing results are involved.
+        let result = self.stage.after_moe(gpu, self.bundle, self.moe, self.layer);
+        self.layer += 1;
+        self.fail(result)
     }
 }
 
@@ -3486,33 +3538,35 @@ impl Qwen4GpuForward {
                     }
                     execute(gpu, &steps[start..])?;
                 } else if let Some(stage) = expert_stage {
-                    let mut start = 0usize;
-                    let mut layer = 0usize;
-                    for (index, step) in steps.iter().enumerate() {
-                        if ple_split == Some(index) {
-                            execute(gpu, &steps[start..index])?;
+                    // One interpreter call over the whole program: the stage
+                    // waits and refills run as MoE hooks, so the fusions across
+                    // a MoE call (HC read/write pairing, the combine zero-init,
+                    // the shared-down fold) apply as on an unstaged forward.
+                    let mut hooks = StagedMoeHooks {
+                        stage,
+                        bundle,
+                        moe: &self.moe,
+                        layer: 0,
+                        error: None,
+                    };
+                    let mut run = |gpu: &mut Gpu, steps: &[Step<'_>]| {
+                        execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
+                            .map_err(|error| {
+                                hooks.error.take().unwrap_or_else(|| {
+                                    Qwen4GpuForwardError::Dispatch(format!(
+                                        "execute Qwen4 layer program: {error:?}"
+                                    ))
+                                })
+                            })
+                    };
+                    match ple_split {
+                        Some(split) => {
+                            run(gpu, &steps[..split])?;
                             stage_ple(gpu)?;
-                            start = index;
+                            run(gpu, &steps[split..])?;
                         }
-                        if matches!(step, Step::Moe(_)) {
-                            execute(gpu, &steps[start..index])?;
-                            if self.moe[layer].host_mapped() {
-                                let compute = gpu
-                                    .active_stream
-                                    .as_ref()
-                                    .ok_or_else(|| invalid("G2 compute stream missing"))?;
-                                gpu.hip.stream_wait_event(compute, &stage.ready[layer % 2])?;
-                            }
-                            execute(gpu, &steps[index..=index])?;
-                            start = index + 1;
-                            // Down recorded free before combine. Refill this
-                            // parity for L+2 or restore its donor; no routing
-                            // results are involved.
-                            stage.after_moe(gpu, bundle, &self.moe, layer)?;
-                            layer += 1;
-                        }
+                        None => run(gpu, &steps)?,
                     }
-                    execute(gpu, &steps[start..])?;
                 } else {
                     let trace = self.route_trace.as_ref().filter(|_| n == 1);
                     match (ple_split, trace) {

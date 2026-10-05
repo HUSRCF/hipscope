@@ -771,6 +771,28 @@ pub fn execute_steps<'a>(
     execute_validated_steps(gpu, ctx, steps)
 }
 
+/// Host work a caller interleaves around every `Step::Moe` of a program run
+/// by [`execute_validated_steps_with_moe_hooks`] (Qwen4's G2 expert staging:
+/// wait for a staged layer's experts, then free / refill its stage).
+pub trait MoeStepHooks {
+    /// Before the call's first launch (its target's zero fill included when
+    /// the call takes that fill over).
+    fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+    /// Right after the call's last launch.
+    fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+}
+
+struct NoMoeHooks;
+
+impl MoeStepHooks for NoMoeHooks {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
 /// Execute a list after [`validate_steps`] has completed.  This entry point is
 /// for architecture owners that must preflight the entire list before other
 /// request effects begin.
@@ -778,6 +800,19 @@ pub fn execute_validated_steps<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     steps: &[Step<'a>],
+) -> Result<(), DispatchError> {
+    execute_validated_steps_with_moe_hooks(gpu, ctx, steps, &mut NoMoeHooks)
+}
+
+/// [`execute_validated_steps`] with `hooks` run around each `Step::Moe`, so a
+/// caller that must act between MoE calls still hands the interpreter the
+/// whole program and every fusion across a MoE call (HC read/write pairing,
+/// the combine zero-init, the shared-down fold) stays admitted.
+pub fn execute_validated_steps_with_moe_hooks<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+    hooks: &mut dyn MoeStepHooks,
 ) -> Result<(), DispatchError> {
     let mut i = 0;
     // A fused hyper write that produced the gate quarters of the hyper write
@@ -890,6 +925,7 @@ pub fn execute_validated_steps<'a>(
                     _ => None,
                 };
                 gpu.scratch.prerotated = None;
+                hooks.before_moe(gpu)?;
                 let done = crate::pipeline::sealed_moe::execute_sealed_after_clear(
                     gpu,
                     call,
@@ -897,6 +933,7 @@ pub fn execute_validated_steps<'a>(
                     write,
                     next.map(|(_, read, next_write)| (read, next_write)),
                 )?;
+                hooks.after_moe(gpu)?;
                 if done.folded {
                     pregated = None;
                 }
@@ -935,7 +972,14 @@ pub fn execute_validated_steps<'a>(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else if let Some(plan) = cpu_exec::plan_step(gpu, &steps[i]) {
+            let moe = matches!(steps[i], Step::Moe(_));
+            if moe {
+                hooks.before_moe(gpu)?;
+            }
             cpu_exec::run_step(gpu, &plan)?;
+            if moe {
+                hooks.after_moe(gpu)?;
+            }
             i += 1;
         } else {
             if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
@@ -1011,7 +1055,14 @@ pub fn execute_validated_steps<'a>(
                     continue;
                 }
             }
+            let moe = matches!(steps[i], Step::Moe(_));
+            if moe {
+                hooks.before_moe(gpu)?;
+            }
             launch_op(gpu, ctx, &steps[i])?;
+            if moe {
+                hooks.after_moe(gpu)?;
+            }
             // A pending prerotated input lives until its consumer step ran;
             // a sealed MoE consumes it in one of its granular stages.
             if !matches!(steps[i], Step::Moe(_) | Step::MoeStage(..)) {
