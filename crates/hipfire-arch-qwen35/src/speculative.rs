@@ -501,6 +501,38 @@ pub(crate) fn dflash_download_verify_argmax(
     Ok(host_idx.into_iter().map(|idx| idx as u32).collect())
 }
 
+/// Finish a retained/recorded verify forward through the same lm-head and
+/// argmax route as the ordinary greedy DFlash path.
+///
+/// Redline records only the target forward. The head intentionally remains
+/// outside the retained tape, so its recorded-HIP oracle must call this helper
+/// instead of substituting per-row GEMV (whose reduction order can differ from
+/// the product batched head even when `final_hidden` is byte-identical).
+pub fn dflash_finish_retained_lm_head_argmax(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    final_hidden: &GpuTensor,
+    verify_scratch: &VerifyScratch,
+    b: usize,
+    vocab: usize,
+) -> HipResult<Vec<u32>> {
+    if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
+        dflash_enqueue_verify_lm_head_argmax(gpu, w_out, final_hidden, verify_scratch, b, vocab)?;
+        return dflash_download_verify_argmax(gpu, verify_scratch, b);
+    }
+
+    let dim = w_out.k;
+    let mut argmax = Vec::with_capacity(b);
+    for i in 0..b {
+        let hidden_row = final_hidden.sub_offset(i * dim, dim);
+        let logits_row = verify_scratch.logits.sub_offset(i * vocab, vocab);
+        llama::weight_gemv(gpu, w_out, &hidden_row, &logits_row)?;
+        let row = gpu.download_f32(&logits_row)?;
+        argmax.push(argmax_u32(&row));
+    }
+    Ok(argmax)
+}
+
 /// Fold a DFlash2 candidate-selector proposal into the chain draft buffers.
 ///
 /// Greedy: tokens only — no full-vocab D2H. Temperature: each sparse q row
@@ -1505,7 +1537,10 @@ impl DeltaNetSnapshot {
     pub fn mirrors(&self, state: &DeltaNetState) -> bool {
         fn same(live: &[GpuTensor], backs: &[DeviceBuffer]) -> bool {
             live.len() == backs.len()
-                && live.iter().zip(backs).all(|(t, b)| t.buf.size() == b.size())
+                && live
+                    .iter()
+                    .zip(backs)
+                    .all(|(t, b)| t.buf.size() == b.size())
         }
         same(&state.s_matrices, &self.s_matrix_bufs)
             && same(&state.s_scales, &self.s_scale_bufs)
@@ -2169,23 +2204,27 @@ impl GdnTape {
             let pre: Vec<_> = pre
                 .into_iter()
                 .enumerate()
-                .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
-                    base,
-                    conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
-                })
+                .map(
+                    |(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
+                        base,
+                        conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
+                    },
+                )
                 .collect();
             let gdn: Vec<_> = gdn
                 .into_iter()
                 .enumerate()
-                .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
-                    base,
-                    s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
-                    s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
-                    ef_src: snap
-                        .s_ef_residual_bufs
-                        .get(la)
-                        .map_or(0, |b| b.as_ptr() as u64),
-                })
+                .map(
+                    |(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
+                        base,
+                        s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
+                        s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
+                        ef_src: snap
+                            .s_ef_residual_bufs
+                            .get(la)
+                            .map_or(0, |b| b.as_ptr() as u64),
+                    },
+                )
                 .collect();
             let Some(from) = ml.from.as_mut() else {
                 unreachable!("armed at construction")
@@ -3033,6 +3072,14 @@ impl HiddenStateRingBuffer {
         );
         let row_bytes = self.hidden_dim * 4;
         let bytes = n * row_bytes;
+        // The software Redline recorder retains typed kernel launches, not HIP
+        // memcpy commands. During recording, express this byte-identical F32
+        // copy as a blob-backed kernel so recorded-HIP and PM4 refresh staging
+        // on every replay instead of committing stale rows to the hidden ring.
+        // HipGraph capture keeps the native async memcpy node below.
+        if gpu.replay.is_recording() {
+            return gpu.copy_f32_buffer(&self.staging_bufs[extract_idx], src, n * self.hidden_dim);
+        }
         if let Some(stream) = gpu.active_stream.as_ref() {
             gpu.hip.memcpy_dtod_async_at(
                 &self.staging_bufs[extract_idx].buf,
@@ -6610,7 +6657,8 @@ pub fn spec_step_dflash(
     let verify_out = match verify_pm4 {
         Some(route) => {
             let replay_failures_before = route.counters().replay_failures;
-            let hip_windows = |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
+            let hip_windows =
+                |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
             let hip_windows_before = hip_windows(route);
             match verify_dflash_block_retained(
                 gpu,
@@ -9919,7 +9967,9 @@ impl SeedPrefill {
             ) {
                 Ok(limit) => limit,
                 Err(e) => {
-                    eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
+                    eprintln!(
+                        "dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling"
+                    );
                     qwen35::prefill_max_batch(gpu)
                 }
             }
@@ -9944,9 +9994,12 @@ impl SeedPrefill {
             return remaining;
         }
         let stride = qwen35::prefill::WIDENED_COMMIT_ROWS;
-        let cap = if ring >= stride { ring / stride * stride } else { ring };
-        qwen35::prefill::next_exact_prefill_chunk_len(remaining, cap)
-            .unwrap_or(remaining.min(cap))
+        let cap = if ring >= stride {
+            ring / stride * stride
+        } else {
+            ring
+        };
+        qwen35::prefill::next_exact_prefill_chunk_len(remaining, cap).unwrap_or(remaining.min(cap))
     }
 
     /// Prefill one piece at `pos`, extracting hidden rows into the ring.
@@ -10175,7 +10228,14 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             let end = off + seed.next_len(suffix.len() - off);
             while off < end {
                 let piece = SeedPrefill::piece_len(hidden_rb, end - off);
-                seed.forward(gpu, target, hidden_rb, &suffix[off..off + piece], pos, suffix.len())?;
+                seed.forward(
+                    gpu,
+                    target,
+                    hidden_rb,
+                    &suffix[off..off + piece],
+                    pos,
+                    suffix.len(),
+                )?;
                 pos += piece;
                 off += piece;
             }

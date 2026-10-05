@@ -550,12 +550,18 @@ pub fn load_dflash_state(
         .as_ref()
         .map(|p| p.max_batch)
         .unwrap_or(0);
+    let gfx1100_split_verify = gpu.arch == "gfx1100"
+        && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false)
+        && target_config.n_heads == 24
+        && target_config.n_kv_heads == 4
+        && target_config.head_dim == 256;
     // The draft's selector/dynamic-conv shape is deliberately NOT a gate: the
     // draft forward is outside the tape, so DFlash2 and legacy DFlash yield an
     // identical target verify body.
     let verify_pm4 = match admit_dflash_verify_pm4(
         env_opt_in,
         &gpu.arch,
+        gfx1100_split_verify,
         single_gpu,
         target_config.num_experts,
         kv_is_q8,
@@ -580,7 +586,14 @@ pub fn load_dflash_state(
                 "  DFlash verify PM4: armed (B={}, exact {})",
                 DFLASH_VERIFY_PM4_BLOCK, gpu.arch
             );
-            DflashVerifyPm4::armed()
+            if gfx1100_split_verify {
+                // Keep the faster incumbent below the split verifier's 4K
+                // crossover, and do not capture a short-context tape that
+                // would silently omit the new partial + merge launches.
+                DflashVerifyPm4::armed_after_context(4096)
+            } else {
+                DflashVerifyPm4::armed()
+            }
         }
         Err(reason) => {
             eprintln!("  DFlash verify PM4: disabled ({reason})");
@@ -1851,6 +1864,7 @@ pub fn dflash_repair_terminal_prefix_parts(
 pub fn admit_dflash_verify_pm4(
     env_opt_in: bool,
     arch: &str,
+    gfx1100_split_verify: bool,
     single_gpu: bool,
     num_experts: usize,
     kv_is_q8: bool,
@@ -1870,8 +1884,10 @@ pub fn admit_dflash_verify_pm4(
     if !env_opt_in {
         return Err("HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1".into());
     }
-    if arch != "gfx1201" {
-        return Err(format!("arch is {arch}, not exact gfx1201"));
+    if arch != "gfx1201" && !(arch == "gfx1100" && gfx1100_split_verify) {
+        return Err(format!(
+            "arch is {arch}, not exact gfx1201 or admitted gfx1100 split verifier"
+        ));
     }
     if !single_gpu {
         return Err("multi-GPU load is not admitted".into());
@@ -2323,6 +2339,7 @@ mod admit_dflash_verify_pm4_tests {
     struct Args {
         env_opt_in: bool,
         arch: &'static str,
+        gfx1100_split_verify: bool,
         single_gpu: bool,
         num_experts: usize,
         kv_is_q8: bool,
@@ -2345,6 +2362,7 @@ mod admit_dflash_verify_pm4_tests {
             Self {
                 env_opt_in: true,
                 arch: "gfx1201",
+                gfx1100_split_verify: false,
                 single_gpu: true,
                 num_experts: 0,
                 kv_is_q8: true,
@@ -2368,6 +2386,7 @@ mod admit_dflash_verify_pm4_tests {
         admit_dflash_verify_pm4(
             a.env_opt_in,
             a.arch,
+            a.gfx1100_split_verify,
             a.single_gpu,
             a.num_experts,
             a.kv_is_q8,
@@ -2408,7 +2427,20 @@ mod admit_dflash_verify_pm4_tests {
             ..Args::default()
         })
         .unwrap_err();
-        assert_eq!(err, "arch is gfx1100, not exact gfx1201");
+        assert_eq!(
+            err,
+            "arch is gfx1100, not exact gfx1201 or admitted gfx1100 split verifier"
+        );
+    }
+
+    #[test]
+    fn admits_gfx1100_only_with_split_verifier() {
+        assert!(admit(Args {
+            arch: "gfx1100",
+            gfx1100_split_verify: true,
+            ..Args::default()
+        })
+        .is_ok());
     }
 
     #[test]
