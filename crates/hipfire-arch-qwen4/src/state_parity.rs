@@ -2119,14 +2119,22 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
 }
 
 /// Native-MTP prompt fill digests for each prompt length: the MTP head and
-/// target state families after a cold `mtp_prefill`, the pending hidden row,
-/// the seed, and one following draft window. Run once per
+/// target state families after `mtp_prefill`, the pending hidden row, the
+/// seed, and one following draft window. Run once per
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` setting and compare the two outputs; the
 /// route is read once per process.
+///
+/// `warm_chunks == 0` fills each length cold. Otherwise each length is the
+/// suffix of a prefix-cache hit: a cold fill of a prompt of
+/// `warm_chunks * chunk_rows + 1` tokens publishes the checkpoint at
+/// `P = warm_chunks * chunk_rows`, then a prompt sharing those `P` tokens and
+/// followed by `length` fresh ones is filled from the restored checkpoint
+/// (`start_pos = P`) and digested.
 pub fn run_mtp_fill_digest(
     model_path: &Path,
     lengths: &[usize],
     max_seq: usize,
+    warm_chunks: usize,
 ) -> Result<Value, String> {
     use hipfire_runtime::spec::MtpDrafter;
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
@@ -2155,6 +2163,7 @@ pub fn run_mtp_fill_digest(
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
+    let warm = warm_chunks > 0;
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
         transaction,
@@ -2167,28 +2176,79 @@ pub fn run_mtp_fill_digest(
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
+        if warm {
+            bundle
+                .attach_prefix_cache(&mut gpu)
+                .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        }
         bundle
             .attach_forward(&mut gpu, max_seq)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         bundle
             .attach_mtp(&mut gpu, max_seq)
             .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+        if warm {
+            bundle
+                .attach_prefix_cache(&mut gpu)
+                .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        }
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
         let vocab = config.vocab_size as u64;
-        let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(3, max_seq);
-        let mut rows = Vec::new();
-        for &length in lengths {
-            // A deterministic spread over the real vocabulary.
-            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ length as u64;
-            let prompt: Vec<u32> = (0..length)
+        // A deterministic spread over the real vocabulary.
+        let tokens = |salt: u64, count: usize| -> Vec<u32> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ salt;
+            (0..count)
                 .map(|_| {
                     state = state
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
                     (10 + (state >> 33) % (vocab - 10)) as u32
                 })
-                .collect();
-            let seed = drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?;
+                .collect()
+        };
+        let prefix_len = if warm {
+            let chunk = bundle
+                .spec_chunk_rows()
+                .ok_or("qwen4 forward resources are not attached")?;
+            warm_chunks
+                .checked_mul(chunk)
+                .filter(|&len| len < max_seq)
+                .ok_or("warm prefix does not fit MAX_SEQ")?
+        } else {
+            0
+        };
+        let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(3, max_seq);
+        let mut rows = Vec::new();
+        for &length in lengths {
+            let seed = if warm {
+                // Publish the checkpoint at `prefix_len` (its prompt ends one
+                // row past the boundary), then hit it with a fresh suffix.
+                let shared = tokens(0x5eed ^ prefix_len as u64, prefix_len + 1);
+                drafter
+                    .mtp_prefill(&mut gpu, &mut bundle, &shared, &shared, 0, false, &|| false)?;
+                bundle.commit_prefix();
+                let mut prompt = shared[..prefix_len].to_vec();
+                prompt.extend(tokens(0xa11 ^ length as u64, length));
+                let plan = bundle.plan_prefix(&prompt, crate::bundle::Qwen4PrefixMode::NativeMtp);
+                if plan.start_pos != prefix_len {
+                    return Err(format!(
+                        "warm length {length}: prefix plan starts at {}, expected {prefix_len}",
+                        plan.start_pos
+                    ));
+                }
+                drafter.mtp_prefill(
+                    &mut gpu,
+                    &mut bundle,
+                    &prompt,
+                    &prompt[prefix_len..],
+                    prefix_len,
+                    true,
+                    &|| false,
+                )?
+            } else {
+                let prompt = tokens(length as u64, length);
+                drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
+            };
             let after_fill = bundle_family_json(&gpu, &bundle)?;
             let mut pending = Family::new();
             append_f32(
@@ -2199,16 +2259,8 @@ pub fn run_mtp_fill_digest(
             )?;
             let position = bundle.state.position;
             let eos = bundle.config.eos_token_id;
-            let window = drafter.mtp_step(
-                &mut gpu,
-                &mut bundle,
-                position,
-                seed,
-                &[seed],
-                3,
-                eos,
-                None,
-            )?;
+            let window =
+                drafter.mtp_step(&mut gpu, &mut bundle, position, seed, &[seed], 3, eos, None)?;
             let after_window = bundle_family_json(&gpu, &bundle)?;
             rows.push(json!({
                 "length": length,
@@ -2218,11 +2270,12 @@ pub fn run_mtp_fill_digest(
                 "window_committed": window.committed,
                 "families_after_window": after_window,
             }));
-            eprintln!("mtp-fill digest: length {length} seed {seed}");
+            eprintln!("mtp-fill digest: length {length} start {prefix_len} seed {seed}");
         }
         Ok(json!({
             "batched_fill": hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true),
             "max_seq": max_seq,
+            "warm_prefix": prefix_len,
             "rows": rows,
         }))
     })();
