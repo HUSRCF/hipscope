@@ -1726,7 +1726,7 @@ impl MtpDrafter for DsparkDrafter {
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.temp = cfg.temp;
         self.top_p = cfg.top_p;
-        self.top_k = cfg.top_k;
+        self.top_k = cfg.top_k_cut();
         self.cactus = cfg.cactus_delta;
         self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
     }

@@ -18448,7 +18448,9 @@ impl Gpu {
     /// MQ6G256V2 head `x` in its FWHT basis) restricted to the top 8 entries of
     /// the approximate `logits` (`n` rows), each scored with the decode
     /// kernel's exact row dot; the token id lands in `out[0]`, its exact margin
-    /// over the other seven (f32 bits) in `out[1]`. Logit row j
+    /// over the other seven (f32 bits) in `out[1]`, the 8 candidate tokens in
+    /// `out[2..10]` and their exact scores (f32 bits) in `out[10..18]`
+    /// (`out` holds [`Gpu::TOPK8_OUT_BYTES`]). Logit row j
     /// is token j unless `order = (front, special, tail)` says the ranking head
     /// was laid out `[0, front) ++ [special, special + tail) ++ [front, special)`
     /// (identity: `front >= n`). `partial` is scratch of at least
@@ -18484,7 +18486,11 @@ impl Gpu {
                 ))
             }
         };
-        if chunk > 2048 || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES || x.numel() < 2560 {
+        if chunk > 2048
+            || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
+            || out.buf.size() < Self::TOPK8_OUT_BYTES
+            || x.numel() < 2560
+        {
             return Err(hip_bridge::HipError::new(1, "topk8_rescore_k2560 shape"));
         }
         self.bind_thread()?;
@@ -18556,6 +18562,9 @@ impl Gpu {
 
     /// Scratch bytes [`Gpu::topk8_rescore_k2560`] needs.
     pub const TOPK8_PARTIAL_BYTES: usize = 128 * 8 * 8;
+    /// Output bytes [`Gpu::topk8_rescore_k2560`] writes: token, margin, the
+    /// 8 candidates and their 8 exact scores, 4 bytes each.
+    pub const TOPK8_OUT_BYTES: usize = 18 * 4;
 
     /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.
     pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {

@@ -64,7 +64,9 @@ static __device__ __forceinline__ void topk8_select(
 }
 
 // Thread 0: the best exact score -> out[0] its token, out[1] its margin over
-// the best other candidate (f32 bits).
+// the best other candidate (f32 bits); out[2..10) the 8 candidate tokens and
+// out[10..18) their exact scores (f32 bits), the distribution a sampled draft
+// is drawn from.
 static __device__ __forceinline__ void topk8_finish(const float* exact, const int* cand, int* out) {
     float bv = exact[0];
     int bi = cand[0];
@@ -76,4 +78,8 @@ static __device__ __forceinline__ void topk8_finish(const float* exact, const in
         if (w != bw) second = fmaxf(second, exact[w]);
     out[0] = bi;
     out[1] = __float_as_int(bv - second);
+    for (int w = 0; w < 8; ++w) {
+        out[2 + w] = cand[w];
+        out[10 + w] = __float_as_int(exact[w]);
+    }
 }

@@ -694,7 +694,11 @@ Caveats that are part of the fixture, not trivia:
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
 - **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
-  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  which keep the retained Redline AR route; greedy requests only unless
+  `speculation.mtp_sampled` (`HIPFIRE_MTP_SAMPLED=1`, experimental, default
+  off) also verifies sampled requests by speculative rejection sampling
+  against the AR sampler's distribution (oracle:
+  `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target

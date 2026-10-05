@@ -1690,16 +1690,23 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
         16 => {
-            // Qwen4 native MTP verifies greedy picks only. At temperature 0
-            // the AR producer reduces to argmax and ignores top_p/top_k/min_p
-            // (see `greedy_on_gpu` in `generate_ar_with_forward`), so their
-            // presence on the wire must not demote the request: serve forwards
-            // top_p/top_k whenever the client or the registry sets one. Penalties do move
-            // the argmax, so non-neutral ones, adaptive KV, or a force-AR
-            // switch keep the request on the ordinary Qwen4 producer.
+            // Qwen4 native MTP verifies greedy picks, and sampled requests
+            // too when the drafter reports `supports_temp_verify`
+            // (`speculation.mtp_sampled`): speculative rejection sampling
+            // against the AR sampler's own distribution
+            // (`llama::sample_top_k_p`: temperature, the request's top_k and
+            // min_p, top_p; the verifier's target applies the same cuts, so
+            // they do not demote the request). At temperature 0 the AR producer
+            // reduces to argmax and ignores top_p/top_k/min_p (see
+            // `greedy_on_gpu` in `generate_ar_with_forward`), so their
+            // presence on the wire must not demote the request: serve
+            // forwards top_p/top_k whenever the client or the registry sets
+            // one. Penalties do move the distribution, so non-neutral ones,
+            // adaptive KV, or a force-AR switch keep the request on the
+            // ordinary Qwen4 producer.
             let spec_ok = i.has_speculator
                 && i.speculator_is_mtp
-                && i.temp <= 1e-6
+                && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && !i.nonneutral_penalties
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
@@ -2576,7 +2583,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
@@ -2723,7 +2730,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
@@ -2890,7 +2897,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
@@ -2968,7 +2975,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
@@ -3046,7 +3053,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
@@ -3211,7 +3218,7 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
                 cactus_delta,
                 request_seed as u64,
