@@ -1768,12 +1768,12 @@ pub static FIELDS: &[ConfigField] = &[
         "mtp_sampled",
         Speculation,
         ModelLoad,
-        DefaultValue::Bool(false),
+        DefaultValue::Bool(true),
         ValueRule::Bool,
         false,
-        true,
+        false,
         Some("HIPFIRE_MTP_SAMPLED"),
-        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. Off routes sampled requests to AR."
+        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. On by default; off routes sampled requests to AR."
     ),
     field!(
         "speculation.mode",
@@ -4018,11 +4018,11 @@ fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "on"))
 }
 /// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
-/// `HIPFIRE_MTP_SAMPLED`, default off). On, the Qwen4 MTP drafter verifies
-/// temperature > 0 requests by speculative rejection sampling instead of
-/// leaving them to AR.
+/// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
+/// drafter verifies temperature > 0 requests by speculative rejection
+/// sampling; off leaves them to AR.
 pub fn mtp_sampled_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_SAMPLED", false)
+    developer_bool("HIPFIRE_MTP_SAMPLED", true)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk

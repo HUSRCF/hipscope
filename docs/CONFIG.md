@@ -516,7 +516,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
-| `mtp_sampled` | `false` | bool | **Experimental, opt-in (0.4.1).** Qwen4 (Flash-Next) native MTP for sampled requests: speculative rejection sampling against the AR sampler's distribution (lossless in distribution; greedy unchanged). Off: temperature > 0 runs AR. Env `HIPFIRE_MTP_SAMPLED`. |
+| `mtp_sampled` | `true` | bool | **Default on (0.4.1; experimental opt-in before the flip).** Qwen4 (Flash-Next) native MTP for sampled requests: speculative rejection sampling against the AR sampler's distribution (lossless in distribution; greedy unchanged). Requests with non-neutral repeat/presence/frequency penalties still run AR. `false`: temperature > 0 runs AR. Env `HIPFIRE_MTP_SAMPLED` (`0` opts out). |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
 | `ngram_mode` | `"off"` | `off` \| `on` \| `auto` | Model-free; byte-identical to AR when used. |
 | `ngram_k` | `12` | int 2–32 | |
@@ -795,7 +795,7 @@ uses ambient variables in engine hot paths.
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` |
 | `mtp_k` | `speculation.mtp_k` | `HIPFIRE_MTP_K` | 3 |
-| `mtp_sampled` | `speculation.mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | false |
+| `mtp_sampled` | `speculation.mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | true |
 
 `kernel.lm_head_f16` maps the live Qwen3.5/3.6 loader compatibility control
 `HIPFIRE_LM_HEAD_F16`; the duplicate unused `RuntimeConfig` member was removed.
@@ -1084,7 +1084,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `speculation.mtp` | `mtp_mode` | `HIPFIRE_MTP_MODE` | stable |
 | `speculation.mtp_k` | `mtp_k` | `HIPFIRE_MTP_K` | stable |
 | `speculation.mtp_ngram` | `mtp_ngram` | `HIPFIRE_MTP_NGRAM` | stable |
-| `speculation.mtp_sampled` | `mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | experimental |
+| `speculation.mtp_sampled` | `mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | stable |
 | `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
 | `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
 | `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |

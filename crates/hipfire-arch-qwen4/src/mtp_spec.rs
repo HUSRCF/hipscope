@@ -94,13 +94,13 @@ pub fn target_commit_accept_len(accepted: &GreedyAccept) -> usize {
     accepted.accepted - usize::from(accepted_eos)
 }
 
-/// Without `speculation.mtp_sampled`, native MTP verifies greedy target picks
-/// only, so a sampled request fails closed here (the router keeps such
-/// requests on AR).
+/// With `speculation.mtp_sampled` off (`HIPFIRE_MTP_SAMPLED=0`; on by
+/// default), native MTP verifies greedy target picks only, so a sampled
+/// request fails closed here (the router keeps such requests on AR).
 pub fn require_native_greedy(temp: f32) -> Result<(), String> {
     if !temp.is_finite() || temp.abs() > 1.0e-6 {
         return Err(
-            "Qwen4 native MTP verifies greedy requests only unless speculation.mtp_sampled (HIPFIRE_MTP_SAMPLED=1) enables sampled verification"
+            "Qwen4 native MTP verifies greedy requests only while speculation.mtp_sampled is off (HIPFIRE_MTP_SAMPLED=0)"
                 .to_string(),
         );
     }
