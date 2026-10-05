@@ -3392,4 +3392,53 @@ mod tests {
             combine_k8_case(&mut gpu, 65_600, grouped);
         }
     }
+
+    /// `HIPFIRE_QWEN4_ROUTER_FAST`: the wave-per-token router must store the
+    /// incumbent's expert ids and weights byte for byte on every arch that
+    /// admits it, including tied logits, a partial final workgroup and tokens
+    /// with -inf / +inf / NaN logits (which take the incumbent's selection).
+    #[test]
+    #[ignore = "requires a gfx1151/gfx1201 GPU and working HIP toolchain"]
+    fn router_fast_is_bit_identical_to_incumbent() {
+        const TOKENS: usize = 37;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") => gpu,
+            _ => {
+                eprintln!("skip: needs a gfx1151/gfx1201 GPU");
+                return;
+            }
+        };
+        let mut logits: Vec<f32> = (0..TOKENS * 512)
+            .map(|i| ((i * 7919 % 4093) as f32 - 2046.0) / 311.0)
+            .collect();
+        for t in 0..TOKENS {
+            let row = &mut logits[t * 512..(t + 1) * 512];
+            match t % 6 {
+                // Ten-way and wider ties at the top and across the cut.
+                1 => row.iter_mut().step_by(37).for_each(|v| *v = 9.5),
+                2 => row[100..140].iter_mut().for_each(|v| *v = -7.25),
+                3 => row.iter_mut().step_by(5).for_each(|v| *v = f32::NEG_INFINITY),
+                4 => row[17] = f32::INFINITY,
+                5 => row[300] = f32::NAN,
+                _ => {}
+            }
+        }
+        let logits_gpu = gpu.upload_f32(&logits, &[logits.len()]).expect("logits");
+        for normalize in [false, true] {
+            for round in [false, true] {
+                let mut run = |fast: bool| {
+                    std::sync::Arc::make_mut(&mut gpu.flags).qwen4_router_fast = fast;
+                    let ids = gpu.upload_f32(&vec![f32::from_bits(0x7fc0_4321); TOKENS * 10], &[TOKENS * 10]).expect("ids");
+                    let weights = gpu.upload_f32(&vec![f32::from_bits(0x7fc0_1234); TOKENS * 10], &[TOKENS * 10]).expect("weights");
+                    gpu.moe_router_softmax_top10_f32(&logits_gpu, &ids, &weights, TOKENS, normalize, round)
+                        .expect("router launch");
+                    (gpu.download_raw_bytes(&ids).expect("ids"), gpu.download_raw_bytes(&weights).expect("weights"))
+                };
+                let incumbent = run(false);
+                let fast = run(true);
+                assert_eq!(fast.0, incumbent.0, "expert ids differ (normalize={normalize}, round={round})");
+                assert_eq!(fast.1, incumbent.1, "weights differ (normalize={normalize}, round={round})");
+            }
+        }
+    }
 }
