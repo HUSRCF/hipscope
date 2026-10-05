@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Builder-emitted MQ4V2 x block_i4_128 GEMM for gfx1201 (plan §3-§4).
 //!
 //! Semantics are hipcc K1's `_v3` symbols bit for bit: per 128-K block each

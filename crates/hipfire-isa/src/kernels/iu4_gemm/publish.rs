@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Global fetch and LDS publication of one 64-K slab and of the next block's
 //! token/row metadata. Staging map (hipcc K1's, bank-swizzled): lane `tid`
 //! moves 8 bytes of slab row `R = r * round_rows + tid / 4`, quad `tid % 4`,

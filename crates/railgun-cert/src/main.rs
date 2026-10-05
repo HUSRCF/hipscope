@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `railgun-cert certify [--out DIR] OBJECT...` writes one receipt per code
 //! object to `DIR/receipts/<arch>/<object_sha256>.receipt.json`.
 //!

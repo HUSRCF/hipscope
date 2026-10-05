@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! gfx11 PM4 boundary-cost microbenchmark (the gfx1100 decode-floor rank-5
 //! kill test): one retained PM4 IB of N dependent dispatches, one boundary
 //! rung between every pair, timed against a HIP graph and back-to-back HIP

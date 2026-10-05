@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! M3: re-layout of ld.lld-linked gfx1201 code objects (code object v6).
 //!
 //! When a kernel's code, the metadata note or a kernel's symbol name changes size, the

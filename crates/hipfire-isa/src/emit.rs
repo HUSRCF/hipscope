@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::{plan::KernelSpec,reg::RegPlan,insn::Program};
 
 // Imported regions can mention scalar operands outside the authored RegPlan.

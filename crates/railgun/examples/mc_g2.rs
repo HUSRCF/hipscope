@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Milestone MC gate: G2 on a program made only of copies (railgun design §7,
 //! row MC), with the G3 replay stress, the size × alignment sweep of the copy
 //! kernels against `hipMemcpyDtoD`, a table using every slot argument of

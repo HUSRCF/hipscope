@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The symmetric MQ4V2 x `block_i4_128` IU4 fold shared by the builder GEMMs.
 //!
 //! Per output and ascending K128 epoch: `C` is the exact int32

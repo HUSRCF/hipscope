@@ -116,43 +116,29 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         let stopped_flag = producer.stopped_by_filter;
         match producer.finish(&mut sink, hit_length_cap) {
             Ok((fin, visible)) => {
-                // Mirror production: caller owns open-think epilogue + terminal.
-                // Unit tests have no GPU, so attest rolled_back=false.
-                if matches!(fin.cause, QwenArTerminalCause::OpenThink) {
-                    let ep = hipfire_generate::common::RollbackEpilogue {
-                        rolled_back: false,
-                        context: None,
-                    };
-                    emit_qwen_ar_open_think_terminal(&mut sink, "t1", 0, &ep);
-                } else {
-                    // Default Commit path: stage calls on done (production
-                    // embeds calls in commit_ready/done; no post-commit event).
-                    let effects = hipfire_generate::qwen::qwen_client_commit_effects(
-                        ClientTerminalDecision::Commit,
-                        fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
-                        fin.store_cache,
+                // Default Commit path: stage calls on done (production
+                // embeds calls in commit_ready/done; no post-commit event).
+                let effects = hipfire_generate::qwen::qwen_client_commit_effects(
+                    ClientTerminalDecision::Commit,
+                    fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
+                    fin.store_cache,
+                );
+                if effects.emit_done {
+                    let mut pending = qwen_ar_done_value(
+                        "t1",
+                        fin.finish_reason,
+                        0,
+                        0.0,
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0,
+                        "",
                     );
-                    if effects.emit_done {
-                        let mut pending = qwen_ar_done_value(
-                            "t1",
-                            fin.finish_reason,
-                            0,
-                            0.0,
-                            0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0,
-                            "",
-                        );
-                        stage_terminal_tool_calls(
-                            &mut pending,
-                            fin.finish_reason,
-                            &fin.wire_tool_calls,
-                        );
-                        emit_staged_terminal_done(&mut sink, &pending);
-                    }
+                    stage_terminal_tool_calls(&mut pending, fin.finish_reason, &fin.wire_tool_calls);
+                    emit_staged_terminal_done(&mut sink, &pending);
                 }
                 (
                     String::from_utf8_lossy(&sink).into_owned(),
@@ -703,9 +689,9 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
                 "completed marker must be suppressed: marker={marker:?} visible={visible:?}"
             );
             if *marker == "<think>" {
-                // Open think after prose → validation terminal (no cache).
+                // Open think after prose → reasoning-only stop (no cache).
                 assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
-                assert_eq!(fin.finish_reason, "error");
+                assert_eq!(fin.finish_reason, "stop");
                 assert!(!fin.store_cache);
             } else if *marker == "</think>" {
                 // Orphan closer drops closer, keeps prose; not a stop marker.
@@ -724,47 +710,54 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         }
     }
 
-    #[test]
-    fn open_think_is_fail_closed_validation_no_cache() {
-        // Open think streams reasoning, then fails closed: no calls/done/cache.
-        let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&["still thinking"], true, false);
-        let fin = fin.expect("open think returns Ok finish with error cause");
-        assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
-        assert_eq!(fin.finish_reason, "error");
-        assert!(fin.wire_tool_calls.is_empty());
-        assert!(!fin.store_cache);
-        assert!(visible.is_empty());
-        let events = parse_jsonl(&out);
-        assert!(events
-            .iter()
-            .any(|e| { e["type"] == "reasoning" && e["text"] == "still thinking" }));
-        assert!(!out.contains("<think>"));
-        assert!(
-            events
-                .iter()
-                .any(|e| e["type"] == "error" && e["class"] == "validation"),
-            "expected validation error: {out}"
-        );
-        assert!(
-            events.iter().all(|e| e["type"] != "done"),
-            "open-think must not emit done (terminal XOR): {out}"
-        );
-        let errors: Vec<_> = events.iter().filter(|e| e["type"] == "error").collect();
-        assert_eq!(errors.len(), 1, "exactly one error terminal: {out}");
-        assert_eq!(errors[0]["class"], "validation");
-        assert_eq!(errors[0]["retryable"], false);
-        assert_eq!(errors[0]["attempt_id"], 7);
-        // No unread stale event after the single terminal error.
-        let err_idx = events.iter().position(|e| e["type"] == "error").unwrap();
-        assert_eq!(
-            err_idx,
-            events.len() - 1,
-            "error must be the last event (no stale unread after terminal): {out}"
-        );
-        assert!(events.iter().all(|e| e.get("attempt_id").is_some()));
+    /// Tail of HermesAgent HA-13 (Flash-Next, xhigh): the model emitted
+    /// `<|im_end|>` inside its reasoning, ~1.5K tokens into a 16K budget, and
+    /// serve answered with an "open think span" stream error.
+    const HA13_REASONING_TAIL: &[&str] = &[
+        "Non-200 status (e.g. 500, or 503 even if the server responds)",
+        " counts as down. Good.\n\n",
+        "Schedule: \"0 8 * * *\"",
+        " — every day at 8 AM.\n\n",
+        "Now let's create",
+        " the job.",
+    ];
 
+    /// Asserts the reasoning-only `stop` terminal of a turn that ended inside
+    /// `<think>`: every reasoning byte streamed, then one `done`, no error.
+    fn assert_reasoning_only_stop(out: &str, expected_reasoning: &str) {
+        let events = parse_jsonl(out);
+        let reasoning: String = events
+            .iter()
+            .filter(|e| e["type"] == "reasoning")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasoning, expected_reasoning, "{out}");
+        assert!(events.iter().all(|e| e["type"] != "error"), "no error event: {out}");
+        assert!(!out.contains("<think>") && !out.contains("<|im_end|>"), "{out}");
+        let done: Vec<_> = events.iter().filter(|e| e["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "exactly one done: {out}");
+        assert_eq!(done[0]["finish_reason"], "stop");
+        assert!(done[0].get("tool_calls").is_none(), "{out}");
+        assert_eq!(events.last().unwrap()["type"], "done", "done is the terminal: {out}");
+    }
+
+    #[test]
+    fn eos_inside_open_think_is_reasoning_only_stop_ha13() {
+        // HA-13 replay: prompt-opened think, reasoning, then <|im_end|>.
+        let mut chunks = HA13_REASONING_TAIL.to_vec();
+        chunks.push("<|im_end|>");
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path(&chunks, true, false);
+        assert!(stopped, "<|im_end|> ends the turn");
+        let fin = fin.expect("open think finishes Ok");
+        assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
+        assert_eq!(fin.finish_reason, "stop");
+        assert!(fin.wire_tool_calls.is_empty());
+        assert!(visible.is_empty(), "no answer text: {visible:?}");
+        assert_reasoning_only_stop(&out, &HA13_REASONING_TAIL.concat());
+
+        // The KV holds an unclosed think span: never cached.
+        assert!(!fin.store_cache);
         let action = qwen_ar_cache_action(&fin, &visible);
-        assert!(!action.store);
         let mut sink = HashMap::new();
         assert!(qwen_ar_apply_cache_action(
             |k, v| {
@@ -775,21 +768,43 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         )
         .is_none());
         assert!(sink.is_empty());
+
+        // The same EOS on the final budget token still beats length.
+        let (out, _, fin, _, _, _) = drive_ar_semantic_path(&chunks, true, true);
+        let fin = fin.expect("open think finishes Ok");
+        assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
+        assert_reasoning_only_stop(&out, &HA13_REASONING_TAIL.concat());
     }
 
     #[test]
-    fn open_think_unmatched_generated_think_fail_closed() {
-        let (out, visible, fin, _, _, _) =
-            drive_ar_semantic_path(&["pre ", "<think>secret"], false, false);
-        let fin = fin.expect("open think");
-        let events = parse_jsonl(&out);
+    fn open_think_natural_stop_is_reasoning_only_stop() {
+        // The decode loop ended without EOT or length inside <think>.
+        let (out, visible, fin, stopped, _, _) =
+            drive_ar_semantic_path(&["still thinking"], true, false);
+        assert!(!stopped);
+        let fin = fin.expect("open think finishes Ok");
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
         assert!(!fin.store_cache);
-        assert!(visible.is_empty() || !visible.contains("secret"));
-        assert!(events
+        assert!(visible.is_empty());
+        assert_reasoning_only_stop(&out, "still thinking");
+    }
+
+    #[test]
+    fn generated_unclosed_think_after_prose_is_stop_with_both_channels() {
+        let (out, visible, fin, stopped, _, _) =
+            drive_ar_semantic_path(&["pre ", "<think>secret", "<|im_end|>"], false, false);
+        assert!(stopped);
+        let fin = fin.expect("open think");
+        assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
+        assert!(!fin.store_cache);
+        assert!(!visible.contains("secret"));
+        let content: String = parse_jsonl(&out)
             .iter()
-            .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
-        assert!(!out.contains("\"type\":\"tool_calls\""));
+            .filter(|e| e["type"] == "token")
+            .map(|e| e["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(content.trim_end(), "pre");
+        assert_reasoning_only_stop(&out, "secret");
     }
 
     #[test]
@@ -871,8 +886,8 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         // (stopped_by_filter, stop_sequence, hit_length_cap, open_think)
         // Out of budget inside <think> is a length stop, not a protocol error.
         assert_eq!(QwenArTerminalCause::resolve(false, false, true, true), LengthCap);
-        // The model ending the turn inside <think> stays fail-closed, even on
-        // the final budget token; so does an open think without a length cap.
+        // The model ending the turn inside <think> is an OpenThink stop, even
+        // on the final budget token; so is an open think without a length cap.
         assert_eq!(QwenArTerminalCause::resolve(true, false, true, true), OpenThink);
         assert_eq!(QwenArTerminalCause::resolve(true, false, false, true), OpenThink);
         assert_eq!(QwenArTerminalCause::resolve(false, false, false, true), OpenThink);
@@ -1202,37 +1217,6 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(events
             .iter()
             .any(|e| e["type"] == "token" && e["text"] == "hello"));
-    }
-
-    #[test]
-    fn open_think_terminal_xor_error_only_no_done_no_stale() {
-        // Fix round 4 #1: open-think → exactly one correlated non-retryable
-        // validation error, no done, no unread stale event after terminal.
-        // GPU-less: attest epilogue.rolled_back=false (same writer as production).
-        let _guard = begin_terminal_test("ot1", 7);
-        set_active_attempt_id(7);
-        let mut sink = Vec::new();
-        let ep = hipfire_generate::common::RollbackEpilogue {
-            rolled_back: false,
-            context: None,
-        };
-        emit_qwen_ar_open_think_terminal(&mut sink, "ot1", 4, &ep);
-        let events = parse_jsonl(&String::from_utf8(sink).unwrap());
-        assert_eq!(events.len(), 1, "exactly one terminal event: {events:?}");
-        assert_eq!(events[0]["type"], "error");
-        assert_eq!(events[0]["class"], "validation");
-        assert_eq!(events[0]["retryable"], false);
-        assert_eq!(events[0]["rolled_back"], false);
-        assert_eq!(events[0]["attempt_id"], 7);
-        assert_eq!(events[0]["id"], "ot1");
-        assert!(
-            events[0]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("open think"),
-            "message={:?}",
-            events[0]["message"]
-        );
     }
 
     #[test]

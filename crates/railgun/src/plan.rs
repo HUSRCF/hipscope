@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The per-arch cache table (design §1.3), hazard edges (§1.4) and the PM4
 //! boundary plan of a kernel program (§2.1 segment rule, §2.2 per edge).
 //!

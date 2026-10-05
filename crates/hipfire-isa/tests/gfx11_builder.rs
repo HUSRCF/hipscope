@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! gfx11 builder target: counter waits, LDS barrier drain, VOPD pairing, the
 //! V2C-equivalent SET/ADD/gate-up kernels (gfx1100), the V2B module
 //! (gfx1151), and byte identity of the committed builder products.

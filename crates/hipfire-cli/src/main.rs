@@ -12251,6 +12251,36 @@ mod tests {
         assert_eq!(status, 200, "{text}");
     }
 
+    /// HA-13: a turn the model ended inside `<think>` reaches the client as
+    /// reasoning only, `finish_reason: "stop"`, and no error, both streamed
+    /// and non-streamed.
+    #[cfg(unix)]
+    #[test]
+    fn reasoning_only_stop_streams_and_completes_without_error() {
+        let harness = Task11HttpHarness::spawn("open-think-stop");
+        let port = harness.port();
+        let reasoning = "Schedule: \"0 8 * * *\" — every day at 8 AM.\n\nNow let's create the job.";
+
+        let cap = capture_stream(port, harness.base_body("t11-open-think-stop", true))
+            .expect("stream ends without an error event");
+        assert_eq!(cap.reasoning, reasoning);
+        assert!(cap.content.is_empty(), "no answer: {:?}", cap.content);
+        assert!(cap.tool_calls.is_empty());
+        assert_eq!(cap.finish.as_deref(), Some("stop"));
+        assert!(cap.saw_done);
+
+        let json = complete_nonstream(port, harness.base_body("t11-open-think-stop", false))
+            .expect("non-stream completes with 200");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop");
+        assert_eq!(choice["message"]["reasoning_content"], reasoning);
+        assert!(
+            choice["message"]["content"].is_null() || choice["message"]["content"] == "",
+            "{json}"
+        );
+        assert!(choice["message"].get("tool_calls").is_none(), "{json}");
+    }
+
     /// After a failed switch the daemon holds nothing (tp<=1 unloads first):
     /// `/health` must stop naming the old model and the next request for it
     /// must reload instead of generating against an empty daemon.

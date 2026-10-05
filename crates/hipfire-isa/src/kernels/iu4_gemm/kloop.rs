@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The rolled K-loop. One trip is a whole 256-K group (two 128-K blocks,
 //! plane parity 0 then 1), so every LDS address is an immediate and the
 //! trip ends in the state it started in. The last group is peeled: its

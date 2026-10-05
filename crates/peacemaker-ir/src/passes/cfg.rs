@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C4: branch target leaders, CFG construction, dominators and loops.
 //!
 //! Input contract (shared with the C3 decoder): `build_blocks` takes a `Body`

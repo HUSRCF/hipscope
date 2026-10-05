@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Imported hipcc region: the SiLU epilogue value `h = g / (1 + expf(-g)) * u`.
 //!
 //! `expf` and the IEEE division are lowered by hipcc into a fixed VALU DAG

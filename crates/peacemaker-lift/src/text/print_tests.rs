@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! T3/T9 gate tests for the C3b second opinion. Tool-gated: with a pinned
 //! toolchain (`PEACEMAKER_ROCM`, else `/opt/rocm/core-10.0`) the live tools
 //! must agree; without one the committed objdump fixture is the reference.

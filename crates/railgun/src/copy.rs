@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The hipfire-owned copy kernels behind `Node::Copy` and `Node::CopyBatch`
 //! (`kernels/src/railgun_copy.hip`): source, symbols, the slot-table entry
 //! layout, slot counts and launch geometry.

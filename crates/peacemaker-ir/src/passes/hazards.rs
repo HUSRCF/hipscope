@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: per-arch SGPR, VALU, and WMMA hazards.
 //!
 //! Whole-program hazard replay over typed streams. The gfx12 SGPR tracker

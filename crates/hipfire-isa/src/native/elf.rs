@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The code object `ld.lld -shared` links from one builder `.o`, written directly.
 //!
 //! Layout (lld's rules for an AMDGPU HSA input of one `.text`, one `.rodata`

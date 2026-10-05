@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The `peacemaker-receipt` schema (receipt v1 = radiowave `PeacemakerRecord`
 //! schema 6; the `railgun` section makes it 7). `railgun-cert` writes these
 //! records offline; the runtime reads them through this crate, which depends

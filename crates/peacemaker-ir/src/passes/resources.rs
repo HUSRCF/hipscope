@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: per-kernel resource summary over typed streams.
 //!
 //! Scans explicit `Reg`/`Half` operands plus `Effects` for the

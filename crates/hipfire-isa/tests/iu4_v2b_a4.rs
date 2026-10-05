@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The gfx1151 M512 x N128 V2B gate/up entries (`iu4_v2b_a4`, A4 fusion:
 //! the stage-1 h twin and the stage-2 fused A4 epilogue): determinism, the
 //! per-K256 census of the retiled K loop, assembly, byte identity of the

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Builder-emitted gfx11 (RDNA3, wave32) MQ4V2 x block_i4_128 GEMM with the
 //! hipcc V2C algorithm (`kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip`),
 //! bit for bit, for its three epilogue families:

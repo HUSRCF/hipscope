@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! G7 normalized route diff in shadow mode (design §5 G7, §7 M1): railgun
 //! prepares its lowering of the same recorded tape next to Redline's and the
 //! two are compared; railgun submits nothing.

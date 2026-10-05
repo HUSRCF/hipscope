@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C7: KT48 end-to-end round-trip gates (core.md §8, T1–T10) plus the F2/iu4 bundle round
 //! trips, exercised only through public APIs: `lift_object` → typed program → `emit`.
 //! Errata (Main): KT48's selected kernel has 25 args (11 explicit + 14 hidden); the sound

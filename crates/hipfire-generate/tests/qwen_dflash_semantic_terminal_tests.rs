@@ -436,95 +436,133 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
     }
 
-    #[test]
-    fn open_think_is_error_xor_done_no_cache() {
-        // Production emitter (prompt-started OpenThink) -> real FinishSummary
-        // -> production wire terminal. No hand-built open_think mirrors.
-        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
-        let reasoning: String = stream
-            .iter()
-            .filter_map(|e| match e {
-                ClientEvent::Reasoning(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasoning, "still thinking");
-        assert!(fin.open_think, "emitter must latch open_think");
-        assert_eq!(fin.finish_reason, "open_think");
-        assert!(fin.events.is_empty());
-        assert_eq!(fin.tool_calls, 0);
-        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
-        match &term {
-            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
-                class,
-                retryable,
-                message,
+    /// Tail of HermesAgent HA-13 (Flash-Next, xhigh): the model emitted
+    /// `<|im_end|>` inside its reasoning and serve answered with an "open
+    /// think span" stream error.
+    const HA13_REASONING_TAIL: &str = "Non-200 status (e.g. 500, or 503 even if the server \
+        responds) counts as down. Good.\n\nSchedule: \"0 8 * * *\" — every day at 8 AM.\n\n\
+        Now let's create the job.";
+
+    /// Production wire for one spec turn: the mid-loop events, the terminal
+    /// flush, then the wire terminal (done, or the fail-closed error).
+    fn render_spec_turn(
+        id: &str,
+        stream: &[ClientEvent],
+        fin: &FinishSummary,
+        term: &hipfire_generate::qwen::QwenDflashWireTerminal,
+    ) -> Vec<serde_json::Value> {
+        let mut sink = Vec::new();
+        hipfire_generate::qwen::render_client_events(&mut sink, id, stream, 0, false);
+        hipfire_generate::qwen::render_client_events(&mut sink, id, &fin.events, 0, true);
+        match term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                wire_tool_calls,
                 ..
             } => {
-                assert_eq!(*class, "validation");
-                assert!(!*retryable);
-                assert!(message.contains("open think"));
+                let mut done = hipfire_generate::qwen::qwen_dflash_done_value(
+                    id,
+                    fin.tool_calls,
+                    1.0,
+                    1,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1,
+                    0,
+                    finish_reason,
+                    21,
+                );
+                stage_terminal_tool_calls(&mut done, finish_reason, wire_tool_calls);
+                sink.extend_from_slice(format!("{done}\n").as_bytes());
             }
-            other => panic!("expected open_think Malformed, got {other:?}"),
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
+                message,
+                class,
+                retryable,
+                rolled_back,
+            } => {
+                let ep = attest_epilogue(*rolled_back);
+                hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
+                    &mut sink, id, message, class, *retryable, &ep,
+                );
+            }
         }
-        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
-        assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
-        // Production Malformed writer: error XOR done (GPU-less attested epilogue).
+        parse_jsonl(&String::from_utf8(sink).unwrap())
+    }
+
+    /// Reasoning-only `stop`: every reasoning byte streamed, no answer, no
+    /// call, no cache, and one `done` as the last event — no error.
+    fn assert_spec_reasoning_only_stop(
+        label: &str,
+        stream: &[ClientEvent],
+        fin: &FinishSummary,
+        expected_reasoning: &str,
+    ) {
+        assert!(fin.open_think, "{label}: emitter must latch open_think");
+        assert_eq!(fin.finish_reason, "open_think", "{label}");
+        assert_eq!(fin.tool_calls, 0, "{label}");
+        assert!(!fin.events.iter().any(|e| matches!(e, ClientEvent::ToolCalls(_))), "{label}");
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(fin, false, false, "", false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "stop", "{label}");
+                assert!(!*release_tool_calls, "{label}");
+                assert!(!*store_cache, "{label}: an unclosed think span is never cached");
+                assert!(wire_tool_calls.is_empty(), "{label}");
+            }
+            other => panic!("{label}: expected stop Done, got {other:?}"),
+        }
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
+
         let _guard = begin_terminal_test("req-ot", 21);
-        set_active_attempt_id(21);
-        let mut sink = Vec::new();
-        if let hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
-            message,
-            class,
-            retryable,
-            rolled_back,
-        } = &term
-        {
-            let ep = attest_epilogue(*rolled_back);
-            hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
-                &mut sink, "req-ot", message, class, *retryable, &ep,
-            );
-        }
-        let out = String::from_utf8(sink).unwrap();
-        let lines = parse_jsonl(&out);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["type"], "error");
-        assert_eq!(lines[0]["attempt_id"], 21);
-        assert!(!out.contains(r#""type":"done""#));
+        let wire = render_spec_turn("req-ot", stream, fin, &term);
+        let reasoning: String = wire
+            .iter()
+            .filter(|e| e["type"] == "reasoning")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasoning, expected_reasoning, "{label}");
+        assert!(wire.iter().all(|e| e["type"] != "error"), "{label}: {wire:?}");
+        assert!(wire.iter().all(|e| e["type"] != "tool_calls"), "{label}: {wire:?}");
+        let done: Vec<_> = wire.iter().filter(|e| e["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "{label}: {wire:?}");
+        assert_eq!(done[0]["finish_reason"], "stop", "{label}");
+        assert_eq!(wire.last().unwrap()["type"], "done", "{label}");
     }
 
     #[test]
-    fn open_think_prompt_started_and_generated_flags() {
+    fn eos_inside_open_think_is_reasoning_only_stop_ha13() {
+        // HA-13 replay on the spec (MTP/DFlash) emitter: prompt-opened think,
+        // reasoning, then <|im_end|> (id 1) — on the final budget token too.
+        let tok = test_tokenizer();
+        let mut ids = tok.encode(HA13_REASONING_TAIL);
+        ids.push(1);
+        let (stream, fin, _raw) = drive_qwen_ids(&ids, AssistantPrefix::OpenThink);
+        assert!(fin.decoded_eot, "<|im_end|> is a decoded end of turn");
+        // EOS on the final budget token is not a length exit.
+        assert!(!qwen_dflash_hit_length_cap(ids.len(), ids.len(), fin.decoded_eot, true));
+        assert_spec_reasoning_only_stop("eos", &stream, &fin, HA13_REASONING_TAIL);
+    }
+
+    #[test]
+    fn open_think_without_eos_or_length_is_reasoning_only_stop() {
         // (a) prompt-started OpenThink; (b) generated unclosed <think>.
         let cases = [
-            ("prompt", AssistantPrefix::OpenThink, "still thinking"),
-            ("generated", AssistantPrefix::Plain, "pre <think>secret"),
+            ("prompt", AssistantPrefix::OpenThink, "still thinking", "still thinking"),
+            ("generated", AssistantPrefix::Plain, "pre <think>secret", "secret"),
         ];
-        for (label, prefix, body) in cases {
+        for (label, prefix, body, expected_reasoning) in cases {
             let (stream, fin, _raw) = drive_qwen_emit(body, prefix);
-            let reasoning: String = stream
-                .iter()
-                .filter_map(|e| match e {
-                    ClientEvent::Reasoning(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let expected_reasoning = if label == "prompt" {
-                "still thinking"
-            } else {
-                "secret"
-            };
-            assert_eq!(reasoning, expected_reasoning, "{label}");
-            assert!(fin.open_think, "{label}: open_think");
-            assert_eq!(fin.finish_reason, "open_think", "{label}");
-            assert_eq!(fin.tool_calls, 0, "{label}");
-            assert!(fin.events.is_empty(), "{label}: no release on open_think");
-            let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
-            assert!(
-                matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }),
-                "{label}: expected Malformed"
-            );
-            assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
+            assert_spec_reasoning_only_stop(label, &stream, &fin, expected_reasoning);
         }
     }
 
@@ -2266,20 +2304,14 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
 
     /// Legacy non-qwen hipfire_generate::qwen::generate_dflash else-branch: fail_closed_rollback.is_some()
     /// || grammar_violated → hipfire_generate::common::emit_fail_closed_error only; no extract/release/
-    /// cache store / done. Message classified by grammar / open_think /
-    /// malformed_protocol / generic.
+    /// cache store / done. Message classified by grammar / malformed_protocol /
+    /// generic.
     #[test]
     fn legacy_non_qwen_fail_closed_epilogue_error_only_no_extract() {
         // Production message selection (qwen_semantic_v2 == false branch).
-        fn legacy_fail_closed_message(
-            grammar_violated: bool,
-            open_think: bool,
-            finish_reason: &str,
-        ) -> &'static str {
+        fn legacy_fail_closed_message(grammar_violated: bool, finish_reason: &str) -> &'static str {
             if grammar_violated {
                 "grammar violation during speculative decode"
-            } else if open_think || finish_reason == "open_think" {
-                "open think span at end of generation (validation)"
             } else if finish_reason == "malformed_protocol" {
                 "malformed tool protocol"
             } else {
@@ -2288,37 +2320,15 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         }
 
         let cases = [
-            (
-                true,
-                false,
-                "stop",
-                "grammar violation during speculative decode",
-            ),
-            (
-                false,
-                true,
-                "stop",
-                "open think span at end of generation (validation)",
-            ),
-            (
-                false,
-                false,
-                "open_think",
-                "open think span at end of generation (validation)",
-            ),
-            (
-                false,
-                false,
-                "malformed_protocol",
-                "malformed tool protocol",
-            ),
-            (false, false, "length", "fail-closed speculative decode"),
+            (true, "stop", "grammar violation during speculative decode"),
+            (false, "malformed_protocol", "malformed tool protocol"),
+            (false, "length", "fail-closed speculative decode"),
         ];
 
         let _guard = begin_terminal_test("leg-fc", 500);
-        for (i, (grammar, open_think, reason, expected_msg)) in cases.iter().enumerate() {
+        for (i, (grammar, reason, expected_msg)) in cases.iter().enumerate() {
             assert_eq!(
-                legacy_fail_closed_message(*grammar, *open_think, reason),
+                legacy_fail_closed_message(*grammar, reason),
                 *expected_msg,
                 "case {i} message select"
             );
@@ -3364,3 +3374,279 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(!out.contains("\"finish_reason\":\"tool_calls\""));
         assert!(out.contains("\"attempt_id\":33"));
     }
+
+
+// ── Explicit think budget: Qwen4 AR and MTP force the same close ─────────
+
+/// Test-tokenizer ids: `\n` byte token 110, `</think>` 3, `<think>` 2,
+/// `<|im_end|>` 1.
+const NL: u32 = 110;
+const TEMPLATE_CLOSE_IDS: [u32; 4] = [NL, 3, NL, NL];
+
+/// A deterministic greedy "model": thinks through `think`, and once its
+/// history holds a `</think>` it answers `answer` then `<|im_end|>`. With
+/// `reopen`, the first token after a close re-opens `<think>` instead and
+/// it thinks forever. Out of thinking text, it ends the turn (EOS).
+fn scripted_next(tok: &Tokenizer, history: &[u32], think: &str, answer: &str, reopen: bool) -> u32 {
+    let think_ids = tok.encode(think);
+    let answer_ids = tok.encode(answer);
+    match history.iter().rposition(|&t| t == 3) {
+        Some(close_at) => {
+            let after = &history[close_at + 1..];
+            // Skip the close's own trailing newlines.
+            let body: Vec<u32> = after.iter().copied().skip_while(|&t| t == NL).collect();
+            if reopen {
+                if after.iter().all(|&t| t == NL) && after.len() >= 2 {
+                    return 2;
+                }
+                if body.first() == Some(&2) {
+                    return think_ids[(body.len() - 1) % think_ids.len()];
+                }
+            }
+            answer_ids.get(body.len()).copied().unwrap_or(1)
+        }
+        None => think_ids.get(history.len()).copied().unwrap_or(1),
+    }
+}
+
+struct BudgetRun {
+    tokens: Vec<u32>,
+    reasoning: String,
+    content: String,
+    finish_reason: &'static str,
+    jsonl: String,
+}
+
+/// The Qwen4 AR decode body over the scripted model: production producer
+/// and budget step; forced tokens run through the same commit path.
+fn run_ar_budget(
+    tok: &Tokenizer,
+    max_think: usize,
+    max_tokens: usize,
+    think: &str,
+    answer: &str,
+    reopen: bool,
+) -> BudgetRun {
+    let _guard = begin_terminal_test("tb-ar", 501);
+    set_active_attempt_id(501);
+    let mut producer = QwenArSemanticProducer::new("tb-ar", true);
+    let mut budget = hipfire_runtime::emit_text::ThinkBudget::new(max_think);
+    let mut forced = std::collections::VecDeque::new();
+    let (mut sink, mut conversation, mut streamed) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut seq_pos, mut generated, mut natural_stop) = (0usize, 0usize, false);
+    let mut stream_bytes = Vec::new();
+    while generated < max_tokens {
+        let token = forced
+            .pop_front()
+            .unwrap_or_else(|| scripted_next(tok, &streamed, think, answer, reopen));
+        let fed = stream_bytes.len();
+        tok.decode_token_bytes_into(token, &mut stream_bytes);
+        let filter_stop = producer
+            .commit_and_observe(
+                &mut sink,
+                &mut conversation,
+                &mut streamed,
+                &mut seq_pos,
+                token,
+                &stream_bytes[fed..],
+            )
+            .expect("classify");
+        generated += 1;
+        if filter_stop || token == 9 || tok.is_terminator(token) {
+            natural_stop = true;
+            break;
+        }
+        match qwen_ar_think_budget_step(&mut budget, &stream_bytes, true, tok) {
+            QwenArThinkBudgetAction::Continue => {}
+            QwenArThinkBudgetAction::Close(close) => forced.extend(close),
+            QwenArThinkBudgetAction::Stop => {
+                natural_stop = true;
+                break;
+            }
+        }
+    }
+    let (fin, content) = producer
+        .finish(&mut sink, generated >= max_tokens && !natural_stop)
+        .expect("finish");
+    let jsonl = String::from_utf8_lossy(&sink).into_owned();
+    let reasoning = parse_jsonl(&jsonl)
+        .iter()
+        .filter(|e| e["type"] == "reasoning")
+        .map(|e| e["text"].as_str().unwrap().to_string())
+        .collect();
+    BudgetRun {
+        tokens: streamed,
+        reasoning,
+        content,
+        finish_reason: fin.finish_reason,
+        jsonl,
+    }
+}
+
+/// The Qwen4 MTP emitter over the same scripted model (one token per step;
+/// acceptance width does not change what is committed).
+fn run_mtp_budget(
+    tok: &Tokenizer,
+    max_think: usize,
+    max_tokens: usize,
+    think: &str,
+    answer: &str,
+    reopen: bool,
+) -> BudgetRun {
+    let mut emit =
+        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx_template_think_close(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think,
+            max_tokens,
+            assistant_prefix: AssistantPrefix::OpenThink,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+    let mut events = Vec::new();
+    let mut forced = std::collections::VecDeque::new();
+    let mut generated = 0usize;
+    let mut semantic_stop = None;
+    while generated < max_tokens {
+        let token = forced
+            .pop_front()
+            .unwrap_or_else(|| scripted_next(tok, emit.streamed_tokens(), think, answer, reopen));
+        let outcome = if generated == 0 {
+            emit.begin(token)
+        } else {
+            emit.observe(token)
+        };
+        generated += 1;
+        events.extend(outcome.events);
+        if outcome.stop.is_some() {
+            semantic_stop = outcome.stop;
+            break;
+        }
+        forced.extend(emit.take_forced());
+    }
+    let tokens = emit.streamed_tokens().to_vec();
+    let finish = emit.finish();
+    events.extend(finish.events.clone());
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for event in events {
+        match event {
+            ClientEvent::Reasoning(text) => reasoning.push_str(&text),
+            ClientEvent::Token(text) => content.push_str(&text),
+            _ => {}
+        }
+    }
+    let hit_length = qwen_dflash_hit_length_cap(
+        generated,
+        max_tokens,
+        finish.decoded_eot,
+        semantic_stop.is_some(),
+    );
+    BudgetRun {
+        tokens,
+        reasoning,
+        content,
+        finish_reason: if hit_length { "length" } else { "stop" },
+        jsonl: String::new(),
+    }
+}
+
+#[test]
+fn think_budget_splices_template_close_then_answer_ar_matches_mtp() {
+    let tok = test_tokenizer();
+    assert_eq!(
+        tok.encode(hipfire_runtime::emit_text::QWEN_TEMPLATE_THINK_CLOSE),
+        TEMPLATE_CLOSE_IDS
+    );
+    let think = "abcdefghijklmnop";
+    let ar = run_ar_budget(&tok, 5, 64, think, "Yes.", false);
+    // Five think tokens (the first generated token counts), then exactly
+    // the template close, then the model's own answer and end of turn.
+    let mut want = tok.encode("abcde");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.extend(tok.encode("Yes."));
+    want.push(1);
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.content, "Yes.");
+    assert!(ar.reasoning.starts_with("abcde"), "{:?}", ar.reasoning);
+    assert_eq!(ar.finish_reason, "stop");
+    assert!(!ar.jsonl.contains("\"type\":\"error\""), "{}", ar.jsonl);
+    assert!(!ar.jsonl.contains("</think>"), "{}", ar.jsonl);
+
+    let mtp = run_mtp_budget(&tok, 5, 64, think, "Yes.", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.reasoning, ar.reasoning);
+    assert_eq!(mtp.content, ar.content);
+    assert_eq!(mtp.finish_reason, ar.finish_reason);
+}
+
+#[test]
+fn think_budget_of_one_closes_after_the_first_token_on_both_routes() {
+    let tok = test_tokenizer();
+    let ar = run_ar_budget(&tok, 1, 64, "abc", "Ok", false);
+    let mut want = tok.encode("a");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.extend(tok.encode("Ok"));
+    want.push(1);
+    assert_eq!(ar.tokens, want);
+    let mtp = run_mtp_budget(&tok, 1, 64, "abc", "Ok", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.content, "Ok");
+}
+
+#[test]
+fn think_budget_unset_or_unreached_leaves_the_stream_alone() {
+    let tok = test_tokenizer();
+    // The model closes on its own after 9 think tokens and answers; a
+    // budget it never reaches and no budget give the identical stream and
+    // wire bytes.
+    let think = "abcdefgh\n</think>";
+    let mut natural = tok.encode(think);
+    natural.extend(tok.encode("Done."));
+    natural.push(1);
+    let plain = run_ar_budget(&tok, 0, 64, think, "Done.", false);
+    assert_eq!(plain.tokens, natural);
+    assert_eq!(plain.content, "Done.");
+    for budget in [0, 10, 1000] {
+        let ar = run_ar_budget(&tok, budget, 64, think, "Done.", false);
+        assert_eq!(ar.jsonl, plain.jsonl, "budget {budget}");
+        let mtp = run_mtp_budget(&tok, budget, 64, think, "Done.", false);
+        assert_eq!(mtp.tokens, natural, "budget {budget}");
+        assert_eq!(mtp.content, "Done.");
+    }
+}
+
+#[test]
+fn think_budget_spent_again_after_reopen_stops_with_reasoning_only() {
+    let tok = test_tokenizer();
+    let ar = run_ar_budget(&tok, 3, 64, "abcdef", "", true);
+    // The re-opening `<think>` counts as the first token of the new span.
+    let mut want = tok.encode("abc");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.push(2);
+    want.extend(tok.encode("ab"));
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.finish_reason, "stop");
+    assert!(!ar.jsonl.contains("\"type\":\"error\""), "{}", ar.jsonl);
+    let mtp = run_mtp_budget(&tok, 3, 64, "abcdef", "", true);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.reasoning, ar.reasoning);
+    assert_eq!(mtp.finish_reason, "stop");
+}
+
+#[test]
+fn think_budget_close_clipped_by_max_tokens_is_length() {
+    let tok = test_tokenizer();
+    // Budget hit on token 4 of 6: only `\n` + `</think>` of the close fit.
+    let ar = run_ar_budget(&tok, 4, 6, "abcdefgh", "Yes.", false);
+    let mut want = tok.encode("abcd");
+    want.extend(&TEMPLATE_CLOSE_IDS[..2]);
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.finish_reason, "length");
+    let mtp = run_mtp_budget(&tok, 4, 6, "abcdefgh", "Yes.", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.finish_reason, "length");
+}

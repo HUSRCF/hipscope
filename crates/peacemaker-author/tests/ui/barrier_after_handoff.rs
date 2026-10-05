@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // The reviewer's handoff counterexample: after the handoff only the reading
 // waves run, so a barrier there would wait on writers that have left. The
 // reader continuation is wave scope and has no barrier.

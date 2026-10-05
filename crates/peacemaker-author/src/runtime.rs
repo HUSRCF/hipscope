@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Runtime-checked driver: the typed core's rules with dynamic region ids
 //! (R6: the standalone `.rip` front end elaborates into this, because it
 //! cannot spell `LdsRegion<R, Writing>` in source text).

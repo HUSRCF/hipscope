@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Integer bit-level round-to-nearest-even conversions, independent of host FP mode.
 pub fn f16_to_f32(h:u16)->u32 {
     let sign=u32::from(h&0x8000)<<16;let exp=(h>>10)&31;let frac=u32::from(h&1023);

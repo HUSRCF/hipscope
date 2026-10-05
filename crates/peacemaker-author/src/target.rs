@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Targets are types. A kernel names its target once (`Workgroup<Gfx1151, _>`)
 //! and every capability it uses is a trait bound that only targets with a
 //! certified lowering implement, so a missing capability is a rustc error

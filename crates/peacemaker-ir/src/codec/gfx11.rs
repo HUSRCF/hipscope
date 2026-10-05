@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! RDNA3/RDNA3.5 codec: separate target opcode tables, shared typed field codec.
 use smallvec::SmallVec;
 use crate::inst::{Arch, Inst};

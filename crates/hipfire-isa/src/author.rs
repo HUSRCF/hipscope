@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `Builder` as the lowering backend of the typed core
 //! (`peacemaker_author::Workgroup<T, Builder>`). Every request maps onto the
 //! builder call a hand-written kernel would make, in the same order, so a

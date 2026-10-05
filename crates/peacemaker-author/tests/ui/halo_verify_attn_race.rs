@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Halo VerifyAttn (gfx1151) `6f708aef3`: the K tile's `ds_store_b128` at the
 // loop tail (`k_stage`, attention_verify_wmma.gfx1151.hip:270) reaches the
 // loop-head `s_barrier` (:248) on the back edge with no `s_waitcnt lgkmcnt`.

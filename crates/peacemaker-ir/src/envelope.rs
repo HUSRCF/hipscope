@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Pure-data ELF and HIP bundle envelope. Kernel code, descriptors, and metadata maps are
 //! holes owned by `Program::kernels`; the lifter parses and re-emits this structure.
 

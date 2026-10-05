@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // A barrier under wave-dependent control: the branch body sees only a
 // `Wave`, which has no barrier.
 use peacemaker_author::{Backend, Gfx1100, Workgroup};

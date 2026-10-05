@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! A1/A3/A4 (railgun design §1.5): kernarg pointer provenance, per-argument
 //! access summaries, read-cache classes and scalar kernarg roles for one
 //! lifted kernel, as [`KernargFacts`].

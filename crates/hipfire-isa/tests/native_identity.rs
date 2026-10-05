@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The native code-object writer against the ROCm oracle it replaces: every
 //! PM-emitted kernel symbol on gfx1100, gfx1151 and gfx1201, alone and in its
 //! product module, must link to the code object `llvm-mc` + `ld.lld -shared`

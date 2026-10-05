@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Parser gate tests: every canonical KT48 line parses back to the
 //! instruction the codec decoded (semantics plus re-encoding), and the `.s`
 //! source structure carries labels/directives for `lift_text`.

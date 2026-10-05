@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! f32 -> BF16 rounding, as two named contracts. Both round finite values to
 //! nearest-even; they differ on non-finite input, so the bytes a kernel
 //! stores for a NaN depend on which one it names, and its oracle must use the

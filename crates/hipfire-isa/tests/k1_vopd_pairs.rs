@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use hipfire_isa::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
 use hipfire_isa::kernels::iu4_k1::{emit_fold, FoldRegisters, Variant};
 use hipfire_isa::reg::Live;

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The typed core over the builder: a publish/read/rotate double buffer
 //! written against `peacemaker_author` emits exactly what the same program
 //! emits through the untyped builder (instructions, waits and barrier

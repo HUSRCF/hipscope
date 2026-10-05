@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Corpus lookup and the CI check over a one-object corpus built from a real
 //! code object and a real railgun-cert receipt. CPU only.
 use std::path::{Path, PathBuf};

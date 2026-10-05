@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The railgun copy kernels (`kernels/src/railgun_copy.hip`, milestone MC)
 //! through the certifier, on every arch railgun certifies them for. Both must
 //! be A1-Proven with exact modes: `railgun_copy` reads `src` and writes

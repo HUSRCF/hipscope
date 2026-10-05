@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Execution scopes, condition handles and loops (design §4.6-§4.7).
 //!
 //! - `Workgroup`: workgroup-uniform control. Barriers, LDS layout,

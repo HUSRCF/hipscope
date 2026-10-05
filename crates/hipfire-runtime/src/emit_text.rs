@@ -35,6 +35,91 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
+/// The close a Qwen chat template frames reasoning with (`<think>\n…\n</think>\n\n`).
+/// Spliced when an explicit `max_think_tokens` budget runs out on the Qwen4
+/// routes, so the model continues from the exact text it was trained to answer
+/// after (vLLM's `thinking_token_budget` forces the parser's end marker the same
+/// way). For Flash-Next this encodes to `\n` 198, `</think>` 248069, `\n\n` 271.
+pub const QWEN_TEMPLATE_THINK_CLOSE: &str = "\n</think>\n\n";
+
+/// What [`ThinkBudget::observe`] asks the decode loop to do after a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkBudgetStep {
+    /// Keep decoding.
+    Continue,
+    /// The budget ran out inside the think span: splice the close text next.
+    ForceClose,
+    /// The budget ran out again in a span re-opened after the forced close:
+    /// stop the turn (no second splice, so a model that keeps re-opening
+    /// `<think>` cannot run the turn out).
+    Exhausted,
+}
+
+/// Explicit `max_think_tokens` accounting shared by the AR and speculative
+/// producers, so both force the close after the same token.
+///
+/// Every committed token that leaves the stream inside a think span counts;
+/// entering a span starts the count over. When the count reaches the budget the
+/// first time, the caller splices the close and reports how many tokens it
+/// queued through [`Self::closing`]; those tokens are not counted (the leading
+/// `\n` of [`QWEN_TEMPLATE_THINK_CLOSE`] is still inside the span).
+#[derive(Debug, Clone, Default)]
+pub struct ThinkBudget {
+    max: usize,
+    count: usize,
+    prev_in_think: bool,
+    force_closed: bool,
+    closing: usize,
+}
+
+impl ThinkBudget {
+    /// `max == 0` is uncapped: [`Self::observe`] always continues.
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a budget is set (callers skip the think scan otherwise).
+    pub fn enabled(&self) -> bool {
+        self.max > 0
+    }
+
+    /// Account one committed token; `in_think` is the stream state after it.
+    pub fn observe(&mut self, in_think: bool) -> ThinkBudgetStep {
+        if self.max == 0 {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.closing > 0 {
+            self.closing -= 1;
+            self.prev_in_think = in_think;
+            return ThinkBudgetStep::Continue;
+        }
+        if in_think && !self.prev_in_think {
+            self.count = 0;
+        }
+        if in_think {
+            self.count += 1;
+        }
+        self.prev_in_think = in_think;
+        if !in_think || self.count < self.max {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.force_closed {
+            return ThinkBudgetStep::Exhausted;
+        }
+        self.force_closed = true;
+        ThinkBudgetStep::ForceClose
+    }
+
+    /// The caller queued `tokens` close tokens after a
+    /// [`ThinkBudgetStep::ForceClose`]; skip them in the count.
+    pub fn closing(&mut self, tokens: usize) {
+        self.closing = tokens;
+    }
+}
+
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
@@ -833,8 +918,11 @@ fn extract_qwen_xml_tool_call_inner(
         }
         rest = &rest[key_end + 1..];
         let value_end = rest.find("</parameter>")?;
-        let value = rest[..value_end].trim();
-        arguments.insert(key.to_string(), coerce_qwen_xml_parameter(value));
+        let value = strip_template_newlines(&rest[..value_end]);
+        arguments.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         rest = &rest[value_end + "</parameter>".len()..];
     }
     // Strict: after all parameters, only whitespace may remain before </function>.
@@ -867,19 +955,19 @@ fn extract_qwen_xml_tool_call_inner(
     Some((name.to_string(), serde_json::Value::Object(arguments)))
 }
 
-/// Match the CLI's native-XML value coercion: JSON primitives, objects, and
-/// arrays retain their types; ordinary text stays a string.
-fn coerce_qwen_xml_parameter(value: &str) -> serde_json::Value {
-    let typed = matches!(value, "true" | "false" | "null")
-        || value.parse::<f64>().is_ok()
-        || (value.starts_with('{') && value.ends_with('}'))
-        || (value.starts_with('[') && value.ends_with(']'));
-    if typed {
-        if let Ok(parsed) = serde_json::from_str(value) {
-            return parsed;
-        }
-    }
-    serde_json::Value::String(value.to_string())
+/// Strip the formatting newline the Qwen chat template puts around every
+/// parameter value (`<parameter=K>\nVALUE\n</parameter>`): at most one leading
+/// and one trailing `\n`, nothing else. All other whitespace belongs to the
+/// value (a file's final newline, a patch's leading indent). Matches vLLM's
+/// Qwen3-Coder/XML parser (`trim_one_wrapping_newline`,
+/// `rust/src/parser/src/tool/qwen_coder.rs:298-301` @ v0.31.0).
+///
+/// Values stay strings here. The parser has no tool schemas; the serve
+/// gateway types them against the request's declared schema, so a `string`
+/// parameter keeps the model's exact text even when it looks like JSON.
+pub(crate) fn strip_template_newlines(value: &str) -> &str {
+    let value = value.strip_prefix('\n').unwrap_or(value);
+    value.strip_suffix('\n').unwrap_or(value)
 }
 
 /// Relaxed name extraction: matches `"name": "X"` (or `'name': 'X'`,
@@ -1124,13 +1212,15 @@ mod tests {
     }
 
     #[test]
-    fn coerces_qwen_native_xml_parameter_types() {
-        let emitted = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
+    fn qwen_xml_values_stay_untyped_strings() {
+        // No schema at parse time: typing is the serve gateway's job.
+        let emitted = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n<parameter=missing>null</parameter>\n</function>\n</tool_call>";
         let calls = extract_tool_calls_from_text(emitted);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["count"], 42);
-        assert_eq!(calls[0].arguments["enabled"], true);
-        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+        assert_eq!(calls[0].arguments["count"], "42");
+        assert_eq!(calls[0].arguments["enabled"], "true");
+        assert_eq!(calls[0].arguments["options"], "{\"mode\":\"fast\"}");
+        assert_eq!(calls[0].arguments["missing"], "null");
     }
 
     #[test]
@@ -1139,7 +1229,96 @@ mod tests {
         let calls = extract_tool_calls_from_text(emitted);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "write_file");
-        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "{\"name\":\"wrong\",\"arguments\":{\"x\":1}}"
+        );
+    }
+
+    /// HA-12 (hermesagent20 p1 `http/00201`): `skill_manage` writes a Python
+    /// file whose verifier wants 88 bytes ending in `\n`. The call is rebuilt
+    /// in the template's `<parameter=K>\nVALUE\n</parameter>` shape from the
+    /// captured arguments; the value's own final newline sits before the
+    /// template's.
+    const HA12_CALL: &str = "<tool_call>\n<function=skill_manage>\n<parameter=action>\nwrite_file\n</parameter>\n<parameter=name>\nrelease-check\n</parameter>\n<parameter=file_path>\nscripts/validate_release.py\n</parameter>\n<parameter=file_content>\ndef validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n\n</parameter>\n</function>\n</tool_call>";
+    const HA12_FILE: &str =
+        "def validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n";
+
+    #[test]
+    fn qwen_xml_ha12_file_keeps_trailing_newline() {
+        assert_eq!(HA12_FILE.len(), 88);
+        let calls = extract_tool_calls_from_text(HA12_CALL);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["file_content"], HA12_FILE);
+        assert_eq!(calls[0].arguments["action"], "write_file");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "scripts/validate_release.py"
+        );
+        // Streaming router: byte-split anywhere, same exact bytes.
+        for split in [1, 97, 300, HA12_CALL.len() - 30] {
+            let (vis, routed, term) = feed(&[&HA12_CALL[..split], &HA12_CALL[split..]]);
+            assert_eq!(term, Terminal::Ok);
+            assert_eq!(vis, "");
+            assert_eq!(routed.len(), 1);
+            call_eq(&routed[0], &calls[0]);
+        }
+    }
+
+    /// HA-17 (hermesagent20 p1 `http/00313-00324`): the sub-agent wrote
+    /// `{"sum": 10}` (with a space) and got `{"sum":10}` back 14 times.
+    #[test]
+    fn qwen_xml_ha17_json_looking_string_is_verbatim() {
+        let write = "<tool_call>\n<function=write_file>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=content>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>";
+        let patch = "<tool_call>\n<function=patch>\n<parameter=mode>\nreplace\n</parameter>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=old_string>\n{\"sum\":10}\n</parameter>\n<parameter=new_string>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>";
+        for (text, key, want) in [
+            (write, "content", "{\"sum\": 10}"),
+            (patch, "old_string", "{\"sum\":10}"),
+            (patch, "new_string", "{\"sum\": 10}"),
+        ] {
+            let calls = extract_tool_calls_from_text(text);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].arguments[key], want);
+            let (_, routed, term) = feed(&[text]);
+            assert_eq!(term, Terminal::Ok);
+            assert_eq!(routed[0].arguments[key], want);
+        }
+    }
+
+    #[test]
+    fn qwen_xml_strips_exactly_one_template_newline_each_side() {
+        let cases: &[(&str, &str)] = &[
+            // Template-shaped value: both formatting newlines go.
+            ("\nplain\n", "plain"),
+            // Inner and extra edge whitespace is value content.
+            ("\n    indented();\n\n", "    indented();\n"),
+            ("\n\nblank first line\n", "\nblank first line"),
+            ("  spaces  ", "  spaces  "),
+            ("\n\ttab\t\n", "\ttab\t"),
+            // CRLF: only `\n` is a template newline (vLLM parity), so the
+            // `\r`s stay.
+            ("\r\nline\r\n", "\r\nline\r"),
+            ("\nline\r\n\n", "line\r\n"),
+            // Empty values.
+            ("", ""),
+            ("\n", ""),
+            ("\n\n", ""),
+            ("\n\n\n", "\n"),
+            ("   ", "   "),
+            // Nested JSON in a string param keeps its spacing.
+            ("\n{\"a\": {\"b\": [1, 2]}}\n", "{\"a\": {\"b\": [1, 2]}}"),
+        ];
+        for (raw, want) in cases {
+            let text = format!(
+                "<tool_call>\n<function=f>\n<parameter=v>{raw}</parameter>\n</function>\n</tool_call>"
+            );
+            let calls = extract_tool_calls_from_text(&text);
+            assert_eq!(calls.len(), 1, "raw={raw:?}");
+            assert_eq!(calls[0].arguments["v"], *want, "legacy raw={raw:?}");
+            let (_, routed, term) = feed(&[&text]);
+            assert_eq!(term, Terminal::Ok, "raw={raw:?}");
+            assert_eq!(routed[0].arguments["v"], *want, "router raw={raw:?}");
+        }
     }
 
     #[test]
@@ -1372,20 +1551,23 @@ mod tests {
     }
 
     #[test]
-    fn router_qwen_xml_type_coercion_and_name_priority() {
+    fn router_qwen_xml_untyped_values_and_name_priority() {
         let a = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
         let (vis, calls, term) = feed(&[a]);
         assert_eq!(term, Terminal::Ok);
-        assert_eq!(calls[0].arguments["count"], 42);
-        assert_eq!(calls[0].arguments["enabled"], true);
-        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+        assert_eq!(calls[0].arguments["count"], "42");
+        assert_eq!(calls[0].arguments["enabled"], "true");
+        assert_eq!(calls[0].arguments["options"], "{\"mode\":\"fast\"}");
         assert_no_protocol_leak(&vis);
 
         let b = "<tool_call><function=write_file><parameter=content>{\"name\":\"wrong\",\"arguments\":{\"x\":1}}</parameter></function></tool_call>";
         let (_, calls, term) = feed(&[b]);
         assert_eq!(term, Terminal::Ok);
         assert_eq!(calls[0].name, "write_file");
-        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "{\"name\":\"wrong\",\"arguments\":{\"x\":1}}"
+        );
     }
 
     #[test]

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: split-barrier pairing, gfx11 full barriers, and DS drain checks.
 //!
 //! Gfx11 `s_barrier` is one combined arrival and wait for the live waves of

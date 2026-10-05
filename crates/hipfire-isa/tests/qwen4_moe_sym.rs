@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen4 symmetric IU4 MoE builder family (gfx1151 + gfx1201).
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::qwen4_moe_sym::{self, Kind, Spec};

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // The Halo fix (`1ba84942a`): drain the tile's LDS store before the
 // loop-head barrier, exactly one `s_waitcnt lgkmcnt(0)` per trip.
 use peacemaker_author::{rotate, trace::Trace, Backend, Gfx1151, Ring, Workgroup};

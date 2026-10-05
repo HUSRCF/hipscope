@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #![forbid(unsafe_code)]
 //! PM kernel language, milestone M0: the typed core
 //! (`/home/kaden/qcal/release-0.4.1/pm-kernel-lang-design.md` §4, §12 M0).

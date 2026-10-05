@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The runtime-checked driver (`runtime::Driver`) against the typed core:
 //! the two shipped LDS races are rejected dynamically (twins of
 //! `tests/ui/halo_verify_attn_race.rs` and `fa2_mailbox_race.rs`), their

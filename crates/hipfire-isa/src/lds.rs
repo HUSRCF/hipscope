@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use serde::Serialize;
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize)] pub enum SlotState {Free,Publishing,Published,Reading}
 #[derive(Clone,Debug,PartialEq,Serialize)] pub struct LdsSlot {pub name:String,pub base:u32,pub len:u32,pub state:SlotState}

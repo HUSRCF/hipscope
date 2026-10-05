@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The two shipped LDS races as rustc errors (design §9), each with a
 //! positive control that compiles and runs on the reference backend.
 #[test]

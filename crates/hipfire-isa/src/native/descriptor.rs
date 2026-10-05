@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `.amdhsa_kernel` directives → the 64-byte kernel descriptor (AMDGPU
 //! code object v6, gfx11/gfx12; LLVM `AMDGPUUsage`, "Kernel Descriptor").
 //!

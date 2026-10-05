@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #![forbid(unsafe_code)]
 //! An imported `Region<In, Out>` must take ownership of typed live-in `V<N>`/`S<N>`
 //! ranges and LDS slot tokens, then return its live-out handles. The seam carries

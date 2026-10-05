@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Builder-emitted gfx1151 (RDNA3.5, wave32) MQ4V2 x block_i4_128 gate/up
 //! SiLU GEMM on an M512 x N128 tile: the retile of the certified V2B SiLU
 //! entry (`iu4_v2b.rs`) that puts one whole 256-feature `h` group of each

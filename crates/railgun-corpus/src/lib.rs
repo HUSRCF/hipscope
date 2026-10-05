@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! railgun-corpus: the runtime's read-only view of railgun fact records
 //! (railgun design §2.5, D1, D12).
 //!

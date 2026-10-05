@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use super::{ActScale, Builder, END, EPILOGUE, Epi, Spec, gdn_epilogue, vo, vload};
 use crate::kernels::common::{lit, mem, op, s, sop, sr, v, vr};
 use crate::{insn::MemoryClass, kernels::iu4_gemm::region::{self, Binding, Region}};

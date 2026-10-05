@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C4: clause windows and path-sensitive delay-ALU facts.
 //!
 //! Clause rule (core.md §2.8, §5.2): an `s_clause N` window is the N+1

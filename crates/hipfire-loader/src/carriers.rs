@@ -286,7 +286,8 @@ impl Carrier for Qwen4Carrier {
         &self,
         ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        Ok(Qwen35Emit::from_ctx(ctx))
+        // Same close the Qwen4 AR producer splices on a spent think budget.
+        Ok(Qwen35Emit::from_ctx_template_think_close(ctx))
     }
 
     fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {

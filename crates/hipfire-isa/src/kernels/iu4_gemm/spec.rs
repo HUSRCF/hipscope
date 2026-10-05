@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Typed variant axes of the builder-emitted MQ4V2 x int4 GEMM family and the
 //! geometry every generator derives from them (plan §3.1-§3.5).
 use crate::{Arch, KernargLayout, kernels::iu4_k1::Variant};

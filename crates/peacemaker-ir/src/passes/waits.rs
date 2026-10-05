@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: per-counter weighted wait replay across the CFG.
 //!
 //! CFG-aware port of `hipfire-isa/src/ledger_replay.rs` onto typed streams,
