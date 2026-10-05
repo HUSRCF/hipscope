@@ -461,6 +461,55 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         );
     }
 }
+
+#[test]
+fn qwen4_sampled_mtp_route_needs_temp_verify_and_neutral_penalties() {
+    let sampled = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        temp: 0.7,
+        user_explicit_sampling: true,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::Qwen4Spec
+    );
+    // min_p is ignored by the Qwen4 AR sampler, so it does not demote.
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            min_p: Some(0.05),
+            ..sampled
+        }),
+        GenerationRoute::Qwen4Spec
+    );
+    for refused in [
+        GenerationRouteInputs {
+            supports_temp_swor: false,
+            ..sampled
+        },
+        GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..sampled
+        },
+        GenerationRouteInputs {
+            temp_spec_env_off: true,
+            ..sampled
+        },
+        GenerationRouteInputs {
+            kv_adaptive: true,
+            ..sampled
+        },
+    ] {
+        assert_eq!(
+            select_generation_route(&refused),
+            GenerationRoute::Qwen4Ar,
+            "sampled Qwen4 request must stay on AR: {refused:?}"
+        );
+    }
+}
 #[test]
 fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
     // Native Qwen4 MTP replays the whole prefix cold.

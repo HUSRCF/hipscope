@@ -1764,6 +1764,18 @@ pub static FIELDS: &[ConfigField] = &[
         "MTP + ngram-mod composition for greedy (temperature 0), thinking-off requests on native MTP. on arms it; off and auto keep MTP alone (auto stays off: greedy text differs from MTP-only on gfx1201)."
     ),
     field!(
+        "speculation.mtp_sampled",
+        "mtp_sampled",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        false,
+        true,
+        Some("HIPFIRE_MTP_SAMPLED"),
+        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. Off routes sampled requests to AR."
+    ),
+    field!(
         "speculation.mode",
         "speculation",
         Speculation,
@@ -4004,6 +4016,13 @@ pub fn mtp_ngram_enabled() -> bool {
 }
 fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "on"))
+}
+/// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
+/// `HIPFIRE_MTP_SAMPLED`, default off). On, the Qwen4 MTP drafter verifies
+/// temperature > 0 requests by speculative rejection sampling instead of
+/// leaving them to AR.
+pub fn mtp_sampled_enabled() -> bool {
+    developer_bool("HIPFIRE_MTP_SAMPLED", false)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk

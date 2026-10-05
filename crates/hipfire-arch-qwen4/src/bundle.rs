@@ -24,6 +24,7 @@ use crate::weights::{
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
+use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
 use crate::state::Qwen4StateFormat;
@@ -785,6 +786,72 @@ impl Qwen4Bundle {
         self.mtp
             .as_ref()
             .map_or(f32::INFINITY, |mtp| mtp.draft.margin())
+    }
+
+    /// Row `row` of the last speculative forward's logits as `spec`'s
+    /// truncated distribution. `host` and `scratch` are reused buffers.
+    pub(crate) fn spec_row_dist(
+        &self,
+        gpu: &Gpu,
+        row: usize,
+        spec: SampleSpec,
+        host: &mut Vec<f32>,
+        scratch: &mut Vec<(u32, f32)>,
+        out: &mut SparseDist,
+    ) -> Result<(), BundleError> {
+        let vocab = self.config.vocab_size;
+        let logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        let offset = row
+            .checked_mul(vocab)
+            .filter(|offset| offset + vocab <= logits.numel())
+            .ok_or_else(|| {
+                BundleError::Forward(format!("Qwen4 spec logit row {row} is outside capacity"))
+            })?;
+        gpu.download_f32_into(&logits.sub_offset(offset, vocab), host)
+            .map_err(BundleError::Hip)?;
+        out.build_from_logits(host, spec, scratch)
+            .map_err(BundleError::Forward)
+    }
+
+    /// The last MTP prediction's draft distribution under `spec`: its 8
+    /// re-scored candidates' exact logits, or the whole draft logit row when
+    /// the draft head does not re-score.
+    pub(crate) fn mtp_draft_dist(
+        &self,
+        gpu: &Gpu,
+        spec: SampleSpec,
+        host: &mut Vec<f32>,
+        scratch: &mut Vec<(u32, f32)>,
+        out: &mut SparseDist,
+    ) -> Result<(), BundleError> {
+        let draft = &self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .draft;
+        let vocab = self.config.vocab_size as u32;
+        match draft.rescored_candidates() {
+            Some(candidates) => {
+                scratch.clear();
+                scratch.extend(
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|&(token, _)| token < vocab),
+                );
+                out.build_from_candidates(scratch, spec)
+            }
+            None => {
+                gpu.download_f32_into(draft.logits(), host)
+                    .map_err(BundleError::Hip)?;
+                out.build_from_logits(host, spec, scratch)
+            }
+        }
+        .map_err(BundleError::Forward)
     }
 
     pub(crate) fn mtp_advance_token(

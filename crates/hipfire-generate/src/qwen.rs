@@ -3667,8 +3667,9 @@ pub fn generate_spec(
     max_tokens: usize,
     emit_req: SpecEmitRequest,
     // Request sampling temperature. >0 only reaches here for speculators that
-    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR); greedy
-    // drafters ignore it. The daemon's routing gate enforces that invariant.
+    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR, sampled
+    // MTP); greedy drafters ignore it. The daemon's routing gate enforces that
+    // invariant.
     temp: f32,
 ) -> Option<SpecRun> {
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.

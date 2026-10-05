@@ -4769,6 +4769,18 @@ impl Gpu {
         Ok(data)
     }
 
+    /// [`Self::download_f32`] into a caller-owned buffer (resized to the
+    /// tensor), so a per-row reader reuses one host allocation.
+    pub fn download_f32_into(&self, tensor: &GpuTensor, out: &mut Vec<f32>) -> HipResult<()> {
+        self.bind_thread()?;
+        let numel = tensor.numel();
+        out.resize(numel, 0.0);
+        // SAFETY: `out` holds exactly `numel` f32s; any byte pattern is a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, numel * 4) };
+        self.hip.memcpy_dtoh(bytes, &tensor.buf)
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///

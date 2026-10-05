@@ -83,6 +83,7 @@ pub mod spec;
 
 pub mod ngram_mod;
 pub mod spec_ngram;
+pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
