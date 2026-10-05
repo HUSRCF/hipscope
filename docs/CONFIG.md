@@ -367,19 +367,24 @@ sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
 recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
 arch, `fp32` through the `state_quant` load parameter.
 
-| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other arches |
-|---|---|---|
-| `auto` / unset | `fp8` | `bf16` |
-| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same |
-| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused |
-| anything else (`q8`, `fwhtN`, `f16`, …) | refused | refused |
+| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other gfx11/gfx12 | other arches |
+|---|---|---|---|
+| `auto` / unset | `fp8` | `bf16` | `bf16` |
+| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same | same |
+| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | refused |
+| `q8` (opt-in) | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same | refused |
+| anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused |
 
 `auto` picks fp8 only on exact gfx1201 and only for a head geometry the
 kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
-otherwise it stays `bf16`. The native MTP layer keeps the exact state. On
-Flash-Next, fp8 cuts each trunk QSA layer's context state from 4,736 to
-1,352 bytes per token, and the Q8 GDN state is 3.88× smaller than F32;
-`memory.max_seq` goes up to the native 262,144.
+otherwise it stays `bf16`. `auto` never picks `q8`; it needs head_dim 256.
+The native MTP layer keeps the exact state. On Flash-Next, each trunk QSA
+layer's context state is 4,736 bytes per token at `bf16`, 1,352 at fp8 and
+1,408 at q8 (12 layers at 262,144 tokens: 14,208, 4,056 and 4,224 MiB). The
+Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
+native 262,144. Index keys hold the same values in every format, so
+selection is unchanged; only the attention over the selected K/V rows sees
+the quantization.
 
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick

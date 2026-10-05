@@ -36,7 +36,7 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
 /// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
 /// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
-/// the F32 state, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// the F32 and q8 states, gfx1201 on the fp8 state.  Not bit-exact against the hg4
 /// kernel; admitted because its error against an f64 reference is no worse
 /// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
 /// route.  Read once.
@@ -4252,7 +4252,8 @@ fn indexed_attention_attention_batch_impl(
 /// head_dim 256 in four-head KV groups, and every row's selection is its
 /// whole causal window: the budget covers every visible block and the
 /// capacity every visible token (indexed_attention_select then emits all of
-/// them). Only F32 caches take this route (fp8 is gfx12-only).
+/// them). Only F32 caches take this route; q8 caches take the gathered route,
+/// whose per-call F16 convert dequantizes them (fp8 is gfx12-only).
 fn qsa_dense_wmma_applies(
     gpu: &Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
