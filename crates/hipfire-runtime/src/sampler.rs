@@ -44,7 +44,7 @@ use rdna_compute::{Gpu, GpuTensor};
 /// them via `sampler::` so new code has a single import path.
 pub use crate::llama::{
     apply_ngram_block, apply_repeat_penalty, apply_repeat_penalty_candidates,
-    apply_special_token_attractor_block, apply_unclosed_attractor_block, argmax,
+    apply_special_token_attractor_block, apply_unclosed_attractor_block, argmax, sample_top_k_p,
     sample_top_p as sample_top_p_cpu, sample_top_p_from_candidates, sampler_rng_restore,
     sampler_rng_snapshot, SamplingConfig,
 };
@@ -224,15 +224,17 @@ pub fn sample(
     tok
 }
 
-/// CPU-only fallback: same math as [`sample`] but operates on a host
-/// `logits` slice. Used by the VL path (`generate_vl` in daemon.rs), where
-/// the argmax/top-p selection runs after CPU-side policy mutations that have
-/// no GPU equivalent. Callers that want a positional n-gram ban apply
-/// [`llama::apply_ngram_block`] before calling this function.
+/// CPU-only fallback: same policy as [`sample`] but operates on a host
+/// `logits` slice. Used by the Qwen4 AR producer, the VL path, and the
+/// grammar-active Qwen3.5 branches, where the argmax/top-p selection runs
+/// after CPU-side policy mutations that have no GPU equivalent. Callers that
+/// want a positional n-gram ban apply [`llama::apply_ngram_block`] before
+/// calling this function.
 ///
-/// This is a thin wrapper over `llama::apply_repeat_penalty` +
-/// `llama::sample_top_p` that exists so call sites have one import
-/// path; the math is unchanged.
+/// Penalties and blocked tokens, then [`llama::sample_top_k_p`], which honours
+/// `cfg.top_k` and `cfg.min_p` with the GPU kernel's semantics. Both `None`
+/// (and `top_k == Some(20)`, `min_p == Some(0.0)`) reproduce the legacy
+/// top-20 nucleus byte-for-byte.
 pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u32 {
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         llama::apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
@@ -259,7 +261,7 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
             logits[tok as usize] = f32::NEG_INFINITY;
         }
     }
-    llama::sample_top_p(logits, cfg.temperature, cfg.top_p)
+    llama::sample_top_k_p(logits, cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p)
 }
 
 /// Compute the unclosed-opener attractor blocked-token list (#111).
