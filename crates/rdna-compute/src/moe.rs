@@ -1809,7 +1809,7 @@ impl Gpu {
         round_logits: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // `HIPFIRE_QWEN4_ROUTER_FAST` (exact gfx1151): eager batched calls take
+        // `HIPFIRE_QWEN4_ROUTER_FAST` (exact gfx1151 / gfx1201): eager batched calls take
         // the wave-per-token kernel, bytewise the same outputs; decode (one
         // token), recording and graph capture keep the incumbent symbol.
         let fast = tokens > 1

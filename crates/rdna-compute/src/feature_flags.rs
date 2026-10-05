@@ -74,17 +74,19 @@ pub struct FeatureFlags {
     /// for gfx1151, off elsewhere.
     pub qwen4_hc_up_tile: bool,
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
-    /// for gfx1151, off elsewhere.
+    /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
     /// MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): combine + shared fold + HC
     /// write + the next HC read's norm/gate in one row kernel; default on
     /// for gfx1151, off elsewhere.
     pub qwen4_hc_row_fold: bool,
     /// Wave-per-token Qwen4 E512/top-10 prefill router
-    /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151, off elsewhere.
+    /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
+    /// elsewhere.
     pub qwen4_router_fast: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
-    /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151, off elsewhere.
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
+    /// elsewhere.
     pub qwen4_ple_fuse: bool,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
     /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
@@ -591,8 +593,13 @@ impl FeatureFlags {
         let is_gfx906 = arch == "gfx906";
         // The bytewise-identical Halo hyper units (H5 GDN conv+Q/K norm, H4
         // HC fusion level 3, H3 HC up tile, H8a combine zero-init) default on
-        // for exact gfx1151 only; gfx1201 keeps them opt-in.
+        // for exact gfx1151 only; gfx1201 keeps the ones that hook into its
+        // opt-in F16 WMMA route opt-in.
         let halo_hyper_default = arch == "gfx1151";
+        // The exact units that do not need the F16 WMMA route (H8a combine
+        // zero-init, wave-per-token router, fused PLE tail) default on for
+        // exact gfx1151 and gfx1201.
+        let exact_unit_default = matches!(arch, "gfx1151" | "gfx1201");
 
         let mmq_screen_default: bool = false;
         let mmq_screen_threshold_default: f32 = if is_gfx906 { 0.50 } else { 0.10 };
@@ -688,10 +695,10 @@ impl FeatureFlags {
                 .unwrap_or(if halo_hyper_default { 3 } else { 0 }),
             qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE").unwrap_or(halo_hyper_default),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
-                .unwrap_or(halo_hyper_default),
+                .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),
-            qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(halo_hyper_default),
-            qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(halo_hyper_default),
+            qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(exact_unit_default),
+            qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
             gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
@@ -1085,15 +1092,15 @@ impl FeatureFlags {
     }
 
     /// Wave-per-token E512/top-10 router for batched prefill
-    /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151.
+    /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
     pub fn qwen4_router_fast_enabled(&self) -> bool {
-        self.qwen4_router_fast && self.arch == "gfx1151"
+        self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
-    /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 only.
+    /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 / gfx1201.
     pub fn qwen4_ple_fuse_enabled(&self) -> bool {
-        self.qwen4_ple_fuse && self.arch == "gfx1151"
+        self.qwen4_ple_fuse && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
@@ -1401,9 +1408,9 @@ mod tests {
         assert!(f.fuse_qkv_bias);
     }
 
-    /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset they default on
-    /// (level 3) for gfx1151 only, `0` turns each off there, and the fusion
-    /// level is clamped to 3.
+    /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 (level 3) and
+    /// H3 default on for gfx1151 only and H8a for both, `0` turns each off,
+    /// and the fusion level is clamped to 3.
     #[test]
     fn qwen4_hc_flags_default_on_gfx1151_and_exact_gfx1151_gfx1201() {
         let with = |fuse: &'static str, rest: &'static str| {
@@ -1420,12 +1427,12 @@ mod tests {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert_eq!(unset.qwen4_hc_fuse_level(), if halo { 3 } else { 0 }, "{arch}");
             assert_eq!(unset.qwen4_hc_up_tile_enabled(), halo, "{arch}");
-            assert_eq!(unset.qwen4_moe_combine_zinit_enabled(), halo, "{arch}");
+            let exact = matches!(arch, "gfx1151" | "gfx1201");
+            assert_eq!(unset.qwen4_moe_combine_zinit_enabled(), exact, "{arch}");
             assert_eq!(unset.qwen4_hc_row_fold_enabled(), halo, "{arch}");
             let off = FeatureFlags::from_lookup(arch, with("0", "0"));
             assert_eq!(off.qwen4_hc_fuse_level(), 0, "{arch}");
             assert!(!off.qwen4_hc_up_tile_enabled() && !off.qwen4_moe_combine_zinit_enabled());
-            let exact = matches!(arch, "gfx1151" | "gfx1201");
             let on = FeatureFlags::from_lookup(arch, with("2", "1"));
             assert_eq!(on.qwen4_hc_fuse_level(), if exact { 2 } else { 0 }, "{arch}");
             assert_eq!(on.qwen4_hc_up_tile_enabled(), exact, "{arch}");
@@ -1441,35 +1448,37 @@ mod tests {
         }
     }
 
-    /// The fused PLE tail defaults on for exact gfx1151 only; `0` turns it off.
+    /// The fused PLE tail defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
-    fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1151() {
+    fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1151_gfx1201() {
         let with = |value: &'static str| {
             move |name: &str| -> std::result::Result<String, ()> {
                 if name == "HIPFIRE_QWEN4_PLE_FUSE" { Ok(value.into()) } else { Err(()) }
             }
         };
-        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1201"] {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            let exact = matches!(arch, "gfx1151" | "gfx1201");
             assert_eq!(
                 FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_ple_fuse_enabled(),
-                arch == "gfx1151",
+                exact,
                 "{arch}"
             );
             assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_ple_fuse_enabled());
             assert_eq!(
                 FeatureFlags::from_lookup(arch, with("1")).qwen4_ple_fuse_enabled(),
-                arch == "gfx1151",
+                exact,
                 "{arch}"
             );
         }
     }
 
-    /// The wave-per-token router defaults on for exact gfx1151 only; `0` turns it off.
+    /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
-    fn qwen4_router_fast_defaults_on_exact_gfx1151() {
+    fn qwen4_router_fast_defaults_on_exact_gfx1151_gfx1201() {
         for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            let exact = matches!(arch, "gfx1151" | "gfx1201");
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_router_fast_enabled(), arch == "gfx1151", "{arch}");
+            assert_eq!(unset.qwen4_router_fast_enabled(), exact, "{arch}");
             let off = FeatureFlags::from_lookup(arch, |n| {
                 if n == "HIPFIRE_QWEN4_ROUTER_FAST" { Ok("0".into()) } else { Err(()) }
             });
@@ -1477,7 +1486,7 @@ mod tests {
             let on = FeatureFlags::from_lookup(arch, |n| {
                 if n == "HIPFIRE_QWEN4_ROUTER_FAST" { Ok("1".into()) } else { Err(()) }
             });
-            assert_eq!(on.qwen4_router_fast_enabled(), arch == "gfx1151", "{arch}");
+            assert_eq!(on.qwen4_router_fast_enabled(), exact, "{arch}");
         }
     }
 

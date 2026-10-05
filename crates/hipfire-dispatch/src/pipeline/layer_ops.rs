@@ -2715,7 +2715,7 @@ pub fn execute_grouped_depthwise(
     let gated = view(op.gated, 0, op.rows * channels);
     let normed = view(op.normed, 0, op.rows * channels);
     let output = view(op.output, 0, op.rows * channels);
-    // Opt-in `HIPFIRE_QWEN4_PLE_FUSE`: on exact gfx1151 with BF16 HC streams
+    // `HIPFIRE_QWEN4_PLE_FUSE`: on exact gfx1151 / gfx1201 with BF16 HC streams
     // (never a recorder, retained tape or graph capture) three launches replace
     // the widen / gate / norm / convolution / stream-add chain below, with the
     // same streams and convolution state byte for byte.
