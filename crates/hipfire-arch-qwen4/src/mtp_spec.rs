@@ -1628,6 +1628,13 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
         && config.linear_conv_kernel_dim == 4
 }
 
+/// Whether a native MTP request on this GPU allocates the batched
+/// prompt-fill scratch (`MtpAppendScratch`): exact gfx1151 with
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on.
+pub fn native_mtp_batched_fill(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1151() && mtp_batched_fill_enabled()
+}
+
 /// Device bytes native MTP adds to a load whose QSA context storage is
 /// `context` (its admitted `max_seq` and committed part) with a
 /// `chunk_rows` prefill chunk, drafts of up to `max_k` tokens and the
@@ -1635,9 +1642,10 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
 /// (`Qwen4MtpGpu`) commits, plus the larger of its build scratch (released
 /// at attach) and what the first speculative request allocates after it —
 /// the verify hidden rows (`max_k + 1` rows or one forward chunk, whichever
-/// is larger), the pending and row hidden carries, and, with `row_capture`
-/// (the GDN state format, where [`native_mtp_row_capture`]), the
-/// `max_k + 1`-row GDN capture in that format.
+/// is larger), the pending and row hidden carries, with `row_capture`
+/// (the GDN state format, where [`native_mtp_row_capture`]) the
+/// `max_k + 1`-row GDN capture in that format, and with `batched_fill`
+/// (where [`native_mtp_batched_fill`]) the batched prompt-fill scratch.
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -1645,6 +1653,7 @@ pub fn native_mtp_device_bytes(
     max_k: usize,
     head_dtype: rdna_compute::DType,
     row_capture: Option<crate::GdnStateFormat>,
+    batched_fill: bool,
 ) -> Option<u64> {
     let rows = max_k.clamp(1, 10) + 1;
     let hidden_row = config
@@ -1658,12 +1667,16 @@ pub fn native_mtp_device_bytes(
     };
     let (resident, scratch) =
         crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
-    let fill_rows = MTP_FILL_ROWS.min(chunk_rows).max(1);
+    let fill = if batched_fill {
+        MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS.min(chunk_rows).max(1))?
+    } else {
+        0
+    };
     let request = verify_rows
         .checked_add(2)?
         .checked_mul(hidden_row)?
         .checked_add(capture)?
-        .checked_add(MtpAppendScratch::device_bytes(config, fill_rows)?)?;
+        .checked_add(fill)?;
     u64::try_from(resident.checked_add(scratch.max(request))?).ok()
 }
 

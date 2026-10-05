@@ -493,6 +493,7 @@ impl Carrier for Qwen4Carrier {
                         max_k,
                         head,
                         row_capture,
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_batched_fill(ctx.gpu),
                     )
                     .ok_or("qwen4: native MTP device bytes overflow")?,
                 )

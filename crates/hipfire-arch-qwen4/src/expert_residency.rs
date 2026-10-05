@@ -559,6 +559,7 @@ mod tests {
                 max_k,
                 DType::MQ6G256V2,
                 row_capture,
+                false,
             )
             .unwrap()
         };
@@ -609,6 +610,25 @@ mod tests {
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
             let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
             assert_eq!(native(&measured, 10, Some(gdn)), resident + scratch.max(request));
+            // The gfx1151 batched prompt fill adds its row scratch to the
+            // request (sub-chunks of at most MTP_FILL_ROWS rows).
+            let fill = crate::mtp_gpu::MtpAppendScratch::device_bytes(
+                &config,
+                crate::mtp_gpu::MTP_FILL_ROWS.min(AUTO_VRAM_RESERVE_CHUNK),
+            )
+            .unwrap() as u64;
+            assert!(fill > 0);
+            let batched = crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                &measured,
+                AUTO_VRAM_RESERVE_CHUNK,
+                10,
+                DType::MQ6G256V2,
+                Some(gdn),
+                true,
+            )
+            .unwrap();
+            assert_eq!(batched, resident + scratch.max(request + fill));
         }
         // On the measured R9700 the MTP bytes fit beside the chosen layers,
         // and one layer more would not have left them.
