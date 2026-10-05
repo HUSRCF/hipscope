@@ -182,17 +182,19 @@ pub(crate) fn qwen4_native_mtp(
 
 /// Whether an admitted Qwen4 native MTP head stays attached once
 /// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
-/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Greedy MTP over host-mapped experts
-/// gains little (gfx1201 N=12: 1.08x median AR, slower on low-tau prompts) and
-/// its text differs from AR on 4/8 prompts, so `auto` keeps AR there and only
-/// an explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head.
-/// Device-resident loads (Strix Halo: MTP text = AR on 8/8, 1.41x) keep the
-/// `auto` default on.
+/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Device-resident loads (Strix Halo:
+/// MTP text = AR on 8/8, 1.41x) and exact gfx1201 (R9700, `auto` placement:
+/// greedy MTP text = AR on 8/8 prompts, faster on every one) keep the `auto`
+/// default on; other arches with host-mapped experts are unmeasured, so
+/// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
+/// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
+/// AR (the admitted head is never attached then).
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     spec: SpecLoadCfg,
+    gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    host_mapped_experts == 0 || spec.mtp == Some(true)
+    host_mapped_experts == 0 || spec.mtp == Some(true) || gpu_arch == "gfx1201"
 }
 
 /// The source-only portion of Qwen4 admission. The validated config and
@@ -1426,10 +1428,13 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         // Device-resident experts: the admitted head stays on under `auto`.
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), 0));
-        // Host-mapped experts: `auto` keeps AR, an explicit `on` keeps MTP.
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
+        // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
+        // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1201", 21));
     }
 
     mod qwen4_ddtree_admission {

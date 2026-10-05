@@ -476,9 +476,10 @@ impl Carrier for Qwen4Carrier {
             );
             // Every placement host-maps at least the MTP layer's routed
             // experts, so the head is still attached after it only where the
-            // host-mapped policy keeps it (an explicit `--spec mtp`); only
-            // then does it need VRAM.
-            let mtp_kept = native_mtp && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, 1);
+            // host-mapped policy keeps it (exact gfx1201, or an explicit
+            // `--spec mtp`); only then does it need VRAM.
+            let mtp_kept = native_mtp
+                && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, 1);
             let mtp_bytes = if mtp_kept {
                 let head = residency::language_head_dtype(&manifest.weights)
                     .ok_or("qwen4: manifest has no language head")?;
@@ -644,11 +645,13 @@ impl Carrier for Qwen4Carrier {
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
-            if native_mtp && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, moved)
+            if native_mtp
+                && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
             {
                 native_mtp = false;
                 eprintln!(
-                    "  qwen4 native MTP: off by default with host-mapped experts; opt in with --spec mtp (speculation.mtp = \"on\")"
+                    "  qwen4 native MTP: off by default with host-mapped experts on {}; opt in with --spec mtp (speculation.mtp = \"on\")",
+                    ctx.gpu.arch
                 );
             }
         }
