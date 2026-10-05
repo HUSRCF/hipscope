@@ -1077,7 +1077,7 @@ pub const DECISIONS: &[Decision] = &[
         switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; recorded/captured: the incumbent unfused launches",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); HC_FUSE (level 3) and MOE_COMBINE_ZINIT default on for exact gfx1151 only, QSA_SELECT_EXACT is default off, and no railgun default program is a qwen4 program",
+        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); HC_FUSE (level 3), MOE_COMBINE_ZINIT, HC_ROW_FOLD, ROUTER_FAST, PLE_FUSE and HC_DOWN_TILE default on for exact gfx1151 only, QSA_SELECT_EXACT is default off, and no railgun default program is a qwen4 program",
         reaches: &[],
     },
     Decision {

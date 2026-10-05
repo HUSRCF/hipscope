@@ -196,9 +196,10 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
-/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default off.
+/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default on
+/// (the only call site checks gfx1151), `0` keeps the 64 x 64 tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true)
 });
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
@@ -889,30 +890,63 @@ fn mqv2_mw_waves(
 
 // Three-run Halo artifact sweeps for both output dtypes; unmeasured cases retain BT8/RW4.
 // This table is used by HIPFIRE_QWEN4_MQ6_X4_TILE=auto and, with it unset, inside the Qwen4 forward.
+// N=8192/2048 rows: cold-cache three-process sweep (qcal/release-0.4.1/mq6-exact/bench/profile.md).
 fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
     match (m, k, n) {
         (48, 2560, 1536 | 512 | 1131) => Some([8, 4, 2]),
         (640, 2560, 1536) => Some([8, 8, 1]),
         (640, 2560, 512) => Some([8, 4, 2]),
+        (640, 2560, 8192 | 2048) => Some([8, 8, 2]),
+        (512, 2560, 8192 | 2048) => Some([8, 8, 1]),
         (2560, 6144, 1536 | 512 | 1131) => Some([8, 8, 1]),
         (6144, 2560, 1536 | 512 | 1131) => Some([8, 8, 1]),
         (10240 | 12288, 2560, 1536) => Some([12, 8, 2]),
         (10240, 2560, 512) => Some([8, 8, 2]),
-        (10240, 2560, 1131) => Some([8, 8, 1]),
-        (12288, 2560, 512 | 1131) => Some([8, 8, 1]),
+        (10240, 2560, 1131 | 8192 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 512 | 1131 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 8192) => Some([8, 8, 2]),
+        _ => None,
+    }
+}
+
+// Regions (a/b/z fold, keyed on its total rows 48 + 48 + 6144) and HC-write twins: cold-cache
+// three-process sweep at the FN shapes, BF16 HC streams (qcal/release-0.4.1/pm-perf-fn/mq6timing).
+// N=8192: regions 7.18 -> 6.97 ms, HC-write 10.50 -> 10.10 ms. N=2048 HC-write keeps BT8/RW4.
+fn mq6_x4_halo_twin_policy(kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+    match (kind, m, k, n) {
+        (Mq6X4Kind::Regions, 6240, 2560, 8192) => Some([8, 8, 2]),
+        (Mq6X4Kind::Regions, 6240, 2560, 2048) => Some([8, 8, 1]),
+        (Mq6X4Kind::Hcw, 2560, 6144, 8192) => Some([8, 8, 2]),
         _ => None,
     }
 }
 
 // U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
 fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
+    let kind = if bf16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
+    let (name, rows, block) = mq6_x4_halo_entry(tile, kind);
+    (name, rows, block, tile[0] as usize)
+}
+
+/// Output form of a gfx1151 MQ6 X-LDS tile twin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mq6X4Kind {
+    Plain,
+    Bf16,
+    Regions,
+    Hcw,
+}
+
+/// Twin entry name, rows per workgroup (16 * RW) and block size (32 * RW).
+fn mq6_x4_halo_entry(tile: [u8; 3], kind: Mq6X4Kind) -> (&'static str, usize, u32) {
     macro_rules! entry {
         ($b:literal, $r:literal, $p:literal) => {
-            (if bf16 {
-                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out")
-            } else {
-                concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p)
-            }, 16 * $r, 32 * $r, $b)
+            (match kind {
+                Mq6X4Kind::Plain => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p),
+                Mq6X4Kind::Bf16 => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out"),
+                Mq6X4Kind::Regions => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_regions"),
+                Mq6X4Kind::Hcw => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_hcw"),
+            }, 16 * $r, 32 * $r)
         };
     }
     match tile {
@@ -924,7 +958,11 @@ fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usi
         [12, 4, 2] => entry!(12, 4, 2),
         [12, 8, 1] => entry!(12, 8, 1),
         [12, 8, 2] => entry!(12, 8, 2),
-        _ => unreachable!("tile override is parsed into the eight supported entries"),
+        [16, 4, 1] => entry!(16, 4, 1),
+        [16, 4, 2] => entry!(16, 4, 2),
+        [16, 8, 1] => entry!(16, 8, 1),
+        [16, 8, 2] => entry!(16, 8, 2),
+        _ => unreachable!("tile override is parsed into the twelve supported entries"),
     }
 }
 
@@ -38181,19 +38219,11 @@ impl Gpu {
                 ));
             }
         };
+        let kind = if y.dtype == DType::BF16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
         let (func_name, rows_per_block, block, batch_tile) =
-            if xlds && overwrite && self.arch.as_str() == "gfx1151" {
-                let tile = match self.qwen4_mq6_x4_tile() {
-                    Some([0, 0, 0]) => mq6_x4_halo_policy(m, k, batch_size),
-                    explicit => explicit,
-                };
-                match tile {
-                    Some(tile) if tile[0] != 12 || batch_size % 192 == 0 =>
-                        mq6_x4_halo_tile(tile, y.dtype == DType::BF16),
-                    _ => (func_name, rows_per_block, block, batch_tile),
-                }
-            } else {
-                (func_name, rows_per_block, block, batch_tile)
+            match (xlds && overwrite).then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size)).flatten() {
+                Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
+                None => (func_name, rows_per_block, block, batch_tile),
             };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
@@ -40655,6 +40685,25 @@ impl Gpu {
             .unwrap_or((self.qwen4_scope && self.arch.as_str() == "gfx1151").then_some([0, 0, 0]))
     }
 
+    /// The gfx1151 X-LDS tile twin for one MQ6 launch of `kind`: an explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_TILE` wins, `auto`/the Qwen4 forward uses the
+    /// measured table, `None` keeps the incumbent entry.  BV12 needs
+    /// `n % 192 == 0` and has no regions/HC-write twins.
+    fn qwen4_mq6_x4_pick(&self, kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+        if self.arch.as_str() != "gfx1151" {
+            return None;
+        }
+        let tile = match self.qwen4_mq6_x4_tile()? {
+            [0, 0, 0] => match kind {
+                Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
+                Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, k, n)?,
+            },
+            explicit => explicit,
+        };
+        let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+        (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+    }
+
     /// U3: the MQ6 a/b/z row-region fold.  Explicit
     /// `HIPFIRE_QWEN4_MQ6_X4_REGIONS` wins; unset, on inside the Qwen4 forward
     /// on gfx1151.
@@ -40717,20 +40766,27 @@ impl Gpu {
         {
             return Ok(false);
         }
-        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(64)).sum();
+        let (module, source, name, rows, block, bv) = if self.arch_caps.has_wmma_w32_gfx12() {
+            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
+                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
+                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 8)
+        } else {
+            let (name, rows, block, bv) =
+                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, regions.iter().map(|r| r.2).sum(), k, batch_size) {
+                    Some(tile) => {
+                        let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Regions);
+                        (name, rows, block, tile[0] as usize)
+                    }
+                    None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions", 64, 128, 8),
+                };
+            ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                name, rows, block, bv)
+        };
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(rows)).sum();
         if row_tiles == 0 || batch_size == 0 || k == 0 {
             return Ok(true);
         }
         self.bind_thread()?;
-        let (module, source, name) = if self.arch_caps.has_wmma_w32_gfx12() {
-            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
-                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
-                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions")
-        } else {
-            ("qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions")
-        };
         self.ensure_kernel(module, source, name)?;
         let mut ptrs = [
             regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
@@ -40751,8 +40807,8 @@ impl Gpu {
             + batch_size * k * 2 + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
         let result = self.launch_maybe_blob(
-            name, [row_tiles as u32, batch_size.div_ceil(128) as u32, 1],
-            [128, 1, 1], 0, &mut params, || {
+            name, [row_tiles as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            [block, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 for ptr in ptrs { blob.push_ptr(ptr); }
                 for dim in dims { blob.push_i32(dim); }
@@ -40810,16 +40866,27 @@ impl Gpu {
         hc_bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, source, func_name): (&str, &str, &'static str) = match self.arch.as_str() {
-            "gfx1151" => (
-                "qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                "gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw",
-            ),
+        type Entry = (&'static str, &'static str, &'static str, usize, u32, usize);
+        let (module, source, func_name, rows, block, bv): Entry = match self.arch.as_str() {
+            "gfx1151" => {
+                let (name, rows, block, bv) =
+                    match self.qwen4_mq6_x4_pick(Mq6X4Kind::Hcw, m, k, batch_size) {
+                        Some(tile) => {
+                            let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Hcw);
+                            (name, rows, block, tile[0] as usize)
+                        }
+                        None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw", 64, 128, 8),
+                    };
+                ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                    name, rows, block, bv)
+            }
             "gfx1201" => (
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt8_mq5v2",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
                 "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+                64,
+                128,
+                8,
             ),
             _ => {
                 return Err(hip_bridge::HipError::new(
@@ -40867,8 +40934,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
-            [m.div_ceil(64) as u32, batch_size.div_ceil(128) as u32, 1],
-            [128, 1, 1],
+            [m.div_ceil(rows) as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
