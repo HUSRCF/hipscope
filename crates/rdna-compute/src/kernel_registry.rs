@@ -626,7 +626,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "indexed_attention_norm_rope_f32_batched", "indexed_attention_pool_rope_bf16", "indexed_attention_pool_rope_f32",
             "indexed_attention_reuse_selection", "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial",
             "indexed_attention_select_f32", "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial",
-            "indexed_attention_select_f32_serial", "scale_f32",
+            "indexed_attention_select_f32_serial", "indexed_attention_select_from_scores", "indexed_attention_select_scores_rows8_f32",
+            "scale_f32",
         ]);
     }
     if arch == "gfx1201" {

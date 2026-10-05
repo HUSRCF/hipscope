@@ -3359,6 +3359,24 @@ fn indexed_attention_select_batch_impl(
     let parallel = gpu.arch_caps.has_gfx11_plus_simt()
         && shape_blocks > 0
         && !select_forced_serial();
+    // Live F32 launches with the pinned index geometry score eight rows per
+    // pooled key read into the shared F16 X scratch, then select from those
+    // scores (any block count: the score rows live in global memory). The
+    // opt-in exact selector (`HIPFIRE_QWEN4_QSA_SELECT_EXACT=1`) keeps its
+    // own route.
+    if parallel
+        && !*QWEN4_QSA_SELECT_EXACT
+        && p.pooled.dtype == DType::F32
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.block_count > 0
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
+    {
+        return indexed_attention_select_rows8(gpu, p, mirror);
+    }
     // Past the LDS row the scores go to global rows (one per workgroup, at
     // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
     let global = parallel
@@ -3509,6 +3527,98 @@ fn indexed_attention_select_batch_impl(
     )?;
     Ok(mirror.is_some())
 }
+
+/// Score-scratch budget of [`indexed_attention_select_rows8`]: rows are
+/// selected in groups whose scores fit it.
+const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
+/// `indexed_attention_select_from_scores` holds the chosen blocks in 512 LDS
+/// entries; larger budgets take the batched kernel.
+const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
+
+/// [`indexed_attention_select_batch_impl`]'s live route: row groups of
+/// `indexed_attention_select_scores_rows8_f32` scores, each followed by
+/// `indexed_attention_select_from_scores` reading them. Selection bytes are
+/// unchanged.
+fn indexed_attention_select_rows8(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    let stride = p.block_count;
+    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 8 * 8)
+        .max(8)
+        .min(p.rows);
+    // Growth goes through the accessor that invalidates captured state first.
+    let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
+    for kernel in ["indexed_attention_select_scores_rows8_f32", "indexed_attention_select_from_scores"] {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    }
+    let mirror =
+        mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let block_tiles = checked_u32(p.block_count.div_ceil(256), "QSA select block tiles")?;
+    let mut g0 = 0usize;
+    while g0 < p.rows {
+        let n = group.min(p.rows - g0);
+        let query = unsafe {
+            (p.query.buf.as_ptr() as *mut f32).add(g0 * p.query_row_stride) as *mut std::ffi::c_void
+        };
+        let selected = unsafe {
+            (p.selected.buf.as_ptr() as *mut i32).add(g0 * p.capacity) as *mut std::ffi::c_void
+        };
+        let position_start = checked_i32(p.position_start + g0, "QSA batch select position")?;
+        let rows = checked_i32(n, "QSA batch select rows")?;
+        let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(query);
+        args.push_ptr(p.pooled.buf.as_ptr());
+        args.push_ptr(scores);
+        args.push_i32(rows);
+        args.push_i32(query_row_stride);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(block_count);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "indexed_attention_select_scores_rows8_f32",
+            [block_tiles, checked_u32(n.div_ceil(8), "QSA select row groups")?, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        // The persistent selection is the final row's: the last group's.
+        let last = g0 + n == p.rows;
+        let mirror_ptr = mirror
+            .filter(|_| last)
+            .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
+        let mut args = KernargBlob::new();
+        args.push_ptr(scores);
+        args.push_i32(block_count);
+        args.push_ptr(selected);
+        args.push_i32(rows);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.budget_blocks, "QSA batch select budget")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
+        args.push_ptr(mirror_ptr);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "indexed_attention_select_from_scores",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        g0 += n;
+    }
+    Ok(mirror.is_some())
+}
+
 /// Device-side stable reuse of a prior MTP QSA selection row.
 ///
 /// `selected` is a byte-addressed [`DType::Raw`] allocation containing i32
