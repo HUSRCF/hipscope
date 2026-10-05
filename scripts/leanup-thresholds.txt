@@ -122,4 +122,7 @@ bypass_slack                == 0
 # dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
 # RATCHET-RAISE 296 -> 300: the +4 gfx1151 A4-fusion arms recorded on the
 # hipfire-arch-qwen35 ledger row (HIPFIRE_V2B_A4_EPI, default on gfx1151 since v0.4.1).
-bypass_total                <= 300
+# RATCHET-RAISE 300 -> 307: the +7 row-exact gfx1151 batched native-MTP prompt
+# fill calls (a5b0cc14f) recorded on the hipfire-arch-qwen4 ledger row; follow-up:
+# migrate row-exact kernels into a dispatch-registry row family (0.4.2).
+bypass_total                <= 307
