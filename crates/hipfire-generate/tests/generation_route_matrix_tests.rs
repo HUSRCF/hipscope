@@ -271,6 +271,9 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
 const SAFE_ROUTES: &[GenerationRoute] = &[
     GenerationRoute::QwenAr,
     GenerationRoute::Qwen4Ar,
+    // Native Qwen4 MTP: same `<tool_call>` router as Qwen4 AR over committed
+    // tokens, tool grammar forced off, so greedy tools match AR byte-for-byte.
+    GenerationRoute::Qwen4Spec,
     GenerationRoute::QwenDflash,
     GenerationRoute::Deepseek4Ar,
     GenerationRoute::Deepseek4Ep,
@@ -485,7 +488,7 @@ fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
+fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -495,12 +498,33 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 9);
+    assert_eq!(from_all.len(), 10);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
             assert!(!r.supports_tools(), "{:?} must not be tool-safe", r);
         }
+    }
+}
+
+#[test]
+fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
+    // Qwen4 AR and native MTP joined the Qwen3.5-family AR/DFlash routes: an
+    // eval request with `stop` on Flash-Next used to be refused with 400.
+    let mut with_stop: Vec<&str> = GenerationRoute::ALL
+        .iter()
+        .filter(|r| r.supports_stop())
+        .map(|r| r.name())
+        .collect();
+    with_stop.sort_unstable();
+    assert_eq!(
+        with_stop,
+        ["qwen4_ar", "qwen4_spec", "qwen_ar", "qwen_dflash"]
+    );
+    // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so
+    // attaching MTP never changes which request shapes are accepted.
+    for route in [GenerationRoute::Qwen4Ar, GenerationRoute::Qwen4Spec] {
+        assert!(route.supports_tools() && route.supports_stop(), "{route:?}");
     }
 }
 

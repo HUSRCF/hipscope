@@ -892,8 +892,13 @@ impl GenerationRoute {
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer
-    /// AR, Glimmer spec, Maple AR.
+    /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
+    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR.
+    ///
+    /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
+    /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
+    /// `QwenArSemanticProducer`, with the tool-call grammar forced off so the
+    /// greedy verify commits exactly the AR argmax stream (`generate_dflash`).
     ///
     /// `MapleAr` is admitted on the LEGACY contract, not semantic v2: its
     /// carrier keeps `semantic_contract_version: None` (no router-backed
@@ -911,6 +916,7 @@ impl GenerationRoute {
             self,
             Self::QwenAr
                 | Self::Qwen4Ar
+                | Self::Qwen4Spec
                 | Self::QwenDflash
                 | Self::Deepseek4Ar
                 | Self::Deepseek4Ep
@@ -923,11 +929,16 @@ impl GenerationRoute {
 
     /// Routes that honour OpenAI `stop`: the Qwen3.5-family semantic producers
     /// (single-GPU AR, dense TP and MoE EP via `QwenArSemanticProducer`;
-    /// DFlash/MTP via `Qwen35Emit`). Each matches only the answer channel,
-    /// holds a possible stop prefix back, and never emits the stop text. Every
-    /// other route would ignore `stop` or leak it, so `generate` refuses it.
+    /// DFlash/MTP via `Qwen35Emit`) and Qwen4 (AR via
+    /// `generate_ar_with_forward`'s `QwenArSemanticProducer`, native MTP via
+    /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
+    /// stop prefix back, and never emits the stop text. Every other route
+    /// would ignore `stop` or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
-        matches!(self, Self::QwenAr | Self::QwenDflash)
+        matches!(
+            self,
+            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash
+        )
     }
 
     pub const fn name(self) -> &'static str {
@@ -2000,8 +2011,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         && !((sampler_config.presence_penalty > 0.0 || sampler_config.frequency_penalty > 0.0)
             && sampler_config.repeat_window > 0)
         && sampler_config.blocked_tokens.is_empty();
+    // User stop sequences gate the answer channel before it is emitted: a
+    // stop spanning a token boundary is held back, and the matched text and
+    // everything after it never reach the client.
     let mut semantic =
-        QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled);
+        QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled)
+            .with_stop(stop);
     let mut streamed_tokens = Vec::new();
     let mut generated = 0usize;
     // Raw bytes of `streamed_tokens`, grown one token at a time.
@@ -2088,11 +2103,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             );
             return;
         }
-        let custom_stop = stop
-            .iter()
-            .any(|value| !value.is_empty() && semantic.visible().ends_with(value));
+        // `filter_stop` also latches on a user stop-sequence match.
         if filter_stop
-            || custom_stop
             || next_token == eos_token
             || m.tokenizer
                 .as_ref()
