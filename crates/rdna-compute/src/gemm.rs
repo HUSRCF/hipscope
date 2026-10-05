@@ -196,9 +196,10 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
-/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default off.
+/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default on
+/// (the only call site checks gfx1151), `0` keeps the 64 x 64 tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true)
 });
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
