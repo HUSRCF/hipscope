@@ -3374,3 +3374,279 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(!out.contains("\"finish_reason\":\"tool_calls\""));
         assert!(out.contains("\"attempt_id\":33"));
     }
+
+
+// ── Explicit think budget: Qwen4 AR and MTP force the same close ─────────
+
+/// Test-tokenizer ids: `\n` byte token 110, `</think>` 3, `<think>` 2,
+/// `<|im_end|>` 1.
+const NL: u32 = 110;
+const TEMPLATE_CLOSE_IDS: [u32; 4] = [NL, 3, NL, NL];
+
+/// A deterministic greedy "model": thinks through `think`, and once its
+/// history holds a `</think>` it answers `answer` then `<|im_end|>`. With
+/// `reopen`, the first token after a close re-opens `<think>` instead and
+/// it thinks forever. Out of thinking text, it ends the turn (EOS).
+fn scripted_next(tok: &Tokenizer, history: &[u32], think: &str, answer: &str, reopen: bool) -> u32 {
+    let think_ids = tok.encode(think);
+    let answer_ids = tok.encode(answer);
+    match history.iter().rposition(|&t| t == 3) {
+        Some(close_at) => {
+            let after = &history[close_at + 1..];
+            // Skip the close's own trailing newlines.
+            let body: Vec<u32> = after.iter().copied().skip_while(|&t| t == NL).collect();
+            if reopen {
+                if after.iter().all(|&t| t == NL) && after.len() >= 2 {
+                    return 2;
+                }
+                if body.first() == Some(&2) {
+                    return think_ids[(body.len() - 1) % think_ids.len()];
+                }
+            }
+            answer_ids.get(body.len()).copied().unwrap_or(1)
+        }
+        None => think_ids.get(history.len()).copied().unwrap_or(1),
+    }
+}
+
+struct BudgetRun {
+    tokens: Vec<u32>,
+    reasoning: String,
+    content: String,
+    finish_reason: &'static str,
+    jsonl: String,
+}
+
+/// The Qwen4 AR decode body over the scripted model: production producer
+/// and budget step; forced tokens run through the same commit path.
+fn run_ar_budget(
+    tok: &Tokenizer,
+    max_think: usize,
+    max_tokens: usize,
+    think: &str,
+    answer: &str,
+    reopen: bool,
+) -> BudgetRun {
+    let _guard = begin_terminal_test("tb-ar", 501);
+    set_active_attempt_id(501);
+    let mut producer = QwenArSemanticProducer::new("tb-ar", true);
+    let mut budget = hipfire_runtime::emit_text::ThinkBudget::new(max_think);
+    let mut forced = std::collections::VecDeque::new();
+    let (mut sink, mut conversation, mut streamed) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut seq_pos, mut generated, mut natural_stop) = (0usize, 0usize, false);
+    let mut stream_bytes = Vec::new();
+    while generated < max_tokens {
+        let token = forced
+            .pop_front()
+            .unwrap_or_else(|| scripted_next(tok, &streamed, think, answer, reopen));
+        let fed = stream_bytes.len();
+        tok.decode_token_bytes_into(token, &mut stream_bytes);
+        let filter_stop = producer
+            .commit_and_observe(
+                &mut sink,
+                &mut conversation,
+                &mut streamed,
+                &mut seq_pos,
+                token,
+                &stream_bytes[fed..],
+            )
+            .expect("classify");
+        generated += 1;
+        if filter_stop || token == 9 || tok.is_terminator(token) {
+            natural_stop = true;
+            break;
+        }
+        match qwen_ar_think_budget_step(&mut budget, &stream_bytes, true, tok) {
+            QwenArThinkBudgetAction::Continue => {}
+            QwenArThinkBudgetAction::Close(close) => forced.extend(close),
+            QwenArThinkBudgetAction::Stop => {
+                natural_stop = true;
+                break;
+            }
+        }
+    }
+    let (fin, content) = producer
+        .finish(&mut sink, generated >= max_tokens && !natural_stop)
+        .expect("finish");
+    let jsonl = String::from_utf8_lossy(&sink).into_owned();
+    let reasoning = parse_jsonl(&jsonl)
+        .iter()
+        .filter(|e| e["type"] == "reasoning")
+        .map(|e| e["text"].as_str().unwrap().to_string())
+        .collect();
+    BudgetRun {
+        tokens: streamed,
+        reasoning,
+        content,
+        finish_reason: fin.finish_reason,
+        jsonl,
+    }
+}
+
+/// The Qwen4 MTP emitter over the same scripted model (one token per step;
+/// acceptance width does not change what is committed).
+fn run_mtp_budget(
+    tok: &Tokenizer,
+    max_think: usize,
+    max_tokens: usize,
+    think: &str,
+    answer: &str,
+    reopen: bool,
+) -> BudgetRun {
+    let mut emit =
+        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx_template_think_close(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think,
+            max_tokens,
+            assistant_prefix: AssistantPrefix::OpenThink,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+    let mut events = Vec::new();
+    let mut forced = std::collections::VecDeque::new();
+    let mut generated = 0usize;
+    let mut semantic_stop = None;
+    while generated < max_tokens {
+        let token = forced
+            .pop_front()
+            .unwrap_or_else(|| scripted_next(tok, emit.streamed_tokens(), think, answer, reopen));
+        let outcome = if generated == 0 {
+            emit.begin(token)
+        } else {
+            emit.observe(token)
+        };
+        generated += 1;
+        events.extend(outcome.events);
+        if outcome.stop.is_some() {
+            semantic_stop = outcome.stop;
+            break;
+        }
+        forced.extend(emit.take_forced());
+    }
+    let tokens = emit.streamed_tokens().to_vec();
+    let finish = emit.finish();
+    events.extend(finish.events.clone());
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for event in events {
+        match event {
+            ClientEvent::Reasoning(text) => reasoning.push_str(&text),
+            ClientEvent::Token(text) => content.push_str(&text),
+            _ => {}
+        }
+    }
+    let hit_length = qwen_dflash_hit_length_cap(
+        generated,
+        max_tokens,
+        finish.decoded_eot,
+        semantic_stop.is_some(),
+    );
+    BudgetRun {
+        tokens,
+        reasoning,
+        content,
+        finish_reason: if hit_length { "length" } else { "stop" },
+        jsonl: String::new(),
+    }
+}
+
+#[test]
+fn think_budget_splices_template_close_then_answer_ar_matches_mtp() {
+    let tok = test_tokenizer();
+    assert_eq!(
+        tok.encode(hipfire_runtime::emit_text::QWEN_TEMPLATE_THINK_CLOSE),
+        TEMPLATE_CLOSE_IDS
+    );
+    let think = "abcdefghijklmnop";
+    let ar = run_ar_budget(&tok, 5, 64, think, "Yes.", false);
+    // Five think tokens (the first generated token counts), then exactly
+    // the template close, then the model's own answer and end of turn.
+    let mut want = tok.encode("abcde");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.extend(tok.encode("Yes."));
+    want.push(1);
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.content, "Yes.");
+    assert!(ar.reasoning.starts_with("abcde"), "{:?}", ar.reasoning);
+    assert_eq!(ar.finish_reason, "stop");
+    assert!(!ar.jsonl.contains("\"type\":\"error\""), "{}", ar.jsonl);
+    assert!(!ar.jsonl.contains("</think>"), "{}", ar.jsonl);
+
+    let mtp = run_mtp_budget(&tok, 5, 64, think, "Yes.", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.reasoning, ar.reasoning);
+    assert_eq!(mtp.content, ar.content);
+    assert_eq!(mtp.finish_reason, ar.finish_reason);
+}
+
+#[test]
+fn think_budget_of_one_closes_after_the_first_token_on_both_routes() {
+    let tok = test_tokenizer();
+    let ar = run_ar_budget(&tok, 1, 64, "abc", "Ok", false);
+    let mut want = tok.encode("a");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.extend(tok.encode("Ok"));
+    want.push(1);
+    assert_eq!(ar.tokens, want);
+    let mtp = run_mtp_budget(&tok, 1, 64, "abc", "Ok", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.content, "Ok");
+}
+
+#[test]
+fn think_budget_unset_or_unreached_leaves_the_stream_alone() {
+    let tok = test_tokenizer();
+    // The model closes on its own after 9 think tokens and answers; a
+    // budget it never reaches and no budget give the identical stream and
+    // wire bytes.
+    let think = "abcdefgh\n</think>";
+    let mut natural = tok.encode(think);
+    natural.extend(tok.encode("Done."));
+    natural.push(1);
+    let plain = run_ar_budget(&tok, 0, 64, think, "Done.", false);
+    assert_eq!(plain.tokens, natural);
+    assert_eq!(plain.content, "Done.");
+    for budget in [0, 10, 1000] {
+        let ar = run_ar_budget(&tok, budget, 64, think, "Done.", false);
+        assert_eq!(ar.jsonl, plain.jsonl, "budget {budget}");
+        let mtp = run_mtp_budget(&tok, budget, 64, think, "Done.", false);
+        assert_eq!(mtp.tokens, natural, "budget {budget}");
+        assert_eq!(mtp.content, "Done.");
+    }
+}
+
+#[test]
+fn think_budget_spent_again_after_reopen_stops_with_reasoning_only() {
+    let tok = test_tokenizer();
+    let ar = run_ar_budget(&tok, 3, 64, "abcdef", "", true);
+    // The re-opening `<think>` counts as the first token of the new span.
+    let mut want = tok.encode("abc");
+    want.extend(TEMPLATE_CLOSE_IDS);
+    want.push(2);
+    want.extend(tok.encode("ab"));
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.finish_reason, "stop");
+    assert!(!ar.jsonl.contains("\"type\":\"error\""), "{}", ar.jsonl);
+    let mtp = run_mtp_budget(&tok, 3, 64, "abcdef", "", true);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.reasoning, ar.reasoning);
+    assert_eq!(mtp.finish_reason, "stop");
+}
+
+#[test]
+fn think_budget_close_clipped_by_max_tokens_is_length() {
+    let tok = test_tokenizer();
+    // Budget hit on token 4 of 6: only `\n` + `</think>` of the close fit.
+    let ar = run_ar_budget(&tok, 4, 6, "abcdefgh", "Yes.", false);
+    let mut want = tok.encode("abcd");
+    want.extend(&TEMPLATE_CLOSE_IDS[..2]);
+    assert_eq!(ar.tokens, want);
+    assert_eq!(ar.finish_reason, "length");
+    let mtp = run_mtp_budget(&tok, 4, 6, "abcdefgh", "Yes.", false);
+    assert_eq!(mtp.tokens, ar.tokens);
+    assert_eq!(mtp.finish_reason, "length");
+}

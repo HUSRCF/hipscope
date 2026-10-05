@@ -17,7 +17,8 @@
 
 use crate::grammar;
 use hipfire_runtime::emit_text::{
-    currently_in_think, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteEvent,
+    currently_in_think, ThinkBudget, ThinkBudgetStep, ThinkOutputRouter, ThinkRouteEvent,
+    ToolOutputRouter, ToolRouteEvent, QWEN_TEMPLATE_THINK_CLOSE,
 };
 use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::prompt_frame::AssistantPrefix;
@@ -55,16 +56,14 @@ pub struct Qwen35Emit<'a> {
     im_end_token: Option<u32>,
     /// User `stop` sequences, matched on answer text before it is emitted.
     stop: StopMatcher,
-    max_think_tokens: usize,
+    /// Explicit `max_think_tokens` accounting (shared with the AR producer).
+    think_budget: ThinkBudget,
     open_think_prefix: bool,
-    think_count: usize,
-    prev_in_think: bool,
+    /// Text spliced when the think budget runs out.
+    think_close: String,
     /// Think-budget force-close continuation drained by `take_forced` so the
     /// target advances over `</think>` and continues into visible output.
     forced: Vec<u32>,
-    /// Prevent an endlessly re-opened reasoning span from being force-closed
-    /// repeatedly. A second cap hit hard-stops through `ThinkCap`.
-    think_force_closed: bool,
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
@@ -80,8 +79,20 @@ impl<'a> Qwen35Emit<'a> {
     /// extracting the grammar `ToolSchema` list from the request's raw tool JSON
     /// (`ctx.tools`). Returns the arch-erased `Box<dyn SpecEmit>` the daemon
     /// drives. The JSON→schema extraction mirrors the daemon's old
-    /// `tool_schemas_dflash` builder.
+    /// `tool_schemas_dflash` builder. A spent think budget splices
+    /// `HIPFIRE_THINK_CONTINUATION` (default `</think>\n\n`).
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        Self::with_think_close(ctx, think_continuation_text())
+    }
+
+    /// [`Self::from_ctx`] for Qwen4, whose AR producer splices the template's
+    /// own close ([`QWEN_TEMPLATE_THINK_CLOSE`]) when the think budget runs
+    /// out; MTP must splice the same tokens to produce the same text.
+    pub fn from_ctx_template_think_close(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string())
+    }
+
+    fn with_think_close(ctx: SpecEmitCtx<'a>, think_close: String) -> Box<dyn SpecEmit + 'a> {
         let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
@@ -138,12 +149,10 @@ impl<'a> Qwen35Emit<'a> {
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,
             stop: StopMatcher::new(&ctx.stop),
-            max_think_tokens: ctx.max_think,
+            think_budget: ThinkBudget::new(ctx.max_think),
             open_think_prefix,
-            think_count: 0,
-            prev_in_think: false,
+            think_close,
             forced: Vec::new(),
-            think_force_closed: false,
             generated_hint: 0,
         })
     }
@@ -281,6 +290,30 @@ impl<'a> Qwen35Emit<'a> {
                 .unwrap_or(false)
     }
 
+    /// Count the just-pushed token against the think budget. Queues the close
+    /// on the first exhaustion; a second one (span re-opened) is a stop.
+    fn think_budget_stop(&mut self) -> Option<StopReason> {
+        if !self.think_budget.enabled() {
+            return None;
+        }
+        let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
+        let in_think = currently_in_think(raw_str, self.open_think_prefix);
+        match self.think_budget.observe(in_think) {
+            ThinkBudgetStep::Continue => None,
+            ThinkBudgetStep::ForceClose => {
+                self.forced = self.tokenizer.encode(&self.think_close);
+                self.think_budget.closing(self.forced.len());
+                eprintln!(
+                    "[think-cap] route=spec think budget reached; closing with tokens {:?}",
+                    self.forced
+                );
+                None
+            }
+            // A pathological re-open after the injected close hard-stops.
+            ThinkBudgetStep::Exhausted => Some(StopReason::ThinkCap),
+        }
+    }
+
     /// Producer-authorized visible text for asst-turn cache fingerprinting.
     pub fn visible_text(&self) -> &str {
         &self.visible_acc
@@ -313,7 +346,9 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
                 stop: Some(StopReason::StopSequence),
             };
         }
-        EmitOutcome { events, stop: None }
+        // The first token counts against the think budget like every later one.
+        let stop = self.think_budget_stop();
+        EmitOutcome { events, stop }
     }
 
     fn observe(&mut self, token: u32) -> EmitOutcome {
@@ -385,34 +420,10 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             };
         }
 
-        // max_think_tokens enforcement. Mirrors 4632-4664.
-        if self.max_think_tokens > 0 {
-            let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
-            let in_think = currently_in_think(raw_str, self.open_think_prefix);
-            if in_think && !self.prev_in_think {
-                self.think_count = 0;
-            }
-            if in_think {
-                self.think_count += 1;
-            }
-            self.prev_in_think = in_think;
-
-            if in_think && self.think_count >= self.max_think_tokens {
-                if !self.think_force_closed {
-                    self.forced = self.tokenizer.encode(&think_continuation_text());
-                    self.think_force_closed = true;
-                    return EmitOutcome { events, stop: None };
-                }
-                // A pathological re-open after the injected close hard-stops.
-                // Do not push raw "</think>\n" as a Token; surface stop only.
-                return EmitOutcome {
-                    events,
-                    stop: Some(StopReason::ThinkCap),
-                };
-            }
-        }
-
-        EmitOutcome { events, stop: None }
+        // max_think_tokens enforcement: a spent budget queues the close
+        // (`take_forced`); a re-opened span spending it again stops.
+        let stop = self.think_budget_stop();
+        EmitOutcome { events, stop }
     }
 
     fn finish(mut self: Box<Self>) -> FinishSummary {

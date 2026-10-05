@@ -185,6 +185,47 @@ impl QwenArTerminalCause {
     }
 }
 
+/// What the AR decode loop does after a committed token under an explicit
+/// `max_think_tokens` budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QwenArThinkBudgetAction {
+    Continue,
+    /// Run these close tokens next, each through the normal decode body.
+    Close(Vec<u32>),
+    /// The model re-opened `<think>` after the forced close and spent the
+    /// budget again: end the turn (a reasoning-only stop).
+    Stop,
+}
+
+/// Count the token just appended to `stream_bytes` against `budget`. Uses the
+/// raw-stream think scan and the template close the Qwen4 MTP emitter
+/// (`Qwen35Emit::from_ctx_template_think_close`) uses, so both splice the same
+/// tokens after the same token.
+pub fn qwen_ar_think_budget_step(
+    budget: &mut hipfire_runtime::emit_text::ThinkBudget,
+    stream_bytes: &[u8],
+    started_in_think: bool,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> QwenArThinkBudgetAction {
+    use hipfire_runtime::emit_text::{currently_in_think, ThinkBudgetStep};
+    if !budget.enabled() {
+        return QwenArThinkBudgetAction::Continue;
+    }
+    let in_think = currently_in_think(
+        std::str::from_utf8(stream_bytes).unwrap_or(""),
+        started_in_think,
+    );
+    match budget.observe(in_think) {
+        ThinkBudgetStep::Continue => QwenArThinkBudgetAction::Continue,
+        ThinkBudgetStep::ForceClose => {
+            let close = tokenizer.encode(hipfire_runtime::emit_text::QWEN_TEMPLATE_THINK_CLOSE);
+            budget.closing(close.len());
+            QwenArThinkBudgetAction::Close(close)
+        }
+        ThinkBudgetStep::Exhausted => QwenArThinkBudgetAction::Stop,
+    }
+}
+
 /// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
 /// or primes asst_turn_cache. Decoded EOT on the final budget token still
 /// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
@@ -1971,6 +2012,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // Raw bytes of `streamed_tokens`, grown one token at a time.
     let mut stream_bytes: Vec<u8> = Vec::new();
     let mut natural_stop = false;
+    // An explicit `max_think_tokens` budget force-closes the think span with
+    // the template's own close, which the model then answers after. Same
+    // accounting and close as the Qwen4 MTP emitter, so greedy AR and MTP
+    // produce the same text.
+    let mut think_budget = hipfire_runtime::emit_text::ThinkBudget::new(max_think_tokens);
+    // Close tokens still to run; each goes through the decode body below
+    // exactly like a sampled token (KV write, commit, classify, stops).
+    let mut forced_close = std::collections::VecDeque::new();
     let t_decode = Instant::now();
 
     while generated < max_tokens {
@@ -1979,6 +2028,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
+        }
+        if let Some(token) = forced_close.pop_front() {
+            pending = Some(token);
         }
         let next_token = match forward_token(m, gpu, pending.take(), &decode_logits) {
             Ok(token) => token,
@@ -2038,20 +2090,6 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             }
         };
         generated += 1;
-        if max_think_tokens > 0 && semantic.think_router.in_think() && generated >= max_think_tokens
-        {
-            let _ = gpu.free_tensor(decode_logits);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!("{} think token budget exceeded", route.name()),
-                "validation",
-                false,
-                &ep,
-            );
-            return;
-        }
         let custom_stop = stop
             .iter()
             .any(|value| !value.is_empty() && semantic.visible().ends_with(value));
@@ -2065,8 +2103,35 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             natural_stop = true;
             break;
         }
+        match qwen_ar_think_budget_step(
+            &mut think_budget,
+            &stream_bytes,
+            started_in_think,
+            m.tokenizer.as_ref().unwrap(),
+        ) {
+            QwenArThinkBudgetAction::Continue => {}
+            QwenArThinkBudgetAction::Close(close) => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} reached at generated={generated}; closing with tokens {close:?}",
+                    route.name()
+                );
+                forced_close.extend(close);
+            }
+            QwenArThinkBudgetAction::Stop => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} spent again after the forced close; stopping",
+                    route.name()
+                );
+                natural_stop = true;
+                break;
+            }
+        }
         if generated >= max_tokens {
             break;
+        }
+        if !forced_close.is_empty() {
+            // The next forward runs the next close token instead of a sample.
+            continue;
         }
 
         if greedy_on_gpu {
@@ -2114,6 +2179,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             return;
         }
     };
+    if finish.cause == QwenArTerminalCause::OpenThink {
+        // Tells `<|im_end|>` from `<|endoftext|>` (both EOS) in captures.
+        eprintln!(
+            "[open-think] id={id} route={} model ended the turn inside reasoning; terminal token {:?}",
+            route.name(),
+            streamed_tokens.last()
+        );
+    }
     let t_end = Instant::now();
     let total_ms = t_end.duration_since(t0).as_secs_f64() * 1000.0;
     let decode_ms = t_end.duration_since(t_decode).as_secs_f64() * 1000.0;

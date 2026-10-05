@@ -3190,14 +3190,15 @@ fn main() {
                 // new clients send `thinking_enabled` as authority and keep
                 // `max_think_tokens` independent.
                 //
-                // When the cap is reached the daemon force-emits "</think>\n"
-                // through the same KV-write + sample path as a normal token,
-                // closing the thinking block so the model commits to an
-                // answer with the remaining max_tokens budget. Caught by
-                // Codex stop-time review on 2026-04-28: the field had been
-                // shipping in genParams since cli/index.ts but the daemon
-                // was silently ignoring it, making the new reasoning.effort
-                // / enable_thinking knobs no-ops on the wire.
+                // When the cap is reached the generate path splices a think
+                // close through the same KV-write + commit path as a sampled
+                // token, and the model answers with the remaining max_tokens
+                // budget. Qwen4 (AR and MTP) splices the template's own
+                // "\n</think>\n\n"; the Qwen3.5 AR/DFlash loops splice
+                // `HIPFIRE_THINK_CONTINUATION` (default "</think>\n\n"); the
+                // multi-slot engine masks to the close instead. The Qwen3.5
+                // dense-TP and MoE-EP producers still fail the request
+                // ("think token budget exceeded").
                 let max_think_tokens = msg
                     .get("max_think_tokens")
                     .and_then(|v| v.as_u64())

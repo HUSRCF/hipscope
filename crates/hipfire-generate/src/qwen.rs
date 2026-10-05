@@ -3298,6 +3298,13 @@ pub fn generate_dflash(
                 *store_cache = false;
             }
         }
+        if run.finish.open_think && !hit_length_cap {
+            // Tells `<|im_end|>` from `<|endoftext|>` (both EOS) in captures.
+            eprintln!(
+                "[open-think] id={id} route=spec model ended the turn inside reasoning; terminal token {:?}",
+                run.streamed_tokens.last()
+            );
+        }
         match &terminal {
             QwenDflashWireTerminal::Malformed {
                 message,

@@ -35,6 +35,91 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
+/// The close a Qwen chat template frames reasoning with (`<think>\n…\n</think>\n\n`).
+/// Spliced when an explicit `max_think_tokens` budget runs out on the Qwen4
+/// routes, so the model continues from the exact text it was trained to answer
+/// after (vLLM's `thinking_token_budget` forces the parser's end marker the same
+/// way). For Flash-Next this encodes to `\n` 198, `</think>` 248069, `\n\n` 271.
+pub const QWEN_TEMPLATE_THINK_CLOSE: &str = "\n</think>\n\n";
+
+/// What [`ThinkBudget::observe`] asks the decode loop to do after a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkBudgetStep {
+    /// Keep decoding.
+    Continue,
+    /// The budget ran out inside the think span: splice the close text next.
+    ForceClose,
+    /// The budget ran out again in a span re-opened after the forced close:
+    /// stop the turn (no second splice, so a model that keeps re-opening
+    /// `<think>` cannot run the turn out).
+    Exhausted,
+}
+
+/// Explicit `max_think_tokens` accounting shared by the AR and speculative
+/// producers, so both force the close after the same token.
+///
+/// Every committed token that leaves the stream inside a think span counts;
+/// entering a span starts the count over. When the count reaches the budget the
+/// first time, the caller splices the close and reports how many tokens it
+/// queued through [`Self::closing`]; those tokens are not counted (the leading
+/// `\n` of [`QWEN_TEMPLATE_THINK_CLOSE`] is still inside the span).
+#[derive(Debug, Clone, Default)]
+pub struct ThinkBudget {
+    max: usize,
+    count: usize,
+    prev_in_think: bool,
+    force_closed: bool,
+    closing: usize,
+}
+
+impl ThinkBudget {
+    /// `max == 0` is uncapped: [`Self::observe`] always continues.
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a budget is set (callers skip the think scan otherwise).
+    pub fn enabled(&self) -> bool {
+        self.max > 0
+    }
+
+    /// Account one committed token; `in_think` is the stream state after it.
+    pub fn observe(&mut self, in_think: bool) -> ThinkBudgetStep {
+        if self.max == 0 {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.closing > 0 {
+            self.closing -= 1;
+            self.prev_in_think = in_think;
+            return ThinkBudgetStep::Continue;
+        }
+        if in_think && !self.prev_in_think {
+            self.count = 0;
+        }
+        if in_think {
+            self.count += 1;
+        }
+        self.prev_in_think = in_think;
+        if !in_think || self.count < self.max {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.force_closed {
+            return ThinkBudgetStep::Exhausted;
+        }
+        self.force_closed = true;
+        ThinkBudgetStep::ForceClose
+    }
+
+    /// The caller queued `tokens` close tokens after a
+    /// [`ThinkBudgetStep::ForceClose`]; skip them in the count.
+    pub fn closing(&mut self, tokens: usize) {
+        self.closing = tokens;
+    }
+}
+
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
