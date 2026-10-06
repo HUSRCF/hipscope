@@ -8,10 +8,12 @@
 //! `indexed_attention_select_from_scores_pm_gfx1151` (`qsa_topk`), with the
 //! kernarg ABI, grid and output bytes of the hipcc pair in
 //! `kernels/src/tensor_ops.hip`. Every other target is refused.
+//! `qsa_select_bf16_pm_gfx1151` instead pairs the BF16-pooled score variant
+//! (exact widening, identical score arithmetic) with the unchanged select.
 use crate::{Arch, Emitted};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Kind { Score, Select }
+pub enum Kind { Score, ScoreBf16, Select }
 impl Kind {
     pub const ALL: [Kind; 2] = [Kind::Score, Kind::Select];
 }
@@ -20,11 +22,13 @@ impl Kind {
 pub struct Spec { pub arch: Arch, pub kind: Kind }
 
 pub fn module(arch: Arch) -> String { format!("qsa_select_pm_{}", arch.name()) }
+pub fn module_bf16(arch: Arch) -> String { format!("qsa_select_bf16_pm_{}", arch.name()) }
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     if spec.arch != Arch::Gfx1151 { return Err("qsa_select: built for gfx1151 only".into()) }
     match spec.kind {
         Kind::Score => super::qsa_score::emit(spec.arch),
+        Kind::ScoreBf16 => super::qsa_score::emit_bf16(spec.arch),
         Kind::Select => super::qsa_topk::emit(spec.arch),
     }
 }
@@ -33,5 +37,12 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
     let emitted = Kind::ALL.into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &module(arch))?;
+    Ok((emitted, text, proof))
+}
+
+/// BF16-pooled score followed by the unchanged select, as one module.
+pub fn emit_module_bf16(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = [Kind::ScoreBf16, Kind::Select].into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = super::iu4_gemm::module(&emitted, &module_bf16(arch))?;
     Ok((emitted, text, proof))
 }

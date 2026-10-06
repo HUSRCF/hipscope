@@ -8,6 +8,8 @@
 //! waves) and output bytes of the hipcc twin
 //! `indexed_attention_select_scores_rows16_f32` in `kernels/src/tensor_ops.hip`
 //! (host contract: `index_heads = 4`, `index_dim = 128`):
+//! The BF16-pooled variant (`indexed_attention_select_scores_rows16_bf16_pm_gfx1151`)
+//! has the same ABI and arithmetic, with exact BF16-to-F32 bit widening.
 //!
 //! ```text
 //! scores[(row0 + r) * score_stride + block] =
@@ -27,6 +29,9 @@
 //!   workgroup's first block with `num_records = min(block_count - 256 *
 //!   wg_x, 256) * 512`, so a lane with `block >= block_count` reads 0 and
 //!   touches no memory;
+//!   BF16 uses 256-byte rows and 16 loads into the upper 64 key VGPRs;
+//!   after `vmcnt(0)`, ascending in-place unpack shifts each low half by 16
+//!   and masks each high half with `0xffff0000`, giving the same 128 F32 keys;
 //! - the query is workgroup-uniform, so it streams through SGPRs: a row is 16
 //!   stages of 8 dims, each four `s_load_b256` (one per head, 32 SGPRs) into a
 //!   double-buffered 64-SGPR ring. SMEM loads return out of order, so every
@@ -70,6 +75,15 @@ use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::{I
 use peacemaker_author::{Gfx1151, Wave, Workgroup};
 
 pub fn symbol(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_f32_pm_{}", arch.name()) }
+pub fn symbol_bf16(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_bf16_pm_{}", arch.name()) }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Pooled { F32, Bf16 }
+impl Pooled {
+    fn row_shift(self) -> u32 { match self { Self::F32 => 9, Self::Bf16 => 8 } }
+    fn load_count(self) -> u8 { match self { Self::F32 => 32, Self::Bf16 => 16 } }
+    fn packed_base(self) -> u8 { match self { Self::F32 => KEYS, Self::Bf16 => KEYS + 64 } }
+}
 
 /// `sqrtf(128.0f)` correctly rounded (`128f32.sqrt().to_bits()`).
 const SQRT_INDEX_DIM: u32 = 0x4135_04f3;
@@ -137,14 +151,24 @@ fn plan() -> Result<RegPlan, String> {
 }
 
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
+    emit_pooled(arch, Pooled::F32)
+}
+
+pub fn emit_bf16(arch: Arch) -> Result<Emitted, String> {
+    emit_pooled(arch, Pooled::Bf16)
+}
+
+fn emit_pooled(arch: Arch, pooled: Pooled) -> Result<Emitted, String> {
     if arch != Arch::Gfx1151 { return Err("qsa_score: built for gfx1151 only".into()) }
     let spec = KernelSpec {
-        kernel_id: "qsa_select".into(), variant: "score".into(), arch, symbol: symbol(arch),
+        kernel_id: "qsa_select".into(),
+        variant: if pooled == Pooled::F32 { "score" } else { "score-bf16" }.into(), arch,
+        symbol: if pooled == Pooled::F32 { symbol(arch) } else { symbol_bf16(arch) },
         kernargs: kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
         workgroup_size: 256, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut b = Builder::new(spec, plan()?);
-    author(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?)?;
+    author(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, pooled)?;
     b.finish()
 }
 
@@ -154,14 +178,14 @@ fn scmp(w: &mut Wave<'_, Gfx1151, Builder>, text: String, uses: &[u8]) -> Result
     w.scmp(Instruction::new(text, vec![], uses.iter().map(|&n| s(n)).collect()))
 }
 
-fn author(wg: Wg) -> Result<(), String> {
+fn author(wg: Wg, pooled: Pooled) -> Result<(), String> {
     let end = wg.exit(".Lqsc_end")?;
     let b = wg.isa();
     smem(b, A0, 8, KARG, 0)?;
     smem(b, A1, 4, KARG, 0x20)?;
     smem(b, SCSTRIDE, 1, KARG, 0x30)?;
     // Lane constants: key row byte offset, score byte offset, the divisor and this wave's index.
-    op(b, format!("v_lshlrev_b32_e32 v{KOFF}, 9, v{TID}"), &[v(KOFF)], &[v(TID)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{KOFF}, {}, v{TID}", pooled.row_shift()), &[v(KOFF)], &[v(TID)])?;
     op(b, format!("v_lshlrev_b32_e32 v{SOFF}, 2, v{TID}"), &[v(SOFF)], &[v(TID)])?;
     op(b, format!("v_mov_b32_e32 v{DIV}, {}", lit(SQRT_INDEX_DIM)), &[v(DIV)], &[])?;
     op(b, format!("v_lshrrev_b32_e32 v{ACC}, 5, v{TID}"), &[v(ACC)], &[v(TID)])?;
@@ -180,16 +204,16 @@ fn author(wg: Wg) -> Result<(), String> {
     Wave::<Gfx1151, Builder>::exit_unless(wg, some, &end)?;
     let b = wg.isa();
     // Pooled key descriptor: this workgroup's first block, at most 256 blocks of records.
-    sop(b, format!("s_lshl_b32 s{T1}, s{WGX}, 17"), &[T1], &[WGX])?;
+    sop(b, format!("s_lshl_b32 s{T1}, s{WGX}, {}", pooled.row_shift() + 8), &[T1], &[WGX])?;
     sop(b, format!("s_add_u32 s{SRD_K}, s{POOLED}, s{T1}"), &[SRD_K], &[POOLED, T1])?;
     sop(b, format!("s_addc_u32 s{}, s{}, 0", SRD_K + 1, POOLED + 1), &[SRD_K + 1], &[POOLED + 1])?;
     sop(b, format!("s_sub_i32 s{T1}, s{BLOCK_COUNT}, s{BLK0}"), &[T1], &[BLOCK_COUNT, BLK0])?;
     sop(b, format!("s_min_i32 s{T1}, s{T1}, {}", lit(TILE_BLOCKS)), &[T1], &[T1])?;
-    sop(b, format!("s_lshl_b32 s{}, s{T1}, 9", SRD_K + 2), &[SRD_K + 2], &[T1])?;
+    sop(b, format!("s_lshl_b32 s{}, s{T1}, {}", SRD_K + 2, pooled.row_shift()), &[SRD_K + 2], &[T1])?;
     sop(b, format!("s_mov_b32 s{}, {}", SRD_K + 3, lit(SRD_WORD3)), &[SRD_K + 3], &[])?;
     // Every lane's whole key row, in one clause.
     b.clause(|b| {
-        for i in 0..(DIM * 4 / 16) as u8 { bload(b, 4, KEYS + 4 * i, KOFF, SRD_K, 16 * u32::from(i))?; }
+        for i in 0..pooled.load_count() { bload(b, 4, pooled.packed_base() + 4 * i, KOFF, SRD_K, 16 * u32::from(i))?; }
         Ok(())
     })?;
     // Query row cursor and the scores descriptor, based at row0 and this tile's first block.
@@ -215,6 +239,17 @@ fn author(wg: Wg) -> Result<(), String> {
     set_visible(b)?;
     sop(b, format!("s_mov_b32 s{ROW}, 0"), &[ROW], &[])?;
     b.wait(Counter::Vm, 0)?;
+    if pooled == Pooled::Bf16 {
+        // Ascending unpack cannot overwrite a future packed source. The last
+        // high destination aliases its source; emit low before high.
+        for i in 0..64u8 {
+            let packed = pooled.packed_base() + i;
+            let lo = KEYS + 2 * i;
+            let hi = lo + 1;
+            op(b, format!("v_lshlrev_b32_e32 v{lo}, 16, v{packed}"), &[v(lo)], &[v(packed)])?;
+            op(b, format!("v_and_b32_e32 v{hi}, 0xffff0000, v{packed}"), &[v(hi)], &[v(packed)])?;
+        }
+    }
     wg.loop_until(".Lqsc_rows", ".Lqsc_rows_done", |w, exit| {
         row(w.isa())?;
         let b = w.isa();
