@@ -1314,6 +1314,7 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "gated_delta_chunk_route", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_attention_batch_impl", occurrences: 2, decisions: &["qwen4-indexed-attention-lds-bound"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_impl", occurrences: 4, decisions: &["qwen4-opt-in-eager-fusions"] },
+    Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_pm_arm", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_dense_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_gathered_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
     Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_f16_windowed", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
