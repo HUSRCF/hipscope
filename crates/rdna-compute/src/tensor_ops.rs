@@ -58,6 +58,18 @@ static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
 });
+/// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
+/// unless `0`) run the live QSA selector pair's rows16 F32 score /
+/// select-from-scores kernel from the certified builder module
+/// (`kernels::QSA_SELECT_PM_GFX1151`: same kernargs, grid, block and output
+/// bytes as the hipcc kernels) on exact gfx1151 prefill calls the module
+/// covers ([`qsa_select_pm_fits`]).  `0` keeps that hipcc kernel.  Read once.
+static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true)
+});
+static QWEN4_QSA_SELECT_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_PM", true)
+});
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
 /// ranks; selected indices and mirror byte-identical) for complete <= 2048
@@ -3390,7 +3402,8 @@ fn indexed_attention_select_batch_impl(
         && p.block_count > 0
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
     {
-        return indexed_attention_select_rows8(gpu, p, mirror);
+        let pm = qsa_select_pm_arm(gpu, p);
+        return indexed_attention_select_rows8(gpu, p, mirror, pm);
     }
     // Past the LDS row the scores go to global rows (one per workgroup, at
     // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
@@ -3550,30 +3563,125 @@ const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
 /// entries; larger budgets take the batched kernel.
 const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
 
+/// Which kernels of the live pair come from the certified builder module
+/// (`kernels::QSA_SELECT_PM_GFX1151`) instead of the hipcc source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QsaSelectPmArm {
+    Hipcc,
+    ScoreOnly,
+    SelectOnly,
+    Both,
+}
+impl QsaSelectPmArm {
+    fn score(self) -> bool { matches!(self, Self::ScoreOnly | Self::Both) }
+    fn select(self) -> bool { matches!(self, Self::SelectOnly | Self::Both) }
+}
+
+/// Pooled blocks the builder selector serves: its per-lane bit-sliced
+/// counters take at most 511 packets of 32 keys per wave.
+const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
+/// Original-call rows from which the builder pair runs (prefill; decode and
+/// verify keep the hipcc pair).
+const QSA_SELECT_PM_MIN_ROWS: usize = 512;
+
+/// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
+/// prefill rows, the fixed four-head / 128-dim F32 geometry, and every
+/// buffer the kernels address through 32-bit raw-buffer offsets below their
+/// out-of-range offset.
+fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
+    const PM_OOB_OFFSET: usize = 0x7fff_ff00;
+    let below = |n: Option<usize>| n.is_some_and(|bytes| bytes < PM_OOB_OFFSET);
+    gpu.arch_caps.is_gfx1151()
+        && p.rows >= QSA_SELECT_PM_MIN_ROWS
+        && p.index_heads == 4
+        && p.index_dim == 128
+        && p.block_count <= QSA_SELECT_PM_MAX_BLOCKS
+        && below(p.rows.checked_mul(p.query_row_stride).and_then(|n| n.checked_mul(4)))
+        && below(p.block_count.checked_mul(128 * 4))
+        && below(p.rows.checked_mul(p.capacity).and_then(|n| n.checked_mul(4)))
+}
+
+/// The route's arm: `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM`
+/// (each on unless `0`) where the builder pair covers the call.
+fn qsa_select_pm_arm(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> QsaSelectPmArm {
+    if !qsa_select_pm_fits(gpu, p) {
+        return QsaSelectPmArm::Hipcc;
+    }
+    match (*QWEN4_QSA_SCORE_PM, *QWEN4_QSA_SELECT_PM) {
+        (false, false) => QsaSelectPmArm::Hipcc,
+        (true, false) => QsaSelectPmArm::ScoreOnly,
+        (false, true) => QsaSelectPmArm::SelectOnly,
+        (true, true) => QsaSelectPmArm::Both,
+    }
+}
+
+/// Lab entry of the live pair with an explicit arm (the route's grouping,
+/// scratch and mirror persistence; only the env choice is bypassed). Refuses,
+/// before any launch, every call the live pair or the builder pair does not
+/// cover (with `Hipcc`, only the live pair's own gate applies).
+#[cfg(any(test, feature = "lab"))]
+pub fn indexed_attention_select_batch_pm_arm(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    arm: QsaSelectPmArm,
+) -> HipResult<bool> {
+    let live = gpu.arch_caps.has_gfx11_plus_simt()
+        && p.pooled.dtype == DType::F32
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.block_count > 0
+        && p.rows > 8
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET;
+    if !live || (arm != QsaSelectPmArm::Hipcc && !qsa_select_pm_fits(gpu, p)) {
+        return Err(HipError::new(0, "QSA select PM arm: call not covered"));
+    }
+    indexed_attention_select_rows8(gpu, p, mirror, arm)
+}
+
 /// [`indexed_attention_select_batch_impl`]'s live route: row groups of
 /// `indexed_attention_select_scores_rows{8,16}_f32` scores, each followed by
-/// `indexed_attention_select_from_scores` reading them. Selection bytes are
-/// unchanged.
+/// `indexed_attention_select_from_scores` reading them, either from the hipcc
+/// source or (per `pm`) the certified builder module's
+/// `indexed_attention_select_scores_rows16_f32_pm_gfx1151` /
+/// `indexed_attention_select_from_scores_pm_gfx1151`, which take the same
+/// kernargs, grids and blocks. Selection bytes are unchanged.
 fn indexed_attention_select_rows8(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
     mirror: Option<&GpuTensor>,
+    pm: QsaSelectPmArm,
 ) -> HipResult<bool> {
+    const PM_MODULE: &str = "qsa_select_pm_gfx1151";
     let stride = p.block_count;
     // Prefill scores sixteen rows per pooled-key read; decode and few-row
     // verify keep eight (the sixteen-row kernel costs them more than it saves).
-    let (score_kernel, score_rows) = if p.rows > 8 {
+    let (score_kernel, score_rows) = if pm.score() {
+        ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
+    } else if p.rows > 8 {
         ("indexed_attention_select_scores_rows16_f32", 16)
     } else {
         ("indexed_attention_select_scores_rows8_f32", 8)
+    };
+    let select_kernel = if pm.select() {
+        "indexed_attention_select_from_scores_pm_gfx1151"
+    } else {
+        "indexed_attention_select_from_scores"
     };
     let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
         .max(16)
         .min(p.rows);
     // Growth goes through the accessor that invalidates captured state first.
     let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
-    for kernel in [score_kernel, "indexed_attention_select_from_scores"] {
-        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    for (kernel, built) in [(score_kernel, pm.score()), (select_kernel, pm.select())] {
+        if built {
+            gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, kernel)?;
+        } else {
+            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+        }
     }
     let mirror =
         mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
@@ -3633,7 +3741,7 @@ fn indexed_attention_select_rows8(
         args.push_ptr(mirror_ptr);
         args.pad_to(16);
         gpu.launch_blob_recorded(
-            "indexed_attention_select_from_scores",
+            select_kernel,
             [rows as u32, 1, 1],
             [256, 1, 1],
             0,

@@ -4219,6 +4219,15 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// (`hipfire peacemaker native-emit`).
 pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
 pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
+/// Certified builder module of the live QSA selector pair
+/// (`hipfire-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
+/// obligation-free): the rows16 F32 score and the select-from-scores kernels,
+/// with the kernargs, grids, blocks and output bytes of
+/// `indexed_attention_select_scores_rows16_f32` /
+/// `indexed_attention_select_from_scores` in `kernels/src/tensor_ops.hip`.
+/// Default on (`HIPFIRE_QWEN4_QSA_SCORE_PM=0` / `HIPFIRE_QWEN4_QSA_SELECT_PM=0`
+/// keep the hipcc kernels).
+pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
 pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
