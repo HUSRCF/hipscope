@@ -8,8 +8,8 @@
 //! `indexed_attention_select_from_scores_pm_gfx1151` (`qsa_topk`), with the
 //! kernarg ABI, grid and output bytes of the hipcc pair in
 //! `kernels/src/tensor_ops.hip`. Every other target is refused.
-//! `qsa_select_bf16_pm_gfx1151` instead pairs the BF16-pooled score variant
-//! (exact widening, identical score arithmetic) with the unchanged select.
+//! `qsa_select_bf16_pm_gfx1151` contains only the BF16-pooled score variant
+//! (exact widening, identical score arithmetic); its route reuses the F32 select image.
 use crate::{Arch, Emitted};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,9 +40,9 @@ pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm:
     Ok((emitted, text, proof))
 }
 
-/// BF16-pooled score followed by the unchanged select, as one module.
+/// BF16-pooled score only; the select symbol is shipped in the F32 module.
 pub fn emit_module_bf16(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = [Kind::ScoreBf16, Kind::Select].into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
+    let emitted = vec![emit(Spec { arch, kind: Kind::ScoreBf16 })?];
     let (text, proof) = super::iu4_gemm::module(&emitted, &module_bf16(arch))?;
     Ok((emitted, text, proof))
 }

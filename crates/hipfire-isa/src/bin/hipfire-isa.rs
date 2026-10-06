@@ -79,7 +79,7 @@ fn qsa_gather(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=qsa_gather::emit(Spec{arch,kind})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
-/// `all` (default) emits F32 score + select; `bf16` emits BF16-pooled score + select.
+/// `all` (default) emits F32 score + select; `bf16` emits only BF16-pooled score.
 fn qsa_select(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::qsa_select::{self,Kind,Spec};
  if epi=="all"{let (_,text,proof)=qsa_select::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}

@@ -9,11 +9,11 @@ use hipfire_isa::kernels::{qsa_score, qsa_select::{self, Kind, Spec}, qsa_topk};
 const ARCH: Arch = Arch::Gfx1151;
 
 fn symbol(kind: Kind) -> String {
-    match kind { Kind::Score => qsa_score::symbol(ARCH), Kind::Select => qsa_topk::symbol(ARCH) }
+    match kind { Kind::Score => qsa_score::symbol(ARCH), Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => qsa_topk::symbol(ARCH) }
 }
 
 fn tag(kind: Kind) -> &'static str {
-    match kind { Kind::Score => "score", Kind::Select => "select" }
+    match kind { Kind::Score => "score", Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => "select" }
 }
 
 #[test]

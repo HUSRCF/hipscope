@@ -47,7 +47,7 @@ fn standalone_qsa_select_matches_rust_and_shipped_objects() {
     assert_eq!(fs::read(&b.hsaco).unwrap(), fs::read(&shipped).unwrap(), "shipped bundle");
     for kind in Kind::ALL {
         let _ = Spec { arch, kind };
-        let (symbol, tag) = match kind { Kind::Score => (qsa_score::symbol(arch), "score"), Kind::Select => (qsa_topk::symbol(arch), "select") };
+        let (symbol, tag) = match kind { Kind::Score => (qsa_score::symbol(arch), "score"), Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => (qsa_topk::symbol(arch), "select") };
         let report = pm_check::m7(&b.elf, arch.name(), &symbol).unwrap();
         assert_eq!(report["lift"], "byte-exact");
         assert_eq!(report["obligations"], serde_json::json!({}));
