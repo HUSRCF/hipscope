@@ -28,6 +28,9 @@
 //! `--tied` adds the synthetic all-tied rows (16384, 32768 and 65536 blocks)
 //! for the PM selector only, against the CPU stable-order oracle; the
 //! pre-fix hipcc selector never runs on them.
+//!
+//! `--g3 --beta-src ABS_FILE` runs the G3 exact-oracle + HIP-graph gate of the
+//! PM pair as the default route (see `mod g3`; build with `--features lab`).
 
 use hip_bridge::{Function, KernargBlob, Module};
 use rayon::prelude::*;
@@ -415,6 +418,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut dirs, mut out, mut timed, mut image) = (Vec::new(), None, 0usize, None::<PathBuf>);
     let (mut arms, mut cpu_stride, mut screen, mut tied) = ((Impl::Hipcc, Impl::Hipcc), 64usize, true, false);
+    let (mut g3, mut beta_src) = (false, None::<PathBuf>);
     let parse_impl = |v: Option<String>| -> Result<Impl> {
         match v.as_deref() { Some("hipcc") => Ok(Impl::Hipcc), Some("pm") => Ok(Impl::Pm), _ => Err("arm must be hipcc|pm".into()) }
     };
@@ -429,10 +433,18 @@ fn main() -> Result<()> {
             "--cpu-rows" => cpu_stride = it.next().ok_or("--cpu-rows N")?.parse().map_err(err)?,
             "--no-screen" => screen = false,
             "--tied" => tied = true,
+            "--g3" => g3 = true,
+            "--beta-src" => beta_src = Some(PathBuf::from(it.next().ok_or("--beta-src ABS_FILE")?)),
             _ => dirs.push(PathBuf::from(a)),
         }
     }
     let out = out.ok_or("--out OUT.jsonl required")?;
+    if g3 {
+        #[cfg(feature = "lab")]
+        return g3::run(&dirs, Path::new(&out), beta_src, image.is_some());
+        #[cfg(not(feature = "lab"))]
+        return Err("--g3 needs --features lab".into());
+    }
     let mut paths = Vec::new();
     for d in &dirs { snapshots(d, &mut paths)?; }
     if paths.is_empty() && !tied { return Err("no snapshot.json found".into()) }
@@ -592,4 +604,654 @@ fn main() -> Result<()> {
     for e in events { gpu.hip.event_destroy(e).map_err(err)?; }
     if failures > 0 { return Err(format!("{failures} failing checks; see {out}")) }
     Ok(())
+}
+
+// ---------------------------------------------------------------- G3
+
+/// `--g3 --beta-src ABS_FILE`: exact oracle + graph-safety gate of the PM QSA
+/// selector pair as the default gfx1151 prefill route.  Needs
+/// `--features lab` (the explicit-arm helper is lab-only):
+/// `cargo build --release -p rdna-compute --features lab --example qsa_select_pm_check`.
+///
+/// `qsa_select_pm_check SNAPSHOT_DIR... --g3 --beta-src ABS_FILE --out OUT.jsonl`
+///
+/// Arms (one JSONL record per case x arm, then one summary line; nonzero exit
+/// on any failing record or refusal):
+/// - `raw-fixed` / `raw-pm` / `beta`: raw-ABI production grouping (own 64 MiB
+///   scratch, scores downloaded) of the in-tree hipcc pair / embedded PM image /
+///   the pre-fix hipcc pair compiled from `--beta-src` as a separate module;
+/// - `fixed` / `pm` / `pm-score-only` / `pm-select-only`: the production helper
+///   `indexed_attention_select_batch_pm_arm` with `Hipcc` / `Both` / `ScoreOnly` /
+///   `SelectOnly`;
+/// - `pm-graph`: the PM pair's raw launches captured into a HIP graph on a
+///   private stream (buffers reserved and poisoned outside capture), replayed
+///   twice and compared with the eager `pm` arm;
+/// - `live`: the public route (`indexed_attention_select_batch[_mirrored]`),
+///   default flags, which must equal the `pm` arm.
+/// Every arm runs twice serially (`repeat_identical`).  Oracle: CPU stable
+/// `(score desc, block asc)` selection + tail/fill/mirror over the fixed
+/// arm's scores (sampled rows rescored on the CPU bit for bit); snapshot cases
+/// are also compared with the captured `selected.i32` / `selected-mirror.i32`.
+#[cfg(feature = "lab")]
+mod g3 {
+    use super::*;
+    use hip_bridge::{Graph, GraphExec, Stream};
+    use rdna_compute::tensor_ops::{
+        indexed_attention_select_batch, indexed_attention_select_batch_mirrored,
+        indexed_attention_select_batch_pm_arm, IndexedAttentionSelectBatch, QsaSelectPmArm,
+    };
+
+    const PM_IMAGE: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
+    const BETA_MODULE: &str = "qsa_select_beta_060cadcd3b";
+    /// Poisoned bytes after `selected` / `mirror`: any stray write shows.
+    const CANARY: usize = 4096;
+    /// The pre-fix tie-count overflow range: beta never runs from here.
+    const BETA_MAX_BLOCKS: usize = 32768;
+    const PM_MAX_BLOCKS: usize = 511 * 8 * 32;
+    const OOB: usize = 0x7fff_ff00;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum RawImpl { Fixed, Beta, Pm }
+
+    struct Env {
+        _beta: Module, beta_score: Function, beta_select: Function,
+        _pm: Module, pm_score: Function, pm_select: Function,
+    }
+
+    struct Sink { f: std::fs::File, failures: usize, records: usize, cases: usize }
+    impl Sink {
+        fn put(&mut self, mut rec: Value, ok: bool) -> Result<()> {
+            rec["ok"] = json!(ok);
+            if !ok { self.failures += 1; eprintln!("FAIL {rec}"); }
+            self.records += 1;
+            writeln!(self.f, "{rec}").map_err(err)?;
+            self.f.flush().map_err(err)
+        }
+    }
+
+    struct Case {
+        name: String,
+        c: Call,
+        shape_blocks: usize,
+        qbytes: Vec<u8>,
+        pbytes: Vec<u8>,
+        qh: String,
+        ph: String,
+        snap: Option<(Vec<u8>, Vec<u8>)>,
+        mirror: bool,
+        beta_skip: Option<&'static str>,
+    }
+
+    struct Out { sel: Vec<u8>, mirror: Vec<u8>, scores: Vec<u8>, canary: bool, persisted: Option<bool> }
+    fn same(a: &Out, b: &Out) -> bool { a.sel == b.sel && a.mirror == b.mirror && a.scores == b.scores && a.canary == b.canary }
+
+    struct Expect<'a> { mirror: bool, sel: &'a [u8], mirror_bytes: &'a [u8], snap: Option<&'a (Vec<u8>, Vec<u8>)> }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    fn bytes_f32(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect() }
+    fn word_diff(a: &[u8], b: &[u8]) -> u64 {
+        if a.len() != b.len() { return u64::MAX }
+        a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count() as u64
+    }
+
+    // ------------------------------------------------------------ launches
+
+    fn raw_launch(gpu: &mut Gpu, env: &Env, which: RawImpl, score: bool, grid: [u32; 3], blob: &mut KernargBlob) -> Result<()> {
+        match which {
+            RawImpl::Fixed => gpu
+                .launch_kernel_blob(if score { HIPCC_SCORE } else { HIPCC_SELECT }, grid, [256, 1, 1], 0, blob.as_mut_slice())
+                .map_err(err),
+            RawImpl::Beta => {
+                let f = if score { &env.beta_score } else { &env.beta_select };
+                unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+            }
+            RawImpl::Pm => {
+                let f = if score { &env.pm_score } else { &env.pm_select };
+                unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+            }
+        }
+    }
+
+    /// The production pair over all groups with the given kernels (`keep`
+    /// downloads each group's scratch after its score launch).
+    fn raw_call(gpu: &mut Gpu, env: &Env, which: RawImpl, c: &Call, b: &Bufs, mirror: bool, mut keep: Option<&mut Vec<u8>>) -> Result<()> {
+        let group = c.group();
+        let mut g0 = 0;
+        while g0 < c.rows {
+            let n = group.min(c.rows - g0);
+            if keep.is_some() { gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?; }
+            let mut blob = score_blob(c, b, g0, n);
+            raw_launch(gpu, env, which, true, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], &mut blob)?;
+            if let Some(k) = keep.as_deref_mut() {
+                gpu.hip.device_synchronize().map_err(err)?;
+                let mut bytes = vec![0u8; n * c.block_count * 4];
+                let len = bytes.len();
+                gpu.hip.memcpy_dtoh(&mut bytes, &b.scores.buf.byte_view(0, len)).map_err(err)?;
+                k.extend_from_slice(&bytes);
+            }
+            let mut blob = select_blob(c, b, g0, n, mirror && g0 + n == c.rows);
+            raw_launch(gpu, env, which, false, [n as u32, 1, 1], &mut blob)?;
+            g0 += n;
+        }
+        gpu.hip.device_synchronize().map_err(err)
+    }
+
+    fn read_out(gpu: &Gpu, b: &Bufs, c: &Call, scores: Vec<u8>, persisted: Option<bool>) -> Result<Out> {
+        let sel_len = c.rows * c.capacity * 4;
+        let mir_len = c.capacity * 4;
+        let mut sel = download(gpu, &b.selected)?;
+        let mut mirror = download(gpu, &b.mirror)?;
+        let canary = sel[sel_len..].iter().all(|&x| x == POISON) && mirror[mir_len..].iter().all(|&x| x == POISON);
+        sel.truncate(sel_len);
+        mirror.truncate(mir_len);
+        Ok(Out { sel, mirror, scores, canary, persisted })
+    }
+
+    fn arm_raw(gpu: &mut Gpu, env: &Env, which: RawImpl, case: &Case, b: &Bufs) -> Result<Out> {
+        poison_outputs(gpu, b)?;
+        let mut scores = Vec::new();
+        raw_call(gpu, env, which, &case.c, b, case.mirror, Some(&mut scores))?;
+        read_out(gpu, b, &case.c, scores, None)
+    }
+
+    fn params<'a>(case: &'a Case, b: &'a Bufs) -> IndexedAttentionSelectBatch<'a> {
+        let c = &case.c;
+        IndexedAttentionSelectBatch {
+            query: &b.query, pooled: &b.pooled, selected: &b.selected, rows: c.rows, query_row_stride: c.stride,
+            block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
+            position_start: c.position_start, capacity: c.capacity, shape_blocks: case.shape_blocks,
+        }
+    }
+
+    /// `arm` Some: the lab helper with that arm; None: the live route.
+    fn arm_helper(gpu: &mut Gpu, case: &Case, b: &Bufs, arm: Option<QsaSelectPmArm>) -> Result<Out> {
+        poison_outputs(gpu, b)?;
+        let p = params(case, b);
+        let persisted = match arm {
+            Some(a) => indexed_attention_select_batch_pm_arm(gpu, &p, case.mirror.then_some(&b.mirror), a).map_err(err)?,
+            None if case.mirror => indexed_attention_select_batch_mirrored(gpu, &p, &b.mirror).map_err(err)?,
+            None => { indexed_attention_select_batch(gpu, &p).map_err(err)?; false }
+        };
+        gpu.hip.device_synchronize().map_err(err)?;
+        read_out(gpu, b, &case.c, Vec::new(), Some(persisted))
+    }
+
+    fn twice<F: FnMut(&mut Gpu) -> Result<Out>>(gpu: &mut Gpu, mut f: F) -> Result<(Out, Out)> {
+        let a = f(gpu)?;
+        let b = f(gpu)?;
+        Ok((a, b))
+    }
+
+    // -------------------------------------------------------------- graph
+
+    struct GraphRun { stream: Stream, graph: Graph, exec: GraphExec, _blobs: Vec<Vec<u8>> }
+
+    /// Capture the PM pair's raw launches (score+select per group, or select
+    /// only for injected scores) on a private non-blocking stream.  All kernarg
+    /// blobs are built before capture and owned by the result; nothing but
+    /// kernel launches is issued inside the capture window.
+    fn build_graph(gpu: &mut Gpu, env: &Env, c: &Call, b: &Bufs, mirror: bool, with_score: bool) -> Result<GraphRun> {
+        let group = c.group();
+        let mut items: Vec<(&Function, [u32; 3], Vec<u8>)> = Vec::new();
+        let mut g0 = 0;
+        while g0 < c.rows {
+            let n = group.min(c.rows - g0);
+            if with_score {
+                items.push((&env.pm_score, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], score_blob(c, b, g0, n).into_vec()));
+            }
+            items.push((&env.pm_select, [n as u32, 1, 1], select_blob(c, b, g0, n, mirror && g0 + n == c.rows).into_vec()));
+            g0 += n;
+        }
+        gpu.hip.device_synchronize().map_err(err)?;
+        let stream = gpu.hip.stream_create_non_blocking().map_err(err)?;
+        gpu.hip.stream_begin_capture(&stream, 0).map_err(err)?;
+        let mut launched = Ok(());
+        for (f, grid, blob) in items.iter_mut() {
+            launched = unsafe { gpu.hip.launch_kernel_blob(f, *grid, [256, 1, 1], 0, Some(&stream), blob.as_mut_slice()) };
+            if launched.is_err() { break }
+        }
+        let graph = gpu.hip.stream_end_capture(&stream);
+        launched.map_err(err)?;
+        let graph = graph.map_err(err)?;
+        let exec = gpu.hip.graph_instantiate(&graph).map_err(err)?;
+        Ok(GraphRun { stream, graph, exec, _blobs: items.into_iter().map(|x| x.2).collect() })
+    }
+
+    fn replay(gpu: &Gpu, g: &GraphRun) -> Result<()> {
+        gpu.hip.device_synchronize().map_err(err)?;
+        gpu.hip.graph_launch(&g.exec, &g.stream).map_err(err)?;
+        gpu.hip.stream_synchronize(&g.stream).map_err(err)
+    }
+
+    fn free_graph(gpu: &Gpu, g: GraphRun) -> Result<()> {
+        gpu.hip.stream_synchronize(&g.stream).map_err(err)?;
+        gpu.hip.graph_exec_destroy(g.exec).map_err(err)?;
+        gpu.hip.graph_destroy(g.graph).map_err(err)?;
+        gpu.hip.stream_destroy(g.stream).map_err(err)
+    }
+
+    // ------------------------------------------------------------- oracle
+
+    /// CPU stable-order selection of every row over the raw score bytes.
+    fn oracle(c: &Call, scores: &[u8]) -> Vec<u8> {
+        let bc = c.block_count;
+        let rows: Vec<Vec<u8>> = (0..c.rows).into_par_iter().map(|r| {
+            let keys: Vec<u32> = scores[r * bc * 4..(r * bc + c.row_blocks(r)) * 4]
+                .chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect();
+            selection_row(&rank(&keys), c, r).iter().flat_map(|v| v.to_le_bytes()).collect()
+        }).collect();
+        rows.concat()
+    }
+
+    /// Sampled rows rescored on the CPU (per-head serial FMA chain): number
+    /// of causal score words that differ from the GPU's.
+    fn rescore_diff(c: &Call, q: &[f32], p: &[f32], scores: &[u8]) -> u64 {
+        let bc = c.block_count;
+        (0..c.rows).into_par_iter().filter(|r| r % 61 == 0 || *r == c.rows - 1).map(|r| {
+            let qr = &q[r * c.stride..r * c.stride + 4 * c.dim];
+            (0..c.row_blocks(r)).filter(|&b| {
+                let (s, _) = cpu_score(qr, &p[b * c.dim..(b + 1) * c.dim], c.dim);
+                let o = (r * bc + b) * 4;
+                s.to_bits() != u32::from_le_bytes(scores[o..o + 4].try_into().unwrap())
+            }).count() as u64
+        }).sum()
+    }
+
+    fn judge(name: &str, arm: &str, e: &Expect, o1: &Out, o2: &Out, inputs_ok: bool, extra: Vec<(&str, Value)>, extra_ok: bool) -> (Value, bool) {
+        let eq_oracle = o1.sel == e.sel;
+        let eq_snap = e.snap.map(|s| o1.sel == s.0 && o1.mirror == s.1);
+        let mirror_ok = (if e.mirror { o1.mirror == e.mirror_bytes } else { o1.mirror.iter().all(|&x| x == POISON) })
+            && o1.persisted.is_none_or(|p| p == e.mirror);
+        let repeat = same(o1, o2);
+        let mut rec = json!({"case":name,"arm":arm,"bytes_equal_oracle":eq_oracle,"mirror_ok":mirror_ok,
+            "canary_ok":o1.canary,"inputs_unchanged":inputs_ok,"repeat_identical":repeat});
+        if let Some(s) = eq_snap { rec["bytes_equal_snapshot"] = json!(s); }
+        for (k, v) in extra { rec[k] = v; }
+        let ok = eq_oracle && eq_snap.unwrap_or(true) && mirror_ok && o1.canary && inputs_ok && repeat && extra_ok;
+        (rec, ok)
+    }
+
+    fn inputs_unchanged(gpu: &Gpu, b: &Bufs, qh: &str, ph: &str) -> Result<bool> {
+        Ok(sha256(&download(gpu, &b.query)?) == qh && sha256(&download(gpu, &b.pooled)?) == ph)
+    }
+
+    fn alloc_bufs(gpu: &mut Gpu, case: &Case) -> Result<Bufs> {
+        let c = &case.c;
+        let (q, p) = (bytes_f32(&case.qbytes), bytes_f32(&case.pbytes));
+        let scores = c.group() * c.block_count * 4;
+        let sel = c.rows * c.capacity * 4 + CANARY;
+        let mir = c.capacity * 4 + CANARY;
+        Ok(Bufs {
+            query: gpu.upload_f32(&q, &[q.len()]).map_err(err)?,
+            pooled: gpu.upload_f32(&p, &[p.len()]).map_err(err)?,
+            scores: gpu.upload_raw(&vec![0u8; scores], &[scores]).map_err(err)?,
+            selected: gpu.upload_raw(&vec![POISON; sel], &[sel]).map_err(err)?,
+            mirror: gpu.upload_raw(&vec![POISON; mir], &[mir]).map_err(err)?,
+        })
+    }
+
+    fn free_bufs(gpu: &mut Gpu, b: Bufs) -> Result<()> {
+        for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] { gpu.free_tensor(t).map_err(err)?; }
+        Ok(())
+    }
+
+    /// Whether the builder pair covers the call (mirrors the route's gate).
+    fn covered(c: &Call) -> bool {
+        let below = |n: Option<usize>| n.is_some_and(|x| x < OOB);
+        c.rows >= 512 && c.budget <= 512 && c.block_count > 0 && c.block_count <= PM_MAX_BLOCKS
+            && below(c.rows.checked_mul(c.stride).and_then(|n| n.checked_mul(4)))
+            && below(c.block_count.checked_mul(128 * 4))
+            && below(c.rows.checked_mul(c.capacity).and_then(|n| n.checked_mul(4)))
+    }
+
+    // -------------------------------------------------------------- cases
+
+    fn run_case(gpu: &mut Gpu, env: &Env, sink: &mut Sink, case: &Case) -> Result<()> {
+        let c = &case.c;
+        sink.cases += 1;
+        if !covered(c) {
+            sink.put(json!({"case":case.name,"arm":"*","refused":"call not covered by the PM pair / production helper (rows < 512, budget > 512 or extent)"}), false)?;
+            return Ok(());
+        }
+        let b = alloc_bufs(gpu, case)?;
+        let (q, p) = (bytes_f32(&case.qbytes), bytes_f32(&case.pbytes));
+        eprintln!("case {} rows={} bc={} group={} compress={} budget={} capacity={} mirror={}", case.name, c.rows, c.block_count,
+            c.group(), c.compress, c.budget, c.capacity, case.mirror);
+
+        // raw-fixed: the oracle's scores.
+        let (fx1, fx2) = twice(gpu, |g| arm_raw(g, env, RawImpl::Fixed, case, &b))?;
+        let orc = oracle(c, &fx1.scores);
+        let orc_mirror = orc[(c.rows - 1) * c.capacity * 4..].to_vec();
+        let rescore = rescore_diff(c, &q, &p, &fx1.scores);
+        let exp = Expect { mirror: case.mirror, sel: &orc, mirror_bytes: &orc_mirror, snap: case.snap.as_ref() };
+        let oracle_snap = case.snap.as_ref().map(|s| orc == s.0 && orc_mirror == s.1);
+        let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
+        let (rec, ok) = judge(&case.name, "raw-fixed", &exp, &fx1, &fx2, ok_in,
+            vec![("cpu_rescore_bits_diff", json!(rescore)), ("oracle_equal_snapshot", json!(oracle_snap))],
+            rescore == 0 && oracle_snap.unwrap_or(true));
+        sink.put(rec, ok)?;
+
+        // raw-pm and raw beta: same score bits (incl. untouched poison) and bytes.
+        for (which, arm) in [(RawImpl::Pm, "raw-pm"), (RawImpl::Beta, "beta")] {
+            if which == RawImpl::Beta {
+                if let Some(reason) = case.beta_skip {
+                    sink.put(json!({"case":case.name,"arm":"beta","skipped":reason}), true)?;
+                    continue;
+                }
+            }
+            let (o1, o2) = twice(gpu, |g| arm_raw(g, env, which, case, &b))?;
+            let diff = word_diff(&o1.scores, &fx1.scores);
+            let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
+            let (mut rec, mut ok) = judge(&case.name, arm, &exp, &o1, &o2, ok_in, vec![("score_bits_diff", json!(diff))], diff == 0);
+            if which == RawImpl::Beta { rec["beta_src"] = json!("pre-fix hipcc pair"); }
+            ok &= o1.scores.len() == fx1.scores.len();
+            sink.put(rec, ok)?;
+        }
+
+        // helper arms (production grouping / scratch / mirror persistence).
+        let mut eager_pm: Option<Out> = None;
+        for (arm, name) in [
+            (QsaSelectPmArm::Hipcc, "fixed"), (QsaSelectPmArm::Both, "pm"),
+            (QsaSelectPmArm::ScoreOnly, "pm-score-only"), (QsaSelectPmArm::SelectOnly, "pm-select-only"),
+        ] {
+            let (o1, o2) = twice(gpu, |g| arm_helper(g, case, &b, Some(arm)))?;
+            let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
+            let (rec, ok) = judge(&case.name, name, &exp, &o1, &o2, ok_in, Vec::new(), true);
+            sink.put(rec, ok)?;
+            if arm == QsaSelectPmArm::Both { eager_pm = Some(o1); }
+        }
+        let eager_pm = eager_pm.unwrap();
+
+        // pm-graph: captured raw PM launches, replayed twice.
+        {
+            let g = build_graph(gpu, env, c, &b, case.mirror, true)?;
+            let mut outs = Vec::new();
+            for _ in 0..2 {
+                poison_outputs(gpu, &b)?;
+                gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?;
+                replay(gpu, &g)?;
+                outs.push(read_out(gpu, &b, c, Vec::new(), None)?);
+            }
+            free_graph(gpu, g)?;
+            let o2 = outs.pop().unwrap();
+            let o1 = outs.pop().unwrap();
+            let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
+            let eq_eager = o1.sel == eager_pm.sel && o1.mirror == eager_pm.mirror;
+            let (rec, ok) = judge(&case.name, "pm-graph", &exp, &o1, &o2, ok_in, vec![("equal_eager_pm", json!(eq_eager))], eq_eager);
+            sink.put(rec, ok)?;
+        }
+
+        // live route, default flags: bytes of the pm arm.
+        {
+            let (o1, o2) = twice(gpu, |g| arm_helper(g, case, &b, None))?;
+            let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
+            let eq_pm = o1.sel == eager_pm.sel && o1.mirror == eager_pm.mirror;
+            let (rec, ok) = judge(&case.name, "live", &exp, &o1, &o2, ok_in, vec![("equal_pm", json!(eq_pm))], eq_pm);
+            sink.put(rec, ok)?;
+        }
+        free_bufs(gpu, b)
+    }
+
+    fn load_snapshot(path: &Path) -> Result<Case> {
+        let root = path.parent().unwrap();
+        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let sel = &header["identity"]["selector"];
+        if header["identity"]["arch"] != "gfx1151" { return Err("snapshot arch not gfx1151".into()) }
+        if sel["pooled_dtype"] != "F32" || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the F32 pooled route", path.display())) }
+        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        let get = |name: &str| -> Result<Vec<u8>> {
+            let b = std::fs::read(root.join(name)).map_err(err)?;
+            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            Ok(b)
+        };
+        let g = &header["geometry"];
+        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
+        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        if compress == 0 { return Err(format!("{}: zero compress", path.display())) }
+        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
+            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
+        if c.budget > 512 || c.block_count == 0 { return Err("uncovered budget/block count".into()) }
+        let pooled_capacity = n(sel, "pooled_capacity")?;
+        let qbytes = get("index-projection.f32")?;
+        let pbytes = get("pooled.source")?;
+        let snap_sel = get("selected.i32")?;
+        let snap_mirror = get("selected-mirror.i32")?;
+        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * 4 || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
+            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        }
+        let name = format!("{} ctx={} layer={}", path.display(), header["identity"]["ctx"], header["identity"]["layer"]);
+        Ok(Case { name, c, shape_blocks: pooled_capacity, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes,
+            snap: Some((snap_sel, snap_mirror)), mirror: true,
+            beta_skip: (c.block_count >= BETA_MAX_BLOCKS).then_some("block_count >= 32768: pre-fix tie-count overflow range, beta never runs") })
+    }
+
+    // --------------------------------------------------------- synthetic
+
+    #[derive(Clone, Copy)]
+    enum Tie { Dense, Sparse, Dup, Float, Zero, Same }
+
+    struct Spec { name: &'static str, compress: usize, bc: usize, rows: usize, tail: usize, budget: usize, cap_extra: usize, mirror: bool, tie: Tie }
+
+    fn int(r: &mut Rng) -> f32 { (r.next() % 3) as f32 - 1.0 }
+    fn flt(r: &mut Rng) -> f32 { (r.next() >> 40) as f32 / 8_388_608.0 - 1.0 }
+
+    /// Deterministic case.  Query/pooled values are small integers (exact,
+    /// order-independent dots: dense score ties) or floats; `Dup` draws every
+    /// block from 40 key vectors (exact equal-threshold ties).  `tail` is the
+    /// last row's partial block, `position_start = bc*compress + tail - rows`.
+    fn synth_case(idx: usize, s: &Spec) -> Case {
+        let (compress, bc, rows) = (s.compress, s.bc, s.rows);
+        assert!(s.tail < compress && bc * compress + s.tail >= rows, "{}", s.name);
+        let position_start = bc * compress + s.tail - rows;
+        let capacity = s.budget * compress + compress - 1 + s.cap_extra;
+        let stride = 640usize;
+        let shape_blocks = bc + 7;
+        let mut rng = Rng(0x5eed_0000_0000 + idx as u64);
+        let float_mode = matches!(s.tie, Tie::Float);
+        let mut q = Vec::with_capacity(rows * stride);
+        for _ in 0..rows {
+            for d in 0..stride { q.push(if d < 512 && !float_mode { int(&mut rng) } else { flt(&mut rng) }); }
+        }
+        let mut p = Vec::with_capacity(shape_blocks * 128);
+        match s.tie {
+            Tie::Dense => for _ in 0..bc * 128 { p.push(int(&mut rng)); },
+            Tie::Float => for _ in 0..bc * 128 { p.push(flt(&mut rng)); },
+            Tie::Sparse => for _ in 0..bc * 128 {
+                let v = rng.next();
+                p.push(if v % 16 == 0 { if v & 16 == 0 { 1.0 } else { -1.0 } } else { 0.0 });
+            },
+            Tie::Zero => p.resize(bc * 128, 0.0),
+            Tie::Dup => {
+                let keys: Vec<Vec<f32>> = (0..40).map(|_| (0..128).map(|_| int(&mut rng)).collect()).collect();
+                for _ in 0..bc { let k = &keys[(rng.next() % 40) as usize]; p.extend_from_slice(k); }
+            }
+            Tie::Same => {
+                let k: Vec<f32> = (0..128).map(|_| int(&mut rng)).collect();
+                for _ in 0..bc { p.extend_from_slice(&k); }
+            }
+        }
+        // Blocks past the active count are never read: garbage the hash guards.
+        for _ in 0..(shape_blocks - bc) * 128 { p.push(flt(&mut rng)); }
+        let (qbytes, pbytes) = (f32_bytes(&q), f32_bytes(&p));
+        let c = Call { rows, stride, block_count: bc, dim: 128, compress, position_start, budget: s.budget, capacity };
+        Case { name: format!("synthetic:{}", s.name), c, shape_blocks, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, snap: None, mirror: s.mirror,
+            beta_skip: (bc >= BETA_MAX_BLOCKS).then_some("block_count >= 32768: pre-fix tie-count overflow range, beta never runs") }
+    }
+
+    fn specs() -> Vec<Spec> {
+        use Tie::*;
+        let s = |name, compress, bc, rows, tail, budget, cap_extra, mirror, tie| Spec { name, compress, bc, rows, tail, budget, cap_extra, mirror, tie };
+        vec![
+            // position % 4 residues (every row also walks all residues)
+            s("c4-res0", 4, 700, 512, 0, 512, 0, true, Dense),
+            s("c4-res1", 4, 700, 512, 1, 512, 0, false, Dense),
+            s("c4-res2", 4, 700, 512, 2, 512, 37, true, Sparse),
+            s("c4-res3", 4, 700, 512, 3, 512, 0, false, Dup),
+            // visible blocks fewer / equal / more than the budget
+            s("c4-fewer-than-budget", 4, 128, 512, 0, 512, 0, true, Dense),
+            s("c4-equal-budget", 4, 512, 512, 1, 512, 0, true, Float),
+            s("c4-more-than-budget", 4, 1024, 1024, 0, 512, 0, false, Sparse),
+            // budgets 0 / 1 / 511
+            s("c4-budget0", 4, 600, 600, 2, 0, 0, true, Dense),
+            s("c4-budget1", 4, 2000, 700, 3, 1, 5, true, Dup),
+            s("c4-budget511", 4, 2100, 2100, 1, 511, 0, true, Dense),
+            // all-zero and identical keys (everything tied)
+            s("c4-zero-keys", 4, 4096, 640, 3, 512, 0, true, Zero),
+            s("c4-same-keys", 4, 4096, 640, 2, 512, 0, true, Same),
+            // ragged groups (64 MiB scratch: group = 16 MiB / (4 bc) rounded to 16)
+            s("c4-ragged-1027-g1024+3", 4, 16384, 1027, 3, 512, 0, true, Dense),
+            s("c4-ragged-2020-g1024+996", 4, 16384, 2020, 0, 512, 0, true, Float),
+            s("c4-ragged-2051-g2048+3", 4, 8192, 2051, 1, 511, 0, false, Dup),
+            s("c4-ragged-1019-single-group", 4, 8192, 1019, 2, 512, 0, true, Sparse),
+            s("c4-ragged-2100-g1392+708", 4, 12000, 2100, 3, 1, 0, true, Dense),
+            s("c4-ragged-1668-g832x2+4", 4, 20000, 1668, 3, 512, 0, true, Dup),
+            // > 32768 blocks (beta never runs)
+            s("c4-bc40000-g416x2+3", 4, 40000, 835, 1, 512, 0, true, Float),
+            s("c4-bc65536-g64x8+3", 4, 65536, 515, 3, 512, 0, true, Dup),
+            // compress 128
+            s("c128-res0", 128, 16, 512, 0, 32, 0, true, Dense),
+            s("c128-res1", 128, 16, 512, 1, 32, 0, false, Dense),
+            s("c128-res63", 128, 16, 512, 63, 32, 3, true, Float),
+            s("c128-res127-fewer-than-budget", 128, 16, 512, 127, 512, 0, true, Dense),
+            s("c128-more-than-budget", 128, 600, 512, 64, 512, 0, true, Sparse),
+            s("c128-budget0", 128, 64, 520, 9, 0, 0, true, Dense),
+            s("c128-ragged-1027-g1024+3", 128, 16384, 1027, 5, 64, 0, true, Dup),
+        ]
+    }
+
+    // ----------------------------------------------------------- all-tied
+
+    /// Scores injected directly (every score equal): select-only raw
+    /// launches of the fixed hipcc / embedded PM / (16384 only) pre-fix hipcc
+    /// select symbol, and the PM select captured into a graph.
+    fn run_tied(gpu: &mut Gpu, env: &Env, sink: &mut Sink, blocks: usize, value: f32) -> Result<()> {
+        sink.cases += 1;
+        let (compress, rows) = (4usize, 3usize);
+        // Every row sees exactly `blocks` complete blocks plus a 1..3-token tail.
+        let position_start = blocks * compress + 3 - rows;
+        let c = Call { rows, stride: 0, block_count: blocks, dim: 128, compress, position_start, budget: 512, capacity: 512 * compress + compress - 1 };
+        let name = format!("tied:blocks={blocks}:value={value}");
+        let fill: Vec<u8> = (0..rows * blocks).flat_map(|_| value.to_le_bytes()).collect();
+        let sel_len = rows * c.capacity * 4;
+        let (sel_b, mir_b) = (sel_len + CANARY, c.capacity * 4 + CANARY);
+        let b = Bufs {
+            query: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
+            pooled: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
+            scores: gpu.upload_raw(&fill, &[fill.len()]).map_err(err)?,
+            selected: gpu.upload_raw(&vec![POISON; sel_b], &[sel_b]).map_err(err)?,
+            mirror: gpu.upload_raw(&vec![POISON; mir_b], &[mir_b]).map_err(err)?,
+        };
+        let orc = oracle(&c, &fill);
+        let orc_mirror = orc[(rows - 1) * c.capacity * 4..].to_vec();
+        let exp = Expect { mirror: true, sel: &orc, mirror_bytes: &orc_mirror, snap: None };
+        let fill_hash = sha256(&fill);
+        let mut eager_pm: Option<Out> = None;
+        let mut arms = vec![("fixed", Some(RawImpl::Fixed)), ("pm", Some(RawImpl::Pm))];
+        if blocks == 16384 { arms.push(("beta", Some(RawImpl::Beta))); } else {
+            sink.put(json!({"case":name,"arm":"beta","skipped":"block_count >= 32768: pre-fix tie-count overflow range, beta never runs"}), true)?;
+        }
+        arms.push(("pm-graph", None));
+        for (arm, which) in arms {
+            let one = |g: &mut Gpu, graph: Option<&GraphRun>| -> Result<Out> {
+                poison_outputs(g, &b)?;
+                match (which, graph) {
+                    (Some(w), _) => {
+                        let mut blob = select_blob(&c, &b, 0, rows, true);
+                        raw_launch(g, env, w, false, [rows as u32, 1, 1], &mut blob)?;
+                        g.hip.device_synchronize().map_err(err)?;
+                    }
+                    (None, Some(gr)) => replay(g, gr)?,
+                    (None, None) => return Err("graph arm without a graph".into()),
+                }
+                read_out(g, &b, &c, Vec::new(), None)
+            };
+            let (o1, o2, graph_run) = if which.is_none() {
+                let gr = build_graph(gpu, env, &c, &b, true, false)?;
+                let r = (one(gpu, Some(&gr))?, one(gpu, Some(&gr))?);
+                free_graph(gpu, gr)?;
+                (r.0, r.1, true)
+            } else {
+                (one(gpu, None)?, one(gpu, None)?, false)
+            };
+            let ok_in = sha256(&download(gpu, &b.scores)?) == fill_hash;
+            let mut extra = vec![("blocks", json!(blocks)), ("value", json!(value)), ("rows", json!(rows)), ("position_start", json!(position_start))];
+            let mut extra_ok = true;
+            if graph_run {
+                let eq = eager_pm.as_ref().is_some_and(|p| p.sel == o1.sel && p.mirror == o1.mirror);
+                extra.push(("equal_eager_pm", json!(eq)));
+                extra_ok = eq;
+            }
+            let (rec, ok) = judge(&name, arm, &exp, &o1, &o2, ok_in, extra, extra_ok);
+            sink.put(rec, ok)?;
+            if arm == "pm" { eager_pm = Some(o1); }
+        }
+        free_bufs(gpu, b)
+    }
+
+    // --------------------------------------------------------------- run
+
+    fn load_env(gpu: &mut Gpu, beta_src: &Path) -> Result<Env> {
+        if !beta_src.is_absolute() { return Err("--beta-src must be absolute".into()) }
+        let src = std::fs::read_to_string(beta_src).map_err(err)?;
+        if !src.contains(HIPCC_SCORE) || !src.contains(HIPCC_SELECT) { return Err("--beta-src lacks the QSA select symbols".into()) }
+        if src == TENSOR_OPS_SRC { return Err("--beta-src equals the in-tree (fixed) source; the beta arm must be the pre-fix pair".into()) }
+        let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, gpu.flags.hipcc_extra_flags.clone()).map_err(err)?;
+        let obj = compiler.compile_for_symbol(BETA_MODULE, &src, HIPCC_SCORE).map_err(err)?.to_path_buf();
+        let beta = gpu.hip.module_load(obj.to_str().ok_or("non-utf8 beta object path")?).map_err(err)?;
+        let beta_score = gpu.hip.module_get_function(&beta, HIPCC_SCORE).map_err(err)?;
+        let beta_select = gpu.hip.module_get_function(&beta, HIPCC_SELECT).map_err(err)?;
+        eprintln!("beta src {} sha256 {} object {}", beta_src.display(), sha256(src.as_bytes()), obj.display());
+        let pm = gpu.hip.module_load_data(PM_IMAGE).map_err(err)?;
+        let pm_score = gpu.hip.module_get_function(&pm, PM_SCORE).map_err(err)?;
+        let pm_select = gpu.hip.module_get_function(&pm, PM_SELECT).map_err(err)?;
+        eprintln!("embedded pm image sha256 {}", sha256(PM_IMAGE));
+        for k in [HIPCC_SCORE, HIPCC_SELECT] { gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k).map_err(err)?; }
+        Ok(Env { _beta: beta, beta_score, beta_select, _pm: pm, pm_score, pm_select })
+    }
+
+    pub fn run(dirs: &[PathBuf], out: &Path, beta_src: Option<PathBuf>, pm_image_given: bool) -> Result<()> {
+        if pm_image_given { return Err("--pm-image is not used by --g3 (the embedded certified image is tested)".into()) }
+        let beta_src = beta_src.ok_or("--g3 requires --beta-src ABS_FILE (mq_fwht256.h + tensor_ops.hip of 060cadcd3b)")?;
+        for v in ["HIPFIRE_QWEN4_QSA_SCORE_PM", "HIPFIRE_QWEN4_QSA_SELECT_PM", "HIPFIRE_QWEN4_QSA_SELECT_EXACT"] {
+            if std::env::var_os(v).is_some() { return Err(format!("{v} is set: --g3 checks the live route with default flags") ) }
+        }
+        let mut paths = Vec::new();
+        for d in dirs { snapshots(d, &mut paths)?; }
+        if paths.is_empty() { return Err("no snapshot.json found".into()) }
+        let mut gpu = Gpu::init().map_err(err)?;
+        if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
+        let env = load_env(&mut gpu, &beta_src)?;
+        let mut sink = Sink { f: std::fs::File::create(out).map_err(err)?, failures: 0, records: 0, cases: 0 };
+
+        for path in &paths {
+            let case = load_snapshot(path)?;
+            run_case(&mut gpu, &env, &mut sink, &case)?;
+        }
+        for (i, s) in specs().iter().enumerate() {
+            let case = synth_case(i, s);
+            run_case(&mut gpu, &env, &mut sink, &case)?;
+        }
+        for blocks in [16384usize, 32768, 65536, 70000] {
+            for value in [1.0f32, 0.0] { run_tied(&mut gpu, &env, &mut sink, blocks, value)?; }
+        }
+        let summary = json!({"summary":true,"cases":sink.cases,"records":sink.records,"failures":sink.failures,"pass":sink.failures == 0});
+        eprintln!("{summary}");
+        writeln!(sink.f, "{summary}").map_err(err)?;
+        sink.f.flush().map_err(err)?;
+        if sink.failures > 0 { return Err(format!("{} failing G3 records; see {}", sink.failures, out.display())) }
+        Ok(())
+    }
 }
