@@ -268,6 +268,9 @@ struct Probe {
     /// is `ctx - decode`).
     decode: usize,
     dump_dir: Option<std::path::PathBuf>,
+    /// `QSA_DUMP_POSITIONS=0,57344`: restrict dumps to these all-prefill chunk
+    /// starts and skip the pre-prologue dumps.
+    dump_positions: Option<Vec<usize>>,
     artifact_id: String,
     expected_state: Vec<(String, String)>,
     validation_cursor: Option<usize>,
@@ -300,6 +303,7 @@ impl Probe {
 
     fn projection_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
+        if self.dump_positions.is_some() { return Ok(()); }
         let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, op.state.position);
         let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
         let tensors = [
@@ -352,6 +356,13 @@ impl Probe {
 
     fn full_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
+        // QSA_DUMP_POSITIONS: only the all-prefill calls at these chunk starts.
+        if let Some(positions) = self.dump_positions.as_ref() {
+            if slot == 0 {
+                eprintln!("[dump-pos] phase {} position {} rows {}", self.phase, op.state.position, op.rows);
+            }
+            if self.phase != "all_prefill" || !positions.contains(&op.state.position) { return Ok(()); }
+        }
         if op.state.format == QsaKvFormat::Q8 {
             return Err("qsa evidence dumps cover the f32 and fp8 states only".into());
         }
@@ -796,6 +807,7 @@ fn main() -> Result<()> {
         pooled_checked: Vec::new(),
         decode,
         dump_dir: std::env::var_os("QSA_DUMP_DIR").map(std::path::PathBuf::from),
+        dump_positions: std::env::var("QSA_DUMP_POSITIONS").ok().map(|v| v.split(',').map(|p| p.trim().parse().unwrap()).collect()),
         artifact_id: std::env::var("QSA_ARTIFACT_ID").unwrap_or_else(|_| args[1].clone()),
         expected_state: Vec::new(),
         validation_cursor: None,
