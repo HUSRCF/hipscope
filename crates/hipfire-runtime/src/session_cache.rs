@@ -211,13 +211,15 @@ fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
     }
 }
 
-fn memory_fits(gpu: &mut Gpu, need: u64) -> Result<bool, String> {
+/// Whether `need` more bytes leave the guard's headroom; `None` when the
+/// free-memory query itself fails.
+fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
     if gpu.is_uma() {
-        Ok(rdna_compute::kv_slots::mem_available_bytes()
-            .is_some_and(|available| available >= need + UMA_HEADROOM))
+        let available = rdna_compute::kv_slots::mem_available_bytes()?;
+        Some(available >= need + UMA_HEADROOM)
     } else {
-        let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
-        Ok(free as u64 >= need + VRAM_HEADROOM)
+        let (free, _) = gpu.hip.get_vram_info().ok()?;
+        Some(free as u64 >= need + VRAM_HEADROOM)
     }
 }
 
@@ -520,8 +522,16 @@ impl SessionCache {
         let mut fits = Ok(());
         loop {
             let over_budget = self.pool.total_bytes() + pending_bytes + bytes > self.budget;
-            if !over_budget && memory_fits(gpu, bytes + growth)? {
-                break;
+            if !over_budget {
+                match memory_fits(gpu, bytes + growth) {
+                    Some(true) => break,
+                    Some(false) => {}
+                    // Evicting cannot help a query that fails.
+                    None => {
+                        fits = Err("memory query failed");
+                        break;
+                    }
+                }
             }
             match self.pool.pop_lru() {
                 Some(evicted) => self.drop_snapshot(gpu, evicted),
@@ -617,6 +627,11 @@ impl SessionCache {
             }
         }
         self.turn = None;
+    }
+
+    /// Bytes of every published snapshot.
+    pub fn stored_bytes(&self) -> u64 {
+        self.pool.total_bytes()
     }
 
     /// Free every snapshot.

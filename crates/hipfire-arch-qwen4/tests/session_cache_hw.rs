@@ -11,22 +11,31 @@
 //! Prompt A (three chunks and a tail) is prefilled cold, capturing a chain of
 //! delta snapshots at its three chunk boundaries. Prompt B shares only A's
 //! first chunk and is also prefilled cold, so its two-chunk snapshot is a
-//! delta over A's first. A is then restored through its three-link chain and
-//! B through the shared root. Each restored prefill's final logits must be
-//! byte-equal to its cold run's and greedy decode must emit the same ids;
-//! this also proves that rows below a boundary never change afterwards.
+//! delta over A's first (asserted through the stored bytes). A is then
+//! restored through its three-link chain and B through the shared root.
+//!
+//! Each restored prefill must leave the live state byte-equal to its cold
+//! prefill: a SHA-256 of every state part (metadata, every fixed part and the
+//! valid rows of every row stream) is compared, so a wrong byte in rows that
+//! attention never selects still fails. The AR leg also compares the final
+//! logits and 16 greedy ids; the MTP leg repeats the chain and branch on the
+//! native MTP route (target plus draft head and its policy) and compares the
+//! seed token.
 
-use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
+use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::serve_contract::CacheDomain;
-use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
+use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
+use hipfire_runtime::spec::MtpDrafter;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
@@ -45,18 +54,62 @@ fn prompt(seed: u64, len: usize) -> Vec<u32> {
         .collect()
 }
 
-/// Prefill `tokens` reusing `reused` cached tokens, commit, then return the
-/// final logits bytes and `DECODE` greedy ids.
+/// SHA-256 of every part of the live state at `position` on `route`: the
+/// metadata, each fixed part, then the valid rows of each row stream.
+fn state_digests(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    route: SessionRoute,
+    position: usize,
+) -> Vec<[u8; 32]> {
+    let SnapshotParts { meta, layout } =
+        SessionState::snapshot_parts(bundle, gpu, route, position).expect("state parts");
+    gpu.hip.device_synchronize().expect("sync");
+    let mut digests = vec![Sha256::digest(&meta).into()];
+    let ranges = layout
+        .fixed
+        .iter()
+        .map(|part| (part.buf, part.offset, part.bytes))
+        .chain(
+            layout
+                .rows
+                .iter()
+                .map(|stream| (stream.buf, 0, stream.rows * stream.row_bytes)),
+        );
+    for (buf, offset, bytes) in ranges {
+        let mut host = vec![0u8; bytes];
+        gpu.hip
+            .memcpy_dtoh_at(&mut host, buf, offset)
+            .expect("download state part");
+        digests.push(Sha256::digest(&host).into());
+    }
+    digests
+}
+
+/// Fail with the index of the first state part a restore got wrong.
+fn assert_same_state(name: &str, cold: &[[u8; 32]], warm: &[[u8; 32]]) {
+    assert_eq!(cold.len(), warm.len(), "{name}: state part count");
+    if let Some(part) = (0..cold.len()).find(|&i| cold[i] != warm[i]) {
+        panic!(
+            "{name}: state part {part} of {} differs from cold (0 = metadata)",
+            cold.len()
+        );
+    }
+}
+
+/// Prefill `tokens` reusing `reused` cached tokens and commit. Returns the
+/// state digests, the final logits bytes and `DECODE` greedy ids.
 fn run(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     logits: &GpuTensor,
     tokens: &[u32],
     reused: usize,
-) -> (Vec<u8>, Vec<u32>) {
+) -> (Vec<[u8; 32]>, Vec<u8>, Vec<u32>) {
     bundle
         .prefill_final(gpu, tokens, reused, logits)
         .expect("prefill");
+    let digests = state_digests(bundle, gpu, SessionRoute::Ar, tokens.len());
     bundle.session_commit();
     let mut bytes = vec![0u8; logits.byte_size()];
     gpu.hip.device_synchronize().expect("sync");
@@ -70,7 +123,49 @@ fn run(
                 .expect("decode")
         })
         .collect();
-    (bytes, ids)
+    (digests, bytes, ids)
+}
+
+/// Native MTP prefill of `tokens` reusing `reused` cached tokens, then
+/// commit. Returns the state digests (target and draft head) and the seed.
+fn run_mtp(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    drafter: &mut Qwen4MtpDrafter,
+    tokens: &[u32],
+    reused: usize,
+) -> (Vec<[u8; 32]>, u32) {
+    let seed = drafter
+        .mtp_prefill(
+            gpu,
+            bundle,
+            tokens,
+            &tokens[reused..],
+            reused,
+            reused > 0,
+            &|| false,
+        )
+        .expect("MTP prefill");
+    let digests = state_digests(bundle, gpu, SessionRoute::Mtp, tokens.len());
+    bundle.session_commit();
+    (digests, seed)
+}
+
+fn stored_bytes(bundle: &Qwen4Bundle) -> u64 {
+    bundle
+        .session_cache()
+        .expect("session cache")
+        .stored_bytes()
+}
+
+/// Four snapshots (A's three links and B's one) of one chunk each: a full
+/// copy of B's two chunks would exceed four chunk-sized snapshots.
+fn assert_four_deltas(route: &str, stored: u64, one: u64) {
+    println!("{route}: {stored} bytes stored, {one} per one-chunk snapshot");
+    assert!(
+        stored > 3 * one && stored <= 4 * one,
+        "{route}: expected four one-chunk snapshots ({stored} bytes, {one} each)"
+    );
 }
 
 #[test]
@@ -137,8 +232,14 @@ fn restored_prefill_matches_cold_on_flash_next() {
         backend.name()
     );
 
+    let one = |mtp| {
+        session_snapshot_bytes(&bundle.config, state_format, mtp, chunk).expect("snapshot bytes")
+    };
+    let (one_ar, one_mtp) = (one(false), one(true));
+
     let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
     let cold_b = run(&mut bundle, &mut gpu, &logits, &b, 0);
+    assert_four_deltas("AR", stored_bytes(&bundle), one_ar);
     for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
         let reused = bundle.session_plan(tokens, SessionRoute::Ar);
         assert_eq!(
@@ -146,13 +247,36 @@ fn restored_prefill_matches_cold_on_flash_next() {
             links * chunk,
             "plan must offer {name}'s {links}-chunk snapshot"
         );
-        let (warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
-        println!("{name} cold ids {:?}\n{name} warm ids {warm_ids:?}", cold.1);
-        assert!(
-            warm_logits == cold.0,
-            "{name}: restored final logits differ from cold"
+        let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
+        println!(
+            "AR {name} cold ids {:?}\nAR {name} warm ids {warm_ids:?}",
+            cold.2
         );
-        assert_eq!(warm_ids, cold.1, "{name}");
+        assert_same_state(&format!("AR {name}"), &cold.0, &digests);
+        assert!(
+            warm_logits == cold.1,
+            "AR {name}: restored final logits differ from cold"
+        );
+        assert_eq!(warm_ids, cold.2, "AR {name}");
+    }
+
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let before = stored_bytes(&bundle);
+    let cold_a = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a, 0);
+    let cold_b = run_mtp(&mut bundle, &mut gpu, &mut drafter, &b, 0);
+    assert_four_deltas("MTP", stored_bytes(&bundle) - before, one_mtp);
+    for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
+        let reused = bundle.session_plan(tokens, SessionRoute::Mtp);
+        assert_eq!(
+            reused,
+            links * chunk,
+            "MTP plan must offer {name}'s {links}-chunk snapshot"
+        );
+        let (digests, seed) = run_mtp(&mut bundle, &mut gpu, &mut drafter, tokens, reused);
+        println!("MTP {name} seed cold {} warm {seed}", cold.1);
+        assert_same_state(&format!("MTP {name}"), &cold.0, &digests);
+        assert_eq!(seed, cold.1, "MTP {name} seed");
     }
 
     gpu.free_tensor(logits).expect("free logits");
