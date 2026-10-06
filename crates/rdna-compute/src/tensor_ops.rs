@@ -59,14 +59,16 @@ static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
 });
 /// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
-/// unless `0`) run the live QSA selector pair's rows16 F32 score /
-/// select-from-scores kernel from the certified builder module
-/// (`kernels::QSA_SELECT_PM_GFX1151`: same kernargs, grid, block and output
-/// bytes as the hipcc kernels) on exact gfx1151 prefill calls the module
-/// covers ([`qsa_select_pm_fits`]).  `0` keeps that hipcc kernel.  Read once.
+/// unless `0`) use the certified builder rows16 F32/BF16 score and
+/// select-from-scores kernels on covered gfx1151 prefill calls
+/// ([`qsa_select_pm_fits`]), with identical output bytes. For F32, `0` keeps
+/// the corresponding hipcc kernel; SCORE_PM=0 keeps the fused hipcc selector
+/// for BF16 arenas. SELECT_PM chooses PM versus hipcc selection. Read once.
 static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true)
 });
+/// Select PM versus hipcc from-scores for either dtype; BF16 only reaches
+/// this choice when SCORE_PM is enabled, otherwise it stays fused hipcc.
 static QWEN4_QSA_SELECT_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_PM", true)
 });
@@ -3289,17 +3291,9 @@ fn indexed_attention_select_batch_impl(
 ) -> HipResult<bool> {
     ensure_f32(p.query)?;
     // Pooled keys are F32 or BF16 arenas (`QsaKvFormat::index_dtype`).
-    let (parallel_kernel, serial_kernel) = match p.pooled.dtype {
-        DType::F32 => (
-            "indexed_attention_select_f32_batched",
-            "indexed_attention_select_f32_batched_serial",
-        ),
-        DType::BF16 => (
-            "indexed_attention_select_bf16_batched",
-            "indexed_attention_select_bf16_batched_serial",
-        ),
-        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
-    };
+    if !matches!(p.pooled.dtype, DType::F32 | DType::BF16) {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
     if p.selected.dtype != DType::Raw
         || p.rows == 0
         || p.query_row_stride == 0
@@ -3339,16 +3333,16 @@ fn indexed_attention_select_batch_impl(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let rows = checked_i32(p.rows, "QSA batch select rows")?;
-    let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
-    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
-    let index_heads = checked_i32(p.index_heads, "QSA batch select heads")?;
-    let index_dim = checked_i32(p.index_dim, "QSA batch select dim")?;
-    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch select budget")?;
-    let compress = checked_i32(p.compress, "QSA batch select compress")?;
-    let position_start = checked_i32(p.position_start, "QSA batch select position")?;
-    let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
-    let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
+    checked_i32(p.rows, "QSA batch select rows")?;
+    checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+    checked_i32(p.block_count, "QSA batch select blocks")?;
+    checked_i32(p.index_heads, "QSA batch select heads")?;
+    checked_i32(p.index_dim, "QSA batch select dim")?;
+    checked_i32(p.budget_blocks, "QSA batch select budget")?;
+    checked_i32(p.compress, "QSA batch select compress")?;
+    checked_i32(p.position_start, "QSA batch select position")?;
+    checked_i32(p.capacity, "QSA batch select capacity")?;
+    checked_u32(p.rows, "QSA batch select row grid")?;
     // The active count is declared to the recorder as `(position_start + rows) /
     // compress`, so replay re-derives it. Verify the caller used that formula:
     // a mismatch would make replay select against a different block count.
@@ -3380,20 +3374,19 @@ fn indexed_attention_select_batch_impl(
         ));
     }
     let shape_blocks = p.shape_blocks;
-    let lds_bytes = shape_blocks
+    shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
     let parallel = gpu.arch_caps.has_gfx11_plus_simt()
         && shape_blocks > 0
         && !select_forced_serial();
-    // Live F32 launches with the pinned index geometry score eight rows per
-    // pooled key read into the shared F16 X scratch, then select from those
-    // scores (any block count: the score rows live in global memory). The
-    // opt-in exact selector (`HIPFIRE_QWEN4_QSA_SELECT_EXACT=1`) keeps its
-    // own route.
+    // Live F32 launches use the score/select pair. Covered BF16 prefill
+    // launches use the builder score with either select kernel; SCORE_PM=0
+    // keeps the fused BF16 selector. The opt-in exact selector keeps its route.
     if parallel
         && !*QWEN4_QSA_SELECT_EXACT
-        && p.pooled.dtype == DType::F32
+        && (p.pooled.dtype == DType::F32
+            || (qsa_select_pm_fits(gpu, p) && *QWEN4_QSA_SCORE_PM))
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.index_heads == 4
@@ -3405,6 +3398,43 @@ fn indexed_attention_select_batch_impl(
         let pm = qsa_select_pm_arm(gpu, p);
         return indexed_attention_select_rows8(gpu, p, mirror, pm);
     }
+    indexed_attention_select_fused(gpu, p, mirror)
+}
+
+/// Incumbent fused selector, also used as the BF16 lab baseline.
+fn indexed_attention_select_fused(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    let (parallel_kernel, serial_kernel) = match p.pooled.dtype {
+        DType::F32 => (
+            "indexed_attention_select_f32_batched",
+            "indexed_attention_select_f32_batched_serial",
+        ),
+        DType::BF16 => (
+            "indexed_attention_select_bf16_batched",
+            "indexed_attention_select_bf16_batched_serial",
+        ),
+        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+    };
+    let rows = checked_i32(p.rows, "QSA batch select rows")?;
+    let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let index_heads = checked_i32(p.index_heads, "QSA batch select heads")?;
+    let index_dim = checked_i32(p.index_dim, "QSA batch select dim")?;
+    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch select budget")?;
+    let compress = checked_i32(p.compress, "QSA batch select compress")?;
+    let position_start = checked_i32(p.position_start, "QSA batch select position")?;
+    let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
+    let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
+    let shape_blocks = p.shape_blocks;
+    let lds_bytes = shape_blocks
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
+    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+        && shape_blocks > 0
+        && !select_forced_serial();
     // Past the LDS row the scores go to global rows (one per workgroup, at
     // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
     let global = parallel
@@ -3436,7 +3466,12 @@ fn indexed_attention_select_batch_impl(
                 capacity: p.capacity,
                 shape_blocks: p.shape_blocks,
             };
-            persisted = indexed_attention_select_batch_impl(
+            let select = if p.pooled.dtype == DType::BF16 {
+                indexed_attention_select_fused
+            } else {
+                indexed_attention_select_batch_impl
+            };
+            persisted = select(
                 gpu,
                 &group,
                 if last { mirror } else { None },
@@ -3563,8 +3598,9 @@ const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
 /// entries; larger budgets take the batched kernel.
 const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
 
-/// Which kernels of the live pair come from the certified builder module
-/// (`kernels::QSA_SELECT_PM_GFX1151`) instead of the hipcc source.
+/// Which kernels of the live pair come from certified builder modules.
+/// For BF16, `Hipcc` is the fused incumbent, `ScoreOnly` and `Both` use the
+/// BF16 PM score; `SelectOnly` is unsupported (no hipcc BF16 rows score).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QsaSelectPmArm {
     Hipcc,
@@ -3581,23 +3617,24 @@ impl QsaSelectPmArm {
 /// counters take at most 511 packets of 32 keys per wave.
 const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
 /// Original-call rows from which the builder pair runs (prefill; decode and
-/// verify keep the hipcc pair).
+/// verify keep the hipcc F32 pair or fused BF16 selector).
 const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 
 /// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
-/// prefill rows, the fixed four-head / 128-dim F32 geometry, and every
-/// buffer the kernels address through 32-bit raw-buffer offsets below their
-/// out-of-range offset.
+/// prefill rows, the fixed four-head / 128-dim F32-query geometry with F32 or
+/// BF16 pooled keys, and every buffer addressed through 32-bit raw-buffer
+/// offsets below the out-of-range offset (pooled extents use its element size).
 fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
     const PM_OOB_OFFSET: usize = 0x7fff_ff00;
     let below = |n: Option<usize>| n.is_some_and(|bytes| bytes < PM_OOB_OFFSET);
     gpu.arch_caps.is_gfx1151()
+        && matches!(p.pooled.dtype, DType::F32 | DType::BF16)
         && p.rows >= QSA_SELECT_PM_MIN_ROWS
         && p.index_heads == 4
         && p.index_dim == 128
         && p.block_count <= QSA_SELECT_PM_MAX_BLOCKS
         && below(p.rows.checked_mul(p.query_row_stride).and_then(|n| n.checked_mul(4)))
-        && below(p.block_count.checked_mul(128 * 4))
+        && below(p.block_count.checked_mul(128 * p.pooled.dtype.size()))
         && below(p.rows.checked_mul(p.capacity).and_then(|n| n.checked_mul(4)))
 }
 
@@ -3615,10 +3652,10 @@ fn qsa_select_pm_arm(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> QsaSelec
     }
 }
 
-/// Lab entry of the live pair with an explicit arm (the route's grouping,
-/// scratch and mirror persistence; only the env choice is bypassed). Refuses,
-/// before any launch, every call the live pair or the builder pair does not
-/// cover (with `Hipcc`, only the live pair's own gate applies).
+/// Lab entry with an explicit arm (grouping, scratch and mirror persistence;
+/// only the env choice is bypassed). Refuses uncovered calls before launch.
+/// BF16 `Hipcc` uses the fused incumbent; `ScoreOnly`/`Both` use PM scores
+/// with hipcc/PM selection, and `SelectOnly` is refused.
 #[cfg(any(test, feature = "lab"))]
 pub fn indexed_attention_select_batch_pm_arm(
     gpu: &mut Gpu,
@@ -3627,7 +3664,7 @@ pub fn indexed_attention_select_batch_pm_arm(
     arm: QsaSelectPmArm,
 ) -> HipResult<bool> {
     let live = gpu.arch_caps.has_gfx11_plus_simt()
-        && p.pooled.dtype == DType::F32
+        && matches!(p.pooled.dtype, DType::F32 | DType::BF16)
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.index_heads == 4
@@ -3639,16 +3676,21 @@ pub fn indexed_attention_select_batch_pm_arm(
     if !live || (arm != QsaSelectPmArm::Hipcc && !qsa_select_pm_fits(gpu, p)) {
         return Err(HipError::new(0, "QSA select PM arm: call not covered"));
     }
+    if p.pooled.dtype == DType::BF16 {
+        if arm == QsaSelectPmArm::SelectOnly {
+            return Err(HipError::new(0, "QSA select BF16 requires PM score"));
+        }
+        if arm == QsaSelectPmArm::Hipcc {
+            return indexed_attention_select_fused(gpu, p, mirror);
+        }
+    }
     indexed_attention_select_rows8(gpu, p, mirror, arm)
 }
 
-/// [`indexed_attention_select_batch_impl`]'s live route: row groups of
-/// `indexed_attention_select_scores_rows{8,16}_f32` scores, each followed by
-/// `indexed_attention_select_from_scores` reading them, either from the hipcc
-/// source or (per `pm`) the certified builder module's
-/// `indexed_attention_select_scores_rows16_f32_pm_gfx1151` /
-/// `indexed_attention_select_from_scores_pm_gfx1151`, which take the same
-/// kernargs, grids and blocks. Selection bytes are unchanged.
+/// Live score/select route: F32 uses hipcc rows8/16 or PM rows16 scores.
+/// BF16 requires the PM rows16 score from `qsa_select_bf16_pm_gfx1151`;
+/// there is no hipcc BF16 rows score. Both dtypes select using hipcc or the
+/// existing PM select module, with identical kernargs, grids and output bytes.
 fn indexed_attention_select_rows8(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
@@ -3656,10 +3698,15 @@ fn indexed_attention_select_rows8(
     pm: QsaSelectPmArm,
 ) -> HipResult<bool> {
     const PM_MODULE: &str = "qsa_select_pm_gfx1151";
+    if p.pooled.dtype == DType::BF16 && !pm.score() {
+        return Err(HipError::new(0, "QSA select BF16 requires PM score"));
+    }
     let stride = p.block_count;
     // Prefill scores sixteen rows per pooled-key read; decode and few-row
     // verify keep eight (the sixteen-row kernel costs them more than it saves).
-    let (score_kernel, score_rows) = if pm.score() {
+    let (score_kernel, score_rows) = if p.pooled.dtype == DType::BF16 {
+        ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
+    } else if pm.score() {
         ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
     } else if p.rows > 8 {
         ("indexed_attention_select_scores_rows16_f32", 16)
@@ -3676,12 +3723,21 @@ fn indexed_attention_select_rows8(
         .min(p.rows);
     // Growth goes through the accessor that invalidates captured state first.
     let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
-    for (kernel, built) in [(score_kernel, pm.score()), (select_kernel, pm.select())] {
-        if built {
-            gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, kernel)?;
-        } else {
-            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-        }
+    if p.pooled.dtype == DType::BF16 {
+        gpu.ensure_embedded_kernel(
+            "qsa_select_bf16_pm_gfx1151",
+            crate::kernels::QSA_SELECT_BF16_PM_GFX1151,
+            score_kernel,
+        )?;
+    } else if pm.score() {
+        gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, score_kernel)?;
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, score_kernel)?;
+    }
+    if pm.select() {
+        gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, select_kernel)?;
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, select_kernel)?;
     }
     let mirror =
         mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
@@ -9662,5 +9718,285 @@ mod tests {
                 assert!(want == got, "{name} differ: rows={rows}");
             }
         }
+    }
+
+    const BF16_PM_ROWS: usize = 600;
+    const BF16_PM_BLOCKS: usize = 2000;
+    const BF16_PM_COMPRESS: usize = 4;
+    const BF16_PM_HEADS: usize = 4;
+    const BF16_PM_DIM: usize = 128;
+    const BF16_PM_BUDGET: usize = 256;
+    const BF16_PM_CAPACITY: usize = BF16_PM_BUDGET * BF16_PM_COMPRESS + BF16_PM_COMPRESS - 1;
+    /// Padded past `heads * dim` so the query row stride is not the extent.
+    const BF16_PM_QUERY_STRIDE: usize = BF16_PM_HEADS * BF16_PM_DIM + 16;
+    const BF16_PM_POISON: u8 = 0xa5;
+    /// Poisoned bytes after `selected` / `mirror`: a stray write shows.
+    const BF16_PM_CANARY: usize = 4096;
+
+    /// Prefill-sized BF16-pooled selection (600 rows, so the last sixteen-row
+    /// score group is ragged: 600 = 37 * 16 + 8; 2000 blocks) on synthetic
+    /// keys with many equal scores: a run of 40 and a run of 50 identical
+    /// blocks (the budget boundary falls inside the second), a 400-block
+    /// region of four constant key levels, a run of all-negative (ReLU zero)
+    /// keys, and every seventh block a copy of the block three before it.
+    struct Bf16PmSelect {
+        query: GpuTensor,
+        pooled: GpuTensor,
+        selected: GpuTensor,
+        mirror: GpuTensor,
+    }
+
+    struct Bf16PmOut {
+        selected: Vec<u8>,
+        mirror: Vec<u8>,
+        persisted: bool,
+    }
+
+    impl Bf16PmOut {
+        fn selected_len() -> usize {
+            BF16_PM_ROWS * BF16_PM_CAPACITY * 4
+        }
+
+        fn mirror_len() -> usize {
+            BF16_PM_CAPACITY * 4
+        }
+
+        fn canaries_intact(&self) -> bool {
+            self.selected[Self::selected_len()..].iter().all(|b| *b == BF16_PM_POISON)
+                && self.mirror[Self::mirror_len()..].iter().all(|b| *b == BF16_PM_POISON)
+        }
+
+        fn untouched(&self) -> bool {
+            self.selected.iter().all(|b| *b == BF16_PM_POISON)
+                && self.mirror.iter().all(|b| *b == BF16_PM_POISON)
+        }
+
+        fn last_row(&self) -> &[u8] {
+            &self.selected[Self::selected_len() - Self::mirror_len()..Self::selected_len()]
+        }
+
+        fn selected_entries(&self) -> usize {
+            self.selected[..Self::selected_len()]
+                .chunks_exact(4)
+                .filter(|w| i32::from_ne_bytes((*w).try_into().expect("i32 word")) >= 0)
+                .count()
+        }
+    }
+
+    impl Bf16PmSelect {
+        fn new(gpu: &mut Gpu) -> Self {
+            let mut state = 0x51ca_17b3u32;
+            let mut next = move || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / 16_777_216.0
+            };
+            // Positive queries: a block whose keys are all negative scores 0.
+            let query: Vec<f32> = (0..BF16_PM_ROWS * BF16_PM_QUERY_STRIDE).map(|_| next()).collect();
+            let mut keys = vec![0f32; BF16_PM_BLOCKS * BF16_PM_DIM];
+            for block in 0..BF16_PM_BLOCKS {
+                for d in 0..BF16_PM_DIM {
+                    let random = next();
+                    keys[block * BF16_PM_DIM + d] = match block {
+                        1000..=1039 => 0.9,
+                        1200..=1249 => 0.6,
+                        300..=699 => {
+                            [0.05f32, 0.15, 0.25, 0.35][(block.wrapping_mul(2_654_435_761) >> 5) & 3]
+                        }
+                        1500..=1599 => -random - 0.01,
+                        _ => random - 0.25,
+                    };
+                }
+            }
+            for block in (8..BF16_PM_BLOCKS).filter(|b| b % 7 == 3) {
+                keys.copy_within(
+                    (block - 3) * BF16_PM_DIM..(block - 2) * BF16_PM_DIM,
+                    block * BF16_PM_DIM,
+                );
+            }
+            let pooled_bytes: Vec<u8> = keys
+                .iter()
+                .flat_map(|v| {
+                    // Round to nearest even, the BF16 the index-key append stores.
+                    let bits = v.to_bits();
+                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16;
+                    (rounded as u16).to_le_bytes()
+                })
+                .collect();
+            let mut pooled = gpu
+                .upload_raw(&pooled_bytes, &[pooled_bytes.len()])
+                .expect("pooled upload");
+            pooled.dtype = DType::BF16;
+            pooled.shape = vec![keys.len()];
+            let selected_len = Bf16PmOut::selected_len() + BF16_PM_CANARY;
+            let mirror_len = Bf16PmOut::mirror_len() + BF16_PM_CANARY;
+            Self {
+                query: gpu.upload_f32(&query, &[query.len()]).expect("query upload"),
+                pooled,
+                selected: gpu
+                    .upload_raw(&vec![BF16_PM_POISON; selected_len], &[selected_len])
+                    .expect("selected upload"),
+                mirror: gpu
+                    .upload_raw(&vec![BF16_PM_POISON; mirror_len], &[mirror_len])
+                    .expect("mirror upload"),
+            }
+        }
+
+        fn params(&self) -> IndexedAttentionSelectBatch<'_> {
+            IndexedAttentionSelectBatch {
+                query: &self.query,
+                pooled: &self.pooled,
+                selected: &self.selected,
+                rows: BF16_PM_ROWS,
+                query_row_stride: BF16_PM_QUERY_STRIDE,
+                block_count: BF16_PM_BLOCKS,
+                index_heads: BF16_PM_HEADS,
+                index_dim: BF16_PM_DIM,
+                budget_blocks: BF16_PM_BUDGET,
+                compress: BF16_PM_COMPRESS,
+                // (position_start + rows) / compress == block_count.
+                position_start: BF16_PM_BLOCKS * BF16_PM_COMPRESS - BF16_PM_ROWS,
+                capacity: BF16_PM_CAPACITY,
+                shape_blocks: BF16_PM_BLOCKS,
+            }
+        }
+
+        fn poison(&self, gpu: &Gpu) {
+            for t in [&self.selected, &self.mirror] {
+                gpu.hip
+                    .memset(&t.buf, BF16_PM_POISON as i32, t.byte_size())
+                    .expect("poison outputs");
+            }
+        }
+
+        fn download(&self, gpu: &Gpu, persisted: bool) -> Bf16PmOut {
+            Bf16PmOut {
+                selected: gpu.download_raw_bytes(&self.selected).expect("selected download"),
+                mirror: gpu.download_raw_bytes(&self.mirror).expect("mirror download"),
+                persisted,
+            }
+        }
+
+        /// The lab helper with `arm`, outputs poisoned first.
+        fn run_arm(&self, gpu: &mut Gpu, arm: QsaSelectPmArm, with_mirror: bool) -> Bf16PmOut {
+            self.poison(gpu);
+            let persisted = indexed_attention_select_batch_pm_arm(
+                gpu,
+                &self.params(),
+                with_mirror.then_some(&self.mirror),
+                arm,
+            )
+            .unwrap_or_else(|e| panic!("BF16 select arm {arm:?}: {e}"));
+            self.download(gpu, persisted)
+        }
+
+        /// The default route (`indexed_attention_select_batch[_mirrored]`),
+        /// outputs poisoned first.
+        fn run_default(&self, gpu: &mut Gpu, with_mirror: bool) -> Bf16PmOut {
+            self.poison(gpu);
+            let persisted = if with_mirror {
+                indexed_attention_select_batch_mirrored(gpu, &self.params(), &self.mirror)
+                    .expect("default mirrored BF16 select")
+            } else {
+                indexed_attention_select_batch(gpu, &self.params())
+                    .expect("default BF16 select");
+                false
+            };
+            self.download(gpu, persisted)
+        }
+
+        fn free(self, gpu: &mut Gpu) {
+            for t in [self.query, self.pooled, self.selected, self.mirror] {
+                gpu.free_tensor(t).expect("free");
+            }
+        }
+    }
+
+    /// The fused BF16 arm (`Hipcc`) is the reference; the builder score pair
+    /// (`ScoreOnly`, `Both`) must reproduce its selection, mirror and
+    /// persisted flag byte for byte, with and without a mirror. `SelectOnly`
+    /// has no hipcc BF16 rows score kernel and must refuse before any launch.
+    #[test]
+    fn qsa_bf16_pm_select_arms_match_the_fused_bf16_arm_byte_for_byte() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let case = Bf16PmSelect::new(&mut gpu);
+
+        // SelectOnly on BF16 keys: refused, and nothing was launched.
+        case.poison(&gpu);
+        let refused = indexed_attention_select_batch_pm_arm(
+            &mut gpu,
+            &case.params(),
+            Some(&case.mirror),
+            QsaSelectPmArm::SelectOnly,
+        );
+        assert!(refused.is_err(), "BF16 SelectOnly must be refused");
+        assert!(
+            case.download(&gpu, false).untouched(),
+            "refused BF16 SelectOnly wrote outputs (launched before refusing)"
+        );
+
+        let reference = case.run_arm(&mut gpu, QsaSelectPmArm::Hipcc, true);
+        assert!(reference.persisted, "fused BF16 arm did not persist the mirror");
+        assert!(reference.canaries_intact(), "fused BF16 arm wrote past its outputs");
+        // Every row emits its 256 blocks (1024 tokens); the rows' tails follow.
+        assert!(
+            reference.selected_entries() >= BF16_PM_ROWS * BF16_PM_BUDGET * BF16_PM_COMPRESS,
+            "fused BF16 arm selected too few tokens"
+        );
+        assert_eq!(
+            &reference.mirror[..Bf16PmOut::mirror_len()],
+            reference.last_row(),
+            "mirror is not the final row's selection"
+        );
+        for arm in [QsaSelectPmArm::ScoreOnly, QsaSelectPmArm::Both] {
+            let out = case.run_arm(&mut gpu, arm, true);
+            assert!(out.persisted, "{arm:?}: mirror not persisted");
+            assert!(out.canaries_intact(), "{arm:?}: wrote past its outputs");
+            assert!(out.selected == reference.selected, "{arm:?}: selection differs from the fused BF16 arm");
+            assert!(out.mirror == reference.mirror, "{arm:?}: mirror differs from the fused BF16 arm");
+        }
+        // Without a mirror: the same selection, nothing persisted, mirror untouched.
+        for arm in [QsaSelectPmArm::Hipcc, QsaSelectPmArm::ScoreOnly, QsaSelectPmArm::Both] {
+            let out = case.run_arm(&mut gpu, arm, false);
+            assert!(!out.persisted, "{arm:?}: persisted without a mirror");
+            assert!(out.selected == reference.selected, "{arm:?}: selection differs without a mirror");
+            assert!(
+                out.mirror.iter().all(|b| *b == BF16_PM_POISON),
+                "{arm:?}: wrote a mirror it was not given"
+            );
+        }
+        case.free(&mut gpu);
+    }
+
+    /// The default mirrored entry on BF16 keys (whichever arm the route's
+    /// environment picks) must equal the fused BF16 arm byte for byte.
+    #[test]
+    fn qsa_bf16_default_mirrored_select_matches_the_fused_bf16_arm() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let case = Bf16PmSelect::new(&mut gpu);
+        let reference = case.run_arm(&mut gpu, QsaSelectPmArm::Hipcc, true);
+        assert!(reference.persisted, "fused BF16 arm did not persist the mirror");
+        let mirrored = case.run_default(&mut gpu, true);
+        assert!(mirrored.persisted, "default BF16 route did not persist the mirror");
+        assert!(mirrored.canaries_intact(), "default BF16 route wrote past its outputs");
+        assert!(mirrored.selected == reference.selected, "default BF16 selection differs from the fused arm");
+        assert!(mirrored.mirror == reference.mirror, "default BF16 mirror differs from the fused arm");
+        let plain = case.run_default(&mut gpu, false);
+        assert!(!plain.persisted);
+        assert!(plain.selected == reference.selected, "default BF16 selection without a mirror differs");
+        case.free(&mut gpu);
     }
 }
