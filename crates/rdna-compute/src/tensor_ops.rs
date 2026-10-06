@@ -7721,6 +7721,516 @@ mod tests {
         gpu.free_tensor(copy_dst).expect("free copy dst");
     }
 
+    /// A retained PM4 tape owns raw device addresses, not allocations. The QSA
+    /// K/V and raw index-key arenas are VMM tensors: virtual ranges reserved up
+    /// front whose mapped prefix grows in place, so a base address recorded in
+    /// the tape must keep naming the same bytes after growth. This records the
+    /// full QSA sequence (index-key write, pool/RoPE, select, attention) while
+    /// only the first granule of each arena is mapped, prepares the PM4 tape,
+    /// and only then maps two more granules. Replaying positions inside the
+    /// newly mapped granules must then read and write the grown pages (the
+    /// attention tail and the raw index-key write land there, and for the last
+    /// position the pooled blocks also cover grown raw keys) and match, byte
+    /// for byte, the same sequence launched through plain HIP. Outputs, the
+    /// selection, the pooled prefix and the written index-key row are poisoned
+    /// before every execution so a stale result cannot pass.
+    #[test]
+    fn retained_pm4_tape_replays_over_grown_vmm_qsa_arena() {
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+
+        const COMPRESS: usize = 4;
+        const INDEX_HEADS: usize = 2;
+        const N_HEADS: usize = 2;
+        const N_KV_HEADS: usize = 1;
+        const DIM: usize = 128;
+        const BUDGET_BLOCKS: usize = 2;
+        const SELECTED_CAPACITY: usize = BUDGET_BLOCKS * COMPRESS + COMPRESS - 1;
+        const CAPTURE_POSITION: usize = 3;
+        const F32_BYTES: usize = std::mem::size_of::<f32>();
+
+        struct Qsa {
+            reserved_rows: usize,
+            raw_keys: GpuTensor,
+            full_keys: GpuTensor,
+            full_values: GpuTensor,
+            pooled: GpuTensor,
+            index_src: GpuTensor,
+            query: GpuTensor,
+            q_with_gate: GpuTensor,
+            selected: GpuTensor,
+            output: GpuTensor,
+        }
+
+        struct Observed {
+            raw_row: Vec<u8>,
+            pooled: Vec<u8>,
+            selected: Vec<u8>,
+            output: Vec<f32>,
+        }
+
+        /// The QSA sequence at one position, launched through whatever route
+        /// `gpu.replay` currently selects (recorded when capturing).
+        fn run_qsa(gpu: &mut Gpu, t: &Qsa, position: usize) {
+            let blocks = (position + 1) / COMPRESS;
+            let max_blocks = t.reserved_rows / COMPRESS;
+            gpu.copy_rows_strided_f32(
+                &t.index_src,
+                &t.raw_keys,
+                1,
+                DIM,
+                DIM,
+                DIM,
+                position * DIM,
+                Some(DIM),
+            )
+            .expect("index-key write");
+            indexed_attention_pool_rope(
+                gpu,
+                &IndexedAttentionPoolRope {
+                    raw_keys: &t.raw_keys,
+                    pooled: &t.pooled,
+                    norm: None,
+                    block_count: blocks,
+                    compress: COMPRESS,
+                    index_dim: DIM,
+                    position: Some(QsaPositionBinding {
+                        position_start: position,
+                        rows: 1,
+                    }),
+                    grid_bound: max_blocks,
+                },
+            )
+            .expect("QSA pool/RoPE");
+            indexed_attention_select_batch(
+                gpu,
+                &IndexedAttentionSelectBatch {
+                    query: &t.query,
+                    pooled: &t.pooled,
+                    selected: &t.selected,
+                    rows: 1,
+                    query_row_stride: INDEX_HEADS * DIM,
+                    block_count: blocks,
+                    index_heads: INDEX_HEADS,
+                    index_dim: DIM,
+                    budget_blocks: BUDGET_BLOCKS,
+                    compress: COMPRESS,
+                    position_start: position,
+                    capacity: SELECTED_CAPACITY,
+                    shape_blocks: max_blocks,
+                },
+            )
+            .expect("QSA select");
+            indexed_attention_attention_batch(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &t.q_with_gate,
+                    full_keys: &t.full_keys,
+                    full_values: &t.full_values,
+                    selected: &t.selected,
+                    output: &t.output,
+                    rows: 1,
+                    position_start: position,
+                    n_heads: N_HEADS,
+                    n_kv_heads: N_KV_HEADS,
+                    head_dim: DIM,
+                    budget_blocks: BUDGET_BLOCKS,
+                    compress: COMPRESS,
+                    capacity: SELECTED_CAPACITY,
+                    full_capacity: t.reserved_rows,
+                    format: QsaKvFormat::F32,
+                    shape_selected: SELECTED_CAPACITY,
+                },
+            )
+            .expect("QSA attention");
+        }
+
+        /// Poison every result location, execute the position through the
+        /// retained PM4 tape or (replay disabled) plain HIP, and read back.
+        fn observe(gpu: &mut Gpu, t: &Qsa, position: usize, replay: bool) -> Observed {
+            let blocks = (position + 1) / COMPRESS;
+            let row_offset = position * DIM * F32_BYTES;
+            let nan_bytes = |count: usize| f32::NAN.to_ne_bytes().repeat(count);
+            gpu.hip
+                .memcpy_htod_offset(&t.raw_keys.buf, row_offset, &nan_bytes(DIM))
+                .expect("poison index-key row");
+            gpu.hip
+                .memcpy_htod(&t.pooled.buf, &nan_bytes(t.pooled.numel()))
+                .expect("poison pooled");
+            gpu.hip
+                .memcpy_htod(&t.selected.buf, &vec![0xFFu8; SELECTED_CAPACITY * 4])
+                .expect("poison selected");
+            gpu.hip
+                .memcpy_htod(&t.output.buf, &nan_bytes(t.output.numel()))
+                .expect("poison output");
+            gpu.hip.device_synchronize().expect("sync poison");
+            if replay {
+                // SAFETY: every tensor the tape recorded is live in `t`, at the
+                // base address captured (the arenas only grew in place).
+                unsafe { gpu.replay.replay_pm4(position) }
+                    .unwrap_or_else(|reason| panic!("PM4 replay at {position}: {reason}"));
+            } else {
+                let retained = std::mem::replace(
+                    &mut gpu.replay,
+                    ReplayController::new(ReplayBackendRequest::Hip),
+                );
+                run_qsa(gpu, t, position);
+                gpu.replay = retained;
+            }
+            gpu.hip.device_synchronize().expect("sync execution");
+            let mut raw_row = vec![0u8; DIM * F32_BYTES];
+            gpu.hip
+                .memcpy_dtoh_at(&mut raw_row, &t.raw_keys.buf, row_offset)
+                .expect("read index-key row");
+            let mut pooled = vec![0u8; blocks * DIM * F32_BYTES];
+            gpu.hip
+                .memcpy_dtoh_at(&mut pooled, &t.pooled.buf, 0)
+                .expect("read pooled prefix");
+            Observed {
+                raw_row,
+                pooled,
+                selected: gpu.download_raw_bytes(&t.selected).expect("read selected"),
+                output: gpu.download_f32(&t.output).expect("read output"),
+            }
+        }
+
+        fn selected_tokens(observed: &Observed) -> Vec<i32> {
+            observed
+                .selected
+                .chunks_exact(4)
+                .map(|word| i32::from_ne_bytes(word.try_into().expect("selected word")))
+                .collect()
+        }
+
+        fn assert_same(label: &str, replayed: &Observed, reference: &Observed) {
+            assert_eq!(
+                replayed.raw_row, reference.raw_row,
+                "{label}: index-key row differs from the HIP reference"
+            );
+            assert!(
+                replayed.pooled == reference.pooled,
+                "{label}: pooled prefix differs from the HIP reference"
+            );
+            assert_eq!(
+                replayed.selected, reference.selected,
+                "{label}: selection differs from the HIP reference"
+            );
+            assert!(
+                replayed
+                    .output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(reference.output.iter().map(|value| value.to_bits())),
+                "{label}: attention output differs from the HIP reference: {:?} vs {:?}",
+                &replayed.output[..4],
+                &reference.output[..4]
+            );
+        }
+
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: needs gfx1201, found {}", gpu.arch);
+            return;
+        }
+        let Ok(gran) = gpu.vmm_recommended_granularity() else {
+            eprintln!("skip: no VMM allocation granularity");
+            return;
+        };
+        // The retained PM4 route must be available on this very HSA agent, not
+        // merely configured: kernel admission and prepare failures below are
+        // real failures and must not be skipped.
+        let device_ordinal = gpu.device_id as usize;
+        let pm4_agent = redline_dispatch::aql::load_symbols()
+            .ok()
+            .and_then(|symbols| {
+                let runtime = redline_dispatch::aql::Runtime::initialize(symbols).ok()?;
+                let device = runtime
+                    .select_gpu(redline_dispatch::aql::GpuSelector::Ordinal(device_ordinal))
+                    .ok()?;
+                Some(device.name().eq_ignore_ascii_case("gfx1201"))
+            })
+            .unwrap_or(false);
+        if !pm4_agent {
+            eprintln!("skip: no gfx1201 HSA agent for retained PM4");
+            return;
+        }
+
+        // One row of every arena is DIM F32 values; the first granule holds
+        // `initial_rows` of them and each arena reserves three granules.
+        assert_eq!(gran % (DIM * F32_BYTES), 0, "granule must hold whole rows");
+        eprintln!("gfx1201 VMM granularity: {gran} bytes");
+        let initial_rows = gran / (DIM * F32_BYTES);
+        assert_eq!(initial_rows % COMPRESS, 0, "granule must hold whole blocks");
+        assert!(initial_rows > CAPTURE_POSITION + 1);
+        let reserved_rows = 3 * initial_rows;
+        let max_blocks = reserved_rows / COMPRESS;
+        assert!(
+            max_blocks * F32_BYTES + QSA_SELECT_BATCHED_STATIC_LDS_BYTES
+                <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES,
+            "granule {gran} reserves a select LDS row beyond the dynamic LDS limit"
+        );
+        // `(position + 1) % COMPRESS == 3`: each replay position has a full
+        // three-token tail that starts at a grown row and is always selected.
+        let p0 = CAPTURE_POSITION;
+        let p1 = initial_rows + 2;
+        let p2 = 2 * initial_rows + 2;
+        for position in [p1, p2] {
+            assert_eq!((position + 1) % COMPRESS, 3);
+            assert!(position + 1 <= reserved_rows);
+        }
+        assert!(p0 < initial_rows && p1 >= initial_rows && p1 < 2 * initial_rows);
+        assert!(p2 >= 2 * initial_rows && p2 < reserved_rows);
+
+        let device = gpu.device_id;
+        let baseline_vmm = gpu.vmm_allocation_count();
+        let vmm_tensor = |gpu: &mut Gpu, label: &str| {
+            // SAFETY: only the mapped prefix is touched until the arena grows.
+            unsafe {
+                gpu.alloc_vmm_tensor(&[reserved_rows * DIM], DType::F32, gran, &[device])
+            }
+            .unwrap_or_else(|error| panic!("{label} VMM tensor: {error}"))
+        };
+        let raw_keys = vmm_tensor(&mut gpu, "raw index keys");
+        let full_keys = vmm_tensor(&mut gpu, "full keys");
+        let full_values = vmm_tensor(&mut gpu, "full values");
+        assert_eq!(gpu.vmm_allocation_count(), baseline_vmm + 3);
+        for tensor in [&raw_keys, &full_keys, &full_values] {
+            assert_eq!(gpu.vmm_granularity(tensor), Some(gran));
+            assert_eq!(gpu.vmm_mapped_bytes(tensor), Some(gran));
+        }
+
+        let rows_f32 = |first: usize, count: usize, value: &dyn Fn(usize, usize) -> f32| {
+            let mut bytes = Vec::with_capacity(count * DIM * F32_BYTES);
+            for row in first..first + count {
+                for channel in 0..DIM {
+                    bytes.extend_from_slice(&value(row, channel).to_ne_bytes());
+                }
+            }
+            bytes
+        };
+        let raw_key = |row: usize, channel: usize| {
+            (((row * 13 + channel * 7) % 31) as f32 - 15.0) / 16.0
+        };
+        let full_key = |row: usize, channel: usize| {
+            (((row * 5 + channel * 3) % 11) as f32 - 5.0) / 20.0
+        };
+        // The value level steps by 256 per granule, so attention output that
+        // misses (or misreads) a grown row is far from the expected level.
+        let full_value = |row: usize, channel: usize| {
+            (row / initial_rows) as f32 * 256.0
+                + 1.0
+                + ((row * 7 + channel * 3) % 13) as f32 / 16.0
+        };
+
+        // The initial pages are written with plain HIP copies.
+        gpu.hip
+            .memcpy_htod(&raw_keys.buf, &rows_f32(0, initial_rows, &raw_key))
+            .expect("initial raw keys");
+        gpu.hip
+            .memcpy_htod(&full_keys.buf, &rows_f32(0, initial_rows, &full_key))
+            .expect("initial full keys");
+        gpu.hip
+            .memcpy_htod(&full_values.buf, &rows_f32(0, initial_rows, &full_value))
+            .expect("initial full values");
+
+        let index_source: Vec<f32> = (0..DIM)
+            .map(|channel| ((channel * 5 + 3) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+        let index_row_bytes: Vec<u8> = index_source
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        let index_query: Vec<f32> = (0..INDEX_HEADS * DIM)
+            .map(|i| ((i * 3) % 7) as f32 * 0.1 + 0.05)
+            .collect();
+        let mut q_with_gate = Vec::with_capacity(N_HEADS * 2 * DIM);
+        for head in 0..N_HEADS {
+            q_with_gate.extend((0..DIM).map(|c| 0.02 * (1 + (c + head) % 5) as f32));
+            q_with_gate.extend(std::iter::repeat(0.5f32).take(DIM));
+        }
+
+        let mut t = Qsa {
+            reserved_rows,
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled: gpu
+                .zeros(&[max_blocks * DIM], DType::F32)
+                .expect("pooled"),
+            index_src: gpu.upload_f32(&index_source, &[DIM]).expect("index source"),
+            query: gpu
+                .upload_f32(&index_query, &[INDEX_HEADS * DIM])
+                .expect("index query"),
+            q_with_gate: gpu
+                .upload_f32(&q_with_gate, &[N_HEADS * 2 * DIM])
+                .expect("q with gate"),
+            selected: gpu
+                .zeros(&[SELECTED_CAPACITY * 4], DType::Raw)
+                .expect("selected"),
+            output: gpu.zeros(&[N_HEADS * DIM], DType::F32).expect("output"),
+        };
+
+        // Record the tape at p0 while only the first granule is mapped.
+        gpu.replay = ReplayController::new_manual_pm4();
+        assert!(gpu.replay.uses_pm4_transport());
+        gpu.replay.begin_capture().expect("open recording window");
+        run_qsa(&mut gpu, &t, p0);
+        gpu.hip.device_synchronize().expect("sync capture");
+        gpu.replay.finish_capture().expect("close recording window");
+        let launches = gpu.replay.recorded_launches().len();
+        assert_eq!(launches, 4, "the recorded QSA sequence changed");
+        for launch in gpu.replay.recorded_launches() {
+            assert!(
+                !launch.declared_kernarg_bindings().is_empty(),
+                "{}: position bindings were not declared",
+                launch.kernel
+            );
+        }
+        let (dispatches, _, _) = gpu
+            .replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .unwrap_or_else(|reason| panic!("PM4 prepare: {reason}"));
+        assert_eq!(dispatches, launches);
+        assert!(gpu.replay.prepared_pm4_plan_ready());
+        assert!(gpu.replay.uses_pm4_transport());
+
+        // Control inside the mapped granule, before any growth.
+        let replayed_p0 = observe(&mut gpu, &t, p0, true);
+        let reference_p0 = observe(&mut gpu, &t, p0, false);
+        assert_same("pre-growth p0", &replayed_p0, &reference_p0);
+        assert_eq!(replayed_p0.raw_row, index_row_bytes);
+
+        // Map two more granules into each arena in place; the tape is not told.
+        let bases = [
+            t.raw_keys.buf.as_ptr() as usize,
+            t.full_keys.buf.as_ptr() as usize,
+            t.full_values.buf.as_ptr() as usize,
+        ];
+        for tensor in [&mut t.raw_keys, &mut t.full_keys, &mut t.full_values] {
+            let mapped = gpu
+                .grow_vmm_tensor(tensor, 2 * gran, &[device])
+                .expect("grow VMM arena");
+            assert_eq!(mapped, 3 * gran);
+        }
+        for (tensor, base) in [&t.raw_keys, &t.full_keys, &t.full_values]
+            .into_iter()
+            .zip(bases)
+        {
+            assert_eq!(tensor.buf.as_ptr() as usize, base, "growth moved the arena");
+            let mapped = gpu.vmm_mapped_bytes(tensor).expect("registered VMM owner");
+            assert_eq!(mapped, 3 * gran);
+            assert!(mapped > gran);
+        }
+
+        // The grown pages are written with plain HIP copies after growth.
+        let grown_rows = reserved_rows - initial_rows;
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.raw_keys.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &raw_key),
+            )
+            .expect("grown raw keys");
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.full_keys.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &full_key),
+            )
+            .expect("grown full keys");
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.full_values.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &full_value),
+            )
+            .expect("grown full values");
+
+        let mut replayed = Vec::new();
+        for position in [p1, p2] {
+            let blocks = (position + 1) / COMPRESS;
+            let tail_start = (blocks * COMPRESS) as i32;
+            let tape = observe(&mut gpu, &t, position, true);
+            let reference = observe(&mut gpu, &t, position, false);
+            let label = format!("grown position {position}");
+            assert_same(&label, &tape, &reference);
+
+            // The kernel wrote the index-key row into a newly mapped page.
+            assert_eq!(tape.raw_row, index_row_bytes, "{label}: index-key row");
+            // Every pooled block (grown raw keys included) replaced the poison.
+            assert!(
+                tape.pooled
+                    .chunks_exact(4)
+                    .all(|word| f32::from_ne_bytes(word.try_into().unwrap()).is_finite()),
+                "{label}: pooled prefix was not fully written"
+            );
+            // Selection: the chosen blocks' tokens, then the three-token tail
+            // that starts at a grown row.
+            let tokens = selected_tokens(&tape);
+            assert_eq!(tokens.len(), SELECTED_CAPACITY);
+            let chosen = BUDGET_BLOCKS * COMPRESS;
+            assert!(
+                tokens[..chosen]
+                    .iter()
+                    .all(|&token| token >= 0 && token < tail_start),
+                "{label}: chosen tokens {:?}",
+                &tokens[..chosen]
+            );
+            assert_eq!(&tokens[chosen..], &[tail_start, tail_start + 1, tail_start + 2]);
+            assert!(
+                tokens.iter().any(|&token| token as usize >= initial_rows),
+                "{label}: selection never reached the grown region"
+            );
+            // Attention reads the grown tail's values (level >= 257), so every
+            // channel lies far above the first granule's 1..2 level.
+            assert!(
+                tape.output.iter().all(|value| value.is_finite() && *value > 8.0),
+                "{label}: attention output {:?}",
+                &tape.output[..4]
+            );
+            replayed.push(tape);
+        }
+        assert!(
+            replayed[0]
+                .output
+                .iter()
+                .zip(&replayed[1].output)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "positions in different grown granules produced identical outputs"
+        );
+
+        // The tape owns the addresses: keep every tensor live until it is gone.
+        gpu.replay.shutdown().expect("retained replay quiescence");
+        let Qsa {
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled,
+            index_src,
+            query,
+            q_with_gate,
+            selected,
+            output,
+            ..
+        } = t;
+        for tensor in [
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled,
+            index_src,
+            query,
+            q_with_gate,
+            selected,
+            output,
+        ] {
+            gpu.free_tensor(tensor).expect("free tensor");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), baseline_vmm);
+    }
+
     /// The retained-replay shape pin (a fixed grid or LDS bound larger than the
     /// active length) must not change a single output byte: the kernels mask, so
     /// a bigger reservation is never read. This is the premise the G3 shape
