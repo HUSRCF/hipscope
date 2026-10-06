@@ -1920,7 +1920,7 @@ impl GdnTape {
     }
 
     /// Railgun D8: whether [`Self::replay_gdn_from_snapshot`] can run —
-    /// `HIPFIRE_DN_SNAPSHOT_FLIP=1`, the two-launch replay admits this call,
+    /// `HIPFIRE_DN_SNAPSHOT_FLIP` not `0`, the two-launch replay admits this call,
     /// and `snap` mirrors `dn_state` (one same-size backup per live tensor in
     /// every family). Host-only; no allocation.
     pub fn replay_from_snapshot_admits(
@@ -6440,7 +6440,7 @@ pub fn spec_step_dflash(
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
     //
-    // Railgun D8 (`HIPFIRE_DN_SNAPSHOT_FLIP=1`, exact gfx1201, tape path with
+    // Railgun D8 (default on; `HIPFIRE_DN_SNAPSHOT_FLIP=0` opts out; exact gfx1201, tape path with
     // the two-launch replay admitted) drops the restore copy. `target_snap`
     // stays the pre-verify (pre-window) state throughout, so terminal repair
     // is unaffected, and the live state ends byte-identical to restore +
