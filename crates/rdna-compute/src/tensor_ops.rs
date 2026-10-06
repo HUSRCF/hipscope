@@ -8366,9 +8366,11 @@ mod tests {
     /// `indexed_attention_select_from_scores` on synthetic score rows with
     /// tens of thousands of blocks tied at the threshold (65,536 is 262K
     /// context at compress 4). The above/equal counts once shared one packed
-    /// int whose 16-bit equal field overflowed past 32,767 ties (negative
-    /// LDS slots) and wrapped past 65,535, sending later ties back into the
-    /// first selection slots.
+    /// int whose 16-bit equal field went negative past 32,767 ties and
+    /// wrapped past 65,535. Up to 65,536 blocks the old code only wrote to
+    /// negative LDS indices, which neither the output check nor the canary
+    /// can see; only the 70,000-block cases, where later ties wrap back into
+    /// the first selection slots, detect it. The rest pin the selection.
     #[test]
     fn select_from_scores_survives_tens_of_thousands_of_ties() {
         let Some(mut gpu) = try_gpu() else {
