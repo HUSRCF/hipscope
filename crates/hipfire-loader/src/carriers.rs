@@ -231,7 +231,10 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
     let Some(devices) = hipfire_config::devices::startup_devices() else {
         return;
     };
-    let archs = devices.iter().map(|device| device.arch.as_str()).collect::<Vec<_>>();
+    let archs = devices
+        .iter()
+        .map(|device| device.arch.as_str())
+        .collect::<Vec<_>>();
     if hipfire_arch_qwen4::expert_residency::keeps_host_memory_out_of_reclaim(arch_id, &archs) {
         hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
     }
@@ -618,11 +621,14 @@ impl Carrier for Qwen4Carrier {
         let mut manifest = receipt.manifest;
         let metadata = receipt.ple;
         let placements = receipt.placements;
-        // Radix cache identity input, taken while `hfq` is still owned: the
-        // cache is VMM-only and follows the prefix cache and radix switches.
-        let radix_content_digest = (backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm
-            && hipfire_arch_qwen4::bundle::radix_cache_requested())
-        .then(|| hfq.content_digest());
+        let session_domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
+            &hfq,
+            &meta.tokenizer,
+            meta.chat_template.as_deref(),
+            "qwen4",
+            ctx.gpu.device_id,
+        );
+        let session_budget = hipfire_config::memory::session_cache_bytes();
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
             hfq.drop_mmap();
@@ -649,7 +655,8 @@ impl Carrier for Qwen4Carrier {
         use hipfire_arch_qwen4::expert_residency as residency;
         const MIB: u64 = 1 << 20;
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            hfq.tensor_data(&entry.name)
+                .map(|(_, bytes)| bytes.len() as u64)
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
         // per-layer expert bytes, and the reserve (with its native MTP and
@@ -664,11 +671,14 @@ impl Carrier for Qwen4Carrier {
                 .hip
                 .get_vram_info()
                 .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
-            let (non_expert, layer_experts) = residency::resident_split(&manifest.weights, bytes_of)
-                .map_err(|error| format!("qwen4: {error}"))?;
-            let chunk_rows =
-                hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
-            let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
+            let (non_expert, layer_experts) =
+                residency::resident_split(&manifest.weights, bytes_of)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+            let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+                &ctx.gpu.arch,
+                ctx.max_seq,
+            );
+            let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
                 backend,
                 use_ranges,
                 ctx.max_seq,
@@ -684,8 +694,9 @@ impl Carrier for Qwen4Carrier {
             let mtp_bytes = if mtp_kept {
                 let head = residency::language_head_dtype(&manifest.weights)
                     .ok_or("qwen4: manifest has no language head")?;
-                let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config)
-                    .then_some(state_format.gdn);
+                let row_capture =
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config)
+                        .then_some(state_format.gdn);
                 Some(
                     hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                         &config,
@@ -705,30 +716,51 @@ impl Carrier for Qwen4Carrier {
             // the context is (none when the route is off: the reserve is then
             // unchanged). Bytes already committed by an earlier load in this
             // process are out of `free` and only growth past them is charged.
-            let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
-                .then(|| {
-                    rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                        config.num_key_value_heads,
-                        context.tokens,
-                    )
-                    .map(|bytes| (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64))
-                    .ok_or("qwen4: QSA gather scratch size overflows")
-                })
-                .transpose()?;
-            // The prefix cache's checkpoint is allocated at load (before the
-            // forward), so it is charged here, before placement.
-            let prefix_bytes = if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
-                hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(&config, state_format, mtp_kept)
-                    .ok_or("qwen4: prefix cache device bytes overflow")?
+            let gather_bytes =
+                rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
+                    .then(|| {
+                        rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                            config.num_key_value_heads,
+                            context.tokens,
+                        )
+                        .map(|bytes| {
+                            (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64)
+                        })
+                        .ok_or("qwen4: QSA gather scratch size overflows")
+                    })
+                    .transpose()?;
+            // Room for one session-cache snapshot of a whole prefill chunk,
+            // charged before placement (the cache itself grows on demand).
+            let prefix_bytes = if session_budget > 0 {
+                hipfire_arch_qwen4::bundle::session_snapshot_bytes(
+                    &config,
+                    state_format,
+                    mtp_kept,
+                    chunk_rows,
+                )
+                .ok_or("qwen4: session snapshot bytes overflow")?
             } else {
                 0
             };
-            let reserve =
-                residency::auto_vram_reserve(&config, &context, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
-                    .map_err(|error| format!("qwen4: {error}"))?
-                    .checked_add(prefix_bytes)
-                    .ok_or("qwen4: auto expert VRAM reserve overflows")?;
-            Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
+            let reserve = residency::auto_vram_reserve(
+                &config,
+                &context,
+                chunk_rows,
+                qsa_format,
+                mtp_bytes,
+                gather_bytes,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?
+            .checked_add(prefix_bytes)
+            .ok_or("qwen4: auto expert VRAM reserve overflows")?;
+            Ok((
+                free as u64,
+                non_expert,
+                layer_experts,
+                reserve,
+                mtp_bytes,
+                gather_bytes,
+            ))
         };
         let explicit =
             residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
@@ -762,13 +794,14 @@ impl Carrier for Qwen4Carrier {
         eprintln!(
             "  qwen4 expert placement: {}{unset_note}",
             match (explicit, placement) {
-                (Some(residency::ExpertVramLayers::Layers(layers)), _) => format!(
-                    "{}={layers}",
-                    residency::EXPERT_VRAM_LAYERS_ENV
-                ),
+                (Some(residency::ExpertVramLayers::Layers(layers)), _) =>
+                    format!("{}={layers}", residency::EXPERT_VRAM_LAYERS_ENV),
                 (Some(residency::ExpertVramLayers::Auto), _) =>
                     format!("{}=auto", residency::EXPERT_VRAM_LAYERS_ENV),
-                (None, None) => format!("{} unset, fully resident", residency::EXPERT_VRAM_LAYERS_ENV),
+                (None, None) => format!(
+                    "{} unset, fully resident",
+                    residency::EXPERT_VRAM_LAYERS_ENV
+                ),
                 (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
             }
         );
@@ -848,7 +881,11 @@ impl Carrier for Qwen4Carrier {
                 gib(ttm_pool)
             );
             if native_mtp
-                && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
+                && !crate::admission::qwen4_mtp_with_host_mapped_experts(
+                    ctx.spec,
+                    &ctx.gpu.arch,
+                    moved,
+                )
             {
                 native_mtp = false;
                 eprintln!(
@@ -897,7 +934,8 @@ impl Carrier for Qwen4Carrier {
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
         // check mode verifies it unchanged instead of snapshotting it (§2.4).
-        let weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+        let weights_role =
+            hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
         let transaction = fulfill_manifest_from_payloads(
             &manifest.weights,
             &mesh,
@@ -946,16 +984,6 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             ),
         })?;
-        // The target checkpoint is allocated before the forward so the
-        // admitted chunk rung is chosen from the VRAM left after it; the
-        // second call below adds the MTP head's part.
-        if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
-            if let Err(error) = bundle.attach_prefix_cache(ctx.gpu) {
-                let detail = error.to_string();
-                let _ = bundle.free_gpu(ctx.gpu);
-                return Err(format!("qwen4: prefix cache setup failed: {detail}"));
-            }
-        }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
@@ -1000,21 +1028,23 @@ impl Carrier for Qwen4Carrier {
         } else {
             None
         };
-        if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
-            if let Err(error) = bundle.attach_prefix_cache(ctx.gpu) {
-                let detail = error.to_string();
-                let _ = bundle.free_gpu(ctx.gpu);
-                return Err(format!("qwen4: prefix cache setup failed: {detail}"));
-            }
-            let bytes = hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(
+        if session_budget > 0 {
+            let chunk = bundle.spec_chunk_rows().unwrap_or(0);
+            let one = hipfire_arch_qwen4::bundle::session_snapshot_bytes(
                 &bundle.config,
                 state_format,
                 native_mtp,
+                chunk,
             )
             .unwrap_or(0);
+            bundle.attach_session_cache(hipfire_runtime::session_cache::SessionCache::new(
+                session_domain,
+                session_budget,
+            ));
             eprintln!(
-                "  qwen4 prefix cache: live continuation + end-of-prompt checkpoint ({} KiB)",
-                bytes / 1024
+                "  qwen4 session cache: {} MiB budget, {} MiB per {chunk}-token snapshot",
+                session_budget >> 20,
+                one >> 20
             );
         }
         let (committed_target, committed_mtp) = match bundle.qsa_context_committed_bytes(ctx.gpu) {
@@ -1954,7 +1984,6 @@ impl Carrier for Qwen35Carrier {
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))
     }
-
 }
 
 // ─── LlamaCarrier ────────────────────────────────────────────────────

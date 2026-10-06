@@ -40,8 +40,6 @@ pub trait CheckpointBlob {
     fn bytes_len(&self) -> u64;
 }
 
-
-
 // ───────────────────────────────────────────────────────────────────────────
 // Pool entry
 // ───────────────────────────────────────────────────────────────────────────
@@ -106,11 +104,11 @@ struct ExactEntry<B> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// QwenCheckpointPool
+// CheckpointPool
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Byte-bounded LRU pool of immutable Qwen3.5 hybrid-state checkpoint
-/// bundles (spec §4.5 C5).
+/// Byte-bounded LRU pool of immutable model-state checkpoint bundles
+/// (spec §4.5 C5).
 ///
 /// Keyed by `(CacheDomain, boundary_p)`. Entries are captured only at
 /// page-aligned boundaries. When the pool exceeds `max_bytes`, the oldest
@@ -120,7 +118,7 @@ struct ExactEntry<B> {
 /// Generic over `B: CheckpointBlob` so host tests can use a byte-counting
 /// test double without GPU device buffers. The GPU-backed capture and
 /// restore paths use `B = DeltaNetSnapshot`.
-pub struct QwenCheckpointPool<B: CheckpointBlob> {
+pub struct CheckpointPool<B: CheckpointBlob> {
     entries: HashMap<CheckpointKey, CheckpointEntry<B>>,
     /// Keys that were explicitly evicted (for distinguishing
     /// [`MissReason::Evicted`] from [`MissReason::NoCheckpoint`]).
@@ -138,7 +136,7 @@ pub struct QwenCheckpointPool<B: CheckpointBlob> {
     lru_clock: u64,
 }
 
-impl<B: CheckpointBlob> QwenCheckpointPool<B> {
+impl<B: CheckpointBlob> CheckpointPool<B> {
     /// Create a pool with a byte capacity of `max_bytes`.
     pub fn new(max_bytes: u64) -> Self {
         Self {
@@ -309,6 +307,13 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             self.evicted.insert(key);
             entry.blob
         })
+    }
+
+    /// Evict the oldest unpinned entry and return its blob for the caller
+    /// to free. `None` when the pool is empty or every entry is pinned.
+    pub fn pop_lru(&mut self) -> Option<B> {
+        let key = self.find_oldest_unpinned_key()?;
+        self.evict_internal(key)
     }
 
     /// Explicitly evict the checkpoint at `(domain, p, fp)`.
@@ -612,7 +617,7 @@ fn complete_bundle(drafter: DrafterDecision) -> ResumeBundle {
 /// Does NOT return `p = 0` — the initial state does not require a
 /// checkpoint and is handled separately by the caller.
 fn find_largest_pool_checkpoint<B: CheckpointBlob>(
-    pool: &QwenCheckpointPool<B>,
+    pool: &CheckpointPool<B>,
     domain: &CacheDomain,
     tokens: &[u32],
     max_p: u64,
@@ -633,7 +638,7 @@ fn find_largest_pool_checkpoint<B: CheckpointBlob>(
 /// Find the largest page-aligned checkpoint boundary `p > 0` with
 /// `p < below_p` in the pool for `domain` matching `tokens[..p]`.
 fn find_largest_pool_checkpoint_below<B: CheckpointBlob>(
-    pool: &QwenCheckpointPool<B>,
+    pool: &CheckpointPool<B>,
     domain: &CacheDomain,
     tokens: &[u32],
     below_p: u64,
@@ -691,7 +696,7 @@ fn find_largest_pool_checkpoint_below<B: CheckpointBlob>(
 /// `committed_tokens` and `materialized_rows` must reflect only this
 /// processed prefix, not the accepted token history.
 pub fn plan_resume<B: CheckpointBlob>(
-    pool: &mut QwenCheckpointPool<B>,
+    pool: &mut CheckpointPool<B>,
     domain: &CacheDomain,
     prompt_tokens: &[u32],
     lookup: &PrefixLookup,
@@ -710,7 +715,7 @@ pub fn plan_resume<B: CheckpointBlob>(
 }
 
 fn plan_resume_inner<B: CheckpointBlob>(
-    pool: &QwenCheckpointPool<B>,
+    pool: &CheckpointPool<B>,
     domain: &CacheDomain,
     prompt_tokens: &[u32],
     lookup: &PrefixLookup,
@@ -868,7 +873,7 @@ mod tests {
 
     #[test]
     fn a7_capture_at_128_plan_200() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a7");
 
         // Capture at p=128 (page-aligned).
@@ -898,7 +903,7 @@ mod tests {
 
     #[test]
     fn a7_exact_match_selects_earlier_boundary() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a7-exact");
 
         // Capture at p=128 only.
@@ -927,7 +932,7 @@ mod tests {
 
     #[test]
     fn a7_exact_match_with_prior_checkpoint() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a7-prior");
 
         // Capture at p=128 and p=256.
@@ -952,7 +957,7 @@ mod tests {
 
     #[test]
     fn a7_empty_prompt_no_underflow() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a7-empty");
 
         // No checkpoints, empty prompt, resumable=0.
@@ -967,7 +972,7 @@ mod tests {
 
     #[test]
     fn a8_missing_checkpoint_is_no_checkpoint() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a8-missing");
 
         // Lookup claims 128 resumable tokens, but no checkpoint in pool.
@@ -987,7 +992,7 @@ mod tests {
 
     #[test]
     fn a8_evicted_checkpoint_is_evicted() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a8-evicted");
 
         // Insert at p=128, then evict it.
@@ -1011,7 +1016,7 @@ mod tests {
 
     #[test]
     fn a8_missing_is_not_silent_hit() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a8-silent");
 
         // resumable > 0 but no checkpoint → must error, not return a plan.
@@ -1030,7 +1035,7 @@ mod tests {
 
     #[test]
     fn a9_boundary_is_materialized_prefix() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a9");
 
         // Capture at p=128.
@@ -1061,7 +1066,7 @@ mod tests {
 
     #[test]
     fn a9_exact_match_boundary_strictly_less() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a9-exact");
 
         pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 4096 });
@@ -1088,7 +1093,7 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_unpinned() {
         // Capacity: 2 entries of 4096 bytes each.
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let mut pool = CheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru");
 
         let (id0, _) = pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 4096 });
@@ -1116,7 +1121,7 @@ mod tests {
     /// `DeltaNetSnapshot` leaks its device buffers (no freeing `Drop`).
     #[test]
     fn displaced_blobs_are_returned_never_dropped() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let mut pool = CheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("displaced");
 
         // LRU eviction returns the evicted blob.
@@ -1155,7 +1160,7 @@ mod tests {
 
     #[test]
     fn lru_pinned_survives_eviction() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let mut pool = CheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru-pinned");
 
         pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 4096 });
@@ -1184,7 +1189,7 @@ mod tests {
 
     #[test]
     fn lru_access_refreshes_recency() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let mut pool = CheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru-recency");
 
         pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 4096 });
@@ -1207,7 +1212,7 @@ mod tests {
 
     #[test]
     fn domain_isolation() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom_a = test_domain("isolation-a");
         let dom_b = test_domain("isolation-b");
 
@@ -1246,7 +1251,7 @@ mod tests {
 
     #[test]
     fn domain_isolation_eviction() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let mut pool = CheckpointPool::<HostBlob>::new(8192);
         let dom_a = test_domain("iso-evict-a");
         let dom_b = test_domain("iso-evict-b");
 
@@ -1267,7 +1272,7 @@ mod tests {
 
     #[test]
     fn non_aligned_boundary_rejected() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("align");
 
         let (id, _) = pool.insert(dom.clone(), 100, fp(100), HostBlob { bytes: 4096 });
@@ -1284,7 +1289,7 @@ mod tests {
 
     #[test]
     fn p0_is_valid_boundary() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("p0");
 
         let (id, _) = pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 0 });
@@ -1296,7 +1301,7 @@ mod tests {
 
     #[test]
     fn checkpoint_ids_are_monotonic() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("monotonic");
 
         let (id1, _) = pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 100 });
@@ -1312,7 +1317,7 @@ mod tests {
 
     #[test]
     fn byte_accounting() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("bytes");
 
         pool.insert(dom.clone(), 0, fp(0), HostBlob { bytes: 1000 });
@@ -1329,7 +1334,7 @@ mod tests {
 
     #[test]
     fn drafter_decision_is_input() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("drafter");
 
         pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 4096 });
@@ -1387,7 +1392,7 @@ mod tests {
 
     #[test]
     fn exact_match_falls_back_to_p0() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("fallback-p0");
 
         // Only a checkpoint at p=0.
@@ -1412,7 +1417,7 @@ mod tests {
 
     #[test]
     fn resumable_rounds_down_to_page_boundary() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("round");
 
         // Checkpoint at p=128 only.
@@ -1458,7 +1463,7 @@ mod tests {
 
     #[test]
     fn r1_divergent_prefixes_same_boundary_get_distinct_entries() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("r1");
 
         // Prefix A captures at p=128.
@@ -1485,7 +1490,7 @@ mod tests {
 
     #[test]
     fn r1_resume_for_prefix_a_never_returns_prefix_b_state() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("r1b");
 
         // A captures at 128; B (divergent) captures at 128 too.
@@ -1531,7 +1536,7 @@ mod tests {
         // Two prompts that genuinely share the first 128 tokens MUST share
         // the checkpoint — the fingerprint is over tokens[..p], so a shared
         // prefix yields the same key. This is the correct-sharing case.
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("r1c");
         pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 4096 });
 

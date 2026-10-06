@@ -86,6 +86,22 @@ pub trait ArchModel: Send + std::any::Any {
         Ok(())
     }
 
+    /// Whether a [`crate::session_cache::SessionCache`] is attached, i.e. the
+    /// model reports reusable prompt prefixes itself.
+    fn session_cache_attached(&self) -> bool {
+        false
+    }
+
+    /// Prompt tokens the next prefill on `route` can restore instead of
+    /// computing; 0 when nothing is cached.
+    fn session_plan(&self, _prompt: &[u32], _route: crate::session_cache::SessionRoute) -> usize {
+        0
+    }
+
+    /// Publish the snapshots the last prefill captured. Call once the turn's
+    /// output is committed to the client.
+    fn session_commit(&mut self) {}
+
     /// Downcast hatch for the architecture composition root.
     ///
     /// `hipfire-generate` legitimately needs the concrete bundle to call a
@@ -98,7 +114,6 @@ pub trait ArchModel: Send + std::any::Any {
     /// A whole-struct accessor cannot: that distinction is why the accessor
     /// experiment converted 15 sites of 154 and this hatch is expected to do
     /// better.
-
 
     /// Return every GPU buffer this model owns.
     ///

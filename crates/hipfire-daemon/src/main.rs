@@ -65,16 +65,16 @@ use hipfire_generate::batch::{
     lfm_prefill_cancellable_or_fallback,
 };
 use hipfire_generate::redline::{
-    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace, handle_redline_pm4_prefix_profile,
-    handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
-    redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
-    redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
-    redline_dspark_verify_snapshot, redline_is_dense_lfm, redline_lfm2moe_snapshot,
-    redline_pm4_prefix_profile_deepseek4, redline_prepare_retained_fixture,
-    redline_prime_deepseek4, redline_prime_dspark_shadow_arm, redline_prime_qwen,
-    redline_prime_retained_fixture, redline_qwen_debug_hashes, redline_qwen_snapshot,
-    redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
+    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4,
+    handle_redline_dispatch_profile, handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace,
+    handle_redline_pm4_prefix_profile, handle_redline_prefix_shadow, handle_redline_probe_aql,
+    handle_redline_shadow, redline_append_tensor_slice, redline_bench_decode_deepseek4,
+    redline_bench_decode_lfm2moe, redline_deepseek4_snapshot, redline_dspark_shadow_block,
+    redline_dspark_verify_guard, redline_dspark_verify_snapshot, redline_is_dense_lfm,
+    redline_lfm2moe_snapshot, redline_pm4_prefix_profile_deepseek4,
+    redline_prepare_retained_fixture, redline_prime_deepseek4, redline_prime_dspark_shadow_arm,
+    redline_prime_qwen, redline_prime_retained_fixture, redline_qwen_debug_hashes,
+    redline_qwen_snapshot, redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
     redline_run_deepseek4_decode, redline_run_direct_fixture, redline_run_dspark_capture_arm,
     redline_run_dspark_direct_arm, redline_run_dspark_replay_arm, redline_shadow_deepseek4,
     redline_shadow_dspark_verify_pm4, redline_snapshot, RedlineDeepseek4Snapshot, RedlineDsparkArm,
@@ -600,7 +600,6 @@ impl ResidentKvDiag {
     }
 }
 
-
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
 /// After a new EP model is constructed, the prior model is unloaded. The new
@@ -814,7 +813,8 @@ fn receive_startup_config(
             config.validate().map_err(|error| error.to_string())?;
             return Ok(Some((config, None, true, model)));
         }
-        let model = model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
+        let model =
+            model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
         let pending = match announce_generate_terminal(&msg) {
@@ -854,10 +854,12 @@ fn main() {
             std::process::exit(1);
         });
         // Packaging needs only the arch and reserves no card.
-        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(|error| {
-            eprintln!("FATAL: failed to install process configuration: {error}");
-            std::process::exit(1);
-        });
+        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(
+            |error| {
+                eprintln!("FATAL: failed to install process configuration: {error}");
+                std::process::exit(1);
+            },
+        );
         // A separate --module probe below exercises the real GPU launch. Normal
         // packaging needs the active architecture but no writable cold directory
         // during Gpu::init: pack_to publishes to the executable-neighbor path.
@@ -885,21 +887,31 @@ fn main() {
                 gpu.free_tensor(weight)?;
                 gpu.free_tensor(output)?;
                 Ok(values)
-            })().unwrap_or_else(|error| {
+            })()
+            .unwrap_or_else(|error| {
                 eprintln!("ERROR: rmsnorm_f32 execution failed: {error}");
                 std::process::exit(1);
             });
             let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let weight = [1.0f32, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25];
-            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5).sqrt().recip();
-            if result.iter().zip(input.iter().zip(weight)).any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5) {
+            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5)
+                .sqrt()
+                .recip();
+            if result
+                .iter()
+                .zip(input.iter().zip(weight))
+                .any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5)
+            {
                 eprintln!("ERROR: rmsnorm_f32 numerical output differs from reference: {result:?}");
                 std::process::exit(1);
             }
             eprintln!(
                 "precompile: rmsnorm_f32 execution succeeded on {}: output_bits={:?}",
                 gpu.arch,
-                result.iter().map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>()
+                result
+                    .iter()
+                    .map(|v| format!("{:08x}", v.to_bits()))
+                    .collect::<Vec<_>>()
             );
             return;
         }
@@ -910,10 +922,14 @@ fn main() {
             .join("kernels")
             .join("compiled")
             .join(&gpu.arch);
-        let extra_flags = rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
+        let extra_flags =
+            rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
         let entries = rdna_compute::kernel_registry::entries(&gpu.arch, &extra_flags)
             .unwrap_or_else(|error| {
-                eprintln!("ERROR: no indexed kernel registry for {}: {error:?}", gpu.arch);
+                eprintln!(
+                    "ERROR: no indexed kernel registry for {}: {error:?}",
+                    gpu.arch
+                );
                 std::process::exit(1);
             });
         let count = entries.len();
@@ -923,17 +939,26 @@ fn main() {
                 std::process::exit(1);
             });
         for entry in entries {
-            compiler.pack_to(
-                entry.module,
-                entry.source(),
-                &entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<Vec<_>>(),
-                &output,
-            ).unwrap_or_else(|error| {
-                eprintln!("ERROR: packaging {} failed: {error}", entry.module);
-                std::process::exit(1);
-            });
+            compiler
+                .pack_to(
+                    entry.module,
+                    entry.source(),
+                    &entry
+                        .symbols
+                        .iter()
+                        .map(|symbol| (*symbol).to_owned())
+                        .collect::<Vec<_>>(),
+                    &output,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("ERROR: packaging {} failed: {error}", entry.module);
+                    std::process::exit(1);
+                });
         }
-        eprintln!("precompile: packaged {count} indexed modules for {}", gpu.arch);
+        eprintln!(
+            "precompile: packaged {count} indexed modules for {}",
+            gpu.arch
+        );
         return;
     }
 
@@ -1041,7 +1066,6 @@ fn main() {
     // unload and empty handoff; preserved when a replacement fails and the prior
     // resident remains loaded.
     let mut resident_kv: Option<ResidentKvDiag> = None;
-
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -1212,7 +1236,8 @@ fn main() {
                     .map(|n| n as usize);
                 if requested_seq.is_some_and(|n| n < MIN_REQUESTED_SEQ) {
                     let e = format!(
-                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}", requested_seq.unwrap()
+                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}",
+                        requested_seq.unwrap()
                     );
                     emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                     let _ = stdout.flush();
@@ -1496,7 +1521,6 @@ fn main() {
                             }
                             batch_clear_all_terminals();
                             resident_kv = None;
-
                         }
                     }
                 }
@@ -1644,9 +1668,11 @@ fn main() {
                 // One warning line when the load names a deprecated KV format
                 // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
                 if let Some(warning) = [
-                    Some(kv_mode_override.as_deref().unwrap_or(
-                        hipfire_runtime::config::get().kv_mode.as_str(),
-                    )),
+                    Some(
+                        kv_mode_override
+                            .as_deref()
+                            .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
+                    ),
                     kv_k_override.as_deref(),
                 ]
                 .into_iter()
@@ -2066,27 +2092,45 @@ fn main() {
                     expert_count_override: deepseek4_experts_per_token.is_some(),
                     pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
                 };
-                let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
-                    kv_backend_override.as_deref()
-                ) {
-                    Ok(request) => request,
-                    Err(e) => {
-                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
+                let backend_request =
+                    match hipfire_loader::admission::KvBackendRequest::from_override(
+                        kv_backend_override.as_deref(),
+                    ) {
+                        Ok(request) => request,
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &e,
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
                 let admission = match hipfire_loader::admission::admit_source_with_options(
-                    path, tp, pp, backend_request, draft_path.as_deref(),
-                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
-                    head_path.as_deref(), max_seq,
+                    path,
+                    tp,
+                    pp,
+                    backend_request,
+                    draft_path.as_deref(),
+                    gpu.arch.as_str(),
+                    vision_path.as_deref(),
+                    &vision_mode,
+                    head_path.as_deref(),
+                    max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
                         kv_k: kv_k_override.as_deref(),
                         kv_v: kv_v_override.as_deref(),
                         kv_adaptive: kv_adaptive_override.as_deref(),
                         cask: Some(&cask),
-                        deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
+                        deepseek4_heterogeneous: !matches!(
+                            deepseek4_compute_placement,
+                            hipfire_config::Deepseek4ComputePlacement::Single
+                        ),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
                         free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
@@ -2222,7 +2266,11 @@ fn main() {
                         let max_seq = m.max_seq;
                         let resolved = m.sequence.as_ref();
                         let seq_bound = resolved.map_or(
-                            if requested_seq.is_some() { "user" } else { "legacy" },
+                            if requested_seq.is_some() {
+                                "user"
+                            } else {
+                                "legacy"
+                            },
                             |s| s.bound,
                         );
                         let model_ctx = resolved.map(|s| s.model_ctx);
@@ -2276,11 +2324,12 @@ fn main() {
                             && !hipfire_runtime::config::mq4r_redline_default(
                                 &gpu.arch, path, pp, tp,
                             );
-                        gpu.replay.set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
-                            rdna_compute::replay::gfx1201_pm4_pacing_from_config()
-                        } else {
-                            Default::default()
-                        });
+                        gpu.replay
+                            .set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
+                                rdna_compute::replay::gfx1201_pm4_pacing_from_config()
+                            } else {
+                                Default::default()
+                            });
                         let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
@@ -2467,12 +2516,14 @@ fn main() {
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
                         // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        // Qwen4 (16) is cache-capable when its prefix cache is attached
-                        // (live continuation + end-of-prompt checkpoint,
-                        // `Qwen4Bundle::attach_prefix_cache`).
+                        // Qwen4 (16) only with its attached session cache
+                        // (`ArchModel::session_cache_attached`).
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            16 => m.qwen4().is_some_and(|bundle| bundle.prefix_cache_attached()),
+                            16 => m
+                                .state
+                                .as_deref()
+                                .is_some_and(|state| state.session_cache_attached()),
                             _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
@@ -2502,12 +2553,10 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        let backend_reason_json =
-                            serde_json::to_string(&pending_kv_diag.reason)
-                                .expect("backend reason is serializable");
-                        let backend_warning_json =
-                            serde_json::to_string(&pending_kv_diag.warning)
-                                .expect("backend warning is serializable");
+                        let backend_reason_json = serde_json::to_string(&pending_kv_diag.reason)
+                            .expect("backend reason is serializable");
+                        let backend_warning_json = serde_json::to_string(&pending_kv_diag.warning)
+                            .expect("backend warning is serializable");
                         // Publish resident KV metadata with the loaded ACK.
                         resident_kv = Some(ResidentKvDiag {
                             mode: Some(seq_kv.to_owned()),
@@ -2536,8 +2585,12 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
+                                max_seq,
+                                seq_bound,
+                                seq_reason_json,
+                                serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(),
+                                seq_kv,
                             );
                         } else {
                             let _ = writeln!(
@@ -2559,8 +2612,12 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
+                                max_seq,
+                                seq_bound,
+                                seq_reason_json,
+                                serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(),
+                                seq_kv,
                             );
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -4755,7 +4812,14 @@ fn main() {
                 let g0 = match hipfire_engine::redline::G0Arm::from_request(&msg) {
                     Ok(g0) => g0,
                     Err(reason) => {
-                        emit_uncorrelated_error(&mut stdout, None, &reason, "validation", false, false);
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &reason,
+                            "validation",
+                            false,
+                            false,
+                        );
                         let _ = stdout.flush();
                         continue;
                     }
@@ -4867,7 +4931,14 @@ fn main() {
                 let g0_before = match g0.map(|arm| arm.begin(&mut gpu)).transpose() {
                     Ok(before) => before,
                     Err(reason) => {
-                        emit_uncorrelated_error(&mut stdout, None, &reason, "unsupported", false, false);
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &reason,
+                            "unsupported",
+                            false,
+                            false,
+                        );
                         let _ = stdout.flush();
                         continue;
                     }
@@ -4938,7 +5009,14 @@ fn main() {
                     (Some(arm), Some(before)) => match arm.finish(&mut gpu, before) {
                         Ok(value) => Some(value),
                         Err(reason) => {
-                            emit_uncorrelated_error(&mut stdout, None, &reason, "internal", false, false);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &reason,
+                                "internal",
+                                false,
+                                false,
+                            );
                             let _ = stdout.flush();
                             continue;
                         }
@@ -5173,7 +5251,10 @@ mod tests {
             announce("req-seed");
             let _scope = BatchAttemptScope::enter_for("req-seed", 7);
             let mut output = Vec::new();
-            assert_eq!(client_seed_or_refuse(&mut output, "req-seed", Some(&seed)), None);
+            assert_eq!(
+                client_seed_or_refuse(&mut output, "req-seed", Some(&seed)),
+                None
+            );
             let events = error_events(&output);
             assert_eq!(events.len(), 1, "{seed}");
             assert_eq!(events[0]["type"], "error");
@@ -5187,7 +5268,10 @@ mod tests {
             client_seed_or_refuse(&mut output, "req-seed", Some(&serde_json::json!(42))),
             Some(Some(42))
         );
-        assert_eq!(client_seed_or_refuse(&mut output, "req-seed", None), Some(None));
+        assert_eq!(
+            client_seed_or_refuse(&mut output, "req-seed", None),
+            Some(None)
+        );
         assert!(output.is_empty(), "a valid or absent seed emits nothing");
 
         for gated in [None, Some("/models/x-vision.hfq")] {

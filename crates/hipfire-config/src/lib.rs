@@ -524,8 +524,23 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
+    "auto",
+    "f32",
+    "f16",
+    "bf16",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+    "fp8",
+    "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -1531,6 +1546,19 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_PROMPT_CACHE_CAP",
         "Maximum cached assistant-turn tokenizations; zero keeps no entries."
+    ),
+    process_field!(
+        "memory.session_cache_bytes",
+        "session_cache_bytes",
+        Memory,
+        DefaultValue::Integer(8589934592),
+        ValueRule::Integer {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_BYTES",
+        "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
     ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
@@ -3793,7 +3821,10 @@ fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
         let Some(name) = developer_env_for_key(key) else {
             continue;
         };
-        if FIELDS.iter().any(|schema| schema.env_compat == Some(name.as_str())) {
+        if FIELDS
+            .iter()
+            .any(|schema| schema.env_compat == Some(name.as_str()))
+        {
             continue;
         }
         if let Some(value) = render_compat_value(value) {
@@ -5380,7 +5411,10 @@ mod tests {
             values,
         };
         let table = legacy_table(&config);
-        let mut names: Vec<&str> = FIELDS.iter().filter_map(|schema| schema.env_compat).collect();
+        let mut names: Vec<&str> = FIELDS
+            .iter()
+            .filter_map(|schema| schema.env_compat)
+            .collect();
         names.extend([
             "HIPFIRE_DSPARK_Q8_WMMA",
             "HIPFIRE_NGRAM_WINDOW",
@@ -6006,7 +6040,10 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
@@ -6501,6 +6538,14 @@ pub mod memory {
     /// residency (the zero-diff baseline).
     pub fn gpu_layer_budget() -> GpuLayerBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
+    }
+
+    /// Byte budget of the session cache (`memory.session_cache_bytes`, compat
+    /// env `HIPFIRE_SESSION_CACHE_BYTES`); 0 disables it.
+    pub fn session_cache_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8589934592)
     }
 
     /// Which engine executes the ops that read a spilled layer's weights

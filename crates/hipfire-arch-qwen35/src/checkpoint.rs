@@ -6,13 +6,13 @@
 //! GPU capture/restore over a live `DeltaNetState`, and re-exports so
 //! existing `crate::checkpoint::…` paths keep working.
 
+use crate::qwen35::DeltaNetState;
 use crate::speculative::DeltaNetSnapshot;
+use hip_bridge::{HipError, HipResult};
 pub use hipfire_runtime::checkpoint_pool::{
-    plan_resume, prefix_fingerprint, CheckpointBlob, CheckpointId, QwenCheckpointPool,
+    plan_resume, prefix_fingerprint, CheckpointBlob, CheckpointId, CheckpointPool,
 };
 use hipfire_runtime::serve_contract::CacheDomain;
-use crate::qwen35::DeltaNetState;
-use hip_bridge::{HipError, HipResult};
 use rdna_compute::Gpu;
 
 impl CheckpointBlob for DeltaNetSnapshot {
@@ -38,13 +38,13 @@ impl CheckpointBlob for DeltaNetSnapshot {
 /// path at page-aligned completed boundaries.
 pub fn capture_checkpoint(
     gpu: &mut Gpu,
-    pool: &mut QwenCheckpointPool<DeltaNetSnapshot>,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
     domain: &CacheDomain,
     p: u64,
     boundary_tokens: &[u32],
     state: &DeltaNetState,
 ) -> HipResult<CheckpointId> {
-    if !QwenCheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
+    if !CheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
         return Err(HipError::new(
             0,
             "capture_checkpoint: boundary not page-aligned",
@@ -89,7 +89,7 @@ pub fn capture_checkpoint(
 /// private recurrent state for a running request.
 pub fn restore_private(
     gpu: &mut Gpu,
-    pool: &mut QwenCheckpointPool<DeltaNetSnapshot>,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
     domain: &CacheDomain,
     p: u64,
     fp: u64,
@@ -104,5 +104,3 @@ pub fn restore_private(
 // ───────────────────────────────────────────────────────────────────────────
 // Tests (host-only — no GPU/HIP required)
 // ───────────────────────────────────────────────────────────────────────────
-
-

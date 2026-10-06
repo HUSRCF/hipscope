@@ -220,6 +220,56 @@ impl CacheDomain {
         out
     }
 
+    /// Domain of one loaded single-device model: content, tokenizer and
+    /// chat-template identity. Arch policy carries only `arch_tag`; callers
+    /// narrow it per state ABI with [`Self::scoped`].
+    pub fn for_model(
+        hfq: &crate::hfq::HfqFile,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        chat_template: Option<&str>,
+        arch_tag: &str,
+        device_id: i32,
+    ) -> CacheDomain {
+        CacheDomain {
+            model_content_digest: hfq.content_digest(),
+            model_load_epoch: 1,
+            sidecar_digests: Vec::new(),
+            tokenizer: TokenizerIdentity {
+                vocab_digest: tokenizer.vocab_digest(),
+                config_digest: tokenizer.config_digest(),
+            },
+            template: TemplateIdentity {
+                template_digest: sha256_len_prefixed(&[chat_template.unwrap_or("").as_bytes()]),
+                normalization_tag: "jinja".to_string(),
+            },
+            arch_policy: ArchPolicy {
+                arch_tag: arch_tag.to_string(),
+                state_abi_tag: String::new(),
+                position_attention_tag: String::new(),
+            },
+            kv_layout: KvLayout {
+                k_stride_bytes: Vec::new(),
+                v_stride_bytes: Vec::new(),
+                layout_tag: String::new(),
+            },
+            device: DeviceTopology {
+                device_id: format!("gpu-{device_id}"),
+                topology_id: "single".to_string(),
+                allocation_epoch: 1,
+            },
+            namespace: SharingNamespace {
+                domain_id: "default".to_string(),
+            },
+        }
+    }
+
+    /// This domain narrowed to one state ABI (`arch_policy.state_abi_tag`).
+    pub fn scoped(&self, scope: &str) -> CacheDomain {
+        let mut domain = self.clone();
+        domain.arch_policy.state_abi_tag = scope.to_owned();
+        domain
+    }
+
     /// Inverse of [`CacheDomain::to_canonical_bytes`]. Returns the domain
     /// only if the byte stream is a complete, well-formed canonical encoding
     /// at the current version; otherwise an error. Used for radix persistence
