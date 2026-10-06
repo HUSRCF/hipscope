@@ -104,8 +104,11 @@ const SRD_A: u8 = 4; const SRD_X: u8 = 8; const SRD_Y: u8 = 12;
 const PA: u8 = 16; const PX: u8 = 18; const PY: u8 = 20; const SM: u8 = 22; const SK: u8 = 23; const SN: u8 = 24;
 const GPR: u8 = 25; const NCHM1: u8 = 26; const GPRM1: u8 = 27; const WGX: u8 = 28; const WGY: u8 = 29;
 const G: u8 = 30; const GOFF: u8 = 31; const NGOFF: u8 = 32; const SXOFF: u8 = 33; const C8: u8 = 34;
-const ST0: u8 = 35; const ST1: u8 = 36; const MASK0: u8 = 37; const MASK1: u8 = 38; const SYOFF: u8 = 39;
+const ST0: u8 = 35; const ST1: u8 = 36; const SZERO: u8 = 37;
 const YSTEP: u8 = 40; const SNB: u8 = 41; const SMJ: u8 = 42; const SK2: u8 = 43;
+/// Lane masks sit at even SGPRs with their odd neighbour unused: VOPC `_e64`
+/// destinations are encoded (and analysed) as SGPR pairs.
+const MASK0: u8 = 44; const MASK1: u8 = 46;
 
 fn plan(spec: &Spec) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(XR) + 4 * u16::from(spec.xpt()), 48)?;
@@ -122,7 +125,9 @@ fn plan(spec: &Spec) -> Result<RegPlan, String> {
     p.s::<2>("kernarg_ptr", KARG, w())?;
     for srd in [SRD_A, SRD_X, SRD_Y] { p.s::<4>("srd", srd, w())?; }
     p.s::<8>("kernargs", PA, w())?;
-    for n in SN..=SK2 { p.s::<1>("scalar", n, w())?; }
+    for n in SN..=SZERO { p.s::<1>("scalar", n, w())?; }
+    for n in YSTEP..=SK2 { p.s::<1>("scalar", n, w())?; }
+    for m in [MASK0, MASK1] { p.s::<2>("lane_mask", m, w())?; }
     Ok(p)
 }
 
@@ -376,9 +381,14 @@ fn epilogue(b: &mut Builder, spec: &Spec) -> R {
     b.wait_all()?;
     b.label(&lbl(spec, "epi"))?;
     for n in 0..8 * BT { op(b, format!("v_add_f32_e32 v{0}, 0, v{0}", ACC + n), &[v(ACC + n)], &[v(ACC + n)])?; }
-    // Tile t: token + 16t, Y offset + t*16*M*4.
+    // Tile t: token + 16t, Y offset + t*16*M*4 in v[RINGB+t] (the B ring is
+    // dead here), so no store source is redefined while stores are in flight.
     sop(b, format!("s_lshl_b32 s{YSTEP}, s{SM}, 6"), &[YSTEP], &[SM])?;
-    sop(b, format!("s_mov_b32 s{SYOFF}, 0"), &[SYOFF], &[])?;
+    sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
+    op(b, format!("v_mov_b32_e32 v{RINGB}, v{VYOFF}"), &[v(RINGB)], &[v(VYOFF)])?;
+    for t in 1..BT {
+        op(b, format!("v_add_nc_u32_e32 v{}, s{YSTEP}, v{}", RINGB + t, RINGB + t - 1), &[v(RINGB + t)], &[s(YSTEP), v(RINGB + t - 1)])?;
+    }
     sop(b, format!("s_mov_b32 s{SNB}, s{SN}"), &[SNB], &[SN])?;
     sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
     sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
@@ -390,10 +400,9 @@ fn epilogue(b: &mut Builder, spec: &Spec) -> R {
         wait_alu(b, "depctr_va_sdst(0)")?;
         op(b, format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"), &[], &[s(MASK0), s(MASK1)])?;
         let acc = ACC + 8 * t;
-        bstore(b, 4, acc, VYOFF, SRD_Y, SYOFF, 0)?;
-        bstore(b, 4, acc + 4, VYOFF, SRD_Y, SYOFF, 16)?;
+        bstore(b, 4, acc, RINGB + t, SRD_Y, SZERO, 0)?;
+        bstore(b, 4, acc + 4, RINGB + t, SRD_Y, SZERO, 16)?;
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
-        sop(b, format!("s_add_co_i32 s{SYOFF}, s{SYOFF}, s{YSTEP}"), &[SYOFF], &[SYOFF, YSTEP])?;
         sop(b, format!("s_add_co_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
     }
     op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
@@ -406,11 +415,10 @@ fn epilogue(b: &mut Builder, spec: &Spec) -> R {
             op(b, format!("v_cmp_gt_i32_e64 s{MASK1}, s{SMJ}, v{VROW0}"), &[s(MASK1)], &[s(SMJ), v(VROW0)])?;
             wait_alu(b, "depctr_va_sdst(0)")?;
             op(b, format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"), &[], &[s(MASK0), s(MASK1)])?;
-            bstore(b, 1, ACC + 8 * t + e, VYOFF, SRD_Y, SYOFF, 4 * u32::from(e))?;
+            bstore(b, 1, ACC + 8 * t + e, RINGB + t, SRD_Y, SZERO, 4 * u32::from(e))?;
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
             sop(b, format!("s_add_co_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
         }
-        sop(b, format!("s_add_co_i32 s{SYOFF}, s{SYOFF}, s{YSTEP}"), &[SYOFF], &[SYOFF, YSTEP])?;
         sop(b, format!("s_add_co_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
     }
     b.label(&lbl(spec, "end"))?;

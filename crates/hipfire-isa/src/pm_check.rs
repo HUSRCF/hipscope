@@ -141,6 +141,7 @@ fn step(w: &mut Wave, name: &str, ops: &[&str]) {
         "v_mul_u32_u24_e32" => bin(|x, y| (x & 0xff_ffff).wrapping_mul(y & 0xff_ffff)),
         "v_lshl_add_u32" => tri(|x, s, y| (x << (s & 31)).wrapping_add(y)),
         "v_mad_u32_u24" => tri(|x, y, z| (x & 0xff_ffff).wrapping_mul(y & 0xff_ffff).wrapping_add(z)),
+        "v_bfe_u32" => tri(|x, o, w| (x >> (o & 31)) & ((1u32 << (w & 31)) - 1)),
         "v_readfirstlane_b32" => { let x = a(1); [x[0]; 32] }
         "s_lshr_b32" | "s_and_b32" | "s_lshl_b32" | "s_mov_b32" | "s_add_i32" | "s_mul_i32" => {
             let x = w.scalar(ops.get(1).unwrap_or(&""));

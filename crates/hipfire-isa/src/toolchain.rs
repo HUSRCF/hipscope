@@ -507,11 +507,13 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // The register-use audit covers every builder symbol that reuses
         // registers across phases: F2 and the fused A4 GDN projection.
         let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
-        // gfx11 builder kernels and the gfx1201 Qwen4 MoE and QSA gathered
-        // families carry M7's lift identity and analyses (M7's gfx1201 tables).
+        // gfx11 builder kernels and the gfx1201 Qwen4 MoE, QSA gathered and
+        // MQ6 X4 trunk GEMM families carry M7's lift identity and analyses
+        // (M7's gfx1201 tables).
         let qsa_pm=contract.symbol.starts_with("indexed_attention_")&&contract.symbol.contains("_pm_gfx");
+        let mq6_pm=contract.symbol.starts_with("qwen4_mq6_x4_pm_gfx");
         let m7_cert=matches!(arch,"gfx1100"|"gfx1151")
-            || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm);
+            || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm || mq6_pm);
         if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {
             let mut highest_v=0u32;
             let mut highest_s=0u32;
@@ -574,6 +576,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
                 // is its largest size); every other access is bounded by the static part.
                 crate::pm_check::lds_bounds_host(&source_text,&contract.symbol,waves,kd.group_segment_size,
                     &crate::kernels::qsa_gather::TOKEN_ADDRESS_VGPRS)?.0.max(kd.group_segment_size+dynamic)
+            } else if mq6_pm {
+                // Static LDS only (two X slots, no dynamic list): every access is
+                // lane-derived, so no address VGPR is host-bounded.
+                crate::pm_check::lds_bounds_host(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic,&[])?.0
             } else {
                 crate::pm_check::lds_bounds(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic)?
             };
