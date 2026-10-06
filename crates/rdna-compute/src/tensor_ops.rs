@@ -8363,6 +8363,106 @@ mod tests {
         );
     }
 
+    /// `indexed_attention_select_from_scores` on synthetic score rows with
+    /// tens of thousands of blocks tied at the threshold (65,536 is 262K
+    /// context at compress 4). The above/equal counts once shared one packed
+    /// int whose 16-bit equal field overflowed past 32,767 ties (negative
+    /// LDS slots) and wrapped past 65,535, sending later ties back into the
+    /// first selection slots.
+    #[test]
+    fn select_from_scores_survives_tens_of_thousands_of_ties() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "indexed_attention_select_from_scores")
+            .expect("select kernel");
+        const CANARY: i32 = 0x5A5A_5A5A;
+        const GUARD: usize = 64;
+        let (compress, budget, tail) = (4usize, 512usize, 3usize);
+        let capacity = budget * compress + tail;
+        let tied = |blocks: usize| vec![1.0f32; blocks];
+        // 300 blocks scored above the tie, scattered, with some repeats so
+        // the above blocks also break ties by index.
+        let partial = |blocks: usize| {
+            let mut scores = vec![1.0f32; blocks];
+            for i in 0..300usize {
+                scores[(i * 7919 + 13) % blocks] = 2.0 + (i % 97) as f32 * 0.25;
+            }
+            scores
+        };
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("all tied 65536", tied(65_536)),
+            ("all tied 40000", tied(40_000)),
+            ("partial tie 65536", partial(65_536)),
+            ("partial tie 40000", partial(40_000)),
+            ("all tied 70000", tied(70_000)),
+            ("partial tie 70000", partial(70_000)),
+        ];
+        for (name, scores) in cases {
+            let blocks = scores.len();
+            // Visible spans every block plus `tail` tail tokens.
+            let position_start = blocks * compress + tail - 1;
+            let mut order: Vec<usize> = (0..blocks).collect();
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+            let mut expected = vec![-1i32; capacity];
+            for (rank, &block) in order.iter().take(budget).enumerate() {
+                for slot in 0..compress {
+                    expected[rank * compress + slot] = (block * compress + slot) as i32;
+                }
+            }
+            for t in 0..tail {
+                expected[budget * compress + t] = (blocks * compress + t) as i32;
+            }
+            let scores_gpu = gpu.upload_f32(&scores, &[blocks]).expect("scores upload");
+            let init: Vec<u8> = std::iter::repeat(CANARY)
+                .take(capacity + GUARD)
+                .flat_map(i32::to_ne_bytes)
+                .collect();
+            let selected = gpu.upload_raw(&init, &[init.len()]).expect("selected upload");
+            let mut args = KernargBlob::new();
+            args.push_ptr(scores_gpu.buf.as_ptr());
+            args.push_i32(blocks as i32);
+            args.push_ptr(selected.buf.as_ptr());
+            args.push_i32(1);
+            args.push_i32(blocks as i32);
+            args.push_i32(budget as i32);
+            args.push_i32(compress as i32);
+            args.push_i32(position_start as i32);
+            args.push_i32(capacity as i32);
+            args.push_ptr(std::ptr::null_mut());
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                "indexed_attention_select_from_scores",
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )
+            .expect("select launch");
+            let mut bytes = vec![0u8; init.len()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &selected.buf).expect("selected download");
+            gpu.free_tensor(selected).expect("free selected");
+            gpu.free_tensor(scores_gpu).expect("free scores");
+            let got: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("i32 chunk")))
+                .collect();
+            assert!(
+                got[capacity..].iter().all(|&v| v == CANARY),
+                "{name}: guard canary after the selection overwritten"
+            );
+            let first_bad = (0..capacity).find(|&i| got[i] != expected[i]);
+            assert!(
+                first_bad.is_none(),
+                "{name}: selection differs from CPU reference at slot {first_bad:?}: got {:?} want {:?}",
+                first_bad.map(|i| got[i]),
+                first_bad.map(|i| expected[i])
+            );
+        }
+    }
+
     /// The parallel rank path and the serial selection-sort fallback are two
     /// symbols for the same logical selection, chosen only by the LDS
     /// reservation; they must emit identical `selected` bytes. A

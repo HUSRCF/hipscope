@@ -3926,6 +3926,7 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_from_
     if (row != rows - 1) mirror = nullptr;
     __shared__ unsigned hist[8][256];  // one copy per wave: fewer atomic collisions
     __shared__ int wave_totals[8];
+    __shared__ int wave_equals[8];
     __shared__ unsigned radix_prefix;
     __shared__ int radix_need;
     __shared__ int2 entries[512];
@@ -3981,23 +3982,36 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_from_
         const int per = (row_block_count + 255) / 256;
         const int first = min(tid * per, row_block_count);
         const int last = min(first + per, row_block_count);
-        int packed = 0;
+        // Above and equal counts scan separately: ties can number every block
+        // (65,536 at 262K context), which overflows a 16-bit packed field.
+        int above_count = 0;
+        int equal_count = 0;
         for (int block = first; block < last; ++block) {
             const unsigned key = keys[block];
-            packed += key > prefix ? 1 : (key == prefix ? 1 << 16 : 0);
+            above_count += key > prefix;
+            equal_count += key == prefix;
         }
-        int inclusive = packed;
+        int above_inclusive = above_count;
+        int equal_inclusive = equal_count;
         for (int offset = 1; offset < 32; offset <<= 1) {
-            const int up = __shfl_up(inclusive, offset, 32);
-            if (lane >= offset) inclusive += up;
+            const int above_up = __shfl_up(above_inclusive, offset, 32);
+            const int equal_up = __shfl_up(equal_inclusive, offset, 32);
+            if (lane >= offset) {
+                above_inclusive += above_up;
+                equal_inclusive += equal_up;
+            }
         }
-        if (lane == 31) wave_totals[wave] = inclusive;
+        if (lane == 31) {
+            wave_totals[wave] = above_inclusive;
+            wave_equals[wave] = equal_inclusive;
+        }
         __syncthreads();
-        int before = 0;
-        for (int w = 0; w < wave; ++w) before += wave_totals[w];
-        const int exclusive = before + inclusive - packed;
-        int above_slot = exclusive & 0xffff;
-        int equal_seen = exclusive >> 16;
+        int above_slot = above_inclusive - above_count;
+        int equal_seen = equal_inclusive - equal_count;
+        for (int w = 0; w < wave; ++w) {
+            above_slot += wave_totals[w];
+            equal_seen += wave_equals[w];
+        }
         for (int block = first; block < last; ++block) {
             const unsigned key = keys[block];
             if (key > prefix) {
