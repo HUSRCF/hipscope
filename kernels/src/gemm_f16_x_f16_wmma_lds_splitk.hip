@@ -523,6 +523,15 @@ SK_KERNEL(qwen4_wmma_lds_64_128_32_64_k64_s4,    64, 128, 2, 4, 64, false, 4)
 SK_KERNEL(qwen4_wmma_lds_64_128_32_64_k64_p_s8,  64, 128, 2, 4, 64, true,  8)
 SK_KERNEL(qwen4_wmma_lds_64_64_32_32_k64_p_s4,   64,  64, 2, 2, 64, true,  4)
 SK_KERNEL(qwen4_wmma_lds_64_128_32_32_k64_p_s4,  64, 128, 2, 2, 64, true,  4)
+// gfx1201 HC input_mix_down (M = 320, K % 256 == 0; HIPFIRE_QWEN4_HC_DOWN_TILE): 160 x 80
+// of five 32 x 80 waves with K staged 32 at a time.  15360 B of LDS per workgroup
+// (the 64 x 128 / k64 tile's 24576 B caps the WGP at 5 workgroups); the same four K
+// splits, ascending 16-element substeps and fragment map, so every partial is bytewise
+// the p_s4 tile's.  R9700, 320 x 10240: 447 -> 384 us at B = 4096, 887 -> 714 at 8192
+// (qcal/release-0.4.1/hc-down-g0).  178 VGPRs, no scratch.
+#if defined(__gfx1201__)
+SK_KERNEL(qwen4_wmma_lds_160_80_32_80_k32_p_s4, 160,  80, 2, 5, 32, true,  4)
+#endif
 
 
 // Shared-down incumbent gfx1201 tile, single completed accumulator.

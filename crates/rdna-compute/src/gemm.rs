@@ -204,8 +204,9 @@ static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
 static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true)
 });
-/// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default on
-/// (the only call site checks gfx1151), `0` keeps the 64 x 64 tile.
+/// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
+/// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
+/// of the 64 x 128 / k64 split-K tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true)
 });
@@ -314,8 +315,8 @@ impl LdsTile {
 
 /// One tile of the split-K LDS WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip`, gfx1201 and gfx1151):
-/// block `bm × bn`, wave `wm × wn`, K staged 64 at a time, optional software
-/// pipelining and a deterministic `split`-way K split.
+/// block `bm × bn`, wave `wm × wn`, K staged `ks` (64 unless [`LdsTileSplitK::k_stage`]) at
+/// a time, optional software pipelining and a deterministic `split`-way K split.
 /// [`LdsTileSplitK::entry`] names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LdsTileSplitK {
@@ -325,6 +326,7 @@ pub struct LdsTileSplitK {
     pub wn: usize,
     pub pipe: bool,
     pub split: usize,
+    pub ks: usize,
 }
 
 impl LdsTileSplitK {
@@ -336,17 +338,31 @@ impl LdsTileSplitK {
             wn,
             pipe,
             split,
+            ks: 64,
         }
     }
+
+    /// The same tile with K staged `ks` (32 or 64) elements per barrier pair.
+    pub const fn k_stage(self, ks: usize) -> Self {
+        Self { ks, ..self }
+    }
+
+    /// gfx1201 HC input_mix_down (M = 320, K % 256 == 0, `HIPFIRE_QWEN4_HC_DOWN_TILE`):
+    /// 160 x 80 of five 32 x 80 waves, K staged 32, the 64 x 128 p_s4 tile's four K
+    /// splits, so the partials (and the reduced output) are bytewise that tile's.
+    /// 15360 B of LDS per workgroup instead of 24576. R9700, 320 x 10240, lab harness
+    /// (`qcal/release-0.4.1/hc-down-g0`): 447 -> 384 us at B = 4096, 887 -> 714 us at 8192.
+    pub const HC_DOWN_GFX1201: Self = Self::new(160, 80, 32, 80, true, 4).k_stage(32);
 
     /// Kernel entry-point name, matching `SK_KERNEL` in the .hip.
     pub fn entry(&self) -> String {
         format!(
-            "qwen4_wmma_lds_{}_{}_{}_{}_k64{}{}",
+            "qwen4_wmma_lds_{}_{}_{}_{}_k{}{}{}",
             self.bm,
             self.bn,
             self.wm,
             self.wn,
+            self.ks,
             if self.pipe { "_p" } else { "" },
             if self.split > 1 { format!("_s{}", self.split) } else { String::new() }
         )
@@ -27910,7 +27926,13 @@ impl Gpu {
             dtype: DType::F16,
         };
         if self.arch_caps.is_gfx1201() {
-            let tile = Self::qwen4_lds_tile_gfx1201(m, k);
+            // HC-down keeps the incumbent 64 x 128 p_s4 tile's four K splits on the
+            // 160 x 80 / k32 tile (HIPFIRE_QWEN4_HC_DOWN_TILE), so the bytes match.
+            let tile = if *QWEN4_HC_DOWN_TILE && m == 320 && k % 256 == 0 {
+                LdsTileSplitK::HC_DOWN_GFX1201
+            } else {
+                Self::qwen4_lds_tile_gfx1201(m, k)
+            };
             return self.gemm_f16_x_f16_wmma_lds_splitk(&w_view, x_f16, y, m, k, batch_size, tile);
         }
         // Measured gfx1151 (flushed, N = 8192 / 2048 / 512): 3.66 / 1.75 / 0.60 ms on 64 x 64
@@ -28342,7 +28364,7 @@ impl Gpu {
     /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
     /// `tile.split > 1` the K-split partials go to the shared deterministic
     /// K-split scratch (`split·B·M` F32) and are added in ascending split
-    /// order.  gfx1201 and gfx1151 only; `K % (64·split) == 0`.
+    /// order.  gfx1201 and gfx1151 only; `K % (ks·split) == 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16_x_f16_wmma_lds_splitk(
         &mut self,
@@ -28363,9 +28385,9 @@ impl Gpu {
             self.arch
         );
         assert!(
-            k > 0 && k % (64 * tile.split) == 0,
+            k > 0 && k % (tile.ks * tile.split) == 0,
             "gemm_f16_x_f16_wmma_lds_splitk: K must be a positive multiple of {} (got {k})",
-            64 * tile.split
+            tile.ks * tile.split
         );
         assert!(
             a_f16.numel() >= m * k && x_f16.numel() >= batch_size * k && y_f32.numel() >= batch_size * m,
@@ -46815,6 +46837,52 @@ mod tests {
                 "builder module differs from hipcc in {differing} cells at M={m} K={k} N={n}"
             );
             gpu.free_tensor(x_gpu).expect("free x");
+            gpu.free_tensor(a).expect("free a");
+        }
+    }
+
+    /// The gfx1201 HC-down tile (`HIPFIRE_QWEN4_HC_DOWN_TILE`) must produce the
+    /// 64 x 128 p_s4 tile's bytes: real 320-row shapes, a ragged token tail in
+    /// the last 80-token block and ragged rows in the last 160-row block.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn hc_down_tile_gfx1201_matches_p_s4_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        let incumbent = Gpu::qwen4_lds_tile_gfx1201(320, 10240);
+        assert_eq!(incumbent.entry(), "qwen4_wmma_lds_64_128_32_64_k64_p_s4");
+        for (m, k, n) in [(320usize, 10240usize, 512usize), (320, 10240, 1131), (320, 20480, 4097), (161, 256, 81)] {
+            // F16 bit patterns with magnitudes in [0.125, 0.5) and mixed signs.
+            let bits = |len: usize, seed: usize| -> Vec<u16> {
+                (0..len)
+                    .map(|i| 0x3000 | ((i * 7919 + seed) % 2048) as u16 | if (i + seed) % 3 == 0 { 0x8000 } else { 0 })
+                    .collect()
+            };
+            let a = gpu.upload_f16_bits(&bits(m * k, 3), &[m * k]).expect("a upload");
+            let x = gpu.upload_f16_bits(&bits(n * k, 11), &[n * k]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run = |gpu: &mut Gpu, tile: LdsTileSplitK| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.gemm_f16_x_f16_wmma_lds_splitk(&a, &x, &y, m, k, n, tile).expect("split-K GEMM");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, incumbent);
+            let got = run(&mut gpu, LdsTileSplitK::HC_DOWN_GFX1201);
+            assert!(want.iter().all(|v| v.is_finite()));
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(differing, 0, "HC-down tile differs in {differing} cells at M={m} K={k} N={n}");
+            gpu.free_tensor(x).expect("free x");
             gpu.free_tensor(a).expect("free a");
         }
     }

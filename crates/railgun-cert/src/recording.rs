@@ -1077,7 +1077,7 @@ pub const DECISIONS: &[Decision] = &[
         switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; recorded/captured: the incumbent unfused launches",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and HC_DOWN_TILE default on for exact gfx1151 only, MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, and no railgun default program is a qwen4 program",
+        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, and no railgun default program is a qwen4 program",
         reaches: &[],
     },
     Decision {
