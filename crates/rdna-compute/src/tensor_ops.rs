@@ -4698,7 +4698,7 @@ fn qsa_gathered_wmma_bytes(n_kv_heads: usize, tokens: usize) -> HipResult<usize>
 
 /// Reserve the gathered route's per-GPU workspace for a QSA cache of
 /// `tokens` rows when the route is enabled for `format`. Where the VMM
-/// workspace is admitted (gfx1151 on a VMM-certified platform) this is a
+/// workspace is admitted (gfx1151/gfx1201 on a VMM-certified platform) this is a
 /// stable-VA reservation that commits no pages, released by
 /// `Gpu::invalidate_weight_caches` (model unload); elsewhere the legacy
 /// slot is allocated whole, as before. Returns the reserved bytes, 0 when

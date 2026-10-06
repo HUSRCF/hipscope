@@ -2394,6 +2394,89 @@ mod tests {
         assert_eq!(gpu.vmm_allocation_count(), owners);
     }
 
+    /// Every QSA state format the device serves (`bf16` / `auto` / `q8` /
+    /// `fp8` requests that resolve here: the gfx1201 default is fp8) is
+    /// demand-mapped like the F32 case above: nothing committed at
+    /// construction, growth that covers each request, keeps mapped rows and
+    /// zeroes only new pages, and a whole-context map that commits the legacy
+    /// state's bytes up to whole driver pages per arena.
+    #[test]
+    fn vmm_context_maps_every_served_qsa_format() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        if !crate::kv_backend::qwen4_vmm_supported(&gpu) {
+            eprintln!("skip: Qwen4 VMM unsupported on {}", gpu.arch);
+            return;
+        }
+        let config = crate::config::compact_test_config();
+        let mut formats = Vec::new();
+        for request in ["bf16", "auto", "q8", "fp8"] {
+            if let Ok(format) = resolve_qsa_format(request, &gpu, &config) {
+                if !formats.contains(&format) {
+                    formats.push(format);
+                }
+            }
+        }
+        if gpu.arch_caps.is_gfx1201() {
+            assert!(formats.contains(&QsaKvFormat::Fp8), "gfx1201 serves fp8 QSA state");
+        }
+        let s = 16_384;
+        let arenas = config.n_full_layers() * QSA_CONTEXT_ARENAS;
+        for qsa in formats {
+            let format = Qwen4StateFormat {
+                qsa,
+                gdn: GdnStateFormat::F32,
+            };
+            let owners = gpu.vmm_allocation_count();
+            let mut legacy =
+                Qwen4State::new_with_backend(&mut gpu, &config, s, format, Qwen4KvBackend::Legacy)
+                    .expect("legacy state");
+            let full = legacy.mapped_context_bytes(&gpu).unwrap();
+            legacy.free_gpu(&mut gpu).expect("free legacy state");
+            let mut state =
+                Qwen4State::new_with_backend(&mut gpu, &config, s, format, Qwen4KvBackend::Vmm)
+                    .expect("VMM state");
+            assert_eq!(gpu.vmm_allocation_count(), owners + arenas, "{}", qsa.name());
+            assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), 0);
+            let granularity = gpu.vmm_granularity(&state.qsa[0].full_keys).unwrap();
+            eprintln!("{} VMM QSA state: granularity {granularity} B", qsa.name());
+
+            state.ensure_mapped_capacity(&mut gpu, 1).expect("first page");
+            let first = state.mapped_context_tokens();
+            assert!(first >= 1 && first < s, "{}: first coverage {first}", qsa.name());
+            let keys = &state.qsa[0].full_keys;
+            let row_bytes = keys.byte_size() / s;
+            let pattern: Vec<u8> = (0..row_bytes).map(|i| (i % 251) as u8 | 1).collect();
+            gpu.hip.memcpy_htod(&keys.buf, &pattern).expect("write row 0");
+
+            let old_size = state.qsa[0].full_keys.buf.size();
+            state.ensure_mapped_capacity(&mut gpu, first + 1).expect("grow");
+            assert!(state.mapped_context_tokens() > first, "{}", qsa.name());
+            let keys = &state.qsa[0].full_keys;
+            assert!(keys.buf.size() > old_size);
+            let mut row = vec![0u8; row_bytes];
+            gpu.hip.memcpy_dtoh(&mut row, &keys.buf).expect("read row 0");
+            assert_eq!(row, pattern, "{}: growth preserves mapped rows", qsa.name());
+            let element = keys.dtype.size();
+            let fresh = keys.sub_offset(old_size / element, (keys.buf.size() - old_size) / element);
+            let mut grown = vec![0xFFu8; fresh.buf.size()];
+            gpu.hip.memcpy_dtoh(&mut grown, &fresh.buf).expect("read new page");
+            assert!(grown.iter().all(|&b| b == 0), "{}: new pages are zeroed", qsa.name());
+
+            state.ensure_mapped_capacity(&mut gpu, s).expect("whole context");
+            assert_eq!(state.mapped_context_tokens(), s);
+            let committed = state.mapped_context_bytes(&gpu).unwrap();
+            assert!(
+                committed >= full && committed < full + arenas * granularity,
+                "{}: whole-context commit {committed} vs legacy {full}",
+                qsa.name()
+            );
+            state.free_gpu(&mut gpu).expect("free VMM state");
+            assert_eq!(gpu.vmm_allocation_count(), owners);
+        }
+    }
+
     /// Hardware smoke at the canonical geometry (Halo): grow a VMM state
     /// across chunk boundaries to native context and compare with a legacy
     /// state. Reads the config from `$HIPFIRE_MODELS_DIR/qwen3.8-flash-next-gptq3.mq4`

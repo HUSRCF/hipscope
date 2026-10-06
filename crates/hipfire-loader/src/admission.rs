@@ -1034,7 +1034,7 @@ pub fn admit_source_with_options(
         }
     }
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
-    // Qwen4 owns its own VMM QSA layout and certification (gfx1151 only), so
+    // Qwen4 owns its own VMM QSA layout and certification (gfx1151/gfx1201), so
     // its capability replaces the Qwen/KvCache predicates below; its
     // topology is Single by the refusals above.
     let unsupported = if arch_id == QWEN4_ARCH_ID {
