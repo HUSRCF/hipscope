@@ -458,6 +458,7 @@ Read only by `pm-npu`, `railgun` (feature `npu`) and `npu-tools`; nothing on the
 | Variable | Reader | Meaning |
 |---|---|---|
 | `NPU_FCLK_GUARD` | `railgun::npu::fclk` (npu-coop, coop27) | `require` (unset; refuse concurrent GPU+NPU work unless the Halo iGPU fabric clock is pinned), `pin` (pin for the process, restore on exit), `off` (skip, loud warning) |
+| `NPU_IGPU_PCI` | `railgun::npu::fclk` (fclk sysfs device, npu-coop GPU) | PCI bus id of the Halo iGPU, default `0000:bf:00.0` (hipx); other Halo boxes enumerate it elsewhere (e.g. `0000:c5:00.0`) |
 | `NPU_M4_CMD`, `NPU_M4_ALONE_CMD` | `npu-tools m4` | NPU loop command run concurrently with the GPU prefills (required) and alone (defaults to `NPU_M4_CMD`) in the M4 derate measurement |
 | `AIE2P_VENDOR_CORPUS` | `pm-npu` tests | Vendor `vendor-artifacts` directory for byte-oracle cross-checks; tests skip when unset |
 | `AIE2P_OBJDUMP` | `pm-npu` `isa_decode` (ignored test) | llvm-aie `llvm-objdump` used as the decode oracle (default `/tmp/aie2p-llvm-objdump`) |

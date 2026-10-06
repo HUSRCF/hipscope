@@ -408,11 +408,17 @@ impl Device {
         let mut gi = GetBoInfo { handle: cb.handle, ..Default::default() };
         ioctl(self.fd, amdxdna::<GetBoInfo>(GET_BO_INFO), &mut gi, "get_bo_info userptr")?;
         let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_LOCKED, self.fd, gi.map_offset as i64) };
+        // Linux 7.2 amdxdna refuses mmap of a userptr BO (EINVAL); the caller's mapping is a view of the same pinned
+        // pages, so fall back to it (unowned: `mapped` stays false and Drop does not munmap it).
         if host == sys::MAP_FAILED {
-            return Err(format!("mmap userptr bo: errno={}", errno()));
+            if errno() != 22 {
+                return Err(format!("mmap userptr bo: errno={}", errno()));
+            }
+            bo.host = ptr;
+        } else {
+            bo.host = host as *mut u8;
+            bo.mapped = true;
         }
-        bo.host = host as *mut u8;
-        bo.mapped = true;
         bo.xdna = gi.xdna_addr;
         Ok(bo)
     }

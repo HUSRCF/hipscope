@@ -334,7 +334,37 @@ impl ArrayDesign {
     pub fn append_lean_run_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
         -> Result<(), String>
     {
-        let plan = self.lean_plan()?;
+        self.lean_body(txn, arena_base, extra, true, false)
+    }
+
+    /// [`ArrayDesign::append_lean_run_body`] that does not rewrite the shim BD words / S2MM controller ids (only DDR
+    /// patches and tasks). Valid ONLY when the previous body executed on this hardware context was a body of this SAME
+    /// design (not merely the same PDI: e.g. [`ArrayDesign::with_a_repeat`] shares the PDI but not the shim BDs).
+    pub fn append_lean_run_body_same_design(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
+        -> Result<(), String>
+    {
+        self.lean_body(txn, arena_base, extra, false, false)
+    }
+
+    /// [`ArrayDesign::append_lean_run_body_same_design`] that keeps B resident (G80 only, whose whole-K B stays in the
+    /// memtile for a submit): no shim B stream, no memtile B fill; the B ready locks are set to the `kc` credits the
+    /// fill would have released. Valid ONLY when the previous body on this hardware context was a body of this same
+    /// design whose B argument held the same bytes (the memtile B regions still hold them); `arena_base[1]` is unused.
+    pub fn append_lean_run_body_b_resident(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
+        -> Result<(), String>
+    {
+        if self.variant != Variant::G80 {
+            return Err(format!("B-resident lean body is derived for G80 only, not {}", self.variant));
+        }
+        self.lean_body(txn, arena_base, extra, false, true)
+    }
+
+    fn lean_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)], shim_bd_words: bool,
+        b_resident: bool) -> Result<(), String>
+    {
+        let mut plan = self.lean_plan()?;
+        // B resident: the fill task is not requeued (nothing streams B in); the guards get the fill's credits instead.
+        if b_resident { plan.mem.requeues.retain(|t| !(t.direction == S2mm && t.channel == B_S2MM_CH)); }
         let geo = &self.geo;
         let topo = geo.topo;
         let cores: Vec<Location> = topo.cores().collect();
@@ -420,6 +450,14 @@ impl ArrayDesign {
             let (addr, value) = dma::lock_write(mem_loc(col), id, initial_mem_locks[id as usize]);
             txn.write32(addr, value);
         }
+        if b_resident {
+            for col in 0..topo.cols as u32 {
+                for id in gemm_g80::B_READY {
+                    let (addr, value) = dma::lock_write(mem_loc(col), id, geo.kc as u32);
+                    txn.write32(addr, value);
+                }
+            }
+        }
         // 5. release core reset, PC = 0.
         for &tile in &cores {
             txn.mask_write(tile.address(regs::core::CORE_CONTROL), 0, 2);
@@ -432,13 +470,15 @@ impl ArrayDesign {
             }
         }
         for &(loc, t) in &mem_resets {
+            // B resident: a reset B fill channel stays idle (requeueing it would park a fill waiting for data).
+            if b_resident && t.direction == S2mm && t.channel == B_S2MM_CH { continue; }
             if !mem_requeues.iter().any(|&(l, q)| l == loc && q.direction == t.direction && q.channel == t.channel) {
                 t.emit_txn(loc, txn);
             }
         }
         for &(loc, t) in &mem_requeues { t.emit_txn(loc, txn); }
         // 7. shim BDs / DDR patches / tokens / tasks.
-        emit_shim_at(txn, geo, arena_base);
+        emit_shim_at(txn, geo, arena_base, shim_bd_words, b_resident);
         // 8. cores last, then wait for the C tokens.
         for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
         emit_sync(txn, topo, false);

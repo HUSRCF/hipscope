@@ -313,10 +313,11 @@ fn declared_words(d:&PersistentDesign,runs:usize)->Vec<usize> {
 }
 /// `rounds` submissions of `s` runs each on ONE simulator + ring (round r = global runs `r*s..(r+1)*s`, seq0 = `r*s+1`), once
 /// with the lean ring and once with the full-body ring under the identical producer schedule. Later rounds re-use the first
-/// round's stream through `patch_seq`, which needs the slot of run i to repeat each round (`s % nslots == 0`).
-fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,rounds:usize,gap:usize) {
+/// round's stream through `patch_seq`, which needs the slot of run i to repeat each round (`s % nslots == 0`). `rearm`:
+/// rounds after the first submit the lean-first `persistent_v9_lean_rearm` stream instead.
+fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,rounds:usize,gap:usize,rearm:bool) {
     assert!(rounds==1 || s%nslots==0,"patch_seq keeps slots: rounds>1 needs S % nslots == 0");
-    let what=format!("{m}x{n}x{k} S={s} nslots={nslots} rounds={rounds} gap={gap}");
+    let what=format!("{m}x{n}x{k} S={s} nslots={nslots} rounds={rounds} gap={gap} rearm={rearm}");
     let (l0,f0)=(rig_shape(m,n,k,nslots,s,0,1,None,true),rig_shape(m,n,k,nslots,s,0,1,None,false));
     assert_bytes(&l0.d.pdi,&f0.d.pdi,&format!("{what}: lean and full ring load the same PDI"));
     assert!(l0.d.insts.len()<f0.d.insts.len(),"{what}: lean ring stream ({} B) is not smaller than the full-body ring ({} B)",l0.d.insts.len(),f0.d.insts.len());
@@ -328,9 +329,18 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
         let (base,seq0)=(round*s,1+(round*s) as u32);
         if round>0 {
             let (fl,ff)=(rig_shape(m,n,k,nslots,s,base,seq0,None,true),rig_shape(m,n,k,nslots,s,base,seq0,None,false));
-            assert_eq!(diff_words(&lean_insts,&fl.d.insts),dl,"{what}: lean byte diff between rounds must be exactly the declared words");
-            patch_seq(&mut lean_insts,&l0.d.patch_sites,seq0);patch_seq(&mut full_insts,&f0.d.patch_sites,seq0);
-            assert_bytes(&lean_insts,&fl.d.insts,&format!("{what}: patched lean stream != from-scratch lean build"));
+            if rearm {
+                let fr=persistent_with(gemm_array::design_v9(m,n,k,gemm_array::V8_DEFAULT_EPILOGUE,Control::Fast),l0.layout,&fl.plans,seq0,Bodies::LeanFirst,false);
+                assert_bytes(&fr.pdi,&l0.d.pdi,&format!("{what}: rearm ring loads the same PDI"));
+                assert_eq!(declared_words(&fr,s).len(),dl.len());
+                if round>1 {patch_seq(&mut lean_insts,&fr.patch_sites,seq0);assert_bytes(&lean_insts,&fr.insts,&format!("{what}: patched rearm stream != from-scratch rearm build"));}
+                lean_insts=fr.insts;
+            } else {
+                assert_eq!(diff_words(&lean_insts,&fl.d.insts),dl,"{what}: lean byte diff between rounds must be exactly the declared words");
+                patch_seq(&mut lean_insts,&l0.d.patch_sites,seq0);
+                assert_bytes(&lean_insts,&fl.d.insts,&format!("{what}: patched lean stream != from-scratch lean build"));
+            }
+            patch_seq(&mut full_insts,&f0.d.patch_sites,seq0);
             assert_bytes(&full_insts,&ff.d.insts,&format!("{what}: patched full stream != from-scratch full build"));
             assert_eq!(df,declared_words(&ff.d,s));
         }
@@ -354,13 +364,99 @@ fn lean_rounds(m:usize,n:usize,k:usize,gold:&[Golden],nslots:usize,s:usize,round
 fn lean_ring_matrix(m:usize,n:usize,k:usize) {
     let probe=rig_shape(m,n,k,2,3,0,1,None,true);let gold=goldens(&probe,8);
     for gap in [0,20_000] {
-        lean_rounds(m,n,k,&gold,2,3,1,gap);// S=3 > nslots=2: slot wrap inside one submission
-        lean_rounds(m,n,k,&gold,2,4,2,gap);// two retained rounds, second via patch_seq, wrap in each
+        lean_rounds(m,n,k,&gold,2,3,1,gap,false);// S=3 > nslots=2: slot wrap inside one submission
+        lean_rounds(m,n,k,&gold,2,4,2,gap,false);// two retained rounds, second via patch_seq, wrap in each
+        lean_rounds(m,n,k,&gold,2,2,3,gap,true);// lean-first re-arm: round 1 from scratch, round 2 via patch_seq
     }
 }
 #[test] fn lean_ring_512x512x128() {lean_ring_matrix(512,512,128)}
 #[test] fn lean_ring_1024x512x128() {lean_ring_matrix(1024,512,128)}
 #[test] fn lean_ring_512x512x64_all_odd_parity() {lean_ring_matrix(512,512,64)}
+
+/// Ring of an explicit `design` (`persistent_with`): round 0 lean (full run 0), later rounds lean-first, against the
+/// full-body ring of the same design under the same schedule. Every run is CPU + eager exact, and the lean ring's
+/// arguments and retained array state equal the full-body ring's after every round. Returns the goldens.
+fn design_rounds(m:usize,n:usize,k:usize,what:&str,design:&dyn Fn()->ArrayDesign)->Vec<Golden> {
+    let (nslots,s,rounds)=(2,2,3);
+    let layout=RingLayout {nslots};
+    let rig_of=|base:usize,seq0:u32,bodies:Bodies|->Rig {
+        let eager=design();let (a,b,c)=(eager.args[0].bytes,eager.args[1].bytes,eager.args[2].bytes);
+        let plans=plans(base,s,nslots,a,b,c);
+        let d=persistent_with(design(),layout,&plans,seq0,bodies,false);
+        Rig {m,n,k,layout,eager,d,plans,cb:c,used:nslots}
+    };
+    let (l0,f0)=(rig_of(0,1,Bodies::Lean),rig_of(0,1,Bodies::Full));
+    let gold=goldens(&l0,s*rounds);
+    let (mut args_l,mut args_f)=(fresh_args(&l0),fresh_args(&f0));
+    let (mut sim_l,mut sim_f)=(Config::from_pdi(&l0.d.pdi).unwrap(),Config::from_pdi(&f0.d.pdi).unwrap());
+    for round in 0..rounds {
+        let (base,seq0)=(round*s,1+(round*s) as u32);
+        let (rl,rf)=(rig_of(base,seq0,if round==0 {Bodies::Lean} else {Bodies::LeanFirst}),rig_of(base,seq0,Bodies::Full));
+        let mut p=Producer::new(&rl,&gold,base,s,0,vec![],&args_l);run(&mut sim_l,&rl.d.insts,&mut args_l,&mut p);p.finish(&args_l);
+        let mut pf=Producer::new(&rf,&gold,base,s,0,vec![],&args_f);run(&mut sim_f,&rf.d.insts,&mut args_f,&mut pf);pf.finish(&args_f);
+        for (r,args) in [(&rl,&args_l),(&rf,&args_f)] {check_outputs(r,&gold,args,base+s);check_done_lines(r.layout,args,base+s,&[]);}
+        for a in 0..4 {assert_bytes(&args_l[a],&args_f[a],&format!("{what} {m}x{n}x{k} round {round}: lean arg{a} != full arg{a}"));}
+        assert!(sim_l.state_snapshot()==sim_f.state_snapshot(),"{what} {m}x{n}x{k} round {round}: lean ring state != full ring");
+        eprintln!("PASS {what} ring {m}x{n}x{k} round {round}: exact, state == full ring");
+    }
+    gold
+}
+
+/// `ArrayDesign::with_a_repeat` (host A = each `mw` tile once, the shim task replays it `NW` times): the ring rounds of
+/// [`design_rounds`], and every eager C equals the default (replicated-A) V9's.
+fn a_repeat_rounds(m:usize,n:usize,k:usize) {
+    let v9=|arep:bool| {let d=gemm_array::design_v9(m,n,k,INT8,Control::Fast);if arep {d.with_a_repeat()} else {d}};
+    let plain=v9(false);
+    assert_eq!(v9(true).pdi,plain.pdi,"A repeat keeps the PDI");
+    assert_eq!(v9(true).args[0].bytes*n.div_ceil(512),plain.args[0].bytes,"A repeat holds 1/NW of the replicated A");
+    let gold=design_rounds(m,n,k,"A-repeat",&||v9(true));
+    for (g,i) in gold.iter().zip(0..) {
+        let (a,b)=matrices(m,n,k,0xc001d00d+i as u32*7919);let [ap,bp]=plain.pack_in(&a,&b);
+        let mut args=vec![ap,bp,vec![POISON;plain.args[2].bytes]];
+        Config::from_pdi(&plain.pdi).unwrap().submit(&plain.insts,&mut args).unwrap();
+        assert_bytes(&g.eager_c,&args[2],"A-repeat eager C != default V9 eager C");
+    }
+}
+#[test] fn a_repeat_ring_512x1280x128() {a_repeat_rounds(512,1280,128)}
+#[test] fn a_repeat_ring_1024x1280x64_two_m_waves() {a_repeat_rounds(1024,1280,64)}
+#[test] fn g80_ring_512x1280x128() {design_rounds(512,1280,128,"G80",&||pm_npu::kernels::gemm_g80::design_g80(512,1280,128,INT8,Control::Fast));}
+
+/// G80 B-resident ring (`persistent_with(.., b_shared = true)`): every run shares one B; run 0 of round 0 fills it from
+/// DDR, every later run keeps it in the memtile. From run 2 on the host B is poison, so an exact C proves the lean
+/// runs read the resident B and nothing from DDR.
+#[test] fn g80_b_resident_ring_512x1280x128() {
+    let (m,n,k,nslots,s,rounds)=(512,1280,128,2,2,3);
+    let layout=RingLayout {nslots};
+    let design=||pm_npu::kernels::gemm_g80::design_g80(m,n,k,INT8,Control::Fast);
+    let eager=design();
+    let (ab,bb,cb)=(eager.args[0].bytes,eager.args[1].bytes,eager.args[2].bytes);
+    let plans_of=|base:usize|->Vec<SlotPlan> {(0..s).map(|i|{let slot=(base+i)%nslots;SlotPlan {slot,a_off:(slot*ab) as u64,b_off:0,c_off:(slot*cb) as u64}}).collect()};
+    let rig_of=|base:usize,seq0:u32,bodies:Bodies|->Rig {
+        let plans=plans_of(base);
+        Rig {m,n,k,layout,eager:design(),d:persistent_with(design(),layout,&plans,seq0,bodies,true),plans,cb,used:nslots}
+    };
+    let (_,b)=matrices(m,n,k,0xb0b);
+    let r0=rig_of(0,1,Bodies::Lean);
+    let gold:Vec<Golden>=(0..s*rounds).map(|g|{
+        let (a,_)=matrices(m,n,k,0xc001d00d+g as u32*7919);
+        let [ap,bp]=eager.pack_in(&a,&b);
+        let mut args=vec![ap.clone(),bp.clone(),vec![POISON;cb]];
+        Config::from_pdi(&eager.pdi).unwrap().submit(&eager.insts,&mut args).unwrap();
+        let reference=eager.reference(&a,&b);assert_eq!(eager.unpack_out(&args[2]),reference);
+        // Only run 0 reads B from DDR. Run 1's operands are written while run 0 runs (same bytes); from run 2 on (slot of
+        // run 0 reused, so run 0 is done) the producer writes poison there.
+        Golden {a:ap,b:if g<2 {bp} else {vec![0x5a;bb]},eager_c:args.swap_remove(2),reference}
+    }).collect();
+    let mut args=fresh_args(&r0);let mut sim=Config::from_pdi(&r0.d.pdi).unwrap();
+    for round in 0..rounds {
+        let (base,seq0)=(round*s,1+(round*s) as u32);
+        let r=if round==0 {rig_of(0,1,Bodies::Lean)} else {rig_of(base,seq0,Bodies::LeanFirst)};
+        let mut p=Producer::new(&r,&gold,base,s,0,vec![],&args);run(&mut sim,&r.d.insts,&mut args,&mut p);p.finish(&args);
+        check_outputs(&r,&gold,&args,base+s);check_done_lines(r.layout,&args,base+s,&[]);
+        if round>0 {assert!(args[1].iter().all(|&x|x==0x5a),"host B is poison");}
+        eprintln!("PASS G80 B-resident ring round {round}: exact with poisoned host B");
+    }
+}
 
 /// What a run of a (possibly broken) lean ring did wrong, judged against the CPU/eager goldens and the full-body ring state.
 #[derive(Debug)] #[allow(dead_code)]

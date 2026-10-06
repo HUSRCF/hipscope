@@ -184,7 +184,7 @@ const B_READ_CH: [u32; 2] = G80_B_MM2S_CH;
 const B_GUARD_BD: [u32; 2] = G80_B_GUARD_BD;
 const B_WHOLE_BD: [u32; 2] = G80_B_WHOLE_BD;
 /// B ready locks per parity (`gemm_core::B_EMPTY` ids 4 and 6; the `B_FULL` ids 5 and 7 are unused).
-const B_READY: [u32; 2] = [gemm_core::B_EMPTY[0], gemm_core::B_EMPTY[1]];
+pub(crate) const B_READY: [u32; 2] = [gemm_core::B_EMPTY[0], gemm_core::B_EMPTY[1]];
 const A_S2MM_CH: u32 = 5;
 const A_S2MM_BD: [u32; 2] = [28, 29];
 const A_MM2S_CH: u32 = 2;

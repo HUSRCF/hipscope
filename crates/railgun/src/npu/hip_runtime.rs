@@ -143,7 +143,7 @@ const SYMBOLS: [&str; 15] = [
 ];
 
 /// Symbols required only by `HipRuntime`, in `GpuApi` field order.
-const GPU_SYMBOLS: [&str; 20] = [
+const GPU_SYMBOLS: [&str; 22] = [
     "hipDeviceGetPCIBusId",
     "hipGetDevicePropertiesR0600",
     "hipDeviceGetAttribute",
@@ -164,6 +164,8 @@ const GPU_SYMBOLS: [&str; 20] = [
     "hipHostGetDevicePointer",
     "hipHostUnregister",
     "hipMemcpyDtoD",
+    "hipStreamCreateWithFlags",
+    "hipStreamDestroy",
 ];
 
 /// Resolved HIP entry points shared by `HipDmabufA` and `HipRuntime` (all required).
@@ -213,6 +215,8 @@ struct GpuApi {
     host_get_device_pointer: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> HipStatus,
     host_unregister: unsafe extern "C" fn(*mut c_void) -> HipStatus,
     memcpy_dtod: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> HipStatus,
+    stream_create: unsafe extern "C" fn(*mut Handle, c_uint) -> HipStatus,
+    stream_destroy: unsafe extern "C" fn(Handle) -> HipStatus,
 }
 
 fn dl_error() -> String {
@@ -311,6 +315,8 @@ fn load_with_gpu(prefix: &'static str) -> Result<(Api, GpuApi), String> {
             host_get_device_pointer: t(ptrs[17]),
             host_unregister: t(ptrs[18]),
             memcpy_dtod: t(ptrs[19]),
+            stream_create: t(ptrs[20]),
+            stream_destroy: t(ptrs[21]),
         }
     };
     Ok((api, gpu))
@@ -699,6 +705,12 @@ impl HipRuntime {
     /// events). `kernarg` is passed as the kernel-argument blob through `HIP_LAUNCH_PARAM_BUFFER_POINTER` /
     /// `HIP_LAUNCH_PARAM_BUFFER_SIZE`.
     pub fn launch(&self, function: &HipFunction, grid: u32, block: u32, kernarg: &mut [u8]) -> Result<(), String> {
+        self.launch_on(None, function, grid, block, kernarg)
+    }
+
+    /// [`HipRuntime::launch`] on `stream` (`None`: the null stream).
+    pub fn launch_on(&self, stream: Option<&HipStream>, function: &HipFunction, grid: u32, block: u32, kernarg: &mut [u8]) -> Result<(), String> {
+        if let Some(st) = stream { self.owns(&st.shared, "launch stream")?; }
         self.owns(&function.module.shared, "launch function")?;
         if grid == 0 || block == 0 {
             return Err(format!("{RUNTIME_PREFIX} stage args: launch grid {grid} / block {block} must be non-zero"));
@@ -714,7 +726,7 @@ impl HipRuntime {
         ];
         s.check("hipModuleLaunchKernel", &format!("hipModuleLaunchKernel(grid {grid}, block {block}, kernarg {} B)", kernarg.len()), unsafe {
             (s.gpu.module_launch_kernel)(
-                function.handle, grid, 1, 1, block, 1, 1, 0, core::ptr::null_mut(), core::ptr::null_mut(), extra.as_mut_ptr(),
+                function.handle, grid, 1, 1, block, 1, 1, 0, stream.map_or(core::ptr::null_mut(), |st| st.handle), core::ptr::null_mut(), extra.as_mut_ptr(),
             )
         })
     }
@@ -762,11 +774,28 @@ impl HipRuntime {
         Ok(HipEvent { shared: Rc::clone(&self.shared), handle: event })
     }
 
+    /// `hipStreamCreateWithFlags(hipStreamNonBlocking)`: an in-order queue that does not synchronise with the null
+    /// stream (`synchronize` still waits for it).
+    pub fn stream(&self) -> Result<HipStream, String> {
+        let s = &*self.shared;
+        let mut stream: Handle = core::ptr::null_mut();
+        s.check("hipStreamCreateWithFlags", "hipStreamCreateWithFlags(NonBlocking)", unsafe { (s.gpu.stream_create)(&mut stream, 1) })?;
+        Ok(HipStream { shared: Rc::clone(&self.shared), handle: stream })
+    }
+
     /// `hipEventRecord` on the null stream.
     pub fn record(&self, event: &HipEvent) -> Result<(), String> {
+        self.record_on(event, None)
+    }
+
+    /// `hipEventRecord` on `stream` (`None`: the null stream).
+    pub fn record_on(&self, event: &HipEvent, stream: Option<&HipStream>) -> Result<(), String> {
         self.owns(&event.shared, "record event")?;
+        if let Some(st) = stream { self.owns(&st.shared, "record stream")?; }
         let s = &*self.shared;
-        s.check("hipEventRecord", "hipEventRecord", unsafe { (s.gpu.event_record)(event.handle, core::ptr::null_mut()) })
+        s.check("hipEventRecord", "hipEventRecord", unsafe {
+            (s.gpu.event_record)(event.handle, stream.map_or(core::ptr::null_mut(), |st| st.handle))
+        })
     }
 
     /// `hipEventSynchronize(end)` then `hipEventElapsedTime(start, end)` in milliseconds.
@@ -983,5 +1012,17 @@ pub struct HipEvent {
 impl Drop for HipEvent {
     fn drop(&mut self) {
         unsafe { (self.shared.gpu.event_destroy)(self.handle) };
+    }
+}
+
+/// A HIP stream (`HipRuntime::stream`); destroyed on drop.
+pub struct HipStream {
+    shared: Rc<Shared>,
+    handle: Handle,
+}
+
+impl Drop for HipStream {
+    fn drop(&mut self) {
+        unsafe { (self.shared.gpu.stream_destroy)(self.handle) };
     }
 }

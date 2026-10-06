@@ -617,6 +617,8 @@ impl Topo {
 pub(crate) struct Geometry {
     pub(crate) topo: Topo, pub(crate) m: usize, pub(crate) n: usize, pub(crate) k: usize,
     pub(crate) kc: usize, pub(crate) mw: usize, pub(crate) nw: usize, pub(crate) waves: usize,
+    /// V9 ([`ArrayDesign::with_a_repeat`]): host A holds each `mw` tile once; the shim A task repeats it `nw` times.
+    pub(crate) a_repeat: bool,
 }
 
 impl Geometry {
@@ -630,7 +632,7 @@ impl Geometry {
             "G80 K must be a multiple of {CHUNK_K} in {CHUNK_K}..={}, got {k}", gemm_core_g80::MAX_KC * CHUNK_K);
         let (kc, mw) = (k / CHUNK_K, m.div_ceil(G80_WAVE_M));
         assert!(mw <= MAX_WAVES, "{mw} waves exceed {MAX_WAVES}");
-        Self { topo: Topo::g80(epi, ctl, kc, mw), m, n, k, kc, mw, nw: 1, waves: mw }
+        Self { topo: Topo::g80(epi, ctl, kc, mw), m, n, k, kc, mw, nw: 1, waves: mw, a_repeat: false }
     }
     /// IEF15 geometry: `m` tokens x `n` features x `k` (K128 epochs, `kc = k / 128`), 256 x 256 waves in the order
     /// `w = mw*NW + nw`, `waves <= 256`.
@@ -641,7 +643,7 @@ impl Geometry {
             iu4_ief15_core::MAX_EPOCHS * iu4_ief15_core::EPOCH_K);
         let (epochs, mw, nw) = (k / iu4_ief15_core::EPOCH_K, m.div_ceil(IEF15_WAVE), n.div_ceil(IEF15_WAVE));
         assert!(mw * nw <= MAX_WAVES, "{} waves exceed {MAX_WAVES}", mw * nw);
-        Self { topo: Topo::ief15(ctl, epochs, mw, nw), m, n, k, kc: epochs, mw, nw, waves: mw * nw }
+        Self { topo: Topo::ief15(ctl, epochs, mw, nw), m, n, k, kc: epochs, mw, nw, waves: mw * nw, a_repeat: false }
     }
     fn new(topo: Topo, m: usize, n: usize, k: usize) -> Self {
         assert!(m > 0 && n > 0, "empty GEMM");
@@ -650,13 +652,13 @@ impl Geometry {
         let (mw, nw) = (m.div_ceil(topo.wave_m()), n.div_ceil(topo.wave_n()));
         let waves = mw * nw;
         assert!(waves <= MAX_WAVES, "{waves} waves exceed {MAX_WAVES}");
-        Self { topo, m, n, k, kc: k / CHUNK_K, mw, nw, waves }
+        Self { topo, m, n, k, kc: k / CHUNK_K, mw, nw, waves, a_repeat: false }
     }
     /// Bytes of one A host segment: a core-row block (`A_BYTES` per chunk) or, for V8, one injecting
-    /// column's A half (`A_HALF_BYTES` per chunk) per wave; V10 holds each `mw` tile once (`mw` tiles).
+    /// column's A half (`A_HALF_BYTES` per chunk) per wave; V10 and `a_repeat` V9 hold each `mw` tile once (`mw` tiles).
     pub(crate) fn a_segment_bytes(&self) -> usize {
         if self.topo.is_ief15() { return self.waves * self.kc * iu4_ief15_core::A_HALF_BYTES; }
-        let tiles = if self.topo.mw_outer() { self.mw } else { self.waves };
+        let tiles = if self.topo.mw_outer() || self.a_repeat { self.mw } else { self.waves };
         tiles * self.kc * if self.topo.is_pair() { A_HALF_BYTES } else { A_BYTES }
     }
     /// Bytes of one B host segment: every wave's B tile (`waves*kc*B_BYTES`) or, for V9 / V10, each `nw` tile once.
@@ -722,8 +724,9 @@ impl Geometry {
                     self.pack_a_half_chunk(a, row0, h, ch, &mut tile[ch * A_HALF_BYTES..(ch + 1) * A_HALF_BYTES]);
                 }
             }
-            if self.topo.mw_outer() {
-                // V10: every `mw` tile once, in `mw` order (the cores see it `NW` times from the memtile).
+            if self.topo.mw_outer() || self.a_repeat {
+                // V10: every `mw` tile once, in `mw` order (the cores see it `NW` times from the memtile); `a_repeat`
+                // V9: the same layout, the shim task replays it `NW` times (nw-outer wave order).
                 out.extend_from_slice(&tiles);
             } else {
                 for w in 0..self.waves {
@@ -1531,17 +1534,22 @@ pub(crate) fn build_cdo(topo: Topo, programs: [&[u8]; 2], start: bool) -> Cdo {
 }
 
 /// Shim BDs (DDR-patched), token controller id and finite shim tasks for every shim of the topology.
-fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3]) }
+fn emit_shim(txn: &mut Txn, geo: &Geometry) { emit_shim_at(txn, geo, [0; 3], true, false) }
 
 /// [`emit_shim`] with every DDR patch advanced by `base[arg]` bytes (the arena offset of that run in args 0..=2).
-fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3]) {
+/// `!bd_words`: the shim BD words and S2MM controller ids written by an earlier body of the SAME design are still in
+/// place, so only the DDR patches and tasks are emitted (the patch rewrites the one address word that differs).
+/// `skip_b`: no B stream at all (B resident in the memtile, G80 B-resident lean body).
+fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool, skip_b: bool) {
     let topo = geo.topo;
     let kc = geo.kc;
     for col in 0..topo.cols {
         let shim = shim_loc(col as u32);
         let (a_off, b_off, c_off) = geo.column_offsets(col);
-        txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL), 0xf00, 0x1f00);
-        if topo.is_pair() { txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL + 8), 0xf00, 0x1f00); }
+        if bd_words {
+            txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL), 0xf00, 0x1f00);
+            if topo.is_pair() { txn.mask_write(shim.address(regs::shim::DMA_S2MM_0_CTRL + 8), 0xf00, 0x1f00); }
+        }
         // (bd id, argument, byte offset, words, direction, channel, token)
         let streams = if topo.is_pair() {
             // B MM2S0 (BD0), C rows 0,1 S2MM0 (BD1), A half MM2S1 (BD2), C rows 2,3 S2MM1 (BD3): the C argument
@@ -1572,12 +1580,15 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3]) {
             if topo.has_a(col as u32) { s.push((2, 0, a_off, geo.waves * kc * A_BYTES / 4, Mm2s, 1, false)); }
             s
         };
+        let streams: Vec<_> = streams.into_iter().filter(|s| !(skip_b && s.1 == 1)).collect();
         for &(id, arg, offset, words, ..) in &streams {
-            Bd::new(0, words as u32).emit_txn(shim, id, txn);
+            if bd_words { Bd::new(0, words as u32).emit_txn(shim, id, txn); }
             txn.ddr_patch(Bd::address(shim, id) + 4, arg, offset as u64 + base[arg as usize]);
         }
-        for &(bd, _, _, _, direction, channel, token) in streams.iter().rev() {
-            Task { direction, channel, bd, repeat: 1, issue_token: token }.emit_txn(shim, txn);
+        for &(bd, arg, _, _, direction, channel, token) in streams.iter().rev() {
+            // `a_repeat` (pair designs): the host A segment is the `mw` tiles once; replay it for every `nw`.
+            let repeat = if geo.a_repeat && arg == 0 { geo.nw as u32 } else { 1 };
+            Task { direction, channel, bd, repeat, issue_token: token }.emit_txn(shim, txn);
         }
     }
 }
@@ -1656,7 +1667,7 @@ fn emit_dynamic_body(txn: &mut Txn, geo: &Geometry, per_column_sync: bool, base:
             if tile.kind() == TileType::Compute { task.enable_txn(tile, txn); }
         }
     }
-    emit_shim_at(txn, geo, base);
+    emit_shim_at(txn, geo, base, true, false);
     // 6. cores last, then wait for the C token(s).
     for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
     emit_sync(txn, topo, per_column_sync);
@@ -2009,6 +2020,23 @@ impl ArrayDesign {
     pub fn append_run_body(&self, txn: &mut Txn, arena_base: [u64; 3]) {
         assert!(!self.variant.is_static(), "{} is a static design: its TXN cannot be re-run", self.variant);
         emit_dynamic_body(txn, &self.geo, self.variant.per_column_sync(), arena_base);
+    }
+
+    /// Memtile BD `id` is used by this design's descriptors in some column.
+    pub(crate) fn uses_memtile_bd(&self, id: u32) -> bool {
+        (0..self.geo.topo.cols as u32).any(|col| memtile_descriptors(self.geo.topo, col).iter().any(|&(b, _)| b == id))
+    }
+
+    /// V9 only: host A holds each `mw` tile once (`1/NW` of the default packing, which replicates A for every N-wave)
+    /// and the shim A task replays it `NW` times. The NPU receives the identical A stream, so C, the PDI and every
+    /// memtile / core descriptor are unchanged; `args[0]`, [`ArrayDesign::pack_in`] and the shim tasks change.
+    pub fn with_a_repeat(mut self) -> Self {
+        assert_eq!(self.variant, Variant::V9, "A repeat needs the nw-outer V9 wave order");
+        assert!(self.geo.nw <= 256, "shim task repeat is at most 256");
+        self.geo.a_repeat = true;
+        self.args[0].bytes = self.geo.a_bytes();
+        self.insts = build_txn_dynamic(&self.geo, false).to_bytes();
+        self
     }
 }
 

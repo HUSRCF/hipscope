@@ -235,7 +235,7 @@ impl PersistentDesign {
 pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, false, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some((Bodies::Full, false)), ring, slots, seq0, neg)
 }
 
 /// [`persistent_v9`] with the same arguments, operand offsets, patch inventory (exactly [`PatchKind::PollSeq`] and
@@ -243,17 +243,48 @@ pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[Sl
 /// `1..` use the lean body ([`ArrayDesign::append_lean_run_body`]) with the memtile channels that the POLL / DONE tasks
 /// clobber (column 0 S2MM4 and MM2S0) forced through reset + requeue (module documentation, "Lean bodies").
 /// Every submission built by this function starts with a full body, so it is valid for the first submit after the PDI
-/// and for any submit after a completed submit of the same design; there is no lean-first variant.
+/// and for any submit after a completed submit of the same design; [`persistent_with`] builds the lean-first form.
 /// `Neg::SkipLeanRequeue(i)` (1 <= i < runs) omits only the forced repairs of lean run `i`.
 pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), true, true, ring, slots, seq0, neg)
+    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some((Bodies::Lean, false)), ring, slots, seq0, neg)
+}
+
+/// Which body each run of a persistent V9 submission executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bodies {
+    /// Every run the full body ([`persistent_v9`]).
+    Full,
+    /// Run 0 full, runs `1..` lean ([`persistent_v9_lean`]).
+    Lean,
+    /// Every run lean, run 0 too: the re-arm form, valid ONLY directly after a completed lean submission of the same
+    /// design on the same hardware context (the array is still configured and every channel is where a completed lean
+    /// run leaves it). Saves one full re-initialisation of the array per re-armed submission.
+    LeanFirst,
+}
+
+/// Persistent ring of an explicit V9 or G80 `design` (e.g. [`ArrayDesign::with_a_repeat`]); same patch inventory and ring
+/// protocol as [`persistent_v9`]. `b_shared` (G80, lean bodies only): every run reads the same B bytes (one `b_off` for
+/// all slots) and the lean runs keep B resident in the memtile instead of refilling it
+/// ([`ArrayDesign::append_lean_run_body_b_resident`]); a `Bodies::LeanFirst` submission is then valid only after one
+/// whose B (at that offset) held the same bytes.
+pub fn persistent_with(design: ArrayDesign, ring: RingLayout, slots: &[SlotPlan], seq0: u32, bodies: Bodies, b_shared: bool)
+    -> PersistentDesign
+{
+    if b_shared {
+        assert_eq!(design.variant, gemm_array::Variant::G80, "B-resident lean bodies are derived for G80 only");
+        assert!(bodies != Bodies::Full, "B-resident needs lean bodies");
+        assert!(slots.iter().all(|s| s.b_off == slots[0].b_off), "b_shared needs one B offset for every run");
+    }
+    assert!(matches!(design.variant, gemm_array::Variant::V9 | gemm_array::Variant::G80),
+        "the ring is derived for the V9 / G80 pair designs, not {}", design.variant);
+    build(design, Some((bodies, b_shared)), ring, slots, seq0, None)
 }
 
 /// Poll + DONE only (no GEMM, no body) on the `512x512x64` V9 image: measures the protocol.
 pub fn empty_persistent(ring: RingLayout, slots: &[SlotPlan], seq0: u32) -> PersistentDesign {
-    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, ring, slots, seq0, None)
+    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, ring, slots, seq0, None)
 }
 
 fn check_seq_range(seq0: u32, runs: usize) {
@@ -273,7 +304,8 @@ fn reset_release(txn: &mut Txn, loc: Location, direction: crate::dma::Direction,
     txn.mask_write(ctrl, 0, 2);
 }
 
-fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
+/// `body`: `None` = protocol only (no GEMM body); else the bodies and whether lean runs keep a shared B resident.
+fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
     -> PersistentDesign
 {
     ring.check();
@@ -281,7 +313,7 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slot
     check_seq_range(seq0, slots.len());
     if let Some(Neg::SkipDone(i)) = neg { assert!(i < slots.len(), "SkipDone({i}) but {} runs", slots.len()); }
     if let Some(Neg::SkipLeanRequeue(i)) = neg {
-        assert!(lean && i >= 1 && i < slots.len(),
+        assert!(matches!(body, Some((Bodies::Lean, _))) && i >= 1 && i < slots.len(),
             "SkipLeanRequeue({i}) needs a lean run: persistent_v9_lean with 1 <= i < {} runs", slots.len());
     }
     for s in slots {
@@ -291,6 +323,7 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slot
     let spare = gemm_array::v9_spare_memtile_bds(false);
     assert!(spare.len() >= 2, "no spare even-bank memtile BDs: {spare:?}");
     let (q_bd, dq_bd) = (spare[0], spare[1]);
+    assert!(!design.uses_memtile_bd(q_bd) && !design.uses_memtile_bd(dq_bd), "ring spare memtile BDs {q_bd}/{dq_bd} collide with {}", design.variant);
     assert!(q_bd < 24 && dq_bd < 24);
 
     let (shim, mem) = (Location::new(0, 0), Location::new(0, 1));
@@ -330,12 +363,13 @@ fn build(mut design: ArrayDesign, gemm: bool, lean: bool, ring: RingLayout, slot
         txn.write32(shim_bd(SHIM_BD_P) + 4 * 7, drain_tail);
         txn.mask_poll(x_addr, SENTINEL, 0xFFFF_FFFF);
         // BODY.
-        if gemm {
+        if let Some((body, b_shared)) = body {
             let arena = [plan.a_off, plan.b_off, plan.c_off];
-            if lean && i > 0 {
+            if body == Bodies::LeanFirst || (body == Bodies::Lean && i > 0) {
                 let forced: &[(u32, crate::dma::Direction, u32)] =
                     if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i) { &[] } else { &LEAN_FORCED };
-                design.append_lean_run_body(&mut txn, arena, forced)
+                let lean = if b_shared { ArrayDesign::append_lean_run_body_b_resident } else { ArrayDesign::append_lean_run_body_same_design };
+                lean(&design, &mut txn, arena, forced)
                     .unwrap_or_else(|e| panic!("lean body of run {i}: {e}"));
             } else {
                 design.append_run_body(&mut txn, arena);
@@ -467,13 +501,13 @@ mod tests {
         let r = RingLayout { nslots: 2 };
         let p = plans(3, 2);
         let full = empty_persistent(r, &p, 1);
-        let skip = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, r, &p, 1,
+        let skip = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
             Some(Neg::SkipDone(1)));
         assert_eq!(skip.patch_sites.len(), 5);
         assert!(!skip.patch_sites.iter().any(|s| s.1 == PatchKind::DoneSeq(1)));
         assert!(skip.patch_sites.iter().any(|s| s.1 == PatchKind::PollSeq(1)));
         // SkipSeqPatch is host-only: the builder output is the normal one.
-        let host = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), false, false, r, &p, 1,
+        let host = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
             Some(Neg::SkipSeqPatch));
         assert_eq!((host.insts.clone(), host.patch_sites.clone()), (full.insts.clone(), full.patch_sites.clone()));
     }
