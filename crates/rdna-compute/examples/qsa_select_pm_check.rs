@@ -8,7 +8,7 @@
 //! `qsa_select_pm_check SNAPSHOT_DIR... --out OUT.jsonl [--time N]
 //!     [--score hipcc|pm] [--select hipcc|pm] [--pm-image ABS_FILE]
 //!     [--cpu-rows STRIDE] [--no-screen] [--tied] [--shape-blocks N]
-//!     [--tied-bf16-hipcc]`
+//!     [--tied-bf16-hipcc] [--g3-bf16]`
 //!
 //! Every snapshot (pre-prologue dumps skipped) is replayed with the
 //! production grouping (64 MiB score scratch, rows16, one select WG per row):
@@ -32,6 +32,16 @@
 //!
 //! `--g3 --beta-src ABS_FILE` runs the G3 exact-oracle + HIP-graph gate of the
 //! PM pair as the default route (see `mod g3`; build with `--features lab`).
+//!
+//! `--g3-bf16 [SNAPSHOT_DIR...] --out OUT.jsonl` runs the BF16 production-route
+//! gate (see `mod g3_bf16`; build with `--features lab`; no `--beta-src`, no
+//! `--pm-image`, no timing/F32-route flags): BF16 `qsa-source-v1` snapshots
+//! (optional; synthetic-only when no directory is given) plus synthetic
+//! all-tied fixtures run the explicit lab arms (`Hipcc`, `ScoreOnly`, `Both`),
+//! the default production route (mirrored and no-mirror), and the default
+//! mirrored route captured into a HIP graph, at `shape_blocks =
+//! pooled_capacity` and again at 65536; one JSONL record per case and shape,
+//! then a summary line; nonzero exit on any failing record.
 //!
 //! BF16 route (auto: header `identity.selector.pooled_dtype == "BF16"`; the
 //! projection stays F32, heads 4, dim 128; `pooled.source` is raw BF16,
@@ -880,7 +890,7 @@ fn main() -> Result<()> {
     let (mut dirs, mut out, mut timed, mut image) = (Vec::new(), None, 0usize, None::<PathBuf>);
     let (mut arms, mut cpu_stride, mut screen, mut tied) = ((Impl::Hipcc, Impl::Hipcc), 64usize, true, false);
     let (mut g3, mut beta_src) = (false, None::<PathBuf>);
-    let (mut shape_flag, mut tied_bf16) = (65536usize, false);
+    let (mut shape_flag, mut tied_bf16, mut g3_bf16) = (65536usize, false, false);
     let parse_impl = |v: Option<String>| -> Result<Impl> {
         match v.as_deref() { Some("hipcc") => Ok(Impl::Hipcc), Some("pm") => Ok(Impl::Pm), _ => Err("arm must be hipcc|pm".into()) }
     };
@@ -899,10 +909,21 @@ fn main() -> Result<()> {
             "--beta-src" => beta_src = Some(PathBuf::from(it.next().ok_or("--beta-src ABS_FILE")?)),
             "--shape-blocks" => shape_flag = it.next().ok_or("--shape-blocks N")?.parse().map_err(err)?,
             "--tied-bf16-hipcc" => tied_bf16 = true,
+            "--g3-bf16" => g3_bf16 = true,
             _ => dirs.push(PathBuf::from(a)),
         }
     }
     let out = out.ok_or("--out OUT.jsonl required")?;
+    if g3_bf16 {
+        if g3 || beta_src.is_some() || image.is_some() || tied || tied_bf16 || timed > 0
+            || arms != (Impl::Hipcc, Impl::Hipcc) || cpu_stride != 64 || !screen || shape_flag != 65536 {
+            return Err("--g3-bf16 takes only SNAPSHOT_DIR... and --out (no --g3/--beta-src/--pm-image/--tied*/--time/--score/--select/--cpu-rows/--no-screen/--shape-blocks)".into())
+        }
+        #[cfg(feature = "lab")]
+        return g3_bf16::run(&dirs, Path::new(&out));
+        #[cfg(not(feature = "lab"))]
+        return Err("--g3-bf16 needs --features lab".into());
+    }
     if g3 {
         #[cfg(feature = "lab")]
         return g3::run(&dirs, Path::new(&out), beta_src, image.is_some());
@@ -1729,6 +1750,425 @@ mod g3 {
         writeln!(sink.f, "{summary}").map_err(err)?;
         sink.f.flush().map_err(err)?;
         if sink.failures > 0 { return Err(format!("{} failing G3 records; see {}", sink.failures, out.display())) }
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------- G3 BF16
+
+/// `--g3-bf16 [SNAPSHOT_DIR...] --out OUT.jsonl`: exact-oracle + HIP-graph gate
+/// of the BF16 production selector (`QsaKvFormat::index_dtype` BF16 pooled
+/// keys, F32 query).  Needs `--features lab` (the explicit-arm helper is
+/// lab-only):
+/// `cargo build --release -p rdna-compute --features lab --example qsa_select_pm_check`.
+///
+/// Cases: every BF16 `qsa-source-v1` snapshot found under the directories
+/// (hash-checked `selected.i32`, `selected-mirror.i32`, raw BF16
+/// `pooled.source`, F32 `index-projection.f32`; gfx1151, pooled BF16,
+/// projection F32, heads 4 / dim 128), then synthetic all-tied fixtures (every
+/// key `0x0000` or `0x3f80`, query 1.0; 16384/32768/65536 blocks, 512 rows,
+/// compress 4, budget 512, capacity 2051, stride 512, `position_start =
+/// blocks * 4 + 3 - rows`; budgets 0/1/511 at 16384 blocks; 128 blocks =
+/// fewer visible blocks than the budget).  Synthetic expectations are the CPU
+/// `selection_row(&rank(keys))` of every row (tails included); snapshot
+/// expectations are the captured bytes.  With no directory the run is
+/// synthetic-only.
+///
+/// Every case runs at `shape_blocks = pooled_capacity` and again at 65536 when
+/// that covers the active blocks (also when identical).  One JSONL record per
+/// case and shape holds every arm.  Mirrored (`Hipcc`, `ScoreOnly`, `Both`
+/// through `indexed_attention_select_batch_pm_arm` with a mirror, and the
+/// default `indexed_attention_select_batch_mirrored`): selected and mirror
+/// equal the expectation, `persisted` equals the `Hipcc` arm's, canaries
+/// intact.  No-mirror (same arms with `None`, and `indexed_attention_select_batch`):
+/// selected equals the expectation, the mirror buffer stays poison, `persisted`
+/// is null.  Every output payload and its 4096-byte trailing canary is
+/// poisoned before each arm; `Both` runs twice and must repeat bit for bit.
+/// After all arms the default mirrored production call is captured into a HIP
+/// graph (kernels, scratch and buffers warmed by the eager arms; capture on a
+/// private non-blocking stream routed through `gpu.active_stream` with
+/// `gpu.graphs.capture_mode` set; capture state restored on every path), the
+/// instantiated graph is launched and synchronised, and its output must equal
+/// the eager arm, the expectation, the canaries and `persisted`.  The
+/// captured kernel symbol and launch count are recorded.  Finally query and
+/// pooled are downloaded and compared with the originals.  The process
+/// environment is neither read nor modified.
+#[cfg(feature = "lab")]
+mod g3_bf16 {
+    use super::*;
+    use rdna_compute::tensor_ops::{
+        indexed_attention_select_batch, indexed_attention_select_batch_mirrored,
+        indexed_attention_select_batch_pm_arm, IndexedAttentionSelectBatch, QsaSelectPmArm,
+    };
+    use rdna_compute::DType;
+
+    /// Poisoned bytes after `selected` / `mirror`: any stray write shows.
+    const CANARY: usize = 4096;
+    /// The second shape pass.
+    const FIXED_SHAPE: usize = 65536;
+    const ARMS: [(&str, Option<QsaSelectPmArm>); 4] = [
+        ("hipcc", Some(QsaSelectPmArm::Hipcc)),
+        ("score-only", Some(QsaSelectPmArm::ScoreOnly)),
+        ("both", Some(QsaSelectPmArm::Both)),
+        ("default", None),
+    ];
+
+    struct Sink { f: std::fs::File, failures: usize, records: usize, cases: usize }
+    impl Sink {
+        fn put(&mut self, mut rec: Value, ok: bool) -> Result<()> {
+            rec["ok"] = json!(ok);
+            if !ok { self.failures += 1; eprintln!("FAIL {rec}"); } else { eprintln!("{rec}"); }
+            self.records += 1;
+            writeln!(self.f, "{rec}").map_err(err)?;
+            self.f.flush().map_err(err)
+        }
+    }
+
+    struct Case {
+        name: String,
+        kind: &'static str,
+        c: Call,
+        pooled_capacity: usize,
+        qbytes: Vec<u8>,
+        pbytes: Vec<u8>,
+        qh: String,
+        ph: String,
+        /// Expected `selected` rows / final-row mirror (snapshot bytes or CPU oracle).
+        sel: Vec<u8>,
+        mirror: Vec<u8>,
+    }
+
+    /// Production tensors: F32 query, BF16 pooled, Raw selected / mirror with
+    /// trailing canaries.
+    struct Dev { query: GpuTensor, pooled: GpuTensor, selected: GpuTensor, mirror: GpuTensor }
+
+    struct Out { sel: Vec<u8>, mirror: Vec<u8>, canary: bool, persisted: Option<bool> }
+    fn same(a: &Out, b: &Out) -> bool { a.sel == b.sel && a.mirror == b.mirror && a.canary == b.canary && a.persisted == b.persisted }
+
+    fn le_f32(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect() }
+
+    fn alloc_dev(gpu: &mut Gpu, case: &Case) -> Result<Dev> {
+        let c = &case.c;
+        let q = le_f32(&case.qbytes);
+        let query = gpu.upload_f32(&q, &[q.len()]).map_err(err)?;
+        let mut pooled = gpu.upload_raw(&case.pbytes, &[case.pbytes.len()]).map_err(err)?;
+        pooled.dtype = DType::BF16;
+        pooled.shape = vec![case.pbytes.len() / 2];
+        let (sel, mir) = (c.rows * c.capacity * 4 + CANARY, c.capacity * 4 + CANARY);
+        let selected = gpu.upload_raw(&vec![POISON; sel], &[sel]).map_err(err)?;
+        let mirror = gpu.upload_raw(&vec![POISON; mir], &[mir]).map_err(err)?;
+        Ok(Dev { query, pooled, selected, mirror })
+    }
+
+    fn free_dev(gpu: &mut Gpu, d: Dev) -> Result<()> {
+        for t in [d.query, d.pooled, d.selected, d.mirror] { gpu.free_tensor(t).map_err(err)?; }
+        Ok(())
+    }
+
+    /// Poison the whole selected / mirror allocations (payload and canary).
+    fn poison_dev(gpu: &Gpu, d: &Dev) -> Result<()> {
+        for t in [&d.selected, &d.mirror] { gpu.hip.memset(&t.buf, POISON as i32, t.byte_size()).map_err(err)?; }
+        Ok(())
+    }
+
+    fn read_out(gpu: &Gpu, case: &Case, d: &Dev, persisted: Option<bool>) -> Result<Out> {
+        let c = &case.c;
+        let (sel_len, mir_len) = (c.rows * c.capacity * 4, c.capacity * 4);
+        let mut sel = download(gpu, &d.selected)?;
+        let mut mirror = download(gpu, &d.mirror)?;
+        let canary = sel[sel_len..].iter().all(|&x| x == POISON) && mirror[mir_len..].iter().all(|&x| x == POISON);
+        sel.truncate(sel_len);
+        mirror.truncate(mir_len);
+        Ok(Out { sel, mirror, canary, persisted })
+    }
+
+    fn params<'a>(case: &'a Case, d: &'a Dev, shape: usize) -> IndexedAttentionSelectBatch<'a> {
+        let c = &case.c;
+        IndexedAttentionSelectBatch {
+            query: &d.query, pooled: &d.pooled, selected: &d.selected, rows: c.rows, query_row_stride: c.stride,
+            block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
+            position_start: c.position_start, capacity: c.capacity, shape_blocks: shape,
+        }
+    }
+
+    /// One eager arm: `arm` Some = lab helper, None = the public route;
+    /// `mirror` selects the mirrored / no-mirror entry.  `persisted` is the
+    /// mirrored entry's return, null for no-mirror.
+    fn run_arm(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, mirror: bool, arm: Option<QsaSelectPmArm>) -> Result<Out> {
+        poison_dev(gpu, d)?;
+        let p = params(case, d, shape);
+        let r = match arm {
+            Some(a) => indexed_attention_select_batch_pm_arm(gpu, &p, mirror.then_some(&d.mirror), a).map_err(err)?,
+            None if mirror => indexed_attention_select_batch_mirrored(gpu, &p, &d.mirror).map_err(err)?,
+            None => { indexed_attention_select_batch(gpu, &p).map_err(err)?; false }
+        };
+        gpu.hip.device_synchronize().map_err(err)?;
+        read_out(gpu, case, d, mirror.then_some(r))
+    }
+
+    fn judge(case: &Case, mirror: bool, o: &Out, reference: Option<&Out>, repeat: Option<bool>) -> (Value, bool) {
+        let sel_ok = o.sel == case.sel;
+        let mirror_ok = if mirror { o.mirror == case.mirror } else { o.mirror.iter().all(|&x| x == POISON) };
+        let persisted_ok = o.persisted.is_some() == mirror;
+        let eq_hipcc = reference.is_some_and(|r| o.sel == r.sel && o.mirror == r.mirror && o.persisted == r.persisted);
+        let repeat_ok = repeat.unwrap_or(true);
+        let mut rec = json!({"selected_equal_expected":sel_ok,"persisted":o.persisted,"persisted_kind_ok":persisted_ok,
+            "canary_ok":o.canary,"equal_hipcc_arm":eq_hipcc});
+        rec[if mirror { "mirror_equal_expected" } else { "mirror_untouched_poison" }] = json!(mirror_ok);
+        if let Some(r) = repeat { rec["repeat_identical"] = json!(r); }
+        (rec, sel_ok && mirror_ok && persisted_ok && o.canary && eq_hipcc && repeat_ok)
+    }
+
+    struct Mode { rec: Value, ok: bool, hipcc: Option<Out>, default: Option<Out> }
+
+    /// All four arms of one entry kind (mirrored or no-mirror).
+    fn run_mode(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, mirror: bool) -> Mode {
+        let mut arms = serde_json::Map::new();
+        let (mut ok, mut hipcc, mut default) = (true, None::<Out>, None::<Out>);
+        for (name, arm) in ARMS {
+            let first = run_arm(gpu, case, d, shape, mirror, arm);
+            let second = (arm == Some(QsaSelectPmArm::Both)).then(|| run_arm(gpu, case, d, shape, mirror, arm));
+            let (mut rec, arm_ok, out) = match first {
+                Err(e) => (json!({"error":e}), false, None),
+                Ok(o1) => {
+                    let repeat = match &second {
+                        None => Ok(None),
+                        Some(Ok(o2)) => Ok(Some(same(&o1, o2))),
+                        Some(Err(e)) => Err(e.clone()),
+                    };
+                    match repeat {
+                        Err(e) => (json!({"error":format!("second run: {e}")}), false, Some(o1)),
+                        Ok(rep) => {
+                            let reference = if name == "hipcc" { Some(&o1) } else { hipcc.as_ref() };
+                            let (rec, arm_ok) = judge(case, mirror, &o1, reference, rep);
+                            (rec, arm_ok, Some(o1))
+                        }
+                    }
+                }
+            };
+            rec["ok"] = json!(arm_ok);
+            ok &= arm_ok;
+            arms.insert(name.to_string(), rec);
+            match name { "hipcc" => hipcc = out, "default" => default = out, _ => {} }
+        }
+        Mode { rec: Value::Object(arms), ok, hipcc, default }
+    }
+
+    // -------------------------------------------------------------- graph
+
+    /// Production fused launches of one call: 256-row groups in global-score
+    /// mode with more than 256 rows, else one.
+    fn expected_launches(rows: usize, shape: usize) -> usize {
+        let global = shape * 4 + STATIC_LDS_BYTES > LDS_LIMIT_BYTES;
+        if global && rows > GLOBAL_ROWS { rows.div_ceil(GLOBAL_ROWS) } else { 1 }
+    }
+
+    fn replay_graph(gpu: &Gpu, case: &Case, d: &Dev, stream: &hip_bridge::Stream, persisted: bool) -> Result<Out> {
+        poison_dev(gpu, d)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, stream).map_err(err)?;
+        gpu.hip.stream_synchronize(stream).map_err(err)?;
+        read_out(gpu, case, d, Some(persisted))
+    }
+
+    /// Capture the default mirrored production call, launch the instantiated
+    /// graph and compare with the eager `default` / `hipcc` arms.  Eager arms of
+    /// the same shape have already loaded the kernels and sized every scratch.
+    fn run_graph(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, eager: &Out, hipcc: &Out) -> Result<(Value, bool)> {
+        if gpu.active_stream.is_some() || gpu.graphs.capture_mode { return Err("capture state not clean before graph".into()) }
+        poison_dev(gpu, d)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        let stream = gpu.hip.stream_create_non_blocking().map_err(err)?;
+        if let Err(e) = gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream) {
+            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
+            let _ = gpu.hip.stream_destroy(stream);
+            return Err(format!("begin capture: {}", err(e)));
+        }
+        gpu.active_stream = Some(stream);
+        let called = {
+            let p = params(case, d, shape);
+            indexed_attention_select_batch_mirrored(gpu, &p, &d.mirror)
+        };
+        let symbol = gpu.last_launched_kernel().map(str::to_string);
+        let blobs = gpu.graphs.capture_blobs.len();
+        let stream = gpu.active_stream.take().ok_or("active stream vanished during capture")?;
+        let ended = match &called {
+            Ok(_) => gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream),
+            Err(_) => Ok(()),
+        };
+        if called.is_err() || ended.is_err() {
+            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
+            let _ = gpu.hip.stream_destroy(stream);
+            return Err(format!("capture failed: call={:?} end={:?}", called.map_err(err), ended.map_err(err)));
+        }
+        let persisted = called.map_err(err)?;
+        let state_restored = !gpu.graphs.capture_mode && gpu.active_stream.is_none();
+        let replayed = replay_graph(gpu, case, d, &stream, persisted);
+        gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+        let destroyed = gpu.hip.stream_destroy(stream).map_err(err);
+        let o = replayed?;
+        destroyed?;
+
+        let launches = expected_launches(case.c.rows, shape);
+        let (sel_ok, mirror_ok) = (o.sel == case.sel, o.mirror == case.mirror);
+        let eq_eager = o.sel == eager.sel && o.mirror == eager.mirror && o.persisted == eager.persisted;
+        let persisted_hipcc = o.persisted == hipcc.persisted;
+        let symbol_ok = symbol.as_deref() == Some(FUSED_BF16);
+        let launches_ok = blobs == launches;
+        let ok = sel_ok && mirror_ok && eq_eager && persisted_hipcc && o.canary && symbol_ok && launches_ok && state_restored;
+        let rec = json!({"captured_symbol":symbol,"captured_symbol_ok":symbol_ok,"captured_launches":blobs,
+            "expected_launches":launches,"captured_launches_ok":launches_ok,"capture_state_restored":state_restored,
+            "capture_persisted":persisted,"persisted":o.persisted,"persisted_equal_hipcc_arm":persisted_hipcc,
+            "selected_equal_expected":sel_ok,"mirror_equal_expected":mirror_ok,"equal_eager_default":eq_eager,
+            "canary_ok":o.canary,"ok":ok});
+        Ok((rec, ok))
+    }
+
+    // -------------------------------------------------------------- cases
+
+    fn run_pass(gpu: &mut Gpu, sink: &mut Sink, case: &Case, d: &Dev, shape: usize, label: &str) -> Result<()> {
+        let c = &case.c;
+        eprintln!("case {} {label} shape_blocks={shape} rows={} bc={} compress={} budget={} capacity={}",
+            case.name, c.rows, c.block_count, c.compress, c.budget, c.capacity);
+        let mut rec = json!({"case":case.name,"kind":case.kind,"pass":label,"shape_blocks":shape,"pooled_capacity":case.pooled_capacity,
+            "rows":c.rows,"block_count":c.block_count,"compress":c.compress,"position_start":c.position_start,"budget_blocks":c.budget,
+            "capacity":c.capacity,"projection_stride":c.stride,"heads":4,"dim":c.dim,"pooled_dtype":"BF16","projection_dtype":"F32",
+            "pooled_dtype_tensor_is_bf16":d.pooled.dtype == DType::BF16,"query_sha256":case.qh,"pooled_sha256":case.ph});
+        let mirrored = run_mode(gpu, case, d, shape, true);
+        let plain = run_mode(gpu, case, d, shape, false);
+        let mut ok = mirrored.ok && plain.ok;
+        rec["mirrored"] = mirrored.rec;
+        rec["no_mirror"] = plain.rec;
+        if let Err(e) = gpu.hip.device_synchronize() { rec["sync_error"] = json!(err(e)); ok = false; }
+        match (&mirrored.default, &mirrored.hipcc) {
+            (Some(eager), Some(hipcc)) => match run_graph(gpu, case, d, shape, eager, hipcc) {
+                Ok((g, g_ok)) => { rec["graph"] = g; ok &= g_ok; }
+                Err(e) => { rec["graph"] = json!({"error":e,"ok":false}); ok = false; }
+            },
+            _ => { rec["graph"] = json!({"skipped":"mirrored hipcc/default arm failed","ok":false}); ok = false; }
+        }
+        match (download(gpu, &d.query), download(gpu, &d.pooled)) {
+            (Ok(q_back), Ok(p_back)) => {
+                let inputs_ok = q_back == case.qbytes && p_back == case.pbytes;
+                rec["inputs_unchanged"] = json!(inputs_ok);
+                ok &= inputs_ok;
+            }
+            (q, p) => {
+                rec["inputs_unchanged"] = json!(false);
+                rec["input_download_error"] = json!(format!("query: {:?} pooled: {:?}", q.err(), p.err()));
+                ok = false;
+            }
+        }
+        sink.put(rec, ok)
+    }
+
+    fn run_case(gpu: &mut Gpu, sink: &mut Sink, case: &Case) -> Result<()> {
+        sink.cases += 1;
+        let d = match alloc_dev(gpu, case) {
+            Ok(d) => d,
+            Err(e) => return sink.put(json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("alloc: {e}")}), false),
+        };
+        let mut passes = vec![(case.pooled_capacity, "pooled_capacity")];
+        if FIXED_SHAPE >= case.c.block_count { passes.push((FIXED_SHAPE, "shape_65536")); }
+        for (shape, label) in passes { run_pass(gpu, sink, case, &d, shape, label)?; }
+        match free_dev(gpu, d) {
+            Ok(()) => Ok(()),
+            Err(e) => sink.put(json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("free: {e}")}), false),
+        }
+    }
+
+    fn load_snapshot(path: &Path) -> Result<Case> {
+        let root = path.parent().unwrap();
+        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let sel = &header["identity"]["selector"];
+        if header["identity"]["arch"] != "gfx1151" { return Err(format!("{}: snapshot arch not gfx1151", path.display())) }
+        if sel["pooled_dtype"] != "BF16" || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the BF16 pooled / F32 projection route", path.display())) }
+        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        let get = |name: &str| -> Result<Vec<u8>> {
+            let b = std::fs::read(root.join(name)).map_err(err)?;
+            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            Ok(b)
+        };
+        let g = &header["geometry"];
+        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
+        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        if compress == 0 || rows == 0 { return Err(format!("{}: zero compress/rows", path.display())) }
+        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
+            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
+        if c.budget > 512 || c.block_count == 0 || c.capacity == 0 || c.stride < 4 * c.dim { return Err(format!("{}: uncovered budget/block count/capacity/stride", path.display())) }
+        let pooled_capacity = n(sel, "pooled_capacity")?;
+        let qbytes = get("index-projection.f32")?;
+        let pbytes = get("pooled.source")?;
+        let snap_sel = get("selected.i32")?;
+        let snap_mirror = get("selected-mirror.i32")?;
+        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * 2 || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
+            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        }
+        let name = format!("{} ctx={} layer={}", path.display(), header["identity"]["ctx"], header["identity"]["layer"]);
+        Ok(Case { name, kind: "snapshot", c, pooled_capacity, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, sel: snap_sel, mirror: snap_mirror })
+    }
+
+    /// All-tied fixture: every BF16 key `vbits`, query 1.0 in every element.
+    /// The last row sees `blocks` complete blocks plus a 3-token tail; the
+    /// expectation is the CPU stable selection of every row.
+    fn synth_case(blocks: usize, vbits: u16, budget: usize, tag: &str) -> Case {
+        let (rows, compress, stride, capacity) = (512usize, 4usize, 512usize, 2051usize);
+        assert!(blocks * compress + 3 >= rows, "{tag}");
+        let position_start = blocks * compress + 3 - rows;
+        let c = Call { rows, stride, block_count: blocks, dim: 128, compress, position_start, budget, capacity };
+        debug_assert_eq!((position_start + rows) / compress, blocks);
+        let value = f32::from_bits((vbits as u32) << 16);
+        let qbytes: Vec<u8> = (0..rows * stride).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let pbytes: Vec<u8> = (0..blocks * 128).flat_map(|_| vbits.to_le_bytes()).collect();
+        let key_bits = cpu_score(&vec![1.0f32; 4 * c.dim], &vec![value; c.dim], c.dim).0.to_bits();
+        let per_row: Vec<Vec<u8>> = (0..rows).into_par_iter().map(|r| {
+            let keys = vec![key_bits; c.row_blocks(r)];
+            selection_row(&rank(&keys), &c, r).iter().flat_map(|v| v.to_le_bytes()).collect()
+        }).collect();
+        let sel = per_row.concat();
+        let mirror = sel[(rows - 1) * capacity * 4..].to_vec();
+        Case { name: format!("synthetic:{tag}:blocks={blocks}:value=0x{vbits:04x}:budget={budget}"), kind: "synthetic", c, pooled_capacity: blocks,
+            qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, sel, mirror }
+    }
+
+    fn synthetic_cases() -> Vec<Case> {
+        let mut v = Vec::new();
+        for blocks in [16384usize, 32768, 65536] {
+            for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(blocks, vbits, 512, "tied")); }
+        }
+        for budget in [0usize, 1, 511] {
+            for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(16384, vbits, budget, "budget")); }
+        }
+        // position_start 3: every row sees at most 128 blocks, fewer than the budget.
+        for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(128, vbits, 512, "fewer-visible-than-budget")); }
+        v
+    }
+
+    pub fn run(dirs: &[PathBuf], out: &Path) -> Result<()> {
+        let mut paths = Vec::new();
+        for d in dirs { snapshots(d, &mut paths)?; }
+        if !dirs.is_empty() && paths.is_empty() { return Err("no snapshot.json found".into()) }
+        let mut gpu = Gpu::init().map_err(err)?;
+        if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
+        let mut sink = Sink { f: std::fs::File::create(out).map_err(err)?, failures: 0, records: 0, cases: 0 };
+        for path in &paths {
+            match load_snapshot(path) {
+                Ok(case) => run_case(&mut gpu, &mut sink, &case)?,
+                Err(e) => {
+                    sink.cases += 1;
+                    sink.put(json!({"case":path.display().to_string(),"kind":"snapshot","arm":"*","error":format!("load: {e}")}), false)?;
+                }
+            }
+        }
+        for case in synthetic_cases() { run_case(&mut gpu, &mut sink, &case)?; }
+        let summary = json!({"summary":true,"mode":"g3-bf16","snapshots":paths.len(),"cases":sink.cases,"records":sink.records,
+            "failures":sink.failures,"pass":sink.failures == 0});
+        eprintln!("{summary}");
+        writeln!(sink.f, "{summary}").map_err(err)?;
+        sink.f.flush().map_err(err)?;
+        if sink.failures > 0 { return Err(format!("{} failing G3 BF16 records; see {}", sink.failures, out.display())) }
         Ok(())
     }
 }
