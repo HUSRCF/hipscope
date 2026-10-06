@@ -2841,16 +2841,24 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
 //   F32  kv_heads * head_dim f32.
 //   FP8  kv_heads * head_dim E4M3 codes, then kv_heads f16 scales: the qwen35
 //        native fp8 row, quantized as kv_cache_write_fp8_e4m3 does (gfx12).
+//   Q8   kv_heads * head_dim / 32 Q8_0 blocks (f16 scale, 32 int8 codes;
+//        34 bytes), head-major: the dense q8 KV row, quantized as
+//        kv_cache_write_q8_0 does (gfx11 and gfx12).
 // An fp8 key score is the head's scale times the in-order sum of q * code; a
-// value is scale * code. Every attention kernel goes through the helpers
-// below, so for each format the per-head, grouped and serial kernels stay
-// bitwise equal. The indexer's raw and pooled keys are BF16 values in every
-// format; the fp8 format stores them as BF16, which holds the same values as
-// the F32 arenas.
+// q8 key score sums, block by block, the block's scale times its in-order
+// sum of q * code; a value is scale * code. Every attention kernel goes
+// through the helpers below, so for each format the per-head, grouped and
+// serial kernels stay bitwise equal. The indexer's raw and pooled keys are
+// BF16 values in every format; the quantized formats store them as BF16,
+// which holds the same values as the F32 arenas.
 #define QSA_KV_F32 0
 #define QSA_KV_FP8 1
+#define QSA_KV_Q8 2
 #if defined(__GFX12__)
 #define QSA_HAS_FP8 1
+#endif
+#if defined(__GFX11__) || defined(__GFX12__)
+#define QSA_HAS_Q8 1
 #endif
 
 typedef float qsa_f32x2 __attribute__((ext_vector_type(2)));
@@ -2859,9 +2867,16 @@ template <int F>
 static __device__ __forceinline__ int qsa_kv_row_bytes(int kv_heads, int head_dim) {
     if constexpr (F == QSA_KV_F32) {
         return kv_heads * head_dim * 4;
-    } else {
+    } else if constexpr (F == QSA_KV_FP8) {
         return kv_heads * (head_dim + 2);
+    } else {
+        return kv_heads * (head_dim / 32) * 34;
     }
+}
+
+// Signed int8 code `byte` (0..3) of a little-endian word, as a float.
+static __device__ __forceinline__ float qsa_q8_code(unsigned int word, int byte) {
+    return (float)((int)(word << (24 - 8 * byte)) >> 24);
 }
 
 static __device__ __forceinline__ float qsa_half_bits(unsigned int bits) {
@@ -2875,7 +2890,7 @@ static __device__ __forceinline__ float qsa_fp8_code(unsigned int code) {
 }
 #endif
 
-// Value channel `channel` of KV head `kv_head` in the fp8 token row `row`.
+// Value channel `channel` of KV head `kv_head` in the quantized token row `row`.
 template <int F>
 static __device__ __forceinline__ float qsa_kv_value(
     const unsigned char* row,
@@ -2883,7 +2898,12 @@ static __device__ __forceinline__ float qsa_kv_value(
     int head_dim,
     int kv_head,
     int channel) {
-    static_assert(F == QSA_KV_FP8, "F32 values keep each kernel's own loads");
+    static_assert(F != QSA_KV_F32, "F32 values keep each kernel's own loads");
+    if constexpr (F == QSA_KV_Q8) {
+        const unsigned char* block = row + (kv_head * (head_dim / 32) + channel / 32) * 34;
+        return (float)(signed char)block[2 + (channel & 31)]
+            * qsa_half_bits(*reinterpret_cast<const unsigned short*>(block));
+    } else {
 #if defined(QSA_HAS_FP8)
     const float scale = qsa_half_bits(*reinterpret_cast<const unsigned short*>(
         row + kv_heads * head_dim + 2 * kv_head));
@@ -2891,10 +2911,11 @@ static __device__ __forceinline__ float qsa_kv_value(
 #else
     return 0.0f;
 #endif
+    }
 }
 
 // Unscaled QK dot of `heads` query rows (`q + h * q_stride`, head_dim floats
-// each) with KV head `kv_head` of the fp8 token row `row`, added to
+// each) with KV head `kv_head` of the quantized token row `row`, added to
 // `score[h]`; every head sees the same key loads and the association above.
 template <int F, int HEADS>
 static __device__ __forceinline__ void qsa_kv_key_dots(
@@ -2905,7 +2926,54 @@ static __device__ __forceinline__ void qsa_kv_key_dots(
     int head_dim,
     int kv_head,
     float (&score)[HEADS]) {
-    static_assert(F == QSA_KV_FP8, "F32 keys keep each kernel's own loop");
+    static_assert(F != QSA_KV_F32, "F32 keys keep each kernel's own loop");
+    if constexpr (F == QSA_KV_Q8) {
+        // A pair of blocks is 68 bytes, 4-byte aligned (the host admits q8 for
+        // head_dim 256 only, so every head and token row is):
+        // word 0 = scale0 | codes0[0..1], words 1..7 = codes0[2..29],
+        // word 8 = codes0[30..31] | scale1, words 9..16 = codes1[0..31].
+        const unsigned int* pairs =
+            reinterpret_cast<const unsigned int*>(row + kv_head * (head_dim / 32) * 34);
+        float total[HEADS];
+#pragma unroll
+        for (int h = 0; h < HEADS; ++h) total[h] = 0.0f;
+        for (int pair = 0; pair < head_dim / 64; ++pair) {
+            unsigned int w[17];
+#pragma unroll
+            for (int i = 0; i < 17; ++i) w[i] = pairs[pair * 17 + i];
+            const float scale0 = qsa_half_bits(w[0] & 0xFFFFu);
+            const float scale1 = qsa_half_bits(w[8] >> 16);
+            float code[64];
+            code[0] = qsa_q8_code(w[0], 2);
+            code[1] = qsa_q8_code(w[0], 3);
+#pragma unroll
+            for (int i = 1; i < 8; ++i) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) code[4 * i - 2 + b] = qsa_q8_code(w[i], b);
+            }
+            code[30] = qsa_q8_code(w[8], 0);
+            code[31] = qsa_q8_code(w[8], 1);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) code[32 + 4 * i + b] = qsa_q8_code(w[9 + i], b);
+            }
+#pragma unroll
+            for (int h = 0; h < HEADS; ++h) {
+                const float* qh = q + h * q_stride + pair * 64;
+                float dot0 = 0.0f;
+                float dot1 = 0.0f;
+#pragma unroll
+                for (int d = 0; d < 32; ++d) dot0 += qh[d] * code[d];
+#pragma unroll
+                for (int d = 0; d < 32; ++d) dot1 += qh[32 + d] * code[32 + d];
+                total[h] += dot0 * scale0;
+                total[h] += dot1 * scale1;
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < HEADS; ++h) score[h] += total[h];
+    } else {
 #if defined(QSA_HAS_FP8)
     // Codes are 4-byte aligned: the host admits fp8 for head_dim 256 and an
     // even KV-head count only.
@@ -2932,13 +3000,15 @@ static __device__ __forceinline__ void qsa_kv_key_dots(
 #pragma unroll
     for (int h = 0; h < HEADS; ++h) score[h] += dot[h] * scale;
 #endif
+    }
 }
 
-// Store one channel of a K or V row in the fp8 format. Every thread of the
-// block calls it (block 256 over one KV head, `channel` = threadIdx.x; lanes
-// at or past head_dim pass any value and store nothing). The head's absmax is
-// reduced through wave shuffles and `amax_lds` (one float per wave), which
-// synchronizes.
+// Store one channel of a K or V row in a quantized format. Every thread of
+// the block calls it (block 256 over one KV head, `channel` = threadIdx.x;
+// lanes at or past head_dim pass any value and store nothing). fp8: the
+// head's absmax is reduced through wave shuffles and `amax_lds` (one float
+// per wave), which synchronizes. q8: each wave32 is one 32-channel Q8_0
+// block, reduced and encoded as kv_cache_write_q8_0 does (no barrier).
 template <int F>
 static __device__ __forceinline__ void qsa_kv_store(
     unsigned char* row,
@@ -2948,7 +3018,22 @@ static __device__ __forceinline__ void qsa_kv_store(
     int kv_head,
     int channel,
     float* amax_lds) {
-    static_assert(F == QSA_KV_FP8, "F32 rows are stored directly");
+    static_assert(F != QSA_KV_F32, "F32 rows are stored directly");
+    if constexpr (F == QSA_KV_Q8) {
+        const bool active = channel < head_dim;
+        float amax = active ? fabsf(value) : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+        }
+        const float scale = amax / 127.0f;
+        const float inv_scale = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int q = __float2int_rn(value * inv_scale);
+        q = max(-127, min(127, q));
+        if (!active) return;
+        unsigned char* block = row + (kv_head * (head_dim / 32) + channel / 32) * 34;
+        if ((channel & 31) == 0) *reinterpret_cast<_Float16*>(block) = (_Float16)scale;
+        block[2 + (channel & 31)] = (unsigned char)(signed char)q;
+    } else {
 #if defined(QSA_HAS_FP8)
     const bool active = channel < head_dim;
     float amax = active ? fabsf(value) : 0.0f;
@@ -2980,6 +3065,7 @@ static __device__ __forceinline__ void qsa_kv_store(
         *reinterpret_cast<_Float16*>(row + kv_heads * head_dim + 2 * kv_head) = s16;
     }
 #endif
+    }
 }
 
 static __device__ __forceinline__ float qsa_index_f32(float value) {
@@ -3180,6 +3266,10 @@ QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_f32, QSA_KV_F32, float, fl
 QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_fp8, QSA_KV_FP8, unsigned char,
                     __hip_bfloat16)
 #endif
+#if defined(QSA_HAS_Q8)
+QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_q8, QSA_KV_Q8, unsigned char,
+                    __hip_bfloat16)
+#endif
 #undef QSA_DECODE_PROLOGUE
  
 
@@ -3212,7 +3302,7 @@ extern "C" __global__ void indexed_attention_cache_append_f32_batched(
     full_values[position * kv_width + channel] = value[row * kv_width + channel];
 }
 
-// Fp8 twin of indexed_attention_cache_append_f32_batched: grid
+// Quantized twin of indexed_attention_cache_append_f32_batched: grid
 // [kv_heads, rows], block 256, one block per KV head of one row. The rows are
 // byte-identical to the decode prologue's for the same K/V.
 template <int F>
@@ -3245,6 +3335,14 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_cache_append
     int rows, int position_start, int kv_heads, int head_dim) {
     qsa_cache_append_batched<QSA_KV_FP8>(key, value, full_keys, full_values, rows,
                                          position_start, kv_heads, head_dim);
+}
+#endif
+#if defined(QSA_HAS_Q8)
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_cache_append_q8_batched(
+    const float* key, const float* value, unsigned char* full_keys, unsigned char* full_values,
+    int rows, int position_start, int kv_heads, int head_dim) {
+    qsa_cache_append_batched<QSA_KV_Q8>(key, value, full_keys, full_values, rows,
+                                        position_start, kv_heads, head_dim);
 }
 #endif
 
@@ -4440,7 +4538,7 @@ static __device__ __forceinline__ void qsa_attention_single(
 }
 
 // One exported kernel per (body, format): F32 keeps its historical names and
-// float cache pointers, fp8 takes byte rows.
+// float cache pointers, the quantized formats take byte rows.
 #define QSA_ATTENTION_BATCHED(NAME, BODY, BOUNDS, FORMAT, CACHE)                            \
     extern "C" __global__ BOUNDS void NAME(                                                 \
         const float* q_with_gate, const CACHE* full_keys, const CACHE* full_values,        \
@@ -4476,6 +4574,9 @@ static __device__ __forceinline__ void qsa_attention_single(
 QSA_ATTENTION_KERNELS(f32, QSA_KV_F32, float)
 #if defined(QSA_HAS_FP8)
 QSA_ATTENTION_KERNELS(fp8, QSA_KV_FP8, unsigned char)
+#endif
+#if defined(QSA_HAS_Q8)
+QSA_ATTENTION_KERNELS(q8, QSA_KV_Q8, unsigned char)
 #endif
 #undef QSA_ATTENTION_KERNELS
 #undef QSA_NO_BOUNDS

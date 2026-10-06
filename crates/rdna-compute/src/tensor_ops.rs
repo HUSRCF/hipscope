@@ -36,7 +36,7 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
 /// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
 /// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
-/// the F32 state, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// the F32 and q8 states, gfx1201 on the fp8 state.  Not bit-exact against the hg4
 /// kernel; admitted because its error against an f64 reference is no worse
 /// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
 /// route.  Read once.
@@ -2467,8 +2467,9 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
 
 /// Storage format of a QSA layer's state: the full K/V caches and the
 /// indexer's raw and pooled keys (`kernels/src/tensor_ops.hip`, "QSA state
-/// formats"). The index keys are BF16 values in every format, so the fp8
-/// format's BF16 index arenas pool and select exactly what F32 arenas do.
+/// formats"). The index keys are BF16 values in every format, so the
+/// quantized formats' BF16 index arenas pool and select exactly what F32
+/// arenas do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QsaKvFormat {
     /// F32 K/V and index keys: the exact reference.
@@ -2476,6 +2477,9 @@ pub enum QsaKvFormat {
     /// E4M3 K/V with one f16 scale per head and token (the Qwen3.5 native fp8
     /// row; gfx12 only), BF16 index keys.
     Fp8,
+    /// Q8_0 K/V (32-element blocks of one f16 scale and 32 int8 codes, the
+    /// dense q8 KV row; gfx11 and gfx12), BF16 index keys.
+    Q8,
 }
 
 impl QsaKvFormat {
@@ -2483,6 +2487,7 @@ impl QsaKvFormat {
         match self {
             Self::F32 => "f32",
             Self::Fp8 => "fp8",
+            Self::Q8 => "q8",
         }
     }
 
@@ -2493,14 +2498,17 @@ impl QsaKvFormat {
             // Whole-head scales over one 256-thread block, and 4-byte aligned
             // code rows (`kv_heads * 258` bytes).
             Self::Fp8 => head_dim == 256 && kv_heads % 2 == 0,
+            // One 256-thread block per head, eight 32-lane Q8_0 blocks, and
+            // 4-byte aligned block pairs (272-byte heads).
+            Self::Q8 => head_dim == 256 && kv_heads > 0,
         }
     }
 
-    /// Dtype of the K/V tensors: F32 elements, or fp8 byte rows as Raw.
+    /// Dtype of the K/V tensors: F32 elements, or quantized byte rows as Raw.
     pub const fn kv_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 => DType::Raw,
+            Self::Fp8 | Self::Q8 => DType::Raw,
         }
     }
 
@@ -2509,6 +2517,7 @@ impl QsaKvFormat {
         match self {
             Self::F32 => kv_heads * head_dim,
             Self::Fp8 => kv_heads * (head_dim + 2),
+            Self::Q8 => kv_heads * (head_dim / 32) * 34,
         }
     }
 
@@ -2516,7 +2525,7 @@ impl QsaKvFormat {
     pub const fn kv_row_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim * 4,
-            Self::Fp8 => self.kv_row_units(kv_heads, head_dim),
+            Self::Fp8 | Self::Q8 => self.kv_row_units(kv_heads, head_dim),
         }
     }
 
@@ -2524,12 +2533,12 @@ impl QsaKvFormat {
     pub const fn index_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 => DType::BF16,
+            Self::Fp8 | Self::Q8 => DType::BF16,
         }
     }
 
-    /// This format's entry of a `[f32, fp8]` kernel-name table.
-    fn kernel(self, names: [&'static str; 2]) -> &'static str {
+    /// This format's entry of a `[f32, fp8, q8]` kernel-name table.
+    fn kernel(self, names: [&'static str; 3]) -> &'static str {
         names[self as usize]
     }
 }
@@ -2554,6 +2563,9 @@ fn check_qsa_format(
     }
     if format == QsaKvFormat::Fp8 && !(gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201()) {
         return Err(HipError::new(0, "QSA fp8 K/V needs a gfx12 device"));
+    }
+    if format == QsaKvFormat::Q8 && !gpu.arch_caps.has_gfx11_plus_simt() {
+        return Err(HipError::new(0, "QSA q8 K/V needs a gfx11 or gfx12 device"));
     }
     if tensors.iter().any(|tensor| tensor.dtype != format.kv_dtype()) {
         return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
@@ -2639,6 +2651,7 @@ pub fn indexed_attention_decode_prologue(
     let kernel = p.format.kernel([
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
+        "indexed_attention_decode_prologue_q8",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -2762,6 +2775,7 @@ pub fn indexed_attention_append_prologue(
     let kernel = p.format.kernel([
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
+        "indexed_attention_decode_prologue_q8",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -2997,6 +3011,7 @@ pub fn indexed_attention_cache_append_batch(
     let kernel = p.format.kernel([
         "indexed_attention_cache_append_f32_batched",
         "indexed_attention_cache_append_fp8_batched",
+        "indexed_attention_cache_append_q8_batched",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3893,10 +3908,12 @@ pub fn indexed_attention_attention(
         p.format.kernel([
             "indexed_attention_attention_f32",
             "indexed_attention_attention_fp8",
+            "indexed_attention_attention_q8",
         ]),
         p.format.kernel([
             "indexed_attention_attention_f32_serial",
             "indexed_attention_attention_fp8_serial",
+            "indexed_attention_attention_q8_serial",
         ]),
     ];
     let (kernel_name, shared_mem) =
@@ -4140,6 +4157,7 @@ fn indexed_attention_attention_batch_impl(
             p.format.kernel([
                 "indexed_attention_attention_f32_batched_hg4",
                 "indexed_attention_attention_fp8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4",
             ]),
             [
                 checked_u32(
@@ -4166,6 +4184,7 @@ fn indexed_attention_attention_batch_impl(
                     p.format.kernel([
                         "indexed_attention_attention_f32_batched",
                         "indexed_attention_attention_fp8_batched",
+                        "indexed_attention_attention_q8_batched",
                     ]),
                     [head_grid, dim_grid, row_grid],
                     bytes as u32,
@@ -4175,6 +4194,7 @@ fn indexed_attention_attention_batch_impl(
                 p.format.kernel([
                     "indexed_attention_attention_f32_batched_serial",
                     "indexed_attention_attention_fp8_batched_serial",
+                    "indexed_attention_attention_q8_batched_serial",
                 ]),
                 [head_grid, dim_grid, row_grid],
                 0,
@@ -4232,7 +4252,8 @@ fn indexed_attention_attention_batch_impl(
 /// head_dim 256 in four-head KV groups, and every row's selection is its
 /// whole causal window: the budget covers every visible block and the
 /// capacity every visible token (indexed_attention_select then emits all of
-/// them). Only F32 caches take this route (fp8 is gfx12-only).
+/// them). Only F32 caches take this route; q8 caches take the gathered route,
+/// whose per-call F16 convert dequantizes them (fp8 is gfx12-only).
 fn qsa_dense_wmma_applies(
     gpu: &Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -4331,14 +4352,15 @@ const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 
 /// Whether this process runs QSA prefill attention in `format` on the
 /// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` (read
 /// first, so with it `0` nothing else is consulted), the Qwen4 F16 route not opted
-/// out, and an arch with a kernel for the state format (gfx1151: F32,
-/// gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
+/// out, and an arch with a kernel for the state format (gfx1151: F32 and
+/// q8, gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
 pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
     *QWEN4_QSA_WMMA_GATHER
         && *crate::gemm::QWEN4_F16_WMMA
         && match format {
             QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
             QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
+            QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
         }
 }
 
@@ -4474,6 +4496,8 @@ fn qsa_gathered_pm_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
 
 /// The gathered route's producer and attention launches: the hipcc kernels,
 /// or with `pm` the certified builder module (`kernels::QSA_GATHER_PM_*`).
+/// The builder module has no q8 producer: q8 converts with the hipcc kernel
+/// and attends through either (the attend reads only the F16 workspace).
 fn qsa_gathered_wmma_launch(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -4481,30 +4505,39 @@ fn qsa_gathered_wmma_launch(
     max_selected: usize,
     pm: bool,
 ) -> HipResult<()> {
-    let (module, src, convert, attend) = match (p.format, pm) {
+    // (module, hipcc source or the builder image, kernel).
+    type Code = (&'static str, Result<&'static str, &'static [u8]>, &'static str);
+    const GFX1151: &str = "indexed_attention_gathered_wmma";
+    const GFX1201: &str = "indexed_attention_gathered_wmma_gfx1201";
+    const PM_GFX1151: &str = "qsa_gather_pm_gfx1151";
+    const PM_GFX1201: &str = "qsa_gather_pm_gfx1201";
+    let hip = |module, src, kernel| -> Code { (module, Ok(src), kernel) };
+    let built = |module, image, kernel| -> Code { (module, Err(image), kernel) };
+    let attend_gfx1151 = if pm {
+        built(PM_GFX1151, crate::kernels::QSA_GATHER_PM_GFX1151, "indexed_attention_gathered_wmma_f16_pm_gfx1151")
+    } else {
+        hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_gathered_wmma_f16")
+    };
+    let (convert, attend) = match (p.format, pm) {
         (QsaKvFormat::F32, false) => (
-            "indexed_attention_gathered_wmma",
-            INDEXED_ATTENTION_GATHERED_WMMA_SRC,
-            "indexed_attention_kv_f16vb",
-            "indexed_attention_gathered_wmma_f16",
-        ),
-        (QsaKvFormat::Fp8, false) => (
-            "indexed_attention_gathered_wmma_gfx1201",
-            INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
-            "indexed_attention_kv_f16vb_fp8_gfx1201",
-            "indexed_attention_gathered_wmma_f16_gfx1201",
+            hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_kv_f16vb"),
+            attend_gfx1151,
         ),
         (QsaKvFormat::F32, true) => (
-            "qsa_gather_pm_gfx1151",
-            "",
-            "indexed_attention_kv_f16vb_pm_gfx1151",
-            "indexed_attention_gathered_wmma_f16_pm_gfx1151",
+            built(PM_GFX1151, crate::kernels::QSA_GATHER_PM_GFX1151, "indexed_attention_kv_f16vb_pm_gfx1151"),
+            attend_gfx1151,
+        ),
+        (QsaKvFormat::Q8, _) => (
+            hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_kv_f16vb_q8"),
+            attend_gfx1151,
+        ),
+        (QsaKvFormat::Fp8, false) => (
+            hip(GFX1201, INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC, "indexed_attention_kv_f16vb_fp8_gfx1201"),
+            hip(GFX1201, INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC, "indexed_attention_gathered_wmma_f16_gfx1201"),
         ),
         (QsaKvFormat::Fp8, true) => (
-            "qsa_gather_pm_gfx1201",
-            "",
-            "indexed_attention_kv_f16vb_fp8_pm_gfx1201",
-            "indexed_attention_gathered_wmma_f16_pm_gfx1201",
+            built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_kv_f16vb_fp8_pm_gfx1201"),
+            built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_gathered_wmma_f16_pm_gfx1201"),
         ),
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
@@ -4520,17 +4553,17 @@ fn qsa_gathered_wmma_launch(
     let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
     let tokens = checked_i32(end_position, "QSA gathered tokens")?;
     let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
-    for kernel in [convert, attend] {
-        if pm {
-            let image = match p.format {
-                QsaKvFormat::F32 => crate::kernels::QSA_GATHER_PM_GFX1151,
-                QsaKvFormat::Fp8 => crate::kernels::QSA_GATHER_PM_GFX1201,
-            };
-            gpu.ensure_embedded_kernel(module, image, kernel)?;
-        } else {
-            gpu.ensure_kernel_public(module, src, kernel)?;
+    for (module, code, kernel) in [convert, attend] {
+        match code {
+            Ok(src) => {
+                gpu.ensure_kernel_public(module, src, kernel)?;
+            }
+            Err(image) => {
+                gpu.ensure_embedded_kernel(module, image, kernel)?;
+            }
         }
     }
+    let (convert, attend) = (convert.2, attend.2);
     let mut args = KernargBlob::new();
     args.push_ptr(p.full_keys.buf.as_ptr());
     args.push_ptr(p.full_values.buf.as_ptr());
@@ -7931,42 +7964,50 @@ mod tests {
         }
     }
 
-    fn gathered_format(gpu: &Gpu) -> Option<QsaKvFormat> {
+    /// State formats the gathered route serves on this device.
+    fn gathered_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
         if gpu.arch_caps.is_gfx1151() {
-            Some(QsaKvFormat::F32)
+            vec![QsaKvFormat::F32, QsaKvFormat::Q8]
         } else if gpu.arch_caps.is_gfx1201() {
-            Some(QsaKvFormat::Fp8)
+            vec![QsaKvFormat::Fp8]
         } else {
-            None
+            Vec::new()
         }
     }
 
     /// The gathered F16 WMMA route must match the exact per-head kernel of
-    /// the same state format to F16-rounding accuracy ([`GatheredCase`]).
+    /// the same state format to F16-rounding accuracy ([`GatheredCase`]),
+    /// through the hipcc and the PM attend alike.
     #[test]
     fn qsa_gathered_wmma_matches_per_head_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
-        let Some(format) = gathered_format(&gpu) else {
+        let formats = gathered_formats(&gpu);
+        if formats.is_empty() {
             eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
             return;
-        };
-        // Visible 1901..2420 against a 512-block budget: 475..605 blocks.
-        let case = GatheredCase::new(&mut gpu, format, 520, 1900, 2432);
-        let p = case.params();
-        indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
-        let reference = gpu.download_f32(&case.output).expect("reference download");
-        qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity).expect("gathered QSA");
-        let gathered = gpu.download_f32(&case.output).expect("gathered download");
-        let rel = rel_l2(&reference, &gathered);
-        eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
-        // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
-        // dim or key/value pairing lands near 1e-1 or above.
-        assert!(rel < 5e-3, "gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
-        assert!(rel > 0.0, "gathered QSA WMMA route did not run");
-        case.free(&mut gpu);
+        }
+        for format in formats {
+            // Visible 1901..2420 against a 512-block budget: 475..605 blocks.
+            let case = GatheredCase::new(&mut gpu, format, 520, 1900, 2432);
+            let p = case.params();
+            indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
+            let reference = gpu.download_f32(&case.output).expect("reference download");
+            qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity).expect("gathered QSA");
+            let gathered = gpu.download_f32(&case.output).expect("gathered download");
+            let rel = rel_l2(&reference, &gathered);
+            eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+            // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
+            // dim or key/value pairing lands near 1e-1 or above.
+            assert!(rel < 5e-3, "gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+            assert!(rel > 0.0, "gathered QSA WMMA route did not run");
+            let hip = case.gathered(&mut gpu, false);
+            let pm = case.gathered(&mut gpu, true);
+            assert!(hip == pm, "PM vs hipcc gathered bytes differ ({})", format.name());
+            case.free(&mut gpu);
+        }
     }
 
     /// Where admitted (`Gpu::qsa_gather_vmm_capable`), the gathered workspace
@@ -7983,7 +8024,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        let Some(format) = gathered_format(&gpu) else {
+        let Some(&format) = gathered_formats(&gpu).first() else {
             eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
             return;
         };
@@ -8471,14 +8512,20 @@ mod tests {
         gpu.free_tensor(norm).expect("free norm");
     }
 
-    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only).
+    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only;
+    /// q8: gfx11 and gfx12).
     fn quantized_qsa_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
+        let mut formats = Vec::new();
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-            vec![QsaKvFormat::Fp8]
-        } else {
-            eprintln!("skip: fp8 QSA K/V needs a gfx12 GPU");
-            Vec::new()
+            formats.push(QsaKvFormat::Fp8);
         }
+        if gpu.arch_caps.has_gfx11_plus_simt() {
+            formats.push(QsaKvFormat::Q8);
+        }
+        if formats.is_empty() {
+            eprintln!("skip: quantized QSA K/V needs a gfx11 or gfx12 GPU");
+        }
+        formats
     }
 
     fn qsa_lcg(seed: usize, n: usize) -> Vec<f32> {
@@ -8535,6 +8582,11 @@ mod tests {
                     QsaKvFormat::Fp8 => {
                         let scale = half(base + kv_heads * head_dim + element / head_dim * 2);
                         e4m3_to_f32(bytes[base + element]) * scale
+                    }
+                    QsaKvFormat::Q8 => {
+                        let (head, d) = (element / head_dim, element % head_dim);
+                        let block = base + (head * (head_dim / 32) + d / 32) * 34;
+                        bytes[block + 2 + d % 32] as i8 as f32 * half(block)
                     }
                     QsaKvFormat::F32 => unreachable!("F32 rows are not quantized"),
                 });
@@ -8673,13 +8725,35 @@ mod tests {
             let (k_rows, v_rows) = (tail(&decode_k), tail(&decode_v));
             let dequant_k = dequantize_qsa_rows(format, &k_rows, rows, kv_heads, head_dim);
             let dequant_v = dequantize_qsa_rows(format, &v_rows, rows, kv_heads, head_dim);
-            // E4M3 keeps 3 mantissa bits. A wrong head or scale lands near 1.
-            let tolerance = 5e-2;
-            for (reference, actual, what) in
-                [(&normed, &dequant_k, "keys"), (&values, &dequant_v, "values")]
-            {
+            // E4M3 keeps 3 mantissa bits, Q8_0 7 bits per 32-element block. A
+            // wrong head, block or scale lands near 1.
+            let tolerance = if format == QsaKvFormat::Q8 { 1e-2 } else { 5e-2 };
+            for (reference, actual, bytes, what) in [
+                (&normed, &dequant_k, &k_rows, "keys"),
+                (&values, &dequant_v, &v_rows, "values"),
+            ] {
                 let rel = rel_l2(reference, actual);
                 assert!(rel < tolerance, "{name} {what} rel L2 {rel:.3e}");
+                if format != QsaKvFormat::Q8 {
+                    continue;
+                }
+                // Q8_0 rounds against the f32 scale amax / 127 and stores it
+                // as f16: every element is within half an f32 step plus 127
+                // times the scale's f16 rounding. Blocks are consecutive
+                // 34-byte runs, in element order.
+                for (block, (want, got)) in
+                    reference.chunks_exact(32).zip(actual.chunks_exact(32)).enumerate()
+                {
+                    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 127.0;
+                    let stored = f16_to_f32(u16::from_le_bytes([bytes[34 * block], bytes[34 * block + 1]]));
+                    let bound = 0.5 * scale * (1.0 + 1e-4) + 127.0 * (scale - stored).abs();
+                    for (w, g) in want.iter().zip(got) {
+                        assert!(
+                            (w - g).abs() <= bound,
+                            "{name} {what} block {block}: {g} vs {w} past the int8 bound {bound:.3e}"
+                        );
+                    }
+                }
             }
             for tensor in [
                 index_gpu, qgate_gpu, keys_gpu, values_gpu, index_norm, head_norm, decode_k,
@@ -8809,7 +8883,7 @@ mod tests {
                 .count();
             assert_eq!(differing, 0, "{name} grouped attention differs in {differing} cells");
             let rel = rel_l2(&reference, &per_head);
-            let tolerance = 5e-2;
+            let tolerance = if format == QsaKvFormat::Q8 { 1e-2 } else { 5e-2 };
             assert!(rel > 0.0 && rel < tolerance, "{name} attention rel L2 {rel:.3e}");
             // The single-row entry (explicit selection length) is the batched
             // per-head body for that row.
