@@ -28041,50 +28041,73 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if projections.is_empty()
-            || !projections
-                .iter()
-                .all(|(weight, _, _)| self.qwen4_f16_wmma_applies(weight, k, batch_size))
+        self.gemm_bf16_xf32_f16_wmma_qwen4_groups(&[projections], x, k, batch_size)
+    }
+
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4`] for several projection groups
+    /// reading the same X, converted to F16 once for all of them: each group
+    /// launches exactly what its own call would (the opt-in region fold is
+    /// still decided per group), in group order, so every output's bytes are
+    /// unchanged.  Returns `false` with nothing launched unless the route
+    /// applies to every weight of every group.
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_groups(
+        &mut self,
+        groups: &[&[(&GpuTensor, &GpuTensor, usize)]],
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if groups.iter().any(|g| g.is_empty())
+            || !groups.iter().flat_map(|g| g.iter()).all(|(weight, _, _)| {
+                self.qwen4_f16_wmma_applies(weight, k, batch_size)
+            })
         {
             return Ok(false);
         }
         self.bind_thread()?;
         let gfx1201 = self.arch_caps.is_gfx1201();
         let short = move |m: usize| m < 16 && gfx1201;
-        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
-            self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
-        }
-        if projections.iter().all(|&(_, _, m)| short(m)) {
-            return Ok(true);
-        }
-        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
-        let x_view = GpuTensor {
-            buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
-            shape: vec![batch_size * k],
-            dtype: DType::F16,
-        };
-        if *QWEN4_PROJ_REGIONS
-            && k == 2560 && projections.len() > 1
-            && projections.iter().all(|p| matches!(p.2, 1 | 512 | 640))
-            && (self.arch_caps.has_wmma_w32() || self.arch_caps.is_gfx1201())
-        {
-            let mut group = [projections[0]; 4];
-            let mut count = 0;
-            for &p in projections.iter().filter(|&&(_, _, m)| !short(m)) {
-                group[count] = p;
-                count += 1;
-                if count == 4 {
-                    self.gemm_bf16_xf16_f16_wmma_regions(&group, &x_view, k, batch_size)?;
-                    count = 0;
+        let mut x_view: Option<GpuTensor> = None;
+        for projections in groups {
+            for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
+                self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+            }
+            if projections.iter().all(|&(_, _, m)| short(m)) {
+                continue;
+            }
+            // Nothing between the groups writes X or the F16 scratch.
+            if x_view.is_none() {
+                let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+                x_view = Some(GpuTensor {
+                    buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
+                    shape: vec![batch_size * k],
+                    dtype: DType::F16,
+                });
+            }
+            let x_view = x_view.as_ref().unwrap();
+            if *QWEN4_PROJ_REGIONS
+                && k == 2560 && projections.len() > 1
+                && projections.iter().all(|p| matches!(p.2, 1 | 512 | 640))
+                && (self.arch_caps.has_wmma_w32() || self.arch_caps.is_gfx1201())
+            {
+                let mut group = [projections[0]; 4];
+                let mut count = 0;
+                for &p in projections.iter().filter(|&&(_, _, m)| !short(m)) {
+                    group[count] = p;
+                    count += 1;
+                    if count == 4 {
+                        self.gemm_bf16_xf16_f16_wmma_regions(&group, x_view, k, batch_size)?;
+                        count = 0;
+                    }
                 }
+                if count != 0 {
+                    self.gemm_bf16_xf16_f16_wmma_regions(&group[..count], x_view, k, batch_size)?;
+                }
+                continue;
             }
-            if count != 0 {
-                self.gemm_bf16_xf16_f16_wmma_regions(&group[..count], &x_view, k, batch_size)?;
+            for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
+                self.gemm_bf16_xf16_f16_wmma(weight, x_view, y, m, k, batch_size)?;
             }
-            return Ok(true);
-        }
-        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
-            self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
         }
         Ok(true)
     }

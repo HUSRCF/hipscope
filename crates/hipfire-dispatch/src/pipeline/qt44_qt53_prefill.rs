@@ -122,7 +122,7 @@ pub(crate) fn router_projection(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
-    if router_with_shared(p) {
+    if router_with_shared(p) || router_shares_f16(gpu, p) {
         return Ok(());
     }
     batch_projection(
@@ -152,6 +152,32 @@ fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
         })
 }
 
+/// Whether the router and the all-BF16 shared selector/gate/up (one K) all
+/// take the F16 WMMA route: the shared gate/up stage (which the route always
+/// runs right after the router stage, with no writer of `x_norm_batch` in
+/// between) then launches the router's own GEMM off the same F16 conversion
+/// of `x_norm_batch` instead of converting it a second time.
+fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    let router = &p.prelude.router;
+    p.batch_size > 8
+        && p.x_norm_batch.dtype == DType::F32
+        && router.dtype == DType::BF16
+        && gpu.qwen4_f16_wmma_applies(router.buf, router.k, p.batch_size)
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            [
+                &shared.weights.selector,
+                &shared.weights.gate,
+                &shared.weights.up,
+            ]
+            .iter()
+            .all(|w| {
+                w.dtype == DType::BF16
+                    && w.k == router.k
+                    && gpu.qwen4_f16_wmma_applies(w.buf, w.k, p.batch_size)
+            })
+        })
+}
+
 /// Shared selector and gate/up are ordinary batched projections.  This is the
 /// typed route's BF16 exception to the generic MoE prefill table: the common
 /// family remains fail-closed for QT53 while this exact route uses the native
@@ -178,6 +204,28 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
                 (&weights.up, shared.up_out),
             ],
         )?;
+    } else if router_shares_f16(gpu, p) {
+        // The router group first (its own launches, as `router_projection`
+        // would issue them), then the shared group, off one F16 conversion.
+        let router = &p.prelude.router;
+        let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_groups(
+            &[
+                &[(router.buf, p.prelude.router_logits, router.m)],
+                &[
+                    (weights.selector.buf, shared.scalar, weights.selector.m),
+                    (weights.gate.buf, shared.gate_out, weights.gate.m),
+                    (weights.up.buf, shared.up_out, weights.up.m),
+                ],
+            ],
+            p.x_norm_batch,
+            router.k,
+            p.batch_size,
+        ))?;
+        if !launched {
+            return Err(DispatchError::Hip(
+                "qt44/qt53 router + shared F16 WMMA route did not apply".into(),
+            ));
+        }
     } else if [&weights.selector, &weights.gate, &weights.up]
         .iter()
         .all(|w| w.dtype == DType::BF16)
