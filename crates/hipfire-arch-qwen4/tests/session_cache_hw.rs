@@ -8,10 +8,13 @@
 //! `qwen3.8-flash-next-gptq3.mq4` artifact named by
 //! `HIPFIRE_SESSION_CACHE_MODEL`.
 //!
-//! Prompt A is prefilled cold (capturing snapshots at both chunk boundaries),
-//! then an unrelated prompt B overwrites the live state, then A is prefilled
-//! again from its two-chunk snapshot. The final logits must be byte-equal to
-//! the cold run's and greedy decode must emit the same ids.
+//! Prompt A (three chunks and a tail) is prefilled cold, capturing a chain of
+//! delta snapshots at its three chunk boundaries. Prompt B shares only A's
+//! first chunk and is also prefilled cold, so its two-chunk snapshot is a
+//! delta over A's first. A is then restored through its three-link chain and
+//! B through the shared root. Each restored prefill's final logits must be
+//! byte-equal to its cold run's and greedy decode must emit the same ids;
+//! this also proves that rows below a boundary never change afterwards.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
@@ -126,24 +129,31 @@ fn restored_prefill_matches_cold_on_flash_next() {
     bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
-    let a = prompt(0xa, 2 * chunk + 300);
-    let b = prompt(0xb, 2 * chunk + 200);
+    let a = prompt(0xa, 3 * chunk + 300);
+    let mut b = a[..chunk].to_vec();
+    b.extend(prompt(0xb, chunk + 200));
     println!(
         "chunk={chunk} state={state_format:?} backend={}",
         backend.name()
     );
 
-    let (cold_logits, cold_ids) = run(&mut bundle, &mut gpu, &logits, &a, 0);
-    run(&mut bundle, &mut gpu, &logits, &b, 0);
-    let reused = bundle.session_plan(&a, SessionRoute::Ar);
-    assert_eq!(reused, 2 * chunk, "plan must offer A's two-chunk snapshot");
-    let (warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a, reused);
-    println!("cold ids {cold_ids:?}\nwarm ids {warm_ids:?}");
-    assert!(
-        warm_logits == cold_logits,
-        "restored final logits differ from cold"
-    );
-    assert_eq!(warm_ids, cold_ids);
+    let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
+    let cold_b = run(&mut bundle, &mut gpu, &logits, &b, 0);
+    for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
+        let reused = bundle.session_plan(tokens, SessionRoute::Ar);
+        assert_eq!(
+            reused,
+            links * chunk,
+            "plan must offer {name}'s {links}-chunk snapshot"
+        );
+        let (warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
+        println!("{name} cold ids {:?}\n{name} warm ids {warm_ids:?}", cold.1);
+        assert!(
+            warm_logits == cold.0,
+            "{name}: restored final logits differ from cold"
+        );
+        assert_eq!(warm_ids, cold.1, "{name}");
+    }
 
     gpu.free_tensor(logits).expect("free logits");
     bundle.free_gpu(&mut gpu).expect("free bundle");
