@@ -748,6 +748,31 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
                 with_b(it, &Value::Nat(n.clone()), cx, |b| b.enable_delay_alu())?;
                 Some(unit())
             }
+            "clause" => {
+                need(1)?;
+                let f = a[0].clone();
+                let mut cb = Cb { fail: None };
+                let r = with_b(it, &Value::Nat(n.clone()), cx, |b| b.clause(|draft| {
+                    let cell = Rc::new(RefCell::new(Some(draft.clone())));
+                    let mut cx = Cx { d: None, fwd: None, brk: None };
+                    let r = it.call_value(&f, vec![nat(Nat::Builder(cell.clone()))], &mut cx);
+                    let v = match r {
+                        Ok(v) | Err(Ctl::Return(v)) => v,
+                        Err(other) => {
+                            cb.fail = Some(other);
+                            return Err("script fault".into());
+                        }
+                    };
+                    if let Value::Enum(t, var, mut p) = it.deref(v) {
+                        if &*t == "Result" && &*var != "Ok" {
+                            return Err(crate::fmt::display(&p.pop().unwrap_or(Value::Unit)).unwrap_or_else(|e| e));
+                        }
+                    }
+                    *draft = cell.borrow_mut().take().ok_or("the clause builder was already finished")?;
+                    Ok(())
+                }))?;
+                return finish_cb(cb, r, Value::Unit).map(Some);
+            }
             "wait" => {
                 need(2)?;
                 let Some(Nat::Counter(c)) = nat_of(it, &a[0]) else { return Err("wait(Counter, n)".into()) };
