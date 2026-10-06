@@ -485,6 +485,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemm_bf16_xf32_multirow_rows3", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
             "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
         ]);
+        // Native MTP batched prompt fill, HC input_mix_up (K = 320).
+        add!("gemm_bf16_xf32_multirow_pto2", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
+            "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
+        ]);
         add!("gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC, [
             "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
         ]);
@@ -551,6 +555,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     if matches!(arch, "gfx1201" | "gfx1151") {
         add!("gemv_mq2g256v2", kernels::GEMV_MQ2G256V2_SRC, ["gemv_mq2g256v2"]);
         add!("gemv_mq6g256v2_mq6v2", kernels::GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2"]);
+        // Default-on `HIPFIRE_QWEN4_ROUTER_FAST`: every eager multi-row router call.
+        add!("moe_router_softmax_top10_f32_fast", kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC, ["moe_router_softmax_top10_f32_fast"]);
     }
     if matches!(arch, "gfx1100" | "gfx1151") {
         add!("copy_rows_strided_f32", kernels::COPY_ROWS_STRIDED_F32_SRC, ["copy_rows_strided_f32"]);
@@ -665,7 +671,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "hc_activation_fused_f32", "hc_state_bf16_add_f32", "hc_state_bf16_to_f32", "hyper_norm_f32", "hyper_norm_gate_f32",
             "hyper_norm_gate_outputs", "hyper_norm_gate_outputs_f32", "hyper_read_f32", "hyper_read_projected_f32", "hyper_read_up_fused_f32",
             "hyper_write_bf16x2", "hyper_write_f32", "indexed_attention_attention_f32", "indexed_attention_attention_f32_batched",
-            "indexed_attention_attention_f32_batched_hg4", "indexed_attention_attention_f32_batched_serial",
+            "indexed_attention_attention_f32_batched_hg12", "indexed_attention_attention_f32_batched_hg4",
+            "indexed_attention_attention_f32_batched_serial",
             "indexed_attention_attention_f32_serial", "indexed_attention_attention_fp8", "indexed_attention_attention_fp8_batched",
             "indexed_attention_attention_fp8_batched_hg4", "indexed_attention_attention_fp8_batched_serial",
             "indexed_attention_attention_fp8_serial", "indexed_attention_cache_append_f32", "indexed_attention_cache_append_f32_batched",
@@ -674,8 +681,30 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "indexed_attention_pool_rope_bf16", "indexed_attention_pool_rope_f32", "indexed_attention_reuse_selection",
             "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial", "indexed_attention_select_f32",
             "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial", "indexed_attention_select_f32_serial",
+            "indexed_attention_select_from_scores", "indexed_attention_select_scores_rows16_f32",
+            "indexed_attention_select_scores_rows8_f32",
             "scale_f32",
         ]);
+        // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
+        // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
+        // 128, wider projections 128 x 256), the HC read-up tile, and the
+        // symmetric-IU4 MoE load check, A4 producers and stable scatter.
+        add!("gemm_wmma_lds_splitk", kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, [
+            "qwen4_wmma_lds_128_128_32_64_k64", "qwen4_wmma_lds_128_256_32_64_k64", "qwen4_wmma_lds_128_256_32_64_k64_bsr",
+            "qwen4_wmma_lds_160_80_32_80_k32_p_s4", "qwen4_wmma_lds_64_128_32_32_k64_p_s4", "qwen4_wmma_lds_64_128_32_64_k64_p",
+            "qwen4_wmma_lds_64_128_32_64_k64_p_s2", "qwen4_wmma_lds_64_128_32_64_k64_p_s4", "qwen4_wmma_lds_64_128_32_64_k64_p_s8",
+            "qwen4_wmma_lds_64_128_32_64_k64_s4", "qwen4_wmma_lds_64_64_32_32_k64_p_s4", "qwen4_wmma_lds_64_64_32_64_k64_p",
+            "qwen4_wmma_lds_64_64_32_64_k64_p_s2", "qwen4_wmma_lds_64_64_32_64_k64_p_s4", "qwen4_wmma_lds_reduce",
+        ]);
+        add!("hyper_read_up_wmma_gfx1201", crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC, [
+            "hyper_read_up_wmma_bf16_gfx1201", "hyper_read_up_wmma_bf16_gfx1201_t128",
+        ]);
+        add!("mq_rotate_x_i4", kernels::MQ_ROTATE_X_I4_SRC, ["mq_rotate_x_i4"]);
+        add!("qwen4_moe_rotate128_i4", kernels::QWEN4_MOE_ROTATE128_I4_SRC, ["qwen4_moe_rotate128_i4"]);
+        add!("qwen4_moe_scatter_stable_top10", kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC, [
+            "qwen4_moe_group_prefix", "qwen4_moe_group_ranks", "qwen4_moe_group_scatter",
+        ]);
+        add!("qwen4_moe_sym_check_gfx1201", kernels::QWEN4_MOE_SYM_CHECK_GFX1201_SRC, ["qwen4_moe_sym_check_gfx1201"]);
     }
     if arch == "gfx1100" {
         add!("add", kernels::ADD_SRC, ["add_f32", "broadcast_add_rows_f32"]);
@@ -806,6 +835,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen4_moe_scatter_stable_top10", kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC, [
             "qwen4_moe_group_prefix", "qwen4_moe_group_ranks", "qwen4_moe_group_scatter",
         ]);
+        // Default-on `HIPFIRE_QWEN4_HC_ROW_FOLD`: grouped MoE prefill fold.
+        add!("hc_row_fold", crate::hc_row_fold::SRC, ["hc_row_fold_norm_gate"]);
     }
     // Qwen3.5-MoE (ornith-1.5-35b-a3b) load, AR prefill/decode and native MTP,
     // plus Qwen3.5 dense (H2): every module a kernel-load trace
@@ -1158,12 +1189,13 @@ mod tests {
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid), the
         // five multi-slot `*_paged` modules of the q8/asym3 routes, the
         // 36 H2 decode, prefill, MTP and DFlash modules added for
-        // compiler-free packs, the 37 Qwen3.8-Flash-Next modules (including
+        // compiler-free packs, the 45 Qwen3.8-Flash-Next modules (including
         // the gfx1201 `fn_gdn_dense` adapter)
-        // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv) and the 32
-        // Qwen3.5-MoE modules (tests/fixtures/kernel-trace-qwen35.tsv). Those
-        // 114 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 114, "unexpected gfx1201 inventory size");
+        // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
+        // 8K-128K prefill, MTP and serve rows) and the 32 Qwen3.5-MoE modules
+        // (tests/fixtures/kernel-trace-qwen35.tsv). Those 122 keys are
+        // additional to P0's 92.
+        assert_eq!(registry.len(), count + 122, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

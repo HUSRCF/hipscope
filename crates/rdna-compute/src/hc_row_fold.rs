@@ -20,7 +20,7 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
-const SRC: &str = include_str!("../../../kernels/src/hc_row_fold.hip");
+pub(crate) const SRC: &str = include_str!("../../../kernels/src/hc_row_fold.hip");
 const ENTRY: &str = "hc_row_fold_norm_gate";
 
 /// Operands of [`Gpu::hc_row_fold_norm_gate`].
