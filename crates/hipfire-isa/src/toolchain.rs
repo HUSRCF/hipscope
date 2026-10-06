@@ -567,7 +567,9 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             let dynamic=contract.launch_dynamic_lds_bytes.ok_or("M7-certified contract missing launch dynamic LDS bytes")?;
             let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
             let waves=workgroup_size(&source_text,&contract.symbol)?.div_ceil(32);
-            let max_end=if qsa_pm {
+            // Only the gathered attention family has the token list.
+            let token_list=qsa_pm&&(contract.symbol.starts_with("indexed_attention_gathered_")||contract.symbol.starts_with("indexed_attention_kv_f16vb"));
+            let max_end=if token_list {
                 // The token list is the launch's dynamic LDS (`launch_dynamic_lds_bytes`
                 // is its largest size); every other access is bounded by the static part.
                 crate::pm_check::lds_bounds_host(&source_text,&contract.symbol,waves,kd.group_segment_size,

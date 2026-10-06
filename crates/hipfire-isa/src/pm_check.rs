@@ -176,12 +176,16 @@ fn ds_ranges(name: &str, ops: &str) -> Option<Vec<(u32, u32)>> {
     }
 }
 
-/// Every DS access of every lane of `waves` waves of `symbol`, whose address
-/// VGPR the entry block (the straight-line code before the first label or
-/// branch) derives from the work-item id and which nothing after it
-/// redefines, ends at or before `limit` bytes. Returns the maximum end. A
-/// kernel without DS memory accesses passes only with no allocation
-/// (`limit == 0`).
+/// Every DS access of every lane of `waves` waves of `symbol` ends at or
+/// before `limit` bytes. Its address VGPR is either one the entry block (the
+/// straight-line code before the first label or branch) derives from the
+/// work-item id and which nothing after it redefines, or a masked address:
+/// in the access's own straight-line block its last definition is
+/// `v_and_b32_e32 vR, M, vX` with an immediate `M`, and nothing between them
+/// names `vR` except DS accesses addressed by it, so every lane's address is
+/// a submask of `M` (at most `M`, aligned to `M`'s trailing zeros). Returns
+/// the maximum end. A kernel without DS memory accesses passes only with no
+/// allocation (`limit == 0`).
 pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<u32> {
     lds_bounds_host(source, symbol, waves, limit, &[]).map(|(end, _)| end)
 }
@@ -247,7 +251,17 @@ pub fn lds_bounds_host(source: &str, symbol: &str, waves: u32, limit: u32, host_
                 continue;
             }
             if i > head && lines[head + 1..].iter().any(|(n2, o2, _)| n2.starts_with('v') && o2.first().and_then(|o| dst(o)) == Some(('v', reg))) {
-                return Err(format!("LDS address v{reg} is redefined inside the K loop"));
+                let mask = masked_address(&lines, head, i, reg)
+                    .ok_or_else(|| format!("LDS address v{reg} is redefined inside the K loop"))?;
+                for &(offset, width) in &ranges {
+                    let align = width.min(8);
+                    if mask % align != 0 || offset % align != 0 { return Err(format!("{name} {rest}: masked LDS address 0x{mask:x} + {offset} is not {align}-aligned")) }
+                    let e = mask.checked_add(offset).and_then(|x| x.checked_add(width)).ok_or("LDS address overflow")?;
+                    if e > limit { return Err(format!("{name} {rest}: masked address reaches byte {e} of {limit}")) }
+                    end = end.max(e);
+                }
+                checked += 1;
+                continue;
             }
             let addr = w.v.get(&reg).copied().unwrap_or([None; 32]);
             for (lane, value) in addr.iter().enumerate() {
@@ -264,6 +278,32 @@ pub fn lds_bounds_host(source: &str, symbol: &str, waves: u32, limit: u32, host_
     }
     if checked == 0 && hosted == 0 && limit != 0 { return Err("no LDS access found".into()) }
     Ok((end, hosted))
+}
+
+/// The immediate mask `M` of the `v_and_b32_e32 vR, M, vX` that is the last
+/// definition of `vR` before line `at`, in the same straight-line block
+/// (after the entry block), when nothing between them names `vR` except DS
+/// accesses that only read it as their address.
+fn masked_address(lines: &[(&str, Vec<&str>, &str)], head: usize, at: usize, reg: u16) -> Option<u32> {
+    let names = |text: &str| text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '[' || c == ']' || c == ':')).any(|t| {
+        t.strip_prefix('v').and_then(|n| n.parse::<u16>().ok()) == Some(reg)
+            || t.strip_prefix("v[").and_then(|r| r.strip_suffix(']')).and_then(|r| r.split_once(':'))
+                .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?))).is_some_and(|(a, b)| a <= reg && reg <= b)
+    });
+    for j in (head + 1..at).rev() {
+        let (name, ops, rest) = &lines[j];
+        if name.ends_with(':') || name.starts_with("s_branch") || name.starts_with("s_cbranch") || name.starts_with("s_setpc") || name.starts_with("s_swappc") { return None }
+        if *name == "v_and_b32_e32" && ops.len() == 3 && dst(ops[0]) == Some(('v', reg)) {
+            return parse_imm(ops[1]).filter(|_| ops[2].starts_with('v') && ops[2][1..].parse::<u16>().is_ok());
+        }
+        if !names(rest) { continue }
+        let address = if name.starts_with("ds_store") { ops.first() } else if name.starts_with("ds_load") { ops.get(1) } else { None };
+        let writes = name.starts_with("ds_load") && ops.first().is_some_and(|o| names(o));
+        if address.and_then(|o| dst(o.split_whitespace().next().unwrap_or(""))) != Some(('v', reg)) || writes { return None }
+        // A DS store naming vR only as its address (not as data) reads it.
+        if name.starts_with("ds_store") && ops[1..].iter().any(|o| names(o)) { return None }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -306,5 +346,22 @@ mod tests {
             let text = K.replace("\tv_lshl_add_u32 v2", &format!("\t{clobber}\n\tv_lshl_add_u32 v2"));
             assert!(lds_bounds(&text, "k", 1, 1 << 20).is_err(), "{clobber}");
         }
+    }
+    /// A loop-defined address is bounded by its immediate `v_and_b32` mask
+    /// only when that mask is its last definition in the access's block.
+    #[test]
+    fn masked_loop_addresses_are_bounded_by_their_mask() {
+        let base = K.replace(".Lk_end:", "\tv_xor_b32_e32 v3, 0x100, v2\n\tv_and_b32_e32 v3, 0x7f8, v3\n\tds_load_b64 v[8:9], v3 offset:2048\n\tds_store_b64 v3, v[10:11] offset:2048\n.Lk_end:");
+        assert_eq!(lds_bounds(&base, "k", 2, 4096).unwrap(), 0x7f8 + 2048 + 8);
+        assert!(lds_bounds(&base, "k", 2, 4096 - 1024).is_err());
+        // Unmasked, written after the mask, across a label, misaligned mask, overwritten by a load, or by a dual op.
+        for bad in [
+            base.replace("\tv_and_b32_e32 v3, 0x7f8, v3\n", ""),
+            base.replace("\tds_load_b64 v[8:9], v3", "\tv_add_nc_u32_e32 v3, 8, v3\n\tds_load_b64 v[8:9], v3"),
+            base.replace("\tds_load_b64 v[8:9], v3", ".Lmid:\n\tds_load_b64 v[8:9], v3"),
+            base.replace("0x7f8", "0x7fc"),
+            base.replace("ds_load_b64 v[8:9], v3", "ds_load_b64 v[2:3], v3"),
+            base.replace("\tds_store_b64 v3, v[10:11]", "\tv_dual_mov_b32 v3, v4 :: v_dual_mov_b32 v5, v6\n\tds_store_b64 v3, v[10:11]"),
+        ] { assert!(lds_bounds(&bad, "k", 2, 1 << 20).is_err(), "{bad}") }
     }
 }

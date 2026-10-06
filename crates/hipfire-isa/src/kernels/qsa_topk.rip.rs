@@ -141,7 +141,9 @@ const LB: [u8; 5] = [80, 82, 84, 86, 88];
 const PSEL: u8 = 90; const ARUN: u8 = 92; const ERUN: u8 = 93; const X1: u8 = 94; const X2: u8 = 95;
 /// Wave-bit masks of the sort (the totals' scratch, dead by then).
 const WB: [u8; 3] = [60, 61, 62];
-const S_END: u8 = 96;
+/// Low lane-select words of `v_permlane16_b32` for the in-row xor strides 1, 2, 4, 8.
+const XSEL: [u8; 4] = [96, 97, 98, 99];
+const S_END: u8 = 100;
 
 // ---- VGPRs ------------------------------------------------------------------
 const TID: u8 = 0; const LANE: u8 = 1; const LANE4: u8 = 2; const TID8: u8 = 3;
@@ -219,6 +221,14 @@ fn cmp_w(w: &mut W, text: String, uses: &[RegRef]) -> Result<Uniform<Scc>, Strin
 fn ds_ld(text: String, dst: RegRef, addr: u8) -> Instruction { Instruction::new(text, vec![dst], vec![v(addr)]).memory(MemoryClass::DsLoad) }
 fn ds_st(text: String, addr: u8, data: RegRef) -> Instruction { Instruction::new(text, vec![], vec![v(addr), data]).memory(MemoryClass::DsStore) }
 fn off(o: u32) -> String { if o == 0 { String::new() } else { format!(" offset:{o}") } }
+/// `v_permlane16_b32` lane-select word half (`hi`: lanes 8..15 of a row) for lane `l ^ m`.
+fn xsel(m: u32, hi: bool) -> u32 { (0..8u32).map(|i| ((i + 8 * u32::from(hi)) ^ m) << (4 * i)).sum() }
+/// `dst = src` of lane `l ^ m` for `m < 16` (inside a row of 16). A VOP3
+/// VALU, unlike DPP, so every `s_delay_alu` window around it resolves.
+fn xlane(b: &mut Builder, dst: u8, src: u8, m: u32) -> R {
+    let k = m.trailing_zeros() as usize;
+    op(b, format!("v_permlane16_b32 v{dst}, v{src}, s{}, {}", XSEL[k], lit(xsel(m, true))), &[v(dst)], &[v(src), s(XSEL[k])])
+}
 
 /// `s[dst:dst+1] = s[src:src+1] + x * y` (64-bit).
 fn add64_mul(b: &mut Builder, dst: u8, src: u8, x: u8, y: u8, lo: u8, hi: u8) -> R {
@@ -302,6 +312,7 @@ fn prologue(wg: &mut Wg, end: &End) -> R {
         sop(b, format!("s_mov_b32 s{}, 0", LB[k] + 1), &[LB[k] + 1], &[])?;
     }
     sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+    for (k, m) in [1u32, 2, 4, 8].into_iter().enumerate() { sop(b, format!("s_mov_b32 s{}, {}", XSEL[k], lit(xsel(m, false))), &[XSEL[k]], &[])?; }
     for m in [MP0, MP1, MP2, MP3] { sop(b, format!("s_mov_b32 s{}, 0", m + 1), &[m + 1], &[])?; }
     let outside = cmp_wg(wg, format!("s_cmp_ge_i32 s{ROW}, s{ROWS}"), &[s(ROW), s(ROWS)])?;
     wg.exit_if(outside, end)?;
@@ -482,7 +493,7 @@ fn pass(wg: &mut Wg, g: &Gen, tile: LdsRegion<Tile, Free>) -> Result<(LdsRegion<
     op(b, format!("v_mov_b32_e32 v{VP}, v{CNT}"), &[v(VP)], &[v(CNT)])?;
     op(b, format!("v_mov_b32_e32 v{VTOT}, v{CNT}"), &[v(VTOT)], &[v(CNT)])?;
     for (k, m) in [1u32, 2, 4, 8].into_iter().enumerate() {
-        op(b, format!("v_mov_b32_dpp v{VB}, v{VTOT} row_xmask:{m} row_mask:0xf bank_mask:0xf"), &[v(VB)], &[v(VTOT)])?;
+        xlane(b, VB, VTOT, m)?;
         op(b, format!("v_cndmask_b32_e64 v{VT}, 0, v{VB}, s{}", LB[k]), &[v(VT)], &[v(VB), mask(LB[k])])?;
         op(b, format!("v_add_nc_u32_e32 v{VP}, v{VP}, v{VT}"), &[v(VP)], &[v(VP), v(VT)])?;
         op(b, format!("v_add_nc_u32_e32 v{VTOT}, v{VTOT}, v{VB}"), &[v(VTOT)], &[v(VTOT), v(VB)])?;
@@ -552,7 +563,7 @@ fn reduce_planes(b: &mut Builder, planes: u8) -> R {
         let (mut c, mut cn) = (VC0, VC1);
         for p in 0..n {
             let a = PL + p;
-            if m < 16 { op(b, format!("v_mov_b32_dpp v{VB}, v{a} row_xmask:{m} row_mask:0xf bank_mask:0xf"), &[v(VB)], &[v(a)])?; }
+            if m < 16 { xlane(b, VB, a, m)?; }
             else { op(b, format!("v_permlanex16_b32 v{VB}, v{a}, s{PSEL}, 0xfedcba98"), &[v(VB)], &[v(a), s(PSEL)])?; }
             if p == 0 {
                 op(b, format!("v_and_b32_e32 v{c}, v{a}, v{VB}"), &[v(c)], &[v(a), v(VB)])?;
@@ -634,6 +645,8 @@ fn fill_pass(wg: &mut Wg, g: &Gen, tile: LdsRegion<Tile, Free>, ctl: LdsRegion<C
         op(b, format!("v_add_nc_u32_e32 v{VPE}, s{ATOT}, v{VPE}"), &[v(VPE)], &[s(ATOT), v(VPE)])?;
         op(b, format!("v_cndmask_b32_e64 v{VPOS}, v{VPE}, v{VPA}, s{MP1}"), &[v(VPOS)], &[v(VPE), v(VPA), mask(MP1)])?;
         op(b, format!("v_lshlrev_b32_e32 v{VAD}, 3, v{VPOS}"), &[v(VAD)], &[v(VPOS)])?;
+        // The position is below 1024: the mask keeps the address provably in the tile.
+        op(b, format!("v_and_b32_e32 v{VAD}, {}, v{VAD}", lit(H_BYTES - 8)), &[v(VAD)], &[v(VAD)])?;
         // Entry (key << 32) | ~block as the pair (lo, key).
         op(b, format!("v_add_nc_u32_e32 v{}, s{T2}, v{LANE}", lo(u)), &[v(lo(u))], &[s(T2), v(LANE)])?;
         op(b, format!("v_xor_b32_e32 v{0}, -1, v{0}", lo(u)), &[v(lo(u))], &[v(lo(u))])?;
@@ -699,7 +712,7 @@ fn lane_stage(wg: &mut Wg, g: &Gen, k: u32, j: u32) -> R {
             let b = w.isa();
             let (x, p) = (ent(e), part(e));
             for d in 0..2u8 {
-                if j < 16 { op(b, format!("v_mov_b32_dpp v{}, v{} row_xmask:{j} row_mask:0xf bank_mask:0xf", p + d, x + d), &[v(p + d)], &[v(x + d)])?; }
+                if j < 16 { xlane(b, p + d, x + d, j)?; }
                 else { op(b, format!("v_permlanex16_b32 v{}, v{}, s{PSEL}, 0xfedcba98", p + d, x + d), &[v(p + d)], &[v(x + d), s(PSEL)])?; }
             }
             compare_exchange(b, j, k, e)
@@ -742,6 +755,8 @@ fn wave_stage(wg: &mut Wg, g: &Gen, k: u32, j: u32, tile: LdsRegion<Tile, Free>)
     let d = wg.wait(pend)?;
     let (tp,) = wg.barrier((ready(tw, d),))?;
     op(wg.isa(), format!("v_xor_b32_e32 v{VPAD}, {}, v{TID8}", lit(8 * j)), &[v(VPAD)], &[v(TID8)])?;
+    // tid ^ j < 256: the mask keeps the partner address provably in its slice.
+    op(wg.isa(), format!("v_and_b32_e32 v{VPAD}, {}, v{VPAD}", lit(2048 - 8)), &[v(VPAD)], &[v(VPAD)])?;
     for e in 0..4u32 {
         wg.ds_load(&tp, ds_ld(format!("ds_load_b64 {}, v{VPAD}{}", vp(part(e)), off(2048 * e)), vr(part(e), 2), VPAD))?;
     }
@@ -828,8 +843,10 @@ fn output(wg: &mut Wg, g: &Gen, ranks: &LdsRegion<Ranks, Published>) -> R {
             op(b, format!("v_mul_lo_u32 v{VT3}, v{VQ}, s{COMP}"), &[v(VT3)], &[v(VQ), s(COMP)])?;
             op(b, format!("v_sub_nc_u32_e32 v{VRM}, v{VS}, v{VT3}"), &[v(VRM)], &[v(VS), v(VT3)])?;
             op(b, format!("v_min_u32_e32 v{VRAD}, {}, v{VQ}", lit(511)), &[v(VRAD)], &[v(VQ)])?;
-            op(b, format!("v_lshl_add_u32 v{VRAD}, v{VRAD}, 2, {}", lit(R_BASE)), &[v(VRAD)], &[v(VRAD)])?;
-            wg.ds_load(ranks, ds_ld(format!("ds_load_b32 v{VBLK}, v{VRAD}"), v(VBLK), VRAD))?;
+            op(b, format!("v_lshlrev_b32_e32 v{VRAD}, 2, v{VRAD}"), &[v(VRAD)], &[v(VRAD)])?;
+            // min(q, 511) * 4: the mask keeps the rank address provably in the table.
+            op(b, format!("v_and_b32_e32 v{VRAD}, {}, v{VRAD}", lit(R_BYTES - 4)), &[v(VRAD)], &[v(VRAD)])?;
+            wg.ds_load(ranks, ds_ld(format!("ds_load_b32 v{VBLK}, v{VRAD}{}", off(R_BASE)), v(VBLK), VRAD))?;
             let b = wg.isa();
             op(b, format!("v_cmp_gt_u32_e64 s{MP0}, s{RANKED}, v{VS}"), &[mask(MP0)], &[s(RANKED), v(VS)])?;
             op(b, format!("v_mul_lo_u32 v{VV}, v{VBLK}, s{COMP}"), &[v(VV)], &[v(VBLK), s(COMP)])?;
