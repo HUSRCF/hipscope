@@ -132,7 +132,7 @@ fn plan(spec: &Spec) -> Result<RegPlan, String> {
 }
 
 fn wait_alu(b: &mut Builder, what: &str) -> R { op(b, format!("s_wait_alu {what}"), &[], &[]) }
-fn rs(base: u8, len: u8) -> String { if len == 1 { format!("v{base}") } else { format!("v[{base}:{}]", base + len - 1) } }
+fn rs(base: u8, len: u8) -> String { if len == 1 { format!("v{base}") } else { format!("v[{base}:{}]", u16::from(base) + u16::from(len) - 1) } }
 fn off(imm: u32) -> String { if imm == 0 { String::new() } else { format!(" offset:{imm}") } }
 
 /// buffer_load_b{32,64,128} dst, v{voff}, s[srd], s{soff} offen offset:imm
