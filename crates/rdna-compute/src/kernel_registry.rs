@@ -228,6 +228,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         _ => add!("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC, ["gemv_hfq4g256"]),
     }
     if arch == "gfx1100" {
+        add!("fused_gate_up_mq4g256v2_k5120_gfx1100", kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(), ["fused_gate_up_mq4g256v2_k5120_gfx1100"]);
         // Default gfx1100 precompile branches (dispatch.rs:4944-4962,5304-5308).
         add!("fused_qkvza_hfq4g256_k2048_gfx1100", kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC, ["fused_qkvza_hfq4g256_k2048"]);
         add!("fused_gate_up_hfq4g256_stage_x32_gfx1100", kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC, ["fused_gate_up_hfq4g256_stage_x32_gfx1100"]);
@@ -1111,6 +1112,24 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
+
+    #[test]
+    fn mq4v2_k5120_inventory_preserves_generic_and_limits_arch() {
+        let module = "fused_gate_up_mq4g256v2_k5120_gfx1100";
+        let registry = entries("gfx1100", "").unwrap();
+        let candidate = registry.iter().find(|entry| entry.module == module).unwrap();
+        assert_eq!(candidate.symbols, [module]);
+        let body = candidate.source().strip_prefix(
+            "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_k5120_gfx1100\n"
+        ).unwrap();
+        assert_eq!(
+            body.replace("const int groups_per_row = 20;", "const int groups_per_row = K / 256;"),
+            kernels::FUSED_GATE_UP_MQ4G256V2_SRC
+        );
+        for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
+            assert!(!entries(arch, "").unwrap().iter().any(|entry| entry.module == module));
+        }
+    }
 
     #[test]
     fn kernel_registry_p0_sources_are_byte_identical() {
