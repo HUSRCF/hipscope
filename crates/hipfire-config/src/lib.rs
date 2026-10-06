@@ -2353,10 +2353,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.mq4v2_gateup_k5120",
         "mq4v2_gateup_k5120",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_MQ4V2_GATEUP_K5120",
-        "Enable experimental exact gfx1100 MQ4V2 K5120 gate/up decode (17408 rows per output)."
+        "Run exact gfx1100 MQ4V2 K5120 gate/up decode (17408 rows per output) on its fixed-group-count kernel (default on; byte-identical to the generic kernel; set to false or HIPFIRE_MQ4V2_GATEUP_K5120=0 to restore the generic route)."
     ),
     process_bool_field!(
         "kernel.gfx12_mq4v2_fp8_gateup",

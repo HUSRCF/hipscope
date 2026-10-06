@@ -1421,7 +1421,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MQ4G256V2_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ4G256V2_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ4V2_DOWN_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs | developer |
-| `HIPFIRE_MQ4V2_GATEUP_K5120` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_MQ4V2_GATEUP_K5120` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MQ4V2_GATE_UP_KERNEL` | crates/rdna-compute/examples/mq4v2_moe_parity.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ4V2_GATE_UP_NOLDS` | crates/rdna-compute/examples/mq4v2_moe_parity.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ4V2_GATE_UP_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs | developer |

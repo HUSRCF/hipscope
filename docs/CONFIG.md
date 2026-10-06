@@ -120,12 +120,11 @@ per-key help:
 |---|---|
 | RDNA3 QKV/ZA | `kernel.rdna3_hfq4_qkv_wave64`, `kernel.rdna3_hfq4_qkvza_2wave`, `kernel.rdna3_hfq4_qkvza_wavepack4`, `kernel.rdna3_hfq4_qkvza_ldsx8`, `kernel.rdna3_hfq4_qkvza_reduce_chain`, `kernel.rdna3_hfq4_qkvza_hoist_x32` |
 | RDNA3 residual / sigmoid / head | `kernel.rdna3_hfq4_residual_k2048`, `kernel.rdna3_hfq4_sigmoid_tight_grid`, `kernel.rdna3_hfq4_sigmoid_rows4`, `kernel.rdna3_hfq4_lm_head_k2048`, `kernel.rdna3_hfq4_moe_gate_up_k2048` |
-| RDNA3 MQ4V2 gate/up decode | `kernel.mq4v2_gateup_k5120` (exact gfx1100, K=5120, 17408 rows per output; default off) |
 | RMSNorm | `kernel.rmsnorm_mq_tight_lds`, `kernel.rdna3_rmsnorm_wavegrid`, `kernel.rdna3_rmsnorm_split`, `kernel.rdna3_rmsnorm_sign_lds`, `kernel.rdna3_rmsnorm_sign_const` |
 | MoE | `kernel.moe_grouped_i8_k8`, `kernel.moe_grouped_i8_k4`, `kernel.moe_grouped_i8_k4_gfx12`, `kernel.moe_grouped_m2`, `kernel.moe_grouped_4w`, `kernel.moe_down_combine_vec4`, `kernel.moe_hfq6_i8`, `kernel.moe_hfq6_v2` |
 | Other kernel routes | `kernel.fp8_wmma`, `kernel.dot2_gemv`, `kernel.wo_mmq`, `kernel.lm_head_overwrite`, `kernel.hfq4_mmq_gfx906_y64`, `kernel.gate_up_nosync`, `kernel.qkvza_split_tail`, `kernel.gfx942_gemv_v3`, `kernel.deterministic`, `kernel.q8_batched_legacy`, `kernel.rope_interleaved_legacy`, `kernel.rocblas_all_archs`, `kernel.lloyd_force_baseline` |
 
-Set `hipfire config set kernel.mq4v2_gateup_k5120 true` to opt in, or `false` to restore the generic route. The one-shot compatibility override is `HIPFIRE_MQ4V2_GATEUP_K5120=1` / `0`. This process-wide setting is snapshotted at GPU initialization; restart an existing daemon after changing it. Other architectures, shapes, and quantization formats keep their existing routes. Compiler-less installations need a kernel pack containing `fused_gate_up_mq4g256v2_k5120_gfx1100` to enable it.
+`kernel.mq4v2_gateup_k5120` (exact gfx1100, K=5120, 17408 rows per output) is default on since 0.4.1: that gate/up decode runs on a fixed-group-count kernel whose output is byte-identical to the generic one. Set `hipfire config set kernel.mq4v2_gateup_k5120 false` to restore the generic route; the one-shot compatibility override is `HIPFIRE_MQ4V2_GATEUP_K5120=0` / `1`. This process-wide setting is snapshotted at GPU initialization; restart an existing daemon after changing it. Other architectures, shapes, and quantization formats keep their existing routes. Compiler-less installations need a kernel pack containing `fused_gate_up_mq4g256v2_k5120_gfx1100` (the 0.4.1 gfx1100 pack carries it).
 
 Architecture-gated default-on kernel routes (exact arch only; other arches keep their prior routes; all are process-wide and snapshotted at GPU initialization, so restart an existing daemon after changing them):
 
@@ -995,7 +994,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `kernel.moe_hfq6_v2` | `moe_hfq6_v2` | `HIPFIRE_MOE_HFQ6_V2` | experimental |
 | `kernel.moe_paro_i8` | `moe_paro_i8` | `HIPFIRE_MOE_PARO_I8` | experimental |
 | `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | `HIPFIRE_MOE_PARO_I8_K8` | experimental |
-| `kernel.mq4v2_gateup_k5120` | `mq4v2_gateup_k5120` | `HIPFIRE_MQ4V2_GATEUP_K5120` | experimental |
+| `kernel.mq4v2_gateup_k5120` | `mq4v2_gateup_k5120` | `HIPFIRE_MQ4V2_GATEUP_K5120` | stable |
 | `kernel.npu_spillover` | `npu_spillover` | `HIPFIRE_NPU_SPILLOVER` | experimental |
 | `kernel.prefill_batched` | `prefill_batched` | `HIPFIRE_PREFILL_BATCHED` | stable |
 | `kernel.q8_batched_legacy` | `q8_batched_legacy` | `HIPFIRE_Q8_BATCHED_LEGACY` | experimental |
