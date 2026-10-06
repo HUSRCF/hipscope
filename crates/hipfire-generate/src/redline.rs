@@ -3085,12 +3085,27 @@ pub fn redline_shadow_dflash_verify_pm4(
         return Err("DFlash shadow iterations must be non-zero".into());
     }
     let count = iterations.max(12);
-    // The gfx1100 split-KV verifier is admitted only beyond its 4K crossover.
-    // Start the shadow at the 8K boundary so capture/record/PM4 evidence names
-    // the new partial + merge route rather than a short-context fallback tape.
-    let split_gfx1100 = gpu.arch == "gfx1100"
-        && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false);
-    let base: usize = if split_gfx1100 { 8176 } else { 112 };
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let slot = guard.model_slot()?;
+    // The gfx1100 split-KV verifier is admitted only beyond its resolved
+    // crossover. Start the shadow at no less than the 8K boundary so
+    // capture/record/PM4 evidence names the new partial + merge route rather
+    // than a short-context fallback tape.
+    let split_min_ctx =
+        qwen35::prefill::gfx1100_split_verify_min_ctx(gpu, &slot.config).filter(|&threshold| {
+            qwen35::prefill::gfx1100_split_verify_admitted(
+                gpu,
+                &slot.config,
+                slot.kv_cache.quant_q8,
+                batch,
+                threshold.saturating_add(1),
+                slot.scratch.flash_partials.numel(),
+            )
+        });
+    let base: usize = split_min_ctx
+        .map(|threshold| threshold.saturating_add(1).max(8192).saturating_sub(batch))
+        .unwrap_or(112);
     let mut positions: Vec<usize> = Vec::with_capacity(count);
     for i in 0..count {
         positions.push(base + i * batch);
@@ -3105,10 +3120,6 @@ pub fn redline_shadow_dflash_verify_pm4(
             last + batch
         ));
     }
-
-    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
-    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
-    let slot = guard.model_slot()?;
     let hidden_k = slot.config.dim.next_power_of_two();
     let max_n = batch + 1;
     let mut fixtures = RedlineDflashFixtures {

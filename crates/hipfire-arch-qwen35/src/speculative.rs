@@ -517,7 +517,15 @@ pub fn dflash_finish_retained_lm_head_argmax(
     vocab: usize,
 ) -> HipResult<Vec<u32>> {
     if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
-        dflash_enqueue_verify_lm_head_argmax(gpu, w_out, final_hidden, verify_scratch, b, vocab)?;
+        dflash_enqueue_verify_lm_head_argmax(
+            gpu,
+            w_out,
+            final_hidden,
+            verify_scratch,
+            b,
+            vocab,
+            DenseBatchMath::Product,
+        )?;
         return dflash_download_verify_argmax(gpu, verify_scratch, b);
     }
 
@@ -4097,10 +4105,24 @@ fn verify_dflash_block_inner(
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
     let tree_verify_present = tree_verify.is_some();
-    // Launch-fusion prescaffold: frozen AR/verify discriminator. Linear chain
-    // verify (`tree_verify` is `None`) arms `ChainVerify`; tree verify stays `Off`.
+    // Launch-fusion prescaffold: frozen AR/verify discriminator. The split
+    // variant is selected only when this exact live window also satisfies the
+    // dense gfx1100 Q8 attention route. That prevents the split flag from
+    // widening capture-time F16/LDS auxiliary kernels below the crossover or
+    // on unsupported model shapes.
     let fusion = if tree_verify.is_none() {
-        qwen35::DflashFusionCtx::ChainVerify
+        if qwen35::prefill::gfx1100_split_verify_admitted(
+            gpu,
+            &target.config,
+            target.kv_cache.quant_q8,
+            b,
+            required_tokens,
+            target.scratch.flash_partials.numel(),
+        ) {
+            qwen35::DflashFusionCtx::ChainVerifySplit
+        } else {
+            qwen35::DflashFusionCtx::ChainVerify
+        }
     } else {
         qwen35::DflashFusionCtx::Off
     };

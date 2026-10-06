@@ -40,6 +40,10 @@ use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::context::DispatchWorkload;
 use hipfire_dispatch::families::attention::AttnParams;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyModel;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyRoute;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_admitted as dispatch_gfx1100_split_verify_admitted;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_min_ctx as dispatch_gfx1100_split_verify_min_ctx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
@@ -5592,9 +5596,9 @@ pub(crate) fn batch_chunk_upload_positions(
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
     let recording = gpu.graphs.capture_mode || gpu.replay.is_recording();
-    let recording_supported =
-        !recording || hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false);
-    matches!(fusion, DflashFusionCtx::ChainVerify)
+    let recording_supported = !recording
+        || (fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n));
+    fusion.is_chain_verify()
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
@@ -6308,7 +6312,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // (kill switch, non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
-    if fusion == DflashFusionCtx::ChainVerify
+    if fusion.is_chain_verify()
         && !gpu.flags.gdn_pre_fuse_off
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && config.linear_num_key_heads < n_v_heads
@@ -6562,7 +6566,7 @@ fn s4_residual_fast(
     epilogue: &BatchEpilogue<'_>,
     n: usize,
 ) -> bool {
-    fusion == DflashFusionCtx::ChainVerify
+    fusion.is_chain_verify()
         && !gpu.flags.mq_f16_residual_off
         && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
@@ -7506,6 +7510,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -8778,7 +8783,7 @@ fn batch_chunk_full_attn_prepare(
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
-    let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
+    let fa_prep_fused_ok = (fusion.is_chain_verify()
         || (fusion == DflashFusionCtx::Off
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true)))
         && gpu.arch_caps.is_gfx1100()
@@ -9235,6 +9240,48 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
     }
 }
 
+/// Scalar adapter from Qwen model state into the dispatch-owned split-verifier
+/// admission contract. The predicate itself intentionally stays out of the
+/// arch prefill body so declarative Steps can reuse it without semantic drift.
+fn gfx1100_split_verify_model<'a>(
+    gpu: &'a Gpu,
+    config: &Qwen35Config,
+) -> Gfx1100SplitVerifyModel<'a> {
+    Gfx1100SplitVerifyModel {
+        arch: gpu.arch_caps.arch(),
+        verify_attn: gpu.flags.verify_attn,
+        split_verify: gpu.flags.gfx1100_fa2_split_verify,
+        num_experts: config.num_experts,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        resolved_min_ctx: fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+    }
+}
+
+#[doc(hidden)]
+pub fn gfx1100_split_verify_min_ctx(gpu: &Gpu, config: &Qwen35Config) -> Option<usize> {
+    dispatch_gfx1100_split_verify_min_ctx(&gfx1100_split_verify_model(gpu, config))
+}
+
+#[doc(hidden)]
+pub fn gfx1100_split_verify_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    quant_q8: bool,
+    batch_size: usize,
+    logical_ctx_len: usize,
+    flash_partials_numel: usize,
+) -> bool {
+    dispatch_gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+        model: gfx1100_split_verify_model(gpu, config),
+        quant_q8,
+        batch_size,
+        logical_ctx_len,
+        flash_partials_numel,
+    })
+}
+
 /// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
 /// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
 /// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
@@ -9563,6 +9610,14 @@ fn batch_chunk_fa_attend(
             start_pos + n,
             n,
             &s.flash_partials,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8,
+                n,
+                start_pos + n,
+                s.flash_partials.numel(),
+            ),
         )? {
             return Ok(());
         }
@@ -9731,7 +9786,7 @@ fn batch_chunk_fa_attend_a4(
 fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
-        && fusion != DflashFusionCtx::ChainVerify
+        && !fusion.is_chain_verify()
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
         && config.head_dim == 256
@@ -9998,6 +10053,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -12813,8 +12869,6 @@ fn forward_prefill_chunk_pair(
         fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
-        gpu.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false),
     );
     let multirow_admitted = |max_ctx: usize| {
         q8_multirow_attn_admitted(
@@ -12828,7 +12882,14 @@ fn forward_prefill_chunk_pair(
             false,
             multirow_common.4,
             multirow_common.5,
-            multirow_common.6,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8,
+                n,
+                max_ctx,
+                s.flash_partials.numel(),
+            ),
         )
     };
     let multirow_c = multirow_admitted(max_ctx_c);
@@ -13510,7 +13571,8 @@ pub(crate) fn forward_batch_chunk_impl(
     // GEMMs stay batched either way — only the attend step switches to the
     // multi-row tile. The incumbent tile grid is sized from the live logical
     // context and therefore stays out of capture. The gfx1100 split-KV route
-    // uses fixed S=8 geometry and is admitted only behind its explicit opt-in;
+    // uses fixed S=8 geometry and is admitted only inside its exact default-on
+    // gfx1100 envelope (with parent and route-specific opt-outs);
     // the launcher independently rejects every other captured shape.
     let fa_attn_multirow = q8_multirow_attn_admitted(
         gpu.arch_caps.arch(),
@@ -13523,8 +13585,14 @@ pub(crate) fn forward_batch_chunk_impl(
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
-        gpu.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false),
+        gfx1100_split_verify_admitted(
+            gpu,
+            config,
+            kv_cache.quant_q8,
+            n,
+            start_pos + n,
+            s.flash_partials.numel(),
+        ),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,

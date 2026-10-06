@@ -722,6 +722,52 @@ fn gfx1100_q8_fa2_split_admitted(
         && (4..=32).contains(&batch_size)
 }
 
+/// F32 elements required by the production gfx1100 S=8 split-KV verifier.
+///
+/// Kept shared with the product admission so a reduced
+/// `HIPFIRE_FLASH_PARTIALS_BATCH` cannot arm split-only capture fusions while
+/// the attention launcher itself must fall back for lack of workspace.
+#[doc(hidden)]
+pub fn gfx1100_q8_fa2_split_partials_len(
+    batch_size: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Option<usize> {
+    batch_size
+        .checked_mul(n_heads)?
+        .checked_mul(8)?
+        .checked_mul(head_dim.checked_add(1)?)
+}
+
+#[inline]
+fn q8_multirow_fail_closed_after_split_miss(
+    arch: &str,
+    split_admitted: bool,
+    capture_mode: bool,
+    replay_recording: bool,
+) -> bool {
+    replay_recording || (arch == "gfx1100" && split_admitted && capture_mode)
+}
+
+#[inline]
+fn gfx1100_split_capture_assets_ready(
+    partial_loaded: bool,
+    merge_loaded: bool,
+    preconvert_loaded: bool,
+    q16_scratch_bytes: usize,
+    q16_scratch_present: bool,
+    need_q16_bytes: usize,
+) -> bool {
+    partial_loaded
+        && merge_loaded
+        && preconvert_loaded
+        && !crate::scratch::scratch_will_grow(
+            q16_scratch_bytes,
+            q16_scratch_present,
+            need_q16_bytes,
+        )
+}
+
 /// `head_dim` envelope of a batched flash-tile kernel, inclusive.
 ///
 /// The launcher-level check (`positive multiple of 32, <= 512`) describes the
@@ -7571,7 +7617,7 @@ impl Gpu {
     /// Experimental exact-gfx1100 split-KV twin of the tuned Q16/R3 FA2
     /// kernel. The partial grid partitions the live KT32 range across Z and
     /// the merge performs a stable LSE-weighted reduction. Product dispatch
-    /// reaches this only through the fail-closed, opt-in admission in
+    /// reaches this only through the fail-closed exact-shape admission in
     /// [`Self::attention_flash_q8_0_rows_masked`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -7672,6 +7718,7 @@ impl Gpu {
         const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1100";
         const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1100";
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100";
+        const MODULE: &str = "attention_q8_0_fa2_gqa_gfx1100";
         let src = format!(
             "// HIPFIRE_COMPILER_FLAGS: -mcumode\n\
              #define HIPFIRE_FA2_KT 32\n\
@@ -7681,13 +7728,13 @@ impl Gpu {
             kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
         );
         if !self.functions.contains_key(PARTIAL) {
-            self.ensure_kernel(PARTIAL, &src, PARTIAL)?;
+            self.ensure_kernel(MODULE, &src, PARTIAL)?;
         }
         if !self.functions.contains_key(PRECONVERT) {
-            self.ensure_kernel(PARTIAL, &src, PRECONVERT)?;
+            self.ensure_kernel(MODULE, &src, PRECONVERT)?;
         }
         if !self.functions.contains_key(MERGE) {
-            self.ensure_kernel(MERGE, &src, MERGE)?;
+            self.ensure_kernel(MODULE, &src, MERGE)?;
         }
 
         let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
@@ -7803,19 +7850,35 @@ impl Gpu {
     /// retained-PM4 capture is active. Capture must never trigger JIT or move
     /// the persistent Q16 scratch pointer; the direct warmup/prime window
     /// materializes both before either recorder reaches this predicate.
-    fn gfx1100_q8_fa2_split_capture_ready(&self, batch_size: usize) -> bool {
+    #[doc(hidden)]
+    pub fn gfx1100_q8_fa2_split_capture_assets_ready(&self, batch_size: usize) -> bool {
         const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1100";
         const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1100";
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100";
         let need_q16_bytes = batch_size * 24 * 256 * 2;
-        self.functions.contains_key(PARTIAL)
-            && self.functions.contains_key(MERGE)
-            && self.functions.contains_key(PRECONVERT)
-            && !crate::scratch::scratch_will_grow(
-                self.scratch.fa2_q16_scratch_bytes,
-                self.scratch.fa2_q16_scratch.is_some(),
-                need_q16_bytes,
-            )
+        gfx1100_split_capture_assets_ready(
+            self.functions.contains_key(PARTIAL),
+            self.functions.contains_key(MERGE),
+            self.functions.contains_key(PRECONVERT),
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        )
+    }
+
+    /// Full capture readiness, including the caller-owned partial/merge
+    /// workspace. The auxiliary F16/LDS producers use the asset-only twin
+    /// after `ChainVerifySplit` has already proved this capacity at the model
+    /// boundary.
+    #[doc(hidden)]
+    pub fn gfx1100_q8_fa2_split_capture_ready(
+        &self,
+        batch_size: usize,
+        partials_numel: usize,
+    ) -> bool {
+        self.gfx1100_q8_fa2_split_capture_assets_ready(batch_size)
+            && gfx1100_q8_fa2_split_partials_len(batch_size, 24, 256)
+                .is_some_and(|need| partials_numel >= need)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7832,13 +7895,15 @@ impl Gpu {
         head_dim: usize,
         logical_ctx_len: usize,
         batch_size: usize,
+        route_admitted: bool,
     ) -> HipResult<bool> {
         const SPLITS: usize = 8;
         let capturing = self.graphs.capture_mode || self.replay.is_recording();
-        let capture_ready = !capturing || self.gfx1100_q8_fa2_split_capture_ready(batch_size);
+        let capture_ready =
+            !capturing || self.gfx1100_q8_fa2_split_capture_ready(batch_size, partials.numel());
         if !capture_ready
             || !gfx1100_q8_fa2_split_admitted(
-                hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false),
+                route_admitted && self.flags.verify_attn && self.flags.gfx1100_fa2_split_verify,
                 &self.arch,
                 logical_ctx_len,
                 n_heads,
@@ -7855,10 +7920,7 @@ impl Gpu {
         else {
             return Ok(false);
         };
-        let Some(need_partials) = batch_size
-            .checked_mul(n_heads)
-            .and_then(|v| v.checked_mul(SPLITS))
-            .and_then(|v| v.checked_mul(head_dim + 1))
+        let Some(need_partials) = gfx1100_q8_fa2_split_partials_len(batch_size, n_heads, head_dim)
         else {
             return Ok(false);
         };
@@ -9408,6 +9470,7 @@ impl Gpu {
             max_ctx_len,
             batch_size,
             partials,
+            true,
         )
     }
 
@@ -9432,6 +9495,7 @@ impl Gpu {
         logical_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        allow_gfx1100_split: bool,
     ) -> HipResult<bool> {
         if !q8_multirow_arch_supported(self.arch_caps.arch()) {
             return Ok(false);
@@ -9457,13 +9521,19 @@ impl Gpu {
             head_dim,
             logical_ctx_len,
             batch_size,
+            allow_gfx1100_split,
         )? {
             return Ok(true);
         }
-        // The incumbent multi-row and VerifyGQA routes are not certified for
-        // retained recording. The split-KV route above is: it has fixed launch
-        // geometry, recorder-owned kernargs, and a warmup-stable scratch base.
-        if self.replay.is_recording() {
+        // The incumbent multi-row/VerifyGQA routes are outside this captured
+        // split contract. If split admission or readiness misses during either
+        // recorder, fail closed to the caller's established batched route.
+        if q8_multirow_fail_closed_after_split_miss(
+            self.arch_caps.arch(),
+            allow_gfx1100_split,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        ) {
             return Ok(false);
         }
         if self.try_attention_verify_gqa_rows(
@@ -23603,9 +23673,10 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, gfx1100_q8_fa2_split_admitted,
-        pack_attention_q8_0_fa2_gqa_gfx11_kernarg, q8_flash_default_tile_size,
-        q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported, replay_stable_tile_count,
+        flux_attn_route_name, gfx1100_q8_fa2_split_admitted, gfx1100_q8_fa2_split_partials_len,
+        gfx1100_split_capture_assets_ready, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
+        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
+        q8_multirow_fail_closed_after_split_miss, replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
@@ -23686,6 +23757,62 @@ mod tests {
         assert!(!gfx1100_q8_fa2_split_admitted(
             false, "gfx1100", 262_144, 24, 4, 256, 16,
         ));
+    }
+
+    #[test]
+    fn split_miss_capture_fallback_is_gfx1100_only() {
+        assert!(q8_multirow_fail_closed_after_split_miss(
+            "gfx1100", true, true, false,
+        ));
+        for arch in ["gfx1151", "gfx1201"] {
+            assert!(
+                !q8_multirow_fail_closed_after_split_miss(arch, true, true, false),
+                "arch={arch} must retain its incumbent HipGraph VerifyAttn path"
+            );
+        }
+        assert!(!q8_multirow_fail_closed_after_split_miss(
+            "gfx1100", false, true, false,
+        ));
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(q8_multirow_fail_closed_after_split_miss(
+                arch, false, false, true,
+            ));
+        }
+    }
+
+    #[test]
+    fn split_capture_assets_require_all_symbols_and_fixed_q16_scratch() {
+        assert!(gfx1100_split_capture_assets_ready(
+            true, true, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            false, true, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, false, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, false, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, true, 196_607, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, true, 196_608, false, 196_608,
+        ));
+    }
+
+    #[test]
+    fn gfx1100_split_partials_len_is_checked_and_matches_s8_layout() {
+        assert_eq!(
+            gfx1100_q8_fa2_split_partials_len(16, 24, 256),
+            Some(16 * 24 * 8 * 257)
+        );
+        assert_eq!(
+            gfx1100_q8_fa2_split_partials_len(32, 24, 256),
+            Some(32 * 24 * 8 * 257)
+        );
+        assert_eq!(gfx1100_q8_fa2_split_partials_len(usize::MAX, 24, 256), None);
     }
 
     /// The suffix table is the mapping from tensor dtypes to a kernel symbol.

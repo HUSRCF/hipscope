@@ -471,6 +471,7 @@ impl Gpu {
         up_m: usize,
         k: usize,
         batch_size: usize,
+        split_verify_capture: bool,
     ) -> HipResult<()> {
         if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
@@ -492,8 +493,7 @@ impl Gpu {
         // contracts for this exact launch, so its capture must preserve the eager
         // reduction route instead of silently switching to the base kernel.
         let recording = self.replay.is_recording() || self.graphs.capture_mode;
-        let recording_supported =
-            !recording || hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false);
+        let recording_supported = !recording || split_verify_capture;
         let (kname, ksrc, block_x) = if recording_supported
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"

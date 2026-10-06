@@ -298,6 +298,7 @@ pub fn load_dflash_state(
     // Retained-PM4 admission facts owned by the loader/target, not the draft.
     target_weights: &Qwen35Weights,
     kv_is_q8: bool,
+    target_flash_partials_numel: usize,
     single_gpu: bool,
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
@@ -550,11 +551,18 @@ pub fn load_dflash_state(
         .as_ref()
         .map(|p| p.max_batch)
         .unwrap_or(0);
-    let gfx1100_split_verify = gpu.arch == "gfx1100"
-        && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false)
-        && target_config.n_heads == 24
-        && target_config.n_kv_heads == 4
-        && target_config.head_dim == 256;
+    let gfx1100_split_verify_min_ctx =
+        qwen35::prefill::gfx1100_split_verify_min_ctx(gpu, target_config).filter(|&threshold| {
+            qwen35::prefill::gfx1100_split_verify_admitted(
+                gpu,
+                target_config,
+                kv_is_q8,
+                DFLASH_VERIFY_PM4_BLOCK,
+                threshold.saturating_add(1),
+                target_flash_partials_numel,
+            )
+        });
+    let gfx1100_split_verify = gfx1100_split_verify_min_ctx.is_some();
     // The draft's selector/dynamic-conv shape is deliberately NOT a gate: the
     // draft forward is outside the tape, so DFlash2 and legacy DFlash yield an
     // identical target verify body.
@@ -586,11 +594,11 @@ pub fn load_dflash_state(
                 "  DFlash verify PM4: armed (B={}, exact {})",
                 DFLASH_VERIFY_PM4_BLOCK, gpu.arch
             );
-            if gfx1100_split_verify {
-                // Keep the faster incumbent below the split verifier's 4K
-                // crossover, and do not capture a short-context tape that
-                // would silently omit the new partial + merge launches.
-                DflashVerifyPm4::armed_after_context(4096)
+            if let Some(min_ctx) = gfx1100_split_verify_min_ctx {
+                // Keep the faster incumbent below the resolved crossover, and
+                // do not capture a short-context tape that would silently omit
+                // the new partial + merge launches.
+                DflashVerifyPm4::armed_after_context(min_ctx)
             } else {
                 DflashVerifyPm4::armed()
             }
