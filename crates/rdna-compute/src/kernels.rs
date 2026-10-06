@@ -4240,6 +4240,18 @@ pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_se
 /// SHA-256 1d2662aa9d16c3dba66603f83bd84a5234cd5c7d1b4d57141e2a0f6e88c952cf
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
+/// Certified builder module of gfx1151's MQ6 trunk GEMM
+/// (`hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 --arch gfx1151`, M7
+/// obligation-free): the exact twin of the U3 `resid_bt_xlds<6, 8, 8, true, ..>`
+/// entries in `kernels/src/qwen4_gemm_mqv2_wmma_gfx11_bt.hip`, with their
+/// arguments and output bytes, over 256-token tiles (grid
+/// `[ceil(M/rows), ceil(N/256), 1]`). The module carries `qwen4_mq6_x4_pm_gfx1151_{w4,w8}`
+/// (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and `_w8_hcw`; the runtime
+/// launches only `_w8`, `_w8_bf16out` and `_w8_regions`, from M >= 2560 and
+/// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
+/// SHA-256 24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01
+/// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
+pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

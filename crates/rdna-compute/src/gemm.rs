@@ -200,10 +200,21 @@ static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
 /// `HIPFIRE_QWEN4_MQ6_X4_PM` (on unless `0`) runs gfx1201's MQ6 F32 overwrite
 /// trunk GEMM from the certified builder module (`kernels::QWEN4_MQ6_X4_PM_GFX1201`,
 /// same arguments and output bytes as `gemm_mq6g256v2_wmma_gfx12_bt8_x4`, its own
-/// 256-token grid) instead of the hipcc kernel. `0` keeps the hipcc kernel. Read once.
+/// 256-token grid) instead of the hipcc kernel, and gfx1151's large MQ6 overwrite
+/// launches (see [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`]) from
+/// `kernels::QWEN4_MQ6_X4_PM_GFX1151`. `0` keeps the hipcc kernels. Read once.
 static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true)
 });
+/// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`): the MQ6 X-LDS overwrite
+/// launches (F32, BF16 output, and the a/b/z regions fold, all 128-row `_w8` entries of
+/// `kernels::QWEN4_MQ6_X4_PM_GFX1151`, 256-token tiles) run from the certified builder
+/// module at `M >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151` rows (regions: summed rows) and
+/// `N >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151` tokens, the large FN pp8192 trunk shapes. Smaller
+/// launches, the `_w4` entries and the HC-write (`hcw`) entry stay on hipcc / U3.
+pub const QWEN4_MQ6_X4_PM_MIN_M_GFX1151: usize = 2560;
+/// See [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`].
+pub const QWEN4_MQ6_X4_PM_MIN_N_GFX1151: usize = 2048;
 /// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
 /// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
 /// of the 64 x 128 / k64 split-K tile.
@@ -943,6 +954,13 @@ fn mq6_x4_halo_twin_policy(kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Opt
         (Mq6X4Kind::Hcw, 2560, 6144, 8192) => Some([8, 8, 2]),
         _ => None,
     }
+}
+
+/// Whether an MQ6 overwrite launch of `m` rows (regions: summed rows) and `n` tokens is
+/// large enough for the gfx1151 PM module ([`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] /
+/// [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`]).
+const fn mq6_x4_pm_gfx1151_shape(m: usize, n: usize) -> bool {
+    m >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151 && n >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151
 }
 
 // U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
@@ -38306,18 +38324,29 @@ impl Gpu {
             }
         };
         let kind = if y.dtype == DType::BF16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
-        let halo = (xlds && overwrite).then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size)).flatten();
-        let use_pm = pm
+        // gfx1151 PM (F32 and BF16 output, M/N from the selective thresholds, flag on):
+        // the 128-row `_w8` entry of the certified builder module replaces the hipcc entry
+        // and the U3 twin; everything smaller keeps U3 / hipcc.
+        let pm1151 = xlds && overwrite && self.mq6_x4_pm_gfx1151(pm, m, batch_size);
+        let halo = (xlds && overwrite && !pm1151)
+            .then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size))
+            .flatten();
+        let pm1201 = pm
             && xlds
             && overwrite
             && gfx12
             && self.arch.as_str() == "gfx1201"
             && y.dtype != DType::BF16
             && halo.is_none();
+        let use_pm = pm1151 || pm1201;
         let (func_name, rows_per_block, block, batch_tile) = match halo {
             Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
-            None if use_pm && m <= 64 => ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile),
-            None if use_pm => ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile),
+            None if pm1151 && kind == Mq6X4Kind::Bf16 => {
+                ("qwen4_mq6_x4_pm_gfx1151_w8_bf16out", 128, 256, batch_tile)
+            }
+            None if pm1151 => ("qwen4_mq6_x4_pm_gfx1151_w8", 128, 256, batch_tile),
+            None if pm1201 && m <= 64 => ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile),
+            None if pm1201 => ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile),
             None => (func_name, rows_per_block, block, batch_tile),
         };
         let group_bytes: usize = match bits {
@@ -38337,7 +38366,9 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        if use_pm {
+        if pm1151 {
+            self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1151", kernels::QWEN4_MQ6_X4_PM_GFX1151, func_name)?;
+        } else if pm1201 {
             self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1201", kernels::QWEN4_MQ6_X4_PM_GFX1201, func_name)?;
         } else if xlds {
             let (module, source) = if gfx12 {
@@ -40810,6 +40841,14 @@ impl Gpu {
             .unwrap_or(self.qwen4_scope && self.arch.as_str() == "gfx1151")
     }
 
+    /// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`, `pm`): an MQ6 X-LDS overwrite
+    /// launch of `m` rows (regions: summed rows) and `n` tokens runs from the certified
+    /// builder module `qwen4_mq6_x4_pm_gfx1151` from [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] rows
+    /// and [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`] tokens up (256-token tiles, `_w8` entries).
+    fn mq6_x4_pm_gfx1151(&self, pm: bool, m: usize, n: usize) -> bool {
+        pm && self.arch.as_str() == "gfx1151" && mq6_x4_pm_gfx1151_shape(m, n)
+    }
+
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
     /// overwrite route with no recorder or capture active.
     pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
@@ -40856,35 +40895,57 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if !self.qwen4_mq6_x4_regions()
-            || !matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+        if !self.qwen4_mq6_x4_regions() {
+            return Ok(false);
+        }
+        self.gemm_mq6g256v2_xf16_regions_pm(regions, x_f16, k, batch_size, *QWEN4_MQ6_X4_PM)
+    }
+
+    /// [`Gpu::gemm_mq6g256v2_xf16_regions`] past the fold flag, with the PM flag explicit
+    /// (gfx1151: the builder module's `_w8_regions` entry from the selective thresholds).
+    fn gemm_mq6g256v2_xf16_regions_pm(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        pm: bool,
+    ) -> HipResult<bool> {
+        if !matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
             || !self.gemm_mq6g256v2_xf16_applies(k, batch_size)
             || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
         {
             return Ok(false);
         }
-        let (module, source, name, rows, block, bv) = if self.arch_caps.has_wmma_w32_gfx12() {
+        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
+        let pm1151 = self.mq6_x4_pm_gfx1151(pm, total_m, batch_size);
+        let (module, source, name, rows, block, n_tile) = if self.arch_caps.has_wmma_w32_gfx12() {
             ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
-                kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
-                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 8)
+                Some(kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC),
+                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 16 * 8)
+        } else if pm1151 {
+            ("qwen4_mq6_x4_pm_gfx1151", None, "qwen4_mq6_x4_pm_gfx1151_w8_regions", 128, 256, 256)
         } else {
             let (name, rows, block, bv) =
-                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, regions.iter().map(|r| r.2).sum(), k, batch_size) {
+                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, total_m, k, batch_size) {
                     Some(tile) => {
                         let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Regions);
                         (name, rows, block, tile[0] as usize)
                     }
                     None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions", 64, 128, 8),
                 };
-            ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                name, rows, block, bv)
+            ("qwen4_gemm_mqv2_wmma_gfx11_bt", Some(kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC),
+                name, rows, block, 16 * bv)
         };
         let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(rows)).sum();
         if row_tiles == 0 || batch_size == 0 || k == 0 {
             return Ok(true);
         }
         self.bind_thread()?;
-        self.ensure_kernel(module, source, name)?;
+        match source {
+            Some(source) => self.ensure_kernel(module, source, name)?,
+            None => self.ensure_embedded_kernel(module, kernels::QWEN4_MQ6_X4_PM_GFX1151, name)?,
+        }
         let mut ptrs = [
             regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
             x_f16.buf.as_ptr(),
@@ -40899,12 +40960,11 @@ impl Gpu {
                 dims.as_mut_ptr().wrapping_add(i - 7).cast()
             }
         });
-        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
         let bytes = total_m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
             + batch_size * k * 2 + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
         let result = self.launch_maybe_blob(
-            name, [row_tiles as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            name, [row_tiles as u32, batch_size.div_ceil(n_tile) as u32, 1],
             [block, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 for ptr in ptrs { blob.push_ptr(ptr); }
@@ -46838,6 +46898,143 @@ mod tests {
             );
             gpu.free_tensor(x_gpu).expect("free x");
             gpu.free_tensor(a).expect("free a");
+        }
+    }
+
+    /// The gfx1151 selective PM route takes only launches of at least
+    /// `QWEN4_MQ6_X4_PM_MIN_M_GFX1151` rows and `QWEN4_MQ6_X4_PM_MIN_N_GFX1151` tokens.
+    #[test]
+    fn mq6_x4_pm_gfx1151_shape_thresholds() {
+        assert_eq!((QWEN4_MQ6_X4_PM_MIN_M_GFX1151, QWEN4_MQ6_X4_PM_MIN_N_GFX1151), (2560, 2048));
+        // The FN pp8192 trunk shapes (N = 8192): plain 12288, bf16out 10240, regions 6240.
+        for m in [12288usize, 10240, 6240, 2560] {
+            assert!(mq6_x4_pm_gfx1151_shape(m, 8192), "M={m}");
+        }
+        assert!(mq6_x4_pm_gfx1151_shape(2560, 2048));
+        assert!(!mq6_x4_pm_gfx1151_shape(2559, 2048));
+        assert!(!mq6_x4_pm_gfx1151_shape(2560, 2047));
+        // Small projections (M 640 / 512 / 64) and short chunks stay on hipcc / U3.
+        for m in [640usize, 512, 64] {
+            assert!(!mq6_x4_pm_gfx1151_shape(m, 8192), "M={m}");
+        }
+        assert!(!mq6_x4_pm_gfx1151_shape(10240, 1131));
+        assert!(!mq6_x4_pm_gfx1151_shape(10240, 512));
+    }
+
+    /// gfx1151: the builder-module `_w8` and `_w8_bf16out` entries (selected through
+    /// `mqv2_wmma_gfx11_bt_pm`) and the `_w8_regions` entry (through
+    /// `gemm_mq6g256v2_xf16_regions_pm`) must produce the bytes of the hipcc / U3 launches
+    /// (`pm = false`) on shapes at and above the thresholds, with ragged row and token
+    /// tails in the last 128-row block and 256-token tile.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn mq6_x4_pm_gfx1151_matches_hipcc_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1151" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1151");
+                return;
+            }
+        };
+        let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let weights_of = |rows: usize, k: usize, seed: u32| -> Vec<u8> {
+            let mut weights = vec![0u8; rows * k / 256 * group];
+            let mut state = seed;
+            for chunk in weights.chunks_mut(group) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                    chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            weights
+        };
+        let x_of = |n: usize, k: usize| -> Vec<f32> {
+            (0..n * k).map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0).collect()
+        };
+        // Plain F32 and BF16 output overwrite.
+        for (m, k, n) in [(2560usize, 2560usize, 2048usize), (2563, 512, 2049), (6240, 2560, 2300)] {
+            let a = gpu.upload_raw(&weights_of(m, k, 13), &[m * k / 256 * group]).expect("w upload");
+            let x_gpu = gpu.upload_f32(&x_of(n, k), &[n * k]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run_f32 = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("f32 overwrite");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run_f32(&mut gpu, false);
+            let got = run_f32(&mut gpu, true);
+            assert!(want.iter().any(|v| *v != 0.0));
+            let differing = got.iter().zip(&want).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+            assert_eq!(differing, 0, "plain: builder module differs from hipcc in {differing} cells at M={m} K={k} N={n}");
+            let run_bf16 = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.zeros(&[n * m], DType::BF16).expect("BF16 y");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("bf16 overwrite");
+                let mut bytes = vec![0u8; n * m * 2];
+                gpu.hip.memcpy_dtoh(&mut bytes, &y.buf).expect("BF16 download");
+                gpu.free_tensor(y).expect("free y");
+                bytes
+            };
+            let want = run_bf16(&mut gpu, false);
+            let got = run_bf16(&mut gpu, true);
+            assert!(want.iter().any(|b| *b != 0));
+            let differing = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+            assert_eq!(differing, 0, "bf16out: builder module differs from hipcc in {differing} bytes at M={m} K={k} N={n}");
+            gpu.free_tensor(x_gpu).expect("free x");
+            gpu.free_tensor(a).expect("free a");
+        }
+        // Regions (a/b/z row fold): three F32 outputs, summed rows >= the M threshold.
+        for (ms, k, n) in [([48usize, 48, 6144], 2560usize, 2048usize), ([50, 49, 2561], 2560, 2049)] {
+            let regions_w: Vec<GpuTensor> = ms
+                .iter()
+                .enumerate()
+                .map(|(i, &m)| {
+                    gpu.upload_raw(&weights_of(m, k, 21 + i as u32), &[m * k / 256 * group]).expect("region w")
+                })
+                .collect();
+            let x_gpu = gpu.upload_f32(&x_of(n, k), &[n * k]).expect("x upload");
+            let x16 = gpu.rotate_x_mq_batched_f16(&x_gpu, k, n).expect("rotate f16");
+            let run = |gpu: &mut Gpu, pm: bool| -> Vec<Vec<f32>> {
+                let ys: Vec<GpuTensor> = ms
+                    .iter()
+                    .map(|&m| {
+                        let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+                        gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload")
+                    })
+                    .collect();
+                let regions = [
+                    (&regions_w[0], &ys[0], ms[0]),
+                    (&regions_w[1], &ys[1], ms[1]),
+                    (&regions_w[2], &ys[2], ms[2]),
+                ];
+                let launched = gpu
+                    .gemm_mq6g256v2_xf16_regions_pm(&regions, &x16, k, n, pm)
+                    .expect("regions overwrite");
+                assert!(launched, "regions fold did not apply at K={k} N={n}");
+                let out = ys.iter().map(|y| gpu.download_f32(y).expect("y download")).collect();
+                for y in ys {
+                    gpu.free_tensor(y).expect("free y");
+                }
+                out
+            };
+            let want = run(&mut gpu, false);
+            let got = run(&mut gpu, true);
+            for (region, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(w.iter().any(|v| *v != 0.0));
+                let differing = g.iter().zip(w).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+                assert_eq!(differing, 0, "regions: builder module differs from hipcc in {differing} cells of region {region} at M={ms:?} K={k} N={n}");
+            }
+            gpu.free_tensor(x16).expect("free x16");
+            gpu.free_tensor(x_gpu).expect("free x");
+            for w in regions_w {
+                gpu.free_tensor(w).expect("free w");
+            }
         }
     }
 
