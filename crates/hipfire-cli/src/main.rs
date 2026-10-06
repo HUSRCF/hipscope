@@ -2502,6 +2502,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     insert_optional_f64(&mut request, "min_p", min_p);
     insert_optional_f64(&mut request, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut request, "repeat_penalty", repeat_penalty);
+    if args.max_tokens.is_none() {
+        // The configured default is only a ceiling: the daemon fits it to the
+        // context left after the prompt, as serve does for an omitted value.
+        request["max_tokens_fit"] = serde_json::Value::Bool(true);
+    }
     if let Some(system) = system_prompt {
         request["system"] = serde_json::Value::String(system);
     }
