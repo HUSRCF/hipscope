@@ -620,13 +620,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "hc_activation_fused_f32", "hc_state_bf16_add_f32", "hc_state_bf16_to_f32", "hyper_norm_f32", "hyper_norm_gate_f32",
             "hyper_norm_gate_outputs", "hyper_norm_gate_outputs_f32", "hyper_read_f32", "hyper_read_projected_f32", "hyper_read_up_fused_f32",
             "hyper_write_bf16x2", "hyper_write_f32", "indexed_attention_attention_f32", "indexed_attention_attention_f32_batched",
-            "indexed_attention_attention_f32_batched_hg4", "indexed_attention_attention_f32_batched_serial",
+            "indexed_attention_attention_f32_batched_hg12", "indexed_attention_attention_f32_batched_hg4",
+            "indexed_attention_attention_f32_batched_serial",
             "indexed_attention_attention_f32_serial", "indexed_attention_cache_append_f32", "indexed_attention_cache_append_f32_batched",
             "indexed_attention_decode_prologue_f32", "indexed_attention_index_key_append_bf16_batched", "indexed_attention_norm_rope_f32",
             "indexed_attention_norm_rope_f32_batched", "indexed_attention_pool_rope_bf16", "indexed_attention_pool_rope_f32",
             "indexed_attention_reuse_selection", "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial",
             "indexed_attention_select_f32", "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial",
-            "indexed_attention_select_f32_serial", "scale_f32",
+            "indexed_attention_select_f32_serial", "indexed_attention_select_from_scores", "indexed_attention_select_scores_rows16_f32",
+            "indexed_attention_select_scores_rows8_f32", "scale_f32",
         ]);
     }
     if arch == "gfx1201" {

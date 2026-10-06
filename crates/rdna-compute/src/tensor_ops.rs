@@ -3374,6 +3374,24 @@ fn indexed_attention_select_batch_impl(
     let parallel = gpu.arch_caps.has_gfx11_plus_simt()
         && shape_blocks > 0
         && !select_forced_serial();
+    // Live F32 launches with the pinned index geometry score eight rows per
+    // pooled key read into the shared F16 X scratch, then select from those
+    // scores (any block count: the score rows live in global memory). The
+    // opt-in exact selector (`HIPFIRE_QWEN4_QSA_SELECT_EXACT=1`) keeps its
+    // own route.
+    if parallel
+        && !*QWEN4_QSA_SELECT_EXACT
+        && p.pooled.dtype == DType::F32
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.block_count > 0
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
+    {
+        return indexed_attention_select_rows8(gpu, p, mirror);
+    }
     // Past the LDS row the scores go to global rows (one per workgroup, at
     // most QSA_SELECT_GLOBAL_ROWS per launch); the selection is the same.
     let global = parallel
@@ -3524,6 +3542,109 @@ fn indexed_attention_select_batch_impl(
     )?;
     Ok(mirror.is_some())
 }
+
+/// Score-scratch budget of [`indexed_attention_select_rows8`]: rows are
+/// selected in groups whose scores fit it.
+const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
+/// `indexed_attention_select_from_scores` holds the chosen blocks in 512 LDS
+/// entries; larger budgets take the batched kernel.
+const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
+
+/// [`indexed_attention_select_batch_impl`]'s live route: row groups of
+/// `indexed_attention_select_scores_rows{8,16}_f32` scores, each followed by
+/// `indexed_attention_select_from_scores` reading them. Selection bytes are
+/// unchanged.
+fn indexed_attention_select_rows8(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    let stride = p.block_count;
+    // Prefill scores sixteen rows per pooled-key read; decode and few-row
+    // verify keep eight (the sixteen-row kernel costs them more than it saves).
+    let (score_kernel, score_rows) = if p.rows > 8 {
+        ("indexed_attention_select_scores_rows16_f32", 16)
+    } else {
+        ("indexed_attention_select_scores_rows8_f32", 8)
+    };
+    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
+        .max(16)
+        .min(p.rows);
+    // Growth goes through the accessor that invalidates captured state first.
+    let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
+    for kernel in [score_kernel, "indexed_attention_select_from_scores"] {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    }
+    let mirror =
+        mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let block_tiles = checked_u32(p.block_count.div_ceil(256), "QSA select block tiles")?;
+    let mut g0 = 0usize;
+    while g0 < p.rows {
+        let n = group.min(p.rows - g0);
+        let query = unsafe {
+            (p.query.buf.as_ptr() as *mut f32).add(g0 * p.query_row_stride) as *mut std::ffi::c_void
+        };
+        let selected = unsafe {
+            (p.selected.buf.as_ptr() as *mut i32).add(g0 * p.capacity) as *mut std::ffi::c_void
+        };
+        let position_start = checked_i32(p.position_start + g0, "QSA batch select position")?;
+        let rows = checked_i32(n, "QSA batch select rows")?;
+        let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(query);
+        args.push_ptr(p.pooled.buf.as_ptr());
+        args.push_ptr(scores);
+        args.push_i32(rows);
+        args.push_i32(query_row_stride);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(block_count);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            score_kernel,
+            [
+                block_tiles,
+                checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
+                1,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        // The persistent selection is the final row's: the last group's.
+        let last = g0 + n == p.rows;
+        let mirror_ptr = mirror
+            .filter(|_| last)
+            .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
+        let mut args = KernargBlob::new();
+        args.push_ptr(scores);
+        args.push_i32(block_count);
+        args.push_ptr(selected);
+        args.push_i32(rows);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.budget_blocks, "QSA batch select budget")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
+        args.push_ptr(mirror_ptr);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "indexed_attention_select_from_scores",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        g0 += n;
+    }
+    Ok(mirror.is_some())
+}
+
 /// Device-side stable reuse of a prior MTP QSA selection row.
 ///
 /// `selected` is a byte-addressed [`DType::Raw`] allocation containing i32
@@ -3982,6 +4103,15 @@ pub struct IndexedAttentionAttentionBatch<'a> {
 
 /// Query heads per workgroup in `indexed_attention_attention_f32_batched_hg4`.
 const QSA_ATTENTION_HG4_HEADS: usize = 4;
+/// Query heads per KV head of `indexed_attention_attention_f32_batched_hg12`
+/// (one workgroup per KV group; its scores live in registers, QSA_T = 9
+/// tiles of 256 selected rows).
+const QSA_ATTENTION_HG12_HEADS: usize = 12;
+const QSA_ATTENTION_HG12_MAX_SELECTED: usize = 9 * 256;
+/// Few-row verify launches only `rows * n_kv_heads` hg12 workgroups; hg4's
+/// three per KV group fill the GPU better there (4-row MTP verify at 32k
+/// context: decode 51.4 -> 50.8 tok/s with hg12).
+const QSA_ATTENTION_HG12_MIN_ROWS: usize = 16;
 
 /// Below this many rows the grouped kernel launches too few workgroups
 /// (`rows * n_heads / 4`) to fill the GPU and the per-head kernel is faster
@@ -4149,10 +4279,27 @@ fn indexed_attention_attention_batch_impl(
     let capacity = checked_i32(p.capacity, "QSA batch attention capacity")?;
     let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
-    let hg4_bytes = allow_fast
+    let hg12 = allow_fast
+        && p.format == QsaKvFormat::F32
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && p.head_dim == 256
+        && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
+        && p.rows >= QSA_ATTENTION_HG12_MIN_ROWS
+        && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
+    let hg4_bytes = (allow_fast && !hg12)
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
         .flatten();
-    let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes {
+    let (kernel_name, grid, shared_mem) = if hg12 {
+        (
+            "indexed_attention_attention_f32_batched_hg12",
+            [
+                checked_u32(p.n_kv_heads, "QSA batch attention KV head grid")?,
+                1,
+                row_grid,
+            ],
+            0,
+        )
+    } else if let Some(bytes) = hg4_bytes {
         (
             p.format.kernel([
                 "indexed_attention_attention_f32_batched_hg4",
@@ -7597,12 +7744,12 @@ mod tests {
         gpu.free_tensor(selected_gpu).expect("free selected");
     }
 
-    /// The grouped QSA attention kernel must equal the per-head batched kernel
-    /// bit for bit at the production shape (24 heads, 2 KV heads, head_dim
-    /// 256): permuted selections, invalid slots, a partial key tile and
-    /// rows with and without a tail all included.
+    /// The grouped QSA attention kernels must equal the per-head batched
+    /// kernel bit for bit (24 heads, head_dim 256; 2 KV heads is the
+    /// production shape): permuted selections, invalid slots, a partial key
+    /// tile and rows with and without a tail all included.
     #[test]
-    fn qsa_attention_hg4_is_bit_identical_to_per_head_kernel() {
+    fn qsa_attention_grouped_is_bit_identical_to_per_head_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
@@ -7611,107 +7758,111 @@ mod tests {
             eprintln!("skip: needs a gfx11/gfx12 GPU");
             return;
         }
-        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
-        // 600+ visible tokens with a 150-block budget: selections longer than
-        // one 256-row score pass, plus the causal tail.
-        let (rows, position_start, full_capacity) = (20usize, 610usize, 640usize);
-        let budget_blocks = 150usize;
-        let capacity = budget_blocks * compress + compress - 1;
-        let lcg = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n)
-                .map(|i| {
-                    ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
-                        / 997.0
-                })
-                .collect()
-        };
-        let q = lcg(1, rows * n_heads * 2 * head_dim);
-        let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
-        let values = lcg(13, full_capacity * n_kv_heads * head_dim);
-        let mut selected = vec![-1i32; rows * capacity];
-        for row in 0..rows {
-            let visible = position_start + row + 1;
-            let blocks = visible / compress;
-            let chosen = budget_blocks.min(blocks);
-            // Descending-stride block choice, then the tail, as the selector emits.
-            for slot in 0..chosen {
-                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
-                for r in 0..compress {
-                    selected[row * capacity + slot * compress + r] =
-                        block * compress as i32 + r as i32;
+        // hg12 (2 KV heads) over three and nine 256-row tiles, hg4 (6 KV heads).
+        for (n_kv_heads, position_start, full_capacity, budget_blocks) in [
+            (2usize, 610usize, 640usize, 150usize),
+            (2, 2100, 2200, 512),
+            (6, 610, 640, 150),
+        ] {
+            let (n_heads, head_dim, compress) = (24usize, 256usize, 4usize);
+            let rows = 20usize;
+            let capacity = budget_blocks * compress + compress - 1;
+            let lcg = |seed: usize, n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
+                            / 997.0
+                    })
+                    .collect()
+            };
+            let q = lcg(1, rows * n_heads * 2 * head_dim);
+            let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
+            let values = lcg(13, full_capacity * n_kv_heads * head_dim);
+            let mut selected = vec![-1i32; rows * capacity];
+            for row in 0..rows {
+                let visible = position_start + row + 1;
+                let blocks = visible / compress;
+                let chosen = budget_blocks.min(blocks);
+                // Descending-stride block choice, then the tail, as the selector emits.
+                for slot in 0..chosen {
+                    let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                    for r in 0..compress {
+                        selected[row * capacity + slot * compress + r] =
+                            block * compress as i32 + r as i32;
+                    }
                 }
+                let mut offset = chosen * compress;
+                for token in blocks * compress..visible {
+                    selected[row * capacity + offset] = token as i32;
+                    offset += 1;
+                }
+                // An invalid slot inside the active length must be skipped.
+                selected[row * capacity + 3] = -1;
             }
-            let mut offset = chosen * compress;
-            for token in blocks * compress..visible {
-                selected[row * capacity + offset] = token as i32;
-                offset += 1;
+            let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+            let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+            let values_gpu = gpu
+                .upload_f32(&values, &[values.len()])
+                .expect("values upload");
+            let selected_gpu = gpu
+                .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+                .expect("selected allocation");
+            let bytes = selected
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip
+                .memcpy_htod(&selected_gpu.buf, &bytes)
+                .expect("selected upload");
+            let run = |gpu: &mut Gpu, allow_fast: bool| {
+                let output = gpu
+                    .zeros(&[rows * n_heads * head_dim], DType::F32)
+                    .expect("output allocation");
+                indexed_attention_attention_batch_impl(
+                    gpu,
+                    &IndexedAttentionAttentionBatch {
+                        q_with_gate: &q_gpu,
+                        full_keys: &keys_gpu,
+                        full_values: &values_gpu,
+                        selected: &selected_gpu,
+                        output: &output,
+                        rows,
+                        position_start,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        budget_blocks,
+                        compress,
+                        capacity,
+                        full_capacity,
+                        format: QsaKvFormat::F32,
+                        shape_selected: capacity,
+                    },
+                    allow_fast,
+                )
+                .expect("QSA attention");
+                let values = gpu.download_f32(&output).expect("output download");
+                gpu.free_tensor(output).expect("free output");
+                values
+            };
+            let reference = run(&mut gpu, false);
+            let grouped = run(&mut gpu, true);
+            assert!(
+                reference.iter().any(|v| *v != 0.0),
+                "reference output is all zero"
+            );
+            let differing = reference
+                .iter()
+                .zip(&grouped)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "grouped QSA attention differs in {differing} cells"
+            );
+            for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+                gpu.free_tensor(tensor).expect("free");
             }
-            // An invalid slot inside the active length must be skipped.
-            selected[row * capacity + 3] = -1;
-        }
-        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
-        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
-        let values_gpu = gpu
-            .upload_f32(&values, &[values.len()])
-            .expect("values upload");
-        let selected_gpu = gpu
-            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
-            .expect("selected allocation");
-        let bytes = selected
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect::<Vec<_>>();
-        gpu.hip
-            .memcpy_htod(&selected_gpu.buf, &bytes)
-            .expect("selected upload");
-        let run = |gpu: &mut Gpu, allow_fast: bool| {
-            let output = gpu
-                .zeros(&[rows * n_heads * head_dim], DType::F32)
-                .expect("output allocation");
-            indexed_attention_attention_batch_impl(
-                gpu,
-                &IndexedAttentionAttentionBatch {
-                    q_with_gate: &q_gpu,
-                    full_keys: &keys_gpu,
-                    full_values: &values_gpu,
-                    selected: &selected_gpu,
-                    output: &output,
-                    rows,
-                    position_start,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    budget_blocks,
-                    compress,
-                    capacity,
-                    full_capacity,
-                    format: QsaKvFormat::F32,
-                    shape_selected: capacity,
-                },
-                allow_fast,
-            )
-            .expect("QSA attention");
-            let values = gpu.download_f32(&output).expect("output download");
-            gpu.free_tensor(output).expect("free output");
-            values
-        };
-        let reference = run(&mut gpu, false);
-        let grouped = run(&mut gpu, true);
-        assert!(
-            reference.iter().any(|v| *v != 0.0),
-            "reference output is all zero"
-        );
-        let differing = reference
-            .iter()
-            .zip(&grouped)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        assert_eq!(
-            differing, 0,
-            "grouped QSA attention differs in {differing} cells"
-        );
-        for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
-            gpu.free_tensor(tensor).expect("free");
         }
     }
 
@@ -8231,14 +8382,26 @@ mod tests {
         for &compress in &[2usize, 4, 8] {
             for &index_dim in &[8usize, 128] {
                 for &index_heads in &[1usize, 4] {
-                    for &rows in &[1usize, 5] {
+                    // 37 rows: three sixteen-row scoring groups, the last
+                    // partial, each row with its own visible block count.
+                    for &rows in &[1usize, 5, 37] {
                         // `(position_start + rows) / compress` must equal the
                         // wrapper's declared block count.
-                        if rows > compress - 1 {
+                        if rows < 37 && rows > compress - 1 {
                             continue;
                         }
                         for &block_count in &[0usize, 1, 3, 17, 72, 128, 500] {
                             for &budget_blocks in &[1usize, 4, 64, 512] {
+                                // Many rows: the pinned geometry (the live
+                                // rows16 route), smaller budgets.
+                                let pinned = compress == 4 && index_heads == 4 && index_dim == 128;
+                                if rows == 37
+                                    && (!pinned
+                                        || budget_blocks > 64
+                                        || block_count * compress + compress - 1 < rows)
+                                {
+                                    continue;
+                                }
                                 let case = SelectCase {
                                     compress,
                                     index_heads,
@@ -8247,7 +8410,11 @@ mod tests {
                                     block_count,
                                     budget_blocks,
                                     capacity: budget_blocks * compress + compress - 1,
-                                    position_start: block_count * compress,
+                                    position_start: if rows < compress {
+                                        block_count * compress
+                                    } else {
+                                        block_count * compress + compress - 1 - rows
+                                    },
                                 };
                                 let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
                                     .map(|_| next())
