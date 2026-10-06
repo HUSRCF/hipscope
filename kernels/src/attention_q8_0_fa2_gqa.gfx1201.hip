@@ -62,6 +62,16 @@
 #define HIPFIRE_FA2_KMODE 0
 #endif
 
+// Product split-KV verifier (HIPFIRE_GFX12_FA2_SPLIT_VERIFY): only the base
+// f16/Q8 `attention_q8_0_fa2_gqa_{partial,merge}_gfx1201` entries use the CK
+// style LSE + normalized-Oacc record layout. Every other module build
+// (fp8-KV KMODE=8, FP8 renamed symbols, fwht3k KMODE=3, stage-b / packet)
+// keeps the 258-float [m, l, O_unnormalized] records, so those objects stay
+// byte-identical.
+#if HIPFIRE_FA2_KMODE == 0 && !defined(HIPFIRE_FA2_FP8)
+#define HIPFIRE_FA2_SPLIT_LSE_ENTRY 1
+#endif
+
 // U0 scaffold: HIPFIRE_FA2_FP8 renames entry symbols only. Body stays the
 // f16 kernel until Ua (planes) / Ub (QK) / Uc (PV). gfx120x-only.
 #ifdef HIPFIRE_FA2_FP8
@@ -125,13 +135,19 @@ static __device__ __forceinline__ float fa2_fp8_e4m3_to_f32(unsigned char b) {
 #endif
 
 // Shared workgroup body. PARTIAL=false writes normalized O to `out`;
-// PARTIAL=true writes [m, l, O_unnormalized[256]] records (stride 258) to
-// `out`. `tile0/tile1` bound the KT64 tile range (direct: whole sequence;
-// partial split: this split's disjoint range). `split` selects the record
-// plane for PARTIAL (ignored otherwise). Q arrives f16 pre-converted
-// row-major [batch, 24, 256] (see attention_fa2_q_preconvert_gfx1201);
-// the body never touches f32 Q.
-template <bool PARTIAL>
+// PARTIAL=true && !SPLIT_LSE writes [m, l, O_unnormalized[256]] records
+// (stride 258) to `out`. `tile0/tile1` bound the KT64 tile range (direct:
+// whole sequence; partial split: this split's disjoint range). `split`
+// selects the record plane for PARTIAL (ignored otherwise).
+// SPLIT_LSE (PARTIAL only; the product split-KV verifier, see
+// attention_q8_0_fa2_gqa_partial_gfx1201) follows CK split-KV's accumulator
+// contract in one caller-owned allocation: F32 LSE records first, then
+// normalized F32 O accumulators, record index
+// ((query * H + head) * n_splits + split); tile0/tile1 are ignored and each
+// split takes its range of the live tiles derived from positions[]. Q arrives
+// f16 pre-converted row-major [batch, 24, 256] (see
+// attention_fa2_q_preconvert_gfx1201); the body never touches f32 Q.
+template <bool PARTIAL, bool SPLIT_LSE = false>
 __device__ __forceinline__ void fa2_gqa_body(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
@@ -218,7 +234,18 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int seq_len = gmax + 1;
 
     // ---- Transitions 2-4: KT64 tiles ----
-    for (int tile = tile0; tile < tile1; ++tile) {
+    // SPLIT_LSE: this split owns a disjoint range of the live KT64 tiles
+    // derived from positions[] (not the max-context-sized static range the
+    // caller passes for the legacy 258-float records).
+    int t_begin = tile0;
+    int t_end = tile1;
+    if constexpr (SPLIT_LSE) {
+        const int tiles_total = (seq_len + 63) / 64;
+        const int tiles_per_split = (tiles_total + n_splits - 1) / n_splits;
+        t_begin = split * tiles_per_split;
+        t_end = min(t_begin + tiles_per_split, tiles_total);
+    }
+    for (int tile = t_begin; tile < t_end; ++tile) {
         const int ktile = tile * 64;
         if (ktile >= seq_len)
             break;
@@ -692,6 +719,37 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                     for (int j = 0; j < 8; ++j)
                         out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+                }
+            }
+        } else if constexpr (SPLIT_LSE) {
+            // CK-style split-KV contract. Keep LSE and Oacc in separate
+            // logical planes so the combine kernel has unambiguous strides:
+            //   lse[record]
+            //   oacc[record][256] (normalized partial output)
+            // record = ((query * H + head) * n_splits + split).
+            const unsigned records =
+                (unsigned)batch_size * 24u * (unsigned)n_splits;
+            float* lse = out;
+            float* oacc = out + records;
+            const unsigned record =
+                ((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                    * (unsigned)n_splits + (unsigned)split;
+            const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+            if (kg == 0) {
+                if (qok_ml) {
+                    lse[record] = l_val > 0.0f
+                        ? m_old + __logf(l_val)
+                        : -INFINITY;
+                }
+            }
+            if (qok_ml) {
+                float* rec = oacc + record * 256u;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = (unsigned)(kg * 8 + j);
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j] * inv;
                 }
             }
         } else {
@@ -1619,6 +1677,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
     const int split = blockIdx.z;
     if (split >= n_splits)
         return;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_ENTRY)
+    // Product split-KV: each split derives its tile range from the live
+    // seq_len inside the body (SPLIT_LSE) and writes LSE + normalized O.
+    fa2_gqa_body<true, true>(q16, k_cache, v_cache, partials, positions,
+                             batch_size, scale_attn, kv_h, q_base, 0, 0,
+                             split, n_splits);
+#else
     // Key-range partition needs seq_len, which lives in positions[] on
     // the host side of the launcher... instead partition by tile index
     // with an unbounded range: split s owns tiles [s*T/S,(s+1)*T/S) of
@@ -1630,6 +1695,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
     const int t1 = t0 + per;
     fa2_gqa_body<true>(q16, k_cache, v_cache, partials, positions, batch_size,
                        scale_attn, kv_h, q_base, t0, t1, split, n_splits);
+#endif
 }
 #endif
 
@@ -1701,6 +1767,31 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
     const int rec = blockIdx.x * 8 + wave;
     if (rec >= batch_size * n_heads)
         return;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_ENTRY)
+    // Product split-KV records (see fa2_gqa_body<true, true>): F32 LSE plane
+    // first, then normalized F32 O accumulators. Stable max-LSE combine; a
+    // split with no live tiles carries LSE=-inf and contributes nothing.
+    const long long records =
+        (long long)batch_size * n_heads * n_splits;
+    const float* lse = partials;
+    const float* oacc = partials + records;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s)
+        m = fmaxf(m, lse[(long long)rec * n_splits + s]);
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const long long record = (long long)rec * n_splits + s;
+            const float split_lse = lse[record];
+            const float w = isfinite(split_lse) ? __expf(split_lse - m) : 0.0f;
+            den += w;
+            num += w * oacc[record * head_dim + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+#else
     float m = -INFINITY;
     for (int s = 0; s < n_splits; ++s) {
         const float* pr =
@@ -1721,6 +1812,7 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
         out[(long long)rec * head_dim + d] =
             (den > 0.0f) ? num / den : 0.0f;
     }
+#endif
 }
 #endif
 // ---- Packet-minimal Q128 body (FaPacket K1, exact) ----

@@ -7167,17 +7167,36 @@ impl Gpu {
         result
     }
 
-    /// Benchmark-only split-KV FA2 GQA path (S partitions + stable merge).
+    /// F32 elements of caller-owned scratch that
+    /// [`Self::attention_q8_0_fa2_gqa_split_gfx1201`] needs: one LSE plane
+    /// (`n_splits * batch * n_heads`) plus normalized-O accumulators
+    /// (`head_dim` each). Callers sharing a scratch buffer (the verifier
+    /// reuses `flash_partials`) MUST check capacity against this before
+    /// taking the split route; the launcher returns `Err` when it is too
+    /// small.
+    pub fn fa2_gqa_split_gfx1201_partials_len(
+        n_splits: usize,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> usize {
+        n_splits * batch_size * n_heads * (head_dim + 1)
+    }
+
+    /// gfx1201 split-KV FA2 GQA path (S partitions + stable merge), used by
+    /// the opt-in DFlash verifier route (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY=1`).
     ///
     /// `partials` is caller-owned F32 scratch of at least
-    /// `n_splits * batch_size * n_heads * (head_dim + 2)` elements; this
+    /// `n_splits * batch_size * n_heads * (head_dim + 1)` elements: an LSE
+    /// plane followed by normalized-O accumulators (the base f16/Q8
+    /// `partial`/`merge` entries only; the fp8 / stage-b / packet split
+    /// entries keep their 258-float records). This
     /// method never allocates. Partial grid is `[ceil(batch/8), 4,
     /// n_splits]` (block 128, LDS 65536); merge grid is
     /// `[ceil(batch*n_heads/8), 1, 1]` (block 256, LDS 0). No profile
     /// timer: the harness times the whole call with GPU events.
-    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_fa2_gqa_split_gfx1201_bench(
+    pub fn attention_q8_0_fa2_gqa_split_gfx1201(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -7196,7 +7215,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires gfx1201, got {}",
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -7205,7 +7224,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires H24/KV4/D256, got \
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires H24/KV4/D256, got \
                      H{n_heads}/KV{n_kv_heads}/D{head_dim}"
                 ),
             ));
@@ -7214,7 +7233,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires 1 <= batch <= 384, got {batch_size}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= batch <= 384, got {batch_size}"
                 ),
             ));
         }
@@ -7222,16 +7241,17 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires 1 <= n_splits <= 8, got {n_splits}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 8, got {n_splits}"
                 ),
             ));
         }
-        let need_partials = n_splits * batch_size * n_heads * (head_dim + 2);
+        let need_partials =
+            Self::fa2_gqa_split_gfx1201_partials_len(n_splits, batch_size, n_heads, head_dim);
         if partials.numel() < need_partials {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench scratch too small: \
+                    "attention_q8_0_fa2_gqa_split_gfx1201 scratch too small: \
                      partials={} (need>={need_partials})",
                     partials.numel()
                 ),
