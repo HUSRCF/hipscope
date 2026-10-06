@@ -396,6 +396,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gdn_chunk_prep_fixup", kernels::GDN_CHUNK_PREP_FIXUP_SRC, ["gdn_chunk_prep_fixup"]);
         add!("gdn_chunk_scan_bf16", kernels::GDN_CHUNK_SCAN_BF16_SRC, ["gdn_chunk_scan_bf16"]);
         add!("gdn_chunk_scan_bf16_mseg", kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, ["gdn_chunk_scan_bf16_mseg"]);
+        add!("fn_gdn_dense", kernels::FN_GDN_DENSE_SRC, ["fn_gdn_dense_producer", "fn_gdn_dense_gate_bf16in", "fn_gdn_dense_gate_rotate_bf16in"]);
         add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
         add!("qwen35_fa_prep_fp8q_nogate_batched_gfx1201", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1201_SRC, ["qwen35_fa_prep_batched_gfx1201", "qwen35_fa_prep_fp8q_batched_gfx1201", "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"]);
         add!("select_regrid", crate::select_regrid::SELECT_REGRID_SRC, ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]);
@@ -1157,11 +1158,12 @@ mod tests {
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid), the
         // five multi-slot `*_paged` modules of the q8/asym3 routes, the
         // 36 H2 decode, prefill, MTP and DFlash modules added for
-        // compiler-free packs, the 36 Qwen3.8-Flash-Next modules
+        // compiler-free packs, the 37 Qwen3.8-Flash-Next modules (including
+        // the gfx1201 `fn_gdn_dense` adapter)
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv) and the 32
         // Qwen3.5-MoE modules (tests/fixtures/kernel-trace-qwen35.tsv). Those
-        // 113 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 113, "unexpected gfx1201 inventory size");
+        // 114 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 114, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

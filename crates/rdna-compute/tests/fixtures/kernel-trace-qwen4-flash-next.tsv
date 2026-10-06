@@ -4,6 +4,8 @@
 # ~300, ~450, ~1.4K and ~3K-token prompts, greedy native MTP on ~20, ~1.4K and ~3K.
 # Empty exe-relative cold dir; each row is a <module>.index.json the runtime
 # wrote back. Columns: arch, module, symbols the run resolved.
+# gfx1201 inventory also covers the default fused FN dense scan's loaded
+# modules; pipe128 Q8 remains required for short tails and decode.
 gfx1151	add	add_f32
 gfx1151	convert_f32_to_f16	convert_f32_to_f16
 gfx1151	copy_f32_buffer	copy_f32_buffer
@@ -59,6 +61,9 @@ gfx1201	add	add_f32
 gfx1201	convert_f32_to_f16	convert_f32_to_f16
 gfx1201	copy_f32_buffer	copy_f32_buffer
 gfx1201	embedding_q8_batched	embedding_q8_batched
+gfx1201	fn_gdn_dense	fn_gdn_dense_producer,fn_gdn_dense_gate_bf16in,fn_gdn_dense_gate_rotate_bf16in
+gfx1201	gdn_chunk_kkt_solve_batched	gdn_chunk_kkt_solve_batched
+gfx1201	gdn_chunk_scan_bf16_mseg	gdn_chunk_scan_bf16_mseg
 gfx1201	gemm_bf16_xf32_multirow	gemm_bf16_xf32_multirow
 gfx1201	gemm_bf16_xf32_multirow_r16w4_gfx1151	gemm_bf16_xf32_multirow_r16w4_gfx1151
 gfx1201	gemm_bf16_xf32_multirow_r16w4t_gfx1151	gemm_bf16_xf32_multirow_r16w4t_gfx1151

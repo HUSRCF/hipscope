@@ -8439,6 +8439,16 @@ pub const GDN_CHUNK_SCAN_BF16_MSEG_SRC: &str = concat!(
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip")
 );
 
+/// gfx1201 FN dense GDN scan adapter (`fn_gdn_dense_producer`: convolution +
+/// gate params + Q/K norm + F16 packing + chunk cumsum + EF zero in one
+/// launch; `fn_gdn_dense_gate_bf16in` / `fn_gdn_dense_gate_rotate_bf16in`: the
+/// gated RMSNorm [+ rotation] reading the scan's BF16 plane). Default compile
+/// flags, like tensor_ops, whose expressions it copies bit for bit.
+pub const FN_GDN_DENSE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/fn_gdn_dense.gfx1201.hip")
+);
+
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K
 /// head directly, eliminating the materializing repeat-interleave launch.

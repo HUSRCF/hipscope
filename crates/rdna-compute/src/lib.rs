@@ -35,6 +35,8 @@ pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
+#[cfg(feature = "deltanet")]
+pub mod fn_gdn_dense;
 pub mod norm;
 pub mod page_pool;
 pub mod pool;

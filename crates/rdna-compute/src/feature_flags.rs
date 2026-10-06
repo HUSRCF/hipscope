@@ -560,6 +560,9 @@ pub struct FeatureFlags {
     /// Byte-identical; default on (the replay admission gates the arch);
     /// `HIPFIRE_DN_SNAPSHOT_FLIP=0` restores the copy.
     pub dn_snapshot_flip: bool,
+    /// Default-on gfx1201 Flash-Next dense GDN prefill scan (architecture and
+    /// admission are gated by the runtime); `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
+    pub fn_gdn_dense_scan: bool,
 }
 
 impl FeatureFlags {
@@ -1002,6 +1005,7 @@ impl FeatureFlags {
             gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
+            fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
         }
     }
 
@@ -1401,6 +1405,7 @@ impl FeatureFlags {
             gdn_replay_ml_off: false,
             select_regrid_off: false,
             dn_snapshot_flip: false,
+            fn_gdn_dense_scan: false,
         }
     }
 }
@@ -1422,6 +1427,21 @@ mod tests {
                 }
             });
             assert_eq!(flags.dn_snapshot_flip, expected);
+        }
+    }
+
+    #[test]
+    fn fn_gdn_dense_scan_defaults_on_and_zero_opts_out() {
+        assert!(FeatureFlags::from_lookup("gfx1201", |_| Err(())).fn_gdn_dense_scan);
+        for (value, expected) in [("0", false), ("1", true)] {
+            let flags = FeatureFlags::from_lookup("gfx1201", |name| {
+                if name == "HIPFIRE_FN_GDN_DENSE_SCAN" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
     }
 

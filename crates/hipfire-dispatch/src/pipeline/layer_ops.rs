@@ -1682,8 +1682,17 @@ pub fn execute_gated_delta_net_hc(
         let fused_qk = chunked
             && capture.is_none()
             && gated_delta_conv_qknorm_route(gpu, &step, &conv);
+        // gfx1201 FN dense route: its producer replaces the convolution, the
+        // gate-parameter pass and the step (the gate below finishes it).
+        #[cfg(feature = "deltanet")]
+        let dense = !chunked && rdna_compute::fn_gdn_dense::applies(gpu, &step);
+        #[cfg(not(feature = "deltanet"))]
+        let dense = false;
         // Convolution and gate parameters in one launch.
-        if fused_qk {
+        if dense {
+            #[cfg(feature = "deltanet")]
+            hip(rdna_compute::fn_gdn_dense::run(gpu, &conv, &gate_params, &step))?;
+        } else if fused_qk {
             hip(gated_delta_conv_params_qknorm_batched(
                 gpu,
                 &conv,
@@ -1717,13 +1726,24 @@ pub fn execute_gated_delta_net_hc(
                 hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
             }
         } else {
-            hip(gated_delta_step_batched(gpu, &step))?;
+            if !dense {
+                hip(gated_delta_step_batched(gpu, &step))?;
+            }
             // An FWHT-basis output projection rotates the gate output first:
             // the gate writes that rotation too (its rotate then skips).
-            if rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
+            let rotate = rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
                 && op.output.k == value
-                && op.value_heads.is_multiple_of(2)
-            {
+                && op.value_heads.is_multiple_of(2);
+            if dense {
+                // `recurrent_output` is scratch with no reader after the gate.
+                #[cfg(feature = "deltanet")]
+                if rotate {
+                    let rotated = view(op.rotation, 0, op.rows * value);
+                    hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, Some(&rotated)))?;
+                } else {
+                    hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, None))?;
+                }
+            } else if rotate {
                 let rotated = view(op.rotation, 0, op.rows * value);
                 hip(gated_delta_gate_batched_rotate(gpu, &gated, &rotated))?;
             } else {
