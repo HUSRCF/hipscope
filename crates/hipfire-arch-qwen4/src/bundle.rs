@@ -788,16 +788,13 @@ impl Qwen4Bundle {
             .map_or(f32::INFINITY, |mtp| mtp.draft.margin())
     }
 
-    /// Row `row` of the last speculative forward's logits as `spec`'s
-    /// truncated distribution. `host` and `scratch` are reused buffers.
-    pub(crate) fn spec_row_dist(
+    /// Host copy of row `row` of the last speculative forward's logits into
+    /// the reused buffer `host`.
+    pub(crate) fn spec_row_logits(
         &self,
         gpu: &Gpu,
         row: usize,
-        spec: SampleSpec,
         host: &mut Vec<f32>,
-        scratch: &mut Vec<(u32, f32)>,
-        out: &mut SparseDist,
     ) -> Result<(), BundleError> {
         let vocab = self.config.vocab_size;
         let logits = self.spec_logits.as_ref().ok_or_else(|| {
@@ -810,7 +807,21 @@ impl Qwen4Bundle {
                 BundleError::Forward(format!("Qwen4 spec logit row {row} is outside capacity"))
             })?;
         gpu.download_f32_into(&logits.sub_offset(offset, vocab), host)
-            .map_err(BundleError::Hip)?;
+            .map_err(BundleError::Hip)
+    }
+
+    /// Row `row` of the last speculative forward's logits as `spec`'s
+    /// truncated distribution. `host` and `scratch` are reused buffers.
+    pub(crate) fn spec_row_dist(
+        &self,
+        gpu: &Gpu,
+        row: usize,
+        spec: SampleSpec,
+        host: &mut Vec<f32>,
+        scratch: &mut Vec<(u32, f32)>,
+        out: &mut SparseDist,
+    ) -> Result<(), BundleError> {
+        self.spec_row_logits(gpu, row, host)?;
         out.build_from_logits(host, spec, scratch)
             .map_err(BundleError::Forward)
     }

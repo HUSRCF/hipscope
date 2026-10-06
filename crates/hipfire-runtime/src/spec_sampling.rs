@@ -19,9 +19,17 @@
 //! residual is taken across the two supports. `p` is the distribution the
 //! autoregressive producer samples, so the speculative stream is the AR
 //! stream in distribution.
+//!
+//! [`accept_naive_prefix`] is the alternative verifier (SpecInfer naive
+//! sampling): drafts stay the draft head's argmax, each verify row's target
+//! token is drawn with the host AR sampler itself ([`naive_target_sampler`],
+//! shared request-seeded RNG), and a draft is accepted iff it equals its
+//! row's draw. Every emitted token is one AR draw in AR's order, so a seeded
+//! request emits AR's exact tokens wherever the verify logits equal AR's.
 
 use crate::llama::{CPU_SAMPLE_LEGACY_POOL, CPU_SAMPLE_WIDE_POOL};
-use crate::spec::{request_rng_state, GreedyAccept};
+use crate::sampler::SamplerConfig;
+use crate::spec::{request_rng_state, GreedyAccept, SpecRequestConfig};
 
 /// A request's truncation, resolved as the host AR sampler
 /// (`sampler::sample_cpu` → [`crate::llama::sample_top_k_p`]) resolves it:
@@ -399,6 +407,56 @@ where
     Ok(GreedyAccept {
         committed,
         accepted,
+        hit_eos: eos == Some(bonus),
+    })
+}
+
+/// The host AR producer's sampler for a sampled request with neutral
+/// penalties: what `sampler::sample_cpu` draws a Qwen4 AR token with.
+/// `top_k` passes through as sent (absent and `Some(0)` differ); a
+/// non-positive `min_p` is the AR sampler's absent.
+pub fn naive_target_sampler(cfg: &SpecRequestConfig) -> SamplerConfig {
+    SamplerConfig {
+        temperature: cfg.temp,
+        top_p: cfg.top_p,
+        top_k: cfg.top_k,
+        min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
+        ..SamplerConfig::greedy()
+    }
+}
+
+/// SpecInfer naive sampled verification, with the result shape and EOS rule
+/// of [`crate::spec::accept_greedy_prefix`]. `draw(row)` returns verify row
+/// `row`'s target draw; it is called in row order and only up to the row the
+/// verdict ends on: the first draft that differs from its draw (the draw
+/// replaces it), an accepted EOS draft (no bonus), or the bonus row
+/// `drafts.len()`. Each emitted token is therefore exactly one draw, in
+/// emission order.
+pub fn accept_naive_prefix<F>(
+    drafts: &[u32],
+    eos: Option<u32>,
+    mut draw: F,
+) -> Result<GreedyAccept, String>
+where
+    F: FnMut(usize) -> Result<u32, String>,
+{
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    for (row, &draft) in drafts.iter().enumerate() {
+        let token = draw(row)?;
+        committed.push(token);
+        if token != draft || eos == Some(token) {
+            return Ok(GreedyAccept {
+                committed,
+                accepted: row + usize::from(token == draft),
+                hit_eos: eos == Some(token),
+            });
+        }
+    }
+    let bonus = draw(drafts.len())?;
+    committed.push(bonus);
+    Ok(GreedyAccept {
+        committed,
+        accepted: drafts.len(),
         hit_eos: eos == Some(bonus),
     })
 }
@@ -867,5 +925,118 @@ mod tests {
             SpecRng::new(0).next_u64(),
             SpecRng::new(0x1357_9BDF).next_u64()
         );
+    }
+
+    /// Toy target for the naive-verify stream test: each context's logit
+    /// row is a hash of its last two tokens, and EOS gains mass late so
+    /// some streams end on it (as an accepted draft, a replacement or a
+    /// bonus).
+    const TOY_VOCAB: usize = 300;
+    const TOY_EOS: u32 = 5;
+
+    fn toy_row(ctx: &[u32]) -> Vec<f32> {
+        let n = ctx.len();
+        let key = ((ctx[n - 1] as u64) << 20) | ctx[n - 2] as u64;
+        let mut row = logits(TOY_VOCAB, key ^ 0x70E5, 2.5);
+        if n >= 40 {
+            row[TOY_EOS as usize] += 4.0;
+        }
+        row
+    }
+
+    /// The draft head's argmax, wrong on about a quarter of the contexts
+    /// (it picks the runner-up there).
+    fn toy_draft(ctx: &[u32]) -> u32 {
+        let row = toy_row(ctx);
+        let mut ranked: Vec<u32> = (0..TOY_VOCAB as u32).collect();
+        ranked.sort_unstable_by(|&a, &b| row[b as usize].total_cmp(&row[a as usize]));
+        let salt = ctx.len() as u64 ^ ((ctx[ctx.len() - 1] as u64) << 8);
+        let miss = SpecRng::new(salt).next_u64() % 4 == 0;
+        ranked[usize::from(miss)]
+    }
+
+    fn toy_draw(ctx: &[u32], sampler: &SamplerConfig) -> u32 {
+        crate::sampler::sample_cpu(&mut toy_row(ctx), &[], sampler)
+    }
+
+    /// Naive verification emits the AR producer's exact stream at the same
+    /// seed, over windows of every depth 1..=4 (the interleaved route is the
+    /// one-draft case), under each request truncation the AR sampler honours.
+    #[test]
+    fn naive_verify_emits_the_seeded_ar_stream() {
+        const TOKENS: usize = 64;
+        let _rng = crate::llama::sampler_rng_test_guard();
+        let prompt = [11u32, 42, 7];
+        let (mut accepted, mut rejected, mut eos_ends) = (0usize, 0usize, 0usize);
+        for (temp, top_p, top_k, min_p) in [
+            (0.7, 0.8, Some(20), 0.0),
+            (1.0, 0.95, None, 0.0),
+            (0.8, 0.9, Some(0), 0.0),
+            (0.7, 0.9, Some(40), 0.05),
+        ] {
+            let sampler = naive_target_sampler(&SpecRequestConfig {
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                ..SpecRequestConfig::default()
+            });
+            for seed in 1..=24u32 {
+                let seed = (SpecRng::new(seed as u64).next_u64() >> 32) as u32;
+                crate::llama::reset_cpu_sampler_rng(seed);
+                let mut ar = prompt.to_vec();
+                while ar.len() - prompt.len() < TOKENS {
+                    let token = toy_draw(&ar, &sampler);
+                    ar.push(token);
+                    if token == TOY_EOS {
+                        break;
+                    }
+                }
+                let ar = &ar[prompt.len()..];
+                eos_ends += usize::from(ar.last() == Some(&TOY_EOS));
+
+                for depths in [[1usize, 1, 1, 1], [1, 3, 2, 4], [4, 4, 4, 4]] {
+                    crate::llama::reset_cpu_sampler_rng(seed);
+                    let mut ctx = prompt.to_vec();
+                    // The prefill seed: the last prompt row's draw.
+                    ctx.push(toy_draw(&ctx, &sampler));
+                    let mut window = 0usize;
+                    while ctx.len() - prompt.len() < TOKENS && ctx.last() != Some(&TOY_EOS) {
+                        let mut block = ctx.clone();
+                        let mut drafts = Vec::new();
+                        for _ in 0..depths[window % depths.len()] {
+                            let draft = toy_draft(&block);
+                            drafts.push(draft);
+                            block.push(draft);
+                        }
+                        window += 1;
+                        let verdict = accept_naive_prefix(&drafts, Some(TOY_EOS), |row| {
+                            let mut rows = ctx.clone();
+                            rows.extend_from_slice(&drafts[..row]);
+                            Ok(toy_draw(&rows, &sampler))
+                        })
+                        .unwrap();
+                        accepted += verdict.accepted;
+                        rejected += usize::from(
+                            verdict.accepted < drafts.len()
+                                && !(verdict.hit_eos
+                                    && verdict.committed.len() == verdict.accepted),
+                        );
+                        ctx.extend_from_slice(&verdict.committed);
+                    }
+                    let mut spec = ctx[prompt.len()..].to_vec();
+                    spec.truncate(TOKENS);
+                    assert_eq!(
+                        spec, ar,
+                        "T{temp} top_p {top_p} top_k {top_k:?} min_p {min_p} seed {seed} depths {depths:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            accepted > 0 && rejected > 0,
+            "accepted {accepted}, rejected {rejected}"
+        );
+        assert!(eos_ends > 0, "no stream reached EOS");
     }
 }

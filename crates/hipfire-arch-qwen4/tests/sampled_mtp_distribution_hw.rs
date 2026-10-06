@@ -34,6 +34,18 @@
 //! is reused, so the arms can run first as separate time-boxed invocations of
 //! `sampled_mtp_distribution_arm` (set `HIPFIRE_SAMPLED_MTP_ARM`,
 //! `HIPFIRE_MTP_SAMPLED=1` and the arm's `HIPFIRE_MTP_INCREMENTAL` yourself).
+//! The arms inherit `HIPFIRE_MTP_SAMPLED_MODE`, so the test checks whichever
+//! sampled verifier that selects (unset: speculative rejection sampling).
+//!
+//! `naive_sampled_mtp_emits_seeded_ar_ids` checks the stronger property of
+//! `HIPFIRE_MTP_SAMPLED_MODE=naive`: with the same seed, every MTP route
+//! (`batched`, `interleaved`, `adaptive` = route knob unset) emits the AR
+//! arm's exact IDs. Cases: the serve bench's `lru_cache_pep8_strict` and
+//! `prose_river_short` prompts × T0.7/top_p 0.8/top_k 20, T1.0/top_p 0.95
+//! and T0.8/top_p 0.95/top_k 40/min_p 0.05 × `ID_SEEDS` seeds, `ID_TOKENS`
+//! IDs each (cut after EOS). Arms run as fresh processes of
+//! `sampled_mtp_identity_arm`; an arm whose `<arm>.identity.json` already
+//! exists in `HIPFIRE_SAMPLED_MTP_OUT` is reused.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -316,40 +328,19 @@ fn sampled_mtp_distribution_arm() {
     }
 }
 
-fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
-    let trials: usize = env_or(TRIALS_ENV, 2000);
-    let temp: f32 = env_or(TEMP_ENV, 1.0);
-    let top_p: f32 = env_or(TOP_P_ENV, 0.95);
-    let top_k: Option<u32> = std::env::var(TOP_K_ENV)
-        .ok()
-        .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
-        .transpose()?;
-    let min_p: f32 = env_or(MIN_P_ENV, 0.0);
+/// A loaded Flash-Next target with its tokenizer and chat template.
+struct Loaded {
+    gpu: Gpu,
+    bundle: Qwen4Bundle,
+    tokenizer: Tokenizer,
+    template: String,
+    state: String,
+}
+
+fn load(model: &Path) -> Result<Loaded, String> {
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
-    let user = Message {
-        role: Role::User,
-        content: PROSE.to_string(),
-        reasoning_content: None,
-        name: None,
-        rendered_name: None,
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        tool_plan: String::new(),
-    };
-    let rendered = JinjaChatFrame {
-        tokenizer: &tokenizer,
-        template: &template,
-        system: None,
-        user: PROSE,
-        enable_thinking: false,
-        bos_token: None,
-        reasoning_strength: None,
-        reasoning_effort: None,
-    }
-    .render_messages(&[user], None, None)?;
-    let prompt = tokenizer.encode(&rendered);
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     if gpu.is_uma() {
@@ -379,7 +370,6 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         &gpu,
         &receipt.config,
     )?;
-    let vocab = receipt.config.vocab_size;
     let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
@@ -395,97 +385,209 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     bundle
         .attach_forward(&mut gpu, MAX_SEQ)
         .map_err(|e| e.to_string())?;
+    Ok(Loaded {
+        gpu,
+        bundle,
+        tokenizer,
+        template,
+        state: format!("{state_format:?}"),
+    })
+}
+
+impl Loaded {
+    /// `text` as one user message, thinking off, rendered as `hipfire serve`
+    /// renders it.
+    fn render(&self, text: &str) -> Result<Vec<u32>, String> {
+        let user = Message {
+            role: Role::User,
+            content: text.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let rendered = JinjaChatFrame {
+            tokenizer: &self.tokenizer,
+            template: &self.template,
+            system: None,
+            user: text,
+            enable_thinking: false,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
+        }
+        .render_messages(&[user], None, None)?;
+        Ok(self.tokenizer.encode(&rendered))
+    }
+
+    /// Seeded AR from a cold state with the production host sampler: up to
+    /// `tokens` IDs, cut after EOS.
+    fn ar_ids(
+        &mut self,
+        logits: &rdna_compute::GpuTensor,
+        prompt: &[u32],
+        cfg: &SamplerConfig,
+        seed: u32,
+        tokens: usize,
+    ) -> Result<Vec<u32>, String> {
+        let eos = self.bundle.config.eos_token_id;
+        hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
+        self.bundle
+            .reset(&mut self.gpu)
+            .map_err(|e| e.to_string())?;
+        self.bundle
+            .forward_chunk_final(&mut self.gpu, prompt, logits, None)
+            .map_err(|e| e.to_string())?;
+        let mut history = prompt.to_vec();
+        let mut ids = Vec::with_capacity(tokens);
+        loop {
+            let mut row = self.gpu.download_f32(logits).map_err(|e| e.to_string())?;
+            let token = sample_cpu(&mut row, &history, cfg);
+            ids.push(token);
+            history.push(token);
+            if ids.len() == tokens || token == eos {
+                return Ok(ids);
+            }
+            self.bundle
+                .forward_token_or_argmax(&mut self.gpu, Some(token), logits)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    /// Sampled native MTP from a cold state: up to `tokens` IDs, cut after
+    /// EOS. Returns the IDs and the windows' (drafts, accepted) totals.
+    fn mtp_ids(
+        &mut self,
+        drafter: &mut Qwen4MtpDrafter,
+        prompt: &[u32],
+        cfg: SpecRequestConfig,
+        tokens: usize,
+    ) -> Result<(Vec<u32>, usize, usize), String> {
+        let eos = self.bundle.config.eos_token_id;
+        drafter.configure_request(cfg);
+        let mut seed_token = drafter.mtp_prefill(
+            &mut self.gpu,
+            &mut self.bundle,
+            prompt,
+            prompt,
+            0,
+            false,
+            &|| false,
+        )?;
+        let mut ids = vec![seed_token];
+        let (mut drafted, mut accepted) = (0, 0);
+        while ids.len() < tokens && seed_token != eos {
+            let position = self.bundle.state.position;
+            let window = drafter.mtp_step(
+                &mut self.gpu,
+                &mut self.bundle,
+                position,
+                seed_token,
+                &ids,
+                MTP_K.min(tokens - ids.len()),
+                eos,
+                None,
+            )?;
+            drafted += window.drafts_generated;
+            accepted += window.accepted;
+            seed_token = *window.committed.last().ok_or("empty MTP window")?;
+            ids.extend_from_slice(&window.committed);
+        }
+        ids.truncate(tokens);
+        Ok((ids, drafted, accepted))
+    }
+}
+
+fn ar_sampler(temp: f32, top_p: f32, top_k: Option<u32>, min_p: f32) -> SamplerConfig {
+    SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty: 1.0,
+        repeat_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p: (min_p > 0.0).then_some(min_p),
+    }
+}
+
+fn spec_request(
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: f32,
+    seed: u64,
+) -> SpecRequestConfig {
+    SpecRequestConfig {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        cactus_delta: 0.0,
+        rng_seed: seed,
+        allow_ngram_modifier: false,
+    }
+}
+
+fn new_drafter(loaded: &mut Loaded) -> Result<Qwen4MtpDrafter, String> {
+    loaded
+        .bundle
+        .attach_mtp(&mut loaded.gpu, MAX_SEQ)
+        .map_err(|e| e.to_string())?;
+    let drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None);
+    if !drafter.supports_temp_verify() {
+        return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+    }
+    Ok(drafter)
+}
+
+fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let trials: usize = env_or(TRIALS_ENV, 2000);
+    let temp: f32 = env_or(TEMP_ENV, 1.0);
+    let top_p: f32 = env_or(TOP_P_ENV, 0.95);
+    let top_k: Option<u32> = std::env::var(TOP_K_ENV)
+        .ok()
+        .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
+        .transpose()?;
+    let min_p: f32 = env_or(MIN_P_ENV, 0.0);
+    let mut loaded = load(model)?;
+    let prompt = loaded.render(PROSE)?;
+    let eos = loaded.bundle.config.eos_token_id;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} state={state_format:?}",
-        gpu.arch,
-        prompt.len()
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} state={}",
+        loaded.gpu.arch,
+        prompt.len(),
+        loaded.state
     );
     let started = std::time::Instant::now();
     let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
     if arm == "ar" {
-        let logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
-        let cfg = SamplerConfig {
-            temperature: temp,
-            top_p,
-            repeat_penalty: 1.0,
-            repeat_window: 0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            blocked_tokens: Vec::new(),
-            top_k,
-            min_p: (min_p > 0.0).then_some(min_p),
-        };
-        let mut history = prompt.clone();
-        for trial in 0..trials {
-            hipfire_runtime::llama::reset_cpu_sampler_rng(trial_seed(0xA11, trial) as u32);
-            bundle.reset(&mut gpu).map_err(|e| e.to_string())?;
-            bundle
-                .forward_chunk_final(&mut gpu, &prompt, &logits, None)
-                .map_err(|e| e.to_string())?;
-            history.truncate(prompt.len());
-            let mut ids = Vec::with_capacity(TOKENS);
-            loop {
-                let mut row = gpu.download_f32(&logits).map_err(|e| e.to_string())?;
-                let token = sample_cpu(&mut row, &history, &cfg);
-                ids.push(token);
-                history.push(token);
-                if ids.len() == TOKENS {
-                    break;
-                }
-                bundle
-                    .forward_token_or_argmax(&mut gpu, Some(token), &logits)
-                    .map_err(|e| e.to_string())?;
-            }
-            samples.push(ids);
-        }
-        gpu.free_tensor(logits).map_err(|e| e.to_string())?;
-    } else {
-        bundle
-            .attach_mtp(&mut gpu, MAX_SEQ)
+        let logits = loaded
+            .gpu
+            .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
             .map_err(|e| e.to_string())?;
-        let mut drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None);
-        if !drafter.supports_temp_verify() {
-            return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+        let cfg = ar_sampler(temp, top_p, top_k, min_p);
+        for trial in 0..trials {
+            let seed = trial_seed(0xA11, trial) as u32;
+            samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
-        let eos = bundle.config.eos_token_id;
-        let mut run = |drafter: &mut Qwen4MtpDrafter, seed: u64| -> Result<Vec<u32>, String> {
-            drafter.configure_request(SpecRequestConfig {
-                temp,
-                top_p,
-                top_k,
-                min_p,
-                cactus_delta: 0.0,
-                rng_seed: seed,
-                allow_ngram_modifier: false,
-            });
-            let mut seed_token =
-                drafter
-                    .mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?;
-            let mut ids = vec![seed_token];
-            while ids.len() < TOKENS && seed_token != eos {
-                let position = bundle.state.position;
-                let window = drafter.mtp_step(
-                    &mut gpu,
-                    &mut bundle,
-                    position,
-                    seed_token,
-                    &ids,
-                    MTP_K.min(TOKENS - ids.len()),
-                    eos,
-                    None,
-                )?;
-                seed_token = *window.committed.last().ok_or("empty MTP window")?;
-                ids.extend_from_slice(&window.committed);
-            }
-            ids.truncate(TOKENS);
-            ids.resize(TOKENS, eos);
-            Ok(ids)
+        loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    } else {
+        let mut drafter = new_drafter(&mut loaded)?;
+        let mut run = |loaded: &mut Loaded, seed: u64| {
+            let cfg = spec_request(temp, top_p, top_k, min_p, seed);
+            loaded
+                .mtp_ids(&mut drafter, &prompt, cfg, TOKENS)
+                .map(|(ids, _, _)| ids)
         };
         for trial in 0..trials {
-            samples.push(run(&mut drafter, trial_seed(0x5EC, trial))?);
+            samples.push(run(&mut loaded, trial_seed(0x5EC, trial))?);
         }
         for trial in 0..REPLAYS.min(trials) {
-            let replay = run(&mut drafter, trial_seed(0x5EC, trial))?;
+            let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
             if replay != samples[trial] {
                 return Err(format!(
                     "seed {} replayed {replay:?}, first run {:?}",
@@ -498,24 +600,244 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             "ARM {arm} replayed {} seeds identically",
             REPLAYS.min(trials)
         );
-        Box::new(drafter).mtp_free(&mut gpu);
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
-    if arm == "ar" {
-        for ids in &mut samples {
-            if let Some(end) = ids.iter().position(|&t| t == bundle.config.eos_token_id) {
-                ids[end..].fill(bundle.config.eos_token_id);
-            }
-        }
+    // Positions after an EOS read as EOS.
+    for ids in &mut samples {
+        ids.resize(TOKENS, eos);
     }
     println!(
         "ARM {arm} {trials} trials in {:.1}s; first sample: {:?}",
         started.elapsed().as_secs_f64(),
-        tokenizer.decode(&samples[0])
+        loaded.tokenizer.decode(&samples[0])
     );
     fs::write(
         dir.join(format!("{arm}.ids.json")),
         serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    bundle.free_gpu(&mut gpu).map_err(|e| e.to_string())
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
+}
+
+const ID_ARM_TEST: &str = "sampled_mtp_identity_arm";
+const ID_ARMS: [&str; 4] = ["ar", "batched", "interleaved", "adaptive"];
+const ID_TOKENS: usize = 128;
+const ID_SEEDS: usize = 6;
+/// (name, temperature, top_p, top_k, min_p).
+const ID_SAMPLINGS: [(&str, f32, f32, Option<u32>, f32); 3] = [
+    ("T0.7/p0.8/k20", 0.7, 0.8, Some(20), 0.0),
+    ("T1.0/p0.95", 1.0, 0.95, None, 0.0),
+    ("T0.8/p0.95/k40/minp0.05", 0.8, 0.95, Some(40), 0.05),
+];
+const ID_PROMPTS: [(&str, &str); 2] = [
+    (
+        "lru_cache",
+        include_str!("../../../benchmarks/prompts/lru_cache_pep8_strict.txt"),
+    ),
+    (
+        "prose_river",
+        include_str!("../../../benchmarks/prompts/prose_river_short.txt"),
+    ),
+];
+
+/// One identity case's result in an arm.
+struct IdCase {
+    case: String,
+    ids: Vec<u32>,
+    drafted: usize,
+    accepted: usize,
+}
+
+impl IdCase {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "case": self.case,
+            "ids": self.ids,
+            "drafted": self.drafted,
+            "accepted": self.accepted,
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Self {
+        let count = |key: &str| value[key].as_u64().expect("identity count") as usize;
+        Self {
+            case: value["case"].as_str().expect("identity case").to_string(),
+            ids: serde_json::from_value(value["ids"].clone()).expect("identity ids"),
+            drafted: count("drafted"),
+            accepted: count("accepted"),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn naive_sampled_mtp_emits_seeded_ar_ids() {
+    let model = model_path();
+    let dir = out_dir();
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut arms: Vec<Vec<IdCase>> = Vec::new();
+    for arm in ID_ARMS {
+        let ids_path = dir.join(format!("{arm}.identity.json"));
+        if !ids_path.exists() {
+            let mut child = Command::new(&exe);
+            child
+                .args([
+                    "--exact",
+                    ID_ARM_TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ARM_ENV, arm)
+                .env(MODEL_ENV, &model)
+                .env(OUT_ENV, &dir)
+                .env("HIPFIRE_MTP_SAMPLED", "1")
+                .env("HIPFIRE_MTP_SAMPLED_MODE", "naive")
+                .env_remove("HIPFIRE_MTP_INCREMENTAL")
+                .stdin(Stdio::null());
+            match arm {
+                "batched" => {
+                    child.env("HIPFIRE_MTP_INCREMENTAL", "0");
+                }
+                "interleaved" => {
+                    child.env("HIPFIRE_MTP_INCREMENTAL", "1");
+                }
+                _ => {}
+            }
+            let output = child
+                .output()
+                .unwrap_or_else(|e| panic!("spawn {arm}: {e}"));
+            fs::write(dir.join(format!("{arm}.identity.out")), &output.stdout).unwrap();
+            fs::write(dir.join(format!("{arm}.identity.err")), &output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{arm} arm failed ({}); logs in {}",
+                output.status,
+                dir.display()
+            );
+        }
+        let json: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&ids_path).expect("arm identity ids"))
+                .expect("arm identity json");
+        arms.push(json.iter().map(IdCase::from_json).collect());
+    }
+    let mut report = String::new();
+    let mut failures = 0usize;
+    let ar = &arms[0];
+    for (arm, cases) in ID_ARMS.iter().zip(&arms).skip(1) {
+        assert_eq!(cases.len(), ar.len(), "{arm}: case count");
+        let mut same = 0usize;
+        for (a, m) in ar.iter().zip(cases) {
+            assert_eq!(a.case, m.case, "{arm}: case order");
+            match a.ids.iter().zip(&m.ids).position(|(x, y)| x != y) {
+                None if a.ids.len() == m.ids.len() => same += 1,
+                first => {
+                    failures += 1;
+                    report.push_str(&format!(
+                        "{arm} {}: first differs at {} (ar {} ids, mtp {} ids)\n",
+                        m.case,
+                        first.unwrap_or(a.ids.len().min(m.ids.len())),
+                        a.ids.len(),
+                        m.ids.len()
+                    ));
+                }
+            }
+        }
+        let (drafted, accepted) = cases
+            .iter()
+            .fold((0, 0), |(d, a), c| (d + c.drafted, a + c.accepted));
+        report.push_str(&format!(
+            "{arm}: {same}/{} cases identical to AR; drafts {drafted}, accepted {accepted}\n",
+            ar.len()
+        ));
+    }
+    eprint!("{report}");
+    fs::write(dir.join("identity-report.txt"), &report).unwrap();
+    assert_eq!(
+        failures,
+        0,
+        "naive sampled MTP left AR's seeded IDs (logs in {}):\n{report}",
+        dir.display()
+    );
+}
+
+/// One identity arm in a fresh process; spawned by the test above.
+#[test]
+#[ignore = "child process of naive_sampled_mtp_emits_seeded_ar_ids"]
+fn sampled_mtp_identity_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_identity_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} identity arm: {error}");
+    }
+}
+
+fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let mut loaded = load(model)?;
+    let started = std::time::Instant::now();
+    let logits = loaded
+        .gpu
+        .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+        .map_err(|e| e.to_string())?;
+    let mut drafter = if arm == "ar" {
+        None
+    } else {
+        Some(new_drafter(&mut loaded)?)
+    };
+    let mut out = Vec::new();
+    for (prompt_name, text) in ID_PROMPTS {
+        let prompt = loaded.render(text)?;
+        for (sampling, temp, top_p, top_k, min_p) in ID_SAMPLINGS {
+            for n in 0..ID_SEEDS {
+                let seed = trial_seed(0x1D, n) as u32;
+                let case = format!("{prompt_name} {sampling} seed#{n}");
+                let (ids, drafted, accepted) = match drafter.as_mut() {
+                    None => {
+                        let cfg = ar_sampler(temp, top_p, top_k, min_p);
+                        let ids = loaded.ar_ids(&logits, &prompt, &cfg, seed, ID_TOKENS)?;
+                        (ids, 0, 0)
+                    }
+                    Some(drafter) => {
+                        let cfg = spec_request(temp, top_p, top_k, min_p, seed as u64);
+                        loaded.mtp_ids(drafter, &prompt, cfg, ID_TOKENS)?
+                    }
+                };
+                println!(
+                    "ARM {arm} {case}: {} ids, drafts {drafted}, accepted {accepted}",
+                    ids.len()
+                );
+                out.push(IdCase {
+                    case,
+                    ids,
+                    drafted,
+                    accepted,
+                });
+            }
+        }
+    }
+    println!(
+        "ARM {arm} {} cases in {:.1}s (arch {}, state {})",
+        out.len(),
+        started.elapsed().as_secs_f64(),
+        loaded.gpu.arch,
+        loaded.state
+    );
+    fs::write(
+        dir.join(format!("{arm}.identity.json")),
+        serde_json::to_vec(&out.iter().map(IdCase::to_json).collect::<Vec<_>>())
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(drafter) = drafter {
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
+    }
+    loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
 }
