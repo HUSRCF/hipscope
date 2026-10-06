@@ -354,6 +354,62 @@ impl Probe {
         Ok(())
     }
 
+    /// q8 (BF16 index arenas) selector-only `qsa-source-v1` snapshot: post-step
+    /// index projection, BF16 pooled arena, ordered selection and mirror.
+    fn selector_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>, root: std::path::PathBuf) -> Result<()> {
+        let g = evidence::Geometry {
+            rows: op.rows, position_start: op.state.position, heads: op.heads,
+            kv_heads: op.kv_heads, dim: op.head_dim, budget_blocks: op.budget / op.compress,
+            compress: op.compress, capacity: op.state.selected_capacity,
+            full_capacity: op.state.full_capacity, fp8: false,
+        };
+        let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, g.position_start);
+        let selected = read_bytes(gpu, op.selected_scratch, 0, g.rows * g.capacity * 4)?;
+        let mirror = read_bytes(gpu, op.state.selected_indices, 0, g.capacity * 4)?;
+        let pooled = read_raw(gpu, op.state.pooled_keys, 0, op.state.pooled_capacity * op.index_dim)?;
+        let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let index_projection = read_raw(gpu, op.index_scratch, 0, g.rows * index_stride)?;
+        let blobs = [
+            ("selected.i32", selected.as_slice()), ("selected-mirror.i32", mirror.as_slice()),
+            ("pooled.source", pooled.as_slice()), ("index-projection.f32", index_projection.as_slice()),
+        ];
+        let digest = evidence::sha256(serde_json::to_string(
+            &blobs.iter().map(|(name, b)| (*name, evidence::sha256(b))).collect::<Vec<_>>()
+        ).map_err(err)?.as_bytes());
+        if let Some(cursor) = self.validation_cursor.as_mut() {
+            if self.expected_state.get(*cursor) != Some(&(key.clone(), digest.clone())) {
+                return Err(format!("instrumented/uninstrumented state differs at {key} (event {cursor})"));
+            }
+            *cursor += 1;
+            return Ok(());
+        }
+        self.expected_state.push((key.clone(), digest));
+        let mut geometry = g.json();
+        geometry["format"] = json!("q8");
+        let dir = root.join(&key);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let mut files = serde_json::Map::new();
+        for (name, bytes) in blobs {
+            std::fs::write(dir.join(name), bytes).map_err(err)?;
+            files.insert(name.into(), json!({"bytes":bytes.len(),"sha256":evidence::sha256(bytes)}));
+        }
+        let identity = json!({"artifact": self.artifact_id, "layer": slot, "chunk": g.position_start,
+            "phase": self.phase, "ctx": self.ctx, "arch": gpu.arch,
+            "source_format": op.state.format.name(), "instrumentation_state_differing_bytes": 0,
+            "selector_only": true,
+            "selector":{"heads":op.index_heads,"kv_heads":op.index_kv_heads,"dim":op.index_dim,
+                "projection_stride":index_stride,"projection_dtype":format!("{:?}",op.index_scratch.dtype),
+                "raw_dtype":format!("{:?}",op.state.raw_index_keys.dtype),
+                "pooled_dtype":format!("{:?}",op.state.pooled_keys.dtype),
+                "norm_dtype":format!("{:?}",op.indexer_k_norm.dtype),"pooled_capacity":op.state.pooled_capacity}});
+        let path = dir.join("snapshot.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&json!({"schema":"qsa-source-v1","identity":identity,
+            "geometry":geometry,"files":files})).map_err(err)?).map_err(err)?;
+        self.rows.push(json!({"kind":"selector_evidence","slot":slot,"chunk":g.position_start,
+            "phase":self.phase,"ctx":self.ctx,"snapshot":path.display().to_string()}));
+        Ok(())
+    }
+
     fn full_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
         // QSA_DUMP_POSITIONS: only the all-prefill calls at these chunk starts.
@@ -364,7 +420,14 @@ impl Probe {
             if self.phase != "all_prefill" || !positions.contains(&op.state.position) { return Ok(()); }
         }
         if op.state.format == QsaKvFormat::Q8 {
-            return Err("qsa evidence dumps cover the f32 and fp8 states only".into());
+            // Lab (BF16-index select route G0): with QSA_DUMP_POSITIONS, the q8
+            // state dumps the selector inputs/outputs only (no K/V attention
+            // reference: the exact attention oracle covers f32/fp8 only).
+            if self.dump_positions.is_none() {
+                return Err("qsa evidence dumps cover the f32 and fp8 states only (q8: selector-only with QSA_DUMP_POSITIONS)".into());
+            }
+            let root = root.clone();
+            return self.selector_evidence(gpu, slot, op, root);
         }
         let g = evidence::Geometry {
             rows: op.rows, position_start: op.state.position, heads: op.heads,
