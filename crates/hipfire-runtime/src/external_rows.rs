@@ -921,6 +921,30 @@ impl RowStore {
         }
     }
 
+    /// True when `ticket` belongs to this store, is still live (not canceled,
+    /// consumed, or invalidated by an epoch change/quiesce) in the current
+    /// epoch, and was enqueued for exactly `row_ids` in that order.
+    pub fn ticket_matches(&self, ticket: &RowTicket, row_ids: &[u64]) -> bool {
+        let Some(inner) = ticket.inner.upgrade() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&inner, &self.inner)
+            || ticket.consumed.load(Ordering::Acquire)
+            || ticket.canceled.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let state = inner.state.lock().expect("row store state mutex poisoned");
+        state.accepting
+            && !state.stop
+            && ticket.epoch == inner.current_epoch.load(Ordering::Acquire)
+            && state.tickets.get(&ticket.id).is_some_and(|entry| {
+                !entry.canceled.load(Ordering::Acquire)
+                    && entry.epoch == ticket.epoch
+                    && entry.ids == row_ids
+            })
+    }
+
     pub fn cancel(&self, ticket: &RowTicket) -> Result<(), RowStoreError> {
         ticket.cancel()
     }
@@ -1136,6 +1160,34 @@ impl<'a> RowFetch<'a> {
 
     pub const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Start a fetch of `row_ids`, adopting `retained` instead when it is a
+    /// live ticket of this store's current epoch for exactly those rows (a
+    /// lookahead issued after the previous forward committed).  Rows are a
+    /// pure function of their ids, so the adopted lease is byte-identical to
+    /// a fresh read; the worker simply built it under the previous forward.
+    /// Anything else drops `retained` (returning its staging buffer) and
+    /// starts a fresh epoch exactly like [`Self::begin`] + [`Self::prefetch`].
+    pub fn begin_or_adopt(
+        store: &'a RowStore,
+        retained: Option<RowTicket>,
+        row_ids: Vec<u64>,
+    ) -> Result<Self, RowStoreError> {
+        if let Some(ticket) = retained {
+            if store.ticket_matches(&ticket, &row_ids) {
+                return Ok(Self {
+                    store,
+                    epoch: ticket.epoch,
+                    ticket: Some(ticket),
+                    lease: None,
+                    armed: true,
+                });
+            }
+        }
+        let mut fetch = Self::begin(store)?;
+        fetch.prefetch(row_ids)?;
+        Ok(fetch)
     }
 
     /// Enqueue this request's rows.  Call once, as soon as the ids are known.
@@ -2654,6 +2706,71 @@ mod tests {
         let stats = rows.cache_stats();
         assert_eq!(stats.queue_depth, 0);
         assert_eq!(stats.outstanding_readers, 0);
+        assert_eq!(stats.outstanding_leases, 0);
+        assert_eq!(stats.staging_in_use, 0);
+        assert!(rows.unload().unwrap().is_clean());
+    }
+
+    #[test]
+    fn fetch_adopts_only_a_live_exact_lookahead_ticket() {
+        let source = Arc::new(MemoryRowSource {
+            shards: rows_source(2, 64),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        });
+        let rows = RowStore::from_test_source(metadata(128), 64, source.clone()).unwrap();
+        rows.begin_epoch(0).unwrap();
+        let reference = rows.prefetch_tokens(0, 7, &[3, 4]).unwrap();
+        let ids = reference.row_ids().unwrap();
+        let expected = rows
+            .wait_completed_lease(&reference)
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .to_vec();
+
+        // Exact ids in the current epoch: adopted, no new epoch, same bytes.
+        let ahead = rows.prefetch_tokens(0, 7, &[3, 4]).unwrap();
+        let reads = source.reads.load(Ordering::Acquire);
+        let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
+        assert_eq!(fetch.epoch(), 0);
+        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        fetch.complete();
+        drop(fetch);
+        assert_eq!(rows.current_epoch(), 0);
+        assert_eq!(source.reads.load(Ordering::Acquire), reads);
+
+        // Mismatched ids: dropped, fresh epoch, the requested rows returned.
+        let ahead = rows.prefetch_tokens(0, 7, &[5]).unwrap();
+        let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
+        assert_eq!(fetch.epoch(), 1);
+        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        fetch.complete();
+        drop(fetch);
+
+        // An epoch change (reset/restore) or quiesce (snapshot) stales it.
+        let ahead = rows.prefetch_tokens(1, 7, &[3, 4]).unwrap();
+        rows.reset_epoch(Duration::from_secs(5)).unwrap();
+        assert!(!rows.ticket_matches(&ahead, &ids));
+        let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
+        assert_eq!(fetch.epoch(), 3);
+        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        fetch.complete();
+        drop(fetch);
+        let ahead = rows.prefetch_tokens(3, 7, &[3, 4]).unwrap();
+        rows.quiesce(Duration::from_secs(5)).unwrap();
+        rows.resume().unwrap();
+        assert!(!rows.ticket_matches(&ahead, &ids));
+        drop(ahead);
+
+        // An aborted adopted fetch drains into a fresh epoch.
+        let ahead = rows.prefetch_tokens(3, 7, &[3, 4]).unwrap();
+        let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids).unwrap();
+        assert_eq!(fetch.epoch(), 3);
+        assert_eq!(fetch.abort().unwrap(), 4);
+        drop(fetch);
+        let stats = rows.cache_stats();
+        assert_eq!(stats.queue_depth, 0);
         assert_eq!(stats.outstanding_leases, 0);
         assert_eq!(stats.staging_in_use, 0);
         assert!(rows.unload().unwrap().is_clean());

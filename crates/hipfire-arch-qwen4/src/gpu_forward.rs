@@ -45,7 +45,7 @@ use hipfire_dispatch::pipeline::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
-use hipfire_runtime::external_rows::RowFetch;
+use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
@@ -1978,10 +1978,14 @@ pub struct Qwen4GpuForward {
     host_token_bytes: Vec<u8>,
     host_ple_bytes: Vec<u8>,
     /// Tokens of the prefill chunk that follows the next forward. A
-    /// successful forward warms their PLE rows into the row store's page
-    /// cache once its own rows are consumed, so the next chunk's SSD reads
-    /// overlap this chunk's GPU work. Consumed (cleared) by every forward.
+    /// successful forward enqueues their PLE rows (hashed from the history it
+    /// committed) as `ple_ahead` once its own lease is released, so the next
+    /// chunk's reads and row materialization overlap this chunk's GPU work.
+    /// Consumed (cleared) by every forward.
     ple_lookahead: Vec<u32>,
+    /// Retained next-chunk PLE ticket. The next forward adopts it when its
+    /// row ids and epoch match exactly, else drops it and fetches afresh.
+    ple_ahead: Option<RowTicket>,
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
     moe: Vec<Qwen4MoeLayerRuntime>,
@@ -2265,6 +2269,7 @@ impl Qwen4GpuForward {
             host_token_bytes,
             host_ple_bytes,
             ple_lookahead: Vec::new(),
+            ple_ahead: None,
             token_readback: None,
             moe,
             decode_q8,
@@ -2537,6 +2542,24 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_rows,
         )?;
+        // Start the first tile's PLE rows now, ahead of the output-resource
+        // preflight, unless a retained lookahead already names them. The
+        // tile's forward adopts this ticket (same epoch, same ids).
+        let first_ids = bundle.state.ple_history.row_ids(
+            &bundle.ple_metadata,
+            &tokens[..tokens.len().min(self.scratch.max_chunk)],
+        );
+        if !self
+            .ple_ahead
+            .as_ref()
+            .is_some_and(|ticket| bundle.ple_rows.ticket_matches(ticket, &first_ids))
+        {
+            drop(self.ple_ahead.take());
+            self.ple_ahead = bundle
+                .ple_rows
+                .prefetch(bundle.ple_rows.current_epoch(), first_ids)
+                .ok();
+        }
         let vocab = bundle.config.vocab_size;
         let max_chunk = self.scratch.max_chunk;
         let preflight_rows = if output_rows == Qwen4OutputRows::Final {
@@ -2823,18 +2846,22 @@ impl Qwen4GpuForward {
         }
 
         // The PLE row fetch runs on the row store's worker while the step
-        // program is built below.
-        let mut ple = RowFetch::begin(&bundle.ple_rows)
-            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-        if argmax_of.is_none() {
-            ple.prefetch(
+        // program is built below; a matching retained lookahead is adopted.
+        let retained = self.ple_ahead.take();
+        let mut ple = if argmax_of.is_none() {
+            RowFetch::begin_or_adopt(
+                &bundle.ple_rows,
+                retained,
                 bundle
                     .state
                     .ple_history
                     .row_ids(&bundle.ple_metadata, tokens),
             )
-            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+        } else {
+            drop(retained);
+            RowFetch::begin(&bundle.ple_rows)
         }
+        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
         let router_logits = matrix_view(&self.scratch.router_logits, n, dims.num_experts)?;
         let scratch_desc = layer_scratch(&self.scratch, &router_logits);
         // Decided once: every op touching the HC streams in this forward agrees.
@@ -3710,16 +3737,22 @@ impl Qwen4GpuForward {
                     next_history.push(token);
                 }
                 bundle.state.ple_history = next_history;
-                // This forward's lease is released, so the reader is free: warm
-                // the next chunk's rows, hashed from the history just committed,
-                // while the GPU runs this chunk. Best effort, and the bytes are
-                // unchanged: the next forward reads the same pages from the cache.
+                // This forward's lease is released, so the reader has a free
+                // staging buffer: enqueue the next chunk's rows, hashed from
+                // the history just committed, while the GPU runs this chunk.
+                // The next forward adopts the materialized ticket when its ids
+                // match exactly (bytes are a pure function of the ids), else
+                // drops it. Best effort: a refused enqueue only loses overlap.
                 if !ple_lookahead.is_empty() {
                     let fit = bundle.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
                     let ahead = &ple_lookahead[..ple_lookahead.len().min(fit)];
-                    let _ = bundle
+                    self.ple_ahead = bundle
                         .ple_rows
-                        .warm(next_history.row_ids(&bundle.ple_metadata, ahead));
+                        .prefetch(
+                            bundle.ple_rows.current_epoch(),
+                            next_history.row_ids(&bundle.ple_metadata, ahead),
+                        )
+                        .ok();
                 }
                 bundle.state.commit_row_capture(n);
                 bundle.state.position = next_position
