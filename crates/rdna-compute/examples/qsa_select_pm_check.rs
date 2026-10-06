@@ -7,7 +7,8 @@
 //!
 //! `qsa_select_pm_check SNAPSHOT_DIR... --out OUT.jsonl [--time N]
 //!     [--score hipcc|pm] [--select hipcc|pm] [--pm-image ABS_FILE]
-//!     [--cpu-rows STRIDE] [--no-screen] [--tied]`
+//!     [--cpu-rows STRIDE] [--no-screen] [--tied] [--shape-blocks N]
+//!     [--tied-bf16-hipcc]`
 //!
 //! Every snapshot (pre-prologue dumps skipped) is replayed with the
 //! production grouping (64 MiB score scratch, rows16, one select WG per row):
@@ -31,6 +32,46 @@
 //!
 //! `--g3 --beta-src ABS_FILE` runs the G3 exact-oracle + HIP-graph gate of the
 //! PM pair as the default route (see `mod g3`; build with `--features lab`).
+//!
+//! BF16 route (auto: header `identity.selector.pooled_dtype == "BF16"`; the
+//! projection stays F32, heads 4, dim 128; `pooled.source` is raw BF16,
+//! `pooled_capacity * 128 * 2` bytes). F32 snapshots keep the exact F32 path
+//! above; F32 and BF16 snapshots may be mixed in one run. The incumbent is the
+//! production fused `indexed_attention_select_bf16_batched` launch (raw ABI,
+//! `--shape-blocks N`, default 65536, which must cover the active blocks):
+//! global score scratch iff `N*4 + 4096 > 65536` (groups of 256 rows,
+//! `256 * stride * 4` bytes, `stride = ceil(N/4)*4`, dynamic LDS 0, per-group
+//! block count / position start, mirror on the last group only), else one
+//! launch with dynamic LDS `N*4`. Records carry `route:"bf16"`.
+//! - baseline hipcc/hipcc (fused): selected/mirror must equal the snapshot
+//!   bytes. In global mode the scratch is poisoned before every group, each
+//!   group's causal prefix is downloaded into canonical `rows*block_count`
+//!   poison-padded score keys and the whole fused scratch outside the causal
+//!   extents (incl. unused rows) must still be 0xa5; the existing CPU
+//!   rescoring / stable selection / screen / WMMA diagnostics then run on the
+//!   BF16 pooled values widened exactly (`bits << 16`) with the F32 query. In
+//!   LDS mode no score capture exists: the CPU comparisons and screen are
+//!   reported as skipped (never substituted by another kernel);
+//! - `--score pm --select pm|hipcc` (`indexed_attention_select_scores_rows16_bf16_pm_gfx1151`,
+//!   existing PM select or hipcc from_scores select, 64 MiB rows16 grouping):
+//!   selected/mirror must equal the fused bytes, every causal score bit must
+//!   equal the fused global capture (`skipped` in LDS mode) and the WHOLE
+//!   candidate scratch outside causal extents, including unused allocated
+//!   rows after each score group, must remain 0xa5 (poisoned before every
+//!   score launch). `--score hipcc --select pm` and any BF16 hipcc score arm
+//!   are rejected;
+//! - `--time N` (baseline): `fused_ms`, `score_phase_ms` (appended lab kernel
+//!   `qsa_bf16_batched_score_only_lab` = the fused pre-selection code through
+//!   its first `__syncthreads`, extracted from the live source) and
+//!   `select_phase_ms = fused - score` per rep; PM arms report `score_ms` /
+//!   `select_ms` as the F32 route does;
+//! - `--tied-bf16-hipcc`: the six all-tied fixtures (16384/32768/65536 blocks
+//!   x BF16 value 0x0000/0x3f80, query all 0/1; rows 3, compress 4, budget
+//!   512, capacity 2051, stride 512, `position_start = blocks*4`) run the
+//!   fused launch (and the PM pair iff `--pm-image` supplies the BF16 score
+//!   and select symbols) with selected/mirror each inside a 64 KiB 0xa5
+//!   guard on both sides; the ordered rows + mirror must equal the CPU stable
+//!   oracle and every guard of both buffers must be unchanged.
 
 use hip_bridge::{Function, KernargBlob, Module};
 use rayon::prelude::*;
@@ -52,6 +93,7 @@ const HIPCC_SCORE: &str = "indexed_attention_select_scores_rows16_f32";
 const HIPCC_SELECT: &str = "indexed_attention_select_from_scores";
 const PM_SCORE: &str = "indexed_attention_select_scores_rows16_f32_pm_gfx1151";
 const PM_SELECT: &str = "indexed_attention_select_from_scores_pm_gfx1151";
+const PM_SCORE_BF16: &str = "indexed_attention_select_scores_rows16_bf16_pm_gfx1151";
 const SCORE_SCRATCH_BYTES: usize = 64 << 20;
 const POISON: u8 = 0xa5;
 
@@ -72,7 +114,7 @@ fn snapshots(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 #[derive(Clone, Copy, PartialEq)]
 enum Impl { Hipcc, Pm }
 
-struct Pm { _module: Module, score: Option<Function>, select: Option<Function> }
+struct Pm { _module: Module, score: Option<Function>, score_bf16: Option<Function>, select: Option<Function> }
 
 /// One original select call's geometry.
 #[derive(Clone, Copy)]
@@ -178,6 +220,425 @@ fn download(gpu: &Gpu, t: &GpuTensor) -> Result<Vec<u8>> {
 fn poison_outputs(gpu: &Gpu, b: &Bufs) -> Result<()> {
     gpu.hip.memset(&b.selected.buf, POISON as i32, b.selected.byte_size()).map_err(err)?;
     gpu.hip.memset(&b.mirror.buf, POISON as i32, b.mirror.byte_size()).map_err(err)
+}
+
+// ------------------------------------------------------------ BF16 route
+
+const FUSED_BF16: &str = "indexed_attention_select_bf16_batched";
+const LAB_MODULE: &str = "qsa_bf16_lab";
+const LAB_BF16: &str = "qsa_bf16_batched_score_only_lab";
+/// `QSA_SELECT_GLOBAL_ROWS`, `QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES` and
+/// `QSA_SELECT_BATCHED_STATIC_LDS_BYTES` of `rdna-compute/src/tensor_ops.rs`.
+const GLOBAL_ROWS: usize = 256;
+const LDS_LIMIT_BYTES: usize = 64 * 1024;
+const STATIC_LDS_BYTES: usize = 4 * 1024;
+const GUARD_BYTES: usize = 64 << 10;
+const LAB_SIG: &str = "extern \"C\" __global__ void qsa_bf16_batched_score_only_lab(const float* query, \
+    const __hip_bfloat16* pooled, int* selected, int rows, int query_row_stride, int block_count, \
+    int index_heads, int index_dim, int budget_blocks, int compress, int position_start, int capacity, \
+    int* mirror, float* scores_global, int scores_stride) {";
+
+fn widen_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect()
+}
+
+fn le_u32(bytes: &[u8]) -> Vec<u32> { bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect() }
+fn le_i32(bytes: &[u8]) -> Vec<i32> { bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect() }
+
+/// The appended lab kernel: the live source's `qsa_select_batched` body
+/// through its first `__syncthreads` (the -1 fill and every block score),
+/// behind an explicit BF16 extern signature, so it reproduces the fused
+/// pre-selection phase exactly.
+fn lab_source() -> Result<String> {
+    let marker = "static __device__ __forceinline__ void qsa_select_batched(";
+    let start = TENSOR_OPS_SRC.find(marker).ok_or("qsa_select_batched not found in tensor_ops source")?;
+    let after = &TENSOR_OPS_SRC[start + marker.len()..];
+    let open = after.find(") {").ok_or("qsa_select_batched signature end not found")?;
+    let rest = &after[open + 3..];
+    let sync = "__syncthreads();";
+    let end = rest.find(sync).ok_or("qsa_select_batched first __syncthreads not found")? + sync.len();
+    let mut s = String::from(TENSOR_OPS_SRC);
+    s.push('\n');
+    s.push_str(LAB_SIG);
+    s.push_str(&rest[..end]);
+    s.push_str("\n}\n");
+    Ok(s)
+}
+
+/// Production fused-launch geometry for shape bound `shape` plus its score
+/// scratch (global mode only).
+struct Fused { shape: usize, stride: usize, global: bool, scratch: Option<GpuTensor> }
+
+impl Fused {
+    fn new(gpu: &Gpu, shape: usize) -> Result<Fused> {
+        if shape == 0 { return Err("shape blocks must be > 0".into()) }
+        let global = shape * 4 + STATIC_LDS_BYTES > LDS_LIMIT_BYTES;
+        let stride = shape.div_ceil(4) * 4;
+        let scratch = if global {
+            let bytes = GLOBAL_ROWS * stride * 4;
+            Some(gpu.upload_raw(&vec![POISON; bytes], &[bytes]).map_err(err)?)
+        } else { None };
+        Ok(Fused { shape, stride, global, scratch })
+    }
+    /// `(first, rows)` launch groups: 256-row groups past the LDS row, else one.
+    fn groups(&self, c: &Call) -> Vec<(usize, usize)> {
+        if self.global && c.rows > GLOBAL_ROWS {
+            (0..c.rows).step_by(GLOBAL_ROWS).map(|first| (first, GLOBAL_ROWS.min(c.rows - first))).collect()
+        } else {
+            vec![(0, c.rows)]
+        }
+    }
+    fn free(self, gpu: &mut Gpu) -> Result<()> {
+        match self.scratch { Some(s) => gpu.free_tensor(s).map_err(err), None => Ok(()) }
+    }
+}
+
+/// Query/pooled/selected/mirror of one fused launch (selected/mirror may be
+/// guarded sub-views).
+struct Io<'a> { query: &'a GpuTensor, pooled: &'a GpuTensor, selected: &'a GpuTensor, mirror: &'a GpuTensor }
+
+/// Production raw ABI: ptr(query, pooled, selected), i32(rows, stride,
+/// block_count, heads4, dim128, budget, compress, position_start, capacity),
+/// ptr(mirror, scores_global), i32(scores_stride), pad16. A group's block
+/// count is `(position_start + first + rows) / compress`.
+fn fused_blob(c: &Call, io: &Io, f: &Fused, first: usize, rows: usize, last: bool) -> KernargBlob {
+    let mut a = KernargBlob::new();
+    a.push_ptr(unsafe { (io.query.buf.as_ptr() as *const f32).add(first * c.stride) } as *const _);
+    a.push_ptr(io.pooled.buf.as_ptr());
+    a.push_ptr(unsafe { (io.selected.buf.as_ptr() as *const u8).add(first * c.capacity * 4) } as *const _);
+    a.push_i32(rows as i32);
+    a.push_i32(c.stride as i32);
+    a.push_i32(((c.position_start + first + rows) / c.compress) as i32);
+    a.push_i32(4);
+    a.push_i32(c.dim as i32);
+    a.push_i32(c.budget as i32);
+    a.push_i32(c.compress as i32);
+    a.push_i32((c.position_start + first) as i32);
+    a.push_i32(c.capacity as i32);
+    a.push_ptr(if last { io.mirror.buf.as_ptr() } else { std::ptr::null_mut() });
+    a.push_ptr(f.scratch.as_ref().map_or(std::ptr::null_mut(), |s| s.buf.as_ptr()));
+    a.push_i32(f.stride as i32);
+    a.pad_to(16);
+    a
+}
+
+/// Copy each row's causal prefix of a poison-initialised score scratch into
+/// the canonical `rows * block_count` layout (`canon` stays poison elsewhere)
+/// and report whether every scratch byte outside the causal extents, including
+/// every allocated row past `group_rows`, is still poison.
+fn extract_scores(scratch: &[u8], row_bytes: usize, group_rows: usize, first: usize, c: &Call, canon: &mut [u8]) -> bool {
+    let canon_row = c.block_count * 4;
+    let mut ok = true;
+    for r in 0..scratch.len() / row_bytes {
+        let row = &scratch[r * row_bytes..(r + 1) * row_bytes];
+        let live = if r < group_rows { c.row_blocks(first + r) * 4 } else { 0 };
+        ok &= row[live..].iter().all(|&x| x == POISON);
+        if live > 0 {
+            let at = (first + r) * canon_row;
+            canon[at..at + live].copy_from_slice(&row[..live]);
+        }
+    }
+    ok
+}
+
+struct FusedRun { ms: f64, canon: Option<Vec<u8>>, poison_ok: bool }
+
+/// The production fused launch(es) of `kernel` (the incumbent or the lab
+/// kernel, identical blob/grouping/dynamic LDS). `capture` (global mode only)
+/// poisons the scratch before every group, then extracts the group's scores.
+/// `ms` sums the per-group event times.
+fn run_fused(gpu: &mut Gpu, c: &Call, io: &Io, f: &Fused, kernel: &str, capture: bool, events: Option<&[hip_bridge::Event; 3]>)
+    -> Result<FusedRun> {
+    let capture = capture && f.global;
+    let mut canon = capture.then(|| vec![POISON; c.rows * c.block_count * 4]);
+    let (mut poison_ok, mut ms) = (true, 0.0f64);
+    let shared = if f.global { 0 } else { (f.shape * 4) as u32 };
+    for (first, rows) in f.groups(c) {
+        let last = first + rows == c.rows;
+        if capture {
+            let s = f.scratch.as_ref().unwrap();
+            gpu.hip.memset(&s.buf, POISON as i32, s.byte_size()).map_err(err)?;
+        }
+        let mut blob = fused_blob(c, io, f, first, rows, last);
+        if let Some(e) = events { gpu.hip.event_record(&e[0], None).map_err(err)?; }
+        gpu.launch_kernel_blob(kernel, [rows as u32, 1, 1], [256, 1, 1], shared, blob.as_mut_slice()).map_err(err)?;
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[1], None).map_err(err)?;
+            gpu.hip.event_synchronize(&e[1]).map_err(err)?;
+            ms += gpu.hip.event_elapsed_ms(&e[0], &e[1]).map_err(err)? as f64;
+        }
+        if capture {
+            gpu.hip.device_synchronize().map_err(err)?;
+            let bytes = download(gpu, f.scratch.as_ref().unwrap())?;
+            poison_ok &= extract_scores(&bytes, f.stride * 4, rows, first, c, canon.as_mut().unwrap());
+        }
+    }
+    gpu.hip.device_synchronize().map_err(err)?;
+    Ok(FusedRun { ms, canon, poison_ok })
+}
+
+fn launch_pm_score_bf16(gpu: &mut Gpu, pm: &Option<Pm>, grid: [u32; 3], blob: &mut KernargBlob) -> Result<()> {
+    let pm = pm.as_ref().ok_or("--pm-image required for a pm arm")?;
+    let f = pm.score_bf16.as_ref().ok_or("pm image lacks the BF16 score symbol")?;
+    unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+}
+
+/// The candidate pair (BF16 PM score + PM or hipcc from_scores select) over
+/// the production 64 MiB / rows16 grouping. `capture` poisons the scratch
+/// before every score launch and, after it, downloads the WHOLE scratch:
+/// returns the canonical causal scores and whether everything outside the
+/// causal extents (incl. unused allocated rows) stayed poison.
+fn run_pm_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, Impl), capture: bool,
+               events: Option<&[hip_bridge::Event; 3]>) -> Result<(Timing, Option<(Vec<u8>, bool)>)> {
+    let group = c.group();
+    let (mut score_ms, mut select_ms) = (0.0f64, 0.0f64);
+    let mut canon = capture.then(|| vec![POISON; c.rows * c.block_count * 4]);
+    let mut poison_ok = true;
+    let mut g0 = 0;
+    while g0 < c.rows {
+        let n = group.min(c.rows - g0);
+        if capture { gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?; }
+        let mut blob = score_blob(c, b, g0, n);
+        if let Some(e) = events { gpu.hip.event_record(&e[0], None).map_err(err)?; }
+        launch_pm_score_bf16(gpu, pm, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], &mut blob)?;
+        if let Some(e) = events { gpu.hip.event_record(&e[1], None).map_err(err)?; }
+        if capture {
+            gpu.hip.device_synchronize().map_err(err)?;
+            let bytes = download(gpu, &b.scores)?;
+            poison_ok &= extract_scores(&bytes, c.block_count * 4, n, g0, c, canon.as_mut().unwrap());
+        }
+        let mut blob = select_blob(c, b, g0, n, g0 + n == c.rows);
+        launch(gpu, pm, arms.1, false, [n as u32, 1, 1], &mut blob)?;
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[2], None).map_err(err)?;
+            gpu.hip.event_synchronize(&e[2]).map_err(err)?;
+            score_ms += gpu.hip.event_elapsed_ms(&e[0], &e[1]).map_err(err)? as f64;
+            select_ms += gpu.hip.event_elapsed_ms(&e[1], &e[2]).map_err(err)? as f64;
+        }
+        g0 += n;
+    }
+    gpu.hip.device_synchronize().map_err(err)?;
+    Ok((Timing { score_ms, select_ms }, canon.map(|v| (v, poison_ok))))
+}
+
+/// Full BF16 snapshot replay (see the module doc); returns whether the
+/// incumbent fused launch reproduced the snapshot bytes.
+#[allow(clippy::too_many_arguments)]
+fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u8], snap_mirror: &[u8], qbytes: &[u8], pbytes: &[u8],
+               arms: (Impl, Impl), shape_flag: usize, timed: usize, cpu_stride: usize, screen: bool,
+               events: &[hip_bridge::Event; 3], rec: &mut Value, failures: &mut usize) -> Result<bool> {
+    if arms == (Impl::Hipcc, Impl::Pm) { return Err("BF16 route rejects --score hipcc --select pm".into()) }
+    if arms != (Impl::Hipcc, Impl::Hipcc) {
+        let p = pm.as_ref().ok_or("--pm-image required for a pm arm")?;
+        if p.score_bf16.is_none() || (arms.1 == Impl::Pm && p.select.is_none()) {
+            return Err("pm image lacks the BF16 score/select symbols".into())
+        }
+    }
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16).map_err(err)?;
+    if shape_flag < c.block_count { return Err("--shape-blocks is below the active block count".into()) }
+    let shape = shape_flag;
+    let fused = Fused::new(gpu, shape)?;
+    let io = Io { query: &b.query, pooled: &b.pooled, selected: &b.selected, mirror: &b.mirror };
+    rec["route"] = json!("bf16");
+    rec["shape_blocks"] = json!(shape);
+    rec["fused_score_scratch"] = json!(if fused.global { "global" } else { "lds" });
+    rec["fused_groups"] = json!(fused.groups(c).len());
+
+    // Incumbent fused launch against the captured bytes.
+    poison_outputs(gpu, b)?;
+    let base = run_fused(gpu, c, &io, &fused, FUSED_BF16, true, None)?;
+    let base_sel = download(gpu, &b.selected)?;
+    let base_mirror = download(gpu, &b.mirror)?;
+    let baseline_exact = base_sel == snap_sel && base_mirror == snap_mirror;
+    rec["baseline_selected_equal"] = json!(base_sel == snap_sel);
+    rec["baseline_mirror_equal"] = json!(base_mirror == snap_mirror);
+    if !baseline_exact { *failures += 1; }
+    if fused.global {
+        rec["fused_scratch_outside_causal_poison_ok"] = json!(base.poison_ok);
+        if !base.poison_ok { *failures += 1; }
+    }
+    if let Some(canon) = &base.canon {
+        let score_keys = le_u32(canon);
+        let query: Vec<f32> = qbytes.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect();
+        let pooled = widen_bf16(pbytes);
+        let hipcc_sel = le_i32(&base_sel);
+        if screen || cpu_stride > 0 {
+            let (cpu, mut s) = cpu_checks(c, &query, &pooled, &score_keys, &hipcc_sel, cpu_stride.max(1), screen);
+            if cpu["cpu_selection_rows_differ"] != 0 || cpu["rescore_bits_differ"] != 0 { *failures += 1; }
+            rec["cpu"] = cpu;
+            if screen { rec["screen"] = screen_json(&mut s); }
+        }
+    } else {
+        let why = json!({"skipped":"lds_mode: fused scores live in LDS, no score capture; CPU rescoring/selection/screen not run"});
+        if screen || cpu_stride > 0 { rec["cpu"] = why.clone(); }
+        if screen { rec["screen"] = why; }
+    }
+
+    // Experimental pair against the fused bytes.
+    if arms != (Impl::Hipcc, Impl::Hipcc) {
+        poison_outputs(gpu, b)?;
+        let (_, cap) = run_pm_bf16(gpu, pm, c, b, arms, true, None)?;
+        let (arm_canon, poison_ok) = cap.unwrap();
+        let sel_eq = download(gpu, &b.selected)? == base_sel;
+        let mir_eq = download(gpu, &b.mirror)? == base_mirror;
+        let score_eq = base.canon.as_ref().map(|bc| *bc == arm_canon);
+        rec["arm"] = json!({"route":"bf16","score":"pm","select":if arms.1 == Impl::Pm {"pm"} else {"hipcc"},
+            "selected_equal":sel_eq,"mirror_equal":mir_eq,
+            "score_causal_bits_equal_fused":score_eq,
+            "score_causal_comparison":if score_eq.is_some() {"performed"} else {"skipped_lds_mode_no_fused_score_capture"},
+            "scratch_outside_causal_poison_ok":poison_ok});
+        if !(sel_eq && mir_eq && poison_ok && score_eq.unwrap_or(true)) { *failures += 1; }
+    }
+
+    if timed > 0 {
+        let median = |v: &[f64]| v[v.len() / 2];
+        if arms == (Impl::Hipcc, Impl::Hipcc) {
+            let lab = lab_source()?;
+            gpu.ensure_kernel_public(LAB_MODULE, &lab, LAB_BF16).map_err(err)?;
+            for _ in 0..2 {
+                run_fused(gpu, c, &io, &fused, FUSED_BF16, false, Some(events))?;
+                run_fused(gpu, c, &io, &fused, LAB_BF16, false, Some(events))?;
+            }
+            let (mut fu, mut sc, mut se) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..timed {
+                let f = run_fused(gpu, c, &io, &fused, FUSED_BF16, false, Some(events))?.ms;
+                let s = run_fused(gpu, c, &io, &fused, LAB_BF16, false, Some(events))?.ms;
+                fu.push(f);
+                sc.push(s);
+                se.push(f - s);
+            }
+            fu.sort_by(f64::total_cmp);
+            sc.sort_by(f64::total_cmp);
+            se.sort_by(f64::total_cmp);
+            rec["timing"] = json!({"reps":timed,"route":"bf16","fused_ms_median":median(&fu),"score_phase_ms_median":median(&sc),
+                "select_phase_ms_median":median(&se),"fused_ms":fu,"score_phase_ms":sc,"select_phase_ms":se,
+                "note":"fused_ms sums per-group launches; score_phase_ms is the appended lab kernel (fused pre-selection through the first __syncthreads, no static LDS); select_phase_ms = fused - score per rep"});
+        } else {
+            for _ in 0..2 { run_pm_bf16(gpu, pm, c, b, arms, false, Some(events))?; }
+            let (mut sc, mut se) = (Vec::new(), Vec::new());
+            for _ in 0..timed {
+                let (t, _) = run_pm_bf16(gpu, pm, c, b, arms, false, Some(events))?;
+                sc.push(t.score_ms);
+                se.push(t.select_ms);
+            }
+            sc.sort_by(f64::total_cmp);
+            se.sort_by(f64::total_cmp);
+            rec["timing"] = json!({"reps":timed,"route":"bf16","score_ms_median":median(&sc),"select_ms_median":median(&se),
+                "score_ms":sc,"select_ms":se});
+        }
+    }
+    fused.free(gpu)?;
+    Ok(baseline_exact)
+}
+
+/// An allocation `[guard | payload | guard]` of 0xa5 whose payload is exposed
+/// as a non-owning sub-view; only `alloc` is ever freed.
+struct Guarded { alloc: GpuTensor, view: GpuTensor, payload: usize }
+
+impl Guarded {
+    fn new(gpu: &Gpu, payload: usize) -> Result<Guarded> {
+        let total = payload + 2 * GUARD_BYTES;
+        let alloc = gpu.upload_raw(&vec![POISON; total], &[total]).map_err(err)?;
+        let view = alloc.sub_offset(GUARD_BYTES, payload);
+        Ok(Guarded { alloc, view, payload })
+    }
+    /// Poison guards and payload alike.
+    fn poison(&self, gpu: &Gpu) -> Result<()> {
+        gpu.hip.memset(&self.alloc.buf, POISON as i32, self.alloc.byte_size()).map_err(err)
+    }
+    /// (both guards unchanged, payload bytes).
+    fn read(&self, gpu: &Gpu) -> Result<(bool, Vec<u8>)> {
+        let all = download(gpu, &self.alloc)?;
+        let ok = all[..GUARD_BYTES].iter().all(|&x| x == POISON) && all[GUARD_BYTES + self.payload..].iter().all(|&x| x == POISON);
+        Ok((ok, all[GUARD_BYTES..GUARD_BYTES + self.payload].to_vec()))
+    }
+}
+
+/// `--tied-bf16-hipcc`: six all-tied fixtures through the fused launch (and
+/// the PM pair iff an image is supplied) against the CPU stable-order oracle,
+/// selected/mirror each inside 64 KiB guards.
+fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut std::fs::File, failures: &mut usize) -> Result<()> {
+    if let Some(p) = pm {
+        if p.score_bf16.is_none() || p.select.is_none() { return Err("--tied-bf16-hipcc with --pm-image needs the BF16 score and select symbols".into()) }
+    }
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16).map_err(err)?;
+    for blocks in [16384usize, 32768, 65536] {
+        for vbits in [0x0000u16, 0x3f80] {
+            let value = f32::from_bits((vbits as u32) << 16);
+            let (rows, compress) = (3usize, 4usize);
+            // The last row sees exactly `blocks` complete blocks plus a 3-token tail.
+            let position_start = blocks * compress + 3 - rows;
+            let c = Call { rows, stride: 512, block_count: blocks, dim: 128, compress, position_start, budget: 512, capacity: 2051 };
+            let shape = blocks.max(shape_flag);
+            let qbytes: Vec<u8> = (0..rows * 512).flat_map(|_| value.to_le_bytes()).collect();
+            let pbytes: Vec<u8> = (0..blocks * 128).flat_map(|_| vbits.to_le_bytes()).collect();
+            let query = gpu.upload_raw(&qbytes, &[qbytes.len()]).map_err(err)?;
+            let pooled = gpu.upload_raw(&pbytes, &[pbytes.len()]).map_err(err)?;
+            let sel_g = Guarded::new(gpu, rows * c.capacity * 4)?;
+            let mir_g = Guarded::new(gpu, c.capacity * 4)?;
+            let fused = Fused::new(gpu, shape)?;
+
+            // CPU stable oracle over the (all-tied) scores.
+            let score_bits = cpu_score(&vec![value; 512], &vec![value; 128], 128).0.to_bits();
+            let keys = vec![score_bits; blocks];
+            let check = |sel: &[u8], mir: &[u8]| -> (bool, bool) {
+                let (got, mirror) = (le_i32(sel), le_i32(mir));
+                let (mut s_ok, mut m_ok) = (true, true);
+                for r in 0..rows {
+                    let want = selection_row(&rank(&keys[..c.row_blocks(r)]), &c, r);
+                    s_ok &= got[r * c.capacity..(r + 1) * c.capacity] == want[..];
+                    if r == rows - 1 { m_ok &= mirror == want; }
+                }
+                (s_ok, m_ok)
+            };
+
+            sel_g.poison(gpu)?;
+            mir_g.poison(gpu)?;
+            let io = Io { query: &query, pooled: &pooled, selected: &sel_g.view, mirror: &mir_g.view };
+            let run = run_fused(gpu, &c, &io, &fused, FUSED_BF16, true, None)?;
+            let (sel_guard, sel) = sel_g.read(gpu)?;
+            let (mir_guard, mir) = mir_g.read(gpu)?;
+            let (s_ok, m_ok) = check(&sel, &mir);
+            let uniform = run.canon.as_ref().map_or(true, |canon| {
+                (0..rows).all(|r| le_u32(&canon[r * blocks * 4..r * blocks * 4 + c.row_blocks(r) * 4]).iter().all(|&k| k == score_bits))
+            });
+            let fused_ok = s_ok && m_ok && sel_guard && mir_guard && run.poison_ok;
+            if !fused_ok { *failures += 1; }
+            let mut rec = json!({"tied_bf16":true,"route":"bf16","blocks":blocks,"value_bf16":format!("0x{vbits:04x}"),
+                "query_value":value,"rows":rows,"position_start":position_start,"shape_blocks":shape,
+                "fused_score_scratch":if fused.global {"global"} else {"lds"},
+                "fused":{"selected_equal_cpu_oracle":s_ok,"mirror_equal_cpu_oracle":m_ok,"selected_guards_ok":sel_guard,
+                    "mirror_guards_ok":mir_guard,"scratch_outside_causal_poison_ok":run.poison_ok,
+                    "scores_all_equal_cpu_bits":uniform,"ok":fused_ok}});
+
+            if pm.is_some() {
+                // Re-poison guards and payloads, then the candidate pair.
+                sel_g.poison(gpu)?;
+                mir_g.poison(gpu)?;
+                let group = c.group();
+                let sbytes = group * blocks * 4;
+                let scores = gpu.upload_raw(&vec![POISON; sbytes], &[sbytes]).map_err(err)?;
+                let b = Bufs { query: query.shallow_clone(), pooled: pooled.shallow_clone(), scores,
+                    selected: sel_g.view.shallow_clone(), mirror: mir_g.view.shallow_clone() };
+                let (_, cap) = run_pm_bf16(gpu, pm, &c, &b, (Impl::Pm, Impl::Pm), true, None)?;
+                let (_, poison_ok) = cap.unwrap();
+                let Bufs { scores, .. } = b;
+                gpu.free_tensor(scores).map_err(err)?;
+                let (sel_guard, sel) = sel_g.read(gpu)?;
+                let (mir_guard, mir) = mir_g.read(gpu)?;
+                let (s_ok, m_ok) = check(&sel, &mir);
+                let pm_ok = s_ok && m_ok && sel_guard && mir_guard && poison_ok;
+                if !pm_ok { *failures += 1; }
+                rec["pm"] = json!({"selected_equal_cpu_oracle":s_ok,"mirror_equal_cpu_oracle":m_ok,"selected_guards_ok":sel_guard,
+                    "mirror_guards_ok":mir_guard,"scratch_outside_causal_poison_ok":poison_ok,"ok":pm_ok});
+            }
+            eprintln!("{rec}");
+            writeln!(out_f, "{rec}").map_err(err)?;
+            fused.free(gpu)?;
+            for t in [query, pooled, sel_g.alloc, mir_g.alloc] { gpu.free_tensor(t).map_err(err)?; }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- CPU side
@@ -419,6 +880,7 @@ fn main() -> Result<()> {
     let (mut dirs, mut out, mut timed, mut image) = (Vec::new(), None, 0usize, None::<PathBuf>);
     let (mut arms, mut cpu_stride, mut screen, mut tied) = ((Impl::Hipcc, Impl::Hipcc), 64usize, true, false);
     let (mut g3, mut beta_src) = (false, None::<PathBuf>);
+    let (mut shape_flag, mut tied_bf16) = (65536usize, false);
     let parse_impl = |v: Option<String>| -> Result<Impl> {
         match v.as_deref() { Some("hipcc") => Ok(Impl::Hipcc), Some("pm") => Ok(Impl::Pm), _ => Err("arm must be hipcc|pm".into()) }
     };
@@ -435,6 +897,8 @@ fn main() -> Result<()> {
             "--tied" => tied = true,
             "--g3" => g3 = true,
             "--beta-src" => beta_src = Some(PathBuf::from(it.next().ok_or("--beta-src ABS_FILE")?)),
+            "--shape-blocks" => shape_flag = it.next().ok_or("--shape-blocks N")?.parse().map_err(err)?,
+            "--tied-bf16-hipcc" => tied_bf16 = true,
             _ => dirs.push(PathBuf::from(a)),
         }
     }
@@ -447,7 +911,7 @@ fn main() -> Result<()> {
     }
     let mut paths = Vec::new();
     for d in &dirs { snapshots(d, &mut paths)?; }
-    if paths.is_empty() && !tied { return Err("no snapshot.json found".into()) }
+    if paths.is_empty() && !tied && !tied_bf16 { return Err("no snapshot.json found".into()) }
     let mut gpu = Gpu::init().map_err(err)?;
     if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
     for k in [HIPCC_SCORE, HIPCC_SELECT] { gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k).map_err(err)?; }
@@ -457,9 +921,10 @@ fn main() -> Result<()> {
             let bytes = std::fs::read(p).map_err(err)?;
             let module = gpu.hip.module_load_data(&bytes).map_err(err)?;
             let score = gpu.hip.module_get_function(&module, PM_SCORE).ok();
+            let score_bf16 = gpu.hip.module_get_function(&module, PM_SCORE_BF16).ok();
             let select = gpu.hip.module_get_function(&module, PM_SELECT).ok();
-            eprintln!("pm image {} sha256 {} score={} select={}", p.display(), sha256(&bytes), score.is_some(), select.is_some());
-            Some(Pm { _module: module, score, select })
+            eprintln!("pm image {} sha256 {} score={} score_bf16={} select={}", p.display(), sha256(&bytes), score.is_some(), score_bf16.is_some(), select.is_some());
+            Some(Pm { _module: module, score, score_bf16, select })
         }
         None => None,
     };
@@ -473,7 +938,8 @@ fn main() -> Result<()> {
         if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
         let sel = &header["identity"]["selector"];
         if header["identity"]["arch"] != "gfx1151" { return Err("snapshot arch not gfx1151".into()) }
-        if sel["pooled_dtype"] != "F32" || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the F32 pooled route", path.display())) }
+        let bf16 = sel["pooled_dtype"] == "BF16";
+        if !(sel["pooled_dtype"] == "F32" || bf16) || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the F32/BF16 pooled route", path.display())) }
         if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
         let get = |name: &str| -> Result<Vec<u8>> {
             let b = std::fs::read(root.join(name)).map_err(err)?;
@@ -491,7 +957,8 @@ fn main() -> Result<()> {
         let pbytes = get("pooled.source")?;
         let snap_sel = get("selected.i32")?;
         let snap_mirror = get("selected-mirror.i32")?;
-        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * 4 || snap_sel.len() != rows * c.capacity * 4
+        let pooled_elem = if bf16 { 2 } else { 4 };
+        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * pooled_elem || snap_sel.len() != rows * c.capacity * 4
             || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
             return Err(format!("{}: geometry/extent mismatch", path.display()))
         }
@@ -506,6 +973,15 @@ fn main() -> Result<()> {
         let mut rec = json!({"snapshot":path.display().to_string(),"ctx":header["identity"]["ctx"],"layer":header["identity"]["layer"],
             "position_start":position_start,"rows":rows,"block_count":c.block_count,"group":group,
             "groups":rows.div_ceil(group),"budget_blocks":c.budget,"capacity":c.capacity,"stride":c.stride});
+        if bf16 {
+            let exact = replay_bf16(&mut gpu, &pm, &c, &bufs, &snap_sel, &snap_mirror, &qbytes, &pbytes, arms, shape_flag, timed,
+                cpu_stride, screen, &events, &mut rec, &mut failures)?;
+            eprintln!("{} bf16 baseline_exact={} {}", path.display(), exact, rec.get("timing").map(|t| t.to_string()).unwrap_or_default());
+            writeln!(out_f, "{rec}").map_err(err)?;
+            out_f.flush().map_err(err)?;
+            for t in [bufs.query, bufs.pooled, bufs.scores, bufs.selected, bufs.mirror] { gpu.free_tensor(t).map_err(err)?; }
+            continue;
+        }
 
         // Baseline hipcc/hipcc against the captured bytes, keeping the scores.
         poison_outputs(&gpu, &bufs)?;
@@ -601,6 +1077,7 @@ fn main() -> Result<()> {
             for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] { gpu.free_tensor(t).map_err(err)?; }
         }
     }
+    if tied_bf16 { run_tied_bf16(&mut gpu, &pm, shape_flag, &mut out_f, &mut failures)?; }
     for e in events { gpu.hip.event_destroy(e).map_err(err)?; }
     if failures > 0 { return Err(format!("{failures} failing checks; see {out}")) }
     Ok(())
