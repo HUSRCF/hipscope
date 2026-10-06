@@ -2,6 +2,12 @@
 
 ## v0.4.1 — unreleased (target 2026-10-06)
 
+### Qwen3.8-27B verifier
+- **gfx1201 packed-Q8 split-KV DFlash verification, opt-in and default off** (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY=1`, `HIPFIRE_GFX12_FA2_SPLIT_COUNT=2|4|8`, default 8), by @HUSRCF (#760). Exact gfx1201 H24/KV4/D256, eager sequential multi-row verification only; AR, tree, independent-batch, graph and retained recording keep the established route. An undersized `flash_partials` buffer falls through to the rows route instead of failing verification.
+  - R9700, canonical Qwen3.8-27B MQ4-XTS plus DFlash2 MQ4v2, Q8 VMM, B16/S8, `HIPFIRE_VERIFY_GRAPH=0`, 21,550 prompt tokens and 200 output tokens: **48.4 → 61.65 decode tok/s (+27.4 %)**, medians of six fresh processes per arm in three OFF/ON/ON/OFF blocks after warming. Every sample retained τ 2.21 and 62 cycles. This reproduces the speedup direction, not the PR's different-model absolute numbers.
+  - Against beta `046b57fa46`, default-off committed token IDs and text are identical on that long prompt; on/off also match all 200 IDs there (not a universal bit-exactness claim). Greedy serve battery and chain pass on both arms; default-off text, token counts, τ and cycles equal beta. The B16 capacity fallback passes with `HIPFIRE_FLASH_PARTIALS_BATCH=1` and `max_seq=4096`.
+  - No new persistent VRAM allocation: split records reuse `flash_partials`; observed load VRAM is unchanged. Default prefill and every FP8 shared-source code object retain their bytes. With the local JIT toolchain, partial/merge use 238/18 VGPRs and zero scratch or spills.
+
 ### Highlights
 - **Flash-Next prefill at the new defaults** (gathered F16 WMMA QSA attention on gfx1151/gfx1201, MQ6 X-LDS trunk projections), against the previous land head `20f981d7a`: pp8192 on an R9700 with `auto` expert placement 1011.6 → 1216.7 tok/s (+20.3 %); Strix Halo 1158.5 → 1446.2 tok/s (+24.8 %). Medians of 3 fresh processes per arm.
 - **Flash-Next prefill chunk per arch** (8192 rows on gfx1151, 4096 on gfx1201), against `cd2b9d91a`: pp8192 on an R9700 with `auto` expert placement 746.2 → 1011.9 tok/s (+35.6 %); Strix Halo 1048.9 → 1164.8 tok/s (+11.0 %). Medians of 3 fresh processes per arm.
