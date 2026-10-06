@@ -23,7 +23,7 @@ fn probe(arch:Arch)->Result<Emitted,String>{
  b.control(Instruction::new("s_endpgm",vec![],vec![]))?;
  b.finish()
 }
-const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
+const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
 const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
@@ -94,6 +94,16 @@ fn qwen4_mq6_x4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  if epi=="all"{let (_,text,proof)=qwen4_mq6_x4::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
  let wr=match epi{"w4"=>4,"w8"=>8,_=>return Err(format!("qwen4_mq6_x4 --epi {epi} (w4|w8|all)"))};
  let e=qwen4_mq6_x4::emit(Spec{arch,wr})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1151 MQ6 trunk GEMM twin of hipcc's U3 BV8/RW8 entries: `--epi <wr>[_<kind>]`
+/// (`w8`, `w4`, `w8_bf16out`, `w4_bf16out`, `w8_regions`, `w8_hcw`) one entry, `all` the module.
+fn qwen4_mq6_x4_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_mq6_x4_gfx11::{self,Kind,Spec};
+ if epi=="all"{let (_,text,proof)=qwen4_mq6_x4_gfx11::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let (wr,kind)=match epi{"w4"=>(4,Kind::Plain),"w8"=>(8,Kind::Plain),"w4_bf16out"=>(4,Kind::Bf16),"w8_bf16out"=>(8,Kind::Bf16),"w8_regions"=>(8,Kind::Regions),"w8_hcw"=>(8,Kind::Hcw),
+  _=>return Err(format!("qwen4_mq6_x4_gfx11 --epi {epi} (w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all)"))};
+ let e=qwen4_mq6_x4_gfx11::emit(Spec{arch,wr,kind})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -186,6 +196,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qsa_gather"=>qsa_gather(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_select"=>qsa_select(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
  // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
