@@ -18879,10 +18879,16 @@ impl Gpu {
         }
     }
 
+    /// Rows [`Self::requant_g256_rows`] expands to F32 at a time: the F32
+    /// scratch is at most this many rows (20 MiB at K = 2560), never the
+    /// whole `[m, k]` weight.
+    pub const REQUANT_G256_CHUNK_ROWS: usize = 2048;
+
     /// `(F32 scratch, packed output)` bytes [`Self::requant_g256`] allocates
     /// for an `[m, k]` weight; `None` for a non-MQ-G256-V2 target. The
-    /// scratch goes back to the device (not the pool) when the requant
-    /// returns, so only the packed output stays allocated.
+    /// scratch (at most [`Self::REQUANT_G256_CHUNK_ROWS`] rows) goes back to
+    /// the device (not the pool) when the requant returns, so only the
+    /// packed output stays allocated.
     pub fn requant_g256_bytes(m: usize, k: usize, target: DType) -> Option<(usize, usize)> {
         let bits = match target {
             DType::MQ2G256V2 => 2,
@@ -18894,7 +18900,9 @@ impl Gpu {
         };
         let n = m.checked_mul(k)?;
         Some((
-            n.checked_mul(std::mem::size_of::<f32>())?,
+            m.min(Self::REQUANT_G256_CHUNK_ROWS)
+                .checked_mul(k)?
+                .checked_mul(std::mem::size_of::<f32>())?,
             (n / 256).checked_mul(8 + 32 * bits)?,
         ))
     }
@@ -18909,6 +18917,35 @@ impl Gpu {
         m: usize,
         k: usize,
         target: DType,
+    ) -> HipResult<GpuTensor> {
+        self.requant_g256_rows(weight, m, k, target, &[(0, m)])
+    }
+
+    /// [`Self::requant_g256`] with the output rows in `ranges` order: the
+    /// packed rows of each `[start, end)` source range, concatenated. Every
+    /// kernel is row-local, so each packed row is byte-identical to the
+    /// whole-weight requant's; the ranges must cover `[0, m)` exactly once.
+    pub fn requant_g256_rows(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        target: DType,
+        ranges: &[(usize, usize)],
+    ) -> HipResult<GpuTensor> {
+        self.requant_g256_chunked(weight, m, k, target, ranges, Self::REQUANT_G256_CHUNK_ROWS)
+    }
+
+    /// [`Self::requant_g256_rows`] expanding at most `chunk_rows` rows to F32
+    /// at a time.
+    pub(crate) fn requant_g256_chunked(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        target: DType,
+        ranges: &[(usize, usize)],
+        chunk_rows: usize,
     ) -> HipResult<GpuTensor> {
         let bad = |what: &str| {
             Err(hip_bridge::HipError::new(
@@ -18935,24 +18972,49 @@ impl Gpu {
                 None => return bad("source must be BF16, Q8_0 or an MQ G256 V2 format"),
             },
         };
-        if m == 0 || !k.is_multiple_of(256) {
-            return bad("needs m > 0 and K % 256 == 0");
+        if m == 0 || chunk_rows == 0 || !k.is_multiple_of(256) {
+            return bad("needs m > 0, chunk_rows > 0 and K % 256 == 0");
+        }
+        let mut covered = 0usize;
+        for &(start, end) in ranges {
+            if start > end || end > m {
+                return bad("row range outside the weight");
+            }
+            covered += end - start;
+        }
+        if covered != m {
+            return bad("row ranges must cover every row once");
         }
         let Some((_, out_bytes)) = Self::requant_g256_bytes(m, k, target) else {
             return bad("weight size overflows");
         };
+        let source_row = match weight.dtype {
+            DType::BF16 => k * 2,
+            DType::Q8_0 => k / 32 * 34,
+            _ => k / 256 * (8 + 32 * source_bits as usize),
+        };
+        let out_row = k / 256 * (8 + 32 * bits as usize);
+        if weight.buf.size() < m * source_row {
+            return bad("source holds fewer than m rows");
+        }
         self.bind_thread()?;
-        let n = m * k;
-        let values = self.alloc_tensor(&[n], DType::F32)?;
-        let out = self.alloc_tensor(&[out_bytes], target)?;
+        let chunk = m.min(chunk_rows);
+        let values = self.alloc_tensor(&[chunk * k], DType::F32)?;
+        let out = match self.alloc_tensor(&[out_bytes], target) {
+            Ok(out) => out,
+            Err(error) => {
+                let _ = self.release_tensor_immediate(values);
+                return Err(error);
+            }
+        };
         let run = |gpu: &mut Self,
                    func: &str,
-                   src: &GpuTensor,
-                   dst: &GpuTensor,
+                   s: *mut c_void,
+                   d: *mut c_void,
                    count: usize,
                    bits: i32| {
             gpu.ensure_kernel("requant_g256", kernels::REQUANT_G256_SRC, func)?;
-            let (s, d, c) = (src.buf.as_ptr(), dst.buf.as_ptr(), count as i64);
+            let c = count as i64;
             let mut params: Vec<*mut c_void> = vec![
                 &s as *const _ as *mut c_void,
                 &d as *const _ as *mut c_void,
@@ -18975,17 +19037,31 @@ impl Gpu {
                 },
             )
         };
+        let at = |tensor: &GpuTensor, offset: usize| -> *mut c_void {
+            tensor.buf.as_ptr().cast::<u8>().wrapping_add(offset).cast()
+        };
         let result = (|| {
-            run(self, unpack, weight, &values, n, source_bits)?;
-            if rotate {
-                self.rotate_x_mq_batched(&values, &values, k, m)?;
+            let mut written = 0usize;
+            for &(start, end) in ranges {
+                let mut row = start;
+                while row < end {
+                    let rows = (end - row).min(chunk);
+                    let n = rows * k;
+                    let source = at(weight, row * source_row);
+                    run(self, unpack, source, at(&values, 0), n, source_bits)?;
+                    if rotate {
+                        self.rotate_x_mq_batched(&values, &values, k, rows)?;
+                    }
+                    let packed = at(&out, written);
+                    run(self, "requant_pack_mqg256v2", at(&values, 0), packed, n / 128, bits)?;
+                    written += rows * out_row;
+                    row += rows;
+                }
             }
-            run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
             self.hip.device_synchronize()
         })();
-        // Back to the device, not the pool: a pooled vocab x hidden F32
-        // scratch (2.5 GB for a 248k x 2560 head) sits in a size bucket no
-        // later allocation reuses.
+        // Back to the device, not the pool: nothing later reuses the
+        // chunk-sized F32 scratch's size bucket.
         let freed = self.release_tensor_immediate(values);
         match result.and(freed) {
             Ok(()) => Ok(out),

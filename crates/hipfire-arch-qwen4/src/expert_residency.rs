@@ -590,21 +590,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(with_gather - base, gather);
-        // The draft head's F32 requant scratch (vocab x hidden x 4) goes back
-        // to the device at attach, before the first request allocates its
-        // verify rows and GDN capture: the reserve holds the larger phase on
-        // top of what the head keeps, not both.
+        // The draft head's F32 requant scratch is row-chunked (at most
+        // `REQUANT_G256_CHUNK_ROWS` rows, never vocab x hidden x 4) and goes
+        // back to the device at attach, before the first request allocates
+        // its verify rows and GDN capture: the reserve holds the larger phase
+        // on top of what the head keeps, not both.
         let (resident, scratch) =
             crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, &measured, DType::MQ6G256V2)
                 .unwrap();
         let (resident, scratch) = (resident as u64, scratch as u64);
-        assert_eq!(scratch, (config.vocab_size * config.hidden_size * 4) as u64);
-        // At K = 3 the scratch outweighs the request, row capture included.
-        assert_eq!(mtp, resident + scratch);
-        assert_eq!(native(&measured, 3, None), mtp);
-        assert_eq!(native(&measured, 10, None), resident + scratch);
-        // The 11-row GDN capture is charged in the state's real GDN format.
+        assert_eq!(
+            scratch,
+            (rdna_compute::Gpu::REQUANT_G256_CHUNK_ROWS * config.hidden_size * 4) as u64
+        );
+        // The request now outweighs the build scratch at every K.
         let hidden_row = (config.hc_count * config.hidden_size * 4) as u64;
+        let verify = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row;
+        assert!(verify > scratch);
+        let capture4 =
+            crate::state::Qwen4State::row_capture_bytes(&config, crate::GdnStateFormat::Q8, 4).unwrap()
+                as u64;
+        assert_eq!(mtp, resident + verify + capture4);
+        assert_eq!(native(&measured, 3, None), resident + verify);
+        assert_eq!(native(&measured, 10, None), resident + verify);
+        // The 11-row GDN capture is charged in the state's real GDN format.
         for gdn in [crate::GdnStateFormat::Q8, crate::GdnStateFormat::F32] {
             let capture =
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;

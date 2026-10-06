@@ -113,44 +113,6 @@ fn ranking(
     }
 }
 
-/// `head` (`vocab` equal rows) reordered `[0, front) ++ [special, vocab)
-/// ++ [front, special)`; `front == 0` keeps it.
-fn front_first(
-    gpu: &mut Gpu,
-    head: GpuTensor,
-    front: usize,
-    special: usize,
-    vocab: usize,
-) -> hip_bridge::HipResult<GpuTensor> {
-    if front == 0 {
-        return Ok(head);
-    }
-    let stride = head.buf.size() / vocab;
-    let out = match gpu.alloc_tensor(&head.shape, head.dtype) {
-        Ok(out) => out,
-        Err(error) => {
-            let _ = gpu.free_tensor(head);
-            return Err(error);
-        }
-    };
-    let mut dst = 0;
-    let mut copied = Ok(());
-    for (start, end) in [(0, front), (special, vocab), (front, special)] {
-        let bytes = (end - start) * stride;
-        copied = copied
-            .and_then(|_| gpu.memcpy_dtod_at_auto(&out.buf, dst, &head.buf, start * stride, bytes));
-        dst += bytes;
-    }
-    let copied = copied.and_then(|_| gpu.hip.device_synchronize());
-    // Back to the device: nothing else reuses a pooled vocab-sized copy.
-    let freed = gpu.release_tensor_immediate(head);
-    if let Err(error) = copied.and(freed) {
-        let _ = gpu.free_tensor(out);
-        return Err(error);
-    }
-    Ok(out)
-}
-
 /// What [`DraftHead::new`] builds for a `head_dtype` head: the ranking-copy
 /// format, whether the copy's top 8 are re-scored, and the layout front.
 fn plan(
@@ -181,15 +143,15 @@ fn plan(
 impl DraftHead {
     /// `(resident, load scratch)` device bytes [`Self::new`] takes for a
     /// `head_dtype` head: what the head keeps, and the most it holds on top
-    /// of that while building — the F32 requant scratch, or the unordered
-    /// copy while rows are reordered. Both go back to the device, not the
-    /// pool, before `new` returns.
+    /// of that while building — the row-chunked F32 requant scratch
+    /// (`Gpu::REQUANT_G256_CHUNK_ROWS` rows), which goes back to the device,
+    /// not the pool, before `new` returns.
     pub fn device_bytes(
         head_dtype: DType,
         layout: DraftHeadLayout,
         policy: DraftHeadPolicy,
     ) -> Option<(usize, usize)> {
-        let (copy_format, rescore, front) = plan(head_dtype, layout, policy);
+        let (copy_format, rescore, _) = plan(head_dtype, layout, policy);
         let mut resident = layout
             .vocab
             .checked_mul(std::mem::size_of::<f32>())?
@@ -199,7 +161,7 @@ impl DraftHead {
         if let Some(format) = copy_format {
             let (values, copy) = Gpu::requant_g256_bytes(layout.vocab, layout.hidden, format)?;
             resident = resident.checked_add(copy)?;
-            scratch = if front == 0 { values } else { values.max(copy) };
+            scratch = values;
         }
         if rescore {
             resident = resident.checked_add(Gpu::TOPK8_PARTIAL_BYTES)?;
@@ -217,8 +179,15 @@ impl DraftHead {
         let mut owned: Vec<GpuTensor> = Vec::with_capacity(5);
         let allocated = (|| -> hip_bridge::HipResult<()> {
             if let Some(format) = copy_format {
-                let copy = gpu.requant_g256(head, layout.vocab, layout.hidden, format)?;
-                owned.push(front_first(gpu, copy, front, layout.special, layout.vocab)?);
+                // Requantized straight into the layout order: no unordered
+                // copy beside the ordered one.
+                let (front, special, vocab) = (front, layout.special, layout.vocab);
+                let ranges: &[(usize, usize)] = if front == 0 {
+                    &[(0, vocab)]
+                } else {
+                    &[(0, front), (special, vocab), (front, special)]
+                };
+                owned.push(gpu.requant_g256_rows(head, vocab, layout.hidden, format, ranges)?);
             }
             if rescore {
                 owned.push(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?);

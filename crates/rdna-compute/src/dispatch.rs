@@ -6986,6 +6986,57 @@ mod tests {
         gpu.free_tensor(dev).ok();
     }
 
+    /// The row-chunked requant (and its reordered ranges) packs every row
+    /// byte-identically to the one-shot whole-weight requant: unpack, rotate
+    /// and pack are all row-local.
+    #[test]
+    fn requant_g256_chunked_rows_match_the_one_shot_requant() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (m, k) = (4101usize, 512usize);
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut q8 = Vec::with_capacity(m * k / 32 * 34);
+        for _ in 0..m * k / 32 {
+            // f16 scales in [2^-6, 2^-5): finite, normal.
+            q8.extend_from_slice(&(0x2400u16 | (next() as u16 & 0x03ff)).to_le_bytes());
+            q8.extend((0..32).map(|_| next() as u8));
+        }
+        let mut weight = gpu.upload_raw(&q8, &[q8.len()]).expect("upload Q8_0");
+        weight.dtype = DType::Q8_0;
+        for target in [DType::MQ2G256V2, DType::MQ6G256V2] {
+            let row = Gpu::requant_g256_bytes(1, k, target).unwrap().1;
+            let whole = gpu
+                .requant_g256_chunked(&weight, m, k, target, &[(0, m)], m)
+                .expect("one-shot requant");
+            let whole_bytes = gpu.download_raw_bytes(&whole).expect("download");
+            let ranges = [(0, 1500), (3000, m), (1500, 3000)];
+            let chunked = gpu
+                .requant_g256_chunked(&weight, m, k, target, &ranges, 1000)
+                .expect("chunked requant");
+            let chunked_bytes = gpu.download_raw_bytes(&chunked).expect("download");
+            let expected: Vec<u8> = ranges
+                .iter()
+                .flat_map(|&(start, end)| whole_bytes[start * row..end * row].iter().copied())
+                .collect();
+            assert_eq!(chunked_bytes.len(), expected.len());
+            assert!(chunked_bytes == expected, "{target:?}: chunked rows differ");
+            let default = gpu.requant_g256(&weight, m, k, target).expect("requant");
+            assert!(gpu.download_raw_bytes(&default).expect("download") == whole_bytes);
+            for tensor in [whole, chunked, default] {
+                gpu.free_tensor(tensor).ok();
+            }
+        }
+        gpu.free_tensor(weight).ok();
+    }
+
     /// A D→H copy is a host sync point and can never be part of a captured
     /// graph. Entering capture with one pending is a bug in whoever decided to
     /// capture a CPU-executed step, so it must fail loudly rather than enqueue
