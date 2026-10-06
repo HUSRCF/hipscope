@@ -100,11 +100,21 @@ gfx1201	requant_g256	requant_mqg256v2_to_f32,requant_pack_mqg256v2
 gfx1201	tensor_ops	argmax_f32,bf16_scaled_add_batched_f32,copy_regions_u32,gated_delta_conv_bf16_f32_batched_k4,gated_delta_conv_params_bf16_f32,gated_delta_gate_rotate_bf16_f32_batched,gated_delta_rollback_layers_q8,gated_delta_step_gate_norm128_q8,gated_delta_step_halves_state128_persistent256_capture_q8,gated_delta_step_halves_state128_persistent256_q8,gated_delta_step_pipe128_q8,hc_activation_fused_f32,hc_state_bf16_add_f32,hc_state_bf16_to_f32,hyper_norm_f32,hyper_norm_gate_f32,hyper_read_projected_f32,hyper_read_up_fused_f32,hyper_write_bf16x2,hyper_write_f32,indexed_attention_attention_f32,indexed_attention_attention_f32_batched,indexed_attention_attention_fp8_batched,indexed_attention_attention_fp8_batched_hg4,indexed_attention_cache_append_fp8_batched,indexed_attention_decode_prologue_f32,indexed_attention_decode_prologue_fp8,indexed_attention_index_key_append_bf16_batched,indexed_attention_norm_rope_f32_batched,indexed_attention_pool_rope_bf16,indexed_attention_pool_rope_f32,indexed_attention_reuse_selection,indexed_attention_select_bf16_batched,indexed_attention_select_f32_batched
 gfx1201	topk8_rescore_mq6g256v2	topk8_rescore_mq6g256v2_k2560
 gfx1201	zero_f32	zero_f32
-# Cold-kernel-cache trace at 0614d9e2a8 with that commit's kernel pack installed
-# exe-relative: qwen3.8-flash-next-gptq3.mq4, default route, Ciru 128K/8K/32K prefill,
-# greedy AR, greedy and sampled native MTP, serve battery. Each row is a module the
-# runtime JIT-compiled into the empty kernel cache (not served by the pack), or a
-# symbol the packaged index lacked.
+# Cold-kernel-cache runs with the kernel pack installed exe-relative:
+# qwen3.8-flash-next-gptq3.mq4, default route, Ciru 128K/8K/32K prefill, greedy AR,
+# greedy and sampled native MTP, serve battery. gfx1151 (Strix Halo, 0614d9e2a8 pack):
+# modules the runtime JIT-compiled into the empty kernel cache. gfx1201 (R9700 card B,
+# fixed pack): modules the run loaded from the pack that the 9e24ed333b pack lacks
+# (symbols from their default callsites), plus qwen4_silu_mul, which that run still
+# JIT-compiled before it was added for gfx1201.
 gfx1151	gemm_bf16_xf32_multirow_pto2	gemm_bf16_xf32_multirow_pto2
 gfx1151	hc_row_fold	hc_row_fold_norm_gate
 gfx1151	moe_router_softmax_top10_f32_fast	moe_router_softmax_top10_f32_fast
+gfx1201	gemm_wmma_lds_splitk	qwen4_wmma_lds_160_80_32_80_k32_p_s4,qwen4_wmma_lds_reduce,qwen4_wmma_lds_128_128_32_64_k64,qwen4_wmma_lds_128_256_32_64_k64
+gfx1201	hyper_read_up_wmma_gfx1201	hyper_read_up_wmma_bf16_gfx1201_t128
+gfx1201	moe_router_softmax_top10_f32_fast	moe_router_softmax_top10_f32_fast
+gfx1201	mq_rotate_x_i4	mq_rotate_x_i4
+gfx1201	qwen4_moe_rotate128_i4	qwen4_moe_rotate128_i4
+gfx1201	qwen4_moe_scatter_stable_top10	qwen4_moe_group_ranks,qwen4_moe_group_prefix,qwen4_moe_group_scatter
+gfx1201	qwen4_moe_sym_check_gfx1201	qwen4_moe_sym_check_gfx1201
+gfx1201	qwen4_silu_mul	shared_expert_activation_bf16_f32

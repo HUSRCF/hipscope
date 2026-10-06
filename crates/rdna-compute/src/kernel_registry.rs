@@ -545,6 +545,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "topk8_partial_f32", "topk8_rescore_q8_0_k2560",
         ]);
         add!("qwen4_hc_streams_init_from_embed_batched", kernels::QWEN4_HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC, ["hc_streams_init_from_embed_batched_bf16"]);
+        add!("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, ["shared_expert_activation_bf16_f32", "silu_mul_bf16_rt_f32"]);
         add!("requant_g256", kernels::REQUANT_G256_SRC, ["requant_bf16_to_f32", "requant_mqg256v2_to_f32", "requant_pack_mqg256v2", "requant_q8_0_to_f32"]);
         add!("topk8_rescore_mq6g256v2", kernels::TOPK8_RESCORE_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4", "topk8_rescore_mq6g256v2_k2560"]);
         add!("zero_f32", kernels::ZERO_F32_SRC, ["zero_f32"]);
@@ -613,7 +614,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_qkvza_mq3g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq3g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq5g256v2_wmma_gfx11_bt12",
             "gemm_qkvza_mq5g256v2_wmma_gfx11_bt4", "gemm_qkvza_mq6g256v2_wmma_gfx11_bt12", "gemm_qkvza_mq6g256v2_wmma_gfx11_bt4",
         ]);
-        add!("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, ["shared_expert_activation_bf16_f32", "silu_mul_bf16_rt_f32"]);
         add!("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, [
             "argmax_f32", "bf16_roundtrip_f32", "bf16_scaled_add_batched_f32", "bf16_scaled_add_f32", "copy_regions_u32",
             "gated_delta_conv_bf16_f32", "gated_delta_conv_bf16_f32_batched_k4", "gated_delta_conv_params_bf16_f32",
@@ -1189,13 +1189,13 @@ mod tests {
         // RMSNorm+FWHT group grid, rmsnorm row split, RoPE head grid), the
         // five multi-slot `*_paged` modules of the q8/asym3 routes, the
         // 36 H2 decode, prefill, MTP and DFlash modules added for
-        // compiler-free packs, the 45 Qwen3.8-Flash-Next modules (including
+        // compiler-free packs, the 46 Qwen3.8-Flash-Next modules (including
         // the gfx1201 `fn_gdn_dense` adapter)
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
         // 8K-128K prefill, MTP and serve rows) and the 32 Qwen3.5-MoE modules
-        // (tests/fixtures/kernel-trace-qwen35.tsv). Those 122 keys are
+        // (tests/fixtures/kernel-trace-qwen35.tsv). Those 123 keys are
         // additional to P0's 92.
-        assert_eq!(registry.len(), count + 122, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 123, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
