@@ -3078,6 +3078,9 @@ mod tests {
                 vision: true,
                 n_embd: 5120,
                 n_vocab: 248320,
+                reasoning_contract: "qwen_jinja".into(),
+                reasoning_effort_native: true,
+                reasoning_efforts: vec!["low".into(), "high".into()],
             },
             ..ServeMeta::new("test".to_owned())
         });
@@ -3101,7 +3104,13 @@ mod tests {
         let meta = meta.lock().unwrap_or_else(|error| error.into_inner());
         assert!(meta.current_model.is_none());
         assert_eq!(meta.n_ctx, 0);
-        assert_eq!(meta.loaded, LoadedInfo::default());
+        assert_eq!(
+            meta.loaded,
+            LoadedInfo {
+                reasoning_contract: "unsupported".to_owned(),
+                ..LoadedInfo::default()
+            }
+        );
         drop(meta);
         drop(runtime);
         let _ = fs::remove_dir_all(&root);
