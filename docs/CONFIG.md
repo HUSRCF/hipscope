@@ -1078,6 +1078,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `serve.retry_enabled` | `retry_enabled` | `HIPFIRE_SERVE_RETRY_ENABLED` | experimental |
 | `serve.stream_stall_timeout_ms` | `stream_stall_timeout_ms` | `HIPFIRE_SERVE_STREAM_STALL_TIMEOUT_MS` | experimental |
 | `serve.structured_jump_forward` | `structured_jump_forward` | `HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD` | experimental |
+| `serve.ui` | `serve_ui` | `HIPFIRE_SERVE_UI` | stable |
 | `speculation.ddtree_budget` | `ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | experimental |
 | `speculation.ddtree_topk` | `ddtree_topk` | `HIPFIRE_DDTREE_TOPK` | experimental |
 | `speculation.ddtree_tree_la` | `ddtree_tree_la` | `HIPFIRE_DDTREE_TREE_LA` | experimental |
