@@ -310,22 +310,19 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 
 Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
 
-### LFM optimized prefill — branch-only scope
+### LFM optimized prefill — branch-only, not in this tree
 
-**Branch-only; not shipped** on `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`.
+**Branch-only; not shipped.** This tree has no environment-selectable batched LFM prefill path and no LFM2 prefill-batch, prefill-chunk, or gfx1201 decode-fusion environment variables: nothing under `crates/` reads them. LFM prefill and decode use the eager per-token path on every GPU.
 
-Audited branch wording allowed for optimized LFM prefill (and nothing broader):
+Audited branch wording allowed for the optimized path that exists only on a separate branch (and nothing broader):
 
-- Exact cohort: **350M dense MQ4** fixture path used by the branch **runtime fixture validation/guard** (`lfm2.5-350m.mq4` shape checks in `hipfire-arch-lfm2moe` forward), **not** a generic “all LFM” claim.
-- GPU: **gfx1201** only for the batched opt-in path.
-- Flag: explicit opt-in **`HIPFIRE_LFM2_PREFILL_BATCH=1`** (default off). Optional chunk override `HIPFIRE_LFM2_PREFILL_MAX_BATCH` (default 256, hard cap 512 in source).
-- Pin when citing branch implementation: `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (or later branch commits only if re-grounded).
+- Exact cohort: the **350M dense MQ4** fixture (`lfm2.5-350m.mq4`), **not** a generic “all LFM” claim.
+- GPU: **gfx1201** only.
+- Pin when citing the branch implementation: `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (or later branch commits only if re-grounded).
 
 **Planned (not implemented claims here):** Q8-first generic completion of the optimized path, wider LFM cohorts (1.2B / 8B-A1B), multi-GPU, and Phase-4 default-on.
-**Admitted (exact one row):** [`admissions.yml`](admissions.yml) schema v2 admits only the sealed gfx1201 LFM2.5-350M MQ4 retained-PM4 plain-AR product route; nothing else.
+**Admitted (exact one row):** [`admissions.yml`](admissions.yml) schema v2 admits only the sealed gfx1201 LFM2.5-350M MQ4 retained-PM4 plain-AR product route; nothing else. That admission is the sole authority and does not imply a batched-prefill product path.
 **Not a current baseline:** any exploratory tok/s tables in designs/plans.
-
-Eager per-token prefill / decode remains the portable LFM path when the opt-in flag is off **or** the GPU is not gfx1201. On **gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`**, the daemon selects the batched path from GPU+flag alone and has **no post-selection fallback**: requests outside the exact **350M dense MQ4** fixture fail closed at the runtime fixture guard. Source symbol `validate_350m_mq4_admission` names that fixture check only — it does **not** create a product admission; [`admissions.yml`](admissions.yml) remains the sole authority (schema v2, exactly one earned retained-PM4 product row for this sealed fixture).
 
 ---
 

@@ -117,6 +117,14 @@ With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
 any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
 optimizations do not gate ordinary-HIP serving.
 
+The grouped symmetric IU4 MoE prefill route (`HIPFIRE_QWEN4_MOE_SYM_IU4`) is
+**on by default** on gfx1151 and gfx1201 for layers whose routed-expert
+headers verify symmetric at load (a symmetric requant such as GPTQ3); shipped
+asymmetric artifacts fail that check and stay on the F16 WMMA route.
+`HIPFIRE_QWEN4_MOE_SYM_IU4=0` opts out and keeps the F16 route, preserving its
+lower KLD (gfx1151 GPTQ3: 0.0661 vs 0.1027 on the IU4 route; see
+[`env-vars.md`](env-vars.md)).
+
 ## Request lifecycle
 
 ```text
@@ -335,10 +343,6 @@ After `load_model`, request handling builds sampling defaults
 Capability examples that are **implemented** but not automatically
 “product-certified”:
 
-- LFM2.5 gfx1201 batched prefill is **branch-implemented**, not shipped/admitted:
-  only the frozen **350M dense MQ4** fixture under `arch_id == 11 && is_gfx1201()`
-  with explicit `HIPFIRE_LFM2_PREFILL_BATCH=1`; every other LFM cohort/dtype fails
-  closed after that gate. Default remains eager/decode-shaped prefill.
 - N-gram draft is model-free opt-in (`HIPFIRE_NGRAM_DRAFT`); many arches
   implement `SpecTarget`, but acceptance and product defaults are separate.
 - DFlash draft resolution is CLI-side path/auto-match; daemon loads the path it

@@ -5,12 +5,12 @@
 
 ## Purpose
 
-LFM2.5-8B-A1B hybrid (`arch_id` 11, `model_type` `lfm2_moe`): 18 double-gated LIV short-convolution mixers + 6 GQA+QK-norm attention layers, feeding a DeepSeek-style sigmoid-bias top-4 MoE (layers ≥ `num_dense_layers`) or dense SwiGLU MLP. Owns `config.rs`/`forward.rs`/`state.rs`/`spec_impl.rs` and the `Architecture` bring-up; batched prefill is branch-implemented only for the frozen 350M dense MQ4 fixture on gfx1201 behind `HIPFIRE_LFM2_PREFILL_BATCH=1`. See the `//!` docs in [`src/lib.rs`](src/lib.rs).
+LFM2.5-8B-A1B hybrid (`arch_id` 11, `model_type` `lfm2_moe`): 18 double-gated LIV short-convolution mixers + 6 GQA+QK-norm attention layers, feeding a DeepSeek-style sigmoid-bias top-4 MoE (layers ≥ `num_dense_layers`) or dense SwiGLU MLP. Owns `config.rs`/`forward.rs`/`state.rs`/`spec_impl.rs` and the `Architecture` bring-up; prefill is eager/decode-shaped (sequential `decode_step` per position; `prefill_embed_step` for VL, per-lane `prefill_lane` in `batch.rs`) — no batched-prefill path exists in this crate, and `HIPFIRE_LFM2_PREFILL_BATCH` has no reader (the gfx1201 batched-prefill design in `docs/design/` is historical only). See the `//!` docs in [`src/lib.rs`](src/lib.rs).
 
 ## Gotchas
 
 - Mixer choice comes from checkpoint `layer_types`, not a hard-coded table — hardcoding will mis-route LIV vs attention.
-- Batched prefill (gfx1201, 350M dense MQ4) is branch-implemented, not shipped — default remains eager/decode-shaped prefill; do not advertise it as product.
+- Batched prefill (gfx1201, 350M dense MQ4) is a historical design proposal only — not implemented in this crate; prefill is always eager/decode-shaped. `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` have no readers; do not advertise them as product.
 
 ## Crate map
 

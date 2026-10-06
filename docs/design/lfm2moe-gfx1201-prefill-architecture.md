@@ -1,5 +1,7 @@
 # LFM2.5 gfx1201 batched-prefill architecture — FROZEN CONTRACT
 
+> **Historical-design notice (2026-10):** this document is a historical proposal. `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` named below have **no readers in crate sources** and no current runtime effect; the batched-prefill/decode-fusion routes described here are not selectable. The text is kept unchanged as design evidence.
+
 **Status:** ✅ FROZEN by conductor (Main) 2026-07-18. Reviewer `PrimitiveLeech` FINAL VERDICT = APPROVE/freezable after 3 adversarial cycles (BLOCK → BLOCK → APPROVE) resolving 7 blockers + 3 residuals (grouped-MoE 16-alignment, flash-partials footprint, capacity cap) + the per-cohort manifest correction (dense vocab 65536 / θ 1e6 / 350M hidden 1024; only 8B is 2048/128000/5e6). Oversight `WhisperingPike` PASS; baseline Amdahl (`local://lfm-baseline-amdahl.md`) sets lane priority (dense-GEMM > attention > conv). Frozen contracts: `forward_prefill_batch`/`forward_prefill_chunk` API (§2), additive lazy `Lfm2MoeState` scratch (§4), chunking/state-transition contract (§3), per-cohort admissions (§8). Phase 0 head-elision is committed (`62dedc41a`) + hardened parity oracle (`0198fe6c0`). Implementation MAY now proceed per the §10 vertical-slice order (350m.q8 first); §13 items are implementation/promotion gates, not design blockers.
 
 **Checkout witnessed:** `lfm-redline` at `62dedc41aa5d335f0518e70cb9e748da332b6138`.

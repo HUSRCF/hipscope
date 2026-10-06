@@ -353,8 +353,8 @@ pub struct FeatureFlags {
     /// any byte difference kills it.
     pub gfx11_producer_quant_fused: bool,
     /// gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion
-    /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default OFF;
-    /// `=1` opts in on exact gfx1201. The `_mq4v2_fp8_gfx12` producer twins
+    /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default ON on
+    /// exact gfx1201; `=0` opts out. The `_mq4v2_fp8_gfx12` producer twins
     /// emit byte-identical `prepare_mq4v2_fp8_x_f32` (scale_mode=1) outputs
     /// for the qkvza/gate_up/qkv inputs, so the standalone
     /// `pack_f32_to_fp8_mq4v2_gfx12` launch disappears at each admitted site.

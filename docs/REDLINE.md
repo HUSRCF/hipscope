@@ -898,6 +898,8 @@ Exact scope: **LFM2.5-350M dense MQ4** on **gfx1201**, candidate path with
 explicit `HIPFIRE_LFM2_DECODE_FUSION=1`, ordinary serial HIP only (no AQL/PM4/
 HipGraph product route). **Rejected / not shipped.**
 
+> **Historical/inert flags:** `HIPFIRE_LFM2_DECODE_FUSION` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` (here and in the reproduce commands below) have no readers in current crate sources and no effect today. They are recorded as the campaign's historical candidate-route labels; measurement evidence is unchanged.
+
 **2026-07-19 Stage-A disposition:** LFM was not admitted to a retained route
 in that campaign — no Redline admission predicate then covered `arch_id==11`.
 That remains the historical Stage A rejection (serial-HIP fusion only; not an
@@ -963,6 +965,7 @@ Reproduce the exact shadow and submission proof from a release daemon:
 ```bash
 cargo build -p hipfire-runtime --release --example daemon --features deltanet
 
+# HISTORICAL/INERT: HIPFIRE_LFM2_GFX1201_DECODE_FUSION has no reader in current crate sources; the export below is retained as recorded and has no effect on the route.
 HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1 \
 HIPFIRE_REPLAY_LOWERED_FORWARD=1 \
 HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
@@ -990,6 +993,7 @@ and performance evidence.
 Run the product arm separately; do not stitch its result to the shadow report:
 
 ```bash
+# HISTORICAL/INERT: HIPFIRE_LFM2_GFX1201_DECODE_FUSION has no reader in current crate sources; the export below is retained as recorded and has no effect on the route.
 HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1 \
 HIPFIRE_REPLAY_LOWERED_FORWARD=1 \
 HIPFIRE_REPLAY_PM4_WAIT_POLICY=resource \

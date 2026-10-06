@@ -127,6 +127,16 @@ per-key help:
 
 Set `hipfire config set kernel.mq4v2_gateup_k5120 true` to opt in, or `false` to restore the generic route. The one-shot compatibility override is `HIPFIRE_MQ4V2_GATEUP_K5120=1` / `0`. This process-wide setting is snapshotted at GPU initialization; restart an existing daemon after changing it. Other architectures, shapes, and quantization formats keep their existing routes. Compiler-less installations need a kernel pack containing `fused_gate_up_mq4g256v2_k5120_gfx1100` to enable it.
 
+Architecture-gated default-on kernel routes (exact arch only; other arches keep their prior routes; all are process-wide and snapshotted at GPU initialization, so restart an existing daemon after changing them):
+
+| Key | Default on | Opt out | Notes |
+|---|---|---|---|
+| `kernel.gemma4_ple_branch_batched_prefill` | `auto`: exact gfx1100 and gfx1201 | `false` / `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` | Exact-arithmetic batched PLE branch projections; gfx1101, gfx1102, gfx1151, gfx1200 stay off. Separate from `kernel.gemma4_ple_batched_prefill` (default off). |
+| `kernel.gfx11_q8_fa2_wide` | `auto`: exact gfx1100 and gfx1151 (not gfx1100-only) | `false` / `HIPFIRE_GFX11_Q8_FA2_WIDE=0` | Whole-chunk Q8/Q8 FA2 prefill; requires `kernel.gfx11_fa2_prefill`. gfx1151 enabled deliberately in commit `ae9c5cf9d12a5a63ae60630637d22d00a4fc964e` via the twin CU-mode dispatch (same arithmetic, byte-identical). |
+| `kernel.gfx12_fp8_stream` | exact gfx1201 | `false` / `HIPFIRE_GFX12_FP8_STREAM=0` | RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion; byte-identical outputs; other arches off. |
+
+See [`env-vars.md`](env-vars.md) for the full per-variable rows.
+
 Diagnostic booleans all default off: `diagnostic.prompt_token_heat`,
 `diagnostic.prompt_heat_json`, `diagnostic.draft_gemm_dump`,
 `diagnostic.draft_subphase`, `diagnostic.mmq_quantize_only`,
@@ -520,7 +530,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
-| `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads; `HIPFIRE_DFLASH_ADAPTIVE_B=0` forces fixed. |
+| `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads. `HIPFIRE_DFLASH_ADAPTIVE_B=0` is a kill switch read through the `[developer]` namespace (not a schema env alias): it forces the fixed block even when this is `true`, and cannot enable adaptive. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |

@@ -83,7 +83,7 @@ The gfx1201 route-isolation run measured 454.03 tok/s for baseline, 453.29 tok/s
 
 ## Production Decision
 
-The exact replacement passed the full cross-model hard30 gate and is therefore enabled by auto policy on gfx1100 and gfx1201. It remains independently disableable through `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`; other architectures remain off. Across E2B and E4B on both validated architectures, all 120 candidate predictions were byte-identical to their paired all-routes-off baselines, with no correctness regressions or gains.
+The exact replacement passed the full cross-model hard30 gate and is therefore enabled by auto policy on gfx1100 and gfx1201 (`HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL` unset). It remains independently disableable through `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` (or `kernel.gemma4_ple_branch_batched_prefill=false`); other architectures remain off, and setting the flag to `1` there does not enable the route. The original F16-activation WMMA route is no longer reachable: the shipped batched path always uses `gemm_q8_0_batched_wide_exact`, per projection, for Q8_0 weights with `K <= 1536` and `B > 1`, and other projections stay row-wise. Across E2B and E4B on both validated architectures, all 120 candidate predictions were byte-identical to their paired all-routes-off baselines, with no correctness regressions or gains.
 
 | Architecture | Model | Accuracy off -> exact | Prefill off -> exact | Prefill delta | TTFT off -> exact | TTFT delta | Identical predictions |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -94,7 +94,7 @@ The exact replacement passed the full cross-model hard30 gate and is therefore e
 
 The exact-policy artifacts are under `target/validation/gemma4-longbench-prefill/gfx1100/exact-ple-hard30-w7900-r1-20260816` and, on the gfx1201 validation host, `target/validation/gemma4-longbench-prefill/gfx1201/exact-ple-hard30-gfx1201-r1-20260816`.
 
-The final hard30 gate ran 30 paired prompts for both E2B and E4B on each architecture with an 8,192-token output cap. All 120 safe-policy predictions were byte-identical to their corresponding all-routes-off baselines, with zero correctness regressions or gains.
+The second hard30 gate below ran with PLE branch batching explicitly disabled and the batched-embedding and fused-activation routes enabled ("safe" = branch route off). It is retained as the evidence that those two routes are exact-trajectory safe in isolation, and as the opt-out baseline; it is not the current default policy. All 120 safe-policy predictions were byte-identical to their corresponding all-routes-off baselines, with zero correctness regressions or gains. The 30 paired prompts per model per architecture used an 8,192-token output cap.
 
 | Architecture | Model | Accuracy off -> safe | Prefill off -> safe | Prefill delta | TTFT off -> safe | TTFT delta | Identical predictions |
 |---|---|---|---:|---:|---:|---:|---:|
