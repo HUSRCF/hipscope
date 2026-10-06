@@ -7781,8 +7781,9 @@ pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1
 /// generation components, served through `hipfire img` / `/v1/images/*`, not
 /// completion trunks a `/v1/models` pick can generate text from. `8`
 /// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
-/// completions.
-pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// completions. `16` (Qwen4 / Flash-Next) is present as a text-serving primary
+/// arch: an unregistered local Flash-Next trunk must be advertised too.
+pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 fn source_label(source: &ConfigSource) -> String {
     match source {
@@ -8053,6 +8054,11 @@ mod tests {
         // A locally quantized trunk of a primary arch: advertised.
         write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
         assert!(classify("local-trunk.mq4"));
+
+        // A locally produced Flash-Next (Qwen4) trunk, arch 16, is a text-serving
+        // primary: advertised even though the registry does not name the file.
+        write_hfq_fixture(&paths.models.join("local-flash-next.mq4"), 16);
+        assert!(classify("local-flash-next.mq4"));
 
         // Locally produced sidecars: never advertised, whatever the registry
         // knows. 20 = DFlash draft, 23 = Muse Glimmer drafter.
