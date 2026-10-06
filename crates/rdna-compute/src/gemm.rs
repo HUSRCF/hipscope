@@ -197,6 +197,13 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
+/// `HIPFIRE_QWEN4_MQ6_X4_PM` (on unless `0`) runs gfx1201's MQ6 F32 overwrite
+/// trunk GEMM from the certified builder module (`kernels::QWEN4_MQ6_X4_PM_GFX1201`,
+/// same arguments and output bytes as `gemm_mq6g256v2_wmma_gfx12_bt8_x4`, its own
+/// 256-token grid) instead of the hipcc kernel. `0` keeps the hipcc kernel. Read once.
+static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true)
+});
 /// HC-down (320 x 10240) on a 160 x 64 pipelined tile, gfx1151 only, rows >= 2048; default on
 /// (the only call site checks gfx1151), `0` keeps the 64 x 64 tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -38171,10 +38178,31 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false, None)
     }
 
-    /// `overwrite` (`Y = W·X`, MQ6 BT8 X-LDS) equals zeroing Y and
-    /// then accumulating, in one launch.
     #[allow(clippy::too_many_arguments)]
     fn mqv2_wmma_gfx11_bt(
+        &mut self,
+        bits: u8,
+        batch_tile: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        overwrite: bool,
+        x_f16: Option<*mut c_void>,
+    ) -> HipResult<()> {
+        self.mqv2_wmma_gfx11_bt_pm(
+            bits, batch_tile, a_raw, x, y, m, k, batch_size, overwrite, x_f16, *QWEN4_MQ6_X4_PM,
+        )
+    }
+
+    /// `overwrite` (`Y = W·X`, MQ6 BT8 X-LDS) equals zeroing Y and
+    /// then accumulating, in one launch.
+    /// `pm` runs the gfx1201 MQ6 F32 overwrite GEMM from the builder module
+    /// (`HIPFIRE_QWEN4_MQ6_X4_PM`): same arguments and output bytes, 256-token grid.
+    #[allow(clippy::too_many_arguments)]
+    fn mqv2_wmma_gfx11_bt_pm(
         &mut self,
         bits: u8,
         batch_tile: usize,
@@ -38188,6 +38216,7 @@ impl Gpu {
         // X already converted to F16 (e.g. by `rotate_x_mq_batched_f16`);
         // `None` converts `x` here.
         x_f16: Option<*mut c_void>,
+        pm: bool,
     ) -> HipResult<()> {
         let func_name: &'static str = match (bits, batch_tile) {
             (2, 4) => "gemm_mq2g256v2_residual_wmma_gfx11_bt4",
@@ -38232,11 +38261,20 @@ impl Gpu {
             }
         };
         let kind = if y.dtype == DType::BF16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
-        let (func_name, rows_per_block, block, batch_tile) =
-            match (xlds && overwrite).then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size)).flatten() {
-                Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
-                None => (func_name, rows_per_block, block, batch_tile),
-            };
+        let halo = (xlds && overwrite).then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size)).flatten();
+        let use_pm = pm
+            && xlds
+            && overwrite
+            && gfx12
+            && self.arch.as_str() == "gfx1201"
+            && y.dtype != DType::BF16
+            && halo.is_none();
+        let (func_name, rows_per_block, block, batch_tile) = match halo {
+            Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
+            None if use_pm && m <= 64 => ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile),
+            None if use_pm => ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile),
+            None => (func_name, rows_per_block, block, batch_tile),
+        };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
             3 => crate::dispatch::MQ3G256V2_GROUP_BYTES,
@@ -38254,7 +38292,9 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        if xlds {
+        if use_pm {
+            self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1201", kernels::QWEN4_MQ6_X4_PM_GFX1201, func_name)?;
+        } else if xlds {
             let (module, source) = if gfx12 {
                 ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4", kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC)
             } else {
@@ -38292,7 +38332,7 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(rows_per_block);
-        let n_tile = 16 * batch_tile;
+        let n_tile = if use_pm { 256 } else { 16 * batch_tile };
         let batch_tiles = batch_size.div_ceil(n_tile);
         let weight_bytes = m * (k / 256) * group_bytes;
         let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
@@ -46695,6 +46735,64 @@ mod tests {
                 );
             }
             gpu.free_tensor(x_gpu).expect("free x");
+        }
+    }
+
+    /// The builder-module MQ6 overwrite GEMM (`HIPFIRE_QWEN4_MQ6_X4_PM`) must
+    /// produce the hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` bytes: the 64-row
+    /// entry (M <= 64), the 128-row entry with a full and a ragged row tail,
+    /// and token tails inside the last 256-token tile.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn mq6_x4_pm_matches_hipcc_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        for (m, k, n) in [(10240usize, 2560usize, 512usize), (64, 2560, 300), (1003, 512, 257)] {
+            let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+            let mut weights = vec![0u8; m * k / 256 * group];
+            let mut state = 13u32;
+            for chunk in weights.chunks_mut(group) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                    chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            let a = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
+            let x: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("overwrite");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, false);
+            let got = run(&mut gpu, true);
+            assert!(want.iter().any(|v| *v != 0.0));
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "builder module differs from hipcc in {differing} cells at M={m} K={k} N={n}"
+            );
+            gpu.free_tensor(x_gpu).expect("free x");
+            gpu.free_tensor(a).expect("free a");
         }
     }
 }

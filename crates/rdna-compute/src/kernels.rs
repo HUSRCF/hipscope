@@ -4228,6 +4228,18 @@ pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_ga
 /// Default on (`HIPFIRE_QWEN4_QSA_SCORE_PM=0` / `HIPFIRE_QWEN4_QSA_SELECT_PM=0`
 /// keep the hipcc kernels).
 pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
+/// Certified builder module of gfx1201's MQ6 trunk overwrite GEMM
+/// (`hipfire-isa emit --kernel qwen4_mq6_x4 --epi all --arch gfx1201`, M7
+/// obligation-free; `hipfire peacemaker native-emit` writes the bundle): the
+/// exact twin of hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` (F32 overwrite, BT8
+/// X-LDS) in `kernels/src/qwen4_gemm_mq6g256v2_wmma_gfx12_x4.hip`, with that
+/// kernel's arguments and output bytes. Entries `qwen4_mq6_x4_pm_gfx1201_w4`
+/// (64-row block of 128 threads) and `_w8` (128-row block of 256 threads),
+/// both over 256-token tiles (grid `[ceil(M/rows), ceil(N/256), 1]`).
+/// Default on (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps the hipcc kernel).
+/// SHA-256 75d8489189dc5b5096c23fa1a9e22e1bb3ee1201f20df75d5b360c1f7111b80e
+/// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
+pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
 pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
