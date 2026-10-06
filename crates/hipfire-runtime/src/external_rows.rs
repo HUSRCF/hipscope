@@ -48,8 +48,24 @@ pub const PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// overhead outside the byte budget. Four rows keeps the page inside a fifth of
 /// an OS page and the index overhead near a quarter of the payload.
 const ROWS_PER_PAGE: usize = 4;
-/// Concurrent source reads of one request's scattered page groups.
+/// Concurrent source reads of one request's scattered page groups: a small
+/// request (decode, MTP verify, short prompts) keeps this many readers.
 const PARALLEL_READERS: usize = 16;
+/// Reader ceiling of a large request (a prefill chunk's ~110K scattered
+/// pages). Random 1280-byte buffered reads on the Halo (gfx1151) host's NVMe
+/// measured ~37K IOPS at 16 readers, ~90K at 128 and ~101K at 256. The first
+/// prefill chunk's fetch has no earlier chunk to hide behind, so the GPU
+/// idles for its whole read and that read is bound by queue depth.
+const MAX_PARALLEL_READERS: usize = 256;
+/// Page groups each extra reader must have before another is spawned, so a
+/// thread's spawn cost stays small against its reads.
+const READS_PER_READER: usize = 64;
+
+/// Readers for `groups` scattered page-group reads, at most `max_readers`.
+fn reader_count(groups: usize, max_readers: usize) -> usize {
+    (groups / READS_PER_READER).clamp(PARALLEL_READERS, max_readers)
+}
+
 /// Default byte budget of one coalesced read or one staging buffer.  The
 /// effective size is rounded down to a whole number of decoded rows; a
 /// caller that requests more rows at once sizes it with
@@ -566,24 +582,28 @@ impl RowStore {
         descriptors: Vec<SourceRangeDescriptor>,
         valid_rows: u64,
     ) -> Result<Self, RowStoreError> {
-        Self::with_staging_rows(name, descriptors, valid_rows, 0)
+        Self::with_staging_rows(name, descriptors, valid_rows, 0, true)
     }
 
     /// [`RowStore::new`] whose staging buffers (and coalesced reads) hold at
     /// least `rows` decoded rows, so a prefetch of `rows` row ids is
-    /// admissible.  Never smaller than the default budget.
+    /// admissible.  Never smaller than the default budget.  `wide_readers`
+    /// lets a large request scale its concurrent reads up to
+    /// `MAX_PARALLEL_READERS`; without it every request keeps
+    /// `PARALLEL_READERS`.
     pub fn with_staging_rows(
         name: &str,
         descriptors: Vec<SourceRangeDescriptor>,
         valid_rows: u64,
         rows: usize,
+        wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
         let layout = validate_descriptors(&descriptors, valid_rows)?;
         let source: Arc<dyn PositionalRowSource> = Arc::new(DescriptorRowSource {
             descriptors: descriptors.clone(),
         });
-        Self::spawn(name, source, descriptors, layout, rows)
+        Self::spawn(name, source, descriptors, layout, rows, wide_readers)
     }
 
     fn spawn(
@@ -592,6 +612,7 @@ impl RowStore {
         descriptors: Arc<[SourceRangeDescriptor]>,
         layout: Layout,
         staging_rows: usize,
+        wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let decoded_row_bytes = layout.row_width * 2;
         let staging_bytes = staging_rows
@@ -612,6 +633,11 @@ impl RowStore {
             encoded_row_bytes: layout.encoding.encoded_row_bytes(layout.row_width),
             decoded_row_bytes,
             staging_bytes,
+            max_readers: if wide_readers {
+                MAX_PARALLEL_READERS
+            } else {
+                PARALLEL_READERS
+            },
             rows_per_shard: layout.rows_per_shard,
             rows_per_page: layout.rows_per_page,
             current_epoch: AtomicU64::new(0),
@@ -1215,6 +1241,8 @@ struct RowStoreInner {
     decoded_row_bytes: usize,
     /// Whole-row size of one staging buffer / coalesced read.
     staging_bytes: usize,
+    /// Reader ceiling of one request's scattered reads.
+    max_readers: usize,
     rows_per_shard: usize,
     rows_per_page: usize,
     epoch_started: AtomicBool,
@@ -1468,7 +1496,9 @@ impl RowStoreInner {
             // full device round trip (~64 reads = 10-15 ms per few-token
             // request on NVMe), issued together the device overlaps them.
             let mut buffers: Vec<Vec<u8>> = vec![Vec::new(); groups.len()];
-            let per_thread = groups.len().div_ceil(PARALLEL_READERS);
+            let per_thread = groups
+                .len()
+                .div_ceil(reader_count(groups.len(), self.max_readers));
             std::thread::scope(|scope| -> Result<(), RowStoreError> {
                 let handles: Vec<_> = groups
                     .chunks(per_thread)
@@ -2335,8 +2365,39 @@ mod tests {
                     encoding,
                 },
                 0,
+                true,
             )
         }
+    }
+
+    /// Small requests keep the original 16 readers; a prefill chunk's page
+    /// set saturates at the ceiling, and a store built without wide readers
+    /// never leaves 16.
+    #[test]
+    fn reader_count_scales_only_large_requests() {
+        for groups in [
+            0,
+            1,
+            16,
+            64,
+            1024,
+            16 * READS_PER_READER + READS_PER_READER - 1,
+        ] {
+            assert_eq!(
+                reader_count(groups, MAX_PARALLEL_READERS),
+                PARALLEL_READERS,
+                "{groups} groups"
+            );
+        }
+        assert_eq!(
+            reader_count(64 * READS_PER_READER, MAX_PARALLEL_READERS),
+            64
+        );
+        assert_eq!(
+            reader_count(111_412, MAX_PARALLEL_READERS),
+            MAX_PARALLEL_READERS
+        );
+        assert_eq!(reader_count(111_412, PARALLEL_READERS), PARALLEL_READERS);
     }
 
     /// The production constructor reads real sealed HFQ ranges: rows come back
@@ -2431,7 +2492,7 @@ mod tests {
         assert!(default.unload().unwrap().is_clean());
 
         let rows = default_max * 2 + 3;
-        let store = RowStore::with_staging_rows("t", descriptors, valid_rows, rows).unwrap();
+        let store = RowStore::with_staging_rows("t", descriptors, valid_rows, rows, true).unwrap();
         assert_eq!(store.max_rows_per_prefetch(), rows);
         assert!(matches!(
             store.prefetch(0, vec![0; rows + 1]),

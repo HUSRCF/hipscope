@@ -17,6 +17,7 @@ use crate::gpu_forward::{
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
+use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
@@ -27,7 +28,6 @@ use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
-use crate::state::Qwen4StateFormat;
 use rdna_compute::{Gpu, GpuTensor};
 use std::fmt;
 use std::time::Duration;
@@ -242,6 +242,9 @@ impl Qwen4Bundle {
             descriptors,
             metadata.valid_rows(),
             staging_rows,
+            // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent reads
+            // for every PLE request, including a whole prefill chunk.
+            hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
         ) {
             Ok(rows) => rows,
             Err(error) => {
@@ -254,27 +257,22 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let mut state = match Qwen4State::new_with_backend(
-            gpu,
-            &config,
-            max_seq_len,
-            state_format,
-            backend,
-        ) {
-            Ok(state) => state,
-            Err(error) => {
-                // `unload` consumes the reader and joins its worker even on a
-                // quiesce error, so source descriptors cannot outlive failure.
-                let _ = ple_rows.unload();
-                let weight_result = weights.free_gpu(gpu);
-                let cleanup = transaction.rollback(gpu);
-                return Err(cleanup_bundle_failure(
-                    BundleError::State(error),
-                    weight_result,
-                    cleanup,
-                ));
-            }
-        };
+        let mut state =
+            match Qwen4State::new_with_backend(gpu, &config, max_seq_len, state_format, backend) {
+                Ok(state) => state,
+                Err(error) => {
+                    // `unload` consumes the reader and joins its worker even on a
+                    // quiesce error, so source descriptors cannot outlive failure.
+                    let _ = ple_rows.unload();
+                    let weight_result = weights.free_gpu(gpu);
+                    let cleanup = transaction.rollback(gpu);
+                    return Err(cleanup_bundle_failure(
+                        BundleError::State(error),
+                        weight_result,
+                        cleanup,
+                    ));
+                }
+            };
         state.bind_transaction_generation(transaction.inventory_len() as u64);
         Ok(Self {
             config,
@@ -371,18 +369,22 @@ impl Qwen4Bundle {
         if let Some(qsa) = self.state.qsa.first() {
             let heads = self.config.num_key_value_heads;
             let reserved = match self.state.qsa_backend() {
-                Qwen4KvBackend::Legacy => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
-                    gpu,
-                    qsa.format,
-                    heads,
-                    qsa.full_capacity,
-                ),
-                Qwen4KvBackend::Vmm => rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
-                    gpu,
-                    qsa.format,
-                    heads,
-                    qsa.full_capacity,
-                ),
+                Qwen4KvBackend::Legacy => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_scratch(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
+                Qwen4KvBackend::Vmm => {
+                    rdna_compute::tensor_ops::reserve_qsa_gathered_wmma_workspace(
+                        gpu,
+                        qsa.format,
+                        heads,
+                        qsa.full_capacity,
+                    )
+                }
             }
             .map_err(BundleError::Hip)?;
             if reserved > 0 {
@@ -915,8 +917,7 @@ impl Qwen4Bundle {
 
     /// Whether [`Self::mtp_append_rows`] can run on this GPU for this model.
     pub(crate) fn mtp_append_rows_supported(&self, gpu: &Gpu) -> bool {
-        self.mtp.is_some()
-            && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
+        self.mtp.is_some() && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
     }
 
     /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
@@ -1388,9 +1389,7 @@ impl Qwen4Bundle {
                     .map_err(|error| BundleError::Forward(error.to_string()))?;
             }
         }
-        self.state
-            .restore_prefix(gpu)
-            .map_err(BundleError::State)?;
+        self.state.restore_prefix(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
             match mode {
                 Qwen4PrefixMode::NativeMtp => mtp.restore_prefix(gpu),
@@ -1449,9 +1448,7 @@ impl Qwen4Bundle {
         mode: Qwen4PrefixMode,
     ) -> Result<(), BundleError> {
         self.quiesce_ple()?;
-        self.state
-            .capture_prefix(gpu)
-            .map_err(BundleError::State)?;
+        self.state.capture_prefix(gpu).map_err(BundleError::State)?;
         match (mode, self.mtp.as_mut()) {
             (Qwen4PrefixMode::NativeMtp, Some(mtp)) => mtp
                 .capture_prefix(gpu)
