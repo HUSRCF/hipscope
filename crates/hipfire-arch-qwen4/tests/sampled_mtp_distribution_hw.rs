@@ -62,6 +62,38 @@
 //! different config is a hard error. Use one `HIPFIRE_SAMPLED_MTP_OUT`
 //! directory per config (e.g. `.../neutral`, `.../presence1.5`).
 //!
+//! # N-gram composition arms
+//!
+//! `sampled_mtp_ngram_matches_ar_distribution_on_flash_next` repeats the
+//! comparison with the request-local n-gram pool armed (drafter built
+//! `.with_ngram(Some(qwen4_ngram_mod_config((5, 3, 3))?))`, request
+//! `allow_ngram_modifier: true`, the same neutral T/top_p/top_k/min_p, no
+//! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm:
+//!
+//! - `ngram_batched` / `ngram_interleaved`: the prose prompt, so the pool
+//!   mostly misses and the native window runs; compared with the existing
+//!   `ar` arm (a window-source mix must leave the target law unchanged);
+//!   native windows (`mtp_windows`) must occur;
+//! - `copy_ar`: AR on the copied-span fixture (the reference);
+//! - `copy_batched` / `copy_interleaved`: the copied-span fixture, whose
+//!   prompt is a "rewrite this passage" request with the passage's first
+//!   `COPY_PRIMED` tokens already in the assistant turn, so the pool proposes
+//!   the passage's continuation on the first window (the fixture is
+//!   pre-checked on the CPU against `MtpNgramContext` for the prompt). Hits
+//!   are REQUIRED: `request_stats().ngram_mod_windows`, summed over the
+//!   trials, and the offered drafts must both be nonzero, in the arm and again
+//!   in the parent from `<arm>.stats.json`.
+//!
+//! Every MTP arm is compared with its AR reference by the same per-position
+//! marginals and (t1, t2) joint chi-square (every p-value > `ALPHA`), and
+//! replays its first `REPLAYS` seeds: identical IDs and identical window
+//! counters. Each arm runs in a fresh process of
+//! `sampled_mtp_ngram_distribution_arm` (`ar` still comes from
+//! `sampled_mtp_distribution_arm`; an arm whose `<arm>.ids.json` exists is
+//! reused). The `HIPFIRE_SAMPLED_MTP_*_PENALTY` / `_REPEAT_WINDOW` env
+//! reaches the n-gram arms and `copy_ar` exactly as above, so a presence-1.5
+//! run checks penalized `p` on the n-gram rows (one output dir per config).
+//!
 //! `naive_sampled_mtp_emits_seeded_ar_ids` checks the stronger property of
 //! `HIPFIRE_MTP_SAMPLED_MODE=naive`: with the same seed, every MTP route
 //! (`batched`, `interleaved`, `adaptive` = route knob unset) emits the AR
@@ -75,14 +107,15 @@
 //! Both identity arms read the same penalty and prompt-fixture env as above.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
-use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
+use hipfire_arch_qwen4::mtp_spec::{qwen4_ngram_mod_config, Qwen4MtpDrafter};
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
-use hipfire_runtime::spec::{MtpDrafter, SpecRequestConfig};
+use hipfire_runtime::spec::{MtpDrafter, MtpRequestStats, SpecRequestConfig};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu};
@@ -116,6 +149,68 @@ const MTP_K: usize = 3;
 const REPLAYS: usize = 5;
 const ALPHA: f64 = 1e-3;
 const ARMS: [&str; 3] = ["ar", "batched", "interleaved"];
+
+/// The n-gram triple under test (`n_match`, `n_min`, `n_max`): the arch-16
+/// default of `hipfire_config::ngram_mod_triple_for_arch`.
+const NGRAM_TRIPLE: (usize, usize, usize) = (5, 3, 3);
+/// Fewest independent seeded trials per n-gram arm.
+const NGRAM_MIN_TRIALS: usize = 2000;
+const NGRAM_ARM_TEST: &str = "sampled_mtp_ngram_distribution_arm";
+/// The AR reference arm of the copied-span fixture.
+const COPY_AR_ARM: &str = "copy_ar";
+const COPY_AR_SALT: u64 = 0xC0A11;
+
+/// Copied-span fixture: the user asks for a rewrite that keeps the wording,
+/// and the assistant turn already holds the passage's first `COPY_PRIMED`
+/// tokens, so the last five context tokens before the first window's seed
+/// (the passage's token `COPY_PRIMED`, when sampled) occur in the prompt.
+const COPY_INSTRUCTION: &str = "Rewrite the following passage, keeping its wording wherever you can.\n\n";
+const COPY_PASSAGE: &str = "The old lighthouse keeper climbed the spiral stairs every evening to light the great lamp, and every morning he polished the brass until it shone like gold.";
+const COPY_PRIMED: usize = 8;
+
+/// One n-gram combo arm.
+struct NgramArm {
+    name: &'static str,
+    /// The AR arm whose distribution this arm must match.
+    reference: &'static str,
+    /// Runs the copied-span fixture (hits required) rather than the prose prompt.
+    copy: bool,
+    /// `trial_seed` salt, distinct per arm.
+    salt: u64,
+    /// `HIPFIRE_MTP_INCREMENTAL` the parent gives the arm's process.
+    incremental: &'static str,
+}
+
+static NGRAM_ARMS: [NgramArm; 4] = [
+    NgramArm {
+        name: "ngram_batched",
+        reference: "ar",
+        copy: false,
+        salt: 0x4E1,
+        incremental: "0",
+    },
+    NgramArm {
+        name: "ngram_interleaved",
+        reference: "ar",
+        copy: false,
+        salt: 0x4E2,
+        incremental: "1",
+    },
+    NgramArm {
+        name: "copy_batched",
+        reference: COPY_AR_ARM,
+        copy: true,
+        salt: 0xC0B1,
+        incremental: "0",
+    },
+    NgramArm {
+        name: "copy_interleaved",
+        reference: COPY_AR_ARM,
+        copy: true,
+        salt: 0xC0B2,
+        incremental: "1",
+    },
+];
 
 /// SplitMix64 of `arm_salt ^ trial`, never zero.
 fn trial_seed(arm_salt: u64, trial: usize) -> u64 {
@@ -745,6 +840,18 @@ impl Loaded {
         cfg: SpecRequestConfig,
         tokens: usize,
     ) -> Result<(Vec<u32>, usize, usize), String> {
+        self.mtp_request(drafter, prompt, cfg, tokens)
+            .map(|(ids, drafted, accepted, _)| (ids, drafted, accepted))
+    }
+
+    /// [`mtp_ids`](Self::mtp_ids) plus the request's `request_stats()`.
+    fn mtp_request(
+        &mut self,
+        drafter: &mut Qwen4MtpDrafter,
+        prompt: &[u32],
+        cfg: SpecRequestConfig,
+        tokens: usize,
+    ) -> Result<(Vec<u32>, usize, usize, MtpRequestStats), String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
         let mut seed_token = drafter.mtp_prefill(
@@ -776,7 +883,7 @@ impl Loaded {
             ids.extend_from_slice(&window.committed);
         }
         ids.truncate(tokens);
-        Ok((ids, drafted, accepted))
+        Ok((ids, drafted, accepted, drafter.request_stats()))
     }
 }
 
@@ -824,12 +931,36 @@ fn spec_request(
     }
 }
 
+/// [`spec_request`] with the n-gram pool armed (`allow_ngram_modifier`).
+fn spec_request_ngram(
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: f32,
+    seed: u64,
+    pen: &Penalties,
+) -> SpecRequestConfig {
+    SpecRequestConfig {
+        allow_ngram_modifier: true,
+        ..spec_request(temp, top_p, top_k, min_p, seed, pen)
+    }
+}
+
 fn new_drafter(loaded: &mut Loaded) -> Result<Qwen4MtpDrafter, String> {
+    new_drafter_with(loaded, None)
+}
+
+/// A sampled-verify drafter; `ngram` is the pool configuration requests that
+/// arm `allow_ngram_modifier` use (`None`: every window native).
+fn new_drafter_with(
+    loaded: &mut Loaded,
+    ngram: Option<NgramModConfig>,
+) -> Result<Qwen4MtpDrafter, String> {
     loaded
         .bundle
         .attach_mtp(&mut loaded.gpu, MAX_SEQ)
         .map_err(|e| e.to_string())?;
-    let drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None);
+    let drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None).with_ngram(ngram);
     if !drafter.supports_temp_verify() {
         return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
     }
@@ -1186,6 +1317,362 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
     loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// N-gram composition arms
+// ---------------------------------------------------------------------------
+
+/// Per-position marginals and the (t1, t2) joint of `mtp` against its AR
+/// `reference`; lines go to `report`, p-values under `ALPHA` to `failures`.
+fn compare_to_reference(
+    arm: &str,
+    reference: &str,
+    ar: &[Vec<u32>],
+    mtp: &[Vec<u32>],
+    report: &mut String,
+    failures: &mut Vec<String>,
+) {
+    for position in 0..TOKENS {
+        let a: Vec<u32> = ar.iter().map(|ids| ids[position]).collect();
+        let b: Vec<u32> = mtp.iter().map(|ids| ids[position]).collect();
+        let (stat, df, p) = homogeneity(&a, &b);
+        let line = format!(
+            "{arm} vs {reference}, token {}: chi2={stat:.2} df={df} p={p:.4} (n={}+{})\n",
+            position + 1,
+            a.len(),
+            b.len()
+        );
+        if p < ALPHA {
+            failures.push(line.clone());
+        }
+        report.push_str(&line);
+    }
+    let a: Vec<(u32, u32)> = ar.iter().map(|ids| (ids[0], ids[1])).collect();
+    let b: Vec<(u32, u32)> = mtp.iter().map(|ids| (ids[0], ids[1])).collect();
+    let (stat, df, p) = homogeneity(&a, &b);
+    let line = format!("{arm} vs {reference}, (t1,t2) joint: chi2={stat:.2} df={df} p={p:.4}\n");
+    if p < ALPHA {
+        failures.push(line.clone());
+    }
+    report.push_str(&line);
+}
+
+/// Run one arm as a fresh process of `test`.
+fn run_ngram_arm_process(
+    test: &str,
+    arm: &str,
+    incremental: Option<&str>,
+    model: &Path,
+    dir: &Path,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("test binary path: {e}"))?;
+    let mut child = Command::new(exe);
+    child
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ARM_ENV, arm)
+        .env(MODEL_ENV, model)
+        .env(OUT_ENV, dir)
+        .env("HIPFIRE_MTP_SAMPLED", "1")
+        .env_remove("HIPFIRE_MTP_INCREMENTAL")
+        .stdin(Stdio::null());
+    if let Some(value) = incremental {
+        child.env("HIPFIRE_MTP_INCREMENTAL", value);
+    }
+    let output = child
+        .output()
+        .map_err(|e| format!("spawn {arm}: {e}"))?;
+    fs::write(dir.join(format!("{arm}.out")), &output.stdout).map_err(|e| e.to_string())?;
+    fs::write(dir.join(format!("{arm}.err")), &output.stderr).map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "{arm} arm failed ({}); logs in {}",
+            output.status,
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let trials: usize = env_or(TRIALS_ENV, NGRAM_MIN_TRIALS);
+    assert!(
+        trials >= NGRAM_MIN_TRIALS,
+        "{TRIALS_ENV}={trials}: the n-gram arms need at least {NGRAM_MIN_TRIALS} trials"
+    );
+    let mut arms: Vec<(&str, Option<&NgramArm>)> = vec![("ar", None), (COPY_AR_ARM, None)];
+    arms.extend(NGRAM_ARMS.iter().map(|arm| (arm.name, Some(arm))));
+    let mut samples: HashMap<&str, Vec<Vec<u32>>> = HashMap::new();
+    for (name, spec) in arms {
+        let ids_path = dir.join(format!("{name}.ids.json"));
+        if ids_path.exists() {
+            eprintln!("reusing {}", ids_path.display());
+        } else {
+            let test = if name == "ar" {
+                ARM_TEST
+            } else {
+                NGRAM_ARM_TEST
+            };
+            run_ngram_arm_process(test, name, spec.map(|arm| arm.incremental), &model, &dir)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let ids: Vec<Vec<u32>> =
+            serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
+        assert!(
+            ids.len() >= NGRAM_MIN_TRIALS,
+            "{name}: {} trials in {}, need at least {NGRAM_MIN_TRIALS}",
+            ids.len(),
+            ids_path.display()
+        );
+        samples.insert(name, ids);
+    }
+    let mut report = String::new();
+    let mut failures = Vec::new();
+    for arm in &NGRAM_ARMS {
+        compare_to_reference(
+            arm.name,
+            arm.reference,
+            &samples[arm.reference],
+            &samples[arm.name],
+            &mut report,
+            &mut failures,
+        );
+        let stats_path = dir.join(format!("{}.stats.json", arm.name));
+        let bytes = fs::read(&stats_path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (the arm writes its stats with its ids; delete {}.ids.json to rerun it)",
+                stats_path.display(),
+                arm.name
+            )
+        });
+        let stats: serde_json::Value = serde_json::from_slice(&bytes).expect("arm stats json");
+        let count = |key: &str| stats[key].as_u64().expect("arm stats count") as usize;
+        let (windows, drafts, accepted, native) = (
+            count("ngram_mod_windows"),
+            count("ngram_mod_drafts"),
+            count("ngram_mod_accepted"),
+            count("mtp_windows"),
+        );
+        let line = format!(
+            "{}: ngram_mod_windows={windows} drafts={drafts} accepted={accepted} mtp_windows={native} (summed over {} trials)\n",
+            arm.name,
+            count("trials")
+        );
+        if arm.copy && (windows == 0 || drafts == 0) {
+            failures.push(format!("{line}  the copied-span fixture produced no n-gram hits\n"));
+        } else if !arm.copy && native == 0 {
+            failures.push(format!("{line}  no native MTP window ran on the prose prompt\n"));
+        }
+        report.push_str(&line);
+    }
+    eprint!("{report}");
+    fs::write(dir.join("ngram-report.txt"), &report).unwrap();
+    assert!(
+        failures.is_empty(),
+        "n-gram + sampled MTP differs from AR in distribution or never hit (alpha {ALPHA}; logs in {}):\n{}",
+        dir.display(),
+        failures.concat()
+    );
+}
+
+/// One n-gram arm in a fresh process; spawned by the test above.
+#[test]
+#[ignore = "child process of sampled_mtp_ngram_matches_ar_distribution_on_flash_next"]
+fn sampled_mtp_ngram_distribution_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_ngram_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} arm: {error}");
+    }
+}
+
+fn sampling_from_env() -> Result<(f32, f32, Option<u32>, f32), String> {
+    let temp: f32 = env_or(TEMP_ENV, 1.0);
+    let top_p: f32 = env_or(TOP_P_ENV, 0.95);
+    let top_k: Option<u32> = std::env::var(TOP_K_ENV)
+        .ok()
+        .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
+        .transpose()?;
+    let min_p: f32 = env_or(MIN_P_ENV, 0.0);
+    Ok((temp, top_p, top_k, min_p))
+}
+
+/// The copied-span fixture's prompt: the rendered rewrite request plus the
+/// passage's first `COPY_PRIMED` tokens as the start of the assistant turn.
+/// Fails unless the passage tokens occur in the request and the pool, seeded
+/// from this prompt, proposes the passage's next `n_max` tokens after the
+/// passage token `COPY_PRIMED` (the first window's seed when sampled).
+fn copy_fixture(loaded: &Loaded) -> Result<Vec<u32>, String> {
+    let (_, n_min, n_max) = NGRAM_TRIPLE;
+    let passage = loaded.tokenizer.encode(COPY_PASSAGE);
+    if passage.len() < COPY_PRIMED + 1 + n_max.max(n_min) {
+        return Err(format!(
+            "copy passage has {} tokens, need {}",
+            passage.len(),
+            COPY_PRIMED + 1 + n_max.max(n_min)
+        ));
+    }
+    let mut prompt = loaded.render(&format!("{COPY_INSTRUCTION}{COPY_PASSAGE}"))?;
+    if !prompt
+        .windows(passage.len())
+        .any(|window| window == passage.as_slice())
+    {
+        return Err("the passage's own tokens do not occur in the rendered request".into());
+    }
+    prompt.extend_from_slice(&passage[..COPY_PRIMED]);
+    let mut pool = MtpNgramContext::new(qwen4_ngram_mod_config(NGRAM_TRIPLE)?)
+        .map_err(|e| e.to_string())?;
+    pool.begin_request(&prompt);
+    let seed = &passage[COPY_PRIMED..=COPY_PRIMED];
+    let want = &passage[COPY_PRIMED + 1..COPY_PRIMED + 1 + n_max];
+    match pool.propose(seed, n_max) {
+        Some(candidates) if candidates == want => Ok(prompt),
+        other => Err(format!(
+            "copy fixture: the pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected {want:?}"
+        )),
+    }
+}
+
+fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let spec = NGRAM_ARMS.iter().find(|spec| spec.name == arm);
+    if spec.is_none() && arm != COPY_AR_ARM {
+        return Err(format!("unknown n-gram arm {arm}"));
+    }
+    let trials: usize = env_or(TRIALS_ENV, NGRAM_MIN_TRIALS);
+    if trials < NGRAM_MIN_TRIALS {
+        return Err(format!(
+            "{TRIALS_ENV}={trials}: the n-gram arms need at least {NGRAM_MIN_TRIALS} trials"
+        ));
+    }
+    let (temp, top_p, top_k, min_p) = sampling_from_env()?;
+    // The env penalties reach both the AR reference and the n-gram arms.
+    let pen = Penalties::from_env()?;
+    let mut loaded = load(model)?;
+    let copy = spec.is_none_or(|spec| spec.copy);
+    let prompt = if copy {
+        copy_fixture(&loaded)?
+    } else {
+        loaded.render(PROSE)?
+    };
+    let eos = loaded.bundle.config.eos_token_id;
+    println!(
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={NGRAM_TRIPLE:?} state={}",
+        loaded.gpu.arch,
+        prompt.len(),
+        loaded.state
+    );
+    let started = std::time::Instant::now();
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    match spec {
+        None => {
+            let logits = loaded
+                .gpu
+                .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+                .map_err(|e| e.to_string())?;
+            let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+            for trial in 0..trials {
+                let seed = trial_seed(COPY_AR_SALT, trial) as u32;
+                samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
+            }
+            loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+        }
+        Some(spec) => {
+            let config = qwen4_ngram_mod_config(NGRAM_TRIPLE)?;
+            let mut drafter = new_drafter_with(&mut loaded, Some(config))?;
+            let mut run = |loaded: &mut Loaded, trial: usize| {
+                let cfg = spec_request_ngram(
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    trial_seed(spec.salt, trial),
+                    &pen,
+                );
+                loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
+            };
+            let (mut windows, mut drafts, mut accepted, mut native) = (0usize, 0usize, 0usize, 0usize);
+            let mut first_stats: Vec<MtpRequestStats> = Vec::new();
+            for trial in 0..trials {
+                let (ids, _, _, stats) = run(&mut loaded, trial)?;
+                if !stats.mtp_ngram {
+                    return Err(format!("trial {trial}: the n-gram pool was not armed"));
+                }
+                windows += stats.ngram_mod_windows;
+                drafts += stats.ngram_mod_drafts;
+                accepted += stats.ngram_mod_accepted;
+                native += stats.mtp_windows;
+                if trial < REPLAYS {
+                    first_stats.push(stats);
+                }
+                samples.push(ids);
+            }
+            for trial in 0..REPLAYS.min(trials) {
+                let (replay, _, _, stats) = run(&mut loaded, trial)?;
+                if replay != samples[trial] || stats != first_stats[trial] {
+                    return Err(format!(
+                        "trial {trial} replayed {replay:?} / {stats:?}, first run {:?} / {:?}",
+                        samples[trial], first_stats[trial]
+                    ));
+                }
+            }
+            println!(
+                "ARM {arm} replayed {} seeds identically; ngram_mod_windows={windows} drafts={drafts} accepted={accepted} mtp_windows={native}",
+                REPLAYS.min(trials)
+            );
+            if spec.copy && (windows == 0 || drafts == 0) {
+                return Err(format!(
+                    "the copied-span fixture produced no n-gram hits in {trials} trials (ngram_mod_windows={windows}, drafts={drafts})"
+                ));
+            }
+            if !spec.copy && native == 0 {
+                return Err(format!(
+                    "no native MTP window ran in {trials} prose trials (ngram_mod_windows={windows})"
+                ));
+            }
+            fs::write(
+                dir.join(format!("{arm}.stats.json")),
+                serde_json::to_vec(&serde_json::json!({
+                    "trials": trials,
+                    "ngram_mod_windows": windows,
+                    "ngram_mod_drafts": drafts,
+                    "ngram_mod_accepted": accepted,
+                    "mtp_windows": native,
+                }))
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            Box::new(drafter).mtp_free(&mut loaded.gpu);
+        }
+    }
+    // Positions after an EOS read as EOS.
+    for ids in &mut samples {
+        ids.resize(TOKENS, eos);
+    }
+    println!(
+        "ARM {arm} {trials} trials in {:.1}s; first sample: {:?}",
+        started.elapsed().as_secs_f64(),
+        loaded.tokenizer.decode(&samples[0])
+    );
+    fs::write(
+        dir.join(format!("{arm}.ids.json")),
+        serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     loaded
         .bundle
         .free_gpu(&mut loaded.gpu)
