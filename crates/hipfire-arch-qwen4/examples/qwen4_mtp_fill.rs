@@ -10,8 +10,10 @@
 //! for byte.
 //!
 //! Without WARM_CHUNKS (or with 0) every fill is cold. With WARM_CHUNKS = K,
-//! each LEN is the suffix of a prefix-cache hit that restores the checkpoint
-//! after K whole prefill chunks and fills from that `start_pos`.
+//! each LEN is the suffix of a prefix-cache hit: an exact warm prompt of
+//! P = K * chunk rows tokens captures the end-of-prompt checkpoint at P, and
+//! a prompt sharing those P tokens then restores it and fills the LEN fresh
+//! tokens from `start_pos = P`.
 //!
 //!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity \
 //!     --example qwen4_mtp_fill -- MODEL OUT.json MAX_SEQ LEN[,LEN...] [WARM_CHUNKS]

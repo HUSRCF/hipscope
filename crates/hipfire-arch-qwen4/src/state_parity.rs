@@ -2125,10 +2125,10 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
 /// route is read once per process.
 ///
 /// `warm_chunks == 0` fills each length cold. Otherwise each length is the
-/// suffix of a prefix-cache hit: a cold fill of a prompt of
-/// `warm_chunks * chunk_rows + 1` tokens publishes the checkpoint at
-/// `P = warm_chunks * chunk_rows`, then a prompt sharing those `P` tokens and
-/// followed by `length` fresh ones is filled from the restored checkpoint
+/// suffix of a prefix-cache hit: a cold fill of an exact warm prompt of
+/// `P = warm_chunks * chunk_rows` tokens captures the end-of-prompt
+/// checkpoint at `P`, then a prompt sharing those `P` tokens and followed by
+/// `length` fresh ones is filled from the restored checkpoint
 /// (`start_pos = P`) and digested.
 pub fn run_mtp_fill_digest(
     model_path: &Path,
@@ -2221,18 +2221,29 @@ pub fn run_mtp_fill_digest(
         let mut rows = Vec::new();
         for &length in lengths {
             let seed = if warm {
-                // Publish the checkpoint at `prefix_len` (its prompt ends one
-                // row past the boundary), then hit it with a fresh suffix.
-                let shared = tokens(0x5eed ^ prefix_len as u64, prefix_len + 1);
+                // Warm with exactly the shared `prefix_len` tokens: the cold
+                // fill captures the end-of-prompt checkpoint at `prefix_len`
+                // and an empty-history commit publishes that checkpoint only.
+                // A prompt with a fresh suffix then restores it.
+                let shared = tokens(0x5eed ^ prefix_len as u64, prefix_len);
                 drafter
                     .mtp_prefill(&mut gpu, &mut bundle, &shared, &shared, 0, false, &|| false)?;
-                bundle.commit_prefix();
-                let mut prompt = shared[..prefix_len].to_vec();
+                bundle.commit_prefix(&[]);
+                let mut prompt = shared;
                 prompt.extend(tokens(0xa11 ^ length as u64, length));
-                let plan = bundle.plan_prefix(&prompt, crate::bundle::Qwen4PrefixMode::NativeMtp);
-                if plan.start_pos != prefix_len {
+                let plan = bundle
+                    .bind_prefix_plan(
+                        &prompt,
+                        prefix_len,
+                        crate::bundle::Qwen4PrefixMode::NativeMtp,
+                    )
+                    .map_err(|error| format!("warm length {length}: {error}"))?;
+                if plan.source() != crate::bundle::Qwen4PrefixSource::Prompt
+                    || plan.start_pos != prefix_len
+                {
                     return Err(format!(
-                        "warm length {length}: prefix plan starts at {}, expected {prefix_len}",
+                        "warm length {length}: prefix plan is {:?} at {}, expected Prompt at {prefix_len}",
+                        plan.source(),
                         plan.start_pos
                     ));
                 }
@@ -2288,6 +2299,1144 @@ pub fn run_mtp_fill_digest(
         return Err(error);
     }
     Ok(value)
+}
+
+use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan, Qwen4PrefixSource};
+use crate::mtp_spec::Qwen4MtpDrafter;
+
+/// Prompt lengths `P` of the prefix-cache session oracle.
+const SESSION_PROMPT_LENGTHS: [usize; 11] = [1, 5, 63, 64, 65, 511, 513, 1025, 1900, 4097, 8193];
+/// Fixed suffix lengths; a multi-chunk suffix (`2 * chunk_rows + 1`) is added.
+const SESSION_SUFFIX_LENGTHS: [usize; 4] = [1, 3, 64, 513];
+/// Tokens decoded before a request commits (crosses compress-4 pooling
+/// boundaries and GDN ring flips).
+const SESSION_DECODE_TOKENS: usize = 9;
+/// Greedy ids compared after each suffix prefill.
+const SESSION_NEXT_IDS: usize = 6;
+const SESSION_MTP_K: usize = 3;
+/// Rows past `prompt + suffix` a case may use for decode and verify windows.
+const SESSION_HEADROOM: usize = 64;
+const SESSION_NEGATIVE_PROMPT: usize = 65;
+const SESSION_NEGATIVE_TAIL: usize = 3;
+
+type CaseOutcome = Result<(Option<String>, Value), String>;
+type NegativeCase =
+    fn(&mut SessionRig, &mut Gpu, &mut Option<Qwen4MtpDrafter>, Qwen4PrefixMode) -> CaseOutcome;
+type SuffixCase = fn(&mut SessionRig, &mut Gpu, Qwen4PrefixMode, usize, usize) -> CaseOutcome;
+
+fn mode_name(mode: Qwen4PrefixMode) -> &'static str {
+    match mode {
+        Qwen4PrefixMode::Ar => "ar",
+        Qwen4PrefixMode::NativeMtp => "native_mtp",
+    }
+}
+
+/// Digest `units` elements of `tensor` byte for byte (GDN Q8 codes and scales
+/// included): the generic readers above widen to F32.
+fn append_units(
+    gpu: &Gpu,
+    family: &mut Family,
+    tensor: &GpuTensor,
+    units: usize,
+) -> Result<(), String> {
+    if units == 0 {
+        return Ok(());
+    }
+    let view = tensor.sub_offset(0, units);
+    let bytes = gpu
+        .download_raw_bytes(&view)
+        .map_err(|error| error.to_string())?;
+    family.bytes(&bytes, units);
+    Ok(())
+}
+
+/// Every target state family in the state's own storage formats: GDN
+/// recurrent bytes and scales, conv, active QSA rows and marks, PLE conv and
+/// history, HC feedback.
+fn session_target_families(
+    gpu: &Gpu,
+    config: &crate::config::Qwen4Config,
+    state: &Qwen4State,
+) -> Result<Families, String> {
+    let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
+    let full_width = config.num_key_value_heads * config.head_dim;
+    let mut recurrent = Family::new();
+    let mut conv = Family::new();
+    for layer in &state.gdn {
+        append_units(
+            gpu,
+            &mut recurrent,
+            &layer.recurrent,
+            layer.recurrent.numel(),
+        )?;
+        append_units(gpu, &mut conv, &layer.conv, layer.conv.numel())?;
+    }
+    let mut full_keys = Family::new();
+    let mut full_values = Family::new();
+    let mut raw_index_keys = Family::new();
+    let mut pooled_keys = Family::new();
+    let mut partial_keys = Family::new();
+    let mut partial_values = Family::new();
+    let mut selected_indices = Family::new();
+    let mut metadata = Family::new();
+    for qsa in &state.qsa {
+        let kv_units = qsa.full_len * qsa.full_row_units;
+        append_units(gpu, &mut full_keys, &qsa.full_keys, kv_units)?;
+        append_units(gpu, &mut full_values, &qsa.full_values, kv_units)?;
+        append_units(
+            gpu,
+            &mut raw_index_keys,
+            &qsa.raw_index_keys,
+            qsa.raw_len * raw_width,
+        )?;
+        append_units(
+            gpu,
+            &mut pooled_keys,
+            &qsa.pooled_keys,
+            qsa.pooled_len * raw_width,
+        )?;
+        append_units(
+            gpu,
+            &mut partial_keys,
+            &qsa.partial_keys,
+            qsa.partial_len * raw_width,
+        )?;
+        append_units(
+            gpu,
+            &mut partial_values,
+            &qsa.partial_values,
+            qsa.partial_len * full_width,
+        )?;
+        append_units(
+            gpu,
+            &mut selected_indices,
+            &qsa.selected_indices,
+            qsa.selected_len * std::mem::size_of::<i32>(),
+        )?;
+        metadata_usize(
+            &mut metadata,
+            [
+                qsa.full_len,
+                qsa.raw_len,
+                qsa.pooled_len,
+                qsa.partial_len,
+                qsa.selected_len,
+                qsa.position,
+            ],
+        );
+    }
+    metadata_usize(&mut metadata, [state.position, state.max_seq_len]);
+    let mut ple_conv = Family::new();
+    append_units(gpu, &mut ple_conv, &state.ple_conv, state.ple_conv.numel())?;
+    let mut hyper_feedback = Family::new();
+    append_units(
+        gpu,
+        &mut hyper_feedback,
+        &state.hyper_feedback,
+        state.hyper_feedback.numel(),
+    )?;
+    let mut ple_history = Family::new();
+    ple_history.bytes(format!("{:?}", state.ple_history).as_bytes(), 1);
+    let mut families = Families::new();
+    for (name, family) in [
+        ("gdn_recurrent", recurrent),
+        ("gdn_conv", conv),
+        ("qsa_full_keys", full_keys),
+        ("qsa_full_values", full_values),
+        ("qsa_raw_index_keys", raw_index_keys),
+        ("qsa_pooled_keys", pooled_keys),
+        ("qsa_partial_keys", partial_keys),
+        ("qsa_partial_values", partial_values),
+        ("qsa_selected_indices", selected_indices),
+        ("ple_conv", ple_conv),
+        ("ple_history", ple_history),
+        ("hyper_feedback", hyper_feedback),
+        ("metadata", metadata),
+    ] {
+        families.insert(name.into(), family.finish());
+    }
+    Ok(families)
+}
+
+/// Target families, and for native MTP the head families and the drafter's
+/// pending target hidden row.
+struct SessionState {
+    target: Families,
+    mtp: Option<Families>,
+    pending: Option<Value>,
+}
+
+fn family_digest(value: Option<&Value>) -> &str {
+    value
+        .and_then(|value| value.get("digest"))
+        .and_then(Value::as_str)
+        .unwrap_or("-")
+}
+
+fn first_family_mismatch(scope: &str, left: &Families, right: &Families) -> Option<String> {
+    let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
+    for key in keys {
+        let (a, b) = (left.get(key), right.get(key));
+        if a != b {
+            return Some(format!(
+                "{scope}.{key}: {} vs {}",
+                family_digest(a),
+                family_digest(b)
+            ));
+        }
+    }
+    None
+}
+
+fn first_state_mismatch(stage: &str, left: &SessionState, right: &SessionState) -> Option<String> {
+    first_family_mismatch(&format!("{stage}:target"), &left.target, &right.target)
+        .or_else(|| match (&left.mtp, &right.mtp) {
+            (Some(a), Some(b)) => first_family_mismatch(&format!("{stage}:mtp"), a, b),
+            (None, None) => None,
+            _ => Some(format!("{stage}:mtp head presence differs")),
+        })
+        .or_else(|| {
+            (left.pending != right.pending).then(|| {
+                format!(
+                    "{stage}:pending_hidden: {} vs {}",
+                    family_digest(left.pending.as_ref()),
+                    family_digest(right.pending.as_ref())
+                )
+            })
+        })
+}
+
+/// Everything one suffix prefill and the greedy decode after it produce.
+struct FlowOut {
+    source: Qwen4PrefixSource,
+    start: usize,
+    /// Native MTP's first emitted token.
+    seed: Option<u32>,
+    /// Digest of the AR final logits row (native MTP exposes none).
+    logits: Option<String>,
+    after_fill: SessionState,
+    ids: Vec<u32>,
+    after_decode: SessionState,
+}
+
+fn first_flow_mismatch(left: &FlowOut, right: &FlowOut) -> Option<String> {
+    first_state_mismatch("after_fill", &left.after_fill, &right.after_fill)
+        .or_else(|| {
+            (left.logits != right.logits).then(|| {
+                format!(
+                    "after_fill:final_logits: {:?} vs {:?}",
+                    left.logits, right.logits
+                )
+            })
+        })
+        .or_else(|| {
+            (left.seed != right.seed)
+                .then(|| format!("after_fill:seed: {:?} vs {:?}", left.seed, right.seed))
+        })
+        .or_else(|| {
+            (left.ids != right.ids)
+                .then(|| format!("decode:ids: {:?} vs {:?}", left.ids, right.ids))
+        })
+        .or_else(|| first_state_mismatch("after_decode", &left.after_decode, &right.after_decode))
+}
+
+fn expect_refusal<T, E: std::fmt::Display>(
+    what: &str,
+    result: Result<T, E>,
+) -> Result<String, String> {
+    match result {
+        Ok(_) => Err(format!("{what}: expected a refusal, got success")),
+        Err(error) => Ok(error.to_string()),
+    }
+}
+
+fn case_value(
+    case: &str,
+    mode: Qwen4PrefixMode,
+    prompt_len: usize,
+    suffix_len: usize,
+    outcome: CaseOutcome,
+) -> Value {
+    let (mismatch, detail) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => (Some(format!("error: {error}")), Value::Null),
+    };
+    json!({
+        "case": case,
+        "mode": mode_name(mode),
+        "prompt_len": prompt_len,
+        "suffix_len": suffix_len,
+        "status": if mismatch.is_none() {"pass"} else {"fail"},
+        "first_mismatch": mismatch,
+        "detail": detail,
+    })
+}
+
+/// The committed first request of a session.
+struct Committed {
+    /// Host history passed to `commit_prefix`: prompt plus consumed tokens.
+    full: Vec<u32>,
+    /// Tokens the decode emitted (empty without decode).
+    decode_ids: Vec<u32>,
+    /// The bundle published `full` as its live lineage.
+    live: bool,
+}
+
+struct Decoded {
+    ids: Vec<u32>,
+    /// Tokens the target consumed (all of `ids` for AR; all but the pending
+    /// last one for native MTP).
+    consumed: Vec<u32>,
+}
+
+/// One bundle driven through sequential prefix-cache session arms.
+struct SessionRig {
+    bundle: Qwen4Bundle,
+    logits: GpuTensor,
+    max_seq: usize,
+    vocab: usize,
+    eos: u32,
+}
+
+impl SessionRig {
+    /// Deterministic spread over the real vocabulary, never the EOS id.
+    fn tokens(&self, salt: u64, count: usize) -> Vec<u32> {
+        let span = self.vocab as u64 - 10;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ salt.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let token = (10 + (state >> 33) % span) as u32;
+            if token != self.eos {
+                out.push(token);
+            }
+        }
+        out
+    }
+
+    /// A real-vocabulary token that is neither `token` nor EOS.
+    fn other_token(&self, token: u32) -> u32 {
+        let mut candidate = token;
+        loop {
+            candidate = if candidate as usize + 1 >= self.vocab {
+                10
+            } else {
+                candidate + 1
+            };
+            if candidate != token && candidate != self.eos {
+                return candidate;
+            }
+        }
+    }
+
+    fn with_drafter<T>(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        f: impl FnOnce(&mut Self, &mut Gpu, &mut Option<Qwen4MtpDrafter>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use hipfire_runtime::spec::MtpDrafter;
+        let mut drafter = (mode == Qwen4PrefixMode::NativeMtp)
+            .then(|| Qwen4MtpDrafter::new(SESSION_MTP_K, self.max_seq, None));
+        let result = f(self, gpu, &mut drafter);
+        if let Some(drafter) = drafter {
+            MtpDrafter::mtp_free(Box::new(drafter), gpu);
+        }
+        result
+    }
+
+    fn state(
+        &self,
+        gpu: &Gpu,
+        drafter: &Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+    ) -> Result<SessionState, String> {
+        let target = session_target_families(gpu, &self.bundle.config, &self.bundle.state)?;
+        if mode == Qwen4PrefixMode::Ar {
+            return Ok(SessionState {
+                target,
+                mtp: None,
+                pending: None,
+            });
+        }
+        let head = self
+            .bundle
+            .mtp
+            .as_ref()
+            .ok_or("native MTP head is not attached")?;
+        let mtp = mtp_families(gpu, &self.bundle.config, head.parity_state())?;
+        let pending = match drafter {
+            Some(drafter) => {
+                let hidden = drafter.pending_hidden_for_parity()?;
+                Some(prefix(gpu, hidden, hidden.numel())?)
+            }
+            None => None,
+        };
+        Ok(SessionState {
+            target,
+            mtp: Some(mtp),
+            pending,
+        })
+    }
+
+    /// Prefill `prompt`: cold without a plan, else the hit `plan` binds.
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        prompt: &[u32],
+        plan: Option<Qwen4PrefixPlan>,
+    ) -> Result<Option<u32>, String> {
+        use hipfire_runtime::spec::MtpDrafter;
+        match mode {
+            Qwen4PrefixMode::Ar => {
+                self.bundle
+                    .prefill_final(gpu, prompt, plan.unwrap_or_default(), &self.logits)
+                    .map_err(|error| error.to_string())?;
+                Ok(None)
+            }
+            Qwen4PrefixMode::NativeMtp => {
+                let drafter = drafter
+                    .as_mut()
+                    .ok_or("native MTP drafter is not allocated")?;
+                let seed = match plan {
+                    None => drafter.mtp_prefill(
+                        gpu,
+                        &mut self.bundle,
+                        prompt,
+                        prompt,
+                        0,
+                        false,
+                        &|| false,
+                    )?,
+                    Some(plan) => drafter.mtp_prefill(
+                        gpu,
+                        &mut self.bundle,
+                        prompt,
+                        &prompt[plan.start_pos..],
+                        plan.start_pos,
+                        true,
+                        &|| false,
+                    )?,
+                };
+                Ok(Some(seed))
+            }
+        }
+    }
+
+    /// Greedy decode of at least `count` tokens: AR forwards each argmax;
+    /// native MTP runs verify windows from the prefill `seed`.
+    fn decode(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        seed: Option<u32>,
+        count: usize,
+    ) -> Result<Decoded, String> {
+        use hipfire_runtime::spec::MtpDrafter;
+        match mode {
+            Qwen4PrefixMode::Ar => {
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ids.push(
+                        self.bundle
+                            .forward_token_or_argmax(gpu, None, &self.logits)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok(Decoded {
+                    consumed: ids.clone(),
+                    ids,
+                })
+            }
+            Qwen4PrefixMode::NativeMtp => {
+                let drafter = drafter
+                    .as_mut()
+                    .ok_or("native MTP drafter is not allocated")?;
+                let mut seed = seed.ok_or("native MTP decode needs the prefill seed")?;
+                let mut ids = vec![seed];
+                while ids.len() <= count {
+                    let position = self.bundle.state.position;
+                    // No token is EOS: the oracle compares fixed-length streams.
+                    let window = drafter.mtp_step(
+                        gpu,
+                        &mut self.bundle,
+                        position,
+                        seed,
+                        &ids,
+                        SESSION_MTP_K,
+                        u32::MAX,
+                        None,
+                    )?;
+                    seed = *window
+                        .committed
+                        .last()
+                        .ok_or("native MTP window committed nothing")?;
+                    ids.extend_from_slice(&window.committed);
+                }
+                let consumed = ids[..ids.len() - 1].to_vec();
+                Ok(Decoded { ids, consumed })
+            }
+        }
+    }
+
+    /// Cold prefill of `prompt`, optional decode, then the client's terminal
+    /// commit of the full consumed history.
+    fn first_session(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        prompt: &[u32],
+        decode: bool,
+    ) -> Result<Committed, String> {
+        let seed = self.prefill(gpu, drafter, mode, prompt, None)?;
+        let decoded = if decode {
+            self.decode(gpu, drafter, mode, seed, SESSION_DECODE_TOKENS)?
+        } else {
+            Decoded {
+                ids: Vec::new(),
+                consumed: Vec::new(),
+            }
+        };
+        let mut full = prompt.to_vec();
+        full.extend_from_slice(&decoded.consumed);
+        if self.bundle.state.position != full.len() {
+            return Err(format!(
+                "consumed history is {} tokens but the target is at {}",
+                full.len(),
+                self.bundle.state.position
+            ));
+        }
+        self.bundle.commit_prefix(&full);
+        let live = self.bundle.prefix_cache_tokens(mode) == Some(full.as_slice());
+        Ok(Committed {
+            full,
+            decode_ids: decoded.ids,
+            live,
+        })
+    }
+
+    fn require_live(&self, committed: &Committed) -> Result<(), String> {
+        if committed.live {
+            return Ok(());
+        }
+        Err(format!(
+            "live lineage of {} tokens was not published (target at {}, head at {:?})",
+            committed.full.len(),
+            self.bundle.state.position,
+            self.bundle.mtp_position().ok()
+        ))
+    }
+
+    /// Bind the planner's `start` and require the receipt's source.
+    fn bind(
+        &self,
+        prompt: &[u32],
+        start: usize,
+        mode: Qwen4PrefixMode,
+        expect: Qwen4PrefixSource,
+    ) -> Result<Qwen4PrefixPlan, String> {
+        let plan = self
+            .bundle
+            .bind_prefix_plan(prompt, start, mode)
+            .map_err(|error| format!("bind at {start}: {error}"))?;
+        if plan.source() != expect || plan.start_pos != start {
+            return Err(format!(
+                "bind at {start} produced {:?} at {}, expected {expect:?}",
+                plan.source(),
+                plan.start_pos
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// The hit's suffix prefill, then the next greedy ids; state families
+    /// are digested after each.
+    fn run_suffix(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+    ) -> Result<FlowOut, String> {
+        let seed = self.prefill(gpu, drafter, mode, prompt, Some(plan))?;
+        if self.bundle.state.position != prompt.len() {
+            return Err(format!(
+                "suffix prefill left the target at {}, expected {}",
+                self.bundle.state.position,
+                prompt.len()
+            ));
+        }
+        let logits = match mode {
+            Qwen4PrefixMode::Ar => Some(download_host_logits(gpu, &self.logits)?.digest),
+            Qwen4PrefixMode::NativeMtp => None,
+        };
+        let after_fill = self.state(gpu, drafter, mode)?;
+        let decoded = self.decode(gpu, drafter, mode, seed, SESSION_NEXT_IDS)?;
+        let after_decode = self.state(gpu, drafter, mode)?;
+        Ok(FlowOut {
+            source: plan.source(),
+            start: plan.start_pos,
+            seed,
+            logits,
+            after_fill,
+            ids: decoded.ids,
+            after_decode,
+        })
+    }
+
+    /// Production: cold `P1`, decode, commit, then a prompt `P1 + S2` that
+    /// diverges from the decoded tokens at `P` restores the end-of-prompt
+    /// checkpoint (`Prompt`) and prefills `S2`. Returns the flow, `S2`, and
+    /// whether the live lineage was also published.
+    fn divergence_production(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        p1: &[u32],
+        suffix_len: usize,
+    ) -> Result<(FlowOut, Vec<u32>, bool), String> {
+        let committed = self.first_session(gpu, drafter, mode, p1, true)?;
+        let first_generated = committed.full[p1.len()];
+        let mut s2 = self.tokens(
+            0x52 ^ ((p1.len() as u64) << 20) ^ suffix_len as u64,
+            suffix_len,
+        );
+        if s2[0] == first_generated {
+            s2[0] = self.other_token(first_generated);
+        }
+        let mut prompt = p1.to_vec();
+        prompt.extend_from_slice(&s2);
+        let plan = self.bind(&prompt, p1.len(), mode, Qwen4PrefixSource::Prompt)?;
+        if self.bundle.prefix_checkpoint_position(mode) != Some(p1.len()) {
+            return Err(format!(
+                "end-of-prompt checkpoint is {:?}, expected {}",
+                self.bundle.prefix_checkpoint_position(mode),
+                p1.len()
+            ));
+        }
+        let out = self.run_suffix(gpu, drafter, mode, &prompt, plan)?;
+        Ok((out, s2, committed.live))
+    }
+
+    /// Oracle: cold `P1`, commit with no decode (live at `P`), then the same
+    /// `P1 + S2` continues the live state (`Live`).
+    fn divergence_oracle(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        p1: &[u32],
+        s2: &[u32],
+    ) -> Result<FlowOut, String> {
+        let committed = self.first_session(gpu, drafter, mode, p1, false)?;
+        self.require_live(&committed)?;
+        let mut prompt = p1.to_vec();
+        prompt.extend_from_slice(s2);
+        let plan = self.bind(&prompt, p1.len(), mode, Qwen4PrefixSource::Live)?;
+        self.run_suffix(gpu, drafter, mode, &prompt, plan)
+    }
+
+    fn case_divergence(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        p: usize,
+        s: usize,
+    ) -> CaseOutcome {
+        let p1 = self.tokens(0xd1 ^ p as u64, p);
+        let (production, s2, live_published) = self.with_drafter(gpu, mode, |rig, gpu, d| {
+            rig.divergence_production(gpu, d, mode, &p1, s)
+        })?;
+        let oracle = self.with_drafter(gpu, mode, |rig, gpu, d| {
+            rig.divergence_oracle(gpu, d, mode, &p1, &s2)
+        })?;
+        let mismatch = first_flow_mismatch(&production, &oracle);
+        Ok((
+            mismatch,
+            json!({
+                "production_source": format!("{:?}", production.source),
+                "production_start": production.start,
+                "oracle_source": format!("{:?}", oracle.source),
+                "oracle_start": oracle.start,
+                "live_also_published": live_published,
+                "seed": production.seed,
+                "ids": production.ids,
+            }),
+        ))
+    }
+
+    /// Cold `P1`, decode, commit, then `consumed + S3` continues the live
+    /// state; returns the flow and the first request's decoded ids.
+    fn live_run(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        p1: &[u32],
+        suffix_len: usize,
+    ) -> Result<(FlowOut, Vec<u32>), String> {
+        self.with_drafter(gpu, mode, |rig, gpu, drafter| {
+            let committed = rig.first_session(gpu, drafter, mode, p1, true)?;
+            rig.require_live(&committed)?;
+            let mut prompt = committed.full.clone();
+            prompt.extend(rig.tokens(
+                0x11fe ^ ((p1.len() as u64) << 20) ^ suffix_len as u64,
+                suffix_len,
+            ));
+            let plan = rig.bind(&prompt, committed.full.len(), mode, Qwen4PrefixSource::Live)?;
+            let out = rig.run_suffix(gpu, drafter, mode, &prompt, plan)?;
+            Ok((out, committed.decode_ids))
+        })
+    }
+
+    /// The same live-continuation session twice from reset must agree.
+    fn case_live_determinism(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        p: usize,
+        s: usize,
+    ) -> CaseOutcome {
+        let p1 = self.tokens(0xd1 ^ p as u64, p);
+        let (first, first_decode) = self.live_run(gpu, mode, &p1, s)?;
+        let (second, second_decode) = self.live_run(gpu, mode, &p1, s)?;
+        let mismatch = (first_decode != second_decode)
+            .then(|| format!("first_request:ids: {first_decode:?} vs {second_decode:?}"))
+            .or_else(|| first_flow_mismatch(&first, &second));
+        Ok((
+            mismatch,
+            json!({
+                "source": format!("{:?}", first.source),
+                "start": first.start,
+                "seed": first.seed,
+                "ids": first.ids,
+            }),
+        ))
+    }
+
+    /// `begin_prefix` with a `Live` receipt must leave every state family
+    /// untouched; replaying the consumed receipt must be refused before any
+    /// write.
+    fn case_live_noop(&mut self, gpu: &mut Gpu, mode: Qwen4PrefixMode, p: usize) -> CaseOutcome {
+        let p1 = self.tokens(0xd1 ^ p as u64, p);
+        self.with_drafter(gpu, mode, |rig, gpu, drafter| {
+            let committed = rig.first_session(gpu, drafter, mode, &p1, true)?;
+            rig.require_live(&committed)?;
+            let live_end = committed.full.len();
+            let mut prompt = committed.full.clone();
+            prompt.extend(rig.tokens(0x71 ^ p as u64, 1));
+            let plan = rig.bind(&prompt, live_end, mode, Qwen4PrefixSource::Live)?;
+            let before = rig.state(gpu, drafter, mode)?;
+            rig.bundle
+                .begin_prefix(gpu, &prompt, plan, mode)
+                .map_err(|error| format!("Live begin: {error}"))?;
+            let after = rig.state(gpu, drafter, mode)?;
+            let mut mismatch = first_state_mismatch("live_begin", &before, &after);
+            if mismatch.is_none() && rig.bundle.state.position != live_end {
+                mismatch = Some(format!(
+                    "live_begin:position: {live_end} vs {}",
+                    rig.bundle.state.position
+                ));
+            }
+            let refusal = expect_refusal(
+                "second begin with the consumed Live receipt",
+                rig.bundle.begin_prefix(gpu, &prompt, plan, mode),
+            )?;
+            let after_stale = rig.state(gpu, drafter, mode)?;
+            if mismatch.is_none() {
+                mismatch = first_state_mismatch("stale_live_begin", &after, &after_stale);
+            }
+            Ok((
+                mismatch,
+                json!({"live_end": live_end, "stale_refusal": refusal}),
+            ))
+        })
+    }
+
+    /// A commit whose history is longer than, shorter than, or empty against
+    /// the target position must not publish a live lineage: no live bind is
+    /// accepted, only the end-of-prompt checkpoint.
+    fn negative_misaligned(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+    ) -> CaseOutcome {
+        let p1 = self.tokens(0x91, SESSION_NEGATIVE_PROMPT);
+        let extra = self.tokens(0x92, 1)[0];
+        let tail = self.tokens(0x93, SESSION_NEGATIVE_TAIL);
+        let mut detail = Map::new();
+        for variant in ["longer", "shorter", "empty"] {
+            let seed = self.prefill(gpu, drafter, mode, &p1, None)?;
+            let decoded = self.decode(gpu, drafter, mode, seed, SESSION_DECODE_TOKENS)?;
+            let live_end = p1.len() + decoded.consumed.len();
+            if self.bundle.state.position != live_end {
+                return Err(format!(
+                    "{variant}: target at {}, expected {live_end}",
+                    self.bundle.state.position
+                ));
+            }
+            let mut record = p1.clone();
+            record.extend_from_slice(&decoded.consumed);
+            let mut history = record.clone();
+            match variant {
+                "longer" => history.push(extra),
+                "shorter" => {
+                    history.pop();
+                }
+                _ => history.clear(),
+            }
+            self.bundle.commit_prefix(&history);
+            let mut prompt = record;
+            prompt.push(extra);
+            prompt.extend_from_slice(&tail);
+            if self.bundle.prefix_cache_tokens(mode) != Some(p1.as_slice()) {
+                return Err(format!(
+                    "{variant}: published lineage is not the end-of-prompt record"
+                ));
+            }
+            if self.bundle.prefix_checkpoint_position(mode) != Some(p1.len()) {
+                return Err(format!(
+                    "{variant}: checkpoint position is {:?}, expected {}",
+                    self.bundle.prefix_checkpoint_position(mode),
+                    p1.len()
+                ));
+            }
+            let live_refusal = expect_refusal(
+                &format!("{variant}: bind at the unpublished live end {live_end}"),
+                self.bundle.bind_prefix_plan(&prompt, live_end, mode),
+            )?;
+            let history_refusal = if history.len() > p1.len() && history.len() != live_end {
+                Some(expect_refusal(
+                    &format!("{variant}: bind at the history end {}", history.len()),
+                    self.bundle.bind_prefix_plan(&prompt, history.len(), mode),
+                )?)
+            } else {
+                None
+            };
+            self.bind(&prompt, p1.len(), mode, Qwen4PrefixSource::Prompt)?;
+            detail.insert(
+                variant.to_string(),
+                json!({"live_refusal": live_refusal, "history_refusal": history_refusal}),
+            );
+        }
+        Ok((None, Value::Object(detail)))
+    }
+
+    /// A checkpoint of one mode must not bind or begin under the other.
+    fn negative_mode_mismatch(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+    ) -> CaseOutcome {
+        let other = match mode {
+            Qwen4PrefixMode::Ar => Qwen4PrefixMode::NativeMtp,
+            Qwen4PrefixMode::NativeMtp => Qwen4PrefixMode::Ar,
+        };
+        let p1 = self.tokens(0x94, SESSION_NEGATIVE_PROMPT);
+        let mut prompt = p1.clone();
+        prompt.extend(self.tokens(0x95, SESSION_NEGATIVE_TAIL));
+        self.prefill(gpu, drafter, mode, &p1, None)?;
+        self.bundle.commit_prefix(&p1);
+        let bind_refusal = expect_refusal(
+            "bind under the other mode",
+            self.bundle.bind_prefix_plan(&prompt, p1.len(), other),
+        )?;
+        if self.bundle.prefix_cache_tokens(other).is_some()
+            || self.bundle.prefix_checkpoint_position(other).is_some()
+        {
+            return Err("the other mode sees a published lineage or checkpoint".to_string());
+        }
+        let plan = self.bind(&prompt, p1.len(), mode, Qwen4PrefixSource::Live)?;
+        let before = self.state(gpu, drafter, mode)?;
+        let begin_refusal = expect_refusal(
+            "begin under the other mode",
+            self.bundle.begin_prefix(gpu, &prompt, plan, other),
+        )?;
+        let after = self.state(gpu, drafter, mode)?;
+        Ok((
+            first_state_mismatch("refused_mode_begin", &before, &after),
+            json!({"bind_refusal": bind_refusal, "begin_refusal": begin_refusal}),
+        ))
+    }
+
+    /// A consumed receipt, or one overtaken by another begin, is refused
+    /// before any device write.
+    fn negative_stale_receipt(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+    ) -> CaseOutcome {
+        let p1 = self.tokens(0x96, SESSION_NEGATIVE_PROMPT);
+        let mut detail = Map::new();
+        let mut mismatch = None;
+        for scenario in ["replayed_prompt_receipt", "after_cold_begin"] {
+            let committed = self.first_session(gpu, drafter, mode, &p1, true)?;
+            let mut s2 = self.tokens(0x97, SESSION_NEGATIVE_TAIL);
+            if s2[0] == committed.full[p1.len()] {
+                s2[0] = self.other_token(s2[0]);
+            }
+            let mut prompt = p1.clone();
+            prompt.extend_from_slice(&s2);
+            let plan = self.bind(&prompt, p1.len(), mode, Qwen4PrefixSource::Prompt)?;
+            let baseline = if scenario == "replayed_prompt_receipt" {
+                self.bundle
+                    .begin_prefix(gpu, &prompt, plan, mode)
+                    .map_err(|error| format!("{scenario}: Prompt begin: {error}"))?;
+                self.state(gpu, drafter, mode)?
+            } else {
+                self.bundle
+                    .begin_prefix(gpu, &prompt, Qwen4PrefixPlan::default(), mode)
+                    .map_err(|error| format!("{scenario}: cold begin: {error}"))?;
+                self.state(gpu, drafter, mode)?
+            };
+            let refusal =
+                expect_refusal(scenario, self.bundle.begin_prefix(gpu, &prompt, plan, mode))?;
+            let after = self.state(gpu, drafter, mode)?;
+            if mismatch.is_none() {
+                mismatch = first_state_mismatch(scenario, &baseline, &after);
+            }
+            detail.insert(scenario.to_string(), json!({"refusal": refusal}));
+        }
+        Ok((mismatch, Value::Object(detail)))
+    }
+}
+
+/// Prefix-cache session oracle. One bundle carries sequential arms on the
+/// product's default context and shipped state formats, for AR and native
+/// MTP, over prompt lengths `P`, suffix lengths `S` and a multi-chunk suffix:
+///
+/// - `prompt_divergence`: cold `P1`, decode, commit; `P1 + S2` diverging at
+///   `P` binds the end-of-prompt checkpoint (`Prompt`). The oracle is cold
+///   `P1` committed with no decode, then the same `P1 + S2` on the live state
+///   (`Live`). Every target family, head family, pending hidden row, final
+///   logits or seed, and the next greedy ids must match byte for byte.
+/// - `live_continuation`: cold `P1`, decode, commit; `consumed + S3` continues
+///   the live state. Run twice from reset: digests, logits and ids must be
+///   identical. `live_begin_noop` digests every family around the `Live`
+///   `begin_prefix` and requires them unchanged.
+/// - Negative: misaligned commits never bind `Live`, a checkpoint of one mode
+///   refuses the other, and stale receipts are refused before any write.
+///
+/// Native MTP exposes no final logits row; its comparison covers the seed,
+/// pending hidden row, head families and ids.
+pub fn run_prefix_cache_session_parity(
+    model_path: &Path,
+    corpus_path: &Path,
+) -> Result<StateParityReport, String> {
+    let (_, corpus) = read_state_tokens(corpus_path)?;
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let receipt = crate::admit_hfqm_artifact(&hfq)
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let config = receipt.config.clone();
+    let manifest = receipt.manifest.clone();
+    let metadata = receipt.ple.clone();
+    let placements = receipt.placements.clone();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
+        .map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| qwen4_range_payload(&source, entry),
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let state_format = crate::state::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        "",
+        &gpu,
+        &config,
+    )?;
+    let backend = Qwen4KvBackend::automatic(&gpu);
+    // The product's default context; every case's rows must fit it.
+    let max_seq = crate::QWEN4_DEFAULT_CONTEXT.min(config.max_position_embeddings);
+    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+        config.clone(),
+        transaction,
+        &placements,
+        &mut gpu,
+        max_seq,
+        metadata,
+        state_format,
+        backend,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    // The loader's order: target prefix arena, forward, MTP head, then the
+    // head's part of the prefix arena.
+    let attach = (|| -> Result<(), String> {
+        bundle
+            .attach_prefix_cache(&mut gpu)
+            .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        bundle
+            .attach_forward(&mut gpu, max_seq)
+            .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+        bundle
+            .attach_mtp(&mut gpu, max_seq)
+            .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+        bundle
+            .attach_prefix_cache(&mut gpu)
+            .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        if !bundle.prefix_cache_attached() {
+            return Err("qwen4 prefix cache is not attached".to_string());
+        }
+        Ok(())
+    })();
+    let logits = match attach.and_then(|()| {
+        gpu.zeros(&[config.vocab_size], DType::F32)
+            .map_err(|error| format!("allocate session logits: {error}"))
+    }) {
+        Ok(logits) => logits,
+        Err(error) => {
+            let _ = bundle.free_gpu(&mut gpu);
+            return Err(error);
+        }
+    };
+    let mut rig = SessionRig {
+        bundle,
+        logits,
+        max_seq,
+        vocab: config.vocab_size,
+        eos: config.eos_token_id,
+    };
+    let run = (|| -> Result<Value, String> {
+        let chunk = rig
+            .bundle
+            .spec_chunk_rows()
+            .ok_or("qwen4 forward resources are not attached")?;
+        let mut suffixes = SESSION_SUFFIX_LENGTHS.to_vec();
+        suffixes.push(2 * chunk + 1);
+        let mut cases: Vec<Value> = Vec::new();
+        let mut record = |value: Value| {
+            eprintln!(
+                "prefix-cache session: {} {} P={} S={}: {}{}",
+                value["mode"].as_str().unwrap_or("?"),
+                value["case"].as_str().unwrap_or("?"),
+                value["prompt_len"],
+                value["suffix_len"],
+                value["status"].as_str().unwrap_or("?"),
+                value["first_mismatch"]
+                    .as_str()
+                    .map(|mismatch| format!(" ({mismatch})"))
+                    .unwrap_or_default(),
+            );
+            cases.push(value);
+        };
+        for mode in [Qwen4PrefixMode::Ar, Qwen4PrefixMode::NativeMtp] {
+            let negatives: [(&str, NegativeCase); 3] = [
+                (
+                    "negative_misaligned_commit",
+                    SessionRig::negative_misaligned,
+                ),
+                ("negative_mode_mismatch", SessionRig::negative_mode_mismatch),
+                ("negative_stale_receipt", SessionRig::negative_stale_receipt),
+            ];
+            for (name, case) in negatives {
+                let started = Instant::now();
+                let outcome =
+                    rig.with_drafter(&mut gpu, mode, |rig, gpu, d| case(rig, gpu, d, mode));
+                let mut value = case_value(name, mode, SESSION_NEGATIVE_PROMPT, 0, outcome);
+                value["elapsed_s"] = json!(started.elapsed().as_secs_f64());
+                record(value);
+            }
+            for &p in &SESSION_PROMPT_LENGTHS {
+                let started = Instant::now();
+                let outcome = match session_case_fits(max_seq, p, 1) {
+                    Ok(()) => rig.case_live_noop(&mut gpu, mode, p),
+                    Err(error) => Err(error),
+                };
+                let mut value = case_value("live_begin_noop", mode, p, 1, outcome);
+                value["elapsed_s"] = json!(started.elapsed().as_secs_f64());
+                record(value);
+                for &s in &suffixes {
+                    let suffix_cases: [(&str, SuffixCase); 2] = [
+                        ("prompt_divergence", SessionRig::case_divergence),
+                        ("live_continuation", SessionRig::case_live_determinism),
+                    ];
+                    for (name, case) in suffix_cases {
+                        let started = Instant::now();
+                        let outcome = match session_case_fits(max_seq, p, s) {
+                            Ok(()) => case(&mut rig, &mut gpu, mode, p, s),
+                            Err(error) => Err(error),
+                        };
+                        let mut value = case_value(name, mode, p, s, outcome);
+                        value["elapsed_s"] = json!(started.elapsed().as_secs_f64());
+                        record(value);
+                    }
+                }
+            }
+        }
+        let failed = cases
+            .iter()
+            .filter(|case| !is_pass(case))
+            .map(|case| {
+                format!(
+                    "{} {} P={} S={}: {}",
+                    case["mode"].as_str().unwrap_or("?"),
+                    case["case"].as_str().unwrap_or("?"),
+                    case["prompt_len"],
+                    case["suffix_len"],
+                    case["first_mismatch"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "status": if failed.is_empty() {"pass"} else {"fail"},
+            "max_seq": max_seq,
+            "chunk_rows": chunk,
+            "state_format": format!("{state_format:?}"),
+            "total": cases.len(),
+            "failed": failed,
+            "cases": cases,
+        }))
+    })();
+    let SessionRig { bundle, logits, .. } = rig;
+    let logits_cleanup = gpu
+        .free_tensor(logits)
+        .err()
+        .map(|error| format!("free session logits: {error}"));
+    let bundle_cleanup = bundle
+        .free_gpu(&mut gpu)
+        .err()
+        .map(|error| format!("qwen4 bundle teardown failed: {error}"));
+    let session = run?;
+    if let Some(error) = logits_cleanup.or(bundle_cleanup) {
+        return Err(error);
+    }
+    Ok(StateParityReport(json!({
+        "schema": "hipfire.qwen4.prefix_cache_session_parity.v1",
+        "gpu_arch": gpu.arch,
+        "model": model_path,
+        "corpus": corpus,
+        "status": session["status"],
+        "session": session,
+    })))
+}
+
+fn session_case_fits(max_seq: usize, prompt: usize, suffix: usize) -> Result<(), String> {
+    if prompt + suffix + SESSION_HEADROOM > max_seq {
+        return Err(format!(
+            "prompt {prompt} + suffix {suffix} + {SESSION_HEADROOM} rows of decode headroom exceeds max_seq {max_seq}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
