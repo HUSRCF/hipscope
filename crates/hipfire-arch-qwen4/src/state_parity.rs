@@ -18,6 +18,7 @@ use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
 use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::state::Qwen4State;
+use hip_bridge::VmmPhysicalId;
 use hip_bridge::launch_counters;
 use hipfire_runtime::external_rows::RowCacheStats;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -3437,6 +3438,1504 @@ fn session_case_fits(max_seq: usize, prompt: usize, suffix: usize) -> Result<(),
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Radix prefix-cache session oracle
+// ---------------------------------------------------------------------------
+
+/// Process-unique load epoch of the oracle's radix cache domains.
+static RADIX_ORACLE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const RADIX_MODES: [Qwen4PrefixMode; 2] = [Qwen4PrefixMode::Ar, Qwen4PrefixMode::NativeMtp];
+/// Prompt `PA` of the cross-session and A-B-A cases.
+const RADIX_PROMPT_A: usize = 600;
+const RADIX_PROMPT_B: usize = 200;
+const RADIX_SUFFIX: usize = 48;
+const RADIX_NEW_TURN: usize = 24;
+/// Shared system turn `S` (>= the 128-token anchor minimum) of the anchor case.
+const RADIX_SYSTEM_TURN: usize = 160;
+const RADIX_USER_TURN: usize = 90;
+const RADIX_ASSISTANT_TAIL: usize = 6;
+/// Long enough that the context arenas span several physical granules, so the
+/// aliased-granule comparison of the sibling case is not vacuous.
+const RADIX_SIBLING_PROMPT: usize = 9000;
+const RADIX_SIBLING_SUFFIX: usize = 16;
+const RADIX_COLD_PROMPT: usize = 300;
+const RADIX_UNRELATED_PROMPT: usize = 7;
+/// End-of-prompt lengths of the boundary case.
+const RADIX_BOUNDARY_PROMPTS: [usize; 13] =
+    [1, 3, 4, 5, 127, 128, 129, 4095, 4096, 4097, 8191, 8192, 8193];
+const RADIX_BOUNDARY_SUFFIXES: [usize; 2] = [1, 513];
+/// Cases the radix oracle reports: per mode `cold_identity`, `cross_session`,
+/// `a_b_a`, `anchor`, `siblings`, one `boundary_fork` per (prompt, suffix)
+/// pair and `pressure`.
+pub const RADIX_SESSION_CASES: usize =
+    2 * (5 + RADIX_BOUNDARY_PROMPTS.len() * RADIX_BOUNDARY_SUFFIXES.len() + 1);
+
+/// How a request picks its prefill start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Production: `select_prefix_plan` over the local candidate, radix
+    /// checkpoints and the conditional turn anchor.
+    Select,
+    /// An unconditional cold start (`Qwen4PrefixPlan::default`).
+    Cold,
+}
+
+/// One context arena of the live bank.
+struct ArenaView {
+    /// Base virtual address of the arena owner.
+    base: usize,
+    /// Physical granule ids in offset order.
+    granules: Vec<VmmPhysicalId>,
+    /// Leading granules a capture at the current marks aliases.
+    alias: usize,
+}
+
+/// One production-style request: select, prefill, decode, commit.
+struct Req {
+    flow: FlowOut,
+    /// Host history committed: prompt plus the consumed decode tokens.
+    full: Vec<u32>,
+    /// Context arenas right after the prefill (before any decode).
+    view: Vec<ArenaView>,
+}
+
+/// First failed expectation and the per-comparison details of a case.
+#[derive(Default)]
+struct Findings {
+    first: Option<String>,
+    detail: Map<String, Value>,
+}
+
+impl Findings {
+    fn expect(&mut self, mismatch: Option<String>) {
+        if self.first.is_none() {
+            self.first = mismatch;
+        }
+    }
+
+    fn push(&mut self, key: &str, (mismatch, detail): (Option<String>, Value)) {
+        self.expect(mismatch);
+        self.detail.insert(key.to_string(), detail);
+    }
+
+    fn note(&mut self, key: &str, detail: Value) {
+        self.detail.insert(key.to_string(), detail);
+    }
+
+    fn finish(self) -> (Option<String>, Value) {
+        (self.first, Value::Object(self.detail))
+    }
+}
+
+fn route_mismatch(
+    label: &str,
+    flow: &FlowOut,
+    source: Qwen4PrefixSource,
+    start: usize,
+) -> Option<String> {
+    (flow.source != source || flow.start != start).then(|| {
+        format!(
+            "{label}: route {:?}@{} expected {source:?}@{start}",
+            flow.source, flow.start
+        )
+    })
+}
+
+fn family_digests(families: &Families) -> Value {
+    Value::Object(
+        families
+            .iter()
+            .map(|(name, value)| (name.clone(), json!(family_digest(Some(value)))))
+            .collect(),
+    )
+}
+
+fn state_digests(state: &SessionState) -> Value {
+    json!({
+        "target": family_digests(&state.target),
+        "mtp": state.mtp.as_ref().map(family_digests),
+        "pending_hidden": family_digest(state.pending.as_ref()),
+    })
+}
+
+fn flow_report(flow: &FlowOut) -> Value {
+    json!({
+        "source": format!("{:?}", flow.source),
+        "start": flow.start,
+        "seed": flow.seed,
+        "logits": flow.logits,
+        "ids": flow.ids,
+        "digests": {
+            "after_fill": state_digests(&flow.after_fill),
+            "after_decode": state_digests(&flow.after_decode),
+        },
+    })
+}
+
+/// Every state family, the logits, the seed and the ids that differ.
+fn flow_mismatches(left: &FlowOut, right: &FlowOut) -> Vec<String> {
+    let mut out = Vec::new();
+    for (stage, a, b) in [
+        ("after_fill", &left.after_fill, &right.after_fill),
+        ("after_decode", &left.after_decode, &right.after_decode),
+    ] {
+        for (scope, x, y) in [
+            ("target", Some(&a.target), Some(&b.target)),
+            ("mtp", a.mtp.as_ref(), b.mtp.as_ref()),
+        ] {
+            match (x, y) {
+                (Some(x), Some(y)) => {
+                    let keys = x.keys().chain(y.keys()).collect::<BTreeSet<_>>();
+                    for key in keys {
+                        if x.get(key) != y.get(key) {
+                            out.push(format!("{stage}:{scope}.{key}"));
+                        }
+                    }
+                }
+                (None, None) => {}
+                _ => out.push(format!("{stage}:{scope} presence")),
+            }
+        }
+        if a.pending != b.pending {
+            out.push(format!("{stage}:pending_hidden"));
+        }
+    }
+    if left.logits != right.logits {
+        out.push("final_logits".to_string());
+    }
+    if left.seed != right.seed {
+        out.push("seed".to_string());
+    }
+    if left.ids != right.ids {
+        out.push("decode:ids".to_string());
+    }
+    out
+}
+
+/// A production request against its oracle: the route, the oracle's own
+/// route (a live continuation at `start`) and every digest.
+fn oracle_comparison(
+    label: &str,
+    flow: &FlowOut,
+    oracle: &FlowOut,
+    source: Qwen4PrefixSource,
+    start: usize,
+) -> (Option<String>, Value) {
+    let mismatch = route_mismatch(label, flow, source, start)
+        .or_else(|| {
+            route_mismatch(
+                &format!("{label} oracle"),
+                oracle,
+                Qwen4PrefixSource::Live,
+                start,
+            )
+        })
+        .or_else(|| first_flow_mismatch(flow, oracle).map(|m| format!("{label}: {m}")));
+    (
+        mismatch,
+        json!({
+            "production": flow_report(flow),
+            "oracle": flow_report(oracle),
+            "mismatching_families": flow_mismatches(flow, oracle),
+        }),
+    )
+}
+
+fn radix_stats_json(stats: &crate::bundle::Qwen4RadixStats) -> Value {
+    json!({
+        "lookups": stats.lookups,
+        "hits_live": stats.hits_live,
+        "hits_prompt": stats.hits_prompt,
+        "hits_radix": stats.hits_radix,
+        "forks": stats.forks,
+        "fresh_banks": stats.fresh_banks,
+        "captures": stats.captures,
+        "anchors": stats.anchors,
+        "periodic": stats.periodic,
+        "published": stats.published,
+        "duplicates": stats.duplicates,
+        "evictions": stats.evictions,
+        "alias_bytes": stats.alias_bytes,
+        "copied_bytes": stats.copied_bytes,
+        "ledger_bytes": stats.ledger_bytes,
+        "peak_ledger_bytes": stats.peak_ledger_bytes,
+        "relocations": stats.relocations,
+        "retired_va_bytes": stats.retired_va_bytes,
+        "banks_created": stats.banks_created,
+    })
+}
+
+/// Granules the checkpoint aliases must be the live fork bank's leading
+/// granules; returns how many were compared.
+fn alias_findings(source: &[ArenaView], live: &[ArenaView]) -> (usize, Option<String>) {
+    if source.len() != live.len() {
+        return (
+            0,
+            Some(format!(
+                "arena count {} vs {}",
+                source.len(),
+                live.len()
+            )),
+        );
+    }
+    let mut compared = 0;
+    for (arena, (s, l)) in source.iter().zip(live).enumerate() {
+        for index in 0..s.alias {
+            if l.granules.get(index) != s.granules.get(index) {
+                return (
+                    compared,
+                    Some(format!(
+                        "arena {arena} granule {index}: fork maps {:?}, checkpoint aliases {:?}",
+                        l.granules.get(index),
+                        s.granules.get(index)
+                    )),
+                );
+            }
+            compared += 1;
+        }
+    }
+    (compared, None)
+}
+
+/// Cache configuration of a loaded oracle bundle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RigCache {
+    /// No prefix cache attached: the cache-disabled tier.
+    Disabled,
+    /// Prefix cache and radix store under `RadixSizing`.
+    Radix(RadixSizing),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RadixSizing {
+    /// Room for every case of a unit: no eviction.
+    Roomy,
+    /// Two checkpoints and a device cap of two slots: the pressure case.
+    Pressure,
+}
+
+struct LoadedRig {
+    rig: SessionRig,
+    /// Live VMM granule bytes before the load.
+    baseline_granule_bytes: usize,
+    limits: Option<crate::bundle::Qwen4RadixLimits>,
+    state_format: String,
+}
+
+/// What one loaded bundle produced, with its unload outcome.
+struct RigRun<T> {
+    result: Result<T, String>,
+    /// Live VMM granule bytes after the unload, or the leak description.
+    unload: Result<usize, String>,
+    limits: Option<crate::bundle::Qwen4RadixLimits>,
+    stats: Option<crate::bundle::Qwen4RadixStats>,
+    max_seq: usize,
+    chunk: usize,
+    state_format: String,
+}
+
+impl<T> RigRun<T> {
+    fn unit_value(&self, name: &str) -> Value {
+        json!({
+            "unit": name,
+            "max_seq": self.max_seq,
+            "chunk_rows": self.chunk,
+            "state_format": self.state_format,
+            "limits": self.limits.map(|limits| json!({
+                "device_bytes": limits.device_bytes,
+                "host_bytes": limits.host_bytes,
+                "checkpoints": limits.checkpoints,
+            })),
+            "radix_stats": self.stats.as_ref().map(radix_stats_json),
+            "unload": match &self.unload {
+                Ok(live) => json!({"live_granule_bytes": live}),
+                Err(error) => json!({"error": error}),
+            },
+        })
+    }
+
+    /// The unit's value, or its first infrastructure failure.
+    fn finish(self) -> Result<T, String> {
+        match (self.result, self.unload) {
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+            (Err(error), Err(unload)) => Err(format!("{error}; unload also failed: {unload}")),
+        }
+    }
+}
+
+/// The radix `CacheDomain` of the oracle bundle (the loader's construction,
+/// without a tokenizer or chat template: the oracle drives token ids).
+fn radix_oracle_domain(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    format: crate::state::Qwen4StateFormat,
+    content_digest: Vec<u8>,
+) -> hipfire_runtime::serve_contract::CacheDomain {
+    use hipfire_runtime::serve_contract::{
+        sha256_len_prefixed, ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
+        TemplateIdentity, TokenizerIdentity,
+    };
+    let config = &bundle.config;
+    let qsa = format.qsa;
+    let kv_row = qsa.kv_row_bytes(config.num_key_value_heads, config.head_dim) as u64;
+    let full_layers = config.n_full_layers();
+    let epoch = RADIX_ORACLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut device_id = format!("{}-gpu{}", gpu.arch, gpu.device_id);
+    if let Ok(bus) = gpu.hip.device_pci_bus_id(gpu.device_id) {
+        device_id.push_str(&format!("-pci{bus}"));
+    }
+    CacheDomain {
+        model_content_digest: content_digest,
+        model_load_epoch: epoch,
+        sidecar_digests: Vec::new(),
+        tokenizer: TokenizerIdentity {
+            vocab_digest: sha256_len_prefixed(&[
+                b"qwen4-radix-oracle-vocab",
+                config.vocab_size.to_string().as_bytes(),
+            ]),
+            config_digest: sha256_len_prefixed(&[b"qwen4-radix-oracle-token-ids"]),
+        },
+        template: TemplateIdentity {
+            template_digest: sha256_len_prefixed(&[b""]),
+            normalization_tag: "prompt-frame;qwen-splice-v1".to_string(),
+        },
+        arch_policy: ArchPolicy {
+            arch_tag: "qwen4-flash-next-16".to_string(),
+            state_abi_tag: format!("gdn-{}+qsa-{}", format.gdn.name(), qsa.name()),
+            position_attention_tag: format!("qsa-compress-{}", config.indexer_compress_ratio),
+        },
+        kv_layout: KvLayout {
+            k_stride_bytes: vec![kv_row; full_layers],
+            v_stride_bytes: vec![kv_row; full_layers],
+            layout_tag: format!(
+                "qsa-{};kv{}x{};index{}x{};compress{};head-f32",
+                qsa.name(),
+                config.num_key_value_heads,
+                config.head_dim,
+                config.indexer_kv_heads,
+                config.indexer_head_dim,
+                config.indexer_compress_ratio
+            ),
+        },
+        device: DeviceTopology {
+            device_id,
+            topology_id: "radix-oracle-single".to_string(),
+            allocation_epoch: epoch,
+        },
+        namespace: SharingNamespace {
+            domain_id: "default".to_string(),
+        },
+    }
+}
+
+/// Explicit per-unit radix budgets.
+fn radix_oracle_limits(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    format: crate::state::Qwen4StateFormat,
+    sizing: RadixSizing,
+) -> Result<crate::bundle::Qwen4RadixLimits, String> {
+    const MIB: u64 = 1 << 20;
+    let host_bytes = 64usize << 20;
+    match sizing {
+        RadixSizing::Roomy => {
+            let (free, _) = gpu
+                .hip
+                .get_vram_info()
+                .map_err(|error| format!("VRAM query: {error}"))?;
+            Ok(crate::bundle::Qwen4RadixLimits {
+                device_bytes: (free as u64 / 2).min(8 * 1024 * MIB),
+                host_bytes,
+                checkpoints: 48,
+            })
+        }
+        RadixSizing::Pressure => {
+            // Two baseline slots plus a small margin for retained slabs.
+            let slot = crate::bundle::prefix_cache_device_bytes(&bundle.config, format, true)
+                .ok_or("radix oracle slot sizing overflows")?;
+            Ok(crate::bundle::Qwen4RadixLimits {
+                device_bytes: 2 * slot + 16 * MIB,
+                host_bytes,
+                checkpoints: 2,
+            })
+        }
+    }
+}
+
+/// Load one bundle with the shipped state formats, the product's default
+/// context and the VMM backend: the loader's attach order (prefix arena,
+/// forward, MTP head, head's prefix part, radix store).
+fn load_session_rig(
+    gpu: &mut Gpu,
+    model_path: &Path,
+    cache: RigCache,
+) -> Result<LoadedRig, String> {
+    let baseline_granule_bytes = hip_bridge::vmm_live_granule_bytes();
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let receipt = crate::admit_hfqm_artifact(&hfq)
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let config = receipt.config.clone();
+    let manifest = receipt.manifest.clone();
+    let metadata = receipt.ple.clone();
+    let placements = receipt.placements.clone();
+    let content_digest = hfq.content_digest();
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
+        .map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, gpu);
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        config.num_hidden_layers,
+        gpu,
+        expected,
+        |entry| qwen4_range_payload(&source, entry),
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let state_format = crate::state::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        "",
+        gpu,
+        &config,
+    )?;
+    let backend = Qwen4KvBackend::automatic(gpu);
+    if matches!(cache, RigCache::Radix(_)) && backend != Qwen4KvBackend::Vmm {
+        return Err(format!(
+            "the radix oracle needs the VMM QSA context backend, got {backend:?}"
+        ));
+    }
+    let max_seq = crate::QWEN4_DEFAULT_CONTEXT.min(config.max_position_embeddings);
+    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+        config.clone(),
+        transaction,
+        &placements,
+        gpu,
+        max_seq,
+        metadata,
+        state_format,
+        backend,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    let attach = (|| -> Result<Option<crate::bundle::Qwen4RadixLimits>, String> {
+        let RigCache::Radix(sizing) = cache else {
+            bundle
+                .attach_forward(gpu, max_seq)
+                .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+            bundle
+                .attach_mtp(gpu, max_seq)
+                .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+            return Ok(None);
+        };
+        bundle
+            .attach_prefix_cache(gpu)
+            .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        bundle
+            .attach_forward(gpu, max_seq)
+            .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+        bundle
+            .attach_mtp(gpu, max_seq)
+            .map_err(|error| format!("qwen4 MTP setup failed: {error}"))?;
+        bundle
+            .attach_prefix_cache(gpu)
+            .map_err(|error| format!("qwen4 prefix cache setup failed: {error}"))?;
+        if !bundle.prefix_cache_attached() {
+            return Err("qwen4 prefix cache is not attached".to_string());
+        }
+        let limits = radix_oracle_limits(&bundle, gpu, state_format, sizing)?;
+        let domain = radix_oracle_domain(&bundle, gpu, state_format, content_digest.clone());
+        bundle
+            .attach_radix_cache(gpu, domain, limits)
+            .map_err(|error| format!("qwen4 radix cache setup failed: {error}"))?;
+        if !bundle.radix_cache_attached() {
+            return Err("qwen4 radix cache is not attached".to_string());
+        }
+        Ok(Some(limits))
+    })();
+    let logits = match attach.and_then(|limits| {
+        gpu.zeros(&[config.vocab_size], DType::F32)
+            .map(|logits| (limits, logits))
+            .map_err(|error| format!("allocate session logits: {error}"))
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = bundle.free_gpu(gpu);
+            return Err(error);
+        }
+    };
+    let (limits, logits) = logits;
+    Ok(LoadedRig {
+        rig: SessionRig {
+            bundle,
+            logits,
+            max_seq,
+            vocab: config.vocab_size,
+            eos: config.eos_token_id,
+        },
+        baseline_granule_bytes,
+        limits,
+        state_format: format!("{state_format:?}"),
+    })
+}
+
+/// Free a loaded bundle and require the process's live VMM granule bytes to
+/// return to their pre-load value.
+fn unload_session_rig(gpu: &mut Gpu, loaded: LoadedRig) -> Result<usize, String> {
+    let baseline = loaded.baseline_granule_bytes;
+    let SessionRig { bundle, logits, .. } = loaded.rig;
+    let logits_cleanup = gpu
+        .free_tensor(logits)
+        .err()
+        .map(|error| format!("free session logits: {error}"));
+    let bundle_cleanup = bundle
+        .free_gpu(gpu)
+        .err()
+        .map(|error| format!("qwen4 bundle teardown failed: {error}"));
+    if let Some(error) = logits_cleanup.or(bundle_cleanup) {
+        return Err(error);
+    }
+    let _ = hip_bridge::retry_pending_granule_releases(&gpu.hip);
+    let live = hip_bridge::vmm_live_granule_bytes();
+    if live != baseline {
+        return Err(format!(
+            "unload left {live} live VMM granule bytes, {baseline} before the load"
+        ));
+    }
+    Ok(live)
+}
+
+/// Load, run `f`, read the radix counters, unload. `Err` only when the load
+/// itself failed.
+fn with_session_rig<T>(
+    gpu: &mut Gpu,
+    model_path: &Path,
+    cache: RigCache,
+    f: impl FnOnce(&mut SessionRig, &mut Gpu, Option<crate::bundle::Qwen4RadixLimits>) -> Result<T, String>,
+) -> Result<RigRun<T>, String> {
+    let mut loaded = load_session_rig(gpu, model_path, cache)?;
+    let result = f(&mut loaded.rig, gpu, loaded.limits);
+    let stats = loaded.rig.bundle.radix_stats();
+    let max_seq = loaded.rig.max_seq;
+    let chunk = loaded.rig.bundle.spec_chunk_rows().unwrap_or(0);
+    let limits = loaded.limits;
+    let state_format = loaded.state_format.clone();
+    let unload = unload_session_rig(gpu, loaded);
+    Ok(RigRun {
+        result,
+        unload,
+        limits,
+        stats,
+        max_seq,
+        chunk,
+        state_format,
+    })
+}
+
+fn timed_case(
+    name: &str,
+    mode: Qwen4PrefixMode,
+    prompt_len: usize,
+    suffix_len: usize,
+    run: impl FnOnce() -> CaseOutcome,
+) -> Value {
+    let started = Instant::now();
+    let outcome = run();
+    let mut value = case_value(name, mode, prompt_len, suffix_len, outcome);
+    value["elapsed_s"] = json!(started.elapsed().as_secs_f64());
+    value
+}
+
+impl SessionRig {
+    /// Tokens like [`Self::tokens`] whose first id is none of `avoid`.
+    fn tokens_apart(&self, salt: u64, count: usize, avoid: &[u32]) -> Vec<u32> {
+        let mut tokens = self.tokens(salt, count);
+        while avoid.contains(&tokens[0]) {
+            tokens[0] = self.other_token(tokens[0]);
+        }
+        tokens
+    }
+
+    /// The shared planner's candidate start: the live end or the checkpoint
+    /// end when `prompt` extends that record, else cold.
+    fn local_start(&self, prompt: &[u32], mode: Qwen4PrefixMode) -> usize {
+        let Some(record) = self.bundle.prefix_cache_tokens(mode) else {
+            return 0;
+        };
+        if prompt.len() > record.len() && prompt[..record.len()] == *record {
+            return record.len();
+        }
+        match self.bundle.prefix_checkpoint_position(mode) {
+            Some(p) if p < prompt.len() && p <= record.len() && prompt[..p] == record[..p] => p,
+            _ => 0,
+        }
+    }
+
+    fn radix_counters(&self) -> Result<crate::bundle::Qwen4RadixStats, String> {
+        self.bundle
+            .radix_stats()
+            .ok_or_else(|| "the radix store is not attached".to_string())
+    }
+
+    /// Host-only: what `select_prefix_plan` would pick for `prompt` now.
+    fn probe_route(
+        &mut self,
+        prompt: &[u32],
+        mode: Qwen4PrefixMode,
+    ) -> Result<(Qwen4PrefixSource, usize), String> {
+        self.bundle.abandon_prefix_selection();
+        self.bundle.set_prefix_turn_boundaries(&[]);
+        let local = self.local_start(prompt, mode);
+        let plan = self
+            .bundle
+            .select_prefix_plan(prompt, local, mode)
+            .map_err(|error| format!("select: {error}"))?;
+        self.bundle.abandon_prefix_selection();
+        Ok((plan.source(), plan.start_pos))
+    }
+
+    /// The live context arenas (target, plus the head for native MTP): base
+    /// address, physical granules and the aliased granule count a capture
+    /// at the current marks takes.
+    fn context_view(&self, gpu: &Gpu, mode: Qwen4PrefixMode) -> Result<Vec<ArenaView>, String> {
+        let mut specs = self
+            .bundle
+            .state
+            .context_prefix_specs()
+            .map_err(|error| error.to_string())?;
+        if mode == Qwen4PrefixMode::NativeMtp {
+            let head = self
+                .bundle
+                .mtp
+                .as_ref()
+                .ok_or("native MTP head is not attached")?;
+            specs.extend(
+                head.context_prefix_specs()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        specs
+            .iter()
+            .map(|spec| {
+                let granules = gpu
+                    .vmm_physical_granules(spec.tensor)
+                    .ok_or("a context arena is not a registered VMM owner")?;
+                let limit = spec.valid_bytes.min(spec.writable_from);
+                let (mut end, mut alias) = (0usize, 0usize);
+                for &(_, size) in &granules {
+                    match end.checked_add(size) {
+                        Some(next) if size != 0 && next <= limit => {
+                            end = next;
+                            alias += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(ArenaView {
+                    base: spec.tensor.buf.as_ptr() as usize,
+                    granules: granules.into_iter().map(|(id, _)| id).collect(),
+                    alias,
+                })
+            })
+            .collect()
+    }
+
+    /// One request as production drives it: select (or a forced cold start),
+    /// `begin_prefix` through the mode's prefill (which stages the anchor,
+    /// periodic and end-of-prompt checkpoints), decode the compared ids, then
+    /// `commit_prefix(prompt + consumed)`.
+    fn request(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        prompt: &[u32],
+        boundaries: &[usize],
+        route: Route,
+    ) -> Result<Req, String> {
+        use hipfire_runtime::spec::MtpDrafter;
+        self.bundle.abandon_prefix_selection();
+        let plan = match route {
+            Route::Select => {
+                self.bundle.set_prefix_turn_boundaries(boundaries);
+                let local = self.local_start(prompt, mode);
+                self.bundle
+                    .select_prefix_plan(prompt, local, mode)
+                    .map_err(|error| format!("select at local {local}: {error}"))?
+            }
+            Route::Cold => {
+                self.bundle.set_prefix_turn_boundaries(&[]);
+                Qwen4PrefixPlan::default()
+            }
+        };
+        let seed = match mode {
+            Qwen4PrefixMode::Ar => {
+                self.bundle
+                    .prefill_final(gpu, prompt, plan, &self.logits)
+                    .map_err(|error| error.to_string())?;
+                None
+            }
+            Qwen4PrefixMode::NativeMtp => {
+                let drafter = drafter
+                    .as_mut()
+                    .ok_or("native MTP drafter is not allocated")?;
+                let seed = if plan.start_pos == 0 {
+                    drafter.mtp_prefill(
+                        gpu,
+                        &mut self.bundle,
+                        prompt,
+                        prompt,
+                        0,
+                        false,
+                        &|| false,
+                    )?
+                } else {
+                    drafter.mtp_prefill(
+                        gpu,
+                        &mut self.bundle,
+                        prompt,
+                        &prompt[plan.start_pos..],
+                        plan.start_pos,
+                        true,
+                        &|| false,
+                    )?
+                };
+                Some(seed)
+            }
+        };
+        if self.bundle.state.position != prompt.len() {
+            return Err(format!(
+                "prefill left the target at {}, expected {}",
+                self.bundle.state.position,
+                prompt.len()
+            ));
+        }
+        let view = if self.bundle.radix_cache_attached() {
+            self.context_view(gpu, mode)?
+        } else {
+            Vec::new()
+        };
+        let logits = match mode {
+            Qwen4PrefixMode::Ar => Some(download_host_logits(gpu, &self.logits)?.digest),
+            Qwen4PrefixMode::NativeMtp => None,
+        };
+        let after_fill = self.state(gpu, drafter, mode)?;
+        let decoded = self.decode(gpu, drafter, mode, seed, SESSION_NEXT_IDS)?;
+        let after_decode = self.state(gpu, drafter, mode)?;
+        let mut full = prompt.to_vec();
+        full.extend_from_slice(&decoded.consumed);
+        if self.bundle.state.position != full.len() {
+            return Err(format!(
+                "consumed history is {} tokens but the target is at {}",
+                full.len(),
+                self.bundle.state.position
+            ));
+        }
+        self.bundle.commit_prefix(&full);
+        Ok(Req {
+            flow: FlowOut {
+                source: plan.source(),
+                start: plan.start_pos,
+                seed,
+                logits,
+                after_fill,
+                ids: decoded.ids,
+                after_decode,
+            },
+            full,
+            view,
+        })
+    }
+
+    /// The session-exact oracle: cold prefill of `base` committed with no
+    /// decode, then the live continuation of `prompt` (which extends `base`).
+    fn live_oracle(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        base: &[u32],
+        prompt: &[u32],
+    ) -> Result<FlowOut, String> {
+        self.bundle.abandon_prefix_selection();
+        self.bundle.set_prefix_turn_boundaries(&[]);
+        let committed = self.first_session(gpu, drafter, mode, base, false)?;
+        self.require_live(&committed)?;
+        let plan = self.bind(prompt, base.len(), mode, Qwen4PrefixSource::Live)?;
+        self.run_suffix(gpu, drafter, mode, prompt, plan)
+    }
+
+    /// First-ever cold request on a radix-attached bundle must equal the
+    /// cache-disabled bundle's result.
+    fn radix_case_cold_identity(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        disabled: &[(Qwen4PrefixMode, FlowOut)],
+    ) -> CaseOutcome {
+        let reference = &disabled
+            .iter()
+            .find(|(m, _)| *m == mode)
+            .ok_or("no cache-disabled reference for this mode")?
+            .1;
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let prompt = rig.tokens(0xf0, RADIX_COLD_PROMPT);
+            let before = rig.radix_counters()?;
+            let req = rig.request(gpu, d, mode, &prompt, &[], Route::Select)?;
+            let mut found = Findings::default();
+            found.expect(route_mismatch("cold", &req.flow, Qwen4PrefixSource::Cold, 0));
+            found.expect(first_flow_mismatch(&req.flow, reference).map(|m| format!("cold: {m}")));
+            found.note(
+                "attached",
+                json!({
+                    "production": flow_report(&req.flow),
+                    "cache_disabled": flow_report(reference),
+                    "mismatching_families": flow_mismatches(&req.flow, reference),
+                    "lookups_before": before.lookups,
+                }),
+            );
+            Ok(found.finish())
+        })
+    }
+
+    /// A decodes and commits, an unrelated B runs cold, then `C = PA + suffix`
+    /// must select the radix checkpoint at `|PA|` and equal the oracle.
+    fn radix_case_cross_session(&mut self, gpu: &mut Gpu, mode: Qwen4PrefixMode) -> CaseOutcome {
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let mut found = Findings::default();
+            let pa = rig.tokens(0xa1, RADIX_PROMPT_A);
+            let pb = rig.tokens_apart(0xa2, RADIX_PROMPT_B, &[pa[0]]);
+            let mut pc = pa.clone();
+            pc.extend(rig.tokens(0xa3, RADIX_SUFFIX));
+            let a = rig.request(gpu, d, mode, &pa, &[], Route::Select)?;
+            found.expect(route_mismatch("A", &a.flow, Qwen4PrefixSource::Cold, 0));
+            let b = rig.request(gpu, d, mode, &pb, &[], Route::Select)?;
+            found.expect(route_mismatch("B", &b.flow, Qwen4PrefixSource::Cold, 0));
+            let c = rig.request(gpu, d, mode, &pc, &[], Route::Select)?;
+            let oracle = rig.live_oracle(gpu, d, mode, &pa, &pc)?;
+            found.push(
+                "C",
+                oracle_comparison("C", &c.flow, &oracle, Qwen4PrefixSource::Radix, pa.len()),
+            );
+            Ok(found.finish())
+        })
+    }
+
+    /// A-B-A: A2 is A's committed history plus a new turn, after an unrelated
+    /// B; it must restore A's end-of-prompt checkpoint, not run cold.
+    fn radix_case_a_b_a(&mut self, gpu: &mut Gpu, mode: Qwen4PrefixMode) -> CaseOutcome {
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let mut found = Findings::default();
+            let pa = rig.tokens(0xa4, RADIX_PROMPT_A);
+            let pb = rig.tokens_apart(0xa5, RADIX_PROMPT_B, &[pa[0]]);
+            let a = rig.request(gpu, d, mode, &pa, &[], Route::Select)?;
+            found.expect(route_mismatch("A", &a.flow, Qwen4PrefixSource::Cold, 0));
+            let b = rig.request(gpu, d, mode, &pb, &[], Route::Select)?;
+            found.expect(route_mismatch("B", &b.flow, Qwen4PrefixSource::Cold, 0));
+            let mut a2 = a.full.clone();
+            a2.extend(rig.tokens(0xa6, RADIX_NEW_TURN));
+            let second = rig.request(gpu, d, mode, &a2, &[], Route::Select)?;
+            let oracle = rig.live_oracle(gpu, d, mode, &pa, &a2)?;
+            found.push(
+                "A2",
+                oracle_comparison("A2", &second.flow, &oracle, Qwen4PrefixSource::Radix, pa.len()),
+            );
+            Ok(found.finish())
+        })
+    }
+
+    /// Three sessions share a system turn `S`. The first cold one splits
+    /// nothing; the second observes the shared turn, splits and captures at
+    /// `S`; the third hits `S` and equals the cold-`[0, S)` oracle.
+    fn radix_case_anchor(&mut self, gpu: &mut Gpu, mode: Qwen4PrefixMode) -> CaseOutcome {
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let mut found = Findings::default();
+            let s = RADIX_SYSTEM_TURN;
+            let sys = rig.tokens(0xb1, s);
+            let tail = rig.tokens(0xb8, RADIX_ASSISTANT_TAIL);
+            let mut prompts = Vec::new();
+            for turn in 0..3u64 {
+                let mut prompt = sys.clone();
+                prompt.extend(rig.tokens(0xb2 + turn, RADIX_USER_TURN));
+                prompt.extend_from_slice(&tail);
+                prompts.push(prompt);
+            }
+            // The `<|im_end|>` positions: after the system turn and after the
+            // user turn.
+            let boundaries = [s, s + RADIX_USER_TURN];
+
+            let before = rig.radix_counters()?;
+            let first = rig.request(gpu, d, mode, &prompts[0], &boundaries, Route::Select)?;
+            let after_first = rig.radix_counters()?;
+            found.expect(route_mismatch("first", &first.flow, Qwen4PrefixSource::Cold, 0));
+            if after_first.anchors != before.anchors {
+                found.expect(Some(format!(
+                    "first cold session split an anchor ({} -> {})",
+                    before.anchors, after_first.anchors
+                )));
+            }
+            if after_first.captures != before.captures + 1 {
+                found.expect(Some(format!(
+                    "first cold session captured {} checkpoints, expected only the end of prompt",
+                    after_first.captures - before.captures
+                )));
+            }
+
+            let second = rig.request(gpu, d, mode, &prompts[1], &boundaries, Route::Select)?;
+            let after_second = rig.radix_counters()?;
+            found.expect(route_mismatch("second", &second.flow, Qwen4PrefixSource::Cold, 0));
+            if after_second.anchors != after_first.anchors + 1 {
+                found.expect(Some(format!(
+                    "second observation took {} anchors, expected 1",
+                    after_second.anchors - after_first.anchors
+                )));
+            }
+            if after_second.captures != after_first.captures + 2 {
+                found.expect(Some(format!(
+                    "second observation captured {} checkpoints, expected the anchor and the end of prompt",
+                    after_second.captures - after_first.captures
+                )));
+            }
+            if after_second.periodic != after_first.periodic {
+                found.expect(Some("second observation took a periodic capture".to_string()));
+            }
+
+            let third = rig.request(gpu, d, mode, &prompts[2], &boundaries, Route::Select)?;
+            let after_third = rig.radix_counters()?;
+            let oracle = rig.live_oracle(gpu, d, mode, &prompts[2][..s], &prompts[2])?;
+            found.push(
+                "third",
+                oracle_comparison("third", &third.flow, &oracle, Qwen4PrefixSource::Radix, s),
+            );
+            found.note(
+                "counters",
+                json!({
+                    "before": radix_stats_json(&before),
+                    "after_first": radix_stats_json(&after_first),
+                    "after_second": radix_stats_json(&after_second),
+                    "after_third": radix_stats_json(&after_third),
+                    "system_turn": s,
+                    "boundaries": boundaries,
+                }),
+            );
+            Ok(found.finish())
+        })
+    }
+
+    /// Forks from one checkpoint: C1, C2, C1 again and C3 each restore the
+    /// same source into a fresh bank. C1 repeats byte-identically, the source
+    /// stays reusable, the aliased granules are the checkpoint's, and no base
+    /// virtual address repeats.
+    fn radix_case_siblings(&mut self, gpu: &mut Gpu, mode: Qwen4PrefixMode) -> CaseOutcome {
+        session_case_fits(self.max_seq, RADIX_SIBLING_PROMPT, RADIX_SIBLING_SUFFIX)?;
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let mut found = Findings::default();
+            let pa = rig.tokens(0xc1, RADIX_SIBLING_PROMPT);
+            let pu = rig.tokens_apart(0xc2, RADIX_PROMPT_B, &[pa[0]]);
+            let mut suffixes: Vec<Vec<u32>> = Vec::new();
+            for salt in 0..3u64 {
+                let first_ids: Vec<u32> = suffixes.iter().map(|s| s[0]).collect();
+                suffixes.push(rig.tokens_apart(0xc3 + salt, RADIX_SIBLING_SUFFIX, &first_ids));
+            }
+            let prompt_with = |suffix: &[u32]| {
+                let mut prompt = pa.clone();
+                prompt.extend_from_slice(suffix);
+                prompt
+            };
+            let a = rig.request(gpu, d, mode, &pa, &[], Route::Select)?;
+            found.expect(route_mismatch("A", &a.flow, Qwen4PrefixSource::Cold, 0));
+            let source_alias: usize = a.view.iter().map(|arena| arena.alias).sum();
+            let unrelated = rig.request(gpu, d, mode, &pu, &[], Route::Select)?;
+            found.expect(route_mismatch("U", &unrelated.flow, Qwen4PrefixSource::Cold, 0));
+
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            for arena in a.view.iter().chain(&unrelated.view) {
+                seen.insert(arena.base);
+            }
+            let order = [("C1", 0usize), ("C2", 1), ("C1_again", 0), ("C3", 2)];
+            let mut forks: Vec<(&str, usize, Req)> = Vec::new();
+            let mut alias_detail = Map::new();
+            for (label, which) in order {
+                let prompt = prompt_with(&suffixes[which]);
+                let req = rig.request(gpu, d, mode, &prompt, &[], Route::Select)?;
+                found.expect(route_mismatch(
+                    label,
+                    &req.flow,
+                    Qwen4PrefixSource::Radix,
+                    pa.len(),
+                ));
+                let (compared, alias_mismatch) = alias_findings(&a.view, &req.view);
+                found.expect(alias_mismatch.map(|m| format!("{label}: {m}")));
+                alias_detail.insert(label.to_string(), json!(compared));
+                for (arena, view) in req.view.iter().enumerate() {
+                    if !seen.insert(view.base) {
+                        found.expect(Some(format!(
+                            "{label}: arena {arena} base VA {:#x} repeats an earlier bank",
+                            view.base
+                        )));
+                    }
+                }
+                forks.push((label, which, req));
+            }
+            if source_alias == 0 {
+                found.expect(Some(
+                    "the source checkpoint aliases no granule: the alias comparison is vacuous"
+                        .to_string(),
+                ));
+            }
+            found.note(
+                "alias",
+                json!({"source_alias_granules": source_alias, "compared_per_fork": alias_detail}),
+            );
+            // C1 repeats byte-identical.
+            let (c1, c1_again) = (&forks[0].2, &forks[2].2);
+            found.expect(
+                first_flow_mismatch(&c1.flow, &c1_again.flow).map(|m| format!("C1 repeat: {m}")),
+            );
+            let c1_repeat = flow_mismatches(&c1.flow, &c1_again.flow);
+            found.note("c1_repeat_mismatching_families", json!(c1_repeat));
+            // Every fork equals the session-exact oracle.
+            for (label, which, req) in &forks {
+                if *label == "C1_again" {
+                    continue;
+                }
+                let prompt = prompt_with(&suffixes[*which]);
+                let oracle = rig.live_oracle(gpu, d, mode, &pa, &prompt)?;
+                found.push(
+                    label,
+                    oracle_comparison(
+                        label,
+                        &req.flow,
+                        &oracle,
+                        Qwen4PrefixSource::Radix,
+                        pa.len(),
+                    ),
+                );
+            }
+            Ok(found.finish())
+        })
+    }
+
+    /// An end-of-prompt checkpoint at `p` tokens (run cold), then an
+    /// unrelated request, then fork hits with each suffix length; each must
+    /// select the radix checkpoint at `p` and equal the oracle.
+    fn radix_boundary_group(
+        &mut self,
+        gpu: &mut Gpu,
+        drafter: &mut Option<Qwen4MtpDrafter>,
+        mode: Qwen4PrefixMode,
+        p: usize,
+    ) -> Result<Vec<CaseOutcome>, String> {
+        let pp = self.tokens(0xd0 ^ ((p as u64) << 8), p);
+        let pu = self.tokens_apart(0xd1, RADIX_UNRELATED_PROMPT, &[pp[0]]);
+        let periodic_before = self.radix_counters()?.periodic;
+        let a = self.request(gpu, drafter, mode, &pp, &[], Route::Select)?;
+        let periodic = self.radix_counters()?.periodic - periodic_before;
+        let unrelated = self.request(gpu, drafter, mode, &pu, &[], Route::Select)?;
+        let mut first_ids: Vec<u32> = vec![a.full.get(p).copied().unwrap_or(pp[0])];
+        let mut outcomes = Vec::new();
+        for &s in &RADIX_BOUNDARY_SUFFIXES {
+            let outcome = (|| -> CaseOutcome {
+                session_case_fits(self.max_seq, p, s)?;
+                let suffix = self.tokens_apart(0xd2 ^ (s as u64), s, &first_ids);
+                first_ids.push(suffix[0]);
+                let mut prompt = pp.clone();
+                prompt.extend_from_slice(&suffix);
+                let mut found = Findings::default();
+                found.expect(route_mismatch("A", &a.flow, Qwen4PrefixSource::Cold, 0));
+                found.expect(route_mismatch(
+                    "U",
+                    &unrelated.flow,
+                    Qwen4PrefixSource::Cold,
+                    0,
+                ));
+                let fork = self.request(gpu, drafter, mode, &prompt, &[], Route::Select)?;
+                let oracle = self.live_oracle(gpu, drafter, mode, &pp, &prompt)?;
+                found.push(
+                    "fork",
+                    oracle_comparison("fork", &fork.flow, &oracle, Qwen4PrefixSource::Radix, p),
+                );
+                found.note("periodic_captures_of_the_checkpoint_request", json!(periodic));
+                Ok(found.finish())
+            })();
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Pressure under `limits` (two checkpoints, a small device cap): three
+    /// distinct checkpoints evict the GDSF victim, the ledger stays within
+    /// the cap, and a pinned (selected, uncommitted) checkpoint survives an
+    /// eviction attempt that takes an unpinned, higher-priority entry instead.
+    fn radix_case_pressure(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+        limits: crate::bundle::Qwen4RadixLimits,
+    ) -> CaseOutcome {
+        self.with_drafter(gpu, mode, |rig, gpu, d| {
+            let mut found = Findings::default();
+            let x1 = rig.tokens(0xe1, 600);
+            let x2 = rig.tokens_apart(0xe2, 130, &[x1[0]]);
+            let x3 = rig.tokens_apart(0xe3, 1100, &[x1[0], x2[0]]);
+            let probe_suffix = rig.tokens(0xe4, 16);
+            let with_suffix = |prompt: &[u32], suffix: &[u32]| {
+                let mut out = prompt.to_vec();
+                out.extend_from_slice(suffix);
+                out
+            };
+            let mut ledger_checks = Vec::new();
+            let mut check_ledger = |label: &str, stats: &crate::bundle::Qwen4RadixStats| {
+                ledger_checks.push(json!({
+                    "after": label,
+                    "ledger_bytes": stats.ledger_bytes,
+                    "peak_ledger_bytes": stats.peak_ledger_bytes,
+                    "cap": limits.device_bytes,
+                }));
+                (stats.ledger_bytes > limits.device_bytes).then(|| {
+                    format!(
+                        "{label}: ledger {} bytes exceeds the {}-byte cap",
+                        stats.ledger_bytes, limits.device_bytes
+                    )
+                })
+            };
+            let r1 = rig.request(gpu, d, mode, &x1, &[], Route::Select)?;
+            let r2 = rig.request(gpu, d, mode, &x2, &[], Route::Select)?;
+            found.expect(route_mismatch("X1", &r1.flow, Qwen4PrefixSource::Cold, 0));
+            found.expect(route_mismatch("X2", &r2.flow, Qwen4PrefixSource::Cold, 0));
+            let evictions_two = rig.radix_counters()?.evictions;
+            let r3 = rig.request(gpu, d, mode, &x3, &[], Route::Select)?;
+            found.expect(route_mismatch("X3", &r3.flow, Qwen4PrefixSource::Cold, 0));
+            let after_three = rig.radix_counters()?;
+            found.expect(check_ledger("three checkpoints", &after_three));
+            if after_three.evictions <= evictions_two {
+                found.expect(Some(format!(
+                    "publishing a third checkpoint under a limit of {} evicted nothing ({} evictions)",
+                    limits.checkpoints, after_three.evictions
+                )));
+            }
+            // The GDSF victim is the lowest cost per byte: the shortest, X2.
+            let victim = rig.probe_route(&with_suffix(&x2, &probe_suffix), mode)?;
+            if victim.0 == Qwen4PrefixSource::Radix {
+                found.expect(Some(format!(
+                    "the GDSF victim X2 still hits ({:?}@{})",
+                    victim.0, victim.1
+                )));
+            }
+            let kept = rig.probe_route(&with_suffix(&x1, &probe_suffix), mode)?;
+            if kept != (Qwen4PrefixSource::Radix, x1.len()) {
+                found.expect(Some(format!(
+                    "X1 should survive the eviction, got {:?}@{}",
+                    kept.0, kept.1
+                )));
+            }
+            found.note(
+                "after_three",
+                json!({
+                    "victim_probe": format!("{:?}@{}", victim.0, victim.1),
+                    "kept_probe": format!("{:?}@{}", kept.0, kept.1),
+                    "stats": radix_stats_json(&after_three),
+                }),
+            );
+            // X1 is selected (pinned) and its request's end-of-prompt capture
+            // must evict: only the unpinned X3 may go, though X1 is cheaper.
+            let prompt = with_suffix(&x1, &rig.tokens(0xe5, 24));
+            let evictions_before = rig.radix_counters()?.evictions;
+            let pinned = rig.request(gpu, d, mode, &prompt, &[], Route::Select)?;
+            let after_pinned = rig.radix_counters()?;
+            found.expect(check_ledger("pinned request", &after_pinned));
+            if after_pinned.evictions <= evictions_before {
+                found.expect(Some(
+                    "the pinned request's capture attempted no eviction".to_string(),
+                ));
+            }
+            let survivor = rig.probe_route(&with_suffix(&x1, &probe_suffix), mode)?;
+            if survivor != (Qwen4PrefixSource::Radix, x1.len()) {
+                found.expect(Some(format!(
+                    "the pinned X1 was evicted: {:?}@{}",
+                    survivor.0, survivor.1
+                )));
+            }
+            let evicted = rig.probe_route(&with_suffix(&x3, &probe_suffix), mode)?;
+            if evicted.0 == Qwen4PrefixSource::Radix {
+                found.expect(Some(format!(
+                    "the unpinned X3 was kept ({:?}@{})",
+                    evicted.0, evicted.1
+                )));
+            }
+            let oracle = rig.live_oracle(gpu, d, mode, &x1, &prompt)?;
+            found.push(
+                "pinned",
+                oracle_comparison(
+                    "pinned",
+                    &pinned.flow,
+                    &oracle,
+                    Qwen4PrefixSource::Radix,
+                    x1.len(),
+                ),
+            );
+            let final_stats = rig.radix_counters()?;
+            found.expect(check_ledger("final", &final_stats));
+            found.note(
+                "after_pinned",
+                json!({
+                    "survivor_probe": format!("{:?}@{}", survivor.0, survivor.1),
+                    "evicted_probe": format!("{:?}@{}", evicted.0, evicted.1),
+                    "stats": radix_stats_json(&final_stats),
+                }),
+            );
+            found.note("ledger", Value::Array(ledger_checks.clone()));
+            Ok(found.finish())
+        })
+    }
+}
+
+/// Radix prefix-cache session oracle. Each unit loads a fresh bundle with
+/// the shipped state formats, the product's default context and the VMM
+/// backend, attaches the prefix cache and a radix store under explicit
+/// [`Qwen4RadixLimits`], and drives requests as production does: `select_prefix_plan`,
+/// `begin_prefix` through the mode's prefill (AR `prefill_final`, native MTP
+/// `mtp_prefill` with its `next_prefix_capture` / `stage_prefix_boundary`
+/// ordering), a short greedy decode, `commit_prefix`. For AR and native MTP:
+///
+/// - `cold_identity`: the first cold request equals a bundle with no prefix
+///   cache attached.
+/// - `cross_session`, `a_b_a`: a checkpoint published by one session serves a
+///   later one after an unrelated request, equal to the oracle "cold prefill
+///   of the checkpoint prompt committed with no decode, then the live
+///   continuation of the suffix".
+/// - `anchor`: the first cold session splits nothing, the second observation
+///   of a shared turn splits and captures at it, the third hits it.
+/// - `siblings`: repeated forks of one checkpoint into fresh banks alias its
+///   granules, never repeat a base VA, leave the source reusable and repeat
+///   byte for byte.
+/// - `boundary_fork`: end-of-prompt checkpoints at 1, 3, 4, 5, 127, 128, 129,
+///   4095, 4096, 4097, 8191, 8192 and 8193 tokens, each forked with a 1-token
+///   and a 513-token suffix.
+/// - `pressure`: two checkpoints and a small device cap: GDSF eviction, the
+///   ledger within the cap, a pinned checkpoint surviving, and the live VMM
+///   granule bytes returning to their pre-load value after unload.
+///
+/// Every comparison covers the target families (GDN states, active QSA
+/// K/V/raw/pooled/partial/selected, PLE history and conv, HC, marks), the
+/// native head families (context, selection, policy), the pending hidden
+/// row, the final logits or seed and the next greedy ids. The report has the
+/// shape of the prefix-cache session oracle plus a top-level `passed`.
+pub fn run_radix_cache_session_parity(
+    model_path: &Path,
+    corpus_path: &Path,
+) -> Result<StateParityReport, String> {
+    let (_, corpus) = read_state_tokens(corpus_path)?;
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let mut cases: Vec<Value> = Vec::new();
+    let mut units: Vec<Value> = Vec::new();
+    let record = |cases: &mut Vec<Value>, value: Value| {
+        eprintln!(
+            "radix-cache session: {} {} P={} S={}: {}{}",
+            value["mode"].as_str().unwrap_or("?"),
+            value["case"].as_str().unwrap_or("?"),
+            value["prompt_len"],
+            value["suffix_len"],
+            value["status"].as_str().unwrap_or("?"),
+            value["first_mismatch"]
+                .as_str()
+                .map(|mismatch| format!(" ({mismatch})"))
+                .unwrap_or_default(),
+        );
+        cases.push(value);
+    };
+
+    // Unit 1: the cache-disabled tier (no prefix cache, no radix store).
+    let disabled_run = with_session_rig(&mut gpu, model_path, RigCache::Disabled, |rig, gpu, _| {
+        let mut flows = Vec::new();
+        for mode in RADIX_MODES {
+            let prompt = rig.tokens(0xf0, RADIX_COLD_PROMPT);
+            let req = rig.with_drafter(gpu, mode, |rig, gpu, d| {
+                rig.request(gpu, d, mode, &prompt, &[], Route::Cold)
+            })?;
+            flows.push((mode, req.flow));
+        }
+        Ok(flows)
+    })?;
+    units.push(disabled_run.unit_value("cache_disabled"));
+    let max_seq = disabled_run.max_seq;
+    let chunk = disabled_run.chunk;
+    let state_format = disabled_run.state_format.clone();
+    let disabled = disabled_run.finish()?;
+
+    // Unit 2: short sessions. The first-ever cold requests come first.
+    let run = with_session_rig(
+        &mut gpu,
+        model_path,
+        RigCache::Radix(RadixSizing::Roomy),
+        |rig, gpu, _| {
+            let mut values = Vec::new();
+            for mode in RADIX_MODES {
+                values.push(timed_case("cold_identity", mode, RADIX_COLD_PROMPT, 0, || {
+                    rig.radix_case_cold_identity(gpu, mode, &disabled)
+                }));
+            }
+            for mode in RADIX_MODES {
+                values.push(timed_case("cross_session", mode, RADIX_PROMPT_A, RADIX_SUFFIX, || {
+                    rig.radix_case_cross_session(gpu, mode)
+                }));
+                values.push(timed_case("a_b_a", mode, RADIX_PROMPT_A, RADIX_NEW_TURN, || {
+                    rig.radix_case_a_b_a(gpu, mode)
+                }));
+                values.push(timed_case(
+                    "anchor",
+                    mode,
+                    RADIX_SYSTEM_TURN,
+                    RADIX_USER_TURN + RADIX_ASSISTANT_TAIL,
+                    || rig.radix_case_anchor(gpu, mode),
+                ));
+            }
+            Ok(values)
+        },
+    )?;
+    units.push(run.unit_value("sessions"));
+    for value in run.finish()? {
+        record(&mut cases, value);
+    }
+
+    // Unit 3: sibling forks of one long checkpoint.
+    let run = with_session_rig(
+        &mut gpu,
+        model_path,
+        RigCache::Radix(RadixSizing::Roomy),
+        |rig, gpu, _| {
+            let mut values = Vec::new();
+            for mode in RADIX_MODES {
+                values.push(timed_case(
+                    "siblings",
+                    mode,
+                    RADIX_SIBLING_PROMPT,
+                    RADIX_SIBLING_SUFFIX,
+                    || rig.radix_case_siblings(gpu, mode),
+                ));
+            }
+            Ok(values)
+        },
+    )?;
+    units.push(run.unit_value("siblings"));
+    for value in run.finish()? {
+        record(&mut cases, value);
+    }
+
+    // One unit per boundary prompt length: a fresh pool keeps every
+    // checkpoint the fork needs from competing for eviction.
+    for &p in &RADIX_BOUNDARY_PROMPTS {
+        let run = with_session_rig(
+            &mut gpu,
+            model_path,
+            RigCache::Radix(RadixSizing::Roomy),
+            |rig, gpu, _| {
+                let mut values = Vec::new();
+                for mode in RADIX_MODES {
+                    let started = Instant::now();
+                    let group = rig.with_drafter(gpu, mode, |rig, gpu, d| {
+                        rig.radix_boundary_group(gpu, d, mode, p)
+                    });
+                    let elapsed = started.elapsed().as_secs_f64();
+                    for (index, &s) in RADIX_BOUNDARY_SUFFIXES.iter().enumerate() {
+                        let outcome = match &group {
+                            Ok(outcomes) => match &outcomes[index] {
+                                Ok(outcome) => Ok(outcome.clone()),
+                                Err(error) => Err(error.clone()),
+                            },
+                            Err(error) => Err(error.clone()),
+                        };
+                        let mut value = case_value("boundary_fork", mode, p, s, outcome);
+                        value["elapsed_s"] = json!(elapsed);
+                        values.push(value);
+                    }
+                }
+                Ok(values)
+            },
+        )?;
+        units.push(run.unit_value(&format!("boundary_{p}")));
+        for value in run.finish()? {
+            record(&mut cases, value);
+        }
+    }
+
+    // Pressure: one bundle per mode so the unload check covers it.
+    for mode in RADIX_MODES {
+        let started = Instant::now();
+        let run = with_session_rig(
+            &mut gpu,
+            model_path,
+            RigCache::Radix(RadixSizing::Pressure),
+            |rig, gpu, limits| {
+                let limits = limits.ok_or("the pressure bundle reported no limits")?;
+                rig.radix_case_pressure(gpu, mode, limits)
+            },
+        )?;
+        units.push(run.unit_value(&format!("pressure_{}", mode_name(mode))));
+        let RigRun { result, unload, .. } = run;
+        let outcome = match (result, unload) {
+            (Ok((mismatch, mut detail)), unload) => {
+                let mismatch = match &unload {
+                    Ok(live) => {
+                        detail["unload"] = json!({"live_granule_bytes": live});
+                        mismatch
+                    }
+                    Err(error) => {
+                        detail["unload"] = json!({"error": error});
+                        mismatch.or_else(|| Some(format!("unload: {error}")))
+                    }
+                };
+                Ok((mismatch, detail))
+            }
+            (Err(error), _) => Err(error),
+        };
+        let mut value = case_value("pressure", mode, 1100, 24, outcome);
+        value["elapsed_s"] = json!(started.elapsed().as_secs_f64());
+        record(&mut cases, value);
+    }
+
+    let failed = cases
+        .iter()
+        .filter(|case| !is_pass(case))
+        .map(|case| {
+            format!(
+                "{} {} P={} S={}: {}",
+                case["mode"].as_str().unwrap_or("?"),
+                case["case"].as_str().unwrap_or("?"),
+                case["prompt_len"],
+                case["suffix_len"],
+                case["first_mismatch"].as_str().unwrap_or("?"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let passed = failed.is_empty();
+    let status = if passed { "pass" } else { "fail" };
+    Ok(StateParityReport(json!({
+        "schema": "hipfire.qwen4.radix_cache_session_parity.v1",
+        "gpu_arch": gpu.arch,
+        "model": model_path,
+        "corpus": corpus,
+        "status": status,
+        "passed": passed,
+        "session": {
+            "status": status,
+            "passed": passed,
+            "max_seq": max_seq,
+            "chunk_rows": chunk,
+            "state_format": state_format,
+            "total": cases.len(),
+            "failed": failed,
+            "units": units,
+            "cases": cases,
+        },
+    })))
 }
 
 #[cfg(test)]
