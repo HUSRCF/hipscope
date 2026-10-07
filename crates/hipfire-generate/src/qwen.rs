@@ -2372,11 +2372,21 @@ pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bo
     env_disabled || native_qwen4_mtp
 }
 
-/// Publishes pending Qwen4 session snapshots after a committed terminal.
+/// Publishes pending Qwen4 session snapshots after a committed terminal and
+/// keeps the live state for an in-conversation continuation.
+/// `conversation_tokens` is the consumed host history (prompt plus emitted
+/// tokens, empty after an unrepaired terminal); the bundle validates it
+/// against its device state. Takes the fields, not the whole model, so the
+/// borrows stay disjoint. No-op for other families.
 fn commit_qwen4_session(model: &mut LoadedModel) {
     if model.qwen4().is_some() {
-        if let Some(state) = model.state.as_deref_mut() {
-            state.session_commit();
+        let LoadedModel {
+            state,
+            conversation_tokens,
+            ..
+        } = model;
+        if let Some(state) = state.as_deref_mut() {
+            state.session_commit_live(conversation_tokens);
         }
     }
 }
@@ -3114,8 +3124,9 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
-    // Native Qwen4 MTP plans against the full canonical prompt. Every hit
-    // restores a snapshot; live continuation is not a cache source.
+    // Native Qwen4 MTP plans against the full canonical prompt. A hit is the
+    // longest of the live state (this conversation's previous turn) and a
+    // cold-exact session snapshot.
     if qwen4_native_mtp {
         let start = m
             .state

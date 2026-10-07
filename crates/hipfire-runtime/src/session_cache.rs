@@ -340,6 +340,24 @@ impl SessionCache {
         Ok(())
     }
 
+    /// Start a prefill that continues the live state in place: the caller
+    /// keeps every owner as it is (no reset, no restore) and prefills only the
+    /// suffix. Does the bookkeeping head of [`Self::begin`] (frees displaced
+    /// buffers, drops uncommitted snapshots) and arms no boundary, so
+    /// [`Self::next_boundary`] is `None` and nothing is captured this turn.
+    ///
+    /// A live-continued turn's state descends from decode, never from a cold
+    /// canonical prefill, so it must not enter the cross-session cache.
+    pub fn begin_live(&mut self, gpu: &mut Gpu) {
+        for snapshot in std::mem::take(&mut self.release) {
+            free_buffer(gpu, snapshot);
+        }
+        for (_, snapshot) in std::mem::take(&mut self.pending) {
+            self.drop_snapshot(gpu, snapshot);
+        }
+        self.turn = None;
+    }
+
     /// Copy the snapshot of `prefix` and its ancestors into the live state.
     fn restore(
         &mut self,
@@ -905,6 +923,47 @@ mod tests {
         turn(&mut tiny, gpu, &mut toy, &a, true);
         assert_eq!(tiny.plan(&toy, &a, SessionRoute::Ar), 0);
         assert!(tiny.children.is_empty());
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
+    fn live_begin_keeps_state_drops_pending_and_captures_nothing() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let fixed = gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap();
+        let rows = gpu
+            .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+            .unwrap();
+        let mut toy = Toy {
+            fixed,
+            rows,
+            position: 0,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), 4 * one);
+        let a = prompt(1, 2 * STRIDE + 5);
+
+        // An uncommitted turn leaves pending snapshots and an armed turn.
+        turn(&mut cache, gpu, &mut toy, &a, false);
+        assert_eq!(cache.pending.len(), 2);
+
+        // A live begin drops them, arms no boundary and leaves the state alone.
+        let before = toy.bytes(gpu);
+        cache.begin_live(gpu);
+        assert!(cache.pending.is_empty());
+        assert!(cache.children.is_empty());
+        assert_eq!(cache.next_boundary(), None);
+        assert_eq!(toy.position, a.len());
+        assert_eq!(toy.bytes(gpu), before);
+
+        // Committing the live turn publishes nothing.
+        cache.commit();
+        assert_eq!(cache.pool.total_bytes(), 0);
+        assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 0);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }
