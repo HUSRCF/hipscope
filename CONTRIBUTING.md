@@ -87,6 +87,60 @@ CPU Python tests, and the env/docs drift check. Required CI on `master` is
 changes still owe claim-matched GPU/model evidence for direct review; that
 evidence is not a separate required CI check.
 
+### Tokenizer differential test (HF oracle)
+
+`hipfire_runtime::tokenizer::Tokenizer::from_hf_json` is checked against the
+HuggingFace `tokenizers` crate for every tokenizer in
+`crates/hipfire-runtime/tests/fixtures/hf_tokenizer_differential/manifest.json`
+(`family`, `file`, `md5`, `source`, `revision`; `file` is relative to that
+directory, and the Qwen3.8 entries reuse
+`../hf_tokenizer_corpus/tokenizer.json`). The oracle is pinned
+`tokenizers =0.22.2` with the pure-Rust `fancy-regex` backend plus `md5`, both
+`[dev-dependencies]` of `hipfire-runtime` only: no C/C++ regex library, no
+Python, no network and nothing in the shipped binaries. `tokenizers` and its
+new transitive crates (including `esaxx-rs` and `spm_precompiled`) are
+Apache-2.0, already on the `deny.toml` allowlist.
+
+```bash
+cargo test --release -p hipfire-runtime --test hf_tokenizer_differential   # all families
+cargo test --release -p hipfire-runtime --test hf_tokenizer_differential qwen35 -- --nocapture
+```
+
+Each family is its own test (`qwen3`, `qwen35`, `qwen36`, `qwen38`,
+`qwen38_flash_next`, `dots_ocr`, `deepseek4`, `minimax`, `minimax27`, `lfm2`,
+`lfm25`, `llama_bpe`), so one failing family never skips another;
+`manifest_integrity` verifies every MD5, and `unlisted_manifest_families` runs
+any manifest family without a dedicated test. Per tokenizer the test compares
+exact IDs (`add_special_tokens=false`) on all 945 cases in
+`hf_tokenizer_corpus/cases.jsonl`, every sorted `benchmarks/prompts/*.txt`,
+and a deterministic seeded adversarial corpus (whitespace, tabs, CRLF, unicode
+spaces, digit runs, combining marks, emoji/ZWJ, CJK, code, JSON, added-token
+boundaries). Where HF `decode(ids)` reproduces the input it also checks
+hipfire decode and decode→re-encode. Mismatches never stop the run: every one
+is recorded and minimised, and the test fails at the end.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HIPFIRE_TOKENIZER_FUZZ_CASES` | `50000` | adversarial cases per tokenizer |
+| `HIPFIRE_TOKENIZER_FUZZ_SEED` | built-in | u64 (decimal or `0x`); xor-ed with a per-family hash |
+| `HIPFIRE_TOKENIZER_DIFF_REPORT_DIR` | `<temp>/hipfire_tokenizer_differential` | where reports are written |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_PROBES` | `5000` | minimisation budget per unique signature |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_LIMIT` | `2000` | max signatures minimised per family (rest reported as `skipped_limit`) |
+| `HIPFIRE_TOKENIZER_DIFF_PRINT_LIMIT` | `50` | root signatures printed per family |
+
+Reports per family (complete JSONL, nothing capped or dropped):
+`<family>.failures.jsonl` (every failing case/kind with full input and both ID
+streams), `<family>.minimized.jsonl` (one line per unique signature: minimal
+repro, ID streams, every contributing case source) and `<family>.summary.json`
+(counts and one minimal repro per distinct root signature). The console prints
+counts and the minimal repro for each root signature.
+
+Fixtures are immutable inputs: refresh a tokenizer by replacing the file *and*
+its `md5`/`revision` in the manifest. When a runtime fix lands, append the
+minimal repro to `hf_tokenizer_differential/regressions.jsonl`
+(`{"family","text","ids"}`); the test then pins HF and hipfire to those exact
+IDs. Do not shrink the 945-case corpus.
+
 ### GPU kernel correctness check
 
 ```bash

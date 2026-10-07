@@ -410,6 +410,19 @@ registry-authorized.
 
 ---
 
+## Manual — tokenizer differential test (dev-only, not runtime)
+
+Read only by `crates/hipfire-runtime/tests/hf_tokenizer_differential.rs` (see [`CONTRIBUTING.md`](../CONTRIBUTING.md#tokenizer-differential-test-hf-oracle)); the pure-Rust HF `tokenizers` oracle is a `[dev-dependencies]` entry and never ships.
+
+| Variable | Default | Role |
+|---|---|---|
+| `HIPFIRE_TOKENIZER_FUZZ_CASES` | `50000` | adversarial cases per tokenizer |
+| `HIPFIRE_TOKENIZER_FUZZ_SEED` | built-in | u64 seed (decimal or `0x` hex), mixed with a per-family hash |
+| `HIPFIRE_TOKENIZER_DIFF_REPORT_DIR` | `<temp>/hipfire_tokenizer_differential` | JSONL/summary report directory |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_PROBES` | `5000` | minimisation probe budget per unique signature |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_LIMIT` | `2000` | max signatures minimised per family |
+| `HIPFIRE_TOKENIZER_DIFF_PRINT_LIMIT` | `50` | root signatures printed per family |
+
 ## Manual — top-level doc references
 
 The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.md`, `README.md`, and `CONTRIBUTING.md` to appear in this file. Tokens historically routed from those surfaces (keep listed even if a root file is later thinned):
@@ -524,7 +537,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1432
+**Count:** 1438
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1879,6 +1892,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/cli.rs | developer |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_LIMIT` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
+| `HIPFIRE_TOKENIZER_DIFF_MIN_PROBES` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
+| `HIPFIRE_TOKENIZER_DIFF_PRINT_LIMIT` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
+| `HIPFIRE_TOKENIZER_DIFF_REPORT_DIR` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
+| `HIPFIRE_TOKENIZER_FUZZ_CASES` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
+| `HIPFIRE_TOKENIZER_FUZZ_SEED` | crates/hipfire-runtime/tests/hf_tokenizer_differential.rs | harness |
 | `HIPFIRE_TOPK8_RESCORE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TOPK_FIXUP_MARKED` | crates/rdna-compute/src/select_regrid.rs | developer |
 | `HIPFIRE_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |

@@ -117,6 +117,9 @@ sha2.workspace = true
 # edge, which is what allows hipfire-runtime to list arch crates here
 # despite each arch crate already depending on hipfire-runtime.
 [dev-dependencies]
+# HF reference oracle only: pure-Rust regex, no runtime dependency or C++ trainer.
+tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
+md5 = "0.7"
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
 sha2.workspace = true
 # `tests/cpu_quant_cross_check.rs`: holds `hipfire-cpu`'s transcription of the
