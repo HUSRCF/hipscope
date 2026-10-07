@@ -21,8 +21,9 @@
 use hip_bridge::{DeviceBuffer, Event, HipError, HipResult};
 use rdna_compute::Gpu;
 
-/// `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD=0` keeps the blocking upload for a deferred
-/// PLE stage. Default on.
+/// `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD=1` opts in to the fenced asynchronous upload
+/// for a deferred PLE stage; unset or `0` keeps the blocking upload. Default
+/// off (warm-cache and cache-quality identity unconfirmed on the RC4c gate).
 pub const PLE_ASYNC_UPLOAD_ENV: &str = "HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD";
 
 /// Whether an asynchronous copy may still read the staging bytes.

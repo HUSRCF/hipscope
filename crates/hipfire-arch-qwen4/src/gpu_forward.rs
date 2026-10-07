@@ -2302,7 +2302,7 @@ impl Qwen4GpuForward {
             uploaded_id_rows: 0,
             host_ple: PleHostStage::new(
                 host_ple_bytes,
-                hipfire_config::developer_bool(PLE_ASYNC_UPLOAD_ENV, true),
+                hipfire_config::developer_bool(PLE_ASYNC_UPLOAD_ENV, false),
             ),
             ple_lookahead: Vec::new(),
             ple_ahead: None,

@@ -3418,9 +3418,10 @@ fn mtp_batched_fill_enabled() -> bool {
 /// `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS`: the prompt-fill head Append embeds
 /// from the token ids the trunk forward of the same chunk already uploaded
 /// (checked against the chunk's tokens), instead of uploading them again,
-/// unless set to `0`; read at every `mtp_prefill`.
+/// only when set to `1` (default off: the warm path was not output-identical);
+/// read at every `mtp_prefill`.
 fn mtp_reuse_prefill_ids_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS", true)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS", false)
 }
 
 /// `Qwen4Bundle::mtp_append_rows`'s `trunk_ids_row` for a prompt-fill
