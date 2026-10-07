@@ -16,6 +16,7 @@ use crate::gpu_forward::{
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights};
+use crate::state::{meta_bytes, meta_words, whole_part};
 use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
@@ -29,19 +30,22 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
+use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
     hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
     indexed_attention_pool_rope_incremental, HyperNorm, HyperReadProjected,
     IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
-use rdna_compute::{DType, Gpu, GpuTensor, VmmPrefixSpec};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
 
 const MTP_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
+/// Metadata words of an MTP head session snapshot: model id and the state mark.
+const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;
@@ -113,9 +117,6 @@ pub enum MtpGpuError {
     Forward(Qwen4GpuForwardError),
     Invalid(String),
     Grammar(String),
-    /// A context bank with shared (sealed) granules cannot be written in place
-    /// (reset): the caller swaps in a fresh bank first.
-    SealedContext,
 }
 
 impl fmt::Display for MtpGpuError {
@@ -126,10 +127,6 @@ impl fmt::Display for MtpGpuError {
             Self::Forward(error) => write!(f, "Qwen4 MTP GPU forward error: {error}"),
             Self::Invalid(error) => write!(f, "Qwen4 MTP GPU invalid input: {error}"),
             Self::Grammar(error) => write!(f, "Qwen4 MTP grammar error: {error}"),
-            Self::SealedContext => write!(
-                f,
-                "Qwen4 MTP GPU context bank is sealed: its granules are shared with a checkpoint or another bank"
-            ),
         }
     }
 }
@@ -808,56 +805,6 @@ impl MtpGpuStateSnapshotArena {
         first
     }
 }
-/// Retained head checkpoint slot: the speculative-arena copy layout (selection,
-/// device selected length, own wide hidden, the six marks) plus the draft
-/// policy at the boundary. The context arenas are not copied here: a bank
-/// fork aliases or copies them (see `Qwen4MtpGpu::context_prefix_specs`).
-pub(crate) struct Qwen4HeadCheckpoint {
-    arena: MtpGpuStateSnapshotArena,
-    policy: DraftHeadRequestState,
-}
-
-impl Qwen4HeadCheckpoint {
-    /// `Some(position)` while the slot holds a capture.
-    pub(crate) fn position(&self) -> Option<usize> {
-        self.arena.active.then_some(self.arena.mark.position)
-    }
-
-    /// Device bytes the slot holds.
-    pub(crate) fn device_bytes(&self) -> usize {
-        self.arena.selected_indices.byte_size()
-            + self.arena.selected_len_out.byte_size()
-            + self.arena.wide_hidden.byte_size()
-    }
-
-    pub(crate) fn invalidate(&mut self) {
-        self.arena.invalidate();
-    }
-
-    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        match self.arena.free_gpu(gpu) {
-            Some(error) => Err(error.into()),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Per-arena `(valid_bytes, writable_from)` of the head context arenas
-/// (`full_keys`, `full_values`, `raw_index_keys`, `pooled_keys`) at the given
-/// row marks and byte strides. The head has no in-place raw tail, so every
-/// arena's valid bytes are also its first writable byte. `None` on overflow.
-fn head_context_boundary_bytes(
-    full_len: usize,
-    raw_len: usize,
-    pooled_len: usize,
-    strides: [usize; 4],
-) -> Option<[(usize, usize); 4]> {
-    let full = full_len.checked_mul(strides[0])?;
-    let values = full_len.checked_mul(strides[1])?;
-    let raw = raw_len.checked_mul(strides[2])?;
-    let pooled = pooled_len.checked_mul(strides[3])?;
-    Some([(full, full), (values, values), (raw, raw), (pooled, pooled)])
-}
 
 fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), MtpGpuError> {
     if mark.full_len > state.full_capacity
@@ -873,14 +820,12 @@ fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), Mtp
 
 /// Map more of one VMM context arena so it covers `rows` rows of a
 /// `capacity`-row tensor (byte stride = reserved size / capacity), by the
-/// shared [`KvChunkPlan`] policy, and zero the newly mapped bytes. `granular`
-/// maps granule-backed physical handles (shareable with checkpoints).
+/// shared [`KvChunkPlan`] policy, and zero the newly mapped bytes.
 fn grow_context_arena(
     gpu: &mut Gpu,
     tensor: &mut GpuTensor,
     capacity: usize,
     rows: usize,
-    granular: bool,
 ) -> Result<(), MtpGpuError> {
     let mapped = gpu
         .vmm_mapped_bytes(tensor)
@@ -903,11 +848,7 @@ fn grow_context_arena(
         return Ok(());
     };
     let device_id = gpu.device_id;
-    if granular {
-        gpu.grow_vmm_tensor_granules(tensor, growth.size_bytes, &[device_id])?;
-    } else {
-        gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
-    }
+    gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
     // The accessible prefix stops at the logical size even when the last
     // page maps past it.
     let end = (growth.offset_bytes + growth.size_bytes).min(tensor.buf.size());
@@ -951,8 +892,6 @@ pub struct MtpGpuState {
     generation: u64,
     model_id: u64,
     snapshot_arena: MtpGpuStateSnapshotArena,
-    /// Context growth maps shareable granules (radix-cache banks).
-    granular: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1142,7 +1081,6 @@ impl MtpGpuState {
             generation: 0,
             model_id,
             snapshot_arena,
-            granular: false,
         })
     }
 
@@ -1174,14 +1112,13 @@ impl MtpGpuState {
         }
         let pooled_required = required_tokens.div_ceil(self.compress);
         let (full, raw, pooled) = (self.full_capacity, self.raw_capacity, self.pooled_capacity);
-        let granular = self.granular;
         for (tensor, capacity, rows) in [
             (&mut self.full_keys, full, required_tokens),
             (&mut self.full_values, full, required_tokens),
             (&mut self.raw_index_keys, raw, required_tokens),
             (&mut self.pooled_keys, pooled, pooled_required),
         ] {
-            grow_context_arena(gpu, tensor, capacity, rows, granular)?;
+            grow_context_arena(gpu, tensor, capacity, rows)?;
         }
         self.mapped_tokens = self.mapped_token_coverage(gpu)?;
         debug_assert!(self.mapped_tokens >= required_tokens);
@@ -1239,11 +1176,6 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        // Sealed granules are shared with a checkpoint or another bank: the
-        // memset below would corrupt them, so refuse before any write.
-        if self.context_sealed(gpu) {
-            return Err(MtpGpuError::SealedContext);
-        }
         self.snapshot_arena.invalidate();
         for tensor in [
             &self.full_keys,
@@ -1455,70 +1387,95 @@ impl MtpGpuState {
         self.step_index = metadata.step_index;
     }
 
-    /// Allocate a retained checkpoint slot sized for this state's carry.
-    fn new_checkpoint_arena(&self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshotArena, MtpGpuError> {
-        MtpGpuStateSnapshotArena::new(
-            gpu,
-            &self.selected_indices,
-            &self.selected_len_out,
-            &self.wide_hidden,
-            self.model_id,
-            self.mark(),
-        )
+    /// Layout of the state at `mark`: full K/V, raw and pooled rows below it,
+    /// then selection, device selected length and wide hidden.
+    fn session_layout(&self, mark: &MtpStateMark) -> StateLayout<'_> {
+        StateLayout {
+            fixed: vec![
+                whole_part(&self.selected_indices),
+                whole_part(&self.selected_len_out),
+                whole_part(&self.wide_hidden),
+            ],
+            rows: [
+                (&self.full_keys, self.full_capacity, mark.full_len),
+                (&self.full_values, self.full_capacity, mark.full_len),
+                (&self.raw_index_keys, self.raw_capacity, mark.raw_len),
+                (&self.pooled_keys, self.pooled_capacity, mark.pooled_len),
+            ]
+            .into_iter()
+            .map(|(tensor, capacity, rows)| RowStream {
+                buf: &tensor.buf,
+                row_bytes: tensor.byte_size() / capacity,
+                rows,
+            })
+            .collect(),
+        }
     }
 
-    /// Copy the in-place-overwritten MTP owners (selection, device selected
-    /// length, own wide hidden) and the marks incl. `step_index` into `dst`.
-    fn capture_checkpoint_arena(
-        &self,
-        gpu: &mut Gpu,
-        dst: &mut MtpGpuStateSnapshotArena,
-    ) -> Result<(), MtpGpuError> {
-        dst.invalidate();
+    /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
+    /// device ranges of the live state.
+    fn session_parts(&self) -> Result<(Vec<u64>, StateLayout<'_>), MtpGpuError> {
         let mark = self.mark();
         validate_mtp_mark(&mark, self)?;
-        if dst.model_id != self.model_id {
-            return Err(invalid("MTP checkpoint arena model mismatch"));
-        }
-        dst.validate_layout(self)?;
-        for (live, saved) in [
-            (&self.selected_indices, &dst.selected_indices),
-            (&self.selected_len_out, &dst.selected_len_out),
-            (&self.wide_hidden, &dst.wide_hidden),
-        ] {
-            gpu.copy_d2d(live, saved, live.byte_size())?;
-        }
-        dst.mark = mark;
-        dst.active = true;
-        Ok(())
+        let words = [
+            mark.full_len,
+            mark.raw_len,
+            mark.pooled_len,
+            mark.selected_len,
+            mark.position,
+            mark.step_index,
+        ]
+        .map(|value| value as u64);
+        Ok((
+            [self.model_id].into_iter().chain(words).collect(),
+            self.session_layout(&mark),
+        ))
     }
 
-    /// Restore a checkpoint slot. Like a reset it starts a new request epoch
-    /// and retires every speculative ticket; the caller resets on error.
-    fn restore_checkpoint_arena(
+    fn parse_session_mark(&self, words: &[u64]) -> Result<MtpStateMark, MtpGpuError> {
+        if words.len() != MTP_SESSION_WORDS || words[0] != self.model_id {
+            return Err(invalid("MTP session snapshot shape mismatch"));
+        }
+        let mark = MtpStateMark {
+            full_len: words[1] as usize,
+            raw_len: words[2] as usize,
+            pooled_len: words[3] as usize,
+            selected_len: words[4] as usize,
+            position: words[5] as usize,
+            step_index: words[6] as usize,
+        };
+        validate_mtp_mark(&mark, self)?;
+        Ok(mark)
+    }
+
+    /// Map the context arenas to cover every row the snapshot holds and, like
+    /// a reset, start a new request epoch that retires every speculative
+    /// ticket. Live buffers stay in place: the caller copies into the
+    /// returned destination layout.
+    fn prepare_session_restore(
         &mut self,
         gpu: &mut Gpu,
-        src: &MtpGpuStateSnapshotArena,
-    ) -> Result<(), MtpGpuError> {
-        if !src.active {
-            return Err(invalid("MTP prefix checkpoint is not valid"));
-        }
-        if src.model_id != self.model_id {
-            return Err(invalid("MTP checkpoint arena model mismatch"));
-        }
-        validate_mtp_mark(&src.mark, self)?;
-        src.validate_layout(self)?;
-        let mark = src.mark;
+        words: &[u64],
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
+        let required = mark
+            .position
+            .max(mark.full_len)
+            .max(mark.raw_len)
+            .max(
+                mark.pooled_len
+                    .saturating_mul(self.compress)
+                    .min(self.full_capacity),
+            );
+        self.ensure_mapped_capacity(gpu, required)?;
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
-        for (live, saved) in [
-            (&self.selected_indices, &src.selected_indices),
-            (&self.selected_len_out, &src.selected_len_out),
-            (&self.wide_hidden, &src.wide_hidden),
-        ] {
-            gpu.copy_d2d(saved, live, live.byte_size())?;
-        }
+        Ok(self.session_layout(&mark))
+    }
+
+    fn finish_session_restore(&mut self, words: &[u64]) -> Result<(), MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
         self.full_len = mark.full_len;
         self.raw_len = mark.raw_len;
         self.pooled_len = mark.pooled_len;
@@ -1528,167 +1485,22 @@ impl MtpGpuState {
         Ok(())
     }
 
-    /// Later context growth maps shareable granules.
-    pub(crate) fn set_granular_context(&mut self, granular: bool) {
-        self.granular = granular;
-    }
-
-    /// The four context arenas in bank order: `full_keys`, `full_values`,
-    /// `raw_index_keys`, `pooled_keys`.
-    pub(crate) fn context_tensors(&self) -> Vec<&GpuTensor> {
-        vec![
+    /// Context-arena bytes still unmapped below capacity (0 for legacy).
+    fn context_growth_bytes(&self) -> u64 {
+        if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
+            return 0;
+        }
+        let capacity: u64 = [
             &self.full_keys,
             &self.full_values,
             &self.raw_index_keys,
             &self.pooled_keys,
         ]
-    }
-
-    /// Byte stride of one row of each context arena, in bank order.
-    fn context_row_strides(&self) -> [usize; 4] {
-        [
-            self.full_keys.byte_size() / self.full_capacity,
-            self.full_values.byte_size() / self.full_capacity,
-            self.raw_index_keys.byte_size() / self.raw_capacity,
-            self.pooled_keys.byte_size() / self.pooled_capacity,
-        ]
-    }
-
-    /// Prefix specs of the four context arenas at the current marks (VMM only).
-    pub(crate) fn context_prefix_specs(&self) -> Result<Vec<VmmPrefixSpec<'_>>, MtpGpuError> {
-        if self.backend != Qwen4KvBackend::Vmm {
-            return Err(invalid("MTP context prefixes require the VMM backend"));
-        }
-        let bytes = head_context_boundary_bytes(
-            self.full_len,
-            self.raw_len,
-            self.pooled_len,
-            self.context_row_strides(),
-        )
-        .ok_or_else(|| invalid("MTP context prefix byte extent overflow"))?;
-        Ok(self
-            .context_tensors()
-            .into_iter()
-            .zip(bytes)
-            .map(|(tensor, (valid_bytes, writable_from))| VmmPrefixSpec {
-                tensor,
-                valid_bytes,
-                writable_from,
-            })
-            .collect())
-    }
-
-    /// Four empty, fresh (never-mapped) VMM owners shaped like the context
-    /// arenas, in bank order.
-    pub(crate) fn new_context_bank(&self, gpu: &mut Gpu) -> Result<Vec<GpuTensor>, MtpGpuError> {
-        if self.backend != Qwen4KvBackend::Vmm {
-            return Err(invalid("MTP context banks require the VMM backend"));
-        }
-        let device_id = gpu.device_id;
-        let mut bank = Vec::with_capacity(4);
-        for tensor in self.context_tensors() {
-            // SAFETY: every access to a VMM context arena is bounded by
-            // `mapped_tokens`, which `install_context_bank` recomputes from
-            // the installed bank's mapped coverage and
-            // `ensure_mapped_capacity` raises only after mapping and zeroing.
-            let fresh = unsafe {
-                gpu.alloc_vmm_tensor(&[tensor.numel()], tensor.dtype, 0, &[device_id])
-            };
-            match fresh {
-                Ok(fresh) => bank.push(fresh),
-                Err(error) => {
-                    for fresh in bank {
-                        let _ = gpu.free_tensor(fresh);
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        Ok(bank)
-    }
-
-    /// Swap in `bank` (same count, shapes and dtypes, every tensor a
-    /// registered VMM owner), returning the old tensors. `mapped_tokens` is
-    /// recomputed from the new bank's coverage and the speculative ticket is
-    /// retired. Host-only; a refused bank is dropped, not freed.
-    pub(crate) fn install_context_bank(
-        &mut self,
-        gpu: &Gpu,
-        bank: Vec<GpuTensor>,
-    ) -> Result<Vec<GpuTensor>, MtpGpuError> {
-        if self.backend != Qwen4KvBackend::Vmm {
-            return Err(invalid("MTP context banks require the VMM backend"));
-        }
-        let current = self.context_tensors();
-        if bank.len() != current.len() {
-            return Err(invalid(format!(
-                "MTP context bank has {} arenas; expected {}",
-                bank.len(),
-                current.len()
-            )));
-        }
-        for (new, old) in bank.iter().zip(current) {
-            if new.dtype != old.dtype || new.numel() != old.numel() {
-                return Err(invalid("MTP context bank arena shape mismatch"));
-            }
-            if gpu.vmm_mapped_bytes(new).is_none() {
-                return Err(invalid("MTP context bank arena is not a registered VMM owner"));
-            }
-        }
-        let mut incoming = bank.into_iter();
-        let mut swap = |slot: &mut GpuTensor| {
-            std::mem::replace(slot, incoming.next().expect("one tensor per context arena"))
-        };
-        let old = vec![
-            swap(&mut self.full_keys),
-            swap(&mut self.full_values),
-            swap(&mut self.raw_index_keys),
-            swap(&mut self.pooled_keys),
-        ];
-        self.snapshot_arena.invalidate();
-        self.mapped_tokens = self.mapped_token_coverage(gpu)?;
-        Ok(old)
-    }
-
-    /// Free a bank returned by [`Self::install_context_bank`] or
-    /// [`Self::new_context_bank`]; every tensor is freed, the first error returned.
-    pub(crate) fn free_context_bank(
-        gpu: &mut Gpu,
-        bank: Vec<GpuTensor>,
-    ) -> Result<(), MtpGpuError> {
-        let mut first = None;
-        for tensor in bank {
-            if let Err(error) = gpu.free_tensor(tensor) {
-                first.get_or_insert(error);
-            }
-        }
-        first.map_or(Ok(()), |error| Err(error.into()))
-    }
-
-    /// True while any context arena has granules shared with another owner.
-    pub(crate) fn context_sealed(&self, gpu: &Gpu) -> bool {
-        self.context_tensors()
-            .into_iter()
-            .any(|tensor| gpu.vmm_sealed_bytes(tensor).unwrap_or(0) > 0)
-    }
-
-    /// True when every arena's sealed bytes end at or below the first byte a
-    /// restore to `position` would write.
-    pub(crate) fn context_writable_at(&self, gpu: &Gpu, position: usize) -> bool {
-        let Some(bytes) = head_context_boundary_bytes(
-            position,
-            position,
-            position / self.compress,
-            self.context_row_strides(),
-        ) else {
-            return false;
-        };
-        self.context_tensors()
-            .into_iter()
-            .zip(bytes)
-            .all(|(tensor, (_, writable_from))| {
-                gpu.vmm_sealed_bytes(tensor).unwrap_or(0) <= writable_from
-            })
+        .iter()
+        .map(|tensor| tensor.byte_size() as u64)
+        .sum();
+        capacity * self.full_capacity.saturating_sub(self.mapped_tokens) as u64
+            / self.full_capacity as u64
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -1892,10 +1704,6 @@ impl Qwen4MtpGpu {
     /// hold and margin are request-local, never inherited from the previous
     /// request.
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        // A sealed bank is refused before the draft policy changes too.
-        if self.state.context_sealed(gpu) {
-            return Err(MtpGpuError::SealedContext);
-        }
         self.draft.reset_request_state();
         self.state.reset(gpu)
     }
@@ -1914,86 +1722,54 @@ impl Qwen4MtpGpu {
         self.state.mapped_context_bytes(gpu)
     }
 
-    /// Allocate a retained checkpoint slot (selection, wide hidden, marks,
-    /// draft policy).
-    pub(crate) fn new_checkpoint(&self, gpu: &mut Gpu) -> Result<Qwen4HeadCheckpoint, MtpGpuError> {
-        Ok(Qwen4HeadCheckpoint {
-            arena: self.state.new_checkpoint_arena(gpu)?,
-            policy: DraftHeadRequestState::default(),
-        })
+    /// Session-cache capture of the head state plus the draft policy.
+    /// Prompt appends only `observe` (a qualifying input sets the full hold);
+    /// drafts are the only decrement, so at a prompt boundary the policy is
+    /// the canonical prompt summary.
+    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, StateLayout<'_>), MtpGpuError> {
+        let (mut words, parts) = self.state.session_parts()?;
+        let policy = self.draft.request_state();
+        words.extend([
+            u64::from(policy.full_steps),
+            u64::from(policy.margin.to_bits()),
+        ]);
+        Ok((meta_bytes(&words), parts))
     }
 
-    /// Checkpoint the head state and the draft policy into `dst`. Prompt
-    /// appends only `observe` (a qualifying input sets the full hold); drafts
-    /// are the only decrement, so at a prompt boundary this is the canonical
-    /// prompt summary.
-    pub(crate) fn capture_checkpoint(
-        &self,
+    fn session_words(meta: &[u8]) -> Result<Vec<u64>, MtpGpuError> {
+        meta_words(meta)
+            .filter(|words| words.len() == MTP_SESSION_WORDS + 2)
+            .ok_or_else(|| invalid("MTP session snapshot shape mismatch"))
+    }
+
+    pub(crate) fn prepare_session_restore(
+        &mut self,
         gpu: &mut Gpu,
-        dst: &mut Qwen4HeadCheckpoint,
-    ) -> Result<(), MtpGpuError> {
-        self.state.capture_checkpoint_arena(gpu, &mut dst.arena)?;
-        dst.policy = self.draft.request_state();
+        meta: &[u8],
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .prepare_session_restore(gpu, &words[..MTP_SESSION_WORDS])
+    }
+
+    pub(crate) fn finish_session_restore(&mut self, meta: &[u8]) -> Result<(), MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .finish_session_restore(&words[..MTP_SESSION_WORDS])?;
+        let policy = &words[MTP_SESSION_WORDS..];
+        self.draft.set_request_state(DraftHeadRequestState {
+            full_steps: u32::try_from(policy[0])
+                .map_err(|_| invalid("MTP session draft policy"))?,
+            margin: f32::from_bits(
+                u32::try_from(policy[1]).map_err(|_| invalid("MTP session draft policy"))?,
+            ),
+        });
         Ok(())
     }
 
-    /// Restore the head state and the draft policy from `src`; see
-    /// [`MtpGpuState::restore_checkpoint_arena`].
-    pub(crate) fn restore_checkpoint(
-        &mut self,
-        gpu: &mut Gpu,
-        src: &Qwen4HeadCheckpoint,
-    ) -> Result<(), MtpGpuError> {
-        self.state.restore_checkpoint_arena(gpu, &src.arena)?;
-        self.draft.set_request_state(src.policy);
-        Ok(())
-    }
-
-    /// See [`MtpGpuState::set_granular_context`].
-    pub(crate) fn set_granular_context(&mut self, granular: bool) {
-        self.state.set_granular_context(granular);
-    }
-
-    /// See [`MtpGpuState::context_prefix_specs`].
-    pub(crate) fn context_prefix_specs(&self) -> Result<Vec<VmmPrefixSpec<'_>>, MtpGpuError> {
-        self.state.context_prefix_specs()
-    }
-
-    /// See [`MtpGpuState::context_tensors`].
-    pub(crate) fn context_tensors(&self) -> Vec<&GpuTensor> {
-        self.state.context_tensors()
-    }
-
-    /// See [`MtpGpuState::new_context_bank`].
-    pub(crate) fn new_context_bank(&self, gpu: &mut Gpu) -> Result<Vec<GpuTensor>, MtpGpuError> {
-        self.state.new_context_bank(gpu)
-    }
-
-    /// See [`MtpGpuState::install_context_bank`].
-    pub(crate) fn install_context_bank(
-        &mut self,
-        gpu: &Gpu,
-        bank: Vec<GpuTensor>,
-    ) -> Result<Vec<GpuTensor>, MtpGpuError> {
-        self.state.install_context_bank(gpu, bank)
-    }
-
-    /// See [`MtpGpuState::free_context_bank`].
-    pub(crate) fn free_context_bank(
-        gpu: &mut Gpu,
-        bank: Vec<GpuTensor>,
-    ) -> Result<(), MtpGpuError> {
-        MtpGpuState::free_context_bank(gpu, bank)
-    }
-
-    /// See [`MtpGpuState::context_sealed`].
-    pub(crate) fn context_sealed(&self, gpu: &Gpu) -> bool {
-        self.state.context_sealed(gpu)
-    }
-
-    /// See [`MtpGpuState::context_writable_at`].
-    pub(crate) fn context_writable_at(&self, gpu: &Gpu, position: usize) -> bool {
-        self.state.context_writable_at(gpu, position)
+    /// See [`MtpGpuState::context_growth_bytes`].
+    pub(crate) fn context_growth_bytes(&self) -> u64 {
+        self.state.context_growth_bytes()
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)
@@ -2615,7 +2391,7 @@ impl Qwen4MtpGpu {
 mod tests {
     use super::*;
     use crate::config::compact_test_config;
-    use crate::state::{Qwen4State, StateError};
+    use crate::state::Qwen4State;
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {
@@ -2631,58 +2407,6 @@ mod tests {
 
     fn invalid_contains<T>(result: Result<T, MtpGpuError>, needle: &str) -> bool {
         matches!(result, Err(MtpGpuError::Invalid(message)) if message.contains(needle))
-    }
-
-    /// Head context specs: every arena's valid bytes are its first writable
-    /// byte (no in-place raw tail), scaled by that arena's row stride.
-    #[test]
-    fn head_context_boundary_bytes_are_row_marks_times_strides() {
-        let strides = [512, 512, 256, 128];
-        let bytes = head_context_boundary_bytes(1000, 1000, 250, strides).expect("no overflow");
-        assert_eq!(
-            bytes,
-            [
-                (512_000, 512_000),
-                (512_000, 512_000),
-                (256_000, 256_000),
-                (32_000, 32_000)
-            ]
-        );
-        for (valid, writable_from) in bytes {
-            assert_eq!(valid, writable_from);
-        }
-        assert_eq!(
-            head_context_boundary_bytes(0, 0, 0, strides),
-            Some([(0, 0); 4])
-        );
-    }
-
-    /// A boundary off the compress ratio floors the pooled rows; the full and
-    /// raw arenas keep the exact token mark.
-    #[test]
-    fn head_context_boundary_bytes_floor_pooled_rows() {
-        let compress = 4;
-        let position = 1003;
-        let bytes =
-            head_context_boundary_bytes(position, position, position / compress, [8, 8, 4, 2])
-                .expect("no overflow");
-        assert_eq!(bytes[0].1, 1003 * 8);
-        assert_eq!(bytes[2].1, 1003 * 4);
-        assert_eq!(bytes[3].1, 250 * 2);
-    }
-
-    #[test]
-    fn head_context_boundary_bytes_refuse_overflow() {
-        assert_eq!(head_context_boundary_bytes(usize::MAX, 1, 1, [2, 1, 1, 1]), None);
-        assert_eq!(head_context_boundary_bytes(1, usize::MAX, 1, [1, 1, 2, 1]), None);
-        assert_eq!(head_context_boundary_bytes(1, 1, usize::MAX, [1, 1, 1, 2]), None);
-    }
-
-    #[test]
-    fn sealed_context_error_is_typed_and_descriptive() {
-        let error = MtpGpuError::SealedContext;
-        assert!(matches!(error, MtpGpuError::SealedContext));
-        assert!(error.to_string().contains("sealed"));
     }
 
     #[test]

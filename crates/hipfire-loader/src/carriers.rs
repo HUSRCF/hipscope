@@ -262,198 +262,6 @@ const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
     }
 }
 
-/// Process-unique load epoch of Qwen4 radix cache domains.
-static QWEN4_RADIX_LOAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// What `attach_qwen4_radix_cache` reads from the load.
-struct Qwen4RadixInputs<'a> {
-    model_content_digest: Vec<u8>,
-    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
-    chat_template: Option<&'a str>,
-    state_format: hipfire_arch_qwen4::state::Qwen4StateFormat,
-    max_seq: usize,
-    vmm_granularity: usize,
-    native_mtp: bool,
-    topology_id: String,
-    /// QSA context bytes committed now (target + MTP head).
-    committed_context_bytes: usize,
-}
-
-/// The sized radix cache, for the load log.
-struct Qwen4RadixAttached {
-    device_bytes: u64,
-    arch_cap_bytes: u64,
-    slack_bytes: u64,
-    checkpoints: usize,
-    host_bytes: usize,
-    multi_entry_blocked: bool,
-}
-
-/// Build the Qwen4 radix `CacheDomain`, size the cache from what placement
-/// left free, and attach it. The device cap is `min(arch cap, slack)`, slack
-/// being current free VRAM less the forward headroom the chunk admission
-/// keeps, the VMM context growth to `max_seq` and the gathered-attention
-/// workspace growth not yet committed (free VRAM does not contain them on
-/// either memory type, so each is subtracted once). Placement is not touched.
-fn attach_qwen4_radix_cache(
-    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
-    gpu: &mut rdna_compute::Gpu,
-    inputs: Qwen4RadixInputs<'_>,
-) -> Result<Qwen4RadixAttached, String> {
-    use hipfire_runtime::serve_contract::{
-        sha256_len_prefixed, ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
-        TemplateIdentity, TokenizerIdentity,
-    };
-    const MIB: u64 = 1 << 20;
-    let qsa = inputs.state_format.qsa;
-    let overflow = || "radix cache byte sizing overflows".to_string();
-    let (domain, slack_bytes, prefix_bytes) = {
-        let config = &bundle.config;
-        let kv_row = qsa.kv_row_bytes(config.num_key_value_heads, config.head_dim) as u64;
-        let full_layers = config.n_full_layers();
-        let chat_template = inputs.chat_template.unwrap_or_default();
-        let template_digest = sha256_len_prefixed(&[chat_template.as_bytes()]);
-        let epoch = QWEN4_RADIX_LOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let mut device_id = format!("{}-gpu{}", gpu.arch, gpu.device_id);
-        if let Ok(bus) = gpu.hip.device_pci_bus_id(gpu.device_id) {
-            device_id.push_str(&format!("-pci{bus}"));
-        }
-        let domain = CacheDomain {
-            model_content_digest: inputs.model_content_digest,
-            model_load_epoch: epoch,
-            // The native MTP head lives in the same artifact: no external sidecar.
-            sidecar_digests: Vec::new(),
-            tokenizer: TokenizerIdentity {
-                vocab_digest: inputs.tokenizer.vocab_digest(),
-                config_digest: inputs.tokenizer.config_digest(),
-            },
-            template: TemplateIdentity {
-                template_digest,
-                normalization_tag: format!(
-                    "{};qwen-splice-v1",
-                    if chat_template.is_empty() {
-                        "prompt-frame"
-                    } else {
-                        "jinja"
-                    }
-                ),
-            },
-            arch_policy: ArchPolicy {
-                arch_tag: "qwen4-flash-next-16".to_string(),
-                state_abi_tag: format!(
-                    "gdn-{}+qsa-{}",
-                    inputs.state_format.gdn.name(),
-                    qsa.name()
-                ),
-                position_attention_tag: format!("qsa-compress-{}", config.indexer_compress_ratio),
-            },
-            kv_layout: KvLayout {
-                k_stride_bytes: vec![kv_row; full_layers],
-                v_stride_bytes: vec![kv_row; full_layers],
-                layout_tag: format!(
-                    "qsa-{};kv{}x{};index{}x{};compress{};head-f32",
-                    qsa.name(),
-                    config.num_key_value_heads,
-                    config.head_dim,
-                    config.indexer_kv_heads,
-                    config.indexer_head_dim,
-                    config.indexer_compress_ratio
-                ),
-            },
-            device: DeviceTopology {
-                device_id,
-                topology_id: inputs.topology_id,
-                allocation_epoch: epoch,
-            },
-            namespace: SharingNamespace {
-                domain_id: "default".to_string(),
-            },
-        };
-
-        let (free, _) = gpu
-            .hip
-            .get_vram_info()
-            .map_err(|error| format!("VRAM query: {error}"))?;
-        let full_context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
-            hipfire_arch_qwen4::Qwen4KvBackend::Vmm,
-            inputs.max_seq,
-            inputs.max_seq,
-            inputs.vmm_granularity,
-        );
-        let trunk_full = full_context
-            .committed_layer_bytes(config, qsa)
-            .and_then(|bytes| bytes.checked_mul(full_layers))
-            .ok_or_else(overflow)?;
-        let head_full = if inputs.native_mtp {
-            full_context
-                .committed_layer_bytes(config, hipfire_arch_qwen4::QsaKvFormat::F32)
-                .ok_or_else(overflow)?
-        } else {
-            0
-        };
-        let context_growth = trunk_full
-            .checked_add(head_full)
-            .ok_or_else(overflow)?
-            .saturating_sub(inputs.committed_context_bytes) as u64;
-        let gather_growth = if rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa) {
-            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                config.num_key_value_heads,
-                inputs.max_seq,
-            )
-            .ok_or_else(overflow)?
-            .saturating_sub(gpu.qsa_gather_scratch_bytes()) as u64
-        } else {
-            0
-        };
-        let slack = (free as u64)
-            .saturating_sub(hipfire_arch_qwen4::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES)
-            .saturating_sub(context_growth)
-            .saturating_sub(gather_growth);
-        let prefix_bytes = hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(
-            config,
-            inputs.state_format,
-            inputs.native_mtp,
-        )
-        .unwrap_or(0);
-        (domain, slack, prefix_bytes)
-    };
-
-    let (arch_cap_bytes, checkpoints) = if gpu.arch_caps.is_gfx1151() {
-        (1024 * MIB, 8)
-    } else {
-        // gfx1201 and every other VMM-certified arch: 512 MiB, 4 checkpoints.
-        (512 * MIB, 4)
-    };
-    let device_bytes = arch_cap_bytes.min(slack_bytes);
-    let host_bytes = 32usize << 20;
-    // Two distinct entries plus one fork transaction: each entry is a
-    // checkpoint's device bytes and 52 context granules.
-    let granularity = inputs.vmm_granularity.max(1);
-    let granule = (granularity.max(2 << 20).div_ceil(granularity) * granularity) as u64;
-    let two_entries = prefix_bytes
-        .saturating_add(granule.saturating_mul(52))
-        .saturating_mul(2);
-    bundle
-        .attach_radix_cache(
-            gpu,
-            domain,
-            hipfire_arch_qwen4::bundle::Qwen4RadixLimits {
-                device_bytes,
-                host_bytes,
-                checkpoints,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(Qwen4RadixAttached {
-        device_bytes,
-        arch_cap_bytes,
-        slack_bytes,
-        checkpoints,
-        host_bytes,
-        multi_entry_blocked: device_bytes < two_entries,
-    })
-}
-
 pub struct Qwen4Carrier;
 
 impl Carrier for Qwen4Carrier {
@@ -671,7 +479,7 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: {error}"))?;
             let chunk_rows =
                 hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
-            let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+            let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
                 backend,
                 use_ranges,
                 ctx.max_seq,
@@ -718,24 +526,9 @@ impl Carrier for Qwen4Carrier {
                     .ok_or("qwen4: QSA gather scratch size overflows")
                 })
                 .transpose()?;
-            // Room for one session-cache snapshot of a whole prefill chunk,
-            // charged before placement (the cache itself grows on demand).
-            let prefix_bytes = if session_budget > 0 {
-                hipfire_arch_qwen4::bundle::session_snapshot_bytes(
-                    &config,
-                    state_format,
-                    mtp_kept,
-                    chunk_rows,
-                )
-                .ok_or("qwen4: session snapshot bytes overflow")?
-            } else {
-                0
-            };
             let reserve =
                 residency::auto_vram_reserve(&config, &context, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
-                    .map_err(|error| format!("qwen4: {error}"))?
-                    .checked_add(prefix_bytes)
-                    .ok_or("qwen4: auto expert VRAM reserve overflows")?;
+                    .map_err(|error| format!("qwen4: {error}"))?;
             Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
         };
         let explicit =
@@ -865,27 +658,6 @@ impl Carrier for Qwen4Carrier {
                 );
             }
         }
-        // Placement is frozen; the radix cache's device identity names it.
-        let radix_topology_id = if radix_content_digest.is_some() {
-            let vram_layers = manifest
-                .weights
-                .iter()
-                .filter(|entry| {
-                    entry.residency == hipfire_runtime::weight_manifest::WeightResidency::Resident
-                        && !entry.name.starts_with("mtp.")
-                        && entry.name.ends_with(".mlp.experts.gate_up_proj")
-                })
-                .count();
-            let host_mapped = residency::host_mapped_bytes(&manifest.weights, bytes_of)
-                .map_err(|error| format!("qwen4: {error}"))?;
-            let chunk =
-                hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
-            Some(format!(
-                "vram-layers-{vram_layers};host-mapped-bytes-{host_mapped};native-mtp-{native_mtp};chunk-{chunk}"
-            ))
-        } else {
-            None
-        };
         // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
         // head's, which stays F32): what legacy storage allocates at assembly
         // (named in the refusal when it does not fit), and VMM storage only
@@ -1017,62 +789,18 @@ impl Carrier for Qwen4Carrier {
                 one >> 20
             );
         }
-        let (committed_target, committed_mtp) = match bundle.qsa_context_committed_bytes(ctx.gpu) {
-            Ok((target, mtp)) => {
-                eprintln!(
-                    "  qwen4 QSA context: {} storage, {context_state_mib} MiB virtual for {} tokens, {} MiB target + {} MiB MTP committed at load",
-                    backend.name(),
-                    ctx.max_seq,
-                    target >> 20,
-                    mtp >> 20
-                );
-                (target, mtp)
-            }
+        match bundle.qsa_context_committed_bytes(ctx.gpu) {
+            Ok((target, mtp)) => eprintln!(
+                "  qwen4 QSA context: {} storage, {context_state_mib} MiB virtual for {} tokens, {} MiB target + {} MiB MTP committed at load",
+                backend.name(),
+                ctx.max_seq,
+                target >> 20,
+                mtp >> 20
+            ),
             Err(error) => {
                 let detail = error.to_string();
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!("qwen4: QSA context census failed: {detail}"));
-            }
-        };
-        // The radix cache attaches last: every baseline allocation (scratch,
-        // forward, MTP head, prefix checkpoint) is placed, so its device cap
-        // comes out of what placement left free, never out of the reserve.
-        if let Some(model_content_digest) = radix_content_digest {
-            let attachment = attach_qwen4_radix_cache(
-                &mut bundle,
-                ctx.gpu,
-                Qwen4RadixInputs {
-                    model_content_digest,
-                    tokenizer: &meta.tokenizer,
-                    chat_template: meta.chat_template.as_deref(),
-                    state_format,
-                    max_seq: ctx.max_seq,
-                    vmm_granularity,
-                    native_mtp,
-                    topology_id: radix_topology_id.unwrap_or_default(),
-                    committed_context_bytes: committed_target.saturating_add(committed_mtp),
-                },
-            );
-            match attachment {
-                Ok(attached) => {
-                    eprintln!(
-                        "  qwen4 radix cache: cap {} MiB (arch {} MiB, post-placement slack {} MiB), {} checkpoints, host {} MiB",
-                        attached.device_bytes / MIB,
-                        attached.arch_cap_bytes / MIB,
-                        attached.slack_bytes / MIB,
-                        attached.checkpoints,
-                        attached.host_bytes as u64 / MIB
-                    );
-                    if attached.multi_entry_blocked {
-                        eprintln!(
-                            "  qwen4 radix cache: WARNING multi-entry blocked by post-placement slack"
-                        );
-                    }
-                }
-                Err(detail) => {
-                    let _ = bundle.free_gpu(ctx.gpu);
-                    return Err(format!("qwen4: radix cache setup failed: {detail}"));
-                }
             }
         }
         let mut model = LoadedModel {

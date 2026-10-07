@@ -14,7 +14,7 @@
 //! entries (the radix cache's retained prefixes): keyed by `(domain, exact
 //! token sequence)` at any boundary, addressed by [`CheckpointId`], pinned
 //! with counted pins and never auto-evicted. See
-//! [`QwenCheckpointPool::insert_exact`].
+//! [`CheckpointPool::insert_exact`].
 
 use crate::serve_contract::{
     CacheDomain, DrafterDecision, LastTokenHandling, MissReason, PrefixLookup, ResumeBundle,
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[test]
     fn exact_insert_find_and_shared_tokens() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-basic");
         let tokens = arc_toks(&[1, 2, 3, 4, 5]);
 
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn exact_first_writer_wins_on_duplicate() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-dup");
 
         let (first, _) = pool.insert_exact(dom.clone(), arc_toks(&[9, 8, 7]), HostBlob { bytes: 10 });
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[test]
     fn exact_fingerprint_collision_with_different_tokens_gets_distinct_ids() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-collide");
         let a = arc_toks(&[1, 2, 3]);
         let b = arc_toks(&[3, 2, 1]);
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn exact_overlapping_pins_refuse_take_until_fully_unpinned() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-pins");
         let (id, _) = pool.insert_exact(dom.clone(), arc_toks(&[4, 4, 4]), HostBlob { bytes: 64 });
 
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn exact_insufficient_room_refuses_without_evicting() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1000);
+        let mut pool = CheckpointPool::<HostBlob>::new(1000);
         let dom = test_domain("exact-room");
 
         // An unpinned aligned entry is NOT sacrificed to make room.
@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn exact_domain_isolation() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom_a = test_domain("exact-iso-a");
         let dom_b = test_domain("exact-iso-b");
         let tokens = [5u32, 6, 7];
@@ -1745,7 +1745,7 @@ mod tests {
 
     #[test]
     fn exact_drain_ignores_pins_and_keeps_aligned_entries() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-drain");
 
         let (a, _) = pool.insert_exact(dom.clone(), arc_toks(&[1, 1]), HostBlob { bytes: 10 });
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn exact_ids_are_monotonic_and_never_reused() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("exact-ids");
 
         let (first, _) = pool.insert_exact(dom.clone(), arc_toks(&[1]), HostBlob { bytes: 1 });
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[test]
     fn aligned_pin_remains_idempotent_boolean() {
-        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("aligned-pin");
         pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 1 });
 

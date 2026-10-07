@@ -10,8 +10,8 @@
 //! for byte.
 //!
 //! Without WARM_CHUNKS (or with 0) every fill is cold. With WARM_CHUNKS = K,
-//! each LEN is the suffix of a prefix-cache hit: an exact warm prompt of
-//! P = K * chunk rows tokens captures the end-of-prompt checkpoint at P, and
+//! each LEN is the suffix of a session-cache hit: a warm prompt of
+//! P = K * chunk rows tokens (plus one row) publishes the snapshot at P, and
 //! a prompt sharing those P tokens then restores it and fills the LEN fresh
 //! tokens from `start_pos = P`.
 //!

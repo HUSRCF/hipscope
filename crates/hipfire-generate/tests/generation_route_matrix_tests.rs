@@ -664,6 +664,23 @@ fn qwen_cache_planner_is_ineligible_cold() {
     assert_eq!(plan.new_tokens, vec![10, 11, 12]);
 }
 
+/// Native Qwen4 MTP never uses the shared conversation planner, including on a
+/// transition from an AR turn: its reusable prefixes are the bundle's session
+/// cache (`ArchModel::session_plan` with `SessionRoute::Mtp`), planned
+/// separately.
+#[test]
+fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
+    // Native Qwen4 MTP bypasses the shared planner.
+    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
+    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
+    // on the loaded family, not on the speculator name "mtp".
+    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
+        false, false
+    ));
+    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
+    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
+}
+
 /// Asserts every `PromptCachePlan` field against the expected start and resume.
 /// `start == 0` means a cold miss.
 fn assert_plan(
@@ -685,10 +702,11 @@ fn assert_plan(
     );
 }
 
-/// Qwen4 prefix cache planning: lineage = the committed live tokens, one exact
-/// end-of-prompt checkpoint at an arbitrary (non-chunk-aligned) position `p`.
+/// Shared planner (Qwen3.5-family AR/DFlash): lineage = the committed live
+/// tokens, one exact end-of-prompt checkpoint at an arbitrary
+/// (non-chunk-aligned) position `p`.
 #[test]
-fn qwen4_eop_checkpoint_plans_use_the_shared_qwen3_planner() {
+fn eop_checkpoint_plans_use_the_shared_planner() {
     use hipfire_generate::qwen::plan_from_rendered as plan;
     // Distinct divergent suffix tokens never collide with the 0..n lineage.
     let fork = |keep: usize, extra: usize| -> Vec<u32> {
@@ -762,57 +780,34 @@ fn qwen4_eop_checkpoint_plans_use_the_shared_qwen3_planner() {
     }
 }
 
-// The radix select itself (Live vs radix candidate, depth ties, stale ids, the
-// shared-turn anchor policy) is covered by the pure selection tests in
-// `crates/hipfire-arch-qwen4/src/bundle.rs`. The tests below pin only the
-// host-side seam in front of it: turn-boundary extraction and the shared local
-// planner, whose `start_pos` is the Live/EOP candidate the bundle receives as
-// `local_start`.
+// Qwen4 does not plan through the shared conversation planner: its AR and
+// native-MTP prefixes come from the bundle's session cache
+// (`ArchModel::session_plan` with `SessionRoute::{Ar,Mtp}`), which returns a
+// bare `usize` start and never continues a live session. The tests below pin
+// the shared `plan_from_rendered` planner that the Qwen3.5-family AR/DFlash
+// routes still use.
 
+/// Inputs reach the shared planner unchanged: the local Live/EOP candidate is
+/// `plan.start_pos`. An empty lineage (no live record, no EOP record) is a
+/// plain miss.
 #[test]
-fn qwen4_turn_boundaries_are_every_im_end_plus_one_ascending() {
-    use hipfire_generate::qwen::qwen4_turn_boundaries as boundaries;
-    const IM_END: u32 = 151_645;
-    let prompt = [1, 2, IM_END, 3, IM_END, IM_END, 4, 5, IM_END];
-    assert_eq!(boundaries(&prompt, Some(IM_END)), vec![3, 5, 6, 9]);
-    // A terminator at index 0 and a prompt ending in the terminator.
-    assert_eq!(boundaries(&[IM_END], Some(IM_END)), vec![1]);
-    assert_eq!(boundaries(&[IM_END, 7, 8, IM_END], Some(IM_END)), vec![1, 4]);
-    // Always strictly ascending and within 1..=len.
-    let got = boundaries(&prompt, Some(IM_END));
-    assert!(got.windows(2).all(|w| w[0] < w[1]), "{got:?}");
-    assert!(got.iter().all(|&b| (1..=prompt.len()).contains(&b)), "{got:?}");
-    // Every boundary sits right after an `<|im_end|>` token.
-    assert!(got.iter().all(|&b| prompt[b - 1] == IM_END), "{got:?}");
-    // No terminator present, an empty prompt, or an unknown terminator id: none.
-    assert!(boundaries(&[1, 2, 3], Some(IM_END)).is_empty());
-    assert!(boundaries(&[], Some(IM_END)).is_empty());
-    assert!(boundaries(&prompt, None).is_empty());
-    // A different terminator id selects its own positions only.
-    assert_eq!(boundaries(&prompt, Some(4)), vec![7]);
-}
-
-/// Qwen4 inputs reach the shared planner unchanged: the local Live/EOP
-/// candidate is `plan.start_pos`, and an empty lineage (no live record, no EOP
-/// record) is a plain local miss that the radix select may still override.
-#[test]
-fn qwen4_empty_lineage_is_a_local_miss_for_the_radix_select_to_override() {
+fn empty_lineage_is_a_local_miss() {
     use hipfire_generate::qwen::plan_from_rendered as plan;
     let rendered: Vec<u32> = (0..64).collect();
     for ckpts in [&[][..], &[16usize][..], &[16usize, 40][..]] {
         for resume in [false, true] {
-            let got = plan(&[], rendered.clone(), true, ckpts, resume, "q4");
+            let got = plan(&[], rendered.clone(), true, ckpts, resume, "q35");
             assert_plan(&got, &rendered, 0, None, "empty lineage");
         }
     }
-    // Live record plus an EOP checkpoint: the local candidate stays the
-    // lineage's own deepest hit, exactly as for the Qwen3 planner.
+    // Live record plus an EOP checkpoint: the candidate stays the lineage's
+    // own deepest hit.
     let live: Vec<u32> = (0..40).collect();
-    let got = plan(&live, rendered.clone(), true, &[16], true, "q4");
+    let got = plan(&live, rendered.clone(), true, &[16], true, "q35");
     assert_plan(&got, &rendered, 40, None, "live candidate");
     // EOP-only lineage (checkpoint-length record) yields the EOP candidate.
     let eop: Vec<u32> = (0..16).collect();
-    let got = plan(&eop, rendered.clone(), true, &[16], true, "q4");
+    let got = plan(&eop, rendered.clone(), true, &[16], true, "q35");
     assert_plan(&got, &rendered, 16, None, "EOP candidate");
 }
 
@@ -820,7 +815,7 @@ fn qwen4_empty_lineage_is_a_local_miss_for_the_radix_select_to_override() {
 /// never a hit: every plan keeps a nonempty `new_tokens` tail and
 /// `start_pos < rendered.len()`.
 #[test]
-fn qwen4_local_candidate_never_covers_the_whole_prompt() {
+fn local_candidate_never_covers_the_whole_prompt() {
     use hipfire_generate::qwen::plan_from_rendered as plan;
     let seq = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
     for n in 1..=24usize {
@@ -849,7 +844,7 @@ fn qwen4_local_candidate_never_covers_the_whole_prompt() {
                         "n={n} lineage_len={} ckpts={ckpts:?} eligible={eligible} resume={resume}",
                         lineage.len()
                     );
-                    let got = plan(lineage, rendered.clone(), eligible, &ckpts, resume, "q4");
+                    let got = plan(lineage, rendered.clone(), eligible, &ckpts, resume, "q35");
                     assert!(got.start_pos < n, "{ctx}: start_pos {} >= n", got.start_pos);
                     assert!(!got.new_tokens.is_empty(), "{ctx}: empty suffix");
                     assert_eq!(got.new_tokens, rendered[got.start_pos..].to_vec(), "{ctx}");
@@ -862,29 +857,34 @@ fn qwen4_local_candidate_never_covers_the_whole_prompt() {
     }
 }
 
-/// A disabled cache (`HIPFIRE_QWEN_PROMPT_CACHE=0`, eviction active, or any
-/// non-native Qwen4 speculator) reaches the planner as `cache_eligible =
-/// false`: cold even where a live extension or checkpoint resume would hit.
+/// A disabled cache (`HIPFIRE_QWEN_PROMPT_CACHE=0` or eviction active) reaches
+/// the shared planner as `cache_eligible = false`: cold even where a live
+/// extension or checkpoint resume would hit.
 #[test]
-fn qwen4_cache_disabled_inputs_plan_cold_and_non_native_specs_stay_on_ar() {
+fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
     use hipfire_generate::qwen::plan_from_rendered as plan;
     let lineage: Vec<u32> = (0..50).collect();
     let extension: Vec<u32> = (0..70).collect();
     let divergent: Vec<u32> = (0..45).chain(1_000_000..1_000_003).collect();
     for rendered in [&extension, &divergent] {
-        let got = plan(&lineage, rendered.clone(), false, &[37], true, "q4");
+        let got = plan(&lineage, rendered.clone(), false, &[37], true, "q35");
         assert_plan(&got, rendered, 0, None, "cache disabled");
     }
     // The same inputs with the cache enabled hit, so the cold plans above are
     // due to eligibility alone.
-    let got = plan(&lineage, extension.clone(), true, &[37], true, "q4");
+    let got = plan(&lineage, extension.clone(), true, &[37], true, "q35");
     assert_plan(&got, &extension, 50, None, "cache enabled extension");
-    let got = plan(&lineage, divergent.clone(), true, &[37], true, "q4");
+    let got = plan(&lineage, divergent.clone(), true, &[37], true, "q35");
     assert_plan(&got, &divergent, 37, Some(37), "cache enabled divergence");
+}
 
-    // Mode isolation at the route layer: only the native MTP speculator
-    // selects the cached Qwen4 spec route; an n-gram (non-MTP) speculator on
-    // arch 16 stays on Qwen4 AR even when it can sample.
+/// Route isolation: only the native MTP speculator selects the Qwen4 spec
+/// route; an n-gram (non-MTP) speculator on arch 16 stays on Qwen4 AR even
+/// when it can sample. Both routes plan their prefix through the bundle's
+/// session cache (`SessionRoute::Ar` / `SessionRoute::Mtp`), never through the
+/// shared conversation planner.
+#[test]
+fn non_mtp_speculators_on_qwen4_stay_on_ar() {
     for ngram_can_sample in [false, true] {
         let ngram = GenerationRouteInputs {
             arch_id: 16,

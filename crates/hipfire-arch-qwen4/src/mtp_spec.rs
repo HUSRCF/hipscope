@@ -15,13 +15,14 @@
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
-use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode};
+use crate::bundle::Qwen4Bundle;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
+use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow,
     SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
@@ -133,10 +134,9 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
 /// Validate a native MTP prefill request before touching either owner.
 ///
 /// A cold fill is the complete prompt from position zero. A cache hit fills
-/// exactly `prompt_tokens[start_pos..]` after the bundle bound a Live (no
-/// copy) or Prompt (end-of-prompt checkpoint restore) receipt at `start_pos`
-/// (`Qwen4Bundle::begin_prefix` re-validates it), so target and MTP resume at
-/// the same absolute position.
+/// exactly `prompt_tokens[start_pos..]` after the bundle restored its
+/// session snapshot at `start_pos`, so target and MTP resume at the same
+/// absolute position.
 pub fn validate_native_mtp_prefill_request(
     prompt_tokens: &[u32],
     fill_tokens: &[u32],
@@ -301,14 +301,6 @@ impl SpecTarget for Qwen4Bundle {
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.reset(gpu)
             .map_err(|error| format!("Qwen4 reset_recurrent: {error}"))
-    }
-
-    /// Native MTP retains no pre-window snapshot to repair from, and the
-    /// end-of-prompt checkpoint references the live QSA K/V rows a reset would
-    /// zero: rewind to it so the next turn can still restore it.
-    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.rewind_to_prefix(gpu)
-            .map_err(|error| format!("Qwen4 terminal rewind: {error}"))
     }
 
     fn retry_reset_eligible(&self) -> bool {
@@ -2481,16 +2473,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ctx.begin_request(prompt_tokens);
             }
         }
-        // Bind the planner's `start_pos` (0 on a miss) to the bundle's receipt:
-        // the pending radix selection (a cold selection carries the armed
-        // shared-turn anchor), the Live receipt (committed state, no copy), the
-        // Prompt receipt (end-of-prompt checkpoint restore), or a plain cold
-        // reset when nothing is pending.
-        let plan = Self::bundle(target)?
-            .bind_prefix_plan(prompt_tokens, start_pos, Qwen4PrefixMode::NativeMtp)
-            .map_err(|error| error.to_string())?;
+        // A miss resets target, head and draft policy; a hit restores the
+        // session snapshot at `start_pos` into all three.
+        let reused = if cache_hit { start_pos } else { 0 };
         Self::bundle(target)?
-            .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
+            .session_begin(gpu, prompt_tokens, reused, SessionRoute::Mtp)
             .map_err(|error| error.to_string())?;
         self.ensure_resources(gpu, target)?;
         {
@@ -2530,15 +2517,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 target.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            // A chunk ends at the bundle's due capture boundary (turn anchor,
-            // periodic or end of prompt) when one lies inside the natural
-            // chunk, else at the natural chunk end.
+            // A chunk ends at the session cache's next snapshot boundary when
+            // one lies inside the natural chunk, else at the natural chunk end.
             let natural = pos
                 .checked_add(chunk_rows)
                 .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?
                 .min(prompt_tokens.len());
-            let capture = Self::bundle(target)?.next_prefix_capture(pos, natural);
-            let end = capture.unwrap_or(natural);
+            let boundary = Self::bundle(target)?
+                .session_next_boundary()
+                .filter(|&boundary| boundary > pos && boundary <= natural);
+            let end = boundary.unwrap_or(natural);
             if end <= pos || end > natural {
                 return Err(format!(
                     "Qwen4 native MTP prefill chunk end {end} is outside ({pos}, {natural}]"
@@ -2603,11 +2591,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 }
             }
             // Target and head both hold the exact state at `end` only now: a
-            // due capture boundary stages here, after the forward and the
+            // due snapshot boundary is reported here, after the forward and the
             // head append of this chunk.
-            if capture == Some(end) {
+            if boundary == Some(end) {
                 Self::bundle(target)?
-                    .stage_prefix_boundary(gpu, &prompt_tokens[..end], end == prompt_tokens.len())
+                    .session_at_boundary(gpu, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
