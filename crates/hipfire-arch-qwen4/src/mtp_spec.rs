@@ -2156,7 +2156,10 @@ impl Qwen4MtpDrafter {
         if !self.ngram_active || self.floor_takeover_blocked() {
             return false;
         }
-        let limit = self.ngram_config.map_or(k, |config| config.n_max);
+        // `k` already includes the remaining emit budget: n-gram extension may
+        // exceed the native depth but never this caller cap (a takeover commits
+        // seed + candidates to both device owners before the host sees them).
+        let limit = self.ngram_config.map_or(k, |config| config.n_max.min(k));
         let Some(ctx) = self.ngram.as_mut() else {
             return false;
         };
@@ -3881,6 +3884,114 @@ mod tests {
         assert!(drafter.ngram_window_cost(8).is_infinite());
         drafter.stats.ngram_mod_accepted = 12;
         assert_eq!(drafter.ngram_takeover_depth(8, 3), 3);
+    }
+
+    /// A drafter whose pool is trained on `0..21` (so `[0, 1]` continues as
+    /// `[2, 3, 4, ..]`) and whose takeover history is confident and
+    /// well-established: the cost-aware chooser extends past the native depth.
+    fn armed_ngram_drafter(n_min: usize, n_max: usize) -> Qwen4MtpDrafter {
+        let config = NgramModConfig {
+            capacity: 1024,
+            n_match: 2,
+            n_min,
+            n_max,
+        };
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_ngram(Some(config));
+        let mut pool = MtpNgramContext::new(config).expect("pool");
+        pool.begin_request(&(0..21u32).collect::<Vec<_>>());
+        drafter.ngram = Some(pool);
+        drafter.ngram_active = true;
+        drafter.floor_enabled = false;
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.stats.ngram_mod_windows = 5;
+        drafter.stats.ngram_mod_drafts = 15;
+        drafter.stats.ngram_mod_accepted = 15;
+        drafter.ngram_yield = (20.0, 5.0);
+        drafter
+    }
+
+    #[test]
+    fn ngram_hit_never_proposes_past_the_callers_budget() {
+        let emitted = [0u32, 1];
+
+        // The fixture is live: a full budget takes the whole trained chain.
+        let mut drafter = armed_ngram_drafter(3, 3);
+        assert!(drafter.ngram_hit(&emitted, 3));
+        assert_eq!(drafter.ngram_candidates, vec![2, 3, 4]);
+
+        // A budget below n_min refuses the hit instead of extending past it.
+        for k in 0..3 {
+            let mut drafter = armed_ngram_drafter(3, 3);
+            assert!(!drafter.ngram_hit(&emitted, k), "k={k}");
+        }
+
+        // With n_min = 1 every admitted proposal fits the budget; k = 0 is no
+        // takeover. (`ngram_candidates` is only meaningful after a true hit.)
+        for k in 0..=8usize {
+            let mut drafter = armed_ngram_drafter(1, 8);
+            let hit = drafter.ngram_hit(&emitted, k);
+            assert_eq!(hit, k > 0, "k={k}");
+            if hit {
+                assert!(
+                    drafter.ngram_candidates.len() <= k,
+                    "k={k}: {} candidates exceed the budget",
+                    drafter.ngram_candidates.len()
+                );
+            }
+        }
+
+        // The cap is the caller's budget, not the native depth: a large
+        // budget still extends past `max_k = 3` for a configured longer match.
+        let mut drafter = armed_ngram_drafter(3, 8);
+        assert!(drafter.ngram_hit(&emitted, 8));
+        assert!(
+            drafter.ngram_candidates.len() > 3,
+            "{:?}",
+            drafter.ngram_candidates
+        );
+    }
+
+    #[test]
+    fn ngram_takeover_consumes_exactly_the_emitted_rows_and_leaves_the_bonus_pending() {
+        let emitted = [0u32, 1];
+        let start = 1256usize;
+        for k in 1..=8usize {
+            let mut drafter = armed_ngram_drafter(1, 8);
+            assert!(drafter.ngram_hit(&emitted, k), "k={k}");
+            let candidates = drafter.ngram_candidates.clone();
+            assert!(candidates.len() <= k, "k={k}");
+
+            // The verifier accepts every candidate and picks bonus 99.
+            let mut picks = candidates.clone();
+            picks.push(99);
+            let acceptance = accept_native_greedy(&candidates, &picks, None).unwrap();
+            assert_eq!(acceptance.accepted, candidates.len());
+            let consumed = target_commit_accept_len(&acceptance) + 1;
+            let step = window_to_spec_step(MtpWindow {
+                committed: acceptance.committed.clone(),
+                accepted: acceptance.accepted,
+                drafts_generated: candidates.len(),
+            })
+            .unwrap()
+            .cap_emit(k + 1);
+
+            // No release-only host clipping: the clip is a no-op and the rows
+            // the target and head consumed equal the emitted count.
+            assert_eq!(step.emit.len(), acceptance.committed.len(), "k={k}");
+            assert_eq!(consumed, step.emit.len(), "k={k}");
+            assert_eq!(step.accepted, candidates.len(), "k={k}");
+            // The bonus is the pending seed: emitted, but not yet a device row.
+            assert_eq!(step.next_seed, 99, "k={k}");
+            let owners = native_commit_position(start, consumed).unwrap();
+            assert_eq!(owners, start + step.emit.len(), "k={k}");
+            // The terminal pending-seed flush writes exactly that one row to
+            // both owners and meets the host cursor.
+            assert_eq!(native_commit_position(owners, 1).unwrap(), owners + 1, "k={k}");
+            if k == 1 {
+                assert_eq!(owners, 1258);
+                assert_eq!(native_commit_position(owners, 1).unwrap(), 1259);
+            }
+        }
     }
 
     #[test]
