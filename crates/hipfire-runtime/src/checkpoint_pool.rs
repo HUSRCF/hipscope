@@ -199,11 +199,23 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         fp: u64,
         blob: B,
     ) -> (CheckpointId, Vec<B>) {
-        let mut displaced: Vec<B> = Vec::new();
         if !Self::is_aligned(p) {
-            displaced.push(blob);
-            return (CheckpointId::NONE, displaced);
+            return (CheckpointId::NONE, vec![blob]);
         }
+        self.insert_unaligned(domain, p, fp, blob)
+    }
+
+    /// [`Self::insert`] without the page-alignment requirement, for owners
+    /// whose boundaries are not page multiples (the session cache snapshots
+    /// message ends). Same eviction, ceiling and displaced-blob contract.
+    pub fn insert_unaligned(
+        &mut self,
+        domain: CacheDomain,
+        p: u64,
+        fp: u64,
+        blob: B,
+    ) -> (CheckpointId, Vec<B>) {
+        let mut displaced: Vec<B> = Vec::new();
 
         let bytes = blob.bytes_len();
         let key = (domain, p, fp);
@@ -644,8 +656,6 @@ mod tests {
         }
     }
 
-    const PAGE: u64 = PAGE_TOKENS as u64; // 128
-
     /// Deterministic prompt of `n` tokens for fingerprint tests.
     fn toks(n: u64) -> Vec<u32> {
         (0..n as u32)
@@ -657,6 +667,36 @@ mod tests {
     /// was captured under.
     fn fp(p: u64) -> u64 {
         prefix_fingerprint(&toks(p.max(1))[..p as usize])
+    }
+
+    #[test]
+    fn insert_refuses_unaligned_but_insert_unaligned_accepts_it() {
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("unaligned");
+
+        let (id, displaced) = pool.insert(dom.clone(), 70, fp(70), HostBlob { bytes: 4096 });
+        assert_eq!(id, CheckpointId::NONE);
+        assert_eq!(displaced.len(), 1, "a refused blob is handed back");
+        assert!(!pool.contains(&dom, 70, fp(70)));
+        assert_eq!(pool.total_bytes(), 0);
+
+        let (id, displaced) =
+            pool.insert_unaligned(dom.clone(), 70, fp(70), HostBlob { bytes: 4096 });
+        assert_ne!(id, CheckpointId::NONE);
+        assert!(displaced.is_empty());
+        assert!(pool.contains(&dom, 70, fp(70)));
+        assert_eq!(pool.total_bytes(), 4096);
+
+        // Same ceiling and replace contract as `insert`.
+        let (again, displaced) =
+            pool.insert_unaligned(dom.clone(), 70, fp(70), HostBlob { bytes: 1024 });
+        assert_eq!(again, id, "re-capture keeps the id");
+        assert_eq!(displaced.len(), 1);
+        assert_eq!(pool.total_bytes(), 1024);
+        let mut small = CheckpointPool::<HostBlob>::new(1000);
+        let (id, displaced) = small.insert_unaligned(dom, 70, fp(70), HostBlob { bytes: 2000 });
+        assert_eq!(id, CheckpointId::NONE);
+        assert_eq!(displaced.len(), 1);
     }
 
     // ── A7: structural — capture at p=128, plan 200-token prompt ────────

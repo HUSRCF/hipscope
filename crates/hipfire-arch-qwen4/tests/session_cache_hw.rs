@@ -24,7 +24,7 @@
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
-use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
+use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend, Qwen4StateFormat};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -168,9 +168,21 @@ fn assert_four_deltas(route: &str, stored: u64, one: u64) {
     );
 }
 
-#[test]
-#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
-fn restored_prefill_matches_cold_on_flash_next() {
+/// A loaded Flash-Next bundle with the session cache attached.
+struct Loaded {
+    bundle: Qwen4Bundle,
+    gpu: Gpu,
+    tokenizer: Tokenizer,
+    state_format: Qwen4StateFormat,
+    vocab: usize,
+    backend: Qwen4KvBackend,
+}
+
+/// Load the model named by `HIPFIRE_SESSION_CACHE_MODEL` and attach the
+/// forward and an unbounded session cache. `turn_snapshots` sets message-end
+/// snapshots explicitly, whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the
+/// `<|im_end|>` token is still the caller's `set_turn_end_token`).
+fn load(turn_snapshots: bool) -> Loaded {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
@@ -220,8 +232,30 @@ fn restored_prefill_matches_cold_on_flash_next() {
         backend,
     )
     .expect("assemble");
+    bundle.set_turn_snapshots(turn_snapshots);
     bundle.attach_forward(&mut gpu, MAX_SEQ).expect("forward");
     bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
+    Loaded {
+        bundle,
+        gpu,
+        tokenizer,
+        state_format,
+        vocab,
+        backend,
+    }
+}
+
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn restored_prefill_matches_cold_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        state_format,
+        vocab,
+        backend,
+        ..
+    } = load(false);
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);
@@ -278,6 +312,93 @@ fn restored_prefill_matches_cold_on_flash_next() {
         assert_same_state(&format!("MTP {name}"), &cold.0, &digests);
         assert_eq!(seed, cold.1, "MTP {name} seed");
     }
+
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// P1b: message-end snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`, forced on through
+/// `set_turn_snapshots`). A prompt with two message ends below one chunk is
+/// prefilled cold and committed; a second prompt extending the first message
+/// ends plans exactly the deepest of them. Message-end snapshots are
+/// cold-schedule split at the message ends, so the restored prefill is
+/// compared with (a) a second restore of the same snapshot and (b) a cold
+/// prefill of the second prompt with the same flag on, which splits at the
+/// same message ends by construction. It is NOT compared with the chunk-only
+/// cold schedule.
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn message_end_snapshots_restore_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        tokenizer,
+        vocab,
+        ..
+    } = load(true);
+    let im_end = tokenizer
+        .special_token_id("<|im_end|>")
+        .expect("tokenizer has <|im_end|>");
+    bundle.set_turn_end_token(Some(im_end));
+    assert!(bundle.turn_snapshots_active());
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    assert!(chunk >= 128, "test needs message ends below one chunk");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+
+    // Two messages (message ends at u + 1 and 2u + 2) and a 40-token tail, all
+    // below one chunk.
+    let u = chunk / 4;
+    let mut first = prompt(0x1, u);
+    first.push(im_end);
+    first.extend(prompt(0x2, u));
+    first.push(im_end);
+    let (end_a, end_b) = (u + 1, 2 * u + 2);
+    assert_eq!(first.len(), end_b);
+    let mut s1 = first.clone();
+    s1.extend(prompt(0x3, 40));
+    assert!(s1.len() < chunk);
+    // Extends the message-end prefix with different content.
+    let mut s2 = first.clone();
+    s2.extend(prompt(0x4, 70));
+
+    assert_eq!(bundle.session_plan(&s1, SessionRoute::Ar), 0);
+    run(&mut bundle, &mut gpu, &logits, &s1, 0);
+    assert!(stored_bytes(&bundle) > 0, "message ends were not published");
+    // The first prompt itself reuses its deepest message end, and one that
+    // only passes the first message reuses that one.
+    assert_eq!(bundle.session_plan(&s1, SessionRoute::Ar), end_b);
+    let mut one_message = s1[..end_a].to_vec();
+    one_message.extend(prompt(0x5, 30));
+    assert_eq!(bundle.session_plan(&one_message, SessionRoute::Ar), end_a);
+
+    // The second prompt plans exactly the deepest shared message end.
+    let reused = bundle.session_plan(&s2, SessionRoute::Ar);
+    assert_eq!(reused, end_b, "plan must offer the message-end snapshot");
+
+    // Flag off scopes to chunk multiples only: nothing is offered.
+    bundle.set_turn_snapshots(false);
+    assert_eq!(bundle.session_plan(&s2, SessionRoute::Ar), 0);
+    bundle.set_turn_snapshots(true);
+    assert_eq!(bundle.session_plan(&s2, SessionRoute::Ar), end_b);
+
+    let warm = run(&mut bundle, &mut gpu, &logits, &s2, reused);
+    let again = run(&mut bundle, &mut gpu, &logits, &s2, reused);
+    assert_same_state("restore twice", &warm.0, &again.0);
+    assert!(warm.1 == again.1, "same snapshot restored twice: logits");
+    assert_eq!(warm.2, again.2, "same snapshot restored twice: ids");
+
+    // Cold with the same split (flag on): message ends at u + 1 and 2u + 2.
+    let cold = run(&mut bundle, &mut gpu, &logits, &s2, 0);
+    println!(
+        "AR message-end cold ids {:?}\nAR message-end warm ids {:?}",
+        cold.2, warm.2
+    );
+    assert_same_state("AR message-end", &cold.0, &warm.0);
+    assert!(
+        warm.1 == cold.1,
+        "message-end restored final logits differ from the same-split cold prefill"
+    );
+    assert_eq!(warm.2, cold.2, "AR message-end ids");
 
     gpu.free_tensor(logits).expect("free logits");
     bundle.free_gpu(&mut gpu).expect("free bundle");

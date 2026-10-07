@@ -84,8 +84,9 @@ impl AttachedWeightStore {
 /// Host record of the committed live state: the consumed history it holds and
 /// the route that produced it. A live continuation is *session-exact* (its
 /// state descends from decode, as in a continuous conversation), not
-/// cold-exact, so it is only ever resumed in place and never captured into
-/// the cross-session snapshot cache.
+/// cold-exact, so it is only resumed in place and never captured into the
+/// cross-session snapshot cache, except by message-end snapshots
+/// (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`), which live in their own `/turns` scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Qwen4LiveRecord {
     tokens: Vec<u32>,
@@ -150,6 +151,43 @@ fn plan_start(snapshot: usize, live: Option<usize>) -> usize {
     }
 }
 
+/// Environment flag that adds message-end snapshot boundaries (P1b), read once
+/// when the bundle is assembled. Off by default.
+const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
+
+/// Positions just after every `im_end` token of `prompt` (a message end:
+/// user, tool, system or assistant) in `(after, up_to]`, ascending.
+fn message_end_boundaries(prompt: &[u32], im_end: u32, after: usize, up_to: usize) -> Vec<usize> {
+    let end = up_to.min(prompt.len());
+    if after >= end {
+        return Vec::new();
+    }
+    (after..end)
+        .filter(|&i| prompt[i] == im_end)
+        .map(|i| i + 1)
+        .collect()
+}
+
+/// Ascending, deduplicated snapshot boundaries in `(after, up_to]`: multiples
+/// of `chunk`, plus message ends when `im_end` is `Some`.
+fn session_boundaries(
+    chunk: usize,
+    prompt: &[u32],
+    im_end: Option<u32>,
+    after: usize,
+    up_to: usize,
+) -> Vec<usize> {
+    let mut boundaries: Vec<usize> = (after / chunk + 1..=up_to / chunk)
+        .map(|k| k * chunk)
+        .collect();
+    if let Some(im_end) = im_end {
+        boundaries.extend(message_end_boundaries(prompt, im_end, after, up_to));
+        boundaries.sort_unstable();
+        boundaries.dedup();
+    }
+    boundaries
+}
+
 /// Published Qwen4 architecture owner.
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
@@ -186,6 +224,11 @@ pub struct Qwen4Bundle {
     live: Option<Qwen4LiveRecord>,
     /// Prompt and route of the request in flight (set by `session_begin`).
     turn: Option<(Vec<u32>, SessionRoute)>,
+    /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
+    /// at message ends. Active only with `turn_end_token`.
+    turn_snapshots: bool,
+    /// The tokenizer's `<|im_end|>` id (`set_turn_end_token`).
+    turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
     state_format: Qwen4StateFormat,
 }
@@ -264,19 +307,24 @@ impl SessionState for Qwen4Bundle {
         if route == SessionRoute::Mtp && self.mtp.is_none() {
             return None;
         }
+        // Message-end snapshots split prefill off the plain chunk schedule, so
+        // they never share a domain with chunk-only ones.
+        let turns = if self.turn_snapshots_active() {
+            "/turns"
+        } else {
+            ""
+        };
         Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}",
+            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}",
             self.state_format
         ))
     }
 
-    fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize> {
+    fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
         let Some(chunk) = self.spec_chunk_rows() else {
             return Vec::new();
         };
-        (after / chunk + 1..=up_to / chunk)
-            .map(|k| k * chunk)
-            .collect()
+        session_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
     }
 
     fn snapshot_parts(
@@ -484,6 +532,8 @@ impl Qwen4Bundle {
             session: None,
             live: None,
             turn: None,
+            turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
+            turn_end_token: None,
             state_format,
         })
     }
@@ -737,6 +787,33 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
+    }
+
+    /// The `<|im_end|>` token message-end snapshots split after, when active.
+    fn turn_end_token_active(&self) -> Option<u32> {
+        self.turn_end_token.filter(|_| self.turn_snapshots)
+    }
+
+    /// Whether prefill also snapshots at message ends (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`
+    /// on and the `<|im_end|>` token known).
+    pub fn turn_snapshots_active(&self) -> bool {
+        self.turn_end_token_active().is_some()
+    }
+
+    /// Set the tokenizer's `<|im_end|>` id: with `HIPFIRE_QWEN4_TURN_SNAPSHOTS`
+    /// on, every message end becomes a snapshot boundary (cold, restored and
+    /// live prefills), in the session-cache scope `.../turns`. `None` keeps
+    /// chunk multiples only.
+    pub fn set_turn_end_token(&mut self, token: Option<u32>) {
+        self.turn_end_token = token;
+    }
+
+    /// Force message-end snapshots on or off regardless of the environment
+    /// (hardware tests; production reads `HIPFIRE_QWEN4_TURN_SNAPSHOTS` once
+    /// at assembly). Changing it changes the snapshot scope, so call it before
+    /// the first prefill that fills the cache.
+    pub fn set_turn_snapshots(&mut self, on: bool) {
+        self.turn_snapshots = on;
     }
 
     pub(crate) fn spec_forward_rows(
@@ -1597,8 +1674,9 @@ impl Qwen4Bundle {
     /// Start a prefill of `prompt` on `route` that skips `reused` tokens:
     /// - live: `reused` is the end of the committed live state (this
     ///   conversation's previous turn); every owner and position is kept, no
-    ///   snapshot is restored and none is captured this turn, so the
-    ///   cross-session cache only ever holds cold-exact state;
+    ///   snapshot is restored, and nothing is captured unless message-end
+    ///   snapshots are active (then the boundaries above `reused` are, in the
+    ///   `/turns` scope);
     /// - snapshot: restore the `reused`-token snapshot the cache planned;
     /// - `reused == 0`: cold start.
     ///
@@ -1617,13 +1695,14 @@ impl Qwen4Bundle {
             && self.live_hit(prompt, route) == Some(reused);
         self.live = None;
         self.turn = None;
+        let capture = self.turn_snapshots_active();
         let result = if live {
             // The kept state continues, so request-local PLE work from the
             // previous request must not publish into it.
             self.invalidate_ple_epoch().map(|()| {
-                if let Some(cache) = self.session.as_mut() {
-                    cache.begin_live(gpu);
-                }
+                self.with_session(|cache, bundle| {
+                    cache.begin_live(gpu, bundle, prompt, route, reused, capture)
+                });
             })
         } else {
             match self
@@ -1838,7 +1917,7 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     /// prompt and the owners sit exactly at its end. The next turn of the
     /// conversation then prefills only the suffix in place (session-exact,
     /// decode lineage); the snapshots just published stay cold-exact because a
-    /// live turn captures none.
+    /// live turn captures none unless message-end snapshots are active.
     fn session_commit_live(&mut self, consumed: &[u32]) {
         let Some(cache) = self.session.as_mut() else {
             self.live = None;
@@ -2189,6 +2268,58 @@ mod tests {
             tokens: tokens.to_vec(),
             route,
         }
+    }
+
+    const END: u32 = 7;
+
+    #[test]
+    fn message_end_boundaries_follow_every_im_end() {
+        // None.
+        assert!(message_end_boundaries(&[1, 2, 3], END, 0, 3).is_empty());
+        assert!(message_end_boundaries(&[], END, 0, 0).is_empty());
+        // Several: the position just after each im_end.
+        let prompt = [1, END, 2, 3, END, 4, END];
+        assert_eq!(message_end_boundaries(&prompt, END, 0, 7), [2, 5, 7]);
+        // `after` is exclusive, `up_to` inclusive.
+        assert_eq!(message_end_boundaries(&prompt, END, 2, 7), [5, 7]);
+        assert_eq!(message_end_boundaries(&prompt, END, 1, 7), [2, 5, 7]);
+        assert_eq!(message_end_boundaries(&prompt, END, 0, 5), [2, 5]);
+        assert_eq!(message_end_boundaries(&prompt, END, 0, 4), [2]);
+        assert_eq!(message_end_boundaries(&prompt, END, 5, 7), [7]);
+        assert!(message_end_boundaries(&prompt, END, 7, 7).is_empty());
+        assert!(message_end_boundaries(&prompt, END, 3, 4).is_empty());
+        // Consecutive im_end tokens each end a message.
+        assert_eq!(message_end_boundaries(&[END, END, 1, END], END, 0, 4), [1, 2, 4]);
+        // im_end at the last position ends at the prompt length.
+        assert_eq!(message_end_boundaries(&[1, 2, END], END, 0, 3), [3]);
+        // `up_to` beyond the prompt never reads past it.
+        assert_eq!(message_end_boundaries(&[1, END], END, 0, 9), [2]);
+    }
+
+    #[test]
+    fn session_boundaries_union_chunks_and_message_ends() {
+        let mut prompt = vec![1u32; 20];
+        prompt[2] = END; // ends at 3
+        prompt[7] = END; // ends at 8: a chunk multiple
+        prompt[13] = END; // ends at 14
+        // Chunk multiples only without a token (flag off or token unknown).
+        assert_eq!(session_boundaries(4, &prompt, None, 0, 20), [4, 8, 12, 16, 20]);
+        // Union, sorted and deduplicated (8 is both).
+        assert_eq!(
+            session_boundaries(4, &prompt, Some(END), 0, 20),
+            [3, 4, 8, 12, 14, 16, 20]
+        );
+        // The `(after, up_to]` window applies to both sources.
+        assert_eq!(session_boundaries(4, &prompt, Some(END), 3, 14), [4, 8, 12, 14]);
+        assert_eq!(session_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
+        // Message ends below one chunk are boundaries on their own.
+        assert_eq!(session_boundaries(64, &prompt, Some(END), 0, 20), [3, 8, 14]);
+        assert!(session_boundaries(64, &prompt, None, 0, 20).is_empty());
+        // A prompt without the token matches the chunk-only schedule.
+        assert_eq!(
+            session_boundaries(4, &[1; 20], Some(END), 0, 20),
+            session_boundaries(4, &[1; 20], None, 0, 20)
+        );
     }
 
     #[test]

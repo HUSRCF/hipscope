@@ -788,6 +788,12 @@ impl Carrier for Qwen4Carrier {
                 session_budget >> 20,
                 one >> 20
             );
+            bundle.set_turn_end_token(meta.tokenizer.special_token_id("<|im_end|>"));
+            if bundle.turn_snapshots_active() {
+                eprintln!(
+                    "  qwen4 session cache: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
+                );
+            }
         }
         match bundle.qsa_context_committed_bytes(ctx.gpu) {
             Ok((target, mtp)) => eprintln!(

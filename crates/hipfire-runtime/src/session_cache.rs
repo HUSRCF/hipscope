@@ -8,12 +8,16 @@
 //! The cache owns keys, planning, eviction, the memory guard, storage
 //! placement and every copy. An architecture only describes its live state
 //! through [`SessionState`]: where a cold prefill materializes canonical state
-//! ([`SessionState::snapshot_boundaries`]) and which device byte ranges plus
-//! host metadata make up that state ([`SessionState::snapshot_parts`]). Drivers
-//! call [`SessionCache::begin`] before prefill, split prefill at
-//! [`SessionCache::next_boundary`], report each boundary through
-//! [`SessionCache::at_boundary`], and [`SessionCache::commit`] once the turn's
-//! output reached the client.
+//! ([`SessionState::snapshot_boundaries`], a function of the prompt tokens so
+//! an architecture can also split at message ends) and which device byte
+//! ranges plus host metadata make up that state
+//! ([`SessionState::snapshot_parts`]). Drivers call [`SessionCache::begin`]
+//! before prefill, split prefill at [`SessionCache::next_boundary`], report
+//! each boundary through [`SessionCache::at_boundary`], and
+//! [`SessionCache::commit`] once the turn's output reached the client. A turn
+//! that continues the live state in place starts with
+//! [`SessionCache::begin_live`], which arms boundaries only when asked to
+//! capture.
 //!
 //! Snapshots are deltas: one stores the fixed (overwritten-in-place) state
 //! whole, but of each append-only [`RowStream`] only the rows above its
@@ -83,9 +87,11 @@ pub trait SessionState {
     /// reusable for `route` (route, prefill chunk, state formats). `None` = not
     /// cacheable now.
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String>;
-    /// Ascending positions p with after < p <= up_to where a cold prefill of
-    /// this prompt materializes canonical state.
-    fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize>;
+    /// Ascending, deduplicated positions p of `prompt` with
+    /// `after < p <= up_to` (`up_to <= prompt.len()`) where a prefill of this
+    /// prompt materializes state: chunk multiples, and whatever token-
+    /// dependent split points (message ends) the architecture adds.
+    fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize>;
     /// Layout + host metadata of the live state, which must be exactly at
     /// `position`.
     fn snapshot_parts(
@@ -244,7 +250,7 @@ impl SessionCache {
         }
         let domain = self.domain.scoped(&scope);
         state
-            .snapshot_boundaries(0, prompt.len() - 1)
+            .snapshot_boundaries(prompt, 0, prompt.len() - 1)
             .into_iter()
             .rev()
             .find(|&p| {
@@ -332,7 +338,7 @@ impl SessionCache {
         }
         self.turn = Some(Turn {
             boundaries: state
-                .snapshot_boundaries(reused, prompt.len())
+                .snapshot_boundaries(prompt, reused, prompt.len())
                 .into(),
             domain,
             route,
@@ -343,12 +349,28 @@ impl SessionCache {
     /// Start a prefill that continues the live state in place: the caller
     /// keeps every owner as it is (no reset, no restore) and prefills only the
     /// suffix. Does the bookkeeping head of [`Self::begin`] (frees displaced
-    /// buffers, drops uncommitted snapshots) and arms no boundary, so
-    /// [`Self::next_boundary`] is `None` and nothing is captured this turn.
+    /// buffers, drops uncommitted snapshots).
     ///
-    /// A live-continued turn's state descends from decode, never from a cold
+    /// With `capture == false` it arms no boundary, so
+    /// [`Self::next_boundary`] is `None` and nothing is captured this turn: a
+    /// live-continued turn's state descends from decode, never from a cold
     /// canonical prefill, so it must not enter the cross-session cache.
-    pub fn begin_live(&mut self, gpu: &mut Gpu) {
+    ///
+    /// With `capture == true` it arms `snapshot_boundaries(prompt, reused,
+    /// prompt.len())` under the route's scoped domain exactly like
+    /// [`Self::begin`] (still no reset, no restore), and the captures publish
+    /// at [`Self::commit`]. The caller passes `true` only for boundaries the
+    /// architecture defines as session-lineage reusable (message ends), whose
+    /// scope never aliases cold-exact snapshots.
+    pub fn begin_live(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+        capture: bool,
+    ) {
         for snapshot in std::mem::take(&mut self.release) {
             free_buffer(gpu, snapshot);
         }
@@ -356,6 +378,19 @@ impl SessionCache {
             self.drop_snapshot(gpu, snapshot);
         }
         self.turn = None;
+        if !capture {
+            return;
+        }
+        let Some(scope) = state.snapshot_scope(route) else {
+            return;
+        };
+        self.turn = Some(Turn {
+            boundaries: state
+                .snapshot_boundaries(prompt, reused, prompt.len())
+                .into(),
+            domain: self.domain.scoped(&scope),
+            route,
+        });
     }
 
     /// Copy the snapshot of `prefix` and its ancestors into the live state.
@@ -482,7 +517,7 @@ impl SessionCache {
         }
         let growth = state.growth_reserve_bytes();
         let ancestors: Vec<Key> = state
-            .snapshot_boundaries(0, p - 1)
+            .snapshot_boundaries(prefix, 0, p - 1)
             .into_iter()
             .rev()
             .map(|b| (domain.clone(), b as u64, prefix_fingerprint(&prefix[..b])))
@@ -624,7 +659,7 @@ impl SessionCache {
                 continue;
             }
             let (domain, p, fp) = key.clone();
-            let (id, displaced) = self.pool.insert(domain, p, fp, snapshot);
+            let (id, displaced) = self.pool.insert_unaligned(domain, p, fp, snapshot);
             if id == CheckpointId::NONE {
                 refused.insert(key);
             } else if self.children.contains_key(&key) {
@@ -672,6 +707,8 @@ mod tests {
     const ROW_BYTES: usize = 16;
     const ROW_CAPACITY: usize = 1024;
     const STRIDE: usize = 128;
+    /// A token after which the toy also splits, like a message end.
+    const MARKER: u32 = 999_999_999;
 
     /// A fixed part that depends on the whole prefix and one append-only row
     /// per token that depends only on the tokens up to it.
@@ -724,10 +761,14 @@ mod tests {
         fn snapshot_scope(&self, _route: SessionRoute) -> Option<String> {
             Some("toy".to_string())
         }
-        fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize> {
-            (after / STRIDE + 1..=up_to / STRIDE)
+        fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
+            let mut boundaries: Vec<usize> = (after / STRIDE + 1..=up_to / STRIDE)
                 .map(|k| k * STRIDE)
-                .collect()
+                .collect();
+            boundaries.extend((after..up_to).filter(|&i| prompt[i] == MARKER).map(|i| i + 1));
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            boundaries
         }
         fn snapshot_parts(
             &mut self,
@@ -953,7 +994,7 @@ mod tests {
 
         // A live begin drops them, arms no boundary and leaves the state alone.
         let before = toy.bytes(gpu);
-        cache.begin_live(gpu);
+        cache.begin_live(gpu, &mut toy, &a, SessionRoute::Ar, a.len(), false);
         assert!(cache.pending.is_empty());
         assert!(cache.children.is_empty());
         assert_eq!(cache.next_boundary(), None);
@@ -964,6 +1005,88 @@ mod tests {
         cache.commit();
         assert_eq!(cache.pool.total_bytes(), 0);
         assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 0);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
+    fn prompt_aware_boundaries_plan_arm_and_capture_live() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let fixed = gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap();
+        let rows = gpu
+            .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+            .unwrap();
+        let mut toy = Toy {
+            fixed,
+            rows,
+            position: 0,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), 64 * one);
+        let scoped = domain().scoped("toy");
+        let held = |cache: &SessionCache, prompt: &[u32], p: usize| {
+            cache
+                .pool
+                .contains(&scoped, p as u64, prefix_fingerprint(&prompt[..p]))
+        };
+
+        // Markers at 40 and 70 sit below one stride (and are not page
+        // aligned); 200 sits between strides.
+        let mut m = prompt(4, 2 * STRIDE + 10);
+        for at in [39, 69, 199] {
+            m[at] = MARKER;
+        }
+        assert_eq!(
+            toy.snapshot_boundaries(&m, 0, m.len()),
+            [40, 70, STRIDE, 200, 2 * STRIDE]
+        );
+        assert_eq!(toy.snapshot_boundaries(&m, 40, 200), [70, STRIDE, 200]);
+
+        // begin arms the marker boundaries; the cold turn captures each and
+        // commit publishes them although they are not page multiples.
+        cache.begin(gpu, &mut toy, &m, SessionRoute::Ar, 0).unwrap();
+        assert_eq!(cache.next_boundary(), Some(40));
+        cache.commit();
+        assert_eq!(turn(&mut cache, gpu, &mut toy, &m, true), 0);
+        for p in [40, 70, STRIDE, 200, 2 * STRIDE] {
+            assert!(held(&cache, &m, p), "boundary {p} missing");
+        }
+        assert_eq!(cache.pool.len(), 5);
+
+        // plan finds the marker-boundary snapshot below the first stride.
+        let mut early = m[..70].to_vec();
+        early.extend(prompt(5, 20));
+        assert_eq!(cache.plan(&toy, &early, SessionRoute::Ar), 70);
+        assert_restores(&mut cache, gpu, &mut toy, &early, 70);
+
+        // A live continuation that captures: state at the end of m, extended
+        // by a message with a marker. Only boundaries above `reused` are
+        // armed, and commit publishes them.
+        assert_eq!(turn(&mut cache, gpu, &mut toy, &m, true), 2 * STRIDE);
+        let mut tail = prompt(6, 30);
+        tail[9] = MARKER;
+        let mut live = m.clone();
+        live.extend(tail);
+        let mut probe = live.clone();
+        probe.push(1);
+        assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);
+        cache.begin_live(gpu, &mut toy, &live, SessionRoute::Ar, m.len(), true);
+        let marker_end = m.len() + 10;
+        assert_eq!(cache.next_boundary(), Some(marker_end));
+        toy.advance(gpu, &live[..marker_end]);
+        cache.at_boundary(gpu, &mut toy, &live[..marker_end]).unwrap();
+        assert_eq!(cache.next_boundary(), None);
+        toy.advance(gpu, &live);
+        assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);
+        cache.commit();
+        assert!(held(&cache, &live, marker_end));
+        assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), marker_end);
+        assert_restores(&mut cache, gpu, &mut toy, &probe, marker_end);
+        cache.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }
