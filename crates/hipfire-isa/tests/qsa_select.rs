@@ -72,6 +72,7 @@ fn committed_bundle_equals_fresh_emission() {
     assert!(text_section(&link(&text, ARCH.name(), &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
 }
 
+
 fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     use std::process::Command;
     let dir = std::env::temp_dir().join(format!("hipfire-isa-qsa-select-{}", std::process::id()));

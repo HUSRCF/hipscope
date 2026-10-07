@@ -7,6 +7,8 @@ use hipfire_isa::kernels::iu4_k1::{emit_fold, FoldRegisters, Variant};
 use hipfire_isa::reg::Live;
 use std::io::Write;
 use std::process::{Command, Stdio};
+#[path = "support/rocm.rs"]
+mod rocm;
 
 #[macro_use]
 #[path = "support/rocm.rs"]

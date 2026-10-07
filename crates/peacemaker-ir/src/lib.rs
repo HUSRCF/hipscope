@@ -25,6 +25,16 @@ pub mod wait;
 pub use cfg::{Block, BlockId, Body, InstId};
 pub use inst::{Arch, Form, FormFields, Inst, Kernel, Opcode, Program, Target};
 
+/// Test-only `llvm-mc` of the pinned ROCm install: `ROCM_PATH`, else the
+/// `/opt/rocm/core-10.0` default (same rule as `hipfire-isa::toolchain`).
+/// The path may not exist; callers decide whether to skip.
+#[cfg(test)]
+pub(crate) fn rocm_llvm_mc() -> std::path::PathBuf {
+    std::env::var_os("ROCM_PATH").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm/core-10.0"))
+        .join("lib/llvm/bin/llvm-mc")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,9 +170,7 @@ mod tests {
     /// assembler exists.
     #[test]
     fn opcode_examples_match_pinned_llvm_mc_for_every_declared_form() {
-        let root = std::env::var_os("ROCM_PATH").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm/core-10.0"));
-        let mc = root.join("lib/llvm/bin/llvm-mc");
+        let mc = rocm_llvm_mc();
         if !mc.exists() {
             eprintln!("pinned llvm-mc not present at {} — skipping table gate", mc.display());
             return;

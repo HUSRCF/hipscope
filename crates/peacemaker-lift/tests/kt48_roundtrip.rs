@@ -334,8 +334,8 @@ fn rejection(result: Result<Lifted<Program>, LiftError>) -> (Option<String>, u64
 }
 
 /// Pinned second-opinion toolchain: `PEACEMAKER_ROCM` must hold the tools (fail, never
-/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise the default
-/// install is used when present.
+/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise `ROCM_PATH`
+/// (default `/opt/rocm/core-10.0`) is used when it holds the tools.
 struct Tools {
     objdump: PathBuf,
     mc: PathBuf,
@@ -351,7 +351,8 @@ fn toolchain() -> Option<Tools> {
     if std::env::var_os("PEACEMAKER_NO_ROCM").is_some() {
         return None;
     }
-    let tools = at(Path::new("/opt/rocm/core-10.0"));
+    let root = std::env::var_os("ROCM_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"));
+    let tools = at(&root);
     (tools.objdump.is_file() && tools.mc.is_file()).then_some(tools)
 }
 

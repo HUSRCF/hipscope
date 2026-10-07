@@ -21,10 +21,10 @@ pub use print::{PrintError, canonical, kernel_lines};
 pub(crate) mod support {
     use std::path::PathBuf;
 
-    /// Pinned second-opinion toolchain (`PEACEMAKER_ROCM`, else the default
-    /// install). `Some` means the live tools must agree; `None` means the
-    /// committed objdump fixture is the reference. A set-but-unusable
-    /// `PEACEMAKER_ROCM` is a hard error, never a silent skip.
+    /// Pinned second-opinion toolchain (`PEACEMAKER_ROCM`, else `ROCM_PATH`,
+    /// else `/opt/rocm/core-10.0`). `Some` means the live tools must agree;
+    /// `None` means the committed objdump fixture is the reference. A
+    /// set-but-unusable `PEACEMAKER_ROCM` is a hard error, never a silent skip.
     pub(crate) struct Toolchain {
         pub(crate) objdump: PathBuf,
         pub(crate) mc: PathBuf,
@@ -49,7 +49,8 @@ pub(crate) mod support {
         if std::env::var("PEACEMAKER_NO_ROCM").is_ok() {
             return Ok(None);
         }
-        let root = PathBuf::from("/opt/rocm/core-10.0");
+        let root = std::env::var_os("ROCM_PATH").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"));
         let objdump = root.join(BIN).join("llvm-objdump");
         let mc = root.join(BIN).join("llvm-mc");
         if objdump.is_file() && mc.is_file() {

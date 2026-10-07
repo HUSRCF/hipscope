@@ -369,6 +369,18 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
     Ok(())
 }
 
+/// ROCm root the census actually ran against. The objdump argument is what
+/// disassembled the objects, so a `<root>/lib/llvm/bin/llvm-objdump` path names
+/// its root exactly; any other layout falls back to the shared resolution of
+/// the lift tests: `PEACEMAKER_ROCM`, else `ROCM_PATH`, else `/opt/rocm/core-10.0`.
+fn rocm_root(objdump: &Path) -> PathBuf {
+    let layout = objdump.ancestors().nth(4).filter(|root| root.join("lib/llvm/bin").join("llvm-objdump") == objdump);
+    layout.map(Path::to_path_buf).unwrap_or_else(|| {
+        ["PEACEMAKER_ROCM", "ROCM_PATH"].iter().find_map(|var| std::env::var_os(var).filter(|v| !v.is_empty()))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"))
+    })
+}
+
 fn run() -> Result<()> {
     let args = std::env::args_os().skip(1).map(PathBuf::from).collect::<Vec<_>>();
     let [arch_arg, registry, compiled, output, objdump, xml_tsv, builders @ ..] = args.as_slice() else {
@@ -412,7 +424,7 @@ fn run() -> Result<()> {
         "registry_sha256": hex(&Sha256::digest(&fs::read(registry)?)),
         "xml_encoding_tsv_sha256": hex(&Sha256::digest(&fs::read(xml_tsv)?)),
         "llvm_objdump_sha256": hex(&Sha256::digest(&fs::read(objdump)?)),
-        "rocm": "/opt/rocm/core-10.0", "xml_sha256": xml_sha(arch)
+        "rocm": rocm_root(objdump).display().to_string(), "xml_sha256": xml_sha(arch)
     });
     report(&modules, &unknowns, provenance, output, arch)?;
     eprintln!("wrote {} and {}", output.join("census.json").display(), output.join("census.md").display());

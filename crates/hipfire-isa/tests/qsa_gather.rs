@@ -40,6 +40,7 @@ fn committed_bundles_equal_fresh_emission() {
     }
 }
 
+
 fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     use std::process::Command;
     let dir = std::env::temp_dir().join(format!("hipfire-isa-qsa-{}", std::process::id()));
