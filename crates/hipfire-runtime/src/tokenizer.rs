@@ -551,6 +551,11 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// HF BPE `ignore_merges`: try the entire byte-encoded pre-token in the
+    /// model vocabulary before applying merges. `Some(max_raw_bytes)` enables
+    /// the lookup and bounds it to tokens that could exist in that vocabulary.
+    /// GGUF and models without this flag keep their existing hot path.
+    ignore_merges_max_chunk_bytes: Option<usize>,
     /// SentencePiece `add_dummy_prefix`: when true, `encode_sentencepiece`
     /// prepends a `▁` to each raw text segment (the LLaMA convention —
     /// `normalizer: [Prepend("▁"), Replace(" "→"▁")]`). CONFIG-DRIVEN, not
@@ -852,6 +857,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
@@ -1000,6 +1006,12 @@ impl Tokenizer {
                 .get("normalizer")
                 .map(normalizer_is_nfc)
                 .unwrap_or(false);
+        // HF BPE checks for an exact whole-pretoken vocabulary hit *before*
+        // merging when `ignore_merges` is set. The model vocab alone determines
+        // this bound (added tokens are handled separately before BPE).
+        let ignore_merges_max_chunk_bytes = (is_gpt2_bpe
+            && model.get("ignore_merges").and_then(|v| v.as_bool()) == Some(true))
+        .then(|| vocab_map.keys().map(|s| s.chars().count()).max().unwrap_or(0));
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -1020,6 +1032,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            ignore_merges_max_chunk_bytes,
             sp_dummy_prefix,
             hf_pretok,
             normalizer_nfc,
@@ -1207,6 +1220,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
@@ -1560,6 +1574,38 @@ impl Tokenizer {
     /// prompt — each chunk is typically ≤10 bytes so the per-chunk state
     /// is tiny.
     fn encode_gpt2_chunk(&self, chunk_bytes: &[u8], out: &mut Vec<u32>) {
+        if chunk_bytes.is_empty() {
+            return;
+        }
+        if let Some(max_bytes) = self.ignore_merges_max_chunk_bytes {
+            if chunk_bytes.len() <= max_bytes {
+                // GPT-2's byte-to-char map uses at most two UTF-8 bytes per
+                // source byte. Most pre-tokens fit on the stack; very long
+                // vocabulary tokens take the cold, exact dynamic fallback.
+                let mut key = [0u8; 512];
+                let id = if chunk_bytes.len() <= key.len() / 2 {
+                    let mut used = 0;
+                    for &b in chunk_bytes {
+                        let mut utf8 = [0u8; 4];
+                        let encoded = byte_to_gpt2_char(b).encode_utf8(&mut utf8);
+                        key[used..used + encoded.len()].copy_from_slice(encoded.as_bytes());
+                        used += encoded.len();
+                    }
+                    self.token_to_id.get(std::str::from_utf8(&key[..used]).unwrap())
+                } else {
+                    let mut owned = String::with_capacity(chunk_bytes.len().saturating_mul(2));
+                    for &b in chunk_bytes {
+                        owned.push(byte_to_gpt2_char(b));
+                    }
+                    self.token_to_id.get(owned.as_str())
+                };
+                if let Some(&id) = id {
+                    out.push(id);
+                    return;
+                }
+            }
+        }
+
         // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
         // Construction guarantees `byte_to_id` covers every byte 0..=255
         // for GPT-2 BPE tokenizers (else `from_*` returned
@@ -1763,6 +1809,11 @@ impl Tokenizer {
                 if s.drop_gaps {
                     h.update(b"\x00drop-gaps");
                 }
+            }
+            // Existing models retain their cache identity; only the HF
+            // ignore-merges variant gets a distinct identity.
+            if self.ignore_merges_max_chunk_bytes.is_some() {
+                h.update(b"hf-bpe-ignore-merges:v1");
             }
             h.update([u8::from(self.normalizer_nfc)]);
             if self.normalizer_nfc {
@@ -2418,6 +2469,7 @@ mod token_text_stream_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: false,
             hf_pretok: None,
             normalizer_nfc: false,
@@ -2562,6 +2614,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: true,
             hf_pretok: None,
             normalizer_nfc: false,
@@ -2622,6 +2675,48 @@ mod bpe_tests {
         );
         assert_eq!(tok.encode_gpt2_bpe("ho"), vec![0, 3]);
     }
+    #[test]
+    fn hf_ignore_merges_uses_whole_pretoken_before_merges() {
+        // "ab" exists in the model vocab, but the only merge reaches "bc".
+        // HF's ignore_merges bypasses that merge when the full chunk is known.
+        let mut tok = synth(&["a", "b", "c", "ab", "bc"], &[("b", "c")]);
+        assert_eq!(tok.encode_gpt2_bpe("ab"), vec![0, 1]);
+        let original_digest = tok.config_digest();
+        tok.ignore_merges_max_chunk_bytes = Some(2);
+        assert_ne!(tok.config_digest(), original_digest);
+        assert_eq!(tok.encode_gpt2_bpe("ab"), vec![3]);
+        assert_eq!(tok.encode_gpt2_bpe("bc"), vec![4]);
+        assert_eq!(tok.encode_gpt2_bpe("abc"), vec![0, 4]);
+        // A chunk larger than the largest model token must use ordinary BPE.
+        let mut out = Vec::new();
+        tok.encode_gpt2_chunk(b"abc", &mut out);
+        assert_eq!(out, vec![0, 4]);
+    }
+
+    #[test]
+    fn hf_ignore_merges_is_parsed_only_when_enabled() {
+        // Include every byte symbol so the production constructor validates
+        // byte coverage; Ġthe makes the vocab unambiguously byte-level BPE.
+        let mut vocab = serde_json::Map::new();
+        for b in 0u8..=255 {
+            vocab.insert(byte_to_gpt2_char(b).to_string(), serde_json::json!(b));
+        }
+        vocab.insert("Ġthe".to_string(), serde_json::json!(256));
+        vocab.insert("ab".to_string(), serde_json::json!(257));
+        let mut json = serde_json::json!({
+            "model": {"type": "BPE", "vocab": vocab, "merges": [],
+                "ignore_merges": false},
+        });
+        let disabled = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        assert_eq!(disabled.ignore_merges_max_chunk_bytes, None);
+        assert_eq!(disabled.encode("ab"), vec![97, 98]);
+        json["model"]["ignore_merges"] = serde_json::json!(true);
+        let enabled = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        assert_eq!(enabled.ignore_merges_max_chunk_bytes, Some(4));
+        assert_eq!(enabled.encode("ab"), vec![257]);
+        assert_ne!(enabled.config_digest(), disabled.config_digest());
+    }
+
 
     #[test]
     fn encode_leftmost_on_tie_priority() {
@@ -3370,6 +3465,7 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            ignore_merges_max_chunk_bytes: None,
             // The pre-existing SP unit tests below were written against the
             // unconditional-prefix behavior; keep them on the LLaMA
             // convention. Config-driven coverage lives in

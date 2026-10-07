@@ -183,3 +183,16 @@
 {"family": "north_mini_code", "id": "north_mini_code/hf-right-digits/074", "text": " \u20039", "ids": [751, 230, 29]}
 {"family": "north_mini_code", "id": "north_mini_code/hf-right-digits/075", "text": " \u20282", "ids": [751, 106, 22]}
 {"family": "north_mini_code", "id": "north_mini_code/hf-right-digits/076", "text": " \f1", "ids": [131759, 21]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/000", "text": " recursively", "ids": [91708]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/001", "text": "_needed", "ids": [94601]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/002", "text": "eparated", "ids": [92289]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/003", "text": "Hypothesis", "ids": [116510]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/004", "text": "snippet", "ids": [90943]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/005", "text": "-overlapping", "ids": [93851]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/006", "text": "rllib", "ids": [97597]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/007", "text": "-tokens", "ids": [106253]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/008", "text": " ..................", "ids": [122397]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/009", "text": " ...................................", "ids": [117893]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/010", "text": "_roo", "ids": [93254]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/011", "text": "consecutive", "ids": [94389]}
+{"family": "lfm25_moe", "id": "lfm25_moe/hf-ignore-merges/012", "text": ".tao", "ids": [66144]}
