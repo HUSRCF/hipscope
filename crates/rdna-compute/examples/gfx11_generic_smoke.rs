@@ -205,8 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut compiler =
-        KernelCompiler::new("gfx11-generic", "-mcode-object-version=6".to_owned())?;
+    let mut compiler = KernelCompiler::new("gfx11-generic", String::new())?;
     let artifact = compiler.compile("gfx11_generic_rawbits", SOURCE)?.to_owned();
     let image = std::fs::read(&artifact)?;
     println!(

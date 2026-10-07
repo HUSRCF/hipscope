@@ -1259,7 +1259,7 @@ mod tests {
             "kv_cache_write_q8_0_independent_masked",
             "rotate_x_mq_awq",
         ];
-        const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
+        const FLAGS_ADDED_SINCE_P0: [&str; 2] = ["-fuse-cuid=none", "-mcode-object-version=6"];
         let mut repins_seen = HashSet::new();
         for (trace, expected_count) in [("cold1", 35), ("smokecold1", 35), ("preinstall", 58)] {
             let records = std::fs::read_to_string(root.join(format!("{trace}.hipcc.jsonl"))).unwrap();

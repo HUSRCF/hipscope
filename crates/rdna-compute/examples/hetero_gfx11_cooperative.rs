@@ -1933,7 +1933,7 @@ fn compile_exact(
     arch: &str,
     module: &str,
 ) -> Result<(Arc<[u8]>, String), Box<dyn std::error::Error>> {
-    let mut compiler = KernelCompiler::new(arch, "-mcode-object-version=6".to_owned())?;
+    let mut compiler = KernelCompiler::new(arch, String::new())?;
     let artifact = compiler.compile(module, SOURCE)?.to_owned();
     let image: Arc<[u8]> = Arc::from(std::fs::read(&artifact)?);
     Ok((image, artifact.display().to_string()))

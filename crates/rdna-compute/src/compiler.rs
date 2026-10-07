@@ -328,7 +328,10 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 ///
 /// 5: `core_hipcc_flags` gained `-fuse-cuid=none`, so objects built under 4
 /// carry a path-derived `__hip_cuid_*` symbol that current builds do not.
-pub const KERNEL_CACHE_ABI: u32 = 5;
+///
+/// 6: `core_hipcc_flags` gained `-mcode-object-version=6`, so the code-object
+/// version no longer follows the compiler default (which LLVM 24 may move).
+pub const KERNEL_CACHE_ABI: u32 = 6;
 
 /// Leading hipcc flags of every runtime JIT and packaged compile. The argv and
 /// the recipe recorded in pack indexes both come from here, so they cannot drift.
@@ -343,6 +346,9 @@ pub const KERNEL_CACHE_ABI: u32 = 5;
 ///   and recipe produced different bytes with identical code. With it, the
 ///   bytes depend only on the source, the recipe and the toolchain and headers
 ///   the compile resolves.
+/// - `-mcode-object-version=6`: pins the AMDGPU code-object version instead of
+///   inheriting the compiler default, which a newer LLVM may change. The
+///   current toolchain already defaults to v6, so its objects do not change.
 fn core_hipcc_flags(arch: &str) -> Vec<String> {
     vec![
         "--genco".to_owned(),
@@ -350,6 +356,7 @@ fn core_hipcc_flags(arch: &str) -> Vec<String> {
         "-O3".to_owned(),
         "--no-offload-compress".to_owned(),
         "-fuse-cuid=none".to_owned(),
+        "-mcode-object-version=6".to_owned(),
     ]
 }
 
@@ -2237,6 +2244,7 @@ mod tests {
                 "-O3",
                 "--no-offload-compress",
                 "-fuse-cuid=none",
+                "-mcode-object-version=6",
                 "-I/opt/rocm/include",
                 "-o",
                 "kernel.hsaco",
