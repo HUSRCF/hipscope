@@ -10,6 +10,16 @@
 //! cap `n_max=64`. Occupancy above 25% and five consecutive low-acceptance
 //! attempts (`drafted > 0 && accepted * 4 < drafted`) both clear the table.
 //!
+//! [`MtpNgramContext`] is the shared request-local lifecycle used by the
+//! Qwen3.5 and Qwen4 MTP drafters. At every request boundary
+//! ([`MtpNgramContext::begin_request`]) the pool is cleared (table memory
+//! reused) and reseeded from the full canonical prompt, so another request's
+//! transitions never change this request's candidates. During the request
+//! only tokens the emitter retained ([`MtpNgramContext::sync_emitted`]) are
+//! learned; speculative candidates and rejected verify tails never are.
+//! [`NgramModPool::draft_into`] lets the per-window proposal reuse one
+//! candidate buffer instead of allocating.
+//!
 //! Pure host Rust. Existing [`crate::spec::PldMatcher`] / [`crate::spec::NgramCache`]
 //! are unchanged for DFlash and legacy standalone users.
 
@@ -150,22 +160,35 @@ impl NgramModPool {
     /// `context`'s suffix. Returns `None` unless at least `n_min` tokens
     /// chain; length is capped by `n_max` and `caller_max`.
     ///
-    /// The only heap allocation is the returned candidate `Vec` (capacity
-    /// reserved once up front).
+    /// Allocating wrapper over [`draft_into`](Self::draft_into); the only heap
+    /// allocation is the returned candidate `Vec`.
     pub fn draft(&self, context: &[u32], caller_max: usize) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        if self.draft_into(context, caller_max, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Like [`draft`](Self::draft), but writes into `out` (cleared first,
+    /// capacity reused). Returns `true` iff `out.len() >= n_min`; on `false`,
+    /// `out` is left empty. No allocation when `out` already has capacity
+    /// `>= min(n_max, caller_max)`.
+    pub fn draft_into(&self, context: &[u32], caller_max: usize, out: &mut Vec<u32>) -> bool {
+        out.clear();
         let n = self.config.n_match;
         let limit = self.config.n_max.min(caller_max);
         if limit == 0 || context.len() < n || self.config.n_min > limit {
-            return None;
+            return false;
         }
+        out.reserve(limit);
 
-        // Only the returned candidate Vec is heap-allocated. The sliding key is
-        // tracked purely as a rolling hash; the token that ages out of the
-        // window is read from `context` for the first `n` steps and from
-        // previously drafted tokens thereafter.
+        // The sliding key is tracked purely as a rolling hash; the token that
+        // ages out of the window is read from `context` for the first `n`
+        // steps and from previously drafted tokens thereafter.
         let base = context.len() - n;
         let mut hash = hash_window(&context[base..]);
-        let mut out: Vec<u32> = Vec::with_capacity(limit);
 
         for k in 0..limit {
             let idx = (hash as usize) & self.mask;
@@ -184,9 +207,10 @@ impl NgramModPool {
         }
 
         if out.len() < self.config.n_min {
-            None
+            out.clear();
+            false
         } else {
-            Some(out)
+            true
         }
     }
 
@@ -218,6 +242,145 @@ impl NgramModPool {
             self.occupied += 1;
         }
         self.table[idx] = next;
+    }
+}
+
+/// Request-local n-gram proposal owner shared by the Qwen3.5 and Qwen4 MTP
+/// drafters.
+///
+/// Owns one [`NgramModPool`], the request's canonical token history
+/// (`prompt ++ emitted`), and a reusable candidate buffer. The pool is cleared
+/// and reseeded from the full prompt at every request boundary
+/// ([`begin_request`](Self::begin_request)), so another request's transitions
+/// never change this request's candidates. Only tokens the emitter retained
+/// ([`sync_emitted`](Self::sync_emitted)) are ever learned: speculative
+/// candidates and rejected verify tails are not history.
+pub struct MtpNgramContext {
+    pool: NgramModPool,
+    /// `prompt ++ emitted`.
+    history: Vec<u32>,
+    /// Prefix of `history` whose transitions are already in the pool.
+    indexed_until: usize,
+    /// Number of `emitted` tokens already appended to `history`.
+    emitted_len: usize,
+    /// Reusable draft buffer; capacity reserved to `n_max` once in `new`.
+    candidate: Vec<u32>,
+    /// `begin_request` ran and `reset_request` has not since.
+    begun: bool,
+}
+
+impl MtpNgramContext {
+    /// Build the pool and reserve the candidate buffer (`n_max` tokens).
+    pub fn new(config: NgramModConfig) -> Result<Self, &'static str> {
+        let pool = NgramModPool::new(config)?;
+        Ok(Self {
+            pool,
+            history: Vec::new(),
+            indexed_until: 0,
+            emitted_len: 0,
+            candidate: Vec::with_capacity(config.n_max),
+            begun: false,
+        })
+    }
+
+    /// Config the underlying pool was built with.
+    #[inline]
+    pub fn config(&self) -> &NgramModConfig {
+        self.pool.config()
+    }
+
+    /// Request boundary: clear the pool (table memory is reused; the fill is
+    /// skipped when the pool is already empty) and the history, then seed both
+    /// from the FULL canonical `prompt` (every transition
+    /// `prompt[j-n..j] -> prompt[j]`). Sets `begun`.
+    pub fn begin_request(&mut self, prompt: &[u32]) {
+        if self.pool.occupied() > 0 {
+            self.pool.clear();
+        } else {
+            // Table already empty; still drop any stale low-acceptance streak.
+            self.pool.low_accept_streak = 0;
+        }
+        self.history.clear();
+        self.history.extend_from_slice(prompt);
+        self.emitted_len = 0;
+        let n_match = self.pool.config().n_match;
+        self.pool.insert_range(&self.history, n_match);
+        self.indexed_until = self.history.len();
+        self.candidate.clear();
+        self.begun = true;
+    }
+
+    /// Whether [`begin_request`](Self::begin_request) ran for the live request.
+    #[inline]
+    pub fn is_begun(&self) -> bool {
+        self.begun
+    }
+
+    /// Append only the not-yet-seen suffix of `emitted` (the emitter-retained
+    /// output stream, containing the first token/seed exactly once) to the
+    /// history and index the new transitions. No-op before `begin_request`.
+    /// Never learns candidates or rejected tails.
+    pub fn sync_emitted(&mut self, emitted: &[u32]) {
+        if !self.begun {
+            return;
+        }
+        debug_assert!(
+            emitted.len() >= self.emitted_len,
+            "MTP n-gram emitted history must grow monotonically"
+        );
+        if emitted.len() <= self.emitted_len {
+            return;
+        }
+        self.history.extend_from_slice(&emitted[self.emitted_len..]);
+        self.pool.insert_range(&self.history, self.indexed_until);
+        self.indexed_until = self.history.len();
+        self.emitted_len = emitted.len();
+    }
+
+    /// [`sync_emitted`](Self::sync_emitted)`(emitted)`, then draft from the
+    /// history with `caller_max`. `Some(candidates)` iff a non-empty draft of
+    /// at least `n_min` tokens exists (length `<= min(n_max, caller_max)`);
+    /// the slice borrows the internal candidate buffer. `None` before
+    /// `begin_request`.
+    pub fn propose(&mut self, emitted: &[u32], caller_max: usize) -> Option<&[u32]> {
+        if !self.begun {
+            return None;
+        }
+        self.sync_emitted(emitted);
+        if self.pool.draft_into(&self.history, caller_max, &mut self.candidate)
+            && !self.candidate.is_empty()
+        {
+            Some(&self.candidate)
+        } else {
+            self.candidate.clear();
+            None
+        }
+    }
+
+    /// Record one draft window's `(drafted, accepted)` counts; applies the
+    /// five-consecutive-low-acceptance pool clear
+    /// ([`NgramModPool::record_draft_result`]).
+    pub fn observe_result(&mut self, drafted: usize, accepted: usize) {
+        let drafted = u32::try_from(drafted).unwrap_or(u32::MAX);
+        let accepted = u32::try_from(accepted).unwrap_or(u32::MAX);
+        let _ = self.pool.record_draft_result(drafted, accepted);
+    }
+
+    /// Drop history/emitted bookkeeping and set `begun = false`. The pool
+    /// table is cleared lazily by the next `begin_request`; allocations are
+    /// kept.
+    pub fn reset_request(&mut self) {
+        self.history.clear();
+        self.indexed_until = 0;
+        self.emitted_len = 0;
+        self.candidate.clear();
+        self.begun = false;
+    }
+
+    /// Canonical request history (`prompt ++ emitted`).
+    #[inline]
+    pub fn history(&self) -> &[u32] {
+        &self.history
     }
 }
 
@@ -480,5 +643,282 @@ mod tests {
             assert!(!pool.record_draft_result(4, 0));
         }
         assert!(pool.record_draft_result(4, 0));
+    }
+
+    // ---- draft_into -------------------------------------------------------
+
+    #[test]
+    fn draft_into_matches_draft_including_misses() {
+        let ctx_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        for n_min in [1usize, 2, 3] {
+            let cfg = small_cfg(1 << 20, 2, n_min, 4);
+            let mut pool = NgramModPool::new(cfg).unwrap();
+            pool.insert_range(&ctx_tokens, 0);
+            let contexts: [&[u32]; 7] = [
+                &[1, 2],
+                &[3, 4],
+                &[5, 6],
+                &[7, 8],
+                &[9, 9],
+                &[1],
+                &[],
+            ];
+            for context in contexts {
+                for caller_max in 0..=6usize {
+                    let expected = pool.draft(context, caller_max);
+                    // Junk in `out` must be cleared first.
+                    let mut out: Vec<u32> = vec![99, 98, 97];
+                    let hit = pool.draft_into(context, caller_max, &mut out);
+                    match expected {
+                        Some(v) => {
+                            assert!(hit, "ctx={context:?} max={caller_max} n_min={n_min}");
+                            assert_eq!(out, v);
+                            assert!(out.len() >= n_min);
+                        }
+                        None => {
+                            assert!(!hit, "ctx={context:?} max={caller_max} n_min={n_min}");
+                            assert!(out.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draft_into_n_min_miss_returns_false_and_empty() {
+        let cfg = small_cfg(1 << 20, 2, 3, 4);
+        let mut pool = NgramModPool::new(cfg).unwrap();
+        pool.insert_range(&[1, 2, 3, 4, 5], 0);
+        // (3,4)->5 chains only one token (< n_min = 3).
+        let mut out = vec![7u32; 5];
+        assert!(!pool.draft_into(&[3, 4], 4, &mut out));
+        assert!(out.is_empty());
+        assert_eq!(pool.draft(&[3, 4], 4), None);
+    }
+
+    #[test]
+    fn draft_into_reuses_out_capacity() {
+        let cfg = small_cfg(1 << 20, 2, 2, 4);
+        let mut pool = NgramModPool::new(cfg).unwrap();
+        pool.insert_range(&[1, 2, 3, 4, 5, 6, 7, 8], 0);
+        let mut out: Vec<u32> = Vec::with_capacity(8);
+        let ptr = out.as_ptr();
+        for _ in 0..4 {
+            assert!(pool.draft_into(&[1, 2], 4, &mut out));
+            assert_eq!(out, vec![3, 4, 5, 6]);
+            assert!(!pool.draft_into(&[9, 9], 4, &mut out));
+            assert_eq!(out.as_ptr(), ptr);
+            assert_eq!(out.capacity(), 8);
+        }
+    }
+
+    // ---- MtpNgramContext --------------------------------------------------
+
+    fn ctx_cfg() -> NgramModConfig {
+        small_cfg(1 << 20, 2, 2, 4)
+    }
+
+    #[test]
+    fn context_new_propagates_invalid_config() {
+        assert!(MtpNgramContext::new(small_cfg(3, 2, 1, 4)).is_err());
+        assert!(MtpNgramContext::new(small_cfg(16, 2, 5, 4)).is_err());
+        let ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        assert_eq!(*ctx.config(), ctx_cfg());
+        assert!(!ctx.is_begun());
+        assert!(ctx.history().is_empty());
+    }
+
+    #[test]
+    fn context_propose_before_begin_returns_none() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        assert!(ctx.propose(&[1, 2, 3], 4).is_none());
+        // sync before begin is a no-op.
+        ctx.sync_emitted(&[1, 2, 3]);
+        assert!(ctx.history().is_empty());
+        assert!(!ctx.is_begun());
+        // After a reset the context is un-begun again.
+        ctx.begin_request(&[1, 2, 3, 4, 5, 6]);
+        assert!(ctx.is_begun());
+        ctx.reset_request();
+        assert!(!ctx.is_begun());
+        assert!(ctx.history().is_empty());
+        assert!(ctx.propose(&[1, 2], 4).is_none());
+    }
+
+    #[test]
+    fn context_full_prompt_seed_finds_copied_span() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        let prompt: Vec<u32> = (100..110).collect();
+        ctx.begin_request(&prompt);
+        assert_eq!(ctx.history(), prompt.as_slice());
+        // The model starts copying the prompt: first token + one more.
+        let emitted = [100u32, 101];
+        let cands = ctx.propose(&emitted, 4).expect("copied span must draft");
+        assert_eq!(cands, &[102, 103, 104, 105]);
+        // caller_max caps the candidate length.
+        let capped = ctx.propose(&emitted, 3).expect("capped draft");
+        assert_eq!(capped, &[102, 103, 104]);
+        // caller_max below n_min yields no proposal.
+        assert!(ctx.propose(&emitted, 1).is_none());
+    }
+
+    #[test]
+    fn context_seed_token_learned_exactly_once() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        ctx.begin_request(&[1, 2, 3]);
+        // (1,2)->3 only.
+        assert_eq!(ctx.pool.occupied(), 1);
+        ctx.sync_emitted(&[4]);
+        assert_eq!(ctx.history(), &[1, 2, 3, 4]);
+        assert_eq!(ctx.pool.occupied(), 2); // + (2,3)->4
+        // Re-syncing the same emitted stream (seed included once) is idempotent.
+        ctx.sync_emitted(&[4]);
+        ctx.sync_emitted(&[4]);
+        assert_eq!(ctx.history(), &[1, 2, 3, 4]);
+        assert_eq!(ctx.pool.occupied(), 2);
+        assert_eq!(ctx.indexed_until, 4);
+        assert_eq!(ctx.emitted_len, 1);
+        // Only the new suffix is appended on growth.
+        ctx.sync_emitted(&[4, 5, 6]);
+        assert_eq!(ctx.history(), &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(ctx.pool.occupied(), 4);
+        assert_eq!(ctx.emitted_len, 3);
+        assert_eq!(ctx.indexed_until, 6);
+    }
+
+    #[test]
+    fn context_candidates_and_rejected_tails_never_learned() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        let prompt: Vec<u32> = (100..110).collect();
+        ctx.begin_request(&prompt);
+        let emitted = [100u32, 101];
+        let first = ctx.propose(&emitted, 4).expect("draft").to_vec();
+        let occupied = ctx.pool.occupied();
+        let history_len = ctx.history().len();
+        let second = ctx.propose(&emitted, 4).expect("draft").to_vec();
+        assert_eq!(first, second);
+        assert_eq!(ctx.pool.occupied(), occupied);
+        assert_eq!(ctx.history().len(), history_len);
+        let mut expected_history = prompt.clone();
+        expected_history.extend_from_slice(&emitted);
+        assert_eq!(ctx.history(), expected_history.as_slice());
+        // A candidate token that the emitter has not retained is not history:
+        // the bridge window (first[last], 7777) was never indexed.
+        let tail = *first.last().unwrap();
+        let mut probe = Vec::new();
+        assert!(!ctx.pool.draft_into(&[tail, 7777], 4, &mut probe));
+        // A shrunk emitted stream (rejected tail dropped by the emitter) is a
+        // release-mode no-op; the history keeps what was already retained.
+        #[cfg(not(debug_assertions))]
+        {
+            ctx.sync_emitted(&emitted[..1]);
+            assert_eq!(ctx.history(), expected_history.as_slice());
+        }
+    }
+
+    #[test]
+    fn context_requests_are_isolated() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        let prompt_a: Vec<u32> = (1..=10).collect();
+        let prompt_b: Vec<u32> = (200..210).collect();
+
+        ctx.begin_request(&prompt_a);
+        assert_eq!(ctx.pool.occupied(), prompt_a.len() - 2);
+        assert_eq!(
+            ctx.propose(&[1, 2], 4).expect("A copies A"),
+            &[3, 4, 5, 6]
+        );
+
+        ctx.reset_request();
+        ctx.begin_request(&prompt_b);
+        assert_eq!(ctx.history(), prompt_b.as_slice());
+        assert_eq!(ctx.pool.occupied(), prompt_b.len() - 2);
+        // Request A's transitions must not draft inside request B.
+        assert!(ctx.propose(&[1, 2], 4).is_none());
+        ctx.reset_request();
+        ctx.begin_request(&prompt_b);
+        assert_eq!(
+            ctx.propose(&[200, 201], 4).expect("B copies B"),
+            &[202, 203, 204, 205]
+        );
+
+        // begin_request without an intervening reset_request also isolates.
+        ctx.begin_request(&prompt_a);
+        assert_eq!(ctx.pool.occupied(), prompt_a.len() - 2);
+        assert_eq!(ctx.history(), prompt_a.as_slice());
+        assert_eq!(
+            ctx.propose(&[1, 2], 4).expect("A again"),
+            &[3, 4, 5, 6]
+        );
+        ctx.begin_request(&prompt_b);
+        assert_eq!(ctx.pool.occupied(), prompt_b.len() - 2);
+        assert!(ctx.propose(&[1, 2], 4).is_none());
+    }
+
+    #[test]
+    fn context_candidate_buffer_is_not_reallocated() {
+        let cfg = ctx_cfg();
+        let mut ctx = MtpNgramContext::new(cfg).unwrap();
+        assert!(ctx.candidate.capacity() >= cfg.n_max);
+        let ptr = ctx.candidate.as_ptr();
+        let cap = ctx.candidate.capacity();
+        let prompt: Vec<u32> = (100..110).collect();
+        for _ in 0..3 {
+            ctx.begin_request(&prompt);
+            for caller_max in [4usize, 3, 2, 1, 4] {
+                let _ = ctx.propose(&[100, 101], caller_max);
+                assert_eq!(ctx.candidate.as_ptr(), ptr);
+                assert_eq!(ctx.candidate.capacity(), cap);
+            }
+            ctx.reset_request();
+            assert_eq!(ctx.candidate.as_ptr(), ptr);
+        }
+    }
+
+    #[test]
+    fn context_observe_result_clears_after_five_low_attempts() {
+        let cfg = small_cfg(1 << 20, 2, 1, 4);
+        let mut ctx = MtpNgramContext::new(cfg).unwrap();
+        let prompt: Vec<u32> = (1..=8).collect();
+        ctx.begin_request(&prompt);
+        assert!(ctx.pool.occupied() > 0);
+        for _ in 0..4 {
+            ctx.observe_result(4, 0);
+            assert!(ctx.pool.occupied() > 0);
+        }
+        // A healthy attempt resets the streak.
+        ctx.observe_result(4, 4);
+        for _ in 0..4 {
+            ctx.observe_result(8, 1);
+            assert!(ctx.pool.occupied() > 0);
+        }
+        ctx.observe_result(4, 0);
+        assert_eq!(ctx.pool.occupied(), 0);
+        assert!(ctx.propose(&[1, 2], 4).is_none());
+    }
+
+    #[test]
+    fn context_begin_request_resets_low_accept_streak() {
+        let cfg = small_cfg(1 << 20, 2, 1, 4);
+        let mut ctx = MtpNgramContext::new(cfg).unwrap();
+        let prompt: Vec<u32> = (1..=8).collect();
+        ctx.begin_request(&prompt);
+        for _ in 0..4 {
+            ctx.observe_result(4, 0);
+        }
+        ctx.begin_request(&prompt);
+        // One more low attempt would have been the fifth without the reset.
+        ctx.observe_result(4, 0);
+        assert_eq!(ctx.pool.occupied(), prompt.len() - 2);
+        // An already-empty pool still resets the streak.
+        let mut empty = MtpNgramContext::new(cfg).unwrap();
+        empty.begin_request(&[1]);
+        assert_eq!(empty.pool.occupied(), 0);
+        for _ in 0..4 {
+            empty.observe_result(4, 0);
+        }
+        empty.begin_request(&[1]);
+        assert_eq!(empty.pool.low_accept_streak, 0);
     }
 }

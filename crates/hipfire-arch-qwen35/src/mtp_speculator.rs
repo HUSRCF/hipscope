@@ -21,7 +21,7 @@ use crate::mtp_spec::{
     MtpSpecResult, MtpSpecState, PENALTY_REPEAT_CAP,
 };
 use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
-use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
+use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::spec::{
     terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar,
     SpecRequestConfig, SpecTarget, Speculator,
@@ -73,12 +73,11 @@ pub struct Qwen35MtpDrafter {
     /// `repeat_buf_cap = (repeat_buf bytes / 4).min(request repeat_window)`.
     /// Starts at [`PENALTY_REPEAT_CAP`] until a slot/mesh is first seen.
     ar_repeat_cap: usize,
-    ngram_pool: Option<NgramModPool>,
+    ngram: Option<MtpNgramContext>,
     ngram_active: bool,
-    ngram_context: Vec<u32>,
-    ngram_indexed_until: usize,
-    /// Number of host-emitted request tokens already appended to `ngram_context`.
-    ngram_emitted_len: usize,
+    /// Reusable copy of the current window's n-gram candidates (borrow split
+    /// from `ngram`; no per-window allocation).
+    ngram_candidates: Vec<u32>,
     /// Request-local wire counters (reset on configure_request).
     stats: MtpRequestStats,
     /// Identity of the window whose pre-verify state is still in `trunk_snap`.
@@ -121,11 +120,9 @@ impl Qwen35MtpDrafter {
             ctx_capacity,
             request: SpecRequestConfig::default(),
             ar_repeat_cap: PENALTY_REPEAT_CAP,
-            ngram_pool: None,
+            ngram: None,
             ngram_active: false,
-            ngram_context: Vec::new(),
-            ngram_indexed_until: 0,
-            ngram_emitted_len: 0,
+            ngram_candidates: Vec::new(),
             stats: MtpRequestStats::default(),
             last_window: None,
             checkpoints: Vec::new(),
@@ -256,41 +253,6 @@ impl Qwen35MtpDrafter {
         state.penalty = PenaltyHistory::new(w);
     }
 
-    fn reset_ngram_request(&mut self) {
-        self.ngram_context.clear();
-        self.ngram_indexed_until = 0;
-        self.ngram_emitted_len = 0;
-        self.stats = MtpRequestStats::default();
-    }
-
-    fn ngram_learn_tokens(&mut self, tokens: &[u32]) {
-        if !self.ngram_active || tokens.is_empty() {
-            return;
-        }
-        self.ngram_context.extend_from_slice(tokens);
-        if let Some(pool) = self.ngram_pool.as_mut() {
-            pool.insert_range(&self.ngram_context, self.ngram_indexed_until);
-        }
-        self.ngram_indexed_until = self.ngram_context.len();
-    }
-
-    /// Learn only tokens the emitter retained. GPU verify may commit a longer
-    /// speculative tail, so `mtp_step` results are never authoritative history.
-    fn ngram_sync_emitted(&mut self, emitted: &[u32]) {
-        if !self.ngram_active {
-            return;
-        }
-        debug_assert!(
-            emitted.len() >= self.ngram_emitted_len,
-            "qwen35 MTP emitted history must grow monotonically"
-        );
-        if emitted.len() <= self.ngram_emitted_len {
-            return;
-        }
-        self.ngram_learn_tokens(&emitted[self.ngram_emitted_len..]);
-        self.ngram_emitted_len = emitted.len();
-    }
-
     /// Allocate `state` against `slot` on first use, plus both compressed
     /// sidecar scratches when the head ships a compressed vocab, then apply
     /// the current request. Subsequent calls are a no-op (warm hits persist).
@@ -346,19 +308,18 @@ impl Qwen35MtpDrafter {
         Ok(())
     }
 
-    fn seed_ngram_context(&mut self, prompt_tokens: &[u32], first_token: u32) {
-        // Seed request-local n-gram history exactly once. Prefix realignment
+    fn begin_ngram_request(&mut self, prompt_tokens: &[u32]) {
+        // Begin request-local n-gram history exactly once. Prefix realignment
         // calls prefill again inside the same request; preserving this context
-        // keeps counters and already-emitted history intact.
-        if self.ngram_active && self.ngram_context.is_empty() {
-            self.ngram_context.extend_from_slice(prompt_tokens);
-            self.ngram_context.push(first_token);
-            if let Some(pool) = self.ngram_pool.as_mut() {
-                let n_match = pool.config().n_match;
-                pool.insert_range(&self.ngram_context, n_match);
+        // keeps counters and already-emitted history intact. The first token
+        // reaches the context through `emitted` in `mtp_step`.
+        if !self.ngram_active {
+            return;
+        }
+        if let Some(ctx) = self.ngram.as_mut() {
+            if !ctx.is_begun() {
+                ctx.begin_request(prompt_tokens);
             }
-            self.ngram_indexed_until = self.ngram_context.len();
-            self.ngram_emitted_len = 1;
         }
     }
 
@@ -466,7 +427,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             if abort() {
                 return Err("aborted".into());
             }
-            self.seed_ngram_context(prompt_tokens, first_token);
+            self.begin_ngram_request(prompt_tokens);
             return Ok(first_token);
         }
         let slot = Self::slot(target)?;
@@ -540,7 +501,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             sample_from_logits(&logits, &state.sampling, &mut state.rng).0
         };
 
-        self.seed_ngram_context(prompt_tokens, first_token);
+        self.begin_ngram_request(prompt_tokens);
         Ok(first_token)
     }
 
@@ -560,23 +521,26 @@ impl MtpDrafter for Qwen35MtpDrafter {
         // MtpSpeculator (already clamped by remaining max_emit); the fixed-window
         // compressed-serial core must honor it — never draft state.max_n blindly.
         // Sampling lives on `state` from configure_request; no per-step reconfig.
-        self.ngram_sync_emitted(emitted);
-        if self.ngram_active && !emitted.is_empty() {
-            debug_assert!(
-                self.ngram_context.ends_with(emitted),
-                "qwen35 MTP ngram context suffix must match emitted (ctx={}, emitted={})",
-                self.ngram_context.len(),
-                emitted.len()
-            );
+        self.ngram_candidates.clear();
+        if self.ngram_active {
+            if let Some(ctx) = self.ngram.as_mut() {
+                if Self::tp_target(target).is_some() {
+                    // The mesh has no takeover verify: learn emitted history only.
+                    ctx.sync_emitted(emitted);
+                } else if let Some(c) = ctx.propose(emitted, k) {
+                    self.ngram_candidates.extend_from_slice(c);
+                }
+                if !emitted.is_empty() {
+                    debug_assert!(
+                        ctx.history().ends_with(emitted),
+                        "qwen35 MTP ngram context suffix must match emitted (ctx={}, emitted={})",
+                        ctx.history().len(),
+                        emitted.len()
+                    );
+                }
+            }
         }
-        let ngram_cands = if self.ngram_active {
-            self.ngram_pool
-                .as_ref()
-                .and_then(|pool| pool.draft(&self.ngram_context, k))
-        } else {
-            None
-        };
-        let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
+        let used_ngram = !self.ngram_candidates.is_empty();
         let modifier = self.ngram_active;
         let native_k = k.min(self.max_n);
 
@@ -605,9 +569,15 @@ impl MtpDrafter for Qwen35MtpDrafter {
             if used_ngram {
                 // The takeover fills the head KV for every row it commits, so
                 // native MTP stays live for the next pool miss.
-                let cands = ngram_cands.as_ref().expect("used_ngram implies candidates");
                 spec_step_mtp_compressed_serial_with_takeover_candidates(
-                    gpu, slot, &self.head, state, position, seed, eos, cands,
+                    gpu,
+                    slot,
+                    &self.head,
+                    state,
+                    position,
+                    seed,
+                    eos,
+                    &self.ngram_candidates,
                 )
             } else {
                 spec_step_mtp_compressed_serial_with_k(
@@ -627,8 +597,8 @@ impl MtpDrafter for Qwen35MtpDrafter {
             self.stats.ngram_mod_windows += 1;
             self.stats.ngram_mod_drafts += r.drafts_generated;
             self.stats.ngram_mod_accepted += r.accept_count;
-            if let Some(pool) = self.ngram_pool.as_mut() {
-                let _ = pool.record_draft_result(r.drafts_generated as u32, r.accept_count as u32);
+            if let Some(ctx) = self.ngram.as_mut() {
+                ctx.observe_result(r.drafts_generated, r.accept_count);
             }
         } else {
             self.stats.mtp_windows += 1;
@@ -740,7 +710,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.last_window = None;
         self.tp_reset_pending = self.tp.is_some();
-        self.reset_ngram_request();
+        self.stats = MtpRequestStats::default();
+        if let Some(ctx) = self.ngram.as_mut() {
+            ctx.reset_request();
+        }
         self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
@@ -842,9 +815,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn proposal_capacity(&self) -> usize {
         if self.ngram_active {
-            self.ngram_pool
+            self.ngram
                 .as_ref()
-                .map(|p| self.max_n.max(p.config().n_max))
+                .map(|c| self.max_n.max(c.config().n_max))
                 .unwrap_or(self.max_n)
         } else {
             self.max_n
@@ -871,7 +844,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
         if let Some(rt) = self.tp.as_mut() {
             Self::apply_request(&mut rt.state, cfg, self.ar_repeat_cap);
         }
-        self.reset_ngram_request();
+        self.stats = MtpRequestStats::default();
+        if let Some(ctx) = self.ngram.as_mut() {
+            ctx.reset_request();
+        }
         self.ngram_active = false;
         if !cfg.allow_ngram_modifier || cfg.temp > 1e-6 {
             return;
@@ -879,17 +855,14 @@ impl MtpDrafter for Qwen35MtpDrafter {
         let Some(new_cfg) = ngram_mod_env_config() else {
             return;
         };
-        let reuse = self
-            .ngram_pool
-            .as_ref()
-            .is_some_and(|p| p.config() == &new_cfg);
+        let reuse = self.ngram.as_ref().is_some_and(|c| c.config() == &new_cfg);
         if !reuse {
-            match NgramModPool::new(new_cfg) {
-                Ok(pool) => self.ngram_pool = Some(pool),
+            match MtpNgramContext::new(new_cfg) {
+                Ok(ctx) => self.ngram = Some(ctx),
                 Err(_) => return,
             }
         }
-        self.ngram_active = self.ngram_pool.is_some();
+        self.ngram_active = self.ngram.is_some();
         self.stats.mtp_ngram = self.ngram_active;
     }
 

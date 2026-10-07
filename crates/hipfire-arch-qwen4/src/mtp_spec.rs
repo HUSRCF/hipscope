@@ -16,14 +16,15 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan};
-use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
+use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
+use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
-    SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow,
+    SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
@@ -580,6 +581,21 @@ fn draft_accept_estimate(margin: f32) -> f32 {
     }
 }
 
+/// `QWEN4_MTP_TRACE` per-row `{draft, pick, match}` objects.
+fn trace_rows(drafts: &[u32], picks: &[u32]) -> String {
+    drafts
+        .iter()
+        .zip(picks)
+        .map(|(draft, pick)| {
+            format!(
+                "{{\"draft\":{draft},\"pick\":{pick},\"match\":{}}}",
+                draft == pick
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Sampled verification algorithm (`HIPFIRE_MTP_SAMPLED_MODE`, resolved once
 /// per drafter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -894,6 +910,22 @@ pub struct Qwen4MtpDrafter {
     /// strict-prefix terminal this drafter cannot repair (the spec terminal
     /// reset path).
     end_of_turn: Option<u32>,
+    /// N-gram pool configuration resolved at load for this GPU
+    /// (`hipfire_config::ngram_mod_triple_for_arch`); `None` disables the
+    /// n-gram takeover for every request.
+    ngram_config: Option<NgramModConfig>,
+    /// Request-local n-gram proposal owner, allocated on the first armed
+    /// request and reused (cleared and reseeded) by every later one.
+    ngram: Option<MtpNgramContext>,
+    /// This request tries an n-gram takeover before each native window
+    /// (`SpecRequestConfig::allow_ngram_modifier`).
+    ngram_active: bool,
+    /// The current window's candidates, copied out of the pool (reused).
+    ngram_candidates: Vec<u32>,
+    /// `[seed, candidates..]` of the current takeover window (reused).
+    takeover_block: Vec<u32>,
+    /// Request-local wire counters (reset by `configure_request`).
+    stats: MtpRequestStats,
 }
 
 impl Qwen4MtpDrafter {
@@ -912,7 +944,20 @@ impl Qwen4MtpDrafter {
             sampled: None,
             append_scratch: None,
             end_of_turn,
+            ngram_config: None,
+            ngram: None,
+            ngram_active: false,
+            ngram_candidates: Vec::new(),
+            takeover_block: Vec::new(),
+            stats: MtpRequestStats::default(),
         }
+    }
+
+    /// Enable n-gram takeover windows with `config` for requests that arm
+    /// `allow_ngram_modifier`; `None` keeps every window native.
+    pub fn with_ngram(mut self, config: Option<NgramModConfig>) -> Self {
+        self.ngram_config = config;
+        self
     }
 
     /// A sampled request needs sampled verification enabled (and a valid
@@ -1172,7 +1217,7 @@ impl Qwen4MtpDrafter {
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}"
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}"
             );
         }
         if timers.enabled() {
@@ -1240,6 +1285,480 @@ impl Qwen4MtpDrafter {
     pub(crate) fn pending_hidden_for_parity(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden()
     }
+
+    /// One n-gram takeover window: the pool's `candidates` replace the MTP
+    /// head's drafts for this window.
+    ///
+    /// `[seed, candidates..]` is verified through the same target executor
+    /// as a native window: the batched `verify_block` with row-capture
+    /// rollback, or under `HIPFIRE_MTP_INCREMENTAL=1` the interleaved
+    /// one-row route that stops at the first rejection. Acceptance is the
+    /// shared rule of the request: greedy prefix match, or sampled with each
+    /// candidate's draft distribution the point mass δ(candidate) (accept with
+    /// probability p(candidate), otherwise draw from p without it), or the
+    /// naive AR-sampler draw per row.
+    ///
+    /// The head never proposed these rows, so after the target keeps its
+    /// consumed rows (`seed` plus the accepted candidates; an accepted
+    /// end-of-turn stays pending) the MTP head appends exactly those rows,
+    /// teacher-forced: token `p` paired with the target hidden of row `p`,
+    /// the pairing of the prompt fill and `mtp_forced_advance`, through the
+    /// batched append where it runs. The pending hidden becomes the last
+    /// consumed row's, so the next native window drafts as it would after a
+    /// prompt fill ending there. A rejected tail never reaches either owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_takeover_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        candidates: &[u32],
+        eos: u32,
+    ) -> Result<MtpWindow, String> {
+        let eos = self.end_of_turn.unwrap_or(eos);
+        self.require_supported_request()?;
+        // The window's penalty history restarts from `emitted` (idempotent
+        // after `mtp_step`'s own `begin_window`).
+        if let Some(s) = self.sampled.as_mut() {
+            s.begin_window(emitted);
+        }
+        if candidates.is_empty() {
+            return Err("Qwen4 MTP takeover has no candidates".to_string());
+        }
+        self.ensure_resources(gpu, target)?;
+        {
+            let bundle = Self::bundle(target)?;
+            let vocab = bundle.config.vocab_size;
+            if let Some(&token) = candidates.iter().find(|&&token| token as usize >= vocab) {
+                return Err(format!(
+                    "Qwen4 MTP takeover candidate {token} is outside the {vocab}-token vocabulary"
+                ));
+            }
+            let target_position = bundle.state.position;
+            let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
+            if target_position != position || mtp_position != position {
+                return Err(format!(
+                    "Qwen4 MTP takeover position mismatch: target={target_position}, mtp={mtp_position}, position={position}"
+                ));
+            }
+        }
+        let trace =
+            hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
+        let interleaved = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL")
+            .is_ok_and(|value| value == "1");
+        let mut sampled = self.sampled.take();
+        let window = if interleaved {
+            self.takeover_interleaved(
+                gpu,
+                target,
+                position,
+                seed,
+                candidates,
+                eos,
+                trace,
+                sampled.as_mut(),
+            )
+        } else {
+            self.takeover_batched(
+                gpu,
+                target,
+                position,
+                seed,
+                candidates,
+                eos,
+                trace,
+                sampled.as_mut(),
+            )
+        };
+        self.sampled = sampled;
+        window
+    }
+
+    /// With the request armed, ask the pool for a candidate run over the
+    /// authoritative history (prompt plus `emitted`, which holds the seed);
+    /// a hit runs one takeover window, a miss (`None`) leaves the window to
+    /// native MTP. Takeover results never feed the native agreement table.
+    #[allow(clippy::too_many_arguments)]
+    fn try_ngram_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        k: usize,
+        eos: u32,
+    ) -> Result<Option<MtpWindow>, String> {
+        if !self.ngram_active {
+            return Ok(None);
+        }
+        let Some(ctx) = self.ngram.as_mut() else {
+            return Ok(None);
+        };
+        let Some(candidates) = ctx.propose(emitted, k) else {
+            return Ok(None);
+        };
+        self.ngram_candidates.clear();
+        self.ngram_candidates.extend_from_slice(candidates);
+        let candidates = std::mem::take(&mut self.ngram_candidates);
+        let window =
+            self.mtp_takeover_step(gpu, target, position, seed, emitted, &candidates, eos);
+        self.ngram_candidates = candidates;
+        let window = window?;
+        self.stats.ngram_mod_windows += 1;
+        self.stats.ngram_mod_drafts += window.drafts_generated;
+        self.stats.ngram_mod_accepted += window.accepted;
+        if let Some(ctx) = self.ngram.as_mut() {
+            ctx.observe_result(window.drafts_generated, window.accepted);
+        }
+        Ok(Some(window))
+    }
+
+    /// Batched takeover: one `[seed, candidates..]` verify, rollback to the
+    /// consumed rows, teacher-forced head append. Two-owner transaction as in
+    /// the native batched window: any failure restores target and head.
+    #[allow(clippy::too_many_arguments)]
+    fn takeover_batched(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        candidates: &[u32],
+        eos: u32,
+        trace: bool,
+        mut sampled: Option<&mut SampledVerify>,
+    ) -> Result<MtpWindow, String> {
+        let n = candidates.len();
+        let mut block = std::mem::take(&mut self.takeover_block);
+        block.clear();
+        block.push(seed);
+        block.extend_from_slice(candidates);
+        let mut timers = MtpPhaseTimers::new();
+        let window_start = Instant::now();
+        let mut accepted_drafts = 0usize;
+        let mut snapshot = match Self::bundle(target).and_then(|bundle| {
+            bundle.mtp_snapshot(gpu).map_err(|error| error.to_string())
+        }) {
+            Ok(ticket) => Some(ticket),
+            Err(error) => {
+                self.takeover_block = block;
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<MtpWindow, String> {
+            // The verify's PLE rows are SSD-resident: start reading them now.
+            Self::bundle(target)?.warm_ple_rows(&block);
+            timers.mark(gpu, "verify");
+            let bundle = Self::bundle(target)?;
+            let scratch = self
+                .scratch
+                .as_mut()
+                .ok_or_else(|| "Qwen4 MTP takeover verify scratch is not allocated".to_string())?;
+            let mut target_picks = bundle.verify_block(gpu, &block, position, scratch.as_mut(), None)?;
+            if target_picks.len() < block.len() {
+                return Err(format!(
+                    "Qwen4 MTP takeover verifier returned {} rows for {n} candidates",
+                    target_picks.len()
+                ));
+            }
+            // The request's shared acceptance: each candidate row's `p` is
+            // penalized with the window history plus the candidates before it,
+            // and a sampled candidate's `q` is the point mass on it.
+            let acceptance = match sampled.as_deref_mut() {
+                Some(s) if !s.draws_drafts() => {
+                    s.accept_naive(gpu, bundle, candidates, eos, &mut target_picks)?
+                }
+                Some(s) => s.accept_leviathan(gpu, bundle, candidates, true, eos)?,
+                None => accept_native_greedy(candidates, &target_picks, Some(eos))?,
+            };
+            accepted_drafts = acceptance.accepted;
+            let target_accept_len = target_commit_accept_len(&acceptance);
+            let consumed = target_accept_len + 1;
+            let target_scratch = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .ok_or("Qwen4 MTP takeover target scratch type changed")?;
+            let target_snapshot = target_scratch
+                .target_snapshot
+                .ok_or("Qwen4 MTP takeover target snapshot disappeared")?;
+            if consumed < block.len() && bundle.state.row_capture_rows() >= block.len() {
+                timers.mark(gpu, "target_rollback");
+                bundle
+                    .rollback_verify_rows_retain(gpu, target_snapshot, consumed, &block)
+                    .map_err(|error| error.to_string())?;
+            } else if consumed < block.len() {
+                timers.mark(gpu, "target_replay");
+                bundle
+                    .restore_retain(gpu, target_snapshot)
+                    .map_err(|error| error.to_string())?;
+                bundle
+                    .spec_forward_rows(gpu, &block[..consumed], true)
+                    .map_err(|error| error.to_string())?;
+            }
+            // The kept rows' captured hiddens are spec hidden rows
+            // `0..consumed` (the verify's, or the replay's).
+            timers.mark(gpu, "head_fill");
+            let fill = self
+                .append_scratch
+                .as_mut()
+                .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
+            match fill {
+                Some(fill) => bundle
+                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, position)
+                    .map_err(|error| error.to_string())?,
+                None => {
+                    let row_hidden = self
+                        .row_hidden
+                        .as_ref()
+                        .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+                    for (row, &token) in block[..consumed].iter().enumerate() {
+                        bundle
+                            .copy_spec_hidden_row_to(gpu, row, row_hidden)
+                            .map_err(|error| error.to_string())?;
+                        bundle
+                            .mtp_append_token(gpu, token, Some(row_hidden), position + row)
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            timers.mark(gpu, "commit");
+            let committed_end = position + consumed;
+            let mtp_end = bundle.mtp_position().map_err(|error| error.to_string())?;
+            if bundle.state.position != committed_end || mtp_end != committed_end {
+                return Err(format!(
+                    "Qwen4 MTP takeover ended at target={} mtp={mtp_end}, expected {committed_end}",
+                    bundle.state.position
+                ));
+            }
+            let pending_hidden = self
+                .pending_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(gpu, target_accept_len, pending_hidden)
+                .map_err(|error| error.to_string())?;
+            if trace {
+                eprintln!(
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true}}",
+                    acceptance.accepted,
+                    trace_rows(candidates, &target_picks),
+                    acceptance.committed
+                );
+            }
+            let mtp_ticket = snapshot
+                .as_ref()
+                .copied()
+                .expect("MTP snapshot remains active until transaction commit");
+            bundle
+                .validate_commit(target_snapshot)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .mtp_validate_commit(mtp_ticket)
+                .map_err(|error| error.to_string())?;
+            bundle.commit_validated(target_snapshot);
+            bundle.mtp_commit_validated(mtp_ticket);
+            target_scratch.target_snapshot = None;
+            snapshot = None;
+            Ok(MtpWindow {
+                committed: acceptance.committed,
+                accepted: acceptance.accepted,
+                drafts_generated: n,
+            })
+        })();
+        self.takeover_block = block;
+        if timers.enabled() {
+            let fields = format!(
+                "\"source\":\"ngram\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{n},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
+                window_start.elapsed().as_secs_f64() * 1e6,
+                unix_micros()
+            );
+            timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
+        }
+        if let Err(error) = &result {
+            if let Err(rollback) = self.rollback_failed_window(gpu, target, snapshot.take()) {
+                return Err(format!("{error}; rollback failed: {rollback}"));
+            }
+        }
+        result
+    }
+
+    /// Restore both owners after a failed batched window: the target from
+    /// the verify scratch's active ticket, the head from `mtp_ticket`. Errors
+    /// name every restore that failed.
+    fn rollback_failed_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        mtp_ticket: Option<MtpGpuStateSnapshot>,
+    ) -> Result<(), String> {
+        let mut rollback_errors = Vec::new();
+        let target_ticket = match self.scratch.as_mut() {
+            Some(scratch) => match scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
+                Some(scratch) => scratch.target_snapshot.take(),
+                None => {
+                    rollback_errors.push("target rollback scratch type changed".to_string());
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(ticket) = target_ticket {
+            if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
+                bundle
+                    .restore(gpu, ticket)
+                    .map_err(|restore| restore.to_string())
+            }) {
+                rollback_errors.push(format!("target rollback failed: {rollback}"));
+            }
+        }
+        if let Some(ticket) = mtp_ticket {
+            if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
+                bundle
+                    .mtp_restore(gpu, ticket)
+                    .map_err(|restore| restore.to_string())
+            }) {
+                rollback_errors.push(format!("MTP rollback failed: {rollback}"));
+            }
+        }
+        if rollback_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(rollback_errors.join("; "))
+        }
+    }
+
+    /// Interleaved takeover (`HIPFIRE_MTP_INCREMENTAL=1`): the native
+    /// one-row target route with the candidates in place of head drafts.
+    /// Each row commits as it is produced and the head appends it
+    /// teacher-forced; the window stops at the first rejection.
+    #[allow(clippy::too_many_arguments)]
+    fn takeover_interleaved(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        candidates: &[u32],
+        eos: u32,
+        trace: bool,
+        mut sampled: Option<&mut SampledVerify>,
+    ) -> Result<MtpWindow, String> {
+        let n = candidates.len();
+        let mut timers = MtpPhaseTimers::new();
+        let mut committed: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut picks: Vec<u32> = Vec::with_capacity(n + 1);
+        // Row `r`'s penalty history is the window base plus the candidates
+        // accepted before it.
+        if let Some(s) = sampled.as_deref_mut() {
+            s.history.rewind_drafts();
+        }
+        let mut token = seed;
+        let mut accepted = 0usize;
+        let mut row = 0usize;
+        loop {
+            let token_position = position + row;
+            timers.mark(gpu, "target_row");
+            let mut pick = Self::bundle(target)?
+                .spec_capture_token(gpu, token)
+                .map_err(|error| error.to_string())?;
+            match sampled.as_deref_mut() {
+                Some(s) if !s.draws_drafts() => {
+                    pick = s.naive_draw(gpu, Self::bundle(target)?, 0, row)?
+                }
+                Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
+                None => {}
+            }
+            picks.push(pick);
+            timers.mark(gpu, "head_fill");
+            let row_hidden = self
+                .row_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+            {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .copy_spec_hidden_row_to(gpu, 0, row_hidden)
+                    .map_err(|error| error.to_string())?;
+                bundle
+                    .mtp_append_token(gpu, token, Some(row_hidden), token_position)
+                    .map_err(|error| error.to_string())?;
+            }
+            if row == n {
+                committed.push(match sampled.as_deref_mut() {
+                    Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
+                    _ => pick,
+                });
+                break;
+            }
+            let candidate = candidates[row];
+            let verdict = match sampled.as_deref_mut() {
+                Some(s) if s.draws_drafts() => {
+                    if s.points.is_empty() {
+                        s.points.push(SparseDist::default());
+                    }
+                    s.points[0].set_point_mass(candidate);
+                    verify_sampled_draft(&s.target, &s.points[0], candidate, &mut s.rng)
+                }
+                _ if candidate == pick => DraftVerdict::Accept,
+                _ => DraftVerdict::Reject(pick),
+            };
+            match verdict {
+                DraftVerdict::Accept => {
+                    accepted += 1;
+                    committed.push(candidate);
+                    if let Some(s) = sampled.as_deref_mut() {
+                        s.history.push_draft(candidate);
+                    }
+                    if candidate == eos {
+                        break;
+                    }
+                    token = candidate;
+                    row += 1;
+                }
+                DraftVerdict::Reject(replacement) => {
+                    committed.push(replacement);
+                    break;
+                }
+            }
+        }
+        // The next window's row-0 hidden is the last consumed row's.
+        {
+            let row_hidden = self.row_hidden()?;
+            let pending = self.pending_hidden()?;
+            gpu.copy_d2d(row_hidden, pending, pending.byte_size())
+                .map_err(|error| format!("Qwen4 MTP takeover pending hidden copy: {error}"))?;
+        }
+        let committed_end = position + row + 1;
+        let bundle = Self::bundle(target)?;
+        let mtp_end = bundle.mtp_position().map_err(|error| error.to_string())?;
+        if bundle.state.position != committed_end || mtp_end != committed_end {
+            return Err(format!(
+                "Qwen4 MTP interleaved takeover ended at target={} mtp={mtp_end}, expected {committed_end}",
+                bundle.state.position
+            ));
+        }
+        if trace {
+            eprintln!(
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}}}",
+                trace_rows(candidates, &picks)
+            );
+        }
+        if timers.enabled() {
+            let fields = format!(
+                "\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"t_end\":{}",
+                unix_micros()
+            );
+            timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
+        }
+        Ok(MtpWindow {
+            committed,
+            accepted,
+            drafts_generated: n,
+        })
+    }
 }
 
 impl MtpDrafter for Qwen4MtpDrafter {
@@ -1256,6 +1775,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.require_supported_request()?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+        // The request's n-gram history starts from the full canonical prompt
+        // (cache hit or miss), once per request: a realignment re-prefill
+        // keeps the history it already holds.
+        if self.ngram_active {
+            if let Some(ctx) = self.ngram.as_mut().filter(|ctx| !ctx.is_begun()) {
+                ctx.begin_request(prompt_tokens);
+            }
+        }
         // A miss resets target, head and draft policy; a hit restores the
         // bundle's canonical checkpoint at `start_pos` into all three.
         let plan = Qwen4PrefixPlan {
@@ -1407,10 +1934,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
     ) -> Result<MtpWindow, String> {
         let eos = self.end_of_turn.unwrap_or(eos);
         self.require_supported_request()?;
-        if k > self.max_k {
+        if k > self.proposal_capacity() {
             return Err(format!(
-                "Qwen4 native MTP draft budget {k} exceeds configured K {}",
-                self.max_k
+                "Qwen4 native MTP draft budget {k} exceeds the proposal capacity {}",
+                self.proposal_capacity()
             ));
         }
         // The window's penalty history is rebuilt from the tokens emitted so
@@ -1421,6 +1948,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
 
         self.ensure_resources(gpu, target)?;
+        if let Some(window) = self.try_ngram_window(gpu, target, position, seed, emitted, k, eos)? {
+            return Ok(window);
+        }
+        // A pool miss drafts natively, within the head's own K.
+        let k = k.min(self.max_k);
+        self.stats.mtp_windows += 1;
         let trace =
             hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
         // Route: a (k+1)-row batched verify costs about 2.5 single-row
@@ -1575,7 +2108,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .collect::<Vec<_>>()
                     .join(",");
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
                     acceptance.committed
                 );
             }
@@ -1709,40 +2242,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
         }
         if let Err(error) = &result {
-            let mut rollback_errors = Vec::new();
-            let target_ticket = match self.scratch.as_mut() {
-                Some(scratch) => match scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
-                    Some(scratch) => scratch.target_snapshot.take(),
-                    None => {
-                        rollback_errors.push("target rollback scratch type changed".to_string());
-                        None
-                    }
-                },
-                None => None,
-            };
-            if let Some(ticket) = target_ticket {
-                if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
-                    bundle
-                        .restore(gpu, ticket)
-                        .map_err(|restore| restore.to_string())
-                }) {
-                    rollback_errors.push(format!("target rollback failed: {rollback}"));
-                }
-            }
-            if let Some(ticket) = snapshot.take() {
-                if let Err(rollback) = Self::bundle(target).and_then(|bundle| {
-                    bundle
-                        .mtp_restore(gpu, ticket)
-                        .map_err(|restore| restore.to_string())
-                }) {
-                    rollback_errors.push(format!("MTP rollback failed: {rollback}"));
-                }
-            }
-            if !rollback_errors.is_empty() {
-                return Err(format!(
-                    "{error}; rollback failed: {}",
-                    rollback_errors.join("; ")
-                ));
+            if let Err(rollback) = self.rollback_failed_window(gpu, target, snapshot.take()) {
+                return Err(format!("{error}; rollback failed: {rollback}"));
             }
         }
         result
@@ -1821,8 +2322,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.max_k
     }
 
+    /// An armed n-gram pool may offer up to its `n_max` candidates; native
+    /// windows still draft at most K.
     fn proposal_capacity(&self) -> usize {
-        self.max_k
+        match (self.ngram_active, self.ngram_config) {
+            (true, Some(config)) => self.max_k.max(config.n_max),
+            _ => self.max_k,
+        }
     }
 
     fn ctx_capacity(&self) -> usize {
@@ -1843,25 +2349,72 @@ impl MtpDrafter for Qwen4MtpDrafter {
             (true, Ok(mode)) => Some(SampledVerify::new(cfg, self.max_k, *mode)),
             _ => None,
         };
+        // N-gram takeovers: greedy and sampled, thinking on or off. The pool
+        // allocation is reused; its history restarts with this request.
+        self.stats = MtpRequestStats::default();
+        self.ngram_active = false;
+        if let Some(ctx) = self.ngram.as_mut() {
+            ctx.reset_request();
+        }
+        if let (true, Some(config)) = (cfg.allow_ngram_modifier, self.ngram_config) {
+            if self.ngram.as_ref().is_none_or(|ctx| ctx.config() != &config) {
+                self.ngram = MtpNgramContext::new(config).ok();
+            }
+            self.ngram_active = self.ngram.is_some();
+        }
+        self.stats.mtp_ngram = self.ngram_active;
     }
 
     fn supports_temp_verify(&self) -> bool {
         self.sampled_enabled
     }
+
+    fn request_stats(&self) -> MtpRequestStats {
+        let mut stats = self.stats;
+        stats.ngram_mod_accept_rate = if stats.ngram_mod_drafts > 0 {
+            let rate = stats.ngram_mod_accepted as f64 / stats.ngram_mod_drafts as f64;
+            (rate * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
+        stats
+    }
 }
 
 /// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
-/// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one.
+/// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one;
+/// `ngram` is the n-gram pool configuration requests may arm.
 pub fn build_qwen4_mtp_speculator(
     max_k: usize,
     ctx_capacity: usize,
     end_of_turn: Option<u32>,
+    ngram: Option<NgramModConfig>,
 ) -> Box<dyn Speculator> {
-    Box::new(MtpSpeculator::new(Qwen4MtpDrafter::new(
-        max_k,
-        ctx_capacity,
-        end_of_turn,
-    )))
+    Box::new(MtpSpeculator::new(
+        Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn).with_ngram(ngram),
+    ))
+}
+
+/// The n-gram pool configuration for a `(n_match, n_min, n_max)` triple
+/// (`hipfire_config::ngram_mod_triple_for_arch`). A takeover verifies
+/// `n + 1` rows, so `n_max` is capped one below the spec verify capacity
+/// (and `n_min` with it); a triple the pool cannot run is an error, never a
+/// silently different policy.
+pub fn qwen4_ngram_mod_config(
+    (n_match, n_min, n_max): (usize, usize, usize),
+) -> Result<NgramModConfig, String> {
+    if n_match == 0 || n_max == 0 || n_max > 64 || n_min > n_max {
+        return Err(format!(
+            "invalid n-gram triple n_match={n_match} n_min={n_min} n_max={n_max} (need 1 <= n_match, n_min <= n_max <= 64)"
+        ));
+    }
+    let n_max = n_max.min(crate::gpu_forward::QWEN4_SPEC_VERIFY_ROWS - 1);
+    Ok(NgramModConfig {
+        n_match,
+        n_min: n_min.min(n_max),
+        n_max,
+        ..NgramModConfig::default()
+    })
 }
 
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`: the batched prompt-fill Append pass is on
@@ -2158,5 +2711,19 @@ mod tests {
         assert_eq!(s.history.row(2), &[3, 7, 8, 9]);
         s.history.rewind_drafts();
         assert_eq!(s.history.row(0), &[1, 2, 3, 7]);
+    }
+
+    #[test]
+    fn ngram_config_caps_n_max_below_the_verify_rows() {
+        let config = qwen4_ngram_mod_config((5, 3, 3)).expect("arch-16 default");
+        assert_eq!((config.n_match, config.n_min, config.n_max), (5, 3, 3));
+        assert_eq!(config.capacity, NgramModConfig::default().capacity);
+        // [seed, 64 candidates] would be 65 verify rows: one too many.
+        let config = qwen4_ngram_mod_config((24, 48, 64)).expect("inherited triple");
+        assert_eq!((config.n_match, config.n_min, config.n_max), (24, 48, 63));
+        assert!(qwen4_ngram_mod_config((0, 1, 3)).is_err());
+        assert!(qwen4_ngram_mod_config((5, 4, 3)).is_err());
+        assert!(qwen4_ngram_mod_config((5, 3, 0)).is_err());
+        assert!(qwen4_ngram_mod_config((5, 3, 65)).is_err());
     }
 }
