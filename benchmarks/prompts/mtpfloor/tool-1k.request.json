@@ -1,0 +1,327 @@
+{
+  "model": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request."
+    },
+    {
+      "role": "user",
+      "content": "Find a 45-minute slot next Wednesday afternoon for Elena and Ravi, use the Berlin office only, book the smallest room that fits three people, attach the agenda, and email both attendees."
+    },
+    {
+      "role": "assistant",
+      "content": "I'll start by looking up the contacts and checking available slots and rooms in parallel.\n\n\n\n\n",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "get_contacts",
+            "arguments": "{\"query\":\"Elena\"}"
+          }
+        },
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_contacts",
+            "arguments": "{\"query\":\"Ravi\"}"
+          }
+        },
+        {
+          "id": "call_2",
+          "type": "function",
+          "function": {
+            "name": "search_slots",
+            "arguments": "{\"date\":\"2026-03-25\",\"period\":\"afternoon\",\"duration_minutes\":45}"
+          }
+        },
+        {
+          "id": "call_3",
+          "type": "function",
+          "function": {
+            "name": "search_rooms",
+            "arguments": "{\"office\":\"Berlin\",\"minimum_capacity\":3}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"results\": [{\"name\": \"Elena\", \"email\": \"redacted@example.com\", \"id\": \"contact_1000\", \"department\": \"Engineering\", \"phone\": \"+1-555-0100\", \"title\": \"Team Member\", \"last_contacted\": \"2026-03-18T15:30:00Z\", \"notes\": \"\", \"source\": \"directory\"}], \"total_contacts\": 1, \"directory_version\": \"2026.03\", \"request_id\": \"req_ct_6e3b2a1c\"}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"results\": [{\"name\": \"Ravi\", \"email\": \"redacted@example.com\", \"id\": \"contact_1000\", \"department\": \"Engineering\", \"phone\": \"+1-555-0100\", \"title\": \"Team Member\", \"last_contacted\": \"2026-03-18T15:30:00Z\", \"notes\": \"\", \"source\": \"directory\"}], \"total_contacts\": 1, \"directory_version\": \"2026.03\", \"request_id\": \"req_ct_6e3b2a1c\"}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_2",
+      "content": "{\"slots\": [{\"date\": \"2026-03-25\", \"time\": \"14:00\", \"duration_minutes\": 45}]}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_3",
+      "content": "{\"rooms\": [{\"room_id\": \"berlin_3a\", \"office\": \"Berlin\", \"capacity\": 3, \"available\": true}, {\"room_id\": \"berlin_5b\", \"office\": \"Berlin\", \"capacity\": 5, \"available\": true}, {\"room_id\": \"munich_3a\", \"office\": \"Munich\", \"capacity\": 3, \"available\": true}]}"
+    },
+    {
+      "role": "assistant",
+      "content": "I found a slot and rooms. Now let me locate the agenda file before booking.\n\n",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "search_files",
+            "arguments": "{\"query\":\"agenda\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"results\": [{\"file_id\": \"agenda_q2\", \"name\": \"Agenda_Q2.pdf\", \"size_bytes\": 28416, \"modified_at\": \"2026-03-15T09:22:11Z\", \"created_at\": \"2026-02-10T14:00:00Z\", \"owner\": \"system\", \"path\": \"/documents/Agenda_Q2.pdf\", \"permissions\": \"read\", \"content_type\": \"application/octet-stream\"}], \"total_matches\": 1, \"search_time_ms\": 18, \"index_version\": \"idx-2026.03\", \"request_id\": \"req_fs_3d4a8e2b\"}"
+    },
+    {
+      "role": "assistant",
+      "content": "Now I'll book the smallest qualifying Berlin room (berlin_3a, capacity 3) for the available slot.\n\n",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "book_room",
+            "arguments": "{\"room_id\":\"berlin_3a\",\"date\":\"2026-03-25\",\"time\":\"14:00\",\"duration_minutes\":45,\"attendees\":[\"redacted@example.com\",\"redacted@example.com\"]}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"error\": \"Room became unavailable during booking.\", \"error_code\": \"ERR_TOOL_UNAVAILABLE\", \"timestamp\": \"2026-03-20T12:00:00Z\", \"trace_id\": \"trace_e808a8f8\", \"documentation_url\": \"https://docs.example.com/errors/ERR_TOOL_UNAVAILABLE\", \"request_id\": \"req_err_e808a8f8\"}"
+    },
+    {
+      "role": "assistant",
+      "content": "The first room became unavailable mid-booking. Let me verify current availability and try the next-smallest Berlin option.\n\n",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "search_rooms",
+            "arguments": "{\"office\":\"Berlin\",\"minimum_capacity\":3}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"rooms\": [{\"room_id\": \"berlin_3a\", \"office\": \"Berlin\", \"capacity\": 3, \"available\": true}, {\"room_id\": \"berlin_5b\", \"office\": \"Berlin\", \"capacity\": 5, \"available\": true}, {\"room_id\": \"munich_3a\", \"office\": \"Munich\", \"capacity\": 3, \"available\": true}]}"
+    },
+    {
+      "role": "assistant",
+      "content": "The room shows available again — likely a transient conflict. Retrying the booking with berlin_3a.\n\n",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "book_room",
+            "arguments": "{\"attendees\":[\"redacted@example.com\",\"redacted@example.com\"],\"date\":\"2026-03-25\",\"duration_minutes\":45,\"room_id\":\"berlin_3a\",\"time\":\"14:00\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"error\": \"Room became unavailable during booking.\", \"error_code\": \"ERR_TOOL_UNAVAILABLE\", \"timestamp\": \"2026-03-20T12:00:00Z\", \"trace_id\": \"trace_e808a8f8\", \"documentation_url\": \"https://docs.example.com/errors/ERR_TOOL_UNAVAILABLE\", \"request_id\": \"req_err_e808a8f8\"}"
+    }
+  ],
+  "max_tokens": -1,
+  "temperature": 0.7,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_contacts",
+        "description": "Look up contacts.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_slots",
+        "description": "Search meeting slots.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "date": {
+              "type": "string"
+            },
+            "period": {
+              "type": "string"
+            },
+            "duration_minutes": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "date",
+            "period",
+            "duration_minutes"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_rooms",
+        "description": "Search rooms.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "office": {
+              "type": "string"
+            },
+            "minimum_capacity": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "office",
+            "minimum_capacity"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_files",
+        "description": "Search files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "book_room",
+        "description": "Book a room.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "room_id": {
+              "type": "string"
+            },
+            "date": {
+              "type": "string"
+            },
+            "time": {
+              "type": "string"
+            },
+            "duration_minutes": {
+              "type": "integer"
+            },
+            "attendees": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Email address"
+              }
+            }
+          },
+          "required": [
+            "room_id",
+            "date",
+            "time",
+            "duration_minutes",
+            "attendees"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "send_email",
+        "description": "Send email.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "string",
+              "description": "Email address"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "to",
+            "subject",
+            "body"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "seed": 123,
+  "chat_template_kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+  },
+  "top_p": 0.8,
+  "top_k": 20,
+  "min_p": 0.0,
+  "repetition_penalty": 1.0,
+  "presence_penalty": 1.5,
+  "frequency_penalty": 0.0,
+  "repeat_penalty": 1.0,
+  "cache_prompt": true
+}

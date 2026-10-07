@@ -1,0 +1,209 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"function": {"description": "Look up contacts.", "name": "get_contacts", "parameters": {"additionalProperties": false, "properties": {"query": {"type": "string"}}, "required": ["query"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Search meeting slots.", "name": "search_slots", "parameters": {"additionalProperties": false, "properties": {"date": {"type": "string"}, "duration_minutes": {"type": "integer"}, "period": {"type": "string"}}, "required": ["date", "period", "duration_minutes"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Search rooms.", "name": "search_rooms", "parameters": {"additionalProperties": false, "properties": {"minimum_capacity": {"type": "integer"}, "office": {"type": "string"}}, "required": ["office", "minimum_capacity"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Search files.", "name": "search_files", "parameters": {"additionalProperties": false, "properties": {"query": {"type": "string"}}, "required": ["query"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Book a room.", "name": "book_room", "parameters": {"additionalProperties": false, "properties": {"attendees": {"items": {"description": "Email address", "type": "string"}, "type": "array"}, "date": {"type": "string"}, "duration_minutes": {"type": "integer"}, "room_id": {"type": "string"}, "time": {"type": "string"}}, "required": ["room_id", "date", "time", "duration_minutes", "attendees"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Send email.", "name": "send_email", "parameters": {"additionalProperties": false, "properties": {"attachments": {"items": {"type": "string"}, "type": "array"}, "body": {"type": "string"}, "subject": {"type": "string"}, "to": {"description": "Email address", "type": "string"}}, "required": ["to", "subject", "body"], "type": "object"}}, "type": "function"}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a helpful assistant with access to the tools provided.
+
+Rules:
+- Use a tool ONLY when it is necessary to fulfill the user's request.
+- If you can answer directly from your own knowledge, do so without calling a tool.
+- If a tool call fails, explain the failure and suggest an alternative approach.
+- Never invent information that a tool should provide.
+
+Benchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|im_end|>
+<|im_start|>user
+Find a 45-minute slot next Wednesday afternoon for Elena and Ravi, use the Berlin office only, book the smallest room that fits three people, attach the agenda, and email both attendees.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+I'll start by looking up the contacts and checking available slots and rooms in parallel.
+
+<tool_call>
+<function=get_contacts>
+<parameter=query>
+Elena
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=get_contacts>
+<parameter=query>
+Ravi
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=search_slots>
+<parameter=date>
+2026-03-25
+</parameter>
+<parameter=period>
+afternoon
+</parameter>
+<parameter=duration_minutes>
+45
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=search_rooms>
+<parameter=office>
+Berlin
+</parameter>
+<parameter=minimum_capacity>
+3
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"results": [{"name": "Elena", "email": "redacted@example.com", "id": "contact_1000", "department": "Engineering", "phone": "+1-555-0100", "title": "Team Member", "last_contacted": "2026-03-18T15:30:00Z", "notes": "", "source": "directory"}], "total_contacts": 1, "directory_version": "2026.03", "request_id": "req_ct_6e3b2a1c"}
+</tool_response>
+<tool_response>
+{"results": [{"name": "Ravi", "email": "redacted@example.com", "id": "contact_1000", "department": "Engineering", "phone": "+1-555-0100", "title": "Team Member", "last_contacted": "2026-03-18T15:30:00Z", "notes": "", "source": "directory"}], "total_contacts": 1, "directory_version": "2026.03", "request_id": "req_ct_6e3b2a1c"}
+</tool_response>
+<tool_response>
+{"slots": [{"date": "2026-03-25", "time": "14:00", "duration_minutes": 45}]}
+</tool_response>
+<tool_response>
+{"rooms": [{"room_id": "berlin_3a", "office": "Berlin", "capacity": 3, "available": true}, {"room_id": "berlin_5b", "office": "Berlin", "capacity": 5, "available": true}, {"room_id": "munich_3a", "office": "Munich", "capacity": 3, "available": true}]}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+I found a slot and rooms. Now let me locate the agenda file before booking.
+
+<tool_call>
+<function=search_files>
+<parameter=query>
+agenda
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"results": [{"file_id": "agenda_q2", "name": "Agenda_Q2.pdf", "size_bytes": 28416, "modified_at": "2026-03-15T09:22:11Z", "created_at": "2026-02-10T14:00:00Z", "owner": "system", "path": "/documents/Agenda_Q2.pdf", "permissions": "read", "content_type": "application/octet-stream"}], "total_matches": 1, "search_time_ms": 18, "index_version": "idx-2026.03", "request_id": "req_fs_3d4a8e2b"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Now I'll book the smallest qualifying Berlin room (berlin_3a, capacity 3) for the available slot.
+
+<tool_call>
+<function=book_room>
+<parameter=room_id>
+berlin_3a
+</parameter>
+<parameter=date>
+2026-03-25
+</parameter>
+<parameter=time>
+14:00
+</parameter>
+<parameter=duration_minutes>
+45
+</parameter>
+<parameter=attendees>
+["redacted@example.com", "redacted@example.com"]
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"error": "Room became unavailable during booking.", "error_code": "ERR_TOOL_UNAVAILABLE", "timestamp": "2026-03-20T12:00:00Z", "trace_id": "trace_e808a8f8", "documentation_url": "https://docs.example.com/errors/ERR_TOOL_UNAVAILABLE", "request_id": "req_err_e808a8f8"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+The first room became unavailable mid-booking. Let me verify current availability and try the next-smallest Berlin option.
+
+<tool_call>
+<function=search_rooms>
+<parameter=office>
+Berlin
+</parameter>
+<parameter=minimum_capacity>
+3
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"rooms": [{"room_id": "berlin_3a", "office": "Berlin", "capacity": 3, "available": true}, {"room_id": "berlin_5b", "office": "Berlin", "capacity": 5, "available": true}, {"room_id": "munich_3a", "office": "Munich", "capacity": 3, "available": true}]}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+The room shows available again — likely a transient conflict. Retrying the booking with berlin_3a.
+
+<tool_call>
+<function=book_room>
+<parameter=attendees>
+["redacted@example.com", "redacted@example.com"]
+</parameter>
+<parameter=date>
+2026-03-25
+</parameter>
+<parameter=duration_minutes>
+45
+</parameter>
+<parameter=room_id>
+berlin_3a
+</parameter>
+<parameter=time>
+14:00
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"error": "Room became unavailable during booking.", "error_code": "ERR_TOOL_UNAVAILABLE", "timestamp": "2026-03-20T12:00:00Z", "trace_id": "trace_e808a8f8", "documentation_url": "https://docs.example.com/errors/ERR_TOOL_UNAVAILABLE", "request_id": "req_err_e808a8f8"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

@@ -1,0 +1,16 @@
+# MTP context-floor prompt provenance
+
+Generated 2026-10-07 for worktree revision 90d90306d837. These files are intended to be tracked in the worktree; no git commit was made.
+
+Inputs:
+- `capture.request.json`: byte-for-byte copy of `/home/kaden/qcal/release-0.4.1/release-matrix/runs/halo-fn-90d90306d837/evals/tc-s123/http/00055/request.json`.
+- `qwen-chat-reference.jinja`: byte-for-byte copy of `/home/kaden/ClaudeCode/warpfront/hipfire-mtpfloor/crates/hipfire-runtime/templates/eval/qwen35-official-reference.jinja`.
+- `generate.py`: deterministic Python generator using Jinja2 3.1.6; run `python3 generate.py` from any directory to regenerate siblings. MD5SUMS covers all other artifact files including these inputs and provenance.
+
+Existing construction inspected before choosing formatting: release-matrix/lib/decode.py sends plain prompt text and max_think_tokens=1; the normal daemon then applies the model's embedded Jinja template. Qwen generation uses JinjaChatFrame.render_messages for messages/tools. This artifact instead renders the checked-in Qwen official reference explicitly, including tool schema system block, XML function/parameter calls, grouped tool responses and closed-think assistant generation prefix. Rendered `.txt` must be used with `HIPFIRE_JINJA_CHAT=0` to avoid a second chat wrapper. Alternatively the companion `.request.json` files preserve structured messages/tools for normal chat rendering. The reference template is a declared formatting assumption, not a verified byte-identical extraction of a model's embedded template. No inference or tokenizer runs were performed.
+
+The complete captured system, message order/content, tool calls and tools are retained in tool request JSON. For larger tool contexts a single background user message is inserted after the system and before the original user, without rewriting captured turns. Captured JSON-string tool-call arguments are parsed into objects only while rendering, matching the template's parameter iteration. The template trims message content and does not serialize call IDs; original IDs and whitespace remain in request JSON. The original tool task naturally emits XML tool calls (with JSON-valued compound parameters), not arbitrary standalone JSON. No new output-format instruction was added that would conflict with the preserved tools/system.
+
+Sizes are approximate: target UTF-8 bytes = nominal tokens times four, with full rendered framing included. No standalone tokenizer was discovered in matrix scripts; tokenizer lives in model metadata and loading/building/measuring was outside this assignment. Therefore bytes/4 is only an explicit heuristic, particularly unreliable for code and JSON, not a measured token count. The full tool capture plus framing exceeds the nominal 1K size and is retained intact rather than truncated. See manifest.json for actual lengths and that floor flag. Large contexts are deterministic background padding; a final long-continuation instruction follows code/prose padding. Their requested output exceeds 256 tokens, but absence of EOS is an elicitation goal, not a claimed measurement or guarantee. Context window acceptance and actual token counts remain runtime checks.
+
+Worktree copy location: `benchmarks/prompts/mtpfloor/`. Generated files, inputs and provenance are identical to the qcal copies.
