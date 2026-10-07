@@ -22,8 +22,8 @@ use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
-    SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow,
+    SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
@@ -580,6 +580,256 @@ fn draft_accept_estimate(margin: f32) -> f32 {
     }
 }
 
+/// Speculative windows (native or external, `k > 0`) the AR floor observes
+/// before its first measured decision.  Together with the one calibration
+/// token this bounds the speculation work that precedes the first decision:
+/// at most one head append plus this many windows.
+const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
+
+type Agreement = [(f32, f32); MTP_MAX_DEPTH];
+
+/// Route the floor picks for one native window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloorRoute {
+    /// Ordinary target-only token, no head work (after sticky retirement).
+    Ar,
+    Interleaved,
+    Batched(usize),
+}
+
+/// Which native route a measured window ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeWindow {
+    Interleaved,
+    Batched,
+}
+
+fn valid_us(us: f32) -> bool {
+    us.is_finite() && us > 0.0
+}
+
+/// Add one observation to a decayed `(sum, weight)` pair; only the entry
+/// being observed decays.
+fn decay_add(entry: &mut (f32, f32), sum: f32, weight: f32) {
+    entry.0 = entry.0 * MTP_AGREEMENT_DECAY + sum;
+    entry.1 = entry.1 * MTP_AGREEMENT_DECAY + weight;
+}
+
+/// Expected tokens a `depth`-draft window emits (the seed's bonus plus the
+/// accepted-prefix probabilities); the arithmetic of `batched_depth`.
+fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
+    let mut prefix = 1.0f32;
+    let mut expected = 1.0f32;
+    for &(accepted, total) in agreement.iter().take(depth) {
+        prefix *= accepted / total.max(f32::MIN_POSITIVE);
+        expected += prefix;
+    }
+    expected
+}
+
+/// Same-request AR floor of native MTP.
+///
+/// The price of AR is `ar_us`, measured on this request, on this GPU, by one
+/// calibration token (the ordinary target-only forward, including a sampled
+/// draw).  Speculation is priced from this request's own windows: a batched
+/// window by its decayed mean wall time at the depth it actually drafted,
+/// divided by the agreement-predicted tokens it emits; the interleaved route
+/// by its decayed wall time per emitted token.  The Halo cost table only
+/// orders the options while fewer than [`MTP_FLOOR_PROBE_WINDOWS`] windows
+/// have been observed.  After that budget only measured options are chosen,
+/// and the request retires, stickily, to head-free AR as soon as no measured
+/// option costs strictly less per emitted token than AR (a tie retires).  An
+/// invalid AR measurement retires at the budget too: without a price, a win
+/// cannot be asserted.
+///
+/// External (n-gram) windows are tracked separately and never feed the
+/// native agreement; they count toward the shared probe budget.  A good
+/// external window (cost per token below AR) is never retired by the mere
+/// absence or loss of native measurements: the floor stays alive for external
+/// hits.  The next native window (an external miss) is routed on native
+/// measurements alone and retires the request unless a measured native
+/// option beats AR; a bad external window retires it the same way once
+/// native does not win.
+#[derive(Clone, Debug)]
+struct MtpFloor {
+    calibrated: bool,
+    /// Microseconds of one ordinary AR token; 0 when the measurement was
+    /// invalid.
+    ar_us: f32,
+    probes: usize,
+    retired: bool,
+    /// Per actually drafted depth: decayed (wall us, windows).
+    batched: [(f32, f32); MTP_WINDOW_COST.len()],
+    /// Decayed (wall us, emitted tokens).
+    interleaved: (f32, f32),
+    /// Decayed (wall us, emitted tokens) of external windows.
+    external: (f32, f32),
+    external_blocked: bool,
+}
+
+impl MtpFloor {
+    fn new() -> Self {
+        Self {
+            calibrated: false,
+            ar_us: 0.0,
+            probes: 0,
+            retired: false,
+            batched: [(0.0, 0.0); MTP_WINDOW_COST.len()],
+            interleaved: (0.0, 0.0),
+            external: (0.0, 0.0),
+            external_blocked: false,
+        }
+    }
+
+    fn probing(&self) -> bool {
+        self.probes < MTP_FLOOR_PROBE_WINDOWS
+    }
+
+    fn count_probe(&mut self) {
+        self.probes = (self.probes + 1).min(MTP_FLOOR_PROBE_WINDOWS);
+    }
+
+    fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
+        self.calibrated = true;
+        self.ar_us = if valid_us(us) { us } else { 0.0 };
+        self.decide(agreement);
+    }
+
+    /// One finished native window of `k > 0` budget with wall time `us`.
+    fn observe_native(
+        &mut self,
+        route: NativeWindow,
+        window: &MtpWindow,
+        us: f32,
+        k: usize,
+        agreement: &Agreement,
+    ) {
+        if k == 0 || self.retired || !self.calibrated {
+            return;
+        }
+        // An unusable timing records no cost but still spends probe budget,
+        // so the number of unmeasured windows stays bounded.
+        if valid_us(us) {
+            match route {
+                NativeWindow::Interleaved => {
+                    decay_add(&mut self.interleaved, us, window.committed.len() as f32);
+                }
+                NativeWindow::Batched => {
+                    if let Some(entry) = self
+                        .batched
+                        .get_mut(window.drafts_generated)
+                        .filter(|_| window.drafts_generated >= 1)
+                    {
+                        decay_add(entry, us, 1.0);
+                    }
+                }
+            }
+        }
+        self.count_probe();
+        self.decide(agreement);
+    }
+
+    /// One finished external window (`drafts > 0` offered, `emitted` tokens
+    /// committed, `wall_us` including its verify).  Returns `true` when the
+    /// caller must not take over again this request: the floor retired, or
+    /// external windows cost no less per token than AR.
+    fn observe_external(
+        &mut self,
+        emitted: usize,
+        wall_us: f32,
+        drafts: usize,
+        agreement: &Agreement,
+    ) -> bool {
+        if !self.retired && drafts > 0 {
+            if emitted > 0 && valid_us(wall_us) {
+                decay_add(&mut self.external, wall_us, emitted as f32);
+            }
+            self.count_probe();
+            self.decide(agreement);
+        }
+        self.retired || self.external_blocked
+    }
+
+    /// Cheapest measured native option with at most `max_depth` drafts
+    /// (interleaved is always eligible): `(route, us per emitted token)`.
+    /// Ties keep the earlier (shallower) option.
+    fn best_native(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
+        let mut best = (self.interleaved.1 > 0.0)
+            .then(|| (FloorRoute::Interleaved, self.interleaved.0 / self.interleaved.1));
+        for depth in 1..self.batched.len().min(max_depth.saturating_add(1)) {
+            let (sum, windows) = self.batched[depth];
+            if windows <= 0.0 {
+                continue;
+            }
+            let cost = sum / windows / expected_emitted(agreement, depth);
+            if best.map_or(true, |(_, cheapest)| cost < cheapest) {
+                best = Some((FloorRoute::Batched(depth), cost));
+            }
+        }
+        best
+    }
+
+    /// Retire when, after the probe budget, nothing measured beats AR.
+    fn decide(&mut self, agreement: &Agreement) {
+        if self.retired || !self.calibrated || self.probing() {
+            return;
+        }
+        if self.ar_us <= 0.0 {
+            self.retired = true;
+            return;
+        }
+        let external = (self.external.1 > 0.0).then(|| self.external.0 / self.external.1);
+        self.external_blocked = external.is_some_and(|cost| cost >= self.ar_us);
+        let native_wins = self
+            .best_native(agreement, usize::MAX)
+            .is_some_and(|(_, cost)| cost < self.ar_us);
+        if !native_wins && !(external.is_some() && !self.external_blocked) {
+            self.retired = true;
+        }
+    }
+
+    /// Route for the next native window with `k` drafts of budget.
+    /// `provisional` is the unchanged Halo-table `batched_depth(k)`, used
+    /// only while the probe budget lasts.  Afterwards only a measured option
+    /// within `k` that costs strictly less per emitted token than AR may run;
+    /// when there is none (an external-only budget, `k` below every winning
+    /// measured depth, a losing measured option, no valid AR price) the
+    /// request retires, stickily, and runs AR: no unmeasured or losing route
+    /// is ever run after the budget.
+    fn route(&mut self, agreement: &Agreement, k: usize, provisional: usize) -> FloorRoute {
+        if self.retired {
+            return FloorRoute::Ar;
+        }
+        if self.probing() || !self.calibrated {
+            return match provisional {
+                0 => FloorRoute::Interleaved,
+                depth => FloorRoute::Batched(depth),
+            };
+        }
+        match self.best_native(agreement, k) {
+            Some((route, cost)) if cost < self.ar_us => route,
+            _ => {
+                self.retired = true;
+                FloorRoute::Ar
+            }
+        }
+    }
+}
+
+fn elapsed_us(start: Instant) -> f32 {
+    (start.elapsed().as_secs_f64() * 1e6) as f32
+}
+
+/// Wall time since `start`, after the device drained: a window's cost
+/// includes its whole asynchronous GPU tail, so no tail is billed to the next
+/// window (or to the AR calibration).
+fn synced_elapsed_us(gpu: &Gpu, start: Instant) -> Result<f32, String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("Qwen4 MTP floor window sync: {error}"))?;
+    Ok(elapsed_us(start))
+}
+
 /// Sampled verification algorithm (`HIPFIRE_MTP_SAMPLED_MODE`, resolved once
 /// per drafter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,6 +1002,13 @@ pub struct Qwen4MtpDrafter {
     /// strict-prefix terminal this drafter cannot repair (the spec terminal
     /// reset path).
     end_of_turn: Option<u32>,
+    /// Same-request AR floor model; reset only by `configure_request`
+    /// (sticky retirement survives `mtp_reset`, prefill realignment and
+    /// head refills).
+    floor: MtpFloor,
+    /// Request counters surfaced by `request_stats`; reset only by
+    /// `configure_request`.
+    stats: MtpRequestStats,
 }
 
 impl Qwen4MtpDrafter {
@@ -770,6 +1027,8 @@ impl Qwen4MtpDrafter {
             sampled: None,
             append_scratch: None,
             end_of_turn,
+            floor: MtpFloor::new(),
+            stats: MtpRequestStats::default(),
         }
     }
 
@@ -1083,6 +1342,187 @@ impl Qwen4MtpDrafter {
         best.0
     }
 
+    /// One native window of the AR floor: the ordinary target-only token
+    /// `seed` at `position`, with a sampled draw when the request is sampled.
+    ///
+    /// `calibrate` (the request's first window) times the token including
+    /// that draw, then, outside the timing, keeps the head synced exactly as
+    /// a `k = 0` interleaved window does (the ordinary forward's wide hidden,
+    /// head append with the same `DraftPairing` conditioning, pending hidden)
+    /// before recording the AR price.  Otherwise (retired) it does no head
+    /// work at all and never checks the head position.
+    fn mtp_ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        calibrate: bool,
+    ) -> Result<MtpWindow, String> {
+        let end = position
+            .checked_add(1)
+            .ok_or_else(|| "Qwen4 MTP AR step position overflow".to_string())?;
+        {
+            let bundle = Self::bundle(target)?;
+            let target_position = bundle.state.position;
+            let mtp_position = if calibrate {
+                bundle.mtp_position().map_err(|error| error.to_string())?
+            } else {
+                position
+            };
+            if target_position != position || mtp_position != position {
+                return Err(format!(
+                    "Qwen4 MTP AR step position mismatch: target={target_position}, mtp={mtp_position}, position={position}"
+                ));
+            }
+        }
+        if calibrate {
+            // Prefill's trailing head work must not be billed to AR.
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("Qwen4 MTP AR calibration sync: {error}"))?;
+        }
+        let started = Instant::now();
+        let mut sampled = self.sampled.take();
+        let drawn = (|| -> Result<u32, String> {
+            let mut pick = Self::bundle(target)?
+                .spec_ar_token(gpu, seed)
+                .map_err(|error| error.to_string())?;
+            match sampled.as_mut() {
+                Some(s) if !s.draws_drafts() => {
+                    pick = s.naive_draw(gpu, Self::bundle(target)?, 0)?
+                }
+                Some(s) => {
+                    s.load_target(gpu, Self::bundle(target)?, 0)?;
+                    pick = s.target.sample(s.rng.next_f32());
+                }
+                None => {}
+            }
+            Ok(pick)
+        })();
+        self.sampled = sampled;
+        let pick = drawn?;
+        let us = elapsed_us(started);
+        let target_end = Self::bundle(target)?.state.position;
+        if target_end != end {
+            return Err(format!(
+                "Qwen4 MTP AR step ended at target={target_end}, expected {end}"
+            ));
+        }
+        if calibrate {
+            let pairing = Self::draft_pairing();
+            let row_hidden = self.row_hidden()?;
+            let pending = self.pending_hidden()?;
+            {
+                let bundle = Self::bundle(target)?;
+                bundle
+                    .copy_ar_hidden_to(gpu, row_hidden)
+                    .map_err(|error| error.to_string())?;
+                let hidden = match pairing {
+                    DraftPairing::HeadState => None,
+                    DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
+                };
+                bundle
+                    .mtp_append_token(gpu, seed, hidden, position)
+                    .map_err(|error| error.to_string())?;
+                let mtp_end = bundle.mtp_position().map_err(|error| error.to_string())?;
+                if mtp_end != end {
+                    return Err(format!(
+                        "Qwen4 MTP AR calibration ended at mtp={mtp_end}, expected {end}"
+                    ));
+                }
+            }
+            gpu.copy_d2d(row_hidden, pending, pending.byte_size())
+                .map_err(|error| format!("Qwen4 MTP AR calibration pending hidden copy: {error}"))?;
+            // Drain the calibration's head work so the first probe window
+            // does not bill it.
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("Qwen4 MTP AR calibration tail sync: {error}"))?;
+            self.floor.observe_calibration(us, &self.agreement);
+            self.stats.mtp_windows += 1;
+            self.stats.mtp_retired = self.floor.retired;
+        } else {
+            self.stats.ar_windows += 1;
+        }
+        Ok(MtpWindow {
+            committed: vec![pick],
+            accepted: 0,
+            drafts_generated: 0,
+        })
+    }
+
+    /// Count one finished native window; observe it for the floor unless a
+    /// developer-forced route (`HIPFIRE_MTP_INCREMENTAL=0|1`) bypasses it.
+    fn floor_observe_native(
+        &mut self,
+        forced: bool,
+        route: NativeWindow,
+        window: &MtpWindow,
+        us: f32,
+        k: usize,
+    ) {
+        self.stats.mtp_windows += 1;
+        if !forced {
+            self.floor
+                .observe_native(route, window, us, k, &self.agreement);
+            self.stats.mtp_retired = self.floor.retired;
+        }
+    }
+
+    /// Whether the floor retired this request to head-free AR.  A caller
+    /// that composes an external drafter must check this before every
+    /// takeover: after retirement the head lags the target and must not be
+    /// extended.
+    #[allow(dead_code)]
+    pub(crate) fn floor_retired(&self) -> bool {
+        self.floor.retired
+    }
+
+    /// Whether the request's first window, the AR calibration token, has yet
+    /// to run.  False for a developer-forced route (`HIPFIRE_MTP_INCREMENTAL`
+    /// `0|1`), which bypasses the floor.  A caller that composes an external
+    /// drafter must not take over while this is true: the calibration window
+    /// must be the request's first.
+    #[allow(dead_code)]
+    pub(crate) fn floor_needs_calibration(&self) -> bool {
+        !self.floor.calibrated && !Self::floor_forced()
+    }
+
+    /// `floor_retired() || floor_needs_calibration()`: the exact guard an
+    /// external takeover must pass before it runs.
+    #[allow(dead_code)]
+    pub(crate) fn floor_takeover_blocked(&self) -> bool {
+        self.floor.retired || self.floor_needs_calibration()
+    }
+
+    /// Developer-forced route that bypasses the floor.
+    fn floor_forced() -> bool {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref(),
+            Ok("0" | "1")
+        )
+    }
+
+    /// Report one finished external window: `drafts` offered, `emitted`
+    /// tokens committed, `wall_us` of its whole window (drafting, verify and
+    /// commit).  Counts toward the shared probe budget and prices external
+    /// windows separately from the native agreement.  Returns `true` when
+    /// external takeover must stop for the rest of the request.
+    #[allow(dead_code)]
+    pub(crate) fn floor_observe_external_window(
+        &mut self,
+        emitted: usize,
+        wall_us: f32,
+        drafts: usize,
+    ) -> bool {
+        let stop = self
+            .floor
+            .observe_external(emitted, wall_us, drafts, &self.agreement);
+        self.stats.mtp_retired = self.floor.retired;
+        stop
+    }
+
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden
             .as_ref()
@@ -1258,19 +1698,39 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 self.max_k
             ));
         }
+        let incremental = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").ok();
+        // A developer-forced route is a diagnostic override: the floor
+        // neither calibrates nor retires, so the pinned route runs as before.
+        let forced = matches!(incremental.as_deref(), Some("0" | "1"));
+        if !forced && self.floor.retired {
+            return self.mtp_ar_step(gpu, target, position, seed, false);
+        }
         self.ensure_resources(gpu, target)?;
+        if !forced && !self.floor.calibrated {
+            return self.mtp_ar_step(gpu, target, position, seed, true);
+        }
         let trace =
             hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
         // Route: a (k+1)-row batched verify costs about 2.5 single-row
         // forwards, so it pays only while drafts keep being accepted; the
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
-        let depth = match hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref() {
-            Ok("0") => k,
-            Ok("1") => 0,
-            _ => self.batched_depth(k),
+        let depth = match incremental.as_deref() {
+            Some("0") => k,
+            Some("1") => 0,
+            _ => match {
+                let provisional = self.batched_depth(k);
+                let route = self.floor.route(&self.agreement, k, provisional);
+                self.stats.mtp_retired = self.floor.retired;
+                route
+            } {
+                FloorRoute::Ar => return self.mtp_ar_step(gpu, target, position, seed, false),
+                FloorRoute::Interleaved => 0,
+                FloorRoute::Batched(depth) => depth,
+            },
         };
         if depth == 0 {
+            let window_start = Instant::now();
             let mut sampled = self.sampled.take();
             let window = self.mtp_step_incremental(
                 gpu,
@@ -1285,6 +1745,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
             self.sampled = sampled;
             let window = window?;
             self.observe_agreement(&window);
+            self.floor_observe_native(
+                forced,
+                NativeWindow::Interleaved,
+                &window,
+                if forced {
+                    0.0
+                } else {
+                    synced_elapsed_us(gpu, window_start)?
+                },
+                k,
+            );
             return Ok(window);
         }
         // History picks the route and the most drafts; the drafts' own
@@ -1301,6 +1772,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ));
             }
         }
+        let floor_start = Instant::now();
         let mut snapshot = {
             let bundle = Self::bundle(target)?;
             Some(
@@ -1556,6 +2028,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.sampled = sampled;
         if let Ok(window) = &result {
             self.observe_agreement(window);
+            let us = if forced {
+                0.0
+            } else {
+                synced_elapsed_us(gpu, floor_start)?
+            };
+            self.floor_observe_native(forced, NativeWindow::Batched, window, us, k);
         }
         if timers.enabled() {
             let fields = format!(
@@ -1618,6 +2096,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         if abort() {
             return Ok(true);
+        }
+        // Retired: the head lags the target for good, so the caller advances
+        // the target alone (no capture, no head append).
+        if self.floor.retired {
+            return Ok(false);
         }
         self.ensure_resources(gpu, target)?;
         let pending = self.pending_hidden()?;
@@ -1695,6 +2178,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
+        self.floor = MtpFloor::new();
+        self.stats = MtpRequestStats::default();
         let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
         self.sampled = match (sampled, &self.sampled_mode) {
             (true, Ok(mode)) => Some(SampledVerify::new(cfg, self.max_k, *mode)),
@@ -1704,6 +2189,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
 
     fn supports_temp_verify(&self) -> bool {
         self.sampled_enabled
+    }
+
+    fn request_stats(&self) -> MtpRequestStats {
+        self.stats
     }
 }
 
@@ -1940,5 +2429,281 @@ mod tests {
     fn malformed_target_picks_are_rejected_before_acceptance() {
         assert!(accept_native_greedy(&[2], &[], None).is_err());
         assert!(accept_native_greedy(&[2, 3], &[2, 3], None).is_err());
+    }
+
+    fn agreement(accepted: f32, total: f32) -> Agreement {
+        [(accepted, total); MTP_MAX_DEPTH]
+    }
+
+    fn window(accepted: usize, drafts: usize) -> MtpWindow {
+        MtpWindow {
+            committed: vec![0; accepted + 1],
+            accepted,
+            drafts_generated: drafts,
+        }
+    }
+
+    fn calibrated(ar_us: f32, agreement: &Agreement) -> MtpFloor {
+        let mut floor = MtpFloor::new();
+        floor.observe_calibration(ar_us, agreement);
+        floor
+    }
+
+    fn batched_windows(
+        floor: &mut MtpFloor,
+        agreement: &Agreement,
+        depth: usize,
+        us: f32,
+        n: usize,
+    ) {
+        for _ in 0..n {
+            floor.observe_native(NativeWindow::Batched, &window(depth, depth), us, 7, agreement);
+        }
+    }
+
+    #[test]
+    fn floor_low_acceptance_retires_within_the_probe_budget() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            assert!(!floor.retired);
+            assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Batched(2));
+            floor.observe_native(NativeWindow::Batched, &window(0, 2), 90.0, 3, &bad);
+        }
+        assert!(floor.retired);
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Ar);
+    }
+
+    #[test]
+    fn floor_winning_cost_depth_is_unchanged() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(33.0, &good);
+        batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(!floor.retired);
+        // The provisional (Halo-table) depth is ignored once measured.
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        // `k` below the measured winning depth: no eligible measured option,
+        // so the request retires to AR rather than run an unmeasured route.
+        assert_eq!(floor.route(&good, 2, 5), FloorRoute::Ar);
+        assert!(floor.retired);
+    }
+
+    #[test]
+    fn floor_tie_with_ar_retires() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        for depth in 1..=MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_native(NativeWindow::Batched, &window(0, depth), 30.0, 3, &bad);
+        }
+        assert!(floor.retired);
+    }
+
+    #[test]
+    fn floor_true_ar_price_changes_choices_across_cards() {
+        // Identical measured windows (75 us for 3.44 predicted tokens, 21.8
+        // us per token); only the card's measured AR price differs.
+        let good = agreement(1.8, 2.0);
+        for (ar_us, retires) in [(33.0, false), (22.0, false), (21.0, true), (10.0, true)] {
+            let mut floor = calibrated(ar_us, &good);
+            batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS);
+            assert_eq!(floor.retired, retires, "ar_us {ar_us}");
+        }
+    }
+
+    #[test]
+    fn floor_interleaved_is_priced_per_emitted_token() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_native(NativeWindow::Interleaved, &window(1, 1), 50.0, 3, &bad);
+        }
+        assert!(!floor.retired);
+        assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Interleaved);
+    }
+
+    #[test]
+    fn floor_probe_budget_is_bounded_even_for_unusable_timings() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = MtpFloor::new();
+        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
+        assert_eq!(floor.probes, 0, "uncalibrated windows are not observed");
+        floor.observe_calibration(33.0, &good);
+        floor.observe_native(NativeWindow::Batched, &window(0, 0), 75.0, 0, &good);
+        assert_eq!(floor.probes, 0, "k == 0 is not a probe");
+        // Unusable timings record nothing but spend the budget, and with
+        // nothing measured the request retires at the budget.
+        for us in [f32::NAN, f32::INFINITY, 0.0, -1.0, f32::NAN] {
+            floor.observe_native(NativeWindow::Batched, &window(2, 2), us, 3, &good);
+            assert!(floor.probes <= MTP_FLOOR_PROBE_WINDOWS);
+        }
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(floor.batched[2], (0.0, 0.0));
+        assert!(floor.retired);
+
+        let mut floor = calibrated(33.0, &good);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_external(0, f32::NAN, 4, &good);
+        }
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(floor.retired);
+
+        let mut floor = calibrated(33.0, &good);
+        batched_windows(&mut floor, &good, 2, 60.0, 2);
+        floor.observe_external(4, 60.0, 4, &good);
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        batched_windows(&mut floor, &good, 2, 60.0, 10);
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+    }
+
+    #[test]
+    fn floor_probe_route_is_the_provisional_depth() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = MtpFloor::new();
+        for calibration in [false, true] {
+            if calibration {
+                floor.observe_calibration(33.0, &good);
+            }
+            for provisional in 0..=7 {
+                let expected = match provisional {
+                    0 => FloorRoute::Interleaved,
+                    depth => FloorRoute::Batched(depth),
+                };
+                assert_eq!(floor.route(&good, 7, provisional), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn floor_retirement_is_sticky() {
+        let bad = agreement(0.0, 2.0);
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        batched_windows(&mut floor, &bad, 2, 90.0, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(floor.retired);
+        batched_windows(&mut floor, &good, 3, 5.0, 10);
+        assert!(floor.observe_external(8, 10.0, 8, &good));
+        floor.observe_calibration(1000.0, &good);
+        assert!(floor.retired);
+        assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
+    }
+
+    #[test]
+    fn floor_external_costs_are_separate_from_native_agreement() {
+        let good = agreement(1.8, 2.0);
+        let before = good;
+        let mut floor = calibrated(30.0, &good);
+        batched_windows(&mut floor, &good, 3, 75.0, 2);
+        // 15 us per external token beats AR; native wins too.
+        assert!(!floor.observe_external(4, 60.0, 4, &good));
+        assert!(!floor.retired);
+        assert_eq!(good, before);
+        assert_eq!(floor.interleaved, (0.0, 0.0));
+        // Once external windows lose, takeover stops; native keeps running.
+        let mut stopped = false;
+        for _ in 0..30 {
+            if floor.observe_external(1, 200.0, 4, &good) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped && !floor.retired);
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+    }
+
+    #[test]
+    fn floor_good_external_stays_alive_until_a_native_miss_routes() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        batched_windows(&mut floor, &bad, 1, 90.0, 2);
+        // 15 us per external token beats AR: no retirement on the hit.
+        assert!(!floor.observe_external(4, 60.0, 4, &bad));
+        assert!(!floor.retired);
+        // The next native window (an external miss) does not win: retire.
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
+        assert!(floor.retired);
+    }
+
+    #[test]
+    fn floor_three_good_external_hits_do_not_retire_then_native_miss_retires() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(30.0, &good);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            assert!(!floor.observe_external(4, 60.0, 4, &good));
+            assert!(!floor.retired);
+        }
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        // More good hits with zero native observations still keep it alive.
+        assert!(!floor.observe_external(4, 60.0, 4, &good));
+        assert!(!floor.retired);
+        // The first native window finds nothing measured and retires.
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Ar);
+        assert!(floor.retired);
+    }
+
+    #[test]
+    fn floor_bad_external_retires_when_native_does_not_win() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        batched_windows(&mut floor, &bad, 1, 90.0, 2);
+        assert!(floor.observe_external(1, 200.0, 4, &bad));
+        assert!(floor.retired);
+    }
+
+    #[test]
+    fn floor_blocked_external_leaves_winning_native_running() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(30.0, &good);
+        batched_windows(&mut floor, &good, 3, 75.0, 2);
+        assert!(floor.observe_external(1, 90.0, 2, &good));
+        assert!(!floor.retired);
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+    }
+
+    #[test]
+    fn floor_invalid_ar_price_retires_at_the_budget_not_before() {
+        let good = agreement(1.8, 2.0);
+        for bad_us in [f32::NAN, 0.0, -5.0] {
+            let mut floor = calibrated(bad_us, &good);
+            batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS - 1);
+            assert!(!floor.retired);
+            batched_windows(&mut floor, &good, 3, 75.0, 1);
+            assert!(floor.retired);
+        }
+    }
+
+    #[test]
+    fn floor_depth_is_keyed_by_drafts_actually_generated() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(33.0, &good);
+        floor.observe_native(NativeWindow::Batched, &window(1, 1), 50.0, 3, &good);
+        assert!(floor.batched[1].1 > 0.0);
+        assert_eq!(floor.batched[3], (0.0, 0.0));
+        let depth_one = floor.batched[1];
+        floor.observe_native(NativeWindow::Batched, &window(2, 2), 60.0, 3, &good);
+        assert_eq!(floor.batched[1], depth_one, "decay is entry-local");
+    }
+
+    #[test]
+    fn floor_max_k_beyond_the_cost_table_is_clamped() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(100.0, &good);
+        let top = MTP_WINDOW_COST.len() - 1;
+        assert!(top < MTP_MAX_DEPTH);
+        floor.observe_native(NativeWindow::Batched, &window(top, top), 100.0, 10, &good);
+        floor.observe_native(NativeWindow::Batched, &window(top, top), 100.0, 10, &good);
+        // A window longer than the table has no cost entry; it must not
+        // panic and does not create one.
+        floor.observe_native(
+            NativeWindow::Batched,
+            &window(top + 1, top + 1),
+            100.0,
+            10,
+            &good,
+        );
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(floor.batched.len(), MTP_WINDOW_COST.len());
+        assert!(!floor.retired);
+        assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top));
     }
 }

@@ -705,8 +705,25 @@ Caveats that are part of the fixture, not trivia:
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
+  A same-request AR floor guards the default route: the request's first
+  window is one ordinary target-only token, timed (a sampled draw included)
+  as the AR price and followed by one head append; up to three speculative
+  probe windows then run under the table-ordered route, and from then on only
+  options measured on this request are chosen (batched depth by its decayed
+  window time over the agreement-predicted tokens, interleaved by its time per
+  emitted token). When none costs strictly less per emitted token than AR (a
+  tie, or an invalid AR timing, counts as no win) the request retires to
+  head-free AR for good: no head append, copy, snapshot or replay, forced
+  advances fall back to the target alone, and only `configure_request`
+  (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
+  calibration head append and three probe windows precede the first measured
+  decision; this bounds the speculation work, not the full-request time. Each
+  floor-observed native window ends with one device sync so its whole GPU tail
+  is priced (forced routes skip it), and the retired token host-syncs its
+  top-1, which the AR producer does not.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
-  interleaved. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  interleaved; either forced route is a diagnostic override that bypasses the
+  floor entirely. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
   AR target's single-row route. With Q8 GDN recurrent state, the row-capture
   verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
   per-token Q8 boundary at each row's absolute position, so every captured
