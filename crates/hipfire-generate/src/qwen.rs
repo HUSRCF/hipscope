@@ -3386,6 +3386,12 @@ pub fn generate_dflash(
                                     "ngram_mod_accept_rate".into(),
                                     serde_json::json!(stats.ngram_mod_accept_rate),
                                 );
+                            }
+                            if stats.mtp_ngram
+                                || stats.mtp_windows != 0
+                                || stats.ar_windows != 0
+                                || stats.mtp_retired
+                            {
                                 obj.insert(
                                     "mtp_windows".into(),
                                     serde_json::json!(stats.mtp_windows),
@@ -3571,6 +3577,12 @@ pub fn generate_dflash(
                             "ngram_mod_accept_rate".into(),
                             serde_json::json!(stats.ngram_mod_accept_rate),
                         );
+                    }
+                    if stats.mtp_ngram
+                        || stats.mtp_windows != 0
+                        || stats.ar_windows != 0
+                        || stats.mtp_retired
+                    {
                         obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
                         obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
                         obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
