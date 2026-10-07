@@ -619,9 +619,9 @@ impl Carrier for Qwen4Carrier {
         let metadata = receipt.ple;
         let placements = receipt.placements;
         // Radix cache identity input, taken while `hfq` is still owned: the
-        // cache is VMM-only and follows the prefix cache switch.
+        // cache is VMM-only and follows the prefix cache and radix switches.
         let radix_content_digest = (backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm
-            && hipfire_arch_qwen4::bundle::prefix_cache_requested())
+            && hipfire_arch_qwen4::bundle::radix_cache_requested())
         .then(|| hfq.content_digest());
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {

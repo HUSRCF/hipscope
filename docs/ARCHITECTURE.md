@@ -515,7 +515,7 @@ apply to legacy KV; there is no AR-only fallback tier and no hipGraph route
   `hip_bridge::retired_va_bytes()`, which the per-request
   `[qwen4-radix] begin` trace and the cache stats report.
 
-Switch and trace: `HIPFIRE_QWEN_PROMPT_CACHE` / `HIPFIRE_QWEN_CACHE_TRACE`
+Switch and trace: `HIPFIRE_QWEN_PROMPT_CACHE` (all prefix caching) / `HIPFIRE_QWEN_RADIX_CACHE` (radix store only) / `HIPFIRE_QWEN_CACHE_TRACE`
 (see [`env-vars.md`](env-vars.md)).
 
 ## Observability hooks

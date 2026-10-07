@@ -126,6 +126,14 @@ pub fn prefix_cache_requested() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN_PROMPT_CACHE", QWEN4_PREFIX_CACHE_DEFAULT)
 }
 
+/// Whether a load should attach the multi-entry radix cache. It rides on the
+/// prefix cache (off with `HIPFIRE_QWEN_PROMPT_CACHE=0`) and on VMM context
+/// storage; `HIPFIRE_QWEN_RADIX_CACHE=0` leaves it detached while live
+/// continuation and the end-of-prompt checkpoint stay on.
+pub fn radix_cache_requested() -> bool {
+    prefix_cache_requested() && hipfire_config::developer_bool("HIPFIRE_QWEN_RADIX_CACHE", true)
+}
+
 /// Device bytes [`Qwen4Bundle::attach_prefix_cache`] allocates: the target
 /// state checkpoint plus, with native MTP, the head's selection, device
 /// selected length and wide hidden. Charged by the load's VRAM reserve.
