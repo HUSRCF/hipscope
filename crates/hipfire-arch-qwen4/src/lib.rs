@@ -29,6 +29,8 @@ pub mod reference_forward;
 pub mod reference_mtp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
+pub mod cache_quality;
+#[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
 pub mod weights;
 
