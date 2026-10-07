@@ -713,7 +713,12 @@ Caveats that are part of the fixture, not trivia:
   window time over the agreement-predicted tokens, interleaved by its time per
   emitted token). When none costs strictly less per emitted token than AR (a
   tie, or an invalid AR timing, counts as no win) the request retires to
-  head-free AR for good: no head append, copy, snapshot or replay, forced
+  head-free AR for good, unless n-gram windows keep it alive: a request stays
+  alive on a losing native route only while external (n-gram) windows are
+  measured and unblocked (cost per token below AR) and the decayed realized
+  per-token cost of all its windows, native and external, is strictly below
+  AR; it retires at the first window where that stops holding. A retired
+  request runs with no head append, copy, snapshot or replay, forced
   advances fall back to the target alone, and only `configure_request`
   (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
   calibration head append and three probe windows precede the first measured

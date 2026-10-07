@@ -643,13 +643,14 @@ fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
 /// cannot be asserted.
 ///
 /// External (n-gram) windows are tracked separately and never feed the
-/// native agreement; they count toward the shared probe budget.  A good
-/// external window (cost per token below AR) is never retired by the mere
-/// absence or loss of native measurements: the floor stays alive for external
-/// hits.  The next native window (an external miss) is routed on native
-/// measurements alone and retires the request unless a measured native
-/// option beats AR; a bad external window retires it the same way once
-/// native does not win.
+/// native agreement; they count toward the shared probe budget.  A request
+/// stays alive on a losing (or unmeasured) native route only while external
+/// windows are measured and unblocked (cost per token below AR) AND the
+/// realized per-token cost of all its windows, native and external, decayed
+/// (`combined`), is strictly below AR (a tie loses).  Such a request routes
+/// the cheapest measured native option within `k`, else interleaved; it
+/// retires, stickily, at the first window where that stops holding.  A
+/// measured native option that beats AR needs no external help.
 #[derive(Clone, Debug)]
 struct MtpFloor {
     calibrated: bool,
@@ -665,6 +666,9 @@ struct MtpFloor {
     /// Decayed (wall us, emitted tokens) of external windows.
     external: (f32, f32),
     external_blocked: bool,
+    /// Decayed realized (wall us, emitted tokens) over every valid window
+    /// observed after calibration, native and external alike.
+    combined: (f32, f32),
 }
 
 impl MtpFloor {
@@ -678,6 +682,7 @@ impl MtpFloor {
             interleaved: (0.0, 0.0),
             external: (0.0, 0.0),
             external_blocked: false,
+            combined: (0.0, 0.0),
         }
     }
 
@@ -710,6 +715,7 @@ impl MtpFloor {
         // An unusable timing records no cost but still spends probe budget,
         // so the number of unmeasured windows stays bounded.
         if valid_us(us) {
+            decay_add(&mut self.combined, us, window.committed.len() as f32);
             match route {
                 NativeWindow::Interleaved => {
                     decay_add(&mut self.interleaved, us, window.committed.len() as f32);
@@ -741,8 +747,13 @@ impl MtpFloor {
         agreement: &Agreement,
     ) -> bool {
         if !self.retired && drafts > 0 {
-            if emitted > 0 && valid_us(wall_us) {
-                decay_add(&mut self.external, wall_us, emitted as f32);
+            if valid_us(wall_us) {
+                if self.calibrated {
+                    decay_add(&mut self.combined, wall_us, emitted as f32);
+                }
+                if emitted > 0 {
+                    decay_add(&mut self.external, wall_us, emitted as f32);
+                }
             }
             self.count_probe();
             self.decide(agreement);
@@ -769,7 +780,19 @@ impl MtpFloor {
         best
     }
 
-    /// Retire when, after the probe budget, nothing measured beats AR.
+    /// External windows are measured and their price is below AR.
+    fn external_alive(&self) -> bool {
+        self.external.1 > 0.0 && !self.external_blocked
+    }
+
+    /// The decayed realized per-token cost of every window (native and
+    /// external) is strictly below AR.
+    fn combined_wins(&self) -> bool {
+        self.combined.1 > 0.0 && self.combined.0 / self.combined.1 < self.ar_us
+    }
+
+    /// Retire when, after the probe budget, nothing measured beats AR, and
+    /// external windows are not alive on a mixture that beats AR.
     fn decide(&mut self, agreement: &Agreement) {
         if self.retired || !self.calibrated || self.probing() {
             return;
@@ -783,7 +806,7 @@ impl MtpFloor {
         let native_wins = self
             .best_native(agreement, usize::MAX)
             .is_some_and(|(_, cost)| cost < self.ar_us);
-        if !native_wins && !(external.is_some() && !self.external_blocked) {
+        if !native_wins && !(self.external_alive() && self.combined_wins()) {
             self.retired = true;
         }
     }
@@ -806,13 +829,19 @@ impl MtpFloor {
                 depth => FloorRoute::Batched(depth),
             };
         }
-        match self.best_native(agreement, k) {
-            Some((route, cost)) if cost < self.ar_us => route,
-            _ => {
-                self.retired = true;
-                FloorRoute::Ar
+        let best = self.best_native(agreement, k);
+        if let Some((route, cost)) = best {
+            if cost < self.ar_us {
+                return route;
             }
         }
+        if self.external_alive() && self.combined_wins() {
+            // Losing native route kept alive for the external windows: the
+            // cheapest measured option within `k`, else interleaved.
+            return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
+        }
+        self.retired = true;
+        FloorRoute::Ar
     }
 }
 
@@ -1519,8 +1548,13 @@ impl Qwen4MtpDrafter {
 
     /// Report one finished external window: `drafts` offered, `emitted`
     /// tokens committed, `wall_us` of its whole window (drafting, verify and
-    /// commit).  Counts toward the shared probe budget and prices external
-    /// windows separately from the native agreement.  Returns `true` when
+    /// commit).  Counts toward the shared probe budget, prices external
+    /// windows separately from the native agreement, and feeds the realized
+    /// mixture of all windows.  A request stays alive on a losing native
+    /// route only while external windows are measured and unblocked and the
+    /// decayed realized per-token cost of all its windows is strictly below
+    /// AR; it retires at the first window where that stops holding.
+    /// Returns `true` when
     /// external takeover must stop for the rest of the request; never with
     /// the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`).
     #[allow(dead_code)]
@@ -2483,6 +2517,15 @@ mod tests {
         }
     }
 
+    /// `n` batched windows that drafted `depth` tokens but realized three
+    /// committed tokens in 60 us (20 us per token), whatever the agreement
+    /// predicts.
+    fn batched_windows_realized(floor: &mut MtpFloor, agreement: &Agreement, depth: usize, n: usize) {
+        for _ in 0..n {
+            floor.observe_native(NativeWindow::Batched, &window(2, depth), 60.0, 7, agreement);
+        }
+    }
+
     #[test]
     fn floor_low_acceptance_retires_within_the_probe_budget() {
         let bad = agreement(0.0, 2.0);
@@ -2634,20 +2677,40 @@ mod tests {
     }
 
     #[test]
-    fn floor_good_external_stays_alive_until_a_native_miss_routes() {
+    fn floor_good_external_keeps_a_losing_native_route_alive_while_the_mixture_beats_ar() {
         let bad = agreement(0.0, 2.0);
         let mut floor = calibrated(30.0, &bad);
-        batched_windows(&mut floor, &bad, 1, 90.0, 2);
-        // 15 us per external token beats AR: no retirement on the hit.
-        assert!(!floor.observe_external(4, 60.0, 4, &bad));
+        // 10 us per external token beats AR.
+        assert!(!floor.observe_external(4, 40.0, 4, &bad));
+        assert!(!floor.observe_external(4, 40.0, 4, &bad));
+        // One losing native window (90 us for one token) spends the budget;
+        // the realized mixture (~20.6 us per token) still beats AR.
+        floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
         assert!(!floor.retired);
-        // The next native window (an external miss) does not win: retire.
+        // The measured native route loses to AR, yet it keeps running while
+        // the mixture wins.
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
+        assert!(!floor.retired);
+        // Losing native windows drag the mixture up to AR; it then retires at
+        // the first window where the mixture stops beating AR, stickily.
+        let mut kept_alive = 0;
+        while !floor.retired {
+            assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
+            floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
+            kept_alive += 1;
+            assert!(kept_alive < 50, "never retired");
+        }
+        assert!(kept_alive > 0);
+        assert!(floor.combined.0 / floor.combined.1 >= 30.0);
         assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
         assert!(floor.retired);
+        assert!(floor.observe_external(4, 40.0, 4, &bad));
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
     }
 
     #[test]
-    fn floor_three_good_external_hits_do_not_retire_then_native_miss_retires() {
+    fn floor_three_good_external_hits_do_not_retire_and_route_interleaved() {
         let good = agreement(1.8, 2.0);
         let mut floor = calibrated(30.0, &good);
         for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
@@ -2658,9 +2721,65 @@ mod tests {
         // More good hits with zero native observations still keep it alive.
         assert!(!floor.observe_external(4, 60.0, 4, &good));
         assert!(!floor.retired);
-        // The first native window finds nothing measured and retires.
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Ar);
+        // No native option is measured: the next native window runs the
+        // interleaved route rather than retiring.
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Interleaved);
+        assert!(!floor.retired);
+    }
+
+    #[test]
+    fn floor_good_external_with_no_native_measured_within_k_routes_interleaved() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(30.0, &good);
+        assert!(!floor.observe_external(4, 40.0, 4, &good));
+        assert!(!floor.observe_external(4, 40.0, 4, &good));
+        // Depth 3: 150 us over 3.44 predicted tokens loses to AR, but the
+        // realized mixture (~20 us per token) wins.
+        floor.observe_native(NativeWindow::Batched, &window(3, 3), 150.0, 7, &good);
+        assert!(!floor.retired);
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        // `k` below the only measured depth: nothing measured within k.
+        assert_eq!(floor.route(&good, 2, 5), FloorRoute::Interleaved);
+        assert!(!floor.retired);
+    }
+
+    #[test]
+    fn floor_blocked_external_does_not_keep_a_losing_native_route_alive() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        // Native windows lose by prediction (one token per window) while
+        // their realized cost (20 us per token) would win the mixture.
+        batched_windows_realized(&mut floor, &bad, 1, 2);
+        // One external window at exactly AR's price is blocked (a tie loses).
+        assert!(floor.observe_external(1, 30.0, 4, &bad));
+        assert!(floor.combined.0 / floor.combined.1 < 30.0);
         assert!(floor.retired);
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
+    }
+
+    #[test]
+    fn floor_combined_mixture_prices_every_valid_window_after_calibration() {
+        let good = agreement(1.8, 2.0);
+        let mut floor = MtpFloor::new();
+        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
+        assert_eq!(floor.combined, (0.0, 0.0), "uncalibrated windows are not priced");
+        floor.observe_calibration(30.0, &good);
+        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
+        assert_eq!(floor.combined, (75.0, 3.0));
+        floor.observe_native(NativeWindow::Interleaved, &window(1, 1), 40.0, 3, &good);
+        assert_eq!(
+            floor.combined,
+            (75.0 * MTP_AGREEMENT_DECAY + 40.0, 3.0 * MTP_AGREEMENT_DECAY + 2.0)
+        );
+        let before = floor.combined;
+        floor.observe_native(NativeWindow::Batched, &window(1, 1), f32::NAN, 3, &good);
+        assert_eq!(floor.combined, before, "invalid timings are not priced");
+        floor.observe_external(4, 40.0, 4, &good);
+        assert_eq!(
+            floor.combined,
+            (before.0 * MTP_AGREEMENT_DECAY + 40.0, before.1 * MTP_AGREEMENT_DECAY + 4.0)
+        );
+        assert_eq!(MtpFloor::new().combined, (0.0, 0.0));
     }
 
     #[test]
