@@ -559,6 +559,13 @@ const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
 const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
+/// Emitted tokens a request's first takeover is assumed to yield (one
+/// pseudo-window): the offline 5/3/3 TC/Hermes accepted-prefix-plus-bonus on
+/// a pool hit was 2.9-3.2 (`release-0.4.1/mtp-ngram-plan.md` §1).
+const NGRAM_YIELD_PRIOR: f32 = 3.0;
+/// Per declined pool hit, the takeover yield history decays by this, so a
+/// source that lost to native MTP is re-tried once the evidence ages out.
+const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths tracked (the drafter's K is clamped to this).
 const MTP_MAX_DEPTH: usize = 10;
 /// Smallest probability that a verify row's whole draft prefix is accepted
@@ -922,6 +929,10 @@ pub struct Qwen4MtpDrafter {
     ngram_active: bool,
     /// The current window's candidates, copied out of the pool (reused).
     ngram_candidates: Vec<u32>,
+    /// Decayed (emitted tokens, windows) of this request's takeover windows:
+    /// the n-gram source's own yield, kept apart from the native per-depth
+    /// agreement (see `ngram_wins`).
+    ngram_yield: (f32, f32),
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
     /// Request-local wire counters (reset by `configure_request`).
@@ -948,6 +959,7 @@ impl Qwen4MtpDrafter {
             ngram: None,
             ngram_active: false,
             ngram_candidates: Vec::new(),
+            ngram_yield: (0.0, 0.0),
             takeover_block: Vec::new(),
             stats: MtpRequestStats::default(),
         }
@@ -1275,6 +1287,37 @@ impl Qwen4MtpDrafter {
         best.0
     }
 
+    /// Best expected emitted tokens per unit of window cost the native route
+    /// offers at the current agreement (`batched_depth`'s objective; the
+    /// interleaved route is 1.0).
+    fn native_rate(&self, k: usize) -> f32 {
+        let mut best = 1.0f32;
+        let mut prefix = 1.0f32;
+        let mut expected = 1.0f32;
+        let depths = self.agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
+        for (&(accepted, total), &cost) in depths {
+            prefix *= accepted / total.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            best = best.max(expected / cost);
+        }
+        best
+    }
+
+    /// Whether an `n`-candidate takeover is expected to emit at least as much
+    /// per unit cost as the native window it displaces. N-gram hits and native
+    /// drafts can succeed on the same spans (a pool hit on a span the model
+    /// rewrites displaces a better native window), so the source is chosen by
+    /// each source's own measured yield: the takeover's decayed emitted per
+    /// window (prior `NGRAM_YIELD_PRIOR` tokens, one pseudo-window) against
+    /// the native agreement's best rate. Declined hits let the takeover
+    /// history decay back toward the prior, so the n-gram source is re-tried.
+    fn ngram_wins(&self, n: usize, k: usize) -> bool {
+        let (emitted, windows) = self.ngram_yield;
+        let expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
+        let cost = MTP_WINDOW_COST[n.min(MTP_WINDOW_COST.len() - 1)];
+        expected / cost >= self.native_rate(k.min(self.max_k))
+    }
+
     fn pending_hidden(&self) -> Result<&GpuTensor, String> {
         self.pending_hidden
             .as_ref()
@@ -1402,11 +1445,18 @@ impl Qwen4MtpDrafter {
         };
         self.ngram_candidates.clear();
         self.ngram_candidates.extend_from_slice(candidates);
+        if !self.ngram_wins(self.ngram_candidates.len(), k) {
+            self.ngram_yield.0 *= NGRAM_YIELD_RECOVERY;
+            self.ngram_yield.1 *= NGRAM_YIELD_RECOVERY;
+            return Ok(None);
+        }
         let candidates = std::mem::take(&mut self.ngram_candidates);
         let window =
             self.mtp_takeover_step(gpu, target, position, seed, emitted, &candidates, eos);
         self.ngram_candidates = candidates;
         let window = window?;
+        self.ngram_yield.0 = self.ngram_yield.0 * MTP_AGREEMENT_DECAY + window.committed.len() as f32;
+        self.ngram_yield.1 = self.ngram_yield.1 * MTP_AGREEMENT_DECAY + 1.0;
         self.stats.ngram_mod_windows += 1;
         self.stats.ngram_mod_drafts += window.drafts_generated;
         self.stats.ngram_mod_accepted += window.accepted;
@@ -2353,6 +2403,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // allocation is reused; its history restarts with this request.
         self.stats = MtpRequestStats::default();
         self.ngram_active = false;
+        self.ngram_yield = (0.0, 0.0);
         if let Some(ctx) = self.ngram.as_mut() {
             ctx.reset_request();
         }
@@ -2711,6 +2762,20 @@ mod tests {
         assert_eq!(s.history.row(2), &[3, 7, 8, 9]);
         s.history.rewind_drafts();
         assert_eq!(s.history.row(0), &[1, 2, 3, 7]);
+    }
+
+    #[test]
+    fn ngram_source_runs_only_while_its_yield_matches_native() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        assert!(drafter.ngram_wins(3, 3), "a fresh request tries the pool");
+        // A pool emitting 2 tokens per 3-candidate window (the Halo smoke's
+        // code_edit_rewrite_copy pattern) loses to native MTP agreeing at 0.95.
+        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.ngram_yield = (16.0, 8.0);
+        assert!(!drafter.ngram_wins(3, 3));
+        // A verbatim copy (4 tokens per window) beats it.
+        drafter.ngram_yield = (32.0, 8.0);
+        assert!(drafter.ngram_wins(3, 3));
     }
 
     #[test]
