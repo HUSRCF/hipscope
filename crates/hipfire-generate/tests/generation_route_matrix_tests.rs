@@ -648,17 +648,7 @@ fn llama_dflash_greedy_route_refuses_penalties() {
 }
 
 #[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    // Native Qwen4 MTP replays the whole prefix cold.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
-    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
-    // on the loaded family, not on the speculator name "mtp".
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        false, false
-    ));
-    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
-
+fn qwen_cache_planner_is_ineligible_cold() {
     let plan = hipfire_generate::qwen::plan_from_rendered(
         &[10, 11],
         vec![10, 11, 12],
@@ -670,7 +660,106 @@ fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
     assert!(!plan.cache_hit);
     assert_eq!(plan.start_pos, 0);
     assert_eq!(plan.cached_tokens, 0);
+    assert_eq!(plan.resume_from, None);
     assert_eq!(plan.new_tokens, vec![10, 11, 12]);
+}
+
+/// Asserts every `PromptCachePlan` field against the expected start and resume.
+/// `start == 0` means a cold miss.
+fn assert_plan(
+    plan: &hipfire_generate::qwen::PromptCachePlan,
+    rendered: &[u32],
+    start: usize,
+    resume: Option<usize>,
+    what: &str,
+) {
+    assert_eq!(plan.rendered, rendered, "{what}: rendered");
+    assert_eq!(plan.start_pos, start, "{what}: start_pos");
+    assert_eq!(plan.cached_tokens, start, "{what}: cached_tokens");
+    assert_eq!(plan.cache_hit, start > 0, "{what}: cache_hit");
+    assert_eq!(plan.resume_from, resume, "{what}: resume_from");
+    assert_eq!(
+        plan.new_tokens,
+        rendered[start..].to_vec(),
+        "{what}: new_tokens"
+    );
+}
+
+/// Qwen4 prefix cache planning: lineage = the committed live tokens, one exact
+/// end-of-prompt checkpoint at an arbitrary (non-chunk-aligned) position `p`.
+#[test]
+fn qwen4_eop_checkpoint_plans_use_the_shared_qwen3_planner() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    // Distinct divergent suffix tokens never collide with the 0..n lineage.
+    let fork = |keep: usize, extra: usize| -> Vec<u32> {
+        (0..keep as u32)
+            .chain((0..extra as u32).map(|i| 1_000_000 + i))
+            .collect()
+    };
+    for (p, l) in [(37usize, 50usize), (1903, 2100)] {
+        let lineage: Vec<u32> = (0..l as u32).collect();
+        let ckpts = [p];
+
+        // (a) live extension: the lineage is a strict prefix of the request.
+        let rendered: Vec<u32> = (0..(l + 20) as u32).collect();
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, l, None, "live extension");
+
+        // (b) divergence with p <= lcp < l: rewind to the checkpoint.
+        let rendered = fork(p + 8, 3);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(
+            &got,
+            &rendered,
+            p,
+            Some(p),
+            "divergence past the checkpoint",
+        );
+
+        // (c) divergence exactly at the checkpoint.
+        let rendered = fork(p, 2);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, Some(p), "divergence at the checkpoint");
+
+        // (d) lcp below the checkpoint: cold.
+        let rendered = fork(p - 17, 4);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, 0, None, "lcp below the checkpoint");
+
+        // (e) exact match: resume from the checkpoint when it leaves a tail.
+        let got = plan(&lineage, lineage.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &lineage, p, Some(p), "exact match, p < n");
+        // Exact match whose length equals the checkpoint leaves nothing to
+        // replay: cold.
+        let at_p: Vec<u32> = (0..p as u32).collect();
+        let got = plan(&at_p, at_p.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &at_p, 0, None, "exact match, p == n");
+
+        // (f) shorter request that still covers the checkpoint.
+        let rendered: Vec<u32> = (0..(p + 7) as u32).collect();
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, Some(p), "shorter request, lcp >= p");
+        // A shorter request ending exactly at the checkpoint has no tail: cold.
+        let got = plan(&lineage, at_p.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &at_p, 0, None, "shorter request ending at p");
+
+        // (g) checkpoint-only lineage extended: strict-extension branch, no resume.
+        let rendered: Vec<u32> = (0..(p + 23) as u32).collect();
+        let got = plan(&at_p, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, None, "checkpoint-only lineage extended");
+
+        // (h) cache ineligible: cold even on a divergence that would resume.
+        let rendered = fork(p + 8, 3);
+        let got = plan(&lineage, rendered.clone(), false, &ckpts, true, "t");
+        assert_plan(&got, &rendered, 0, None, "cache ineligible");
+
+        // (i) resume disabled: divergence is cold, a pure extension still hits.
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, false, "t");
+        assert_plan(&got, &rendered, 0, None, "resume disabled, divergence");
+        let ext: Vec<u32> = (0..(l + 20) as u32).collect();
+        let got = plan(&lineage, ext.clone(), true, &ckpts, false, "t");
+        assert_plan(&got, &ext, l, None, "resume disabled, extension");
+    }
 }
 
 #[test]

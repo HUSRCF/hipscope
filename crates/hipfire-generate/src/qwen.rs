@@ -2365,14 +2365,31 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
-/// Native Qwen4 MTP never uses the shared conversation-LCP planner: generated
-/// history is not canonical prefill state. Its cache is the bundle's
-/// whole-chunk checkpoint (`Qwen4Bundle::plan_prefix`), planned separately,
-/// including for transitions from an AR turn. Qwen3.5/3.6/3.8 MTP and
-/// DFlash keep the prompt cache: the loaded model's family decides, never
-/// the speculator's name.
-pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
-    env_disabled || native_qwen4_mtp
+/// Qwen4 bundle behind a model's `state` field. Takes the field, not the
+/// whole model, so callers keep disjoint borrows of the other fields.
+fn qwen4_bundle_of(
+    state: &Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+) -> Option<&hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+    state.as_deref().and_then(|s| {
+        (s as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    })
+}
+
+/// Publishes the Qwen4 prefix cache after the client committed a terminal.
+/// `conversation_tokens` is the consumed host history (prompt plus emitted
+/// tokens, empty after an unrepaired terminal); the bundle validates it
+/// against its device state. No-op for other families.
+fn commit_qwen4_prefix(model: &mut LoadedModel) {
+    let LoadedModel {
+        state,
+        conversation_tokens,
+        ..
+    } = model;
+    if let Some(bundle) = state.as_deref_mut().and_then(|s| {
+        (s as &mut dyn std::any::Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    }) {
+        bundle.commit_prefix(conversation_tokens);
+    }
 }
 
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
@@ -2962,13 +2979,15 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = spec_cache_disabled_for(
-        m.qwen4().is_some(),
-        hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+    let is_qwen4 = m.qwen4().is_some();
+    let qwen4_native_mtp = is_qwen4 && spec_name == "mtp";
+    // Qwen4 reuses state only on its native MTP route; any other Qwen4
+    // speculator prefills cold.
+    let cache_disabled = (is_qwen4 && !qwen4_native_mtp)
+        || hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
             .ok()
             .as_deref()
-            == Some("0"),
-    );
+            == Some("0");
     // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
@@ -2981,16 +3000,41 @@ pub fn generate_dflash(
         .as_deref()
         != Some("0")
         && m.eviction.is_none();
-    let dflash_ckpt_positions: Vec<usize> = m
-        .speculator
-        .as_ref()
-        .map(|s| s.checkpoint_positions())
-        .unwrap_or_default();
+    // Planner inputs. Qwen3.x: the host conversation mirror plus the draft's
+    // recurrent checkpoints. Native Qwen4 MTP: the bundle's committed lineage
+    // (live record, else end-of-prompt record) plus its end-of-prompt
+    // checkpoint position.
+    let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if qwen4_native_mtp {
+        match qwen4_bundle_of(&m.state) {
+            Some(bundle) => (
+                bundle
+                    .prefix_cache_tokens(hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp)
+                    .unwrap_or(&[]),
+                bundle
+                    .prefix_checkpoint_position(
+                        hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp,
+                    )
+                    .into_iter()
+                    .collect(),
+            ),
+            None => (&[][..], Vec::new()),
+        }
+    } else if is_qwen4 {
+        (&[][..], Vec::new())
+    } else {
+        (
+            &m.conversation_tokens[..],
+            m.speculator
+                .as_ref()
+                .map(|s| s.checkpoint_positions())
+                .unwrap_or_default(),
+        )
+    };
     let cache_eligible = !cache_disabled
         && messages_history.is_some()
         && m.eviction.is_none()
         && pflash_bypass_reason.is_none()
-        && !m.conversation_tokens.is_empty();
+        && !conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if try_jinja {
         if let Some(hist) = messages_history {
             let tok = m.tokenizer.as_ref().unwrap();
@@ -3034,7 +3078,7 @@ pub fn generate_dflash(
                 }
             };
             Some(plan_from_rendered(
-                &m.conversation_tokens,
+                conversation_tokens,
                 rendered,
                 cache_eligible,
                 &dflash_ckpt_positions,
@@ -3054,7 +3098,7 @@ pub fn generate_dflash(
             plan_prompt_cache(
                 tok,
                 &mut m.asst_turn_cache,
-                &m.conversation_tokens,
+                conversation_tokens,
                 m.eviction.is_none(),
                 system_prompt,
                 prompt,
@@ -3067,7 +3111,13 @@ pub fn generate_dflash(
             )
         })
     };
-    let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
+    // Qwen4 restores its end-of-prompt checkpoint in the bundle's prefill
+    // (`bind_prefix_plan`), not through the generic `spec.rewind_to` hook.
+    let resume_from: Option<usize> = if m.qwen4().is_some() {
+        None
+    } else {
+        cache_plan.as_ref().and_then(|p| p.resume_from)
+    };
     // `prompt_tokens` becomes the full canonical conversation when the cache
     // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
     // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
@@ -3089,30 +3139,15 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
-    // Native Qwen4 MTP keeps the shared conversation-LCP planner off
-    // (`spec_cache_disabled_for`): its only reusable prefix is the bundle's
-    // whole-chunk checkpoint, planned against this same canonical render.
-    // The drafter's prefill restores it (or resets) and replays the suffix.
-    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash) =
-        match m.qwen4().filter(|_| spec_name == "mtp") {
-            Some(bundle) => {
-                let start = bundle
-                    .plan_prefix(
-                        &prompt_tokens,
-                        hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp,
-                    )
-                    .start_pos;
-                if start > 0 {
-                    m.seq_pos = start;
-                    m.conversation_tokens.clear();
-                    m.conversation_tokens.extend_from_slice(&prompt_tokens[..start]);
-                    (prompt_tokens[start..].to_vec(), start, true, start)
-                } else {
-                    (prompt_tokens.clone(), 0, false, 0)
-                }
-            }
-            None => (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash),
-        };
+    // Native Qwen4 MTP: a hit (live continuation or end-of-prompt restore) is
+    // bound by the drafter's prefill from this plan's start. The host mirrors
+    // match the planned prefix; the bundle owns the device state.
+    if m.qwen4().is_some() && cache_hit && prefill_start > 0 {
+        m.seq_pos = prefill_start;
+        m.conversation_tokens.clear();
+        m.conversation_tokens
+            .extend_from_slice(&prompt_tokens[..prefill_start]);
+    }
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
@@ -3434,9 +3469,7 @@ pub fn generate_dflash(
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
-                if let Some(bundle) = m.qwen4_mut() {
-                    bundle.commit_prefix();
-                }
+                commit_qwen4_prefix(m);
                 // No post-commit tool_calls event; calls live on staged terminal.
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
@@ -3610,9 +3643,7 @@ pub fn generate_dflash(
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
-        if let Some(bundle) = m.qwen4_mut() {
-            bundle.commit_prefix();
-        }
+        commit_qwen4_prefix(m);
         // Safe stop/tool_calls only — length never stores; Abort suppressed above.
         if effects.store_cache {
             let stripped = strip_think_for_fingerprint(&decoded_full);
@@ -7909,8 +7940,11 @@ mod pp_forward_order_tests {
 /// `forward_scratch` bundle.  Keep this body behind the existing AR route
 /// scheduler and semantic producer: the only architecture-specific operation
 /// here is the carrier-owned [`Qwen4Bundle::forward_chunk`]/
-/// [`Qwen4Bundle::forward_token`] call.  Prompt state is restored from the
-/// bundle's whole-chunk prefix checkpoint when one matches, else reset.
+/// [`Qwen4Bundle::forward_token`] call.  The prompt is planned by the shared
+/// Qwen3.x planner (`plan_from_rendered`) against the bundle's committed
+/// lineage and end-of-prompt checkpoint: the prefill continues the live
+/// session, restores the checkpoint, or starts cold, and runs only the
+/// suffix.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_qwen4_ar(
     m: &mut LoadedModel,
@@ -7974,45 +8008,59 @@ pub fn generate_qwen4_ar(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
-    let prompt_tokens = {
+    // Prefix-cache inputs: the bundle's committed lineage (live record or
+    // end-of-prompt record) and its end-of-prompt checkpoint position feed the
+    // shared planner exactly as the Qwen3.x conversation does.
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
+    let resume_enabled = m.eviction.is_none();
+    let (lineage, ckpts): (&[u32], Vec<usize>) = match qwen4_bundle_of(&m.state) {
+        Some(bundle) => (
+            bundle
+                .prefix_cache_tokens(hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar)
+                .unwrap_or(&[]),
+            bundle
+                .prefix_checkpoint_position(hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar)
+                .into_iter()
+                .collect(),
+        ),
+        None => (&[][..], Vec::new()),
+    };
+    let cache_eligible = !cache_disabled
+        && messages_history.is_some()
+        && m.eviction.is_none()
+        && !lineage.is_empty();
+    // `rendered` is the full canonical prompt; `history_plan` is already the
+    // finished plan when the non-Jinja history render planned it itself.
+    let (rendered, history_plan): (Vec<u32>, Option<PromptCachePlan>) = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
             .ok()
             .as_deref()
             != Some("0");
-        let prompt_tokens = if jinja_enabled {
-            if let Some(template) = m.chat_template.as_ref() {
-                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                    tokenizer,
-                    template,
-                    system: system_prompt,
-                    user: prompt,
-                    enable_thinking,
-                    bos_token: None,
-                    reasoning_strength: None,
-                    reasoning_effort,
-                };
-                let rendered = if tools.is_some() || messages_history.is_some() {
-                    let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                    let messages = match messages_history {
-                        Some(messages) => messages,
-                        None => {
-                            let mut value = Vec::new();
-                            if let Some(system) = system_prompt {
-                                value.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: system.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
+        if let Some(template) = m.chat_template.as_ref().filter(|_| jinja_enabled) {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages = match messages_history {
+                    Some(messages) => messages,
+                    None => {
+                        let mut value = Vec::new();
+                        if let Some(system) = system_prompt {
                             value.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: system.to_string(),
                                 reasoning_content: None,
                                 name: None,
                                 rendered_name: None,
@@ -8020,87 +8068,122 @@ pub fn generate_qwen4_ar(
                                 tool_call_id: None,
                                 tool_plan: String::new(),
                             });
-                            synthesized = value;
-                            &synthesized
                         }
-                    };
-                    frame.render_messages(messages, tools, None)
-                } else {
-                    frame.render()
+                        value.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = value;
+                        &synthesized
+                    }
                 };
-                match rendered {
-                    Ok(rendered) => {
-                        started_in_think = render_tail_opens_think(&rendered);
-                        let cold = tokenizer.encode(&rendered);
-                        // Multi-turn: splice the emitted assistant token IDs
-                        // (same machinery + cache as the MTP route) instead of
-                        // re-encoding the decoded history text, so both Qwen4
-                        // modes build byte-identical turn-N prompts.
-                        match messages_history {
-                            Some(hist) => match qwen_jinja_cached_history_tokens(
-                                &frame,
-                                &mut m.asst_turn_cache,
-                                &cold,
-                                hist,
-                                tools,
-                                "qwen4-ar",
-                            ) {
-                                Ok(spliced) => spliced,
-                                Err(e) => {
-                                    if reasoning_effort.is_some() {
-                                        emit_active_attempt_error(
-                                            stdout,
-                                            Some(id),
-                                            &format!("qwen4 AR qwen-cache jinja build: {e}"),
-                                            "validation",
-                                            false,
-                                            false,
-                                        );
-                                        return;
-                                    }
-                                    eprintln!(
-                                        "[qwen-cache] qwen4 AR jinja cached-history build failed ({e}) — cold render"
-                                    );
-                                    cold
-                                }
-                            },
-                            None => cold,
-                        }
-                    }
-                    Err(error) => {
-                        emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &format!("qwen4 Jinja render failed: {error}"),
-                            "validation",
-                            false,
-                            false,
-                        );
-                        return;
-                    }
-                }
+                frame.render_messages(messages, tools, None)
             } else {
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: prompt,
-                    assistant_prefix,
-                    raw: false,
+                frame.render()
+            };
+            match rendered {
+                Ok(rendered) => {
+                    started_in_think = render_tail_opens_think(&rendered);
+                    let cold = tokenizer.encode(&rendered);
+                    // Multi-turn: splice the emitted assistant token IDs
+                    // (same machinery + cache as the MTP route) instead of
+                    // re-encoding the decoded history text, so both Qwen4
+                    // modes build byte-identical turn-N prompts.
+                    let tokens = match messages_history {
+                        Some(hist) => match qwen_jinja_cached_history_tokens(
+                            &frame,
+                            &mut m.asst_turn_cache,
+                            &cold,
+                            hist,
+                            tools,
+                            "qwen4-ar",
+                        ) {
+                            Ok(spliced) => spliced,
+                            Err(e) => {
+                                if reasoning_effort.is_some() {
+                                    emit_active_attempt_error(
+                                        stdout,
+                                        Some(id),
+                                        &format!("qwen4 AR qwen-cache jinja build: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    return;
+                                }
+                                eprintln!(
+                                    "[qwen-cache] qwen4 AR jinja cached-history build failed ({e}) — cold render"
+                                );
+                                cold
+                            }
+                        },
+                        None => cold,
+                    };
+                    (tokens, None)
                 }
-                .build()
+                Err(error) => {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("qwen4 Jinja render failed: {error}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    return;
+                }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
-                tokenizer,
-                system: system_prompt,
-                user: prompt,
-                assistant_prefix,
-                raw: false,
+            match messages_history {
+                Some(hist) => {
+                    let plan = plan_prompt_cache(
+                        tokenizer,
+                        &mut m.asst_turn_cache,
+                        lineage,
+                        resume_enabled,
+                        system_prompt,
+                        prompt,
+                        assistant_prefix,
+                        qwen_history_tool_render(&m.model_path),
+                        hist,
+                        cache_disabled,
+                        &ckpts,
+                        resume_enabled,
+                    );
+                    (Vec::new(), Some(plan))
+                }
+                None => (
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw: false,
+                    }
+                    .build(),
+                    None,
+                ),
             }
-            .build()
-        };
-        prompt_tokens
+        }
     };
+    let plan = history_plan.unwrap_or_else(|| {
+        plan_from_rendered(
+            lineage,
+            rendered,
+            cache_eligible,
+            &ckpts,
+            resume_enabled,
+            "qwen4-ar",
+        )
+    });
+    let start_pos = plan.start_pos;
+    let prompt_tokens = plan.rendered;
     if prompt_tokens.is_empty() {
         emit_active_attempt_error(
             stdout,
@@ -8135,17 +8218,25 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // Plan against the bundle's durable whole-chunk checkpoint (pure; no
-    // state touched). The prefill callback then resets on a miss or restores
-    // it on a hit and replays `prompt_tokens[start_pos..]` in the cold
-    // schedule's global chunks. Host mirrors are rebuilt from the full
-    // prompt after a successful prefill.
-    let prefix_plan = m
-        .qwen4()
-        .map(|bundle| {
-            bundle.plan_prefix(&prompt_tokens, hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar)
-        })
-        .unwrap_or_default();
+    // Bind the shared planner's start to the bundle's live or end-of-prompt
+    // owner (no state touched). The prefill callback then begins from that
+    // owner and runs `prompt_tokens[start_pos..]` once; a bind failure is a
+    // cold prefill. Host mirrors are rebuilt from the full prompt after a
+    // successful prefill.
+    let prefix_plan = match m.qwen4().map(|bundle| {
+        bundle.bind_prefix_plan(
+            &prompt_tokens,
+            start_pos,
+            hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar,
+        )
+    }) {
+        Some(Ok(plan)) => plan,
+        Some(Err(e)) => {
+            eprintln!("[qwen-cache] qwen4 AR bind failed ({e}); cold prefill");
+            hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default()
+        }
+        None => hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default(),
+    };
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -8199,10 +8290,6 @@ pub fn generate_qwen4_ar(
                         .map_err(|error| error.to_string())
                 })
         },
-        |model| {
-            if let Some(bundle) = model.qwen4_mut() {
-                bundle.commit_prefix();
-            }
-        },
+        commit_qwen4_prefix,
     );
 }
