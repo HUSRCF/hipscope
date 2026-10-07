@@ -1171,4 +1171,856 @@ mod tests {
         );
         assert!(eos_ends > 0, "no stream reached EOS");
     }
+
+    // ------------------------------------------------------------------
+    // Penalty history, penalty-aware targets and lossless penalized windows
+    // ------------------------------------------------------------------
+
+    use crate::sampler::{
+        apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, sample_cpu,
+    };
+    use std::collections::HashMap;
+
+    fn splitmix64(x: u64) -> u64 {
+        let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Independent, well-spread AR RNG seed for trial `i` (the AR xorshift32
+    /// maps close seeds to close first draws).
+    fn scrambled_seed(i: u64) -> u32 {
+        (splitmix64(i) >> 32) as u32
+    }
+
+    fn penalty_cfg(
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        repeat_window: usize,
+    ) -> SpecRequestConfig {
+        SpecRequestConfig {
+            temp: 0.7,
+            top_p: 0.8,
+            top_k: Some(20),
+            min_p: 0.0,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            ..SpecRequestConfig::default()
+        }
+    }
+
+    /// `(repeat, presence, frequency)`: presence only, and all three.
+    const PENALTY_CONFIGS: [(f32, f32, f32); 2] = [(1.0, 1.5, 0.0), (1.1, 1.5, 0.5)];
+
+    fn tv_between(a: &SparseDist, b: &SparseDist, vocab: usize) -> f64 {
+        dense(a, vocab)
+            .iter()
+            .zip(dense(b, vocab))
+            .map(|(x, y)| (x - y).abs())
+            .sum::<f64>()
+            / 2.0
+    }
+
+    /// `assert_follows` for an arbitrary trial count `n`: chi-square at
+    /// alpha 1e-6, and a total-variation bound scaled to the support size.
+    fn assert_follows_n(name: &str, counts: &[u64], p: &SparseDist, n: u64) {
+        let expected = dense(p, counts.len());
+        let (stat, df) = chi_square(counts, &expected, n);
+        let crit = chi_square_critical(df, 4.75);
+        let tv = total_variation(counts, &expected, n);
+        let bound = (p.entries().len() as f64 / n as f64).sqrt() + 0.005;
+        eprintln!(
+            "{name}: support={} chi2={stat:.1} df={df} crit(1e-6)={crit:.1} tv={tv:.4} (<{bound:.4})",
+            p.entries().len()
+        );
+        assert!(stat < crit, "{name}: chi2 {stat} >= {crit} (df {df})");
+        assert!(tv < bound, "{name}: total variation {tv} >= {bound}");
+    }
+
+    // ---- fill_penalty_history / PenaltyHistory ----
+
+    fn suffix(tokens: &[u32], window: usize) -> &[u32] {
+        &tokens[tokens.len().saturating_sub(window)..]
+    }
+
+    #[test]
+    fn fill_penalty_history_takes_the_trailing_window_of_prompt_and_emitted() {
+        let fill = |prompt: &[u32], emitted: &[u32], window: usize| {
+            // A dirty buffer: the helper must clear it.
+            let mut out = vec![99u32; 3];
+            fill_penalty_history(&mut out, prompt, emitted, window);
+            out
+        };
+        let p10: Vec<u32> = (1..=10).collect();
+        // Window 0: nothing, whatever the inputs.
+        assert!(fill(&p10, &[11, 12], 0).is_empty());
+        assert!(fill(&[], &[], 0).is_empty());
+        // Nothing at all.
+        assert!(fill(&[], &[], 8).is_empty());
+        // Prompt shorter than W, no emitted tokens yet.
+        assert_eq!(fill(&[1, 2, 3], &[], 8), [1, 2, 3]);
+        // The pending seed appears exactly once.
+        assert_eq!(fill(&[1, 2, 3], &[4], 8), [1, 2, 3, 4]);
+        // Prompt + emitted shorter than W: everything.
+        assert_eq!(fill(&[1, 2, 3], &[4, 5], 8), [1, 2, 3, 4, 5]);
+        // Prompt longer than W, no emitted.
+        assert_eq!(fill(&p10, &[], 4), [7, 8, 9, 10]);
+        // Prompt longer than W, emitted shorter than W: prompt tail first.
+        assert_eq!(fill(&p10, &[11, 12], 5), [8, 9, 10, 11, 12]);
+        assert_eq!(fill(&p10, &[11], 5), [7, 8, 9, 10, 11]);
+        // Emitted alone fills W (prompt contributes nothing).
+        assert_eq!(fill(&p10, &[11, 12, 13, 14, 15], 5), [11, 12, 13, 14, 15]);
+        assert_eq!(
+            fill(&p10, &[11, 12, 13, 14, 15, 16, 17], 5),
+            [13, 14, 15, 16, 17]
+        );
+        // W far above everything: the whole conversation.
+        assert_eq!(fill(&[1, 2], &[3, 4], 1000), [1, 2, 3, 4]);
+        // Always the suffix of the concatenation, for every shape.
+        for window in 0..=14usize {
+            for plen in 0..=12u32 {
+                for elen in 0..=12u32 {
+                    let prompt: Vec<u32> = (0..plen).map(|i| 1000 + i).collect();
+                    let emitted: Vec<u32> = (0..elen).map(|i| 2000 + i).collect();
+                    let concat = [prompt.clone(), emitted.clone()].concat();
+                    assert_eq!(
+                        fill(&prompt, &emitted, window),
+                        suffix(&concat, window),
+                        "window {window} plen {plen} elen {elen}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn penalty_history_window_zero_is_a_no_op() {
+        let mut h = PenaltyHistory::new(0);
+        assert_eq!(h.window(), 0);
+        h.set_prompt(&[1, 2, 3]);
+        assert_eq!(h.begin_window(&[4, 5]), 0);
+        h.push_draft(6);
+        h.push_draft(7);
+        assert!(h.tokens().is_empty(), "window 0 must buffer nothing");
+        // Rows past the (ignored) pushes never panic: there is no history.
+        for i in 0..6 {
+            assert!(h.row(i).is_empty());
+            assert_eq!(h.row_range(i), 0..0);
+        }
+        h.rewind_drafts();
+        assert!(h.tokens().is_empty());
+        // Default is window 0 too.
+        let d = PenaltyHistory::default();
+        assert_eq!(d.window(), 0);
+        assert!(d.row(3).is_empty());
+        assert!(d.tokens().is_empty());
+    }
+
+    #[test]
+    fn penalty_history_rows_track_the_trailing_window() {
+        let prompt: Vec<u32> = (1..=8).collect();
+        let mut h = PenaltyHistory::new(5);
+        assert_eq!(h.window(), 5);
+        // set_prompt keeps the trailing W of the full prompt AND starts the
+        // prefill window: row 0 is suffix_W(P), the first token's history.
+        h.set_prompt(&prompt);
+        assert_eq!(h.row(0), [4, 5, 6, 7, 8]);
+        assert_eq!(h.tokens(), [4, 5, 6, 7, 8]);
+        // A window: emitted holds the pending seed once.
+        assert_eq!(h.begin_window(&[100]), 5);
+        assert_eq!(h.tokens(), [5, 6, 7, 8, 100]);
+        h.push_draft(101);
+        h.push_draft(102);
+        assert_eq!(h.tokens(), [5, 6, 7, 8, 100, 101, 102]);
+        assert_eq!(h.row(0), [5, 6, 7, 8, 100]);
+        assert_eq!(h.row(1), [6, 7, 8, 100, 101]);
+        assert_eq!(h.row(2), [7, 8, 100, 101, 102]);
+        assert_eq!(h.row_range(0), 0..5);
+        assert_eq!(h.row_range(1), 1..6);
+        assert_eq!(h.row_range(2), 2..7);
+        for i in 0..=2 {
+            assert_eq!(&h.tokens()[h.row_range(i)], h.row(i));
+        }
+        // rewind_drafts drops the drafts, keeps the base.
+        h.rewind_drafts();
+        assert_eq!(h.tokens(), [5, 6, 7, 8, 100]);
+        assert_eq!(h.row(0), [5, 6, 7, 8, 100]);
+        // ... and fresh drafts replace them cleanly.
+        h.push_draft(200);
+        assert_eq!(h.row(1), [6, 7, 8, 100, 200]);
+        // begin_window discards prior drafts and rebuilds from `emitted`.
+        h.push_draft(201);
+        assert_eq!(h.begin_window(&[100, 103]), 5);
+        assert_eq!(h.tokens(), [6, 7, 8, 100, 103]);
+        assert_eq!(h.row(0), [6, 7, 8, 100, 103]);
+        // Emitted alone fills W: the prompt no longer contributes.
+        assert_eq!(h.begin_window(&[10, 11, 12, 13, 14, 15]), 5);
+        assert_eq!(h.row(0), [11, 12, 13, 14, 15]);
+        h.push_draft(16);
+        assert_eq!(h.row(1), [12, 13, 14, 15, 16]);
+        assert_eq!(h.row_range(1), 1..6);
+        // A new prompt (the next request's prefill) restarts the window and
+        // drops the previous request's drafts and emitted tokens.
+        h.set_prompt(&[50, 51]);
+        assert_eq!(h.row(0), [50, 51]);
+        assert_eq!(h.tokens(), [50, 51]);
+        // A prompt shorter than W is kept whole and joined by emitted tokens.
+        assert_eq!(h.begin_window(&[60]), 3);
+        assert_eq!(h.row(0), [50, 51, 60]);
+        h.push_draft(61);
+        assert_eq!(h.row(1), [50, 51, 60, 61]);
+    }
+
+    #[test]
+    fn penalty_history_matches_the_reference_suffix_for_every_shape() {
+        for window in 1..=9usize {
+            for plen in 0..=12u32 {
+                for elen in 0..=12u32 {
+                    for k in 0..=4u32 {
+                        let prompt: Vec<u32> = (0..plen).map(|i| 1000 + i).collect();
+                        let emitted: Vec<u32> = (0..elen).map(|i| 2000 + i).collect();
+                        let drafts: Vec<u32> = (0..k).map(|i| 3000 + i).collect();
+                        let concat = [prompt.clone(), emitted.clone()].concat();
+                        let mut h = PenaltyHistory::new(window);
+                        h.set_prompt(&prompt);
+                        assert_eq!(h.row(0), suffix(&prompt, window));
+                        assert_eq!(h.begin_window(&emitted), concat.len().min(window));
+                        for &d in &drafts {
+                            h.push_draft(d);
+                        }
+                        for i in 0..=k as usize {
+                            let full = [concat.clone(), drafts[..i].to_vec()].concat();
+                            let want = suffix(&full, window);
+                            let ctx = format!("W{window} plen {plen} elen {elen} k {k} row {i}");
+                            assert_eq!(h.row(i), want, "{ctx}");
+                            assert_eq!(&h.tokens()[h.row_range(i)], want, "{ctx}");
+                        }
+                        // The pending seed (last emitted) enters exactly once.
+                        if let Some(&seed) = emitted.last() {
+                            assert_eq!(h.row(0).iter().filter(|&&t| t == seed).count(), 1);
+                        }
+                        // The buffer never exceeds base + the window's drafts.
+                        assert!(h.tokens().len() <= window + k as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "penalty history row 2")]
+    fn penalty_history_row_past_pushed_drafts_panics() {
+        let mut h = PenaltyHistory::new(4);
+        h.set_prompt(&[1, 2, 3]);
+        h.begin_window(&[4]);
+        h.push_draft(5);
+        // Row 1 is fine (one draft); row 2 would need a second.
+        assert_eq!(h.row(1), [2, 3, 4, 5]);
+        let _ = h.row(2);
+    }
+
+    #[test]
+    fn naive_target_sampler_carries_all_penalty_controls() {
+        let cfg = SpecRequestConfig {
+            temp: 0.7,
+            top_p: 0.8,
+            top_k: Some(20),
+            min_p: 0.0,
+            repeat_penalty: 1.1,
+            repeat_window: 64,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.5,
+            ..SpecRequestConfig::default()
+        };
+        let s = naive_target_sampler(&cfg);
+        assert_eq!(s.temperature, 0.7);
+        assert_eq!(s.top_p, 0.8);
+        assert_eq!(s.top_k, Some(20));
+        assert_eq!(s.min_p, None);
+        assert_eq!(s.repeat_penalty, 1.1);
+        assert_eq!(s.repeat_window, 64);
+        assert_eq!(s.presence_penalty, 1.5);
+        assert_eq!(s.frequency_penalty, 0.5);
+        assert!(s.blocked_tokens.is_empty());
+        assert_eq!(cfg.penalty_window(), 64);
+        // A positive min_p passes through; the defaults stay neutral.
+        let s = naive_target_sampler(&SpecRequestConfig {
+            min_p: 0.05,
+            ..cfg
+        });
+        assert_eq!(s.min_p, Some(0.05));
+        let neutral = naive_target_sampler(&SpecRequestConfig::default());
+        assert_eq!(neutral.repeat_penalty, 1.0);
+        assert_eq!(neutral.repeat_window, 0);
+        assert_eq!(neutral.presence_penalty, 0.0);
+        assert_eq!(neutral.frequency_penalty, 0.0);
+        assert_eq!(SpecRequestConfig::default().penalty_window(), 0);
+    }
+
+    // ---- the penalized target is the host AR sampler's distribution ----
+
+    /// `apply_logit_policy_cpu` + `SparseDist::build_from_logits` over a
+    /// non-empty history (prompt + emitted, repeated ids including the
+    /// pending seed, crossing the window) follows `sampler::sample_cpu`'s
+    /// empirical distribution over independent scrambled seeds.
+    fn assert_penalized_target_is_sample_cpu(cfg: &SpecRequestConfig, label: &str) {
+        const N: u64 = 40_000;
+        // Draws from the process-global AR RNG; hold it for the whole run.
+        let _rng = crate::llama::sampler_rng_test_guard();
+        let sampler = naive_target_sampler(cfg);
+        let spec = SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p);
+        let prompt: Vec<u32> = (0..100).map(|i| (splitmix64(i) % 70) as u32).collect();
+        let mut emitted: Vec<u32> = (0..60)
+            .map(|i| (splitmix64(1_000 + i) % 70) as u32)
+            .collect();
+        // The pending seed repeats a prompt token.
+        *emitted.last_mut().unwrap() = prompt[10];
+        let seed = *emitted.last().unwrap();
+        let full = [prompt.clone(), emitted.clone()].concat();
+        assert!(full.len() > cfg.repeat_window, "history must cross W");
+        assert!(full.iter().filter(|&&t| t == seed).count() >= 2);
+
+        let mut row = logits(300, 31_337, 2.5);
+        for l in &mut row[..40] {
+            // Make the history ids competitive so the penalties bite.
+            *l += 1.5;
+        }
+        let mut penalized = row.clone();
+        apply_logit_policy_cpu(&mut penalized, &full, &sampler);
+        // The windowed history a speculative loop hands over is bit-identical.
+        let mut windowed = Vec::new();
+        fill_penalty_history(&mut windowed, &prompt, &emitted, cfg.repeat_window);
+        assert_eq!(windowed.len(), cfg.repeat_window);
+        let mut via_window = row.clone();
+        apply_logit_policy_cpu(&mut via_window, &windowed, &sampler);
+        assert!(
+            penalized
+                .iter()
+                .zip(&via_window)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{label}: windowed history diverges from the full one"
+        );
+
+        let mut p = SparseDist::default();
+        p.build_from_logits(&penalized, spec, &mut Vec::new())
+            .unwrap();
+        let mut neutral = SparseDist::default();
+        neutral
+            .build_from_logits(&row, spec, &mut Vec::new())
+            .unwrap();
+        let moved = tv_between(&p, &neutral, row.len());
+        assert!(moved > 0.05, "{label}: penalties barely move p ({moved})");
+
+        let mut counts = vec![0u64; row.len()];
+        let mut buf = row.clone();
+        for trial in 0..N {
+            crate::llama::reset_cpu_sampler_rng(scrambled_seed(trial));
+            buf.copy_from_slice(&row);
+            counts[sample_cpu(&mut buf, &full, &sampler) as usize] += 1;
+        }
+        assert_follows_n(label, &counts, &p, N);
+    }
+
+    #[test]
+    fn presence_penalized_target_is_the_sample_cpu_distribution() {
+        let (r, pr, f) = PENALTY_CONFIGS[0];
+        assert_penalized_target_is_sample_cpu(
+            &penalty_cfg(r, pr, f, 128),
+            "presence 1.5 repeat 1 frequency 0",
+        );
+    }
+
+    #[test]
+    fn combined_penalized_target_is_the_sample_cpu_distribution() {
+        let (r, pr, f) = PENALTY_CONFIGS[1];
+        assert_penalized_target_is_sample_cpu(
+            &penalty_cfg(r, pr, f, 128),
+            "repeat 1.1 presence 1.5 frequency 0.5",
+        );
+    }
+
+    // ---- penalized speculative windows are lossless against AR ----
+
+    const WIN_VOCAB: usize = 24;
+    const WIN_EOS: u32 = 3;
+    const WIN_W: usize = 16;
+    /// `(prompt, emitted)`; `emitted` ends with the pending seed (7, also in
+    /// the prompt). 16 + 5 tokens cross `WIN_W`, and the first five prompt
+    /// tokens (including the only 14 and 15) fall out of the window.
+    fn win_context() -> (Vec<u32>, Vec<u32>) {
+        (
+            vec![15, 14, 7, 1, 9, 2, 7, 4, 1, 11, 2, 7, 9, 5, 13, 1],
+            vec![8, 1, 9, 2, 7],
+        )
+    }
+
+    /// Raw logit row after context token `last` (the toy model depends on
+    /// the last token only; the penalties supply the history dependence).
+    /// Boosted ids are the ones the history repeats, plus EOS.
+    fn win_raw(last: u32, salt: u64) -> Vec<f32> {
+        let mut row = logits(WIN_VOCAB, ((last as u64) << 16) ^ salt, 1.5);
+        for id in [1usize, 3, 7, 14, 15] {
+            row[id] += 1.2;
+        }
+        row
+    }
+
+    /// Target row `policy(raw(last), hist)` truncated as AR truncates it, and
+    /// the 3-candidate draft distributions, memoized by `(last, history)`.
+    struct WinWorld {
+        sampler: SamplerConfig,
+        spec: SampleSpec,
+        q_spec: SampleSpec,
+        p_cache: HashMap<(u32, Vec<u32>), SparseDist>,
+        q_cache: HashMap<(u32, Vec<u32>), SparseDist>,
+    }
+
+    impl WinWorld {
+        fn new(cfg: &SpecRequestConfig) -> Self {
+            Self {
+                sampler: naive_target_sampler(cfg),
+                spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
+                // Three candidates: a support far narrower than p's.
+                q_spec: SampleSpec::cpu_ar(1.0, 1.0, Some(3), 0.0),
+                p_cache: HashMap::new(),
+                q_cache: HashMap::new(),
+            }
+        }
+
+        fn target(&mut self, last: u32, hist: &[u32]) -> &SparseDist {
+            let Self {
+                sampler,
+                spec,
+                p_cache,
+                ..
+            } = self;
+            p_cache.entry((last, hist.to_vec())).or_insert_with(|| {
+                let mut row = win_raw(last, 0x71);
+                apply_logit_policy_cpu(&mut row, hist, sampler);
+                let mut d = SparseDist::default();
+                d.build_from_logits(&row, *spec, &mut Vec::new()).unwrap();
+                d
+            })
+        }
+
+        /// Draft distribution: a perturbed copy of the target's raw row,
+        /// penalized against `hist` or not.
+        fn draft(&mut self, last: u32, hist: &[u32], penalized: bool) -> &SparseDist {
+            let Self {
+                sampler,
+                q_spec,
+                q_cache,
+                ..
+            } = self;
+            let key = (last, if penalized { hist.to_vec() } else { Vec::new() });
+            q_cache.entry(key).or_insert_with(|| {
+                let target_raw = win_raw(last, 0x71);
+                let noise = win_raw(last, 0xD7);
+                let mut row: Vec<f32> = target_raw
+                    .iter()
+                    .zip(&noise)
+                    .map(|(t, n)| t + 0.8 * n)
+                    .collect();
+                if penalized {
+                    apply_logit_policy_cpu(&mut row, hist, sampler);
+                }
+                let mut cands: Vec<(u32, f32)> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &l)| (i as u32, l))
+                    .collect();
+                let mut d = SparseDist::default();
+                d.build_from_candidates(&mut cands, *q_spec).unwrap();
+                d
+            })
+        }
+    }
+
+    /// AR distribution of the first two tokens after the pending seed, from
+    /// the FULL (unwindowed) history: cell `t1 * (V + 1) + t2`, with
+    /// `t2 == V` = "ended on EOS at t1".
+    fn win_joint_expected(cfg: &SpecRequestConfig) -> Vec<f64> {
+        let (prompt, emitted) = win_context();
+        let seed = *emitted.last().unwrap();
+        let full = [prompt, emitted].concat();
+        let mut world = WinWorld::new(cfg);
+        let mut expected = vec![0.0f64; WIN_VOCAB * (WIN_VOCAB + 1)];
+        let p0 = world.target(seed, &full).clone();
+        for &(t1, a) in p0.entries() {
+            if t1 == WIN_EOS {
+                expected[t1 as usize * (WIN_VOCAB + 1) + WIN_VOCAB] += a as f64;
+                continue;
+            }
+            let mut hist = full.clone();
+            hist.push(t1);
+            for &(t2, b) in world.target(t1, &hist).entries() {
+                expected[t1 as usize * (WIN_VOCAB + 1) + t2 as usize] += a as f64 * b as f64;
+            }
+        }
+        expected
+    }
+
+    fn assert_joint_follows(name: &str, counts: &[u64], expected: &[f64], n: u64) {
+        let (stat, df) = chi_square(counts, expected, n);
+        let crit = chi_square_critical(df, 4.75);
+        let tv = total_variation(counts, expected, n);
+        let support = expected.iter().filter(|&&e| e > 0.0).count();
+        let bound = (support as f64 / n as f64).sqrt() + 0.005;
+        eprintln!(
+            "{name}: support={support} chi2={stat:.1} df={df} crit(1e-6)={crit:.1} tv={tv:.4} (<{bound:.4})"
+        );
+        assert!(stat < crit, "{name}: chi2 {stat} >= {crit} (df {df})");
+        assert!(tv < bound, "{name}: total variation {tv} >= {bound}");
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DraftKind {
+        /// q drawn from the penalized draft row.
+        Penalized,
+        /// q drawn from the unpenalized draft row: it must not matter.
+        Unpenalized,
+        /// q = delta(argmax of the raw target row), via `set_point_mass`.
+        PointMass,
+    }
+
+    #[derive(Default, Debug)]
+    struct WindowCoverage {
+        /// Windows whose first rejection was at row 0, 1, 2.
+        rejected_at: [u64; 3],
+        /// Windows that accepted all `k >= 1` drafts and drew the bonus.
+        all_accept: u64,
+        /// Windows that ended on an accepted EOS draft.
+        eos_accepted: u64,
+        /// Windows with no drafts: the bonus is the only token.
+        k0: u64,
+        /// Rejections whose residual token is outside q's support.
+        residual_outside_q: u64,
+    }
+
+    /// Run `trials` windows (depth `trial % 4`, so k = 0..=3) through
+    /// `accept_sampled_prefix` with `PenaltyHistory` rows as the target fill,
+    /// and tally the first two emitted tokens of the stream. When the window
+    /// emits one token, the second is drawn at the next window's row 0 from a
+    /// history rebuilt out of `emitted + t1` (the loop's rebuild-per-window).
+    /// `use_history == false` is the negative control: unpenalized targets.
+    fn run_windows(
+        cfg: &SpecRequestConfig,
+        kind: DraftKind,
+        use_history: bool,
+        trials: u64,
+        rng_seed: u64,
+    ) -> (Vec<u64>, WindowCoverage) {
+        let (prompt, emitted0) = win_context();
+        let seed_tok = *emitted0.last().unwrap();
+        let mut world = WinWorld::new(cfg);
+        let mut rng = SpecRng::new(rng_seed);
+        let mut hist = PenaltyHistory::new(cfg.penalty_window());
+        hist.set_prompt(&prompt);
+        let mut next = PenaltyHistory::new(cfg.penalty_window());
+        next.set_prompt(&prompt);
+        let mut counts = vec![0u64; WIN_VOCAB * (WIN_VOCAB + 1)];
+        let mut cov = WindowCoverage::default();
+        let mut target = SparseDist::default();
+        for trial in 0..trials {
+            let k = (trial % 4) as usize;
+            hist.begin_window(&emitted0);
+            let mut drafts: Vec<u32> = Vec::with_capacity(3);
+            let mut qs: Vec<SparseDist> = Vec::with_capacity(3);
+            let mut last = seed_tok;
+            for i in 0..k {
+                let q = match kind {
+                    DraftKind::PointMass => {
+                        let mut d = SparseDist::default();
+                        d.set_point_mass(crate::llama::argmax(&win_raw(last, 0x71)));
+                        d
+                    }
+                    DraftKind::Penalized => world.draft(last, hist.row(i), true).clone(),
+                    DraftKind::Unpenalized => world.draft(last, &[], false).clone(),
+                };
+                let x = q.sample(rng.next_f32());
+                // Kept drafts only; the next row's history includes it.
+                hist.push_draft(x);
+                drafts.push(x);
+                qs.push(q);
+                last = x;
+            }
+            let res = accept_sampled_prefix(
+                &drafts,
+                &qs,
+                Some(WIN_EOS),
+                &mut rng,
+                &mut target,
+                |row, out| {
+                    let last = if row == 0 { seed_tok } else { drafts[row - 1] };
+                    let h: &[u32] = if use_history { hist.row(row) } else { &[] };
+                    out.clone_from(world.target(last, h));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            if k == 0 {
+                cov.k0 += 1;
+            }
+            let rejected = res.accepted < k && res.committed.len() == res.accepted + 1;
+            if rejected {
+                cov.rejected_at[res.accepted] += 1;
+                if qs[res.accepted].prob(*res.committed.last().unwrap()) == 0.0 {
+                    cov.residual_outside_q += 1;
+                }
+            } else if k > 0 && res.accepted == k && res.committed.len() == k + 1 {
+                cov.all_accept += 1;
+            }
+            if res.accepted > 0 && res.hit_eos && res.committed.len() == res.accepted {
+                cov.eos_accepted += 1;
+            }
+
+            let t1 = res.committed[0];
+            let t2 = if t1 == WIN_EOS {
+                WIN_VOCAB
+            } else if let Some(&t2) = res.committed.get(1) {
+                t2 as usize
+            } else {
+                let mut e = emitted0.clone();
+                e.push(t1);
+                next.begin_window(&e);
+                let h: &[u32] = if use_history { next.row(0) } else { &[] };
+                world.target(t1, h).sample(rng.next_f32()) as usize
+            };
+            counts[t1 as usize * (WIN_VOCAB + 1) + t2] += 1;
+        }
+        (counts, cov)
+    }
+
+    fn assert_window_is_lossless(kind: DraftKind) {
+        const N: u64 = 120_000;
+        for (n, &(r, pr, f)) in PENALTY_CONFIGS.iter().enumerate() {
+            let cfg = penalty_cfg(r, pr, f, WIN_W);
+            let expected = win_joint_expected(&cfg);
+            let (counts, cov) = run_windows(&cfg, kind, true, N, 5 + n as u64);
+            let name = format!("{kind:?} repeat {r} presence {pr} frequency {f}");
+            assert_joint_follows(&name, &counts, &expected, N);
+            eprintln!("{name}: {cov:?}");
+            // Depth-2 rejections need two accepted drafts first: q far from p
+            // (unpenalized / point mass) may never get there; the penalized
+            // kind covers it, the shallower depths are required of every kind.
+            let depths = if kind == DraftKind::Penalized { 3 } else { 2 };
+            assert!(
+                cov.rejected_at[..depths].iter().all(|&c| c > 0),
+                "{name}: rejection never reached depths 0..{depths}: {cov:?}"
+            );
+            assert!(cov.all_accept > 0, "{name}: no all-accept bonus: {cov:?}");
+            assert!(cov.eos_accepted > 0, "{name}: no accepted EOS draft: {cov:?}");
+            assert!(cov.k0 > 0, "{name}: no k = 0 window: {cov:?}");
+            assert!(
+                cov.residual_outside_q > 0,
+                "{name}: no residual outside q's support: {cov:?}"
+            );
+        }
+    }
+
+    /// The AR reference itself: sequential `sample_cpu` over the growing,
+    /// FULL history (independently scrambled seed per draw) follows the
+    /// analytic joint every window test compares against.
+    #[test]
+    fn sample_cpu_ar_stream_follows_the_penalized_joint() {
+        const N: u64 = 60_000;
+        let _rng = crate::llama::sampler_rng_test_guard();
+        let (prompt, emitted) = win_context();
+        let seed = *emitted.last().unwrap();
+        let full = [prompt, emitted].concat();
+        for (n, &(r, pr, f)) in PENALTY_CONFIGS.iter().enumerate() {
+            let cfg = penalty_cfg(r, pr, f, WIN_W);
+            let sampler = naive_target_sampler(&cfg);
+            let expected = win_joint_expected(&cfg);
+            let mut counts = vec![0u64; WIN_VOCAB * (WIN_VOCAB + 1)];
+            for trial in 0..N {
+                crate::llama::reset_cpu_sampler_rng(scrambled_seed(2 * trial));
+                let t1 = sample_cpu(&mut win_raw(seed, 0x71), &full, &sampler);
+                let t2 = if t1 == WIN_EOS {
+                    WIN_VOCAB
+                } else {
+                    crate::llama::reset_cpu_sampler_rng(scrambled_seed(2 * trial + 1));
+                    let mut ctx = full.clone();
+                    ctx.push(t1);
+                    sample_cpu(&mut win_raw(t1, 0x71), &ctx, &sampler) as usize
+                };
+                counts[t1 as usize * (WIN_VOCAB + 1) + t2] += 1;
+            }
+            assert_joint_follows(
+                &format!("sample_cpu AR #{n} repeat {r} presence {pr} frequency {f}"),
+                &counts,
+                &expected,
+                N,
+            );
+        }
+    }
+
+    #[test]
+    fn penalized_window_with_penalized_q_is_lossless() {
+        assert_window_is_lossless(DraftKind::Penalized);
+    }
+
+    /// q need not be penalized: acceptance uses the q the draft came from.
+    #[test]
+    fn penalized_window_with_unpenalized_q_is_lossless() {
+        assert_window_is_lossless(DraftKind::Unpenalized);
+    }
+
+    #[test]
+    fn penalized_window_with_point_mass_q_is_lossless() {
+        assert_window_is_lossless(DraftKind::PointMass);
+    }
+
+    /// Negative control: verifying against unpenalized target rows is far
+    /// from the penalized AR joint, so the lossless tests above can fail.
+    #[test]
+    fn unpenalized_target_rows_are_detected() {
+        const N: u64 = 60_000;
+        let (r, pr, f) = PENALTY_CONFIGS[1];
+        let cfg = penalty_cfg(r, pr, f, WIN_W);
+        let expected = win_joint_expected(&cfg);
+        let (counts, _) = run_windows(&cfg, DraftKind::Penalized, false, N, 99);
+        let tv = total_variation(&counts, &expected, N);
+        eprintln!("unpenalized control: tv={tv:.4}");
+        assert!(tv > 0.05, "unpenalized rows went undetected (tv {tv})");
+    }
+
+    // ---- point-mass drafts ----
+
+    #[test]
+    fn point_mass_draft_accepts_iff_u_below_p_and_never_resamples_itself() {
+        let spec = SampleSpec::cpu_ar(0.7, 1.0, Some(20), 0.0);
+        let mut p = SparseDist::default();
+        p.build_from_logits(&logits(WIN_VOCAB, 77, 1.5), spec, &mut Vec::new())
+            .unwrap();
+        assert!(p.entries().len() > 3);
+        let c = p.entries()[1].0;
+        let pc = p.prob(c);
+        assert!(pc > 0.0 && pc < 1.0);
+        let mut delta = SparseDist::default();
+        delta.set_point_mass(c);
+        assert_eq!(delta.entries(), [(c, 1.0)]);
+
+        let mut rng = SpecRng::new(4242);
+        let mut counts = vec![0u64; WIN_VOCAB];
+        let (mut accepts, mut rejects) = (0u64, 0u64);
+        for _ in 0..100_000 {
+            let mut probe = rng;
+            let u = probe.next_f32();
+            match verify_sampled_draft(&p, &delta, c, &mut rng) {
+                DraftVerdict::Accept => {
+                    assert!(u < pc, "accepted with u {u} >= p(c) {pc}");
+                    accepts += 1;
+                }
+                DraftVerdict::Reject(t) => {
+                    assert!(u >= pc, "rejected with u {u} < p(c) {pc}");
+                    assert_ne!(t, c, "the residual returned the point-mass token");
+                    assert!(p.prob(t) > 0.0, "residual left p's support");
+                    counts[t as usize] += 1;
+                    rejects += 1;
+                }
+            }
+        }
+        // Accept rate = p(c); the rejection draw is p with c removed.
+        let rate = accepts as f64 / (accepts + rejects) as f64;
+        assert!((rate - pc as f64).abs() < 0.01, "accept {rate} vs {pc}");
+        let mut rest = p.clone();
+        let kept: Vec<(u32, f32)> = p
+            .entries()
+            .iter()
+            .filter(|&&(t, _)| t != c)
+            .map(|&(t, v)| (t, v / (1.0 - pc)))
+            .collect();
+        rest.entries.clear();
+        rest.entries.extend(kept);
+        assert_follows_n("point-mass residual", &counts, &rest, rejects);
+
+        // A token outside p's support is never accepted.
+        let outside = (0..WIN_VOCAB as u32).find(|&t| p.prob(t) == 0.0).unwrap();
+        let mut delta_out = SparseDist::default();
+        delta_out.set_point_mass(outside);
+        for _ in 0..10_000 {
+            match verify_sampled_draft(&p, &delta_out, outside, &mut rng) {
+                DraftVerdict::Accept => panic!("accepted a zero-probability draft"),
+                DraftVerdict::Reject(t) => assert!(p.prob(t) > 0.0),
+            }
+        }
+        // p itself a point mass on c: always accepted.
+        let mut pm = SparseDist::default();
+        pm.set_point_mass(c);
+        for _ in 0..10_000 {
+            assert_eq!(
+                verify_sampled_draft(&pm, &delta, c, &mut rng),
+                DraftVerdict::Accept
+            );
+        }
+    }
+
+    // ---- why the policy must precede the pool gather ----
+
+    /// Counterexample: gathering the raw top-20 and penalizing only those
+    /// candidates is NOT the AR distribution. The penalty demotes ids that
+    /// were in the raw top-20, and ids outside it (which AR's policy-first
+    /// gather promotes into the pool) can never enter.
+    #[test]
+    fn policy_must_precede_the_pool_gather() {
+        let vocab = 40usize;
+        let mut raw = vec![9.0f32; vocab];
+        for (i, l) in raw[..20].iter_mut().enumerate() {
+            *l = 10.0 - 0.05 * i as f32;
+        }
+        let history = [0u32, 1, 2, 3, 4];
+        let cfg = SpecRequestConfig {
+            temp: 0.7,
+            top_p: 1.0,
+            top_k: None,
+            min_p: 0.0,
+            presence_penalty: 3.0,
+            repeat_window: 128,
+            ..SpecRequestConfig::default()
+        };
+        let sampler = naive_target_sampler(&cfg);
+        let spec = SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p);
+
+        // Policy, then gather (what AR does).
+        let mut policy_first = raw.clone();
+        apply_logit_policy_cpu(&mut policy_first, &history, &sampler);
+        let mut right = SparseDist::default();
+        right
+            .build_from_logits(&policy_first, spec, &mut Vec::new())
+            .unwrap();
+
+        // Gather the raw top-20, then penalize only the gathered candidates.
+        let mut ranked: Vec<u32> = (0..vocab as u32).collect();
+        ranked.sort_by(|&a, &b| {
+            raw[b as usize]
+                .total_cmp(&raw[a as usize])
+                .then(a.cmp(&b))
+        });
+        let ids = &ranked[..20];
+        assert!(ids.iter().all(|&t| t < 20), "raw top-20 is ids 0..20");
+        let mut values: Vec<f32> = ids.iter().map(|&t| raw[t as usize]).collect();
+        apply_logit_policy_candidates_cpu(ids, &mut values, &history, &sampler);
+        // The per-candidate arithmetic is exact...
+        for (&id, &v) in ids.iter().zip(&values) {
+            assert_eq!(v.to_bits(), policy_first[id as usize].to_bits());
+        }
+        // ... but the pool it feeds is the wrong one.
+        let mut cands: Vec<(u32, f32)> = ids.iter().copied().zip(values).collect();
+        let mut wrong = SparseDist::default();
+        wrong.build_from_candidates(&mut cands, spec).unwrap();
+
+        assert!(
+            right.entries().iter().any(|&(t, _)| t >= 20),
+            "policy-first must promote ids outside the raw top-20"
+        );
+        assert!(wrong.entries().iter().all(|&(t, _)| t < 20));
+        let tv = tv_between(&right, &wrong, vocab);
+        assert!(tv > 0.05, "gather-first matched policy-first (tv {tv})");
+    }
 }
