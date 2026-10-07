@@ -1765,12 +1765,12 @@ pub static FIELDS: &[ConfigField] = &[
         "mtp_ngram",
         Speculation,
         ModelLoad,
-        DefaultValue::String("off"),
+        DefaultValue::String("auto"),
         ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
         true,
         false,
         Some("HIPFIRE_MTP_NGRAM"),
-        "MTP + ngram-mod composition for greedy (temperature 0), thinking-off requests on native MTP. on arms it; off and auto keep MTP alone (auto stays off: greedy text differs from MTP-only on gfx1201)."
+        "N-gram takeover windows inside native MTP (greedy and sampled, thinking on or off). auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves other producers off; on/1 arms every MTP producer that supports it; off/0 disables it."
     ),
     field!(
         "speculation.mtp_sampled",
@@ -4024,16 +4024,43 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
         window_rollback: developer_bool("HIPFIRE_SPEC_WINDOW_ROLLBACK", true),
     }
 }
-/// MTP n-gram-modifier arm enablement (`speculation.mtp_ngram`, env override
-/// `HIPFIRE_MTP_NGRAM`). Only `on`/`1` arms it, and only greedy, thinking-off
-/// MTP requests are eligible. `auto` resolves to off: on gfx1201 / H2 the
-/// composition changes greedy text against MTP-only (the wider verify
-/// windows round differently), so it is not promoted to a default.
+/// MTP n-gram-modifier explicit-arm check (`speculation.mtp_ngram`, env
+/// override `HIPFIRE_MTP_NGRAM`). True only for an explicit `on`/`1`; `auto`
+/// (the schema default), `off`/`0`, and unset all return false. This is the
+/// legacy no-arch answer (Qwen3.5 verify-capacity sizing). Arch-aware arming
+/// decisions use [`mtp_ngram_enabled_for_arch`].
 pub fn mtp_ngram_enabled() -> bool {
     mtp_ngram_enabled_for(process_value("HIPFIRE_MTP_NGRAM").as_deref())
 }
 fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "on"))
+}
+/// Arch-aware MTP + n-gram-modifier arming. `on`/`1` arms every MTP producer
+/// that supports it, `off`/`0` disables it, and `auto` (the schema default;
+/// an unset key also resolves to `auto`) arms it only for native Qwen4 MTP
+/// (`model_arch == 16`) on gfx1151 and gfx1201.
+pub fn mtp_ngram_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
+    mtp_ngram_enabled_for_arch_value(
+        process_value("HIPFIRE_MTP_NGRAM").as_deref(),
+        model_arch,
+        gpu_arch,
+    )
+}
+fn mtp_ngram_enabled_for_arch_value(
+    value: Option<&str>,
+    model_arch: u32,
+    gpu_arch: &str,
+) -> bool {
+    match value {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => ngram_mod_arch_admitted(model_arch, gpu_arch),
+    }
+}
+/// Native Qwen4 MTP (model arch 16) on the two GPUs the n-gram composition is
+/// admitted for.
+fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
+    model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
 /// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
 /// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
@@ -4053,19 +4080,38 @@ pub fn mtp_own_prefill() -> bool {
 /// defaults (24/48/64). Validation (max <= 64, min <= max, …) stays with the
 /// arch consumer; this only resolves the snapshot values.
 pub fn ngram_mod_triple() -> (usize, usize, usize) {
-    let n_match: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_min: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
-    let n_max: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    (n_match, n_min, n_max)
+    ngram_mod_triple_with_defaults((24, 48, 64))
+}
+/// Arch-aware `(n_match, n_min, n_max)` triple. `5/3/3` is the approved
+/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; every other
+/// family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
+/// N_MIN,N_MAX}` override wins per component. Validation stays with the
+/// consumer.
+pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    ngram_mod_triple_with_defaults(ngram_mod_default_triple(model_arch, gpu_arch))
+}
+fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    if ngram_mod_arch_admitted(model_arch, gpu_arch) {
+        (5, 3, 3)
+    } else {
+        (24, 48, 64)
+    }
+}
+fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
+    ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
+}
+fn ngram_mod_triple_resolve(
+    defaults: (usize, usize, usize),
+    get: impl Fn(&str) -> Option<String>,
+) -> (usize, usize, usize) {
+    let pick = |name: &str, default: usize| {
+        get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+    };
+    (
+        pick("HIPFIRE_NGRAM_MOD_N_MATCH", defaults.0),
+        pick("HIPFIRE_NGRAM_MOD_N_MIN", defaults.1),
+        pick("HIPFIRE_NGRAM_MOD_N_MAX", defaults.2),
+    )
 }
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
@@ -5374,6 +5420,7 @@ mod tests {
 
     #[test]
     fn mtp_ngram_key_resolves_tri_state_with_env_override() {
+        // Legacy no-arch resolver: explicit on/1 only.
         for (raw, want) in [
             (None, false),
             (Some("off"), false),
@@ -5386,8 +5433,58 @@ mod tests {
         }
         let field = field("speculation.mtp_ngram").expect("mtp_ngram schema field");
         assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM"));
+        assert!(matches!(field.default, DefaultValue::String("auto")));
         assert!(field.validate(&ConfigValue::String("1".into())).is_ok());
+        assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
         assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+    }
+
+    #[test]
+    fn mtp_ngram_arch_resolver_table() {
+        let cases: [(u32, &str); 4] = [
+            (16, "gfx1151"),
+            (16, "gfx1201"),
+            (16, "gfx1100"),
+            (5, "gfx1151"),
+        ];
+        // auto/unset: only arch 16 on the two admitted GPUs.
+        let auto = [true, true, false, false];
+        for (raw, expect) in [
+            (Some("on"), [true; 4]),
+            (Some("1"), [true; 4]),
+            (Some("off"), [false; 4]),
+            (Some("0"), [false; 4]),
+            (Some("auto"), auto),
+            (None, auto),
+        ] {
+            for (i, (model_arch, gpu)) in cases.iter().enumerate() {
+                assert_eq!(
+                    mtp_ngram_enabled_for_arch_value(raw, *model_arch, gpu),
+                    expect[i],
+                    "{raw:?} arch={model_arch} gpu={gpu}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ngram_mod_triple_defaults_per_arch_with_env_override() {
+        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1100"), (24, 48, 64));
+        assert_eq!(ngram_mod_default_triple(5, "gfx1151"), (24, 48, 64));
+
+        let none = |_: &str| None;
+        assert_eq!(ngram_mod_triple_resolve((5, 3, 3), none), (5, 3, 3));
+        assert_eq!(ngram_mod_triple_resolve((24, 48, 64), none), (24, 48, 64));
+        // Overrides win per component; unparseable values fall back to the default.
+        let env = |name: &str| match name {
+            "HIPFIRE_NGRAM_MOD_N_MATCH" => Some("7".to_string()),
+            "HIPFIRE_NGRAM_MOD_N_MAX" => Some("junk".to_string()),
+            _ => None,
+        };
+        assert_eq!(ngram_mod_triple_resolve((5, 3, 3), env), (7, 3, 3));
+        assert_eq!(ngram_mod_triple_resolve((24, 48, 64), env), (7, 48, 64));
     }
 
     #[test]

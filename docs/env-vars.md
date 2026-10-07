@@ -134,7 +134,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | default **0 (off)** | RuntimeConfig |
 | `HIPFIRE_NGRAM_WINDOW` | default 256 | RuntimeConfig |
 | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` | auto / 3 | Config + RuntimeConfig |
-| `HIPFIRE_MTP_NGRAM` | off | `speculation.mtp_ngram` (`on`/`off`/`auto`, also `1`/`0`; `auto` = off): MTP + ngram-mod for greedy, thinking-off requests |
+| `HIPFIRE_MTP_NGRAM` | **auto** (on for native Qwen4 MTP on gfx1151 / gfx1201); `off`/`0` opts out | `speculation.mtp_ngram` (`on`/`off`/`auto`, also `1`/`0`; env beats TOML beats default): MTP + ngram-mod takeover windows. `auto` arms native Qwen4 MTP (arch 16: Flash-Next) on gfx1151 and gfx1201 and leaves every other producer off; `on`/`1` arms every MTP producer that supports it; `off`/`0` is the kill switch. Eligible requests are greedy **and** sampled, thinking on or off (Qwen4 and Qwen3.5/3.x). A sampled takeover verifies each n-gram candidate with the point-mass draft distribution δ(candidate) through the shared rejection verify, with the request's penalties applied to every candidate row as to native drafts: lossless in distribution, not bit-identical to MTP-only output (greedy takeovers are exact per window). The pool is request-local: cleared and reseeded from the full prompt every request, so a request's candidates never depend on earlier requests. Qwen4 takeover verifies `[seed, candidates..]` on the same batched verify executor as native MTP windows (the interleaved one-row route under `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows, then appends exactly those rows to the MTP head teacher-forced (token p, target hidden p). Load prints `qwen4 native MTP n-gram: on\|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1` window events carry `source` (`ngram`\|`mtp`) and `verify_route`. |
+| `HIPFIRE_NGRAM_MOD_N_MATCH` / `HIPFIRE_NGRAM_MOD_N_MIN` / `HIPFIRE_NGRAM_MOD_N_MAX` | **5 / 3 / 3** on admitted Qwen4 targets; **24 / 48 / 64** elsewhere | Developer overrides for the ngram-mod triple (match length / min draft / max draft), applied per component over the per-arch default. On Qwen4 `n_max` is capped at 63 (the 64-row verify holds the seed plus up to 63 candidates). |
 | `HIPFIRE_MTP_SAMPLED` | **on**; `0` opts out | `speculation.mtp_sampled` (stable; introduced as an experimental opt-in and flipped to default on in 0.4.1): Qwen4 (Flash-Next) native MTP also serves sampled (temperature > 0) requests by speculative rejection sampling — a draft drawn from `q` (the request's truncation applied to the draft head's 8 exactly re-scored candidates) is accepted with probability `min(1, p/q)`, a rejection emits a draw from `(p − q)+`, an all-accepted window emits its bonus from `p`, where `p` is exactly the AR sampler's distribution (`llama::sample_top_k_p`: temperature, top_k with absent = 20 and 0 = 64 candidates, min_p, top_p). Lossless against AR in distribution, not byte-identical to AR for a seed; one seed replays the same text. Greedy requests are unchanged. `0`: sampled requests run AR. Repeat/presence/frequency penalties stay on MTP (0.4.1): every target row — the first token, each verify row and the bonus — is penalized exactly as the host AR sampler penalizes it, against the trailing `repeat_window` tokens of the full prompt + emitted tokens + the window's earlier drafts, before truncation; the draft `q` is penalized the same way. Temperature-0 requests with non-neutral penalties run the Qwen4 AR producer (penalize-then-argmax). |
 | `HIPFIRE_MTP_OWN_PREFILL` | **unset / off**; `1` opts out | Qwen35 MTP prompt fill. Default: the trunk prefills the prompt through AR's own route (same outer chunks, widened chunk, GDN chunk scan, standard dispatch) and hands its hidden rows to the MTP head, so the prompt's KV, DeltaNet state and first-token logits match AR's. `1` restores MTP's previous route: 512-row trunk chunks captured as a speculative verify (sequential GDN recurrence; on Q8 KV, no query16 flash prefill). Resolved once per MTP load (`hipfire_config::mtp_own_prefill`); serve.log prints `qwen35 MTP prompt fill route: …`. |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP. Qwen3.x native MTP (sampled and greedy) applies the request's repeat/presence/frequency penalties to every verify row (and the full-vocab sampled draft row) with the AR GPU sampler's own penalty prepass, against the generated tokens + the window's earlier drafts (never the prompt, as AR), window `min(repeat buffer, max(repeat_window, 1))`. DFlash verifiers implement no penalties: a penalized request on a DFlash drafter runs AR. |
@@ -512,7 +513,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1425
+**Count:** 1426
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -775,7 +776,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | experimental |
 | `HIPFIRE_DEVICE` | crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-cli/src/main.rs | stable |
+| `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | stable |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs | developer |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
@@ -1454,24 +1455,25 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs | developer |
 | `HIPFIRE_MTP_IDENTITY_ARM` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
 | `HIPFIRE_MTP_IDENTITY_CASE` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
-| `HIPFIRE_MTP_IDENTITY_MODEL` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_MTP_IDENTITY_MODEL` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | harness |
 | `HIPFIRE_MTP_IDENTITY_OUT` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
-| `HIPFIRE_MTP_INCREMENTAL` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | developer |
-| `HIPFIRE_MTP_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | stable |
+| `HIPFIRE_MTP_INCREMENTAL` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_K` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
-| `HIPFIRE_MTP_NGRAM` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/qwen.rs | stable |
+| `HIPFIRE_MTP_NGRAM` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
-| `HIPFIRE_MTP_PAIRING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
-| `HIPFIRE_MTP_PHASE_TIMING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_PAIRING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_PHASE_TIMING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_SAMPLED` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | stable |
-| `HIPFIRE_MTP_SAMPLED_MODE` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | developer |
+| `HIPFIRE_MTP_SAMPLED_MODE` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_TAKEOVER_FILL_ARM` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | harness |
 | `HIPFIRE_MTP_TAPE_REPLAY` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_TRACE` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_VERIFY_DECOUPLE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
@@ -1482,9 +1484,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NGRAM_DRAFT_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/ar.rs | stable |
 | `HIPFIRE_NGRAM_MIN_COUNT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
-| `HIPFIRE_NGRAM_MOD_N_MATCH` | crates/hipfire-config/src/lib.rs, scripts/serve_harness.py | developer |
-| `HIPFIRE_NGRAM_MOD_N_MAX` | crates/hipfire-config/src/lib.rs, scripts/serve_harness.py | developer |
-| `HIPFIRE_NGRAM_MOD_N_MIN` | crates/hipfire-config/src/lib.rs, scripts/serve_harness.py | developer |
+| `HIPFIRE_NGRAM_MOD_N_MATCH` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_NGRAM_MOD_N_MAX` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_NGRAM_MOD_N_MIN` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_NGRAM_WINDOW` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/ar.rs | stable |
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | stable |
 | `HIPFIRE_NO_DEVICE_COMPILER` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/compiler.rs | experimental |
@@ -1634,11 +1636,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_SHARED_DOWN_EPI` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_TRUNK_IU4` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_TRUNK_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
-| `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-daemon/src/main.rs, crates/hipfire-generate/src/ar.rs | developer |
+| `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | developer |
 | `HIPFIRE_QWEN_KV_DEFAULT_Q8` | crates/hipfire-loader/src/admission.rs, crates/hipfire-runtime/src/loader_api.rs | developer |
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh | harness |
 | `HIPFIRE_QWEN_MTP` | scripts/benchlocal_campaign.py, scripts/serve_harness.py | harness |
-| `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-generate/src/ar.rs | developer |
+| `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | developer |
 | `HIPFIRE_RAILGUN_BACKEND` | crates/rdna-compute/src/replay.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_CACHE_TABLE` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |

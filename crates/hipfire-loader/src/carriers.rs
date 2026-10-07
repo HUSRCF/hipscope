@@ -750,10 +750,34 @@ impl Carrier for Qwen4Carrier {
                 return Err(format!("qwen4: MTP setup failed: {detail}"));
             }
             eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+            let arch = hipfire_arch_qwen4::ARCH_ID;
+            let ngram = match hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+                hipfire_config::ngram_mod_triple_for_arch(arch, &ctx.gpu.arch),
+            ) {
+                Ok(config) => {
+                    eprintln!(
+                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={})",
+                        if hipfire_config::mtp_ngram_enabled_for_arch(arch, &ctx.gpu.arch) {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        config.n_match,
+                        config.n_min,
+                        config.n_max
+                    );
+                    Some(config)
+                }
+                Err(error) => {
+                    eprintln!("  qwen4 native MTP n-gram: unavailable ({error})");
+                    None
+                }
+            };
             Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
                 max_k,
                 ctx.max_seq,
                 meta.tokenizer.special_token_id("<|im_end|>"),
+                ngram,
             ))
         } else {
             None

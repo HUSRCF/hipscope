@@ -3180,9 +3180,10 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: `speculation.mtp_ngram` (env HIPFIRE_MTP_NGRAM), thinking off. `enable_thinking`
-    // is the resolved Jinja toggle; serve lowers thinking-off to
-    // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
+    // ngram-mod takeovers ride every MTP request the producer can verify
+    // (greedy or sampled, thinking on or off) when `speculation.mtp_ngram`
+    // (env HIPFIRE_MTP_NGRAM) resolves on for this model and GPU: `auto`, the
+    // default, arms native Qwen4 MTP on gfx1151/gfx1201 only.
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3192,9 +3193,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::mtp_ngram_enabled()
-                && temp <= 1e-6
-                && !enable_thinking,
+                && hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, &gpu.arch),
             repeat_penalty,
             repeat_window,
             presence_penalty,

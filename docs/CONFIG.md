@@ -534,6 +534,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
 | `mtp_sampled` | `true` | bool | **Default on (0.4.1; experimental opt-in before the flip).** Qwen4 (Flash-Next) native MTP for sampled requests: speculative rejection sampling against the AR sampler's distribution (lossless in distribution; greedy unchanged). Requests with non-neutral repeat/presence/frequency penalties still run AR. `false`: temperature > 0 runs AR. Env `HIPFIRE_MTP_SAMPLED` (`0` opts out). |
+| `mtp_ngram` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | **Default `auto` (0.4.1).** N-gram takeover windows inside native MTP (ngram-mod). `auto` arms native Qwen4 MTP (arch 16, Flash-Next) on gfx1151 and gfx1201 and leaves every other producer off; `on`/`1` arms every MTP producer that supports it; `off`/`0` is the opt-out (kill switch). Env `HIPFIRE_MTP_NGRAM` beats TOML beats default. Eligible requests are greedy and sampled, thinking on or off; Qwen3.5/3.x takeovers stay greedy-only until its sampled takeover lands. A sampled takeover verifies each candidate with the point-mass draft distribution δ(candidate) through the shared rejection verify: lossless in distribution, not bit-identical to MTP-only output. The pool is request-local (cleared and reseeded from the full prompt every request), so candidates never depend on earlier requests. Triple (`HIPFIRE_NGRAM_MOD_N_MATCH` / `_N_MIN` / `_N_MAX`, overridable per component): 5/3/3 on admitted Qwen4 targets, 24/48/64 elsewhere; on Qwen4 `n_max` is capped at 63 (the 64-row verify). The Qwen4 takeover uses the same batched verify executor as native MTP windows (interleaved one-row route under `HIPFIRE_MTP_INCREMENTAL=1`) and appends the consumed rows to the MTP head teacher-forced (token p, hidden p). Load marker: `qwen4 native MTP n-gram: on\|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1` window events carry `source` / `verify_route`. |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
 | `ngram_mode` | `"off"` | `off` \| `on` \| `auto` | Model-free; byte-identical to AR when used. |
 | `ngram_k` | `12` | int 2–32 | |
@@ -813,6 +814,7 @@ uses ambient variables in engine hot paths.
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` |
 | `mtp_k` | `speculation.mtp_k` | `HIPFIRE_MTP_K` | 3 |
 | `mtp_sampled` | `speculation.mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | true |
+| `mtp_ngram` | `speculation.mtp_ngram` | `HIPFIRE_MTP_NGRAM` | `"auto"` (on for Qwen4 native MTP on gfx1151 / gfx1201; `off`/`0` opts out) |
 
 `kernel.lm_head_f16` maps the live Qwen3.5/3.6 loader compatibility control
 `HIPFIRE_LM_HEAD_F16`; the duplicate unused `RuntimeConfig` member was removed.

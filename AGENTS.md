@@ -729,6 +729,27 @@ Caveats that are part of the fixture, not trivia:
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
+- **MTP + ngram-mod takeover (`speculation.mtp_ngram`, `HIPFIRE_MTP_NGRAM`,
+  default `auto`):** on for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201
+  and off for every other producer; `on`/`1` arms every MTP producer that
+  supports it, `off`/`0` is the opt-out (env beats TOML beats default). It
+  serves greedy and sampled requests, thinking on or off (Qwen3.5/3.x
+  takeovers stay greedy-only until its sampled takeover lands). When the
+  request-local pool (cleared and reseeded from the full prompt every
+  request, so earlier requests never influence candidates) proposes
+  candidates, the window verifies `[seed, candidates..]` on the same batched
+  verify executor as native MTP windows (interleaved one-row route under
+  `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows,
+  and appends exactly those rows to the head teacher-forced (token p, hidden
+  p); a miss runs the unchanged native window. Greedy takeovers are exact;
+  sampled takeovers verify each candidate with the point-mass draft
+  distribution δ(candidate) through the shared rejection verify, so output
+  matches MTP-only in distribution, not byte for byte. Triple
+  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
+  targets and 24/48/64 elsewhere (per-component overrides; Qwen4 `n_max`
+  capped at 63, the 64-row verify). The load log prints `qwen4 native MTP
+  n-gram: on|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1`
+  window events carry `source` (`ngram`/`mtp`) and `verify_route`.
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus
