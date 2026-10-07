@@ -2702,24 +2702,52 @@ impl Qwen4GpuForward {
     }
 
     /// Run bounded forward tiles that only commit model state: every tile
-    /// takes [`Qwen4OutputPolicy::None`], so no head, logits, top-1 or wide
-    /// hidden rows are produced. Tiles are `scratch.max_chunk` rows from the
-    /// start of `tokens`, exactly as [`Self::forward_chunk`] tiles them, so a
-    /// prefill split at tile multiples keeps the trunk numerics byte-identical.
+    /// takes [`Qwen4OutputPolicy::None`], so no head, logits or top-1 rows are
+    /// produced. With `wide_hidden_capture` each tile still writes its wide
+    /// hidden rows into the capture at `offset * wide` (the trunk's output,
+    /// taken before the head, so identical to [`Self::forward_chunk`]'s).
+    /// Tiles are `scratch.max_chunk` rows from the start of `tokens`, exactly
+    /// as [`Self::forward_chunk`] tiles them, so a prefill split at tile
+    /// multiples keeps the trunk numerics byte-identical.
     pub(crate) fn forward_chunk_silent(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
         tokens: &[u32],
+        wide_hidden_capture: Option<&GpuTensor>,
     ) -> Result<(), Qwen4GpuForwardError> {
         let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
         self.validate_tokens(bundle, tokens)?;
+        let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
+        if let Some((capture, wide)) = wide_hidden_capture.zip(capture_width) {
+            let expected = tokens
+                .len()
+                .checked_mul(wide)
+                .ok_or_else(|| invalid("Qwen4 wide hidden capture shape overflows"))?;
+            if capture.dtype != DType::F32 || capture.numel() < expected {
+                return Err(invalid(format!(
+                    "wide hidden capture must be F32 with at least {expected} elements"
+                )));
+            }
+        }
         self.prefetch_first_tile_ple(bundle, tokens);
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
         while offset < tokens.len() {
             let rows = (tokens.len() - offset).min(max_chunk);
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
+            let capture_chunk = wide_hidden_capture
+                .zip(capture_width)
+                .map(|(capture, wide)| {
+                    let capture_offset = offset
+                        .checked_mul(wide)
+                        .ok_or_else(|| invalid("Qwen4 wide capture offset overflows"))?;
+                    let capture_len = rows
+                        .checked_mul(wide)
+                        .ok_or_else(|| invalid("Qwen4 wide capture shape overflows"))?;
+                    Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
+                })
+                .transpose()?;
             self.forward_chunk_inner(
                 bundle,
                 gpu,
@@ -2727,7 +2755,7 @@ impl Qwen4GpuForward {
                 None,
                 None,
                 None,
-                None,
+                capture_chunk.as_ref(),
                 Qwen4OutputPolicy::None,
             )?;
             offset = offset

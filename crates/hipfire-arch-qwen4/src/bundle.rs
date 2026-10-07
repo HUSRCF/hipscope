@@ -839,6 +839,59 @@ impl Qwen4Bundle {
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
+    /// [`Self::spec_prefill_rows`] for a prompt chunk whose pick nothing
+    /// reads (every chunk but the prompt's last): the trunk commits state and
+    /// still captures the full wide hidden rows for the head, but the final
+    /// hyper, LM head, argmax and readback are skipped. Tiles and trunk route
+    /// are `spec_prefill_rows`'s, so the committed state is byte-identical.
+    pub(crate) fn spec_prefill_rows_silent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
+        if tokens.is_empty() {
+            return Err(BundleError::Forward(
+                "Qwen4 spec forward cannot process an empty block".to_string(),
+            ));
+        }
+        let max_chunk = self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .max_chunk;
+        if tokens.len() > max_chunk {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                tokens.len()
+            )));
+        }
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        let hidden_len = tokens
+            .len()
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row overflow".to_string()))?;
+        let hidden = self
+            .spec_hidden
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec hidden is not allocated".to_string()))?
+            .sub_offset(0, hidden_len);
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_chunk_silent(self, gpu, tokens, Some(&hidden))
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
+    }
+
     fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
@@ -1581,7 +1634,7 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let result = forward
-            .forward_chunk_silent(self, gpu, tokens)
+            .forward_chunk_silent(self, gpu, tokens, None)
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result

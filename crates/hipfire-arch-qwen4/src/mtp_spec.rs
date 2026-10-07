@@ -2597,6 +2597,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // chunked prefill rate plus one head step per token.
         // Each prompt token selects with its own query and the pooled keys
         // visible at that position, regardless of target prefill chunking.
+        let skip_intermediate_pick = mtp_skip_intermediate_pick_enabled();
         let chunk_rows = self.prefill_rows.max(1);
         let mut pos = start_pos;
         while pos < prompt_tokens.len() {
@@ -2621,9 +2622,23 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             let chunk = &prompt_tokens[pos..end];
             Self::bundle(target)?.set_ple_lookahead(&prompt_tokens[end..]);
-            let pick = Self::bundle(target)?
-                .spec_prefill_rows(gpu, chunk, true)
-                .map_err(|error| error.to_string())?;
+            // Only the prompt's last chunk's pick is read (the seed): an
+            // earlier chunk still captures its full wide hidden for the head
+            // but skips the final hyper, LM head, argmax and readback.
+            let needs_pick =
+                mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick);
+            let pick = if needs_pick {
+                Some(
+                    Self::bundle(target)?
+                        .spec_prefill_rows(gpu, chunk, true)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                Self::bundle(target)?
+                    .spec_prefill_rows_silent(gpu, chunk)
+                    .map_err(|error| error.to_string())?;
+                None
+            };
             if let Some(scratch) = batched_scratch.as_deref_mut() {
                 // One batched Append pass per sub-chunk of at most `scratch.rows()`
                 // rows; row `i` is still paired with spec hidden row `i`.
@@ -2692,7 +2707,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .session_at_boundary(gpu, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;
             }
-            first_token = Some(pick);
+            if pick.is_some() {
+                first_token = pick;
+            }
             pos = end;
         }
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
@@ -3327,6 +3344,22 @@ fn prefill_trunk_ids_row(reuse: bool, off: usize) -> Option<usize> {
     reuse.then_some(off)
 }
 
+/// `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK`: a non-final `mtp_prefill` chunk
+/// skips the LM head, argmax and readback unless set to `0`; read at every
+/// `mtp_prefill`.
+fn mtp_skip_intermediate_pick_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK", true)
+}
+
+/// Whether the `mtp_prefill` chunk ending at `end` (an exclusive prompt
+/// position, whether it ends at a capture boundary or at the natural chunk
+/// end) runs the LM head and reads its argmax back. Only the prompt's last
+/// chunk's pick is read (the seed, and the last row's logits for a sampled
+/// draw), so with the skip on every chunk ending before the prompt end is
+/// silent; the skip off keeps the pick on every chunk.
+fn mtp_prefill_chunk_needs_pick(end: usize, prompt_len: usize, skip_intermediate: bool) -> bool {
+    !skip_intermediate || end == prompt_len
+}
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
 /// few-row persistent GDN recurrence.
 pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
@@ -3398,6 +3431,83 @@ pub fn mtp_error(error: MtpError) -> String {
 mod tests {
     use super::*;
     use crate::reference_mtp::MtpQsaGeometry;
+
+    /// The `mtp_prefill` chunk ends for a fill of `prompt_len` rows from
+    /// `start`, with natural chunks of `chunk_rows` and capture boundaries at
+    /// `captures` (a chunk ends at the first boundary inside it), mirroring
+    /// the loop's `next_prefix_capture` planning.
+    fn prefill_chunk_ends(
+        start: usize,
+        prompt_len: usize,
+        chunk_rows: usize,
+        captures: &[usize],
+    ) -> Vec<usize> {
+        let mut ends = Vec::new();
+        let mut pos = start;
+        while pos < prompt_len {
+            let natural = (pos + chunk_rows).min(prompt_len);
+            let end = captures
+                .iter()
+                .copied()
+                .find(|&boundary| boundary > pos && boundary <= natural)
+                .unwrap_or(natural);
+            ends.push(end);
+            pos = end;
+        }
+        ends
+    }
+
+    fn picking_chunks(ends: &[usize], prompt_len: usize, skip: bool) -> Vec<bool> {
+        ends.iter()
+            .map(|&end| mtp_prefill_chunk_needs_pick(end, prompt_len, skip))
+            .collect()
+    }
+
+    #[test]
+    fn prefill_pick_only_on_the_final_chunk_when_skipping() {
+        // One chunk is always the final one and keeps its pick.
+        assert_eq!(picking_chunks(&[100], 100, true), vec![true]);
+        // Natural split, no capture boundary: 100 rows in chunks of 40.
+        let ends = prefill_chunk_ends(0, 100, 40, &[]);
+        assert_eq!(ends, vec![40, 80, 100]);
+        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+    }
+
+    #[test]
+    fn prefill_capture_splits_are_silent_unless_they_end_the_prompt() {
+        // A turn anchor and a periodic boundary split the prompt mid-way: both
+        // split chunks are non-final and skip the pick.
+        let ends = prefill_chunk_ends(0, 100, 64, &[30, 90]);
+        assert_eq!(ends, vec![30, 90, 100]);
+        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+        // The end-of-prompt capture boundary closes the final chunk: it keeps
+        // the full logits/readback for the seed.
+        let ends = prefill_chunk_ends(0, 100, 64, &[64, 100]);
+        assert_eq!(ends, vec![64, 100]);
+        assert_eq!(picking_chunks(&ends, 100, true), vec![false, true]);
+        // A split just before the end leaves a one-row final chunk that picks.
+        let ends = prefill_chunk_ends(0, 100, 64, &[99]);
+        assert_eq!(ends, vec![64, 99, 100]);
+        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+    }
+
+    #[test]
+    fn prefill_cache_hit_suffix_keeps_the_final_pick() {
+        // A prefix-cache hit fills only `start..prompt_len`; the decision keys
+        // on the absolute prompt end, so a one-chunk suffix still picks.
+        let ends = prefill_chunk_ends(8192, 8300, 8192, &[]);
+        assert_eq!(ends, vec![8300]);
+        assert_eq!(picking_chunks(&ends, 8300, true), vec![true]);
+        let ends = prefill_chunk_ends(8192, 8300, 64, &[8200]);
+        assert_eq!(ends, vec![8200, 8264, 8300]);
+        assert_eq!(picking_chunks(&ends, 8300, true), vec![false, false, true]);
+    }
+
+    #[test]
+    fn prefill_opt_out_picks_every_chunk() {
+        let ends = prefill_chunk_ends(0, 100, 64, &[30, 90]);
+        assert_eq!(picking_chunks(&ends, 100, false), vec![true; ends.len()]);
+    }
 
     #[test]
     fn prefill_head_append_names_the_trunk_id_row_only_when_reuse_is_on() {
