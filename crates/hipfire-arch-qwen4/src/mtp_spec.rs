@@ -1660,9 +1660,9 @@ impl Qwen4MtpDrafter {
     /// Price both sources on the same clock; unsupported arches retain the
     /// original chooser. Depth drafts require depth + 1 verify rows.
     fn ngram_window_cost(&self, depth: usize) -> f32 {
-        let depth = depth.min(MTP_WINDOW_COST.len() - 1);
+        let legacy_depth = depth.min(MTP_WINDOW_COST.len() - 1);
         let Some((single, extra)) = self.ngram_row_cost else {
-            return MTP_WINDOW_COST[depth];
+            return MTP_WINDOW_COST[legacy_depth];
         };
         if self.floor_enabled {
             if let Some(cost) = self.floor.batched_cost(depth) {
@@ -1674,7 +1674,15 @@ impl Qwen4MtpDrafter {
         } else {
             single
         };
-        (single + extra * depth as f32) / ar_ms
+        // Explicit few-row buckets from the measured fits. Nine or more
+        // rows use a different (expert-sharing) batched route: without its
+        // measurements do not extrapolate or assume it is cheap.
+        let row_ms = if extra == 6.9 {
+            [30.5, 37.4, 44.3, 51.2, 58.1, 65.0, 71.9, 78.8]
+        } else {
+            [30.3, 45.1, 59.9, 74.7, 89.5, 104.3, 119.1, 133.9]
+        };
+        row_ms.get(depth).copied().unwrap_or(f32::INFINITY) / ar_ms
     }
 
     /// Best expected emitted tokens per unit of window cost the native route
@@ -1707,6 +1715,37 @@ impl Qwen4MtpDrafter {
         let expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
         let cost = self.ngram_window_cost(n);
         expected / cost >= self.native_rate(k.min(self.max_k))
+    }
+
+    /// Extend only a well-established copy source, never a fresh or uncertain
+    /// match. Configured n_max remains the hard bound, so defaults stay 5/3/3.
+    fn ngram_takeover_depth(&self, matched: usize, current: usize) -> usize {
+        let base = matched.min(current);
+        if matched <= current
+            || self.ngram_row_cost.is_none()
+            || self.stats.ngram_mod_windows < 5
+            || self.stats.ngram_mod_drafts == 0
+        {
+            return base;
+        }
+        let acceptance =
+            self.stats.ngram_mod_accepted as f32 / self.stats.ngram_mod_drafts as f32;
+        if acceptance < 0.95 {
+            return base;
+        }
+        let (emitted, windows) = self.ngram_yield;
+        let mut expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
+        let mut best = (base, expected / self.ngram_window_cost(base));
+        let mut prefix = acceptance.powi(base as i32);
+        for depth in base + 1..=matched {
+            prefix *= acceptance;
+            expected += prefix;
+            let rate = expected / self.ngram_window_cost(depth);
+            if rate > best.1 && rate >= self.native_rate(current.min(self.max_k)) {
+                best = (depth, rate);
+            }
+        }
+        best.0
     }
 
     /// Route with the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`): the
@@ -2040,15 +2079,22 @@ impl Qwen4MtpDrafter {
         if !self.ngram_active || self.floor_takeover_blocked() {
             return false;
         }
+        let limit = self.ngram_config.map_or(k, |config| config.n_max);
         let Some(ctx) = self.ngram.as_mut() else {
             return false;
         };
-        let Some(candidates) = ctx.propose(emitted, k) else {
+        let Some(candidates) = ctx.propose(emitted, limit) else {
             return false;
         };
         self.ngram_candidates.clear();
         self.ngram_candidates.extend_from_slice(candidates);
-        if !self.ngram_wins(self.ngram_candidates.len(), k) {
+        let native_depth = k.min(self.max_k);
+        let depth = self.ngram_takeover_depth(self.ngram_candidates.len(), native_depth);
+        if self.ngram_config.is_some_and(|config| depth < config.n_min) {
+            return false;
+        }
+        self.ngram_candidates.truncate(depth);
+        if depth <= native_depth && !self.ngram_wins(self.ngram_candidates.len(), k) {
             self.ngram_yield.0 *= NGRAM_YIELD_RECOVERY;
             self.ngram_yield.1 *= NGRAM_YIELD_RECOVERY;
             return false;
@@ -3594,6 +3640,23 @@ mod tests {
         assert!(drafter.ngram_wins(3, 2));
         drafter.ngram_row_cost = None;
         assert_eq!(drafter.ngram_window_cost(3), MTP_WINDOW_COST[3]);
+    }
+
+    #[test]
+    fn cost_aware_ngram_depth_extends_only_confident_long_matches() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.ngram_yield = (20.0, 5.0);
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 3);
+        drafter.stats.ngram_mod_windows = 5;
+        drafter.stats.ngram_mod_drafts = 15;
+        drafter.stats.ngram_mod_accepted = 15;
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 7);
+        assert_eq!(drafter.ngram_takeover_depth(3, 3), 3);
+        assert_eq!(drafter.ngram_takeover_depth(63, 3), 7);
+        assert!(drafter.ngram_window_cost(8).is_infinite());
+        drafter.stats.ngram_mod_accepted = 12;
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 3);
     }
 
     #[test]
