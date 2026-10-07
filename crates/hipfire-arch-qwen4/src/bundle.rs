@@ -758,6 +758,67 @@ impl Qwen4Bundle {
             })
     }
 
+    /// One ordinary target-only forward of `token`: a single final row, no
+    /// wide-hidden capture, so the replay graph route stays eligible. Returns
+    /// the greedy argmax (read into the first 4 bytes of `spec_host_top1`, no
+    /// allocation); the row's logits stay in row 0 of `spec_logits` for a
+    /// sampled follow-up. Clears any stale PLE lookahead first.
+    pub(crate) fn spec_ar_token(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<u32, BundleError> {
+        let vocab = self.config.vocab_size;
+        let logits = self
+            .spec_logits
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec logits are not attached".to_string()))?
+            .sub_offset(0, vocab);
+        let top1_bytes = std::mem::size_of::<i32>();
+        let top1 = self
+            .spec_top1
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax is not attached".to_string()))?
+            .sub_offset(0, top1_bytes);
+        if self.spec_host_top1.len() < top1_bytes {
+            return Err(BundleError::Forward(
+                "Qwen4 spec host argmax capacity is too small".to_string(),
+            ));
+        }
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        forward.set_ple_lookahead(&[]);
+        let result = forward
+            .forward_token(self, gpu, token, &logits, Some(&top1))
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result?;
+        gpu.hip
+            .memcpy_dtoh(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
+            .map_err(BundleError::Hip)?;
+        let bytes = &self.spec_host_top1[..top1_bytes];
+        Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Copy the wide HC stream row the last [`Self::spec_ar_token`] (or any
+    /// ordinary one-token forward) left in the forward scratch into
+    /// `destination` (F32, exactly `hc_count * hidden_size` elements). Valid
+    /// only until the next forward; for calibration, not the hot path.
+    pub(crate) fn copy_ar_hidden_to(
+        &self,
+        gpu: &mut Gpu,
+        destination: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .copy_last_wide_hidden_to(gpu, &self.config, destination)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     pub(crate) fn mtp_forward_token(
         &mut self,
         gpu: &mut Gpu,
