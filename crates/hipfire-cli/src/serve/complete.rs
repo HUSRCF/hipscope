@@ -1716,7 +1716,10 @@ pub(crate) struct ResponseFormat {
 }
 
 /// Architectures that surface reasoning content in multi-turn message history
-/// (`muse_glimmer` and Qwen3.5/3.6-family arches).
+/// (`muse_glimmer`, Qwen3.5/3.6-family arches, and `qwen4`: the Qwen3.8-Flash-Next
+/// template replays every history turn's `reasoning_content` inside `<think>`, so
+/// dropping it renders an empty think block that differs from the prompt the turn
+/// was generated under).
 /// Single source of truth for daemon request projection.
 pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
     let Some(arch) = arch else {
@@ -1736,6 +1739,7 @@ pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
         || lower.contains("qwen3.6")
         || lower.contains("qwen3_5")
         || lower.contains("qwen3_6")
+        || lower == "qwen4"
 }
 
 /// Project the HTTP body into the typed request contract. `multi_slot` is the
