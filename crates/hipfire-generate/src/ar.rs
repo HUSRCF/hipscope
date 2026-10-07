@@ -1645,8 +1645,10 @@ pub struct GenerationRouteInputs {
     pub temp: f32,
     pub user_explicit_sampling: bool,
     pub min_p: Option<f32>,
-    /// At least one repeat/presence/frequency penalty is non-neutral. Sampled
-    /// DFlash chain verify does not implement these controls and must use AR.
+    /// At least one repeat/presence/frequency penalty is non-neutral. Native
+    /// MTP verifiers apply them (Qwen4: sampled only; Qwen3.x: sampled and
+    /// greedy); DFlash verifiers (greedy, DDTree SWOR, selector chain) do not
+    /// implement these controls and must use AR.
     pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
     pub temp_spec_env_off: bool,
@@ -1701,13 +1703,16 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // `greedy_on_gpu` in `generate_ar_with_forward`), so their
             // presence on the wire must not demote the request: serve
             // forwards top_p/top_k whenever the client or the registry sets
-            // one. Penalties do move the distribution, so non-neutral ones,
-            // adaptive KV, or a force-AR switch keep the request on the
-            // ordinary Qwen4 producer.
+            // one. Sampled verification applies the request's penalties to
+            // every target row against the full prompt + emitted history
+            // (`hipfire_runtime::spec_sampling::PenaltyHistory`), so a
+            // penalized sampled request keeps the MTP route. A penalized
+            // greedy request, adaptive KV, or a force-AR switch keeps the
+            // request on the ordinary Qwen4 producer (penalize-then-argmax).
             let spec_ok = i.has_speculator
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
-                && !i.nonneutral_penalties
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor))
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
                 && !i.kv_adaptive;
@@ -1789,6 +1794,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // Selector-chain nucleus may share supports_temp_swor with DDTree SWOR but
     // still takes the sampled chain route (user-explicit top_p/top_k allowed;
     // min_p>0 still blocked — DFlash ignores min_p).
+    // Token penalties: native MTP penalizes every verify row (sampled and
+    // greedy) on the GPU against the emitted history, so it keeps the route;
+    // DFlash verifiers (greedy, DDTree SWOR, selector chain) implement none
+    // and send a penalized request to AR instead of dropping the penalties.
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
@@ -1798,6 +1807,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && i.supports_temp_swor
         && !i.supports_chain_nucleus_verify
         && !i.user_explicit_sampling
+        && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let chain_sample_route = !i.speculator_is_mtp
         && i.temp > 1e-6
@@ -1808,10 +1818,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
+    let qwen_greedy_route = i.temp <= 1e-6 && (!i.nonneutral_penalties || i.speculator_is_mtp);
     let qwen_dflash_route = caps.is_qwen_dflash()
-        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route || mtp_sample_route);
-    let llama_dflash_route =
-        caps.is_llama_dflash() && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+        && (qwen_greedy_route || ddtree_swor_route || chain_sample_route || mtp_sample_route);
+    let llama_dflash_route = caps.is_llama_dflash()
+        && ((i.temp <= 1e-6 && !i.nonneutral_penalties) || ddtree_swor_route || chain_sample_route);
     if i.has_speculator
         && !i.force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)

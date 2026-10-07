@@ -463,7 +463,7 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
 }
 
 #[test]
-fn qwen4_sampled_mtp_route_needs_temp_verify_and_neutral_penalties() {
+fn qwen4_sampled_mtp_route_honors_penalties() {
     let sampled = GenerationRouteInputs {
         arch_id: 16,
         has_speculator: true,
@@ -477,6 +477,16 @@ fn qwen4_sampled_mtp_route_needs_temp_verify_and_neutral_penalties() {
         select_generation_route(&sampled),
         GenerationRoute::Qwen4Spec
     );
+    // Sampled MTP honors repeat/presence/frequency penalties: the verifier's
+    // target applies the same host policy as the AR sampler.
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..sampled
+        }),
+        GenerationRoute::Qwen4Spec,
+        "sampled Qwen4 MTP with penalties must stay on native MTP"
+    );
     // The verifier's target applies min_p as the AR sampler does, so it does
     // not demote.
     assert_eq!(
@@ -486,31 +496,157 @@ fn qwen4_sampled_mtp_route_needs_temp_verify_and_neutral_penalties() {
         }),
         GenerationRoute::Qwen4Spec
     );
-    for refused in [
-        GenerationRouteInputs {
-            supports_temp_swor: false,
-            ..sampled
-        },
-        GenerationRouteInputs {
-            nonneutral_penalties: true,
-            ..sampled
-        },
-        GenerationRouteInputs {
-            temp_spec_env_off: true,
-            ..sampled
-        },
-        GenerationRouteInputs {
-            kv_adaptive: true,
-            ..sampled
-        },
-    ] {
-        assert_eq!(
-            select_generation_route(&refused),
-            GenerationRoute::Qwen4Ar,
-            "sampled Qwen4 request must stay on AR: {refused:?}"
-        );
+    // Every other refusal keeps the request on AR, with or without penalties.
+    for penalties in [false, true] {
+        for refused in [
+            GenerationRouteInputs {
+                supports_temp_swor: false,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                force_ar_chat: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                temp_spec_env_off: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                kv_adaptive: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&refused),
+                GenerationRoute::Qwen4Ar,
+                "sampled Qwen4 request must stay on AR: {refused:?}"
+            );
+        }
     }
 }
+
+#[test]
+fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
+    // --- Arch 5 native MTP: penalties never demote a servable request. ---
+    let mtp = GenerationRouteInputs {
+        arch_id: 5,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        nonneutral_penalties: true,
+        ..base()
+    };
+    let sampled = GenerationRouteInputs {
+        temp: 0.7,
+        user_explicit_sampling: true,
+        ..mtp
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::QwenDflash,
+        "sampled Qwen3.x MTP + penalties"
+    );
+    let greedy = GenerationRouteInputs { temp: 0.0, ..mtp };
+    assert_eq!(
+        select_generation_route(&greedy),
+        GenerationRoute::QwenDflash,
+        "greedy Qwen3.x MTP + penalties"
+    );
+    // Dense-TP EP carries the MTP drafter and honors penalties too.
+    for temp in [0.7_f32, 0.0] {
+        let dense = GenerationRouteInputs {
+            ep: true,
+            dense_tp: true,
+            temp,
+            ..mtp
+        };
+        assert_eq!(
+            select_generation_route(&dense),
+            GenerationRoute::QwenDflash,
+            "dense-TP EP MTP + penalties at temp {temp}"
+        );
+    }
+    for temp in [0.7_f32, 0.0] {
+        let forced = GenerationRouteInputs {
+            force_ar_chat: true,
+            temp,
+            ..mtp
+        };
+        assert_eq!(
+            select_generation_route(&forced),
+            GenerationRoute::QwenAr,
+            "force_ar_chat + penalties must stay AR at temp {temp}"
+        );
+    }
+
+    // --- Arch 5 DFlash (not MTP): penalties keep the request on AR. ---
+    let dflash = GenerationRouteInputs {
+        arch_id: 5,
+        has_speculator: true,
+        speculator_is_mtp: false,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs { temp: 0.0, ..dflash }),
+        GenerationRoute::QwenDflash,
+        "greedy DFlash without penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            temp: 0.0,
+            nonneutral_penalties: true,
+            ..dflash
+        }),
+        GenerationRoute::QwenAr,
+        "greedy DFlash + penalties"
+    );
+    // DDTree SWOR (temp>0, supports_temp_swor, no chain nucleus, no
+    // user-explicit sampling).
+    let ddtree = GenerationRouteInputs {
+        supports_temp_swor: true,
+        supports_chain_nucleus_verify: false,
+        user_explicit_sampling: false,
+        temp: 0.7,
+        ..dflash
+    };
+    assert_eq!(
+        select_generation_route(&ddtree),
+        GenerationRoute::QwenDflash,
+        "DDTree SWOR without penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..ddtree
+        }),
+        GenerationRoute::QwenAr,
+        "DDTree SWOR + penalties"
+    );
+}
+
+#[test]
+fn llama_dflash_greedy_route_refuses_penalties() {
+    // Arch 1 is a llama-DFlash carrier (caps().is_llama_dflash()).
+    let greedy = GenerationRouteInputs {
+        arch_id: 1,
+        has_speculator: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&greedy), GenerationRoute::LlamaSpec);
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..greedy
+        }),
+        GenerationRoute::LlamaAr
+    );
+}
+
 #[test]
 fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
     // Native Qwen4 MTP replays the whole prefix cold.
