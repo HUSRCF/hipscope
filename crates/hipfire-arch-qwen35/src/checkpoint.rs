@@ -6,13 +6,13 @@
 //! GPU capture/restore over a live `DeltaNetState`, and re-exports so
 //! existing `crate::checkpoint::…` paths keep working.
 
-use crate::qwen35::DeltaNetState;
 use crate::speculative::DeltaNetSnapshot;
-use hip_bridge::{HipError, HipResult};
 pub use hipfire_runtime::checkpoint_pool::{
     plan_resume, prefix_fingerprint, CheckpointBlob, CheckpointId, CheckpointPool,
 };
 use hipfire_runtime::serve_contract::CacheDomain;
+use crate::qwen35::DeltaNetState;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::Gpu;
 
 impl CheckpointBlob for DeltaNetSnapshot {
@@ -104,3 +104,5 @@ pub fn restore_private(
 // ───────────────────────────────────────────────────────────────────────────
 // Tests (host-only — no GPU/HIP required)
 // ───────────────────────────────────────────────────────────────────────────
+
+

@@ -85,12 +85,11 @@ pub trait SessionState {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String>;
     /// Ascending positions p with after < p <= up_to where a cold prefill of
     /// this prompt materializes canonical state.
-    fn snapshot_boundaries(&self, route: SessionRoute, after: usize, up_to: usize) -> Vec<usize>;
+    fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize>;
     /// Layout + host metadata of the live state, which must be exactly at
     /// `position`.
     fn snapshot_parts(
         &mut self,
-        gpu: &mut Gpu,
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String>;
@@ -180,7 +179,6 @@ struct Turn {
 pub struct SessionCache {
     pool: CheckpointPool<StoredSnapshot>,
     domain: CacheDomain,
-    budget: u64,
     /// Captured this turn in ascending boundary order, published by
     /// [`Self::commit`].
     pending: Vec<(Key, StoredSnapshot)>,
@@ -228,7 +226,6 @@ impl SessionCache {
         Self {
             pool: CheckpointPool::new(budget_bytes),
             domain,
-            budget: budget_bytes,
             pending: Vec::new(),
             release: Vec::new(),
             children: HashMap::new(),
@@ -247,7 +244,7 @@ impl SessionCache {
         }
         let domain = self.domain.scoped(&scope);
         state
-            .snapshot_boundaries(route, 0, prompt.len() - 1)
+            .snapshot_boundaries(0, prompt.len() - 1)
             .into_iter()
             .rev()
             .find(|&p| {
@@ -335,7 +332,7 @@ impl SessionCache {
         }
         self.turn = Some(Turn {
             boundaries: state
-                .snapshot_boundaries(route, reused, prompt.len())
+                .snapshot_boundaries(reused, prompt.len())
                 .into(),
             domain,
             route,
@@ -430,10 +427,7 @@ impl SessionCache {
             return Err(mismatch());
         }
         copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
-        drop(regions);
-        drop(dst);
-        let meta = leaf.meta.clone();
-        state.finish_restore(gpu, route, &meta)
+        state.finish_restore(gpu, route, &leaf.meta)
     }
 
     /// The next position at which the prefill must stop and call
@@ -470,24 +464,21 @@ impl SessionCache {
         }
         let growth = state.growth_reserve_bytes();
         let ancestors: Vec<Key> = state
-            .snapshot_boundaries(route, 0, p - 1)
+            .snapshot_boundaries(0, p - 1)
             .into_iter()
             .rev()
             .map(|b| (domain.clone(), b as u64, prefix_fingerprint(&prefix[..b])))
             .collect();
-        let SnapshotParts { meta, layout: live } = state.snapshot_parts(gpu, route, p)?;
+        let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
         // The parent's segment ends are this capture's starts; a parent whose
         // streams do not line up is ignored (rows from 0).
         let parent = ancestors.into_iter().find_map(|key| {
-            let ends: Vec<usize> = self.entry(&key)?.segments.iter().map(|s| s.to).collect();
-            let fits =
-                ends.len() == live.rows.len()
-                    && self.entry(&key)?.segments.iter().zip(&live.rows).all(
-                        |(segment, stream)| {
-                            segment.row_bytes == stream.row_bytes && segment.to <= stream.rows
-                        },
-                    );
-            fits.then_some((key, ends))
+            let segments = &self.entry(&key)?.segments;
+            let fits = segments.len() == live.rows.len()
+                && segments.iter().zip(&live.rows).all(|(segment, stream)| {
+                    segment.row_bytes == stream.row_bytes && segment.to <= stream.rows
+                });
+            fits.then(|| (key, segments.iter().map(|s| s.to).collect::<Vec<_>>()))
         });
         let segments: Vec<Segment> = live
             .rows
@@ -510,7 +501,7 @@ impl SessionCache {
         let bytes = total as u64;
         let skip =
             |reason: &str| eprintln!("  session cache: skipped {p}-token snapshot ({reason})");
-        if bytes > self.budget {
+        if bytes > self.pool.max_bytes() {
             skip("exceeds budget");
             return Ok(());
         }
@@ -521,7 +512,8 @@ impl SessionCache {
         let pending_bytes: u64 = self.pending.iter().map(|entry| entry.1.bytes).sum();
         let mut fits = Ok(());
         loop {
-            let over_budget = self.pool.total_bytes() + pending_bytes + bytes > self.budget;
+            let over_budget =
+                self.pool.total_bytes() + pending_bytes + bytes > self.pool.max_bytes();
             if !over_budget {
                 match memory_fits(gpu, bytes + growth) {
                     Some(true) => break,
@@ -582,8 +574,6 @@ impl SessionCache {
             })
             .collect();
         let copied = copy_regions(gpu, &regions);
-        drop(regions);
-        drop(live);
         let snapshot = StoredSnapshot {
             location: SnapshotLocation::Device(dst),
             parent,
@@ -716,19 +706,13 @@ mod tests {
         fn snapshot_scope(&self, _route: SessionRoute) -> Option<String> {
             Some("toy".to_string())
         }
-        fn snapshot_boundaries(
-            &self,
-            _route: SessionRoute,
-            after: usize,
-            up_to: usize,
-        ) -> Vec<usize> {
+        fn snapshot_boundaries(&self, after: usize, up_to: usize) -> Vec<usize> {
             (after / STRIDE + 1..=up_to / STRIDE)
                 .map(|k| k * STRIDE)
                 .collect()
         }
         fn snapshot_parts(
             &mut self,
-            _gpu: &mut Gpu,
             _route: SessionRoute,
             position: usize,
         ) -> Result<SnapshotParts<'_>, String> {

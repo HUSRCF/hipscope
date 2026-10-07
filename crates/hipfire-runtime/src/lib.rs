@@ -24,7 +24,6 @@ pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod chatml;
-pub mod checkpoint_pool;
 pub mod config;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
@@ -64,22 +63,23 @@ pub mod prefix_index;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
-/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
-/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
-/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
-pub mod scheduler;
 pub mod sealed_moe;
 pub mod serve;
+pub mod checkpoint_pool;
 pub mod serve_contract;
 pub mod serve_fairness;
 pub mod serve_wait;
 pub mod session_cache;
-pub mod sidecar;
 /// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
 /// data structure; no GPU dependencies. Moved from `hipfire-arch-qwen35`
 /// (the multi-slot scheduler/batch substrate is model-agnostic). See module
 /// docs for the per-slot-absolute `positions[]` invariant.
 pub mod slot_batch;
+/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
+/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
+/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
+pub mod scheduler;
+pub mod sidecar;
 pub mod spec;
 
 pub mod ngram_mod;
@@ -98,8 +98,8 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
-pub mod session_table;
 pub mod stop_sequence;
+pub mod session_table;
 pub mod tokenizer;
 
 pub mod calibration;

@@ -63,7 +63,7 @@ fn state_digests(
     position: usize,
 ) -> Vec<[u8; 32]> {
     let SnapshotParts { meta, layout } =
-        SessionState::snapshot_parts(bundle, gpu, route, position).expect("state parts");
+        SessionState::snapshot_parts(bundle, route, position).expect("state parts");
     gpu.hip.device_synchronize().expect("sync");
     let mut digests = vec![Sha256::digest(&meta).into()];
     let ranges = layout
