@@ -514,7 +514,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1426
+**Count:** 1430
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1642,6 +1642,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh | harness |
 | `HIPFIRE_QWEN_MTP` | scripts/benchlocal_campaign.py, scripts/serve_harness.py | harness |
 | `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | developer |
+| `HIPFIRE_RADIX_SESSION_CHILD` | crates/hipfire-arch-qwen4/tests/radix_cache_session_hw.rs | harness |
+| `HIPFIRE_RADIX_SESSION_CORPUS` | crates/hipfire-arch-qwen4/tests/radix_cache_session_hw.rs | harness |
+| `HIPFIRE_RADIX_SESSION_MODEL` | crates/hipfire-arch-qwen4/tests/radix_cache_session_hw.rs | harness |
+| `HIPFIRE_RADIX_SESSION_OUT` | crates/hipfire-arch-qwen4/tests/radix_cache_session_hw.rs | harness |
 | `HIPFIRE_RAILGUN_BACKEND` | crates/rdna-compute/src/replay.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_CACHE_TABLE` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_CHECK` | crates/hip-bridge/src/registry.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
