@@ -146,17 +146,82 @@ pub enum Qwen4PrefixMode {
     NativeMtp,
 }
 
-/// Where a prefill starts: `start_pos == 0` is a cold reset, otherwise the
-/// durable checkpoint after exactly `start_pos` tokens is restored and
-/// `prompt[start_pos..]` is replayed. `start_pos` is the cached-token count.
+/// Which owner state a prefill continues from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Qwen4PrefixSource {
+    /// Reset every owner and prefill the whole prompt.
+    #[default]
+    Cold,
+    /// Continue the committed live state in place: no copy, no reset.
+    Live,
+    /// Restore the end-of-prompt checkpoint.
+    Prompt,
+}
+
+/// Where a prefill starts. `start_pos` is the cached-token count: `0` is a
+/// cold reset; otherwise the live state or the end-of-prompt checkpoint at
+/// exactly `start_pos` tokens continues and `prompt[start_pos..]` is
+/// prefilled. A hit plan is a receipt only [`Qwen4Bundle::bind_prefix_plan`]
+/// issues: `begin_prefix` re-binds it and rejects it once the cache has
+/// moved on. `Default` is an unconditional cold start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Qwen4PrefixPlan {
     pub start_pos: usize,
+    source: Qwen4PrefixSource,
+    generation: u64,
 }
 
-/// One durable canonical-chunk checkpoint. The device bytes live in the
-/// state/MTP prefix arenas (their `active` flags are the device validity);
-/// this records which tokens they hold and under which schedule.
+impl Qwen4PrefixPlan {
+    pub fn source(&self) -> Qwen4PrefixSource {
+        self.source
+    }
+}
+
+/// Device positions and the admitted prefill chunk the prefix decisions
+/// read. Plain data so bind, publish and lineage decisions run without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefixMarks {
+    /// Tokens the target state has consumed.
+    target_position: usize,
+    /// Tokens the MTP head has consumed; `None` without a head.
+    mtp_position: Option<usize>,
+    /// Position of the target's valid durable checkpoint.
+    target_prefix: Option<usize>,
+    /// Position of the head's valid durable checkpoint.
+    mtp_prefix: Option<usize>,
+    /// Admitted prefill chunk now; `None` without forward resources.
+    chunk: Option<usize>,
+    /// A speculative verify row capture is in flight.
+    row_capture_armed: bool,
+}
+
+impl PrefixMarks {
+    /// Target (and for native MTP, the head) have consumed exactly `end`.
+    fn aligned_at(&self, end: usize, mode: Qwen4PrefixMode) -> bool {
+        self.target_position == end
+            && (mode == Qwen4PrefixMode::Ar || self.mtp_position == Some(end))
+    }
+
+    /// The live state is the committed state after `end` tokens.
+    fn live_at(&self, end: usize, mode: Qwen4PrefixMode) -> bool {
+        end > 0 && !self.row_capture_armed && self.aligned_at(end, mode)
+    }
+
+    /// The durable arenas hold the checkpoint after `p` tokens: the target's
+    /// always, the head's too for native MTP.
+    fn checkpoint_at(&self, p: usize, mode: Qwen4PrefixMode) -> bool {
+        p > 0
+            && self.target_prefix == Some(p)
+            && (mode == Qwen4PrefixMode::Ar || self.mtp_prefix == Some(p))
+    }
+}
+
+/// Host record of what the device owners hold: one end-of-prompt checkpoint
+/// (`P = prompt_len`) and, after a committed request, the live state.
+///
+/// The device bytes live in the state/MTP prefix arenas (their `active` flags
+/// are the checkpoint's device validity) and in the live state itself; this
+/// records which tokens they hold and under which schedule.
 ///
 /// The key is only tokens, mode and admitted chunk because everything else
 /// is immutable for this owner: model artifact, device, state formats,
@@ -165,16 +230,134 @@ pub struct Qwen4PrefixPlan {
 /// config snapshot (`hipfire_config` `OnceLock`), fixed for the process. Any
 /// future mutable route knob or cross-bundle transport must join the key.
 struct Qwen4PrefixCache {
-    /// Token ids `[0, p)` of the checkpoint; reused allocation.
+    /// One reusable record (capacity `max_seq`): the prompt `[0, prompt_len)`
+    /// after a stage, the full committed history while `live_len` is set.
+    /// The checkpoint key is `tokens[..prompt_len]`, never the vector length.
     tokens: Vec<u32>,
+    /// End of the staged prompt: the checkpoint's position.
+    prompt_len: usize,
+    /// Consumed tokens the live state holds, when published and exact.
+    live_len: Option<usize>,
     mode: Qwen4PrefixMode,
-    /// Admitted prefill chunk the checkpoint's schedule ran with.
+    /// Admitted prefill chunk the record was produced under.
     chunk: usize,
     /// Set only by a client-committed request; a running request's
     /// candidate is never planned against.
     published: bool,
     /// Absolute position the running prefill checkpoints at.
     capture_at: Option<usize>,
+    /// Advances on every begin, reset, rewind and invalidation; a hit receipt
+    /// carries the value it was bound under.
+    generation: u64,
+}
+
+impl Qwen4PrefixCache {
+    fn new(max_seq_len: usize) -> Self {
+        Self {
+            tokens: Vec::with_capacity(max_seq_len),
+            prompt_len: 0,
+            live_len: None,
+            mode: Qwen4PrefixMode::Ar,
+            chunk: 0,
+            published: false,
+            capture_at: None,
+            generation: 0,
+        }
+    }
+
+    /// Drop every record and unpublish.
+    fn clear(&mut self) {
+        self.tokens.clear();
+        self.prompt_len = 0;
+        self.live_len = None;
+        self.published = false;
+        self.capture_at = None;
+        self.generation += 1;
+    }
+
+    /// Published for this `mode` under the chunk the device now admits.
+    fn current(&self, marks: &PrefixMarks, mode: Qwen4PrefixMode) -> bool {
+        self.published && self.mode == mode && marks.chunk == Some(self.chunk)
+    }
+
+    /// End `L` of the live state when it is published and still exactly at `L`.
+    fn live_end(&self, marks: &PrefixMarks, mode: Qwen4PrefixMode) -> Option<usize> {
+        let end = self.live_len?;
+        (self.current(marks, mode) && marks.live_at(end, mode)).then_some(end)
+    }
+
+    /// End `P` of the durable checkpoint when it is published and valid.
+    fn checkpoint_end(&self, marks: &PrefixMarks, mode: Qwen4PrefixMode) -> Option<usize> {
+        (self.current(marks, mode) && marks.checkpoint_at(self.prompt_len, mode))
+            .then_some(self.prompt_len)
+    }
+
+    /// Longest valid published record: the live history, else the prompt.
+    fn prefix_lineage(&self, marks: &PrefixMarks, mode: Qwen4PrefixMode) -> Option<&[u32]> {
+        let end = self
+            .live_end(marks, mode)
+            .or_else(|| self.checkpoint_end(marks, mode))?;
+        Some(&self.tokens[..end])
+    }
+
+    /// Bind the planner-selected `start` for `prompt`.
+    fn bind(
+        &self,
+        marks: &PrefixMarks,
+        prompt: &[u32],
+        start: usize,
+        mode: Qwen4PrefixMode,
+    ) -> Result<Qwen4PrefixPlan, String> {
+        let plan = |source| Qwen4PrefixPlan {
+            start_pos: start,
+            source,
+            generation: self.generation,
+        };
+        if start == 0 {
+            return Ok(plan(Qwen4PrefixSource::Cold));
+        }
+        if start >= prompt.len() {
+            return Err(format!(
+                "Qwen4 prefix start {start} leaves no suffix of a {}-token prompt",
+                prompt.len()
+            ));
+        }
+        let record_matches = |end: usize| prompt[..end] == self.tokens[..end];
+        if self.live_end(marks, mode) == Some(start) && record_matches(start) {
+            return Ok(plan(Qwen4PrefixSource::Live));
+        }
+        if self.checkpoint_end(marks, mode) == Some(start) && record_matches(start) {
+            return Ok(plan(Qwen4PrefixSource::Prompt));
+        }
+        Err(format!(
+            "Qwen4 prefix start {start} matches neither the live state ({:?}) nor the checkpoint ({:?})",
+            self.live_end(marks, mode),
+            self.checkpoint_end(marks, mode)
+        ))
+    }
+
+    /// Publish after the client committed the request whose full host history
+    /// is `consumed`. The live state is published iff `consumed` extends the
+    /// staged prompt, the target (and for native MTP, the head) are exactly at
+    /// its end, and no row capture is armed; the record then becomes
+    /// `consumed`, extended in place. Otherwise the record falls back to the
+    /// prompt. Published = live valid or the checkpoint's arenas valid.
+    fn commit(&mut self, marks: &PrefixMarks, consumed: &[u32]) {
+        self.capture_at = None;
+        let p = self.prompt_len;
+        let live = p > 0
+            && consumed.len() >= p
+            && marks.live_at(consumed.len(), self.mode)
+            && consumed[..p] == self.tokens[..p];
+        self.tokens.truncate(p);
+        if live {
+            self.tokens.extend_from_slice(&consumed[p..]);
+            self.live_len = Some(consumed.len());
+        } else {
+            self.live_len = None;
+        }
+        self.published = live || marks.checkpoint_at(p, self.mode);
+    }
 }
 
 impl Qwen4Bundle {
@@ -1225,9 +1408,7 @@ impl Qwen4Bundle {
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         if let Some(cache) = self.prefix.as_mut() {
-            cache.published = false;
-            cache.capture_at = None;
-            cache.tokens.clear();
+            cache.clear();
         }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
@@ -1254,13 +1435,7 @@ impl Qwen4Bundle {
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
         if self.prefix.is_none() {
-            self.prefix = Some(Qwen4PrefixCache {
-                tokens: Vec::with_capacity(self.state.max_seq_len),
-                mode: Qwen4PrefixMode::Ar,
-                chunk: 0,
-                published: false,
-                capture_at: None,
-            });
+            self.prefix = Some(Qwen4PrefixCache::new(self.state.max_seq_len));
         }
         Ok(())
     }
@@ -1285,55 +1460,71 @@ impl Qwen4Bundle {
         Ok((target, mtp))
     }
 
-    /// Pure plan for `prompt` (the full canonical token ids) under `mode`:
-    /// restore the published checkpoint `p` when `prompt[..p]` equals its
-    /// tokens, `p < prompt.len()`, and mode, admitted chunk and device
-    /// validity all match; otherwise cold. No GPU or state mutation.
-    pub fn plan_prefix(&self, prompt: &[u32], mode: Qwen4PrefixMode) -> Qwen4PrefixPlan {
-        let cold = Qwen4PrefixPlan::default();
-        let Some(cache) = self.prefix.as_ref() else {
-            return cold;
-        };
-        let p = cache.tokens.len();
-        if cache.published
-            && cache.mode == mode
-            && Some(cache.chunk) == self.spec_chunk_rows()
-            && p > 0
-            && p < prompt.len()
-            && self.prefix_device_valid(p, mode)
-            && prompt[..p] == cache.tokens[..]
-        {
-            Qwen4PrefixPlan { start_pos: p }
-        } else {
-            cold
+    /// Device positions and admitted chunk the prefix decisions read.
+    fn prefix_marks(&self) -> PrefixMarks {
+        PrefixMarks {
+            target_position: self.state.position,
+            mtp_position: self.mtp.as_ref().map(Qwen4MtpGpu::position),
+            target_prefix: self.state.prefix_position(),
+            mtp_prefix: self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position),
+            chunk: self.spec_chunk_rows(),
+            row_capture_armed: self.state.row_capture_armed,
         }
     }
 
-    /// Whether the device arenas hold the checkpoint after `p` tokens: the
-    /// target's always, the head's too for native MTP.
-    fn prefix_device_valid(&self, p: usize, mode: Qwen4PrefixMode) -> bool {
-        self.state.prefix_position() == Some(p)
-            && match mode {
-                Qwen4PrefixMode::Ar => true,
-                Qwen4PrefixMode::NativeMtp => {
-                    self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position) == Some(p)
-                }
-            }
+    /// Published token lineage for `mode`, the `conversation_tokens` input of
+    /// the shared prompt-cache planner: the full committed record while the
+    /// live state still holds it, else the end-of-prompt record while the
+    /// durable checkpoint is valid, else `None` (no cache, unpublished, or
+    /// mode, admitted chunk or device validity mismatch).
+    pub fn prefix_cache_tokens(&self, mode: Qwen4PrefixMode) -> Option<&[u32]> {
+        self.prefix
+            .as_ref()?
+            .prefix_lineage(&self.prefix_marks(), mode)
+    }
+
+    /// End-of-prompt position `P` while the durable checkpoint is published
+    /// and valid for `mode`; the planner's checkpoint list.
+    pub fn prefix_checkpoint_position(&self, mode: Qwen4PrefixMode) -> Option<usize> {
+        self.prefix
+            .as_ref()?
+            .checkpoint_end(&self.prefix_marks(), mode)
+    }
+
+    /// Bind a planner-selected `start_pos` for `prompt` (the full canonical
+    /// token ids) under `mode`. `0` is a cold start; the valid live end `L`
+    /// (with `prompt[..L]` equal to the committed record) is a live
+    /// continuation, preferred when it also ends at `P`; the valid checkpoint
+    /// end `P` (with `prompt[..P]` equal to its record) is a checkpoint
+    /// restore. A hit must leave a non-empty suffix; any other start is an
+    /// error. No GPU or state mutation.
+    pub fn bind_prefix_plan(
+        &self,
+        prompt: &[u32],
+        start_pos: usize,
+        mode: Qwen4PrefixMode,
+    ) -> Result<Qwen4PrefixPlan, BundleError> {
+        let bound = match self.prefix.as_ref() {
+            Some(cache) => cache.bind(&self.prefix_marks(), prompt, start_pos, mode),
+            None if start_pos == 0 => Ok(Qwen4PrefixPlan::default()),
+            None => Err(format!(
+                "Qwen4 prefix cache is not attached (start {start_pos})"
+            )),
+        };
+        bound.map_err(BundleError::Forward)
     }
 
     /// Discard live decode state the host will never extend, keeping the
-    /// checkpoint: restore it into every owner (its token record and publish
-    /// state untouched), as a hit's prefill would. Without a valid checkpoint,
-    /// or if the restore fails, reset instead. Every later prefill begins
-    /// with [`Self::begin_prefix`], so the live state is never built on.
+    /// end-of-prompt checkpoint: restore it into every owner (its publish
+    /// state untouched), as a checkpoint hit's prefill would. Afterwards no
+    /// live record remains and earlier receipts are stale. Without a valid
+    /// checkpoint, or if the restore fails, reset instead. Every later
+    /// prefill begins with [`Self::begin_prefix`], so the discarded state is
+    /// never built on.
     pub fn rewind_to_prefix(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let marks = self.prefix_marks();
         let mode = match self.prefix.as_ref() {
-            Some(cache)
-                if !cache.tokens.is_empty()
-                    && self.prefix_device_valid(cache.tokens.len(), cache.mode) =>
-            {
-                cache.mode
-            }
+            Some(cache) if marks.checkpoint_at(cache.prompt_len, cache.mode) => cache.mode,
             _ => return self.reset(gpu),
         };
         if let Err(error) = self.restore_prefix_owners(gpu, mode) {
@@ -1344,15 +1535,23 @@ impl Qwen4Bundle {
                 ))),
             };
         }
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.live_len = None;
+            cache.tokens.truncate(cache.prompt_len);
+            cache.generation += 1;
+        }
         Ok(())
     }
 
-    /// Start a prefill of `prompt` under `plan` (re-validated here): a cold
-    /// plan resets every owner, a hit restores the checkpoint into target
-    /// state and, for native MTP, the head and its draft policy. Any failure
-    /// after the first device write resets before returning. The cache is
-    /// unpublished until [`Self::commit_prefix`]; the prefill checkpoints at
-    /// the last whole-chunk boundary of `prompt` past `plan.start_pos`.
+    /// Start a prefill of `prompt` under `plan`. A cold plan resets every
+    /// owner. A live or checkpoint plan is re-bound first and must equal
+    /// `plan` (source, start and generation) before any device write. Live
+    /// continues the committed state in place: only the previous request's
+    /// PLE work is invalidated. Checkpoint restores `P` into target state
+    /// and, for native MTP, the head and its draft policy; a failed restore
+    /// resets before returning. The cache is unpublished until
+    /// [`Self::commit_prefix`], and the prefill checkpoints at
+    /// `prompt.len()`.
     pub fn begin_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -1362,24 +1561,37 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        if plan.start_pos == 0 {
-            self.reset(gpu)?;
-        } else {
-            if self.plan_prefix(prompt, mode) != plan {
-                return Err(BundleError::Forward(format!(
-                    "Qwen4 prefix plan at {} is no longer valid",
-                    plan.start_pos
-                )));
-            }
-            let restored = self.restore_prefix_owners(gpu, mode);
-            if let Err(error) = restored {
-                let reset = self.reset(gpu);
-                return Err(match reset {
-                    Ok(()) => error,
-                    Err(reset) => BundleError::Forward(format!(
-                        "{error}; reset after the failed prefix restore also failed: {reset}"
-                    )),
-                });
+        match plan.source {
+            Qwen4PrefixSource::Cold => self.reset(gpu)?,
+            Qwen4PrefixSource::Live | Qwen4PrefixSource::Prompt => {
+                if self.bind_prefix_plan(prompt, plan.start_pos, mode)? != plan {
+                    return Err(BundleError::Forward(format!(
+                        "Qwen4 prefix plan at {} ({:?}) is no longer valid",
+                        plan.start_pos, plan.source
+                    )));
+                }
+                if plan.source == Qwen4PrefixSource::Live {
+                    if let Some(cache) = self.prefix.as_mut() {
+                        cache.published = false;
+                        cache.live_len = None;
+                        cache.tokens.truncate(cache.prompt_len);
+                    }
+                    self.invalidate_ple_epoch()?;
+                } else {
+                    if let Err(error) = self.restore_prefix_owners(gpu, mode) {
+                        let reset = self.reset(gpu);
+                        return Err(match reset {
+                            Ok(()) => error,
+                            Err(reset) => BundleError::Forward(format!(
+                                "{error}; reset after the failed prefix restore also failed: {reset}"
+                            )),
+                        });
+                    }
+                    if let Some(cache) = self.prefix.as_mut() {
+                        cache.live_len = None;
+                        cache.tokens.truncate(cache.prompt_len);
+                    }
+                }
             }
         }
         let chunk = self.spec_chunk_rows();
@@ -1390,8 +1602,17 @@ impl Qwen4Bundle {
             cache.published = false;
             cache.mode = mode;
             cache.chunk = chunk;
-            let boundary = prompt.len() / chunk * chunk;
-            cache.capture_at = (boundary > plan.start_pos).then_some(boundary);
+            cache.capture_at = Some(prompt.len());
+            cache.generation += 1;
+        }
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").is_ok_and(|value| value == "1")
+        {
+            eprintln!(
+                "[qwen4-prefix] begin source={:?} start={} prompt={} mode={mode:?}",
+                plan.source,
+                plan.start_pos,
+                prompt.len()
+            );
         }
         Ok(())
     }
@@ -1433,33 +1654,37 @@ impl Qwen4Bundle {
         self.prefix.as_ref().and_then(|cache| cache.capture_at)
     }
 
-    /// Checkpoint the live state at the armed boundary. `prefix` is
-    /// `prompt[..boundary]`; target (and for native MTP, the head) must have
-    /// consumed exactly it. A failure leaves no valid checkpoint.
+    /// Checkpoint the live state at the armed end of prompt. `prefix` is the
+    /// whole prompt; target (and for native MTP, the head) must have consumed
+    /// exactly it. On success the host record is `prefix` and the live record
+    /// is dropped; a failure leaves no valid checkpoint.
     pub fn stage_prefix(&mut self, gpu: &mut Gpu, prefix: &[u32]) -> Result<(), BundleError> {
         let (at, mode) = match self.prefix.as_ref() {
             Some(cache) => (cache.capture_at, cache.mode),
             None => return Ok(()),
         };
-        let mtp_position = self.mtp.as_ref().map(Qwen4MtpGpu::position);
-        let aligned = at == Some(prefix.len())
-            && self.state.position == prefix.len()
-            && (mode == Qwen4PrefixMode::Ar || mtp_position == Some(prefix.len()));
+        let marks = self.prefix_marks();
+        let aligned = at == Some(prefix.len()) && marks.aligned_at(prefix.len(), mode);
         let result = if aligned {
             self.capture_prefix_owners(gpu, mode)
         } else {
             Err(BundleError::Forward(format!(
-                "Qwen4 prefix checkpoint at {} is not aligned (armed {at:?}, target {}, mtp {mtp_position:?})",
+                "Qwen4 prefix checkpoint at {} is not aligned (armed {at:?}, target {}, mtp {:?})",
                 prefix.len(),
-                self.state.position
+                marks.target_position,
+                marks.mtp_position
             )))
         };
         let cache = self.prefix.as_mut().expect("prefix cache checked above");
         cache.capture_at = None;
+        cache.published = false;
+        cache.live_len = None;
+        cache.prompt_len = 0;
         cache.tokens.clear();
         match result {
             Ok(()) => {
                 cache.tokens.extend_from_slice(prefix);
+                cache.prompt_len = prefix.len();
                 Ok(())
             }
             Err(error) => {
@@ -1491,21 +1716,23 @@ impl Qwen4Bundle {
         }
     }
 
-    /// Publish the checkpoint after the client committed the request. A
-    /// request that restored `p` and crossed no new boundary republishes `p`.
-    pub fn commit_prefix(&mut self) {
+    /// Publish after the client committed the request. `consumed_tokens` is
+    /// the full host history the device now holds (prompt plus every consumed
+    /// generated token). The live state is published when it is exactly that
+    /// history (see `Qwen4PrefixCache::commit`); the end-of-prompt checkpoint
+    /// is published whenever its device arenas are valid, so a terminal that
+    /// leaves no exact live state still keeps `P`.
+    pub fn commit_prefix(&mut self, consumed_tokens: &[u32]) {
+        let marks = self.prefix_marks();
         if let Some(cache) = self.prefix.as_mut() {
-            cache.capture_at = None;
-            cache.published = !cache.tokens.is_empty();
+            cache.commit(&marks, consumed_tokens);
         }
     }
 
-    /// Drop the checkpoint (device validity and its token record).
+    /// Drop the checkpoint and live record (device validity and host record).
     pub fn invalidate_prefix(&mut self) {
         if let Some(cache) = self.prefix.as_mut() {
-            cache.published = false;
-            cache.capture_at = None;
-            cache.tokens.clear();
+            cache.clear();
         }
         self.state.invalidate_prefix();
         if let Some(mtp) = self.mtp.as_mut() {
@@ -1514,9 +1741,9 @@ impl Qwen4Bundle {
     }
 
     /// AR prefill of the full canonical `prompt` under `plan`, keeping only
-    /// the final logits row: begin (reset or restore), replay
-    /// `prompt[plan.start_pos..]` in the cold schedule's global chunks, and
-    /// checkpoint at the armed whole-chunk boundary.
+    /// the final logits row: begin (reset, live continuation or checkpoint
+    /// restore), one forward over `prompt[plan.start_pos..]`, then the
+    /// end-of-prompt checkpoint at `prompt.len()`.
     pub fn prefill_final(
         &mut self,
         gpu: &mut Gpu,
@@ -1525,19 +1752,11 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
         self.begin_prefix(gpu, prompt, plan, Qwen4PrefixMode::Ar)?;
-        let start = plan.start_pos;
-        match self.prefix_capture_at() {
-            Some(at) => {
-                self.set_ple_lookahead(&prompt[at..]);
-                self.forward_chunk_final(gpu, &prompt[start..at], logits, None)?;
-                self.stage_prefix(gpu, &prompt[..at])?;
-                if at < prompt.len() {
-                    self.forward_chunk_final(gpu, &prompt[at..], logits, None)?;
-                }
-                Ok(())
-            }
-            None => self.forward_chunk_final(gpu, &prompt[start..], logits, None),
+        self.forward_chunk_final(gpu, &prompt[plan.start_pos..], logits, None)?;
+        if self.prefix_capture_at() == Some(prompt.len()) {
+            self.stage_prefix(gpu, prompt)?;
         }
+        Ok(())
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
@@ -1978,5 +2197,304 @@ mod tests {
             BundleError::Weights(WeightError::DescriptorMismatch(message))
                 if message.contains("valid rows")
         ));
+    }
+
+    const CHUNK: usize = 256;
+
+    /// Device marks of a target (and, for native MTP, head) sitting at `at`
+    /// with a durable checkpoint at `checkpoint`.
+    fn marks(mode: Qwen4PrefixMode, at: usize, checkpoint: Option<usize>) -> PrefixMarks {
+        let mtp = mode == Qwen4PrefixMode::NativeMtp;
+        PrefixMarks {
+            target_position: at,
+            mtp_position: mtp.then_some(at),
+            target_prefix: checkpoint,
+            mtp_prefix: if mtp { checkpoint } else { None },
+            chunk: Some(CHUNK),
+            row_capture_armed: false,
+        }
+    }
+
+    /// A cache whose request staged `prompt` (unpublished), as after `stage_prefix`.
+    fn staged(prompt: &[u32], mode: Qwen4PrefixMode) -> Qwen4PrefixCache {
+        let mut cache = Qwen4PrefixCache::new(64);
+        cache.mode = mode;
+        cache.chunk = CHUNK;
+        cache.generation = 7;
+        cache.tokens.extend_from_slice(prompt);
+        cache.prompt_len = prompt.len();
+        cache
+    }
+
+    fn prompt(len: u32) -> Vec<u32> {
+        (1..=len).collect()
+    }
+
+    /// `staged` + committed generation: record = prompt + `generated` tokens.
+    fn committed(
+        prompt_len: u32,
+        generated: u32,
+        mode: Qwen4PrefixMode,
+    ) -> (Qwen4PrefixCache, Vec<u32>) {
+        let mut cache = staged(&prompt(prompt_len), mode);
+        let consumed = prompt(prompt_len + generated);
+        let end = consumed.len();
+        cache.commit(&marks(mode, end, Some(prompt_len as usize)), &consumed);
+        (cache, consumed)
+    }
+
+    const AR: Qwen4PrefixMode = Qwen4PrefixMode::Ar;
+    const MTP: Qwen4PrefixMode = Qwen4PrefixMode::NativeMtp;
+
+    #[test]
+    fn default_plan_is_unconditional_cold() {
+        let plan = Qwen4PrefixPlan::default();
+        assert_eq!(plan.start_pos, 0);
+        assert_eq!(plan.source(), Qwen4PrefixSource::Cold);
+    }
+
+    #[test]
+    fn cold_bind_ignores_cache_state() {
+        let cache = Qwen4PrefixCache::new(64);
+        let m = marks(AR, 0, None);
+        let plan = cache.bind(&m, &prompt(10), 0, AR).unwrap();
+        assert_eq!(
+            (plan.start_pos, plan.source()),
+            (0, Qwen4PrefixSource::Cold)
+        );
+        assert!(cache.bind(&m, &prompt(10), 4, AR).is_err());
+    }
+
+    #[test]
+    fn live_bind_extends_the_committed_record() {
+        let (cache, consumed) = committed(8, 5, AR);
+        let m = marks(AR, 13, Some(8));
+        let mut next = consumed.clone();
+        next.extend([900, 901]);
+        let plan = cache.bind(&m, &next, 13, AR).unwrap();
+        assert_eq!(
+            (plan.start_pos, plan.source()),
+            (13, Qwen4PrefixSource::Live)
+        );
+        // L == N leaves no suffix.
+        assert!(cache.bind(&m, &consumed, 13, AR).is_err());
+        // The whole committed record must match, not just the prompt.
+        let mut diverged = next.clone();
+        diverged[10] = 777;
+        assert!(cache.bind(&m, &diverged, 13, AR).is_err());
+    }
+
+    #[test]
+    fn prompt_bind_restores_p_after_divergence() {
+        let (cache, consumed) = committed(8, 5, AR);
+        let m = marks(AR, 13, Some(8));
+        let mut next = consumed[..8].to_vec();
+        next.extend([500, 501, 502]);
+        let plan = cache.bind(&m, &next, 8, AR).unwrap();
+        assert_eq!(
+            (plan.start_pos, plan.source()),
+            (8, Qwen4PrefixSource::Prompt)
+        );
+        // Divergence inside the prompt leaves no matching checkpoint.
+        let mut early = next.clone();
+        early[7] = 999;
+        assert!(cache.bind(&m, &early, 8, AR).is_err());
+        // Only P (and L) are bindable starts, not an arbitrary LCP.
+        assert!(cache.bind(&m, &next, 5, AR).is_err());
+        assert!(cache.bind(&m, &next, 10, AR).is_err());
+        // The prompt must leave a non-empty suffix.
+        assert!(cache.bind(&m, &consumed[..8], 8, AR).is_err());
+    }
+
+    #[test]
+    fn live_is_preferred_when_it_ends_at_the_checkpoint() {
+        let (cache, consumed) = committed(8, 0, AR);
+        let m = marks(AR, 8, Some(8));
+        let mut next = consumed.clone();
+        next.push(42);
+        let plan = cache.bind(&m, &next, 8, AR).unwrap();
+        assert_eq!(plan.source(), Qwen4PrefixSource::Live);
+    }
+
+    #[test]
+    fn mode_or_chunk_mismatch_publishes_nothing() {
+        let (cache, consumed) = committed(8, 5, MTP);
+        let m = marks(MTP, 13, Some(8));
+        let mut next = consumed.clone();
+        next.push(42);
+        assert!(cache.bind(&m, &next, 13, MTP).is_ok());
+        assert!(cache.bind(&m, &next, 13, AR).is_err());
+        assert!(cache.prefix_lineage(&m, AR).is_none());
+        assert_eq!(cache.checkpoint_end(&m, AR), None);
+        let wrong_chunk = PrefixMarks {
+            chunk: Some(CHUNK / 2),
+            ..m
+        };
+        assert!(cache.bind(&wrong_chunk, &next, 13, MTP).is_err());
+        assert!(cache.prefix_lineage(&wrong_chunk, MTP).is_none());
+        let detached = PrefixMarks { chunk: None, ..m };
+        assert!(cache.prefix_lineage(&detached, MTP).is_none());
+    }
+
+    #[test]
+    fn device_marks_gate_live_and_checkpoint() {
+        let (cache, consumed) = committed(8, 5, MTP);
+        let mut next = consumed.clone();
+        next.push(42);
+        let ok = marks(MTP, 13, Some(8));
+        assert_eq!(cache.live_end(&ok, MTP), Some(13));
+        // Target moved: live is gone, the durable checkpoint remains.
+        let moved = PrefixMarks {
+            target_position: 14,
+            ..ok
+        };
+        assert!(cache.bind(&moved, &next, 13, MTP).is_err());
+        assert_eq!(cache.prefix_lineage(&moved, MTP), Some(&consumed[..8]));
+        // A lagging head is never live-eligible.
+        let lagging = PrefixMarks {
+            mtp_position: Some(12),
+            ..ok
+        };
+        assert_eq!(cache.live_end(&lagging, MTP), None);
+        assert!(cache.bind(&lagging, &next, 13, MTP).is_err());
+        // Neither owner's checkpoint valid: no lineage at all.
+        let gone = PrefixMarks {
+            target_position: 14,
+            target_prefix: None,
+            ..ok
+        };
+        assert!(cache.prefix_lineage(&gone, MTP).is_none());
+        // Head checkpoint missing invalidates the NativeMtp checkpoint.
+        let no_head = PrefixMarks {
+            target_position: 14,
+            mtp_prefix: None,
+            ..ok
+        };
+        assert_eq!(cache.checkpoint_end(&no_head, MTP), None);
+    }
+
+    #[test]
+    fn stale_receipt_no_longer_rebinds() {
+        let (mut cache, consumed) = committed(8, 5, AR);
+        let m = marks(AR, 13, Some(8));
+        let mut next = consumed.clone();
+        next.push(42);
+        let plan = cache.bind(&m, &next, 13, AR).unwrap();
+        assert_eq!(cache.bind(&m, &next, 13, AR).unwrap(), plan);
+        cache.generation += 1;
+        assert_ne!(cache.bind(&m, &next, 13, AR).unwrap(), plan);
+    }
+
+    #[test]
+    fn commit_publishes_live_and_extends_the_record_in_place() {
+        let (cache, consumed) = committed(8, 5, MTP);
+        let m = marks(MTP, 13, Some(8));
+        assert_eq!(cache.prompt_len, 8);
+        assert_eq!(cache.live_len, Some(13));
+        assert!(cache.published);
+        assert_eq!(cache.capture_at, None);
+        assert_eq!(cache.prefix_lineage(&m, MTP), Some(&consumed[..]));
+        assert_eq!(cache.checkpoint_end(&m, MTP), Some(8));
+    }
+
+    #[test]
+    fn commit_with_misaligned_target_publishes_the_checkpoint_only() {
+        for target in [12usize, 14] {
+            let mut cache = staged(&prompt(8), AR);
+            let consumed = prompt(13);
+            cache.commit(&marks(AR, target, Some(8)), &consumed);
+            assert_eq!(cache.live_len, None);
+            assert_eq!(cache.tokens.len(), 8);
+            assert!(cache.published);
+            let m = marks(AR, target, Some(8));
+            assert_eq!(cache.prefix_lineage(&m, AR), Some(&consumed[..8]));
+        }
+    }
+
+    #[test]
+    fn commit_with_lagging_head_or_armed_capture_publishes_the_checkpoint_only() {
+        let consumed = prompt(13);
+        let ok = marks(MTP, 13, Some(8));
+        let lagging = PrefixMarks {
+            mtp_position: Some(12),
+            ..ok
+        };
+        let armed = PrefixMarks {
+            row_capture_armed: true,
+            ..ok
+        };
+        for m in [lagging, armed] {
+            let mut cache = staged(&prompt(8), MTP);
+            cache.commit(&m, &consumed);
+            assert_eq!(cache.live_len, None);
+            assert_eq!(cache.tokens.len(), 8);
+            assert!(cache.published);
+        }
+    }
+
+    #[test]
+    fn commit_with_empty_or_foreign_history_publishes_the_checkpoint_only() {
+        let m = marks(AR, 13, Some(8));
+        let mut empty = staged(&prompt(8), AR);
+        empty.commit(&m, &[]);
+        assert_eq!(empty.live_len, None);
+        assert_eq!(empty.tokens.len(), 8);
+        assert!(empty.published);
+
+        let mut shorter = staged(&prompt(8), AR);
+        shorter.commit(&marks(AR, 5, Some(8)), &prompt(5));
+        assert_eq!(shorter.live_len, None);
+
+        let mut foreign = staged(&prompt(8), AR);
+        let mut history = prompt(13);
+        history[3] = 4242;
+        foreign.commit(&m, &history);
+        assert_eq!(foreign.live_len, None);
+        assert_eq!(foreign.tokens.len(), 8);
+    }
+
+    #[test]
+    fn commit_without_a_valid_checkpoint_or_live_state_publishes_nothing() {
+        let mut cache = staged(&prompt(8), AR);
+        cache.commit(&marks(AR, 12, None), &prompt(13));
+        assert!(!cache.published);
+        assert_eq!(cache.live_len, None);
+        assert!(cache.prefix_lineage(&marks(AR, 12, None), AR).is_none());
+
+        let mut unstaged = Qwen4PrefixCache::new(64);
+        unstaged.commit(&marks(AR, 13, None), &prompt(13));
+        assert!(!unstaged.published);
+        assert_eq!(unstaged.live_len, None);
+    }
+
+    #[test]
+    fn lineage_is_the_full_record_when_live_and_the_prompt_otherwise() {
+        let (cache, consumed) = committed(8, 5, AR);
+        let live = marks(AR, 13, Some(8));
+        assert_eq!(cache.prefix_lineage(&live, AR), Some(&consumed[..]));
+        let moved = marks(AR, 40, Some(8));
+        assert_eq!(cache.prefix_lineage(&moved, AR), Some(&consumed[..8]));
+        assert_eq!(cache.checkpoint_end(&moved, AR), Some(8));
+    }
+
+    #[test]
+    fn unpublished_cache_has_no_lineage() {
+        let cache = staged(&prompt(8), AR);
+        let m = marks(AR, 8, Some(8));
+        assert!(cache.prefix_lineage(&m, AR).is_none());
+        assert_eq!(cache.checkpoint_end(&m, AR), None);
+        assert!(cache.bind(&m, &prompt(12), 8, AR).is_err());
+    }
+
+    #[test]
+    fn clear_unpublishes_and_advances_the_generation() {
+        let (mut cache, _) = committed(8, 5, AR);
+        let before = cache.generation;
+        cache.clear();
+        assert!(cache.tokens.is_empty());
+        assert_eq!((cache.prompt_len, cache.live_len), (0, None));
+        assert!(!cache.published);
+        assert_eq!(cache.capture_at, None);
+        assert!(cache.generation > before);
     }
 }

@@ -115,9 +115,10 @@ pub fn require_native_greedy(temp: f32) -> Result<(), String> {
 /// Validate a native MTP prefill request before touching either owner.
 ///
 /// A cold fill is the complete prompt from position zero. A cache hit fills
-/// exactly `prompt_tokens[start_pos..]` after the bundle restored its
-/// checkpoint at `start_pos` (`Qwen4Bundle::begin_prefix` re-validates
-/// it), so target and MTP resume at the same absolute position.
+/// exactly `prompt_tokens[start_pos..]` after the bundle bound a Live (no
+/// copy) or Prompt (end-of-prompt checkpoint restore) receipt at `start_pos`
+/// (`Qwen4Bundle::begin_prefix` re-validates it), so target and MTP resume at
+/// the same absolute position.
 pub fn validate_native_mtp_prefill_request(
     prompt_tokens: &[u32],
     fill_tokens: &[u32],
@@ -285,7 +286,7 @@ impl SpecTarget for Qwen4Bundle {
     }
 
     /// Native MTP retains no pre-window snapshot to repair from, and the
-    /// prompt-cache checkpoint references the live QSA K/V rows a reset would
+    /// end-of-prompt checkpoint references the live QSA K/V rows a reset would
     /// zero: rewind to it so the next turn can still restore it.
     fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.rewind_to_prefix(gpu)
@@ -1256,10 +1257,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.require_supported_request()?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
-        // A miss resets target, head and draft policy; a hit restores the
-        // bundle's canonical checkpoint at `start_pos` into all three.
-        let plan = Qwen4PrefixPlan {
-            start_pos: if cache_hit { start_pos } else { 0 },
+        // A miss resets target, head and draft policy. A hit binds the planner's
+        // `start_pos` to the bundle's Live receipt (committed state, no copy) or
+        // Prompt receipt (end-of-prompt checkpoint restore).
+        let plan = if cache_hit {
+            Self::bundle(target)?
+                .bind_prefix_plan(prompt_tokens, start_pos, Qwen4PrefixMode::NativeMtp)
+                .map_err(|error| error.to_string())?
+        } else {
+            Qwen4PrefixPlan::default()
         };
         Self::bundle(target)?
             .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
@@ -1362,8 +1368,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
             }
-            // The head has caught up with the target: the only point a
-            // whole-chunk checkpoint of both owners is canonical.
+            // The head has caught up with the target after the final chunk:
+            // the one point both owners hold the exact end-of-prompt state.
             let end = start_pos + base + chunk.len();
             if capture_at == Some(end) {
                 Self::bundle(target)?
