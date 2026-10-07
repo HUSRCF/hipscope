@@ -5065,6 +5065,48 @@ mod registry_tests {
         }
     }
 
+    /// Every carrier whose reasoning contract replays prior turns' reasoning in
+    /// history (Qwen Jinja `<think>` replay, Muse Glimmer) must have serve
+    /// forward `reasoning_content` for the arch label its load handshake
+    /// reports. A miss renders an empty think block: the model loses its own
+    /// earlier reasoning, and the next prompt stops extending the previous one,
+    /// so the Qwen4 prefix cache never hits. DeepSeek4 and Gemma4 templates
+    /// drop history reasoning, so they are not required.
+    #[test]
+    fn thinking_contract_arches_forward_history_reasoning() {
+        use super::{arch_label, carrier_for};
+        use saddle_core::caps::{arch_replays_history_reasoning, ReasoningContract};
+        let mut covered = Vec::new();
+        for id in 0u32..=255 {
+            let Some(carrier) = carrier_for(id) else {
+                continue;
+            };
+            let contract = carrier.caps().reasoning_contract;
+            if !matches!(
+                contract,
+                ReasoningContract::QwenJinja | ReasoningContract::MuseGlimmer
+            ) {
+                continue;
+            }
+            // Maple (15) has no `arch_label` entry: it reports the fallback
+            // `qwen3`, shared with Qwen3 dense, so serve cannot single it out.
+            if id == 15 {
+                continue;
+            }
+            let label = arch_label(id);
+            assert!(
+                arch_replays_history_reasoning(label),
+                "arch {id} ({}) declares {contract:?}, but serve drops history \
+                 reasoning_content for its label {label:?}",
+                carrier.name()
+            );
+            covered.push(label);
+        }
+        for label in ["qwen3_5", "qwen3_5_moe", "qwen4", "muse_glimmer"] {
+            assert!(covered.contains(&label), "{label} not covered: {covered:?}");
+        }
+    }
+
     /// Pin every carrier's declared `ArchCaps` AND every arch_id route-table
     /// output. The route tables in `lib.rs` (continuous_batch / bench_decode /
     /// vision / ep_prompt / ep_eos / generation_early) are ROUTING

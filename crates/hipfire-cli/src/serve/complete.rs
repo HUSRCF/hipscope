@@ -1715,31 +1715,11 @@ pub(crate) struct ResponseFormat {
     pub name: Option<String>,
 }
 
-/// Architectures that surface reasoning content in multi-turn message history
-/// (`muse_glimmer`, Qwen3.5/3.6-family arches, and `qwen4`: the Qwen3.8-Flash-Next
-/// template replays every history turn's `reasoning_content` inside `<think>`, so
-/// dropping it renders an empty think block that differs from the prompt the turn
-/// was generated under).
+/// Whether the loaded architecture surfaces reasoning content in multi-turn
+/// message history ([`saddle_core::caps::arch_replays_history_reasoning`]).
 /// Single source of truth for daemon request projection.
 pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
-    let Some(arch) = arch else {
-        return false;
-    };
-    if arch == "muse_glimmer" {
-        return true;
-    }
-    let lower = arch.to_ascii_lowercase();
-    lower == "qwen35"
-        || lower == "qwen35-vl"
-        || lower.starts_with("qwen35")
-        || lower.starts_with("qwen36")
-        || lower.starts_with("qwen3_5")
-        || lower.starts_with("qwen3_6")
-        || lower.contains("qwen3.5")
-        || lower.contains("qwen3.6")
-        || lower.contains("qwen3_5")
-        || lower.contains("qwen3_6")
-        || lower == "qwen4"
+    arch.is_some_and(saddle_core::caps::arch_replays_history_reasoning)
 }
 
 /// Project the HTTP body into the typed request contract. `multi_slot` is the
