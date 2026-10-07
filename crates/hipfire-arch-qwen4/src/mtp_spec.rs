@@ -1783,7 +1783,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
         };
         let mut timers = MtpPhaseTimers::new();
         let mut accepted_drafts = 0usize;
-        let window_start = Instant::now();
         let mut sampled = self.sampled.take();
         let result = (|| -> Result<MtpWindow, String> {
             timers.mark(gpu, "draft");
@@ -2028,7 +2027,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.sampled = sampled;
         if let Ok(window) = &result {
             self.observe_agreement(window);
-            let us = if forced {
+            let us = if forced && !timers.enabled() {
                 0.0
             } else {
                 synced_elapsed_us(gpu, floor_start)?
@@ -2038,7 +2037,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if timers.enabled() {
             let fields = format!(
                 "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
-                window_start.elapsed().as_secs_f64() * 1e6,
+                floor_start.elapsed().as_secs_f64() * 1e6,
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);

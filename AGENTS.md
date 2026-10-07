@@ -719,8 +719,10 @@ Caveats that are part of the fixture, not trivia:
   calibration head append and three probe windows precede the first measured
   decision; this bounds the speculation work, not the full-request time. Each
   floor-observed native window ends with one device sync so its whole GPU tail
-  is priced (forced routes skip it), and the retired token host-syncs its
-  top-1, which the AR producer does not.
+  is priced (forced routes skip it unless phase timing is enabled), and the
+  retired token host-syncs its top-1, which the AR producer does not.
+  With `HIPFIRE_MTP_PHASE_TIMING=1`, batched `window_us` includes the snapshot
+  and commit tail; diagnostic forced routes synchronize for cost accuracy.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
   interleaved; either forced route is a diagnostic override that bypasses the
   floor entirely. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
