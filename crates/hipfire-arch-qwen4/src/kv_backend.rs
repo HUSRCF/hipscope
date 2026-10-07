@@ -50,21 +50,23 @@ impl From<KvBackend> for Qwen4KvBackend {
     }
 }
 
-/// The only architecture whose Qwen4 QSA allocator smoke is proven.
-const VMM_ARCH: &str = "gfx1151";
+/// The architectures whose Qwen4 QSA VMM state is certified: gfx1151 (F32
+/// state) and gfx1201 (fp8 state).
+const VMM_ARCHS: [&str; 2] = ["gfx1151", "gfx1201"];
 
 /// Why Qwen4 QSA context arenas on a `gpu_arch` device cannot be VMM owners,
-/// or `None` when they can: exactly gfx1151, not Windows (whose driver needs
-/// the full-map workaround), the platform VMM KV refusal
+/// or `None` when they can: exactly gfx1151 or gfx1201, not Windows (whose
+/// driver needs the full-map workaround), the platform VMM KV refusal
 /// ([`hipfire_config::devices::vmm_kv_platform_refusal`]) clear, and a HIP
 /// VMM runtime that reports an allocation granularity
 /// (`vmm_runtime_available`). Load admission resolves the backend from this.
 pub fn qwen4_vmm_refusal(gpu_arch: &str, vmm_runtime_available: bool) -> Option<String> {
     if cfg!(windows) {
         Some("Windows maps whole VMM reservations; Qwen4 QSA keeps legacy storage".to_string())
-    } else if gpu_arch != VMM_ARCH {
+    } else if !VMM_ARCHS.contains(&gpu_arch) {
         Some(format!(
-            "Qwen4 VMM QSA state is certified only on {VMM_ARCH}, not {gpu_arch}"
+            "Qwen4 VMM QSA state is certified only on {}, not {gpu_arch}",
+            VMM_ARCHS.join(", ")
         ))
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
@@ -128,6 +130,27 @@ impl Qwen4ContextCommit {
         }
     }
 
+    /// What the `auto` expert-placement reserve charges for a load's context
+    /// arenas. Unified memory charges the arenas as committed ([`Self::new`]:
+    /// VMM pages commit on demand out of the same pool the weights live in).
+    /// A discrete card charges legacy storage of `max_seq` tokens whatever
+    /// the backend: VMM growth during forwards maps VRAM that the placement
+    /// must already have left free, so the reserve, and with it the expert
+    /// layers placed, match legacy storage at every `max_seq`.
+    pub fn for_expert_reserve(
+        backend: Qwen4KvBackend,
+        unified_memory: bool,
+        max_seq: usize,
+        chunk_rows: usize,
+        granularity: usize,
+    ) -> Self {
+        if unified_memory {
+            Self::new(backend, max_seq, chunk_rows, granularity)
+        } else {
+            Self::legacy(max_seq)
+        }
+    }
+
     /// Virtual bytes of one layer's context arenas in `format`.
     pub fn virtual_layer_bytes(&self, config: &Qwen4Config, format: QsaKvFormat) -> Option<usize> {
         config.qsa_context_arena_bytes(self.max_seq, format)
@@ -176,16 +199,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vmm_is_refused_off_gfx1151_and_without_the_runtime() {
-        assert!(qwen4_vmm_refusal("gfx1201", true)
-            .is_some_and(|reason| reason.contains("gfx1151") && reason.contains("gfx1201")));
-        assert!(qwen4_vmm_refusal("gfx1100", true).is_some());
-        if cfg!(windows) || hipfire_config::devices::vmm_kv_platform_refusal().is_some() {
-            assert!(qwen4_vmm_refusal("gfx1151", true).is_some());
-        } else {
-            assert_eq!(qwen4_vmm_refusal("gfx1151", true), None);
-            assert!(qwen4_vmm_refusal("gfx1151", false)
-                .is_some_and(|reason| reason.contains("granularity")));
+    fn vmm_is_refused_off_gfx1151_gfx1201_and_without_the_runtime() {
+        assert!(qwen4_vmm_refusal("gfx1100", true).is_some_and(|reason| {
+            reason.contains("gfx1151") && reason.contains("gfx1201") && reason.contains("gfx1100")
+        }));
+        assert!(qwen4_vmm_refusal("gfx1200", true).is_some());
+        for arch in ["gfx1151", "gfx1201"] {
+            if cfg!(windows) || hipfire_config::devices::vmm_kv_platform_refusal().is_some() {
+                assert!(qwen4_vmm_refusal(arch, true).is_some());
+            } else {
+                assert_eq!(qwen4_vmm_refusal(arch, true), None);
+                assert!(qwen4_vmm_refusal(arch, false)
+                    .is_some_and(|reason| reason.contains("granularity")));
+            }
         }
     }
 

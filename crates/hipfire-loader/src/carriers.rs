@@ -456,9 +456,11 @@ impl Carrier for Qwen4Carrier {
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
         // per-layer expert bytes, and the reserve (with its native MTP and
-        // QSA gather parts). Context arenas are charged as committed (VMM:
-        // the first chunk's pages; legacy: all of `max_seq`), never their
-        // virtual extent.
+        // QSA gather parts). Unified memory charges context arenas as
+        // committed (VMM: the first chunk's pages; legacy: all of `max_seq`),
+        // never their virtual extent; a discrete card charges legacy storage
+        // of `max_seq` whatever the backend, so VMM growth stays inside the
+        // reserve and placement matches legacy.
         let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
             let (free, _) = ctx
                 .gpu
@@ -469,8 +471,9 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: {error}"))?;
             let chunk_rows =
                 hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
-            let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+            let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
                 backend,
+                use_ranges,
                 ctx.max_seq,
                 chunk_rows,
                 vmm_granularity,

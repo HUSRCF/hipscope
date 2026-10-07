@@ -3183,12 +3183,12 @@ impl Gpu {
     }
 
     /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
-    /// VMM owner: gfx1151 (the only arch with evidence for it), a platform
-    /// the VMM KV backend is certified on (not native Windows, not WSL
-    /// without its unsafe override), and a runtime answering the VMM
+    /// VMM owner: gfx1151 or gfx1201 (the arches with evidence for it), a
+    /// platform the VMM KV backend is certified on (not native Windows, not
+    /// WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
     pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
-        self.arch_caps.is_gfx1151()
+        (self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }

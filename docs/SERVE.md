@@ -168,7 +168,7 @@ single-device or pipeline-parallel load (Flash-Next/Qwen4 included) unloads
 the prior model and requires clean VMM state before constructing the new
 one, so a failure after admission leaves no model loaded and the error says
 `no model loaded`. Only tp>1 expert-parallel loads stage the new model before
-retiring the prior one. Flash-Next with VMM QSA state (gfx1151 automatic) owns
+retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201 automatic) owns
 VMM arenas of its own: the target and MTP context arenas and the gathered
 attention workspace. All of them are released when the model unloads, so the
 next load's clean-VMM check starts from zero owners in either swap direction.
