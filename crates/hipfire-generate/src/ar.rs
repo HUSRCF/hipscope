@@ -1909,6 +1909,11 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // Prompt tokens the prefill restored rather than computed (reported as
     // `cached_tokens`; prefill tok/s counts only the computed rest).
     cached_tokens: usize,
+    // The decode callback penalizes the logits it argmaxes (`None` token)
+    // with the request's repeat/presence/frequency penalties over
+    // `m.conversation_tokens`, bit-identical to `sampler::sample_cpu`'s
+    // penalty stage: a penalized greedy request keeps the GPU argmax route.
+    decode_penalizes: bool,
     mut forward_chunk: Prefill,
     mut forward_token: Decode,
     // Runs once after the client committed the terminal, before `done`.
@@ -1921,7 +1926,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         &rdna_compute::GpuTensor,
     ) -> Result<(), String>,
     // Runs the token (`None`: the GPU argmax of the logits tensor, as the
-    // previous decode left it) and returns it.
+    // previous decode left it, penalized first when `decode_penalizes`) and
+    // returns it.
     Decode: FnMut(
         &mut LoadedModel,
         &mut rdna_compute::Gpu,
@@ -2027,13 +2033,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         &m.conversation_tokens,
         &sampler_config,
     ));
-    // `sample_cpu` reduces to `llama::argmax` here: take it on the GPU and
-    // read back one index instead of the logits row.
+    // `sample_cpu` reduces to `llama::argmax` here (after its penalty stage,
+    // which the decode callback applies on the GPU when `decode_penalizes`):
+    // take it on the GPU and read back one index instead of the logits row.
     let greedy_on_gpu = sampler_config.temperature <= 0.0
-        && !(sampler_config.repeat_penalty != 1.0 && sampler_config.repeat_window > 0)
-        && !((sampler_config.presence_penalty > 0.0 || sampler_config.frequency_penalty > 0.0)
-            && sampler_config.repeat_window > 0)
-        && sampler_config.blocked_tokens.is_empty();
+        && sampler_config.blocked_tokens.is_empty()
+        && (decode_penalizes || sampler::PenaltyTable::flags_for(&sampler_config) == 0);
     // User stop sequences gate the answer channel before it is emitted: a
     // stop spanning a token boundary is held back, and the matched text and
     // everything after it never reach the client.

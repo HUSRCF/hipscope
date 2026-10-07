@@ -8653,6 +8653,15 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
 
+/// Penalty stage of the host logit policy (repeat, presence, frequency)
+/// applied in place to logit rows from a host-built token table
+/// (`logit_penalty_table_rows`, launched by `Gpu::apply_penalty_table`): the
+/// host computes every factor and subtrahend, the device only
+/// divides/multiplies and subtracts, so the rows match
+/// `sampler::apply_logit_policy_cpu` bit for bit.
+pub const LOGIT_PENALTY_TABLE_SRC: &str =
+    include_str!("../../../kernels/src/logit_penalty_table.hip");
+
 /// Product-semantics sampler for independent continuous-batch lanes.
 pub const SAMPLE_ROWS_PF_SRC: &str = include_str!("../../../kernels/src/sample_rows_pf.hip");
 

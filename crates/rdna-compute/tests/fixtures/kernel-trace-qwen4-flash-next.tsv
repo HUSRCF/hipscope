@@ -118,3 +118,7 @@ gfx1201	qwen4_moe_rotate128_i4	qwen4_moe_rotate128_i4
 gfx1201	qwen4_moe_scatter_stable_top10	qwen4_moe_group_ranks,qwen4_moe_group_prefix,qwen4_moe_group_scatter
 gfx1201	qwen4_moe_sym_check_gfx1201	qwen4_moe_sym_check_gfx1201
 gfx1201	qwen4_silu_mul	shared_expert_activation_bf16_f32
+# Penalized requests (perf/mtp-penalties-free): greedy AR and sampled native MTP
+# with repeat/presence/frequency penalties load the GPU penalty prepass module.
+gfx1151	logit_penalty_table	logit_penalty_table_rows
+gfx1201	logit_penalty_table	logit_penalty_table_rows

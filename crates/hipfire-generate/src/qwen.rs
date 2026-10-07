@@ -8203,6 +8203,27 @@ pub fn generate_qwen4_ar(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
+    // A penalized greedy decode keeps the device argmax: the decode callback
+    // first penalizes the logits that argmax reads with the GPU prepass (one
+    // table row over the conversation, bit-identical to `sample_cpu`'s
+    // penalty stage). `HIPFIRE_QWEN4_PENALTY_PREPASS=0` downloads the row and
+    // samples on the host instead.
+    let penalty_cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let decode_penalizes = temp <= 0.0
+        && hipfire_runtime::sampler::PenaltyTable::flags_for(&penalty_cfg) != 0
+        && hipfire_arch_qwen4::bundle::penalty_prepass_enabled();
+    let mut penalty_table = hipfire_runtime::sampler::PenaltyTable::default();
+
     crate::ar::generate_ar_with_forward(
         m,
         gpu,
@@ -8229,6 +8250,7 @@ pub fn generate_qwen4_ar(
         // classify `<tool_call>` markup identically.
         tools.is_some(),
         reused,
+        decode_penalizes,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
@@ -8244,14 +8266,22 @@ pub fn generate_qwen4_ar(
                 })
         },
         |model, device, token, logits| {
-            model
+            let penalize = token.is_none() && decode_penalizes;
+            if penalize {
+                penalty_table.reset(&penalty_cfg);
+                penalty_table.push_row(&model.conversation_tokens, &penalty_cfg, vocab_size);
+            }
+            let bundle = model
                 .qwen4_mut()
-                .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())
-                .and_then(|bundle| {
-                    bundle
-                        .forward_token_or_argmax(device, token, logits)
-                        .map_err(|error| error.to_string())
-                })
+                .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())?;
+            if penalize {
+                bundle
+                    .apply_penalty_table(device, logits, &penalty_table)
+                    .map_err(|error| error.to_string())?;
+            }
+            bundle
+                .forward_token_or_argmax(device, token, logits)
+                .map_err(|error| error.to_string())
         },
         commit_qwen4_session,
     );

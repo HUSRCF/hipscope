@@ -15,13 +15,13 @@
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
-use crate::bundle::Qwen4Bundle;
+use crate::bundle::{penalty_prepass_enabled, Qwen4Bundle};
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MTP_FILL_ROWS};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
-use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
+use hipfire_runtime::sampler::{sample_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow,
@@ -1014,6 +1014,17 @@ struct SampledVerify {
     /// The AR producer's sampler ([`naive_target_sampler`]): the target
     /// policy of both modes, penalties included.
     policy: SamplerConfig,
+    /// [`Self::policy`] without its penalty stage: the host policy of a
+    /// target row the GPU prepass already penalized.
+    row_policy: SamplerConfig,
+    /// Target rows take the GPU penalty prepass
+    /// ([`Qwen4Bundle::apply_spec_penalty_table`], bit-identical to the host
+    /// penalty stage) before their download: `policy` has a penalty stage
+    /// and `HIPFIRE_QWEN4_PENALTY_PREPASS` is not `0`. Draft `q`s keep the
+    /// host policy over the same history rows.
+    gpu_rows: bool,
+    /// The prepass's reused per-row token table.
+    table: PenaltyTable,
     /// Penalty history: prompt tail, tokens emitted before the window and
     /// the window's kept drafts; window 0 when no penalty is active.
     history: PenaltyHistory,
@@ -1042,6 +1053,7 @@ impl SampledVerify {
             // route; repeating it keeps a direct caller replayable).
             hipfire_runtime::llama::reset_cpu_sampler_rng(cfg.rng_seed as u32);
         }
+        let policy = naive_target_sampler(&cfg);
         Self {
             spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
             rng: SpecRng::new(cfg.rng_seed),
@@ -1052,7 +1064,10 @@ impl SampledVerify {
             },
             points: Vec::new(),
             naive,
-            policy: naive_target_sampler(&cfg),
+            gpu_rows: PenaltyTable::flags_for(&policy) != 0 && penalty_prepass_enabled(),
+            row_policy: policy.without_penalties(),
+            policy,
+            table: PenaltyTable::default(),
             history: PenaltyHistory::new(cfg.penalty_window()),
             prompt_set: false,
             host: Vec::new(),
@@ -1072,26 +1087,63 @@ impl SampledVerify {
         self.history.begin_window(emitted)
     }
 
+    /// GPU prepass of physical verify rows `first..first + hist_rows.len()`,
+    /// row `first + i` penalized by history row `hist_rows.start + i`, in one
+    /// launch queued behind the forward that wrote them.
+    fn penalize_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
+        first: usize,
+        hist_rows: std::ops::Range<usize>,
+    ) -> Result<(), String> {
+        let vocab = bundle.config.vocab_size;
+        self.table.reset(&self.policy);
+        for hist_row in hist_rows {
+            self.table
+                .push_row(self.history.row(hist_row), &self.policy, vocab);
+        }
+        bundle
+            .apply_spec_penalty_table(gpu, first, &self.table)
+            .map_err(|error| error.to_string())
+    }
+
     /// Naive mode: physical verify row `row`'s target token, one AR-sampler
     /// draw penalized by history row `hist_row`.
     fn naive_draw(
         &mut self,
-        gpu: &Gpu,
-        bundle: &Qwen4Bundle,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
         row: usize,
         hist_row: usize,
     ) -> Result<u32, String> {
         if !self.naive {
             return Err("Qwen4 sampled MTP: naive draw outside naive mode".to_string());
         }
+        if self.gpu_rows {
+            self.penalize_rows(gpu, bundle, row, hist_row..hist_row + 1)?;
+        }
+        self.draw_penalized(gpu, bundle, row, hist_row)
+    }
+
+    /// [`Self::naive_draw`] of a row the GPU prepass already penalized when
+    /// [`Self::gpu_rows`] (the host applies the whole policy otherwise).
+    fn draw_penalized(
+        &mut self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        row: usize,
+        hist_row: usize,
+    ) -> Result<u32, String> {
         bundle
             .spec_row_logits(gpu, row, &mut self.host)
             .map_err(|error| error.to_string())?;
-        Ok(sample_cpu(
-            &mut self.host,
-            self.history.row(hist_row),
-            &self.policy,
-        ))
+        let (policy, history) = if self.gpu_rows {
+            (&self.row_policy, &[][..])
+        } else {
+            (&self.policy, self.history.row(hist_row))
+        };
+        Ok(sample_cpu(&mut self.host, history, policy))
     }
 
     /// Draw the draft token from the last MTP prediction's `q` (penalized by
@@ -1126,18 +1178,26 @@ impl SampledVerify {
     /// `hist_row`) into `self.target`.
     fn load_target(
         &mut self,
-        gpu: &Gpu,
-        bundle: &Qwen4Bundle,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
         row: usize,
         hist_row: usize,
     ) -> Result<(), String> {
+        if self.gpu_rows {
+            self.penalize_rows(gpu, bundle, row, hist_row..hist_row + 1)?;
+        }
+        let (policy, history) = if self.gpu_rows {
+            (&self.row_policy, &[][..])
+        } else {
+            (&self.policy, self.history.row(hist_row))
+        };
         bundle
             .spec_row_dist(
                 gpu,
                 row,
                 self.spec,
-                self.history.row(hist_row),
-                &self.policy,
+                history,
+                policy,
                 &mut self.host,
                 &mut self.scratch,
                 &mut self.target,
@@ -1147,20 +1207,30 @@ impl SampledVerify {
 
     /// Leviathan acceptance over a batched verify: `drafts[i]` is verified
     /// against `p_i` penalized by `H_i` (physical verify row == history
-    /// row). `q_i` is the distribution the draft was drawn from
+    /// row; with [`Self::gpu_rows`] every row is penalized up front by one
+    /// prepass launch). `q_i` is the distribution the draft was drawn from
     /// (`self.drafts[i]`), or with `point_mass` the point mass on the draft.
     fn accept_leviathan(
         &mut self,
-        gpu: &Gpu,
-        bundle: &Qwen4Bundle,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
         drafts: &[u32],
         point_mass: bool,
         eos: u32,
     ) -> Result<GreedyAccept, String> {
+        self.history.rewind_drafts();
+        for &draft in drafts {
+            self.history.push_draft(draft);
+        }
+        if self.gpu_rows {
+            self.penalize_rows(gpu, bundle, 0, 0..drafts.len() + 1)?;
+        }
         let SampledVerify {
             spec,
             rng,
             policy,
+            row_policy,
+            gpu_rows,
             history,
             host,
             scratch,
@@ -1169,10 +1239,6 @@ impl SampledVerify {
             points,
             ..
         } = self;
-        history.rewind_drafts();
-        for &draft in drafts {
-            history.push_draft(draft);
-        }
         let qs: &[SparseDist] = if point_mass {
             if points.len() < drafts.len() {
                 points.resize_with(drafts.len(), SparseDist::default);
@@ -1188,9 +1254,17 @@ impl SampledVerify {
         };
         let history = &*history;
         let spec = *spec;
+        let gpu_rows = *gpu_rows;
+        let gpu = &*gpu;
+        let bundle = &*bundle;
         accept_sampled_prefix(drafts, qs, Some(eos), rng, target, |row, out| {
+            let (policy, row_history) = if gpu_rows {
+                (&*row_policy, &[][..])
+            } else {
+                (&*policy, history.row(row))
+            };
             bundle
-                .spec_row_dist(gpu, row, spec, history.row(row), policy, host, scratch, out)
+                .spec_row_dist(gpu, row, spec, row_history, policy, host, scratch, out)
                 .map_err(|error| error.to_string())
         })
     }
@@ -1199,8 +1273,8 @@ impl SampledVerify {
     /// by `H_i` and recorded in `picks[i]`.
     fn accept_naive(
         &mut self,
-        gpu: &Gpu,
-        bundle: &Qwen4Bundle,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
         drafts: &[u32],
         eos: u32,
         picks: &mut [u32],
@@ -1209,8 +1283,11 @@ impl SampledVerify {
         for &draft in drafts {
             self.history.push_draft(draft);
         }
+        if self.gpu_rows {
+            self.penalize_rows(gpu, bundle, 0, 0..drafts.len() + 1)?;
+        }
         accept_naive_prefix(drafts, Some(eos), |row| {
-            let draw = self.naive_draw(gpu, bundle, row, row)?;
+            let draw = self.draw_penalized(gpu, bundle, row, row)?;
             picks[row] = draw;
             Ok(draw)
         })
@@ -2231,7 +2308,10 @@ impl Qwen4MtpDrafter {
             }
             // The request's shared acceptance: each candidate row's `p` is
             // penalized with the window history plus the candidates before it,
-            // and a sampled candidate's `q` is the point mass on it.
+            // and a sampled candidate's `q` is the point mass on it. `accept`
+            // times the target-row work (penalty prepass, row downloads, host
+            // distributions) apart from the verify forward.
+            timers.mark(gpu, "accept");
             let acceptance = match sampled.as_deref_mut() {
                 Some(s) if !s.draws_drafts() => {
                     s.accept_naive(gpu, bundle, candidates, eos, &mut target_picks)?
@@ -2955,6 +3035,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     target_picks.len()
                 ));
             }
+            // `accept`: the target-row work (penalty prepass, row downloads,
+            // host distributions) apart from the verify forward.
+            timers.mark(gpu, "accept");
             let acceptance = match sampled.as_mut() {
                 // Naive: each row the verdict reads is replaced by its draw.
                 Some(s) if !s.draws_drafts() => {

@@ -2831,6 +2831,19 @@ impl Gpu {
         Some(unsafe { std::slice::from_raw_parts(host_ptr as *const u8, tensor.buf.size()) })
     }
 
+    /// Writable host address of a host-mapped tensor this `Gpu` owns (the
+    /// registry's `hipHostMalloc` pointer, see [`Self::host_bytes`]), for a
+    /// pinned staging buffer the host rewrites between stream-ordered copies.
+    /// The caller must not write while a queued copy may still read it.
+    pub(crate) fn host_mapped_ptr(&self, tensor: &GpuTensor) -> Option<*mut u8> {
+        if !tensor.buf.is_host_mapped() {
+            return None;
+        }
+        self.host_mapped
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(|&host| host as *mut u8)
+    }
+
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.

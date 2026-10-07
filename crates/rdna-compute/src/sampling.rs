@@ -1752,6 +1752,187 @@ impl Gpu {
             )
         }
     }
+
+    /// Apply a host-built penalty table (`hipfire_runtime::sampler::PenaltyTable`)
+    /// in place to `row_ends.len()` consecutive `vocab`-wide rows of `logits`
+    /// (`logit_penalty_table_rows`). `row_ends[r]` is the cumulative entry count
+    /// through row `r`; `entries` holds `{token, factor bits, subtrahend bits}`
+    /// per entry; `flags` bit 0 applies the repeat factor, bit 1 the
+    /// subtrahend. No-op when there is nothing to apply.
+    ///
+    /// Host-asynchronous and stream-ordered: the table is written to `stage`'s
+    /// pinned host buffer, copied to its device table on the active stream,
+    /// then the kernel runs on the same stream, so a caller that has queued
+    /// the forward producing `logits` never waits for it here. The pinned
+    /// buffer is reused only after the previous call's copy and launch
+    /// completed (an event wait, already complete in steady state). `stage`
+    /// is allocated on first use and grown as needed; the caller frees it
+    /// with [`Self::free_penalty_table_stage`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_penalty_table(
+        &mut self,
+        stage: &mut Option<PenaltyTableStage>,
+        logits: &GpuTensor,
+        vocab: usize,
+        flags: u32,
+        row_ends: &[u32],
+        entries: &[u32],
+    ) -> HipResult<()> {
+        let n_rows = row_ends.len();
+        if n_rows == 0 || flags == 0 || entries.is_empty() {
+            return Ok(());
+        }
+        let n_entries = entries.len() / 3;
+        if entries.len() % 3 != 0 || row_ends.last().map(|&end| end as usize) != Some(n_entries)
+        {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "apply_penalty_table: {} entry words and row_ends ending at {:?} disagree",
+                    entries.len(),
+                    row_ends.last()
+                ),
+            ));
+        }
+        if logits.numel() < n_rows * vocab || vocab > i32::MAX as usize || n_rows > i32::MAX as usize
+        {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "apply_penalty_table: {n_rows} rows of {vocab} exceed the {}-element logits",
+                    logits.numel()
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        let words = n_rows + entries.len();
+        if stage.as_ref().is_some_and(|s| s.words < words) {
+            if let Some(old) = stage.take() {
+                self.free_penalty_table_stage(old)?;
+            }
+        }
+        if stage.is_none() {
+            *stage = Some(self.alloc_penalty_table_stage(words.max(PENALTY_TABLE_MIN_WORDS))?);
+        }
+        let stage = stage.as_mut().expect("penalty table stage allocated above");
+        if stage.pending {
+            self.hip.event_synchronize(&stage.done)?;
+            stage.pending = false;
+        }
+        let host = self.host_mapped_ptr(&stage.host).ok_or_else(|| {
+            HipError::new(0, "apply_penalty_table: staging buffer is not host-mapped")
+        })? as *mut u32;
+        // SAFETY: `host` is the live pinned allocation of `stage.words` u32
+        // words (`words <= stage.words`), and the event wait above guarantees
+        // no queued copy still reads it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(row_ends.as_ptr(), host, n_rows);
+            std::ptr::copy_nonoverlapping(entries.as_ptr(), host.add(n_rows), entries.len());
+        }
+        // SAFETY: same allocation, `words * 4` bytes initialized just above.
+        let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, words * 4) };
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memcpy_htod_async(&stage.device.buf, bytes, stream)?,
+            None => self.hip.memcpy_htod_async_default(&stage.device.buf, bytes)?,
+        }
+        const FUNC: &str = "logit_penalty_table_rows";
+        if !self.functions.contains_key(FUNC) {
+            self.ensure_kernel("logit_penalty_table", kernels::LOGIT_PENALTY_TABLE_SRC, FUNC)?;
+        }
+        let func = &self.functions[FUNC];
+        let mut lp = logits.buf.as_ptr();
+        let mut tp = stage.device.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut nr = n_rows as i32;
+        let mut fl = flags;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_rows as u32, 1, 1],
+                [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        self.hip.event_record(&stage.done, self.stream_ref())?;
+        stage.pending = true;
+        Ok(())
+    }
+
+    fn alloc_penalty_table_stage(&mut self, words: usize) -> HipResult<PenaltyTableStage> {
+        let bytes = words * 4;
+        let host = self.upload_raw_host_mapped(&vec![0u8; bytes], &[bytes])?;
+        let device = match self.alloc_tensor(&[words], DType::F32) {
+            Ok(device) => device,
+            Err(error) => {
+                let _ = self.free_tensor(host);
+                return Err(error);
+            }
+        };
+        let done = match self
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+        {
+            Ok(done) => done,
+            Err(error) => {
+                let _ = self.free_tensor(device);
+                let _ = self.free_tensor(host);
+                return Err(error);
+            }
+        };
+        Ok(PenaltyTableStage {
+            host,
+            device,
+            words,
+            done,
+            pending: false,
+        })
+    }
+
+    /// Release a [`PenaltyTableStage`] after its last launch completed.
+    pub fn free_penalty_table_stage(&mut self, stage: PenaltyTableStage) -> HipResult<()> {
+        let PenaltyTableStage {
+            host,
+            device,
+            done,
+            pending,
+            ..
+        } = stage;
+        let wait = if pending {
+            self.hip.event_synchronize(&done)
+        } else {
+            Ok(())
+        };
+        let destroy = self.hip.event_destroy(done);
+        let device = self.free_tensor(device);
+        let host = self.free_tensor(host);
+        wait.and(destroy).and(device).and(host)
+    }
+}
+
+/// Smallest [`PenaltyTableStage`]: the row ends and entries of a full
+/// eleven-row verify block over a 128-token window, so ordinary requests
+/// never regrow it.
+const PENALTY_TABLE_MIN_WORDS: usize = 16 + 3 * 11 * 128;
+
+/// Pinned host table plus its device copy and the completion event of the
+/// last [`Gpu::apply_penalty_table`] that used them. Caller-owned: free it
+/// with [`Gpu::free_penalty_table_stage`] (it holds a registered host-mapped
+/// allocation, so an unload that leaks it is refused like any other).
+pub struct PenaltyTableStage {
+    host: GpuTensor,
+    device: GpuTensor,
+    words: usize,
+    done: hip_bridge::Event,
+    pending: bool,
 }
 
 /// Per-slot sampling parameters, uploaded as a table like `KvSlotDesc`.

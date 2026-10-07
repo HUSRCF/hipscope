@@ -557,7 +557,8 @@ impl MtpDrafter for Qwen35MtpDrafter {
             });
         }
         let slot = Self::slot(target)?;
-        let r = {
+        let window_start = crate::mtp_spec::mtp_phase_timing_enabled().then(std::time::Instant::now);
+        let (r, pen) = {
             let state = self
                 .state
                 .as_mut()
@@ -565,8 +566,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
             // Row i of the verify sees suffix_W(emitted ‖ drafts[..i]); `emitted`
             // already holds the pending seed. Rebuilt every window (also for
             // the n-gram takeover), so rejected/pruned drafts never leak.
+            if window_start.is_some() {
+                state.penalty_timing = Default::default();
+            }
             state.penalty.begin_window(emitted);
-            if used_ngram {
+            let r = if used_ngram {
                 // The takeover fills the head KV for every row it commits, so
                 // native MTP stays live for the next pool miss.
                 spec_step_mtp_compressed_serial_with_takeover_candidates(
@@ -584,8 +588,29 @@ impl MtpDrafter for Qwen35MtpDrafter {
                     gpu, slot, &self.head, state, position, seed, eos, native_k,
                 )
             }
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            (r, state.penalty_timing)
         };
+        // `QWEN35_MTP_PHASE` is the Qwen3.x counterpart of Qwen4's
+        // `QWEN4_MTP_PHASE`: one synced per-window line, only under
+        // `HIPFIRE_MTP_PHASE_TIMING=1`.
+        if let Some(window_start) = window_start {
+            let _ = gpu.hip.device_synchronize();
+            let window_us = window_start.elapsed().as_secs_f64() * 1e6;
+            eprintln!(
+                "QWEN35_MTP_PHASE {{\"event\":\"mtp_phase\",\"source\":\"{}\",\"position\":{},\"k\":{},\"accepted\":{},\"emitted\":{},\"window_us\":{:.1},\"penalty_host_us\":{:.1},\"penalty_launches\":{},\"penalty_uploads\":{},\"t_end\":{}}}",
+                if used_ngram { "ngram" } else { "mtp" },
+                position,
+                r.drafts_generated,
+                r.accept_count,
+                r.committed.len(),
+                window_us,
+                pen.host_us,
+                pen.launches,
+                pen.uploads,
+                rdna_compute::profile::unix_micros(),
+            );
+        }
         self.last_window = Some((position, seed));
         let budget = if used_ngram { k } else { native_k };
         debug_assert!(

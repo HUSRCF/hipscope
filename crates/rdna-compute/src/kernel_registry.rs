@@ -286,6 +286,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("sample_top_p_parallel_w64", sampling::sample_top_p_parallel_w64_src(), ["sample_apply_repeat_penalty_w64", "sample_topk_partial_w64", "sample_topk_finalize_w64"]);
     add!("sample_top_p_parallel_fast21", sampling::sample_top_p_parallel_fast_src(21, "fast21"), ["sample_apply_repeat_penalty_fast21", "sample_topk_partial_fast21", "sample_topk_finalize_fast21"]);
     add!("sample_top_p_parallel_fast65", sampling::sample_top_p_parallel_fast_src(65, "fast65"), ["sample_apply_repeat_penalty_fast65", "sample_topk_partial_fast65", "sample_topk_finalize_fast65"]);
+    // Qwen4 logit-policy penalty prepass (AR greedy rows, sampled-MTP verify
+    // rows; `Gpu::apply_penalty_table`).
+    add!("logit_penalty_table", kernels::LOGIT_PENALTY_TABLE_SRC, ["logit_penalty_table_rows"]);
 
     if arch == "gfx1201" {
         // H2 and small-model first-token JIT: use the actual module key, even
@@ -1192,10 +1195,11 @@ mod tests {
         // compiler-free packs, the 46 Qwen3.8-Flash-Next modules (including
         // the gfx1201 `fn_gdn_dense` adapter)
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
-        // 8K-128K prefill, MTP and serve rows) and the 32 Qwen3.5-MoE modules
-        // (tests/fixtures/kernel-trace-qwen35.tsv). Those 123 keys are
-        // additional to P0's 92.
-        assert_eq!(registry.len(), count + 123, "unexpected gfx1201 inventory size");
+        // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
+        // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
+        // prepass `logit_penalty_table`. Those 124 keys are additional to
+        // P0's 92.
+        assert_eq!(registry.len(), count + 124, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

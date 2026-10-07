@@ -110,6 +110,18 @@ impl SamplerConfig {
             min_p: None,
         }
     }
+
+    /// This config with its penalty stage neutralized (repeat 1, presence and
+    /// frequency 0) and everything else kept: what the host still applies to
+    /// a row a [`PenaltyTable`] prepass already penalized.
+    pub fn without_penalties(&self) -> Self {
+        Self {
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            ..self.clone()
+        }
+    }
 }
 
 impl Default for SamplerConfig {
@@ -313,6 +325,144 @@ pub fn apply_logit_policy_candidates_cpu(
     for (value, &id) in values.iter_mut().zip(ids) {
         if cfg.blocked_tokens.contains(&id) {
             *value = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// [`PenaltyTable`] flag: divide a positive logit by the entry's repeat
+/// factor, multiply any other logit by it.
+pub const PENALTY_TABLE_REPEAT: u32 = 1;
+/// [`PenaltyTable`] flag: subtract the entry's presence/frequency amount.
+pub const PENALTY_TABLE_SUBTRACT: u32 = 2;
+
+/// The penalty stage of [`apply_logit_policy_cpu`] (repeat, then presence /
+/// frequency; blocked tokens are not part of it) for one or more logit rows,
+/// as a token table the GPU prepass `Gpu::apply_penalty_table` applies in
+/// place.
+///
+/// Every number is computed here with the CPU policy's own f32 arithmetic:
+/// per distinct in-vocabulary token of a row's window, the repeat factor
+/// `penalty.powf(count * recency).min(1.5)` (recency of the closest
+/// occurrence) and the amount `frequency * count + presence`. The device
+/// then only divides or multiplies and subtracts, so a row it penalizes is
+/// bit-identical to [`apply_logit_policy_cpu`] over the same history and
+/// config (blocked tokens excluded; apply those with
+/// [`SamplerConfig::without_penalties`]). [`Self::apply_row_cpu`] is the
+/// same arithmetic on the host.
+///
+/// Rows share one buffer: `row_ends[r]` is the cumulative entry count
+/// through row `r`, and each entry is `[token, factor bits, amount bits]`.
+#[derive(Debug, Default)]
+pub struct PenaltyTable {
+    flags: u32,
+    row_ends: Vec<u32>,
+    entries: Vec<u32>,
+    /// Per-row scratch: token -> (count, closest recency).
+    counts: std::collections::HashMap<u32, (u32, f32)>,
+}
+
+impl PenaltyTable {
+    /// The flags of `cfg`'s penalty stage under [`apply_logit_policy_cpu`]'s
+    /// own gates; 0 when it has none.
+    pub fn flags_for(cfg: &SamplerConfig) -> u32 {
+        let mut flags = 0;
+        if cfg.repeat_window > 0 {
+            if cfg.repeat_penalty != 1.0 {
+                flags |= PENALTY_TABLE_REPEAT;
+            }
+            if cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0 {
+                flags |= PENALTY_TABLE_SUBTRACT;
+            }
+        }
+        flags
+    }
+
+    /// Start an empty table for `cfg`'s penalty stage.
+    pub fn reset(&mut self, cfg: &SamplerConfig) {
+        self.flags = Self::flags_for(cfg);
+        self.row_ends.clear();
+        self.entries.clear();
+    }
+
+    /// Append the next row: `cfg`'s penalty stage over `history` (its
+    /// trailing `repeat_window` tokens) for a `vocab`-wide logit row. `cfg`
+    /// must be the config the table was [`Self::reset`] for.
+    pub fn push_row(&mut self, history: &[u32], cfg: &SamplerConfig, vocab: usize) {
+        debug_assert_eq!(self.flags, Self::flags_for(cfg));
+        if self.flags != 0 {
+            let recent = &history[history.len().saturating_sub(cfg.repeat_window)..];
+            let window_len = recent.len() as f32;
+            self.counts.clear();
+            for (i, &t) in recent.iter().enumerate() {
+                let recency = (i as f32 + 1.0) / window_len;
+                let entry = self.counts.entry(t).or_insert((0, 0.0));
+                entry.0 += 1;
+                if recency > entry.1 {
+                    entry.1 = recency;
+                }
+            }
+            for (&t, &(count, recency)) in &self.counts {
+                if (t as usize) >= vocab {
+                    continue;
+                }
+                let factor = if self.flags & PENALTY_TABLE_REPEAT != 0 {
+                    cfg.repeat_penalty.powf(count as f32 * recency).min(1.5)
+                } else {
+                    1.0
+                };
+                let amount = if self.flags & PENALTY_TABLE_SUBTRACT != 0 {
+                    cfg.frequency_penalty * count as f32 + cfg.presence_penalty
+                } else {
+                    0.0
+                };
+                self.entries
+                    .extend_from_slice(&[t, factor.to_bits(), amount.to_bits()]);
+            }
+        }
+        self.row_ends.push((self.entries.len() / 3) as u32);
+    }
+
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    pub fn rows(&self) -> usize {
+        self.row_ends.len()
+    }
+
+    /// No row has an entry: applying the table changes nothing.
+    pub fn is_noop(&self) -> bool {
+        self.flags == 0 || self.entries.is_empty()
+    }
+
+    /// Cumulative entry count through each row.
+    pub fn row_ends(&self) -> &[u32] {
+        &self.row_ends
+    }
+
+    /// `[token, factor bits, amount bits]` per entry, rows in order.
+    pub fn entries(&self) -> &[u32] {
+        &self.entries
+    }
+
+    /// Apply row `row` to a host logit row: the device kernel's arithmetic.
+    pub fn apply_row_cpu(&self, row: usize, logits: &mut [f32]) {
+        let begin = if row == 0 { 0 } else { self.row_ends[row - 1] as usize };
+        for entry in self.entries[3 * begin..3 * self.row_ends[row] as usize].chunks_exact(3) {
+            let Some(value) = logits.get_mut(entry[0] as usize) else {
+                continue;
+            };
+            if self.flags & PENALTY_TABLE_REPEAT != 0 {
+                let factor = f32::from_bits(entry[1]);
+                if *value > 0.0 {
+                    *value /= factor;
+                } else {
+                    *value *= factor;
+                }
+            }
+            if self.flags & PENALTY_TABLE_SUBTRACT != 0 {
+                *value -= f32::from_bits(entry[2]);
+            }
         }
     }
 }
@@ -742,6 +892,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The GPU prepass arithmetic (`PenaltyTable::apply_row_cpu`, then the
+    /// penalty-free policy for blocked tokens) equals the frozen reference
+    /// and `apply_logit_policy_cpu`, bit for bit, with every history of a
+    /// case packed as consecutive rows of one table.
+    #[test]
+    fn penalty_table_rows_match_policy_bitwise() {
+        let mut rng = Lcg(0x7ab1_e003);
+        let mut table = PenaltyTable::default();
+        for case in POLICY_CASES {
+            let cfg = case.cfg();
+            let rest = cfg.without_penalties();
+            for &vocab in &[64usize, 151, 300] {
+                let hists = synth_histories(&mut rng, vocab, case.repeat_window.min(1000));
+                table.reset(&cfg);
+                for hist in &hists {
+                    table.push_row(hist, &cfg, vocab);
+                }
+                assert_eq!(table.rows(), hists.len());
+                assert_eq!(table.flags() == 0, !case.active(), "{}: flags", case.name);
+                for (row, hist) in hists.iter().enumerate() {
+                    let orig = synth_logits(&mut rng, vocab);
+                    let mut want = orig.clone();
+                    ref_policy(
+                        &mut want,
+                        hist,
+                        case.repeat_penalty,
+                        case.repeat_window,
+                        case.presence,
+                        case.frequency,
+                        case.blocked,
+                    );
+                    let mut policy = orig.clone();
+                    apply_logit_policy_cpu(&mut policy, hist, &cfg);
+                    let mut got = orig.clone();
+                    table.apply_row_cpu(row, &mut got);
+                    apply_logit_policy_cpu(&mut got, hist, &rest);
+                    let what = format!("{} vocab={vocab} row={row} hist_len={}", case.name, hist.len());
+                    assert_bits_eq(&got, &want, &what);
+                    assert_bits_eq(&policy, &want, &what);
+                }
+            }
+        }
+    }
+
+    /// A neutral policy builds empty rows; distinct tokens only, in-vocab only.
+    #[test]
+    fn penalty_table_entries_are_distinct_in_vocab_tokens() {
+        let mut table = PenaltyTable::default();
+        let neutral = SamplerConfig::greedy();
+        table.reset(&neutral);
+        table.push_row(&[1, 2, 3], &neutral, 10);
+        assert_eq!(table.row_ends(), &[0]);
+        assert!(table.is_noop());
+
+        let mut cfg = SamplerConfig::greedy();
+        cfg.repeat_window = 4;
+        cfg.presence_penalty = 1.5;
+        table.reset(&cfg);
+        // Window keeps [2, 2, 99, 3]: 99 is out of a 10-wide vocab.
+        table.push_row(&[7, 2, 2, 99, 3], &cfg, 10);
+        table.push_row(&[], &cfg, 10);
+        assert_eq!(table.flags(), PENALTY_TABLE_SUBTRACT);
+        assert_eq!(table.row_ends(), &[2, 2]);
+        let mut tokens: Vec<u32> = table.entries().chunks_exact(3).map(|e| e[0]).collect();
+        tokens.sort_unstable();
+        assert_eq!(tokens, vec![2, 3]);
     }
 
     #[test]

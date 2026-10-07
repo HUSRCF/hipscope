@@ -26,7 +26,7 @@ use crate::weights::{
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::sampler::{
-    apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, SamplerConfig,
+    apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
 use hipfire_runtime::session_cache::{
     SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
@@ -35,6 +35,7 @@ use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
 use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::sampling::PenaltyTableStage;
 use std::fmt;
 use std::time::Duration;
 
@@ -214,6 +215,9 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
+    /// Staging of the GPU penalty prepass (`apply_penalty_table`), allocated
+    /// by the first penalized row and kept until unload.
+    penalty_stage: Option<PenaltyTableStage>,
     /// Prefill snapshot cache shared by every session (`attach_session_cache`);
     /// `None` = off.
     session: Option<SessionCache>,
@@ -231,6 +235,15 @@ pub struct Qwen4Bundle {
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
     state_format: Qwen4StateFormat,
+}
+
+/// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
+/// presence / frequency penalties on the host (download the logit row, then
+/// `apply_logit_policy_cpu`) instead of the bit-identical GPU prepass
+/// ([`Qwen4Bundle::apply_penalty_table`]) on the AR greedy row and the
+/// sampled-MTP target rows. Diagnostic / A-B only; read once per request.
+pub fn penalty_prepass_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_PENALTY_PREPASS").as_deref() != Ok("0")
 }
 
 /// Device bytes of one session-cache snapshot holding `p` rows per token
@@ -529,6 +542,7 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
+            penalty_stage: None,
             session: None,
             live: None,
             turn: None,
@@ -1202,6 +1216,57 @@ impl Qwen4Bundle {
             .ok_or_else(|| {
                 BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
             })
+    }
+
+    /// GPU penalty prepass: apply `table` in place to its `table.rows()`
+    /// consecutive vocabulary-wide rows of `logits`, stream-ordered after the
+    /// work that produced them (`Gpu::apply_penalty_table`). Each row ends
+    /// bit-identical to `apply_logit_policy_cpu` over the row's history.
+    pub fn apply_penalty_table(
+        &mut self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        table: &PenaltyTable,
+    ) -> Result<(), BundleError> {
+        if table.is_noop() {
+            return Ok(());
+        }
+        gpu.apply_penalty_table(
+            &mut self.penalty_stage,
+            logits,
+            self.config.vocab_size,
+            table.flags(),
+            table.row_ends(),
+            table.entries(),
+        )
+        .map_err(BundleError::Hip)
+    }
+
+    /// [`Self::apply_penalty_table`] on the last speculative forward's logit
+    /// rows `first_row..first_row + table.rows()`.
+    pub(crate) fn apply_spec_penalty_table(
+        &mut self,
+        gpu: &mut Gpu,
+        first_row: usize,
+        table: &PenaltyTable,
+    ) -> Result<(), BundleError> {
+        let vocab = self.config.vocab_size;
+        let logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        let rows = table.rows();
+        let view = first_row
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(vocab))
+            .filter(|&end| end <= logits.numel())
+            .map(|_| logits.sub_offset(first_row * vocab, rows * vocab))
+            .ok_or_else(|| {
+                BundleError::Forward(format!(
+                    "Qwen4 spec logit rows {first_row}..{} are outside capacity",
+                    first_row + rows
+                ))
+            })?;
+        self.apply_penalty_table(gpu, &view, table)
     }
 
     /// Host copy of row `row` of the last speculative forward's logits into
@@ -1896,6 +1961,7 @@ impl Qwen4Bundle {
             spec_top1,
             spec_hidden,
             session,
+            penalty_stage,
             ..
         } = self;
         if let Some(mut session) = session {
@@ -1917,7 +1983,13 @@ impl Qwen4Bundle {
                 spec_error.get_or_insert(error);
             }
         }
-        let spec_result = spec_error.map_or(Ok(()), |error| Err(BundleError::Hip(error)));
+        let spec_result = spec_error
+            .map_or(Ok(()), |error| Err(BundleError::Hip(error)))
+            .and(
+                penalty_stage
+                    .map(|stage| gpu.free_penalty_table_stage(stage).map_err(BundleError::Hip))
+                    .unwrap_or(Ok(())),
+            );
         let state_result = state.free_gpu(gpu).map_err(BundleError::State);
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);

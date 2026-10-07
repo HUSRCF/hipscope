@@ -47,6 +47,41 @@ pub(crate) fn mtp_trace_enabled() -> bool {
     })
 }
 
+/// Per-window phase timing for Qwen3.x MTP (`HIPFIRE_MTP_PHASE_TIMING=1`,
+/// `QWEN35_MTP_PHASE` lines); off = no `Instant`, no sync.
+pub(crate) fn mtp_phase_timing_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
+    *ON
+}
+
+/// Host wall time and launch/upload counts of penalty work in one MTP window.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MtpPenaltyTiming {
+    pub host_us: f64,
+    pub launches: u32,
+    pub uploads: u32,
+}
+
+impl MtpPenaltyTiming {
+    /// Start a timed penalty section; `None` (no clock read) unless phase timing is on.
+    fn start() -> Option<Instant> {
+        mtp_phase_timing_enabled().then(Instant::now)
+    }
+
+    /// Account a section begun by [`Self::start`]; no-op when it returned `None`.
+    fn finish(&mut self, t0: Option<Instant>, uploads: u32, launches: u32) {
+        if let Some(t0) = t0 {
+            self.host_us += t0.elapsed().as_secs_f64() * 1e6;
+            self.uploads += uploads;
+            self.launches += launches;
+        }
+    }
+}
+
 /// A10 fault seam (oracle only): while armed, every MTP verify cycle
 /// rejects all candidates, so each cycle advances exactly one trunk token
 /// (the τ=1 full-reject path). Armed through [`arm_mtp_full_reject`], not the
@@ -632,6 +667,9 @@ pub struct MtpSpecState {
     /// `begin_window(emitted)` before every step). Rows are penalized from it
     /// by [`mtp_verify_accept`] and the full-vocab sampled draft.
     pub penalty: hipfire_runtime::spec_sampling::PenaltyHistory,
+
+    /// Per-window host-side penalty cost, filled only under `HIPFIRE_MTP_PHASE_TIMING=1`.
+    pub penalty_timing: MtpPenaltyTiming,
 }
 
 impl MtpSpecState {
@@ -777,6 +815,7 @@ impl MtpSpecState {
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
             penalty: hipfire_runtime::spec_sampling::PenaltyHistory::default(),
+            penalty_timing: MtpPenaltyTiming::default(),
             prev_hidden_pos: None,
             takeover_fill_hidden,
             takeover_fill_batched: None,
@@ -929,6 +968,7 @@ impl MtpSpecState {
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
             penalty: hipfire_runtime::spec_sampling::PenaltyHistory::default(),
+            penalty_timing: MtpPenaltyTiming::default(),
         })
     }
 
@@ -1745,6 +1785,7 @@ fn mtp_apply_verify_penalties(
     if !sampling.penalized() {
         return Ok(());
     }
+    let t0 = MtpPenaltyTiming::start();
     mtp_penalty_require_window(&state.penalty)?;
     debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
     state.penalty.rewind_drafts();
@@ -1763,6 +1804,13 @@ fn mtp_apply_verify_penalties(
             vocab,
             sampling,
         )?;
+    }
+    if t0.is_some() {
+        let uploads = u32::from(!state.penalty.tokens().is_empty());
+        let launches = (0..n_verify)
+            .filter(|&k| !state.penalty.row_range(k).is_empty())
+            .count() as u32;
+        state.penalty_timing.finish(t0, uploads, launches);
     }
     Ok(())
 }
@@ -4251,12 +4299,15 @@ pub fn mtp_draft_phase_inner(
                 // and greedy draft rows stay unpenalized (q need not be
                 // penalized for the verdict to be exact).
                 if use_full_vocab && sampling.penalized() {
+                    let t0 = MtpPenaltyTiming::start();
+                    let mut uploads = 0;
                     if k == 0 {
                         mtp_penalty_begin_drafts(
                             gpu,
                             &mut state.penalty,
                             &state.mtp_sample_repeat_buf,
                         )?;
+                        uploads = u32::from(!state.penalty.tokens().is_empty());
                     }
                     mtp_penalty_apply_row(
                         gpu,
@@ -4267,6 +4318,8 @@ pub fn mtp_draft_phase_inner(
                         vocab,
                         &sampling,
                     )?;
+                    let launches = u32::from(!state.penalty.row_range(k).is_empty());
+                    state.penalty_timing.finish(t0, uploads, launches);
                 }
                 // GPU softmax(+nucleus) over the single draft row (full OR
                 // compressed width). idiom copied from speculative.rs:3457-3492.
@@ -4328,12 +4381,14 @@ pub fn mtp_draft_phase_inner(
                 };
                 candidates.push(token_id);
                 if use_full_vocab && sampling.penalized() {
+                    let t0 = MtpPenaltyTiming::start();
                     mtp_penalty_append_draft(
                         gpu,
                         &mut state.penalty,
                         &state.mtp_sample_repeat_buf,
                         token_id,
                     )?;
+                    state.penalty_timing.finish(t0, 1, 0);
                 }
 
                 // Store the draft nucleus at FULL-vocab width for the residual.
