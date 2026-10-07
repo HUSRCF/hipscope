@@ -333,7 +333,10 @@ impl Oracle {
                 ours.len(),
                 hf.len()
             ),
-            pre_sig: format!("encode_ids|ours:{ow:?}|hf:{hw:?}|len:{:?}", ours.len().cmp(&hf.len())),
+            pre_sig: format!(
+                "encode_ids|ours:{ow:?}|hf:{hw:?}|len:{:?}",
+                ours.len().cmp(&hf.len())
+            ),
             extra: json!({
                 "first_divergence": at,
                 "ours_window": ow,
@@ -677,9 +680,10 @@ impl Rng {
 }
 
 const ASCII_WS: &[&str] = &[
-    " ", "  ", "   ", "    ", "        ", "\t", "\t\t", "\t\t\t", "\n", "\n\n", "\n\n\n", "\n\n\n\n",
-    "\r\n", "\r\n\r\n", "\r", "\r\r", " \n", "\n ", " \n ", "\t\n", "\n\t", " \t ", "\t \t", "\r\n ",
-    " \r\n", "  \n  ", "\n    ", "\n\t\t", "\u{000B}", "\u{000C}", "\u{001C}", "\u{001F}",
+    " ", "  ", "   ", "    ", "        ", "\t", "\t\t", "\t\t\t", "\n", "\n\n", "\n\n\n",
+    "\n\n\n\n", "\r\n", "\r\n\r\n", "\r", "\r\r", " \n", "\n ", " \n ", "\t\n", "\n\t", " \t ",
+    "\t \t", "\r\n ", " \r\n", "  \n  ", "\n    ", "\n\t\t", "\u{000B}", "\u{000C}", "\u{001C}",
+    "\u{001F}",
 ];
 
 const UNI_WS: &[&str] = &[
@@ -701,26 +705,112 @@ const COMBINING_MARKS: &[&str] = &[
 ];
 
 const EMOJI: &[&str] = &[
-    "😀", "😂", "🙂", "😍", "🥲", "🤔", "👍", "👍🏽", "👋🏻", "🔥", "✨", "❤️", "❤", "☺️", "✔️", "©️",
-    "🇺🇸", "🇯🇵", "🇩🇪🇫🇷", "🏳️‍🌈", "🏴‍☠️", "👨‍👩‍👧‍👦", "👩‍💻", "🧑🏽‍🚀", "🤦🏼‍♂️", "1️⃣", "#️⃣", "*️⃣",
-    "🐍", "🦀", "💩", "🎉", "🚀", "🧠", "𝟙", "𝕏", "🅰", "🈶", "⌚", "\u{1F9D1}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}",
-    "\u{E0067}\u{E0062}", "😀😀😀", "👨‍👩‍👧‍👦👨‍👩‍👧‍👦",
+    "😀",
+    "😂",
+    "🙂",
+    "😍",
+    "🥲",
+    "🤔",
+    "👍",
+    "👍🏽",
+    "👋🏻",
+    "🔥",
+    "✨",
+    "❤️",
+    "❤",
+    "☺️",
+    "✔️",
+    "©️",
+    "🇺🇸",
+    "🇯🇵",
+    "🇩🇪🇫🇷",
+    "🏳️‍🌈",
+    "🏴‍☠️",
+    "👨‍👩‍👧‍👦",
+    "👩‍💻",
+    "🧑🏽‍🚀",
+    "🤦🏼‍♂️",
+    "1️⃣",
+    "#️⃣",
+    "*️⃣",
+    "🐍",
+    "🦀",
+    "💩",
+    "🎉",
+    "🚀",
+    "🧠",
+    "𝟙",
+    "𝕏",
+    "🅰",
+    "🈶",
+    "⌚",
+    "\u{1F9D1}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}",
+    "\u{E0067}\u{E0062}",
+    "😀😀😀",
+    "👨‍👩‍👧‍👦👨‍👩‍👧‍👦",
 ];
 
 const CJK: &[&str] = &[
-    "中", "文", "中文", "你好，世界", "这是一个测试。", "日本語のテキスト", "ひらがなカタカナ",
-    "한국어 텍스트", "안녕하세요", "東京都", "漢字", "𠮷", "𠀀", "々", "ー", "ｱｲｳ", "ＡＢＣ１２３",
-    "「引用」", "『二重』", "（括弧）", "【見出し】", "、。！？：；", "…", "——", "·", "〜", "￥", "％",
+    "中",
+    "文",
+    "中文",
+    "你好，世界",
+    "这是一个测试。",
+    "日本語のテキスト",
+    "ひらがなカタカナ",
+    "한국어 텍스트",
+    "안녕하세요",
+    "東京都",
+    "漢字",
+    "𠮷",
+    "𠀀",
+    "々",
+    "ー",
+    "ｱｲｳ",
+    "ＡＢＣ１２３",
+    "「引用」",
+    "『二重』",
+    "（括弧）",
+    "【見出し】",
+    "、。！？：；",
+    "…",
+    "——",
+    "·",
+    "〜",
+    "￥",
+    "％",
 ];
 
 const CJK_PUNCT: &[&str] = &[
-    "。", "，", "、", "！", "？", "：", "；", "「", "」", "『", "』", "（", "）", "【", "】", "《", "》",
-    "〈", "〉", "…", "—", "～", "·", "“", "”", "‘", "’", "«", "»", "¿", "¡", "‽", "※",
+    "。", "，", "、", "！", "？", "：", "；", "「", "」", "『", "』", "（", "）", "【", "】", "《",
+    "》", "〈", "〉", "…", "—", "～", "·", "“", "”", "‘", "’", "«", "»", "¿", "¡", "‽", "※",
 ];
 
 const CONTRACTIONS: &[&str] = &[
-    "don't", "I'm", "it's", "we'll", "they've", "you'd", "can't", "won't", "'s", "'S", "'T", "'re",
-    "'RE", "'ve", "'ll", "'d", "'m", "’s", "’t", "O'Neil", "rock'n'roll", "''", "'''", "'tis",
+    "don't",
+    "I'm",
+    "it's",
+    "we'll",
+    "they've",
+    "you'd",
+    "can't",
+    "won't",
+    "'s",
+    "'S",
+    "'T",
+    "'re",
+    "'RE",
+    "'ve",
+    "'ll",
+    "'d",
+    "'m",
+    "’s",
+    "’t",
+    "O'Neil",
+    "rock'n'roll",
+    "''",
+    "'''",
+    "'tis",
 ];
 
 const CODE: &[&str] = &[
@@ -750,14 +840,38 @@ const JSON_SNIPPETS: &[&str] = &[
     "[{\"id\":1,\"ok\":true},{\"id\":2,\"ok\":false,\"msg\":\"a \\\"quoted\\\" word\"}]",
     "{\n  \"k\": \"v\",\n  \"list\": [\n    1,\n    2\n  ]\n}",
     "{\"emoji\":\"😀\",\"cjk\":\"中文\",\"num\":12345678901234567890}",
-    "\"\\\\\"", "{}", "[]", "[[[[[[]]]]]]", "{\"a\":{\"b\":{\"c\":{\"d\":1}}}}",
+    "\"\\\\\"",
+    "{}",
+    "[]",
+    "[[[[[[]]]]]]",
+    "{\"a\":{\"b\":{\"c\":{\"d\":1}}}}",
     "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>",
 ];
 
 const OTHER_SCRIPTS: &[&str] = &[
-    "привет мир", "Ёлка", "Ελληνικά", "שלום עולם", "مرحبا بالعالم", "สวัสดีครับ", "नमस्ते दुनिया",
-    "বাংলা", "தமிழ்", "ქართული", "հայերեն", "ᓀᐦᐃᔭᐍᐏᐣ", "ꦧꦱꦗꦮ", "ÀÉÎÕÜ àéîõü ß ñ ç", "İstanbul ıi",
-    "Ǆǅǆ ǈ ǋ", "ﬁﬂ ﬃ", "Å", "ℌ ℝ ℂ", "①②③ ½ ¼ ² ³", "٠١٢٣٤٥٦٧٨٩", "०१२३४५६७८९", "௧௨௩",
+    "привет мир",
+    "Ёлка",
+    "Ελληνικά",
+    "שלום עולם",
+    "مرحبا بالعالم",
+    "สวัสดีครับ",
+    "नमस्ते दुनिया",
+    "বাংলা",
+    "தமிழ்",
+    "ქართული",
+    "հայերեն",
+    "ᓀᐦᐃᔭᐍᐏᐣ",
+    "ꦧꦱꦗꦮ",
+    "ÀÉÎÕÜ àéîõü ß ñ ç",
+    "İstanbul ıi",
+    "Ǆǅǆ ǈ ǋ",
+    "ﬁﬂ ﬃ",
+    "Å",
+    "ℌ ℝ ℂ",
+    "①②③ ½ ¼ ² ³",
+    "٠١٢٣٤٥٦٧٨٩",
+    "०१२३४५६७८९",
+    "௧௨௩",
 ];
 
 const ASCII_PUNCT: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
@@ -862,7 +976,9 @@ impl FuzzGen {
                 } else {
                     let n = self.rng.range(1, 6);
                     let bytes = ASCII_PUNCT.as_bytes();
-                    (0..n).map(|_| bytes[self.rng.below(bytes.len())] as char).collect()
+                    (0..n)
+                        .map(|_| bytes[self.rng.below(bytes.len())] as char)
+                        .collect()
                 }
             }
             9 => (*self.rng.pick(CODE)).to_string(),
@@ -976,7 +1092,9 @@ fn systematic_cases(added: &[String]) -> Vec<String> {
     }
     // Whitespace run lengths 1..=40 for the common separators, between words
     // and alone.
-    for w in [" ", "\t", "\n", "\r\n", "\n ", " \n", "\u{00A0}", "\u{3000}", "\u{2003}"] {
+    for w in [
+        " ", "\t", "\n", "\r\n", "\n ", " \n", "\u{00A0}", "\u{3000}", "\u{2003}",
+    ] {
         for n in 1..=40usize {
             let run = w.repeat(n);
             v.push(run.clone());
@@ -1017,7 +1135,11 @@ fn systematic_cases(added: &[String]) -> Vec<String> {
         v.push(format!("{e}{e}"));
         v.push(format!("12{e}34"));
     }
-    for c in CJK.iter().chain(CJK_PUNCT.iter()).chain(OTHER_SCRIPTS.iter()) {
+    for c in CJK
+        .iter()
+        .chain(CJK_PUNCT.iter())
+        .chain(OTHER_SCRIPTS.iter())
+    {
         v.push((*c).to_string());
         v.push(format!("a{c}b"));
         v.push(format!("a {c} b"));
@@ -1035,6 +1157,26 @@ fn systematic_cases(added: &[String]) -> Vec<String> {
         v.push(format!("\n{c}"));
         v.push(c.replace('\n', "\r\n"));
         v.push(c.replace("    ", "\t"));
+    }
+    // NFC edge cases: Unicode-table-sensitive canonical reorderings, plus every
+    // ordered pair of the common combining marks on a base letter.
+    for seq in [
+        "\u{0302}\u{089B}",
+        "\u{089B}\u{0302}",
+        "\u{065D}\u{1DF7}",
+        "\u{1DF7}\u{065D}",
+    ] {
+        v.push(seq.to_string());
+        v.push(format!("e{seq}"));
+        v.push(format!("a{seq}b"));
+        v.push(format!(" {seq} "));
+        v.push(format!("x\n{seq}\ty"));
+        v.push(format!("\u{0627}{seq}"));
+    }
+    for a in COMBINING_MARKS {
+        for b in COMBINING_MARKS {
+            v.push(format!("e{a}{b}"));
+        }
     }
     // Added / special token boundaries.
     for t in added {
@@ -1254,9 +1396,7 @@ fn wline(w: &mut BufWriter<File>, v: &Value) {
 }
 
 fn create(path: &Path) -> BufWriter<File> {
-    BufWriter::new(
-        File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display())),
-    )
+    BufWriter::new(File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display())))
 }
 
 fn run_entry(entry: &ManifestEntry) -> FamilyOutcome {
@@ -1273,7 +1413,10 @@ fn run_entry(entry: &ManifestEntry) -> FamilyOutcome {
     out.summary_path = sum_path.clone();
     // `with_extension` on a family containing '.' would clobber; families are
     // plain identifiers, but be explicit:
-    assert!(!entry.family.contains('.'), "family name must not contain '.'");
+    assert!(
+        !entry.family.contains('.'),
+        "family name must not contain '.'"
+    );
 
     let fuzz_cases = env_usize("HIPFIRE_TOKENIZER_FUZZ_CASES", DEFAULT_FUZZ_CASES);
     let seed = env_u64("HIPFIRE_TOKENIZER_FUZZ_SEED", DEFAULT_FUZZ_SEED) ^ fnv1a(&entry.family);
@@ -1292,14 +1435,24 @@ fn run_entry(entry: &ManifestEntry) -> FamilyOutcome {
         Ok(b) => b,
         Err(e) => {
             out.errors.push(e);
-            write_summary(&sum_path, &header, &out, &BTreeMap::new(), &BTreeMap::new(), 0, 0, 0);
+            write_summary(
+                &sum_path,
+                &header,
+                &out,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                0,
+                0,
+                0,
+            );
             return out;
         }
     };
     let hf = match HfTokenizer::from_bytes(&bytes) {
         Ok(t) => Some(t),
         Err(e) => {
-            out.errors.push(format!("HF tokenizers failed to load {}: {e}", entry.file));
+            out.errors
+                .push(format!("HF tokenizers failed to load {}: {e}", entry.file));
             None
         }
     };
@@ -1307,13 +1460,17 @@ fn run_entry(entry: &ManifestEntry) -> FamilyOutcome {
         Ok(s) => match guarded(|| OursTokenizer::from_hf_json(s)) {
             Ok(Ok(t)) => Some(t),
             Ok(Err(e)) => {
-                out.errors
-                    .push(format!("hipfire from_hf_json failed to load {}: {e}", entry.file));
+                out.errors.push(format!(
+                    "hipfire from_hf_json failed to load {}: {e}",
+                    entry.file
+                ));
                 None
             }
             Err(p) => {
-                out.errors
-                    .push(format!("hipfire from_hf_json panicked on {}: {p}", entry.file));
+                out.errors.push(format!(
+                    "hipfire from_hf_json panicked on {}: {p}",
+                    entry.file
+                ));
                 None
             }
         },
@@ -1323,7 +1480,16 @@ fn run_entry(entry: &ManifestEntry) -> FamilyOutcome {
         }
     };
     let (Some(hf), Some(ours)) = (hf, ours) else {
-        write_summary(&sum_path, &header, &out, &BTreeMap::new(), &BTreeMap::new(), 0, 0, 0);
+        write_summary(
+            &sum_path,
+            &header,
+            &out,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            0,
+            0,
+            0,
+        );
         eprintln!(
             "hf_tokenizer_differential[{}]: LOAD FAILURE: {}",
             entry.family,
@@ -1660,6 +1826,13 @@ family_tests!(
     lfm2,
     lfm25,
     llama_bpe,
+    muse_glimmer,
+    qwen25,
+    north_mini_code,
+    maple,
+    ornith,
+    vibethinker,
+    lfm25_moe,
 );
 
 /// Manifest hygiene: every file exists with the recorded MD5, family names are

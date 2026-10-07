@@ -82,5 +82,54 @@
     "md5": "034bc4e603ccec3bbbc72be339823da2",
     "source": "rednote-hilab/dots.ocr",
     "revision": "c0111ce6bc07803dbc267932ffef0ae3a51dc951"
+  },
+  {
+    "family": "muse_glimmer",
+    "file": "muse_glimmer.json",
+    "md5": "ae4bf15545a10374a97957596126e3b0",
+    "source": "meta-models/Muse-Glimmer-30B",
+    "revision": "a4e59da52a7bc87ae7251dd5545c0dd437c44b68"
+  },
+  {
+    "family": "qwen25",
+    "file": "qwen25.json",
+    "md5": "3f99a313c3754208a7f3acfccadc53cd",
+    "source": "Qwen/Qwen2.5-0.5B",
+    "revision": "060db6499f32faf8b98477b0a26969ef7d8b9987"
+  },
+  {
+    "family": "north_mini_code",
+    "file": "north_mini_code.json",
+    "md5": "197e80d0984fdfcc76dcc5947d0a582f",
+    "source": "CohereLabs/North-Mini-Code-1.0",
+    "revision": "d11e61a842617a22dc328552fa5bb86231ee4f37"
+  },
+  {
+    "family": "maple",
+    "file": "qwen3.json",
+    "md5": "6423133b9cc1a2077b57822c30c211aa",
+    "source": "deepgrove/maple-preview",
+    "revision": "ac1ddd79d2b5cb4406f5d2bebdf95406ce505a07"
+  },
+  {
+    "family": "ornith",
+    "file": "qwen35.json",
+    "md5": "7b6074791b84e7ce3a5fc12746b82d48",
+    "source": "ornith-ai/Ornith-1.5-35B-A3B",
+    "revision": "10fbf86fed7ecee4a061f8b499a618f46001cac1"
+  },
+  {
+    "family": "vibethinker",
+    "file": "vibethinker.json",
+    "md5": "b422c36b9638fd8e4f16b1daeaf5dd38",
+    "source": "WeiboAI/VibeThinker-3B",
+    "revision": "77bd2cced09193c8b9a59a32bd8577bbd1f3e01c"
+  },
+  {
+    "family": "lfm25_moe",
+    "file": "lfm25_moe.json",
+    "md5": "7b8067a580173d3eb1697afae3b456f5",
+    "source": "LiquidAI/LFM2.5-8B-A1B",
+    "revision": "5dd22602c2e9f6a097b1de4c4efe0658b605015c"
   }
 ]

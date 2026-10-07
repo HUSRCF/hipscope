@@ -97,18 +97,19 @@ directory, and the Qwen3.8 entries reuse
 `../hf_tokenizer_corpus/tokenizer.json`). The oracle is pinned
 `tokenizers =0.22.2` with the pure-Rust `fancy-regex` backend plus `md5`, both
 `[dev-dependencies]` of `hipfire-runtime` only: no C/C++ regex library, no
-Python, no network and nothing in the shipped binaries. `tokenizers` and its
-new transitive crates (including `esaxx-rs` and `spm_precompiled`) are
-Apache-2.0, already on the `deny.toml` allowlist.
+Python, no network and nothing in the shipped binaries. `tokenizers`,
+`esaxx-rs` and `spm_precompiled` are Apache-2.0; the remaining resolved
+licenses are permissive and allowed by `deny.toml`.
 
 ```bash
 cargo test --release -p hipfire-runtime --test hf_tokenizer_differential   # all families
 cargo test --release -p hipfire-runtime --test hf_tokenizer_differential qwen35 -- --nocapture
 ```
 
-Each family is its own test (`qwen3`, `qwen35`, `qwen36`, `qwen38`,
+Each family is its own test (`qwen3`, `qwen25`, `qwen35`, `qwen36`, `qwen38`,
 `qwen38_flash_next`, `dots_ocr`, `deepseek4`, `minimax`, `minimax27`, `lfm2`,
-`lfm25`, `llama_bpe`), so one failing family never skips another;
+`lfm25`, `lfm25_moe`, `llama_bpe`, `muse_glimmer`, `north_mini_code`, `maple`,
+`ornith`, `vibethinker`), so one failing family never skips another;
 `manifest_integrity` verifies every MD5, and `unlisted_manifest_families` runs
 any manifest family without a dedicated test. Per tokenizer the test compares
 exact IDs (`add_special_tokens=false`) on all 945 cases in
@@ -140,6 +141,29 @@ its `md5`/`revision` in the manifest. When a runtime fix lands, append the
 minimal repro to `hf_tokenizer_differential/regressions.jsonl`
 (`{"family","text","ids"}`); the test then pins HF and hipfire to those exact
 IDs. Do not shrink the 945-case corpus.
+
+#### Encode throughput benchmark (opt-in, single thread)
+
+`crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs` is an `#[ignore]`d
+release-only benchmark of hipfire vs HF `encode` (and HF `encode_fast`) on the
+pinned Qwen3.8 tokenizer: the committed `hermes138`, `tc55` and `tc14` corpus
+groups, 64K- and 256K-token documents cycled from `benchmarks/prompts/*.txt`,
+and 64K NFC-clean non-ASCII / NFC-adversarial documents. The shipped NFC
+normalizer is compared both to an in-memory no-normalization variant
+(`normalizer: null`) and to an **eager NFC** arm that normalizes every input
+with HF's Unicode 9 tables before encoding with the no-normalizer tokenizer.
+The eager arm isolates the allocation-free NFC fast-path benefit without
+changing normalization semantics. It prints one JSON line per group/nfc/engine
+(requests, bytes, tokens, median `elapsed_ns`, `mb_per_s`, `tokens_per_s`,
+`ms_per_request`, `ids_equal`) plus `hermes_estimate` lines modelling the
+115-request RC4c / 138-request RC3 Hermes pass against
+`hermes-p1-rc4c-breakdown.md`. It is not part of CI.
+
+```bash
+cargo test --release -p hipfire-runtime --test hf_tokenizer_encode_bench \
+    -- --ignored --nocapture --test-threads=1
+# HIPFIRE_TOKBENCH_REPS=7 (default), HIPFIRE_TOKBENCH_ONLY=hermes138,doc64k
+```
 
 ### GPU kernel correctness check
 
