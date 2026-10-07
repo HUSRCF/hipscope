@@ -40,7 +40,9 @@ struct WsTail {
     ws_only: Regex,
 }
 
-/// One compiled HF `Split` regex (behavior `Isolated`).
+/// One compiled HF `Split` regex: behavior `Isolated` (invert=false) keeps
+/// matches and the gaps between them; behavior `Removed` with invert=true
+/// keeps only the matches (`drop_gaps`).
 ///
 /// Pattern text containing the literal `\s+(?!\S)|` has it removed and the
 /// following plain `\s+` alternative wrapped in a named group. Matching is
@@ -59,10 +61,20 @@ struct PretokSplitter {
     ws_tail: Option<WsTail>,
     /// The pattern text as given (pre-rewrite); part of the config digest.
     source: String,
+    /// HF `Split{behavior: Removed, invert: true}`: `invert` flips the
+    /// regex's match flags, so the retained spans are exactly the regex
+    /// matches and every unmatched gap is deleted. `false` is
+    /// `Isolated` (matches and gaps are both pieces).
+    drop_gaps: bool,
 }
 
 impl PretokSplitter {
+    /// Isolated splitter (`drop_gaps = false`).
     fn compile(pattern: &str) -> Result<Self, String> {
+        Self::compile_with_mode(pattern, false)
+    }
+
+    fn compile_with_mode(pattern: &str, drop_gaps: bool) -> Result<Self, String> {
         let (src, has_tail) = match pattern.find(WS_LOOKAHEAD_ALT) {
             None => (pattern.to_owned(), false),
             Some(i) => {
@@ -93,6 +105,7 @@ impl PretokSplitter {
             re,
             ws_tail,
             source: pattern.to_owned(),
+            drop_gaps,
         })
     }
 
@@ -122,8 +135,8 @@ impl PretokSplitter {
         end - last.len_utf8()
     }
 
-    /// Isolated split of `text`: every match is a piece, unmatched text
-    /// between matches is its own piece.
+    /// Split of `text`: every match is a piece; unmatched text between
+    /// matches is its own piece (`Isolated`) or discarded (`drop_gaps`).
     fn split<'a>(&self, text: &'a str, out: &mut Vec<&'a str>) {
         let mut locs = None;
         let (mut pos, mut gap) = (0usize, 0usize);
@@ -147,14 +160,14 @@ impl PretokSplitter {
                     end = self.ws_lookahead_end(tail, text, start, end, &mut locs);
                 }
             }
-            if start > gap {
+            if !self.drop_gaps && start > gap {
                 out.push(&text[gap..start]);
             }
             out.push(&text[start..end]);
             gap = end;
             pos = end;
         }
-        if gap < text.len() {
+        if !self.drop_gaps && gap < text.len() {
             out.push(&text[gap..]);
         }
     }
@@ -190,14 +203,16 @@ fn default_pretokenizer() -> &'static Gpt2Pretokenizer {
 }
 
 /// Extract the `Split` regex chain from an HF `pre_tokenizer` node
-/// (`Split` directly or nested in `Sequence`). `None` — use the canonical
-/// fallback — when there is no regex `Split`, or any regex `Split` cannot be
-/// emulated faithfully (behavior ≠ `Isolated`, `invert`, or a pattern the
-/// `regex` crate cannot compile). A chain is honored whole or not at all.
-/// Other stage types (`ByteLevel`, string-pattern `Split`, …) are ignored,
-/// as before.
+/// (`Split` directly or nested in `Sequence`). Supported modes are
+/// `Isolated` with `invert=false` (matches and gaps kept) and `Removed`
+/// with `invert=true` (matches kept, gaps dropped; e.g. MiniMax). `None` —
+/// use the canonical fallback — when there is no regex `Split`, or any regex
+/// `Split` cannot be emulated faithfully (any other behavior/invert
+/// combination, or a pattern the `regex` crate cannot compile). A chain is
+/// honored whole or not at all. Other stage types (`ByteLevel`,
+/// string-pattern `Split`, …) are ignored, as before.
 fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer> {
-    fn collect(p: &serde_json::Value, patterns: &mut Vec<String>) -> bool {
+    fn collect(p: &serde_json::Value, patterns: &mut Vec<(String, bool)>) -> bool {
         match p.get("type").and_then(|v| v.as_str()) {
             Some("Split") => {
                 let Some(re) = p
@@ -209,14 +224,18 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
                 };
                 let behavior = p.get("behavior").and_then(|v| v.as_str());
                 let invert = p.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
-                if behavior != Some("Isolated") || invert {
-                    eprintln!(
-                        "[tokenizer] unsupported pre_tokenizer Split (behavior={behavior:?}, \
-                         invert={invert}); using canonical GPT-2 pre-tokenizer"
-                    );
-                    return false;
-                }
-                patterns.push(re.to_owned());
+                let drop_gaps = match (behavior, invert) {
+                    (Some("Isolated"), false) => false,
+                    (Some("Removed"), true) => true,
+                    _ => {
+                        eprintln!(
+                            "[tokenizer] unsupported pre_tokenizer Split (behavior={behavior:?}, \
+                             invert={invert}); using canonical GPT-2 pre-tokenizer"
+                        );
+                        return false;
+                    }
+                };
+                patterns.push((re.to_owned(), drop_gaps));
                 true
             }
             Some("Sequence") => p
@@ -238,8 +257,8 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
         return None;
     }
     let mut splitters = Vec::with_capacity(patterns.len());
-    for pattern in &patterns {
-        match PretokSplitter::compile(pattern) {
+    for (pattern, drop_gaps) in &patterns {
+        match PretokSplitter::compile_with_mode(pattern, *drop_gaps) {
             Ok(s) => splitters.push(s),
             Err(e) => {
                 eprintln!(
@@ -1604,6 +1623,11 @@ impl Tokenizer {
             for s in &pretok.splitters {
                 h.update((s.source.len() as u64).to_le_bytes());
                 h.update(s.source.as_bytes());
+                // Only the non-default mode is hashed, so Isolated digests
+                // are unchanged.
+                if s.drop_gaps {
+                    h.update(b"\x00drop-gaps");
+                }
             }
             h.update([u8::from(self.normalizer_nfc)]);
         }
@@ -2667,6 +2691,10 @@ mod pretok_tests {
         json!({"type": "Split", "pattern": {"Regex": pattern}, "behavior": behavior, "invert": false})
     }
 
+    fn split_node_inv(pattern: &str, behavior: &str, invert: bool) -> serde_json::Value {
+        json!({"type": "Split", "pattern": {"Regex": pattern}, "behavior": behavior, "invert": invert})
+    }
+
     fn qwen_like_pretok() -> serde_json::Value {
         json!({"type": "Sequence", "pretokenizers": [
             split_node(QWEN_PATTERN, "Isolated"),
@@ -2733,6 +2761,107 @@ mod pretok_tests {
         ]});
         let tok = load(&[], &[], mixed);
         assert!(tok.hf_pretok.is_none());
+    }
+
+    #[test]
+    fn removed_invert_keeps_matches_and_drops_gaps() {
+        let drop = PretokSplitter::compile_with_mode(r"\p{L}+", true).unwrap();
+        let keep = PretokSplitter::compile(r"\p{L}+").unwrap();
+        let run = |s: &PretokSplitter, t: &'static str| {
+            let mut out = Vec::new();
+            s.split(t, &mut out);
+            out
+        };
+        assert_eq!(run(&drop, "ab, cd"), vec!["ab", "cd"]);
+        assert_eq!(run(&keep, "ab, cd"), vec!["ab", ", ", "cd"]);
+        // Leading and trailing gaps are dropped too.
+        assert_eq!(run(&drop, ", ab,"), vec!["ab"]);
+        // No match at all: nothing survives (Isolated keeps the whole text).
+        assert_eq!(run(&drop, "1, 2"), Vec::<&str>::new());
+        assert_eq!(run(&keep, "1, 2"), vec!["1, 2"]);
+        assert_eq!(run(&drop, ""), Vec::<&str>::new());
+        // Fully tiling regex: both modes agree.
+        let tile_drop = PretokSplitter::compile_with_mode(r"\p{L}+|\s+|[^\s\p{L}]+", true).unwrap();
+        let tile_keep = PretokSplitter::compile(r"\p{L}+|\s+|[^\s\p{L}]+").unwrap();
+        assert_eq!(run(&tile_drop, "ab, cd"), run(&tile_keep, "ab, cd"));
+    }
+
+    #[test]
+    fn removed_invert_chain_is_honored_whole() {
+        let chain = Gpt2Pretokenizer {
+            splitters: vec![
+                PretokSplitter::compile_with_mode(r"\p{L}+", true).unwrap(),
+                PretokSplitter::compile(r"[a-c]+").unwrap(),
+            ],
+        };
+        // Stage 1 drops ", "; stage 2 (Isolated) keeps the "d" gap of "cd".
+        assert_eq!(chain.pieces("ab, cd"), vec!["ab", "c", "d"]);
+        // Mode order is respected the other way round as well.
+        let chain = Gpt2Pretokenizer {
+            splitters: vec![
+                PretokSplitter::compile(r"\p{L}+").unwrap(),
+                PretokSplitter::compile_with_mode(r"[a-c]+", true).unwrap(),
+            ],
+        };
+        assert_eq!(chain.pieces("ab, cd"), vec!["ab", "c"]);
+    }
+
+    #[test]
+    fn from_hf_json_removed_invert_drops_gaps() {
+        // MiniMax shape: Sequence[Split(Removed, invert=true), ByteLevel(use_regex=false)].
+        let pre = json!({"type": "Sequence", "pretokenizers": [
+            split_node_inv(r"\p{L}+", "Removed", true),
+            {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
+        ]});
+        let tok = load(&[], &[], pre);
+        assert!(tok.hf_pretok.is_some());
+        assert_eq!(tok.pretokenizer().pieces("ab, cd"), vec!["ab", "cd"]);
+        assert_eq!(tok.pretokenizer().pieces("1, 2"), Vec::<&str>::new());
+        // The dropped ", " produces no ids.
+        assert_eq!(tok.encode_gpt2_bpe("ab, cd"), vec![97, 98, 99, 100]);
+
+        // Top-level Split, and a mixed chain where every stage is supported.
+        let tok = load(&[], &[], split_node_inv(r"\p{L}+", "Removed", true));
+        assert!(tok.hf_pretok.is_some());
+        let mixed = json!({"type": "Sequence", "pretokenizers": [
+            split_node_inv(r"\p{L}+", "Removed", true),
+            split_node_inv(r"[a-c]+", "Isolated", false),
+        ]});
+        let tok = load(&[], &[], mixed);
+        assert!(tok.hf_pretok.is_some());
+        assert_eq!(tok.pretokenizer().pieces("ab, cd"), vec!["ab", "c", "d"]);
+    }
+
+    #[test]
+    fn from_hf_json_other_split_modes_still_fall_back() {
+        for (behavior, invert) in [
+            ("Removed", false),
+            ("Isolated", true),
+            ("MergedWithPrevious", false),
+            ("MergedWithNext", true),
+            ("Contiguous", false),
+        ] {
+            let tok = load(&[], &[], split_node_inv(QWEN_PATTERN, behavior, invert));
+            assert!(tok.hf_pretok.is_none(), "{behavior} invert={invert}");
+            assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "123"]);
+        }
+        // A single unsupported stage poisons an otherwise supported chain.
+        let mixed = json!({"type": "Sequence", "pretokenizers": [
+            split_node_inv(r"\d+", "Removed", true),
+            split_node_inv(r"\d+", "Removed", false),
+        ]});
+        assert!(load(&[], &[], mixed).hf_pretok.is_none());
+    }
+
+    #[test]
+    fn split_mode_is_part_of_config_digest() {
+        let isolated = load(&[], &[], split_node_inv(r"\p{L}+", "Isolated", false));
+        let removed = load(&[], &[], split_node_inv(r"\p{L}+", "Removed", true));
+        assert_ne!(isolated.config_digest(), removed.config_digest());
+        assert_eq!(
+            removed.config_digest(),
+            load(&[], &[], split_node_inv(r"\p{L}+", "Removed", true)).config_digest()
+        );
     }
 
     #[test]
