@@ -768,7 +768,7 @@ impl Carrier for Qwen4Carrier {
             )
             .unwrap_or(0);
             eprintln!(
-                "  qwen4 prefix cache: one whole-chunk checkpoint ({} KiB)",
+                "  qwen4 prefix cache: live continuation + end-of-prompt checkpoint ({} KiB)",
                 bytes / 1024
             );
         }
