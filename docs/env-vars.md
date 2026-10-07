@@ -512,7 +512,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1421
+**Count:** 1425
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1535,6 +1535,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | stable |
 | `HIPFIRE_PREFILL_MAX_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_PREFILL_REUSE_PBS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
+| `HIPFIRE_PREFIX_SESSION_CHILD` | crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | harness |
+| `HIPFIRE_PREFIX_SESSION_CORPUS` | crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | harness |
+| `HIPFIRE_PREFIX_SESSION_MODEL` | crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | harness |
+| `HIPFIRE_PREFIX_SESSION_OUT` | crates/hipfire-arch-qwen4/tests/prefix_cache_session_hw.rs | harness |
 | `HIPFIRE_PROBE_ALIGN` | crates/hipfire-runtime/src/hfq.rs | developer |
 | `HIPFIRE_PROBE_MODEL` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-runtime/src/hfq.rs | developer |
 | `HIPFIRE_PROBE_READS` | crates/hipfire-runtime/src/hfq.rs | developer |
