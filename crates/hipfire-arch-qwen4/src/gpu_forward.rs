@@ -2504,6 +2504,39 @@ impl Qwen4GpuForward {
         )
     }
 
+    /// Copy the single wide HC stream row the last ordinary one-token
+    /// [`Self::forward_token`] left in `scratch.streams` into `destination`
+    /// as F32, with the conversion `forward_chunk` applies for a wide hidden
+    /// capture (BF16 stream bits widen, F32 streams copy). The final hyper
+    /// reads `streams` into other scratch, so the row is the trunk's output on
+    /// the HIP and the retained-replay route alike. `destination` must be F32
+    /// with exactly `hc_count * hidden_size` elements. Calibration only; the
+    /// row is valid until the next forward writes `streams`.
+    pub(crate) fn copy_last_wide_hidden_to(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        destination: &GpuTensor,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let wide = program_dims(config).wide();
+        if destination.dtype != DType::F32 || destination.numel() != wide {
+            return Err(invalid(format!(
+                "wide hidden destination must be F32 with exactly {wide} elements"
+            )));
+        }
+        if self.scratch.streams.numel() < wide {
+            return Err(invalid("Qwen4 stream scratch is narrower than one wide row"));
+        }
+        let source = view(&self.scratch.streams, 0, wide);
+        let destination = f32_view(destination, 0, wide);
+        if gpu.qwen4_bf16_streams(1) {
+            rdna_compute::tensor_ops::hc_state_bf16_to_f32(gpu, &source, &destination, wide)?;
+        } else {
+            gpu.copy_d2d(&source, &destination, source.byte_size())?;
+        }
+        Ok(())
+    }
+
     /// [`Self::forward_token`] of `token`, or (`None`) of the GPU argmax of
     /// `logits` as the previous forward left them; returns the token. The
     /// argmax is taken only after this forward's step program is built, and

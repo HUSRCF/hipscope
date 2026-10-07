@@ -1034,10 +1034,10 @@ pub fn request_rng_state(rng_seed: u64) -> u64 {
     }
 }
 
-/// Typed MTP+ngram-mod counters surfaced on the wire done event.
+/// Typed MTP and ngram-mod counters surfaced on the wire done event.
 ///
-/// Populated by the Qwen MTP drafter when `HIPFIRE_MTP_NGRAM` composition is
-/// armed for the request; zeroed defaults otherwise. Accept-rate is
+/// Populated by the Qwen MTP drafter. Ngram-mod counters remain zero unless
+/// `HIPFIRE_MTP_NGRAM` composition is armed for the request. Accept-rate is
 /// `accepted/drafts` rounded to three decimals when drafts > 0.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MtpRequestStats {
@@ -1053,11 +1053,12 @@ pub struct MtpRequestStats {
     pub ngram_mod_accept_rate: f64,
     /// Native MTP windows (every n-gram miss, or plain MTP).
     pub mtp_windows: usize,
-    /// Trunk-only (`k=0`) windows. qwen35 MTP no longer retires after an
-    /// n-gram accept (the takeover fills the head KV), so this stays 0; kept
-    /// on the wire for campaign parsers.
+    /// Target-only (`k=0`) windows after sticky native Qwen4 floor retirement.
+    /// Qwen35 MTP does not retire after an n-gram accept because the takeover
+    /// fills the head KV.
     pub ar_windows: usize,
-    /// Always false since takeovers fill the head KV; kept on the wire.
+    /// Sticky native Qwen4 retirement to target-only decoding for this request.
+    /// Qwen35 MTP does not retire because takeovers fill the head KV.
     pub mtp_retired: bool,
 }
 
