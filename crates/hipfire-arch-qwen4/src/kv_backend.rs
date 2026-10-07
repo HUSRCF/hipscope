@@ -130,6 +130,27 @@ impl Qwen4ContextCommit {
         }
     }
 
+    /// What the `auto` expert-placement reserve charges for a load's context
+    /// arenas. Unified memory charges the arenas as committed ([`Self::new`]:
+    /// VMM pages commit on demand out of the same pool the weights live in).
+    /// A discrete card charges legacy storage of `max_seq` tokens whatever
+    /// the backend: VMM growth during forwards maps VRAM that the placement
+    /// must already have left free, so the reserve, and with it the expert
+    /// layers placed, match legacy storage at every `max_seq`.
+    pub fn for_expert_reserve(
+        backend: Qwen4KvBackend,
+        unified_memory: bool,
+        max_seq: usize,
+        chunk_rows: usize,
+        granularity: usize,
+    ) -> Self {
+        if unified_memory {
+            Self::new(backend, max_seq, chunk_rows, granularity)
+        } else {
+            Self::legacy(max_seq)
+        }
+    }
+
     /// Virtual bytes of one layer's context arenas in `format`.
     pub fn virtual_layer_bytes(&self, config: &Qwen4Config, format: QsaKvFormat) -> Option<usize> {
         config.qsa_context_arena_bytes(self.max_seq, format)

@@ -182,8 +182,9 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). Only
 /// committed bytes are charged: VMM context arenas commit the first chunk's
 /// pages (inside the measured layout), their virtual extent nothing, so the
-/// admitted context does not size the VMM reserve; legacy arenas commit all
-/// of `max_seq`.
+/// admitted context does not size a VMM reserve; legacy arenas commit all
+/// of `max_seq`. Callers on a discrete card pass legacy storage whatever the
+/// backend ([`crate::Qwen4ContextCommit::for_expert_reserve`]).
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -719,6 +720,68 @@ mod tests {
             config.qsa_context_arena_bytes(native, F32).unwrap()
                 - vmm(native).committed_layer_bytes(&config, F32).unwrap()
         );
+    }
+
+    #[test]
+    fn discrete_reserve_matches_legacy_and_unified_memory_charges_committed() {
+        use crate::{Qwen4ContextCommit as Commit, Qwen4KvBackend as Backend};
+        let config = crate::config::compact_test_config();
+        let chunk = AUTO_VRAM_RESERVE_CHUNK;
+        let granularity = 2 << 20;
+        let mtp = |context: &Commit| {
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2)
+                .unwrap()
+                .0
+        };
+        // The expert layers `auto` places for a load whose reserve charges
+        // `context`, with the native MTP and QSA gather parts as the loader
+        // computes them from the same context, on the measured R9700 fixture.
+        let placement = |context: &Commit, format| {
+            let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                context.tokens,
+            )
+            .unwrap() as u64;
+            let reserve = auto_vram_reserve(
+                &config,
+                context,
+                chunk,
+                format,
+                Some(mtp(context) as u64),
+                Some(gather),
+            )
+            .unwrap();
+            let free = 32548u64 << 20;
+            let (weights, layer) = (5_364_000_000u64, 1_336_900_000u64);
+            (reserve, auto_vram_layers(free, weights, layer, 48, reserve))
+        };
+        for max_seq in [65_536, 262_144] {
+            let legacy = Commit::legacy(max_seq);
+            for format in [QsaKvFormat::Fp8, F32] {
+                // Discrete: a VMM backend's reserve and placement are legacy
+                // storage's at this `max_seq`.
+                let discrete = Commit::for_expert_reserve(Backend::Vmm, false, max_seq, chunk, granularity);
+                assert_eq!(discrete, legacy);
+                assert_eq!(placement(&discrete, format), placement(&legacy, format));
+                assert_eq!(
+                    Commit::for_expert_reserve(Backend::Legacy, false, max_seq, chunk, granularity),
+                    legacy
+                );
+                // Unified memory is unchanged: VMM charges the first chunk's
+                // pages, legacy all of `max_seq`.
+                let vmm = Commit::new(Backend::Vmm, max_seq, chunk, granularity);
+                let uma_vmm = Commit::for_expert_reserve(Backend::Vmm, true, max_seq, chunk, granularity);
+                assert_eq!(uma_vmm, vmm);
+                assert_eq!(placement(&uma_vmm, format), placement(&vmm, format));
+                assert!(placement(&uma_vmm, format).0 < placement(&legacy, format).0);
+                assert!(placement(&uma_vmm, format).1 >= placement(&legacy, format).1);
+                assert_eq!(
+                    Commit::for_expert_reserve(Backend::Legacy, true, max_seq, chunk, granularity),
+                    legacy
+                );
+            }
+            assert!(mtp(&Commit::for_expert_reserve(Backend::Vmm, true, max_seq, chunk, granularity)) < mtp(&legacy));
+        }
     }
 
     #[test]
