@@ -18,6 +18,7 @@ use crate::{
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -74,6 +75,294 @@ pub fn retired_va_bytes() -> usize {
     retired_va().bytes
 }
 
+/// Physical granule granularity floor: handles are at least this large so a
+/// 2 MiB-granularity device and a 4 KiB-granularity device share one policy.
+const GRANULE_MIN_BYTES: usize = 2 << 20;
+
+/// Generation stamped on every granule table entry. A granule's HIP handle is
+/// never replaced, so the stamp is constant; lookups still compare it so an id
+/// from a differently stamped entry can never alias a live one.
+const GRANULE_GENERATION: u64 = 1;
+
+/// Process-wide identity of one physical VMM granule (one HIP allocation
+/// handle). `id` is monotonic and never reused within a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VmmPhysicalId {
+    pub id: u64,
+    pub generation: u64,
+}
+
+struct GranuleEntry {
+    /// `hipMemGenericAllocationHandle_t` stored as an address so the table is `Send`.
+    handle: usize,
+    size: usize,
+    /// Mapping leases (one per mapped granule segment) plus cache leases
+    /// (one per [`VmmSharedPrefix`] granule). Zero means the handle release
+    /// failed and is pending a retry.
+    leases: usize,
+    generation: u64,
+}
+
+/// Process-global physical granule table: id -> handle, size and lease count.
+struct GranuleTable {
+    next_id: u64,
+    entries: BTreeMap<u64, GranuleEntry>,
+}
+
+impl GranuleTable {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Record a freshly created handle holding its first lease.
+    fn register(&mut self, handle: usize, size: usize) -> VmmPhysicalId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.entries.insert(
+            id,
+            GranuleEntry {
+                handle,
+                size,
+                leases: 1,
+                generation: GRANULE_GENERATION,
+            },
+        );
+        VmmPhysicalId {
+            id,
+            generation: GRANULE_GENERATION,
+        }
+    }
+
+    fn entry(&self, id: VmmPhysicalId) -> Option<&GranuleEntry> {
+        self.entries
+            .get(&id.id)
+            .filter(|entry| entry.generation == id.generation)
+    }
+
+    fn leases(&self, id: VmmPhysicalId) -> Option<usize> {
+        self.entry(id).map(|entry| entry.leases)
+    }
+
+    fn handle(&self, id: VmmPhysicalId) -> Option<usize> {
+        self.entry(id).map(|entry| entry.handle)
+    }
+
+    fn live_bytes(&self) -> usize {
+        self.entries.values().map(|entry| entry.size).sum()
+    }
+
+    fn check_leasable(&self, id: VmmPhysicalId) -> HipResult<()> {
+        match self.entry(id) {
+            Some(entry) if entry.leases > 0 => Ok(()),
+            Some(_) => Err(HipError::new(
+                0,
+                &format!("VMM granule {} has no live lease (release pending)", id.id),
+            )),
+            None => Err(HipError::new(
+                0,
+                &format!("VMM granule {} is not in the granule table", id.id),
+            )),
+        }
+    }
+
+    /// Take one more lease on `id` and return its handle address.
+    fn add_lease(&mut self, id: VmmPhysicalId) -> HipResult<usize> {
+        self.check_leasable(id)?;
+        let entry = self
+            .entries
+            .get_mut(&id.id)
+            .ok_or_else(|| HipError::new(0, "VMM granule table entry vanished"))?;
+        entry.leases += 1;
+        Ok(entry.handle)
+    }
+
+    /// Take one more lease on every id, or none if any id is not leasable.
+    fn add_leases(&mut self, ids: &[VmmPhysicalId]) -> HipResult<()> {
+        for &id in ids {
+            self.check_leasable(id)?;
+        }
+        for &id in ids {
+            self.add_lease(id)?;
+        }
+        Ok(())
+    }
+
+    /// Drop one lease. At zero leases `release` runs on the handle; a failed
+    /// release leaves the entry at zero leases (pending, still counted live).
+    fn drop_lease(
+        &mut self,
+        id: VmmPhysicalId,
+        release: &mut impl FnMut(usize) -> HipResult<()>,
+    ) -> HipResult<()> {
+        self.check_leasable(id)?;
+        let entry = self
+            .entries
+            .get_mut(&id.id)
+            .ok_or_else(|| HipError::new(0, "VMM granule table entry vanished"))?;
+        entry.leases -= 1;
+        if entry.leases > 0 {
+            return Ok(());
+        }
+        release(entry.handle)?;
+        self.entries.remove(&id.id);
+        Ok(())
+    }
+
+    /// Retry every pending (zero-lease) release. Returns how many were
+    /// released and the first failure, if any.
+    fn retry_pending(
+        &mut self,
+        release: &mut impl FnMut(usize) -> HipResult<()>,
+    ) -> (usize, Option<HipError>) {
+        let pending: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.leases == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        let mut released = 0;
+        let mut first_error = None;
+        for id in pending {
+            let Some(entry) = self.entries.get(&id) else {
+                continue;
+            };
+            match release(entry.handle) {
+                Ok(()) => {
+                    self.entries.remove(&id);
+                    released += 1;
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        (released, first_error)
+    }
+}
+
+static GRANULES: Mutex<GranuleTable> = Mutex::new(GranuleTable::new());
+
+fn granule_table() -> std::sync::MutexGuard<'static, GranuleTable> {
+    GRANULES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Process-wide bytes of physical VMM granules that still hold at least one
+/// lease or a pending (failed) `hipMemRelease`.
+pub fn vmm_live_granule_bytes() -> usize {
+    granule_table().live_bytes()
+}
+
+/// Retry every `hipMemRelease` that failed when a granule's last lease was
+/// dropped. Returns the number of handles released; if any retry fails the
+/// first error is returned (successful retries stay released).
+pub fn retry_pending_granule_releases(hip: &HipRuntime) -> HipResult<usize> {
+    let (released, first_error) =
+        granule_table().retry_pending(&mut |handle| release_granule_handle(hip, handle));
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(released),
+    }
+}
+
+fn release_granule_handle(hip: &HipRuntime, handle: usize) -> HipResult<()> {
+    if let Some(err) = take_fault(VmmFaultKind::Release) {
+        return Err(err);
+    }
+    // SAFETY: `handle` was created by `mem_create` for a granule table entry
+    // whose leases reached zero; every mapping lease is dropped only after its
+    // range was unmapped, and shared-prefix leases never map, so no mapped
+    // range still references it.
+    unsafe { hip.mem_release(handle as HipMemGenericAllocationHandle) }
+}
+
+/// Drop one lease per id, continuing past failures; returns the first error.
+fn drop_leases(
+    table: &mut GranuleTable,
+    ids: impl IntoIterator<Item = VmmPhysicalId>,
+    release: &mut impl FnMut(usize) -> HipResult<()>,
+) -> HipResult<()> {
+    let mut first_error = None;
+    for id in ids {
+        if let Err(err) = table.drop_lease(id, release) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Cache leases on the leading granules of a [`VmmArena`], taken by
+/// [`VmmArena::share_prefix`]. The physical memory stays alive until every
+/// lease (this one and each arena mapping) is dropped; the prefix itself maps
+/// nothing and exposes no raw handles.
+#[must_use = "shared VMM prefixes must be released explicitly"]
+#[derive(Debug)]
+pub struct VmmSharedPrefix {
+    granules: Vec<(VmmPhysicalId, usize)>,
+    owner_device: i32,
+    granularity: usize,
+}
+
+impl VmmSharedPrefix {
+    /// A prefix with zero granules; releasing it is a no-op.
+    pub fn empty() -> Self {
+        Self {
+            granules: Vec::new(),
+            owner_device: -1,
+            granularity: 0,
+        }
+    }
+
+    /// Sum of the granule sizes.
+    pub fn bytes(&self) -> usize {
+        self.granules.iter().map(|&(_, size)| size).sum()
+    }
+
+    /// `(id, physical bytes)` of every granule in offset order.
+    pub fn granules(&self) -> &[(VmmPhysicalId, usize)] {
+        &self.granules
+    }
+
+    /// Drop one cache lease per granule. A granule whose last lease this was
+    /// is released unless a mapping still holds a lease; a failed release
+    /// stays pending for [`retry_pending_granule_releases`]. Continues past
+    /// failures and returns the first.
+    pub fn release(mut self, hip: &HipRuntime) -> HipResult<()> {
+        let granules = std::mem::take(&mut self.granules);
+        drop_leases(
+            &mut granule_table(),
+            granules.into_iter().map(|(id, _)| id),
+            &mut |handle| release_granule_handle(hip, handle),
+        )
+    }
+}
+
+impl Drop for VmmSharedPrefix {
+    fn drop(&mut self) {
+        // Dropping cannot call HIP (no runtime, possibly a foreign thread), so
+        // the leases are leaked and stay counted by `vmm_live_granule_bytes`.
+        if cfg!(debug_assertions) && !self.granules.is_empty() {
+            eprintln!(
+                "hip-bridge: VmmSharedPrefix with {} granules ({} bytes) dropped without release(); \
+                 its leases are leaked",
+                self.granules.len(),
+                self.bytes()
+            );
+        }
+    }
+}
+
 /// Deterministic, test-only fault injection for VMM teardown/access stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmmFaultKind {
@@ -83,12 +372,19 @@ pub enum VmmFaultKind {
     Unmap,
     /// Fail the next physical-handle `hipMemRelease` call(s).
     Release,
+    /// Fail the next granule `hipMemMap` call(s) in `map_next_granules` /
+    /// `map_shared_prefix`.
+    Map,
+    /// Fail the next granule `hipMemCreate` call(s) in `map_next_granules`.
+    Create,
 }
 
 thread_local! {
     static FAULT_ACCESS: Cell<u32> = const { Cell::new(0) };
     static FAULT_UNMAP: Cell<u32> = const { Cell::new(0) };
     static FAULT_RELEASE: Cell<u32> = const { Cell::new(0) };
+    static FAULT_MAP: Cell<u32> = const { Cell::new(0) };
+    static FAULT_CREATE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Queue `count` deterministic failures for `kind`. Test-only; real HIP is
@@ -98,6 +394,8 @@ pub fn inject_vmm_fault(kind: VmmFaultKind, count: u32) {
         VmmFaultKind::AccessReset => FAULT_ACCESS.with(|c| c.set(count)),
         VmmFaultKind::Unmap => FAULT_UNMAP.with(|c| c.set(count)),
         VmmFaultKind::Release => FAULT_RELEASE.with(|c| c.set(count)),
+        VmmFaultKind::Map => FAULT_MAP.with(|c| c.set(count)),
+        VmmFaultKind::Create => FAULT_CREATE.with(|c| c.set(count)),
     }
 }
 
@@ -106,6 +404,8 @@ pub fn clear_vmm_faults() {
     FAULT_ACCESS.with(|c| c.set(0));
     FAULT_UNMAP.with(|c| c.set(0));
     FAULT_RELEASE.with(|c| c.set(0));
+    FAULT_MAP.with(|c| c.set(0));
+    FAULT_CREATE.with(|c| c.set(0));
 }
 
 fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
@@ -113,6 +413,8 @@ fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
         VmmFaultKind::AccessReset => &FAULT_ACCESS,
         VmmFaultKind::Unmap => &FAULT_UNMAP,
         VmmFaultKind::Release => &FAULT_RELEASE,
+        VmmFaultKind::Map => &FAULT_MAP,
+        VmmFaultKind::Create => &FAULT_CREATE,
     };
     cell.with(|c| {
         let left = c.get();
@@ -124,6 +426,8 @@ fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
             VmmFaultKind::AccessReset => "access-reset",
             VmmFaultKind::Unmap => "unmap",
             VmmFaultKind::Release => "release",
+            VmmFaultKind::Map => "map",
+            VmmFaultKind::Create => "create",
         };
         Some(HipError::new(
             0x564D_4D46, // 'VMMF'
@@ -137,6 +441,9 @@ struct VmmSegment {
     offset: usize,
     size: usize,
     handle: Option<HipMemGenericAllocationHandle>,
+    /// Physical granule backing this segment; its mapping lease is held in the
+    /// granule table. Exclusive segments (`map_next`) use `handle` instead.
+    granule: Option<VmmPhysicalId>,
     mapped: bool,
 }
 
@@ -150,6 +457,8 @@ pub struct VmmArena {
     segments: Vec<VmmSegment>,
     access_devices: Vec<i32>,
     releasing: bool,
+    /// True once any mapping succeeded; a never-mapped VA may adopt a shared prefix.
+    ever_mapped: bool,
 }
 
 // SAFETY: VmmArena holds a device VA base and opaque HIP allocation handles that
@@ -197,6 +506,7 @@ impl VmmArena {
             segments: Vec::new(),
             access_devices: vec![owner_device],
             releasing: false,
+            ever_mapped: false,
         })
     }
 
@@ -216,7 +526,15 @@ impl VmmArena {
     /// segment exists. Exposed so callers can query the handle's placement with
     /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
     pub fn primary_handle(&self) -> Option<HipMemGenericAllocationHandle> {
-        self.segments.first().and_then(|seg| seg.handle)
+        self.segments.first().and_then(|seg| {
+            seg.handle.or_else(|| {
+                seg.granule.and_then(|id| {
+                    granule_table()
+                        .handle(id)
+                        .map(|handle| handle as HipMemGenericAllocationHandle)
+                })
+            })
+        })
     }
     pub const fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
@@ -316,6 +634,7 @@ impl VmmArena {
                         offset: self.mapped_bytes,
                         size,
                         handle: Some(handle),
+                        granule: None,
                         mapped: false,
                     });
                     self.releasing = true;
@@ -353,6 +672,7 @@ impl VmmArena {
                 offset: self.mapped_bytes,
                 size,
                 handle: Some(handle),
+                granule: None,
                 mapped: true,
             };
             // SAFETY: `address,size` is the segment just mapped; no kernels are
@@ -391,10 +711,380 @@ impl VmmArena {
             offset: self.mapped_bytes,
             size,
             handle: Some(handle),
+            granule: None,
             mapped: true,
         });
         self.mapped_bytes = next_mapped;
+        self.ever_mapped = true;
         Ok(())
+    }
+
+    /// Bytes of one physical granule: `max(granularity, 2 MiB)` rounded up to
+    /// the granularity. Only the last granule at the reserve end may be smaller.
+    pub fn granule_bytes(&self) -> usize {
+        GRANULE_MIN_BYTES
+            .max(self.granularity)
+            .div_ceil(self.granularity)
+            .saturating_mul(self.granularity)
+    }
+
+    /// End offset of the leading run of mapped granule segments: the bytes
+    /// that can be aliased into another arena by [`Self::share_prefix`].
+    pub fn granule_prefix_bytes(&self) -> usize {
+        let mut end = 0;
+        for segment in &self.segments {
+            if segment.granule.is_none() || !segment.mapped || segment.offset != end {
+                break;
+            }
+            end = segment.offset + segment.size;
+        }
+        end
+    }
+
+    /// End offset of the last mapped granule segment whose physical granule
+    /// has more than one lease (shared with a checkpoint or another arena);
+    /// zero when nothing is shared. Bytes below it must never be written.
+    pub fn sealed_bytes(&self) -> usize {
+        let table = granule_table();
+        self.segments
+            .iter()
+            .rev()
+            .find(|segment| {
+                segment.mapped
+                    && segment
+                        .granule
+                        .is_some_and(|id| table.leases(id).is_some_and(|leases| leases > 1))
+            })
+            .map_or(0, |segment| segment.offset + segment.size)
+    }
+
+    /// `(id, bytes)` of every mapped granule segment in offset order.
+    pub fn physical_granules(&self) -> Vec<(VmmPhysicalId, usize)> {
+        self.segments
+            .iter()
+            .filter(|segment| segment.mapped)
+            .filter_map(|segment| segment.granule.map(|id| (id, segment.size)))
+            .collect()
+    }
+
+    /// Take one cache lease on every granule of the leading `bytes`, which
+    /// must be a granule boundary no greater than [`Self::granule_prefix_bytes`].
+    /// Zero returns an empty prefix.
+    pub fn share_prefix(&self, bytes: usize) -> HipResult<VmmSharedPrefix> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "VMM arena is releasing or already released",
+            ));
+        }
+        if bytes == 0 {
+            return Ok(VmmSharedPrefix::empty());
+        }
+        let limit = self.granule_prefix_bytes();
+        if bytes > limit {
+            return Err(HipError::new(
+                0,
+                &format!("VMM share of {bytes} bytes exceeds the granule prefix of {limit} bytes"),
+            ));
+        }
+        let mut granules = Vec::new();
+        let mut end = 0;
+        for segment in &self.segments {
+            let Some(id) = segment.granule else { break };
+            if end >= bytes {
+                break;
+            }
+            end = segment.offset + segment.size;
+            granules.push((id, segment.size));
+        }
+        if end != bytes {
+            return Err(HipError::new(
+                0,
+                &format!("VMM share of {bytes} bytes does not end on a granule boundary"),
+            ));
+        }
+        let ids: Vec<VmmPhysicalId> = granules.iter().map(|&(id, _)| id).collect();
+        granule_table().add_leases(&ids)?;
+        Ok(VmmSharedPrefix {
+            granules,
+            owner_device: self.owner_device,
+            granularity: self.granularity,
+        })
+    }
+
+    /// Map `bytes` (a non-zero multiple of the granularity that fits the
+    /// reserve) as one physical granule per [`Self::granule_bytes`] (the last
+    /// may be shorter), contiguously after the mapped prefix, with one
+    /// `hipMemSetAccess` over the whole mapped prefix. Any failure unmaps and
+    /// drops the leases created by this call and poisons the arena.
+    pub fn map_next_granules(
+        &mut self,
+        hip: &HipRuntime,
+        bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.ensure_mappable()?;
+        if bytes == 0 || !bytes.is_multiple_of(self.granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM granule map size {bytes} must be a non-zero multiple of granularity {}",
+                    self.granularity
+                ),
+            ));
+        }
+        let next_mapped = self
+            .mapped_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| HipError::new(0, "VMM mapped byte count overflowed"))?;
+        if next_mapped > self.reserved_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map would exceed reserve: {} + {bytes} > {}",
+                    self.mapped_bytes, self.reserved_bytes
+                ),
+            ));
+        }
+        let (next_access_devices, access) = self.resolve_access(hip, access_devices)?;
+
+        hip.set_device(self.owner_device)?;
+        let prop = HipMemAllocationProp::device_pinned(self.owner_device);
+        let granule = self.granule_bytes();
+        let mut staged: Vec<VmmSegment> = Vec::with_capacity(bytes.div_ceil(granule));
+        let mut offset = self.mapped_bytes;
+        while offset < next_mapped {
+            let size = (next_mapped - offset).min(granule);
+            let handle = match take_fault(VmmFaultKind::Create)
+                .map_or_else(|| hip.mem_create(size, &prop), Err)
+            {
+                Ok(handle) => handle,
+                Err(err) => return Err(self.abort_granule_map(hip, staged, err)),
+            };
+            let id = granule_table().register(handle as usize, size);
+            staged.push(VmmSegment {
+                offset,
+                size,
+                handle: None,
+                granule: Some(id),
+                mapped: false,
+            });
+            let address = offset_ptr(self.base, offset);
+            let mapped = take_fault(VmmFaultKind::Map).map_or_else(
+                // SAFETY: `address` is base+offset inside the live reserve and
+                // `offset + size <= next_mapped <= reserved_bytes`; `size` is a
+                // granularity multiple; `handle` is a fresh granule covering
+                // `size`, not mapped anywhere.
+                || unsafe { hip.mem_map(address, size, handle) },
+                Err,
+            );
+            if let Err(err) = mapped {
+                return Err(self.abort_granule_map(hip, staged, err));
+            }
+            if let Some(last) = staged.last_mut() {
+                last.mapped = true;
+            }
+            offset += size;
+        }
+        if let Err(err) = self.apply_access(hip, next_mapped, &access, self.mapped_bytes, bytes) {
+            return Err(self.abort_granule_map(hip, staged, err));
+        }
+
+        self.access_devices = next_access_devices;
+        self.segments.append(&mut staged);
+        self.mapped_bytes = next_mapped;
+        self.ever_mapped = true;
+        Ok(())
+    }
+
+    /// Map every granule of `prefix` at `base + offset` of this never-mapped
+    /// arena (one mapping lease per granule, one `hipMemSetAccess`). The
+    /// destination must share the prefix's owner device and granularity. Any
+    /// failure unmaps what it mapped, drops those leases and poisons the arena.
+    pub fn map_shared_prefix(
+        &mut self,
+        hip: &HipRuntime,
+        prefix: &VmmSharedPrefix,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.ensure_mappable()?;
+        if self.ever_mapped || self.mapped_bytes != 0 || !self.segments.is_empty() {
+            return Err(HipError::new(
+                0,
+                "VMM shared prefix needs a never-mapped arena (its VA must not have been translated)",
+            ));
+        }
+        if prefix.granules.is_empty() {
+            return Ok(());
+        }
+        if prefix.owner_device != self.owner_device || prefix.granularity != self.granularity {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM shared prefix (device {}, granularity {}) does not match arena (device {}, granularity {})",
+                    prefix.owner_device, prefix.granularity, self.owner_device, self.granularity
+                ),
+            ));
+        }
+        let prefix_bytes = prefix.bytes();
+        if prefix_bytes > self.reserved_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM shared prefix of {prefix_bytes} bytes exceeds reserve {}",
+                    self.reserved_bytes
+                ),
+            ));
+        }
+        let (next_access_devices, access) = self.resolve_access(hip, access_devices)?;
+
+        hip.set_device(self.owner_device)?;
+        let mut staged: Vec<VmmSegment> = Vec::with_capacity(prefix.granules.len());
+        let mut offset = 0;
+        for &(id, size) in &prefix.granules {
+            // Take the lease before matching: the table guard must not be held
+            // while `abort_granule_map` re-locks the table.
+            let leased = granule_table().add_lease(id);
+            let handle = match leased {
+                Ok(handle) => handle as HipMemGenericAllocationHandle,
+                Err(err) => return Err(self.abort_granule_map(hip, staged, err)),
+            };
+            staged.push(VmmSegment {
+                offset,
+                size,
+                handle: None,
+                granule: Some(id),
+                mapped: false,
+            });
+            let address = offset_ptr(self.base, offset);
+            let mapped = take_fault(VmmFaultKind::Map).map_or_else(
+                // SAFETY: `address` is base+offset inside the live reserve and
+                // `offset + size <= prefix_bytes <= reserved_bytes`; the arena
+                // was never mapped so this VA range is unmapped; `handle` is a
+                // live granule (a lease was just taken) of exactly `size` bytes.
+                || unsafe { hip.mem_map(address, size, handle) },
+                Err,
+            );
+            if let Err(err) = mapped {
+                return Err(self.abort_granule_map(hip, staged, err));
+            }
+            if let Some(last) = staged.last_mut() {
+                last.mapped = true;
+            }
+            offset += size;
+        }
+        if let Err(err) = self.apply_access(hip, prefix_bytes, &access, 0, prefix_bytes) {
+            return Err(self.abort_granule_map(hip, staged, err));
+        }
+
+        self.access_devices = next_access_devices;
+        self.segments.append(&mut staged);
+        self.mapped_bytes = prefix_bytes;
+        self.ever_mapped = true;
+        Ok(())
+    }
+
+    fn ensure_mappable(&self) -> HipResult<()> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "VMM arena is releasing or already released",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate `access_devices` like `map_next` and return the accumulated
+    /// device list plus its access descriptors.
+    fn resolve_access(
+        &self,
+        hip: &HipRuntime,
+        access_devices: &[i32],
+    ) -> HipResult<(Vec<i32>, Vec<HipMemAccessDesc>)> {
+        let count = hip.device_count()?;
+        let mut devices = Vec::with_capacity(access_devices.len() + 1);
+        devices.push(self.owner_device);
+        for &device in access_devices {
+            if device < 0 || device >= count {
+                return Err(HipError::new(
+                    0,
+                    &format!("VMM access device {device} is outside available range 0..{count}"),
+                ));
+            }
+            if device != self.owner_device && !hip.can_access_peer(device, self.owner_device)? {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM access device {device} cannot access owner device {}",
+                        self.owner_device
+                    ),
+                ));
+            }
+            if !devices.contains(&device) {
+                devices.push(device);
+            }
+        }
+        let mut next_access_devices = self.access_devices.clone();
+        for device in devices {
+            if !next_access_devices.contains(&device) {
+                next_access_devices.push(device);
+            }
+        }
+        let access = next_access_devices
+            .iter()
+            .copied()
+            .map(HipMemAccessDesc::read_write_device)
+            .collect();
+        Ok((next_access_devices, access))
+    }
+
+    /// One `hipMemSetAccess` from the reservation base over the mapped prefix
+    /// `[0, next_mapped)` (see `map_next` for why it always starts at the base).
+    fn apply_access(
+        &self,
+        hip: &HipRuntime,
+        next_mapped: usize,
+        access: &[HipMemAccessDesc],
+        new_offset: usize,
+        new_size: usize,
+    ) -> HipResult<()> {
+        take_fault(VmmFaultKind::AccessReset)
+            .map_or_else(
+                // SAFETY: `self.base..+next_mapped` is the contiguous mapped
+                // prefix (the caller just mapped `[new_offset, +new_size)` at its
+                // end); `access` lists only owner/peer devices already validated
+                // for peer access.
+                || unsafe { hip.mem_set_access(self.base, next_mapped, access) },
+                Err,
+            )
+            .map_err(|err| HipError {
+                code: err.code,
+                message: format!(
+                    "{}; VMM access prefix base=0x{:x} size={} (new granules offset={} size={}) granularity={}",
+                    err.message, self.base as usize, next_mapped, new_offset, new_size, self.granularity,
+                ),
+                context: err.context,
+            })
+    }
+
+    /// Roll back the staged segments of a failed granule map: unmap each,
+    /// drop its lease, and poison the arena (a retried map could land a new
+    /// handle on a VA the GPU may still translate to the released one).
+    /// Segments whose unmap failed keep their lease and are retried by `release`.
+    fn abort_granule_map(
+        &mut self,
+        hip: &HipRuntime,
+        mut staged: Vec<VmmSegment>,
+        err: HipError,
+    ) -> HipError {
+        self.releasing = true;
+        match teardown_segments(hip, self.base, &mut staged) {
+            Ok(()) => err,
+            Err(cleanup) => {
+                self.segments.append(&mut staged);
+                combined_cleanup_error(err, cleanup)
+            }
+        }
     }
 
     /// Return a non-owning buffer view over the reserved virtual address.
@@ -465,26 +1155,7 @@ impl VmmArena {
         }
         hip.set_device(self.owner_device)?;
         let base = self.base;
-        let result = cleanup_segments(
-            &mut self.segments,
-            |offset, size| {
-                if let Some(err) = take_fault(VmmFaultKind::Unmap) {
-                    return Err(err);
-                }
-                // SAFETY: offset/size come from tracked segments; release() already
-                // device_synchronize'd every access device so in-flight work is
-                // quiesced before unmap. base is the arena's reserved VA.
-                unsafe { hip.mem_unmap(offset_ptr(base, offset), size) }
-            },
-            |handle| {
-                if let Some(err) = take_fault(VmmFaultKind::Release) {
-                    return Err(err);
-                }
-                // SAFETY: called after the segment's map is unmapped (cleanup_segments
-                // order); handle is owned and no mapped range should still reference it.
-                unsafe { hip.mem_release(handle) }
-            },
-        );
+        let result = teardown_segments(hip, base, &mut self.segments);
 
         if self.segments.is_empty() {
             retired_va().retire(self.reserved_bytes);
@@ -496,6 +1167,40 @@ impl VmmArena {
 
         result
     }
+}
+
+/// Unmap and release `segments` in reverse order (see [`cleanup_segments`]).
+/// Granule segments drop their mapping lease; their handle is released only
+/// at the last lease.
+fn teardown_segments(
+    hip: &HipRuntime,
+    base: *mut c_void,
+    segments: &mut Vec<VmmSegment>,
+) -> HipResult<()> {
+    cleanup_segments(
+        segments,
+        |offset, size| {
+            if let Some(err) = take_fault(VmmFaultKind::Unmap) {
+                return Err(err);
+            }
+            // SAFETY: offset/size come from tracked segments of the arena
+            // reserved at `base`; callers either device_synchronize'd every
+            // access device (release) or unmap granules staged by a failed map
+            // call that never scheduled work on them.
+            unsafe { hip.mem_unmap(offset_ptr(base, offset), size) }
+        },
+        |handle| {
+            if let Some(err) = take_fault(VmmFaultKind::Release) {
+                return Err(err);
+            }
+            // SAFETY: called after the segment's map is unmapped (cleanup_segments
+            // order); handle is owned and no mapped range should still reference it.
+            unsafe { hip.mem_release(handle) }
+        },
+        |id| {
+            granule_table().drop_lease(id, &mut |handle| release_granule_handle(hip, handle))
+        },
+    )
 }
 
 fn offset_ptr(base: *mut c_void, offset: usize) -> *mut c_void {
@@ -529,6 +1234,7 @@ fn cleanup_segments(
     segments: &mut Vec<VmmSegment>,
     mut unmap: impl FnMut(usize, usize) -> HipResult<()>,
     mut release: impl FnMut(HipMemGenericAllocationHandle) -> HipResult<()>,
+    mut drop_lease: impl FnMut(VmmPhysicalId) -> HipResult<()>,
 ) -> HipResult<()> {
     let mut first_error = None;
     for segment in segments.iter_mut().rev() {
@@ -553,8 +1259,20 @@ fn cleanup_segments(
                 }
             }
         }
+        if let Some(id) = segment.granule.take() {
+            // The mapping lease is consumed even when the handle release
+            // fails: the granule table keeps that handle pending for
+            // `retry_pending_granule_releases`.
+            if let Err(err) = drop_lease(id) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
     }
-    segments.retain(|segment| segment.mapped || segment.handle.is_some());
+    segments.retain(|segment| {
+        segment.mapped || segment.handle.is_some() || segment.granule.is_some()
+    });
     match first_error {
         Some(err) => Err(err),
         None => Ok(()),
@@ -570,8 +1288,46 @@ mod tests {
             offset: 4096,
             size: 4096,
             handle: Some(1usize as HipMemGenericAllocationHandle),
+            granule: None,
             mapped,
         }
+    }
+
+    fn granule_segment(offset: usize, size: usize, id: VmmPhysicalId) -> VmmSegment {
+        VmmSegment {
+            offset,
+            size,
+            handle: None,
+            granule: Some(id),
+            mapped: true,
+        }
+    }
+
+    fn host_arena(segments: Vec<VmmSegment>) -> VmmArena {
+        let mapped_bytes = segments.iter().map(|s| s.offset + s.size).max().unwrap_or(0);
+        VmmArena {
+            base: 0x1000_0000usize as *mut c_void,
+            owner_device: 0,
+            granularity: 4096,
+            reserved_bytes: 64 << 20,
+            mapped_bytes,
+            segments,
+            access_devices: vec![0],
+            releasing: false,
+            ever_mapped: true,
+        }
+    }
+
+    fn forget_prefix(mut prefix: VmmSharedPrefix) {
+        let ids: Vec<VmmPhysicalId> = std::mem::take(&mut prefix.granules)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        drop_leases(&mut granule_table(), ids, &mut |_| Ok(())).unwrap();
+    }
+
+    fn forget_global(id: VmmPhysicalId) {
+        granule_table().drop_lease(id, &mut |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -585,6 +1341,7 @@ mod tests {
                 releases += 1;
                 Ok(())
             },
+            |_| panic!("exclusive segment holds no granule lease"),
         )
         .unwrap_err();
         assert!(err.to_string().contains("injected unmap failure"));
@@ -592,7 +1349,13 @@ mod tests {
         assert!(segments[0].mapped);
         assert!(segments[0].handle.is_some());
 
-        cleanup_segments(&mut segments, |_, _| Ok(()), |_| Ok(())).unwrap();
+        cleanup_segments(
+            &mut segments,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |_| panic!("exclusive segment holds no granule lease"),
+        )
+        .unwrap();
         assert!(segments.is_empty());
     }
 
@@ -603,12 +1366,19 @@ mod tests {
             &mut segments,
             |_, _| panic!("unmap must not run for an unmapped segment"),
             |_| Err(HipError::new(2, "injected handle failure")),
+            |_| panic!("exclusive segment holds no granule lease"),
         )
         .unwrap_err();
         assert!(!segments[0].mapped);
         assert!(segments[0].handle.is_some());
 
-        cleanup_segments(&mut segments, |_, _| Ok(()), |_| Ok(())).unwrap();
+        cleanup_segments(
+            &mut segments,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |_| panic!("exclusive segment holds no granule lease"),
+        )
+        .unwrap();
         assert!(segments.is_empty());
     }
 
@@ -660,5 +1430,363 @@ mod tests {
         assert!(message.contains("2 ranges"), "{message}");
         assert!(message.contains("restart"), "{message}");
         assert!(retired.admit(usize::MAX, cap).is_err());
+    }
+
+    const G: usize = 2 << 20;
+
+    /// Three granule segments registered in the global table with one mapping
+    /// lease each (fake handles; no HIP call is ever made on them).
+    fn three_granule_arena() -> (VmmArena, [VmmPhysicalId; 3]) {
+        let mut table = granule_table();
+        let ids = [
+            table.register(0x10, G),
+            table.register(0x20, G),
+            table.register(0x30, G),
+        ];
+        drop(table);
+        let segments = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| granule_segment(i * G, G, id))
+            .collect();
+        (host_arena(segments), ids)
+    }
+
+    fn leases(id: VmmPhysicalId) -> Option<usize> {
+        granule_table().leases(id)
+    }
+
+    #[test]
+    fn granule_released_only_at_last_lease() {
+        let mut table = GranuleTable::new();
+        let id = table.register(0x10, 4096);
+        table.add_lease(id).unwrap();
+        assert_eq!(table.leases(id), Some(2));
+        let mut released = Vec::new();
+        table
+            .drop_lease(id, &mut |handle| {
+                released.push(handle);
+                Ok(())
+            })
+            .unwrap();
+        assert!(released.is_empty(), "a leased granule must not be released");
+        assert_eq!(table.live_bytes(), 4096);
+        table
+            .drop_lease(id, &mut |handle| {
+                released.push(handle);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![0x10]);
+        assert_eq!(table.live_bytes(), 0);
+        assert!(table.leases(id).is_none());
+        assert!(table.drop_lease(id, &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn granule_ids_are_monotonic_and_never_reused() {
+        let mut table = GranuleTable::new();
+        let a = table.register(1, 4096);
+        table.drop_lease(a, &mut |_| Ok(())).unwrap();
+        let b = table.register(1, 4096);
+        assert!(b.id > a.id);
+        assert!(table.leases(a).is_none());
+    }
+
+    #[test]
+    fn shared_prefix_release_before_arena_release_keeps_granule_until_unmap() {
+        let mut table = GranuleTable::new();
+        let id = table.register(0x10, 4096);
+        table.add_lease(id).unwrap(); // the shared prefix's cache lease
+        let mut released = Vec::new();
+
+        drop_leases(&mut table, [id], &mut |handle| {
+            released.push(handle);
+            Ok(())
+        })
+        .unwrap();
+        assert!(released.is_empty(), "the arena mapping still holds a lease");
+
+        let mut segments = vec![granule_segment(0, 4096, id)];
+        cleanup_segments(
+            &mut segments,
+            |_, _| Ok(()),
+            |_| panic!("granule segments never use the exclusive handle"),
+            |id| {
+                table.drop_lease(id, &mut |handle| {
+                    released.push(handle);
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
+        assert!(segments.is_empty());
+        assert_eq!(released, vec![0x10]);
+        assert_eq!(table.live_bytes(), 0);
+    }
+
+    #[test]
+    fn arena_release_before_shared_prefix_release_keeps_granule_until_prefix_drops() {
+        let mut table = GranuleTable::new();
+        let id = table.register(0x10, 4096);
+        table.add_lease(id).unwrap(); // the shared prefix's cache lease
+        let mut released = Vec::new();
+
+        let mut segments = vec![granule_segment(0, 4096, id)];
+        cleanup_segments(
+            &mut segments,
+            |_, _| Ok(()),
+            |_| panic!("granule segments never use the exclusive handle"),
+            |id| {
+                table.drop_lease(id, &mut |handle| {
+                    released.push(handle);
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
+        assert!(segments.is_empty());
+        assert!(released.is_empty(), "the shared prefix still holds a lease");
+        assert_eq!(table.live_bytes(), 4096);
+
+        drop_leases(&mut table, [id], &mut |handle| {
+            released.push(handle);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(released, vec![0x10]);
+        assert_eq!(table.live_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_granule_release_stays_pending_and_is_retried() {
+        let mut table = GranuleTable::new();
+        let id = table.register(0x10, 4096);
+        let mut segments = vec![granule_segment(0, 4096, id)];
+        let err = cleanup_segments(
+            &mut segments,
+            |_, _| Ok(()),
+            |_| panic!("granule segments never use the exclusive handle"),
+            |id| table.drop_lease(id, &mut |_| Err(HipError::new(3, "injected release failure"))),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("injected release failure"));
+        assert!(segments.is_empty(), "the mapping lease is consumed");
+        assert_eq!(table.live_bytes(), 4096, "a pending release is still live");
+        assert_eq!(table.leases(id), Some(0));
+        assert!(table.add_lease(id).is_err(), "a pending granule is not leasable");
+
+        let (released, error) =
+            table.retry_pending(&mut |_| Err(HipError::new(4, "still failing")));
+        assert_eq!(released, 0);
+        assert!(error.is_some());
+        assert_eq!(table.live_bytes(), 4096);
+
+        let mut handles = Vec::new();
+        let (released, error) = table.retry_pending(&mut |handle| {
+            handles.push(handle);
+            Ok(())
+        });
+        assert_eq!((released, handles), (1, vec![0x10]));
+        assert!(error.is_none());
+        assert_eq!(table.live_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_unmap_keeps_granule_lease_for_retry() {
+        let mut table = GranuleTable::new();
+        let id = table.register(0x10, 4096);
+        let mut segments = vec![granule_segment(0, 4096, id)];
+        cleanup_segments(
+            &mut segments,
+            |_, _| Err(HipError::new(1, "injected unmap failure")),
+            |_| panic!("granule segments never use the exclusive handle"),
+            |_| panic!("a still-mapped granule must keep its lease"),
+        )
+        .unwrap_err();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].mapped);
+        assert_eq!(table.leases(id), Some(1));
+    }
+
+    #[test]
+    fn share_prefix_bounds_and_lease_accounting() {
+        let (arena, ids) = three_granule_arena();
+        assert_eq!(arena.granule_bytes(), G);
+        assert_eq!(arena.granule_prefix_bytes(), 3 * G);
+
+        let empty = arena.share_prefix(0).unwrap();
+        assert_eq!(empty.bytes(), 0);
+        assert!(empty.granules().is_empty());
+        assert_eq!(leases(ids[0]), Some(1));
+
+        let err = arena.share_prefix(G / 2).unwrap_err();
+        assert!(err.to_string().contains("granule boundary"), "{err}");
+        let err = arena.share_prefix(G + 4096).unwrap_err();
+        assert!(err.to_string().contains("granule boundary"), "{err}");
+        let err = arena.share_prefix(4 * G).unwrap_err();
+        assert!(err.to_string().contains("granule prefix"), "{err}");
+        assert!(ids.iter().all(|&id| leases(id) == Some(1)), "failed shares take no lease");
+
+        let prefix = arena.share_prefix(2 * G).unwrap();
+        assert_eq!(prefix.bytes(), 2 * G);
+        assert_eq!(prefix.granules(), &[(ids[0], G), (ids[1], G)]);
+        assert_eq!(leases(ids[0]), Some(2));
+        assert_eq!(leases(ids[1]), Some(2));
+        assert_eq!(leases(ids[2]), Some(1));
+        assert_eq!(arena.sealed_bytes(), 2 * G);
+
+        forget_prefix(prefix);
+        assert_eq!(arena.sealed_bytes(), 0);
+        for id in ids {
+            forget_global(id);
+        }
+    }
+
+    #[test]
+    fn granule_prefix_stops_at_exclusive_or_unmapped_segments() {
+        let (mut arena, ids) = three_granule_arena();
+        arena.segments[1] = VmmSegment {
+            offset: G,
+            size: G,
+            handle: Some(1usize as HipMemGenericAllocationHandle),
+            granule: None,
+            mapped: true,
+        };
+        assert_eq!(arena.granule_prefix_bytes(), G);
+        assert_eq!(arena.physical_granules(), vec![(ids[0], G), (ids[2], G)]);
+        let err = arena.share_prefix(2 * G).unwrap_err();
+        assert!(err.to_string().contains("granule prefix"), "{err}");
+        for id in ids {
+            forget_global(id);
+        }
+    }
+
+    #[test]
+    fn physical_granules_and_sealed_bytes_follow_leases() {
+        let (arena, ids) = three_granule_arena();
+        assert_eq!(arena.physical_granules(), vec![(ids[0], G), (ids[1], G), (ids[2], G)]);
+        assert_eq!(arena.sealed_bytes(), 0);
+        granule_table().add_lease(ids[1]).unwrap();
+        assert_eq!(arena.sealed_bytes(), 2 * G);
+        granule_table().add_lease(ids[2]).unwrap();
+        assert_eq!(arena.sealed_bytes(), 3 * G);
+        for id in ids {
+            while leases(id).is_some() {
+                forget_global(id);
+            }
+        }
+    }
+
+    #[test]
+    fn share_prefix_refuses_a_poisoned_arena() {
+        let (mut arena, ids) = three_granule_arena();
+        arena.releasing = true;
+        assert!(arena.share_prefix(G).is_err());
+        assert_eq!(leases(ids[0]), Some(1));
+        for id in ids {
+            forget_global(id);
+        }
+    }
+
+    #[test]
+    fn dropping_an_unreleased_shared_prefix_touches_no_lease() {
+        let id = granule_table().register(0x10, 4096);
+        granule_table().add_lease(id).unwrap();
+        let prefix = VmmSharedPrefix {
+            granules: vec![(id, 4096)],
+            owner_device: 0,
+            granularity: 4096,
+        };
+        drop(prefix);
+        assert_eq!(leases(id), Some(2), "Drop must not release or decrement");
+        forget_global(id);
+        forget_global(id);
+    }
+
+    #[test]
+    fn granule_fault_kinds_are_consumed_once_each() {
+        clear_vmm_faults();
+        inject_vmm_fault(VmmFaultKind::Map, 1);
+        inject_vmm_fault(VmmFaultKind::Create, 2);
+        assert!(take_fault(VmmFaultKind::Map).unwrap().to_string().contains("map"));
+        assert!(take_fault(VmmFaultKind::Map).is_none());
+        assert!(take_fault(VmmFaultKind::Create).unwrap().to_string().contains("create"));
+        assert!(take_fault(VmmFaultKind::Create).is_some());
+        assert!(take_fault(VmmFaultKind::Create).is_none());
+        inject_vmm_fault(VmmFaultKind::Map, 3);
+        inject_vmm_fault(VmmFaultKind::Create, 3);
+        clear_vmm_faults();
+        assert!(take_fault(VmmFaultKind::Map).is_none());
+        assert!(take_fault(VmmFaultKind::Create).is_none());
+    }
+
+    fn gpu_pattern(len: usize, mul: usize, add: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * mul + add) % 251) as u8).collect()
+    }
+
+    #[test]
+    #[ignore = "requires a HIP device with VMM support (select the card with ROCR_VISIBLE_DEVICES)"]
+    fn vmm_granule_alias_two_fresh_vas_hw() {
+        let device = 0;
+        let hip = HipRuntime::load().expect("HIP runtime unavailable: cannot run the VMM test");
+        let count = hip.device_count().expect("hipGetDeviceCount failed");
+        assert!(device < count, "no HIP device visible ({count} devices)");
+        let access = [device];
+        let live_before = vmm_live_granule_bytes();
+
+        let mut a = VmmArena::reserve(&hip, device, 64 << 20).expect("reserve A");
+        let g = a.granule_bytes();
+        assert!(4 * g <= a.reserved_bytes(), "reserve too small for 4 granules of {g} bytes");
+        a.map_next_granules(&hip, 3 * g, &access).expect("map 3 granules in A");
+        assert_eq!(a.mapped_bytes(), 3 * g);
+        assert_eq!(a.granule_prefix_bytes(), 3 * g);
+        assert_eq!(a.sealed_bytes(), 0);
+        assert!(a.primary_handle().is_some());
+        let pattern = gpu_pattern(3 * g, 31, 7);
+        hip.memcpy_htod(&a.buffer(3 * g).unwrap(), &pattern).expect("write A");
+
+        let shared = a.share_prefix(2 * g).expect("share 2 granules");
+        assert_eq!(shared.bytes(), 2 * g);
+        assert_eq!(shared.granules().len(), 2);
+        assert_eq!(a.sealed_bytes(), 2 * g);
+
+        let mut b = VmmArena::reserve(&hip, device, 64 << 20).expect("reserve B");
+        assert_ne!(a.base_address(), b.base_address());
+        b.map_shared_prefix(&hip, &shared, &access).expect("map shared prefix in B");
+        assert_eq!(b.mapped_bytes(), 2 * g);
+        b.map_next_granules(&hip, g, &access).expect("map private granule in B");
+        assert_eq!(b.mapped_bytes(), 3 * g);
+        assert_eq!(b.sealed_bytes(), 2 * g);
+        let physical_b = b.physical_granules();
+        assert_eq!(&physical_b[..2], shared.granules());
+        assert_eq!(&physical_b[..2], &a.physical_granules()[..2]);
+        assert_ne!(physical_b[2].0, a.physical_granules()[2].0);
+        assert!(b.map_shared_prefix(&hip, &shared, &access).is_err(), "B was already mapped");
+
+        let buf_a = a.buffer(3 * g).unwrap();
+        let buf_b = b.buffer(3 * g).unwrap();
+        let mut read = vec![0u8; 2 * g];
+        hip.memcpy_dtoh_at(&mut read, &buf_b, 0).expect("read B alias");
+        assert_eq!(read, pattern[..2 * g]);
+
+        let private = gpu_pattern(g, 13, 99);
+        hip.memcpy_htod_offset(&buf_b, 2 * g, &private).expect("write B private granule");
+        let mut a_third = vec![0u8; g];
+        hip.memcpy_dtoh_at(&mut a_third, &buf_a, 2 * g).expect("read A third granule");
+        assert_eq!(a_third, pattern[2 * g..3 * g], "A's private granule must be unchanged");
+        let mut b_third = vec![0u8; g];
+        hip.memcpy_dtoh_at(&mut b_third, &buf_b, 2 * g).expect("read B third granule");
+        assert_eq!(b_third, private);
+
+        a.release(&hip).expect("release A");
+        assert!(a.is_released());
+        hip.memcpy_dtoh_at(&mut read, &buf_b, 0).expect("read B after A release");
+        assert_eq!(read, pattern[..2 * g], "B must keep the aliased bytes after A is released");
+
+        b.release(&hip).expect("release B");
+        shared.release(&hip).expect("release shared prefix");
+        assert_eq!(vmm_live_granule_bytes(), live_before);
+        assert_eq!(retry_pending_granule_releases(&hip).expect("retry pending"), 0);
     }
 }

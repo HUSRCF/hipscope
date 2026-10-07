@@ -9,13 +9,20 @@
 //!
 //! Moved out of `hipfire-arch-qwen35` so other hybrid families (DeltaNet,
 //! conv-tail, …) share the pool rather than re-implementing it.
+//!
+//! Beside the aligned `(domain, p, fp)` entries the pool also holds EXACT
+//! entries (the radix cache's retained prefixes): keyed by `(domain, exact
+//! token sequence)` at any boundary, addressed by [`CheckpointId`], pinned
+//! with counted pins and never auto-evicted. See
+//! [`QwenCheckpointPool::insert_exact`].
 
 use crate::serve_contract::{
     CacheDomain, DrafterDecision, LastTokenHandling, MissReason, PrefixLookup, ResumeBundle,
     ResumePlan, ResumePlanError,
 };
 use rdna_compute::page_pool::PAGE_TOKENS;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 pub use crate::serve_contract::CheckpointId;
 
@@ -76,9 +83,26 @@ pub fn prefix_fingerprint(tokens: &[u32]) -> u64 {
 struct CheckpointEntry<B> {
     id: CheckpointId,
     blob: B,
-    pinned: bool,
+    /// Pin count. The aligned `pin`/`unpin` API keeps its idempotent
+    /// boolean semantics on top of it (`pin` sets 1, `unpin` sets 0).
+    pins: u32,
     /// Monotonic LRU access stamp; smaller = older.
     lru_stamp: u64,
+}
+
+/// One exact-boundary entry. The token sequence is the caller's shared
+/// `Arc<[u32]>` (never copied) and is the authoritative key: the
+/// fingerprint only narrows candidates, tokens are always compared.
+#[derive(Debug)]
+struct ExactEntry<B> {
+    domain: CacheDomain,
+    tokens: Arc<[u32]>,
+    fingerprint: u64,
+    blob: B,
+    /// Bytes charged to the pool at insert (kept so accounting stays
+    /// consistent even if the blob is mutated through `peek_id_mut`).
+    bytes: u64,
+    pins: u32,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -101,6 +125,13 @@ pub struct QwenCheckpointPool<B: CheckpointBlob> {
     /// Keys that were explicitly evicted (for distinguishing
     /// [`MissReason::Evicted`] from [`MissReason::NoCheckpoint`]).
     evicted: HashSet<CheckpointKey>,
+    /// Exact-boundary entries by id (ordered, so id listings are stable).
+    exact: BTreeMap<u64, ExactEntry<B>>,
+    /// `(domain, fingerprint)` -> ids of exact entries with that
+    /// fingerprint; a candidate list, never an identity.
+    exact_index: HashMap<(CacheDomain, u64), Vec<CheckpointId>>,
+    /// Bytes held by exact entries (included in `total_bytes`).
+    exact_bytes: u64,
     total_bytes: u64,
     max_bytes: u64,
     next_id: u64,
@@ -113,6 +144,9 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         Self {
             entries: HashMap::new(),
             evicted: HashSet::new(),
+            exact: BTreeMap::new(),
+            exact_index: HashMap::new(),
+            exact_bytes: 0,
             total_bytes: 0,
             max_bytes,
             next_id: 1,
@@ -125,19 +159,19 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         self.max_bytes
     }
 
-    /// Current total bytes across all entries.
+    /// Current total bytes across all entries (aligned and exact).
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
-    /// Number of entries currently in the pool.
+    /// Number of entries currently in the pool (aligned and exact).
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.exact.len()
     }
 
     /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.exact.is_empty()
     }
 
     /// Whether a blob of `bytes` could be inserted without exceeding the
@@ -153,7 +187,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         let unpinned_bytes: u64 = self
             .entries
             .iter()
-            .filter(|(k, e)| !e.pinned && **k != *key)
+            .filter(|(k, e)| e.pins == 0 && **k != *key)
             .map(|(_, e)| e.blob.bytes_len())
             .sum();
         let floor = self.total_bytes.saturating_sub(replaced + unpinned_bytes);
@@ -249,7 +283,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             CheckpointEntry {
                 id,
                 blob,
-                pinned: false,
+                pins: 0,
                 lru_stamp: self.lru_clock,
             },
         );
@@ -261,7 +295,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     fn find_oldest_unpinned_key(&self) -> Option<CheckpointKey> {
         self.entries
             .iter()
-            .filter(|(_, e)| !e.pinned)
+            .filter(|(_, e)| e.pins == 0)
             .min_by_key(|(_, e)| e.lru_stamp)
             .map(|(k, _)| k.clone())
     }
@@ -314,12 +348,13 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     }
 
     /// Pin the checkpoint at `(domain, p, fp)` so it survives LRU eviction.
+    /// Idempotent: pinning twice still needs only one [`Self::unpin`].
     ///
     /// Returns `true` if the entry was found and pinned.
     pub fn pin(&mut self, domain: &CacheDomain, p: u64, fp: u64) -> bool {
         let key = (domain.clone(), p, fp);
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.pinned = true;
+            entry.pins = 1;
             true
         } else {
             false
@@ -333,7 +368,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     pub fn unpin(&mut self, domain: &CacheDomain, p: u64, fp: u64) -> bool {
         let key = (domain.clone(), p, fp);
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.pinned = false;
+            entry.pins = 0;
             true
         } else {
             false
@@ -344,17 +379,197 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     pub fn is_pinned(&self, domain: &CacheDomain, p: u64, fp: u64) -> bool {
         self.entries
             .get(&(domain.clone(), p, fp))
-            .map(|e| e.pinned)
+            .map(|e| e.pins > 0)
             .unwrap_or(false)
     }
 
-    /// Drain and return all stored blobs, clearing the pool. Used by the
-    /// serve engine's `free_gpu` to explicitly free each `DeltaNetSnapshot`'s
-    /// device buffers on shutdown (the pool itself has no `Drop` impl that
-    /// touches the GPU).
+    /// Drain and return all stored ALIGNED blobs, clearing them from the
+    /// pool. Used by the serve engine's `free_gpu` to explicitly free each
+    /// `DeltaNetSnapshot`'s device buffers on shutdown (the pool itself has
+    /// no `Drop` impl that touches the GPU). Exact entries are untouched;
+    /// drain them with [`Self::drain_exact`].
     pub fn drain_blobs(&mut self) -> Vec<B> {
-        self.total_bytes = 0;
+        self.total_bytes = self.exact_bytes;
         self.entries.drain().map(|(_, e)| e.blob).collect()
+    }
+
+    // ── Exact-boundary entries (radix cache) ────────────────────────────
+    //
+    // These live beside the aligned entries: addressed by `CheckpointId`,
+    // keyed by `(domain, exact tokens)`, counted pins, no auto-eviction.
+    // The id counter is shared with the aligned API, so ids are monotonic
+    // and never reused. The id-addressed accessors below see ONLY exact
+    // entries; an aligned entry's id yields `None`/`false`/`0`.
+
+    /// Insert an exact-boundary checkpoint for `(domain, tokens)`.
+    ///
+    /// First writer wins: when an entry with the same domain and the same
+    /// token sequence already exists, nothing is replaced and
+    /// `(existing id, Some(blob))` is returned so the caller frees its
+    /// unadopted blob. The fingerprint only selects candidates; token
+    /// sequences are always compared, so a fingerprint collision between
+    /// different sequences yields distinct entries.
+    ///
+    /// Exact entries are never auto-evicted: when the blob does not fit in
+    /// the remaining `max_bytes`, `(CheckpointId::NONE, Some(blob))` is
+    /// returned. The caller owns any returned blob and must free it (a
+    /// dropped `DeltaNetSnapshot` leaks device memory). `tokens` is stored
+    /// as the caller's `Arc` (shared, not copied).
+    pub fn insert_exact(
+        &mut self,
+        domain: CacheDomain,
+        tokens: Arc<[u32]>,
+        blob: B,
+    ) -> (CheckpointId, Option<B>) {
+        let fingerprint = prefix_fingerprint(&tokens);
+        self.insert_exact_with_fingerprint(domain, tokens, fingerprint, blob)
+    }
+
+    /// [`Self::insert_exact`] with the fingerprint supplied, so tests can
+    /// force a collision between different token sequences.
+    fn insert_exact_with_fingerprint(
+        &mut self,
+        domain: CacheDomain,
+        tokens: Arc<[u32]>,
+        fingerprint: u64,
+        blob: B,
+    ) -> (CheckpointId, Option<B>) {
+        if let Some(existing) = self.find_exact_with_fingerprint(&domain, &tokens, fingerprint) {
+            return (existing, Some(blob));
+        }
+        let bytes = blob.bytes_len();
+        match self.total_bytes.checked_add(bytes) {
+            Some(total) if total <= self.max_bytes => {}
+            _ => return (CheckpointId::NONE, Some(blob)),
+        }
+        let id = CheckpointId(self.next_id);
+        self.next_id += 1;
+        self.total_bytes += bytes;
+        self.exact_bytes += bytes;
+        self.exact_index
+            .entry((domain.clone(), fingerprint))
+            .or_default()
+            .push(id);
+        self.exact.insert(
+            id.0,
+            ExactEntry {
+                domain,
+                tokens,
+                fingerprint,
+                blob,
+                bytes,
+                pins: 0,
+            },
+        );
+        (id, None)
+    }
+
+    /// Id of the exact entry for `(domain, tokens)`, comparing the full
+    /// token sequence (the fingerprint is only a candidate filter).
+    pub fn find_exact(&self, domain: &CacheDomain, tokens: &[u32]) -> Option<CheckpointId> {
+        self.find_exact_with_fingerprint(domain, tokens, prefix_fingerprint(tokens))
+    }
+
+    fn find_exact_with_fingerprint(
+        &self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        fingerprint: u64,
+    ) -> Option<CheckpointId> {
+        self.exact_index
+            .get(&(domain.clone(), fingerprint))?
+            .iter()
+            .copied()
+            .find(|id| {
+                self.exact
+                    .get(&id.0)
+                    .is_some_and(|e| e.domain == *domain && *e.tokens == *tokens)
+            })
+    }
+
+    /// Borrow the blob of exact entry `id`.
+    pub fn peek_id(&self, id: CheckpointId) -> Option<&B> {
+        self.exact.get(&id.0).map(|e| &e.blob)
+    }
+
+    /// Mutably borrow the blob of exact entry `id`. Bytes charged at insert
+    /// are not re-measured.
+    pub fn peek_id_mut(&mut self, id: CheckpointId) -> Option<&mut B> {
+        self.exact.get_mut(&id.0).map(|e| &mut e.blob)
+    }
+
+    /// Exact token sequence of entry `id` (the shared `Arc` given at insert).
+    pub fn exact_tokens(&self, id: CheckpointId) -> Option<&Arc<[u32]>> {
+        self.exact.get(&id.0).map(|e| &e.tokens)
+    }
+
+    /// Domain of exact entry `id`.
+    pub fn exact_domain(&self, id: CheckpointId) -> Option<&CacheDomain> {
+        self.exact.get(&id.0).map(|e| &e.domain)
+    }
+
+    /// Add one pin to exact entry `id`. Returns `false` when the entry does
+    /// not exist or the pin count would overflow.
+    pub fn pin_id(&mut self, id: CheckpointId) -> bool {
+        match self.exact.get_mut(&id.0) {
+            Some(entry) => match entry.pins.checked_add(1) {
+                Some(pins) => {
+                    entry.pins = pins;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Drop one pin from exact entry `id`. A no-op for an unknown id or an
+    /// entry with no pins.
+    pub fn unpin_id(&mut self, id: CheckpointId) {
+        if let Some(entry) = self.exact.get_mut(&id.0) {
+            entry.pins = entry.pins.saturating_sub(1);
+        }
+    }
+
+    /// Number of outstanding pins on exact entry `id` (0 when unknown).
+    pub fn pin_count(&self, id: CheckpointId) -> u32 {
+        self.exact.get(&id.0).map_or(0, |e| e.pins)
+    }
+
+    /// Remove exact entry `id` and return its blob for the caller to free.
+    /// Returns `None` for an unknown id and while the entry is pinned.
+    pub fn take_id(&mut self, id: CheckpointId) -> Option<B> {
+        if self.exact.get(&id.0)?.pins > 0 {
+            return None;
+        }
+        let entry = self.exact.remove(&id.0)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        self.exact_bytes = self.exact_bytes.saturating_sub(entry.bytes);
+        let key = (entry.domain, entry.fingerprint);
+        if let Some(ids) = self.exact_index.get_mut(&key) {
+            ids.retain(|candidate| *candidate != id);
+            if ids.is_empty() {
+                self.exact_index.remove(&key);
+            }
+        }
+        Some(entry.blob)
+    }
+
+    /// Ids of every exact entry, ascending.
+    pub fn exact_ids(&self) -> Vec<CheckpointId> {
+        self.exact.keys().map(|&id| CheckpointId(id)).collect()
+    }
+
+    /// Drain every exact blob (unload), ignoring pins, for the caller to
+    /// free. Aligned entries are untouched.
+    pub fn drain_exact(&mut self) -> Vec<B> {
+        self.total_bytes = self.total_bytes.saturating_sub(self.exact_bytes);
+        self.exact_bytes = 0;
+        self.exact_index.clear();
+        std::mem::take(&mut self.exact)
+            .into_values()
+            .map(|e| e.blob)
+            .collect()
     }
 
     /// Check whether a checkpoint at any page-aligned boundary `≤ max_p`
@@ -1332,4 +1547,256 @@ mod tests {
         assert_eq!(plan.boundary, 128);
     }
 
+    // ── Exact-boundary entries (radix cache) ────────────────────────────
+
+    fn arc_toks(tokens: &[u32]) -> Arc<[u32]> {
+        Arc::from(tokens)
+    }
+
+    #[test]
+    fn exact_insert_find_and_shared_tokens() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-basic");
+        let tokens = arc_toks(&[1, 2, 3, 4, 5]);
+
+        let (id, rejected) = pool.insert_exact(dom.clone(), tokens.clone(), HostBlob { bytes: 100 });
+        assert_ne!(id, CheckpointId::NONE);
+        assert!(rejected.is_none());
+        assert_eq!(pool.find_exact(&dom, &[1, 2, 3, 4, 5]), Some(id));
+        assert_eq!(pool.find_exact(&dom, &[1, 2, 3, 4]), None);
+        assert_eq!(pool.find_exact(&dom, &[1, 2, 3, 4, 6]), None);
+        assert_eq!(pool.peek_id(id).map(|b| b.bytes), Some(100));
+        assert_eq!(pool.exact_domain(id), Some(&dom));
+        assert!(
+            Arc::ptr_eq(pool.exact_tokens(id).unwrap(), &tokens),
+            "token evidence must be the caller's Arc, not a copy"
+        );
+        pool.peek_id_mut(id).unwrap().bytes = 7;
+        assert_eq!(pool.peek_id(id).map(|b| b.bytes), Some(7));
+        assert_eq!(pool.total_bytes(), 100, "bytes charged at insert are stable");
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.is_empty());
+        assert_eq!(pool.exact_ids(), vec![id]);
+
+        let unknown = CheckpointId(id.0 + 99);
+        assert!(pool.peek_id(unknown).is_none());
+        assert!(pool.exact_tokens(unknown).is_none());
+        assert!(pool.exact_domain(unknown).is_none());
+        assert!(!pool.pin_id(unknown));
+        assert_eq!(pool.pin_count(unknown), 0);
+        assert!(pool.take_id(unknown).is_none());
+    }
+
+    #[test]
+    fn exact_first_writer_wins_on_duplicate() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-dup");
+
+        let (first, _) = pool.insert_exact(dom.clone(), arc_toks(&[9, 8, 7]), HostBlob { bytes: 10 });
+        assert!(pool.pin_id(first));
+        let (second, rejected) =
+            pool.insert_exact(dom.clone(), arc_toks(&[9, 8, 7]), HostBlob { bytes: 20 });
+        assert_eq!(second, first, "duplicate returns the existing id");
+        assert_eq!(rejected.map(|b| b.bytes), Some(20), "new blob handed back");
+        assert_eq!(pool.peek_id(first).map(|b| b.bytes), Some(10), "never replaced");
+        assert_eq!(pool.pin_count(first), 1, "a pinned entry is never replaced");
+        assert_eq!(pool.total_bytes(), 10);
+        assert_eq!(pool.exact_ids().len(), 1);
+    }
+
+    #[test]
+    fn exact_fingerprint_collision_with_different_tokens_gets_distinct_ids() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-collide");
+        let a = arc_toks(&[1, 2, 3]);
+        let b = arc_toks(&[3, 2, 1]);
+        let forced_fp = 0xDEAD_BEEF_u64;
+
+        let (id_a, none_a) = pool.insert_exact_with_fingerprint(
+            dom.clone(),
+            a.clone(),
+            forced_fp,
+            HostBlob { bytes: 11 },
+        );
+        let (id_b, none_b) = pool.insert_exact_with_fingerprint(
+            dom.clone(),
+            b.clone(),
+            forced_fp,
+            HostBlob { bytes: 22 },
+        );
+        assert!(none_a.is_none() && none_b.is_none());
+        assert_ne!(id_a, CheckpointId::NONE);
+        assert_ne!(id_b, CheckpointId::NONE);
+        assert_ne!(id_a, id_b, "colliding fingerprints must not coalesce tokens");
+        assert_eq!(
+            pool.find_exact_with_fingerprint(&dom, &a, forced_fp),
+            Some(id_a)
+        );
+        assert_eq!(
+            pool.find_exact_with_fingerprint(&dom, &b, forced_fp),
+            Some(id_b)
+        );
+        assert_eq!(
+            pool.find_exact_with_fingerprint(&dom, &[1, 1, 1], forced_fp),
+            None
+        );
+        // Identical tokens under the same forced fingerprint still coalesce.
+        let (again, rejected) = pool.insert_exact_with_fingerprint(
+            dom.clone(),
+            arc_toks(&[1, 2, 3]),
+            forced_fp,
+            HostBlob { bytes: 33 },
+        );
+        assert_eq!(again, id_a);
+        assert_eq!(rejected.map(|x| x.bytes), Some(33));
+
+        // Removing one colliding entry leaves the other addressable.
+        assert_eq!(pool.take_id(id_a).map(|x| x.bytes), Some(11));
+        assert_eq!(
+            pool.find_exact_with_fingerprint(&dom, &a, forced_fp),
+            None
+        );
+        assert_eq!(
+            pool.find_exact_with_fingerprint(&dom, &b, forced_fp),
+            Some(id_b)
+        );
+    }
+
+    #[test]
+    fn exact_overlapping_pins_refuse_take_until_fully_unpinned() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-pins");
+        let (id, _) = pool.insert_exact(dom.clone(), arc_toks(&[4, 4, 4]), HostBlob { bytes: 64 });
+
+        assert!(pool.pin_id(id));
+        assert!(pool.pin_id(id));
+        assert_eq!(pool.pin_count(id), 2);
+        assert!(pool.take_id(id).is_none(), "pinned entry refuses take");
+
+        pool.unpin_id(id);
+        assert_eq!(pool.pin_count(id), 1);
+        assert!(pool.take_id(id).is_none(), "one pin still outstanding");
+        assert_eq!(pool.peek_id(id).map(|b| b.bytes), Some(64));
+
+        pool.unpin_id(id);
+        assert_eq!(pool.pin_count(id), 0);
+        pool.unpin_id(id); // extra unpin is a no-op, never underflows
+        assert_eq!(pool.pin_count(id), 0);
+
+        assert_eq!(pool.take_id(id).map(|b| b.bytes), Some(64));
+        assert_eq!(pool.total_bytes(), 0);
+        assert!(pool.peek_id(id).is_none());
+        assert_eq!(pool.find_exact(&dom, &[4, 4, 4]), None);
+        assert!(pool.is_empty());
+        assert!(pool.take_id(id).is_none(), "already taken");
+    }
+
+    #[test]
+    fn exact_insufficient_room_refuses_without_evicting() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1000);
+        let dom = test_domain("exact-room");
+
+        // An unpinned aligned entry is NOT sacrificed to make room.
+        let (aligned, _) = pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 400 });
+        assert_ne!(aligned, CheckpointId::NONE);
+        let (first, _) = pool.insert_exact(dom.clone(), arc_toks(&[1]), HostBlob { bytes: 500 });
+        assert_ne!(first, CheckpointId::NONE);
+        assert_eq!(pool.total_bytes(), 900);
+
+        let (id, rejected) = pool.insert_exact(dom.clone(), arc_toks(&[2]), HostBlob { bytes: 200 });
+        assert_eq!(id, CheckpointId::NONE);
+        assert_eq!(rejected.map(|b| b.bytes), Some(200));
+        assert!(pool.contains(&dom, 128, fp(128)), "aligned entry survives");
+        assert!(pool.peek_id(first).is_some(), "exact entry survives");
+        assert_eq!(pool.total_bytes(), 900);
+
+        // Exact blobs likewise are never evicted by an aligned insert.
+        let (aligned_id, displaced) = pool.insert(dom.clone(), 256, fp(256), HostBlob { bytes: 600 });
+        assert_eq!(aligned_id, CheckpointId::NONE, "exact bytes are a hard floor");
+        assert!(!displaced.is_empty());
+        assert!(pool.peek_id(first).is_some());
+    }
+
+    #[test]
+    fn exact_domain_isolation() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom_a = test_domain("exact-iso-a");
+        let dom_b = test_domain("exact-iso-b");
+        let tokens = [5u32, 6, 7];
+
+        let (id_a, _) = pool.insert_exact(dom_a.clone(), arc_toks(&tokens), HostBlob { bytes: 8 });
+        assert_eq!(pool.find_exact(&dom_b, &tokens), None);
+        let (id_b, rejected) =
+            pool.insert_exact(dom_b.clone(), arc_toks(&tokens), HostBlob { bytes: 16 });
+        assert!(rejected.is_none(), "same tokens in another domain is not a duplicate");
+        assert_ne!(id_a, id_b);
+        assert_eq!(pool.find_exact(&dom_a, &tokens), Some(id_a));
+        assert_eq!(pool.find_exact(&dom_b, &tokens), Some(id_b));
+        assert_eq!(pool.exact_domain(id_a), Some(&dom_a));
+        assert_eq!(pool.exact_domain(id_b), Some(&dom_b));
+    }
+
+    #[test]
+    fn exact_drain_ignores_pins_and_keeps_aligned_entries() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-drain");
+
+        let (a, _) = pool.insert_exact(dom.clone(), arc_toks(&[1, 1]), HostBlob { bytes: 10 });
+        let (b, _) = pool.insert_exact(dom.clone(), arc_toks(&[2, 2]), HostBlob { bytes: 20 });
+        pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 40 });
+        assert!(pool.pin_id(a));
+        assert_eq!(pool.exact_ids(), vec![a, b]);
+        assert_eq!(pool.total_bytes(), 70);
+
+        let mut drained: Vec<u64> = pool.drain_exact().into_iter().map(|x| x.bytes).collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![10, 20]);
+        assert!(pool.exact_ids().is_empty());
+        assert_eq!(pool.find_exact(&dom, &[1, 1]), None);
+        assert_eq!(pool.total_bytes(), 40);
+        assert!(pool.contains(&dom, 128, fp(128)));
+
+        // drain_blobs (aligned) leaves exact bytes accounted.
+        let (c, _) = pool.insert_exact(dom.clone(), arc_toks(&[3]), HostBlob { bytes: 5 });
+        assert_eq!(pool.drain_blobs().len(), 1);
+        assert_eq!(pool.total_bytes(), 5);
+        assert_eq!(pool.exact_ids(), vec![c]);
+    }
+
+    #[test]
+    fn exact_ids_are_monotonic_and_never_reused() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("exact-ids");
+
+        let (first, _) = pool.insert_exact(dom.clone(), arc_toks(&[1]), HostBlob { bytes: 1 });
+        assert!(pool.take_id(first).is_some());
+        let (second, _) = pool.insert_exact(dom.clone(), arc_toks(&[1]), HostBlob { bytes: 1 });
+        assert!(second.0 > first.0, "a taken id is never reissued");
+
+        // The counter is shared with the aligned API.
+        let (aligned, _) = pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 1 });
+        assert!(aligned.0 > second.0);
+        let (third, _) = pool.insert_exact(dom.clone(), arc_toks(&[2]), HostBlob { bytes: 1 });
+        assert!(third.0 > aligned.0);
+        assert!(pool.peek_id(aligned).is_none(), "id API is exact-only");
+
+        // Draining does not rewind the counter either.
+        drop(pool.drain_exact());
+        let (fourth, _) = pool.insert_exact(dom.clone(), arc_toks(&[1]), HostBlob { bytes: 1 });
+        assert!(fourth.0 > third.0);
+    }
+
+    #[test]
+    fn aligned_pin_remains_idempotent_boolean() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("aligned-pin");
+        pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 1 });
+
+        assert!(pool.pin(&dom, 128, fp(128)));
+        assert!(pool.pin(&dom, 128, fp(128)));
+        assert!(pool.is_pinned(&dom, 128, fp(128)));
+        assert!(pool.unpin(&dom, 128, fp(128)));
+        assert!(!pool.is_pinned(&dom, 128, fp(128)), "one unpin clears it");
+        assert!(!pool.pin(&dom, 256, fp(256)));
+    }
 }

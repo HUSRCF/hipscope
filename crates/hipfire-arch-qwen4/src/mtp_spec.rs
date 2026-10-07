@@ -1834,21 +1834,19 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ctx.begin_request(prompt_tokens);
             }
         }
-        // A miss resets target, head and draft policy. A hit binds the planner's
-        // `start_pos` to the bundle's Live receipt (committed state, no copy) or
-        // Prompt receipt (end-of-prompt checkpoint restore).
-        let plan = if cache_hit {
-            Self::bundle(target)?
-                .bind_prefix_plan(prompt_tokens, start_pos, Qwen4PrefixMode::NativeMtp)
-                .map_err(|error| error.to_string())?
-        } else {
-            Qwen4PrefixPlan::default()
-        };
+        // Bind the planner's `start_pos` (0 on a miss) to the bundle's receipt:
+        // the pending radix selection (a cold selection carries the armed
+        // shared-turn anchor), the Live receipt (committed state, no copy), the
+        // Prompt receipt (end-of-prompt checkpoint restore), or a plain cold
+        // reset when nothing is pending.
+        let plan = Self::bundle(target)?
+            .bind_prefix_plan(prompt_tokens, start_pos, Qwen4PrefixMode::NativeMtp)
+            .map_err(|error| error.to_string())?;
         Self::bundle(target)?
             .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
             .map_err(|error| error.to_string())?;
         self.ensure_resources(gpu, target)?;
-        let capture_at = {
+        {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
             let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -1858,8 +1856,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     target_position, mtp_position
                 ));
             }
-            bundle.prefix_capture_at()
-        };
+        }
         // Field borrows (not `pending_hidden()`): the batched fill below also
         // borrows `append_scratch` mutably.
         let pending = self
@@ -1880,13 +1877,28 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // Each prompt token selects with its own query and the pooled keys
         // visible at that position, regardless of target prefill chunking.
         let chunk_rows = self.prefill_rows.max(1);
-        for (chunk_index, chunk) in fill_tokens.chunks(chunk_rows).enumerate() {
+        let mut pos = start_pos;
+        while pos < prompt_tokens.len() {
             if abort() {
                 target.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            let base = chunk_index * chunk_rows;
-            Self::bundle(target)?.set_ple_lookahead(&fill_tokens[base + chunk.len()..]);
+            // A chunk ends at the bundle's due capture boundary (turn anchor,
+            // periodic or end of prompt) when one lies inside the natural
+            // chunk, else at the natural chunk end.
+            let natural = pos
+                .checked_add(chunk_rows)
+                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?
+                .min(prompt_tokens.len());
+            let capture = Self::bundle(target)?.next_prefix_capture(pos, natural);
+            let end = capture.unwrap_or(natural);
+            if end <= pos || end > natural {
+                return Err(format!(
+                    "Qwen4 native MTP prefill chunk end {end} is outside ({pos}, {natural}]"
+                ));
+            }
+            let chunk = &prompt_tokens[pos..end];
+            Self::bundle(target)?.set_ple_lookahead(&prompt_tokens[end..]);
             let pick = Self::bundle(target)?
                 .spec_prefill_rows(gpu, chunk, true)
                 .map_err(|error| error.to_string())?;
@@ -1900,9 +1912,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         return Err("Qwen4 native MTP prefill aborted".to_string());
                     }
                     let n = (chunk.len() - off).min(scratch.rows());
-                    let position = start_pos
-                        .checked_add(base)
-                        .and_then(|value| value.checked_add(off))
+                    let position = pos
+                        .checked_add(off)
                         .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
                     if n == 1 {
                         // The multirow projections need two rows or more; a
@@ -1932,9 +1943,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         target.reset_recurrent(gpu)?;
                         return Err("Qwen4 native MTP prefill aborted".to_string());
                     }
-                    let position = start_pos
-                        .checked_add(base)
-                        .and_then(|value| value.checked_add(index))
+                    let position = pos
+                        .checked_add(index)
                         .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
                     let bundle = Self::bundle(target)?;
                     bundle
@@ -1945,15 +1955,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
             }
-            // The head has caught up with the target after the final chunk:
-            // the one point both owners hold the exact end-of-prompt state.
-            let end = start_pos + base + chunk.len();
-            if capture_at == Some(end) {
+            // Target and head both hold the exact state at `end` only now: a
+            // due capture boundary stages here, after the forward and the
+            // head append of this chunk.
+            if capture == Some(end) {
                 Self::bundle(target)?
-                    .stage_prefix(gpu, &prompt_tokens[..end])
+                    .stage_prefix_boundary(gpu, &prompt_tokens[..end], end == prompt_tokens.len())
                     .map_err(|error| error.to_string())?;
             }
             first_token = Some(pick);
+            pos = end;
         }
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
         // The seed is the first emitted token: sampled, it is drawn from the

@@ -18,7 +18,7 @@ use rdna_compute::tensor_ops::{
     copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
     GdnStateFormat, QsaKvFormat,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, VmmPrefixSpec};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -349,6 +349,33 @@ impl QsaGpuState {
             },
         ]
     }
+
+    /// Row capacity of each [`Self::context_arenas`] entry.
+    fn context_rows(&self) -> [usize; QSA_CONTEXT_ARENAS] {
+        [
+            self.full_capacity,
+            self.full_capacity,
+            self.raw_capacity,
+            self.pooled_capacity,
+        ]
+    }
+
+    /// Bytes per row of each [`Self::context_arenas`] entry.
+    fn context_row_bytes(&self) -> Result<[usize; QSA_CONTEXT_ARENAS], StateError> {
+        let mut row_bytes = [0usize; QSA_CONTEXT_ARENAS];
+        for ((slot, tensor), rows) in row_bytes
+            .iter_mut()
+            .zip(self.context_arenas())
+            .zip(self.context_rows())
+        {
+            let bytes = tensor.byte_size();
+            if rows == 0 || bytes % rows != 0 {
+                return Err(StateError::DimensionOverflow);
+            }
+            *slot = bytes / rows;
+        }
+        Ok(row_bytes)
+    }
 }
 
 /// QSA context arenas per layer: full K, full V, raw and pooled index keys
@@ -404,6 +431,7 @@ fn grow_context_arena(
     rows: usize,
     required_rows: usize,
     device: i32,
+    granular: bool,
 ) -> Result<usize, StateError> {
     let bytes = tensor.byte_size();
     if rows == 0 || bytes % rows != 0 {
@@ -418,13 +446,16 @@ fn grow_context_arena(
     else {
         return Ok(plan.token_capacity(mapped));
     };
-    let mapped = gpu
-        .grow_vmm_tensor(tensor, growth.size_bytes, &[device])
-        .map_err(|error| StateError::MapGrowth {
-            offset: growth.offset_bytes,
-            bytes: growth.size_bytes,
-            error,
-        })?;
+    let grown = if granular {
+        gpu.grow_vmm_tensor_granules(tensor, growth.size_bytes, &[device])
+    } else {
+        gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device])
+    };
+    let mapped = grown.map_err(|error| StateError::MapGrowth {
+        offset: growth.offset_bytes,
+        bytes: growth.size_bytes,
+        error,
+    })?;
     // The owner view is capped at the logical size; a final page may pass it.
     let element = tensor.dtype.size();
     let fresh = tensor.buf.size() - growth.offset_bytes;
@@ -433,6 +464,22 @@ fn grow_context_arena(
         .memset(&view.buf, 0, view.buf.size())
         .map_err(StateError::Hip)?;
     Ok(plan.token_capacity(mapped))
+}
+
+/// Rows the accessible prefix of a registered VMM context arena of `rows`
+/// capacity rows holds (what [`grow_context_arena`] returns).
+fn context_arena_mapped_rows(
+    gpu: &Gpu,
+    tensor: &GpuTensor,
+    rows: usize,
+) -> Result<usize, StateError> {
+    let bytes = tensor.byte_size();
+    if rows == 0 || bytes % rows != 0 {
+        return Err(StateError::DimensionOverflow);
+    }
+    let mapped = gpu.vmm_mapped_bytes(tensor).ok_or(StateError::VmmOwner)?;
+    let granularity = gpu.vmm_granularity(tensor).ok_or(StateError::VmmOwner)?;
+    Ok(context_arena_plan(bytes / rows, rows, granularity)?.token_capacity(mapped))
 }
 
 /// The QSA state format for a `memory.kv_cache` request on `gpu`
@@ -798,6 +845,19 @@ impl Qwen4StateSnapshotArena {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Device bytes of every tensor the arena owns.
+    fn device_bytes(&self) -> usize {
+        self.recurrent
+            .iter()
+            .chain(&self.conv)
+            .chain(&self.qsa_partial_keys)
+            .chain(&self.qsa_partial_values)
+            .chain(&self.qsa_raw_circular)
+            .chain(&self.qsa_selected)
+            .chain([&self.ple_conv, &self.hyper_feedback])
+            .fold(0usize, |total, tensor| total.saturating_add(tensor.byte_size()))
+    }
+
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let tensors = self
             .recurrent
@@ -818,6 +878,38 @@ impl Qwen4StateSnapshotArena {
     }
 }
 
+/// A caller-owned durable checkpoint slot of the target state: the same copy
+/// layout as the speculative snapshot arena, in its own storage (never a
+/// speculative ticket or a GDN ring slot). It holds the state after exactly
+/// [`Self::position`] consumed tokens while it holds a capture.
+pub(crate) struct Qwen4TargetCheckpoint {
+    arena: Qwen4StateSnapshotArena,
+}
+
+impl Qwen4TargetCheckpoint {
+    /// Consumed-token count of the held capture, if any.
+    pub(crate) fn position(&self) -> Option<usize> {
+        self.arena.active.then_some(self.arena.position)
+    }
+
+    /// Device bytes of the slot's storage.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.arena.device_bytes()
+    }
+
+    /// Drop the held capture; the storage stays allocated.
+    pub(crate) fn invalidate(&mut self) {
+        self.arena.invalidate();
+    }
+
+    /// Free the slot's device storage, attempting every tensor.
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), StateError> {
+        self.arena
+            .free_gpu(gpu)
+            .map_or(Ok(()), |error| Err(StateError::Hip(error)))
+    }
+}
+
 /// The sole production request-state owner for Qwen4.
 pub struct Qwen4State {
     pub gdn: Vec<GdnGpuState>,
@@ -829,11 +921,6 @@ pub struct Qwen4State {
     pub max_seq_len: usize,
     pub qsa_selected_capacity: usize,
     snapshot_arena: Qwen4StateSnapshotArena,
-    /// Durable prefix-cache checkpoint (`Qwen4Bundle` prefix cache): its own
-    /// storage, never a speculative ticket or a GDN ring slot. Present only
-    /// when the cache is attached; `active` means it holds the state after
-    /// exactly `position` consumed tokens and no live write has gone below.
-    prefix_arena: Option<Qwen4StateSnapshotArena>,
     /// Few-row verify rollback points per GDN layer: (recurrent-state ring,
     /// convolution input rows, recurrence inputs); see `GdnRowCapture`. With
     /// a ring, each GDN layer's `recurrent` is a view of its live slot: a
@@ -862,6 +949,9 @@ pub struct Qwen4State {
     /// minimum over all owners, so the no-growth gate never scans layers.
     /// Legacy arenas cover `max_seq_len` from construction.
     qsa_mapped_tokens: usize,
+    /// Whether growth maps whole shareable granules
+    /// ([`Self::set_granular_context`]).
+    qsa_granular: bool,
     /// Raw tokens per pooled index row (`indexer_compress_ratio`).
     qsa_compress: usize,
     model_id: u64,
@@ -1158,7 +1248,6 @@ impl Qwen4State {
             max_seq_len,
             qsa_selected_capacity: selected_capacity,
             snapshot_arena,
-            prefix_arena: None,
             row_capture: Vec::new(),
             row_capture_output: None,
             row_capture_rows: 0,
@@ -1171,6 +1260,7 @@ impl Qwen4State {
                 Qwen4KvBackend::Legacy => max_seq_len,
                 Qwen4KvBackend::Vmm => 0,
             },
+            qsa_granular: false,
             qsa_compress: config.indexer_compress_ratio,
             model_id,
             reset_epoch: 0,
@@ -1179,9 +1269,11 @@ impl Qwen4State {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
+        if self.context_sealed(gpu) {
+            return Err(StateError::SealedContext);
+        }
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
-        self.invalidate_prefix();
         for layer in &self.gdn {
             gpu.hip
                 .memset(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
@@ -1259,11 +1351,13 @@ impl Qwen4State {
         let device = gpu.device_id;
         let compress = self.qsa_compress;
         let max_tokens = self.max_seq_len;
+        let granular = self.qsa_granular;
         let mut covered = max_tokens;
         for layer in &mut self.qsa {
             for arena in layer.context_arenas_mut() {
                 let rows = required_tokens.div_ceil(arena.tokens_per_row(compress));
-                let mapped_rows = grow_context_arena(gpu, arena.tensor, arena.rows, rows, device)?;
+                let mapped_rows =
+                    grow_context_arena(gpu, arena.tensor, arena.rows, rows, device, granular)?;
                 covered = covered.min(qsa_covered_tokens(
                     mapped_rows,
                     arena.tokens_per_row(compress),
@@ -1317,25 +1411,7 @@ impl Qwen4State {
         self.snapshot_arena.invalidate();
     }
 
-    /// Allocate the durable prefix arena once (load time, inside the charged
-    /// VRAM reserve; see [`Self::prefix_arena_bytes`]).
-    pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        if self.prefix_arena.is_none() {
-            self.prefix_arena = Some(Qwen4StateSnapshotArena::new(
-                gpu,
-                &self.gdn,
-                &self.qsa,
-                &self.ple_conv,
-                &self.hyper_feedback,
-                self.model_id,
-                self.ple_history,
-                0,
-            )?);
-        }
-        Ok(())
-    }
-
-    /// Device bytes [`Self::attach_prefix_arena`] allocates: one copy of
+    /// Device bytes one [`Qwen4TargetCheckpoint`] allocates: one copy of
     /// every in-place-overwritten owner, the same layout as the speculative
     /// snapshot arena. The full QSA K/V, raw and pooled arenas are not copied.
     pub fn prefix_arena_bytes(config: &Qwen4Config, format: Qwen4StateFormat) -> Option<u64> {
@@ -1374,65 +1450,73 @@ impl Qwen4State {
         u64::try_from(total).ok()
     }
 
-    /// Consumed-token count of the valid durable checkpoint, if any.
-    pub(crate) fn prefix_position(&self) -> Option<usize> {
-        self.prefix_arena
-            .as_ref()
-            .filter(|arena| arena.active)
-            .map(|arena| arena.position)
-    }
-
-    pub(crate) fn invalidate_prefix(&mut self) {
-        if let Some(arena) = self.prefix_arena.as_mut() {
-            arena.invalidate();
-        }
-    }
-
-    /// A rewind below the checkpoint means later forwards overwrite the
-    /// append-only QSA rows it still points at.
-    fn retire_prefix_past_position(&mut self) {
-        if self.prefix_position().is_some_and(|saved| self.position < saved) {
-            self.invalidate_prefix();
-        }
+    /// Allocate a caller-owned durable checkpoint slot (the old attach
+    /// allocation): one copy of every in-place-overwritten owner. It holds no
+    /// capture until [`Self::capture_checkpoint`].
+    pub(crate) fn new_checkpoint(
+        &self,
+        gpu: &mut Gpu,
+    ) -> Result<Qwen4TargetCheckpoint, StateError> {
+        Ok(Qwen4TargetCheckpoint {
+            arena: Qwen4StateSnapshotArena::new(
+                gpu,
+                &self.gdn,
+                &self.qsa,
+                &self.ple_conv,
+                &self.hyper_feedback,
+                self.model_id,
+                self.ple_history,
+                0,
+            )?,
+        })
     }
 
     /// Copy every in-place-overwritten owner (GDN recurrent bytes of the live
     /// slot plus conv history, QSA partial/selected/raw tail, PLE conv,
-    /// hyper feedback) and the QSA marks, PLE context and position into the
-    /// durable arena. Never inside an armed verify.
-    pub(crate) fn capture_prefix(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        self.invalidate_prefix();
+    /// hyper feedback) and the QSA marks, PLE context and position into
+    /// `dst`. Never inside an armed verify, and never a GDN ring slot.
+    /// `dst` holds no capture on any error.
+    pub(crate) fn capture_checkpoint(
+        &self,
+        gpu: &mut Gpu,
+        dst: &mut Qwen4TargetCheckpoint,
+    ) -> Result<(), StateError> {
+        dst.arena.invalidate();
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
-        let arena = self.prefix_arena.as_ref().ok_or(StateError::SnapshotInactive)?;
-        if arena.model_id != self.model_id {
+        if dst.arena.model_id != self.model_id {
             return Err(StateError::SnapshotTicket);
         }
-        arena.validate_layout(self)?;
+        dst.arena.validate_layout(self)?;
         for layer in &self.qsa {
             validate_qsa_mark(&layer.mark(), &layer.mark_capacity())?;
         }
-        let copies = arena_regions(self, arena, true)?;
+        let copies = arena_regions(self, &dst.arena, true)?;
         copy_regions(gpu, &copies).map_err(StateError::Hip)?;
-        let arena = self.prefix_arena.as_mut().ok_or(StateError::SnapshotInactive)?;
-        for (saved, layer) in arena.qsa_marks.iter_mut().zip(&self.qsa) {
+        for (saved, layer) in dst.arena.qsa_marks.iter_mut().zip(&self.qsa) {
             *saved = layer.mark();
         }
-        arena.ple_history = self.ple_history;
-        arena.position = self.position;
-        arena.active = true;
+        dst.arena.ple_history = self.ple_history;
+        dst.arena.position = self.position;
+        dst.arena.active = true;
         Ok(())
     }
 
-    /// Restore the durable checkpoint into the live owners. Like a reset it
-    /// retires every speculative ticket. The checkpoint stays valid; on a
-    /// failed copy the caller must reset (the live state is then partial).
-    pub(crate) fn restore_prefix(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
+    /// Restore `src` into the live owners. Like a reset it retires every
+    /// speculative ticket. `src` stays valid; on a failed copy the caller
+    /// must reset (the live state is then partial). Refused with
+    /// [`StateError::SealedContext`] before any write when the in-place raw
+    /// tail would overwrite bytes shared with another checkpoint or bank.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        gpu: &mut Gpu,
+        src: &Qwen4TargetCheckpoint,
+    ) -> Result<(), StateError> {
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
-        let arena = self.prefix_arena.as_ref().ok_or(StateError::SnapshotInactive)?;
+        let arena = &src.arena;
         if !arena.active {
             return Err(StateError::SnapshotInactive);
         }
@@ -1442,13 +1526,24 @@ impl Qwen4State {
         arena.validate_layout(self)?;
         for (mark, layer) in arena.qsa_marks.iter().zip(&self.qsa) {
             validate_qsa_mark(mark, &layer.mark_capacity())?;
+            if mark.raw_len == 0 {
+                continue;
+            }
+            let row_bytes = layer.context_row_bytes()?;
+            let (_, writable_from) = context_boundary(
+                ContextRole::Raw,
+                mark,
+                row_bytes[2],
+                layer.partial_capacity,
+            )?;
+            if gpu.vmm_sealed_bytes(&layer.raw_index_keys).unwrap_or(0) > writable_from {
+                return Err(StateError::SealedContext);
+            }
         }
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
-        let arena = self.prefix_arena.as_ref().ok_or(StateError::SnapshotInactive)?;
         let copies = arena_regions(self, arena, false)?;
         copy_regions(gpu, &copies).map_err(StateError::Hip)?;
-        let arena = self.prefix_arena.as_ref().ok_or(StateError::SnapshotInactive)?;
         for (layer, mark) in self.qsa.iter_mut().zip(&arena.qsa_marks) {
             layer.full_len = mark.full_len;
             layer.raw_len = mark.raw_len;
@@ -1461,6 +1556,192 @@ impl Qwen4State {
         self.position = arena.position;
         Ok(())
     }
+
+    /// Later QSA context growth maps whole shareable physical granules
+    /// ([`Gpu::grow_vmm_tensor_granules`]) instead of plain VMM segments.
+    pub(crate) fn set_granular_context(&mut self, granular: bool) {
+        self.qsa_granular = granular;
+    }
+
+    /// The 48-style context prefix specs (4 per full layer, arena order) at
+    /// the current marks: K/V `valid = writable_from = full_len` rows, raw
+    /// `valid = raw_len` rows with `writable_from` below the in-place restored
+    /// tail, pooled `valid = writable_from = pooled_len` rows. VMM backend only.
+    pub(crate) fn context_prefix_specs(&self) -> Result<Vec<VmmPrefixSpec<'_>>, StateError> {
+        self.require_vmm_context()?;
+        let mut specs = Vec::with_capacity(self.qsa.len() * QSA_CONTEXT_ARENAS);
+        for layer in &self.qsa {
+            let mark = layer.mark();
+            validate_qsa_mark(&mark, &layer.mark_capacity())?;
+            let row_bytes = layer.context_row_bytes()?;
+            for (index, tensor) in layer.context_arenas().into_iter().enumerate() {
+                let (valid_bytes, writable_from) = context_boundary(
+                    CONTEXT_ROLES[index],
+                    &mark,
+                    row_bytes[index],
+                    layer.partial_capacity,
+                )?;
+                specs.push(VmmPrefixSpec {
+                    tensor,
+                    valid_bytes,
+                    writable_from,
+                });
+            }
+        }
+        Ok(specs)
+    }
+
+    /// Every context arena tensor, in arena order.
+    pub(crate) fn context_tensors(&self) -> Vec<&GpuTensor> {
+        self.qsa
+            .iter()
+            .flat_map(|layer| layer.context_arenas())
+            .collect()
+    }
+
+    fn require_vmm_context(&self) -> Result<(), StateError> {
+        match self.qsa_backend {
+            Qwen4KvBackend::Vmm => Ok(()),
+            Qwen4KvBackend::Legacy => Err(StateError::ContextBank(
+                "legacy QSA context arenas are not VMM owners",
+            )),
+        }
+    }
+
+    /// A fresh bank: one empty (nothing mapped) never-mapped VMM owner per
+    /// context arena, same shapes and dtypes, arena order. On failure every
+    /// owner created so far is freed.
+    pub(crate) fn new_context_bank(&self, gpu: &mut Gpu) -> Result<Vec<GpuTensor>, StateError> {
+        self.require_vmm_context()?;
+        let device = gpu.device_id;
+        let mut bank = Vec::with_capacity(self.qsa.len() * QSA_CONTEXT_ARENAS);
+        for tensor in self.context_tensors() {
+            // SAFETY: nothing is mapped; every access is bounded by the
+            // mapped prefix `ensure_mapped_capacity` or a fork establishes.
+            match unsafe { gpu.alloc_vmm_tensor(&tensor.shape, tensor.dtype, 0, &[device]) } {
+                Ok(fresh) => bank.push(fresh),
+                Err(error) => {
+                    for fresh in bank {
+                        let _ = gpu.free_tensor(fresh);
+                    }
+                    return Err(StateError::Hip(error));
+                }
+            }
+        }
+        Ok(bank)
+    }
+
+    /// Swap `bank` in as the live context arenas and return the old tensors
+    /// in arena order (the caller frees them with [`Self::free_context_bank`]
+    /// once nothing references them). Host-only. `bank` must hold one VMM
+    /// owner per arena with the arena's shape and dtype, none shared with
+    /// another entry or the live bank. The mapped-token gate is recomputed
+    /// from the new bank's mapped coverage. Nothing changes on error.
+    pub(crate) fn install_context_bank(
+        &mut self,
+        gpu: &Gpu,
+        bank: Vec<GpuTensor>,
+    ) -> Result<Vec<GpuTensor>, StateError> {
+        self.require_vmm_context()?;
+        let expected = self.qsa.len() * QSA_CONTEXT_ARENAS;
+        if bank.len() != expected {
+            return Err(StateError::ContextBank(
+                "bank tensor count differs from the state's context arenas",
+            ));
+        }
+        let compress = self.qsa_compress;
+        let max_tokens = self.max_seq_len;
+        let mut covered = max_tokens;
+        let mut pointers = Vec::with_capacity(2 * expected);
+        for (layer, tensors) in self.qsa.iter().zip(bank.chunks(QSA_CONTEXT_ARENAS)) {
+            let rows = layer.context_rows();
+            for (index, (old, new)) in layer.context_arenas().into_iter().zip(tensors).enumerate() {
+                if new.shape != old.shape || new.dtype != old.dtype {
+                    return Err(StateError::ContextBank(
+                        "bank tensor shape or dtype differs from its arena",
+                    ));
+                }
+                pointers.push(old.buf.as_ptr() as usize);
+                pointers.push(new.buf.as_ptr() as usize);
+                let mapped_rows = context_arena_mapped_rows(gpu, new, rows[index])?;
+                let tokens_per_row = match CONTEXT_ROLES[index] {
+                    ContextRole::Pooled => compress,
+                    ContextRole::FullKv | ContextRole::Raw => 1,
+                };
+                covered = covered.min(qsa_covered_tokens(mapped_rows, tokens_per_row, max_tokens));
+            }
+        }
+        pointers.sort_unstable();
+        if pointers.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StateError::ContextBank(
+                "bank tensor aliases another bank entry or the live bank",
+            ));
+        }
+        let mut incoming = bank.into_iter();
+        let mut old = Vec::with_capacity(expected);
+        for layer in &mut self.qsa {
+            for arena in layer.context_arenas_mut() {
+                let fresh = incoming.next().expect("bank length validated above");
+                old.push(std::mem::replace(arena.tensor, fresh));
+            }
+        }
+        self.qsa_mapped_tokens = covered;
+        Ok(old)
+    }
+
+    /// Free every tensor of a retired bank, attempting all; the first error
+    /// is returned.
+    pub(crate) fn free_context_bank(
+        gpu: &mut Gpu,
+        bank: Vec<GpuTensor>,
+    ) -> Result<(), StateError> {
+        let mut first = None;
+        for tensor in bank {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
+    }
+
+    /// Whether any context arena holds bytes shared with a checkpoint or
+    /// another bank (nothing may write below its sealed prefix).
+    pub(crate) fn context_sealed(&self, gpu: &Gpu) -> bool {
+        self.qsa
+            .iter()
+            .flat_map(|layer| layer.context_arenas())
+            .any(|tensor| gpu.vmm_sealed_bytes(tensor).unwrap_or(0) > 0)
+    }
+
+    /// Whether restoring the boundary at `position` may write every context
+    /// arena: each arena's sealed bytes end at or below the first byte that
+    /// restore overwrites there (the same per-arena formulas as
+    /// [`Self::context_prefix_specs`]).
+    pub(crate) fn context_writable_at(&self, gpu: &Gpu, position: usize) -> bool {
+        let Some(mark) = qsa_mark_at(position, self.qsa_compress) else {
+            return false;
+        };
+        for layer in &self.qsa {
+            let Ok(row_bytes) = layer.context_row_bytes() else {
+                return false;
+            };
+            for (index, tensor) in layer.context_arenas().into_iter().enumerate() {
+                let Ok((_, writable_from)) = context_boundary(
+                    CONTEXT_ROLES[index],
+                    &mark,
+                    row_bytes[index],
+                    layer.partial_capacity,
+                ) else {
+                    return false;
+                };
+                if gpu.vmm_sealed_bytes(tensor).unwrap_or(0) > writable_from {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Capture the fixed-size rollback state into the model-owned arena.
     /// Full-capacity append-only QSA K/V and raw arenas are never copied.
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, StateError> {
@@ -1543,7 +1824,6 @@ impl Qwen4State {
         if result.is_err() && consume {
             self.snapshot_arena.invalidate();
         }
-        self.retire_prefix_past_position();
         result
     }
 
@@ -1593,11 +1873,6 @@ impl Qwen4State {
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), StateError> {
         let mut first = self.snapshot_arena.free_gpu(gpu);
-        if let Some(arena) = self.prefix_arena {
-            if let Some(error) = arena.free_gpu(gpu) {
-                first.get_or_insert(error);
-            }
-        }
         let mut free = |tensor: GpuTensor| {
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
@@ -1947,7 +2222,6 @@ impl Qwen4State {
         }
         self.ple_history = history;
         self.position = start + keep;
-        self.retire_prefix_past_position();
         Ok(())
     }
     pub fn qsa_mut(&mut self, full_layer_index: usize) -> Option<&mut QsaGpuState> {
@@ -1992,6 +2266,69 @@ fn validate_qsa_mark(mark: &QsaMark, capacity: &QsaMarkCapacity) -> Result<(), S
     Ok(())
 }
 
+/// How a QSA context arena's rows map to a prefix boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextRole {
+    /// Full-attention K or V: one row per token.
+    FullKv,
+    /// Raw index keys: one row per token; the last `partial_capacity` rows are
+    /// restored in place.
+    Raw,
+    /// Pooled index keys: one row per `compress` tokens.
+    Pooled,
+}
+
+/// [`ContextRole`] of each [`QsaGpuState::context_arenas`] entry.
+const CONTEXT_ROLES: [ContextRole; QSA_CONTEXT_ARENAS] = [
+    ContextRole::FullKv,
+    ContextRole::FullKv,
+    ContextRole::Raw,
+    ContextRole::Pooled,
+];
+
+/// The marks of a state that consumed exactly `position` tokens, or `None`
+/// for a zero `compress`.
+fn qsa_mark_at(position: usize, compress: usize) -> Option<QsaMark> {
+    Some(QsaMark {
+        full_len: position,
+        raw_len: position,
+        pooled_len: position.checked_div(compress)?,
+        partial_len: position % compress,
+        selected_len: 0,
+        position,
+    })
+}
+
+/// `(valid_bytes, writable_from)` of a context arena of `row_bytes` rows at
+/// `mark`: the bytes holding live rows and the first byte a restore of that
+/// boundary may overwrite in place (only the raw tail, the last
+/// `partial_capacity` rows, is restored in place).
+fn context_boundary(
+    role: ContextRole,
+    mark: &QsaMark,
+    row_bytes: usize,
+    partial_capacity: usize,
+) -> Result<(usize, usize), StateError> {
+    let bytes = |rows: usize| {
+        rows.checked_mul(row_bytes)
+            .ok_or(StateError::DimensionOverflow)
+    };
+    Ok(match role {
+        ContextRole::FullKv => {
+            let valid = bytes(mark.full_len)?;
+            (valid, valid)
+        }
+        ContextRole::Raw => (
+            bytes(mark.raw_len)?,
+            bytes(mark.raw_len - mark.raw_len.min(partial_capacity))?,
+        ),
+        ContextRole::Pooled => {
+            let valid = bytes(mark.pooled_len)?;
+            (valid, valid)
+        }
+    })
+}
+
 #[derive(Debug)]
 pub enum StateError {
     Config(String),
@@ -2025,6 +2362,11 @@ pub enum StateError {
         bytes: usize,
         error: hip_bridge::HipError,
     },
+    /// A QSA context arena holds granules shared with a checkpoint or another
+    /// bank; the state may not write them.
+    SealedContext,
+    /// A context bank request or installed bank violates its contract.
+    ContextBank(&'static str),
 }
 
 impl fmt::Display for StateError {
@@ -2064,6 +2406,11 @@ impl fmt::Display for StateError {
                 f,
                 "Qwen4 QSA context map of {bytes} bytes at offset {offset} failed: {error}"
             ),
+            Self::SealedContext => write!(
+                f,
+                "Qwen4 QSA context holds bytes shared with a checkpoint; install a fresh bank first"
+            ),
+            Self::ContextBank(reason) => write!(f, "Qwen4 QSA context bank: {reason}"),
         }
     }
 }
@@ -2574,5 +2921,79 @@ mod tests {
             state.free_gpu(&mut gpu).expect("free VMM");
             eprintln!("vmm owners after free: {}", gpu.vmm_allocation_count());
         }
+    }
+
+    fn boundary_mark(position: usize, compress: usize) -> QsaMark {
+        qsa_mark_at(position, compress).expect("nonzero compress")
+    }
+
+    #[test]
+    fn context_boundary_kv_is_full_len_rows() {
+        for row_bytes in [516usize, 1024, 4096] {
+            for position in [0usize, 1, 5, 127, 128, 4097] {
+                let mark = boundary_mark(position, 4);
+                let (valid, writable_from) =
+                    context_boundary(ContextRole::FullKv, &mark, row_bytes, 4).unwrap();
+                assert_eq!(valid, position * row_bytes);
+                assert_eq!(writable_from, valid);
+            }
+        }
+    }
+
+    #[test]
+    fn context_boundary_raw_guard_covers_restored_tail() {
+        // partial_capacity 4, FP8-sized 516-byte rows: B = 0..=5.
+        let expected: [(usize, usize); 6] = [
+            (0, 0),
+            (516, 0),
+            (2 * 516, 0),
+            (3 * 516, 0),
+            (4 * 516, 0),
+            (5 * 516, 516),
+        ];
+        for (position, (valid, writable_from)) in expected.into_iter().enumerate() {
+            let mark = boundary_mark(position, 4);
+            assert_eq!(
+                context_boundary(ContextRole::Raw, &mark, 516, 4).unwrap(),
+                (valid, writable_from),
+                "position {position}"
+            );
+        }
+        // A wider guard than the prefix never underflows.
+        let mark = boundary_mark(3, 4);
+        assert_eq!(
+            context_boundary(ContextRole::Raw, &mark, 516, 128).unwrap(),
+            (3 * 516, 0)
+        );
+        // A zero-row guard writes nothing in place.
+        let mark = boundary_mark(9, 4);
+        assert_eq!(
+            context_boundary(ContextRole::Raw, &mark, 516, 0).unwrap(),
+            (9 * 516, 9 * 516)
+        );
+    }
+
+    #[test]
+    fn context_boundary_pooled_floors_by_compress() {
+        for (position, pooled_rows) in [(0usize, 0usize), (3, 0), (4, 1), (7, 1), (8, 2), (130, 32)]
+        {
+            let mark = boundary_mark(position, 4);
+            assert_eq!(mark.pooled_len, pooled_rows);
+            assert_eq!(
+                context_boundary(ContextRole::Pooled, &mark, 516, 4).unwrap(),
+                (pooled_rows * 516, pooled_rows * 516),
+                "position {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_boundary_refuses_overflow_and_zero_compress() {
+        let mark = boundary_mark(2, 4);
+        assert!(matches!(
+            context_boundary(ContextRole::FullKv, &mark, usize::MAX, 4),
+            Err(StateError::DimensionOverflow)
+        ));
+        assert!(qsa_mark_at(5, 0).is_none());
     }
 }

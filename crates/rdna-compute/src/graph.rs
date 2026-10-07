@@ -561,4 +561,111 @@ impl GraphState {
         self.replay.warmed_up.clear();
         self.replay.capturing = None;
     }
+
+    /// Whether any hipGraph, graph exec, per-segment graph, verify/replay cache
+    /// entry, or in-progress capture exists. Every one of them bakes device
+    /// addresses into node parameters or kernarg blobs.
+    fn holds_captured_graph_state(&self) -> bool {
+        self.capture_mode
+            || self.graph_exec.is_some()
+            || self.captured_graph.is_some()
+            || !self.ar_segments.is_empty()
+            || !self.verify.cache.is_empty()
+            || self.verify.capturing.is_some()
+            || !self.replay.cache.is_empty()
+            || self.replay.capturing.is_some()
+    }
+
+    /// Relocation guard for VMM resource moves (`Gpu::relocate_qsa_resources`).
+    ///
+    /// Rewriting the pointer parameters of captured hipGraph kernel nodes is
+    /// not implemented. Qwen4 routes are PM4/HIP only and never capture a
+    /// hipGraph, so the supported state is "no graph state at all": `Ok(())`
+    /// when `moves` is empty or no graph, exec, segment, verify/replay cache
+    /// entry or capture exists. Any captured graph with a non-empty `moves`
+    /// fails closed instead of replaying stale addresses.
+    pub fn relocate_resources(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        moves: &[crate::dispatch::VmmResourceMove],
+    ) -> HipResult<()> {
+        let _ = (hip, device_id);
+        self.check_relocation_supported(moves)
+    }
+
+    fn check_relocation_supported(
+        &self,
+        moves: &[crate::dispatch::VmmResourceMove],
+    ) -> HipResult<()> {
+        if moves.is_empty() || !self.holds_captured_graph_state() {
+            return Ok(());
+        }
+        Err(HipError::new(
+            0,
+            "hipGraph node relocation is not implemented; Qwen4 never captures graphs",
+        ))
+    }
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        let cache = || PerBGraphCache {
+            cache: HashMap::new(),
+            warmed_up: HashSet::new(),
+            capturing: None,
+            lmhead_argmax: HashSet::new(),
+        };
+        Self {
+            capture_mode: false,
+            capture_blobs: Vec::new(),
+            graph_exec: None,
+            captured_graph: None,
+            ar_forward_blobs: Vec::new(),
+            ar_forward_kernel_dirty: true,
+            ar_forward_replay_enabled: false,
+            ar_forward_binding: 0,
+            ar_graph_eligible: true,
+            ar_segments: Vec::new(),
+            verify: cache(),
+            replay: cache(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::VmmResourceMove;
+
+    fn one_move() -> VmmResourceMove {
+        VmmResourceMove {
+            old_base: 0x7f00_0000_0000,
+            new_base: 0x7f00_0100_0000,
+            reserved_bytes: 0x20_0000,
+            mapped_bytes: 0x20_0000,
+            owner_generation: 1,
+        }
+    }
+
+    #[test]
+    fn relocation_without_graph_state_is_ok() {
+        let state = GraphState::empty_for_test();
+        assert!(!state.holds_captured_graph_state());
+        state.check_relocation_supported(&[]).expect("empty moves");
+        state
+            .check_relocation_supported(&[one_move()])
+            .expect("no graph state to relocate");
+    }
+
+    #[test]
+    fn relocation_with_graph_state_fails_closed() {
+        let mut state = GraphState::empty_for_test();
+        state.verify.capturing = Some(4);
+        assert!(state.holds_captured_graph_state());
+        state.check_relocation_supported(&[]).expect("empty moves");
+        let error = state
+            .check_relocation_supported(&[one_move()])
+            .expect_err("captured graph state must refuse relocation");
+        assert!(error.message.contains("not implemented"), "{}", error.message);
+    }
 }

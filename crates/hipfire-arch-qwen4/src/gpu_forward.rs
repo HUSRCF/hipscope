@@ -126,7 +126,7 @@ pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u
 /// Free device memory a chunk rung must leave beside its chunk-sized
 /// resources for the kernels' lazily sized workspaces (333-347 MiB at
 /// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
-pub(crate) const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
+pub const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
 
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
@@ -2374,14 +2374,12 @@ impl Qwen4GpuForward {
             .map_err(|error| invalid(format!("{ROUTE_TRACE_ENV}: {error}")))
     }
 
-    fn validate_request(
+    /// Token-only request checks shared by every forward entry: non-empty,
+    /// within context capacity, inside the embedding vocabulary.
+    fn validate_tokens(
         &self,
         bundle: &Qwen4Bundle,
         tokens: &[u32],
-        logits: &GpuTensor,
-        top1: Option<&GpuTensor>,
-        wide_hidden_capture: Option<&GpuTensor>,
-        output_rows: Qwen4OutputRows,
     ) -> Result<(), Qwen4GpuForwardError> {
         if tokens.is_empty() {
             return Err(invalid("Qwen4 forward cannot process an empty token slice"));
@@ -2407,6 +2405,20 @@ impl Qwen4GpuForward {
                 "Qwen4 token id is outside the embedding vocabulary",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_request(
+        &self,
+        bundle: &Qwen4Bundle,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_rows: Qwen4OutputRows,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.validate_tokens(bundle, tokens)?;
+        let config = &bundle.config;
         let requested_rows = output_rows.count(tokens.len());
         let expected_logits = requested_rows
             .checked_mul(config.vocab_size)
@@ -2485,7 +2497,7 @@ impl Qwen4GpuForward {
             gpu,
             std::slice::from_ref(&token),
             None,
-            logits,
+            Some(logits),
             top1,
             None,
             Qwen4OutputPolicy::Rows(Qwen4OutputRows::Final),
@@ -2510,7 +2522,7 @@ impl Qwen4GpuForward {
             gpu,
             std::slice::from_ref(&placeholder),
             token.is_none().then_some(logits),
-            logits,
+            Some(logits),
             None,
             None,
             Qwen4OutputPolicy::Rows(Qwen4OutputRows::Final),
@@ -2543,23 +2555,8 @@ impl Qwen4GpuForward {
             output_rows,
         )?;
         // Start the first tile's PLE rows now, ahead of the output-resource
-        // preflight, unless a retained lookahead already names them. The
-        // tile's forward adopts this ticket (same epoch, same ids).
-        let first_ids = bundle.state.ple_history.row_ids(
-            &bundle.ple_metadata,
-            &tokens[..tokens.len().min(self.scratch.max_chunk)],
-        );
-        if !self
-            .ple_ahead
-            .as_ref()
-            .is_some_and(|ticket| bundle.ple_rows.ticket_matches(ticket, &first_ids))
-        {
-            drop(self.ple_ahead.take());
-            self.ple_ahead = bundle
-                .ple_rows
-                .prefetch(bundle.ple_rows.current_epoch(), first_ids)
-                .ok();
-        }
+        // preflight.
+        self.prefetch_first_tile_ple(bundle, tokens);
         let vocab = bundle.config.vocab_size;
         let max_chunk = self.scratch.max_chunk;
         let preflight_rows = if output_rows == Qwen4OutputRows::Final {
@@ -2579,15 +2576,10 @@ impl Qwen4GpuForward {
         let mut offset = 0usize;
         while offset < tokens.len() {
             let rows = (tokens.len() - offset).min(max_chunk);
-            let final_chunk = offset + rows == tokens.len();
-            if final_chunk {
-                self.ple_lookahead = caller_lookahead.take().unwrap_or_default();
-            } else {
-                let next = offset + rows;
-                self.ple_lookahead.clear();
-                self.ple_lookahead
-                    .extend_from_slice(&tokens[next..(next + max_chunk).min(tokens.len())]);
-            }
+            // The caller's lookahead belongs to the final tile; earlier tiles
+            // look ahead to the next tile.
+            let final_chunk =
+                self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
             let selected_rows = output_rows.count(rows);
             let logits_offset = if output_rows == Qwen4OutputRows::All {
                 offset
@@ -2634,7 +2626,7 @@ impl Qwen4GpuForward {
                 gpu,
                 &tokens[offset..offset + rows],
                 None,
-                &logits_chunk,
+                Some(&logits_chunk),
                 top1_chunk.as_ref(),
                 capture_chunk.as_ref(),
                 output_policy,
@@ -2646,6 +2638,86 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    /// Run bounded forward tiles that only commit model state: every tile
+    /// takes [`Qwen4OutputPolicy::None`], so no head, logits, top-1 or wide
+    /// hidden rows are produced. Tiles are `scratch.max_chunk` rows from the
+    /// start of `tokens`, exactly as [`Self::forward_chunk`] tiles them, so a
+    /// prefill split at tile multiples keeps the trunk numerics byte-identical.
+    pub(crate) fn forward_chunk_silent(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
+        self.validate_tokens(bundle, tokens)?;
+        self.prefetch_first_tile_ple(bundle, tokens);
+        let max_chunk = self.scratch.max_chunk;
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let rows = (tokens.len() - offset).min(max_chunk);
+            self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
+            self.forward_chunk_inner(
+                bundle,
+                gpu,
+                &tokens[offset..offset + rows],
+                None,
+                None,
+                None,
+                None,
+                Qwen4OutputPolicy::None,
+            )?;
+            offset = offset
+                .checked_add(rows)
+                .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
+        }
+        Ok(())
+    }
+
+    /// Start the first tile's PLE rows now, unless a retained lookahead
+    /// already names them. The tile's forward adopts this ticket (same epoch,
+    /// same ids).
+    fn prefetch_first_tile_ple(&mut self, bundle: &Qwen4Bundle, tokens: &[u32]) {
+        let first_ids = bundle.state.ple_history.row_ids(
+            &bundle.ple_metadata,
+            &tokens[..tokens.len().min(self.scratch.max_chunk)],
+        );
+        if !self
+            .ple_ahead
+            .as_ref()
+            .is_some_and(|ticket| bundle.ple_rows.ticket_matches(ticket, &first_ids))
+        {
+            drop(self.ple_ahead.take());
+            self.ple_ahead = bundle
+                .ple_rows
+                .prefetch(bundle.ple_rows.current_epoch(), first_ids)
+                .ok();
+        }
+    }
+
+    /// Name what follows the tile at `tokens[offset..offset + rows]`: the
+    /// caller's lookahead for the final tile, the next tile's rows otherwise.
+    /// Returns whether this is the final tile.
+    fn set_tile_ple_lookahead(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        rows: usize,
+        caller_lookahead: &mut Option<Vec<u32>>,
+    ) -> bool {
+        let final_chunk = offset + rows == tokens.len();
+        if final_chunk {
+            self.ple_lookahead = caller_lookahead.take().unwrap_or_default();
+        } else {
+            let next = offset + rows;
+            self.ple_lookahead.clear();
+            self.ple_lookahead.extend_from_slice(
+                &tokens[next..(next + self.scratch.max_chunk).min(tokens.len())],
+            );
+        }
+        final_chunk
+    }
+
     /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
     /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
@@ -2655,7 +2727,7 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         tokens: &[u32],
         argmax_of: Option<&GpuTensor>,
-        logits: &GpuTensor,
+        logits: Option<&GpuTensor>,
         top1: Option<&GpuTensor>,
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
@@ -2682,7 +2754,7 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         tokens: &[u32],
         argmax_of: Option<&GpuTensor>,
-        logits: &GpuTensor,
+        logits: Option<&GpuTensor>,
         top1: Option<&GpuTensor>,
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
@@ -2728,6 +2800,9 @@ impl Qwen4GpuForward {
         let dims = program_dims(&config);
         let requested_rows = output_policy.requested_rows(n);
         if let Some(requested_rows) = requested_rows {
+            let logits = logits.ok_or_else(|| {
+                invalid("Qwen4 head output policy requires a logits tensor")
+            })?;
             let expected_logits = requested_rows
                 .checked_mul(config.vocab_size)
                 .ok_or_else(|| invalid("logit shape overflow"))?;
@@ -2823,6 +2898,8 @@ impl Qwen4GpuForward {
             let lm_head = lm_head
                 .as_ref()
                 .ok_or_else(|| invalid("Qwen4 LM head preflight disappeared"))?;
+            let logits = logits
+                .ok_or_else(|| invalid("Qwen4 logits output disappeared before preflight"))?;
             let preflight_scratch = layer_scratch(&self.scratch, &self.scratch.router_logits);
             validate_final_hyper(
                 dims,
@@ -3658,6 +3735,9 @@ impl Qwen4GpuForward {
                 let lm_head = lm_head
                     .as_ref()
                     .ok_or_else(|| invalid("Qwen4 LM head disappeared before execution"))?;
+                let logits = logits.ok_or_else(|| {
+                    invalid("Qwen4 logits output disappeared before execution")
+                })?;
                 execute_final_hyper(
                     gpu,
                     dims,

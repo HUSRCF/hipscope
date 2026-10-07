@@ -2392,6 +2392,68 @@ fn commit_qwen4_prefix(model: &mut LoadedModel) {
     }
 }
 
+/// Turn boundaries of a canonical Qwen4 prompt: the position just after every
+/// `<|im_end|>` token, ascending. Empty when the terminator id is unknown.
+pub fn qwen4_turn_boundaries(prompt: &[u32], im_end: Option<u32>) -> Vec<usize> {
+    let Some(im_end) = im_end else {
+        return Vec::new();
+    };
+    prompt
+        .iter()
+        .enumerate()
+        .filter(|&(_, &token)| token == im_end)
+        .map(|(index, _)| index + 1)
+        .collect()
+}
+
+/// Selects the authoritative Qwen4 prefix plan for a fully canonical prompt:
+/// publishes the prompt's turn boundaries, then asks the bundle to pick the
+/// deepest restorable prefix among the live/prompt candidate `local_start` and
+/// the radix checkpoints. The bundle keeps the selection pending until its
+/// prefill binds it (or `abandon_prefix_selection`). `None` when the model has
+/// no Qwen4 bundle.
+fn qwen4_select_prefix_plan(
+    model: &mut LoadedModel,
+    prompt: &[u32],
+    local_start: usize,
+    mode: hipfire_arch_qwen4::bundle::Qwen4PrefixMode,
+) -> Option<Result<hipfire_arch_qwen4::bundle::Qwen4PrefixPlan, String>> {
+    let im_end = model
+        .tokenizer
+        .as_ref()
+        .and_then(|tokenizer| tokenizer.special_token_id("<|im_end|>"));
+    let boundaries = qwen4_turn_boundaries(prompt, im_end);
+    let bundle = model.qwen4_mut()?;
+    bundle.set_prefix_turn_boundaries(&boundaries);
+    let selected = bundle
+        .select_prefix_plan(prompt, local_start, mode)
+        .map_err(|error| error.to_string());
+    if let Ok(plan) = &selected {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            eprintln!(
+                "[qwen-cache qwen4-select] local={} selected={} source={:?} prompt={}",
+                local_start,
+                plan.start_pos,
+                plan.source(),
+                prompt.len()
+            );
+        }
+    }
+    Some(selected)
+}
+
+/// Drops a pending Qwen4 prefix selection (and its pins) that no prefill
+/// consumed. No-op for other families and when nothing is pending.
+fn abandon_qwen4_prefix_selection(model: &mut LoadedModel) {
+    if let Some(bundle) = model.qwen4_mut() {
+        bundle.abandon_prefix_selection();
+    }
+}
+
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
 /// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
 /// so the DFlash path can use it too. Renders the canonical conversation via
@@ -3125,7 +3187,7 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
-    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash): (
+    let (mut prefill_tokens, mut prefill_start, mut cache_hit, mut cached_tokens_dflash): (
         Vec<u32>,
         usize,
         bool,
@@ -3139,6 +3201,42 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
+    // Native Qwen4 MTP: the bundle's radix/live/prompt selection runs on the
+    // full canonical prompt (no local lineage required) and its `start_pos`
+    // becomes the authoritative restored prefix. The selection stays pending
+    // until the drafter's prefill binds it through `bind_prefix_plan`; the
+    // local planner's input and decision above are unchanged.
+    if qwen4_native_mtp
+        && !cache_disabled
+        && m.eviction.is_none()
+        && pflash_bypass_reason.is_none()
+        && m.qwen4()
+            .is_some_and(|bundle| bundle.prefix_cache_attached())
+    {
+        match qwen4_select_prefix_plan(
+            m,
+            &prompt_tokens,
+            prefill_start,
+            hipfire_arch_qwen4::bundle::Qwen4PrefixMode::NativeMtp,
+        ) {
+            Some(Ok(sel)) => {
+                let start = sel.start_pos.min(prompt_tokens.len());
+                prefill_start = start;
+                prefill_tokens = prompt_tokens[start..].to_vec();
+                cache_hit = start > 0;
+                cached_tokens_dflash = start;
+            }
+            Some(Err(e)) => {
+                eprintln!("[qwen-cache] qwen4 MTP select failed ({e}); cold prefill");
+                abandon_qwen4_prefix_selection(m);
+                prefill_start = 0;
+                prefill_tokens = prompt_tokens.clone();
+                cache_hit = false;
+                cached_tokens_dflash = 0;
+            }
+            None => {}
+        }
+    }
     // Native Qwen4 MTP: a hit (live continuation or end-of-prompt restore) is
     // bound by the drafter's prefill from this plan's start. The host mirrors
     // match the planned prefix; the bundle owns the device state.
@@ -3238,7 +3336,13 @@ pub fn generate_dflash(
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
-        None => return true,
+        // Every exit before the drafter's prefill (validation, context-length,
+        // abort) leaves the Qwen4 selection pending; a prefill that ran
+        // already consumed it (no-op then).
+        None => {
+            abandon_qwen4_prefix_selection(m);
+            return true;
+        }
     };
     debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
 
@@ -8217,24 +8321,49 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // Bind the shared planner's start to the bundle's live or end-of-prompt
-    // owner (no state touched). The prefill callback then begins from that
-    // owner and runs `prompt_tokens[start_pos..]` once; a bind failure is a
-    // cold prefill. Host mirrors are rebuilt from the full prompt after a
+    // Select the authoritative start. With the bundle's prefix cache attached
+    // (and caching enabled) the radix/live/prompt selection runs on the full
+    // canonical prompt even without a local lineage; its `start_pos` is what
+    // the prefill restores and what is reported as cached. Otherwise bind the
+    // shared planner's start to the bundle's live or end-of-prompt owner (no
+    // state touched). The prefill callback then begins from that owner and
+    // runs `prompt_tokens[start..]` once; a selection/bind failure is a cold
+    // prefill. Host mirrors are rebuilt from the full prompt after a
     // successful prefill.
-    let prefix_plan = match m.qwen4().map(|bundle| {
-        bundle.bind_prefix_plan(
+    let radix_eligible = !cache_disabled
+        && m.eviction.is_none()
+        && m.qwen4()
+            .is_some_and(|bundle| bundle.prefix_cache_attached());
+    let prefix_plan = if radix_eligible {
+        match qwen4_select_prefix_plan(
+            m,
             &prompt_tokens,
             start_pos,
             hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar,
-        )
-    }) {
-        Some(Ok(plan)) => plan,
-        Some(Err(e)) => {
-            eprintln!("[qwen-cache] qwen4 AR bind failed ({e}); cold prefill");
-            hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default()
+        ) {
+            Some(Ok(plan)) => plan,
+            Some(Err(e)) => {
+                eprintln!("[qwen-cache] qwen4 AR select failed ({e}); cold prefill");
+                abandon_qwen4_prefix_selection(m);
+                hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default()
+            }
+            None => hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default(),
         }
-        None => hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default(),
+    } else {
+        match m.qwen4().map(|bundle| {
+            bundle.bind_prefix_plan(
+                &prompt_tokens,
+                start_pos,
+                hipfire_arch_qwen4::bundle::Qwen4PrefixMode::Ar,
+            )
+        }) {
+            Some(Ok(plan)) => plan,
+            Some(Err(e)) => {
+                eprintln!("[qwen-cache] qwen4 AR bind failed ({e}); cold prefill");
+                hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default()
+            }
+            None => hipfire_arch_qwen4::bundle::Qwen4PrefixPlan::default(),
+        }
     };
     m.seq_pos = 0;
     m.conversation_tokens.clear();
@@ -8291,4 +8420,7 @@ pub fn generate_qwen4_ar(
         },
         commit_qwen4_prefix,
     );
+    // An abort or validation error before the prefill leaves the selection
+    // pending; a prefill that ran already consumed it (no-op then).
+    abandon_qwen4_prefix_selection(m);
 }

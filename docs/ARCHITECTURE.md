@@ -453,6 +453,71 @@ of the 128 TiB user VA space. Growth inside a live arena only ever maps
 fresh offsets. A failed access reset in `map_next` poisons the arena instead of
 letting a retry map a new handle at the address it just unmapped.
 
+### Qwen4 radix prefix cache
+
+Flash-Next (Qwen4) keeps many exact-boundary checkpoints per loaded model so
+requests that share a prefix with *any* earlier request, not only the last
+session, skip that prefill. It builds on the VMM backend above and does not
+apply to legacy KV; there is no AR-only fallback tier and no hipGraph route
+(Qwen4 replays prepared PM4, below).
+
+- **Logical pages vs physical granules.** `PrefixIndex` (radix tree) and
+  `PagePool` external descriptors track 128-token logical pages: metadata
+  only, no device bytes. Device memory is VMM *granules*, one HIP physical
+  handle each, shared by every checkpoint that aliases them under a lease. A
+  granule is released only when its last lease drops, so evicting a
+  descriptor can reclaim zero bytes; budget loops stop on physical bytes
+  reclaimed, never on page counts.
+- **Exact-boundary checkpoints.** A checkpoint at token boundary `B` is a
+  bounded target + head payload held in reusable slots plus a per-arena
+  *context manifest*: whole granules below the immutable end are aliased (not
+  copied), and one packed frontier slab carries everything at or past it,
+  including the raw-index tail that an in-place restore would overwrite (the
+  restore guard). Publication seals the aliased granules; the index
+  publishes only complete 128-token pages plus the exact boundary.
+- **Fork = fresh VAs, typed relocation.** A restore is in place only when
+  the checkpoint's bank is still the live bank with unchanged rows and no
+  sealed granule lies above the bytes the restore writes. Otherwise it
+  builds a new bank: fresh, never-mapped VMM VAs (on gfx1151 and gfx1201
+  alike) alias the immutable physical granules and receive a private copy of
+  the frontier. A used VA is never remapped, which is what keeps the
+  stale-translation caveat above out of the data path. The prepared
+  tapes are not re-recorded: typed PM4 resource relocation rebinds the moved
+  resources in the prepared kernarg slots and the recorded HIP-oracle
+  snapshots within the same IB / prepared generation. A **sealed bank is
+  never written**; a cold start or reset swaps an empty fresh bank in for
+  every sealed one.
+- **Selection.** Per request: Live continuation wins when its depth is at
+  least the best radix depth; otherwise the deepest checkpoint; the local
+  end-of-prompt (EOP) entry wins ties. A hit always prefills a non-empty
+  suffix.
+- **What is captured.** EOP always. An *anchor* (the shared turn-prefix
+  boundary, at least 128 tokens) is captured only on the **second**
+  observation of that prefix, so one-off prompts never pay for it. A
+  *periodic* checkpoint is taken at a natural chunk end at least 8192
+  tokens past the previous boundary, at most once per request. Optional
+  captures that fail are dropped, not fatal.
+- **Eviction and budget.** GDSF: priority = aging clock + recompute cost x
+  (1 + hits) / physical bytes, with cost superlinear in context length;
+  pinned and staged entries are protected. The device ledger counts physical
+  granule + packed bytes once. The cap is `min(arch cap, post-placement
+  slack)`: 1 GiB / 8 checkpoints on gfx1151, 512 MiB / 4 on gfx1201, plus a
+  32 MiB host budget. The cache attaches *after* expert placement,
+  scratch, context, and native-MTP reservations are fixed, so it only takes
+  what placement left free, is reclaimable before context growth, and never
+  changes expert placement, chunk size, quantization, or MTP admission. If
+  slack cannot hold two entries the load logs that multi-entry is blocked.
+- **Concurrency.** Queued, not parallel: one request executes at a time per
+  loaded model; HTTP concurrency queues and there is no GPU slot scheduler.
+- **Retired-VA accounting.** Releasing a bank (fork replacing the live bank,
+  sealed-bank swap, unload) retires its VA range instead of freeing it, as
+  above; it counts against the same 64 TiB budget via
+  `hip_bridge::retired_va_bytes()`, which the per-request
+  `[qwen4-radix] begin` trace and the cache stats report.
+
+Switch and trace: `HIPFIRE_QWEN_PROMPT_CACHE` / `HIPFIRE_QWEN_CACHE_TRACE`
+(see [`env-vars.md`](env-vars.md)).
+
 ## Observability hooks
 
 Examples (full list: [`env-vars.md`](env-vars.md)):

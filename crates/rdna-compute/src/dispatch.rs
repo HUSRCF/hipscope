@@ -10,7 +10,8 @@ use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{
     DeviceBuffer, HipError, HipMemAllocationProp, HipMemGenericAllocationHandle, HipResult,
-    HipRuntime, Rocblas, VmmArena, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HipRuntime, Rocblas, VmmArena, VmmPhysicalId, VmmSharedPrefix,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -438,6 +439,180 @@ impl GpuTensor {
             dtype: self.dtype,
         }
     }
+}
+
+/// Byte alignment of every frontier entry inside a [`VmmPrefixSet`] slab.
+const VMM_PREFIX_SLAB_ALIGN: usize = 256;
+
+/// One registered VMM owner to checkpoint with [`Gpu::capture_vmm_prefixes`].
+///
+/// `valid_bytes` is the live prefix of the tensor (`<=` its mapped bytes);
+/// `writable_from` is the first byte that a restore may still rewrite in place
+/// (`<= valid_bytes`). Bytes below `writable_from` that fill whole leading
+/// physical granules are aliased instead of copied.
+pub struct VmmPrefixSpec<'a> {
+    pub tensor: &'a GpuTensor,
+    pub valid_bytes: usize,
+    pub writable_from: usize,
+}
+
+/// Per-arena record of a [`VmmPrefixSet`].
+struct VmmPrefixEntry {
+    shape: Vec<usize>,
+    dtype: DType,
+    logical_bytes: usize,
+    reserved_bytes: usize,
+    valid_bytes: usize,
+    writable_from: usize,
+    alias_bytes: usize,
+    slab_offset: usize,
+    prefix: VmmSharedPrefix,
+}
+
+/// A retained prefix of several VMM owners: leases on the aliased leading
+/// granules plus ONE packed slab holding the byte-exact frontier copies.
+///
+/// Release it with [`Gpu::free_vmm_prefixes`]; dropping it leaks the leases.
+#[must_use = "a VmmPrefixSet holds physical granule leases; release it with Gpu::free_vmm_prefixes"]
+pub struct VmmPrefixSet {
+    entries: Vec<VmmPrefixEntry>,
+    slab: Option<GpuTensor>,
+    slab_bytes: usize,
+}
+
+impl VmmPrefixSet {
+    /// Number of arenas in the set.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Sum of aliased (shared, uncopied) bytes.
+    pub fn alias_bytes(&self) -> usize {
+        self.entries.iter().map(|entry| entry.alias_bytes).sum()
+    }
+
+    /// Sum of copied frontier bytes.
+    pub fn frontier_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.valid_bytes - entry.alias_bytes)
+            .sum()
+    }
+
+    /// Actual slab allocation, including alignment padding (0 when nothing was copied).
+    pub fn slab_bytes(&self) -> usize {
+        self.slab_bytes
+    }
+
+    /// Valid bytes recorded for arena `arena`. Panics when `arena >= len()`.
+    pub fn valid_bytes(&self, arena: usize) -> usize {
+        self.entries[arena].valid_bytes
+    }
+
+    /// Aliased bytes recorded for arena `arena`. Panics when `arena >= len()`.
+    pub fn arena_alias_bytes(&self, arena: usize) -> usize {
+        self.entries[arena].alias_bytes
+    }
+
+    /// First in-place-writable byte recorded for arena `arena`. Panics when `arena >= len()`.
+    pub fn arena_writable_from(&self, arena: usize) -> usize {
+        self.entries[arena].writable_from
+    }
+
+    /// Every aliased physical granule, arena by arena, in offset order.
+    pub fn physical_granules(&self) -> impl Iterator<Item = (VmmPhysicalId, usize)> + '_ {
+        self.entries
+            .iter()
+            .flat_map(|entry| entry.prefix.granules().iter().copied())
+    }
+}
+
+/// Re-pointing of one VMM owner to its replacement for [`Gpu::relocate_qsa_resources`].
+/// `reserved_bytes`, `mapped_bytes` and `owner_generation` describe the NEW owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmmResourceMove {
+    pub old_base: usize,
+    pub new_base: usize,
+    pub reserved_bytes: usize,
+    pub mapped_bytes: usize,
+    pub owner_generation: u64,
+}
+
+/// Largest granule boundary `<= limit` over consecutive granule sizes in
+/// offset order. A granule that would cross `limit` (or has no bytes) ends the walk.
+fn vmm_alias_boundary(granule_sizes: impl IntoIterator<Item = usize>, limit: usize) -> usize {
+    let mut end = 0usize;
+    for size in granule_sizes {
+        match end.checked_add(size) {
+            Some(next) if size != 0 && next <= limit => end = next,
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Packed slab layout: per-entry offsets (each [`VMM_PREFIX_SLAB_ALIGN`]-aligned)
+/// and the total slab bytes. `None` when the layout overflows `usize`.
+fn vmm_slab_layout(lens: &[usize]) -> Option<(Vec<usize>, usize)> {
+    let mut offsets = Vec::with_capacity(lens.len());
+    let mut cursor = 0usize;
+    for &len in lens {
+        offsets.push(cursor);
+        cursor = cursor
+            .checked_add(len)?
+            .checked_next_multiple_of(VMM_PREFIX_SLAB_ALIGN)?;
+    }
+    Some((offsets, cursor))
+}
+
+/// Host-only shape checks for a relocation batch: non-empty extents, mapped
+/// within reserved, no overflow, and no duplicate or overlapping old ranges
+/// (or new ranges).
+fn validate_vmm_move_ranges(moves: &[VmmResourceMove]) -> Result<(), String> {
+    let mut old_ranges: Vec<(usize, usize)> = Vec::with_capacity(moves.len());
+    let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(moves.len());
+    for (index, mv) in moves.iter().enumerate() {
+        if mv.reserved_bytes == 0 {
+            return Err(format!("VMM move {index}: reserved_bytes is zero"));
+        }
+        if mv.mapped_bytes > mv.reserved_bytes {
+            return Err(format!(
+                "VMM move {index}: mapped {} exceeds reserved {}",
+                mv.mapped_bytes, mv.reserved_bytes
+            ));
+        }
+        let old_end = mv.old_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
+            format!("VMM move {index}: old range 0x{:x}+{} overflows", mv.old_base, mv.reserved_bytes)
+        })?;
+        let new_end = mv.new_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
+            format!("VMM move {index}: new range 0x{:x}+{} overflows", mv.new_base, mv.reserved_bytes)
+        })?;
+        old_ranges.push((mv.old_base, old_end));
+        new_ranges.push((mv.new_base, new_end));
+    }
+    for (label, ranges) in [("old", &mut old_ranges), ("new", &mut new_ranges)] {
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(format!(
+                    "VMM move batch has duplicate or overlapping {label} ranges: 0x{:x}..0x{:x} and 0x{:x}..0x{:x}",
+                    pair[0].0, pair[0].1, pair[1].0, pair[1].1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Capture-time plan for one [`VmmPrefixSpec`].
+struct VmmPrefixPlan {
+    key: usize,
+    mapped: usize,
+    alias: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -884,6 +1059,13 @@ pub struct Gpu {
     /// VMM owners keyed by their base virtual address. VMM-backed tensors use
     /// non-owning DeviceBuffer views and must bypass GpuPool/hipFree teardown.
     vmm_arenas: HashMap<usize, VmmArena>,
+    /// Monotonic owner generation of every registered VMM owner, keyed like
+    /// `vmm_arenas` and recorded at registration (alloc and fork). A base
+    /// address is never reused for a live owner, but the generation lets
+    /// relocation prove a new owner is the one it was told about.
+    vmm_generations: HashMap<usize, u64>,
+    /// Last generation handed out; owner generations start at 1.
+    vmm_generation_counter: u64,
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
@@ -1609,6 +1791,8 @@ impl Gpu {
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
             vmm_arenas: HashMap::new(),
+            vmm_generations: HashMap::new(),
+            vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
             active_stream: None,
@@ -4276,7 +4460,22 @@ impl Gpu {
                 return Err(self.retain_failed_vmm_arena(arena, err));
             }
         }
-        let buf = match arena.owner_buffer(byte_size) {
+        self.register_vmm_arena(arena, byte_size, shape, dtype)
+    }
+
+    /// Register a mapped arena as the owner of a new VMM tensor, stamping the
+    /// next owner generation. Any failure retires the arena through the
+    /// orphan table, exactly like the allocation path always did.
+    fn register_vmm_arena(
+        &mut self,
+        arena: VmmArena,
+        byte_size: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> HipResult<GpuTensor> {
+        // SAFETY: exactly one owner descriptor is created for this arena and it
+        // is registered below (or the arena is released on failure).
+        let buf = match unsafe { arena.owner_buffer(byte_size) } {
             Ok(buf) => buf,
             Err(err) => {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -4288,6 +4487,8 @@ impl Gpu {
                 HipError::new(0, &format!("duplicate VMM tensor base address 0x{key:x}"));
             return Err(self.retain_failed_vmm_arena(arena, duplicate));
         }
+        self.vmm_generation_counter += 1;
+        self.vmm_generations.insert(key, self.vmm_generation_counter);
         self.vmm_arenas.insert(key, arena);
         Ok(GpuTensor {
             buf,
@@ -4416,6 +4617,28 @@ impl Gpu {
         additional_bytes: usize,
         access_devices: &[i32],
     ) -> HipResult<usize> {
+        self.grow_vmm_tensor_impl(tensor, additional_bytes, access_devices, false)
+    }
+
+    /// [`Self::grow_vmm_tensor`] that maps the new bytes as physical granules
+    /// (`VmmArena::map_next_granules`) so they can later be shared by a prefix
+    /// capture. Returns the new mapped bytes.
+    pub fn grow_vmm_tensor_granules(
+        &mut self,
+        tensor: &mut GpuTensor,
+        additional_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<usize> {
+        self.grow_vmm_tensor_impl(tensor, additional_bytes, access_devices, true)
+    }
+
+    fn grow_vmm_tensor_impl(
+        &mut self,
+        tensor: &mut GpuTensor,
+        additional_bytes: usize,
+        access_devices: &[i32],
+        granules: bool,
+    ) -> HipResult<usize> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
         let logical_bytes = tensor.byte_size();
@@ -4425,7 +4648,11 @@ impl Gpu {
                 &format!("tensor at 0x{key:x} is not a registered VMM owner"),
             )
         })?;
-        arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        if granules {
+            arena.map_next_granules(&self.hip, additional_bytes, access_devices)?;
+        } else {
+            arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        }
         let mapped_bytes = arena.mapped_bytes();
         tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
         Ok(mapped_bytes)
@@ -4444,6 +4671,469 @@ impl Gpu {
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::granularity)
+    }
+
+    /// Monotonic owner generation recorded when `tensor` was registered
+    /// (`alloc_vmm_tensor` or a prefix fork); `None` when it is not a registered owner.
+    pub fn vmm_owner_generation(&self, tensor: &GpuTensor) -> Option<u64> {
+        // bind_thread: skip — pure map lookup, touches no device state.
+        self.vmm_generations
+            .get(&(tensor.buf.as_ptr() as usize))
+            .copied()
+    }
+
+    /// Reserved virtual bytes of a registered VMM owner.
+    pub fn vmm_reserved_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::reserved_bytes)
+    }
+
+    /// End offset of the last granule of a registered VMM owner that is shared
+    /// (lease count above one). Bytes below it must never be written.
+    pub fn vmm_sealed_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::sealed_bytes)
+    }
+
+    /// Mapped physical granules `(id, bytes)` of a registered VMM owner in offset order.
+    pub fn vmm_physical_granules(&self, tensor: &GpuTensor) -> Option<Vec<(VmmPhysicalId, usize)>> {
+        // bind_thread: skip — pure map lookup, touches no device state.
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::physical_granules)
+    }
+
+    /// The relocation record that re-points `old` to `new`, or `None` unless both
+    /// are registered VMM owners. Extents and generation describe the NEW owner.
+    pub fn vmm_resource_move(&self, old: &GpuTensor, new: &GpuTensor) -> Option<VmmResourceMove> {
+        // bind_thread: skip — pure map lookup, touches no device state.
+        let old_base = old.buf.as_ptr() as usize;
+        let new_base = new.buf.as_ptr() as usize;
+        self.vmm_arenas.get(&old_base)?;
+        let new_arena = self.vmm_arenas.get(&new_base)?;
+        let owner_generation = *self.vmm_generations.get(&new_base)?;
+        Some(VmmResourceMove {
+            old_base,
+            new_base,
+            reserved_bytes: new_arena.reserved_bytes(),
+            mapped_bytes: new_arena.mapped_bytes(),
+            owner_generation,
+        })
+    }
+
+    fn refuse_vmm_prefix_op_while_armed(&self, op: &str) -> HipResult<()> {
+        if self.graphs.capture_mode
+            || self.graphs.verify.capturing.is_some()
+            || self.graphs.replay.capturing.is_some()
+            || self.replay.is_recording()
+        {
+            return Err(HipError::new(
+                0,
+                &format!("VMM prefix {op} refused while a graph capture or replay record is armed"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release every lease of `entries` and free the slab; returns the first error
+    /// after attempting all of them.
+    fn discard_vmm_prefix_parts(
+        &mut self,
+        entries: Vec<VmmPrefixEntry>,
+        slab: Option<GpuTensor>,
+    ) -> Option<HipError> {
+        let mut first_error = None;
+        for entry in entries {
+            if let Err(err) = entry.prefix.release(&self.hip) {
+                first_error.get_or_insert(err);
+            }
+        }
+        if let Some(slab) = slab {
+            if let Err(err) = self.free_tensor(slab) {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error
+    }
+
+    /// Checkpoint the leading granules and frontier of several registered VMM
+    /// owners. Whole leading granules below `min(valid, writable_from)` are shared
+    /// by lease (no copy); `[alias, valid)` of every arena is copied byte-exact into
+    /// ONE slab on the active/default stream. On failure every lease taken and the
+    /// slab are released. Refused while a graph capture or replay record is armed.
+    pub fn capture_vmm_prefixes(&mut self, specs: &[VmmPrefixSpec<'_>]) -> HipResult<VmmPrefixSet> {
+        self.bind_thread()?;
+        self.refuse_vmm_prefix_op_while_armed("capture")?;
+        let mut plans: Vec<VmmPrefixPlan> = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.iter().enumerate() {
+            let key = spec.tensor.buf.as_ptr() as usize;
+            let arena = match self.vmm_arenas.get(&key) {
+                Some(arena) if spec.tensor.buf.is_vmm_owner() => arena,
+                _ => {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "VMM prefix spec {index}: tensor at 0x{key:x} is not a registered VMM owner"
+                        ),
+                    ));
+                }
+            };
+            if plans.iter().any(|plan| plan.key == key) {
+                return Err(HipError::new(
+                    0,
+                    &format!("VMM prefix spec {index}: duplicate tensor at 0x{key:x}"),
+                ));
+            }
+            let mapped = arena.mapped_bytes();
+            if spec.valid_bytes > mapped {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM prefix spec {index}: valid {} exceeds mapped {mapped}",
+                        spec.valid_bytes
+                    ),
+                ));
+            }
+            if spec.writable_from > spec.valid_bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM prefix spec {index}: writable_from {} exceeds valid {}",
+                        spec.writable_from, spec.valid_bytes
+                    ),
+                ));
+            }
+            let limit = spec
+                .valid_bytes
+                .min(spec.writable_from)
+                .min(arena.granule_prefix_bytes());
+            let alias = vmm_alias_boundary(
+                arena
+                    .physical_granules()
+                    .into_iter()
+                    .map(|(_, bytes)| bytes),
+                limit,
+            );
+            plans.push(VmmPrefixPlan { key, mapped, alias });
+        }
+        let frontier_lens: Vec<usize> = specs
+            .iter()
+            .zip(&plans)
+            .map(|(spec, plan)| spec.valid_bytes - plan.alias)
+            .collect();
+        let (offsets, slab_bytes) = vmm_slab_layout(&frontier_lens)
+            .ok_or_else(|| HipError::new(0, "VMM prefix slab layout overflowed"))?;
+        let slab = if slab_bytes > 0 {
+            Some(self.alloc_tensor(&[slab_bytes], DType::Raw)?)
+        } else {
+            None
+        };
+
+        let mut entries: Vec<VmmPrefixEntry> = Vec::with_capacity(specs.len());
+        let mut failure = None;
+        for (index, (spec, plan)) in specs.iter().zip(&plans).enumerate() {
+            let shared = match self.vmm_arenas.get(&plan.key) {
+                Some(arena) => arena
+                    .share_prefix(plan.alias)
+                    .map(|prefix| (prefix, arena.reserved_bytes())),
+                None => Err(HipError::new(
+                    0,
+                    &format!("VMM prefix spec {index}: owner vanished during capture"),
+                )),
+            };
+            match shared {
+                Ok((prefix, reserved_bytes)) => entries.push(VmmPrefixEntry {
+                    shape: spec.tensor.shape.clone(),
+                    dtype: spec.tensor.dtype,
+                    logical_bytes: spec.tensor.byte_size(),
+                    reserved_bytes,
+                    valid_bytes: spec.valid_bytes,
+                    writable_from: spec.writable_from,
+                    alias_bytes: plan.alias,
+                    slab_offset: offsets[index],
+                    prefix,
+                }),
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = failure {
+            return Err(self.abort_vmm_prefix_capture(entries, slab, err));
+        }
+
+        if let Some(slab_tensor) = slab.as_ref() {
+            // SAFETY: each view spans the source's mapped prefix, which stays
+            // mapped for the whole call; views are never freed.
+            let sources: Vec<DeviceBuffer> = specs
+                .iter()
+                .zip(&plans)
+                .map(|(spec, plan)| unsafe {
+                    DeviceBuffer::from_raw(spec.tensor.buf.as_ptr(), plan.mapped)
+                })
+                .collect();
+            let regions: Vec<crate::tensor_ops::CopyRegion<'_>> = entries
+                .iter()
+                .zip(&sources)
+                .filter(|(entry, _)| entry.valid_bytes > entry.alias_bytes)
+                .map(|(entry, source)| crate::tensor_ops::CopyRegion {
+                    dst: &slab_tensor.buf,
+                    dst_offset: entry.slab_offset,
+                    src: source,
+                    src_offset: entry.alias_bytes,
+                    bytes: entry.valid_bytes - entry.alias_bytes,
+                })
+                .collect();
+            if let Err(err) = crate::tensor_ops::copy_regions(self, &regions) {
+                drop(regions);
+                return Err(self.abort_vmm_prefix_capture(entries, slab, err));
+            }
+        }
+        Ok(VmmPrefixSet {
+            entries,
+            slab,
+            slab_bytes,
+        })
+    }
+
+    fn abort_vmm_prefix_capture(
+        &mut self,
+        entries: Vec<VmmPrefixEntry>,
+        slab: Option<GpuTensor>,
+        err: HipError,
+    ) -> HipError {
+        match self.discard_vmm_prefix_parts(entries, slab) {
+            Some(cleanup) => HipError::new(
+                err.code,
+                &format!("{err}; prefix cleanup also failed: {cleanup}"),
+            ),
+            None => err,
+        }
+    }
+
+    /// Build one fresh registered owner per entry of `prefix`: shared aliased
+    /// granules, private granules covering `[alias, round_up(valid, granule))`,
+    /// the slab frontier copied into `[alias, valid)` and `[valid, mapped)` of
+    /// the private part zeroed. Owners come back in entry order. On any failure
+    /// every owner created so far is freed; `prefix` is untouched and reusable.
+    /// Refused while a graph capture or replay record is armed.
+    pub fn fork_vmm_prefixes(
+        &mut self,
+        prefix: &VmmPrefixSet,
+        access_devices: &[i32],
+    ) -> HipResult<Vec<GpuTensor>> {
+        self.bind_thread()?;
+        self.refuse_vmm_prefix_op_while_armed("fork")?;
+        let mut created: Vec<GpuTensor> = Vec::with_capacity(prefix.entries.len());
+        for entry in &prefix.entries {
+            match self.fork_vmm_entry(entry, access_devices) {
+                Ok(tensor) => created.push(tensor),
+                Err(err) => return Err(self.free_forked_vmm_tensors(created, err)),
+            }
+        }
+        if let Err(err) = self.fill_forked_vmm_tensors(prefix, &created) {
+            // Queued fill kernels may still target the owners about to unmap.
+            let _ = self.hip.device_synchronize();
+            return Err(self.free_forked_vmm_tensors(created, err));
+        }
+        Ok(created)
+    }
+
+    /// Reserve and map one fork owner (no data movement).
+    fn fork_vmm_entry(
+        &mut self,
+        entry: &VmmPrefixEntry,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, entry.logical_bytes)?;
+        if arena.reserved_bytes() != entry.reserved_bytes {
+            let reserved = arena.reserved_bytes();
+            let err = HipError::new(
+                0,
+                &format!(
+                    "VMM fork reserve {reserved} differs from captured reserve {}",
+                    entry.reserved_bytes
+                ),
+            );
+            return Err(self.retain_failed_vmm_arena(arena, err));
+        }
+        if entry.alias_bytes > 0 {
+            if let Err(err) = arena.map_shared_prefix(&self.hip, &entry.prefix, access_devices) {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        }
+        if entry.valid_bytes > entry.alias_bytes {
+            let end = entry
+                .valid_bytes
+                .next_multiple_of(arena.granule_bytes())
+                .min(arena.reserved_bytes());
+            if let Err(err) =
+                arena.map_next_granules(&self.hip, end - entry.alias_bytes, access_devices)
+            {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        }
+        self.register_vmm_arena(arena, entry.logical_bytes, &entry.shape, entry.dtype)
+    }
+
+    /// Copy the slab frontiers into the fork owners and zero their private tails,
+    /// ordered on the active/default stream.
+    fn fill_forked_vmm_tensors(
+        &mut self,
+        prefix: &VmmPrefixSet,
+        forks: &[GpuTensor],
+    ) -> HipResult<()> {
+        // SAFETY: views span each fork's mapped prefix, which stays mapped for the
+        // call; they are never freed.
+        let mut targets: Vec<DeviceBuffer> = Vec::with_capacity(forks.len());
+        for fork in forks {
+            let mapped = self.vmm_mapped_bytes(fork).ok_or_else(|| {
+                HipError::new(0, "forked tensor is not a registered VMM owner")
+            })?;
+            targets.push(unsafe { DeviceBuffer::from_raw(fork.buf.as_ptr(), mapped) });
+        }
+        if let Some(slab) = prefix.slab.as_ref() {
+            let regions: Vec<crate::tensor_ops::CopyRegion<'_>> = prefix
+                .entries
+                .iter()
+                .zip(&targets)
+                .filter(|(entry, _)| entry.valid_bytes > entry.alias_bytes)
+                .map(|(entry, target)| crate::tensor_ops::CopyRegion {
+                    dst: target,
+                    dst_offset: entry.alias_bytes,
+                    src: &slab.buf,
+                    src_offset: entry.slab_offset,
+                    bytes: entry.valid_bytes - entry.alias_bytes,
+                })
+                .collect();
+            crate::tensor_ops::copy_regions(self, &regions)?;
+        }
+        for (entry, target) in prefix.entries.iter().zip(&targets) {
+            let tail = target.size().saturating_sub(entry.valid_bytes);
+            if tail == 0 {
+                continue;
+            }
+            let view = target.byte_view(entry.valid_bytes, tail);
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&view, 0, tail, stream)?,
+                None => self.hip.memset(&view, 0, tail)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn free_forked_vmm_tensors(&mut self, created: Vec<GpuTensor>, err: HipError) -> HipError {
+        let mut cleanup_error = None;
+        for tensor in created {
+            if let Err(cleanup) = self.free_tensor(tensor) {
+                cleanup_error.get_or_insert(cleanup);
+            }
+        }
+        match cleanup_error {
+            Some(cleanup) => HipError::new(
+                err.code,
+                &format!("{err}; forked owner cleanup also failed: {cleanup}"),
+            ),
+            None => err,
+        }
+    }
+
+    /// Release every lease of `prefix` and free its slab. Attempts everything and
+    /// returns the first error.
+    pub fn free_vmm_prefixes(&mut self, prefix: VmmPrefixSet) -> HipResult<()> {
+        // Release must run even when the thread bind fails, or the leases leak.
+        self.bind_thread_or_warn();
+        let VmmPrefixSet { entries, slab, .. } = prefix;
+        match self.discard_vmm_prefix_parts(entries, slab) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Re-point recorded PM4 replay state (and refuse stale hipGraphs) from old
+    /// VMM owners to their replacements. Every move is validated first: both
+    /// bases are live registered owners, `owner_generation` equals the NEW
+    /// owner's, `mapped_bytes`/`reserved_bytes` match the NEW owner, the old
+    /// owner's reserve covers the range, and no old (or new) range is duplicated
+    /// or overlapping. Call while both owners are alive. The hipGraph check is
+    /// side-effect free and runs first so a refusal never follows a committed
+    /// replay rewrite.
+    pub fn relocate_qsa_resources(
+        &mut self,
+        moves: &[VmmResourceMove],
+    ) -> HipResult<crate::replay::BindingRefreshReport> {
+        self.bind_thread()?;
+        validate_vmm_move_ranges(moves).map_err(|message| HipError::new(0, &message))?;
+        for (index, mv) in moves.iter().enumerate() {
+            let old = self
+                .vmm_arenas
+                .get(&mv.old_base)
+                .filter(|arena| !arena.is_released())
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "VMM move {index}: old base 0x{:x} is not a live registered owner",
+                            mv.old_base
+                        ),
+                    )
+                })?;
+            if old.reserved_bytes() < mv.reserved_bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM move {index}: old reserve {} is smaller than move reserve {}",
+                        old.reserved_bytes(),
+                        mv.reserved_bytes
+                    ),
+                ));
+            }
+            let new = self
+                .vmm_arenas
+                .get(&mv.new_base)
+                .filter(|arena| !arena.is_released())
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "VMM move {index}: new base 0x{:x} is not a live registered owner",
+                            mv.new_base
+                        ),
+                    )
+                })?;
+            let generation = self.vmm_generations.get(&mv.new_base).copied();
+            if generation != Some(mv.owner_generation) {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM move {index}: owner generation {} does not match new owner {generation:?}",
+                        mv.owner_generation
+                    ),
+                ));
+            }
+            if new.mapped_bytes() != mv.mapped_bytes || new.reserved_bytes() != mv.reserved_bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "VMM move {index}: mapped/reserved {}/{} do not match new owner {}/{}",
+                        mv.mapped_bytes,
+                        mv.reserved_bytes,
+                        new.mapped_bytes(),
+                        new.reserved_bytes()
+                    ),
+                ));
+            }
+        }
+        self.graphs
+            .relocate_resources(&self.hip, self.device_id, moves)?;
+        self.replay
+            .relocate_resources(&self.hip, moves)
+            .map_err(|message| HipError::new(0, &message))
     }
 
     /// Whether a tensor was allocated by [`Self::alloc_host_mapped_tensor`] — its pages
@@ -4583,6 +5273,7 @@ impl Gpu {
             };
             if released {
                 self.vmm_arenas.remove(&key);
+                self.vmm_generations.remove(&key);
             }
             if let Err(err) = result {
                 if first_error.is_none() {
@@ -4899,6 +5590,7 @@ impl Gpu {
                 ));
             }
             let mut arena = self.vmm_arenas.remove(&key).unwrap();
+            self.vmm_generations.remove(&key);
             let result = arena.release(&self.hip);
             if arena.is_released() {
                 result
@@ -7304,6 +7996,238 @@ mod tests {
             .expect("dtoh unaligned prefix");
         assert_eq!(actual, expect);
         gpu.free_tensor(tensor).expect("free");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
+    fn vmm_alias_boundary_walks_granule_sizes() {
+        use super::vmm_alias_boundary as alias;
+        const MIB: usize = 1 << 20;
+        let g = [2 * MIB, 2 * MIB, 2 * MIB];
+        assert_eq!(alias(g, 0), 0);
+        assert_eq!(alias(g, 1), 0);
+        assert_eq!(alias(g, 2 * MIB - 1), 0);
+        assert_eq!(alias(g, 2 * MIB), 2 * MIB);
+        assert_eq!(alias(g, 5 * MIB), 4 * MIB);
+        assert_eq!(alias(g, 6 * MIB), 6 * MIB);
+        assert_eq!(alias(g, 100 * MIB), 6 * MIB, "never past the granule list");
+        // A shorter final granule at the reserve end is alias-eligible whole.
+        let short = [2 * MIB, MIB];
+        assert_eq!(alias(short, 3 * MIB), 3 * MIB);
+        assert_eq!(alias(short, 3 * MIB - 1), 2 * MIB);
+        assert_eq!(alias(std::iter::empty::<usize>(), MIB), 0);
+        assert_eq!(alias([0usize, 2 * MIB], 4 * MIB), 0, "zero-size granule ends the walk");
+        assert_eq!(alias([usize::MAX, 2], usize::MAX), usize::MAX);
+        assert_eq!(alias([usize::MAX, 2], usize::MAX - 1), 0, "overflowing sum ends the walk");
+    }
+
+    /// FP8 rows are 516 B (512 payload + 4 scale), so a row straddles the 2 MiB
+    /// granule edge; the alias stops at the granule and the frontier is unaligned.
+    #[test]
+    fn vmm_alias_fp8_rows_straddling_a_granule_and_the_writable_guard() {
+        use super::vmm_alias_boundary as alias;
+        const GRANULE: usize = 2 << 20;
+        const ROW: usize = 516;
+        let granules = [GRANULE; 4];
+        let valid = 4065 * ROW; // row 4064 spans 2_097_024..2_097_540
+        assert!(valid > GRANULE && (GRANULE / ROW) * ROW < GRANULE);
+        // K/V: writable_from == valid -> the first granule is aliased and
+        // the 388-byte frontier (a straddling row's tail) is copied.
+        let limit = valid.min(valid).min(4 * GRANULE);
+        let kv_alias = alias(granules, limit);
+        assert_eq!(kv_alias, GRANULE);
+        assert_eq!(valid - kv_alias, 388);
+        assert_eq!((valid - kv_alias) % ROW, ROW - (GRANULE - (GRANULE / ROW) * ROW));
+        // Raw index with an in-place restored tail: writable_from four rows
+        // short of valid falls inside granule 0, so nothing may alias.
+        let writable_from = valid - 4 * ROW;
+        assert!(writable_from < GRANULE);
+        assert_eq!(alias(granules, valid.min(writable_from).min(4 * GRANULE)), 0);
+        // granule_prefix_bytes caps the alias even when valid is larger.
+        assert_eq!(alias(granules, valid.min(valid).min(GRANULE)), GRANULE);
+        assert_eq!(alias(granules, 3 * GRANULE - 1), 2 * GRANULE);
+    }
+
+    #[test]
+    fn vmm_slab_layout_aligns_every_entry_to_256() {
+        use super::vmm_slab_layout as layout;
+        assert_eq!(layout(&[]), Some((vec![], 0)));
+        assert_eq!(layout(&[0]), Some((vec![0], 0)));
+        assert_eq!(layout(&[1]), Some((vec![0], 256)));
+        assert_eq!(layout(&[256, 257]), Some((vec![0, 256], 768)));
+        let (offsets, total) = layout(&[388, 0, 1000, 256]).unwrap();
+        assert_eq!(offsets, vec![0, 512, 512, 1536]);
+        assert_eq!(total, 1792);
+        assert!(offsets.iter().all(|offset| offset % 256 == 0));
+        assert_eq!(layout(&[usize::MAX]), None);
+        assert_eq!(layout(&[usize::MAX - 255, 1]), None);
+    }
+
+    fn vmm_move(old_base: usize, new_base: usize, reserved: usize) -> super::VmmResourceMove {
+        super::VmmResourceMove {
+            old_base,
+            new_base,
+            reserved_bytes: reserved,
+            mapped_bytes: reserved / 2,
+            owner_generation: 7,
+        }
+    }
+
+    #[test]
+    fn vmm_move_validation_rejects_duplicate_overlap_and_malformed_moves() {
+        use super::validate_vmm_move_ranges as validate;
+        let ok = [
+            vmm_move(0x10_000, 0x90_000, 0x1000),
+            vmm_move(0x11_000, 0x91_000, 0x1000),
+            vmm_move(0x20_000, 0xa0_000, 0x2000),
+        ];
+        assert!(validate(&ok).is_ok(), "adjacent and disjoint ranges are fine");
+        assert!(validate(&[]).is_ok());
+
+        let duplicate = [
+            vmm_move(0x10_000, 0x90_000, 0x1000),
+            vmm_move(0x10_000, 0x91_000, 0x1000),
+        ];
+        assert!(validate(&duplicate).unwrap_err().contains("old ranges"));
+
+        let overlap = [
+            vmm_move(0x10_000, 0x90_000, 0x1000),
+            vmm_move(0x10_800, 0x91_000, 0x1000),
+        ];
+        assert!(validate(&overlap).unwrap_err().contains("old ranges"));
+
+        let nested = [
+            vmm_move(0x10_000, 0x90_000, 0x4000),
+            vmm_move(0x11_000, 0x95_000, 0x1000),
+        ];
+        assert!(validate(&nested).unwrap_err().contains("old ranges"));
+
+        let new_overlap = [
+            vmm_move(0x10_000, 0x90_000, 0x1000),
+            vmm_move(0x20_000, 0x90_800, 0x1000),
+        ];
+        assert!(validate(&new_overlap).unwrap_err().contains("new ranges"));
+
+        assert!(validate(&[vmm_move(0x10_000, 0x90_000, 0)])
+            .unwrap_err()
+            .contains("reserved_bytes is zero"));
+        let mut bad_mapped = vmm_move(0x10_000, 0x90_000, 0x1000);
+        bad_mapped.mapped_bytes = 0x1001;
+        assert!(validate(&[bad_mapped]).unwrap_err().contains("exceeds reserved"));
+        assert!(validate(&[vmm_move(usize::MAX - 8, 0x90_000, 0x1000)])
+            .unwrap_err()
+            .contains("overflows"));
+    }
+
+    /// Capture / fork / free over real VMM granules. Needs a VMM-capable device;
+    /// run with `cargo test -p rdna-compute --lib -- --ignored vmm_prefix_capture_fork_hw`.
+    #[test]
+    #[ignore = "needs a HIP device with VMM granule support"]
+    fn vmm_prefix_capture_fork_hw() {
+        use hip_bridge::DeviceBuffer;
+        let _guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gpu = Gpu::init().expect("vmm_prefix_capture_fork_hw requires a HIP device");
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        const ROW: usize = 516;
+
+        let granularity = gpu
+            .vmm_recommended_granularity()
+            .expect("VMM granularity query");
+        let granule = (2usize << 20).max(granularity).next_multiple_of(granularity);
+        let mut src = unsafe { gpu.alloc_vmm_tensor(&[4 * granule], DType::Raw, 0, &access) }
+            .expect("alloc VMM source");
+        let mapped = gpu
+            .grow_vmm_tensor_granules(&mut src, 3 * granule, &access)
+            .expect("grow three granules");
+        assert_eq!(mapped, 3 * granule);
+        assert_eq!(gpu.vmm_reserved_bytes(&src), Some(4 * granule));
+        assert_eq!(gpu.vmm_sealed_bytes(&src), Some(0));
+        let src_generation = gpu.vmm_owner_generation(&src).expect("source generation");
+
+        let view = |tensor: &super::GpuTensor, bytes: usize| unsafe {
+            DeviceBuffer::from_raw(tensor.buf.as_ptr(), bytes)
+        };
+        let pattern: Vec<u8> = (0..mapped).map(|i| ((i * 131 + 7) % 251) as u8).collect();
+        gpu.hip
+            .memcpy_htod(&view(&src, mapped), &pattern)
+            .expect("fill source");
+
+        // 2.5 granules, rounded down to whole 516-byte rows.
+        let valid = (5 * granule / 2) / ROW * ROW;
+        let writable_from = valid - 4 * ROW;
+        let set = gpu
+            .capture_vmm_prefixes(&[super::VmmPrefixSpec {
+                tensor: &src,
+                valid_bytes: valid,
+                writable_from,
+            }])
+            .expect("capture prefix");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.valid_bytes(0), valid);
+        assert_eq!(set.arena_alias_bytes(0), 2 * granule);
+        assert_eq!(set.alias_bytes(), 2 * granule);
+        assert_eq!(set.frontier_bytes(), valid - 2 * granule);
+        assert!(set.slab_bytes() >= set.frontier_bytes());
+        assert_eq!(gpu.vmm_sealed_bytes(&src), Some(2 * granule));
+        let aliased: Vec<_> = set.physical_granules().collect();
+        assert_eq!(aliased.len(), 2);
+
+        let mut forks = gpu.fork_vmm_prefixes(&set, &access).expect("fork prefix");
+        assert_eq!(forks.len(), 1);
+        let fork = forks.pop().unwrap();
+        assert_ne!(fork.buf.as_ptr(), src.buf.as_ptr(), "fork must use a fresh VA");
+        assert_ne!(gpu.vmm_owner_generation(&fork), Some(src_generation));
+        let fork_mapped = gpu.vmm_mapped_bytes(&fork).expect("fork mapped");
+        assert_eq!(fork_mapped, 3 * granule);
+        assert_eq!(gpu.vmm_reserved_bytes(&fork), Some(4 * granule));
+        let src_ids = gpu.vmm_physical_granules(&src).expect("source granules");
+        let fork_ids = gpu.vmm_physical_granules(&fork).expect("fork granules");
+        assert_eq!(fork_ids.len(), 3);
+        assert_eq!(fork_ids[..2], src_ids[..2], "aliased granules share physical ids");
+        assert_eq!(fork_ids[..2], aliased[..], "set reports the aliased granules");
+        assert_ne!(fork_ids[2], src_ids[2], "the frontier granule is private");
+        let mv = gpu.vmm_resource_move(&src, &fork).expect("resource move");
+        assert_eq!(mv.old_base, src.buf.as_ptr() as usize);
+        assert_eq!(mv.new_base, fork.buf.as_ptr() as usize);
+        assert_eq!(mv.reserved_bytes, 4 * granule);
+        assert_eq!(mv.mapped_bytes, fork_mapped);
+        assert_eq!(Some(mv.owner_generation), gpu.vmm_owner_generation(&fork));
+
+        gpu.hip.device_synchronize().expect("sync after fork");
+        let mut fork_bytes = vec![0u8; fork_mapped];
+        gpu.hip
+            .memcpy_dtoh(&mut fork_bytes, &view(&fork, fork_mapped))
+            .expect("read fork");
+        assert_eq!(fork_bytes[..valid], pattern[..valid], "fork prefix != source");
+        assert!(
+            fork_bytes[valid..].iter().all(|byte| *byte == 0),
+            "fork bytes past valid must be zero"
+        );
+
+        // A write through the fork's private frontier never reaches the source.
+        let poke = [0xEEu8; ROW];
+        gpu.hip
+            .memcpy_htod(&view(&fork, fork_mapped).byte_view(valid, ROW), &poke)
+            .expect("write fork frontier");
+        let mut src_bytes = vec![0u8; mapped];
+        gpu.hip
+            .memcpy_dtoh(&mut src_bytes, &view(&src, mapped))
+            .expect("read source");
+        assert_eq!(src_bytes, pattern, "source changed by a fork write");
+
+        // The fork outlives the source: aliased granules stay alive through the leases.
+        gpu.free_tensor(src).expect("free source");
+        gpu.hip
+            .memcpy_dtoh(&mut fork_bytes, &view(&fork, fork_mapped))
+            .expect("re-read fork");
+        assert_eq!(fork_bytes[..valid], pattern[..valid]);
+        assert_eq!(fork_bytes[valid..valid + ROW], poke);
+
+        gpu.free_tensor(fork).expect("free fork");
+        gpu.free_vmm_prefixes(set).expect("free prefix set");
         assert_eq!(gpu.vmm_allocation_count(), 0);
     }
 

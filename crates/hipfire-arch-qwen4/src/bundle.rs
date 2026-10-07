@@ -15,10 +15,12 @@ use crate::gpu_forward::{
     qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
+use crate::mtp_gpu::{
+    MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4HeadCheckpoint, Qwen4MtpGpu,
+};
 use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
-use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
+use crate::state::{Qwen4State, Qwen4StateSnapshot, Qwen4TargetCheckpoint, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
     PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
@@ -31,9 +33,16 @@ use hipfire_runtime::sampler::{
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
-use rdna_compute::{Gpu, GpuTensor};
+use hip_bridge::VmmPhysicalId;
+use hipfire_runtime::checkpoint_pool::{CheckpointBlob, QwenCheckpointPool};
+use hipfire_runtime::prefix_index::{Handle, PinTicket, PrefixIndex};
+use hipfire_runtime::serve_contract::{sha256_len_prefixed, CacheDomain, CheckpointId};
+use rdna_compute::page_pool::{BlockTable, PagePool, PAGE_TOKENS};
+use rdna_compute::{Gpu, GpuTensor, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -156,6 +165,8 @@ pub enum Qwen4PrefixSource {
     Live,
     /// Restore the end-of-prompt checkpoint.
     Prompt,
+    /// Restore a retained radix checkpoint (in place, or into a fresh bank).
+    Radix,
 }
 
 /// Where a prefill starts. `start_pos` is the cached-token count: `0` is a
@@ -216,12 +227,14 @@ impl PrefixMarks {
     }
 }
 
-/// Host record of what the device owners hold: one end-of-prompt checkpoint
-/// (`P = prompt_len`) and, after a committed request, the live state.
+/// Host record of what the device owners hold: the request's end-of-prompt
+/// checkpoint (`P = prompt_len`) and, after a committed request, the live state.
 ///
-/// The device bytes live in the state/MTP prefix arenas (their `active` flags
-/// are the checkpoint's device validity) and in the live state itself; this
-/// records which tokens they hold and under which schedule.
+/// The device bytes live in checkpoint slots (target state plus, for native
+/// MTP, the head; see [`Qwen4Checkpoint`]) and in the live state itself; this
+/// records which tokens they hold and under which schedule. With a radix store
+/// it also owns the shared index, descriptor pool, checkpoint pool and budget
+/// ledger.
 ///
 /// The key is only tokens, mode and admitted chunk because everything else
 /// is immutable for this owner: model artifact, device, state formats,
@@ -249,6 +262,34 @@ struct Qwen4PrefixCache {
     /// Advances on every begin, reset, rewind and invalidation; a hit receipt
     /// carries the value it was bound under.
     generation: u64,
+    /// Free reusable checkpoint slots.
+    slots: Vec<Qwen4CheckpointSlot>,
+    /// Slots ever allocated and still owned (free, staged, local, pooled).
+    slots_allocated: usize,
+    /// This request's captures, published at commit.
+    staged: Vec<Qwen4Checkpoint>,
+    /// The end-of-prompt checkpoint outside the staged list.
+    local: Option<LocalEop>,
+    /// Planned, not yet consumed by a begin.
+    selection: Option<Qwen4Selection>,
+    /// The running request's pins (consumed selection), released at the
+    /// terminal commit, reset or a failed begin.
+    held: Option<Qwen4Selection>,
+    /// Checkpoints host-only paths dropped; freed at the next quiescent point.
+    deferred: Vec<Qwen4Checkpoint>,
+    /// Id of the live context bank; rows of a checkpoint are restorable in
+    /// place only while its bank is this one.
+    bank: u64,
+    next_bank: u64,
+    /// Positions after each `<|im_end|>` of the planned prompt.
+    turn_boundaries: Vec<usize>,
+    /// The conditional shared-turn anchor armed by the selection.
+    anchor: Option<usize>,
+    /// Last capture (or the start) the periodic distance counts from.
+    periodic_due_from: Option<usize>,
+    /// The request's single periodic capture was taken or refused.
+    periodic_done: bool,
+    radix: Option<Qwen4RadixCache>,
 }
 
 impl Qwen4PrefixCache {
@@ -262,6 +303,20 @@ impl Qwen4PrefixCache {
             published: false,
             capture_at: None,
             generation: 0,
+            slots: Vec::new(),
+            slots_allocated: 0,
+            staged: Vec::new(),
+            local: None,
+            selection: None,
+            held: None,
+            deferred: Vec::new(),
+            bank: 0,
+            next_bank: 1,
+            turn_boundaries: Vec::new(),
+            anchor: None,
+            periodic_due_from: None,
+            periodic_done: false,
+            radix: None,
         }
     }
 
@@ -272,6 +327,9 @@ impl Qwen4PrefixCache {
         self.live_len = None;
         self.published = false;
         self.capture_at = None;
+        self.anchor = None;
+        self.periodic_due_from = None;
+        self.periodic_done = false;
         self.generation += 1;
     }
 
@@ -358,6 +416,1678 @@ impl Qwen4PrefixCache {
         }
         self.published = live || marks.checkpoint_at(p, self.mode);
     }
+}
+
+/// Tokens between periodic checkpoints (`anchor-v1-n8192`).
+const PERIODIC_CAPTURE_TOKENS: usize = 8192;
+/// Smallest turn boundary an anchor may split at.
+const ANCHOR_MIN_TOKENS: usize = 128;
+/// Hard bound on radix tree nodes.
+const RADIX_INDEX_NODES: usize = 65_536;
+/// Descriptor pages minted for published checkpoints (metadata only).
+const RADIX_PAGE_POOL_PAGES: usize = 32_768;
+/// Stale checkpoint ids skipped by one selection before giving up.
+const RADIX_LOOKUP_RETRIES: usize = 8;
+/// Host metadata estimate per radix node.
+const INDEX_NODE_HOST_BYTES: usize = 256;
+/// Alignment of each frontier entry of a retained context's slab.
+const FRONTIER_SLAB_ALIGN: usize = 256;
+
+/// Budgets of the shared radix store, fixed at attach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4RadixLimits {
+    /// Device bytes the cache may hold above the baseline: extra checkpoint
+    /// slots, packed frontier slabs and retained granules the live bank left.
+    pub device_bytes: u64,
+    /// Host metadata bytes (exact token records plus index nodes).
+    pub host_bytes: usize,
+    /// Checkpoint slots (including the baseline one) and pool entries.
+    pub checkpoints: usize,
+}
+
+/// Counters of the radix store, reported by [`Qwen4Bundle::radix_stats`].
+#[derive(Clone, Debug, Default)]
+pub struct Qwen4RadixStats {
+    pub lookups: u64,
+    pub hits_live: u64,
+    pub hits_prompt: u64,
+    pub hits_radix: u64,
+    pub forks: u64,
+    pub fresh_banks: u64,
+    pub captures: u64,
+    pub anchors: u64,
+    pub periodic: u64,
+    pub published: u64,
+    pub duplicates: u64,
+    pub evictions: u64,
+    /// Sum over forks of the aliased (uncopied) bytes.
+    pub alias_bytes: u64,
+    /// Sum over forks of the copied frontier bytes.
+    pub copied_bytes: u64,
+    /// Cache-charged device bytes at the last budget check.
+    pub ledger_bytes: u64,
+    pub peak_ledger_bytes: u64,
+    pub relocations: u64,
+    pub relocation_ns_last: u64,
+    /// Process-wide retired VA bytes when the stats were read.
+    pub retired_va_bytes: u64,
+    pub banks_created: u64,
+}
+
+/// A reusable bounded checkpoint slot: target state (+ native head) payload.
+struct Qwen4CheckpointSlot {
+    target: Qwen4TargetCheckpoint,
+    head: Option<Qwen4HeadCheckpoint>,
+}
+
+impl Qwen4CheckpointSlot {
+    fn device_bytes(&self) -> u64 {
+        self.target.device_bytes() as u64
+            + self
+                .head
+                .as_ref()
+                .map_or(0, |head| head.device_bytes() as u64)
+    }
+
+    fn invalidate(&mut self) {
+        self.target.invalidate();
+        if let Some(head) = self.head.as_mut() {
+            head.invalidate();
+        }
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let Qwen4CheckpointSlot { target, head } = self;
+        let target = target.free_gpu(gpu).map_err(BundleError::State);
+        let head = match head {
+            Some(head) => head
+                .free_gpu(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(()),
+        };
+        target.and(head)
+    }
+}
+
+/// One immutable checkpoint at exact position `B = tokens.len()`.
+pub(crate) struct Qwen4Checkpoint {
+    slot: Qwen4CheckpointSlot,
+    /// `None` = local-only (budget refused): same-bank restore only, never
+    /// published.
+    context: Option<VmmPrefixSet>,
+    /// Exactly the consumed prefix `[0, B)`.
+    tokens: Arc<[u32]>,
+    mode: Qwen4PrefixMode,
+    chunk: usize,
+    /// Bank id whose rows it was captured from.
+    bank: u64,
+    /// That bank's rows `[0, B)` are unchanged since capture.
+    same_bank: bool,
+    /// Captured at the end of its request's prompt.
+    eop: bool,
+    /// Begins that restored from it.
+    hits: u32,
+    /// Recompute cost in token equivalents ([`gdsf_cost`]).
+    cost: f64,
+    /// GDSF eviction priority ([`gdsf_priority`]).
+    priority: f64,
+}
+
+impl Qwen4Checkpoint {
+    fn slab_bytes(&self) -> u64 {
+        self.context
+            .as_ref()
+            .map_or(0, |context| context.slab_bytes() as u64)
+    }
+
+    /// Bytes the eviction priority divides by: slot + slab + aliased granules.
+    fn gdsf_bytes(&self) -> u64 {
+        self.slot
+            .device_bytes()
+            .saturating_add(self.slab_bytes())
+            .saturating_add(
+                self.context
+                    .as_ref()
+                    .map_or(0, |context| context.alias_bytes() as u64),
+            )
+    }
+}
+
+impl CheckpointBlob for Qwen4Checkpoint {
+    fn bytes_len(&self) -> u64 {
+        self.slot.device_bytes().saturating_add(self.slab_bytes())
+    }
+}
+
+/// The request's end-of-prompt checkpoint outside the pool.
+enum LocalEop {
+    /// Owned here (no context, or its publication failed).
+    Owned(Qwen4Checkpoint),
+    /// A reference to an entry of the radix pool.
+    Published(CheckpointId),
+}
+
+/// Where a begin restores from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointRef {
+    /// The staged (unpublished) checkpoint at this index.
+    Staged(usize),
+    LocalOwned,
+    Pool(CheckpointId),
+}
+
+/// What [`Qwen4Bundle::begin_prefix`] does once its plan validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginAction {
+    Cold,
+    Live,
+    Restore(CheckpointRef),
+}
+
+/// Outcome of one boundary capture.
+enum Capture {
+    Staged(Qwen4Checkpoint),
+    /// The pool already holds this exact prefix.
+    Duplicate(CheckpointId),
+    /// Optional capture dropped (no slot / budget refused / copy failed).
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind {
+    EndOfPrompt,
+    Anchor,
+    Periodic,
+}
+
+impl CaptureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::EndOfPrompt => "eop",
+            Self::Anchor => "anchor",
+            Self::Periodic => "periodic",
+        }
+    }
+}
+
+/// What the bank bookkeeping does after a restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankAction {
+    /// Same bank, rewound to `position`: later checkpoints lose their rows.
+    Rewound(usize),
+    /// A new bank replaced the old one.
+    Replaced,
+}
+
+/// Counters of one restore, for stats and the begin trace.
+#[derive(Default)]
+struct RestoreReport {
+    fork: bool,
+    bank_replaced: bool,
+    fresh_bank: bool,
+    alias_bytes: usize,
+    copied_bytes: usize,
+    relocation_ns: u64,
+    attach_ns: u64,
+}
+
+/// A failed restore: `live_modified` = a live owner was already written.
+struct RestoreFailure {
+    error: BundleError,
+    live_modified: bool,
+}
+
+impl RestoreFailure {
+    fn clean(error: BundleError) -> Self {
+        Self {
+            error,
+            live_modified: false,
+        }
+    }
+
+    fn dirty(error: BundleError) -> Self {
+        Self {
+            error,
+            live_modified: true,
+        }
+    }
+
+    fn from_swap(failure: SwapFailure) -> Self {
+        Self {
+            error: failure.error,
+            live_modified: failure.live_modified,
+        }
+    }
+}
+
+struct BankSwap {
+    relocation_ns: u64,
+    /// Freeing the replaced banks failed (the swap itself completed).
+    cleanup: Option<BundleError>,
+}
+
+struct SwapFailure {
+    error: BundleError,
+    live_modified: bool,
+}
+
+/// A pending (unconsumed) or held (running request) plan receipt and its pins.
+struct Qwen4Selection {
+    /// The pinned pool entry (`NONE` for a local or cold selection).
+    id: CheckpointId,
+    start: usize,
+    mode: Qwen4PrefixMode,
+    source: Qwen4PrefixSource,
+    /// The index path pin of a radix lookup (empty otherwise).
+    pin: PinTicket,
+    generation: u64,
+}
+
+impl Qwen4Selection {
+    fn plan(&self) -> Qwen4PrefixPlan {
+        Qwen4PrefixPlan {
+            start_pos: self.start,
+            source: self.source,
+            generation: self.generation,
+        }
+    }
+}
+
+/// The shared, byte-bounded radix store of one bundle.
+struct Qwen4RadixCache {
+    /// `[Ar, NativeMtp]` (see [`mode_index`]).
+    domains: [CacheDomain; 2],
+    limits: Qwen4RadixLimits,
+    index: PrefixIndex,
+    /// Token-page descriptors only: no backing arena.
+    pages: PagePool,
+    /// Exact-boundary checkpoints. Uncapped: the ledger enforces bytes.
+    pool: QwenCheckpointPool<Qwen4Checkpoint>,
+    stats: Qwen4RadixStats,
+    /// Device bytes of one checkpoint slot.
+    slot_bytes: u64,
+    /// Physical granules the live banks map (charged by the baseline).
+    live_granules: HashSet<VmmPhysicalId>,
+    /// Retired ids whose pool entry was still pinned.
+    retire_pending: Vec<CheckpointId>,
+    /// GDSF aging clock: the priority of the last evicted checkpoint.
+    gdsf_clock: f64,
+}
+
+impl Qwen4RadixCache {
+    /// The pool entry `id` is a usable restore source for `prompt[..b]`.
+    fn checkpoint_valid(
+        &self,
+        id: CheckpointId,
+        b: usize,
+        prompt: &[u32],
+        mode: Qwen4PrefixMode,
+        chunk: usize,
+    ) -> bool {
+        let (Some(entry), Some(tokens)) = (self.pool.peek_id(id), self.pool.exact_tokens(id))
+        else {
+            return false;
+        };
+        checkpoint_facts_valid(
+            &CheckpointFacts {
+                tokens,
+                mode: entry.mode,
+                chunk: entry.chunk,
+                has_context: entry.context.is_some(),
+                target_position: entry.slot.target.position(),
+                head_position: entry.slot.head.as_ref().and_then(|head| head.position()),
+            },
+            prompt,
+            b,
+            mode,
+            chunk,
+        )
+    }
+}
+
+// ---- pure decisions over plain data ----
+
+/// Index of `mode`'s domain in [`Qwen4RadixCache::domains`].
+fn mode_index(mode: Qwen4PrefixMode) -> usize {
+    match mode {
+        Qwen4PrefixMode::Ar => 0,
+        Qwen4PrefixMode::NativeMtp => 1,
+    }
+}
+
+/// The winner of the local candidate (`local`, ending at `local_start`) and the
+/// deepest valid radix checkpoint `radix`: live wins when it reaches the radix
+/// boundary, a local prompt wins ties, otherwise the deeper radix boundary.
+fn pick_source(
+    local: Qwen4PrefixSource,
+    local_start: usize,
+    radix: Option<usize>,
+) -> Qwen4PrefixSource {
+    match (local, radix) {
+        (Qwen4PrefixSource::Live, Some(b)) if local_start >= b => Qwen4PrefixSource::Live,
+        (Qwen4PrefixSource::Live, None) => Qwen4PrefixSource::Live,
+        (Qwen4PrefixSource::Prompt, Some(b)) if local_start >= b => Qwen4PrefixSource::Prompt,
+        (Qwen4PrefixSource::Prompt, None) => Qwen4PrefixSource::Prompt,
+        (_, Some(_)) => Qwen4PrefixSource::Radix,
+        (_, None) => Qwen4PrefixSource::Cold,
+    }
+}
+
+/// Sorted, deduplicated turn boundaries below `max_seq`.
+fn normalized_turn_boundaries(boundaries: &[usize], max_seq: usize) -> Vec<usize> {
+    let mut sorted: Vec<usize> = boundaries
+        .iter()
+        .copied()
+        .filter(|&boundary| boundary < max_seq)
+        .collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+}
+
+/// The conditional shared-turn anchor (design §4.1): the first turn boundary
+/// `S` with `128 <= S < prompt_len` and `S > start`, armed only when a
+/// committed path already covers `S` (`index_covers`), no checkpoint exists at
+/// `S` (the deepest radix checkpoint is below it) and a slot/budget is
+/// available. A first-ever cold request finds nothing in the index: no anchor.
+fn anchor_choice(
+    boundaries: &[usize],
+    prompt_len: usize,
+    start: usize,
+    index_covers: impl Fn(usize) -> bool,
+    radix_best: Option<usize>,
+    resources_ok: bool,
+) -> Option<usize> {
+    let s = boundaries
+        .iter()
+        .copied()
+        .find(|&s| s >= ANCHOR_MIN_TOKENS && s < prompt_len && s > start)?;
+    (resources_ok && radix_best.is_none_or(|best| best < s) && index_covers(s)).then_some(s)
+}
+
+/// Look up the deepest valid checkpoint `B < prompt_len`: a hit that fails
+/// `valid` is discarded (its pin released) and the lookup retried below its
+/// boundary, at most [`RADIX_LOOKUP_RETRIES`] times. `lookup(ctx, before)`
+/// returns the hit and its boundary.
+fn lookup_valid_checkpoint<C, H>(
+    ctx: &mut C,
+    prompt_len: usize,
+    lookup: impl Fn(&mut C, usize) -> Option<(H, usize)>,
+    valid: impl Fn(&C, &H, usize) -> bool,
+    discard: impl Fn(&mut C, H),
+) -> Option<(H, usize)> {
+    let mut before = prompt_len;
+    for _ in 0..RADIX_LOOKUP_RETRIES {
+        if before == 0 {
+            return None;
+        }
+        let (hit, boundary) = lookup(ctx, before)?;
+        if boundary == 0 || boundary >= before {
+            discard(ctx, hit);
+            return None;
+        }
+        if valid(ctx, &hit, boundary) {
+            return Some((hit, boundary));
+        }
+        discard(ctx, hit);
+        before = boundary;
+    }
+    None
+}
+
+/// Plain facts of a pool entry [`checkpoint_facts_valid`] checks.
+struct CheckpointFacts<'a> {
+    tokens: &'a [u32],
+    mode: Qwen4PrefixMode,
+    chunk: usize,
+    has_context: bool,
+    target_position: Option<usize>,
+    head_position: Option<usize>,
+}
+
+/// The entry holds exactly `prompt[..b]`'s state for `mode` under `chunk`:
+/// exact tokens, retained context, target (and, for native MTP, head) at `b`.
+fn checkpoint_facts_valid(
+    facts: &CheckpointFacts<'_>,
+    prompt: &[u32],
+    b: usize,
+    mode: Qwen4PrefixMode,
+    chunk: usize,
+) -> bool {
+    b > 0
+        && b < prompt.len()
+        && facts.tokens.len() == b
+        && facts.tokens == &prompt[..b]
+        && facts.mode == mode
+        && facts.chunk == chunk
+        && facts.has_context
+        && facts.target_position == Some(b)
+        && (mode == Qwen4PrefixMode::Ar || facts.head_position == Some(b))
+}
+
+/// Plain inputs of [`Qwen4Bundle::next_prefix_capture`].
+#[derive(Clone, Copy, Debug)]
+struct CaptureSchedule {
+    /// End of the armed prompt; `None` = nothing armed.
+    capture_at: Option<usize>,
+    anchor: Option<usize>,
+    radix: bool,
+    periodic_done: bool,
+    /// Last capture (or the start) periodic distance is measured from.
+    periodic_due_from: Option<usize>,
+    /// A slot and budget exist for an optional capture.
+    resources_ok: bool,
+}
+
+impl CaptureSchedule {
+    /// The boundary the chunk `(position, natural_end]` must end at, if any.
+    fn next(&self, position: usize, natural_end: usize) -> Option<usize> {
+        let prompt_end = self.capture_at?;
+        if natural_end <= position {
+            return None;
+        }
+        if let Some(anchor) = self.anchor {
+            if position < anchor && anchor <= natural_end {
+                return Some(anchor);
+            }
+        }
+        if natural_end == prompt_end {
+            return Some(natural_end);
+        }
+        if self.radix && !self.periodic_done && self.resources_ok && natural_end < prompt_end {
+            let due = self
+                .periodic_due_from
+                .and_then(|from| natural_end.checked_sub(from))
+                .is_some_and(|distance| distance >= PERIODIC_CAPTURE_TOKENS);
+            if due {
+                return Some(natural_end);
+            }
+        }
+        None
+    }
+}
+
+/// A slot can be obtained for an optional capture: a free one, a new one
+/// within the count and byte budget, or an evictable entry.
+fn capture_resources_ok(
+    free_slots: usize,
+    slots_allocated: usize,
+    slot_limit: usize,
+    evictable: usize,
+    ledger: u64,
+    slot_bytes: u64,
+    device_bytes: u64,
+) -> bool {
+    free_slots > 0
+        || (slots_allocated < slot_limit && ledger.saturating_add(slot_bytes) <= device_bytes)
+        || evictable > 0
+}
+
+/// Largest granule boundary `<= limit` over consecutive granule sizes.
+fn alias_boundary(granule_sizes: impl IntoIterator<Item = usize>, limit: usize) -> usize {
+    let mut end = 0usize;
+    for size in granule_sizes {
+        match end.checked_add(size) {
+            Some(next) if size != 0 && next <= limit => end = next,
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Slab bytes one arena's frontier copy needs: valid bytes past the aliased
+/// granule boundary, rounded to the slab alignment.
+fn slab_estimate(
+    valid_bytes: usize,
+    writable_from: usize,
+    granule_sizes: impl IntoIterator<Item = usize>,
+) -> u64 {
+    let alias = alias_boundary(granule_sizes, valid_bytes.min(writable_from));
+    let frontier = (valid_bytes - alias) as u64;
+    let align = FRONTIER_SLAB_ALIGN as u64;
+    frontier.div_ceil(align) * align
+}
+
+fn slab_estimate_total(gpu: &Gpu, specs: &[VmmPrefixSpec<'_>]) -> u64 {
+    specs
+        .iter()
+        .map(|spec| {
+            let sizes = gpu.vmm_physical_granules(spec.tensor).unwrap_or_default();
+            slab_estimate(
+                spec.valid_bytes,
+                spec.writable_from,
+                sizes.into_iter().map(|(_, bytes)| bytes),
+            )
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Bytes of the unique physical granules `contexts` reference that no live
+/// bank maps: each counted once however many checkpoints share it.
+fn cache_granule_bytes(
+    contexts: impl IntoIterator<Item = (VmmPhysicalId, usize)>,
+    live: &HashSet<VmmPhysicalId>,
+) -> u64 {
+    let mut unique: HashMap<VmmPhysicalId, usize> = HashMap::new();
+    for (id, bytes) in contexts {
+        if !live.contains(&id) {
+            unique.entry(id).or_insert(bytes);
+        }
+    }
+    unique.values().map(|&bytes| bytes as u64).sum()
+}
+
+/// Cache-charged device bytes: extra slots, slabs and retained granules.
+fn ledger_total(extra_slot_bytes: u64, slab_bytes: u64, granule_bytes: u64) -> u64 {
+    extra_slot_bytes
+        .saturating_add(slab_bytes)
+        .saturating_add(granule_bytes)
+}
+
+/// A budget is exceeded: device bytes (only checked with a GPU), entry count
+/// or host bytes.
+fn over_budget(
+    device_over: bool,
+    entries: usize,
+    max_entries: usize,
+    host_bytes: usize,
+    max_host_bytes: usize,
+) -> bool {
+    device_over || entries > max_entries || host_bytes > max_host_bytes
+}
+
+/// How one eviction step picks its victim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvictMode {
+    /// Evict the lowest-priority unpinned checkpoint.
+    Checkpoint,
+    /// Prune a pageless/checkpointless tree leaf first (node/host bound).
+    PruneFirst,
+}
+
+fn evict_mode(device_over: bool, count_over: bool) -> EvictMode {
+    if device_over || count_over {
+        EvictMode::Checkpoint
+    } else {
+        EvictMode::PruneFirst
+    }
+}
+
+/// Recompute cost of a checkpoint at `b` in token equivalents: prefill grows
+/// superlinearly with context, and the rebuild replays the whole prefix.
+fn gdsf_cost(b: usize) -> f64 {
+    let b = b as f64;
+    b * (1.0 + b / 65536.0)
+}
+
+/// GDSF priority: the aging clock plus the recompute saved per byte, weighted
+/// by hits.
+fn gdsf_priority(clock: f64, cost: f64, hits: u32, bytes: u64) -> f64 {
+    clock + cost * (1.0 + f64::from(hits)) / bytes.max(1) as f64
+}
+
+/// The lowest-priority unpinned entry (`(id, priority, pinned)`); ties go to
+/// the lowest id.
+fn gdsf_victim(entries: &[(CheckpointId, f64, bool)]) -> Option<CheckpointId> {
+    entries
+        .iter()
+        .filter(|(_, _, pinned)| !pinned)
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+        .map(|(id, _, _)| *id)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn prefix_mode_tag(mode: Qwen4PrefixMode) -> &'static str {
+    match mode {
+        Qwen4PrefixMode::Ar => "ar",
+        Qwen4PrefixMode::NativeMtp => "native-mtp",
+    }
+}
+
+/// Versioned, length-delimited state ABI tag of a radix domain.
+fn radix_state_abi_tag(
+    base_tag: &str,
+    mode: Qwen4PrefixMode,
+    chunk: usize,
+    gdn_format: &str,
+    qsa_format: &str,
+) -> String {
+    let chunk = (chunk as u64).to_le_bytes();
+    let digest = sha256_len_prefixed(&[
+        "qwen4-radix-v1".as_bytes(),
+        base_tag.as_bytes(),
+        prefix_mode_tag(mode).as_bytes(),
+        &chunk,
+        gdn_format.as_bytes(),
+        qsa_format.as_bytes(),
+        "head-f32".as_bytes(),
+        "anchor-v1-n8192".as_bytes(),
+    ]);
+    format!("qwen4-radix-v1:{}", hex(&digest))
+}
+
+/// The `mode` domain derived from the load's base domain: the state ABI tag
+/// binds mode, admitted chunk, state formats and the anchor policy; the layout
+/// strides are the per-arena row strides.
+fn build_radix_domain(
+    base: &CacheDomain,
+    mode: Qwen4PrefixMode,
+    chunk: usize,
+    gdn_format: &str,
+    qsa_format: &str,
+    arena_strides: &[u64],
+) -> CacheDomain {
+    let mut domain = base.clone();
+    domain.arch_policy.state_abi_tag = radix_state_abi_tag(
+        &base.arch_policy.state_abi_tag,
+        mode,
+        chunk,
+        gdn_format,
+        qsa_format,
+    );
+    domain.kv_layout.k_stride_bytes = arena_strides.to_vec();
+    domain.kv_layout.v_stride_bytes = arena_strides.to_vec();
+    domain
+}
+
+/// Row stride of one context arena of `rows` rows.
+fn arena_row_stride(tensor: &GpuTensor, rows: usize) -> Result<u64, BundleError> {
+    let bytes = tensor.byte_size();
+    if rows == 0 || bytes % rows != 0 {
+        return Err(BundleError::Forward(format!(
+            "Qwen4 context arena of {bytes} bytes does not divide into {rows} rows"
+        )));
+    }
+    Ok((bytes / rows) as u64)
+}
+
+/// Logical per-position `(K side, V side)` bytes of the page pool: K rows and
+/// raw index rows, V rows and pooled index rows amortized per token. Strides
+/// are in arena order (K, V, raw, pooled per layer).
+fn logical_page_strides(arena_strides: &[u64], compress: usize) -> (usize, usize) {
+    let (mut k, mut v) = (0u64, 0u64);
+    for (index, &stride) in arena_strides.iter().enumerate() {
+        match index % 4 {
+            0 | 2 => k += stride,
+            1 => v += stride,
+            _ => v += stride.div_ceil(compress.max(1) as u64),
+        }
+    }
+    (k.max(1) as usize, v.max(1) as usize)
+}
+
+/// The checkpoint `source` names, borrowed from disjoint cache fields.
+fn resolve_checkpoint<'a>(
+    staged: &'a [Qwen4Checkpoint],
+    local: &'a Option<LocalEop>,
+    pool: Option<&'a QwenCheckpointPool<Qwen4Checkpoint>>,
+    source: CheckpointRef,
+) -> Option<&'a Qwen4Checkpoint> {
+    match source {
+        CheckpointRef::Staged(index) => staged.get(index),
+        CheckpointRef::LocalOwned => match local {
+            Some(LocalEop::Owned(checkpoint)) => Some(checkpoint),
+            _ => None,
+        },
+        CheckpointRef::Pool(id) => pool?.peek_id(id),
+    }
+}
+
+/// Physical granule ids the live banks map.
+fn live_granule_ids(
+    state: &Qwen4State,
+    mtp: Option<&Qwen4MtpGpu>,
+    gpu: &Gpu,
+) -> HashSet<VmmPhysicalId> {
+    let head = mtp.map(Qwen4MtpGpu::context_tensors).unwrap_or_default();
+    let mut ids = HashSet::new();
+    for tensor in state.context_tensors().into_iter().chain(head) {
+        if let Some(granules) = gpu.vmm_physical_granules(tensor) {
+            ids.extend(granules.into_iter().map(|(id, _)| id));
+        }
+    }
+    ids
+}
+
+/// Free replaced or abandoned context banks; the first error.
+fn free_banks(
+    gpu: &mut Gpu,
+    target: Option<Vec<GpuTensor>>,
+    head: Option<Vec<GpuTensor>>,
+) -> Option<BundleError> {
+    let mut first = None;
+    if let Some(bank) = target {
+        if let Err(error) = Qwen4State::free_context_bank(gpu, bank) {
+            first.get_or_insert(BundleError::State(error));
+        }
+    }
+    if let Some(bank) = head {
+        if let Err(error) = Qwen4MtpGpu::free_context_bank(gpu, bank) {
+            first.get_or_insert(BundleError::Forward(error.to_string()));
+        }
+    }
+    first
+}
+
+/// Install fresh `target` / `head` context banks: pair every old and new
+/// tensor, relocate the replay and graph bindings (old and new both alive),
+/// install, then free the replaced banks. Failure before the relocation frees
+/// the new banks and leaves the owners untouched.
+fn swap_context_banks(
+    state: &mut Qwen4State,
+    mut mtp: Option<&mut Qwen4MtpGpu>,
+    gpu: &mut Gpu,
+    target: Option<Vec<GpuTensor>>,
+    head: Option<Vec<GpuTensor>>,
+) -> Result<BankSwap, SwapFailure> {
+    let mut moves: Vec<VmmResourceMove> = Vec::new();
+    let mut problem: Option<String> = None;
+    if let Some(bank) = target.as_ref() {
+        let old = state.context_tensors();
+        if old.len() != bank.len() {
+            problem = Some(format!(
+                "Qwen4 target bank has {} arenas, expected {}",
+                bank.len(),
+                old.len()
+            ));
+        } else {
+            for (old, new) in old.into_iter().zip(bank) {
+                match gpu.vmm_resource_move(old, new) {
+                    Some(mv) => moves.push(mv),
+                    None => {
+                        problem = Some("Qwen4 context bank tensor is not a VMM owner".to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if problem.is_none() {
+        if let Some(bank) = head.as_ref() {
+            match mtp.as_deref() {
+                Some(m) => {
+                    let old = m.context_tensors();
+                    if old.len() != bank.len() {
+                        problem = Some(format!(
+                            "Qwen4 head bank has {} arenas, expected {}",
+                            bank.len(),
+                            old.len()
+                        ));
+                    } else {
+                        for (old, new) in old.into_iter().zip(bank) {
+                            match gpu.vmm_resource_move(old, new) {
+                                Some(mv) => moves.push(mv),
+                                None => {
+                                    problem = Some(
+                                        "Qwen4 head bank tensor is not a VMM owner".to_string(),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => problem = Some("Qwen4 MTP resources are not attached".to_string()),
+            }
+        }
+    }
+    if let Some(message) = problem {
+        let cleanup = free_banks(gpu, target, head);
+        let note = cleanup.map_or(String::new(), |e| format!("; cleanup failed: {e}"));
+        return Err(SwapFailure {
+            error: BundleError::Forward(format!("{message}{note}")),
+            live_modified: false,
+        });
+    }
+    let started = Instant::now();
+    if let Err(error) = gpu.relocate_qsa_resources(&moves) {
+        let cleanup = free_banks(gpu, target, head);
+        let note = cleanup.map_or(String::new(), |e| format!("; cleanup failed: {e}"));
+        return Err(SwapFailure {
+            error: BundleError::Forward(format!("Qwen4 bank relocation failed: {error}{note}")),
+            live_modified: false,
+        });
+    }
+    let relocation_ns = started.elapsed().as_nanos() as u64;
+    let mut old_target = None;
+    let mut old_head = None;
+    if let Some(bank) = target {
+        match state.install_context_bank(gpu, bank) {
+            Ok(old) => old_target = Some(old),
+            Err(error) => {
+                let _ = free_banks(gpu, None, head);
+                return Err(SwapFailure {
+                    error: BundleError::State(error),
+                    live_modified: true,
+                });
+            }
+        }
+    }
+    if let Some(bank) = head {
+        let installed = match mtp.as_deref_mut() {
+            Some(m) => m
+                .install_context_bank(gpu, bank)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            )),
+        };
+        match installed {
+            Ok(old) => old_head = Some(old),
+            Err(error) => {
+                let _ = free_banks(gpu, old_target, None);
+                return Err(SwapFailure {
+                    error,
+                    live_modified: true,
+                });
+            }
+        }
+    }
+    let cleanup = free_banks(gpu, old_target, old_head);
+    Ok(BankSwap {
+        relocation_ns,
+        cleanup,
+    })
+}
+
+/// Release a checkpoint's context now (GPU quiescent) and return its slot.
+fn recycle_checkpoint(
+    slots: &mut Vec<Qwen4CheckpointSlot>,
+    gpu: &mut Gpu,
+    checkpoint: Qwen4Checkpoint,
+) -> Result<(), BundleError> {
+    let Qwen4Checkpoint {
+        mut slot, context, ..
+    } = checkpoint;
+    slot.invalidate();
+    slots.push(slot);
+    context.map_or(Ok(()), |context| {
+        gpu.free_vmm_prefixes(context).map_err(BundleError::Hip)
+    })
+}
+
+/// Release a checkpoint's context and its slot's device memory (unload).
+fn free_checkpoint_final(gpu: &mut Gpu, checkpoint: Qwen4Checkpoint) -> Result<(), BundleError> {
+    let Qwen4Checkpoint { slot, context, .. } = checkpoint;
+    let context = context.map_or(Ok(()), |context| {
+        gpu.free_vmm_prefixes(context).map_err(BundleError::Hip)
+    });
+    context.and(slot.free_gpu(gpu))
+}
+
+fn keep_first(first: &mut Option<BundleError>, result: Result<(), BundleError>) {
+    if let Err(error) = result {
+        first.get_or_insert(error);
+    }
+}
+
+impl Qwen4PrefixCache {
+    /// Release the pins of a selection.
+    fn release_pins(radix: &mut Option<Qwen4RadixCache>, selection: Qwen4Selection) {
+        if let Some(radix) = radix.as_mut() {
+            radix
+                .index
+                .release_pin(&radix.domains[mode_index(selection.mode)], selection.pin);
+            if selection.id.is_some() {
+                radix.pool.unpin_id(selection.id);
+            }
+        }
+    }
+
+    /// Release an unconsumed selection's pins.
+    fn release_pending(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            Self::release_pins(&mut self.radix, selection);
+        }
+    }
+
+    /// Release the running request's pins (commit, reset, a failed begin).
+    fn release_held(&mut self) {
+        if let Some(selection) = self.held.take() {
+            Self::release_pins(&mut self.radix, selection);
+        }
+    }
+
+    /// Return a host-only-dropped checkpoint to the free slots, or defer it
+    /// while it still retains a context (freed at the next quiescent point).
+    fn retire_host(&mut self, checkpoint: Qwen4Checkpoint) {
+        if checkpoint.context.is_some() {
+            self.deferred.push(checkpoint);
+        } else {
+            let mut slot = checkpoint.slot;
+            slot.invalidate();
+            self.slots.push(slot);
+        }
+    }
+
+    /// Replace the local end-of-prompt checkpoint.
+    fn set_local(&mut self, local: LocalEop) {
+        if let Some(LocalEop::Owned(old)) = self.local.replace(local) {
+            self.retire_host(old);
+        }
+    }
+
+    /// Drop the local end-of-prompt checkpoint (a pool entry survives).
+    fn drop_local(&mut self) {
+        if let Some(LocalEop::Owned(old)) = self.local.take() {
+            self.retire_host(old);
+        }
+    }
+
+    /// The end-of-prompt checkpoint a restore may use: this request's staged
+    /// one, else the local one.
+    fn eop_ref(&self) -> Option<(CheckpointRef, &Qwen4Checkpoint)> {
+        if let Some(index) = self.staged.iter().position(|checkpoint| checkpoint.eop) {
+            return Some((CheckpointRef::Staged(index), &self.staged[index]));
+        }
+        match self.local.as_ref()? {
+            LocalEop::Owned(checkpoint) => Some((CheckpointRef::LocalOwned, checkpoint)),
+            LocalEop::Published(id) => self
+                .radix
+                .as_ref()?
+                .pool
+                .peek_id(*id)
+                .map(|checkpoint| (CheckpointRef::Pool(*id), checkpoint)),
+        }
+    }
+
+    /// `(source, B, mode)` of the end-of-prompt checkpoint when it is
+    /// restorable under the armed mode: payloads at exactly `B`, and either its
+    /// bank's rows still unchanged or a retained context to fork from.
+    fn eop_facts(&self) -> Option<(CheckpointRef, usize, Qwen4PrefixMode)> {
+        let (source, checkpoint) = self.eop_ref()?;
+        let b = checkpoint.tokens.len();
+        let restorable = checkpoint.mode == self.mode
+            && b > 0
+            && checkpoint.slot.target.position() == Some(b)
+            && (checkpoint.mode == Qwen4PrefixMode::Ar
+                || checkpoint
+                    .slot
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.position() == Some(b)))
+            && ((checkpoint.same_bank && checkpoint.bank == self.bank)
+                || checkpoint.context.is_some());
+        restorable.then_some((source, b, checkpoint.mode))
+    }
+
+    fn capture_schedule(&self) -> CaptureSchedule {
+        CaptureSchedule {
+            capture_at: self.capture_at,
+            anchor: self.anchor,
+            radix: self.radix.is_some(),
+            periodic_done: self.periodic_done,
+            periodic_due_from: self.periodic_due_from,
+            resources_ok: self.capture_resources_available(),
+        }
+    }
+
+    /// Conservative (last ledger) check that an optional capture finds a slot.
+    fn capture_resources_available(&self) -> bool {
+        self.radix.as_ref().is_some_and(|radix| {
+            capture_resources_ok(
+                self.slots.len(),
+                self.slots_allocated,
+                radix.limits.checkpoints,
+                radix.pool.len(),
+                radix.stats.ledger_bytes,
+                radix.slot_bytes,
+                radix.limits.device_bytes,
+            )
+        })
+    }
+
+    /// Open a new bank id; returns the previous one.
+    fn start_bank(&mut self) -> u64 {
+        let old = self.bank;
+        self.bank = self.next_bank;
+        self.next_bank += 1;
+        old
+    }
+
+    fn for_each_checkpoint_mut(&mut self, mut apply: impl FnMut(&mut Qwen4Checkpoint)) {
+        for checkpoint in &mut self.staged {
+            apply(checkpoint);
+        }
+        if let Some(LocalEop::Owned(checkpoint)) = self.local.as_mut() {
+            apply(checkpoint);
+        }
+        if let Some(radix) = self.radix.as_mut() {
+            for id in radix.pool.exact_ids() {
+                if let Some(checkpoint) = radix.pool.peek_id_mut(id) {
+                    apply(checkpoint);
+                }
+            }
+        }
+    }
+
+    /// The rows of bank `old` are gone or overwritten.
+    fn bank_gone(&mut self, old: u64) {
+        self.for_each_checkpoint_mut(|checkpoint| {
+            if checkpoint.bank == old {
+                checkpoint.same_bank = false;
+            }
+        });
+    }
+
+    /// Bank `bank` was rewound in place to `position`: checkpoints beyond it
+    /// lose their rows (the suffix overwrites them).
+    fn bank_rewound(&mut self, bank: u64, position: usize) {
+        self.for_each_checkpoint_mut(|checkpoint| {
+            if checkpoint.bank == bank && checkpoint.tokens.len() > position {
+                checkpoint.same_bank = false;
+            }
+        });
+    }
+
+    /// Every checkpoint the cache holds device memory for.
+    fn retained(&self) -> impl Iterator<Item = &Qwen4Checkpoint> + '_ {
+        let local = match &self.local {
+            Some(LocalEop::Owned(checkpoint)) => Some(checkpoint),
+            _ => None,
+        };
+        let pool = self.radix.as_ref();
+        self.staged
+            .iter()
+            .chain(self.deferred.iter())
+            .chain(local)
+            .chain(pool.into_iter().flat_map(|radix| {
+                radix
+                    .pool
+                    .exact_ids()
+                    .into_iter()
+                    .filter_map(move |id| radix.pool.peek_id(id))
+            }))
+    }
+
+    /// Device bytes the cache is charged: extra slots, slabs, and the unique
+    /// retained granules no live bank maps (from the last live refresh).
+    fn ledger_bytes(&self) -> u64 {
+        let Some(radix) = self.radix.as_ref() else {
+            return 0;
+        };
+        let extra_slots = self.slots_allocated.saturating_sub(1) as u64 * radix.slot_bytes;
+        let slabs = self
+            .retained()
+            .map(Qwen4Checkpoint::slab_bytes)
+            .fold(0u64, u64::saturating_add);
+        let granules = cache_granule_bytes(
+            self.retained()
+                .filter_map(|checkpoint| checkpoint.context.as_ref())
+                .flat_map(VmmPrefixSet::physical_granules),
+            &radix.live_granules,
+        );
+        ledger_total(extra_slots, slabs, granules)
+    }
+
+    /// Host bytes: exact token records and the index node estimate.
+    fn host_bytes(&self) -> usize {
+        let tokens: usize = self
+            .retained()
+            .map(|checkpoint| checkpoint.tokens.len() * std::mem::size_of::<u32>())
+            .sum();
+        let nodes = self.radix.as_ref().map_or(0, |radix| {
+            radix.index.total_nodes().saturating_mul(INDEX_NODE_HOST_BYTES)
+        });
+        tokens.saturating_add(nodes)
+    }
+
+    /// Radix half of [`Qwen4Bundle::select_prefix_plan`].
+    fn select_radix(
+        &mut self,
+        prompt: &[u32],
+        local: Qwen4PrefixPlan,
+        mode: Qwen4PrefixMode,
+        chunk: usize,
+    ) -> Result<Qwen4PrefixPlan, BundleError> {
+        let di = mode_index(mode);
+        let resources_ok = self.capture_resources_available();
+        let generation = self.generation;
+        let Some(radix) = self.radix.as_mut() else {
+            return Ok(local);
+        };
+        radix.stats.lookups += 1;
+        let found = lookup_valid_checkpoint(
+            &mut *radix,
+            prompt.len(),
+            |radix: &mut Qwen4RadixCache, before| {
+                radix
+                    .index
+                    .lookup_checkpoint(&radix.domains[di], prompt, before, &radix.pages)
+                    .ok()
+                    .map(|hit| {
+                        let boundary = hit.lookup.resumable_tokens as usize;
+                        (hit, boundary)
+                    })
+            },
+            |radix: &Qwen4RadixCache, hit, boundary| {
+                radix.checkpoint_valid(hit.checkpoint, boundary, prompt, mode, chunk)
+            },
+            |radix: &mut Qwen4RadixCache, hit| {
+                radix.index.release_pin(&radix.domains[di], hit.pin);
+            },
+        );
+        let mut best = None;
+        if let Some((hit, boundary)) = found {
+            if radix.pool.pin_id(hit.checkpoint) {
+                best = Some((hit, boundary));
+            } else {
+                radix.index.release_pin(&radix.domains[di], hit.pin);
+            }
+        }
+        let radix_best = best.as_ref().map(|(_, boundary)| *boundary);
+        let source = pick_source(local.source, local.start_pos, radix_best);
+        let (id, start, pin, source) = match (source, best) {
+            (Qwen4PrefixSource::Radix, Some((hit, boundary))) => {
+                (hit.checkpoint, boundary, hit.pin, Qwen4PrefixSource::Radix)
+            }
+            (_, losing) => {
+                if let Some((hit, _)) = losing {
+                    radix.index.release_pin(&radix.domains[di], hit.pin);
+                    radix.pool.unpin_id(hit.checkpoint);
+                }
+                (
+                    CheckpointId::NONE,
+                    local.start_pos,
+                    PinTicket::none(),
+                    local.source,
+                )
+            }
+        };
+        let anchor = anchor_choice(
+            &self.turn_boundaries,
+            prompt.len(),
+            start,
+            |s| {
+                radix
+                    .index
+                    .inspect(&radix.domains[di], &prompt[..s], &radix.pages)
+                    .matched_tokens
+                    >= s as u64
+            },
+            radix_best,
+            resources_ok,
+        );
+        self.anchor = anchor;
+        let selection = Qwen4Selection {
+            id,
+            start,
+            mode,
+            source,
+            pin,
+            generation,
+        };
+        let plan = selection.plan();
+        self.selection = Some(selection);
+        Ok(plan)
+    }
+
+    /// Host-only validation of `plan` for [`Qwen4Bundle::begin_prefix`].
+    fn validate_plan(
+        &self,
+        marks: &PrefixMarks,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+        mode: Qwen4PrefixMode,
+        selection: Option<&Qwen4Selection>,
+    ) -> Result<BeginAction, BundleError> {
+        let stale = || {
+            BundleError::Forward(format!(
+                "Qwen4 prefix plan at {} ({:?}) is no longer valid",
+                plan.start_pos, plan.source
+            ))
+        };
+        match plan.source {
+            Qwen4PrefixSource::Cold => Ok(BeginAction::Cold),
+            Qwen4PrefixSource::Live | Qwen4PrefixSource::Prompt => {
+                let bound = self
+                    .bind(marks, prompt, plan.start_pos, mode)
+                    .map_err(BundleError::Forward)?;
+                if bound != plan {
+                    return Err(stale());
+                }
+                if plan.source == Qwen4PrefixSource::Live {
+                    return Ok(BeginAction::Live);
+                }
+                match self.eop_facts() {
+                    Some((source, b, m)) if b == plan.start_pos && m == mode => {
+                        Ok(BeginAction::Restore(source))
+                    }
+                    _ => Err(stale()),
+                }
+            }
+            Qwen4PrefixSource::Radix => {
+                let (Some(selection), Some(radix), Some(chunk)) =
+                    (selection, self.radix.as_ref(), marks.chunk)
+                else {
+                    return Err(stale());
+                };
+                if plan.generation != self.generation
+                    || selection.id.is_none()
+                    || radix.pool.pin_count(selection.id) == 0
+                    || !radix.checkpoint_valid(selection.id, plan.start_pos, prompt, mode, chunk)
+                {
+                    return Err(stale());
+                }
+                Ok(BeginAction::Restore(CheckpointRef::Pool(selection.id)))
+            }
+        }
+    }
+
+    /// Count a begin that restored from `source` and re-prioritise it.
+    fn note_restore_hit(&mut self, source: CheckpointRef) {
+        if let (Some(radix), CheckpointRef::Pool(id)) = (self.radix.as_mut(), source) {
+            let clock = radix.gdsf_clock;
+            if let Some(checkpoint) = radix.pool.peek_id_mut(id) {
+                checkpoint.hits = checkpoint.hits.saturating_add(1);
+                checkpoint.priority = gdsf_priority(
+                    clock,
+                    checkpoint.cost,
+                    checkpoint.hits,
+                    checkpoint.gdsf_bytes(),
+                );
+            }
+        }
+    }
+
+    /// Stats and trace of a staged checkpoint.
+    fn note_capture(&mut self, checkpoint: &Qwen4Checkpoint, kind: CaptureKind, trace: bool) {
+        let Some(radix) = self.radix.as_mut() else {
+            return;
+        };
+        radix.stats.captures += 1;
+        match kind {
+            CaptureKind::Anchor => radix.stats.anchors += 1,
+            CaptureKind::Periodic => radix.stats.periodic += 1,
+            CaptureKind::EndOfPrompt => {}
+        }
+        if trace {
+            let (alias, copied) = checkpoint
+                .context
+                .as_ref()
+                .map_or((0, 0), |context| (context.alias_bytes(), context.frontier_bytes()));
+            eprintln!(
+                "[qwen4-radix] stage at={} kind={} alias={alias} copied={copied}",
+                checkpoint.tokens.len(),
+                kind.label()
+            );
+        }
+    }
+
+    /// Bookkeeping after an optional capture at `b` (taken or dropped).
+    fn after_optional_capture(&mut self, b: usize, kind: CaptureKind) {
+        self.periodic_due_from = Some(b);
+        match kind {
+            CaptureKind::Anchor => {
+                if self.anchor == Some(b) {
+                    self.anchor = None;
+                }
+            }
+            CaptureKind::Periodic => self.periodic_done = true,
+            CaptureKind::EndOfPrompt => {}
+        }
+    }
+
+    /// Host-only publication of this request's staged checkpoints (see
+    /// [`Qwen4Bundle::commit_prefix`]): the request's pins are released, every
+    /// staged checkpoint is published or kept, retired ids are reclaimed into
+    /// `deferred`, and the host/count caps are enforced.
+    fn publish_staged(&mut self) {
+        self.release_pending();
+        self.release_held();
+        self.anchor = None;
+        let trace = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .is_ok_and(|value| value == "1");
+        for checkpoint in std::mem::take(&mut self.staged) {
+            let (at, eop) = (checkpoint.tokens.len(), checkpoint.eop);
+            let published_before = self.radix.as_ref().map_or(0, |radix| radix.stats.published);
+            self.publish_one(checkpoint);
+            if trace {
+                let published = self.radix.as_ref().map_or(0, |radix| radix.stats.published);
+                eprintln!(
+                    "[qwen4-radix] publish at={at} eop={eop} published={}",
+                    published > published_before
+                );
+            }
+        }
+        let mut first_error = None;
+        self.reclaim_retired(None, &mut first_error);
+        if let Err(error) = self.evict_for(None, 0) {
+            eprintln!("[qwen4-radix] host-only eviction failed: {error}");
+        }
+    }
+
+    /// Publish one staged checkpoint: radix + context → pool and index;
+    /// otherwise the end of prompt stays local and optional ones return their
+    /// slot.
+    fn publish_one(&mut self, checkpoint: Qwen4Checkpoint) {
+        let eop = checkpoint.eop;
+        if self.radix.is_none() || checkpoint.context.is_none() {
+            if eop {
+                self.set_local(LocalEop::Owned(checkpoint));
+            } else {
+                self.retire_host(checkpoint);
+            }
+            return;
+        }
+        let mut defer = Vec::new();
+        let mut local = None;
+        if let Some(radix) = self.radix.as_mut() {
+            let di = mode_index(checkpoint.mode);
+            let tokens = checkpoint.tokens.clone();
+            let bytes = checkpoint.gdsf_bytes();
+            let cost = checkpoint.cost;
+            let (id, unadopted) = radix.pool.insert_exact(
+                radix.domains[di].clone(),
+                tokens.clone(),
+                checkpoint,
+            );
+            match (id.is_some(), unadopted) {
+                // Pool refused: the end of prompt stays a (context-bearing) local.
+                (false, Some(blob)) => {
+                    if eop {
+                        local = Some(LocalEop::Owned(blob));
+                    } else {
+                        defer.push(blob);
+                    }
+                }
+                (false, None) => {}
+                (true, Some(blob)) => {
+                    radix.stats.duplicates += 1;
+                    defer.push(blob);
+                    if eop {
+                        local = Some(LocalEop::Published(id));
+                    }
+                }
+                (true, None) => match publish_pages(radix, di, &tokens, id) {
+                    Ok(adopted) if adopted == id => {
+                        radix.stats.published += 1;
+                        let clock = radix.gdsf_clock;
+                        if let Some(entry) = radix.pool.peek_id_mut(id) {
+                            entry.priority = gdsf_priority(clock, cost, 0, bytes);
+                        }
+                        if eop {
+                            local = Some(LocalEop::Published(id));
+                        }
+                    }
+                    Ok(adopted) => {
+                        // The index already holds this boundary under another id.
+                        radix.stats.duplicates += 1;
+                        if let Some(blob) = radix.pool.take_id(id) {
+                            defer.push(blob);
+                        }
+                        if eop && radix.pool.peek_id(adopted).is_some() {
+                            local = Some(LocalEop::Published(adopted));
+                        }
+                    }
+                    Err(message) => {
+                        eprintln!("[qwen4-radix] publish refused: {message}");
+                        if let Some(blob) = radix.pool.take_id(id) {
+                            if eop {
+                                local = Some(LocalEop::Owned(blob));
+                            } else {
+                                defer.push(blob);
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        if let Some(local) = local {
+            self.set_local(local);
+        }
+        self.deferred.extend(defer);
+    }
+
+    /// Take the pool entries the index retired (and earlier ones that were
+    /// pinned): freed now with a GPU, else deferred. Returns how many left.
+    fn reclaim_retired(
+        &mut self,
+        mut gpu: Option<&mut Gpu>,
+        first_error: &mut Option<BundleError>,
+    ) -> usize {
+        let Qwen4PrefixCache {
+            radix,
+            slots,
+            deferred,
+            ..
+        } = self;
+        let Some(radix) = radix.as_mut() else {
+            return 0;
+        };
+        let mut ids = std::mem::take(&mut radix.retire_pending);
+        ids.extend(radix.index.take_retired_checkpoints());
+        let mut taken = 0;
+        for id in ids {
+            match radix.pool.take_id(id) {
+                Some(blob) => {
+                    taken += 1;
+                    radix.stats.evictions += 1;
+                    match gpu.as_deref_mut() {
+                        Some(gpu) => {
+                            keep_first(first_error, recycle_checkpoint(slots, gpu, blob));
+                        }
+                        None => deferred.push(blob),
+                    }
+                }
+                None => {
+                    if radix.pool.peek_id(id).is_some() {
+                        radix.retire_pending.push(id);
+                    }
+                }
+            }
+        }
+        taken
+    }
+
+    /// Free the checkpoints host-only paths deferred (GPU quiescent).
+    fn drain_deferred(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let mut first = None;
+        for checkpoint in std::mem::take(&mut self.deferred) {
+            keep_first(&mut first, recycle_checkpoint(&mut self.slots, gpu, checkpoint));
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// One eviction step. Checkpoint victims are GDSF-ranked: the lowest
+    /// priority unpinned pool entry leaves index visibility first, the aging
+    /// clock moves to its priority, then its payload is reclaimed. A pruning
+    /// step removes a pageless/checkpointless tree leaf instead. Returns
+    /// whether anything progressed.
+    fn evict_one(
+        &mut self,
+        mut gpu: Option<&mut Gpu>,
+        mode: EvictMode,
+        free_surplus_slot: bool,
+        first_error: &mut Option<BundleError>,
+    ) -> bool {
+        let mut progressed = false;
+        let mut victim = None;
+        if let Some(radix) = self.radix.as_mut() {
+            if mode == EvictMode::PruneFirst {
+                progressed = radix.index.evict_oldest_unpinned_leaf(&mut radix.pages);
+            }
+            if !progressed {
+                let entries: Vec<(CheckpointId, f64, bool)> = radix
+                    .pool
+                    .exact_ids()
+                    .into_iter()
+                    .filter_map(|id| {
+                        radix
+                            .pool
+                            .peek_id(id)
+                            .map(|entry| (id, entry.priority, radix.pool.pin_count(id) > 0))
+                    })
+                    .collect();
+                if let Some(id) = gdsf_victim(&entries) {
+                    if let Some(entry) = radix.pool.peek_id(id) {
+                        radix.gdsf_clock = entry.priority;
+                    }
+                    radix.index.forget_checkpoint(id);
+                    victim = Some(id);
+                    progressed = true;
+                }
+            }
+        }
+        if self.reclaim_retired(gpu.as_deref_mut(), first_error) > 0 {
+            progressed = true;
+        }
+        // A victim the index did not retire is still ours to take.
+        if let Some(id) = victim {
+            let Qwen4PrefixCache {
+                radix,
+                slots,
+                deferred,
+                ..
+            } = self;
+            if let Some(radix) = radix.as_mut() {
+                if radix.pool.pin_count(id) == 0 {
+                    if let Some(blob) = radix.pool.take_id(id) {
+                        radix.stats.evictions += 1;
+                        match gpu.as_deref_mut() {
+                            Some(gpu) => {
+                                keep_first(first_error, recycle_checkpoint(slots, gpu, blob));
+                            }
+                            None => deferred.push(blob),
+                        }
+                    }
+                }
+            }
+        }
+        if !progressed && free_surplus_slot && self.slots_allocated > 1 {
+            if let Some(gpu) = gpu.as_deref_mut() {
+                if let Some(slot) = self.slots.pop() {
+                    self.slots_allocated -= 1;
+                    keep_first(first_error, slot.free_gpu(gpu));
+                    progressed = true;
+                }
+            }
+        }
+        progressed
+    }
+
+    /// Enforce the budgets: evict until the ledger plus `need` fits the device
+    /// budget (only with a GPU, which also frees deferred checkpoints first)
+    /// and the entry/host caps hold, or nothing evictable remains.
+    fn evict_for(&mut self, mut gpu: Option<&mut Gpu>, need: u64) -> Result<(), BundleError> {
+        let mut first_error = None;
+        if let Some(gpu) = gpu.as_deref_mut() {
+            keep_first(&mut first_error, self.drain_deferred(gpu));
+        }
+        loop {
+            let ledger = self.ledger_bytes();
+            let Some(radix) = self.radix.as_ref() else {
+                break;
+            };
+            let device_over =
+                gpu.is_some() && ledger.saturating_add(need) > radix.limits.device_bytes;
+            let count_over = radix.pool.len() > radix.limits.checkpoints;
+            let over = over_budget(
+                device_over,
+                radix.pool.len(),
+                radix.limits.checkpoints,
+                self.host_bytes(),
+                radix.limits.host_bytes,
+            );
+            if let Some(radix) = self.radix.as_mut() {
+                radix.stats.ledger_bytes = ledger;
+                radix.stats.peak_ledger_bytes = radix.stats.peak_ledger_bytes.max(ledger);
+            }
+            if !over {
+                break;
+            }
+            let mode = evict_mode(device_over, count_over);
+            if !self.evict_one(gpu.as_deref_mut(), mode, device_over, &mut first_error) {
+                break;
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Unload: release the index, every retained checkpoint and every slot.
+    fn free_gpu(self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let Qwen4PrefixCache {
+            staged,
+            local,
+            deferred,
+            slots,
+            radix,
+            ..
+        } = self;
+        let mut first = None;
+        let mut blobs: Vec<Qwen4Checkpoint> = Vec::new();
+        if let Some(mut radix) = radix {
+            radix.index.release_all(&mut radix.pages);
+            blobs.extend(radix.pool.drain_exact());
+        }
+        blobs.extend(staged);
+        blobs.extend(deferred);
+        if let Some(LocalEop::Owned(checkpoint)) = local {
+            blobs.push(checkpoint);
+        }
+        for checkpoint in blobs {
+            keep_first(&mut first, free_checkpoint_final(gpu, checkpoint));
+        }
+        for slot in slots {
+            keep_first(&mut first, slot.free_gpu(gpu));
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+/// Mint `floor(B/128)` sealed descriptor pages and publish the checkpoint into
+/// the index; the table's own references are released again (the index holds
+/// the cache references). Returns the adopted checkpoint id.
+fn publish_pages(
+    radix: &mut Qwen4RadixCache,
+    di: usize,
+    tokens: &[u32],
+    id: CheckpointId,
+) -> Result<CheckpointId, String> {
+    let count = tokens.len() / PAGE_TOKENS;
+    let mut table = BlockTable::new();
+    let published = match radix.pages.alloc_pages_checked(&mut table, count) {
+        Ok(handles) => {
+            let mut sealed = Ok(());
+            for handle in &handles {
+                if let Err(error) = radix.pages.seal(handle.phys) {
+                    sealed = Err(error);
+                    break;
+                }
+            }
+            match sealed {
+                Ok(()) => {
+                    let pages: Vec<Handle> = handles
+                        .iter()
+                        .enumerate()
+                        .map(|(page, handle)| Handle {
+                            handle: *handle,
+                            token_offset: (page * PAGE_TOKENS) as u64,
+                        })
+                        .collect();
+                    radix
+                        .index
+                        .publish_checkpoint(&radix.domains[di], tokens, &pages, id, &mut radix.pages)
+                        .map_err(|error| format!("{error:?}"))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = radix.pages.release_table(&mut table) {
+        eprintln!("[qwen4-radix] descriptor table release failed: {error}");
+    }
+    published
 }
 
 impl Qwen4Bundle {
@@ -1379,6 +3109,25 @@ impl Qwen4Bundle {
         result
     }
 
+    /// Run `tokens` through the shared execution owner committing model state
+    /// only: no logits, argmax or wide-hidden rows. Tiles exactly as
+    /// [`Self::forward_chunk_final`], so a prefill split at a capture boundary
+    /// keeps the trunk numerics of the unsplit one.
+    pub(crate) fn forward_chunk_silent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
+        let mut forward = self.execution.take().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let result = forward
+            .forward_chunk_silent(self, gpu, tokens)
+            .map_err(|error| BundleError::Forward(error.to_string()));
+        self.execution = Some(forward);
+        result
+    }
+
     /// Name the tokens the next prefill forward is followed by, so it warms
     /// their PLE rows while its own chunk runs. Best effort; bytes unchanged.
     pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
@@ -1406,9 +3155,35 @@ impl Qwen4Bundle {
         self.ple_rows.resume().map_err(BundleError::PleRows)
     }
 
+    /// Reset every owner for a cold prefill. With a prefix cache the request's
+    /// pins and staged checkpoints are released (GPU quiescent: freed now), the
+    /// live record and local checkpoint dropped, and every bank whose sealed
+    /// bytes must not be written is swapped for a fresh empty one before the
+    /// owners reset. The shared radix store is never cleared.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        if let Some(cache) = self.prefix.as_mut() {
-            cache.clear();
+        let mut cleanup: Option<BundleError> = None;
+        if self.prefix.is_some() {
+            if let Some(cache) = self.prefix.as_mut() {
+                cache.release_pending();
+                cache.release_held();
+            }
+            if let Err(error) = self.discard_staged(gpu) {
+                cleanup.get_or_insert(error);
+            }
+            if let Err(error) = self.drain_deferred(gpu) {
+                cleanup.get_or_insert(error);
+            }
+            if let Some(cache) = self.prefix.as_mut() {
+                cache.clear();
+                cache.drop_local();
+            }
+            self.swap_sealed_banks(gpu)?;
+            // The reset below rewrites the rows of an unswapped bank, so no
+            // checkpoint may be restored in place into it afterwards.
+            if let Some(cache) = self.prefix.as_mut() {
+                let old = cache.start_bank();
+                cache.bank_gone(old);
+            }
         }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
@@ -1416,26 +3191,34 @@ impl Qwen4Bundle {
             mtp.reset(gpu)
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
-        Ok(())
+        cleanup.map_or(Ok(()), Err)
     }
 
-    /// Allocate the durable prefix checkpoint (target state plus, when
-    /// attached, the MTP head). Call after `attach_forward` and MTP attach;
-    /// its bytes are charged by the load reserve
+    /// Allocate the baseline durable checkpoint slot (target state plus, when
+    /// attached, the MTP head's part). Call after `attach_forward` and MTP
+    /// attach; its bytes are charged by the load reserve
     /// (`Qwen4State::prefix_arena_bytes`).
     /// Idempotent: call once right after assembly, before `attach_forward`
     /// (so its free-VRAM chunk rung sees the checkpoint already allocated),
     /// and again after MTP attach to add the head's part.
     pub fn attach_prefix_cache(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        self.state
-            .attach_prefix_arena(gpu)
-            .map_err(BundleError::State)?;
-        if let Some(mtp) = self.mtp.as_mut() {
-            mtp.attach_prefix_arena(gpu)
-                .map_err(|error| BundleError::Forward(error.to_string()))?;
-        }
         if self.prefix.is_none() {
-            self.prefix = Some(Qwen4PrefixCache::new(self.state.max_seq_len));
+            let target = self
+                .state
+                .new_checkpoint(gpu)
+                .map_err(BundleError::State)?;
+            let mut cache = Qwen4PrefixCache::new(self.state.max_seq_len);
+            cache.slots.push(Qwen4CheckpointSlot { target, head: None });
+            cache.slots_allocated = 1;
+            self.prefix = Some(cache);
+        }
+        if let (Some(mtp), Some(cache)) = (self.mtp.as_ref(), self.prefix.as_mut()) {
+            if let Some(slot) = cache.slots.iter_mut().find(|slot| slot.head.is_none()) {
+                slot.head = Some(
+                    mtp.new_checkpoint(gpu)
+                        .map_err(|error| BundleError::Forward(error.to_string()))?,
+                );
+            }
         }
         Ok(())
     }
@@ -1460,13 +3243,18 @@ impl Qwen4Bundle {
         Ok((target, mtp))
     }
 
-    /// Device positions and admitted chunk the prefix decisions read.
+    /// Device positions and admitted chunk the prefix decisions read. The
+    /// durable checkpoint is the end-of-prompt one: the staged one while the
+    /// request is unpublished, else the local one, valid when restorable.
     fn prefix_marks(&self) -> PrefixMarks {
+        let eop = self.prefix.as_ref().and_then(|cache| cache.eop_facts());
         PrefixMarks {
             target_position: self.state.position,
             mtp_position: self.mtp.as_ref().map(Qwen4MtpGpu::position),
-            target_prefix: self.state.prefix_position(),
-            mtp_prefix: self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position),
+            target_prefix: eop.map(|(_, position, _)| position),
+            mtp_prefix: eop.and_then(|(_, position, mode)| {
+                (mode == Qwen4PrefixMode::NativeMtp).then_some(position)
+            }),
             chunk: self.spec_chunk_rows(),
             row_capture_armed: self.state.row_capture_armed,
         }
@@ -1492,13 +3280,34 @@ impl Qwen4Bundle {
     }
 
     /// Bind a planner-selected `start_pos` for `prompt` (the full canonical
-    /// token ids) under `mode`. `0` is a cold start; the valid live end `L`
-    /// (with `prompt[..L]` equal to the committed record) is a live
-    /// continuation, preferred when it also ends at `P`; the valid checkpoint
-    /// end `P` (with `prompt[..P]` equal to its record) is a checkpoint
-    /// restore. A hit must leave a non-empty suffix; any other start is an
-    /// error. No GPU or state mutation.
+    /// token ids) under `mode`. A pending [`Self::select_prefix_plan`]
+    /// selection matching `(start_pos, mode)` returns its plan. Otherwise:
+    /// `0` is a cold start; the valid live end `L` (with `prompt[..L]` equal
+    /// to the committed record) is a live continuation, preferred when it also
+    /// ends at `P`; the valid checkpoint end `P` (with `prompt[..P]` equal to
+    /// its record) is a checkpoint restore. A hit must leave a non-empty
+    /// suffix; any other start is an error. No GPU or state mutation.
     pub fn bind_prefix_plan(
+        &self,
+        prompt: &[u32],
+        start_pos: usize,
+        mode: Qwen4PrefixMode,
+    ) -> Result<Qwen4PrefixPlan, BundleError> {
+        if let Some(selection) = self
+            .prefix
+            .as_ref()
+            .and_then(|cache| cache.selection.as_ref())
+        {
+            if selection.start == start_pos && selection.mode == mode {
+                return Ok(selection.plan());
+            }
+        }
+        self.bind_prefix_plan_local(prompt, start_pos, mode)
+    }
+
+    /// The local (live record / end-of-prompt checkpoint) bind of
+    /// [`Self::bind_prefix_plan`], ignoring any pending selection.
+    fn bind_prefix_plan_local(
         &self,
         prompt: &[u32],
         start_pos: usize,
@@ -1514,24 +3323,265 @@ impl Qwen4Bundle {
         bound.map_err(BundleError::Forward)
     }
 
+    /// Whether the radix store is attached ([`Self::attach_radix_cache`]).
+    pub fn radix_cache_attached(&self) -> bool {
+        self.prefix
+            .as_ref()
+            .is_some_and(|cache| cache.radix.is_some())
+    }
+
+    /// A copy of the radix counters, `None` without a radix store.
+    pub fn radix_stats(&self) -> Option<Qwen4RadixStats> {
+        let radix = self.prefix.as_ref()?.radix.as_ref()?;
+        let mut stats = radix.stats.clone();
+        stats.retired_va_bytes = hip_bridge::retired_va_bytes() as u64;
+        Some(stats)
+    }
+
+    /// Register the positions after every ChatML turn terminator of the
+    /// canonical prompt (`<|im_end|>`), the anchor candidates of
+    /// [`Self::select_prefix_plan`]. Stored sorted and deduplicated, each
+    /// below the admitted context length.
+    pub fn set_prefix_turn_boundaries(&mut self, boundaries: &[usize]) {
+        let max_seq = self.state.max_seq_len;
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.turn_boundaries = normalized_turn_boundaries(boundaries, max_seq);
+        }
+    }
+
+    /// Host-only: release the pins of a selection no prefill consumed and drop
+    /// its anchor. A prefill that already began owns its pin until
+    /// commit/reset, so this is a no-op then.
+    pub fn abandon_prefix_selection(&mut self) {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.release_pending();
+            cache.anchor = None;
+        }
+    }
+
+    /// Choose the authoritative prefill start for `prompt`. `local_start` is
+    /// the shared planner's start (`0`, or a live/checkpoint end
+    /// [`Self::bind_prefix_plan`] accepts). Without a radix store this equals
+    /// the local bind. With one, the deepest valid retained checkpoint
+    /// `B < prompt.len()` of this mode's domain competes with the local
+    /// candidate (live wins when `L >= B`, otherwise the greater of local
+    /// prompt `P` and `B`, `P` on ties); the winner is pinned, the pending
+    /// selection stored (one at a time) and the conditional turn anchor
+    /// decided. Host-only: no GPU or owner mutation.
+    pub fn select_prefix_plan(
+        &mut self,
+        prompt: &[u32],
+        local_start: usize,
+        mode: Qwen4PrefixMode,
+    ) -> Result<Qwen4PrefixPlan, BundleError> {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.release_pending();
+            cache.anchor = None;
+        }
+        let local = self.bind_prefix_plan_local(prompt, local_start, mode)?;
+        let chunk = self.spec_chunk_rows();
+        let Some(cache) = self.prefix.as_mut() else {
+            return Ok(local);
+        };
+        let Some(chunk) = chunk.filter(|_| cache.radix.is_some()) else {
+            return Ok(local);
+        };
+        cache.select_radix(prompt, local, mode, chunk)
+    }
+
+    /// The next absolute position the running prefill must end its chunk at
+    /// and stage a checkpoint at, if any: the pre-admitted anchor inside
+    /// `(position, natural_end]`, else `natural_end` when it is the end of the
+    /// armed prompt or a due periodic boundary. `None` without a prefix cache.
+    /// `Some(b)` satisfies `position < b <= natural_end`.
+    pub fn next_prefix_capture(&self, position: usize, natural_end: usize) -> Option<usize> {
+        self.prefix
+            .as_ref()?
+            .capture_schedule()
+            .next(position, natural_end)
+    }
+
+    /// Attach the shared radix store: granular context growth for target and
+    /// head, the per-mode cache domains derived from `domain`, and the
+    /// host-side index, descriptor pool and checkpoint pool. Requires
+    /// [`Self::attach_prefix_cache`] (and any MTP head and forward) done and
+    /// no context bytes mapped yet.
+    pub fn attach_radix_cache(
+        &mut self,
+        gpu: &mut Gpu,
+        domain: CacheDomain,
+        limits: Qwen4RadixLimits,
+    ) -> Result<(), BundleError> {
+        let chunk = self.spec_chunk_rows().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let slot_bytes = {
+            let cache = self.prefix.as_ref().ok_or_else(|| {
+                BundleError::Forward("Qwen4 prefix cache is not attached".to_string())
+            })?;
+            if cache.radix.is_some() {
+                return Err(BundleError::Forward(
+                    "Qwen4 radix cache is already attached".to_string(),
+                ));
+            }
+            cache
+                .slots
+                .first()
+                .map(Qwen4CheckpointSlot::device_bytes)
+                .ok_or_else(|| {
+                    BundleError::Forward("Qwen4 baseline checkpoint slot is missing".to_string())
+                })?
+        };
+        if self.state.qsa_backend() != Qwen4KvBackend::Vmm {
+            return Err(BundleError::Forward(
+                "Qwen4 radix cache needs the VMM QSA context backend".to_string(),
+            ));
+        }
+        if self
+            .state
+            .mapped_context_bytes(gpu)
+            .map_err(BundleError::State)?
+            != 0
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 radix cache must attach before any target context is mapped".to_string(),
+            ));
+        }
+        if let Some(mtp) = self.mtp.as_ref() {
+            if mtp.state.backend() != Qwen4KvBackend::Vmm
+                || mtp
+                    .mapped_context_bytes(gpu)
+                    .map_err(|error| BundleError::Forward(error.to_string()))?
+                    != 0
+            {
+                return Err(BundleError::Forward(
+                    "Qwen4 radix cache needs an unmapped VMM MTP head context".to_string(),
+                ));
+            }
+        }
+        let target_strides = self.target_arena_strides()?;
+        let head_strides = self.head_arena_strides()?;
+        let gdn_tag = self
+            .state
+            .gdn
+            .first()
+            .map(|gdn| {
+                format!(
+                    "{:?}:{}:{:?}:{}",
+                    gdn.recurrent.dtype,
+                    gdn.recurrent.numel(),
+                    gdn.conv.dtype,
+                    gdn.conv.numel()
+                )
+            })
+            .unwrap_or_default();
+        let qsa_tag = self
+            .state
+            .qsa
+            .first()
+            .map(|qsa| format!("{:?}", qsa.format))
+            .unwrap_or_default();
+        let ar_strides = target_strides.clone();
+        let mtp_strides: Vec<u64> = target_strides.iter().chain(&head_strides).copied().collect();
+        let domains = [
+            build_radix_domain(&domain, Qwen4PrefixMode::Ar, chunk, &gdn_tag, &qsa_tag, &ar_strides),
+            build_radix_domain(
+                &domain,
+                Qwen4PrefixMode::NativeMtp,
+                chunk,
+                &gdn_tag,
+                &qsa_tag,
+                &mtp_strides,
+            ),
+        ];
+        let compress = self.config.indexer_compress_ratio.max(1);
+        let (k_sum, v_sum) = logical_page_strides(&mtp_strides, compress);
+        let pages = PagePool::new_external_with_strides(RADIX_PAGE_POOL_PAGES, k_sum, v_sum)
+            .map_err(BundleError::Forward)?;
+        self.state.set_granular_context(true);
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.set_granular_context(true);
+        }
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.radix = Some(Qwen4RadixCache {
+                domains,
+                limits,
+                index: PrefixIndex::new(RADIX_INDEX_NODES),
+                pages,
+                pool: QwenCheckpointPool::new(u64::MAX),
+                stats: Qwen4RadixStats::default(),
+                slot_bytes,
+                live_granules: HashSet::new(),
+                retire_pending: Vec::new(),
+                gdsf_clock: 0.0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Row strides of the target's context arenas, arena order (layer by layer:
+    /// K, V, raw index, pooled index).
+    fn target_arena_strides(&self) -> Result<Vec<u64>, BundleError> {
+        let mut strides = Vec::with_capacity(self.state.qsa.len() * 4);
+        for layer in &self.state.qsa {
+            for (tensor, rows) in [
+                (&layer.full_keys, layer.full_capacity),
+                (&layer.full_values, layer.full_capacity),
+                (&layer.raw_index_keys, layer.raw_capacity),
+                (&layer.pooled_keys, layer.pooled_capacity),
+            ] {
+                strides.push(arena_row_stride(tensor, rows)?);
+            }
+        }
+        Ok(strides)
+    }
+
+    /// Row strides of the native head's four context arenas (empty without a head).
+    fn head_arena_strides(&self) -> Result<Vec<u64>, BundleError> {
+        let Some(mtp) = self.mtp.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let max_seq = self.state.max_seq_len;
+        let compress = self.config.indexer_compress_ratio.max(1);
+        let tensors = mtp.context_tensors();
+        if tensors.len() != 4 {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 MTP head exposes {} context arenas, expected 4",
+                tensors.len()
+            )));
+        }
+        let rows = [max_seq, max_seq, max_seq, max_seq.div_ceil(compress)];
+        tensors
+            .into_iter()
+            .zip(rows)
+            .map(|(tensor, rows)| arena_row_stride(tensor, rows))
+            .collect()
+    }
+
     /// Discard live decode state the host will never extend, keeping the
-    /// end-of-prompt checkpoint: restore it into every owner (its publish
-    /// state untouched), as a checkpoint hit's prefill would. Afterwards no
-    /// live record remains and earlier receipts are stale. Without a valid
-    /// checkpoint, or if the restore fails, reset instead. Every later
-    /// prefill begins with [`Self::begin_prefix`], so the discarded state is
-    /// never built on.
+    /// end-of-prompt checkpoint: restore it into every owner (in place, or into
+    /// a fresh bank when the bank is sealed), as a checkpoint hit's prefill
+    /// would. Afterwards no live record remains and earlier receipts are
+    /// stale; staged checkpoints stay publishable. Without a valid checkpoint,
+    /// or if the restore fails, reset instead. Every later prefill begins with
+    /// [`Self::begin_prefix`], so the discarded state is never built on.
     pub fn rewind_to_prefix(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         let marks = self.prefix_marks();
-        let mode = match self.prefix.as_ref() {
-            Some(cache) if marks.checkpoint_at(cache.prompt_len, cache.mode) => cache.mode,
-            _ => return self.reset(gpu),
+        let target = match self.prefix.as_ref() {
+            Some(cache) if marks.checkpoint_at(cache.prompt_len, cache.mode) => cache
+                .eop_facts()
+                .map(|(source, _, mode)| (source, mode)),
+            _ => None,
         };
-        if let Err(error) = self.restore_prefix_owners(gpu, mode) {
+        let Some((source, mode)) = target else {
+            return self.reset(gpu);
+        };
+        if let Err(failure) = self.restore_checkpoint_owners(gpu, source, mode) {
             return match self.reset(gpu) {
                 Ok(()) => Ok(()),
                 Err(reset) => Err(BundleError::Forward(format!(
-                    "{error}; reset after the failed prefix rewind also failed: {reset}"
+                    "{}; reset after the failed prefix rewind also failed: {reset}",
+                    failure.error
                 ))),
             };
         }
@@ -1543,15 +3593,19 @@ impl Qwen4Bundle {
         Ok(())
     }
 
-    /// Start a prefill of `prompt` under `plan`. A cold plan resets every
-    /// owner. A live or checkpoint plan is re-bound first and must equal
-    /// `plan` (source, start and generation) before any device write. Live
-    /// continues the committed state in place: only the previous request's
-    /// PLE work is invalidated. Checkpoint restores `P` into target state
-    /// and, for native MTP, the head and its draft policy; a failed restore
-    /// resets before returning. The cache is unpublished until
-    /// [`Self::commit_prefix`], and the prefill checkpoints at
-    /// `prompt.len()`.
+    /// Start a prefill of `prompt` under `plan`. The plan is validated against
+    /// the pending selection (or the local bind) and the pinned checkpoint
+    /// before any device write. A cold plan resets every owner (a sealed bank
+    /// is swapped for a fresh one; the radix store survives). A live plan
+    /// continues the committed state in place: only the previous request's PLE
+    /// work is invalidated. A checkpoint plan restores `P` into target state
+    /// and, for native MTP, the head and its draft policy: in place when the
+    /// bank is unchanged and unsealed where the restore writes, otherwise into
+    /// a fresh bank (forked from the checkpoint's retained granules, with typed
+    /// PM4 relocation). A failed restore before any live write returns the
+    /// error with the old state intact; after one it resets. The cache is
+    /// unpublished until [`Self::commit_prefix`], and the prefill checkpoints
+    /// at `prompt.len()`.
     pub fn begin_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -1561,36 +3615,109 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        match plan.source {
-            Qwen4PrefixSource::Cold => self.reset(gpu)?,
-            Qwen4PrefixSource::Live | Qwen4PrefixSource::Prompt => {
-                if self.bind_prefix_plan(prompt, plan.start_pos, mode)? != plan {
-                    return Err(BundleError::Forward(format!(
-                        "Qwen4 prefix plan at {} ({:?}) is no longer valid",
-                        plan.start_pos, plan.source
-                    )));
+        let action = self.plan_begin(prompt, plan, mode)?;
+        let result = self.apply_begin(gpu, prompt, plan, mode, action);
+        if result.is_err() {
+            if let Some(cache) = self.prefix.as_mut() {
+                cache.release_held();
+            }
+        }
+        result
+    }
+
+    /// Host-only validation of `plan`; consumes the pending selection into the
+    /// request's held pin.
+    fn plan_begin(
+        &mut self,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+        mode: Qwen4PrefixMode,
+    ) -> Result<BeginAction, BundleError> {
+        let marks = self.prefix_marks();
+        let Some(cache) = self.prefix.as_mut() else {
+            return if plan.source == Qwen4PrefixSource::Cold && plan.start_pos == 0 {
+                Ok(BeginAction::Cold)
+            } else {
+                Err(BundleError::Forward(format!(
+                    "Qwen4 prefix cache is not attached (start {})",
+                    plan.start_pos
+                )))
+            };
+        };
+        let selection = cache.selection.take();
+        let selected = selection.as_ref().is_some_and(|selection| {
+            selection.start == plan.start_pos
+                && selection.source == plan.source
+                && selection.generation == plan.generation
+                && selection.mode == mode
+        });
+        let outcome = cache.validate_plan(
+            &marks,
+            prompt,
+            plan,
+            mode,
+            selection.as_ref().filter(|_| selected),
+        );
+        match outcome {
+            Ok(action) => {
+                cache.release_held();
+                match selection {
+                    Some(selection) if selected => cache.held = Some(selection),
+                    Some(selection) => Qwen4PrefixCache::release_pins(&mut cache.radix, selection),
+                    None => {}
                 }
-                if plan.source == Qwen4PrefixSource::Live {
-                    if let Some(cache) = self.prefix.as_mut() {
-                        cache.published = false;
-                        cache.live_len = None;
-                        cache.tokens.truncate(cache.prompt_len);
-                    }
-                    self.invalidate_ple_epoch()?;
-                } else {
-                    if let Err(error) = self.restore_prefix_owners(gpu, mode) {
-                        let reset = self.reset(gpu);
-                        return Err(match reset {
-                            Ok(()) => error,
-                            Err(reset) => BundleError::Forward(format!(
-                                "{error}; reset after the failed prefix restore also failed: {reset}"
-                            )),
-                        });
-                    }
-                    if let Some(cache) = self.prefix.as_mut() {
-                        cache.live_len = None;
-                        cache.tokens.truncate(cache.prompt_len);
-                    }
+                if !selected || cache.anchor.is_some_and(|anchor| anchor <= plan.start_pos) {
+                    cache.anchor = None;
+                }
+                Ok(action)
+            }
+            Err(error) => {
+                if let Some(selection) = selection {
+                    Qwen4PrefixCache::release_pins(&mut cache.radix, selection);
+                }
+                cache.anchor = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+        mode: Qwen4PrefixMode,
+        action: BeginAction,
+    ) -> Result<(), BundleError> {
+        // Quiescent point: free what the previous request left behind.
+        self.discard_staged(gpu)?;
+        self.drain_deferred(gpu)?;
+        let mut report = RestoreReport::default();
+        match action {
+            BeginAction::Cold => {
+                let anchor = self.prefix.as_ref().and_then(|cache| cache.anchor);
+                self.reset(gpu)?;
+                if let Some(cache) = self.prefix.as_mut() {
+                    cache.anchor = anchor;
+                }
+            }
+            BeginAction::Live => {
+                if let Some(cache) = self.prefix.as_mut() {
+                    cache.published = false;
+                    cache.live_len = None;
+                    cache.tokens.truncate(cache.prompt_len);
+                }
+                self.invalidate_ple_epoch()?;
+            }
+            BeginAction::Restore(source) => {
+                report = match self.restore_checkpoint_owners(gpu, source, mode) {
+                    Ok(report) => report,
+                    Err(failure) => return Err(self.fail_restore(gpu, failure)),
+                };
+                if let Some(cache) = self.prefix.as_mut() {
+                    cache.note_restore_hit(source);
+                    cache.live_len = None;
+                    cache.tokens.truncate(cache.prompt_len);
                 }
             }
         }
@@ -1604,49 +3731,286 @@ impl Qwen4Bundle {
             cache.chunk = chunk;
             cache.capture_at = Some(prompt.len());
             cache.generation += 1;
+            cache.periodic_due_from = Some(plan.start_pos);
+            cache.periodic_done = false;
+            if let Some(radix) = cache.radix.as_mut() {
+                match plan.source {
+                    Qwen4PrefixSource::Live => radix.stats.hits_live += 1,
+                    Qwen4PrefixSource::Prompt => radix.stats.hits_prompt += 1,
+                    Qwen4PrefixSource::Radix => radix.stats.hits_radix += 1,
+                    Qwen4PrefixSource::Cold => {}
+                }
+            }
+        }
+        // Retained granules that left the live bank are cache-charged now.
+        if self.radix_cache_attached() && action != BeginAction::Live {
+            self.refresh_live_granules(&*gpu);
+            self.evict_for(Some(&mut *gpu), 0)?;
         }
         if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").is_ok_and(|value| value == "1")
         {
-            eprintln!(
-                "[qwen4-prefix] begin source={:?} start={} prompt={} mode={mode:?}",
-                plan.source,
-                plan.start_pos,
-                prompt.len()
-            );
+            match self.prefix.as_ref().and_then(|cache| cache.radix.as_ref()) {
+                Some(radix) => eprintln!(
+                    "[qwen4-radix] begin source={:?} start={} prompt={} mode={mode:?} fork={} alias={} copied={} reloc_ns={} attach_ns={} ledger={} entries={} banks={} retired_va={}",
+                    plan.source,
+                    plan.start_pos,
+                    prompt.len(),
+                    report.fork,
+                    report.alias_bytes,
+                    report.copied_bytes,
+                    report.relocation_ns,
+                    report.attach_ns,
+                    radix.stats.ledger_bytes,
+                    radix.pool.len(),
+                    radix.stats.banks_created,
+                    hip_bridge::retired_va_bytes()
+                ),
+                None => eprintln!(
+                    "[qwen4-prefix] begin source={:?} start={} prompt={} mode={mode:?}",
+                    plan.source,
+                    plan.start_pos,
+                    prompt.len()
+                ),
+            }
         }
         Ok(())
     }
 
-    fn restore_prefix_owners(
+    /// A failed restore: before any live write the old state is intact and the
+    /// error is returned as is; after one every owner is reset.
+    fn fail_restore(&mut self, gpu: &mut Gpu, failure: RestoreFailure) -> BundleError {
+        if !failure.live_modified {
+            return failure.error;
+        }
+        match self.reset(gpu) {
+            Ok(()) => failure.error,
+            Err(reset) => BundleError::Forward(format!(
+                "{}; reset after the failed prefix restore also failed: {reset}",
+                failure.error
+            )),
+        }
+    }
+
+    /// Restore the checkpoint `source` into every owner. In place iff the
+    /// checkpoint's bank is still the live bank with its rows unchanged and no
+    /// sealed granule lies above the bytes the restore writes; otherwise a
+    /// fresh bank forked from the checkpoint's retained granules replaces the
+    /// live one (typed PM4 relocation, old bank freed).
+    fn restore_checkpoint_owners(
         &mut self,
         gpu: &mut Gpu,
+        source: CheckpointRef,
         mode: Qwen4PrefixMode,
-    ) -> Result<(), BundleError> {
-        self.invalidate_ple_epoch()?;
-        // Context rows stay mapped until unload, so the checkpoint's rows
-        // are covered; mapping through its position first keeps every
-        // restored access inside the mapped prefix regardless.
-        if let Some(position) = self.state.prefix_position() {
-            self.state
-                .ensure_mapped_capacity(gpu, position)
-                .map_err(BundleError::State)?;
-        }
-        if let (Qwen4PrefixMode::NativeMtp, Some(mtp)) = (mode, self.mtp.as_mut()) {
-            if let Some(position) = mtp.prefix_position() {
-                mtp.ensure_mapped_capacity(gpu, position)
-                    .map_err(|error| BundleError::Forward(error.to_string()))?;
+    ) -> Result<RestoreReport, RestoreFailure> {
+        self.invalidate_ple_epoch().map_err(RestoreFailure::clean)?;
+        let Qwen4Bundle {
+            state, mtp, prefix, ..
+        } = self;
+        let Some(cache) = prefix.as_mut() else {
+            return Err(RestoreFailure::clean(BundleError::Forward(
+                "Qwen4 prefix cache is not attached".to_string(),
+            )));
+        };
+        let head_needed = mode == Qwen4PrefixMode::NativeMtp;
+        let (report, bank_action, cleanup) = {
+            let pool = cache.radix.as_ref().map(|radix| &radix.pool);
+            let Some(x) = resolve_checkpoint(&cache.staged, &cache.local, pool, source) else {
+                return Err(RestoreFailure::clean(BundleError::Forward(
+                    "Qwen4 prefix checkpoint is no longer retained".to_string(),
+                )));
+            };
+            let b = x.tokens.len();
+            if x.mode != mode || b == 0 || x.slot.target.position() != Some(b) {
+                return Err(RestoreFailure::clean(BundleError::Forward(format!(
+                    "Qwen4 prefix checkpoint at {b} ({:?}) does not match a {mode:?} restore",
+                    x.mode
+                ))));
+            }
+            if head_needed
+                && !(mtp.is_some() && x.slot.head.as_ref().is_some_and(|h| h.position() == Some(b)))
+            {
+                return Err(RestoreFailure::clean(BundleError::Forward(
+                    "Qwen4 native MTP checkpoint has no head state".to_string(),
+                )));
+            }
+            let in_place = x.same_bank
+                && x.bank == cache.bank
+                && state.context_writable_at(gpu, b)
+                && (!head_needed
+                    || mtp
+                        .as_ref()
+                        .is_some_and(|mtp| mtp.context_writable_at(gpu, b)));
+            let mut report = RestoreReport::default();
+            let mut cleanup = None;
+            let bank_action;
+            if in_place {
+                state
+                    .ensure_mapped_capacity(gpu, b)
+                    .map_err(|e| RestoreFailure::clean(BundleError::State(e)))?;
+                if head_needed {
+                    mtp.as_mut()
+                        .ok_or_else(|| {
+                            RestoreFailure::clean(BundleError::Forward(
+                                "Qwen4 MTP resources are not attached".to_string(),
+                            ))
+                        })?
+                        .ensure_mapped_capacity(gpu, b)
+                        .map_err(|e| RestoreFailure::clean(BundleError::Forward(e.to_string())))?;
+                }
+                state
+                    .restore_checkpoint(gpu, &x.slot.target)
+                    .map_err(|e| RestoreFailure::dirty(BundleError::State(e)))?;
+                let mut head_swapped = false;
+                if head_needed {
+                    let head = x.slot.head.as_ref().ok_or_else(|| {
+                        RestoreFailure::dirty(BundleError::Forward(
+                            "Qwen4 native MTP checkpoint has no head state".to_string(),
+                        ))
+                    })?;
+                    mtp.as_mut()
+                        .ok_or_else(|| {
+                            RestoreFailure::dirty(BundleError::Forward(
+                                "Qwen4 MTP resources are not attached".to_string(),
+                            ))
+                        })?
+                        .restore_checkpoint(gpu, head)
+                        .map_err(|e| RestoreFailure::dirty(BundleError::Forward(e.to_string())))?;
+                } else if let Some(m) = mtp.as_ref() {
+                    // An AR prefill leaves the head cold, as a reset would; a
+                    // sealed head bank is swapped, never written.
+                    if m.context_sealed(gpu) {
+                        let fresh = m.new_context_bank(gpu).map_err(|e| {
+                            RestoreFailure::dirty(BundleError::Forward(e.to_string()))
+                        })?;
+                        let swap = swap_context_banks(state, mtp.as_mut(), gpu, None, Some(fresh))
+                            .map_err(RestoreFailure::from_swap)?;
+                        report.relocation_ns = swap.relocation_ns;
+                        report.bank_replaced = true;
+                        report.fresh_bank = true;
+                        cleanup = swap.cleanup;
+                        head_swapped = true;
+                    }
+                }
+                if !head_needed {
+                    if let Some(m) = mtp.as_mut() {
+                        m.reset(gpu).map_err(|e| {
+                            RestoreFailure::dirty(BundleError::Forward(e.to_string()))
+                        })?;
+                    }
+                }
+                bank_action = if head_swapped {
+                    BankAction::Replaced
+                } else {
+                    BankAction::Rewound(b)
+                };
+            } else {
+                let Some(context) = x.context.as_ref() else {
+                    return Err(RestoreFailure::clean(BundleError::Forward(format!(
+                        "Qwen4 prefix checkpoint at {b} cannot be restored in place and retains no context"
+                    ))));
+                };
+                let started = Instant::now();
+                let device = gpu.device_id;
+                let mut forked = gpu
+                    .fork_vmm_prefixes(context, &[device])
+                    .map_err(|e| RestoreFailure::clean(BundleError::Hip(e)))?;
+                let target_arenas = state.context_tensors().len();
+                let head_arenas = if head_needed {
+                    mtp.as_ref().map_or(0, |mtp| mtp.context_tensors().len())
+                } else {
+                    0
+                };
+                if forked.len() != target_arenas + head_arenas {
+                    let count = forked.len();
+                    let cleanup = free_banks(gpu, Some(forked), None);
+                    return Err(RestoreFailure::clean(BundleError::Forward(format!(
+                        "Qwen4 fork produced {count} arenas, expected {} {}",
+                        target_arenas + head_arenas,
+                        cleanup.map_or(String::new(), |e| format!("(cleanup failed: {e})"))
+                    ))));
+                }
+                let head_forked = forked.split_off(target_arenas);
+                let head_bank = if head_needed {
+                    Some(head_forked)
+                } else if let Some(m) = mtp.as_ref().filter(|m| m.context_sealed(gpu)) {
+                    match m.new_context_bank(gpu) {
+                        Ok(fresh) => Some(fresh),
+                        Err(error) => {
+                            let _ = free_banks(gpu, Some(forked), None);
+                            return Err(RestoreFailure::clean(BundleError::Forward(
+                                error.to_string(),
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                report.alias_bytes = context.alias_bytes();
+                report.copied_bytes = context.frontier_bytes();
+                let swap = swap_context_banks(state, mtp.as_mut(), gpu, Some(forked), head_bank)
+                    .map_err(RestoreFailure::from_swap)?;
+                report.relocation_ns = swap.relocation_ns;
+                cleanup = swap.cleanup;
+                state
+                    .ensure_mapped_capacity(gpu, b)
+                    .map_err(|e| RestoreFailure::dirty(BundleError::State(e)))?;
+                state
+                    .restore_checkpoint(gpu, &x.slot.target)
+                    .map_err(|e| RestoreFailure::dirty(BundleError::State(e)))?;
+                if head_needed {
+                    let head = x.slot.head.as_ref().ok_or_else(|| {
+                        RestoreFailure::dirty(BundleError::Forward(
+                            "Qwen4 native MTP checkpoint has no head state".to_string(),
+                        ))
+                    })?;
+                    let m = mtp.as_mut().ok_or_else(|| {
+                        RestoreFailure::dirty(BundleError::Forward(
+                            "Qwen4 MTP resources are not attached".to_string(),
+                        ))
+                    })?;
+                    m.ensure_mapped_capacity(gpu, b)
+                        .and_then(|()| m.restore_checkpoint(gpu, head))
+                        .map_err(|e| RestoreFailure::dirty(BundleError::Forward(e.to_string())))?;
+                } else if let Some(m) = mtp.as_mut() {
+                    m.reset(gpu)
+                        .map_err(|e| RestoreFailure::dirty(BundleError::Forward(e.to_string())))?;
+                }
+                report.fork = true;
+                report.bank_replaced = true;
+                report.attach_ns = started.elapsed().as_nanos() as u64;
+                bank_action = BankAction::Replaced;
+            }
+            (report, bank_action, cleanup)
+        };
+        match bank_action {
+            BankAction::Rewound(position) => {
+                let bank = cache.bank;
+                cache.bank_rewound(bank, position);
+            }
+            BankAction::Replaced => {
+                let old = cache.start_bank();
+                cache.bank_gone(old);
             }
         }
-        self.state.restore_prefix(gpu).map_err(BundleError::State)?;
-        if let Some(mtp) = self.mtp.as_mut() {
-            match mode {
-                Qwen4PrefixMode::NativeMtp => mtp.restore_prefix(gpu),
-                // An AR prefill leaves the head cold, as a reset would.
-                Qwen4PrefixMode::Ar => mtp.reset(gpu),
+        if let Some(radix) = cache.radix.as_mut() {
+            let stats = &mut radix.stats;
+            if report.bank_replaced {
+                stats.banks_created += 1;
+                stats.relocations += 1;
+                stats.relocation_ns_last = report.relocation_ns;
             }
-            .map_err(|error| BundleError::Forward(error.to_string()))?;
+            if report.fork {
+                stats.forks += 1;
+                stats.alias_bytes += report.alias_bytes as u64;
+                stats.copied_bytes += report.copied_bytes as u64;
+            } else if report.fresh_bank {
+                stats.fresh_banks += 1;
+            }
         }
-        Ok(())
+        match cleanup {
+            Some(error) => Err(RestoreFailure::dirty(error)),
+            None => Ok(report),
+        }
     }
 
     /// Absolute position the running prefill must checkpoint at, if any.
@@ -1654,95 +4018,485 @@ impl Qwen4Bundle {
         self.prefix.as_ref().and_then(|cache| cache.capture_at)
     }
 
-    /// Checkpoint the live state at the armed end of prompt. `prefix` is the
-    /// whole prompt; target (and for native MTP, the head) must have consumed
-    /// exactly it. On success the host record is `prefix` and the live record
-    /// is dropped; a failure leaves no valid checkpoint.
+    /// Checkpoint the live state at the end of the armed prompt (see
+    /// [`Self::stage_prefix_boundary`]); `prefix` is the whole prompt.
     pub fn stage_prefix(&mut self, gpu: &mut Gpu, prefix: &[u32]) -> Result<(), BundleError> {
+        self.stage_prefix_boundary(gpu, prefix, true)
+    }
+
+    /// Checkpoint the live state at exactly `prefix.len()` tokens: target (and
+    /// for native MTP, the head) must have consumed exactly `prefix` and no row
+    /// capture may be armed. `end_of_prompt` is the armed prompt end: on
+    /// success the host record is `prefix` and the live record is dropped; a
+    /// failure leaves no valid checkpoint. Any other boundary is an optional
+    /// anchor/periodic capture: budget refusal or a capture failure drops it
+    /// and the prefill continues. Staged checkpoints are published by
+    /// [`Self::commit_prefix`].
+    pub fn stage_prefix_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        prefix: &[u32],
+        end_of_prompt: bool,
+    ) -> Result<(), BundleError> {
         let (at, mode) = match self.prefix.as_ref() {
             Some(cache) => (cache.capture_at, cache.mode),
             None => return Ok(()),
         };
+        let b = prefix.len();
         let marks = self.prefix_marks();
-        let aligned = at == Some(prefix.len()) && marks.aligned_at(prefix.len(), mode);
-        let result = if aligned {
-            self.capture_prefix_owners(gpu, mode)
+        let armed = match at {
+            Some(end) if end_of_prompt => end == b,
+            Some(end) => b > 0 && b < end,
+            None => false,
+        };
+        let result = if armed && marks.aligned_at(b, mode) && !marks.row_capture_armed {
+            self.capture_boundary(gpu, prefix, mode, end_of_prompt)
         } else {
             Err(BundleError::Forward(format!(
-                "Qwen4 prefix checkpoint at {} is not aligned (armed {at:?}, target {}, mtp {:?})",
-                prefix.len(),
-                marks.target_position,
-                marks.mtp_position
+                "Qwen4 prefix checkpoint at {b} is not aligned (armed {at:?}, target {}, mtp {:?})",
+                marks.target_position, marks.mtp_position
             )))
         };
-        let cache = self.prefix.as_mut().expect("prefix cache checked above");
-        cache.capture_at = None;
-        cache.published = false;
-        cache.live_len = None;
-        cache.prompt_len = 0;
-        cache.tokens.clear();
+        let trace = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .is_ok_and(|value| value == "1");
+        let Some(cache) = self.prefix.as_mut() else {
+            return result.map(|_| ());
+        };
+        let anchor = cache.anchor;
+        if end_of_prompt {
+            cache.capture_at = None;
+            cache.published = false;
+            cache.live_len = None;
+            cache.prompt_len = 0;
+            cache.tokens.clear();
+            let record = match result {
+                Ok(Capture::Staged(checkpoint)) => {
+                    cache.note_capture(&checkpoint, CaptureKind::EndOfPrompt, trace);
+                    cache.staged.push(checkpoint);
+                    Ok(())
+                }
+                Ok(Capture::Duplicate(id)) => {
+                    cache.set_local(LocalEop::Published(id));
+                    if let Some(radix) = cache.radix.as_mut() {
+                        radix.stats.duplicates += 1;
+                    }
+                    Ok(())
+                }
+                Ok(Capture::Skipped) => Err(BundleError::Forward(
+                    "Qwen4 end-of-prompt checkpoint was skipped".to_string(),
+                )),
+                Err(error) => Err(error),
+            };
+            return match record {
+                Ok(()) => {
+                    cache.tokens.extend_from_slice(prefix);
+                    cache.prompt_len = b;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.invalidate_prefix();
+                    Err(error)
+                }
+            };
+        }
         match result {
-            Ok(()) => {
-                cache.tokens.extend_from_slice(prefix);
-                cache.prompt_len = prefix.len();
+            Ok(Capture::Staged(checkpoint)) => {
+                let kind = if anchor == Some(b) {
+                    CaptureKind::Anchor
+                } else {
+                    CaptureKind::Periodic
+                };
+                cache.note_capture(&checkpoint, kind, trace);
+                cache.staged.push(checkpoint);
+                cache.after_optional_capture(b, kind);
+                Ok(())
+            }
+            Ok(Capture::Duplicate(_)) | Ok(Capture::Skipped) => {
+                let kind = if anchor == Some(b) {
+                    CaptureKind::Anchor
+                } else {
+                    CaptureKind::Periodic
+                };
+                cache.after_optional_capture(b, kind);
                 Ok(())
             }
             Err(error) => {
-                self.invalidate_prefix();
+                // Misaligned optional capture: a caller defect, fail closed.
                 Err(error)
             }
         }
     }
 
-    fn capture_prefix_owners(
+    /// Capture the target (and native head) at exactly `prefix.len()`.
+    fn capture_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        prefix: &[u32],
+        mode: Qwen4PrefixMode,
+        end_of_prompt: bool,
+    ) -> Result<Capture, BundleError> {
+        self.quiesce_ple()?;
+        let di = mode_index(mode);
+        if let Some(radix) = self.prefix.as_ref().and_then(|cache| cache.radix.as_ref()) {
+            if let Some(id) = radix.pool.find_exact(&radix.domains[di], prefix) {
+                return Ok(Capture::Duplicate(id));
+            }
+        }
+        let Some(slot) = self.acquire_slot(gpu, end_of_prompt)? else {
+            return if end_of_prompt {
+                Err(BundleError::Forward(
+                    "Qwen4 prefix cache has no checkpoint slot for the end of prompt".to_string(),
+                ))
+            } else {
+                Ok(Capture::Skipped)
+            };
+        };
+        match self.fill_checkpoint(gpu, prefix, mode, slot, end_of_prompt) {
+            Ok(checkpoint) => Ok(Capture::Staged(checkpoint)),
+            Err((mut slot, error)) => {
+                slot.invalidate();
+                if let Some(cache) = self.prefix.as_mut() {
+                    cache.slots.push(slot);
+                }
+                if end_of_prompt {
+                    Err(error)
+                } else {
+                    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                        .is_ok_and(|value| value == "1")
+                    {
+                        eprintln!(
+                            "[qwen4-radix] optional capture at {} dropped: {error}",
+                            prefix.len()
+                        );
+                    }
+                    Ok(Capture::Skipped)
+                }
+            }
+        }
+    }
+
+    /// Copy the bounded state (and, with a radix store, retain the context) of
+    /// the live owners into `slot`.
+    fn fill_checkpoint(
+        &mut self,
+        gpu: &mut Gpu,
+        prefix: &[u32],
+        mode: Qwen4PrefixMode,
+        mut slot: Qwen4CheckpointSlot,
+        end_of_prompt: bool,
+    ) -> Result<Qwen4Checkpoint, (Qwen4CheckpointSlot, BundleError)> {
+        let b = prefix.len();
+        if let Err(error) = self.state.capture_checkpoint(gpu, &mut slot.target) {
+            return Err((slot, BundleError::State(error)));
+        }
+        let head_result = match mode {
+            Qwen4PrefixMode::NativeMtp => match (self.mtp.as_mut(), slot.head.as_mut()) {
+                (Some(mtp), Some(head)) => mtp
+                    .capture_checkpoint(gpu, head)
+                    .map_err(|error| BundleError::Forward(error.to_string())),
+                _ => Err(BundleError::Forward(
+                    "Qwen4 MTP checkpoint resources are not attached".to_string(),
+                )),
+            },
+            Qwen4PrefixMode::Ar => {
+                if let Some(head) = slot.head.as_mut() {
+                    head.invalidate();
+                }
+                Ok(())
+            }
+        };
+        if let Err(error) = head_result {
+            return Err((slot, error));
+        }
+        let radix_on = self.radix_cache_attached();
+        let context = if radix_on {
+            match self.capture_context(gpu, mode) {
+                Ok(context) => context,
+                Err(error) => return Err((slot, error)),
+            }
+        } else {
+            None
+        };
+        if radix_on && context.is_none() && !end_of_prompt {
+            return Err((
+                slot,
+                BundleError::Forward("Qwen4 radix budget refused the optional capture".to_string()),
+            ));
+        }
+        let chunk = self.spec_chunk_rows().unwrap_or(0);
+        let bank = self.prefix.as_ref().map_or(0, |cache| cache.bank);
+        Ok(Qwen4Checkpoint {
+            slot,
+            context,
+            tokens: Arc::from(prefix),
+            mode,
+            chunk,
+            bank,
+            same_bank: true,
+            eop: end_of_prompt,
+            hits: 0,
+            cost: gdsf_cost(b),
+            priority: 0.0,
+        })
+    }
+
+    /// Retain the live context arenas at the current marks when the ledger can
+    /// afford the frontier copies; `None` = local-only (budget refused).
+    fn capture_context(
         &mut self,
         gpu: &mut Gpu,
         mode: Qwen4PrefixMode,
-    ) -> Result<(), BundleError> {
-        self.quiesce_ple()?;
-        self.state.capture_prefix(gpu).map_err(BundleError::State)?;
-        match (mode, self.mtp.as_mut()) {
-            (Qwen4PrefixMode::NativeMtp, Some(mtp)) => mtp
-                .capture_prefix(gpu)
-                .map_err(|error| BundleError::Forward(error.to_string())),
-            (Qwen4PrefixMode::NativeMtp, None) => Err(BundleError::Forward(
-                "Qwen4 MTP resources are not attached".to_string(),
-            )),
-            (Qwen4PrefixMode::Ar, Some(mtp)) => {
-                mtp.invalidate_prefix();
-                Ok(())
-            }
-            (Qwen4PrefixMode::Ar, None) => Ok(()),
+    ) -> Result<Option<VmmPrefixSet>, BundleError> {
+        let estimate = {
+            let specs = self.context_specs(mode)?;
+            slab_estimate_total(&*gpu, &specs)
+        };
+        self.refresh_live_granules(&*gpu);
+        self.evict_for(Some(&mut *gpu), estimate)?;
+        let affordable = self.prefix.as_ref().is_some_and(|cache| {
+            cache.radix.as_ref().is_some_and(|radix| {
+                cache.ledger_bytes().saturating_add(estimate) <= radix.limits.device_bytes
+            })
+        });
+        if !affordable {
+            return Ok(None);
         }
+        let specs = self.context_specs(mode)?;
+        let set = gpu
+            .capture_vmm_prefixes(&specs)
+            .map_err(BundleError::Hip)?;
+        Ok(Some(set))
+    }
+
+    /// Capture specs of the live context arenas in arena order: the target's
+    /// 48, then the native head's 4.
+    fn context_specs(&self, mode: Qwen4PrefixMode) -> Result<Vec<VmmPrefixSpec<'_>>, BundleError> {
+        let mut specs = self
+            .state
+            .context_prefix_specs()
+            .map_err(BundleError::State)?;
+        if mode == Qwen4PrefixMode::NativeMtp {
+            let mtp = self.mtp.as_ref().ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?;
+            specs.extend(
+                mtp.context_prefix_specs()
+                    .map_err(|error| BundleError::Forward(error.to_string()))?,
+            );
+        }
+        Ok(specs)
+    }
+
+    /// A checkpoint slot for a capture: a free one, else (radix) a new one
+    /// within the count and byte budget, else (radix) one freed by evicting
+    /// the oldest unpinned entries, else (`steal_local`, the end of prompt)
+    /// the superseded local checkpoint's. `None` = no slot.
+    fn acquire_slot(
+        &mut self,
+        gpu: &mut Gpu,
+        steal_local: bool,
+    ) -> Result<Option<Qwen4CheckpointSlot>, BundleError> {
+        let allocation = {
+            let Some(cache) = self.prefix.as_mut() else {
+                return Ok(None);
+            };
+            if let Some(slot) = cache.slots.pop() {
+                return Ok(Some(slot));
+            }
+            cache.radix.as_ref().and_then(|radix| {
+                (cache.slots_allocated < radix.limits.checkpoints)
+                    .then_some((radix.slot_bytes, radix.limits.device_bytes))
+            })
+        };
+        if let Some((slot_bytes, device_bytes)) = allocation {
+            self.refresh_live_granules(&*gpu);
+            let ledger = self.prefix.as_ref().map_or(0, |cache| cache.ledger_bytes());
+            if ledger.saturating_add(slot_bytes) <= device_bytes {
+                let slot = self.new_checkpoint_slot(gpu)?;
+                if let Some(cache) = self.prefix.as_mut() {
+                    cache.slots_allocated += 1;
+                }
+                return Ok(Some(slot));
+            }
+        }
+        let Some(cache) = self.prefix.as_mut() else {
+            return Ok(None);
+        };
+        if cache.radix.is_some() {
+            let mut first_error = None;
+            let slot = loop {
+                if !cache.evict_one(
+                    Some(&mut *gpu),
+                    EvictMode::Checkpoint,
+                    false,
+                    &mut first_error,
+                ) {
+                    break None;
+                }
+                if let Some(slot) = cache.slots.pop() {
+                    break Some(slot);
+                }
+            };
+            if let Some(error) = first_error {
+                if let Some(slot) = slot {
+                    cache.slots.push(slot);
+                }
+                return Err(error);
+            }
+            if slot.is_some() {
+                return Ok(slot);
+            }
+        }
+        if steal_local
+            && matches!(&cache.local, Some(LocalEop::Owned(checkpoint)) if checkpoint.context.is_none())
+        {
+            if let Some(LocalEop::Owned(checkpoint)) = cache.local.take() {
+                let mut slot = checkpoint.slot;
+                slot.invalidate();
+                return Ok(Some(slot));
+            }
+        }
+        Ok(None)
+    }
+
+    fn new_checkpoint_slot(&mut self, gpu: &mut Gpu) -> Result<Qwen4CheckpointSlot, BundleError> {
+        let target = self
+            .state
+            .new_checkpoint(gpu)
+            .map_err(BundleError::State)?;
+        let head = match self.mtp.as_ref() {
+            Some(mtp) => match mtp.new_checkpoint(gpu) {
+                Ok(head) => Some(head),
+                Err(error) => {
+                    let _ = target.free_gpu(gpu);
+                    return Err(BundleError::Forward(error.to_string()));
+                }
+            },
+            None => None,
+        };
+        Ok(Qwen4CheckpointSlot { target, head })
+    }
+
+    /// Recompute which physical granules the live banks map (the ledger's
+    /// "already charged to the baseline" set).
+    fn refresh_live_granules(&mut self, gpu: &Gpu) {
+        let Qwen4Bundle {
+            state, mtp, prefix, ..
+        } = self;
+        if let Some(radix) = prefix.as_mut().and_then(|cache| cache.radix.as_mut()) {
+            radix.live_granules = live_granule_ids(state, mtp.as_ref(), gpu);
+        }
+    }
+
+    /// Enforce the radix budgets (§8): evict the oldest unpinned leaves until
+    /// the ledger plus `need` fits `limits.device_bytes` (only with a GPU: it
+    /// needs the live banks) and the entry/host caps hold. With a GPU the
+    /// freed checkpoints are released now, else they are deferred.
+    fn evict_for(&mut self, gpu: Option<&mut Gpu>, need: u64) -> Result<(), BundleError> {
+        match self.prefix.as_mut() {
+            Some(cache) => cache.evict_for(gpu, need),
+            None => Ok(()),
+        }
+    }
+
+    /// Free every discarded staged checkpoint now (the GPU is quiescent).
+    fn discard_staged(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let Some(cache) = self.prefix.as_mut() else {
+            return Ok(());
+        };
+        let mut first = None;
+        for checkpoint in std::mem::take(&mut cache.staged) {
+            if let Err(error) = recycle_checkpoint(&mut cache.slots, gpu, checkpoint) {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Free the checkpoints host-only publication deferred (quiescent GPU).
+    fn drain_deferred(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        match self.prefix.as_mut() {
+            Some(cache) => cache.drain_deferred(gpu),
+            None => Ok(()),
+        }
+    }
+
+    /// Swap a fresh, empty bank in for every sealed one (a sealed bank's lower
+    /// bytes may never be written). Returns whether any bank was swapped.
+    fn swap_sealed_banks(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let target_sealed = self.state.context_sealed(gpu);
+        let head_sealed = self.mtp.as_ref().is_some_and(|mtp| mtp.context_sealed(gpu));
+        if !target_sealed && !head_sealed {
+            return Ok(());
+        }
+        let target = if target_sealed {
+            Some(
+                self.state
+                    .new_context_bank(gpu)
+                    .map_err(BundleError::State)?,
+            )
+        } else {
+            None
+        };
+        let head = if head_sealed {
+            match self.mtp.as_ref().map(|mtp| mtp.new_context_bank(gpu)) {
+                Some(Ok(bank)) => Some(bank),
+                Some(Err(error)) => {
+                    let _ = free_banks(gpu, target, None);
+                    return Err(BundleError::Forward(error.to_string()));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Qwen4Bundle {
+            state, mtp, prefix, ..
+        } = self;
+        let swap = swap_context_banks(state, mtp.as_mut(), gpu, target, head)
+            .map_err(|failure| failure.error)?;
+        if let Some(radix) = prefix.as_mut().and_then(|cache| cache.radix.as_mut()) {
+            radix.stats.fresh_banks += 1;
+            radix.stats.banks_created += 1;
+            radix.stats.relocations += 1;
+            radix.stats.relocation_ns_last = swap.relocation_ns;
+        }
+        swap.cleanup.map_or(Ok(()), Err)
     }
 
     /// Publish after the client committed the request. `consumed_tokens` is
     /// the full host history the device now holds (prompt plus every consumed
-    /// generated token). The live state is published when it is exactly that
-    /// history (see `Qwen4PrefixCache::commit`); the end-of-prompt checkpoint
-    /// is published whenever its device arenas are valid, so a terminal that
-    /// leaves no exact live state still keeps `P`.
+    /// generated token). Staged checkpoints are first published host-only
+    /// (radix: into the shared index and pool; otherwise the end of prompt
+    /// becomes the local checkpoint); GPU frees are deferred to the next
+    /// quiescent begin / reset / unload. The live state is then published when
+    /// it is exactly that history (see `Qwen4PrefixCache::commit`); the
+    /// end-of-prompt checkpoint is published whenever it is valid, so a
+    /// terminal that leaves no exact live state still keeps `P`.
     pub fn commit_prefix(&mut self, consumed_tokens: &[u32]) {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.publish_staged();
+        }
         let marks = self.prefix_marks();
         if let Some(cache) = self.prefix.as_mut() {
             cache.commit(&marks, consumed_tokens);
         }
     }
 
-    /// Drop the checkpoint and live record (device validity and host record).
+    /// Drop the live record and the local end-of-prompt checkpoint (radix
+    /// entries survive). Host-only.
     pub fn invalidate_prefix(&mut self) {
         if let Some(cache) = self.prefix.as_mut() {
             cache.clear();
-        }
-        self.state.invalidate_prefix();
-        if let Some(mtp) = self.mtp.as_mut() {
-            mtp.invalidate_prefix();
+            cache.drop_local();
         }
     }
 
     /// AR prefill of the full canonical `prompt` under `plan`, keeping only
     /// the final logits row: begin (reset, live continuation or checkpoint
-    /// restore), one forward over `prompt[plan.start_pos..]`, then the
+    /// restore), then the suffix `prompt[plan.start_pos..]` as ONE final
+    /// forward unless a capture (anchor / periodic) is due before the end, in
+    /// which case the prefill splits there (silent forward, stage), and the
     /// end-of-prompt checkpoint at `prompt.len()`.
     pub fn prefill_final(
         &mut self,
@@ -1752,8 +4506,45 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
         self.begin_prefix(gpu, prompt, plan, Qwen4PrefixMode::Ar)?;
-        self.forward_chunk_final(gpu, &prompt[plan.start_pos..], logits, None)?;
-        if self.prefix_capture_at() == Some(prompt.len()) {
+        let chunk = self.spec_chunk_rows().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        let len = prompt.len();
+        if plan.start_pos >= len {
+            return Err(BundleError::Forward(
+                "Qwen4 prefill has no suffix tokens".to_string(),
+            ));
+        }
+        let mut pos = plan.start_pos;
+        while pos < len {
+            // The first capture strictly inside the prompt over the chunk ends
+            // the forward's own tiles land on.
+            let mut split = None;
+            let mut probe = pos;
+            while probe < len {
+                let natural = probe.saturating_add(chunk).min(len);
+                if let Some(end) = self.next_prefix_capture(probe, natural) {
+                    if end < len {
+                        split = Some(end);
+                        break;
+                    }
+                }
+                probe = natural;
+            }
+            match split {
+                Some(end) => {
+                    self.set_ple_lookahead(&prompt[end..]);
+                    self.forward_chunk_silent(gpu, &prompt[pos..end])?;
+                    self.stage_prefix_boundary(gpu, &prompt[..end], false)?;
+                    pos = end;
+                }
+                None => {
+                    self.forward_chunk_final(gpu, &prompt[pos..], logits, None)?;
+                    pos = len;
+                }
+            }
+        }
+        if self.prefix_capture_at() == Some(len) {
             self.stage_prefix(gpu, prompt)?;
         }
         Ok(())
@@ -1818,9 +4609,14 @@ impl Qwen4Bundle {
             spec_logits,
             spec_top1,
             spec_hidden,
+            prefix,
             ..
         } = self;
         let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
+        // Retained checkpoints release their granule leases before the banks go.
+        let prefix_result = prefix
+            .map(|cache| cache.free_gpu(gpu))
+            .unwrap_or(Ok(()));
         let execution_result = execution
             .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
             .unwrap_or(Ok(()));
@@ -1842,6 +4638,7 @@ impl Qwen4Bundle {
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
         first_bundle_error([
             ple_result,
+            prefix_result,
             execution_result,
             mtp_result,
             spec_result,
@@ -2111,7 +4908,7 @@ fn cleanup_bundle_failure(
     }
 }
 
-fn first_bundle_error(results: [Result<(), BundleError>; 7]) -> Result<(), BundleError> {
+fn first_bundle_error(results: [Result<(), BundleError>; 8]) -> Result<(), BundleError> {
     let mut first = None;
     for result in results {
         if let Err(error) = result {
@@ -2496,5 +5293,656 @@ mod tests {
         assert!(!cache.published);
         assert_eq!(cache.capture_at, None);
         assert!(cache.generation > before);
+    }
+
+    // ---- radix store: pure decisions ----
+
+    use hipfire_runtime::serve_contract::{
+        ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity, TokenizerIdentity,
+    };
+
+    const MIB: usize = 1 << 20;
+
+    fn base_domain() -> CacheDomain {
+        CacheDomain {
+            model_content_digest: vec![1],
+            model_load_epoch: 1,
+            sidecar_digests: vec![],
+            tokenizer: TokenizerIdentity {
+                vocab_digest: vec![2],
+                config_digest: vec![3],
+            },
+            template: TemplateIdentity {
+                template_digest: vec![4],
+                normalization_tag: "n".to_string(),
+            },
+            arch_policy: ArchPolicy {
+                arch_tag: "qwen4".to_string(),
+                state_abi_tag: "abi".to_string(),
+                position_attention_tag: "p".to_string(),
+            },
+            kv_layout: KvLayout {
+                k_stride_bytes: vec![],
+                v_stride_bytes: vec![],
+                layout_tag: "l".to_string(),
+            },
+            device: DeviceTopology {
+                device_id: "d".to_string(),
+                topology_id: "t".to_string(),
+                allocation_epoch: 1,
+            },
+            namespace: SharingNamespace {
+                domain_id: "ns".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn live_beats_equal_or_shallower_radix_and_deeper_radix_beats_live() {
+        use Qwen4PrefixSource as S;
+        assert_eq!(pick_source(S::Live, 100, Some(100)), S::Live);
+        assert_eq!(pick_source(S::Live, 100, Some(60)), S::Live);
+        assert_eq!(pick_source(S::Live, 100, None), S::Live);
+        assert_eq!(pick_source(S::Live, 100, Some(101)), S::Radix);
+        assert_eq!(pick_source(S::Live, 100, Some(4096)), S::Radix);
+    }
+
+    #[test]
+    fn prompt_wins_ties_and_the_greater_boundary_wins_otherwise() {
+        use Qwen4PrefixSource as S;
+        assert_eq!(pick_source(S::Prompt, 80, Some(80)), S::Prompt);
+        assert_eq!(pick_source(S::Prompt, 80, Some(40)), S::Prompt);
+        assert_eq!(pick_source(S::Prompt, 80, None), S::Prompt);
+        assert_eq!(pick_source(S::Prompt, 80, Some(81)), S::Radix);
+        assert_eq!(pick_source(S::Cold, 0, Some(1)), S::Radix);
+        assert_eq!(pick_source(S::Cold, 0, None), S::Cold);
+    }
+
+    /// A scripted index: `(id, boundary)` entries, the valid ids, and a log.
+    struct Script {
+        entries: Vec<(u32, usize)>,
+        valid: Vec<u32>,
+        discarded: Vec<u32>,
+        befores: Vec<usize>,
+    }
+
+    fn scripted(script: &mut Script, prompt_len: usize) -> Option<(u32, usize)> {
+        lookup_valid_checkpoint(
+            script,
+            prompt_len,
+            |s: &mut Script, before: usize| {
+                s.befores.push(before);
+                s.entries
+                    .iter()
+                    .filter(|(_, b)| *b < before)
+                    .max_by_key(|(_, b)| *b)
+                    .copied()
+            },
+            |s: &Script, id: &u32, _b: usize| s.valid.contains(id),
+            |s: &mut Script, id: u32| s.discarded.push(id),
+        )
+    }
+
+    #[test]
+    fn stale_checkpoint_ids_retry_below_their_boundary() {
+        let mut script = Script {
+            entries: vec![(1, 256), (2, 1024), (3, 2048)],
+            valid: vec![1],
+            discarded: vec![],
+            befores: vec![],
+        };
+        assert_eq!(scripted(&mut script, 4096), Some((1, 256)));
+        assert_eq!(script.befores, vec![4096, 2048, 1024]);
+        assert_eq!(script.discarded, vec![3, 2]);
+
+        // A valid deepest hit is taken at once.
+        let mut direct = Script {
+            entries: vec![(1, 256), (2, 1024)],
+            valid: vec![1, 2],
+            discarded: vec![],
+            befores: vec![],
+        };
+        assert_eq!(scripted(&mut direct, 4096), Some((2, 1024)));
+        assert!(direct.discarded.is_empty());
+
+        // Nothing below the prompt: a miss.
+        let mut miss = Script {
+            entries: vec![(1, 256)],
+            valid: vec![1],
+            discarded: vec![],
+            befores: vec![],
+        };
+        assert_eq!(scripted(&mut miss, 256), None);
+        assert_eq!(scripted(&mut miss, 0), None);
+    }
+
+    #[test]
+    fn stale_retries_are_bounded_and_release_every_discarded_pin() {
+        let entries: Vec<(u32, usize)> = (1..=20).map(|i| (i, i as usize * 128)).collect();
+        let mut script = Script {
+            entries,
+            valid: vec![],
+            discarded: vec![],
+            befores: vec![],
+        };
+        assert_eq!(scripted(&mut script, 10_000), None);
+        assert_eq!(script.discarded.len(), RADIX_LOOKUP_RETRIES);
+        assert_eq!(script.befores.len(), RADIX_LOOKUP_RETRIES);
+    }
+
+    #[test]
+    fn anchor_arms_only_on_the_second_observation() {
+        let covered = |s: usize| s <= 1000;
+        // The index already covers the first eligible boundary: arm it.
+        assert_eq!(
+            anchor_choice(&[64, 300, 900], 2000, 0, covered, None, true),
+            Some(300)
+        );
+        // First-ever cold request: nothing in the index covers S.
+        assert_eq!(
+            anchor_choice(&[64, 300, 900], 2000, 0, |_| false, None, true),
+            None
+        );
+        // Only the first eligible boundary is considered.
+        assert_eq!(
+            anchor_choice(&[300, 900], 2000, 0, |s| s == 900, None, true),
+            None
+        );
+    }
+
+    #[test]
+    fn anchor_needs_a_free_boundary_a_deeper_start_and_resources() {
+        let covered = |_: usize| true;
+        // A checkpoint already exists at or beyond S.
+        assert_eq!(anchor_choice(&[300], 2000, 0, covered, Some(300), true), None);
+        assert_eq!(anchor_choice(&[300], 2000, 0, covered, Some(512), true), None);
+        assert_eq!(
+            anchor_choice(&[300], 2000, 0, covered, Some(299), true),
+            Some(300)
+        );
+        // S must lie beyond the chosen start and inside the prompt.
+        assert_eq!(
+            anchor_choice(&[300, 900], 2000, 300, covered, None, true),
+            Some(900)
+        );
+        assert_eq!(anchor_choice(&[1900], 1900, 0, covered, None, true), None);
+        assert_eq!(anchor_choice(&[127], 2000, 0, covered, None, true), None);
+        assert_eq!(anchor_choice(&[], 2000, 0, covered, None, true), None);
+        // Budget refusal.
+        assert_eq!(anchor_choice(&[300], 2000, 0, covered, None, false), None);
+    }
+
+    fn schedule() -> CaptureSchedule {
+        CaptureSchedule {
+            capture_at: Some(20_000),
+            anchor: None,
+            radix: true,
+            periodic_done: false,
+            periodic_due_from: Some(0),
+            resources_ok: true,
+        }
+    }
+
+    #[test]
+    fn end_of_prompt_is_always_due_and_nothing_is_without_an_armed_prompt() {
+        let eop = CaptureSchedule {
+            resources_ok: false,
+            radix: false,
+            ..schedule()
+        };
+        assert_eq!(eop.next(19_000, 20_000), Some(20_000));
+        assert_eq!(eop.next(19_000, 19_500), None);
+        let unarmed = CaptureSchedule {
+            capture_at: None,
+            ..schedule()
+        };
+        assert_eq!(unarmed.next(19_000, 20_000), None);
+        assert_eq!(schedule().next(20_000, 20_000), None);
+    }
+
+    #[test]
+    fn periodic_is_due_only_after_8192_tokens_and_at_most_once() {
+        let s = schedule();
+        assert_eq!(s.next(7_680, 7_936), None);
+        assert_eq!(s.next(7_936, 8_192), Some(8_192));
+        // Measured from the last capture, not the prompt start.
+        let later = CaptureSchedule {
+            periodic_due_from: Some(8_192),
+            ..s
+        };
+        assert_eq!(later.next(16_000, 16_383), None);
+        assert_eq!(later.next(16_128, 16_384), Some(16_384));
+        // Once taken (or refused) it never repeats in the request.
+        let done = CaptureSchedule {
+            periodic_done: true,
+            ..s
+        };
+        assert_eq!(done.next(7_936, 8_192), None);
+        // At the prompt end the boundary is the end-of-prompt capture.
+        let tail = CaptureSchedule {
+            capture_at: Some(8_192),
+            ..s
+        };
+        assert_eq!(tail.next(7_936, 8_192), Some(8_192));
+        let unseeded = CaptureSchedule {
+            periodic_due_from: None,
+            ..s
+        };
+        assert_eq!(unseeded.next(7_936, 8_192), None);
+    }
+
+    #[test]
+    fn budget_refusal_skips_optional_captures_but_not_the_end_of_prompt() {
+        let refused = CaptureSchedule {
+            resources_ok: false,
+            anchor: None,
+            ..schedule()
+        };
+        assert_eq!(refused.next(7_936, 8_192), None);
+        assert_eq!(refused.next(19_000, 20_000), Some(20_000));
+        let no_radix = CaptureSchedule {
+            radix: false,
+            ..schedule()
+        };
+        assert_eq!(no_radix.next(7_936, 8_192), None);
+    }
+
+    #[test]
+    fn anchor_splits_only_a_chunk_that_contains_it() {
+        let s = CaptureSchedule {
+            anchor: Some(5_000),
+            ..schedule()
+        };
+        assert_eq!(s.next(4_096, 4_352), None);
+        assert_eq!(s.next(4_864, 5_120), Some(5_000));
+        // The chunk ending exactly at S needs no split.
+        assert_eq!(s.next(4_864, 5_000), Some(5_000));
+        // Already at S: the anchor is behind this chunk.
+        assert_eq!(s.next(5_000, 5_256), None);
+        // The anchor beats the end of prompt inside one chunk.
+        let short = CaptureSchedule {
+            capture_at: Some(5_100),
+            ..s
+        };
+        assert_eq!(short.next(4_864, 5_100), Some(5_000));
+        assert_eq!(short.next(5_000, 5_100), Some(5_100));
+    }
+
+    #[test]
+    fn capture_resources_need_a_slot_a_budgeted_allocation_or_an_evictable_entry() {
+        // A free slot.
+        assert!(capture_resources_ok(1, 4, 4, 0, u64::MAX, 10, 0));
+        // A new slot within count and bytes.
+        assert!(capture_resources_ok(0, 2, 4, 0, 100, 50, 200));
+        assert!(!capture_resources_ok(0, 2, 4, 0, 160, 50, 200));
+        assert!(!capture_resources_ok(0, 4, 4, 0, 0, 50, 200));
+        // An evictable pool entry.
+        assert!(capture_resources_ok(0, 4, 4, 1, 0, 50, 0));
+    }
+
+    #[test]
+    fn checkpoint_validity_requires_exact_tokens_mode_chunk_context_and_head() {
+        let tokens = prompt(8);
+        let long_prompt = prompt(12);
+        let facts = |mode, chunk, ctx, target, head| CheckpointFacts {
+            tokens: &tokens,
+            mode,
+            chunk,
+            has_context: ctx,
+            target_position: target,
+            head_position: head,
+        };
+        let ok = facts(AR, CHUNK, true, Some(8), None);
+        assert!(checkpoint_facts_valid(&ok, &long_prompt, 8, AR, CHUNK));
+        // B must be strictly below the prompt end.
+        assert!(!checkpoint_facts_valid(&ok, &tokens, 8, AR, CHUNK));
+        // Token mismatch, mode, chunk, context, position.
+        let mut other = long_prompt.clone();
+        other[3] = 999;
+        assert!(!checkpoint_facts_valid(&ok, &other, 8, AR, CHUNK));
+        assert!(!checkpoint_facts_valid(&ok, &long_prompt, 8, MTP, CHUNK));
+        assert!(!checkpoint_facts_valid(&ok, &long_prompt, 8, AR, CHUNK / 2));
+        assert!(!checkpoint_facts_valid(
+            &facts(AR, CHUNK, false, Some(8), None),
+            &long_prompt,
+            8,
+            AR,
+            CHUNK
+        ));
+        assert!(!checkpoint_facts_valid(
+            &facts(AR, CHUNK, true, Some(7), None),
+            &long_prompt,
+            8,
+            AR,
+            CHUNK
+        ));
+        assert!(!checkpoint_facts_valid(&ok, &long_prompt, 7, AR, CHUNK));
+        // Native MTP needs the head at B as well.
+        assert!(!checkpoint_facts_valid(
+            &facts(MTP, CHUNK, true, Some(8), None),
+            &long_prompt,
+            8,
+            MTP,
+            CHUNK
+        ));
+        assert!(checkpoint_facts_valid(
+            &facts(MTP, CHUNK, true, Some(8), Some(8)),
+            &long_prompt,
+            8,
+            MTP,
+            CHUNK
+        ));
+        assert!(!checkpoint_facts_valid(
+            &facts(MTP, CHUNK, true, Some(8), Some(7)),
+            &long_prompt,
+            8,
+            MTP,
+            CHUNK
+        ));
+    }
+
+    fn granule(id: u64) -> VmmPhysicalId {
+        VmmPhysicalId { id, generation: 1 }
+    }
+
+    #[test]
+    fn ledger_counts_shared_granules_once_and_skips_live_ones() {
+        let a = vec![(granule(1), 2 * MIB), (granule(2), 2 * MIB)];
+        let b = vec![(granule(2), 2 * MIB), (granule(3), 2 * MIB)];
+        let contexts = || a.iter().copied().chain(b.iter().copied());
+        // Granule 2 is shared by both checkpoints: one charge. Granule 1 is
+        // still mapped by the live bank: baseline-charged.
+        let live: HashSet<VmmPhysicalId> = [granule(1)].into_iter().collect();
+        assert_eq!(cache_granule_bytes(contexts(), &live), 4 * MIB as u64);
+        // No live granules: all three unique ones.
+        assert_eq!(
+            cache_granule_bytes(contexts(), &HashSet::new()),
+            6 * MIB as u64
+        );
+    }
+
+    #[test]
+    fn ledger_charges_retained_granules_after_the_live_bank_leaves_them() {
+        let retained = vec![(granule(7), 2 * MIB), (granule(8), 2 * MIB)];
+        let live_before: HashSet<VmmPhysicalId> =
+            [granule(7), granule(8), granule(9)].into_iter().collect();
+        let before = cache_granule_bytes(retained.iter().copied(), &live_before);
+        assert_eq!(before, 0);
+        // The bank swapped away: the still-referenced granules are now
+        // charged to the cache.
+        let live_after: HashSet<VmmPhysicalId> = [granule(10)].into_iter().collect();
+        let after = cache_granule_bytes(retained.iter().copied(), &live_after);
+        assert_eq!(after, 4 * MIB as u64);
+        assert_eq!(ledger_total(33, 5, after), 38 + 4 * MIB as u64);
+        // Saturates instead of wrapping.
+        assert_eq!(ledger_total(u64::MAX, 1, 1), u64::MAX);
+    }
+
+    #[test]
+    fn budget_caps_trigger_eviction_and_pick_the_victim_kind() {
+        assert!(!over_budget(false, 4, 4, 100, 100));
+        assert!(over_budget(true, 0, 4, 0, 100));
+        assert!(over_budget(false, 5, 4, 0, 100));
+        assert!(over_budget(false, 0, 4, 101, 100));
+        assert_eq!(evict_mode(true, false), EvictMode::Checkpoint);
+        assert_eq!(evict_mode(false, true), EvictMode::Checkpoint);
+        assert_eq!(evict_mode(false, false), EvictMode::PruneFirst);
+    }
+
+    #[test]
+    fn slab_estimate_aliases_whole_granules_below_the_writable_end() {
+        let granules = [2 * MIB; 3];
+        // 5 MiB valid, all writable-safe: two granules aliased, 1 MiB copied.
+        assert_eq!(slab_estimate(5 * MIB, 5 * MIB, granules), MIB as u64);
+        // The in-place restore tail starts at 3 MiB: only one granule aliased.
+        assert_eq!(slab_estimate(5 * MIB, 3 * MIB, granules), 3 * MIB as u64);
+        // Shorter than one granule: nothing aliases.
+        assert_eq!(slab_estimate(MIB, MIB, granules), MIB as u64);
+        assert_eq!(slab_estimate(0, 0, granules), 0);
+        // Entries are padded to the slab alignment.
+        assert_eq!(slab_estimate(1000, 1000, granules), 1024);
+        // No granule segments at all: the whole valid prefix is copied.
+        assert_eq!(slab_estimate(4096, 4096, Vec::<usize>::new()), 4096);
+        assert_eq!(alias_boundary([2 * MIB, 2 * MIB], 3 * MIB), 2 * MIB);
+        assert_eq!(alias_boundary([2 * MIB, 0, 2 * MIB], 8 * MIB), 2 * MIB);
+    }
+
+    #[test]
+    fn gdsf_cost_grows_superlinearly_and_priority_follows_the_formula() {
+        assert!(gdsf_cost(2048) > 2048.0);
+        assert_eq!(gdsf_cost(65_536), 131_072.0);
+        assert!(gdsf_cost(32_768) / 32_768.0 > gdsf_cost(1024) / 1024.0);
+        assert_eq!(gdsf_priority(2.0, 100.0, 1, 50), 6.0);
+        assert_eq!(gdsf_priority(0.0, 10.0, 0, 0), 10.0);
+        // Hits and cost raise it, bytes lower it.
+        assert!(gdsf_priority(0.0, 10.0, 3, 100) > gdsf_priority(0.0, 10.0, 0, 100));
+        assert!(gdsf_priority(0.0, 10.0, 0, 200) < gdsf_priority(0.0, 10.0, 0, 100));
+    }
+
+    #[test]
+    fn gdsf_victim_is_the_lowest_unpinned_priority_with_ties_to_the_lowest_id() {
+        let id = CheckpointId;
+        assert_eq!(gdsf_victim(&[]), None);
+        assert_eq!(
+            gdsf_victim(&[(id(5), 2.0, false), (id(3), 1.0, false), (id(4), 9.0, false)]),
+            Some(id(3))
+        );
+        assert_eq!(
+            gdsf_victim(&[(id(9), 1.0, false), (id(4), 1.0, false), (id(7), 1.0, false)]),
+            Some(id(4))
+        );
+        // A pinned entry is never chosen, however low its priority.
+        assert_eq!(
+            gdsf_victim(&[(id(1), 0.0, true), (id(2), 5.0, false)]),
+            Some(id(2))
+        );
+        assert_eq!(gdsf_victim(&[(id(1), 0.0, true), (id(2), 5.0, true)]), None);
+    }
+
+    struct SimEntry {
+        id: u64,
+        priority: f64,
+    }
+
+    /// Insert a checkpoint of boundary `b` and evict GDSF victims down to `cap`.
+    fn sim_insert(
+        entries: &mut Vec<SimEntry>,
+        clock: &mut f64,
+        cap: usize,
+        (id, b, hits): (u64, usize, u32),
+        bytes: u64,
+    ) -> Vec<u64> {
+        entries.push(SimEntry {
+            id,
+            priority: gdsf_priority(*clock, gdsf_cost(b), hits, bytes),
+        });
+        let mut evicted = Vec::new();
+        while entries.len() > cap {
+            let view: Vec<(CheckpointId, f64, bool)> = entries
+                .iter()
+                .map(|entry| (CheckpointId(entry.id), entry.priority, false))
+                .collect();
+            let victim = gdsf_victim(&view).expect("an unpinned victim");
+            let at = entries
+                .iter()
+                .position(|entry| CheckpointId(entry.id) == victim)
+                .expect("the victim is retained");
+            let gone = entries.remove(at);
+            *clock = gone.priority;
+            evicted.push(gone.id);
+        }
+        evicted
+    }
+
+    #[test]
+    fn a_hot_long_checkpoint_survives_a_burst_of_one_off_short_ones() {
+        let bytes = 40 * MIB as u64;
+        let mut entries = Vec::new();
+        let mut clock = 0.0;
+        sim_insert(&mut entries, &mut clock, 3, (1, 32_768, 3), bytes);
+        for id in 2..=40 {
+            let evicted = sim_insert(&mut entries, &mut clock, 3, (id, 512, 0), bytes);
+            assert!(!evicted.contains(&1), "long hot checkpoint evicted at {id}");
+        }
+        assert!(entries.iter().any(|entry| entry.id == 1));
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn aging_lets_an_old_hot_entry_eventually_go() {
+        let bytes = 40 * MIB as u64;
+        let mut entries = Vec::new();
+        let mut clock = 0.0;
+        sim_insert(&mut entries, &mut clock, 2, (1, 2048, 5), bytes);
+        let mut gone_at = None;
+        for id in 2..=200 {
+            let evicted = sim_insert(&mut entries, &mut clock, 2, (id, 2048, 0), bytes);
+            if evicted.contains(&1) {
+                gone_at = Some(id);
+                break;
+            }
+        }
+        let gone_at = gone_at.expect("the aging clock must eventually pass a stale hot entry");
+        assert!(gone_at > 2, "evicted immediately at {gone_at}");
+        assert!(clock > 0.0);
+    }
+
+    #[test]
+    fn radix_domains_bind_mode_chunk_formats_and_strides() {
+        let base = base_domain();
+        let strides = vec![52u64, 52, 128, 32];
+        let ar = build_radix_domain(&base, AR, 256, "gdn", "qsa", &strides);
+        let again = build_radix_domain(&base, AR, 256, "gdn", "qsa", &strides);
+        assert_eq!(ar, again);
+        assert!(ar.arch_policy.state_abi_tag.starts_with("qwen4-radix-v1:"));
+        assert_eq!(
+            ar.arch_policy.state_abi_tag.len(),
+            "qwen4-radix-v1:".len() + 64
+        );
+        assert_eq!(ar.kv_layout.k_stride_bytes, strides);
+        assert_eq!(ar.kv_layout.v_stride_bytes, strides);
+        // Everything but the tag and strides is the base domain's.
+        assert_eq!(ar.model_content_digest, base.model_content_digest);
+        assert_eq!(ar.namespace, base.namespace);
+        assert_eq!(ar.device, base.device);
+        for other in [
+            build_radix_domain(&base, MTP, 256, "gdn", "qsa", &strides),
+            build_radix_domain(&base, AR, 512, "gdn", "qsa", &strides),
+            build_radix_domain(&base, AR, 256, "gdn-q8", "qsa", &strides),
+            build_radix_domain(&base, AR, 256, "gdn", "qsa-fp8", &strides),
+        ] {
+            assert_ne!(other.arch_policy.state_abi_tag, ar.arch_policy.state_abi_tag);
+        }
+        let mut changed_base = base.clone();
+        changed_base.arch_policy.state_abi_tag = "abi2".to_string();
+        assert_ne!(
+            build_radix_domain(&changed_base, AR, 256, "gdn", "qsa", &strides)
+                .arch_policy
+                .state_abi_tag,
+            ar.arch_policy.state_abi_tag
+        );
+    }
+
+    #[test]
+    fn turn_boundaries_are_sorted_deduplicated_and_bounded() {
+        assert_eq!(
+            normalized_turn_boundaries(&[300, 128, 300, 9000, 64], 8192),
+            vec![64, 128, 300]
+        );
+        assert!(normalized_turn_boundaries(&[], 8192).is_empty());
+        assert!(normalized_turn_boundaries(&[8192], 8192).is_empty());
+    }
+
+    #[test]
+    fn logical_page_strides_sum_k_and_v_sides_per_position() {
+        // One layer: K 100, V 200, raw 50, pooled 40 per 4 tokens.
+        assert_eq!(logical_page_strides(&[100, 200, 50, 40], 4), (150, 210));
+        assert_eq!(logical_page_strides(&[], 4), (1, 1));
+    }
+
+    #[test]
+    fn a_cache_without_radix_schedules_only_the_end_of_prompt() {
+        let mut cache = Qwen4PrefixCache::new(64);
+        assert!(!cache.capture_resources_available());
+        cache.capture_at = Some(1000);
+        cache.anchor = None;
+        cache.periodic_due_from = Some(0);
+        let schedule = cache.capture_schedule();
+        assert!(!schedule.radix);
+        assert_eq!(schedule.next(0, 256), None);
+        assert_eq!(schedule.next(768, 1000), Some(1000));
+        assert_eq!(cache.eop_facts().map(|(_, b, _)| b), None);
+    }
+
+    #[test]
+    fn clear_drops_the_anchor_and_periodic_state() {
+        let mut cache = Qwen4PrefixCache::new(64);
+        cache.anchor = Some(300);
+        cache.periodic_due_from = Some(10);
+        cache.periodic_done = true;
+        cache.clear();
+        assert_eq!(cache.anchor, None);
+        assert_eq!(cache.periodic_due_from, None);
+        assert!(!cache.periodic_done);
+    }
+
+    #[test]
+    fn selection_receipts_carry_start_source_and_generation() {
+        let selection = Qwen4Selection {
+            id: CheckpointId(3),
+            start: 4096,
+            mode: MTP,
+            source: Qwen4PrefixSource::Radix,
+            pin: PinTicket::none(),
+            generation: 11,
+        };
+        let plan = selection.plan();
+        assert_eq!(plan.start_pos, 4096);
+        assert_eq!(plan.source(), Qwen4PrefixSource::Radix);
+        assert_eq!(plan.generation, 11);
+        // Releasing pins without a radix store is a no-op.
+        let mut radix: Option<Qwen4RadixCache> = None;
+        Qwen4PrefixCache::release_pins(&mut radix, selection);
+        let mut cache = Qwen4PrefixCache::new(8);
+        cache.release_pending();
+        cache.release_held();
+    }
+
+    #[test]
+    fn begin_validation_keeps_live_and_cold_and_refuses_unselected_radix() {
+        let (cache, consumed) = committed(8, 5, AR);
+        let m = marks(AR, 13, Some(8));
+        let mut next = consumed.clone();
+        next.push(42);
+        let live = cache.bind(&m, &next, 13, AR).unwrap();
+        assert_eq!(
+            cache.validate_plan(&m, &next, live, AR, None).unwrap(),
+            BeginAction::Live
+        );
+        let cold = cache.bind(&m, &next, 0, AR).unwrap();
+        assert_eq!(
+            cache.validate_plan(&m, &next, cold, AR, None).unwrap(),
+            BeginAction::Cold
+        );
+        // A checkpoint restore needs the checkpoint itself, not just marks.
+        let mut diverged = consumed[..8].to_vec();
+        diverged.extend([500, 501]);
+        let prompt_plan = cache.bind(&m, &diverged, 8, AR).unwrap();
+        assert!(cache
+            .validate_plan(&m, &diverged, prompt_plan, AR, None)
+            .is_err());
+        // A radix plan without its selection is refused.
+        let radix_plan = Qwen4PrefixPlan {
+            start_pos: 8,
+            source: Qwen4PrefixSource::Radix,
+            generation: cache.generation,
+        };
+        assert!(cache
+            .validate_plan(&m, &diverged, radix_plan, AR, None)
+            .is_err());
+        // A stale live receipt is refused too.
+        let mut stale = cache.bind(&m, &next, 13, AR).unwrap();
+        stale.generation += 1;
+        assert!(cache.validate_plan(&m, &next, stale, AR, None).is_err());
     }
 }

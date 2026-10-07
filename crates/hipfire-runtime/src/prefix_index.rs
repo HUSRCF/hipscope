@@ -8,13 +8,24 @@
 //! identity, spec §4.1 C1) and the actual model input token sequence. Edges
 //! store immutable token spans; nodes hold ordered [`PageHandle`]s for **full
 //! 128-token pages only** plus optional [`CheckpointId`]s at resumable
-//! boundaries (spec §4.5 C5). Partial tails are never shareable (spec §4.2).
+//! boundaries (spec §4.5 C5). Partial KV pages are never shared: an exact
+//! checkpoint boundary `B` (any value >= 1) stores only `floor(B/128)` full
+//! pages and its residual `B % 128` tail is a pageless metadata edge.
 //!
 //! Operations: longest-prefix [`lookup`](PrefixIndex::lookup), [`insert`],
 //! [`split`], [`pin`]/[`unpin`], and leaf-first [`evict_unpinned_leaves`].
 //! Lookup pins matching page handles internally so eviction cannot drop them
 //! until `unpin` (spec §4.4 C4). Eviction removes lookup visibility **before**
 //! releasing cache refs.
+//!
+//! Exact checkpoints ([`publish_checkpoint`](PrefixIndex::publish_checkpoint) /
+//! [`lookup_checkpoint`](PrefixIndex::lookup_checkpoint)) are keyed by the
+//! exact token boundary. A boundary `B` is resumable when `B <= matched`,
+//! `B < before`, and full pages `[0, floor(B/128))` are contiguous and valid.
+//! Every checkpoint id that leaves visibility (forget, eviction, `release_all`)
+//! is queued for [`take_retired_checkpoints`](PrefixIndex::take_retired_checkpoints)
+//! BEFORE its pages' cache refs are released, so the payload owner can free
+//! the blob.
 //!
 //! This module performs **no GPU mutation**. `add_cache_ref`/`release_cache_ref`/
 //! `seal` are host-side operations on [`PagePool`] (spec §4.2: "Do not call
@@ -31,7 +42,7 @@
 //! A prefix match that lacks a recurrent checkpoint is [`MissReason::NoCheckpoint`],
 //! not a hit in usage accounting (spec §4.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rdna_compute::page_pool::{PageHandle, PagePool, PAGE_TOKENS};
 
@@ -51,9 +62,10 @@ struct NodeId(u64);
 /// A checkpoint boundary within a node's token span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CheckpointBoundary {
-    /// Token offset *within this node* where the checkpoint applies.
-    /// Always a multiple of `PAGE_TOKENS` (checkpoints live at page
-    /// boundaries, spec §4.5).
+    /// Token offset *within this node* where the checkpoint applies, in
+    /// `1..=edge_tokens.len()` (0 only on the root). Checkpoints sit at node
+    /// ends; for an exact boundary `B` the absolute position is the node's
+    /// start plus this offset and need not be page-aligned (spec §4.5).
     token_offset: u64,
     /// The opaque checkpoint id (non-zero).
     checkpoint: CheckpointId,
@@ -63,10 +75,10 @@ struct CheckpointBoundary {
 ///
 /// Each non-root node stores:
 /// - `edge_tokens`: the immutable token span of its incoming edge.
-/// - `pages`: ordered `PageHandle`s for the full 128-token pages covering
-///   this node's span. `pages.len() * PAGE_TOKENS == edge_tokens.len() +
-///   first_page_skip` when `pages` is non-empty; zero-page split-marker
-///   nodes carry only edge tokens.
+/// - `pages`: ordered `PageHandle`s for the full 128-token pages that END
+///   inside this node's span (at most one per created node). Split markers
+///   and the residual tail of an exact checkpoint boundary carry zero pages
+///   and only edge tokens.
 /// - `first_page_skip`: tokens at the start of `pages[0]` that belong to
 ///   the PARENT edge, not this one (0 for page-aligned nodes). A mid-page
 ///   fork produces children whose first physical page starts before their
@@ -199,6 +211,21 @@ pub struct InspectResult {
     pub resumable_tokens: u64,
 }
 
+/// Result of [`PrefixIndex::lookup_checkpoint`]: the deepest usable exact
+/// checkpoint boundary, its full pages and the pin that keeps the path
+/// root..holder resident until [`PrefixIndex::release_pin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointHit {
+    /// Token counts; `resumable_tokens` is the exact boundary `B`.
+    pub lookup: PrefixLookup,
+    /// The checkpoint id stored at the boundary.
+    pub checkpoint: CheckpointId,
+    /// The `floor(B/128)` full pages `[0, floor(B/128))` in token order.
+    pub pages: Vec<Handle>,
+    /// Pin on every node from the root down to the node holding the boundary.
+    pub pin: PinTicket,
+}
+
 /// Opaque handle to one lookup's pin on a radix path (spec §4.4 C4).
 ///
 /// Returned by [`PrefixIndex::lookup_with_pages`]. Release it with
@@ -329,6 +356,27 @@ pub struct PrefixIndex {
     /// Running sum over all trees of `pages.len() × (k_page + v_page)`
     /// bytes (the same arithmetic eviction credits).
     retained_bytes: usize,
+    /// Checkpoint ids removed from lookup visibility and not yet drained by
+    /// [`take_retired_checkpoints`](Self::take_retired_checkpoints). Only
+    /// exact checkpoints ([`publish_checkpoint`](Self::publish_checkpoint))
+    /// are queued: the aligned API's callers never drain the queue, so their
+    /// ids must not accumulate here.
+    retired: Vec<CheckpointId>,
+    /// Visible checkpoint ids published through the exact API.
+    exact_ids: HashSet<CheckpointId>,
+}
+
+/// The deepest usable exact checkpoint found by a walk.
+#[derive(Clone, Copy)]
+struct ExactCandidate {
+    /// Absolute token boundary.
+    boundary: u64,
+    checkpoint: CheckpointId,
+    /// Number of leading `WalkResult::path` nodes that are ancestors of the
+    /// holder (the holder itself is `holder`, which may be a partially
+    /// matched child that is not on `path`).
+    ancestors: usize,
+    holder: NodeId,
 }
 
 /// Internal result of walking the tree to find the longest token prefix.
@@ -342,6 +390,8 @@ struct WalkResult {
     exhausted_query: bool,
     /// Resident full-page handles along the matched prefix, in token order.
     pages: Vec<Handle>,
+    /// Deepest usable exact checkpoint (only computed when requested).
+    exact: Option<ExactCandidate>,
 }
 
 impl PrefixIndex {
@@ -358,6 +408,8 @@ impl PrefixIndex {
             total_nodes: 0,
             max_retained_bytes: None,
             retained_bytes: 0,
+            retired: Vec::new(),
+            exact_ids: HashSet::new(),
         }
     }
 
@@ -442,7 +494,7 @@ impl PrefixIndex {
         policy: Option<&CachePolicy>,
         pin: bool,
     ) -> (PrefixLookupResult, Vec<Handle>, PinTicket) {
-        let walk = self.walk(domain, tokens, pool);
+        let walk = self.walk(domain, tokens, pool, None);
 
         if walk.matched_tokens == 0 {
             return (
@@ -497,7 +549,7 @@ impl PrefixIndex {
     /// Inspect the index for the three token counts without claiming a Hit
     /// and without pinning (spec §4.2: for metrics).
     pub fn inspect(&self, domain: &CacheDomain, tokens: &[u32], pool: &PagePool) -> InspectResult {
-        let walk = self.walk(domain, tokens, pool);
+        let walk = self.walk(domain, tokens, pool, None);
         InspectResult {
             matched_tokens: walk.matched_tokens,
             resident_kv_tokens: walk.resident_kv_tokens,
@@ -508,7 +560,13 @@ impl PrefixIndex {
     /// Walk the tree to find the longest matching token prefix.
     ///
     /// Does NOT pin. Used by both `lookup` (which pins after) and `inspect`.
-    fn walk(&self, domain: &CacheDomain, tokens: &[u32], pool: &PagePool) -> WalkResult {
+    fn walk(
+        &self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        pool: &PagePool,
+        exact_before: Option<u64>,
+    ) -> WalkResult {
         let tree = match self.trees.get(domain) {
             Some(t) => t,
             None => {
@@ -519,6 +577,7 @@ impl PrefixIndex {
                     path: Vec::new(),
                     exhausted_query: false,
                     pages: Vec::new(),
+                    exact: None,
                 };
             }
         };
@@ -536,6 +595,7 @@ impl PrefixIndex {
         let mut contiguous_resident_tokens: u64 = 0;
         let mut resumable_tokens: u64 = 0;
         let mut pages: Vec<Handle> = Vec::new();
+        let mut exact: Option<ExactCandidate> = None;
 
         loop {
             if query_pos >= tokens.len() {
@@ -609,6 +669,23 @@ impl PrefixIndex {
                     if boundary <= contiguous_resident_tokens {
                         resumable_tokens = resumable_tokens.max(boundary);
                     }
+                    if let Some(before) = exact_before {
+                        // Exact boundary: only the full pages below it are
+                        // required (the residual tail has no page), so the
+                        // gap-free resident prefix must reach the page floor.
+                        let required = boundary - boundary % PAGE_TOKENS as u64;
+                        if boundary < before
+                            && required <= contiguous_resident_tokens
+                            && exact.map_or(true, |e| boundary > e.boundary)
+                        {
+                            exact = Some(ExactCandidate {
+                                boundary,
+                                checkpoint: cb.checkpoint,
+                                ancestors: path.len(),
+                                holder: child_id,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -630,6 +707,7 @@ impl PrefixIndex {
             path,
             exhausted_query: query_pos >= tokens.len(),
             pages,
+            exact,
         }
     }
 
@@ -690,6 +768,37 @@ impl PrefixIndex {
             return Err(InsertError::MisalignedHandle);
         }
 
+        self.insert_validated(domain, tokens, handles, checkpoint, false, pool)
+            .map(|_| ())
+    }
+
+    /// Remove a domain tree this call created (a refused insert must not
+    /// leave an empty root counting against the CPU node bound forever).
+    fn drop_new_tree(&mut self, domain: &CacheDomain) {
+        if let Some(t) = self.trees.remove(domain) {
+            self.total_nodes = self.total_nodes.saturating_sub(t.node_count());
+        }
+    }
+
+    /// Insert body shared by [`insert`](Self::insert) and
+    /// [`publish_checkpoint`](Self::publish_checkpoint); `handles` are already
+    /// validated. The retained-bytes projection assumes the insert can adopt
+    /// every handle, unless `credit_present` is set: then pages below the
+    /// prefix already present in the tree are not charged. The credit is
+    /// recomputed after every eviction round, because evicting leaves on the
+    /// very path being extended removes that credit.
+    /// Returns the checkpoint id visible at
+    /// the final boundary after the insert (a pre-existing id wins), or
+    /// `CheckpointId::NONE` when no checkpoint was requested.
+    fn insert_validated(
+        &mut self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        handles: &[Handle],
+        checkpoint: Option<CheckpointId>,
+        credit_present: bool,
+        pool: &mut PagePool,
+    ) -> Result<CheckpointId, InsertError> {
         // Get or create the domain tree.
         let is_new_tree = !self.trees.contains_key(domain);
         if is_new_tree {
@@ -700,40 +809,53 @@ impl PrefixIndex {
 
         // Retained-bytes ceiling (spec §4.4: cache retention is a ceiling,
         // and §9.1: zero means no retained cache). The insert needs at most
-        // `handles.len()` page slots; evict oldest unpinned leaves until the
+        // one page slot per handle not already present in the tree; evict
+        // oldest unpinned leaves until the
         // ceiling can hold the insert, refusing if eviction cannot progress.
         // Every refusal here must also drop a tree this call created: the
         // caller charges nothing on Err, so a left-behind empty root would
         // count against the CPU node bound forever.
         if let Some(max_bytes) = self.max_retained_bytes {
             let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
-            let refuse = |this: &mut Self, retained: usize, max: usize| {
-                if is_new_tree {
-                    if let Some(t) = this.trees.remove(domain) {
-                        this.total_nodes = this.total_nodes.saturating_sub(t.node_count());
-                    }
-                }
-                InsertError::CacheByteBoundExceeded { retained, max }
-            };
             if max_bytes < page_bytes {
-                return Err(refuse(self, self.retained_bytes, max_bytes));
+                let retained = self.retained_bytes;
+                if is_new_tree {
+                    self.drop_new_tree(domain);
+                }
+                return Err(InsertError::CacheByteBoundExceeded {
+                    retained,
+                    max: max_bytes,
+                });
             }
             loop {
+                let needed_pages = if credit_present {
+                    handles.len()
+                        - (self.matched_len(domain, tokens) / PAGE_TOKENS).min(handles.len())
+                } else {
+                    handles.len()
+                };
                 let projected = self
                     .retained_bytes
-                    .saturating_add(handles.len().saturating_mul(page_bytes));
+                    .saturating_add(needed_pages.saturating_mul(page_bytes));
                 if projected <= max_bytes {
                     break;
                 }
                 let before = self.total_nodes;
                 self.evict_unpinned_leaves(pool, projected.saturating_sub(max_bytes));
                 if self.total_nodes == before {
-                    return Err(refuse(self, self.retained_bytes, max_bytes));
+                    let retained = self.retained_bytes;
+                    if is_new_tree {
+                        self.drop_new_tree(domain);
+                    }
+                    return Err(InsertError::CacheByteBoundExceeded {
+                        retained,
+                        max: max_bytes,
+                    });
                 }
             }
         }
 
-        // Insert, evicting oldest unpinned leaves to make room when the CPU
+        // Insert, evicting the oldest unpinned leaf to make room when the CPU
         // node bound binds (spec §4.4: reclaim cache-only pages before
         // rejecting work). An insert that adds zero nodes (exact re-publish
         // or checkpoint-only) succeeds even at the bound.
@@ -748,7 +870,7 @@ impl PrefixIndex {
                 self.total_nodes,
             );
             match result {
-                Ok((delta, pages_adopted)) => {
+                Ok((delta, pages_adopted, adopted)) => {
                     self.total_nodes = (self.total_nodes as i32 + delta) as usize;
                     // Charge retained bytes by PAGES ADOPTED (one cache
                     // ref each), the exact basis eviction subtracts. The
@@ -759,27 +881,27 @@ impl PrefixIndex {
                     self.retained_bytes = self.retained_bytes.saturating_add(
                         pages_adopted * (pool.k_page_bytes() + pool.v_page_bytes()),
                     );
-                    return Ok(());
+                    return Ok(adopted);
                 }
                 Err(InsertError::CpuNodeBoundExceeded { .. }) => {
-                    // Evict one leaf (one page's worth of bytes) and retry.
-                    // No progress → the bound genuinely cannot be met.
-                    let before = self.total_nodes;
-                    self.evict_unpinned_leaves(pool, pool.k_page_bytes() + pool.v_page_bytes());
-                    if self.total_nodes == before {
-                        return Err(InsertError::CpuNodeBoundExceeded {
+                    // Evict one leaf and retry. No leaf to evict → the
+                    // bound genuinely cannot be met.
+                    if !self.evict_oldest_unpinned_leaf(pool) {
+                        let err = InsertError::CpuNodeBoundExceeded {
                             current: self.total_nodes,
                             max: self.max_cpu_nodes,
-                        });
+                        };
+                        if is_new_tree {
+                            self.drop_new_tree(domain);
+                        }
+                        return Err(err);
                     }
                 }
                 Err(e) => {
                     // Roll back a tree created for a failed insert so an
                     // empty root does not count against the bound forever.
                     if is_new_tree {
-                        if let Some(t) = self.trees.remove(domain) {
-                            self.total_nodes = self.total_nodes.saturating_sub(t.node_count());
-                        }
+                        self.drop_new_tree(domain);
                     }
                     return Err(e);
                 }
@@ -841,13 +963,22 @@ impl PrefixIndex {
     /// alone orphans the cache refs the publisher took at publication, which
     /// strands pages in CacheOnly and drains the pool to zero free pages
     /// within a few reset cycles (A20). Lookup visibility is removed first,
-    /// then each page's cache ref is released (spec §4.4). Returns the
-    /// number of page handles released.
+    /// then each node's checkpoint ids are queued for
+    /// [`take_retired_checkpoints`](Self::take_retired_checkpoints) BEFORE
+    /// its pages' cache refs are released (spec §4.4). Returns the number of
+    /// page handles released.
     pub fn release_all(&mut self, pool: &mut PagePool) -> usize {
         let mut released = 0usize;
         let trees = std::mem::take(&mut self.trees);
         for (_, mut tree) in trees {
             for (_, node) in tree.nodes.drain() {
+                let exact = &mut self.exact_ids;
+                self.retired.extend(
+                    node.checkpoints
+                        .iter()
+                        .map(|cb| cb.checkpoint)
+                        .filter(|id| exact.remove(id)),
+                );
                 for ph in &node.pages {
                     if pool.release_cache_ref(ph.phys).is_ok() {
                         released += 1;
@@ -860,14 +991,81 @@ impl PrefixIndex {
         released
     }
 
+    /// Unlink and remove one unpinned leaf: lookup visibility goes first,
+    /// then its checkpoint ids are queued as retired, then the index's cache
+    /// refs on its pages are released (the index owns exactly one per node
+    /// page slot — see the ownership doc on `PrefixIndex`).
+    ///
+    /// Returns the bytes freed and, when removing the leaf turned its parent
+    /// into a new unpinned leaf, that parent's `(id, insert_seq)`. `None`
+    /// when the node is missing, the root, not a leaf, or pinned.
+    fn evict_leaf(
+        &mut self,
+        domain: &CacheDomain,
+        nid: NodeId,
+        pool: &mut PagePool,
+        evicted_phys: &mut Vec<u32>,
+    ) -> Option<(usize, Option<(NodeId, u64)>)> {
+        let tree = self.trees.get_mut(domain)?;
+        let node = tree.nodes.get(&nid)?;
+        if nid == tree.root || !node.is_leaf_node() || node.pin_count != 0 {
+            return None;
+        }
+        let parent_id = node.parent;
+        let first_token = node.edge_tokens.first().copied();
+
+        // Unlink from the parent via the stored back-pointer.
+        if let (Some(pid), Some(ft)) = (parent_id, first_token) {
+            if let Some(parent) = tree.nodes.get_mut(&pid) {
+                parent.children.remove(&ft);
+            }
+        }
+
+        // Remove the node (remove lookup visibility BEFORE releasing refs).
+        let node = tree.nodes.remove(&nid)?;
+        self.total_nodes = self.total_nodes.saturating_sub(1);
+
+        // Retire checkpoint ids BEFORE the payload's pages are released.
+        let exact = &mut self.exact_ids;
+        self.retired.extend(
+            node.checkpoints
+                .iter()
+                .map(|cb| cb.checkpoint)
+                .filter(|id| exact.remove(id)),
+        );
+
+        let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+        let mut freed = 0usize;
+        for ph in &node.pages {
+            freed += page_bytes;
+            let _ = pool.release_cache_ref(ph.phys);
+            evicted_phys.push(ph.phys);
+            self.retained_bytes = self.retained_bytes.saturating_sub(page_bytes);
+        }
+
+        // Removing this leaf may have turned its parent into a new
+        // unpinned leaf.
+        let parent_candidate = parent_id.and_then(|pid| {
+            let parent = tree.nodes.get(&pid)?;
+            if pid != tree.root && parent.is_leaf_node() && parent.pin_count == 0 {
+                Some((pid, parent.insert_seq))
+            } else {
+                None
+            }
+        });
+        Some((freed, parent_candidate))
+    }
+
     /// Evict oldest unpinned leaves, releasing up to `max_bytes` of device
     /// memory (spec §4.4 C4).
     ///
     /// Leaf-first, oldest first (by insert sequence). Removes lookup
     /// visibility **before** releasing cache refs via
-    /// `PagePool::release_cache_ref`. Keeps useful ancestors while
-    /// descendants use them (ancestors are only evicted when all their
-    /// children are gone).
+    /// `PagePool::release_cache_ref`, and queues evicted checkpoint ids for
+    /// [`take_retired_checkpoints`](Self::take_retired_checkpoints) before
+    /// that release. Keeps useful ancestors while descendants use them
+    /// (ancestors are only evicted when all their children are gone).
+    /// Metadata-only leaves free no bytes and keep the pass going.
     ///
     /// Returns the physical page indices that were evicted.
     pub fn evict_unpinned_leaves(&mut self, pool: &mut PagePool, max_bytes: usize) -> Vec<u32> {
@@ -893,61 +1091,48 @@ impl PrefixIndex {
             let (domain, nid, _) = candidates[cursor].clone();
             cursor += 1;
 
-            let tree = match self.trees.get_mut(&domain) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            // Re-check conditions (may have changed).
-            let node = match tree.nodes.get(&nid) {
-                Some(n) => n,
-                None => continue,
-            };
-            if !node.is_leaf_node() || node.pin_count != 0 {
-                continue;
-            }
-
-            let pages = node.pages.clone();
-            let first_token = node.edge_tokens.first().copied();
-
-            // Unlink from the parent via the stored back-pointer.
-            let parent_id = node.parent;
-
-            if let Some(pid) = parent_id {
-                if let Some(parent) = tree.nodes.get_mut(&pid) {
-                    if let Some(ft) = first_token {
-                        parent.children.remove(&ft);
-                    }
-                }
-            }
-
-            // Remove the node (remove lookup visibility BEFORE releasing refs).
-            tree.nodes.remove(&nid);
-            self.total_nodes = self.total_nodes.saturating_sub(1);
-
-            // Release cache refs (the index owns exactly one per node page
-            // slot — see the ownership doc on `PrefixIndex`).
-            for ph in &pages {
-                let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
-                bytes_freed += page_bytes;
-                let _ = pool.release_cache_ref(ph.phys);
-                evicted_phys.push(ph.phys);
-                self.retained_bytes = self.retained_bytes.saturating_sub(page_bytes);
-            }
-
-            // Removing this leaf may have turned its parent into a new
-            // unpinned leaf — re-evaluate it in the same pass so eviction
-            // can collapse chains instead of stopping one level short.
-            if let Some(pid) = parent_id {
-                if let Some(parent) = tree.nodes.get(&pid) {
-                    if pid != tree.root && parent.is_leaf_node() && parent.pin_count == 0 {
-                        candidates.push((domain.clone(), pid, parent.insert_seq));
-                    }
+            // Re-checks leaf/pin conditions (may have changed).
+            if let Some((freed, parent)) = self.evict_leaf(&domain, nid, pool, &mut evicted_phys)
+            {
+                bytes_freed += freed;
+                // Re-evaluate the parent in the same pass so eviction can
+                // collapse chains instead of stopping one level short.
+                if let Some((pid, seq)) = parent {
+                    candidates.push((domain, pid, seq));
                 }
             }
         }
 
         evicted_phys
+    }
+
+    /// Evict exactly one leaf: the unpinned leaf (any domain, including a
+    /// metadata-only leaf) with the smallest insert sequence. Same
+    /// visibility/retirement/release ordering as
+    /// [`evict_unpinned_leaves`](Self::evict_unpinned_leaves). Returns
+    /// `false` when no unpinned leaf exists.
+    pub fn evict_oldest_unpinned_leaf(&mut self, pool: &mut PagePool) -> bool {
+        let mut best: Option<(CacheDomain, NodeId, u64)> = None;
+        for (domain, tree) in &self.trees {
+            for (nid, node) in &tree.nodes {
+                if *nid == tree.root || !node.is_leaf_node() || node.pin_count != 0 {
+                    continue;
+                }
+                let older = match &best {
+                    None => true,
+                    Some((_, bid, bseq)) => (node.insert_seq, nid.0) < (*bseq, bid.0),
+                };
+                if older {
+                    best = Some((domain.clone(), *nid, node.insert_seq));
+                }
+            }
+        }
+        let Some((domain, nid, _)) = best else {
+            return false;
+        };
+        let mut evicted_phys = Vec::new();
+        self.evict_leaf(&domain, nid, pool, &mut evicted_phys)
+            .is_some()
     }
 
     /// Try to evict enough nodes to fit `needed` new nodes.
@@ -967,6 +1152,238 @@ impl PrefixIndex {
             }
         }
         Ok(())
+    }
+
+    // ── Exact checkpoints ─────────────────────────────────────────────
+
+    /// Longest common token prefix between `tokens` and the domain tree
+    /// (counting a partially matched last edge).
+    fn matched_len(&self, domain: &CacheDomain, tokens: &[u32]) -> usize {
+        let Some(tree) = self.trees.get(domain) else {
+            return 0;
+        };
+        let mut current = tree.root;
+        let mut pos = 0usize;
+        while pos < tokens.len() {
+            let Some((child_id, child)) = tree
+                .nodes
+                .get(&current)
+                .and_then(|n| n.children.get(&tokens[pos]))
+                .and_then(|id| tree.nodes.get(id).map(|c| (*id, c)))
+            else {
+                break;
+            };
+            let m = child
+                .edge_tokens
+                .iter()
+                .zip(&tokens[pos..])
+                .take_while(|(a, b)| a == b)
+                .count();
+            pos += m;
+            if m < child.edge_tokens.len() {
+                break;
+            }
+            current = child_id;
+        }
+        pos
+    }
+
+    /// The checkpoint id stored at exactly the token boundary
+    /// `tokens.len()` in `domain`'s tree, if any.
+    fn find_exact_checkpoint(&self, domain: &CacheDomain, tokens: &[u32]) -> Option<CheckpointId> {
+        if tokens.is_empty() {
+            return None;
+        }
+        let tree = self.trees.get(domain)?;
+        let mut current = tree.root;
+        let mut pos = 0usize;
+        loop {
+            let child_id = *tree.nodes.get(&current)?.children.get(&tokens[pos])?;
+            let child = tree.nodes.get(&child_id)?;
+            let remaining = tokens.len() - pos;
+            let n = remaining.min(child.edge_tokens.len());
+            if child.edge_tokens[..n] != tokens[pos..pos + n] {
+                return None;
+            }
+            if n == remaining {
+                return child
+                    .checkpoints
+                    .iter()
+                    .find(|cb| cb.token_offset == n as u64)
+                    .map(|cb| cb.checkpoint);
+            }
+            pos += n;
+            current = child_id;
+        }
+    }
+
+    /// Publish a checkpoint at the EXACT token boundary `tokens.len()` (any
+    /// value >= 1). `full_pages` are the sealed handles for the
+    /// `tokens.len() / 128` full pages (offsets `0, 128, ...`); the residual
+    /// `tokens.len() % 128` tail is stored as a pageless metadata edge, never
+    /// as a padded or partial page.
+    ///
+    /// First writer wins: an existing checkpoint at the same boundary in the
+    /// same domain is kept and ITS id is returned — the caller then frees its
+    /// unadopted blob. A refused publish rolls the tree, cache refs and
+    /// retained bytes back and queues no retired ids for anything that never
+    /// became visible (ids evicted to make room were visible and ARE queued).
+    pub fn publish_checkpoint(
+        &mut self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        full_pages: &[Handle],
+        checkpoint: CheckpointId,
+        pool: &mut PagePool,
+    ) -> Result<CheckpointId, InsertError> {
+        if checkpoint.is_none() {
+            return Err(InsertError::InvalidHandle(
+                "checkpoint id must be non-zero".to_string(),
+            ));
+        }
+        if tokens.is_empty() || full_pages.len() != tokens.len() / PAGE_TOKENS {
+            return Err(InsertError::MisalignedHandle);
+        }
+        for (i, h) in full_pages.iter().enumerate() {
+            if h.token_offset != (i * PAGE_TOKENS) as u64 {
+                return Err(InsertError::MisalignedHandle);
+            }
+            pool.validate_handle(&h.handle)
+                .map_err(InsertError::InvalidHandle)?;
+        }
+        if let Some(existing) = self.find_exact_checkpoint(domain, tokens) {
+            return Ok(existing);
+        }
+        let adopted =
+            self.insert_validated(domain, tokens, full_pages, Some(checkpoint), true, pool)?;
+        if adopted.is_none() {
+            return Err(InsertError::InvalidHandle(
+                "checkpoint was not attached".to_string(),
+            ));
+        }
+        self.exact_ids.insert(adopted);
+        Ok(adopted)
+    }
+
+    /// Deepest usable exact checkpoint for `tokens` (the actual model input):
+    /// boundary `B` with `B <= matched`, `B < before`, and full pages
+    /// `[0, floor(B/128))` contiguous and valid in `pool`.
+    ///
+    /// On a hit, pins every node from the root down to (and including) the
+    /// node holding the boundary — not the whole matched path — and returns
+    /// the id, the full pages and the [`PinTicket`]. Release it with
+    /// [`release_pin`](Self::release_pin). Misses: [`MissReason::NoMatch`]
+    /// (no token match) or [`MissReason::NoCheckpoint`] (token match but no
+    /// usable boundary).
+    pub fn lookup_checkpoint(
+        &mut self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        before: usize,
+        pool: &PagePool,
+    ) -> Result<CheckpointHit, MissReason> {
+        let walk = self.walk(domain, tokens, pool, Some(before as u64));
+        if walk.matched_tokens == 0 {
+            return Err(MissReason::NoMatch);
+        }
+        let Some(cand) = walk.exact else {
+            return Err(MissReason::NoCheckpoint);
+        };
+        let mut nodes: Vec<NodeId> = walk.path[..cand.ancestors].to_vec();
+        nodes.push(cand.holder);
+        let boundary = cand.boundary;
+        let pages: Vec<Handle> = walk
+            .pages
+            .into_iter()
+            .filter(|h| h.token_offset + PAGE_TOKENS as u64 <= boundary)
+            .collect();
+        let pin = self.pin_path(domain, &nodes);
+        Ok(CheckpointHit {
+            lookup: PrefixLookup {
+                matched_tokens: walk.matched_tokens,
+                resident_kv_tokens: walk.resident_kv_tokens,
+                resumable_tokens: boundary,
+            },
+            checkpoint: cand.checkpoint,
+            pages,
+            pin,
+        })
+    }
+
+    /// Remove the boundary carrying `id` from lookup visibility and queue the
+    /// id as retired. Pageless unpinned leaves left empty by the removal are
+    /// pruned. A pinned holder's boundary may be forgotten (visibility only):
+    /// the caller's payload pin protects the blob. Unknown ids are ignored.
+    pub fn forget_checkpoint(&mut self, id: CheckpointId) {
+        if id.is_none() {
+            return;
+        }
+        let mut found: Option<(CacheDomain, NodeId)> = None;
+        'search: for (domain, tree) in &self.trees {
+            for (nid, node) in &tree.nodes {
+                if node.checkpoints.iter().any(|cb| cb.checkpoint == id) {
+                    found = Some((domain.clone(), *nid));
+                    break 'search;
+                }
+            }
+        }
+        let Some((domain, nid)) = found else {
+            return;
+        };
+        let Some(tree) = self.trees.get_mut(&domain) else {
+            return;
+        };
+        if let Some(node) = tree.nodes.get_mut(&nid) {
+            node.checkpoints.retain(|cb| cb.checkpoint != id);
+        }
+        if self.exact_ids.remove(&id) {
+            self.retired.push(id);
+        }
+
+        // Prune nodes that no longer carry anything: pageless, childless,
+        // checkpoint-free, unpinned.
+        let mut current = nid;
+        while current != tree.root {
+            let Some(node) = tree.nodes.get(&current) else {
+                break;
+            };
+            if !node.children.is_empty()
+                || !node.pages.is_empty()
+                || !node.checkpoints.is_empty()
+                || node.pin_count != 0
+            {
+                break;
+            }
+            let parent_id = node.parent;
+            let first_token = node.edge_tokens.first().copied();
+            if let (Some(pid), Some(ft)) = (parent_id, first_token) {
+                if let Some(parent) = tree.nodes.get_mut(&pid) {
+                    parent.children.remove(&ft);
+                }
+            }
+            tree.nodes.remove(&current);
+            self.total_nodes = self.total_nodes.saturating_sub(1);
+            match parent_id {
+                Some(pid) => current = pid,
+                None => break,
+            }
+        }
+    }
+
+    /// Drain the checkpoint ids that left visibility since the last call
+    /// (explicit forget, every eviction, `release_all`). Each id is returned
+    /// exactly once; the payload owner frees the matching blob.
+    pub fn take_retired_checkpoints(&mut self) -> Vec<CheckpointId> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Number of checkpoint boundaries currently visible across all domains.
+    pub fn checkpoint_count(&self) -> usize {
+        self.trees
+            .values()
+            .flat_map(|t| t.nodes.values())
+            .map(|n| n.checkpoints.len())
+            .sum()
     }
 
     // ── Publication helper ────────────────────────────────────────────
@@ -1045,13 +1462,37 @@ impl PrefixIndex {
 // Free tree manipulation functions (avoid &mut self + &mut tree borrow conflict)
 // =========================================================================
 
+/// Attach `ckpt` at `token_offset` of `node` unless a checkpoint already sits
+/// there (first writer wins). Returns the id visible at that boundary.
+fn attach_checkpoint(node: &mut Node, token_offset: u64, ckpt: CheckpointId) -> CheckpointId {
+    if let Some(existing) = node
+        .checkpoints
+        .iter()
+        .find(|cb| cb.token_offset == token_offset)
+    {
+        return existing.checkpoint;
+    }
+    node.checkpoints.push(CheckpointBoundary {
+        token_offset,
+        checkpoint: ckpt,
+    });
+    node.checkpoints.sort_by_key(|cb| cb.token_offset);
+    ckpt
+}
+
+fn corrupt_tree() -> InsertError {
+    InsertError::InvalidHandle("radix tree node missing".to_string())
+}
+
 /// Insert tokens/handles into a domain tree, splitting edges as needed.
 /// Takes one `PagePool` cache ref for every page handle recorded in a newly
 /// created node (released again if the chain rolls back — see the
 /// cache-ref ownership doc on [`PrefixIndex`]). Returns the net change in
-/// node count (positive = nodes added) AND the number of pages adopted
-/// (cache refs taken) — the retained-bytes basis. Split markers add a
-/// node but adopt no page.
+/// node count (positive = nodes added), the number of pages adopted
+/// (cache refs taken) — the retained-bytes basis — and the checkpoint id
+/// visible at the final boundary (an existing one wins; `NONE` when none was
+/// requested). Split markers add a node but adopt no page; the residual tail
+/// of a non-page-aligned key is a pageless node.
 fn insert_into_tree(
     tree: &mut DomainTree,
     tokens: &[u32],
@@ -1060,42 +1501,30 @@ fn insert_into_tree(
     pool: &mut PagePool,
     max_cpu_nodes: usize,
     current_total: usize,
-) -> Result<(i32, usize), InsertError> {
+) -> Result<(i32, usize, CheckpointId), InsertError> {
     let mut current = tree.root;
     let mut query_pos: usize = 0;
     let mut delta: i32 = 0;
     let mut pages_adopted: usize = 0;
+    let requested = checkpoint.filter(|c| c.is_some());
 
     loop {
         if query_pos >= tokens.len() {
-            if let Some(ckpt) = checkpoint {
-                if ckpt.is_some() {
-                    let node = tree.nodes.get_mut(&current).unwrap();
-                    let token_offset = if current == tree.root {
-                        0
-                    } else {
-                        node.edge_tokens.len() as u64
-                    };
-                    if !node
-                        .checkpoints
-                        .iter()
-                        .any(|cb| cb.token_offset == token_offset)
-                    {
-                        node.checkpoints.push(CheckpointBoundary {
-                            token_offset,
-                            checkpoint: ckpt,
-                        });
-                        node.checkpoints.sort_by_key(|cb| cb.token_offset);
-                    }
-                }
+            let mut adopted = CheckpointId::NONE;
+            if let Some(ckpt) = requested {
+                let is_root = current == tree.root;
+                let node = tree.nodes.get_mut(&current).ok_or_else(corrupt_tree)?;
+                let token_offset = if is_root {
+                    0
+                } else {
+                    node.edge_tokens.len() as u64
+                };
+                adopted = attach_checkpoint(node, token_offset, ckpt);
             }
-            return Ok((delta, pages_adopted));
+            return Ok((delta, pages_adopted, adopted));
         }
 
-        let node = match tree.nodes.get(&current) {
-            Some(n) => n,
-            None => return Ok((delta, pages_adopted)),
-        };
+        let node = tree.nodes.get(&current).ok_or_else(corrupt_tree)?;
 
         let next_token = tokens[query_pos];
         let child_id = match node.children.get(&next_token).copied() {
@@ -1105,7 +1534,7 @@ fn insert_into_tree(
                 // query_pos may sit mid-page (a partial-node match leaves
                 // the cursor inside the new key's current page): the
                 // branch's first node claims only the tail of that page.
-                let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
+                let remaining_handles = &handles[(query_pos / PAGE_TOKENS).min(handles.len())..];
                 let (d, p) = create_chain(
                     tree,
                     current,
@@ -1119,14 +1548,11 @@ fn insert_into_tree(
                 )?;
                 delta += d;
                 pages_adopted += p;
-                return Ok((delta, pages_adopted));
+                return Ok((delta, pages_adopted, requested.unwrap_or(CheckpointId::NONE)));
             }
         };
 
-        let child = match tree.nodes.get(&child_id) {
-            Some(c) => c,
-            None => return Ok((delta, pages_adopted)),
-        };
+        let child = tree.nodes.get(&child_id).ok_or_else(corrupt_tree)?;
 
         let edge = &child.edge_tokens;
         let mut edge_match = 0usize;
@@ -1162,23 +1588,12 @@ fn insert_into_tree(
             let parent = tree.nodes.get(&current).unwrap();
             let split_node_id = parent.children.get(&next_token).copied().unwrap();
 
+            let mut adopted = CheckpointId::NONE;
             if divergence >= tokens.len() {
-                if let Some(ckpt) = checkpoint {
-                    if ckpt.is_some() {
-                        let split_node = tree.nodes.get_mut(&split_node_id).unwrap();
-                        let token_offset = split_node.edge_tokens.len() as u64;
-                        if !split_node
-                            .checkpoints
-                            .iter()
-                            .any(|cb| cb.token_offset == token_offset)
-                        {
-                            split_node.checkpoints.push(CheckpointBoundary {
-                                token_offset,
-                                checkpoint: ckpt,
-                            });
-                            split_node.checkpoints.sort_by_key(|cb| cb.token_offset);
-                        }
-                    }
+                if let Some(ckpt) = requested {
+                    let split_node = tree.nodes.get_mut(&split_node_id).unwrap();
+                    let token_offset = split_node.edge_tokens.len() as u64;
+                    adopted = attach_checkpoint(split_node, token_offset, ckpt);
                 }
             }
 
@@ -1189,7 +1604,7 @@ fn insert_into_tree(
                 // branch's first node claims only the tail of that page.
                 // (page_idx bookkeeping cannot be used here: partial nodes
                 // decouple pages-consumed from tokens-consumed.)
-                let remaining_handles = &handles[divergence / PAGE_TOKENS..];
+                let remaining_handles = &handles[(divergence / PAGE_TOKENS).min(handles.len())..];
                 let first_skip = divergence % PAGE_TOKENS;
                 let chained = create_chain(
                     tree,
@@ -1214,15 +1629,43 @@ fn insert_into_tree(
                 };
                 delta += d;
                 pages_adopted += p;
+                adopted = requested.unwrap_or(CheckpointId::NONE);
             }
 
-            return Ok((delta, pages_adopted));
+            return Ok((delta, pages_adopted, adopted));
         }
     }
 }
 
-/// Create a chain of nodes for a new token span. Each node covers one full
-/// page. Returns the number of nodes added.
+/// Undo a [`create_chain`] partway: unlink the first created node from
+/// `parent` (later nodes hang off earlier created nodes, which removing them
+/// makes unreachable — unlinking later nodes by first_token could remove an
+/// unrelated pre-existing sibling of `parent`) and release every cache ref
+/// the chain took.
+fn rollback_chain(
+    tree: &mut DomainTree,
+    parent: NodeId,
+    created: Vec<(NodeId, u32, Option<PageHandle>)>,
+    pool: &mut PagePool,
+) {
+    if let Some((_, first_ft, _)) = created.first().copied() {
+        if let Some(p) = tree.nodes.get_mut(&parent) {
+            p.children.remove(&first_ft);
+        }
+    }
+    for (id, _, ph) in created.into_iter().rev() {
+        tree.nodes.remove(&id);
+        if let Some(ph) = ph {
+            let _ = pool.release_cache_ref(ph.phys);
+        }
+    }
+}
+
+/// Create a chain of nodes for a new token span. Each node covers up to one
+/// page and owns the physical page it COMPLETES: a node whose span reaches a
+/// page end takes that page's handle; the residual tail of a key that is not
+/// page-aligned is a pageless metadata node (no padded or partial page).
+/// Returns the number of nodes added and the number of pages adopted.
 ///
 /// Transactional (spec §4.3): if the CPU node bound is hit partway through,
 /// every node this call created is removed and unlinked again, and every
@@ -1244,10 +1687,11 @@ fn create_chain(
     let mut token_pos = 0usize;
     let mut handle_idx = 0usize;
     let mut added: i32 = 0;
+    let mut pages_adopted = 0usize;
     // (node_id, first_token, page_handle) for every node created by this
     // call — nodes for unlinking on rollback, handles for releasing the
     // cache refs the index took for them.
-    let mut created: Vec<(NodeId, u32, PageHandle)> = Vec::new();
+    let mut created: Vec<(NodeId, u32, Option<PageHandle>)> = Vec::new();
 
     while token_pos < tokens.len() {
         // The first node of a mid-page branch claims only the tail of its
@@ -1260,7 +1704,13 @@ fn create_chain(
         let first_token = chunk[0];
 
         let node_id = tree.fresh_node_id();
-        let page_handle = handles[handle_idx].handle;
+        // Only a node whose span reaches the page end completes a page, and
+        // the key's `handles` cover exactly the pages completed by the key.
+        let page_handle = if skip + span == PAGE_TOKENS {
+            handles.get(handle_idx).map(|h| h.handle)
+        } else {
+            None
+        };
         let insert_seq = tree.fresh_insert_seq();
 
         let is_last_node = token_pos + span >= tokens.len();
@@ -1269,7 +1719,7 @@ fn create_chain(
             insert_seq,
             current_parent,
             chunk.to_vec(),
-            vec![page_handle],
+            page_handle.into_iter().collect(),
         );
         new_node.first_page_skip = skip;
 
@@ -1286,25 +1736,10 @@ fn create_chain(
 
         let new_total = current_total + added as usize + 1;
         if new_total > max_cpu_nodes {
-            // Roll the partial chain back. Only the FIRST created node was
-            // linked into `parent` — later nodes hang off earlier created
-            // nodes, which `tree.nodes.remove` makes unreachable. Unlinking
-            // later nodes by first_token could otherwise remove an unrelated
-            // pre-existing sibling of `parent`. Each created node held one
-            // cache ref: release them all so the pages stay reclaimable.
-            if let Some((_, first_ft, _)) = created.first().copied() {
-                tree.nodes
-                    .get_mut(&parent)
-                    .unwrap()
-                    .children
-                    .remove(&first_ft);
-            }
-            for (id, _, ph) in created.into_iter().rev() {
-                tree.nodes.remove(&id);
-                let _ = pool.release_cache_ref(ph.phys);
-            }
-            // The unused node id stays allocated (monotonic ids may have
-            // gaps — harmless).
+            // Roll the partial chain back (see `rollback_chain`). The unused
+            // node id stays allocated (monotonic ids may have gaps —
+            // harmless).
+            rollback_chain(tree, parent, created, pool);
             return Err(InsertError::CpuNodeBoundExceeded {
                 current: current_total + added as usize,
                 max: max_cpu_nodes,
@@ -1316,22 +1751,15 @@ fn create_chain(
         // the pool refuses the ref (Free/ReclaimPending page): a node whose
         // ref could not be taken would be released into underflow by
         // eviction later.
-        if let Err(e) = pool.add_cache_ref(page_handle.phys) {
-            if let Some((_, first_ft, _)) = created.first().copied() {
-                tree.nodes
-                    .get_mut(&parent)
-                    .unwrap()
-                    .children
-                    .remove(&first_ft);
+        if let Some(ph) = page_handle {
+            if let Err(e) = pool.add_cache_ref(ph.phys) {
+                rollback_chain(tree, parent, created, pool);
+                return Err(InsertError::InvalidHandle(format!(
+                    "cache ref refused for phys {} (handle gen {}): {e}",
+                    ph.phys, ph.generation
+                )));
             }
-            for (id, _, ph) in created.into_iter().rev() {
-                tree.nodes.remove(&id);
-                let _ = pool.release_cache_ref(ph.phys);
-            }
-            return Err(InsertError::InvalidHandle(format!(
-                "cache ref refused for phys {} (handle gen {}): {e}",
-                page_handle.phys, page_handle.generation
-            )));
+            pages_adopted += 1;
         }
 
         tree.nodes.insert(node_id, new_node);
@@ -1349,9 +1777,9 @@ fn create_chain(
         handle_idx += 1;
     }
 
-    // Every created node adopted exactly one page (one cache ref each) —
-    // the byte-accounting basis that eviction subtracts.
-    Ok((added, added.max(0) as usize))
+    // Every page-completing node adopted exactly one page (one cache ref
+    // each) — the byte-accounting basis that eviction subtracts.
+    Ok((added, pages_adopted))
 }
 
 /// Undo a [`split_edge`] — used when the insert fails AFTER the split was
@@ -1834,6 +2262,22 @@ mod tests {
             }
             other => panic!("expected Hit for 128-token exact match, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn aligned_api_evictions_queue_no_retired_ids() {
+        let (mut pool, handles) = setup_pool_and_pages(1);
+        let tokens = make_tokens(PAGE_TOKENS);
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(1);
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
+        assert_eq!(index.evict_unpinned_leaves(&mut pool, usize::MAX).len(), 1);
+        assert!(
+            index.take_retired_checkpoints().is_empty(),
+            "aligned (Qwen3.5) checkpoint ids never accumulate in the retired queue"
+        );
     }
 
     #[test]
@@ -3138,5 +3582,764 @@ mod tests {
         let evicted = index.evict_unpinned_leaves(&mut pool, usize::MAX);
         assert_eq!(evicted.len(), 3, "one pass must reclaim the whole chain");
         assert_eq!(index.total_nodes(), 1, "only the root remains");
+    }
+
+    // ── Exact checkpoints (Qwen4 radix) ───────────────────────────────
+
+    fn page_bytes_of(pool: &PagePool) -> usize {
+        pool.k_page_bytes() + pool.v_page_bytes()
+    }
+
+    /// Allocate `n` sealed pages; handles at offsets `0, 128, ...`. The
+    /// caller keeps the table until after publishing (the index takes its
+    /// own cache refs) and then releases it.
+    fn alloc_exact(pool: &mut PagePool, n: usize) -> (BlockTable, Vec<Handle>) {
+        let mut table = BlockTable::new();
+        assert_eq!(pool.alloc_pages(&mut table, n), n, "test pool exhausted");
+        let mut handles = Vec::new();
+        for lp in 0..n {
+            let phys = table.physical(lp).unwrap();
+            pool.seal(phys).unwrap();
+            handles.push(Handle {
+                handle: PageHandle {
+                    phys,
+                    epoch: pool.epoch(),
+                    generation: pool.page_generation(phys),
+                },
+                token_offset: (lp * PAGE_TOKENS) as u64,
+            });
+        }
+        (table, handles)
+    }
+
+    /// Publish an exact checkpoint with freshly allocated pages, then drop
+    /// the table refs so the index's cache refs are the only owners of the
+    /// adopted pages (unadopted pages return to the pool). Returns the
+    /// handles too so oracles can see which were adopted (still valid).
+    fn publish_exact_with(
+        index: &mut PrefixIndex,
+        pool: &mut PagePool,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        id: u64,
+    ) -> (Result<CheckpointId, InsertError>, Vec<Handle>) {
+        let (mut table, handles) = alloc_exact(pool, tokens.len() / PAGE_TOKENS);
+        let r = index.publish_checkpoint(domain, tokens, &handles, CheckpointId(id), pool);
+        let _ = pool.release_table(&mut table);
+        pool.drain_completed();
+        (r, handles)
+    }
+
+    fn publish_exact(
+        index: &mut PrefixIndex,
+        pool: &mut PagePool,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        id: u64,
+    ) -> Result<CheckpointId, InsertError> {
+        publish_exact_with(index, pool, domain, tokens, id).0
+    }
+
+    fn exact_pool() -> PagePool {
+        PagePool::new_with_strides(64, 128, 128).unwrap()
+    }
+
+    #[test]
+    fn exact_checkpoints_at_page_edges() {
+        for &b in &[1usize, 127, 128, 129, 255, 256, 257] {
+            let mut pool = exact_pool();
+            let mut index = PrefixIndex::new(1 << 10);
+            let domain = sample_domain(1);
+            let key = make_tokens(b);
+            let id = publish_exact(&mut index, &mut pool, &domain, &key, b as u64).unwrap();
+            assert_eq!(id, CheckpointId(b as u64), "B={b}");
+            let full = b / PAGE_TOKENS;
+            assert_eq!(index.retained_bytes(), full * page_bytes_of(&pool), "B={b}");
+            assert_eq!(index.checkpoint_count(), 1, "B={b}");
+
+            // A query that extends past B resumes at exactly B.
+            let query = make_tokens(b + 40);
+            let hit = index
+                .lookup_checkpoint(&domain, &query, b + 40, &pool)
+                .unwrap();
+            assert_eq!(hit.checkpoint, id, "B={b}");
+            assert_eq!(hit.lookup.matched_tokens, b as u64, "B={b}");
+            assert_eq!(hit.lookup.resumable_tokens, b as u64, "B={b}");
+            assert_eq!(hit.pages.len(), full, "B={b}");
+            for (j, h) in hit.pages.iter().enumerate() {
+                assert_eq!(h.token_offset, (j * PAGE_TOKENS) as u64, "B={b}");
+            }
+            index.release_pin(&domain, hit.pin);
+
+            // B < before is strict.
+            assert_eq!(
+                index.lookup_checkpoint(&domain, &query, b, &pool).unwrap_err(),
+                MissReason::NoCheckpoint,
+                "B={b}"
+            );
+            let hit = index
+                .lookup_checkpoint(&domain, &query, b + 1, &pool)
+                .unwrap();
+            assert_eq!(hit.checkpoint, id, "B={b}");
+            index.release_pin(&domain, hit.pin);
+
+            // A query shorter than B matches tokens but no boundary.
+            if b > 1 {
+                let short = make_tokens(b - 1);
+                assert_eq!(
+                    index
+                        .lookup_checkpoint(&domain, &short, b + 1, &pool)
+                        .unwrap_err(),
+                    MissReason::NoCheckpoint,
+                    "B={b}"
+                );
+            }
+            let other = make_tokens_from(5000, b);
+            assert_eq!(
+                index
+                    .lookup_checkpoint(&domain, &other, b + 1, &pool)
+                    .unwrap_err(),
+                MissReason::NoMatch,
+                "B={b}"
+            );
+
+            // Every pin was released: the whole chain (tail included) evicts
+            // leaf by leaf and the tail's id is reported before the pages.
+            assert!(index.evict_oldest_unpinned_leaf(&mut pool), "B={b}");
+            assert_eq!(
+                index.take_retired_checkpoints(),
+                vec![id],
+                "B={b}: the checkpoint leaf is the first evicted"
+            );
+            while index.evict_oldest_unpinned_leaf(&mut pool) {}
+            assert!(index.take_retired_checkpoints().is_empty(), "B={b}");
+            assert_eq!(index.retained_bytes(), 0, "B={b}");
+            assert_eq!(index.total_nodes(), 1, "B={b}: only the root remains");
+            pool.drain_completed();
+            assert_eq!(pool.free_pages(), 64, "B={b}: no page leaked");
+        }
+    }
+
+    #[test]
+    fn mid_edge_query_pins_holder_and_refuses_eviction() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let k300 = make_tokens(300);
+        let k200 = make_tokens(200);
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &k300, 1).unwrap(),
+            CheckpointId(1)
+        );
+        // B=200 forks mid-page: a pageless marker [128,200) holds it while
+        // the straddling page stays with the child [200,256).
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &k200, 2).unwrap(),
+            CheckpointId(2)
+        );
+        assert_eq!(index.checkpoint_count(), 2);
+
+        // The query diverges inside the child's edge, past the holder.
+        let mut q = make_tokens(210);
+        q.extend_from_slice(&[9000, 9001]);
+        let hit = index
+            .lookup_checkpoint(&domain, &q, q.len(), &pool)
+            .unwrap();
+        assert_eq!(hit.checkpoint, CheckpointId(2));
+        assert_eq!(hit.lookup.matched_tokens, 210);
+        assert_eq!(hit.lookup.resumable_tokens, 200);
+        assert_eq!(hit.pages.len(), 1);
+
+        // Everything below the holder evicts; the pinned holder refuses.
+        let evicted = index.evict_unpinned_leaves(&mut pool, usize::MAX);
+        assert_eq!(evicted.len(), 1, "only the straddling page is released");
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
+        assert!(!index.evict_oldest_unpinned_leaf(&mut pool));
+        assert!(index.take_retired_checkpoints().is_empty());
+
+        // A second overlapping pin on the same holder.
+        let again = index
+            .lookup_checkpoint(&domain, &k200, k200.len() + 1, &pool)
+            .unwrap();
+        assert_eq!(again.checkpoint, CheckpointId(2));
+        index.release_pin(&domain, hit.pin);
+        assert!(
+            !index.evict_oldest_unpinned_leaf(&mut pool),
+            "the second pin still protects the holder"
+        );
+        index.release_pin(&domain, again.pin);
+
+        // The holder is now a metadata-only leaf: evicting it reports its id.
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(2)]);
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool), "page node N0");
+        assert!(index.take_retired_checkpoints().is_empty());
+        assert!(!index.evict_oldest_unpinned_leaf(&mut pool));
+        assert_eq!(index.checkpoint_count(), 0);
+    }
+
+    #[test]
+    fn token_match_without_usable_checkpoint_is_no_checkpoint() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let k300 = make_tokens(300);
+        publish_exact(&mut index, &mut pool, &domain, &k300, 7).unwrap();
+
+        assert_eq!(
+            index
+                .lookup_checkpoint(&domain, &k300, 128, &pool)
+                .unwrap_err(),
+            MissReason::NoCheckpoint,
+            "boundary 300 is not < before"
+        );
+        assert_eq!(
+            index
+                .lookup_checkpoint(&domain, &make_tokens(200), 500, &pool)
+                .unwrap_err(),
+            MissReason::NoCheckpoint,
+            "matched 200 < boundary 300"
+        );
+        assert_eq!(
+            index
+                .lookup_checkpoint(&domain, &make_tokens_from(5000, 100), 500, &pool)
+                .unwrap_err(),
+            MissReason::NoMatch
+        );
+        // A miss pins nothing: the leaf still evicts.
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(7)]);
+    }
+
+    #[test]
+    fn exact_checkpoints_are_domain_isolated() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let da = sample_domain(1);
+        let db = domain_with("model", "");
+        let key = make_tokens(200);
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &da, &key, 1).unwrap(),
+            CheckpointId(1)
+        );
+        assert_eq!(
+            index
+                .lookup_checkpoint(&db, &key, 300, &pool)
+                .unwrap_err(),
+            MissReason::NoMatch
+        );
+        // The same tokens in another domain are a different boundary.
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &db, &key, 2).unwrap(),
+            CheckpointId(2)
+        );
+        let ha = index.lookup_checkpoint(&da, &key, 300, &pool).unwrap();
+        let hb = index.lookup_checkpoint(&db, &key, 300, &pool).unwrap();
+        assert_eq!(ha.checkpoint, CheckpointId(1));
+        assert_eq!(hb.checkpoint, CheckpointId(2));
+        index.release_pin(&da, ha.pin);
+        index.release_pin(&db, hb.pin);
+        assert_eq!(index.checkpoint_count(), 2);
+    }
+
+    #[test]
+    fn stale_page_makes_deeper_boundary_unusable_but_shallower_usable() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let k100 = make_tokens(100);
+        let k300 = make_tokens(300);
+        publish_exact(&mut index, &mut pool, &domain, &k100, 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &k300, 2).unwrap();
+
+        let hit = index
+            .lookup_checkpoint(&domain, &k300, 1000, &pool)
+            .unwrap();
+        assert_eq!(hit.checkpoint, CheckpointId(2));
+        assert_eq!(hit.pages.len(), 2);
+        let page0 = hit.pages[0].handle.phys;
+        index.release_pin(&domain, hit.pin);
+
+        // Losing page 0 breaks the gap-free prefix for B=300 (needs pages
+        // 0 and 1) but not for B=100 (no full page required).
+        index.test_drop_page_ref(&mut pool, &domain, page0);
+        pool.drain_completed();
+        let hit = index
+            .lookup_checkpoint(&domain, &k300, 1000, &pool)
+            .unwrap();
+        assert_eq!(hit.checkpoint, CheckpointId(1));
+        assert_eq!(hit.lookup.resumable_tokens, 100);
+        assert!(hit.pages.is_empty());
+        assert_eq!(hit.lookup.matched_tokens, 300);
+        index.release_pin(&domain, hit.pin);
+        assert_eq!(
+            index
+                .lookup_checkpoint(&domain, &k300, 100, &pool)
+                .unwrap_err(),
+            MissReason::NoCheckpoint
+        );
+    }
+
+    #[test]
+    fn duplicate_publication_keeps_first_id() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let k300 = make_tokens(300);
+        let k200 = make_tokens(200);
+        publish_exact(&mut index, &mut pool, &domain, &k300, 1).unwrap();
+        // B=200 lands inside an existing edge (first writer = id 2).
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &k200, 2).unwrap(),
+            CheckpointId(2)
+        );
+        let free_before = pool.free_pages();
+        let nodes_before = index.total_nodes();
+        let retained_before = index.retained_bytes();
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &k200, 3).unwrap(),
+            CheckpointId(2)
+        );
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &k300, 4).unwrap(),
+            CheckpointId(1)
+        );
+        assert_eq!(index.checkpoint_count(), 2);
+        assert_eq!(index.total_nodes(), nodes_before);
+        assert_eq!(index.retained_bytes(), retained_before);
+        assert_eq!(pool.free_pages(), free_before, "unadopted pages returned");
+        assert!(index.take_retired_checkpoints().is_empty());
+    }
+
+    #[test]
+    fn overlapping_exact_pins_are_counted() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let k300 = make_tokens(300);
+        publish_exact(&mut index, &mut pool, &domain, &k300, 1).unwrap();
+        let h1 = index.lookup_checkpoint(&domain, &k300, 301, &pool).unwrap();
+        let h2 = index.lookup_checkpoint(&domain, &k300, 301, &pool).unwrap();
+        assert_eq!(h1.checkpoint, h2.checkpoint);
+        assert!(index.evict_unpinned_leaves(&mut pool, usize::MAX).is_empty());
+        assert!(index.take_retired_checkpoints().is_empty());
+        index.release_pin(&domain, h1.pin);
+        assert!(index.evict_unpinned_leaves(&mut pool, usize::MAX).is_empty());
+        index.release_pin(&domain, h2.pin);
+        assert_eq!(index.evict_unpinned_leaves(&mut pool, usize::MAX).len(), 2);
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
+    }
+
+    #[test]
+    fn failed_publish_rolls_back_and_retires_nothing() {
+        let mut pool = exact_pool();
+        // root + A's node = 2; a 3-node chain cannot fit and A is pinned.
+        let mut index = PrefixIndex::new(3);
+        let domain = sample_domain(1);
+        let a = make_tokens(100);
+        publish_exact(&mut index, &mut pool, &domain, &a, 1).unwrap();
+        let pin = index.lookup_checkpoint(&domain, &a, 101, &pool).unwrap();
+
+        let nodes = index.total_nodes();
+        let retained = index.retained_bytes();
+        let free = pool.free_pages();
+        let b = make_tokens_from(5000, 300);
+        let err = publish_exact(&mut index, &mut pool, &domain, &b, 2).unwrap_err();
+        assert!(matches!(err, InsertError::CpuNodeBoundExceeded { .. }));
+        assert_eq!(index.total_nodes(), nodes);
+        assert_eq!(index.retained_bytes(), retained);
+        assert_eq!(index.checkpoint_count(), 1);
+        assert_eq!(pool.free_pages(), free, "rolled-back cache refs released");
+        assert!(index.take_retired_checkpoints().is_empty());
+        let again = index.lookup_checkpoint(&domain, &a, 101, &pool).unwrap();
+        assert_eq!(again.checkpoint, CheckpointId(1));
+        index.release_pin(&domain, again.pin);
+        index.release_pin(&domain, pin.pin);
+
+        // A refused publish into a brand-new domain leaves no root behind.
+        let mut tiny = PrefixIndex::new(1);
+        let err = publish_exact(&mut tiny, &mut pool, &domain, &b, 3).unwrap_err();
+        assert!(matches!(err, InsertError::CpuNodeBoundExceeded { .. }));
+        assert_eq!(tiny.total_nodes(), 0);
+        assert_eq!(tiny.domain_count(), 0);
+        assert!(tiny.take_retired_checkpoints().is_empty());
+        assert_eq!(pool.free_pages(), free);
+
+        // Malformed publications are refused before any mutation.
+        let (mut table, handles) = alloc_exact(&mut pool, 1);
+        assert_eq!(
+            index
+                .publish_checkpoint(&domain, &make_tokens(300), &handles, CheckpointId(9), &mut pool)
+                .unwrap_err(),
+            InsertError::MisalignedHandle
+        );
+        assert!(index
+            .publish_checkpoint(&domain, &make_tokens(200), &handles, CheckpointId::NONE, &mut pool)
+            .unwrap_err()
+            .to_string()
+            .contains("non-zero"));
+        assert_eq!(
+            index
+                .publish_checkpoint(&domain, &[], &[], CheckpointId(9), &mut pool)
+                .unwrap_err(),
+            InsertError::MisalignedHandle
+        );
+        let _ = pool.release_table(&mut table);
+        assert_eq!(index.total_nodes(), nodes);
+    }
+
+    #[test]
+    fn capacity_eviction_retires_ids() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(3);
+        let domain = sample_domain(1);
+        let a = make_tokens(100);
+        let b = make_tokens_from(5000, 100);
+        let c = make_tokens_from(9000, 100);
+        publish_exact(&mut index, &mut pool, &domain, &a, 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &b, 2).unwrap();
+        assert_eq!(
+            publish_exact(&mut index, &mut pool, &domain, &c, 3).unwrap(),
+            CheckpointId(3)
+        );
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
+        assert!(index.take_retired_checkpoints().is_empty(), "drained once");
+        assert_eq!(
+            index.lookup_checkpoint(&domain, &a, 101, &pool).unwrap_err(),
+            MissReason::NoMatch
+        );
+        assert_eq!(index.checkpoint_count(), 2);
+    }
+
+    #[test]
+    fn forget_checkpoint_retires_prunes_and_ignores_unknown() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let a = make_tokens(100);
+        publish_exact(&mut index, &mut pool, &domain, &a, 1).unwrap();
+
+        index.forget_checkpoint(CheckpointId(99));
+        index.forget_checkpoint(CheckpointId::NONE);
+        assert!(index.take_retired_checkpoints().is_empty());
+
+        index.forget_checkpoint(CheckpointId(1));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
+        assert!(index.take_retired_checkpoints().is_empty());
+        assert_eq!(index.total_nodes(), 1, "the empty pageless leaf is pruned");
+        assert_eq!(index.checkpoint_count(), 0);
+        assert_eq!(
+            index.lookup_checkpoint(&domain, &a, 200, &pool).unwrap_err(),
+            MissReason::NoMatch
+        );
+
+        // A pinned holder keeps its node when its boundary is forgotten.
+        publish_exact(&mut index, &mut pool, &domain, &a, 2).unwrap();
+        let hit = index.lookup_checkpoint(&domain, &a, 200, &pool).unwrap();
+        index.forget_checkpoint(CheckpointId(2));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(2)]);
+        assert_eq!(index.total_nodes(), 2);
+        assert_eq!(
+            index.lookup_checkpoint(&domain, &a, 200, &pool).unwrap_err(),
+            MissReason::NoCheckpoint
+        );
+        index.release_pin(&domain, hit.pin);
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool));
+        assert!(index.take_retired_checkpoints().is_empty());
+        assert_eq!(index.total_nodes(), 1);
+
+        // Forgetting a tail boundary keeps the page-holding ancestors.
+        let k300 = make_tokens(300);
+        publish_exact(&mut index, &mut pool, &domain, &k300, 3).unwrap();
+        let retained = index.retained_bytes();
+        index.forget_checkpoint(CheckpointId(3));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(3)]);
+        assert_eq!(index.total_nodes(), 3, "root + two page nodes");
+        assert_eq!(index.retained_bytes(), retained);
+    }
+
+    #[test]
+    fn evict_oldest_unpinned_leaf_is_one_leaf_and_skips_pins() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        assert!(!index.evict_oldest_unpinned_leaf(&mut pool));
+        let a = make_tokens(100);
+        let b = make_tokens_from(5000, 100);
+        publish_exact(&mut index, &mut pool, &domain, &a, 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &b, 2).unwrap();
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
+        assert_eq!(index.checkpoint_count(), 1);
+        let pin = index.lookup_checkpoint(&domain, &b, 101, &pool).unwrap();
+        assert!(!index.evict_oldest_unpinned_leaf(&mut pool));
+        index.release_pin(&domain, pin.pin);
+        assert!(index.evict_oldest_unpinned_leaf(&mut pool));
+        assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(2)]);
+    }
+
+    #[test]
+    fn release_all_retires_every_exact_id_once() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let other = domain_with("namespace", "beta");
+        publish_exact(&mut index, &mut pool, &domain, &make_tokens(100), 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &make_tokens(300), 2).unwrap();
+        publish_exact(&mut index, &mut pool, &other, &make_tokens_from(5000, 200), 3).unwrap();
+        let pin = index
+            .lookup_checkpoint(&domain, &make_tokens(300), 400, &pool)
+            .unwrap();
+        assert_eq!(index.release_all(&mut pool), 3);
+        let mut retired = index.take_retired_checkpoints();
+        retired.sort();
+        assert_eq!(
+            retired,
+            vec![CheckpointId(1), CheckpointId(2), CheckpointId(3)]
+        );
+        assert!(index.take_retired_checkpoints().is_empty());
+        assert_eq!(index.checkpoint_count(), 0);
+        assert_eq!(index.retained_bytes(), 0);
+        assert_eq!(index.total_nodes(), 0);
+        // A stale ticket releases harmlessly.
+        index.release_pin(&domain, pin.pin);
+        pool.drain_completed();
+        assert_eq!(pool.free_pages(), 64);
+    }
+
+    /// Model-based test over exact boundaries: random publishes (shared
+    /// prefixes, divergence inside edges, duplicates), lookups with random
+    /// `before`, forgets, evictions (explicit, byte ceiling), pins and
+    /// dropped pages, checked against a brute-force oracle that never
+    /// reads the tree.
+    #[test]
+    fn model_based_exact_checkpoints_match_oracle() {
+        type Map<K, V> = std::collections::HashMap<K, V>;
+
+        fn random_key(rng: &mut XorShift, keys: &[Vec<u32>]) -> Vec<u32> {
+            let mut key: Vec<u32> = Vec::new();
+            if !keys.is_empty() && rng.below(4) != 0 {
+                let base = &keys[rng.below(keys.len() as u64) as usize];
+                let cut = rng.below(base.len() as u64 + 1) as usize;
+                key.extend_from_slice(&base[..cut]);
+            }
+            let extra = rng.below(300) as usize;
+            let run = rng.below(3) as u32 + 1;
+            for i in 0..extra {
+                key.push(run * 10 + (i % 5) as u32);
+            }
+            if key.is_empty() {
+                key.push(run);
+            }
+            key.truncate(640);
+            key
+        }
+
+        fn drain_retired(index: &mut PrefixIndex, visible: &mut Map<Vec<u32>, u64>) {
+            for id in index.take_retired_checkpoints() {
+                let key = visible
+                    .iter()
+                    .find(|(_, v)| **v == id.0)
+                    .map(|(k, _)| k.clone())
+                    .expect("retired id was never visible (or retired twice)");
+                visible.remove(&key);
+            }
+        }
+
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 16);
+        let page_bytes = page_bytes_of(&pool);
+        index.set_max_retained_bytes(14 * page_bytes);
+        let domain = sample_domain(1);
+
+        // exact token boundary -> visible id.
+        let mut visible: Map<Vec<u32>, u64> = Map::new();
+        // page-covering token prefix (len 128*(j+1)) -> the handle the tree adopted.
+        let mut page_map: Map<Vec<u32>, PageHandle> = Map::new();
+        let mut keys: Vec<Vec<u32>> = Vec::new();
+        let mut tickets: Vec<PinTicket> = Vec::new();
+        let mut next_id = 1u64;
+
+        for step in 0..1500 {
+            match rng.below(14) {
+                // Publish.
+                0..=5 => {
+                    let key = random_key(&mut rng, &keys);
+                    let need = key.len() / PAGE_TOKENS;
+                    if pool.free_pages() < need {
+                        index.evict_unpinned_leaves(&mut pool, usize::MAX);
+                        drain_retired(&mut index, &mut visible);
+                    }
+                    if pool.free_pages() < need {
+                        continue;
+                    }
+                    let id = next_id;
+                    next_id += 1;
+                    let (res, handles) =
+                        publish_exact_with(&mut index, &mut pool, &domain, &key, id);
+                    // Evictions made room (or the publish refused) before
+                    // anything else became visible.
+                    drain_retired(&mut index, &mut visible);
+                    match res {
+                        Ok(adopted) => {
+                            match visible.get(&key) {
+                                Some(&existing) => assert_eq!(
+                                    adopted.0, existing,
+                                    "step {step}: first writer must win"
+                                ),
+                                None => {
+                                    assert_eq!(adopted.0, id, "step {step}");
+                                    visible.insert(key.clone(), id);
+                                }
+                            }
+                            for (j, h) in handles.iter().enumerate() {
+                                let prefix = key[..(j + 1) * PAGE_TOKENS].to_vec();
+                                let held = page_map
+                                    .get(&prefix)
+                                    .map_or(false, |p| pool.validate_handle(p).is_ok());
+                                if !held && pool.validate_handle(&h.handle).is_ok() {
+                                    page_map.insert(prefix, h.handle);
+                                }
+                            }
+                            keys.push(key);
+                        }
+                        Err(
+                            InsertError::CacheByteBoundExceeded { .. }
+                            | InsertError::CpuNodeBoundExceeded { .. },
+                        ) => {}
+                        Err(e) => panic!("step {step}: unexpected publish error {e}"),
+                    }
+                }
+                // Lookup + pin.
+                6..=8 => {
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let base = keys[rng.below(keys.len() as u64) as usize].clone();
+                    let mut q = base[..rng.below(base.len() as u64 + 1) as usize].to_vec();
+                    if rng.below(3) == 0 {
+                        q.extend_from_slice(&[777, 778, 779]);
+                    }
+                    if q.is_empty() {
+                        q.push(1);
+                    }
+                    let before = rng.below(q.len() as u64 + 3) as usize;
+
+                    let mut best: Option<(usize, u64)> = None;
+                    for (t, &id) in &visible {
+                        if t.len() >= before || t.len() > q.len() || q[..t.len()] != t[..] {
+                            continue;
+                        }
+                        let full = t.len() / PAGE_TOKENS;
+                        let pages_ok = (0..full).all(|j| {
+                            page_map
+                                .get(&t[..(j + 1) * PAGE_TOKENS].to_vec())
+                                .map_or(false, |h| pool.validate_handle(h).is_ok())
+                        });
+                        if pages_ok && best.map_or(true, |(l, _)| t.len() > l) {
+                            best = Some((t.len(), id));
+                        }
+                    }
+                    let matched = index.inspect(&domain, &q, &pool).matched_tokens;
+                    match (best, index.lookup_checkpoint(&domain, &q, before, &pool)) {
+                        (Some((len, id)), Ok(hit)) => {
+                            assert_eq!(hit.checkpoint.0, id, "step {step}");
+                            assert_eq!(hit.lookup.resumable_tokens, len as u64, "step {step}");
+                            assert_eq!(hit.lookup.matched_tokens, matched, "step {step}");
+                            assert_eq!(hit.pages.len(), len / PAGE_TOKENS, "step {step}");
+                            for (j, h) in hit.pages.iter().enumerate() {
+                                assert_eq!(h.token_offset, (j * PAGE_TOKENS) as u64);
+                                assert_eq!(
+                                    page_map.get(&q[..(j + 1) * PAGE_TOKENS].to_vec()),
+                                    Some(&h.handle),
+                                    "step {step}: page {j} is the adopted handle"
+                                );
+                            }
+                            tickets.push(hit.pin);
+                        }
+                        (None, Err(reason)) => {
+                            let want = if matched == 0 {
+                                MissReason::NoMatch
+                            } else {
+                                MissReason::NoCheckpoint
+                            };
+                            assert_eq!(reason, want, "step {step}");
+                        }
+                        (want, got) => panic!("step {step}: oracle {want:?} vs index {got:?}"),
+                    }
+                }
+                // Release a pin.
+                9 => {
+                    if !tickets.is_empty() {
+                        let t = tickets.swap_remove(rng.below(tickets.len() as u64) as usize);
+                        index.release_pin(&domain, t);
+                    }
+                }
+                // Forget a visible checkpoint.
+                10 => {
+                    if visible.is_empty() {
+                        continue;
+                    }
+                    let mut ids: Vec<u64> = visible.values().copied().collect();
+                    ids.sort_unstable();
+                    let id = ids[rng.below(ids.len() as u64) as usize];
+                    index.forget_checkpoint(CheckpointId(id));
+                    assert_eq!(
+                        index.take_retired_checkpoints(),
+                        vec![CheckpointId(id)],
+                        "step {step}"
+                    );
+                    visible.retain(|_, v| *v != id);
+                }
+                // Evict.
+                11 => {
+                    if rng.below(2) == 0 {
+                        let budget = rng.below(4) as usize * page_bytes;
+                        index.evict_unpinned_leaves(&mut pool, budget);
+                    } else {
+                        index.evict_oldest_unpinned_leaf(&mut pool);
+                    }
+                    drain_retired(&mut index, &mut visible);
+                }
+                // Lose one adopted page.
+                _ => {
+                    let mut live: Vec<PageHandle> = page_map
+                        .values()
+                        .filter(|h| pool.validate_handle(h).is_ok())
+                        .copied()
+                        .collect();
+                    if live.is_empty() {
+                        continue;
+                    }
+                    live.sort_by_key(|h| h.phys);
+                    let h = live[rng.below(live.len() as u64) as usize];
+                    index.test_drop_page_ref(&mut pool, &domain, h.phys);
+                    pool.drain_completed();
+                }
+            }
+            assert_eq!(
+                index.checkpoint_count(),
+                visible.len(),
+                "step {step}: checkpoint_count must match the oracle"
+            );
+            assert!(index.retained_bytes() <= 14 * page_bytes, "step {step}");
+        }
+
+        for t in tickets.drain(..) {
+            index.release_pin(&domain, t);
+        }
+        index.release_all(&mut pool);
+        let mut retired: Vec<u64> = index
+            .take_retired_checkpoints()
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        retired.sort_unstable();
+        let mut want: Vec<u64> = visible.values().copied().collect();
+        want.sort_unstable();
+        assert_eq!(retired, want, "release_all retires exactly the visible ids");
+        pool.drain_completed();
+        assert_eq!(pool.free_pages(), 64, "no page leaked");
     }
 }

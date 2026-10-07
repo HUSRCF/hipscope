@@ -23,8 +23,14 @@ Modes:
             prefix cache (cached_tokens) + cross-turn prefill/decode.
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
+  prefix-fanout — opt-in shared-header concurrency/alternating-session workload.
+            Use --fanout-calibrate to size the header by canonical prompt usage;
+            invoke separately with --fanout-shared-tokens 2048 and 8192.
+            Without a corpus, the built-in text is calibrated automatically.
+            Requires a harness-owned server; restarts after calibration keep
+            the conditioning/fanout workload independent of calibration cache hits.
 """
-import argparse, atexit, base64, errno, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, urllib.error, urllib.request, zlib
+import argparse, atexit, base64, errno, hashlib, json, math, os, random, re, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, zlib
 from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
@@ -282,7 +288,11 @@ def build_config(args):
     max_seq, max_seq_source = resolve_max_seq(getattr(args, "max_seq", None))
     max_tokens, max_tokens_source = resolve_max_tokens(
         getattr(args, "max_tokens", None), tag, args.registry)
-    samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
+    if args.mode == "prefix-fanout":
+        max_tokens, max_tokens_source = args.fanout_output_tokens, "explicit(--fanout-output-tokens)"
+    sampling_spec = ("greedy" if args.mode == "prefix-fanout" and
+                     not getattr(args, "fanout_sampling_explicit", False) else args.sampling)
+    samp, samp_src = resolve_sampling(sampling_spec, tag, args.registry)
     # Effort is parent-model prompt semantics. Budget is an independent hipfire
     # cap policy and must never be inferred from the effort level.
     registry_budget = samp.pop("thinking_budget", None)
@@ -299,6 +309,8 @@ def build_config(args):
             selected_budget = registry_budget
         elif samp.get("reasoning_effort") in ("low", "medium", "high", "xhigh", "max"):
             selected_budget = "uncapped"
+        elif args.mode == "prefix-fanout":
+            selected_budget = "off"
         else:
             selected_budget = "med"
     named_think_cap = THINKING_BUDGET.get(selected_budget)
@@ -427,6 +439,12 @@ def build_config(args):
         "devices": getattr(args, "devices", None),
         "tp": getattr(args, "tp", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
+        **({"fanout": {
+            "clients": args.fanout_clients, "shared_tokens": args.fanout_shared_tokens,
+            "unique_tokens": args.fanout_unique_tokens, "output_tokens": args.fanout_output_tokens,
+            "corpus": args.fanout_corpus, "repeats": args.fanout_repeats,
+            "seed": args.fanout_seed, "calibrate": args.fanout_calibrate or not args.fanout_corpus,
+        }} if args.mode == "prefix-fanout" else {}),
     }
 
 
@@ -545,6 +563,9 @@ def show_config(cfg):
     ):
         if env_key in os.environ:
             print(f"  env {env_key}={os.environ[env_key]!r} (pass-through)")
+    if cfg.get("fanout"):
+        for key, value in cfg["fanout"].items():
+            print(f"  fanout_{key:16}: {value}")
     print("=======================================================================================")
 
 
@@ -3285,6 +3306,7 @@ def _fold_chat_sse_chunks(line_iter, t0):
     itself never synthesizes a terminal.
     """
     ttft = None; think = []; ans = []
+    content_ttft = None
     tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
     terminal_count = 0; terminal_reasons = []; post_terminal_bytes = 0
@@ -3341,11 +3363,13 @@ def _fold_chat_sse_chunks(line_iter, t0):
             think.append(d["reasoning_content"])
         if isinstance(d.get("content"), str):
             if ttft is None and d["content"]: ttft = time.time() - t0
+            if content_ttft is None and d["content"]: content_ttft = ttft if not think else time.time() - t0
             ans.append(d["content"])
         if d.get("tool_calls"):
             _merge_tool_call_deltas(tool_acc, d["tool_calls"])
     return {
         "ttft": ttft, "think": think, "ans": ans, "tool_acc": tool_acc,
+        "content_ttft": content_ttft,
         "usage": usage, "timings": timings, "finish": finish,
         "completion_id": completion_id, "terminal_count": terminal_count,
         "terminal_reasons": terminal_reasons,
@@ -3421,6 +3445,17 @@ def send(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
         "post_terminal_bytes": post_terminal_bytes,
         "saw_done": saw_done,
         "stream_error": stream_error,
+        **({
+            "client_ttft_s": folded["content_ttft"],
+            "queue_wait_est_ms": (
+                max(0.0, folded["content_ttft"] * 1000 - timings["ttft_ms"])
+                if folded["content_ttft"] is not None and
+                isinstance(timings.get("ttft_ms"), (int, float)) else None),
+            "server_ttft_ms": timings.get("ttft_ms"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens"),
+        } if cfg.get("mode") == "prefix-fanout" else {}),
     }
 
 
@@ -3688,6 +3723,244 @@ def _run_images_battery(cfg, args):
     return rows
 
 
+def _parse_fanout_clients(value):
+    try:
+        clients = [int(x) for x in value.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError("fanout clients must be comma-separated positive integers")
+    if not clients or any(x < 1 for x in clients) or len(set(clients)) != len(clients):
+        raise argparse.ArgumentTypeError("fanout clients must be distinct positive integers")
+    return clients
+
+
+def _fanout_percentile(values, fraction):
+    """Linear interpolation, excluding absent timings."""
+    values = sorted(x for x in values if x is not None)
+    if not values:
+        return None
+    position = (len(values) - 1) * fraction
+    lo, hi = math.floor(position), math.ceil(position)
+    return values[lo] + (values[hi] - values[lo]) * (position - lo)
+
+
+def _fanout_summary(rows, clients, repeat, wall):
+    client = [r.get("client_ttft_s") for r in rows]
+    service = [r.get("server_ttft_ms") for r in rows]
+    return {
+        "clients": clients, "repeat": repeat, "requests": len(rows),
+        "ttft_p50_s": _fanout_percentile(client, .50),
+        "ttft_p95_s": _fanout_percentile(client, .95),
+        "ttft_max_s": max((x for x in client if x is not None), default=None),
+        "service_ttft_p50_ms": _fanout_percentile(service, .50),
+        "service_ttft_p95_ms": _fanout_percentile(service, .95),
+        "total_wall_s": wall, "hit_tokens_sum": sum(r.get("cached_tokens", 0) for r in rows),
+    }
+
+
+def _fanout_second_order(clients):
+    """Alternate low/high client ids."""
+    order = []
+    lo, hi = 0, clients - 1
+    while lo <= hi:
+        order.append(lo)
+        if lo != hi:
+            order.append(hi)
+        lo += 1
+        hi -= 1
+    return order
+
+
+def _fanout_barrier_requests(clients, request):
+    """Release first-turn workers together; return in client-id order."""
+    barrier = threading.Barrier(clients + 1)
+    results, errors = [None] * clients, [None] * clients
+    def worker(client):
+        try:
+            barrier.wait()
+            results[client] = request(client)
+        except BaseException as error:
+            errors[client] = error
+    threads = [threading.Thread(target=worker, args=(client,)) for client in range(clients)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    for error in errors:
+        if error is not None:
+            raise error
+    return results
+
+
+def _fanout_prompt_tokens(row):
+    tokens = row.get("prompt_tokens")
+    if not isinstance(tokens, int) or tokens < 1:
+        raise SystemExit("prefix-fanout requires canonical server usage.prompt_tokens")
+    if row.get("stream_error") or not row.get("saw_done") or row.get("finish") is None:
+        raise SystemExit("prefix-fanout token measurement received an incomplete response")
+    return tokens
+
+
+def _fanout_size_text(corpus, prefix, target, measure):
+    """Search text length; only canonical server usage decides convergence."""
+    lo, hi = 0, max(len(corpus), target)
+    length, upper, seen = hi, None, set()
+    for _ in range(40):
+        text = prefix + (corpus * ((length + len(corpus) - 1) // len(corpus)))[:length]
+        actual = measure(text)
+        if abs(actual - target) <= max(1, target * .01):
+            return text, actual
+        if length in seen:
+            break
+        seen.add(length)
+        if actual < target:
+            lo = length + 1
+            if upper is None:
+                hi = max(hi * 2, lo)
+                length = hi
+                continue
+        else:
+            upper, hi = length, length - 1
+        if lo > hi:
+            break
+        length = (lo + hi) // 2
+    raise SystemExit(f"prefix-fanout could not calibrate canonical tokens to {target} within 1%")
+
+
+def _run_prefix_fanout(cfg, args):
+    options = cfg["fanout"]
+    if args.no_spawn:
+        raise SystemExit("prefix-fanout requires a harness-owned serve: calibration must be followed by restart; omit --no-spawn")
+    corpus = (Path(options["corpus"]).read_text(encoding="utf-8") if options["corpus"]
+              else "The shared reference describes rivers, forests, cities, and their histories. ")
+    if not corpus:
+        raise SystemExit("--fanout-corpus must contain nonempty text")
+    calibration = []
+    def probe(messages):
+        row = send(cfg, messages, max_tokens=1, max_think_tokens=1)
+        row.update(phase="calibration", client_id=None, turn=0)
+        calibration.append(row)
+        return _fanout_prompt_tokens(row)
+    system = lambda text: {"role": "system", "content": text}
+    if options["calibrate"]:
+        shared, shared_tokens = _fanout_size_text(
+            corpus, "", options["shared_tokens"], lambda text: probe([system(text)]))
+    else:
+        shared = corpus
+        shared_tokens = probe([system(shared)])
+    if abs(shared_tokens - options["shared_tokens"]) > max(1, options["shared_tokens"] * .01):
+        raise SystemExit("prefix-fanout shared token target differs by >1%; use --fanout-calibrate")
+    # Shared count includes the system-only canonical template overhead.
+    # Unique count is the canonical increment for appending a user turn.
+    rng = random.Random(options["seed"])
+    rows, summaries = [], []
+    for clients in options["clients"]:
+        for repeat in range(options["repeats"]):
+            run_id = f"fanout-{options['seed']}-{clients}-{repeat}"
+            user_turns, user_tokens = {}, {}
+            for client in range(clients):
+                for turn in (1, 2):
+                    prefix = f"Session {rng.getrandbits(64):016x}, turn {turn}. "
+                    user_turns[client, turn], user_tokens[client, turn] = _fanout_size_text(
+                        corpus, prefix, options["unique_tokens"],
+                        lambda text: probe([system(shared), {"role": "user", "content": text}]) - shared_tokens)
+            # Calibration requests must not seed the prefix cache being measured.
+            _kill_serve()
+            restart_offset = spawn_serve(cfg, args.home, args.serve_log)
+            if restart_offset is None:
+                raise SystemExit("prefix-fanout serve failed to warm after calibration restart")
+            cfg["_serve_log_offset"] = restart_offset
+            apply_observed_kv_backend(cfg, _serve_log_text(args.serve_log, restart_offset))
+            _assert_serve_path_proofs(cfg, args.serve_log, offset=restart_offset)
+            group, histories = [], {}
+            def request(client, turn, conditioning=False):
+                session_id = f"{run_id}-{'condition' if conditioning else 'client'}-{client}"
+                messages = ([system(shared)] if conditioning or turn == 1 else list(histories[client]))
+                user = (f"Conditioning observation {client}. Reply briefly." if conditioning
+                        else user_turns[client, turn])
+                messages.append({"role": "user", "content": user})
+                row = send(dict(cfg, seed=options["seed"]), messages, max_tokens=options["output_tokens"])
+                tokens = _fanout_prompt_tokens(row)
+                if not conditioning and turn == 1:
+                    actual_unique = tokens - shared_tokens
+                    if abs(actual_unique - options["unique_tokens"]) > max(1, options["unique_tokens"] * .01):
+                        raise SystemExit("prefix-fanout unique token count changed after calibration")
+                row.update(client_id=client, session_id=session_id, turn=turn,
+                           phase="conditioning" if conditioning else "fanout",
+                           clients=clients, repeat=repeat, shared_tokens_actual=shared_tokens,
+                           unique_tokens_actual=None if conditioning else user_tokens[client, turn],
+                           prompt_md5=hashlib.md5(json.dumps(messages, ensure_ascii=False).encode("utf-8")).hexdigest())
+                if not conditioning:
+                    histories[client] = messages + [_assistant_feedback(row, getattr(args, "feedback_shape", "rich"))]
+                return row
+            started = time.monotonic()
+            for conditioning in range(2):
+                group.append(request(conditioning, 1, conditioning=True))
+            group.extend(_fanout_barrier_requests(clients, lambda client: request(client, 1)))
+            for client in _fanout_second_order(clients):
+                group.append(request(client, 2))
+            summary = _fanout_summary(group, clients, repeat, time.monotonic() - started)
+            summaries.append(summary)
+            rows.extend(group)
+            print("prefix-fanout " + json.dumps(summary, sort_keys=True), flush=True)
+    repeat_summaries = summaries
+    summaries = [
+        _fanout_summary([row for row in rows if row["clients"] == clients], clients, None,
+                        sum(item["total_wall_s"] for item in repeat_summaries if item["clients"] == clients))
+        for clients in options["clients"]
+    ]
+    if args.out:
+        stamp_kv_backend_out_fields(rows, cfg)
+        stamp_kv_backend_out_fields(calibration, cfg)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump({"mode": "prefix-fanout", "options": options, "shared_tokens_actual": shared_tokens,
+                       "shared_tokens_within_target": abs(shared_tokens - options["shared_tokens"]) <= options["shared_tokens"] * .01,
+                       "calibration_primes_cache": False,
+                       "calibration_cache_isolation": "server restarted after calibration",
+                       "rows": rows, "summaries": summaries, "repeat_summaries": repeat_summaries,
+                       "calibration_rows": calibration}, handle, indent=2)
+    return rows
+
+
+def _self_test_prefix_fanout_summary():
+    rows = [{"client_ttft_s": x, "server_ttft_ms": x * 100, "cached_tokens": 10} for x in (1, 2, 3, 4)]
+    rows.append({"client_ttft_s": None, "server_ttft_ms": None, "cached_tokens": 7})
+    summary = _fanout_summary(rows, 2, 0, 9)
+    assert summary["ttft_p50_s"] == 2.5
+    assert abs(summary["ttft_p95_s"] - 3.85) < 1e-12
+    assert summary["ttft_max_s"] == 4
+    assert summary["service_ttft_p50_ms"] == 250
+    assert summary["service_ttft_p95_ms"] == 385
+    assert summary["hit_tokens_sum"] == 47 and summary["total_wall_s"] == 9
+    assert _fanout_percentile([], .5) is None
+    print("serve_harness: prefix-fanout-summary self-test OK", flush=True)
+
+
+def _self_test_prefix_fanout_scheduling():
+    lock, arrived, released = threading.Lock(), [], []
+    original_barrier = threading.Barrier
+    class ObservedBarrier(original_barrier):
+        def wait(self, timeout=None):
+            with lock:
+                released.append(threading.get_ident())
+            return super().wait(timeout)
+    def request(client):
+        with lock:
+            assert len(released) == 5
+            arrived.append(client)
+        return client
+    threading.Barrier = ObservedBarrier
+    try:
+        assert _fanout_barrier_requests(4, request) == [0, 1, 2, 3]
+    finally:
+        threading.Barrier = original_barrier
+    assert sorted(arrived) == [0, 1, 2, 3]
+    assert _fanout_second_order(4) == [0, 3, 1, 2]
+    assert _fanout_second_order(5) == [0, 4, 1, 3, 2]
+    assert _fanout_second_order(1) == [0]
+    print("serve_harness: prefix-fanout-scheduling self-test OK", flush=True)
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
@@ -3695,6 +3968,8 @@ def run(cfg, args):
     feedback_shape = getattr(args, "feedback_shape", None) or "rich"
     if cfg["mode"] == "images":
         return _run_images_battery(cfg, args)
+    if cfg["mode"] == "prefix-fanout":
+        return _run_prefix_fanout(cfg, args)
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
@@ -4003,7 +4278,19 @@ def main():
                     help="context length override; omitted resolves at model/card admission")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
-    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images"])
+    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images", "prefix-fanout"])
+    ap.add_argument("--fanout-clients", type=_parse_fanout_clients, default=[1, 4, 8, 16],
+                    help="Comma-separated concurrent client counts (default 1,4,8,16).")
+    ap.add_argument("--fanout-shared-tokens", type=int, default=2048,
+                    help="Canonical shared-header prompt target; use a second invocation for 8192.")
+    ap.add_argument("--fanout-unique-tokens", type=int, default=128,
+                    help="Canonical incremental prompt-token target for each unique user turn.")
+    ap.add_argument("--fanout-output-tokens", type=int, default=32)
+    ap.add_argument("--fanout-corpus", default=None, help="UTF-8 shared system/header corpus.")
+    ap.add_argument("--fanout-repeats", type=int, default=1)
+    ap.add_argument("--fanout-seed", type=int, default=0)
+    ap.add_argument("--fanout-calibrate", action="store_true",
+                    help="Adjust shared corpus length using usage.prompt_tokens until within 1%%.")
     ap.add_argument(
         "--session",
         default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
@@ -4094,6 +4381,11 @@ def main():
         help="Run deterministic serve path-proof self-tests (no GPU / no serve) and exit.",
     )
     args = ap.parse_args()
+    args.fanout_sampling_explicit = any(x == "--sampling" or x.startswith("--sampling=") for x in sys.argv[1:])
+    if args.mode == "prefix-fanout":
+        for name in ("shared_tokens", "unique_tokens", "output_tokens", "repeats"):
+            if getattr(args, "fanout_" + name) < 1:
+                ap.error("--fanout-" + name.replace("_", "-") + " must be positive")
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
         _self_test_prompt_sources()
@@ -4110,6 +4402,8 @@ def main():
         _self_test_g45_fail_closed_assertions()
         _self_test_g45_cache_store_log_check()
         _self_test_g45_torn_stream_and_error_mapping()
+        _self_test_prefix_fanout_summary()
+        _self_test_prefix_fanout_scheduling()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
@@ -4154,6 +4448,8 @@ def main():
     print(kv_mode_report_line(cfg), flush=True)
     cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)
+    if cfg["mode"] == "prefix-fanout":
+        log_offset = cfg["_serve_log_offset"]
     if not args.no_spawn:
         _assert_dflash_request_proofs(cfg, rows, args.serve_log, offset=log_offset)
         # Glimmer trace also asserted inside run(), but also ensure offset-correct post-check

@@ -35,6 +35,8 @@ use redline_dispatch::{
     ResourceBinding, ResourceId,
 };
 
+use crate::dispatch::VmmResourceMove;
+
 pub(crate) mod railgun_shadow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2059,6 +2061,405 @@ fn bound_kernarg_mismatch_message(
 fn bindings_verify_enabled() -> bool {
     hipfire_config::process_value("HIPFIRE_REPLAY_BINDINGS_VERIFY")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+}
+
+/// One `VmmResourceMove` widened to `u64`; ranges are kept sorted by
+/// `old_start` and never overlap (`relocation_ranges`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelocationRange {
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    new_end: u64,
+    /// Bytes mapped at `new_start`.
+    mapped: u64,
+}
+
+enum RangeMatch<'a> {
+    Outside,
+    Inside(&'a RelocationRange),
+    Straddles(&'a RelocationRange),
+}
+
+/// One tape resource a relocation rebinds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedRelocation {
+    resource: ResourceId,
+    old_key: (u64, u64),
+    new_key: (u64, u64),
+    /// Bytes mapped at the new location starting at `new_key.0`.
+    coverage: u64,
+}
+
+/// Validate `moves` and return them widened and sorted by old base. Rejects a
+/// null/empty/self move, `mapped > reserved`, address overflow, duplicate or
+/// overlapping sources, overlapping destinations, and a destination that
+/// overlaps any source (a chain inside one call would be ambiguous).
+fn relocation_ranges(moves: &[VmmResourceMove]) -> Result<Vec<RelocationRange>, String> {
+    let mut ranges = Vec::with_capacity(moves.len());
+    for (index, relocation) in moves.iter().enumerate() {
+        let widen = |value: usize, what: &str| {
+            u64::try_from(value).map_err(|_| format!("VMM move {index}: {what} exceeds u64"))
+        };
+        let old_start = widen(relocation.old_base, "old_base")?;
+        let new_start = widen(relocation.new_base, "new_base")?;
+        let reserved = widen(relocation.reserved_bytes, "reserved_bytes")?;
+        let mapped = widen(relocation.mapped_bytes, "mapped_bytes")?;
+        if old_start == 0 || new_start == 0 {
+            return Err(format!("VMM move {index}: null base"));
+        }
+        if old_start == new_start {
+            return Err(format!("VMM move {index}: old and new base are both {old_start:#x}"));
+        }
+        if reserved == 0 {
+            return Err(format!("VMM move {index}: zero reserved bytes"));
+        }
+        if mapped > reserved {
+            return Err(format!(
+                "VMM move {index}: mapped {mapped:#x} exceeds reserved {reserved:#x}"
+            ));
+        }
+        let old_end = old_start
+            .checked_add(reserved)
+            .ok_or_else(|| format!("VMM move {index}: old range overflows"))?;
+        let new_end = new_start
+            .checked_add(reserved)
+            .ok_or_else(|| format!("VMM move {index}: new range overflows"))?;
+        ranges.push(RelocationRange {
+            old_start,
+            old_end,
+            new_start,
+            new_end,
+            mapped,
+        });
+    }
+    ranges.sort_unstable_by_key(|range| range.old_start);
+    for pair in ranges.windows(2) {
+        if pair[0].old_end > pair[1].old_start {
+            return Err(if pair[0].old_start == pair[1].old_start {
+                format!("duplicate VMM move for old base {:#x}", pair[0].old_start)
+            } else {
+                format!(
+                    "overlapping VMM move sources {:#x}..{:#x} and {:#x}..{:#x}",
+                    pair[0].old_start, pair[0].old_end, pair[1].old_start, pair[1].old_end
+                )
+            });
+        }
+    }
+    let mut destinations: Vec<(u64, u64)> = ranges
+        .iter()
+        .map(|range| (range.new_start, range.new_end))
+        .collect();
+    destinations.sort_unstable();
+    for pair in destinations.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(format!(
+                "overlapping VMM move destinations {:#x}..{:#x} and {:#x}..{:#x}",
+                pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            ));
+        }
+    }
+    for source in &ranges {
+        for destination in &ranges {
+            if source.old_start < destination.new_end && destination.new_start < source.old_end {
+                return Err(format!(
+                    "VMM move destination {:#x}..{:#x} overlaps source {:#x}..{:#x}",
+                    destination.new_start, destination.new_end, source.old_start, source.old_end
+                ));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// Classify `start..end` against sorted, non-overlapping `ranges`.
+fn classify_range(ranges: &[RelocationRange], start: u64, end: u64) -> RangeMatch<'_> {
+    let at = ranges.partition_point(|range| range.old_start <= start);
+    if let Some(range) = at.checked_sub(1).map(|index| &ranges[index]) {
+        if start < range.old_end {
+            return if end <= range.old_end {
+                RangeMatch::Inside(range)
+            } else {
+                RangeMatch::Straddles(range)
+            };
+        }
+    }
+    match ranges.get(at) {
+        Some(range) if range.old_start < end => RangeMatch::Straddles(range),
+        _ => RangeMatch::Outside,
+    }
+}
+
+/// Pure relocation plan: every `tape_resources` key `(base, size)` contained
+/// in a move's `[old_base, old_base + reserved_bytes)` becomes
+/// `(new_base + (base - old_base), size)`. Fails closed on an invalid move
+/// set, a key straddling a move boundary, a key not fully mapped at the new
+/// location (`new_off + size > mapped_bytes`), or a new key overlapping a
+/// resource that stays. Keys outside every move are untouched and never
+/// probed. The result is ordered by old key.
+fn plan_relocation(
+    tape_resources: &BTreeMap<(u64, u64), ResourceId>,
+    moves: &[VmmResourceMove],
+) -> Result<Vec<PlannedRelocation>, String> {
+    let ranges = relocation_ranges(moves)?;
+    let mut plan = Vec::new();
+    for (&(base, size), &resource) in tape_resources {
+        let end = base
+            .checked_add(size)
+            .ok_or_else(|| format!("tape resource {resource:?} {base:#x}+{size:#x} overflows"))?;
+        match classify_range(&ranges, base, end) {
+            RangeMatch::Outside => {}
+            RangeMatch::Straddles(range) => {
+                return Err(format!(
+                    "tape resource {resource:?} {base:#x}+{size:#x} straddles VMM move source \
+                     {:#x}..{:#x}",
+                    range.old_start, range.old_end
+                ));
+            }
+            RangeMatch::Inside(range) => {
+                let offset = base - range.old_start;
+                let coverage = range
+                    .mapped
+                    .checked_sub(offset)
+                    .filter(|coverage| size <= *coverage)
+                    .ok_or_else(|| {
+                        format!(
+                            "tape resource {resource:?} {base:#x}+{size:#x} is not fully mapped at \
+                             its new location (mapped {:#x} bytes, offset {offset:#x})",
+                            range.mapped
+                        )
+                    })?;
+                plan.push(PlannedRelocation {
+                    resource,
+                    old_key: (base, size),
+                    new_key: (range.new_start + offset, size),
+                    coverage,
+                });
+            }
+        }
+    }
+    for planned in &plan {
+        let (new_base, new_size) = planned.new_key;
+        let new_end = new_base + new_size;
+        if tape_resources
+            .keys()
+            .any(|&(base, size)| base < new_end && new_base < base.saturating_add(size))
+        {
+            return Err(format!(
+                "relocated tape resource {:?} would overlap a tape resource at \
+                 {new_base:#x}..{new_end:#x}",
+                planned.resource
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// `Some(message)` when an untyped launch (no pointer slots) cannot be proven
+/// clear of every relocated range: unknown accesses, or an access overlapping
+/// a move source. Raw kernarg bytes of such a launch cannot be rewritten.
+fn untyped_launch_relocation_hazard(
+    launch: &RecordedHipLaunch,
+    ranges: &[RelocationRange],
+) -> Option<String> {
+    let Some(accesses) = launch.accesses.as_ref() else {
+        return Some(format!(
+            "{}: untyped launch has unknown pointer accesses while VMM ranges relocate; \
+             port the pointer declaration",
+            launch.kernel
+        ));
+    };
+    accesses
+        .iter()
+        .any(|access| {
+            !matches!(
+                classify_range(
+                    ranges,
+                    access.allocation_base,
+                    access.allocation_base.saturating_add(access.allocation_bytes),
+                ),
+                RangeMatch::Outside
+            )
+        })
+        .then(|| {
+            format!(
+                "{}: untyped launch touches a VMM range being relocated; \
+                 port the pointer declaration",
+                launch.kernel
+            )
+        })
+}
+
+/// Shift every access whose allocation lies inside a move source to the new
+/// location. `None` when no access moved; a straddling access fails closed.
+fn relocate_accesses(
+    kernel: &str,
+    accesses: &[RecordedResourceAccess],
+    ranges: &[RelocationRange],
+) -> Result<Option<Vec<RecordedResourceAccess>>, String> {
+    let mut relocated: Option<Vec<RecordedResourceAccess>> = None;
+    for (index, access) in accesses.iter().enumerate() {
+        let end = access.allocation_base.saturating_add(access.allocation_bytes);
+        match classify_range(ranges, access.allocation_base, end) {
+            RangeMatch::Outside => {}
+            RangeMatch::Straddles(range) => {
+                return Err(format!(
+                    "{kernel}: recorded access {:#x}+{:#x} straddles VMM move source {:#x}..{:#x}",
+                    access.allocation_base, access.allocation_bytes, range.old_start, range.old_end
+                ));
+            }
+            RangeMatch::Inside(range) => {
+                let shifted = |address: u64| {
+                    address
+                        .checked_sub(range.old_start)
+                        .and_then(|offset| range.new_start.checked_add(offset))
+                        .ok_or_else(|| {
+                            format!("{kernel}: recorded access address {address:#x} cannot relocate")
+                        })
+                };
+                let out = relocated.get_or_insert_with(|| accesses.to_vec());
+                out[index].allocation_base = shifted(access.allocation_base)?;
+                out[index].access_base = shifted(access.access_base)?;
+            }
+        }
+    }
+    Ok(relocated)
+}
+
+/// Copy of `snapshot` with every pointer slot bound to a moved resource
+/// rewritten to `new_base + interior_offset`; `None` when no slot references a
+/// moved resource. Fails closed when a slot's 8 bytes lie past the coverage
+/// mapped at the new location. Every non-slot byte is the snapshot's.
+fn relocate_kernarg_slots(
+    kernel: &str,
+    snapshot: &[u8],
+    layout: &LaunchBindingLayout,
+    moved: &BTreeMap<ResourceId, PlannedRelocation>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut relocated: Option<Vec<u8>> = None;
+    for slot in &layout.slots {
+        let Some(planned) = moved.get(&slot.resource) else {
+            continue;
+        };
+        let reach = slot.interior_offset.checked_add(8).ok_or_else(|| {
+            format!("{kernel}: pointer slot at offset {} interior overflows", slot.offset)
+        })?;
+        if reach > planned.coverage {
+            return Err(format!(
+                "{kernel}: pointer slot at offset {} reaches {reach:#x} bytes into a resource with \
+                 only {:#x} bytes mapped at its new location",
+                slot.offset, planned.coverage
+            ));
+        }
+        let address = planned
+            .new_key
+            .0
+            .checked_add(slot.interior_offset)
+            .ok_or_else(|| format!("{kernel}: pointer slot at offset {} base overflows", slot.offset))?;
+        let end = slot
+            .offset
+            .checked_add(8)
+            .filter(|end| *end <= snapshot.len())
+            .ok_or_else(|| {
+                format!(
+                    "{kernel}: pointer slot at offset {} out of bounds (len {})",
+                    slot.offset,
+                    snapshot.len()
+                )
+            })?;
+        let out = relocated.get_or_insert_with(|| snapshot.to_vec());
+        out[slot.offset..end].copy_from_slice(&address.to_ne_bytes());
+    }
+    Ok(relocated)
+}
+
+/// Fail-closed gate for a prepared PM4 segment: every byte of `current`
+/// outside the `exempt` `(offset, len)` ranges (sorted by offset) must equal
+/// `expected`. Exempt ranges are the pointer slots and the u32 dynamic
+/// kernarg bindings, which replay patches each launch.
+fn verify_non_slot_bytes_identical(
+    kernel: &str,
+    current: &[u8],
+    expected: &[u8],
+    exempt: &[(usize, usize)],
+) -> Result<(), String> {
+    if current.len() != expected.len() {
+        return Err(format!(
+            "{kernel}: relocated kernarg length {} differs from the prepared segment prefix {}",
+            expected.len(),
+            current.len()
+        ));
+    }
+    let mismatch = |from: usize, to: usize| -> Option<usize> {
+        if current[from..to] == expected[from..to] {
+            return None;
+        }
+        current[from..to]
+            .iter()
+            .zip(&expected[from..to])
+            .position(|(old, new)| old != new)
+            .map(|position| from + position)
+    };
+    let failure = |offset: usize| {
+        format!(
+            "{kernel}: relocated kernarg differs from the prepared segment at non-slot offset \
+             {offset}"
+        )
+    };
+    let mut cursor = 0usize;
+    for &(offset, len) in exempt {
+        let stop = offset.min(current.len());
+        if cursor < stop {
+            if let Some(at) = mismatch(cursor, stop) {
+                return Err(failure(at));
+            }
+        }
+        cursor = cursor.max(offset.saturating_add(len));
+    }
+    if cursor < current.len() {
+        if let Some(at) = mismatch(cursor, current.len()) {
+            return Err(failure(at));
+        }
+    }
+    Ok(())
+}
+
+/// Per prepared dispatch, the sorted `(offset, len)` kernarg ranges a
+/// relocation must not hold to snapshot equality: typed pointer slots (8
+/// bytes), declared/synthesized/GDN u32 dynamic bindings (4 bytes), and the
+/// legacy GDN frame word at 76. Computed once when the PM4 tape is prepared.
+fn bound_exempt_kernarg_ranges(
+    launches: &[RecordedHipLaunch],
+    prefix: usize,
+    dynamic_bindings: &[(usize, ReplayKernargBinding)],
+    legacy_gdn_frames: &[usize],
+) -> Vec<Vec<(usize, usize)>> {
+    let mut ranges: Vec<Vec<(usize, usize)>> = launches
+        .iter()
+        .take(prefix)
+        .map(|launch| {
+            launch
+                .binding_layout
+                .as_ref()
+                .map(|layout| layout.slots.iter().map(|slot| (slot.offset, 8)).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    for (dispatch, binding) in dynamic_bindings {
+        if let Some(entry) = ranges.get_mut(*dispatch) {
+            entry.push((binding.offset(), 4));
+        }
+    }
+    for dispatch in legacy_gdn_frames {
+        if let Some(entry) = ranges.get_mut(*dispatch) {
+            entry.push((76, 4));
+        }
+    }
+    for entry in &mut ranges {
+        entry.sort_unstable();
+        entry.dedup();
+    }
+    ranges
 }
 
 #[derive(Default)]
@@ -4474,6 +4875,10 @@ pub struct PreparedPm4Replay {
     /// segments are encoded at. Unchanged revision ⇒ the buffers are current
     /// and the replay hot path does no re-encode work.
     bound_explicit_lens: Vec<usize>,
+    /// Per prepared dispatch (aligned with `kernargs`): sorted `(offset, len)`
+    /// ranges excluded from the relocation non-slot-bytes gate (pointer slots
+    /// and u32 dynamic bindings). Precomputed once at prepare time.
+    bound_exempt_ranges: Vec<Vec<(usize, usize)>>,
     encoded_revision: BindingRevision,
 }
 
@@ -6361,6 +6766,12 @@ impl ReplayController {
             backlog.join(" "),
         );
         self.pm4_generation += 1;
+        let bound_exempt_ranges = bound_exempt_kernarg_ranges(
+            &self.recorded,
+            prefix,
+            &dynamic_kernarg_bindings,
+            &dynamic_gdn_frames,
+        );
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -6378,6 +6789,7 @@ impl ReplayController {
             dispatch_boundaries: dispatch_profile.then_some(dispatch_boundaries),
             prepared_max_position: self.prepared_max_position,
             bound_explicit_lens,
+            bound_exempt_ranges,
             encoded_revision: self.binding_revision,
         });
         self.state = ReplayState::Ready;
@@ -7188,6 +7600,245 @@ impl ReplayController {
                 self.tape_resources.len(),
                 reencoded,
                 grown
+            );
+        }
+        Ok(BindingRefreshReport::Refreshed {
+            resources: self.tape_resources.len(),
+            reencoded,
+            revision: next_revision,
+        })
+    }
+
+    fn unchanged_relocation_report(&self) -> BindingRefreshReport {
+        BindingRefreshReport::Refreshed {
+            resources: self.tape_resources.len(),
+            reencoded: 0,
+            revision: self.binding_revision,
+        }
+    }
+
+    /// Typed VMM relocation: rebind the tape resources that lie inside
+    /// `moves` to their new bases without re-recording or re-preparing.
+    ///
+    /// `NoRoute` when nothing is recorded or prepared. `Err` (state untouched)
+    /// when a refresh is pending, a move set is invalid, a moved resource is
+    /// not fully mapped at its new location, an untyped launch (no pointer
+    /// slots) has unknown accesses or touches a moved range, or an AQL
+    /// prepared replay references a moved range. Resources outside every move
+    /// are untouched and never probed. No HIP query is made: the caller
+    /// (`Gpu::relocate_qsa_resources`) already validated the new owners.
+    ///
+    /// All changes are staged first and committed together at
+    /// `binding_revision.next()`: rebound ids, rekeyed `tape_resources`, the
+    /// prepared PM4 kernarg slot bytes (non-slot bytes are gated to stay
+    /// identical; the indirect buffer, prepared generation and kernarg
+    /// allocation addresses never change), `encoded_revision`, the recorded
+    /// kernarg snapshots (HIP oracle) and the recorded access bases. When no
+    /// tape resource lies in any move the report carries the current revision
+    /// and `reencoded: 0`, and nothing changes (the revision is not bumped).
+    /// `reencoded` counts rewritten prepared PM4 segments, or rewritten
+    /// recorded snapshots when no PM4 route is installed.
+    pub fn relocate_resources(
+        &mut self,
+        _hip: &HipRuntime,
+        moves: &[VmmResourceMove],
+    ) -> Result<BindingRefreshReport, String> {
+        self.relocate_bindings(moves)
+    }
+
+    fn relocate_bindings(
+        &mut self,
+        moves: &[VmmResourceMove],
+    ) -> Result<BindingRefreshReport, String> {
+        if self.recorded.is_empty() && self.prepared.is_none() && self.prepared_pm4.is_none() {
+            return Ok(BindingRefreshReport::NoRoute);
+        }
+        if self.binding_refresh_pending {
+            return Err(
+                "cannot relocate VMM resources while a scratch-growth binding refresh is pending"
+                    .to_owned(),
+            );
+        }
+        if moves.is_empty() {
+            return Ok(self.unchanged_relocation_report());
+        }
+        let ranges = relocation_ranges(moves)?;
+        for launch in &self.recorded {
+            if launch.binding_layout.is_none() {
+                if let Some(hazard) = untyped_launch_relocation_hazard(launch, &ranges) {
+                    return Err(hazard);
+                }
+            }
+        }
+        let plan = plan_relocation(&self.tape_resources, moves)?;
+        if self.prepared.is_some() {
+            let touched = !plan.is_empty()
+                || self.recorded.iter().any(|launch| {
+                    launch.accesses.as_ref().is_some_and(|accesses| {
+                        accesses.iter().any(|access| {
+                            !matches!(
+                                classify_range(
+                                    &ranges,
+                                    access.allocation_base,
+                                    access.allocation_base.saturating_add(access.allocation_bytes),
+                                ),
+                                RangeMatch::Outside
+                            )
+                        })
+                    })
+                });
+            if touched {
+                return Err(
+                    "prepared AQL replay holds raw kernargs that reference a relocated VMM range"
+                        .to_owned(),
+                );
+            }
+        }
+        if plan.is_empty() {
+            return Ok(self.unchanged_relocation_report());
+        }
+        let next_revision = self.binding_revision.next();
+        let moved: BTreeMap<ResourceId, PlannedRelocation> =
+            plan.iter().map(|planned| (planned.resource, *planned)).collect();
+
+        // Stage 1: every tape resource rebinds at the next revision (moved
+        // ones at their new base), like the post-growth refresh.
+        let mut staged_bindings: Vec<(ResourceId, ResourceBinding)> =
+            Vec::with_capacity(self.tape_resources.len());
+        for (&(base, size), &id) in &self.tape_resources {
+            let current = self.replay_bindings.resource(id).ok_or_else(|| {
+                format!("tape resource {id:?} has no bound resource; route must re-capture")
+            })?;
+            if current.base().as_ptr() as usize as u64 != base || current.size() != size {
+                return Err(format!(
+                    "tape resource {id:?} binding disagrees with its key {base:#x}+{size:#x}"
+                ));
+            }
+            let target = moved.get(&id).map_or(base, |planned| planned.new_key.0);
+            // SAFETY: a moved resource's new range is mapped for `size` bytes
+            // by the new VMM owner (`plan_relocation` coverage check, owners
+            // validated by the caller); an unmoved one keeps its live base.
+            // The revision bumps with this relocation per the
+            // `ResourceBinding::new` contract.
+            let binding = unsafe {
+                ResourceBinding::new(
+                    target as usize as *mut std::ffi::c_void,
+                    size,
+                    next_revision,
+                    current.policy(),
+                )
+            }
+            .map_err(|_| format!("tape resource {id:?} cannot rebind after relocation"))?;
+            staged_bindings.push((id, binding));
+        }
+
+        // Stage 2: rewritten kernarg snapshots and accesses per launch.
+        struct StagedLaunch {
+            index: usize,
+            kernarg: Option<Vec<u8>>,
+            accesses: Option<Vec<RecordedResourceAccess>>,
+        }
+        let mut staged: Vec<StagedLaunch> = Vec::new();
+        for (index, launch) in self.recorded.iter().enumerate() {
+            let Some(layout) = launch.binding_layout.as_ref() else {
+                continue;
+            };
+            let kernarg = relocate_kernarg_slots(&launch.kernel, &launch.kernarg, layout, &moved)?;
+            let accesses = match launch.accesses.as_deref() {
+                Some(accesses) => relocate_accesses(&launch.kernel, accesses, &ranges)?,
+                None => None,
+            };
+            if kernarg.is_some() || accesses.is_some() {
+                staged.push(StagedLaunch {
+                    index,
+                    kernarg,
+                    accesses,
+                });
+            }
+        }
+
+        // Stage 3: gate every prepared PM4 segment before touching any byte.
+        if let Some(prepared) = self.prepared_pm4.as_mut() {
+            if prepared.bound_explicit_lens.len() != prepared.kernargs.len()
+                || prepared.bound_exempt_ranges.len() != prepared.kernargs.len()
+            {
+                return Err(
+                    "retained PM4 binding cache disagrees with prepared kernarg count".to_owned(),
+                );
+            }
+            for entry in &staged {
+                let Some(encoded) = entry.kernarg.as_deref() else {
+                    continue;
+                };
+                if entry.index >= prepared.kernargs.len() {
+                    continue;
+                }
+                let kernel = &self.recorded[entry.index].kernel;
+                let explicit_len = prepared.bound_explicit_lens[entry.index];
+                let bytes = prepared.kernargs[entry.index].as_mut_bytes();
+                if explicit_len > encoded.len() || explicit_len > bytes.len() {
+                    return Err(format!(
+                        "{kernel}: explicit prefix {explicit_len} exceeds segment ({} vs {})",
+                        encoded.len(),
+                        bytes.len()
+                    ));
+                }
+                verify_non_slot_bytes_identical(
+                    kernel,
+                    &bytes[..explicit_len],
+                    &encoded[..explicit_len],
+                    &prepared.bound_exempt_ranges[entry.index],
+                )?;
+            }
+        }
+
+        // Commit: nothing below can fail.
+        for (id, binding) in staged_bindings {
+            self.replay_bindings.bind_resource(id, binding);
+        }
+        for planned in &plan {
+            self.tape_resources.remove(&planned.old_key);
+        }
+        for planned in &plan {
+            self.tape_resources.insert(planned.new_key, planned.resource);
+        }
+        self.binding_revision = next_revision;
+        let mut prepared_rewritten = 0usize;
+        let mut snapshots_rewritten = 0usize;
+        for entry in staged {
+            let launch = &mut self.recorded[entry.index];
+            if let Some(kernarg) = entry.kernarg {
+                if let Some(prepared) = self.prepared_pm4.as_mut() {
+                    if entry.index < prepared.kernargs.len() {
+                        let explicit_len = prepared.bound_explicit_lens[entry.index];
+                        prepared.kernargs[entry.index].as_mut_bytes()[..explicit_len]
+                            .copy_from_slice(&kernarg[..explicit_len]);
+                        prepared_rewritten += 1;
+                    }
+                }
+                launch.kernarg = kernarg;
+                snapshots_rewritten += 1;
+            }
+            if let Some(accesses) = entry.accesses {
+                launch.accesses = Some(accesses);
+            }
+        }
+        if let Some(prepared) = self.prepared_pm4.as_mut() {
+            prepared.encoded_revision = next_revision;
+        }
+        let reencoded = if self.prepared_pm4.is_some() {
+            prepared_rewritten
+        } else {
+            snapshots_rewritten
+        };
+        if self.route_proof_log {
+            eprintln!(
+                "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 revision={} \
+                 event=relocated_resources resources={} moved={} reencoded={}",
+                next_revision.0,
+                self.tape_resources.len(),
+                plan.len(),
+                reencoded
             );
         }
         Ok(BindingRefreshReport::Refreshed {
@@ -11440,5 +12091,367 @@ mod tests {
         for bad in ["nop:0", "nop:16385", "align:64", "64", "pad:8"] {
             assert!(parse_gfx1201_pm4_pacing(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    fn relocation_move(old_base: u64, new_base: u64, reserved: usize, mapped: usize) -> VmmResourceMove {
+        VmmResourceMove {
+            old_base: old_base as usize,
+            new_base: new_base as usize,
+            reserved_bytes: reserved,
+            mapped_bytes: mapped,
+            owner_generation: 7,
+        }
+    }
+
+    const FIXTURE_A_BYTES: u64 = 0x1_0000;
+    const FIXTURE_B_BYTES: u64 = 0x2_0000;
+    const RESERVED: usize = 0x20_0000;
+    const MOVED_A: u64 = 0x7f00_0100_0000;
+    const MOVED_A2: u64 = 0x7f00_0200_0000;
+
+    fn fixture_access(base: u64, bytes: u64, at: u64) -> RecordedResourceAccess {
+        RecordedResourceAccess {
+            allocation_base: base,
+            allocation_bytes: bytes,
+            access_base: at,
+            mode: RecordedAccessMode::Read,
+        }
+    }
+
+    /// Controller holding the slice-1 fixture as one typed recorded launch
+    /// with its two tape resources (A at slot 0, B at slot 16).
+    fn relocation_controller() -> (ReplayController, u64, u64) {
+        let (snapshot, layout, bindings, base_a, base_b) = bound_segment_fixture();
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller
+            .tape_resources
+            .insert((base_a, FIXTURE_A_BYTES), layout.slots[0].resource);
+        controller
+            .tape_resources
+            .insert((base_b, FIXTURE_B_BYTES), layout.slots[1].resource);
+        controller.replay_bindings = bindings;
+        let mut launch = test_launch("typed_fixture");
+        launch.kernarg = snapshot;
+        launch.binding_layout = Some(layout);
+        launch.accesses = Some(vec![
+            fixture_access(base_a, FIXTURE_A_BYTES, base_a + 0x40),
+            fixture_access(base_b, FIXTURE_B_BYTES, base_b),
+        ]);
+        controller.recorded.push(launch);
+        (controller, base_a, base_b)
+    }
+
+    fn bound_base(controller: &ReplayController, resource: ResourceId) -> (u64, BindingRevision) {
+        let binding = controller.replay_bindings.resource(resource).expect("bound");
+        (binding.base().as_ptr() as usize as u64, binding.revision())
+    }
+
+    #[test]
+    fn relocation_rewrites_only_the_moved_slot_and_bumps_revision() {
+        let (mut controller, base_a, base_b) = relocation_controller();
+        let before = controller.recorded[0].kernarg.clone();
+        let resource_a = controller.recorded[0].binding_layout.as_ref().unwrap().slots[0].resource;
+        let resource_b = controller.recorded[0].binding_layout.as_ref().unwrap().slots[1].resource;
+        let report = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("relocates");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 1,
+                revision: BindingRevision(1),
+            }
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(1));
+        let after = &controller.recorded[0].kernarg;
+        assert_eq!(&after[0..8], &(MOVED_A + 0x40).to_ne_bytes());
+        assert_eq!(&after[8..], &before[8..]);
+        assert!(controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+        assert!(!controller.tape_resources.contains_key(&(base_a, FIXTURE_A_BYTES)));
+        assert!(controller.tape_resources.contains_key(&(base_b, FIXTURE_B_BYTES)));
+        assert_eq!(bound_base(&controller, resource_a), (MOVED_A, BindingRevision(1)));
+        assert_eq!(bound_base(&controller, resource_b), (base_b, BindingRevision(1)));
+        let accesses = controller.recorded[0].accesses.as_ref().unwrap();
+        assert_eq!(accesses[0].allocation_base, MOVED_A);
+        assert_eq!(accesses[0].access_base, MOVED_A + 0x40);
+        assert_eq!(accesses[1], fixture_access(base_b, FIXTURE_B_BYTES, base_b));
+    }
+
+    #[test]
+    fn relocated_recorded_snapshot_equals_encoding_of_new_bindings() {
+        let (mut controller, base_a, _) = relocation_controller();
+        controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("relocates");
+        let launch = &controller.recorded[0];
+        let encoded = encode_bound_kernarg(
+            &launch.kernarg,
+            launch.binding_layout.as_ref().unwrap(),
+            &controller.replay_bindings,
+            "typed_fixture",
+        )
+        .expect("encodes");
+        assert_eq!(encoded, launch.kernarg);
+        verify_bound_kernarg("typed_fixture", &launch.kernarg, &encoded).expect("verifies");
+    }
+
+    #[test]
+    fn chained_relocation_follows_the_rekeyed_resource() {
+        let (mut controller, base_a, _) = relocation_controller();
+        controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("A to B");
+        let report = controller
+            .relocate_bindings(&[relocation_move(MOVED_A, MOVED_A2, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("B to C");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 1,
+                revision: BindingRevision(2),
+            }
+        );
+        assert_eq!(
+            &controller.recorded[0].kernarg[0..8],
+            &(MOVED_A2 + 0x40).to_ne_bytes()
+        );
+        assert!(controller.tape_resources.contains_key(&(MOVED_A2, FIXTURE_A_BYTES)));
+        assert!(!controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+    }
+
+    #[test]
+    fn resources_outside_every_move_are_untouched_and_revision_holds() {
+        let (mut controller, _, _) = relocation_controller();
+        let before = controller.recorded[0].kernarg.clone();
+        let keys: Vec<_> = controller.tape_resources.keys().copied().collect();
+        let report = controller
+            .relocate_bindings(&[relocation_move(
+                0x7e00_0000_0000,
+                0x7e00_1000_0000,
+                RESERVED,
+                RESERVED,
+            )])
+            .expect("unrelated move");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 0,
+                revision: BindingRevision(0),
+            }
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+        assert_eq!(controller.recorded[0].kernarg, before);
+        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+    }
+
+    #[test]
+    fn failed_relocation_leaves_every_piece_of_state_unchanged() {
+        let (mut controller, base_a, _) = relocation_controller();
+        // Slot 0 would read 8 bytes at the very end of the mapped coverage.
+        controller.recorded[0].binding_layout.as_mut().unwrap().slots[0].interior_offset = 0xFFFC;
+        let before = controller.recorded[0].clone();
+        let keys: Vec<_> = controller.tape_resources.keys().copied().collect();
+        let error = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect_err("slot past coverage");
+        assert!(error.contains("mapped"), "{error}");
+        assert_eq!(controller.recorded[0], before);
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+        let resource_a = before.binding_layout.as_ref().unwrap().slots[0].resource;
+        assert_eq!(bound_base(&controller, resource_a), (base_a, BindingRevision(0)));
+    }
+
+    #[test]
+    fn mapped_bytes_smaller_than_the_resource_is_rejected() {
+        let (controller, base_a, _) = relocation_controller();
+        let error = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, 0x8000)],
+        )
+        .expect_err("not fully mapped");
+        assert!(error.contains("not fully mapped"), "{error}");
+    }
+
+    #[test]
+    fn plan_rekeys_with_interior_offset_and_orders_by_old_key() {
+        let (controller, base_a, base_b) = relocation_controller();
+        let plan = plan_relocation(
+            &controller.tape_resources,
+            &[
+                relocation_move(base_b, MOVED_A2, FIXTURE_B_BYTES as usize, FIXTURE_B_BYTES as usize),
+                relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize),
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].old_key, (base_a, FIXTURE_A_BYTES));
+        assert_eq!(plan[0].new_key, (MOVED_A, FIXTURE_A_BYTES));
+        assert_eq!(plan[0].coverage, FIXTURE_A_BYTES);
+        assert_eq!(plan[1].new_key, (MOVED_A2, FIXTURE_B_BYTES));
+    }
+
+    #[test]
+    fn overlapping_duplicate_and_aliasing_moves_are_rejected() {
+        let (controller, base_a, _) = relocation_controller();
+        let tape = &controller.tape_resources;
+        let overlapping = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(base_a + 0x1000, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("overlapping sources");
+        assert!(overlapping.contains("overlapping VMM move sources"), "{overlapping}");
+        let duplicate = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(base_a, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("duplicate source");
+        assert!(duplicate.contains("duplicate VMM move"), "{duplicate}");
+        let destinations = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(0x7e00_0000_0000, MOVED_A + 0x1000, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("overlapping destinations");
+        assert!(destinations.contains("destinations"), "{destinations}");
+        let chained = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(MOVED_A, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("destination overlapping a source");
+        assert!(chained.contains("overlaps source"), "{chained}");
+        for bad in [
+            relocation_move(base_a, MOVED_A, 0, 0),
+            relocation_move(base_a, MOVED_A, 0x1000, 0x2000),
+            relocation_move(0, MOVED_A, RESERVED, RESERVED),
+            relocation_move(base_a, base_a, RESERVED, RESERVED),
+        ] {
+            assert!(plan_relocation(tape, &[bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn straddling_and_colliding_tape_resources_are_rejected() {
+        let (controller, base_a, base_b) = relocation_controller();
+        // The move source ends inside resource A.
+        let straddle = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(base_a - 0x8000, MOVED_A, 0x10000, 0x10000)],
+        )
+        .expect_err("straddles");
+        assert!(straddle.contains("straddles"), "{straddle}");
+        // The new range for A lands on resource B, which stays.
+        let collision = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(
+                base_a,
+                base_b + 0x1000,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )],
+        );
+        assert!(collision.is_err(), "{collision:?}");
+    }
+
+    #[test]
+    fn untyped_launch_touching_a_moved_range_is_rejected() {
+        let (mut controller, base_a, _) = relocation_controller();
+        let moved = relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize);
+        let mut untyped = test_launch("legacy_kernel");
+        untyped.accesses = Some(vec![fixture_access(base_a, FIXTURE_A_BYTES, base_a)]);
+        controller.recorded.push(untyped);
+        let error = controller.relocate_bindings(&[moved]).expect_err("touches range");
+        assert!(
+            error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
+            "{error}"
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+
+        controller.recorded[1].accesses = None;
+        let error = controller.relocate_bindings(&[moved]).expect_err("unknown accesses");
+        assert!(
+            error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
+            "{error}"
+        );
+
+        controller.recorded[1].accesses =
+            Some(vec![fixture_access(0x7e00_0000_0000, 0x1000, 0x7e00_0000_0000)]);
+        controller.relocate_bindings(&[moved]).expect("clear of every move");
+        assert_eq!(controller.binding_revision(), BindingRevision(1));
+    }
+
+    #[test]
+    fn relocation_reports_no_route_without_tape_and_rejects_pending_refresh() {
+        let mut empty = ReplayController::new(ReplayBackendRequest::Auto);
+        let report = empty
+            .relocate_bindings(&[relocation_move(0x7f00_0001_0000, MOVED_A, RESERVED, RESERVED)])
+            .expect("no tape");
+        assert_eq!(report, BindingRefreshReport::NoRoute);
+
+        let (mut controller, base_a, _) = relocation_controller();
+        controller.arm_binding_refresh_for_scratch_growth();
+        let error = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, RESERVED, RESERVED)])
+            .expect_err("refresh pending");
+        assert!(error.contains("pending"), "{error}");
+    }
+
+    #[test]
+    fn non_slot_bytes_gate_ignores_slots_and_dynamic_words_only() {
+        let exempt = [(0usize, 8usize), (8, 4), (16, 8)];
+        let expected = vec![0x11u8; 32];
+        let mut current = expected.clone();
+        // Pointer slot and dynamic u32 differences are allowed.
+        current[1] ^= 0xff;
+        current[9] ^= 0xff;
+        current[23] ^= 0xff;
+        verify_non_slot_bytes_identical("k", &current, &expected, &exempt).expect("exempt only");
+        let mut corrupt = current.clone();
+        corrupt[13] ^= 0xff;
+        let error = verify_non_slot_bytes_identical("k", &corrupt, &expected, &exempt)
+            .expect_err("non-slot corruption");
+        assert!(error.contains("non-slot offset 13"), "{error}");
+        let mut tail = current.clone();
+        tail[31] ^= 0xff;
+        let error = verify_non_slot_bytes_identical("k", &tail, &expected, &exempt)
+            .expect_err("tail corruption");
+        assert!(error.contains("non-slot offset 31"), "{error}");
+        assert!(verify_non_slot_bytes_identical("k", &current[..31], &expected, &exempt).is_err());
+    }
+
+    #[test]
+    fn exempt_ranges_cover_slots_dynamic_bindings_and_legacy_gdn_frames() {
+        let (snapshot, layout, _, _, _) = bound_segment_fixture();
+        let mut typed = test_launch("typed_fixture");
+        typed.kernarg = snapshot;
+        typed.binding_layout = Some(layout);
+        let untyped = test_launch("untyped");
+        let ranges = bound_exempt_kernarg_ranges(
+            &[typed, untyped],
+            2,
+            &[
+                (0, ReplayKernargBinding::PositionPlusU32 { offset: 12, addend: 0 }),
+                (1, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
+                (9, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
+            ],
+            &[0],
+        );
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], vec![(0, 8), (12, 4), (16, 8), (76, 4)]);
+        assert_eq!(ranges[1], vec![(4, 4)]);
     }
 }

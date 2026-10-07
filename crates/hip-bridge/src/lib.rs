@@ -42,7 +42,10 @@ pub use rocsolver::{
     RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
     ROCSOLVER_STATUS_SUCCESS,
 };
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, retired_va_bytes, VmmArena, VmmFaultKind};
+pub use vmm::{
+    clear_vmm_faults, inject_vmm_fault, retired_va_bytes, retry_pending_granule_releases,
+    vmm_live_granule_bytes, VmmArena, VmmFaultKind, VmmPhysicalId, VmmSharedPrefix,
+};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

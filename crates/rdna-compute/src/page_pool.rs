@@ -375,16 +375,86 @@ impl PagePool {
         assert!(k_per_pos_bytes > 0, "k_per_pos_bytes must be positive");
         assert!(v_per_pos_bytes > 0, "v_per_pos_bytes must be positive");
 
-        let page_bytes = (PAGE_TOKENS * k_per_pos_bytes)
-            .checked_add(PAGE_TOKENS * v_per_pos_bytes)
-            .ok_or_else(|| "PagePool: arena size overflows u64".to_string())?;
-        let total = (page_bytes as u64)
-            .checked_mul(n_pages as u64)
-            .ok_or_else(|| "PagePool: arena size overflows u64".to_string())?;
+        let total = Self::checked_arena_bytes(n_pages, k_per_pos_bytes, v_per_pos_bytes)?;
         preflight_alloc(total, R9700_VRAM_BYTES, "PagePool arena")?;
+        Ok(Self::with_checked_metadata(
+            n_pages,
+            k_per_pos_bytes,
+            v_per_pos_bytes,
+        ))
+    }
 
+    /// Descriptor pool for EXTERNALLY owned backing (e.g. a VMM arena whose
+    /// granules are allocated and budgeted elsewhere): identical metadata and
+    /// page lifecycle to [`PagePool::new_with_strides`], minus
+    /// `kv_slots::preflight_alloc`.
+    ///
+    /// The page bytes derived from the strides are a logical coverage
+    /// measure (how many positions the pages describe), NOT a physical
+    /// budget: this pool allocates no device memory, so no deployment-target
+    /// VRAM check applies. Returns `Err` (never panics) on a zero page count
+    /// or stride, on `n_pages` exceeding the `u32` page-index space, or when
+    /// the nominal arena size overflows `u64`.
+    pub fn new_external_with_strides(
+        n_pages: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+    ) -> Result<Self, String> {
+        if n_pages == 0 {
+            return Err("PagePool: n_pages must be positive".to_string());
+        }
+        if k_per_pos_bytes == 0 {
+            return Err("PagePool: k_per_pos_bytes must be positive".to_string());
+        }
+        if v_per_pos_bytes == 0 {
+            return Err("PagePool: v_per_pos_bytes must be positive".to_string());
+        }
+        Self::checked_arena_bytes(n_pages, k_per_pos_bytes, v_per_pos_bytes)?;
+        Ok(Self::with_checked_metadata(
+            n_pages,
+            k_per_pos_bytes,
+            v_per_pos_bytes,
+        ))
+    }
+
+    /// Nominal bytes of the K+V arenas (`n_pages` pages), with every
+    /// intermediate product checked and `n_pages` required to fit the `u32`
+    /// physical-page index space. Arguments must be non-zero.
+    fn checked_arena_bytes(
+        n_pages: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+    ) -> Result<u64, String> {
+        const OVERFLOW: &str = "PagePool: arena size overflows u64";
+        if n_pages > u32::MAX as usize {
+            return Err(format!(
+                "PagePool: {} pages exceed the u32 page-index space",
+                n_pages
+            ));
+        }
+        let k_page = PAGE_TOKENS
+            .checked_mul(k_per_pos_bytes)
+            .ok_or_else(|| OVERFLOW.to_string())?;
+        let v_page = PAGE_TOKENS
+            .checked_mul(v_per_pos_bytes)
+            .ok_or_else(|| OVERFLOW.to_string())?;
+        let page_bytes = k_page
+            .checked_add(v_page)
+            .ok_or_else(|| OVERFLOW.to_string())?;
+        (page_bytes as u64)
+            .checked_mul(n_pages as u64)
+            .ok_or_else(|| OVERFLOW.to_string())
+    }
+
+    /// Shared metadata initialization: every page Free at generation 0.
+    /// Callers must have validated the arguments with `checked_arena_bytes`.
+    fn with_checked_metadata(
+        n_pages: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+    ) -> Self {
         let free_pages: Vec<u32> = (0..n_pages as u32).rev().collect();
-        Ok(Self {
+        Self {
             n_pages,
             k_per_pos_bytes,
             v_per_pos_bytes,
@@ -392,7 +462,7 @@ impl PagePool {
             page_meta: vec![PageMeta::free(); n_pages],
             reclaim_pending: Vec::new(),
             epoch: 0,
-        })
+        }
     }
 
     /// Total number of physical pages.
@@ -2342,5 +2412,84 @@ mod tests {
         // freed.) A clean drain still works.
         pool.release_inflight_ref(phys).unwrap();
         assert_eq!(pool.drain_completed(), vec![phys]);
+    }
+
+    /// Drives one alloc → seal → cache-ref → release lifecycle and returns
+    /// every observable that must match between constructors.
+    fn external_lifecycle_trace(pool: &mut PagePool) -> Vec<String> {
+        let mut trace = Vec::new();
+        let mut table = BlockTable::new();
+        let handles = pool.alloc_pages_checked(&mut table, 2).unwrap();
+        trace.push(format!("free_after_alloc={}", pool.free_pages()));
+        for h in &handles {
+            trace.push(format!(
+                "alloc phys={} gen={} state={:?}",
+                h.phys,
+                h.generation,
+                pool.page_state(h.phys)
+            ));
+            pool.validate_handle(h).unwrap();
+        }
+        let first = handles[0];
+        pool.seal(first.phys).unwrap();
+        trace.push(format!("sealed={:?}", pool.page_state(first.phys)));
+        pool.add_cache_ref(first.phys).unwrap();
+        pool.release_table(&mut table).unwrap();
+        trace.push(format!(
+            "after_table_release first={:?} second={:?} free={}",
+            pool.page_state(first.phys),
+            pool.page_state(handles[1].phys),
+            pool.free_pages()
+        ));
+        pool.validate_handle(&first).unwrap();
+        pool.release_cache_ref(first.phys).unwrap();
+        trace.push(format!(
+            "after_cache_release state={:?} gen={} free={}",
+            pool.page_state(first.phys),
+            pool.page_generation(first.phys),
+            pool.free_pages()
+        ));
+        assert!(
+            pool.validate_handle(&first).is_err(),
+            "handle must be stale after the generation bump"
+        );
+        assert_ne!(pool.page_generation(first.phys), first.generation);
+        trace
+    }
+
+    #[test]
+    fn external_pool_lifecycle_matches_new_with_strides() {
+        let mut checked = PagePool::new_with_strides(8, 1088, 544).unwrap();
+        let mut external = PagePool::new_external_with_strides(8, 1088, 544).unwrap();
+        assert_eq!(external.n_pages(), checked.n_pages());
+        assert_eq!(external.k_per_pos_bytes(), checked.k_per_pos_bytes());
+        assert_eq!(external.v_per_pos_bytes(), checked.v_per_pos_bytes());
+        assert_eq!(external.free_pages(), checked.free_pages());
+        assert_eq!(external.epoch(), checked.epoch());
+        assert_eq!(
+            external_lifecycle_trace(&mut external),
+            external_lifecycle_trace(&mut checked)
+        );
+    }
+
+    #[test]
+    fn external_pool_accepts_size_new_with_strides_refuses() {
+        // 4 pages * 128 positions * (64 MiB + 64 MiB) = 64 GiB nominal,
+        // above the 32 GiB deployment budget `new_with_strides` enforces.
+        let stride = 64 * 1024 * 1024;
+        assert!(PagePool::new_with_strides(4, stride, stride).is_err());
+        let mut pool = PagePool::new_external_with_strides(4, stride, stride).unwrap();
+        assert_eq!(pool.n_pages(), 4);
+        assert_eq!(pool.free_pages(), 4);
+        let trace = external_lifecycle_trace(&mut pool);
+        assert!(trace.last().unwrap().contains("state=Free"));
+        assert_eq!(pool.free_pages(), 4);
+    }
+
+    #[test]
+    fn external_pool_refuses_zero_arguments_without_panicking() {
+        assert!(PagePool::new_external_with_strides(0, 1088, 1088).is_err());
+        assert!(PagePool::new_external_with_strides(4, 0, 1088).is_err());
+        assert!(PagePool::new_external_with_strides(4, 1088, 0).is_err());
     }
 }
