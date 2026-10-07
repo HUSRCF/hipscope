@@ -57,7 +57,9 @@ static MTP_FULL_REJECT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub fn arm_mtp_full_reject(on: bool) {
     MTP_FULL_REJECT.store(on, std::sync::atomic::Ordering::Release);
 }
-use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
+use crate::speculative::{
+    apply_topp_trunc, sample_categorical, sample_residual, sample_residual_point_mass,
+};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
@@ -1382,7 +1384,7 @@ fn assemble_greedy_accept_from_gpu_result(
     }
 }
 
-/// Pure bound check for external PLD candidates. Greedy-only window must be
+/// Pure bound check for external PLD/ngram candidates. The window must be
 /// non-empty, and its length must fit the allocated verify batch capacity
 /// (`state.verify_capacity + 1` tokens including the seed `last_committed`).
 /// This is the only pure, GPU-free validation the core exposes — no token
@@ -1828,9 +1830,11 @@ pub(crate) fn mtp_verify_accept(
     let hit_eos;
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
 
-    let effective_use_sampling = if is_external { false } else { use_sampling };
-
-    if effective_use_sampling {
+    // Sampled verify applies to every drafter, including the external
+    // (ngram/PLD takeover) one: its candidates are deterministic proposals,
+    // i.e. a point-mass draft q = δ(c), handled by `mtp_sampled_accept` with
+    // `point_mass = true`. Greedy requests still take the argmax branch below.
+    if use_sampling {
         hit_eos = mtp_sampled_accept(
             gpu,
             state,
@@ -1840,6 +1844,7 @@ pub(crate) fn mtp_verify_accept(
             candidates,
             drafts_generated,
             vocab,
+            is_external,
             sampling.temp,
             sampling.top_p,
             sampling.top_k,
@@ -3643,6 +3648,13 @@ pub fn spec_step_mtp_compressed(
 ///
 /// Full-vocab only: `candidates[k]` is already the trunk token id (vocab_map is
 /// None in full-vocab mode), so it indexes the target softmax row directly.
+///
+/// `point_mass`: the draft is deterministic (ngram/PLD takeover), q = δ(c_k).
+/// Leviathan then accepts with probability `p_t[c_k]` (`draft_probs[k]` MUST be
+/// 1.0) and, on reject, draws from `p_t` with `c_k` removed and renormalized
+/// via `sample_residual_point_mass` — identical to `sample_residual` against a
+/// one-hot, without allocating a vocab row. `draft_softmaxes` is unused (may be
+/// empty). RNG draw count/order is identical to the learned-draft path.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn mtp_sampled_accept(
@@ -3654,6 +3666,7 @@ fn mtp_sampled_accept(
     candidates: &[u32],
     drafts_generated: usize,
     vocab: usize,
+    point_mass: bool,
     temp: f32,
     top_p: f32,
     top_k: usize,
@@ -3725,7 +3738,11 @@ fn mtp_sampled_accept(
             // length `vocab` (different zero-support), so sample_residual's
             // element-wise subtraction is well-formed.
             let u2 = state.rng.next_uniform_f32();
-            let bonus = sample_residual(&target_row_k, &draft_softmaxes[k], u2);
+            let bonus = if point_mass {
+                sample_residual_point_mass(&target_row_k, candidates[k], u2)
+            } else {
+                sample_residual(&target_row_k, &draft_softmaxes[k], u2)
+            };
             committed.push(bonus);
             if bonus == eos_token_id {
                 hit_eos = true;
@@ -4573,12 +4590,18 @@ pub fn spec_step_mtp_compressed_serial_with_k(
 
 /// External ngram-mod/PLD candidate verify with MTP-head KV fill.
 ///
-/// Greedy-lossless, MTP-head-bypass path. The daemon supplies a non-empty
-/// greedy candidate window `candidates` (already filtered for length
-/// `<= state.verify_capacity` and temp==0).
+/// MTP-head-bypass path. The daemon supplies a non-empty candidate window
+/// `candidates` (already filtered for length `<= state.verify_capacity`).
+/// Greedy requests (`state.sampling.temp <= 0`) verify with greedy trunk
+/// acceptance; sampled requests verify with the point-mass q = δ(c_k) through
+/// the same verify/penalty path as native MTP (`mtp_verify_accept` with
+/// `is_external = true`): each candidate is accepted with probability
+/// `p_target(c_k)`, a reject draws from the target with `c_k` removed, and a
+/// full accept draws the bonus from the next verify row. The request's
+/// penalties shape every verify row exactly like the AR sampler; the caller
+/// must have run `state.penalty.begin_window(emitted)` for this window.
 ///
 /// * Bypasses all head proposal / graph / device-chain work.
-/// * Uses greedy trunk acceptance (`chain_truncated=false`).
 /// * Sets `drafts_generated = candidates.len()` and `chain_truncated=false`.
 /// * Before shared verify, stages the pre-window `state.prev_hidden`
 ///   (h_{cur_pos-1}) as row 0 of `takeover_fill_hidden`.
@@ -4588,7 +4611,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
 ///   verify hidden rows. A rejected tail is never written, so native MTP can
 ///   draft on the next window as if those rows had been decoded one by one.
 ///
-/// External candidates must be non-empty, greedy, and `len <= state.verify_capacity`.
+/// External candidates must be non-empty and `len <= state.verify_capacity`.
 /// Panics if those bounds are violated so daemon bugs surface loudly.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
@@ -4609,10 +4632,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         state.verify_capacity,
         state.max_n
     );
-    assert!(
-        state.sampling.is_greedy(),
-        "spec_step_mtp_compressed_serial_with_takeover_candidates requires greedy sampling"
-    );
+    let verify_sampling = state.sampling;
     assert!(
         candidates
             .iter()
@@ -4655,13 +4675,11 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         dim_bytes,
     )?;
 
-    // Verify is greedy-only here, but still the AR target: the request's
-    // repeat/presence/frequency penalties (state.sampling, asserted greedy
-    // above) shape the verify rows exactly like the AR sampler would.
-    let verify_sampling = state.sampling;
-    // Shared greedy verify/accept/rollback. Sampling is forced greedy for
-    // external windows even if state.sampling.temp > 0 (daemon guarantees
-    // temp==0 for ngram/PLD hits; this keeps core lossless).
+    // Verify is the AR target: the request's penalties shape the verify rows
+    // exactly like the AR sampler would. Sampled requests accept against the
+    // deterministic draft's point mass (draft_prob 1.0, no draft softmax).
+    let use_sampling = !verify_sampling.is_greedy();
+    let draft_probs = vec![1.0f32; drafts_generated];
     let mut result = mtp_shared_verify_accept_rollback(
         gpu,
         target,
@@ -4673,9 +4691,9 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         drafts_generated,
         chain_truncated,
         overlap_trunk_snap,
-        false,
+        use_sampling,
         verify_sampling,
-        &[],
+        &draft_probs,
         &[],
         true,
         false,
@@ -4690,8 +4708,8 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
     )?;
 
-    // External path is always greedy and not truncated; ensure result fields
-    // cohere even if shared helper drifted.
+    // External windows are never truncated; ensure result fields cohere even
+    // if the shared helper drifted.
     result.drafts_generated = drafts_generated;
     result.chain_truncated = false;
     Ok(result)

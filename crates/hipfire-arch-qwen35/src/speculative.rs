@@ -3237,6 +3237,40 @@ pub(crate) fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 
     (p_target.len() - 1) as u32
 }
 
+/// [`sample_residual`] against a deterministic (point-mass) draft
+/// `q = δ(excluded)`: draw from `p_target` with `excluded` removed,
+/// renormalized, WITHOUT materializing a one-hot vocab row. Bit-identical to
+/// `sample_residual(p_target, onehot(excluded), u)`: the excluded slot
+/// contributes `p_target[excluded] - 1.0` (≤ 0 for a valid distribution, so
+/// skipped), every other slot contributes `p_target[i]` itself, with the same
+/// summation order and the same degenerate (`argmax`) / last-index fallbacks.
+#[inline]
+pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32) -> u32 {
+    let ex = excluded as usize;
+    let mut sum = 0.0f32;
+    for i in 0..p_target.len() {
+        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        if d > 0.0 {
+            sum += d;
+        }
+    }
+    if sum <= 0.0 {
+        return argmax_u32(p_target);
+    }
+    let u_scaled = u * sum;
+    let mut acc = 0.0f32;
+    for i in 0..p_target.len() {
+        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        if d > 0.0 {
+            acc += d;
+            if u_scaled < acc {
+                return i as u32;
+            }
+        }
+    }
+    (p_target.len() - 1) as u32
+}
+
 // `NgramCache` / `PldMatcher` / `PldMatch` moved to `hipfire_runtime::spec` so
 // the arch-generic `NgramSpeculator` can use them without an arch-crate
 // dependency. Re-exported here so `spec_step_dflash` (and the dflash_spec_demo)
@@ -9507,6 +9541,59 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sample_residual_point_mass` must equal `sample_residual` against an
+    /// explicit one-hot row, bit for bit, and never return the excluded token
+    /// when the residual has mass.
+    #[test]
+    fn residual_point_mass_matches_onehot() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let us = [0.0f32, 1e-6, 0.1, 0.25, 0.5, 0.75, 0.999, 0.999_999];
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for &n in &[2usize, 5, 64, 257] {
+            for _ in 0..8 {
+                let mut r: Vec<f32> = (0..n)
+                    .map(|_| {
+                        let x = xorshift_next_unit(&mut rng);
+                        // Sparse-ish rows: many exact zeros like a nucleus.
+                        if x < 0.5 { 0.0 } else { x }
+                    })
+                    .collect();
+                let s: f32 = r.iter().sum();
+                if s > 0.0 {
+                    r.iter_mut().for_each(|v| *v /= s);
+                } else {
+                    r[0] = 1.0;
+                }
+                rows.push(r);
+            }
+        }
+        // p(excluded) = 1 (degenerate), ties, p(excluded) = 0.
+        rows.push(vec![0.0, 1.0, 0.0]);
+        rows.push(vec![0.25, 0.25, 0.25, 0.25]);
+        rows.push(vec![0.5, 0.5, 0.0]);
+        rows.push(vec![1.0]);
+        for row in &rows {
+            for ex in 0..row.len() {
+                let mut onehot = vec![0.0f32; row.len()];
+                onehot[ex] = 1.0;
+                let sum_without: f32 = row
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &p)| i != ex && p > 0.0)
+                    .map(|(_, &p)| p)
+                    .sum();
+                for &u in &us {
+                    let a = sample_residual(row, &onehot, u);
+                    let b = sample_residual_point_mass(row, ex as u32, u);
+                    assert_eq!(a, b, "row={row:?} ex={ex} u={u}");
+                    if sum_without > 0.0 {
+                        assert_ne!(b as usize, ex, "row={row:?} ex={ex} u={u}");
+                    }
+                }
+            }
+        }
+    }
 
     /// A spine accept needs no row motion — this is what keeps the existing
     /// fast path free of any gather work.

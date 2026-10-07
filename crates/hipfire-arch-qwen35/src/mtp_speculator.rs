@@ -849,7 +849,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
             ctx.reset_request();
         }
         self.ngram_active = false;
-        if !cfg.allow_ngram_modifier || cfg.temp > 1e-6 {
+        // Sampled requests arm the pool too: takeover windows verify with the
+        // deterministic draft's point-mass q (see
+        // `spec_step_mtp_compressed_serial_with_takeover_candidates`).
+        if !cfg.allow_ngram_modifier {
             return;
         }
         let Some(new_cfg) = ngram_mod_env_config() else {
