@@ -1006,6 +1006,9 @@ pub struct Qwen4MtpDrafter {
     /// (sticky retirement survives `mtp_reset`, prefill realignment and
     /// head refills).
     floor: MtpFloor,
+    /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read once per request by
+    /// `configure_request`; false restores the pre-floor chooser.
+    floor_enabled: bool,
     /// Request counters surfaced by `request_stats`; reset only by
     /// `configure_request`.
     stats: MtpRequestStats,
@@ -1028,6 +1031,7 @@ impl Qwen4MtpDrafter {
             append_scratch: None,
             end_of_turn,
             floor: MtpFloor::new(),
+            floor_enabled: true,
             stats: MtpRequestStats::default(),
         }
     }
@@ -1342,6 +1346,13 @@ impl Qwen4MtpDrafter {
         best.0
     }
 
+    /// Route with the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`): the
+    /// pre-floor per-window chooser, `0` = interleaved, else batched at that
+    /// depth.
+    fn floor_off_depth(&self, k: usize) -> usize {
+        self.batched_depth(k)
+    }
+
     /// One native window of the AR floor: the ordinary target-only token
     /// `seed` at `position`, with a sampled draw when the request is sampled.
     ///
@@ -1452,18 +1463,19 @@ impl Qwen4MtpDrafter {
         })
     }
 
-    /// Count one finished native window; observe it for the floor unless a
-    /// developer-forced route (`HIPFIRE_MTP_INCREMENTAL=0|1`) bypasses it.
+    /// Count one finished native window; observe it for the floor unless
+    /// `bypass` (a developer-forced route, `HIPFIRE_MTP_INCREMENTAL=0|1`, or
+    /// `HIPFIRE_MTP_AR_FLOOR=0`) skips the floor.
     fn floor_observe_native(
         &mut self,
-        forced: bool,
+        bypass: bool,
         route: NativeWindow,
         window: &MtpWindow,
         us: f32,
         k: usize,
     ) {
         self.stats.mtp_windows += 1;
-        if !forced {
+        if !bypass {
             self.floor
                 .observe_native(route, window, us, k, &self.agreement);
             self.stats.mtp_retired = self.floor.retired;
@@ -1481,12 +1493,13 @@ impl Qwen4MtpDrafter {
 
     /// Whether the request's first window, the AR calibration token, has yet
     /// to run.  False for a developer-forced route (`HIPFIRE_MTP_INCREMENTAL`
-    /// `0|1`), which bypasses the floor.  A caller that composes an external
-    /// drafter must not take over while this is true: the calibration window
-    /// must be the request's first.
+    /// `0|1`) and with the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`), which
+    /// bypass the floor.  A caller that composes an external drafter must not
+    /// take over while this is true: the calibration window must be the
+    /// request's first.
     #[allow(dead_code)]
     pub(crate) fn floor_needs_calibration(&self) -> bool {
-        !self.floor.calibrated && !Self::floor_forced()
+        self.floor_enabled && !self.floor.calibrated && !Self::floor_forced()
     }
 
     /// `floor_retired() || floor_needs_calibration()`: the exact guard an
@@ -1508,7 +1521,8 @@ impl Qwen4MtpDrafter {
     /// tokens committed, `wall_us` of its whole window (drafting, verify and
     /// commit).  Counts toward the shared probe budget and prices external
     /// windows separately from the native agreement.  Returns `true` when
-    /// external takeover must stop for the rest of the request.
+    /// external takeover must stop for the rest of the request; never with
+    /// the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`).
     #[allow(dead_code)]
     pub(crate) fn floor_observe_external_window(
         &mut self,
@@ -1516,6 +1530,9 @@ impl Qwen4MtpDrafter {
         wall_us: f32,
         drafts: usize,
     ) -> bool {
+        if !self.floor_enabled {
+            return false;
+        }
         let stop = self
             .floor
             .observe_external(emitted, wall_us, drafts, &self.agreement);
@@ -1701,12 +1718,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let incremental = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").ok();
         // A developer-forced route is a diagnostic override: the floor
         // neither calibrates nor retires, so the pinned route runs as before.
+        // `HIPFIRE_MTP_AR_FLOOR=0` (`floor_enabled == false`) bypasses the
+        // floor the same way and restores the pre-floor chooser.
         let forced = matches!(incremental.as_deref(), Some("0" | "1"));
-        if !forced && self.floor.retired {
+        let floor_active = self.floor_enabled && !forced;
+        if floor_active && self.floor.retired {
             return self.mtp_ar_step(gpu, target, position, seed, false);
         }
         self.ensure_resources(gpu, target)?;
-        if !forced && !self.floor.calibrated {
+        if floor_active && !self.floor.calibrated {
             return self.mtp_ar_step(gpu, target, position, seed, true);
         }
         let trace =
@@ -1718,6 +1738,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let depth = match incremental.as_deref() {
             Some("0") => k,
             Some("1") => 0,
+            _ if !self.floor_enabled => self.floor_off_depth(k),
             _ => match {
                 let provisional = self.batched_depth(k);
                 let route = self.floor.route(&self.agreement, k, provisional);
@@ -1746,13 +1767,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let window = window?;
             self.observe_agreement(&window);
             self.floor_observe_native(
-                forced,
+                !floor_active,
                 NativeWindow::Interleaved,
                 &window,
-                if forced {
-                    0.0
-                } else {
+                if floor_active {
                     synced_elapsed_us(gpu, window_start)?
+                } else {
+                    0.0
                 },
                 k,
             );
@@ -2027,12 +2048,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.sampled = sampled;
         if let Ok(window) = &result {
             self.observe_agreement(window);
-            let us = if forced && !timers.enabled() {
+            let us = if !floor_active && !timers.enabled() {
                 0.0
             } else {
                 synced_elapsed_us(gpu, floor_start)?
             };
-            self.floor_observe_native(forced, NativeWindow::Batched, window, us, k);
+            self.floor_observe_native(!floor_active, NativeWindow::Batched, window, us, k);
         }
         if timers.enabled() {
             let fields = format!(
@@ -2178,6 +2199,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
         self.floor = MtpFloor::new();
+        self.floor_enabled =
+            hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
         self.stats = MtpRequestStats::default();
         let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
         self.sampled = match (sampled, &self.sampled_mode) {
@@ -2704,5 +2727,80 @@ mod tests {
         assert_eq!(floor.batched.len(), MTP_WINDOW_COST.len());
         assert!(!floor.retired);
         assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top));
+    }
+
+    fn floor_drafter(floor_enabled: bool) -> Qwen4MtpDrafter {
+        let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+        drafter.floor_enabled = floor_enabled;
+        drafter
+    }
+
+    #[test]
+    fn floor_optout_never_calibrates_or_blocks_takeover() {
+        let drafter = floor_drafter(false);
+        assert!(!drafter.floor.calibrated);
+        assert!(!drafter.floor_needs_calibration());
+        assert!(!drafter.floor_takeover_blocked());
+        assert!(!drafter.floor_retired());
+    }
+
+    #[test]
+    fn floor_optout_external_windows_never_stop_takeover_or_retire() {
+        let mut drafter = floor_drafter(false);
+        for _ in 0..(4 * MTP_FLOOR_PROBE_WINDOWS) {
+            assert!(!drafter.floor_observe_external_window(0, f32::INFINITY, 4));
+            assert!(!drafter.floor_observe_external_window(1, 1.0e9, 4));
+        }
+        assert!(!drafter.floor.retired);
+        assert_eq!(drafter.floor.probes, 0);
+        assert!(!drafter.request_stats().mtp_retired);
+        assert_eq!(drafter.request_stats().ar_windows, 0);
+        assert!(!drafter.floor_takeover_blocked());
+    }
+
+    #[test]
+    fn floor_optout_native_windows_count_without_observing_the_floor() {
+        let mut drafter = floor_drafter(false);
+        let good = window(2, 2);
+        for _ in 0..(2 * MTP_FLOOR_PROBE_WINDOWS) {
+            drafter.floor_observe_native(true, NativeWindow::Batched, &good, 1.0e9, 3);
+            drafter.floor_observe_native(true, NativeWindow::Interleaved, &good, 1.0e9, 3);
+        }
+        let stats = drafter.request_stats();
+        assert_eq!(stats.mtp_windows, 4 * MTP_FLOOR_PROBE_WINDOWS);
+        assert!(!stats.mtp_retired);
+        assert_eq!(stats.ar_windows, 0);
+        assert_eq!(drafter.floor.probes, 0);
+    }
+
+    #[test]
+    fn floor_optout_control_floor_on_still_retires_on_terrible_external_windows() {
+        let mut drafter = floor_drafter(true);
+        let bad = agreement(0.0, 2.0);
+        drafter.floor.observe_calibration(30.0, &bad);
+        let mut stopped = false;
+        for _ in 0..30 {
+            if drafter.floor_observe_external_window(1, 1.0e9, 4) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped);
+    }
+
+    #[test]
+    fn floor_optout_depth_is_the_pre_floor_batched_depth() {
+        let mut drafter = floor_drafter(false);
+        for (accepted, total) in [(0.0, 2.0), (1.0, 2.0), (1.8, 2.0), (2.0, 2.0)] {
+            drafter.agreement = agreement(accepted, total);
+            for k in 0..=drafter.max_k {
+                assert_eq!(drafter.floor_off_depth(k), drafter.batched_depth(k));
+            }
+        }
+        // Perfect agreement pays for batching; none falls back to interleaved.
+        drafter.agreement = agreement(2.0, 2.0);
+        assert!(drafter.floor_off_depth(drafter.max_k) > 0);
+        drafter.agreement = agreement(0.0, 2.0);
+        assert_eq!(drafter.floor_off_depth(drafter.max_k), 0);
     }
 }

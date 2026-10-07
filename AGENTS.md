@@ -725,7 +725,10 @@ Caveats that are part of the fixture, not trivia:
   and commit tail; diagnostic forced routes synchronize for cost accuracy.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
   interleaved; either forced route is a diagnostic override that bypasses the
-  floor entirely. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  floor entirely. `HIPFIRE_MTP_AR_FLOOR=0` opts out of the floor (diagnostic
+  A/B): no calibration token, probe windows, retirement or floor sync, and the
+  per-window chooser routes as before the floor; the forced routes win if both
+  are set. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
   AR target's single-row route. With Q8 GDN recurrent state, the row-capture
   verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
   per-token Q8 boundary at each row's absolute position, so every captured
