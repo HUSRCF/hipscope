@@ -1102,6 +1102,17 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "the reused buffer holds the same i32 ids (checked against the chunk's tokens before use) and the embedding gather runs the same kernel on them; no launch or output byte changes",
         reaches: &[],
     },
+    Decision {
+        id: "qwen4-ple-async-upload",
+        predicates: &[CaptureMode, GraphSlotCapturing],
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs",
+        effect: LaunchMechanism,
+        switches: "hipMemcpyAsync on the null stream with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "same staged PLE bytes, destination and stream order before the unchanged PLE apply kernels; the fence retires before the staging buffer is next written, torn down or dropped, so no copy reads rewritten bytes",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_mixed", occurrences: 16, decisions: &["dspark-capture-safe-verify-body"] },
@@ -1144,7 +1155,8 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "replay_gdn", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "rides_ordinary_prefill", occurrences: 2, decisions: &["widened-prefill-batching", "gdn-chunk-scan"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "verify_dflash_block_inner", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 7, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse"] },
+    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 8, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse", "qwen4-ple-async-upload"] },
+    Site { file: "hipfire-arch-qwen4/src/ple_stage.rs", function: "ple_async_upload", occurrences: 2, decisions: &["qwen4-ple-async-upload"] },
     Site { file: "hipfire-arch-qwen4/src/mtp_gpu.rs", function: "ensure_mapped_capacity", occurrences: 1, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-arch-qwen4/src/state.rs", function: "ensure_mapped_capacity", occurrences: 3, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-daemon/src/main.rs", function: "main", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },

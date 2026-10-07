@@ -14,6 +14,7 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
+use crate::ple_stage::{ple_async_upload, PleHostStage, PLE_ASYNC_UPLOAD_ENV};
 use crate::program::{
     execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
     Qwen4AttentionWeights, Qwen4GdnWeights, Qwen4HyperReadWeights, Qwen4HyperWeights,
@@ -2005,7 +2006,9 @@ pub struct Qwen4GpuForward {
     /// `host_token_bytes` (its mirror): 0 for a HIP single-row body, a device
     /// argmax id or a captured upload.
     uploaded_id_rows: usize,
-    host_ple_bytes: Vec<u8>,
+    /// Host staging for the PLE rows and the fence over its asynchronous
+    /// upload (`HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD`).
+    host_ple: PleHostStage,
     /// Tokens of the prefill chunk that follows the next forward. A
     /// successful forward enqueues their PLE rows (hashed from the history it
     /// committed) as `ple_ahead` once its own lease is released, so the next
@@ -2297,7 +2300,10 @@ impl Qwen4GpuForward {
             scratch,
             host_token_bytes,
             uploaded_id_rows: 0,
-            host_ple_bytes,
+            host_ple: PleHostStage::new(
+                host_ple_bytes,
+                hipfire_config::developer_bool(PLE_ASYNC_UPLOAD_ENV, true),
+            ),
             ple_lookahead: Vec::new(),
             ple_ahead: None,
             token_readback: None,
@@ -2325,6 +2331,7 @@ impl Qwen4GpuForward {
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
         let Qwen4GpuForward {
             scratch,
+            host_ple,
             moe,
             expert_stage,
             token_readback,
@@ -2340,7 +2347,12 @@ impl Qwen4GpuForward {
         if expert_stage.is_some() {
             gpu.hip.device_synchronize()?;
         }
-        let mut first = scratch.free_gpu(gpu);
+        // The PLE staging bytes may still be read by an enqueued upload:
+        // retire it before the device buffers and the host bytes go.
+        let mut first = host_ple.free_gpu(gpu);
+        if let Some(error) = scratch.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
         if let Some(stage) = expert_stage {
             if let Some(error) = stage.free_gpu(gpu) {
                 first.get_or_insert(error);
@@ -3526,7 +3538,12 @@ impl Qwen4GpuForward {
             // A prefill defers this until layer 0 is enqueued (the rows are first
             // read at the PLE layer), so the host fetch overlaps GPU work; a
             // single-token forward keeps it ahead of the retained-body boundary.
-            let host_ple_bytes = &mut self.host_ple_bytes;
+            let ple_host = &mut self.host_ple;
+            let ple_split = steps
+                .iter()
+                .position(|step| matches!(step, Step::GroupedDepthwise(_)))
+                .filter(|_| n > 1 || device_token.is_some());
+            let deferred = ple_split.is_some();
             let readback = self.token_readback.as_ref();
             let token_ids = &self.scratch.token_ids;
             let history = &bundle.state.ple_history;
@@ -3568,18 +3585,34 @@ impl Qwen4GpuForward {
                     .as_bytes()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
                     .len();
+                // Retire any earlier asynchronous upload still reading the
+                // staging bytes before the host copy overwrites them.
                 let stage_started = qwen4_profile_start();
-                let stage_result = lease.stage_into(&mut host_ple_bytes[..upload_len]);
+                let stage_result = match ple_host.stage_buffer(gpu, upload_len) {
+                    Ok(buffer) => lease
+                        .stage_into(buffer)
+                        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string())),
+                    Err(error) => Err(error.into()),
+                };
                 qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
-                stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                stage_result?;
                 let upload_started = qwen4_profile_start();
                 // After a device-token readback the host has synchronized past
                 // the previous forward's upload, so the staging buffer is free.
                 let upload_result = if device_token.is_some() {
-                    gpu.hip
-                        .memcpy_htod_async_default(&staged.buf, &host_ple_bytes[..upload_len])
+                    ple_host.upload_unfenced(gpu, &staged.buf, upload_len)
+                } else if ple_async_upload(
+                    ple_host.enabled(),
+                    false,
+                    deferred,
+                    gpu.graphs.capture_mode,
+                ) {
+                    // Deferred past layer 0: do not make the host wait for the
+                    // layers already enqueued. The fence keeps the staging
+                    // bytes unwritable until the copy has run.
+                    ple_host.upload_async(gpu, &staged.buf, upload_len)
                 } else {
-                    gpu.memcpy_htod_auto(&staged.buf, &host_ple_bytes[..upload_len])
+                    ple_host.upload_blocking(gpu, &staged.buf, upload_len)
                 };
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
@@ -3607,10 +3640,6 @@ impl Qwen4GpuForward {
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
                 Ok(())
             };
-            let ple_split = steps
-                .iter()
-                .position(|step| matches!(step, Step::GroupedDepthwise(_)))
-                .filter(|_| n > 1 || device_token.is_some());
             if ple_split.is_none() {
                 stage_ple(gpu)?;
             }
