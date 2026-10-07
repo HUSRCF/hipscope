@@ -77,6 +77,15 @@ pub struct MtpSamplingConfig {
     pub top_k: usize, // 0 = disabled (no top-K cutoff)
     pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
     pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
+    /// Repeat penalty (1.0 = off). With the presence/frequency penalties it
+    /// is applied by the AR GPU sampler over the last `repeat_window`
+    /// generated tokens; verify (and full-vocab draft) rows reproduce it.
+    pub repeat_penalty: f32,
+    /// Penalty window in tokens (0 = penalties off), already clamped to the
+    /// AR repeat buffer capacity by the caller (≤ [`PENALTY_REPEAT_CAP`]).
+    pub repeat_window: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
 }
 
 impl Default for MtpSamplingConfig {
@@ -86,6 +95,10 @@ impl Default for MtpSamplingConfig {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -94,7 +107,21 @@ impl MtpSamplingConfig {
     pub fn is_greedy(&self) -> bool {
         self.temp <= 0.0
     }
+
+    /// True iff the AR GPU sampler's penalty prepass would run for this
+    /// request: exactly the kernel gate (`SlotSampleParams::penalized`).
+    pub fn penalized(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty > 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
 }
+
+/// Maximum penalty window (tokens) the MTP penalty history buffer
+/// ([`MtpSpecState::mtp_sample_repeat_buf`]) is sized for; mirrors the AR
+/// repeat buffer's 2048-token capacity.
+pub const PENALTY_REPEAT_CAP: usize = 2048;
 
 fn mtp_device_token_chain_enabled_from_env() -> bool {
     // Default on: this path is token-identical in greedy mode and removes the
@@ -546,9 +573,11 @@ pub struct MtpSpecState {
     /// Result buffer for `gpu.sample_top_p`: shape `[2]` u32-as-F32. Slot 0
     /// = sampled token id, slot 1 = updated rng state.
     pub mtp_sample_result: GpuTensor,
-    /// Dummy repeat-penalty buffer for `gpu.sample_top_p` (we pass
-    /// `repeat_window=0`, so the kernel skips this branch entirely;
-    /// only allocated so the dispatch wrapper has a valid pointer).
+    /// Repeat/presence/frequency history for the exact-AR penalty prepass:
+    /// `PENALTY_REPEAT_CAP + verify_capacity + 1` u32 token ids stored in the
+    /// F32-typed tensor (uploaded as raw bytes). Holds `state.penalty.tokens()`
+    /// — base history (≤ window ≤ `PENALTY_REPEAT_CAP`) plus the window's
+    /// drafts. Only written when `sampling.penalized()`.
     pub mtp_sample_repeat_buf: GpuTensor,
     /// Single-element index buf for the per-step p_draft gather. Shape `[1]`
     /// i32-as-F32. H2D'd with the sampled token id, fed to
@@ -595,6 +624,12 @@ pub struct MtpSpecState {
     /// RNG state for sampling. Seeded via [`Self::set_sampling`].
     /// Single global stream across all spec-decode positions in a generation.
     pub rng: MtpRng,
+
+    /// Per-request exact-AR penalty history (window 0 = penalties inactive;
+    /// the drafter installs `PenaltyHistory::new(w)` per request and calls
+    /// `begin_window(emitted)` before every step). Rows are penalized from it
+    /// by [`mtp_verify_accept`] and the full-vocab sampled draft.
+    pub penalty: hipfire_runtime::spec_sampling::PenaltyHistory,
 }
 
 impl MtpSpecState {
@@ -688,7 +723,8 @@ impl MtpSpecState {
         let mtp_topk_idx = gpu.alloc_tensor(&[2], DType::F32)?;
         let mtp_topk_logp = gpu.alloc_tensor(&[2], DType::F32)?;
         let mtp_sample_result = gpu.alloc_tensor(&[2], DType::F32)?;
-        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_sample_repeat_buf =
+            gpu.alloc_tensor(&[PENALTY_REPEAT_CAP + verify_capacity + 1], DType::F32)?;
         let mtp_gather_idx_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
@@ -738,6 +774,7 @@ impl MtpSpecState {
             p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
+            penalty: hipfire_runtime::spec_sampling::PenaltyHistory::default(),
             prev_hidden_pos: None,
             takeover_fill_hidden,
             takeover_fill_batched: None,
@@ -837,7 +874,8 @@ impl MtpSpecState {
         // GPU sampling scratches (always allocated; only used when temp > 0).
         // All are tiny so the unconditional alloc is fine.
         let mtp_sample_result = gpu.alloc_tensor(&[2], DType::F32)?;
-        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_sample_repeat_buf =
+            gpu.alloc_tensor(&[PENALTY_REPEAT_CAP + verify_capacity + 1], DType::F32)?;
         let mtp_gather_idx_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
         let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
@@ -888,12 +926,16 @@ impl MtpSpecState {
             p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
+            penalty: hipfire_runtime::spec_sampling::PenaltyHistory::default(),
         })
     }
 
     /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
+    /// The repeat/presence/frequency penalties in `cfg` are kept as-is; they take
+    /// effect (see [`MtpSamplingConfig::penalized`]) only together with a
+    /// `state.penalty` history the drafter installs and advances per window.
     /// Reseeds BOTH the host RNG (used for the residual accept rule) and the
     /// on-device RNG (used by `gpu.sample_top_p`).
     pub fn set_sampling(&mut self, cfg: MtpSamplingConfig, seed: u64) {
@@ -1577,6 +1619,152 @@ pub(crate) struct MtpVerifyAccepted {
     pub hit_eos: bool,
 }
 
+fn mtp_penalty_require_window(
+    penalty: &hipfire_runtime::spec_sampling::PenaltyHistory,
+) -> HipResult<()> {
+    if penalty.window() == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "MTP penalties active but state.penalty has window 0 (drafter must install \
+             PenaltyHistory::new(window) and begin_window per step)",
+        ));
+    }
+    Ok(())
+}
+
+/// One H2D of the penalty history (`penalty.tokens()`: base history then every
+/// pushed draft) to offset 0 of `repeat_buf`, as raw u32 ids in the F32-typed
+/// tensor (same byte upload as `sampler::sample`'s repeat buffer).
+fn mtp_penalty_upload_history(
+    gpu: &Gpu,
+    penalty: &hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+) -> HipResult<()> {
+    let tokens = penalty.tokens();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    if tokens.len() > repeat_buf.numel() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "MTP penalty history of {} tokens exceeds repeat buffer capacity {} (window {})",
+                tokens.len(),
+                repeat_buf.numel(),
+                penalty.window()
+            ),
+        ));
+    }
+    // SAFETY: u32 slice reinterpreted as its own bytes; length = len * 4.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 4) };
+    gpu.hip.memcpy_htod(&repeat_buf.buf, bytes)
+}
+
+/// Start of a window's sampled draft chain: drop any stale drafts and upload
+/// the base history.
+fn mtp_penalty_begin_drafts(
+    gpu: &Gpu,
+    penalty: &mut hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+) -> HipResult<()> {
+    mtp_penalty_require_window(penalty)?;
+    penalty.rewind_drafts();
+    mtp_penalty_upload_history(gpu, penalty, repeat_buf)
+}
+
+/// Keep a drawn draft: extend the history and upload just that id at the new
+/// last slot of `repeat_buf`.
+fn mtp_penalty_append_draft(
+    gpu: &Gpu,
+    penalty: &mut hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+    token: u32,
+) -> HipResult<()> {
+    mtp_penalty_require_window(penalty)?;
+    penalty.push_draft(token);
+    let len = penalty.tokens().len();
+    if len > repeat_buf.numel() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "MTP penalty history of {len} tokens exceeds repeat buffer capacity {} (window {})",
+                repeat_buf.numel(),
+                penalty.window()
+            ),
+        ));
+    }
+    gpu.hip
+        .memcpy_htod_offset(&repeat_buf.buf, (len - 1) * 4, &token.to_ne_bytes())
+}
+
+/// Penalize one logits row in place against `penalty.row(row)` (a sub-range of
+/// the uploaded history). Same kernel and arguments as the AR GPU sampler's
+/// Phase 0; empty history is a no-op like AR's `window == 0` skip.
+fn mtp_penalty_apply_row(
+    gpu: &mut Gpu,
+    penalty: &hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+    logits_row: &GpuTensor,
+    row: usize,
+    vocab: usize,
+    sampling: &MtpSamplingConfig,
+) -> HipResult<()> {
+    let r = penalty.row_range(row);
+    if r.is_empty() {
+        return Ok(());
+    }
+    let history = repeat_buf.sub_offset(r.start, r.len());
+    gpu.apply_repeat_penalty_row(
+        logits_row,
+        &history,
+        vocab,
+        r.len(),
+        sampling.repeat_penalty,
+        sampling.presence_penalty,
+        sampling.frequency_penalty,
+    )
+}
+
+/// Penalize all `n_verify` rows of `logits_view` (row `k` scores `c_k` after
+/// `[seed, c_0..c_{k-1}]`; history `emitted ‖ c[..k]`). Rewinds and re-pushes
+/// the window's candidates from `candidates[..n_verify - 1]` (so rejected /
+/// pruned draft-phase pushes never survive), uploads the history once, then
+/// launches one prepass per non-empty row. No-op unless `sampling.penalized()`.
+fn mtp_apply_verify_penalties(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    logits_view: &GpuTensor,
+    candidates: &[u32],
+    n_verify: usize,
+    vocab: usize,
+    sampling: &MtpSamplingConfig,
+) -> HipResult<()> {
+    if !sampling.penalized() {
+        return Ok(());
+    }
+    mtp_penalty_require_window(&state.penalty)?;
+    debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
+    state.penalty.rewind_drafts();
+    for &c in &candidates[..n_verify - 1] {
+        state.penalty.push_draft(c);
+    }
+    mtp_penalty_upload_history(gpu, &state.penalty, &state.mtp_sample_repeat_buf)?;
+    for k in 0..n_verify {
+        let row = logits_view.sub_offset(k * vocab, vocab);
+        mtp_penalty_apply_row(
+            gpu,
+            &state.penalty,
+            &state.mtp_sample_repeat_buf,
+            &row,
+            k,
+            vocab,
+            sampling,
+        )?;
+    }
+    Ok(())
+}
+
 /// Trunk lm_head over the verify rows, the greedy/sampled accept rule, and the
 /// `prev_hidden` capture from the last kept row. Everything in an MTP verify
 /// that runs on the drafter's device; the trunk rollback is the caller's
@@ -1585,6 +1773,13 @@ pub(crate) struct MtpVerifyAccepted {
 ///
 /// `state.verify_hidden` must hold the post-norm trunk hidden of all
 /// `n_verify` rows.
+///
+/// When `sampling.penalized()`, every verify row `k` (logits after
+/// `[seed, c_0..c_{k-1}]`, scoring `c_k`) is penalized in place with the
+/// history `state.penalty.row(k)` = `emitted ‖ c[..k]` before the accept
+/// rule runs, so sampled accept/residual/bonus and greedy argmax-match both
+/// see the penalty-adjusted AR distribution. The caller must have run
+/// `state.penalty.begin_window(emitted)` for this window.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mtp_verify_accept(
     gpu: &mut Gpu,
@@ -1614,6 +1809,19 @@ pub(crate) fn mtp_verify_accept(
         n_verify,
         dim,
         vocab,
+    )?;
+
+    // Exact-AR penalties on every verify row the verdict can read (incl. the
+    // bonus row), before softmax (sampled) or argmax (greedy). No-op, no
+    // upload/launch, unless `sampling.penalized()`.
+    mtp_apply_verify_penalties(
+        gpu,
+        state,
+        &logits_view,
+        candidates,
+        n_verify,
+        vocab,
+        &sampling,
     )?;
 
     let mut accept_count = 0usize;
@@ -2137,6 +2345,18 @@ pub fn mtp_batched_verify_accept_from_batch(
         n_verify,
         dim,
         vocab,
+    )?;
+
+    // Penalized request (never the serve slot-engine default): the verdict's
+    // argmax is the penalty-adjusted AR one, row k under `emitted ‖ c[..k]`.
+    mtp_apply_verify_penalties(
+        gpu,
+        state,
+        &logits_view,
+        &draft.candidates,
+        n_verify,
+        vocab,
+        &draft.sampling,
     )?;
 
     // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
@@ -4007,6 +4227,30 @@ pub fn mtp_draft_phase_inner(
                 // mode-agnostic; losslessness holds because the residual covers
                 // the full vocab (unmapped slots keep the full target mass).
 
+                // Exact-AR penalties on the FULL-vocab draft row: the draft is
+                // drawn from (and `draft_softmaxes`/`draft_probs` store) the
+                // penalized q under history `emitted ‖ candidates[..k]` — the
+                // same history the target verify row k uses. Compressed-vocab
+                // and greedy draft rows stay unpenalized (q need not be
+                // penalized for the verdict to be exact).
+                if use_full_vocab && sampling.penalized() {
+                    if k == 0 {
+                        mtp_penalty_begin_drafts(
+                            gpu,
+                            &mut state.penalty,
+                            &state.mtp_sample_repeat_buf,
+                        )?;
+                    }
+                    mtp_penalty_apply_row(
+                        gpu,
+                        &state.penalty,
+                        &state.mtp_sample_repeat_buf,
+                        logits_for_argmax,
+                        k,
+                        vocab,
+                        &sampling,
+                    )?;
+                }
                 // GPU softmax(+nucleus) over the single draft row (full OR
                 // compressed width). idiom copied from speculative.rs:3457-3492.
                 let probs_gpu = gpu.alloc_tensor(&[argmax_vocab], DType::F32)?;
@@ -4066,6 +4310,14 @@ pub fn mtp_draft_phase_inner(
                     None => draft_idx as u32,
                 };
                 candidates.push(token_id);
+                if use_full_vocab && sampling.penalized() {
+                    mtp_penalty_append_draft(
+                        gpu,
+                        &mut state.penalty,
+                        &state.mtp_sample_repeat_buf,
+                        token_id,
+                    )?;
+                }
 
                 // Store the draft nucleus at FULL-vocab width for the residual.
                 // Full-vocab: the row already is full-width. Compressed: scatter
@@ -4403,6 +4655,10 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         dim_bytes,
     )?;
 
+    // Verify is greedy-only here, but still the AR target: the request's
+    // repeat/presence/frequency penalties (state.sampling, asserted greedy
+    // above) shape the verify rows exactly like the AR sampler would.
+    let verify_sampling = state.sampling;
     // Shared greedy verify/accept/rollback. Sampling is forced greedy for
     // external windows even if state.sampling.temp > 0 (daemon guarantees
     // temp==0 for ngram/PLD hits; this keeps core lossless).
@@ -4418,7 +4674,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         chain_truncated,
         overlap_trunk_snap,
         false,
-        MtpSamplingConfig::default(),
+        verify_sampling,
         &[],
         &[],
         true,

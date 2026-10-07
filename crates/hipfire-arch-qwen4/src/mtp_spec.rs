@@ -27,7 +27,7 @@ use hipfire_runtime::spec::{
 };
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
-    DraftVerdict, SampleSpec, SparseDist, SpecRng,
+    DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
 };
 use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
 use rdna_compute::{Gpu, GpuTensor};
@@ -610,58 +610,94 @@ impl SampledMode {
 /// Per-request sampled verification (`speculation.mtp_sampled`, temperature
 /// above zero).
 ///
+/// Target policy: the Qwen4 AR producer is host `sampler::sample_cpu` over
+/// the FULL rendered prompt plus the generated tokens, with the request's
+/// repeat / presence / frequency penalties over the trailing `repeat_window`
+/// tokens, then temperature, top_p, top_k and min_p. [`Self::policy`]
+/// ([`naive_target_sampler`]) is that sampler and is the target policy of
+/// BOTH modes; [`Self::history`] supplies its token history. The history
+/// penalized at verify row `i` (the row that scores the token after `i`
+/// accepted drafts) is `H_i = suffix_W(P ‖ E ‖ drafts[..i])`, with `P` the
+/// prompt, `E` the tokens emitted before the window (pending seed included),
+/// and `W` the penalty window. Rebuilt from `E` every window
+/// ([`Self::begin_window`]): a rejected draft or a pruned proposal never
+/// enters it. A neutral request has window 0 and does no history work.
+///
 /// [`SampledMode::Leviathan`]:
-/// - `p`, a verify row's target distribution: the full logit row truncated by
-///   [`SampleSpec::cpu_ar`] with the request's temperature, top_p, top_k and
-///   min_p — exactly what the Qwen4 AR producer samples (`sampler::sample_cpu`
-///   → `llama::sample_top_k_p`: a 20- or 64-wide pool, the top_k cap with
-///   absent = 20 and 0 = 64, min_p, nucleus).
-/// - `q`, a draft step's distribution: the same truncation applied to the
-///   draft head's 8 re-scored candidates and their exact logits (the whole
-///   draft row when the head does not re-score). The draft token is drawn
-///   from this `q`, and the verdict reads this `q`. Tokens of `p` outside
-///   the 8 candidates are reached through the residual or the bonus draw.
+/// - `p`, a verify row's target distribution: the logit row penalized by
+///   `H_i`, then truncated by [`SampleSpec::cpu_ar`] with the request's
+///   temperature, top_p, top_k and min_p — exactly what the Qwen4 AR
+///   producer samples (`sampler::sample_cpu` → `llama::sample_top_k_p`: a
+///   20- or 64-wide pool, the top_k cap with absent = 20 and 0 = 64, min_p,
+///   nucleus).
+/// - `q`, a draft step's distribution: the same policy and truncation
+///   applied to the draft head's 8 re-scored candidates and their exact
+///   logits (the whole draft row when the head does not re-score), penalized
+///   by the same `H_i` as the verify row the draft is proposed for. The
+///   draft token is drawn from this `q`, and the verdict reads this `q`.
+///   Tokens of `p` outside the 8 candidates are reached through the residual
+///   or the bonus draw.
 ///
 /// Accept with probability `min(1, p/q)`, otherwise emit a draw from
 /// `(p - q)+`; a window whose drafts are all accepted emits its bonus from
 /// `p`. One request-seeded stream supplies every draw.
 ///
 /// [`SampledMode::Naive`] (`naive` set): drafts stay the head's argmax; each
-/// verify row the verdict reads is drawn with `sampler::sample_cpu` and the
-/// AR producer's sampler config, from the process-wide AR sampler RNG, and a
-/// draft is accepted iff it equals its row's draw
-/// ([`accept_naive_prefix`]). Every emitted token is one draw, in AR's order.
+/// verify row the verdict reads is drawn with `sampler::sample_cpu`, the
+/// penalty history `H_i` and the AR producer's sampler config, from the
+/// process-wide AR sampler RNG, and a draft is accepted iff it equals its
+/// row's draw ([`accept_naive_prefix`]). Every emitted token is one draw, in
+/// AR's order.
 struct SampledVerify {
     spec: SampleSpec,
     rng: SpecRng,
-    /// The AR producer's sampler in naive mode; `None` in Leviathan mode.
-    naive: Option<SamplerConfig>,
+    /// [`SampledMode::Naive`]: one AR-sampler draw per verify row, argmax
+    /// drafts. `false`: Leviathan.
+    naive: bool,
+    /// The AR producer's sampler ([`naive_target_sampler`]): the target
+    /// policy of both modes, penalties included.
+    policy: SamplerConfig,
+    /// Penalty history: prompt tail, tokens emitted before the window and
+    /// the window's kept drafts; window 0 when no penalty is active.
+    history: PenaltyHistory,
+    /// The request's prompt is in `history`. Set by the request's first
+    /// prefill; a later prefill of the same request is a strict-prefix
+    /// realign whose `prompt_tokens` replay the prompt AND emitted tokens,
+    /// which `begin_window(emitted)` already supplies.
+    prompt_set: bool,
     /// Host copy of one logit row.
     host: Vec<f32>,
     scratch: Vec<(u32, f32)>,
     target: SparseDist,
     /// `q` of each draft step in the current window (Leviathan only).
     drafts: Vec<SparseDist>,
+    /// Point-mass `q`s of drafts that were not drawn from a distribution
+    /// (`accept_leviathan` with `point_mass`), reused across windows.
+    points: Vec<SparseDist>,
 }
 
 impl SampledVerify {
     fn new(cfg: SpecRequestConfig, max_k: usize, mode: SampledMode) -> Self {
-        let naive = (mode == SampledMode::Naive).then(|| {
+        let naive = mode == SampledMode::Naive;
+        if naive {
             // The AR producer's per-request seeding of the shared sampler
             // RNG (`generate` already did it with this seed on the daemon
             // route; repeating it keeps a direct caller replayable).
             hipfire_runtime::llama::reset_cpu_sampler_rng(cfg.rng_seed as u32);
-            naive_target_sampler(&cfg)
-        });
+        }
         Self {
             spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
             rng: SpecRng::new(cfg.rng_seed),
-            drafts: if naive.is_some() {
+            drafts: if naive {
                 Vec::new()
             } else {
                 vec![SparseDist::default(); max_k]
             },
+            points: Vec::new(),
             naive,
+            policy: naive_target_sampler(&cfg),
+            history: PenaltyHistory::new(cfg.penalty_window()),
+            prompt_set: false,
             host: Vec::new(),
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
@@ -670,51 +706,157 @@ impl SampledVerify {
 
     /// Leviathan mode draws the drafts from `q`; naive keeps the argmax.
     fn draws_drafts(&self) -> bool {
-        self.naive.is_none()
+        !self.naive
     }
 
-    /// Naive mode: verify row `row`'s target token, one AR-sampler draw.
-    fn naive_draw(&mut self, gpu: &Gpu, bundle: &Qwen4Bundle, row: usize) -> Result<u32, String> {
-        let sampler = self
-            .naive
-            .as_ref()
-            .ok_or("Qwen4 sampled MTP: naive draw outside naive mode")?;
+    /// Start a window: rebuild the penalty history from the emitted tokens
+    /// (the pending seed included); returns the history length before drafts.
+    fn begin_window(&mut self, emitted: &[u32]) -> usize {
+        self.history.begin_window(emitted)
+    }
+
+    /// Naive mode: physical verify row `row`'s target token, one AR-sampler
+    /// draw penalized by history row `hist_row`.
+    fn naive_draw(
+        &mut self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        row: usize,
+        hist_row: usize,
+    ) -> Result<u32, String> {
+        if !self.naive {
+            return Err("Qwen4 sampled MTP: naive draw outside naive mode".to_string());
+        }
         bundle
             .spec_row_logits(gpu, row, &mut self.host)
             .map_err(|error| error.to_string())?;
-        Ok(sample_cpu(&mut self.host, &[], sampler))
+        Ok(sample_cpu(
+            &mut self.host,
+            self.history.row(hist_row),
+            &self.policy,
+        ))
     }
 
-    /// Draw the draft token from the last MTP prediction's `q`, kept as the
-    /// window's draft distribution `index`.
+    /// Draw the draft token from the last MTP prediction's `q` (penalized by
+    /// history row `hist_row`), kept as the window's draft distribution
+    /// `index`.
     fn sample_draft(
         &mut self,
         gpu: &Gpu,
         bundle: &Qwen4Bundle,
         index: usize,
+        hist_row: usize,
     ) -> Result<u32, String> {
         let q = self
             .drafts
             .get_mut(index)
             .ok_or_else(|| format!("Qwen4 sampled MTP draft index {index} exceeds K"))?;
         bundle
-            .mtp_draft_dist(gpu, self.spec, &mut self.host, &mut self.scratch, q)
+            .mtp_draft_dist(
+                gpu,
+                self.spec,
+                self.history.row(hist_row),
+                &self.policy,
+                &mut self.host,
+                &mut self.scratch,
+                q,
+            )
             .map_err(|error| error.to_string())?;
         Ok(q.sample(self.rng.next_f32()))
     }
 
-    /// Load verify row `row`'s `p` into `self.target`.
-    fn load_target(&mut self, gpu: &Gpu, bundle: &Qwen4Bundle, row: usize) -> Result<(), String> {
+    /// Load physical verify row `row`'s `p` (penalized by history row
+    /// `hist_row`) into `self.target`.
+    fn load_target(
+        &mut self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        row: usize,
+        hist_row: usize,
+    ) -> Result<(), String> {
         bundle
             .spec_row_dist(
                 gpu,
                 row,
                 self.spec,
+                self.history.row(hist_row),
+                &self.policy,
                 &mut self.host,
                 &mut self.scratch,
                 &mut self.target,
             )
             .map_err(|error| error.to_string())
+    }
+
+    /// Leviathan acceptance over a batched verify: `drafts[i]` is verified
+    /// against `p_i` penalized by `H_i` (physical verify row == history
+    /// row). `q_i` is the distribution the draft was drawn from
+    /// (`self.drafts[i]`), or with `point_mass` the point mass on the draft.
+    fn accept_leviathan(
+        &mut self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        drafts: &[u32],
+        point_mass: bool,
+        eos: u32,
+    ) -> Result<GreedyAccept, String> {
+        let SampledVerify {
+            spec,
+            rng,
+            policy,
+            history,
+            host,
+            scratch,
+            target,
+            drafts: draft_dists,
+            points,
+            ..
+        } = self;
+        history.rewind_drafts();
+        for &draft in drafts {
+            history.push_draft(draft);
+        }
+        let qs: &[SparseDist] = if point_mass {
+            if points.len() < drafts.len() {
+                points.resize_with(drafts.len(), SparseDist::default);
+            }
+            for (point, &draft) in points.iter_mut().zip(drafts) {
+                point.set_point_mass(draft);
+            }
+            &points[..drafts.len()]
+        } else {
+            draft_dists
+                .get(..drafts.len())
+                .ok_or_else(|| "Qwen4 sampled MTP: more drafts than K".to_string())?
+        };
+        let history = &*history;
+        let spec = *spec;
+        accept_sampled_prefix(drafts, qs, Some(eos), rng, target, |row, out| {
+            bundle
+                .spec_row_dist(gpu, row, spec, history.row(row), policy, host, scratch, out)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Naive acceptance over a batched verify: row `i`'s draw is penalized
+    /// by `H_i` and recorded in `picks[i]`.
+    fn accept_naive(
+        &mut self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        drafts: &[u32],
+        eos: u32,
+        picks: &mut [u32],
+    ) -> Result<GreedyAccept, String> {
+        self.history.rewind_drafts();
+        for &draft in drafts {
+            self.history.push_draft(draft);
+        }
+        accept_naive_prefix(drafts, Some(eos), |row| {
+            let draw = self.naive_draw(gpu, bundle, row, row)?;
+            picks[row] = draw;
+            Ok(draw)
+        })
     }
 }
 
@@ -915,9 +1057,9 @@ impl Qwen4MtpDrafter {
             match sampled.as_deref_mut() {
                 // Naive: the row's target token is its AR-sampler draw.
                 Some(s) if !s.draws_drafts() => {
-                    pick = s.naive_draw(gpu, Self::bundle(target)?, 0)?
+                    pick = s.naive_draw(gpu, Self::bundle(target)?, 0, row)?
                 }
-                Some(s) => s.load_target(gpu, Self::bundle(target)?, 0)?,
+                Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
                 None => {}
             }
             picks.push(pick);
@@ -965,7 +1107,7 @@ impl Qwen4MtpDrafter {
             };
             let verdict = match sampled.as_deref_mut() {
                 Some(s) if s.draws_drafts() => {
-                    draft = s.sample_draft(gpu, Self::bundle(target)?, 0)?;
+                    draft = s.sample_draft(gpu, Self::bundle(target)?, 0, row)?;
                     verify_sampled_draft(&s.target, &s.drafts[0], draft, &mut s.rng)
                 }
                 _ if draft == pick => DraftVerdict::Accept,
@@ -976,6 +1118,11 @@ impl Qwen4MtpDrafter {
                 DraftVerdict::Accept => {
                     accepted += 1;
                     committed.push(draft);
+                    // The accepted draft is history for the next row (and
+                    // the bonus); a rejected one never enters it.
+                    if let Some(s) = sampled.as_deref_mut() {
+                        s.history.push_draft(draft);
+                    }
                     if draft == eos {
                         break;
                     }
@@ -1228,12 +1375,20 @@ impl MtpDrafter for Qwen4MtpDrafter {
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
         // The seed is the first emitted token: sampled, it is drawn from the
         // last prompt row's `p` (naive: with the AR sampler itself), exactly
-        // as AR draws its first token.
+        // as AR draws its first token. Its penalty history is the full prompt
+        // (cold and cache-hit alike); `fill_tokens` is only the uncached tail.
         match self.sampled.as_mut() {
-            Some(s) if !s.draws_drafts() => s.naive_draw(gpu, Self::bundle(target)?, 0),
             Some(s) => {
-                s.load_target(gpu, Self::bundle(target)?, 0)?;
-                Ok(s.target.sample(s.rng.next_f32()))
+                if !s.prompt_set {
+                    s.history.set_prompt(prompt_tokens);
+                    s.prompt_set = true;
+                }
+                if s.draws_drafts() {
+                    s.load_target(gpu, Self::bundle(target)?, 0, 0)?;
+                    Ok(s.target.sample(s.rng.next_f32()))
+                } else {
+                    s.naive_draw(gpu, Self::bundle(target)?, 0, 0)
+                }
             }
             None => Ok(pick),
         }
@@ -1245,7 +1400,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
-        _emitted: &[u32],
+        emitted: &[u32],
         k: usize,
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
@@ -1258,6 +1413,13 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 self.max_k
             ));
         }
+        // The window's penalty history is rebuilt from the tokens emitted so
+        // far (the pending seed included); rejected drafts of earlier windows
+        // never enter it.
+        if let Some(s) = self.sampled.as_mut() {
+            s.begin_window(emitted);
+        }
+
         self.ensure_resources(gpu, target)?;
         let trace =
             hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
@@ -1342,7 +1504,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
                 if let Some(s) = sampled.as_mut().filter(|s| s.draws_drafts()) {
-                    input = s.sample_draft(gpu, Self::bundle(target)?, index)?;
+                    input = s.sample_draft(gpu, Self::bundle(target)?, index, index)?;
                 }
                 steps += 1;
                 let margin = Self::bundle(target)?.mtp_draft_margin();
@@ -1354,6 +1516,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 }
                 margins.push(margin);
                 drafts.push(input);
+                // Only a kept draft enters the penalty history: a pruned
+                // proposal broke out above.
+                if let Some(s) = sampled.as_mut() {
+                    s.history.push_draft(input);
+                }
                 if prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH {
                     break;
                 }
@@ -1387,34 +1554,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             let acceptance = match sampled.as_mut() {
                 // Naive: each row the verdict reads is replaced by its draw.
-                Some(s) if !s.draws_drafts() => accept_naive_prefix(&drafts, Some(eos), |row| {
-                    let draw = s.naive_draw(gpu, picks, row)?;
-                    target_picks[row] = draw;
-                    Ok(draw)
-                })?,
-                Some(s) => {
-                    let SampledVerify {
-                        spec,
-                        rng,
-                        host,
-                        scratch: candidates,
-                        target: target_dist,
-                        drafts: draft_dists,
-                        ..
-                    } = s;
-                    accept_sampled_prefix(
-                        &drafts,
-                        &draft_dists[..k],
-                        Some(eos),
-                        rng,
-                        target_dist,
-                        |row, out| {
-                            picks
-                                .spec_row_dist(gpu, row, *spec, host, candidates, out)
-                                .map_err(|error| error.to_string())
-                        },
-                    )?
+                Some(s) if !s.draws_drafts() => {
+                    s.accept_naive(gpu, picks, &drafts, eos, &mut target_picks)?
                 }
+                Some(s) => s.accept_leviathan(gpu, picks, &drafts, false, eos)?,
                 None => accept_native_greedy(&drafts, &target_picks, Some(eos))?,
             };
             accepted_drafts = acceptance.accepted;
@@ -1940,5 +2083,80 @@ mod tests {
     fn malformed_target_picks_are_rejected_before_acceptance() {
         assert!(accept_native_greedy(&[2], &[], None).is_err());
         assert!(accept_native_greedy(&[2, 3], &[2, 3], None).is_err());
+    }
+
+    #[test]
+    fn sampled_verify_carries_penalties_into_policy_and_history() {
+        let cfg = SpecRequestConfig {
+            temp: 0.7,
+            repeat_penalty: 1.15,
+            repeat_window: 64,
+            presence_penalty: 0.5,
+            frequency_penalty: 0.25,
+            ..SpecRequestConfig::default()
+        };
+        assert_eq!(cfg.penalty_window(), 64);
+        for mode in [SampledMode::Leviathan, SampledMode::Naive] {
+            let s = SampledVerify::new(cfg, 4, mode);
+            assert_eq!(s.policy.repeat_penalty, 1.15);
+            assert_eq!(s.policy.repeat_window, 64);
+            assert_eq!(s.policy.presence_penalty, 0.5);
+            assert_eq!(s.policy.frequency_penalty, 0.25);
+            assert_eq!(s.history.window(), 64);
+            assert_eq!(s.draws_drafts(), mode == SampledMode::Leviathan);
+        }
+    }
+
+    #[test]
+    fn sampled_verify_neutral_request_has_no_history_window() {
+        let neutral = SpecRequestConfig {
+            temp: 0.7,
+            ..SpecRequestConfig::default()
+        };
+        assert_eq!(neutral.penalty_window(), 0);
+        let s = SampledVerify::new(neutral, 4, SampledMode::Leviathan);
+        assert_eq!(s.history.window(), 0);
+        assert_eq!(s.policy.repeat_penalty, 1.0);
+        assert_eq!(s.drafts.len(), 4);
+        // A window with no penalty never buffers history.
+        let mut s = s;
+        s.history.set_prompt(&[1, 2, 3]);
+        assert_eq!(s.begin_window(&[4, 5]), 0);
+        s.history.push_draft(6);
+        assert!(s.history.row(1).is_empty());
+
+        // A repeat window with no active penalty is also window 0.
+        let inert = SpecRequestConfig {
+            temp: 0.7,
+            repeat_window: 64,
+            ..SpecRequestConfig::default()
+        };
+        assert_eq!(
+            SampledVerify::new(inert, 4, SampledMode::Leviathan)
+                .history
+                .window(),
+            0
+        );
+    }
+
+    #[test]
+    fn sampled_verify_history_rows_follow_prompt_emitted_and_drafts() {
+        let cfg = SpecRequestConfig {
+            temp: 0.7,
+            repeat_penalty: 1.2,
+            repeat_window: 4,
+            ..SpecRequestConfig::default()
+        };
+        let mut s = SampledVerify::new(cfg, 4, SampledMode::Naive);
+        s.history.set_prompt(&[1, 2, 3]);
+        assert_eq!(s.history.row(0), &[1, 2, 3]);
+        // `emitted` already holds the pending seed.
+        s.begin_window(&[7]);
+        assert_eq!(s.history.row(0), &[1, 2, 3, 7]);
+        s.history.push_draft(8);
+        s.history.push_draft(9);
+        assert_eq!(s.history.row(2), &[3, 7, 8, 9]);
+        s.history.rewind_drafts();
+        assert_eq!(s.history.row(0), &[1, 2, 3, 7]);
     }
 }

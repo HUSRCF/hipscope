@@ -37,6 +37,31 @@
 //! The arms inherit `HIPFIRE_MTP_SAMPLED_MODE`, so the test checks whichever
 //! sampled verifier that selects (unset: speculative rejection sampling).
 //!
+//! Repeat / presence / frequency penalties (default neutral) reach BOTH arms,
+//! as a request's would: `HIPFIRE_SAMPLED_MTP_REPEAT_PENALTY` (1.0),
+//! `HIPFIRE_SAMPLED_MTP_REPEAT_WINDOW` (0 = penalties off),
+//! `HIPFIRE_SAMPLED_MTP_PRESENCE_PENALTY` (0.0) and
+//! `HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY` (0.0). The AR arm applies them
+//! over the full rendered prompt plus its generated IDs (host `sample_cpu`);
+//! the MTP arm installs them on its `SpecRequestConfig`. A malformed value
+//! fails the run rather than falling back to neutral.
+//!
+//! `HIPFIRE_SAMPLED_MTP_PROMPT` selects the prompt fixture: `prose` (default,
+//! the prompt above, so old neutral runs reproduce), `repeat` (a
+//! repetition-heavy pattern-continuation prompt) or `window` (a prompt of
+//! roughly 250 tokens whose distinctive head lies beyond a 128-token window,
+//! so W=128 crosses the prompt / generated boundary from the first token;
+//! the arm fails unless the prompt is longer than the window). In
+//! `naive_sampled_mtp_emits_seeded_ar_ids` a non-`prose` fixture is added as
+//! a third prompt.
+//!
+//! Every arm records its full config (sampling, penalties, fixture, trials,
+//! `HIPFIRE_MTP_SAMPLED_MODE`, `HIPFIRE_MTP_INCREMENTAL`) in a sidecar
+//! `<ids file stem>.config.json` and prints it. An existing ids file is
+//! reused only when its recorded config equals the current one; a missing or
+//! different config is a hard error. Use one `HIPFIRE_SAMPLED_MTP_OUT`
+//! directory per config (e.g. `.../neutral`, `.../presence1.5`).
+//!
 //! `naive_sampled_mtp_emits_seeded_ar_ids` checks the stronger property of
 //! `HIPFIRE_MTP_SAMPLED_MODE=naive`: with the same seed, every MTP route
 //! (`batched`, `interleaved`, `adaptive` = route knob unset) emits the AR
@@ -46,6 +71,8 @@
 //! IDs each (cut after EOS). Arms run as fresh processes of
 //! `sampled_mtp_identity_arm`; an arm whose `<arm>.identity.json` already
 //! exists in `HIPFIRE_SAMPLED_MTP_OUT` is reused.
+//!
+//! Both identity arms read the same penalty and prompt-fixture env as above.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -73,6 +100,13 @@ const TOP_P_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOP_P";
 const TOP_K_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOP_K";
 const MIN_P_ENV: &str = "HIPFIRE_SAMPLED_MTP_MIN_P";
 const ARM_TEST: &str = "sampled_mtp_distribution_arm";
+const REPEAT_PENALTY_ENV: &str = "HIPFIRE_SAMPLED_MTP_REPEAT_PENALTY";
+const REPEAT_WINDOW_ENV: &str = "HIPFIRE_SAMPLED_MTP_REPEAT_WINDOW";
+const PRESENCE_PENALTY_ENV: &str = "HIPFIRE_SAMPLED_MTP_PRESENCE_PENALTY";
+const FREQUENCY_PENALTY_ENV: &str = "HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY";
+const PROMPT_ENV: &str = "HIPFIRE_SAMPLED_MTP_PROMPT";
+const INCREMENTAL_ENV: &str = "HIPFIRE_MTP_INCREMENTAL";
+const SAMPLED_MODE_ENV: &str = "HIPFIRE_MTP_SAMPLED_MODE";
 
 /// The serve battery's prose prompt (`scripts/serve_harness.py`).
 const PROSE: &str = "Write a four-sentence story about a lighthouse keeper who finds something unexpected washed up on the rocks.";
@@ -96,6 +130,249 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parses `name` strictly (unset = `default`): a malformed value is an error,
+/// so a typo cannot silently run the neutral config.
+fn strict_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(v) => v.trim().parse().map_err(|e| format!("{name}={v}: {e}")),
+        Err(_) => Ok(default),
+    }
+}
+
+/// The request's repeat / presence / frequency penalty controls.
+#[derive(Clone, Copy)]
+struct Penalties {
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+}
+
+impl Penalties {
+    fn from_env() -> Result<Self, String> {
+        let p = Self {
+            repeat_penalty: strict_env(REPEAT_PENALTY_ENV, 1.0)?,
+            repeat_window: strict_env(REPEAT_WINDOW_ENV, 0)?,
+            presence_penalty: strict_env(PRESENCE_PENALTY_ENV, 0.0)?,
+            frequency_penalty: strict_env(FREQUENCY_PENALTY_ENV, 0.0)?,
+        };
+        for (name, v) in [
+            (REPEAT_PENALTY_ENV, p.repeat_penalty),
+            (PRESENCE_PENALTY_ENV, p.presence_penalty),
+            (FREQUENCY_PENALTY_ENV, p.frequency_penalty),
+        ] {
+            if !v.is_finite() {
+                return Err(format!("{name}={v} is not finite"));
+            }
+        }
+        Ok(p)
+    }
+}
+
+/// The prompt a run decodes from (`HIPFIRE_SAMPLED_MTP_PROMPT`).
+#[derive(Clone, Copy, PartialEq)]
+enum Fixture {
+    Prose,
+    Repeat,
+    Window,
+}
+
+impl Fixture {
+    fn from_env() -> Result<Self, String> {
+        match std::env::var(PROMPT_ENV).as_deref() {
+            Err(_) | Ok("prose") => Ok(Self::Prose),
+            Ok("repeat") => Ok(Self::Repeat),
+            Ok("window") => Ok(Self::Window),
+            Ok(other) => Err(format!(
+                "{PROMPT_ENV}={other}: expected prose, repeat or window"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Prose => "prose",
+            Self::Repeat => "repeat",
+            Self::Window => "window",
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Self::Prose => PROSE.to_string(),
+            Self::Repeat => format!(
+                "Continue this pattern for as long as you can, writing only the continuation: {}",
+                "red green blue red green blue red green blue ".repeat(24)
+            ),
+            // Head (its distinctive names occur only here), filler, tail: with
+            // a 128-token window the head has left the window before the first
+            // generated token, and the filler drains out as tokens are added.
+            Self::Window => format!(
+                "Harbor log, early shift: the copper ferry Marigold, the gray tug Osprey, \
+                 and the salt barge Tern waited by the cold quay while rain fell on the cranes. {}\
+                 Now forget the harbor log. Write a four-sentence story about a lighthouse \
+                 keeper who finds something unexpected washed up on the rocks.",
+                "Tide table, ordinary entry: water rose slowly, then fell again, as it always \
+                 does along this quiet coast. "
+                    .repeat(8)
+            ),
+        }
+    }
+
+    /// The window fixture must really cross the penalty window.
+    fn check_prompt(self, prompt_tokens: usize, pen: &Penalties) -> Result<(), String> {
+        if self == Self::Window && prompt_tokens <= pen.repeat_window.max(128) + TOKENS {
+            return Err(format!(
+                "window fixture has only {prompt_tokens} prompt tokens; it must exceed the {} \
+                 token penalty window",
+                pen.repeat_window.max(128)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Penalties and fixture as recorded JSON fields.
+fn config_base(kind: &str, arm: &str, pen: &Penalties, fixture: Fixture) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "arm": arm,
+        "fixture": fixture.name(),
+        "repeat_penalty": pen.repeat_penalty,
+        "repeat_window": pen.repeat_window,
+        "presence_penalty": pen.presence_penalty,
+        "frequency_penalty": pen.frequency_penalty,
+        "mtp_k": MTP_K,
+    })
+}
+
+/// `HIPFIRE_MTP_INCREMENTAL` a distribution / identity arm runs under.
+fn arm_incremental(arm: &str) -> Option<&'static str> {
+    match arm {
+        "batched" => Some("0"),
+        "interleaved" => Some("1"),
+        _ => None,
+    }
+}
+
+/// What a child arm process actually runs under.
+fn child_incremental(arm: &str) -> Option<String> {
+    (arm != "ar")
+        .then(|| std::env::var(INCREMENTAL_ENV).ok())
+        .flatten()
+}
+
+fn dist_config(
+    arm: &str,
+    incremental: Option<String>,
+    pen: &Penalties,
+    fixture: Fixture,
+    sampling: (f32, f32, Option<u32>, f32),
+    trials: usize,
+) -> serde_json::Value {
+    let mut config = config_base("distribution", arm, pen, fixture);
+    config["temp"] = serde_json::json!(sampling.0);
+    config["top_p"] = serde_json::json!(sampling.1);
+    config["top_k"] = serde_json::json!(sampling.2);
+    config["min_p"] = serde_json::json!(sampling.3);
+    config["trials"] = serde_json::json!(trials);
+    config["tokens"] = serde_json::json!(TOKENS);
+    config["incremental"] = serde_json::json!(incremental);
+    config["sampled_mode"] = serde_json::json!(std::env::var(SAMPLED_MODE_ENV).ok());
+    config
+}
+
+fn id_config(
+    arm: &str,
+    incremental: Option<String>,
+    mode: Option<String>,
+    pen: &Penalties,
+    fixture: Fixture,
+) -> serde_json::Value {
+    let mut config = config_base("identity", arm, pen, fixture);
+    config["tokens"] = serde_json::json!(ID_TOKENS);
+    config["seeds"] = serde_json::json!(ID_SEEDS);
+    config["incremental"] = serde_json::json!(incremental);
+    config["sampled_mode"] = serde_json::json!(mode);
+    config
+}
+
+/// An existing `ids_path` may only be reused (or overwritten) under the config
+/// recorded next to it.
+fn check_config(ids_path: &Path, expected: &serde_json::Value) -> Result<(), String> {
+    let config_path = ids_path.with_extension("config.json");
+    let recorded: serde_json::Value = match fs::read(&config_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{}: {e}", config_path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{} exists but {} does not: its config is unknown; remove it or use another {OUT_ENV}",
+                ids_path.display(),
+                config_path.display()
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", config_path.display())),
+    };
+    if &recorded != expected {
+        return Err(format!(
+            "{} was produced under a different config; remove it or use another {OUT_ENV}\n  recorded: {recorded}\n  current:  {expected}",
+            ids_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_config(ids_path: &Path, config: &serde_json::Value) -> Result<(), String> {
+    let config_path = ids_path.with_extension("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", config_path.display()))
+}
+
+/// Sampling / trial / penalty / fixture settings of a distribution run.
+struct DistSettings {
+    trials: usize,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: f32,
+    pen: Penalties,
+    fixture: Fixture,
+}
+
+impl DistSettings {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            trials: env_or(TRIALS_ENV, 2000),
+            temp: env_or(TEMP_ENV, 1.0),
+            top_p: env_or(TOP_P_ENV, 0.95),
+            top_k: std::env::var(TOP_K_ENV)
+                .ok()
+                .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
+                .transpose()?,
+            min_p: env_or(MIN_P_ENV, 0.0),
+            pen: Penalties::from_env()?,
+            fixture: Fixture::from_env()?,
+        })
+    }
+
+    fn config(&self, arm: &str, incremental: Option<String>) -> serde_json::Value {
+        dist_config(
+            arm,
+            incremental,
+            &self.pen,
+            self.fixture,
+            (self.temp, self.top_p, self.top_k, self.min_p),
+            self.trials,
+        )
+    }
 }
 
 fn model_path() -> PathBuf {
@@ -231,9 +508,12 @@ fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let dir = out_dir();
     let exe = std::env::current_exe().expect("test binary path");
     let mut samples: Vec<Vec<Vec<u32>>> = Vec::new();
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
     for arm in ARMS {
         let ids_path = dir.join(format!("{arm}.ids.json"));
         if ids_path.exists() {
+            let expected = settings.config(arm, arm_incremental(arm).map(str::to_string));
+            check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
             eprintln!("reusing {}", ids_path.display());
             samples
                 .push(serde_json::from_slice(&fs::read(&ids_path).unwrap()).expect("arm ids json"));
@@ -278,7 +558,7 @@ fn sampled_mtp_matches_ar_distribution_on_flash_next() {
             serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
         samples.push(arm_samples);
     }
-    let mut report = String::new();
+    let mut report = format!("config (ar arm): {}\n", settings.config("ar", None));
     let mut failures = Vec::new();
     let ar = &samples[0];
     for (arm, mtp) in ARMS.iter().zip(&samples).skip(1) {
@@ -500,14 +780,20 @@ impl Loaded {
     }
 }
 
-fn ar_sampler(temp: f32, top_p: f32, top_k: Option<u32>, min_p: f32) -> SamplerConfig {
+fn ar_sampler(
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: f32,
+    pen: &Penalties,
+) -> SamplerConfig {
     SamplerConfig {
         temperature: temp,
         top_p,
-        repeat_penalty: 1.0,
-        repeat_window: 0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
+        repeat_penalty: pen.repeat_penalty,
+        repeat_window: pen.repeat_window,
+        presence_penalty: pen.presence_penalty,
+        frequency_penalty: pen.frequency_penalty,
         blocked_tokens: Vec::new(),
         top_k,
         min_p: (min_p > 0.0).then_some(min_p),
@@ -520,6 +806,7 @@ fn spec_request(
     top_k: Option<u32>,
     min_p: f32,
     seed: u64,
+    pen: &Penalties,
 ) -> SpecRequestConfig {
     SpecRequestConfig {
         temp,
@@ -529,6 +816,10 @@ fn spec_request(
         cactus_delta: 0.0,
         rng_seed: seed,
         allow_ngram_modifier: false,
+        repeat_penalty: pen.repeat_penalty,
+        repeat_window: pen.repeat_window,
+        presence_penalty: pen.presence_penalty,
+        frequency_penalty: pen.frequency_penalty,
         ..SpecRequestConfig::default()
     }
 }
@@ -546,23 +837,43 @@ fn new_drafter(loaded: &mut Loaded) -> Result<Qwen4MtpDrafter, String> {
 }
 
 fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
-    let trials: usize = env_or(TRIALS_ENV, 2000);
-    let temp: f32 = env_or(TEMP_ENV, 1.0);
-    let top_p: f32 = env_or(TOP_P_ENV, 0.95);
-    let top_k: Option<u32> = std::env::var(TOP_K_ENV)
-        .ok()
-        .map(|v| v.parse().map_err(|e| format!("{TOP_K_ENV}={v}: {e}")))
-        .transpose()?;
-    let min_p: f32 = env_or(MIN_P_ENV, 0.0);
+    let DistSettings {
+        trials,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        fixture,
+    } = DistSettings::from_env()?;
+    let settings_config = dist_config(
+        arm,
+        child_incremental(arm),
+        &pen,
+        fixture,
+        (temp, top_p, top_k, min_p),
+        trials,
+    );
+    let ids_path = dir.join(format!("{arm}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &settings_config)?;
+    }
     let mut loaded = load(model)?;
-    let prompt = loaded.render(PROSE)?;
+    let prompt = loaded.render(&fixture.text())?;
+    fixture.check_prompt(prompt.len(), &pen)?;
     let eos = loaded.bundle.config.eos_token_id;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} state={}",
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} repeat_penalty={} repeat_window={} presence_penalty={} frequency_penalty={} fixture={} state={}",
         loaded.gpu.arch,
         prompt.len(),
+        pen.repeat_penalty,
+        pen.repeat_window,
+        pen.presence_penalty,
+        pen.frequency_penalty,
+        fixture.name(),
         loaded.state
     );
+    println!("ARM {arm} config {settings_config}");
     let started = std::time::Instant::now();
     let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
     if arm == "ar" {
@@ -570,7 +881,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             .gpu
             .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
             .map_err(|e| e.to_string())?;
-        let cfg = ar_sampler(temp, top_p, top_k, min_p);
+        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
         for trial in 0..trials {
             let seed = trial_seed(0xA11, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
@@ -579,7 +890,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     } else {
         let mut drafter = new_drafter(&mut loaded)?;
         let mut run = |loaded: &mut Loaded, seed: u64| {
-            let cfg = spec_request(temp, top_p, top_k, min_p, seed);
+            let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             loaded
                 .mtp_ids(&mut drafter, &prompt, cfg, TOKENS)
                 .map(|(ids, _, _)| ids)
@@ -613,10 +924,11 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         loaded.tokenizer.decode(&samples[0])
     );
     fs::write(
-        dir.join(format!("{arm}.ids.json")),
+        &ids_path,
         serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &settings_config)?;
     loaded
         .bundle
         .free_gpu(&mut loaded.gpu)
@@ -680,9 +992,21 @@ fn naive_sampled_mtp_emits_seeded_ar_ids() {
     let dir = out_dir();
     let exe = std::env::current_exe().expect("test binary path");
     let mut arms: Vec<Vec<IdCase>> = Vec::new();
+    let pen = Penalties::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let fixture = Fixture::from_env().unwrap_or_else(|e| panic!("{e}"));
     for arm in ID_ARMS {
         let ids_path = dir.join(format!("{arm}.identity.json"));
-        if !ids_path.exists() {
+        let expected = id_config(
+            arm,
+            arm_incremental(arm).map(str::to_string),
+            Some("naive".to_string()),
+            &pen,
+            fixture,
+        );
+        if ids_path.exists() {
+            check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
+            eprintln!("reusing {}", ids_path.display());
+        } else {
             let mut child = Command::new(&exe);
             child
                 .args([
@@ -778,6 +1102,27 @@ fn sampled_mtp_identity_arm() {
 }
 
 fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let pen = Penalties::from_env()?;
+    let fixture = Fixture::from_env()?;
+    let config = id_config(
+        arm,
+        child_incremental(arm),
+        std::env::var(SAMPLED_MODE_ENV).ok(),
+        &pen,
+        fixture,
+    );
+    let ids_path = dir.join(format!("{arm}.identity.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+    }
+    println!("ARM {arm} config {config}");
+    let mut prompts: Vec<(String, String)> = ID_PROMPTS
+        .iter()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    if fixture != Fixture::Prose {
+        prompts.push((fixture.name().to_string(), fixture.text()));
+    }
     let mut loaded = load(model)?;
     let started = std::time::Instant::now();
     let logits = loaded
@@ -790,20 +1135,23 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         Some(new_drafter(&mut loaded)?)
     };
     let mut out = Vec::new();
-    for (prompt_name, text) in ID_PROMPTS {
+    for (prompt_name, text) in &prompts {
         let prompt = loaded.render(text)?;
+        if *prompt_name == fixture.name() {
+            fixture.check_prompt(prompt.len(), &pen)?;
+        }
         for (sampling, temp, top_p, top_k, min_p) in ID_SAMPLINGS {
             for n in 0..ID_SEEDS {
                 let seed = trial_seed(0x1D, n) as u32;
                 let case = format!("{prompt_name} {sampling} seed#{n}");
                 let (ids, drafted, accepted) = match drafter.as_mut() {
                     None => {
-                        let cfg = ar_sampler(temp, top_p, top_k, min_p);
+                        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
                         let ids = loaded.ar_ids(&logits, &prompt, &cfg, seed, ID_TOKENS)?;
                         (ids, 0, 0)
                     }
                     Some(drafter) => {
-                        let cfg = spec_request(temp, top_p, top_k, min_p, seed as u64);
+                        let cfg = spec_request(temp, top_p, top_k, min_p, seed as u64, &pen);
                         loaded.mtp_ids(drafter, &prompt, cfg, ID_TOKENS)?
                     }
                 };
@@ -828,11 +1176,12 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         loaded.state
     );
     fs::write(
-        dir.join(format!("{arm}.identity.json")),
+        &ids_path,
         serde_json::to_vec(&out.iter().map(IdCase::to_json).collect::<Vec<_>>())
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
     if let Some(drafter) = drafter {
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }

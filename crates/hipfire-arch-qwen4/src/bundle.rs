@@ -25,6 +25,9 @@ use crate::weights::{
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
+use hipfire_runtime::sampler::{
+    apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, SamplerConfig,
+};
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
@@ -813,28 +816,38 @@ impl Qwen4Bundle {
     }
 
     /// Row `row` of the last speculative forward's logits as `spec`'s
-    /// truncated distribution. `host` and `scratch` are reused buffers.
+    /// truncated distribution, after `policy` (repeat/presence/frequency
+    /// penalties and blocked tokens) is applied over `history` — the row's AR
+    /// history — to the whole downloaded row, before the pool gather. `host`
+    /// and `scratch` are reused buffers.
     pub(crate) fn spec_row_dist(
         &self,
         gpu: &Gpu,
         row: usize,
         spec: SampleSpec,
+        history: &[u32],
+        policy: &SamplerConfig,
         host: &mut Vec<f32>,
         scratch: &mut Vec<(u32, f32)>,
         out: &mut SparseDist,
     ) -> Result<(), BundleError> {
         self.spec_row_logits(gpu, row, host)?;
+        apply_logit_policy_cpu(host, history, policy);
         out.build_from_logits(host, spec, scratch)
             .map_err(BundleError::Forward)
     }
 
     /// The last MTP prediction's draft distribution under `spec`: its 8
     /// re-scored candidates' exact logits, or the whole draft logit row when
-    /// the draft head does not re-score.
+    /// the draft head does not re-score. `policy` is applied over `history`
+    /// (the AR history of the row being drafted) to those exact logits, by
+    /// token id, before truncation.
     pub(crate) fn mtp_draft_dist(
         &self,
         gpu: &Gpu,
         spec: SampleSpec,
+        history: &[u32],
+        policy: &SamplerConfig,
         host: &mut Vec<f32>,
         scratch: &mut Vec<(u32, f32)>,
         out: &mut SparseDist,
@@ -856,11 +869,25 @@ impl Qwen4Bundle {
                         .copied()
                         .filter(|&(token, _)| token < vocab),
                 );
+                // `rescored_candidates` is a fixed `[_; 8]`, so the filtered
+                // count is at most 8.
+                let mut ids = [0u32; 8];
+                let mut values = [0f32; 8];
+                let n = scratch.len();
+                for (slot, &(token, logit)) in scratch.iter().enumerate() {
+                    ids[slot] = token;
+                    values[slot] = logit;
+                }
+                apply_logit_policy_candidates_cpu(&ids[..n], &mut values[..n], history, policy);
+                for (entry, &logit) in scratch.iter_mut().zip(&values[..n]) {
+                    entry.1 = logit;
+                }
                 out.build_from_candidates(scratch, spec)
             }
             None => {
                 gpu.download_f32_into(draft.logits(), host)
                     .map_err(BundleError::Hip)?;
+                apply_logit_policy_cpu(host, history, policy);
                 out.build_from_logits(host, spec, scratch)
             }
         }

@@ -18,7 +18,7 @@ use crate::mtp_spec::{
     prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
     spec_step_mtp_compressed_serial_with_k,
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpPromptRoute, MtpSamplingConfig,
-    MtpSpecResult, MtpSpecState,
+    MtpSpecResult, MtpSpecState, PENALTY_REPEAT_CAP,
 };
 use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
@@ -26,6 +26,7 @@ use hipfire_runtime::spec::{
     terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar,
     SpecRequestConfig, SpecTarget, Speculator,
 };
+use hipfire_runtime::spec_sampling::PenaltyHistory;
 use rdna_compute::Gpu;
 
 /// `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` with production defaults.
@@ -65,6 +66,13 @@ pub struct Qwen35MtpDrafter {
     max_n: usize,
     ctx_capacity: usize,
     request: SpecRequestConfig,
+    /// Capacity (tokens) of the AR producer's `repeat_buf` for the loaded
+    /// model: single-GPU = `ModelSlot.scratch.repeat_buf`, dense TP = rank-0
+    /// `Qwen35DenseTpTarget.scratches[0].repeat_buf` (the scratch the TP AR
+    /// sampler uses). It bounds the penalty window exactly as AR's
+    /// `repeat_buf_cap = (repeat_buf bytes / 4).min(request repeat_window)`.
+    /// Starts at [`PENALTY_REPEAT_CAP`] until a slot/mesh is first seen.
+    ar_repeat_cap: usize,
     ngram_pool: Option<NgramModPool>,
     ngram_active: bool,
     ngram_context: Vec<u32>,
@@ -112,6 +120,7 @@ impl Qwen35MtpDrafter {
             max_n: max_n.clamp(1, 8),
             ctx_capacity,
             request: SpecRequestConfig::default(),
+            ar_repeat_cap: PENALTY_REPEAT_CAP,
             ngram_pool: None,
             ngram_active: false,
             ngram_context: Vec::new(),
@@ -164,11 +173,19 @@ impl Qwen35MtpDrafter {
             tp: runtime,
             max_n,
             request,
+            ar_repeat_cap,
             ..
         } = self;
         if runtime.is_none() {
+            // Dense TP has no single-GPU AR scratch; rank 0's scratch is the
+            // one the TP AR sampler penalizes through.
+            *ar_repeat_cap = tp
+                .scratches
+                .first()
+                .map(|s| s.repeat_buf.buf.size() / 4)
+                .unwrap_or(PENALTY_REPEAT_CAP);
             let mut rt = crate::mtp_dense_tp::MtpTpRuntime::new(tp, head, *max_n, MtpKvMode::Q8)?;
-            Self::apply_request(&mut rt.state, *request);
+            Self::apply_request(&mut rt.state, *request, *ar_repeat_cap);
             *runtime = Some(rt);
         }
         Ok((head, tp, runtime.as_mut().expect("built above")))
@@ -182,23 +199,61 @@ impl Qwen35MtpDrafter {
             .ok_or_else(|| "Qwen35MtpDrafter: target is not a Qwen3.5 ModelSlot".to_string())
     }
 
+    /// Qwen3.x AR penalty window for `cfg`: the GPU sampler's history is the
+    /// generated tokens only, its kernel gate is `repeat_penalty > 1.0` /
+    /// `presence > 0` / `frequency > 0`, and the window is
+    /// `min(AR repeat_buf capacity, request repeat_window.max(1))`. `0` ⇒ no
+    /// penalty (neutral request: no history work, no GPU prepass).
+    fn penalty_window(cfg: &SpecRequestConfig, ar_cap: usize) -> usize {
+        if cfg.repeat_penalty > 1.0 || cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0 {
+            ar_cap
+                .min(cfg.repeat_window.max(1))
+                .min(PENALTY_REPEAT_CAP)
+        } else {
+            0
+        }
+    }
+
+    /// Re-bind only the penalty controls + a fresh [`PenaltyHistory`] (used
+    /// when the AR capacity becomes known after the request was installed;
+    /// leaves the RNG and the rest of the sampling untouched).
+    fn install_penalty(state: &mut MtpSpecState, cfg: &SpecRequestConfig, ar_cap: usize) {
+        let w = Self::penalty_window(cfg, ar_cap);
+        state.sampling.repeat_penalty = cfg.repeat_penalty;
+        state.sampling.repeat_window = w;
+        state.sampling.presence_penalty = cfg.presence_penalty;
+        state.sampling.frequency_penalty = cfg.frequency_penalty;
+        state.penalty = PenaltyHistory::new(w);
+    }
+
     /// Install sampling without changing the independent MTP draft-confidence
     /// cutoff initialized by `MtpSpecState` from its arch/env default.
-    fn apply_request(state: &mut MtpSpecState, cfg: SpecRequestConfig) {
+    ///
+    /// Penalties follow the Qwen3.x AR window rule ([`Self::penalty_window`]).
+    /// The fresh [`PenaltyHistory`] is generation-only (`set_prompt` is never
+    /// called): each window rebuilds it from the loop's `emitted`, so the
+    /// `emitted` repeat-penalty contract holds and the prompt never enters it.
+    fn apply_request(state: &mut MtpSpecState, cfg: SpecRequestConfig, ar_cap: usize) {
         let top_p = if cfg.top_p > 0.0 {
             cfg.top_p.min(1.0)
         } else {
             1.0
         };
+        let w = Self::penalty_window(&cfg, ar_cap);
         state.set_sampling(
             MtpSamplingConfig {
                 temp: cfg.temp,
                 top_k: cfg.top_k_cut(),
                 top_p,
                 min_p: cfg.min_p,
+                repeat_penalty: cfg.repeat_penalty,
+                repeat_window: w,
+                presence_penalty: cfg.presence_penalty,
+                frequency_penalty: cfg.frequency_penalty,
             },
             cfg.rng_seed,
         );
+        state.penalty = PenaltyHistory::new(w);
     }
 
     fn reset_ngram_request(&mut self) {
@@ -245,6 +300,15 @@ impl Qwen35MtpDrafter {
     /// smaller allocation while allowing a later eligible request to arm
     /// n-gram-mod without reallocating/destroying warm prefix state.
     fn ensure_state(&mut self, gpu: &mut Gpu, slot: &ModelSlot) -> Result<(), String> {
+        // AR's penalty window is bounded by this slot's `repeat_buf`; refresh
+        // it and re-bind the penalty only if the capacity changed.
+        let slot_cap = slot.scratch.repeat_buf.buf.size() / 4;
+        if slot_cap != self.ar_repeat_cap {
+            self.ar_repeat_cap = slot_cap;
+            if let Some(st) = self.state.as_mut() {
+                Self::install_penalty(st, &self.request, slot_cap);
+            }
+        }
         if self.state.is_none() {
             let verify_capacity = if hipfire_config::mtp_ngram_enabled() {
                 ngram_mod_env_config()
@@ -276,7 +340,7 @@ impl Qwen35MtpDrafter {
                     return Err(error);
                 }
             }
-            Self::apply_request(&mut st, self.request);
+            Self::apply_request(&mut st, self.request, self.ar_repeat_cap);
             self.state = Some(st);
         }
         Ok(())
@@ -336,6 +400,8 @@ impl Qwen35MtpDrafter {
                 })
                 .0
         } else {
+            // The first token is drawn unpenalized: AR's first token has an
+            // empty generation history (the prompt is never penalized).
             sample_from_logits(&logits, &state.sampling, &mut state.rng).0
         };
         Ok(first_token)
@@ -356,10 +422,14 @@ impl Qwen35MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        emitted: &[u32],
         eos: u32,
         k: usize,
     ) -> Result<MtpSpecResult, String> {
         let (head, tp, rt) = self.tp_runtime(target, "step")?;
+        // `rt.state` is the very state `spec_step_mtp_dense_tp` verifies
+        // with, so row i sees suffix_W(emitted ‖ drafts[..i]).
+        rt.state.penalty.begin_window(emitted);
         crate::mtp_dense_tp::spec_step_mtp_dense_tp(tp, head, rt, position, seed, eos, k)
     }
 
@@ -466,6 +536,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 })
                 .0
         } else {
+            // First token is unpenalized: AR's first token has empty history.
             sample_from_logits(&logits, &state.sampling, &mut state.rng).0
         };
 
@@ -512,7 +583,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         if Self::tp_target(target).is_some() {
             // The mesh has no takeover verify, so an n-gram-mod hit is not
             // used there: the window drafts natively.
-            let r = self.tp_step(target, position, seed, eos, native_k)?;
+            let r = self.tp_step(target, position, seed, emitted, eos, native_k)?;
             self.last_window = Some((position, seed));
             self.stats.mtp_windows += 1;
             return Ok(MtpWindow {
@@ -527,6 +598,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 .state
                 .as_mut()
                 .ok_or("Qwen35MtpDrafter: mtp_step before mtp_prefill")?;
+            // Row i of the verify sees suffix_W(emitted ‖ drafts[..i]); `emitted`
+            // already holds the pending seed. Rebuilt every window (also for
+            // the n-gram takeover), so rejected/pruned drafts never leak.
+            state.penalty.begin_window(emitted);
             if used_ngram {
                 // The takeover fills the head KV for every row it commits, so
                 // native MTP stays live for the next pool miss.
@@ -791,10 +866,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
         if let Some(state) = self.state.as_mut() {
-            Self::apply_request(state, cfg);
+            Self::apply_request(state, cfg, self.ar_repeat_cap);
         }
         if let Some(rt) = self.tp.as_mut() {
-            Self::apply_request(&mut rt.state, cfg);
+            Self::apply_request(&mut rt.state, cfg, self.ar_repeat_cap);
         }
         self.reset_ngram_request();
         self.ngram_active = false;
