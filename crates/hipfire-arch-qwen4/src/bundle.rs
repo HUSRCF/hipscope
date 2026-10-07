@@ -2706,6 +2706,32 @@ impl Qwen4Bundle {
             .map_or(f32::INFINITY, |mtp| mtp.draft.margin())
     }
 
+    /// The draft head's request-local policy (full-vocabulary hold, last
+    /// margin). Not part of the MTP state snapshot: a caller that drafts and
+    /// then restores the head must save and restore it separately.
+    pub(crate) fn mtp_draft_request_state(
+        &self,
+    ) -> Result<hipfire_dispatch::pipeline::DraftHeadRequestState, BundleError> {
+        self.mtp
+            .as_ref()
+            .map(|mtp| mtp.draft.request_state())
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })
+    }
+
+    pub(crate) fn set_mtp_draft_request_state(
+        &mut self,
+        state: hipfire_dispatch::pipeline::DraftHeadRequestState,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .map(|mtp| mtp.draft.set_request_state(state))
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })
+    }
+
     /// Host copy of row `row` of the last speculative forward's logits into
     /// the reused buffer `host`.
     pub(crate) fn spec_row_logits(

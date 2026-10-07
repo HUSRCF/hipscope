@@ -34,6 +34,19 @@ use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
 
+/// `HIPFIRE_MTP_PHASE_TIMING=1`: per-window phase lines on stderr.
+fn phase_timing_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1")
+}
+
+/// Wall microseconds since `start`, after the GPU drained: the window's GPU
+/// tail is included. Timing mode only (it synchronizes the device); a sync
+/// failure only loses the tail, never the window.
+fn synced_wall_us(gpu: &Gpu, start: Instant) -> f64 {
+    let _ = gpu.hip.device_synchronize();
+    start.elapsed().as_secs_f64() * 1e6
+}
+
 /// Device-side phase timing for one native MTP window.
 ///
 /// Enabled by `HIPFIRE_MTP_PHASE_TIMING=1`.  Each phase is one `hipEvent` pair
@@ -48,10 +61,7 @@ struct MtpPhaseTimers {
 impl MtpPhaseTimers {
     fn new() -> Self {
         Self {
-            spans: SpanProfiler::new(
-                hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING")
-                    .is_ok_and(|value| value == "1"),
-            ),
+            spans: SpanProfiler::new(phase_timing_enabled()),
             open: None,
         }
     }
@@ -86,6 +96,13 @@ impl MtpPhaseTimers {
             .collect::<Vec<_>>()
             .join(",");
         eprintln!("{tag} {{\"event\":\"mtp_phase\",{fields},\"phases_us\":{{{phases}}}}}");
+    }
+
+    /// Drop the recorded spans without printing (a native window that handed
+    /// over to a takeover): the events are resolved so none stays live.
+    fn discard(mut self, gpu: &Gpu) {
+        self.spans.end(&gpu.hip, None, self.open.take());
+        let _ = self.spans.resolve(&gpu.hip, None);
     }
 }
 
@@ -549,6 +566,37 @@ enum DraftPairing {
     AlignedTarget,
 }
 
+/// How a native batched window's drafting closure ended.
+enum NativeOutcome {
+    /// The window ran to its verdict.
+    Window(MtpWindow),
+    /// The head's first draft equals the pool's first candidate: the window
+    /// is abandoned before any draft is kept or verified, and the n-gram
+    /// takeover runs instead.
+    Takeover,
+}
+
+/// Clock and cost of the native work a takeover was confirmed through (the
+/// batched switch or the interleaved probe), for the takeover's phase line.
+#[derive(Clone, Copy)]
+struct TakeoverProbe {
+    /// The native window's start: the takeover's `window_us` includes the probe.
+    start: Instant,
+    /// Synced wall microseconds from `start` to the switch (timing mode only).
+    probe_us: f64,
+}
+
+fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
+    TakeoverProbe {
+        start,
+        probe_us: if phase_timing_enabled() {
+            synced_wall_us(gpu, start)
+        } else {
+            0.0
+        },
+    }
+}
+
 /// Cost of a batched window that drafts K tokens (index K: K draft steps,
 /// a (K+1)-row verify, rollback), in interleaved-route emitted tokens (one
 /// single-row forward plus one draft step). gfx1151, Qwen3.8-Flash-Next,
@@ -560,6 +608,12 @@ const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
 const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
+/// Per-window relaxation of a depth the window did not compare toward
+/// `MTP_AGREEMENT_PRIOR`. An unobserved depth must drift back to the prior so
+/// the chooser re-explores it: a ratio frozen below the depth's threshold
+/// (one rejected depth-3 draft) keeps that depth out of every later window,
+/// so it is never observed again.
+const MTP_AGREEMENT_RELAX: f32 = 0.95;
 /// Emitted tokens a request's first takeover is assumed to yield (one
 /// pseudo-window): the offline 5/3/3 TC/Hermes accepted-prefix-plus-bonus on
 /// a pool hit was 2.9-3.2 (`release-0.4.1/mtp-ngram-plan.md` §1).
@@ -925,10 +979,13 @@ pub struct Qwen4MtpDrafter {
     /// Request-local n-gram proposal owner, allocated on the first armed
     /// request and reused (cleared and reseeded) by every later one.
     ngram: Option<MtpNgramContext>,
-    /// This request tries an n-gram takeover before each native window
-    /// (`SpecRequestConfig::allow_ngram_modifier`).
+    /// This request may take a window from the n-gram pool
+    /// (`SpecRequestConfig::allow_ngram_modifier`). A pool hit takes the
+    /// window only if the head's own first draft equals the hit's first
+    /// candidate and the yield gate passes; otherwise the window is native.
     ngram_active: bool,
-    /// The current window's candidates, copied out of the pool (reused).
+    /// The current window's pool candidates, copied out of the pool (reused).
+    /// Valid only when `ngram_hit` returned true for the window.
     ngram_candidates: Vec<u32>,
     /// Decayed (emitted tokens, windows) of this request's takeover windows:
     /// the n-gram source's own yield, kept apart from the native per-depth
@@ -1095,6 +1152,7 @@ impl Qwen4MtpDrafter {
     ) -> Result<MtpWindow, String> {
         let pairing = Self::draft_pairing();
         let mut timers = MtpPhaseTimers::new();
+        let window_start = Instant::now();
         let mut committed: Vec<u32> = Vec::with_capacity(k + 1);
         let mut drafts: Vec<u32> = Vec::with_capacity(k);
         let mut picks: Vec<u32> = Vec::with_capacity(k + 1);
@@ -1234,8 +1292,11 @@ impl Qwen4MtpDrafter {
             );
         }
         if timers.enabled() {
+            let window_us = synced_wall_us(gpu, window_start);
             let fields = format!(
-                "\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"pairing\":\"{}\",\"t_end\":{}",
+                "\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"pairing\":\"{}\",\"t_end\":{}",
+                drafts.len(),
+                committed.len(),
                 match pairing {
                     DraftPairing::HeadState => "head-state",
                     DraftPairing::AlignedHead => "aligned-head",
@@ -1254,15 +1315,24 @@ impl Qwen4MtpDrafter {
 
     /// Only the drafts compared before the first rejection count, so each
     /// depth measures the agreement conditional on its prefix being accepted
-    /// (the same quantity on both routes).
+    /// (the same quantity on both routes). Compared depths decay and take the
+    /// observation; depths the window did not compare relax toward
+    /// `MTP_AGREEMENT_PRIOR` (`MTP_AGREEMENT_RELAX`) instead of decaying, so a
+    /// depth rejected once is re-explored rather than frozen below its
+    /// threshold.
     fn observe_agreement(&mut self, window: &MtpWindow) {
         let compared = (window.accepted + 1).min(window.drafts_generated);
+        let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
         for (depth, (accepted, total)) in self.agreement.iter_mut().enumerate() {
-            *accepted *= MTP_AGREEMENT_DECAY;
-            *total *= MTP_AGREEMENT_DECAY;
             if depth < compared {
+                *accepted *= MTP_AGREEMENT_DECAY;
+                *total *= MTP_AGREEMENT_DECAY;
                 *total += 1.0;
                 *accepted += f32::from(u8::from(depth < window.accepted));
+            } else {
+                *accepted = *accepted * MTP_AGREEMENT_RELAX
+                    + prior_accepted * (1.0 - MTP_AGREEMENT_RELAX);
+                *total = *total * MTP_AGREEMENT_RELAX + prior_total * (1.0 - MTP_AGREEMENT_RELAX);
             }
         }
     }
@@ -1350,6 +1420,9 @@ impl Qwen4MtpDrafter {
     /// batched append where it runs. The pending hidden becomes the last
     /// consumed row's, so the next native window drafts as it would after a
     /// prompt fill ending there. A rejected tail never reaches either owner.
+    ///
+    /// This takes the window unconditionally; `mtp_step` calls it (through
+    /// `run_takeover`) only for a pool hit the head's own first draft confirmed.
     #[allow(clippy::too_many_arguments)]
     pub fn mtp_takeover_step(
         &mut self,
@@ -1360,6 +1433,23 @@ impl Qwen4MtpDrafter {
         emitted: &[u32],
         candidates: &[u32],
         eos: u32,
+    ) -> Result<MtpWindow, String> {
+        self.takeover_window(gpu, target, position, seed, emitted, candidates, eos, None)
+    }
+
+    /// `mtp_takeover_step`, with the confirmation probe's clock when the
+    /// takeover was reached through one.
+    #[allow(clippy::too_many_arguments)]
+    fn takeover_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        candidates: &[u32],
+        eos: u32,
+        probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
         let eos = self.end_of_turn.unwrap_or(eos);
         self.require_supported_request()?;
@@ -1403,6 +1493,7 @@ impl Qwen4MtpDrafter {
                 eos,
                 trace,
                 sampled.as_mut(),
+                probe,
             )
         } else {
             self.takeover_batched(
@@ -1414,6 +1505,7 @@ impl Qwen4MtpDrafter {
                 eos,
                 trace,
                 sampled.as_mut(),
+                probe,
             )
         };
         self.sampled = sampled;
@@ -1421,39 +1513,82 @@ impl Qwen4MtpDrafter {
     }
 
     /// With the request armed, ask the pool for a candidate run over the
-    /// authoritative history (prompt plus `emitted`, which holds the seed);
-    /// a hit runs one takeover window, a miss (`None`) leaves the window to
-    /// native MTP. Takeover results never feed the native agreement table.
-    #[allow(clippy::too_many_arguments)]
-    fn try_ngram_window(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        position: usize,
-        seed: u32,
-        emitted: &[u32],
-        k: usize,
-        eos: u32,
-    ) -> Result<Option<MtpWindow>, String> {
+    /// authoritative history (prompt plus `emitted`, which holds the seed) and
+    /// copy it into `ngram_candidates`. A hit is reported only if the yield
+    /// gate (`ngram_wins`) passes; a declined hit decays the takeover yield
+    /// history toward its prior (`NGRAM_YIELD_RECOVERY`). A hit is not yet a
+    /// takeover: `mtp_step` runs it only after the head's own first draft
+    /// equals `ngram_candidates[0]`.
+    fn ngram_hit(&mut self, emitted: &[u32], k: usize) -> bool {
         if !self.ngram_active {
-            return Ok(None);
+            return false;
         }
         let Some(ctx) = self.ngram.as_mut() else {
-            return Ok(None);
+            return false;
         };
         let Some(candidates) = ctx.propose(emitted, k) else {
-            return Ok(None);
+            return false;
         };
         self.ngram_candidates.clear();
         self.ngram_candidates.extend_from_slice(candidates);
         if !self.ngram_wins(self.ngram_candidates.len(), k) {
             self.ngram_yield.0 *= NGRAM_YIELD_RECOVERY;
             self.ngram_yield.1 *= NGRAM_YIELD_RECOVERY;
-            return Ok(None);
+            return false;
         }
+        true
+    }
+
+    /// Interleaved-route confirmation of a pool hit: run the head's row-0
+    /// draft step on a scratch copy of the head (snapshot, one
+    /// `mtp_forward_token`, restore, and the draft policy restored too) and
+    /// compare its argmax with `ngram_candidates[0]`. The head ends exactly as
+    /// it began either way.
+    fn probe_first_draft(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<bool, String> {
+        let Some(&candidate) = self.ngram_candidates.first() else {
+            return Ok(false);
+        };
+        let pending = self
+            .pending_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+        let bundle = Self::bundle(target)?;
+        let policy = bundle
+            .mtp_draft_request_state()
+            .map_err(|error| error.to_string())?;
+        let ticket = bundle.mtp_snapshot(gpu).map_err(|error| error.to_string())?;
+        let drafted = bundle.mtp_forward_token(gpu, seed, Some(pending), position, true);
+        let restored = bundle.mtp_restore(gpu, ticket);
+        let policy_restored = bundle.set_mtp_draft_request_state(policy);
+        let first = drafted.map_err(|error| error.to_string())?;
+        restored.map_err(|error| error.to_string())?;
+        policy_restored.map_err(|error| error.to_string())?;
+        Ok(first == candidate)
+    }
+
+    /// The takeover window over `ngram_candidates` (a confirmed hit), with
+    /// the takeover's own yield and the `ngram_mod_*` counters updated.
+    /// Takeover results never feed the native agreement table.
+    #[allow(clippy::too_many_arguments)]
+    fn run_takeover(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        eos: u32,
+        probe: Option<TakeoverProbe>,
+    ) -> Result<MtpWindow, String> {
         let candidates = std::mem::take(&mut self.ngram_candidates);
         let window =
-            self.mtp_takeover_step(gpu, target, position, seed, emitted, &candidates, eos);
+            self.takeover_window(gpu, target, position, seed, emitted, &candidates, eos, probe);
         self.ngram_candidates = candidates;
         let window = window?;
         self.ngram_yield.0 = self.ngram_yield.0 * MTP_AGREEMENT_DECAY + window.committed.len() as f32;
@@ -1464,7 +1599,7 @@ impl Qwen4MtpDrafter {
         if let Some(ctx) = self.ngram.as_mut() {
             ctx.observe_result(window.drafts_generated, window.accepted);
         }
-        Ok(Some(window))
+        Ok(window)
     }
 
     /// Batched takeover: one `[seed, candidates..]` verify, rollback to the
@@ -1481,6 +1616,7 @@ impl Qwen4MtpDrafter {
         eos: u32,
         trace: bool,
         mut sampled: Option<&mut SampledVerify>,
+        probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
         let n = candidates.len();
         let mut block = std::mem::take(&mut self.takeover_block);
@@ -1488,8 +1624,9 @@ impl Qwen4MtpDrafter {
         block.push(seed);
         block.extend_from_slice(candidates);
         let mut timers = MtpPhaseTimers::new();
-        let window_start = Instant::now();
+        let window_start = probe.map_or_else(Instant::now, |probe| probe.start);
         let mut accepted_drafts = 0usize;
+        let mut emitted_len = 0usize;
         let mut snapshot = match Self::bundle(target).and_then(|bundle| {
             bundle.mtp_snapshot(gpu).map_err(|error| error.to_string())
         }) {
@@ -1613,6 +1750,7 @@ impl Qwen4MtpDrafter {
             bundle.mtp_commit_validated(mtp_ticket);
             target_scratch.target_snapshot = None;
             snapshot = None;
+            emitted_len = acceptance.committed.len();
             Ok(MtpWindow {
                 committed: acceptance.committed,
                 accepted: acceptance.accepted,
@@ -1621,9 +1759,12 @@ impl Qwen4MtpDrafter {
         })();
         self.takeover_block = block;
         if timers.enabled() {
+            let window_us = synced_wall_us(gpu, window_start);
+            let probe_field = probe.map_or_else(String::new, |probe| {
+                format!("\"probe_us\":{:.1},", probe.probe_us)
+            });
             let fields = format!(
-                "\"source\":\"ngram\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{n},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
-                window_start.elapsed().as_secs_f64() * 1e6,
+                "\"source\":\"ngram\",\"verify_route\":\"batched\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
@@ -1696,9 +1837,11 @@ impl Qwen4MtpDrafter {
         eos: u32,
         trace: bool,
         mut sampled: Option<&mut SampledVerify>,
+        probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
         let n = candidates.len();
         let mut timers = MtpPhaseTimers::new();
+        let window_start = probe.map_or_else(Instant::now, |probe| probe.start);
         let mut committed: Vec<u32> = Vec::with_capacity(n + 1);
         let mut picks: Vec<u32> = Vec::with_capacity(n + 1);
         // Row `r`'s penalty history is the window base plus the candidates
@@ -1798,8 +1941,13 @@ impl Qwen4MtpDrafter {
             );
         }
         if timers.enabled() {
+            let window_us = synced_wall_us(gpu, window_start);
+            let probe_field = probe.map_or_else(String::new, |probe| {
+                format!("\"probe_us\":{:.1},", probe.probe_us)
+            });
             let fields = format!(
-                "\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"t_end\":{}",
+                "\"source\":\"ngram\",\"verify_route\":\"interleaved\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"t_end\":{}",
+                committed.len(),
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
@@ -2015,12 +2163,15 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
 
         self.ensure_resources(gpu, target)?;
-        if let Some(window) = self.try_ngram_window(gpu, target, position, seed, emitted, k, eos)? {
-            return Ok(window);
-        }
-        // A pool miss drafts natively, within the head's own K.
+        // A pool hit may take this window, but only if the head's own first
+        // draft equals the hit's first candidate: confirmed on the route the
+        // window runs (batched: inside the drafting loop, reusing the row-0
+        // step; interleaved: a standalone probe). `mtp_windows` counts only
+        // the windows that end native, and a confirmation miss leaves the
+        // takeover yield history untouched.
+        let hit = self.ngram_hit(emitted, k);
+        // Otherwise the window drafts natively, within the head's own K.
         let k = k.min(self.max_k);
-        self.stats.mtp_windows += 1;
         let trace =
             hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
         // Route: a (k+1)-row batched verify costs about 2.5 single-row
@@ -2033,6 +2184,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
             _ => self.batched_depth(k),
         };
         if depth == 0 {
+            let native_start = Instant::now();
+            if hit && self.probe_first_draft(gpu, target, position, seed)? {
+                let probe = takeover_probe(gpu, native_start);
+                return self.run_takeover(gpu, target, position, seed, emitted, eos, Some(probe));
+            }
+            self.stats.mtp_windows += 1;
             let mut sampled = self.sampled.take();
             let window = self.mtp_step_incremental(
                 gpu,
@@ -2052,6 +2209,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // History picks the route and the most drafts; the drafts' own
         // margins stop early.
         let k_max = depth;
+        let window_start = Instant::now();
         {
             let bundle = Self::bundle(target)?;
             let target_position = bundle.state.position;
@@ -2063,6 +2221,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 ));
             }
         }
+        // The draft policy is outside the head snapshot: saved here so a
+        // confirmed takeover can undo the abandoned row-0 step.
+        let draft_state = Self::bundle(target)?
+            .mtp_draft_request_state()
+            .map_err(|error| error.to_string())?;
         let mut snapshot = {
             let bundle = Self::bundle(target)?;
             Some(
@@ -2073,9 +2236,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
         };
         let mut timers = MtpPhaseTimers::new();
         let mut accepted_drafts = 0usize;
-        let window_start = Instant::now();
+        let mut drafts_verified = 0usize;
+        let mut emitted_len = 0usize;
         let mut sampled = self.sampled.take();
-        let result = (|| -> Result<MtpWindow, String> {
+        let result = (|| -> Result<NativeOutcome, String> {
             timers.mark(gpu, "draft");
             let mut drafts = Vec::with_capacity(k_max);
             let mut margins: Vec<f32> = Vec::with_capacity(k_max);
@@ -2100,9 +2264,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 let token_position = position
                     .checked_add(index)
                     .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                input = Self::bundle(target)?
+                let argmax = Self::bundle(target)?
                     .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
                     .map_err(|error| error.to_string())?;
+                // Head-confirmed takeover: the head's own first draft (the
+                // row-0 argmax, before any sampled draw) equals the pool's
+                // first candidate. Nothing is kept or verified yet, so the
+                // window is abandoned here; the target was never touched.
+                if index == 0 && hit && self.ngram_candidates.first() == Some(&argmax) {
+                    return Ok(NativeOutcome::Takeover);
+                }
+                input = argmax;
                 if let Some(s) = sampled.as_mut().filter(|s| s.draws_drafts()) {
                     input = s.sample_draft(gpu, Self::bundle(target)?, index, index)?;
                 }
@@ -2161,6 +2333,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 None => accept_native_greedy(&drafts, &target_picks, Some(eos))?,
             };
             accepted_drafts = acceptance.accepted;
+            drafts_verified = drafts.len();
+            emitted_len = acceptance.committed.len();
             if trace {
                 let rows = drafts
                     .iter()
@@ -2294,16 +2468,36 @@ impl MtpDrafter for Qwen4MtpDrafter {
             picks.mtp_commit_validated(mtp_ticket);
             target_scratch.target_snapshot = None;
             snapshot = None;
-            Ok(window)
+            Ok(NativeOutcome::Window(window))
         })();
         self.sampled = sampled;
+        let result = match result {
+            Ok(NativeOutcome::Window(window)) => Ok(window),
+            Ok(NativeOutcome::Takeover) => {
+                // No target verify ran (`target_snapshot` is None), so this
+                // restores only the head; the draft policy goes back with it.
+                timers.discard(gpu);
+                if let Err(rollback) = self.rollback_failed_window(gpu, target, snapshot.take()) {
+                    return Err(format!(
+                        "Qwen4 MTP takeover switch could not restore the head: {rollback}"
+                    ));
+                }
+                Self::bundle(target)?
+                    .set_mtp_draft_request_state(draft_state)
+                    .map_err(|error| error.to_string())?;
+                let probe = takeover_probe(gpu, window_start);
+                return self.run_takeover(gpu, target, position, seed, emitted, eos, Some(probe));
+            }
+            Err(error) => Err(error),
+        };
+        self.stats.mtp_windows += 1;
         if let Ok(window) = &result {
             self.observe_agreement(window);
         }
         if timers.enabled() {
+            let window_us = synced_wall_us(gpu, window_start);
             let fields = format!(
-                "\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"window_us\":{:.1},\"t_end\":{}",
-                window_start.elapsed().as_secs_f64() * 1e6,
+                "\"source\":\"mtp\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{drafts_verified},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
@@ -2793,6 +2987,31 @@ mod tests {
         // A verbatim copy (4 tokens per window) beats it.
         drafter.ngram_yield = (32.0, 8.0);
         assert!(drafter.ngram_wins(3, 3));
+    }
+
+    #[test]
+    fn unobserved_depth_relaxes_to_the_prior_so_a_rejected_depth_is_re_explored() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        let window = |accepted: usize, drafts_generated: usize| MtpWindow {
+            committed: vec![0; accepted + 1],
+            accepted,
+            drafts_generated,
+        };
+        assert_eq!(drafter.batched_depth(3), 3, "the prior drafts the full depth");
+        // One depth-3 rejection drops that depth below its threshold.
+        drafter.observe_agreement(&window(2, 3));
+        assert_eq!(drafter.batched_depth(3), 2, "the rejected depth is dropped");
+        // Depth 3 is never compared again (k=2 windows), yet must come back.
+        let mut recovered_after = None;
+        for n in 1..=40 {
+            drafter.observe_agreement(&window(2, 2));
+            if drafter.batched_depth(3) == 3 {
+                recovered_after = Some(n);
+                break;
+            }
+        }
+        let n = recovered_after.expect("depth 3 must be re-explored");
+        assert!(n < 40, "depth 3 returned only after {n} windows");
     }
 
     #[test]
