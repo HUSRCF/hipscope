@@ -7,7 +7,7 @@ from pathlib import Path
 import jinja2
 
 ROOT = Path(__file__).resolve().parent
-CAPTURE = json.loads((ROOT / 'capture.request.json').read_text())
+CAPTURE = json.loads((ROOT / 'capture-smallcap.request.json').read_text())
 ENV = jinja2.Environment(undefined=jinja2.StrictUndefined)
 ENV.globals['raise_exception'] = lambda message: (_ for _ in ()).throw(ValueError(message))
 TEMPLATE = ENV.from_string((ROOT / 'qwen-chat-reference.jinja').read_text())
@@ -15,6 +15,8 @@ TEMPLATE = ENV.from_string((ROOT / 'qwen-chat-reference.jinja').read_text())
 def render(request):
     messages = copy.deepcopy(request['messages'])
     for message in messages:
+        if message['role'] == 'assistant':
+            message.setdefault('tool_calls', [])
         for call in message.get('tool_calls', []):
             function = call.get('function', call)
             if isinstance(function.get('arguments'), str):
@@ -35,9 +37,9 @@ def filler(kind, index):
                 'The blue ledger recorded the tide, the wind, and the arrival of each fishing boat. '
                 'On the eastern wall a brass clock marked the watch. Nobody yet knew why the '
                 'sealed letter had been left beneath the lamp. This is background, not the requested continuation.\n')
-    return (f'\nReference record {index:06d}: Berlin office inventory notes, historical only. '
-            'Archived room schedules are not live availability. Follow the tool results in the conversation '
-            'rather than this background. No additional tools, people, bookings or permissions are introduced.\n')
+    return (f'\nReference record {index:06d}: historical inventory notes, background only. '
+            'Archived market reports are not current prices. Follow the live tool results '
+            'rather than this background. No additional tools, tickers or permissions are introduced.\n')
 
 TASKS = {
  'code': 'Write a complete Python implementation of an in-memory transactional key-value store with nested transactions, rollback, commit, snapshots, and deterministic iteration. Include full runnable unittest coverage and explanatory docstrings. Output at least 150 lines of complete code, not a summary or outline. Continue the implementation and tests for at least 2048 output tokens; do not finish early or emit a closing summary.',
@@ -74,17 +76,18 @@ for kind in ('code', 'prose', 'tool'):
         background = ''.join(chunks)
         request = request_with(background)
         text = render(request)
-        name = f'{kind}-{label}.txt'
+        stem = f'{kind}-{label}'
+        name = f'{stem}.txt'
         data = text.encode('utf-8')
         (ROOT / name).write_bytes(data)
-        (ROOT / f'{kind}-{label}.request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2) + '\n')
+        (ROOT / f'{stem}.request.json').write_text(json.dumps(request, ensure_ascii=False, indent=2) + '\n')
         entries.append({'filename': name, 'md5': hashlib.md5(data).hexdigest(),
                         'bytes': len(data), 'characters': len(text),
                         'approximate_tokens_bytes_div_4': len(data) / 4,
                         'requested_approximate_tokens': tokens,
                         'immutable_capture_floor_exceeds_target': kind == 'tool' and len(baseline.encode('utf-8')) > target_bytes,
-                        'request_filename': f'{kind}-{label}.request.json'})
-manifest = {'sizing': 'Heuristic UTF-8 bytes / 4, NOT tokenizer counts; includes rendered chat framing. Tool 1k preserves complete capture and exceeds requested size.',
+                        'request_filename': f'{stem}.request.json'})
+manifest = {'sizing': 'Heuristic UTF-8 bytes / 4, NOT tokenizer counts; includes rendered chat framing. All tool contexts preserve complete capture 00031.',
             'format': 'Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt requires HIPFIRE_JINJA_CHAT=0. Request JSON can instead use normal messages/tools rendering.',
             'generator': 'generate.py', 'jinja2_version': jinja2.__version__, 'prompts': entries}
 (ROOT / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
