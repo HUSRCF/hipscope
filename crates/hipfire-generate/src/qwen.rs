@@ -2707,6 +2707,14 @@ pub fn generate_dflash(
     // Min-p floor. 0.0 disables. Installed on SpecRequestConfig for MTP;
     // DFlash route selection still sends min_p requests to AR.
     min_p: f32,
+    // Request token penalties, as resolved for AR (window 0 disables all
+    // three). Installed on SpecRequestConfig: the MTP drafters penalize every
+    // verify row against the full prompt + emitted history; drafters that do
+    // not implement them are never routed a non-neutral request.
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
@@ -3152,6 +3160,10 @@ pub fn generate_dflash(
                 && hipfire_config::mtp_ngram_enabled()
                 && temp <= 1e-6
                 && !enable_thinking,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();

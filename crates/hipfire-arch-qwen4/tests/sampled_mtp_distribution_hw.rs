@@ -529,6 +529,7 @@ fn spec_request(
         cactus_delta: 0.0,
         rng_seed: seed,
         allow_ngram_modifier: false,
+        ..SpecRequestConfig::default()
     }
 }
 

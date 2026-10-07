@@ -295,6 +295,132 @@ impl SparseDist {
         }
         Ok(())
     }
+
+    /// The point mass `δ(token)`: the draft distribution of a deterministic
+    /// proposal (an n-gram candidate). With it, [`verify_sampled_draft`]
+    /// accepts iff `u < p(token)` and a rejection draws from `p` with
+    /// `token` removed, which is still exactly `p` overall.
+    pub fn set_point_mass(&mut self, token: u32) {
+        self.entries.clear();
+        self.entries.push((token, 1.0));
+    }
+}
+
+/// Write the last `min(prompt.len() + emitted.len(), window)` tokens of
+/// `prompt ‖ emitted` into `out` (cleared, allocation reused) without copying
+/// the whole conversation. `emitted` already holds the pending seed; it is
+/// never appended a second time.
+pub fn fill_penalty_history(out: &mut Vec<u32>, prompt: &[u32], emitted: &[u32], window: usize) {
+    out.clear();
+    if window == 0 {
+        return;
+    }
+    if emitted.len() >= window {
+        out.extend_from_slice(&emitted[emitted.len() - window..]);
+        return;
+    }
+    let from_prompt = (window - emitted.len()).min(prompt.len());
+    out.extend_from_slice(&prompt[prompt.len() - from_prompt..]);
+    out.extend_from_slice(emitted);
+}
+
+/// The penalty history of one speculative request, shared by every
+/// penalty-capable drafter (Qwen3.x MTP, Qwen4 native MTP, n-gram takeover).
+///
+/// AR penalizes each token against the trailing `window` tokens of the full
+/// rendered prompt followed by everything generated so far, so verify row /
+/// draft index `i` of a window must see `suffix_W(P ‖ E ‖ drafts[..i])`,
+/// where `E` is the loop's authoritative committed generation (pending seed
+/// included once). The history is rebuilt from `E` at every window, so
+/// rejected drafts, pruned proposals, forced suffixes, semantic clipping and
+/// rollback never leak into a later window. Holds at most `window` prompt
+/// tokens and `window` + the window's drafts.
+///
+/// Window 0 (penalties inactive, see
+/// [`SpecRequestConfig::penalty_window`]) makes every method a no-op on
+/// empty buffers, so a neutral request does no history work.
+#[derive(Clone, Debug, Default)]
+pub struct PenaltyHistory {
+    prompt_tail: Vec<u32>,
+    tokens: Vec<u32>,
+    window: usize,
+    base: usize,
+}
+
+impl PenaltyHistory {
+    pub fn new(window: usize) -> Self {
+        Self {
+            prompt_tail: Vec::with_capacity(window),
+            tokens: Vec::new(),
+            window,
+            base: 0,
+        }
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// Keep the trailing `window` tokens of the full rendered prompt. Call
+    /// at every prefill, cold or warm (cache hit / realignment), with the
+    /// full `prompt_tokens`, never the cache-fill suffix. Also starts the
+    /// prefill window: row 0 is `suffix_W(P)`, the first token's history.
+    pub fn set_prompt(&mut self, prompt: &[u32]) {
+        self.prompt_tail.clear();
+        self.prompt_tail
+            .extend_from_slice(&prompt[prompt.len().saturating_sub(self.window)..]);
+        self.begin_window(&[]);
+    }
+
+    /// Rebuild from the prompt tail and the loop's authoritative `emitted`
+    /// (which already contains the pending seed). Returns the base length:
+    /// the history of row 0.
+    pub fn begin_window(&mut self, emitted: &[u32]) -> usize {
+        fill_penalty_history(&mut self.tokens, &self.prompt_tail, emitted, self.window);
+        self.base = self.tokens.len();
+        self.base
+    }
+
+    /// Append a kept draft so row `i + 1` sees `drafts[..=i]`. Never push a
+    /// pruned proposal or a rejected draft.
+    pub fn push_draft(&mut self, token: u32) {
+        if self.window > 0 {
+            self.tokens.push(token);
+        }
+    }
+
+    /// Drop every draft pushed since [`Self::begin_window`].
+    pub fn rewind_drafts(&mut self) {
+        self.tokens.truncate(self.base);
+    }
+
+    /// History of verify row / draft index `row`: the trailing
+    /// `min(base + row, window)` tokens of `base + drafts[..row]`, exactly
+    /// the scope AR penalizes against (and what a GPU repeat buffer holds).
+    /// Panics if fewer than `row` drafts were pushed.
+    pub fn row(&self, row: usize) -> &[u32] {
+        &self.tokens[self.row_range(row)]
+    }
+
+    /// [`Self::row`] as a range of [`Self::tokens`]: a GPU consumer uploads
+    /// `tokens()` once and penalizes row `i` against that sub-range.
+    pub fn row_range(&self, row: usize) -> std::ops::Range<usize> {
+        if self.window == 0 {
+            return 0..0;
+        }
+        let end = self.base + row;
+        assert!(
+            end <= self.tokens.len(),
+            "penalty history row {row} needs {row} pushed drafts, has {}",
+            self.tokens.len() - self.base
+        );
+        end.saturating_sub(self.window)..end
+    }
+
+    /// The window's whole buffer: base history then every pushed draft.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
 }
 
 /// Draw from the normalized residual `(p - q)+`. When `p <= q` everywhere
@@ -411,16 +537,22 @@ where
     })
 }
 
-/// The host AR producer's sampler for a sampled request with neutral
-/// penalties: what `sampler::sample_cpu` draws a Qwen4 AR token with.
-/// `top_k` passes through as sent (absent and `Some(0)` differ); a
-/// non-positive `min_p` is the AR sampler's absent.
+/// The host AR producer's sampler for a sampled request: what
+/// `sampler::sample_cpu` draws a Qwen4 AR token with, request penalties
+/// included. It is the target policy of both verifiers: Leviathan builds `p`
+/// from the row it penalizes, naive draws with it. `top_k` passes through as
+/// sent (absent and `Some(0)` differ); a non-positive `min_p` is the AR
+/// sampler's absent.
 pub fn naive_target_sampler(cfg: &SpecRequestConfig) -> SamplerConfig {
     SamplerConfig {
         temperature: cfg.temp,
         top_p: cfg.top_p,
         top_k: cfg.top_k,
         min_p: (cfg.min_p > 0.0).then_some(cfg.min_p),
+        repeat_penalty: cfg.repeat_penalty,
+        repeat_window: cfg.repeat_window,
+        presence_penalty: cfg.presence_penalty,
+        frequency_penalty: cfg.frequency_penalty,
         ..SamplerConfig::greedy()
     }
 }

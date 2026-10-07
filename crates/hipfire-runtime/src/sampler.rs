@@ -236,6 +236,15 @@ pub fn sample(
 /// (and `top_k == Some(20)`, `min_p == Some(0.0)`) reproduce the legacy
 /// top-20 nucleus byte-for-byte.
 pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u32 {
+    apply_logit_policy_cpu(logits, history, cfg);
+    llama::sample_top_k_p(logits, cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p)
+}
+
+/// The logit mutations of [`sample_cpu`], in its order: repeat penalty,
+/// presence/frequency penalties, then blocked tokens. Shared by the host AR
+/// producer and every speculative verifier that must reproduce its
+/// distribution, so one arithmetic serves both.
+pub fn apply_logit_policy_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) {
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         llama::apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
     }
@@ -261,7 +270,51 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
             logits[tok as usize] = f32::NEG_INFINITY;
         }
     }
-    llama::sample_top_k_p(logits, cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p)
+}
+
+/// [`apply_logit_policy_cpu`] restricted to `(ids[i], values[i])` candidate
+/// pairs, where `ids` are in-vocabulary token ids (never ranks): each
+/// candidate's value ends bit-identical to what the dense helper leaves at
+/// `logits[ids[i]]` for the same history and config. No allocation beyond
+/// the repeat-penalty count map the dense helper also builds.
+pub fn apply_logit_policy_candidates_cpu(
+    ids: &[u32],
+    values: &mut [f32],
+    history: &[u32],
+    cfg: &SamplerConfig,
+) {
+    debug_assert_eq!(ids.len(), values.len());
+    if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
+        llama::apply_repeat_penalty_candidates(
+            ids,
+            values,
+            history,
+            cfg.repeat_window,
+            cfg.repeat_penalty,
+        );
+    }
+    if (cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0) && cfg.repeat_window > 0 {
+        let start = history.len().saturating_sub(cfg.repeat_window);
+        let window = &history[start..];
+        for (value, &id) in values.iter_mut().zip(ids) {
+            // Same f32 count construction as the dense helper: one `+= 1.0`
+            // per occurrence, in window order.
+            let mut count = 0.0f32;
+            for &t in window {
+                if t == id {
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                *value -= cfg.frequency_penalty * count + cfg.presence_penalty;
+            }
+        }
+    }
+    for (value, &id) in values.iter_mut().zip(ids) {
+        if cfg.blocked_tokens.contains(&id) {
+            *value = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// Compute the unclosed-opener attractor blocked-token list (#111).

@@ -959,6 +959,16 @@ pub struct SpecRequestConfig {
     pub rng_seed: u64,
     /// When true, allow n-gram draft modifiers that touch the proposal stream.
     pub allow_ngram_modifier: bool,
+    /// Recency-weighted repeat penalty (`llama::apply_repeat_penalty`).
+    /// `1.0` = off.
+    pub repeat_penalty: f32,
+    /// Trailing tokens of the request history the three penalties see.
+    /// `0` disables all of them.
+    pub repeat_window: usize,
+    /// OpenAI presence penalty over the window. `0.0` = off.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty over the window. `0.0` = off.
+    pub frequency_penalty: f32,
 }
 
 impl Default for SpecRequestConfig {
@@ -973,6 +983,10 @@ impl Default for SpecRequestConfig {
             cactus_delta: 0.0,
             rng_seed: 0x1357_9BDF,
             allow_ngram_modifier: false,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -982,6 +996,28 @@ impl SpecRequestConfig {
     /// `Some(0)` both disable.
     pub fn top_k_cut(&self) -> usize {
         self.top_k.map_or(0, |k| k as usize)
+    }
+
+    /// Whether the request's penalties move the target distribution: the
+    /// exact predicate `sampler::sample_cpu` (and the GPU sampler) applies.
+    /// A penalty-capable verifier reproduces AR only if every verify row
+    /// is penalized against `suffix_W(prompt || emitted || earlier drafts)`
+    /// — the full rendered prompt included, not the generated ids alone.
+    pub fn penalties_active(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty != 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
+
+    /// The window a penalty history must keep: `repeat_window` when
+    /// [`Self::penalties_active`], else `0` (no history work at all).
+    pub fn penalty_window(&self) -> usize {
+        if self.penalties_active() {
+            self.repeat_window
+        } else {
+            0
+        }
     }
 }
 
