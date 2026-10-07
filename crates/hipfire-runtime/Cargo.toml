@@ -89,6 +89,11 @@ smallvec = "1"
 # per-iteration costs but not the algorithmic shape — this regex restores
 # the canonical chunking.
 regex = "1"
+# NFC normalizer for HF tokenizer.json files that declare `normalizer: NFC`
+# (Qwen2 family). `compiled_data` bakes the Unicode tables in; the optional
+# utf8_iter/utf16_iter features are not needed for the `&str` API. Licenses
+# are all Unicode-3.0 / MIT / Apache-2.0 (already in deny.toml's allowlist).
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 # Renders the upstream HF chat_template (Jinja) when present in
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`

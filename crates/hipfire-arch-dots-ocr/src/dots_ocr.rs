@@ -2073,27 +2073,13 @@ mod tests {
         assert_eq!(got.last(), expected.last(), "trailing cue diverged");
 
         // The prompt-text interior is tokenized by the shared GPT-2 BPE
-        // path, which has a known `\s+(?!\S)` lookahead gap (see
-        // tokenizer.rs:22 — the `regex` crate can't express the
-        // negative lookahead, so whitespace runs before a non-space split
-        // one token differently than HF). That is NOT a framing bug: the
-        // decoded *text* is identical, only BPE boundaries on indentation
-        // runs differ. Assert text-equality (the strong invariant) and
-        // report any boundary diffs for visibility.
+        // path. Its pretokenizer honors the tokenizer.json `Split` regex and
+        // emulates the `\s+(?!\S)` lookahead exactly (tokenizer.rs), so the
+        // interior — including indentation runs — must match the HF capture
+        // token-for-token.
         assert_eq!(
-            tok.decode(&got),
-            tok.decode(&expected),
-            "decoded prompt text diverged — this IS a real bug (not just a BPE-boundary diff)"
+            got, expected,
+            "prompt token ids diverged from HF capture (BPE pretokenizer / whitespace lookahead)"
         );
-
-        let n_diff = (0..got.len()).filter(|&i| got[i] != expected[i]).count();
-        if n_diff > 0 {
-            eprintln!(
-                "NOTE: {n_diff}/{} tokens differ on BPE whitespace boundaries \
-                 (decoded text identical) — tokenizer.rs `\\s+` lookahead gap, \
-                 tracked separately; verify benign via the daemon OCR grade.",
-                got.len()
-            );
-        }
     }
 }
