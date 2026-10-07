@@ -11558,6 +11558,7 @@ mod tests {
         assert!(include_reasoning_content(Some("Qwen3.6-A3B")));
         assert!(include_reasoning_content(Some("qwen3.5")));
         assert!(include_reasoning_content(Some("qwen4")));
+        assert!(!include_reasoning_content(Some("deepseek4")));
         assert!(!include_reasoning_content(Some("llama")));
         assert!(!include_reasoning_content(Some("gemma4")));
         assert!(!include_reasoning_content(Some("qwen2")));
