@@ -330,6 +330,31 @@ fn f32_view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
 fn view(tensor: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     tensor.sub_offset(offset, len)
 }
+
+/// Byte range `(offset, len)` in `scratch.token_ids` of `tokens` at row
+/// `offset`, when the forward's upload (`uploaded_rows` rows mirrored in
+/// `host_bytes`, native-endian i32) holds exactly those ids there.
+fn uploaded_ids_range(
+    uploaded_rows: usize,
+    host_bytes: &[u8],
+    offset: usize,
+    tokens: &[u32],
+) -> Option<(usize, usize)> {
+    const ID_BYTES: usize = std::mem::size_of::<i32>();
+    let end = offset.checked_add(tokens.len())?;
+    if tokens.is_empty() || end > uploaded_rows {
+        return None;
+    }
+    let start_byte = offset.checked_mul(ID_BYTES)?;
+    let end_byte = end.checked_mul(ID_BYTES)?;
+    let mirror = host_bytes.get(start_byte..end_byte)?;
+    mirror
+        .chunks_exact(ID_BYTES)
+        .zip(tokens)
+        .all(|(bytes, &token)| bytes == (token as i32).to_ne_bytes())
+        .then_some((start_byte, end_byte - start_byte))
+}
+
 fn matrix_view(
     tensor: &GpuTensor,
     rows: usize,
@@ -1976,6 +2001,10 @@ pub type Qwen4QsaTap =
 pub struct Qwen4GpuForward {
     pub scratch: Qwen4GpuForwardScratch,
     host_token_bytes: Vec<u8>,
+    /// Rows of `scratch.token_ids` the last forward uploaded whole from
+    /// `host_token_bytes` (its mirror): 0 for a HIP single-row body, a device
+    /// argmax id or a captured upload.
+    uploaded_id_rows: usize,
     host_ple_bytes: Vec<u8>,
     /// Tokens of the prefill chunk that follows the next forward. A
     /// successful forward enqueues their PLE rows (hashed from the history it
@@ -2267,6 +2296,7 @@ impl Qwen4GpuForward {
             expert_stage,
             scratch,
             host_token_bytes,
+            uploaded_id_rows: 0,
             host_ple_bytes,
             ple_lookahead: Vec::new(),
             ple_ahead: None,
@@ -2705,6 +2735,16 @@ impl Qwen4GpuForward {
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
         }
         Ok(())
+    }
+
+    /// Device view of `tokens` as the ids the last forward holds at row
+    /// `offset` of its `scratch.token_ids` upload, or `None` when that forward
+    /// did not upload them whole from the host or they differ from `tokens`.
+    /// The view borrows `scratch.token_ids`: the next forward overwrites it.
+    pub(crate) fn uploaded_token_ids(&self, offset: usize, tokens: &[u32]) -> Option<GpuTensor> {
+        let (byte_offset, byte_len) =
+            uploaded_ids_range(self.uploaded_id_rows, &self.host_token_bytes, offset, tokens)?;
+        Some(view(&self.scratch.token_ids, byte_offset, byte_len))
     }
 
     /// Start the first tile's PLE rows now, unless a retained lookahead
@@ -3345,6 +3385,8 @@ impl Qwen4GpuForward {
             _ => tokens,
         };
         let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
+        // No claim on the device ids until this forward's own upload lands.
+        self.uploaded_id_rows = 0;
         if let Some(previous) = device_token {
             argmax_f32(
                 gpu,
@@ -3386,6 +3428,11 @@ impl Qwen4GpuForward {
                     &self.scratch.token_ids.buf,
                     &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
                 )?;
+                // Whole-row host upload on the default stream: the device ids
+                // stay as uploaded until the next forward writes them.
+                if !gpu.graphs.capture_mode {
+                    self.uploaded_id_rows = n;
+                }
             }
         }
         let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
@@ -3982,5 +4029,49 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uploaded_ids_range;
+
+    fn bytes(ids: &[u32]) -> Vec<u8> {
+        ids.iter()
+            .flat_map(|&id| (id as i32).to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn uploaded_ids_cover_sub_chunk_offsets() {
+        let ids = [5u32, 6, 7, 8, 9, 10];
+        let host = bytes(&ids);
+        assert_eq!(uploaded_ids_range(6, &host, 0, &ids), Some((0, 24)));
+        assert_eq!(uploaded_ids_range(6, &host, 2, &ids[2..5]), Some((8, 12)));
+        assert_eq!(uploaded_ids_range(6, &host, 5, &ids[5..]), Some((20, 4)));
+    }
+
+    #[test]
+    fn uploaded_ids_refuse_unclaimed_or_out_of_bounds_rows() {
+        let ids = [5u32, 6, 7, 8];
+        let host = bytes(&ids);
+        // Nothing claimed (HIP single-row body, device argmax, graph capture).
+        assert_eq!(uploaded_ids_range(0, &host, 0, &ids), None);
+        // The range may not pass the uploaded rows.
+        assert_eq!(uploaded_ids_range(4, &host, 0, &[5, 6, 7, 8, 9]), None);
+        assert_eq!(uploaded_ids_range(4, &host, 3, &[8, 9]), None);
+        assert_eq!(uploaded_ids_range(3, &host, 2, &[7, 8]), None);
+        // The host mirror must hold the claimed rows.
+        assert_eq!(uploaded_ids_range(4, &host[..12], 0, &ids), None);
+        assert_eq!(uploaded_ids_range(usize::MAX, &host, usize::MAX, &[1]), None);
+        assert_eq!(uploaded_ids_range(4, &host, 0, &[]), None);
+    }
+
+    #[test]
+    fn uploaded_ids_refuse_different_tokens() {
+        let ids = [5u32, 6, 7, 8];
+        let host = bytes(&ids);
+        assert_eq!(uploaded_ids_range(4, &host, 0, &[5, 6, 7, 9]), None);
+        assert_eq!(uploaded_ids_range(4, &host, 1, &[5, 6]), None);
     }
 }

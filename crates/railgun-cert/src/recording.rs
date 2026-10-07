@@ -1091,6 +1091,17 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "no arithmetic changes, only where the unchanged expert bytes are read from; Flash-Next 16K logits on gfx1201 are byte-identical with HIPFIRE_QWEN4_EXPERT_STAGE on and off (CHANGELOG 0.4.1, Flash-Next performance); default on for exact gfx1201 only, and no railgun default program is a qwen4 program",
         reaches: &[],
     },
+    Decision {
+        id: "qwen4-prefill-token-id-reuse",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the device `token_ids` rows of a chunk's whole-row host upload are recorded as reusable by the MTP prompt-fill head Append (HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS) only when the upload ran outside graph capture (`!capture_mode`)",
+        effect: LaunchMechanism,
+        switches: "the batched head Append embeds from the trunk's uploaded ids in place, or from its own upload of the same ids; a captured upload is never reused",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the reused buffer holds the same i32 ids (checked against the chunk's tokens before use) and the embedding gather runs the same kernel on them; no launch or output byte changes",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_mixed", occurrences: 16, decisions: &["dspark-capture-safe-verify-body"] },
@@ -1133,7 +1144,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "replay_gdn", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "rides_ordinary_prefill", occurrences: 2, decisions: &["widened-prefill-batching", "gdn-chunk-scan"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "verify_dflash_block_inner", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 6, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage"] },
+    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 7, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse"] },
     Site { file: "hipfire-arch-qwen4/src/mtp_gpu.rs", function: "ensure_mapped_capacity", occurrences: 1, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-arch-qwen4/src/state.rs", function: "ensure_mapped_capacity", occurrences: 3, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-daemon/src/main.rs", function: "main", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },

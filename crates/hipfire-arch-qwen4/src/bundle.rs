@@ -1309,12 +1309,18 @@ impl Qwen4Bundle {
     /// `position..position + tokens.len()`, row `i` paired with captured spec
     /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
     /// calling [`Self::mtp_append_token`] per row after `copy_spec_hidden_row_to`.
+    ///
+    /// `trunk_ids_row` is `Some(r)` when `tokens` are rows `r..` of the spec
+    /// forward that just ran, with nothing run since: the head then embeds
+    /// from that forward's device token ids when they hold exactly `tokens`,
+    /// and uploads its own copy otherwise (or when `None`).
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
         scratch: &mut MtpAppendScratch,
         tokens: &[u32],
         hidden_row0: usize,
+        trunk_ids_row: Option<usize>,
         position: usize,
     ) -> Result<(), BundleError> {
         if tokens.is_empty() {
@@ -1346,6 +1352,13 @@ impl Qwen4Bundle {
             ));
         }
         let hidden = source.sub_offset(offset, len);
+        // The ids the trunk forward already uploaded stand in for the head's
+        // own copy; no forward runs between that upload and this call.
+        let device_ids = trunk_ids_row.and_then(|row| {
+            self.execution
+                .as_ref()
+                .and_then(|forward| forward.uploaded_token_ids(row, tokens))
+        });
         let last = position
             .checked_add(tokens.len() - 1)
             .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
@@ -1357,6 +1370,7 @@ impl Qwen4Bundle {
                 scratch,
                 tokens,
                 &hidden,
+                device_ids.as_ref(),
                 position,
             )
             .map_err(|error| BundleError::Forward(error.to_string()))

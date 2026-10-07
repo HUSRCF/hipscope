@@ -2122,6 +2122,12 @@ impl Qwen4MtpGpu {
     /// observes each; the QSA state commits `position + tokens.len()` rows.
     /// `wide_hidden`, the selection and its length are not touched (the
     /// per-row Append leaves them alone too).
+    ///
+    /// `device_ids`, when given, holds `tokens` as `tokens.len()` device i32
+    /// ids (at least that many bytes) that the embedding gather reads in place
+    /// of the scratch upload. The backing allocation must remain live and
+    /// any later writes must be ordered after the enqueued embedding gather;
+    /// returning from this call does not imply device completion.
     pub(crate) fn append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -2130,6 +2136,7 @@ impl Qwen4MtpGpu {
         scratch: &mut MtpAppendScratch,
         tokens: &[u32],
         hidden: &GpuTensor,
+        device_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
         let rows = tokens.len();
@@ -2171,6 +2178,17 @@ impl Qwen4MtpGpu {
                 self.state.mapped_tokens
             )));
         }
+        let ids_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid("MTP batched append token id extent overflow"))?;
+        if let Some(ids) = device_ids {
+            if ids.buf.size() < ids_bytes {
+                return Err(invalid(format!(
+                    "MTP batched append device token ids hold {} bytes, need {ids_bytes}",
+                    ids.buf.size()
+                )));
+            }
+        }
         let compress = config.indexer_compress_ratio;
         if compress == 0 {
             return Err(invalid("MTP indexer compress ratio is zero"));
@@ -2179,13 +2197,21 @@ impl Qwen4MtpGpu {
         for &token in tokens {
             self.draft.observe(token);
         }
-        for (bytes, &token) in scratch.host_token_bytes.chunks_exact_mut(4).zip(tokens) {
-            bytes.copy_from_slice(&(token as i32).to_ne_bytes());
-        }
-        gpu.memcpy_htod_auto(
-            &scratch.token_ids.buf,
-            &scratch.host_token_bytes[..rows * std::mem::size_of::<i32>()],
-        )?;
+        // Reused device ids (the trunk's already uploaded rows, same bytes as
+        // `tokens`) skip the host fill and copy; otherwise the scratch uploads.
+        let token_ids = match device_ids {
+            Some(ids) => ids,
+            None => {
+                for (bytes, &token) in scratch.host_token_bytes.chunks_exact_mut(4).zip(tokens) {
+                    bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+                }
+                gpu.memcpy_htod_auto(
+                    &scratch.token_ids.buf,
+                    &scratch.host_token_bytes[..rows * std::mem::size_of::<i32>()],
+                )?;
+                &scratch.token_ids
+            }
+        };
 
         // Exactly-`rows` views: HC norm and read derive their row count from
         // the tensor extent.
@@ -2209,7 +2235,7 @@ impl Qwen4MtpGpu {
         gpu.embedding_lookup_q8_batched(
             mw.embedding,
             &token_embedding,
-            &scratch.token_ids,
+            token_ids,
             rows,
             w.hidden,
         )?;

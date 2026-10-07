@@ -2272,7 +2272,7 @@ impl Qwen4MtpDrafter {
                 .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
             match fill {
                 Some(fill) => bundle
-                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, position)
+                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, position)
                     .map_err(|error| error.to_string())?,
                 None => {
                     let row_hidden = self
@@ -2588,6 +2588,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         } else {
             None
         };
+        let reuse_trunk_ids = mtp_reuse_prefill_ids_enabled();
         let mut first_token = None;
         // One chunked target forward per chunk instead of one single-row forward
         // per prompt token: the shared forward already captures the whole
@@ -2648,7 +2649,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
                             .map_err(|error| error.to_string())?;
                     } else {
                         Self::bundle(target)?
-                            .mtp_append_rows(gpu, scratch, &chunk[off..off + n], off, position)
+                            .mtp_append_rows(
+                                gpu,
+                                scratch,
+                                &chunk[off..off + n],
+                                off,
+                                prefill_trunk_ids_row(reuse_trunk_ids, off),
+                                position,
+                            )
                             .map_err(|error| error.to_string())?;
                     }
                     off += n;
@@ -3304,6 +3312,21 @@ fn mtp_batched_fill_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true)
 }
 
+/// `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS`: the prompt-fill head Append embeds
+/// from the token ids the trunk forward of the same chunk already uploaded
+/// (checked against the chunk's tokens), instead of uploading them again,
+/// unless set to `0`; read at every `mtp_prefill`.
+fn mtp_reuse_prefill_ids_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS", true)
+}
+
+/// `Qwen4Bundle::mtp_append_rows`'s `trunk_ids_row` for a prompt-fill
+/// sub-chunk starting at chunk row `off`: the sub-chunk's rows are that row
+/// of the chunk's trunk upload when reuse is on.
+fn prefill_trunk_ids_row(reuse: bool, off: usize) -> Option<usize> {
+    reuse.then_some(off)
+}
+
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
 /// few-row persistent GDN recurrence.
 pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
@@ -3375,6 +3398,14 @@ pub fn mtp_error(error: MtpError) -> String {
 mod tests {
     use super::*;
     use crate::reference_mtp::MtpQsaGeometry;
+
+    #[test]
+    fn prefill_head_append_names_the_trunk_id_row_only_when_reuse_is_on() {
+        assert_eq!(prefill_trunk_ids_row(true, 0), Some(0));
+        assert_eq!(prefill_trunk_ids_row(true, 1024), Some(1024));
+        assert_eq!(prefill_trunk_ids_row(false, 0), None);
+        assert_eq!(prefill_trunk_ids_row(false, 1024), None);
+    }
 
     #[test]
     fn native_acceptance_lowers_to_the_runtime_window_and_step() {
