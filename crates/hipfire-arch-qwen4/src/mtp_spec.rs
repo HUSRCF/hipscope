@@ -756,6 +756,15 @@ impl MtpFloor {
         }
     }
 
+    /// Measured native window cost in AR-step units, once probing finishes.
+    fn batched_cost(&self, depth: usize) -> Option<f32> {
+        if self.probing() || !valid_us(self.ar_us) {
+            return None;
+        }
+        let &(sum, windows) = self.batched.get(depth)?;
+        (windows > 0.0 && valid_us(sum)).then(|| sum / windows / self.ar_us)
+    }
+
     fn probing(&self) -> bool {
         self.probes < MTP_FLOOR_PROBE_WINDOWS
     }
@@ -1261,6 +1270,8 @@ pub struct Qwen4MtpDrafter {
     /// the n-gram source's own yield, kept apart from the native per-depth
     /// agreement (see `ngram_wins`).
     ngram_yield: (f32, f32),
+    /// Single-row and additional-row verify milliseconds for the loaded arch.
+    ngram_row_cost: Option<(f32, f32)>,
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
     /// Same-request AR floor model; reset only by `configure_request`
@@ -1296,6 +1307,7 @@ impl Qwen4MtpDrafter {
             ngram_active: false,
             ngram_candidates: Vec::new(),
             ngram_yield: (0.0, 0.0),
+            ngram_row_cost: None,
             takeover_block: Vec::new(),
             floor: MtpFloor::new(),
             floor_enabled: true,
@@ -1334,6 +1346,13 @@ impl Qwen4MtpDrafter {
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
+        self.ngram_row_cost = if gpu.arch_caps.is_gfx1151() {
+            Some((30.5, 6.9))
+        } else if gpu.arch_caps.is_gfx1201() {
+            Some((30.3, 14.8))
+        } else {
+            None
+        };
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -1638,6 +1657,26 @@ impl Qwen4MtpDrafter {
         best.0
     }
 
+    /// Price both sources on the same clock; unsupported arches retain the
+    /// original chooser. Depth drafts require depth + 1 verify rows.
+    fn ngram_window_cost(&self, depth: usize) -> f32 {
+        let depth = depth.min(MTP_WINDOW_COST.len() - 1);
+        let Some((single, extra)) = self.ngram_row_cost else {
+            return MTP_WINDOW_COST[depth];
+        };
+        if self.floor_enabled {
+            if let Some(cost) = self.floor.batched_cost(depth) {
+                return cost;
+            }
+        }
+        let ar_ms = if self.floor_enabled && valid_us(self.floor.ar_us) {
+            self.floor.ar_us / 1000.0
+        } else {
+            single
+        };
+        (single + extra * depth as f32) / ar_ms
+    }
+
     /// Best expected emitted tokens per unit of window cost the native route
     /// offers at the current agreement (`batched_depth`'s objective; the
     /// interleaved route is 1.0).
@@ -1645,8 +1684,9 @@ impl Qwen4MtpDrafter {
         let mut best = 1.0f32;
         let mut prefix = 1.0f32;
         let mut expected = 1.0f32;
-        let depths = self.agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
-        for (&(accepted, total), &cost) in depths {
+        let depths = self.agreement.iter().take(k.min(MTP_WINDOW_COST.len() - 1));
+        for (i, &(accepted, total)) in depths.enumerate() {
+            let cost = self.ngram_window_cost(i + 1);
             prefix *= accepted / total.max(f32::MIN_POSITIVE);
             expected += prefix;
             best = best.max(expected / cost);
@@ -1665,7 +1705,7 @@ impl Qwen4MtpDrafter {
     fn ngram_wins(&self, n: usize, k: usize) -> bool {
         let (emitted, windows) = self.ngram_yield;
         let expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
-        let cost = MTP_WINDOW_COST[n.min(MTP_WINDOW_COST.len() - 1)];
+        let cost = self.ngram_window_cost(n);
         expected / cost >= self.native_rate(k.min(self.max_k))
     }
 
@@ -3520,6 +3560,40 @@ mod tests {
         // A verbatim copy (4 tokens per window) beats it.
         drafter.ngram_yield = (32.0, 8.0);
         assert!(drafter.ngram_wins(3, 3));
+    }
+
+    #[test]
+    fn ngram_arch_pricing_refuses_r9700_copy_but_keeps_halo_winner() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.agreement[1] = (0.86 / 0.95, 1.0);
+        assert!((expected_emitted(&drafter.agreement, 2) - 2.81).abs() < 1e-5);
+        // Five takeovers averaging 2.4 emitted tokens; preserve the prior.
+        drafter.ngram_yield = (12.0, 5.0);
+        drafter.ngram_row_cost = Some((30.3, 14.8));
+        assert!((drafter.ngram_window_cost(3) - 74.7 / 30.3).abs() < 1e-5);
+        assert!(!drafter.ngram_wins(3, 2));
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.ngram_yield = (17.0, 5.0);
+        assert!((drafter.ngram_window_cost(3) - 51.2 / 30.5).abs() < 1e-5);
+        assert!(drafter.ngram_wins(3, 2));
+    }
+
+    #[test]
+    fn ngram_pricing_uses_request_measurements_after_probing() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.ngram_row_cost = Some((30.3, 14.8));
+        drafter.floor.ar_us = 30_000.0;
+        drafter.floor.batched[3] = (240_000.0, 2.0);
+        assert!(drafter.floor.batched_cost(3).is_none());
+        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
+        assert_eq!(drafter.floor.batched_cost(3), Some(4.0));
+        assert_eq!(drafter.ngram_window_cost(3), 4.0);
+        assert!(!drafter.ngram_wins(3, 2));
+        drafter.floor.batched[3] = (30_000.0, 2.0);
+        assert!(drafter.ngram_wins(3, 2));
+        drafter.ngram_row_cost = None;
+        assert_eq!(drafter.ngram_window_cost(3), MTP_WINDOW_COST[3]);
     }
 
     #[test]
