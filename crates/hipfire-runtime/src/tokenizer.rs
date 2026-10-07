@@ -323,7 +323,9 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
 /// crate and tables makes the result identical by construction.
 fn nfc_normalize(text: &str) -> std::borrow::Cow<'_, str> {
     use unicode_normalization_alignments::UnicodeNormalization;
-    if is_nfc_no_alloc(text) {
+    // ASCII is always NFC. The byte scan is vectorized and avoids Unicode
+    // table probes per character on the dominant code/JSON prompt path.
+    if text.is_ascii() || is_nfc_no_alloc(text) {
         std::borrow::Cow::Borrowed(text)
     } else {
         std::borrow::Cow::Owned(text.nfc().map(|(c, _)| c).collect())
