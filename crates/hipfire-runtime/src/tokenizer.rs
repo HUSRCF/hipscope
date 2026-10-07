@@ -272,10 +272,104 @@ fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer
     Some(Gpt2Pretokenizer { splitters })
 }
 
-/// NFC-normalize `text`; borrowed (no allocation) when already NFC.
+/// NFC-normalize `text` exactly as HF `tokenizers` does; borrowed (no
+/// allocation) when `text` is already NFC.
+///
+/// HF's `NFC` normalizer is `unicode-normalization-alignments` 0.1.12, whose
+/// tables are **Unicode 9.0.0**. Characters assigned later (e.g. U+089B,
+/// U+1DF7) have combining class 0 there and are never reordered or composed,
+/// so newer-Unicode normalizers (ICU) diverge from HF on them. Using the same
+/// crate and tables makes the result identical by construction.
 fn nfc_normalize(text: &str) -> std::borrow::Cow<'_, str> {
-    // `new_nfc` is a const fn that only borrows the baked-in static data.
-    icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text)
+    use unicode_normalization_alignments::UnicodeNormalization;
+    if is_nfc_no_alloc(text) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.nfc().map(|(c, _)| c).collect())
+    }
+}
+
+/// Allocation-free `text.nfc() == text` under the Unicode 9 tables.
+///
+/// The library's own `is_nfc` falls back to `s.chars().eq(s.chars().nfc())`
+/// on a quick-check `Maybe`; that iterator buffers every pending combining
+/// mark in a `SmallVec<[_; 4]>` and spills to the heap on long combining
+/// runs. This keeps the library's quick check (no allocation) and replaces
+/// only the `Maybe` fallback with [`is_nfc_maybe`]. May return `false` for a
+/// text that is in fact NFC (the caller then builds an owned, identical
+/// string); never returns `true` for a text that is not.
+fn is_nfc_no_alloc(text: &str) -> bool {
+    use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
+    match is_nfc_quick(text.chars()) {
+        IsNormalized::Yes => true,
+        IsNormalized::No => false,
+        IsNormalized::Maybe => is_nfc_maybe(text),
+    }
+}
+
+/// Streaming UAX #15 composition check for a text that passed the quick
+/// check's ordering test and contains no QC=No character (so combining marks
+/// are in non-decreasing class order within each run). Mirrors the library's
+/// `Recompositions` state machine while holding only the current starter and
+/// the class of the last mark after it. Returns `false` as soon as a
+/// composition (or a reorder that could compose) would change the text.
+///
+/// Two details beyond "does `starter + mark` compose":
+/// * A starter that is itself precomposed (`ớ` = o U+031B U+0301) hides the
+///   marks of its decomposition. A following mark with a lower class than the
+///   last hidden mark is reordered *into* that decomposition and may compose
+///   there (`ớ` U+0323 → `ợ` U+0301). The check cannot see that from the
+///   precomposed char, so it conservatively reports "not NFC".
+/// * A new starter composes with the previous one when the previous starter
+///   and the *first* character of the new starter's decomposition compose
+///   (Hangul L+V; Indic vowel signs), so that first character is tested.
+fn is_nfc_maybe(text: &str) -> bool {
+    use unicode_normalization_alignments::char::{
+        canonical_combining_class, compose, decompose_canonical,
+    };
+    let mut starter: Option<char> = None;
+    // Class of the last decomposed mark of `starter`, computed on first need.
+    let mut starter_tail_ccc: Option<u8> = None;
+    // Class of the last mark after `starter`; 0 = none pending.
+    let mut last_ccc = 0u8;
+    for ch in text.chars() {
+        let ccc = canonical_combining_class(ch);
+        if ccc == 0 {
+            if let (Some(prev), 0) = (starter, last_ccc) {
+                let mut first = None;
+                decompose_canonical(ch, |d| {
+                    if first.is_none() {
+                        first = Some(d);
+                    }
+                });
+                if compose(prev, first.unwrap_or(ch)).is_some() {
+                    return false;
+                }
+            }
+            starter = Some(ch);
+            starter_tail_ccc = None;
+            last_ccc = 0;
+            continue;
+        }
+        // A mark before any starter is emitted as-is by the library.
+        let Some(s) = starter else { continue };
+        if last_ccc == 0 {
+            let tail = *starter_tail_ccc.get_or_insert_with(|| {
+                let mut last = s;
+                decompose_canonical(s, |d| last = d);
+                canonical_combining_class(last)
+            });
+            if ccc < tail {
+                return false;
+            }
+        }
+        // Unblocked iff the previous mark's class is strictly lower.
+        if last_ccc < ccc && compose(s, ch).is_some() {
+            return false;
+        }
+        last_ccc = ccc;
+    }
+    true
 }
 
 /// True iff an HF `normalizer` node is exactly NFC: `{"type":"NFC"}`, or a
@@ -1671,6 +1765,17 @@ impl Tokenizer {
 
 /// GPT-2 byte-to-char mapping (matches OpenAI's bytes_to_unicode() exactly).
 /// Printable bytes map to themselves as Unicode chars. Non-printable bytes get
+            if self.normalizer_nfc {
+                // NFC results depend on the normalization tables: HF uses
+                // `unicode-normalization-alignments` 0.1.12 (Unicode 9.0.0).
+                // Hashed only when NFC is active so non-NFC identities are
+                // unchanged; any table/crate change must bump this label.
+                h.update(b"nfc:unicode-normalization-alignments-0.1.12");
+                let (major, minor, patch) = unicode_normalization_alignments::UNICODE_VERSION;
+                for v in [major, minor, patch] {
+                    h.update(v.to_le_bytes());
+                }
+            }
 /// sequential codepoints starting from U+0100, in order of byte value.
 fn byte_to_gpt2_char(b: u8) -> char {
     let b32 = b as u32;
@@ -3943,5 +4048,166 @@ mod cache_identity_digest_tests {
         assert_eq!(t.config_digest(), t.config_digest());
         assert_eq!(t.vocab_digest().len(), 32);
         assert_eq!(t.config_digest().len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod nfc_exactness_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use unicode_normalization_alignments::{is_nfc, UnicodeNormalization};
+
+    thread_local! {
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts allocations per thread so a test only sees its own.
+    struct CountingAlloc;
+
+    // SAFETY: delegates every operation to `System`; only bumps a
+    // const-initialized thread-local counter (no allocation, no destructor).
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.alloc_zeroed(layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.realloc(ptr, layout, new_size)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+
+    fn allocs_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        let before = ALLOCS.with(|c| c.get());
+        let r = f();
+        (r, ALLOCS.with(|c| c.get()) - before)
+    }
+
+    /// HF's NFC: `text.nfc()` collected, always owned.
+    fn hf_nfc(text: &str) -> String {
+        text.nfc().map(|(c, _)| c).collect()
+    }
+
+    #[test]
+    fn hf_nfc_tables_are_unicode_9() {
+        assert_eq!(unicode_normalization_alignments::UNICODE_VERSION, (9, 0, 0));
+    }
+
+    #[test]
+    fn post_unicode9_marks_are_untouched_like_hf() {
+        // U+089B (Unicode 14) and U+1DF7 (Unicode 10) are unassigned in
+        // Unicode 9: class 0, never reordered. ICU (newer data) reorders
+        // both pairs; HF keeps them.
+        for s in ["\u{0302}\u{089B}", "\u{065D}\u{1DF7}"] {
+            assert_eq!(hf_nfc(s), s);
+            let out = nfc_normalize(s);
+            assert!(matches!(out, Cow::Borrowed(_)), "{s:?} must stay borrowed");
+            assert_eq!(out, s);
+        }
+    }
+
+    #[test]
+    fn common_composition_ordering_and_hangul() {
+        let out = nfc_normalize("e\u{0301}");
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, "\u{00E9}");
+        assert!(matches!(nfc_normalize("\u{00E9}"), Cow::Borrowed(_)));
+        assert!(matches!(nfc_normalize("plain ascii"), Cow::Borrowed(_)));
+
+        // Canonical reordering (U+0301 ccc 230 after U+0323 ccc 220), then
+        // composition of the unblocked mark: a + U+0301 + U+0323 → ạ U+0301.
+        assert_eq!(nfc_normalize("a\u{0301}\u{0323}"), "\u{1EA1}\u{0301}");
+        assert_eq!(nfc_normalize("a\u{0323}\u{0301}"), "\u{1EA1}\u{0301}");
+        assert!(matches!(nfc_normalize("\u{1EA1}\u{0301}"), Cow::Borrowed(_)));
+
+        // Hangul L V T and LV T compose; the syllable stays borrowed.
+        assert_eq!(nfc_normalize("\u{1112}\u{1161}\u{11AB}"), "\u{D55C}");
+        assert_eq!(nfc_normalize("\u{D558}\u{11AB}"), "\u{D55C}");
+        assert!(matches!(nfc_normalize("\u{D55C}"), Cow::Borrowed(_)));
+
+        // Precomposed starter hides its marks: ớ + U+0323 reorders into the
+        // decomposition (→ ợ U+0301), so it must NOT be reported as NFC.
+        let tricky = "\u{1EDB}\u{0323}";
+        let out = nfc_normalize(tricky);
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, hf_nfc(tricky));
+        assert_ne!(out, tricky);
+    }
+
+    #[test]
+    fn long_normalized_combining_sequence_borrows_without_allocating() {
+        // 'a' + 40 × U+0346 (ccc 230, does not compose) + U+0301 (QC Maybe,
+        // blocked by the equal-class marks): already NFC, takes the Maybe
+        // path, and far exceeds the library iterator's 4-slot inline buffer.
+        let mut s = String::from("a");
+        for _ in 0..40 {
+            s.push('\u{0346}');
+        }
+        s.push('\u{0301}');
+        assert_eq!(
+            unicode_normalization_alignments::is_nfc_quick(s.chars()),
+            unicode_normalization_alignments::IsNormalized::Maybe
+        );
+        assert_eq!(hf_nfc(&s), s);
+
+        let (borrowed, n) = allocs_during(|| matches!(nfc_normalize(&s), Cow::Borrowed(_)));
+        assert!(borrowed, "already-NFC long combining run must borrow");
+        assert_eq!(n, 0, "borrowed NFC fast path allocated");
+
+        // Why the library checker is not used: on the same input it
+        // allocates (SmallVec spill) while ours does not.
+        let (lib_ok, lib_allocs) = allocs_during(|| is_nfc(&s));
+        assert!(lib_ok);
+        assert!(lib_allocs > 0, "library is_nfc expected to spill on long runs");
+    }
+
+    #[test]
+    fn matches_hf_on_generated_mixed_text() {
+        // Pool: ASCII/precomposed starters, marks of several classes (some
+        // composing, some not), Hangul jamo/syllables, Indic composing
+        // pairs, QC=No chars, and post-Unicode-9 code points.
+        const POOL: &[char] = &[
+            'a', 'e', 'o', 'c', 's', 'x', '\u{00E7}', '\u{1EB7}', '\u{1EDB}', '\u{1E69}',
+            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}',
+            '\u{031B}', '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}',
+            '\u{1100}', '\u{1161}', '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}',
+            '\u{0B3E}', '\u{0958}', '\u{065D}', '\u{089B}', '\u{1DF7}',
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = 1 + (next() % 8) as usize;
+            let s: String = (0..len)
+                .map(|_| POOL[(next() % POOL.len() as u64) as usize])
+                .collect();
+            let reference = hf_nfc(&s);
+            let out = nfc_normalize(&s);
+            assert_eq!(out, reference, "output differs for {s:?}");
+            if matches!(out, Cow::Borrowed(_)) {
+                assert_eq!(reference, s, "borrowed but not NFC: {s:?}");
+            }
+            // Never claims NFC where the library's authoritative check
+            // disagrees.
+            if is_nfc_no_alloc(&s) {
+                assert!(is_nfc(&s), "no-alloc check accepted non-NFC {s:?}");
+            }
+        }
     }
 }

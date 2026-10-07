@@ -77,6 +77,30 @@ Implemented by commit `b15e6f884`.
 - Commands, fixtures, report layout and env knobs: `CONTRIBUTING.md`
   § Tokenizer differential test.
 
+## 2026-10-07 — exact HF NFC normalization (runtime)
+
+- `hipfire-runtime` replaced `icu_normalizer` 2 with
+  `unicode-normalization-alignments =0.1.12` for the tokenizer `NFC`
+  normalizer. HF `tokenizers` 0.22.2 normalizes with this crate, whose tables
+  are Unicode 9.0.0; ICU's newer data reorders post-Unicode-9 marks that HF
+  leaves untouched (observed: U+0302 U+089B and U+065D U+1DF7). Using the same
+  crate and data makes encoding identical to HF by construction.
+- `icu_normalizer` had no other user in the workspace and is removed, along
+  with its `icu_*`/`zerovec`-family transitive crates that nothing else
+  required. The new crate is MIT/Apache-2.0 (both in the `deny.toml`
+  allowlist) and adds no crate beyond `smallvec`, which is already a runtime
+  dependency; the dev-only `tokenizers` oracle already resolved the same
+  version. No runtime dependency on HF `tokenizers` is introduced.
+- The borrowed (no-allocation) fast path for already-NFC text is kept. The
+  crate's own `is_nfc` falls back on a quick-check `Maybe` to an iterator that
+  buffers marks in a 4-slot `SmallVec` and heap-allocates on long combining
+  runs, so `tokenizer.rs` uses the crate's allocation-free quick check plus a
+  streaming starter/last-class composition check, then
+  `text.nfc().map(|c| c.0).collect::<String>()` only when the text changes.
+- Cache identity: `Tokenizer::config_digest` now hashes the NFC implementation
+  label and Unicode version for NFC tokenizers only, invalidating NFC-keyed
+  caches while leaving non-NFC tokenizer identities unchanged.
+
 ## Deferred after inspection
 
 - `lexopt`: not adopted; maintained command-line tools should converge on

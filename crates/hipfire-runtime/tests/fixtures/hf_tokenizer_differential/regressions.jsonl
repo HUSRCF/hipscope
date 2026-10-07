@@ -104,3 +104,5 @@
 {"family": "minimax27", "id": "minimax27/hf-split-inverted-removed/050", "text": " I'M", "ids": [2586, 77]}
 {"family": "minimax27", "id": "minimax27/hf-split-inverted-removed/051", "text": "`\n/)", "ids": [9677, 47, 41]}
 {"family": "minimax27", "id": "minimax27/hf-split-inverted-removed/052", "text": "}\r/n", "ids": [125, 13, 47, 110]}
+{"family": "qwen35", "id": "qwen35/hf-unicode9-nfc/000", "text": "\u0302\u089b", "ids": [136, 224, 156, 95, 249]}
+{"family": "qwen38", "id": "qwen38/hf-unicode9-nfc/000", "text": "\u065d\u1df7", "ids": [149, 251, 157, 115, 115]}
