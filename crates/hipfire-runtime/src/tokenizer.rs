@@ -31,6 +31,16 @@ const WS_LOOKAHEAD_ALT: &str = r"\s+(?!\S)|";
 /// match can be attributed to it.
 const WS_TAIL_GROUP: &str = "hf_ws_tail";
 
+/// North-Mini-Code's digit splitter, matched as the exact literal. The
+/// lookahead `(?=(?:\d{3})*\b)` only holds at the end of a maximal `\d` run
+/// that is followed by a Unicode `\b` (end of text or a non-`\w` char), so
+/// such a run is cut into right-aligned groups of 3 (first group 1..=3).
+const DIGIT_GROUPS_RIGHT_PATTERN: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
+/// Regex used to find the eligible runs of [`DIGIT_GROUPS_RIGHT_PATTERN`]:
+/// `\d+` is greedy and `\b` only holds at the run end, so a match is exactly
+/// a maximal run whose end boundary holds.
+const DIGIT_RUN_PATTERN: &str = r"\d+\b";
+
 /// Bookkeeping for the emulated `\s+(?!\S)` alternative.
 struct WsTail {
     /// Capture index of the plain `\s+` alternative.
@@ -59,6 +69,9 @@ struct WsTail {
 struct PretokSplitter {
     re: Regex,
     ws_tail: Option<WsTail>,
+    /// `re` is [`DIGIT_RUN_PATTERN`]; each match is emitted as right-aligned
+    /// chunks of up to 3 chars instead of as one piece.
+    digit_groups: bool,
     /// The pattern text as given (pre-rewrite); part of the config digest.
     source: String,
     /// HF `Split{behavior: Removed, invert: true}`: `invert` flips the
@@ -75,6 +88,15 @@ impl PretokSplitter {
     }
 
     fn compile_with_mode(pattern: &str, drop_gaps: bool) -> Result<Self, String> {
+        if pattern == DIGIT_GROUPS_RIGHT_PATTERN {
+            return Ok(Self {
+                re: Regex::new(DIGIT_RUN_PATTERN).map_err(|e| e.to_string())?,
+                ws_tail: None,
+                digit_groups: true,
+                source: pattern.to_owned(),
+                drop_gaps,
+            });
+        }
         let (src, has_tail) = match pattern.find(WS_LOOKAHEAD_ALT) {
             None => (pattern.to_owned(), false),
             Some(i) => {
@@ -104,6 +126,7 @@ impl PretokSplitter {
         Ok(Self {
             re,
             ws_tail,
+            digit_groups: false,
             source: pattern.to_owned(),
             drop_gaps,
         })
@@ -163,7 +186,25 @@ impl PretokSplitter {
             if !self.drop_gaps && start > gap {
                 out.push(&text[gap..start]);
             }
-            out.push(&text[start..end]);
+            if self.digit_groups {
+                // Right-aligned groups: first chunk is n%3 chars (3 if n%3==0).
+                let run = &text[start..end];
+                let n = run.chars().count();
+                let mut want = if n % 3 == 0 { 3 } else { n % 3 };
+                let (mut chunk_start, mut in_chunk) = (start, 0usize);
+                for (i, _) in run.char_indices() {
+                    if in_chunk == want {
+                        out.push(&text[chunk_start..start + i]);
+                        chunk_start = start + i;
+                        in_chunk = 0;
+                        want = 3;
+                    }
+                    in_chunk += 1;
+                }
+                out.push(&text[chunk_start..end]);
+            } else {
+                out.push(&text[start..end]);
+            }
             gap = end;
             pos = end;
         }
@@ -1724,6 +1765,17 @@ impl Tokenizer {
                 }
             }
             h.update([u8::from(self.normalizer_nfc)]);
+            if self.normalizer_nfc {
+                // NFC results depend on the normalization tables: HF uses
+                // `unicode-normalization-alignments` 0.1.12 (Unicode 9.0.0).
+                // Hashed only when NFC is active so non-NFC identities are
+                // unchanged; any table/crate change must bump this label.
+                h.update(b"nfc:unicode-normalization-alignments-0.1.12");
+                let (major, minor, patch) = unicode_normalization_alignments::UNICODE_VERSION;
+                for v in [major, minor, patch] {
+                    h.update(v.to_le_bytes());
+                }
+            }
         }
         h.finalize().to_vec()
     }
@@ -1765,17 +1817,6 @@ impl Tokenizer {
 
 /// GPT-2 byte-to-char mapping (matches OpenAI's bytes_to_unicode() exactly).
 /// Printable bytes map to themselves as Unicode chars. Non-printable bytes get
-            if self.normalizer_nfc {
-                // NFC results depend on the normalization tables: HF uses
-                // `unicode-normalization-alignments` 0.1.12 (Unicode 9.0.0).
-                // Hashed only when NFC is active so non-NFC identities are
-                // unchanged; any table/crate change must bump this label.
-                h.update(b"nfc:unicode-normalization-alignments-0.1.12");
-                let (major, minor, patch) = unicode_normalization_alignments::UNICODE_VERSION;
-                for v in [major, minor, patch] {
-                    h.update(v.to_le_bytes());
-                }
-            }
 /// sequential codepoints starting from U+0100, in order of byte value.
 fn byte_to_gpt2_char(b: u8) -> char {
     let b32 = b as u32;
@@ -2744,6 +2785,63 @@ mod pretok_tests {
         assert_eq!(qwen.pieces("a  b"), vec!["a", " ", " b"]);
         assert_eq!(qwen.pieces("a  \n  b"), vec!["a", "  \n", " ", " b"]);
         assert_eq!(qwen.pieces("a  "), vec!["a", "  "]);
+    }
+
+    #[test]
+    fn north_digit_groups_right_aligned() {
+        let d = single(DIGIT_GROUPS_RIGHT_PATTERN);
+        assert_eq!(d.pieces("6789"), vec!["6", "789"]);
+        assert_eq!(d.pieces("12"), vec!["12"]);
+        assert_eq!(d.pieces("123"), vec!["123"]);
+        assert_eq!(d.pieces("1234567"), vec!["1", "234", "567"]);
+        assert_eq!(d.pieces("123456"), vec!["123", "456"]);
+        // Arabic-Indic digits (Nd, multi-byte): grouped by chars, not bytes.
+        assert_eq!(
+            d.pieces("\u{0660}\u{0661}\u{0662}\u{0669}"),
+            vec!["\u{0660}", "\u{0661}\u{0662}\u{0669}"]
+        );
+        // End boundary is `\b`: a following word char (letter, `_`,
+        // combining mark, ZWJ) makes the whole run ineligible.
+        assert_eq!(d.pieces("12a"), vec!["12a"]);
+        assert_eq!(d.pieces("1234a"), vec!["1234a"]);
+        assert_eq!(d.pieces("12_"), vec!["12_"]);
+        assert_eq!(d.pieces("12\u{0301}"), vec!["12\u{0301}"]);
+        assert_eq!(d.pieces("12\u{200D}"), vec!["12\u{200D}"]);
+        // `²` (No) is not `\w`: boundary holds. `Ⅳ` (Nl) is alphabetic: it does not.
+        assert_eq!(d.pieces("12\u{00B2}"), vec!["12", "\u{00B2}"]);
+        assert_eq!(d.pieces("1234\u{00B2}"), vec!["1", "234", "\u{00B2}"]);
+        assert_eq!(d.pieces("12\u{2163}"), vec!["12\u{2163}"]);
+        // Gaps are preserved; non-word followers keep the boundary.
+        assert_eq!(d.pieces("12.5"), vec!["12", ".", "5"]);
+        assert_eq!(d.pieces("x 1234 "), vec!["x ", "1", "234", " "]);
+        assert_eq!(d.pieces("a\n1234\n"), vec!["a\n", "1", "234", "\n"]);
+        // A digit run after a letter is still a run (HF has no start constraint).
+        assert_eq!(d.pieces("a1 1234"), vec!["a", "1", " ", "1", "234"]);
+        assert_eq!(d.pieces("1234 12a 5678"), vec!["1", "234", " 12a ", "5", "678"]);
+        assert_eq!(d.pieces(""), Vec::<&str>::new());
+        // Exact-literal only: other lookaheads stay unsupported.
+        assert!(PretokSplitter::compile(r"\d{1,3}(?=\d)").is_err());
+    }
+
+    #[test]
+    fn north_digit_groups_full_chain() {
+        let chain = Gpt2Pretokenizer {
+            splitters: vec![
+                PretokSplitter::compile(DIGIT_GROUPS_RIGHT_PATTERN).unwrap(),
+                PretokSplitter::compile(
+                    r"\p{N}{1,3}|\p{L}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+                )
+                .unwrap(),
+            ],
+        };
+        assert_eq!(chain.pieces("6789"), vec!["6", "789"]);
+        // Ineligible run falls to the left-aligned `\p{N}{1,3}` of stage two.
+        assert_eq!(chain.pieces("1234a"), vec!["123", "4", "a"]);
+        // The whitespace gap before a digit is its own piece; stage two sees
+        // it as end-of-piece, so `\s+(?!\S)` takes the whole run.
+        assert_eq!(chain.pieces("  2"), vec!["  ", "2"]);
+        assert_eq!(chain.pieces("x 1234 "), vec!["x", " ", "1", "234", " "]);
+        assert_eq!(chain.pieces("a\n12345\n"), vec!["a", "\n", "12", "345", "\n"]);
     }
 
     #[test]
