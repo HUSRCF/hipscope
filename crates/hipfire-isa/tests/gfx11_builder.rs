@@ -159,8 +159,8 @@ fn gfx1100_silu_region_matches_fresh_hipcc_object() {
     use hipfire_isa::kernels::iu4_gemm::region;
     let bundler = require_rocm_tool!("clang-offload-bundler");
     let objdump = require_rocm_tool!("llvm-objdump");
-    let hipcc = "/opt/rocm/core-10.0/bin/hipcc";
-    if !std::path::Path::new(hipcc).exists() { eprintln!("skip: no {hipcc}"); return }
+    let hipcc = rocm::hipcc();
+    assert!(hipcc.is_file(), "required ROCm compiler missing: {}", hipcc.display());
     let root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("v2c-silu-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

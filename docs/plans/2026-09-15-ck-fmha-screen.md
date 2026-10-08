@@ -69,7 +69,7 @@ Optional closer match to mid-prefill mean ctx ~4352: also time `-s_k=4352 -mask=
 
 | Host | Observation |
 |---|---|
-| This research node | `/opt/rocm/core-10.0/.info/version` → **10.0.0**; `hipcc --version` → **HIP 7.15.26333**, AMD clang 23 |
+| This research node | Historical ROCm install `.info/version` → **10.0.0**; `hipcc --version` → **HIP 7.15.26333**, AMD clang 23 |
 | Prior hipfire CK sidecar build note | Validated on **ROCm 7.14** / HIP 7.14 (`experiments/flash-attn-ck-sidecar/README.md`) |
 | CK `develop` HEAD changelog tip | **CK 1.3.0 for ROCm 10.1.0** |
 | hipx | **Unknown here.** Parent MUST `cat /opt/rocm/.info/version /opt/rocm/core*/.info/version` and `hipcc --version` before trusting the build. |
@@ -313,7 +313,7 @@ Kernel header contract: `kernels/src/attention_q8_0_fa2_gqa.gfx11.hip:64-72,115-
 - `scripts/package-ck-runtime.sh` — exact-arch bundle helper  
 
 ### ROCm on research node (not hipx)
-- `/opt/rocm/core-10.0/.info/version` → `10.0.0`  
+- Historical ROCm install `.info/version` → `10.0.0`
 - `hipcc --version` → HIP 7.15.26333  
 
 ---

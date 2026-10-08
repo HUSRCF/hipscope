@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
+#[path = "../../rocm.rs"]
+mod rocm;
 
 #[derive(Clone, Debug)]
 pub struct Toolchain {
@@ -35,8 +37,7 @@ pub struct Toolchain {
 
 impl Default for Toolchain {
     fn default() -> Self {
-        let root = std::env::var_os("ROCM_PATH").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"));
+        let root = rocm::root();
         let llvm = root.join("lib/llvm/bin");
         Self {
             llvm_mc: llvm.join("llvm-mc"), linker: llvm.join("ld.lld"),

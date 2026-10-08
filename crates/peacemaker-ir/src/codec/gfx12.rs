@@ -1111,9 +1111,9 @@ mod tests {
         use std::{io::Write, process::{Command, Stdio}};
         // Oracle test: needs ROCm's llvm-mc. The no-GPU CI runner has no ROCm,
         // so skip there instead of panicking on spawn; ROCm hosts still run it.
-        const LLVM_MC: &str = "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";
-        if !std::path::Path::new(LLVM_MC).exists() {
-            eprintln!("skipping: {LLVM_MC} not present (no ROCm toolchain)");
+        let llvm_mc = crate::rocm_llvm_mc();
+        if crate::rocm::tests_disabled() {
+            eprintln!("skipping: explicitly disabled ROCm toolchain");
             return;
         }
         for (arch, cpu) in [(Arch::Gfx1100, "gfx1100"), (Arch::Gfx1151, "gfx1151"), (Arch::Gfx1201, "gfx1201")] {
@@ -1121,7 +1121,7 @@ mod tests {
                 let words = if arch == Arch::Gfx1201 { vec![0xee050000 | saddr, 10, 20] }
                     else { vec![0xdc520000, 0x0a000014 | saddr << 16] };
                 let input = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(" ");
-                let mut mc = Command::new(LLVM_MC)
+                let mut mc = Command::new(&llvm_mc)
                     .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-disassemble"])
                     .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
                 mc.stdin.take().unwrap().write_all(format!("{input}\n").as_bytes()).unwrap();

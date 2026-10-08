@@ -103,7 +103,7 @@ The W2 STATUS names the local hipcc resource workflow, but its current document 
 - Prelude: `/home/kaden/ClaudeCode/warpfront/wt-lloyd/kernels/src/block_i4_128_quant.hip`, SHA-256 `df39676b9a56d0f381a33c681c8b2ad5feba3f0ca2a2e2188505c59fc87c7ee0`.
 - Kernel: `/home/kaden/ClaudeCode/warpfront/wt-lloyd/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip`, SHA-256 `0ff99b708a5939f2e7dcdf3d1904134343e0a3755d9282c38e0acc935fd2c9ca`.
 - Concatenate those sources, in that order, into `/home/kaden/ClaudeCode/warpfront/wt-lloyd/target/halo-iu4-lowfootprint/ledger-20260916/shipping.hip` (same composition as `/home/kaden/ClaudeCode/warpfront/wt-lloyd/crates/rdna-compute/src/kernels.rs:3403-3406`).
-- Compiler: HIP `7.15.26333-0000000`, AMD clang `23.0.0git`, LLVM revision `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, installed under `/opt/rocm/core-10.0/lib/llvm/bin`.
+- Compiler: HIP `7.15.26333-0000000`, AMD clang `23.0.0git`, LLVM revision `8f497e0992fb7513f7f78a6f6b6f1056c375e961`, from the historical ROCm 10.0 LLVM installation.
 
 With working directory `/home/kaden/ClaudeCode/warpfront/wt-lloyd/target/halo-iu4-lowfootprint/ledger-20260916`, the exact compile command was:
 

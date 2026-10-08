@@ -360,7 +360,7 @@ fn hipcc_spellings_match_codec() {
 }
 
 /// `(text, gfx1100 words, gfx1151 words, gfx1201 words)` pinned from
-/// `/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc -triple=amdgcn -mcpu=<arch>
+/// ROCm 10.0 `llvm-mc -triple=amdgcn -mcpu=<arch>
 /// -show-encoding`. An empty slice means the pinned assembler rejects the
 /// spelling for that arch, so the parser/codec pair must refuse it too.
 type Pinned = (&'static str, &'static [u32], &'static [u32], &'static [u32]);

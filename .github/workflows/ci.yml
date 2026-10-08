@@ -67,6 +67,7 @@ jobs:
       # Belt and braces on a GPU-less runner: no test may see a device.
       ROCR_VISIBLE_DEVICES: "-1"
       HIP_VISIBLE_DEVICES: "-1"
+      HIPFIRE_TEST_REQUIRE_ROCM: "0"
     steps:
       - name: Private hipfire lock dir
         run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"

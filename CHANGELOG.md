@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased (0.4.2)
+
+- ROCm 10.1 preparation pins HIP code object v6 and increments the JIT cache ABI. Oracle tools share `ROCM_PATH`, else `/opt/rocm`, with LLVM tools under `lib/llvm/bin`; missing tools fail unless `HIPFIRE_TEST_REQUIRE_ROCM=0` explicitly marks a no-ROCm test host. Historical fixture provenance is unchanged.
+
 ## v0.4.1.1 — release draft
 
 Public release/tag: **v0.4.1.1**; Cargo workspace/package version: **0.4.1+patch.1**. Cargo build metadata does not give this patch higher SemVer precedence than 0.4.1. Managed installs select the public Git tag with `hipfire update --tag v0.4.1.1`; update resolves Git revisions, not a SemVer latest-release ranking.

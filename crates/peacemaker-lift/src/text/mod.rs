@@ -18,11 +18,15 @@ pub use parse::{SourceFile, SourceKind, SourceLine, parse_line, parse_source};
 pub use print::{PrintError, canonical, kernel_lines};
 
 #[cfg(test)]
+#[path = "../../../rocm.rs"]
+mod rocm;
+
+#[cfg(test)]
 pub(crate) mod support {
     use std::path::PathBuf;
 
     /// Pinned second-opinion toolchain (`PEACEMAKER_ROCM`, else `ROCM_PATH`,
-    /// else `/opt/rocm/core-10.0`). `Some` means the live tools must agree;
+    /// else `/opt/rocm`). `Some` means the live tools must agree;
     /// `None` means the committed objdump fixture is the reference. A
     /// set-but-unusable `PEACEMAKER_ROCM` is a hard error, never a silent skip.
     pub(crate) struct Toolchain {
@@ -46,17 +50,16 @@ pub(crate) mod support {
         }
         // Test hook: exercise the committed-fixture fallback on machines
         // that do have a toolchain.
-        if std::env::var("PEACEMAKER_NO_ROCM").is_ok() {
+        if std::env::var("PEACEMAKER_NO_ROCM").is_ok() || super::rocm::tests_disabled() {
             return Ok(None);
         }
-        let root = std::env::var_os("ROCM_PATH").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"));
+        let root = super::rocm::root();
         let objdump = root.join(BIN).join("llvm-objdump");
         let mc = root.join(BIN).join("llvm-mc");
         if objdump.is_file() && mc.is_file() {
             return Ok(Some(Toolchain { objdump, mc }));
         }
-        Ok(None)
+        Err(format!("required ROCm tools missing from {}", root.display()))
     }
 
     /// Selected KT48 kernel stream as little-endian words plus base VA.

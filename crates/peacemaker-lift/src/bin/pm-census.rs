@@ -372,12 +372,14 @@ fn report(modules: &[Value], unknowns: &BTreeMap<String, Value>, provenance: Val
 /// ROCm root the census actually ran against. The objdump argument is what
 /// disassembled the objects, so a `<root>/lib/llvm/bin/llvm-objdump` path names
 /// its root exactly; any other layout falls back to the shared resolution of
-/// the lift tests: `PEACEMAKER_ROCM`, else `ROCM_PATH`, else `/opt/rocm/core-10.0`.
+/// the lift tests: `PEACEMAKER_ROCM`, else `ROCM_PATH`, else `/opt/rocm`.
+#[path = "../../../rocm.rs"]
+mod rocm;
 fn rocm_root(objdump: &Path) -> PathBuf {
     let layout = objdump.ancestors().nth(4).filter(|root| root.join("lib/llvm/bin").join("llvm-objdump") == objdump);
     layout.map(Path::to_path_buf).unwrap_or_else(|| {
-        ["PEACEMAKER_ROCM", "ROCM_PATH"].iter().find_map(|var| std::env::var_os(var).filter(|v| !v.is_empty()))
-            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/opt/rocm/core-10.0"))
+        std::env::var_os("PEACEMAKER_ROCM").filter(|v| !v.is_empty())
+            .map(PathBuf::from).unwrap_or_else(rocm::root)
     })
 }
 
