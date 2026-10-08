@@ -15,6 +15,76 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use std::sync::{Arc, Mutex};
+
+struct PreparedModule {
+    name: String,
+    hash: String,
+    symbols: Vec<String>,
+}
+
+struct PreparedJob {
+    source: String,
+    module_flags: Vec<String>,
+    modules: Vec<PreparedModule>,
+}
+
+struct CompletedJob {
+    job: PreparedJob,
+    result: HipResult<()>,
+}
+
+/// Finite CPU-only compilation work. Dropping a batch drains its workers.
+pub struct KernelBatch {
+    handles: Vec<thread::JoinHandle<Vec<CompletedJob>>>,
+}
+
+impl Drop for KernelBatch {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+// TEMPORARY A1 shim: replace with compile_jobs::host_compile_job_budget at merge.
+fn host_compile_job_budget() -> Result<usize, String> {
+    let cores = thread::available_parallelism().map_err(|e| e.to_string())?.get();
+    let requested = match hipfire_config::developer_var("HIPFIRE_JIT_JOBS") {
+        Ok(value) => value.parse::<usize>().ok().filter(|n| *n > 0)
+            .ok_or_else(|| "HIPFIRE_JIT_JOBS must be a positive integer".to_owned())?,
+        Err(std::env::VarError::NotPresent) => cores.saturating_sub((cores / 8).max(1)).max(1),
+        Err(error) => return Err(error.to_string()),
+    };
+    let available = std::fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
+        text.lines().find_map(|line| line.strip_prefix("MemAvailable:")
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.saturating_mul(1024)))
+    });
+    let mut available = available;
+    if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) {
+            let mut path = PathBuf::from("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+            loop {
+                if let (Ok(limit), Ok(current)) = (
+                    std::fs::read_to_string(path.join("memory.max")),
+                    std::fs::read_to_string(path.join("memory.current")),
+                ) {
+                    if let (Ok(limit), Ok(current)) = (limit.trim().parse::<u64>(), current.trim().parse::<u64>()) {
+                        let free = limit.saturating_sub(current);
+                        available = Some(available.map_or(free, |host| host.min(free)));
+                    }
+                }
+                if path == Path::new("/sys/fs/cgroup") || !path.pop() { break; }
+            }
+        }
+    }
+    let Some(available) = available else { return Ok(1); };
+    let memory_jobs = available.saturating_sub(1024 * 1024 * 1024) / (1536 * 1024 * 1024);
+    if memory_jobs == 0 { return Err("insufficient memory for one JIT compiler".to_owned()); }
+    Ok(requested.min(cores).min(memory_jobs.min(usize::MAX as u64) as usize))
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -1681,9 +1751,46 @@ impl KernelCompiler {
         self.compile_batch_for_symbols(&with_symbols)
     }
 
-    /// Preserve parallel JIT builds while validating the symbol for packaged hits.
+    /// Compile synchronously with the same bounded executor used during load.
     pub fn compile_batch_for_symbols(&mut self, kernels: &[(&str, &str, &str)]) -> HipResult<()> {
-        let mut to_compile: Vec<(String, String, String, String, Vec<String>)> = Vec::new();
+        let jobs = host_compile_job_budget().map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        let batch = self.prepare_batch(kernels, jobs)?;
+        self.finish_batch(batch)
+    }
+
+    /// Freeze a registry plan and start only its missing CPU compilation work.
+    pub fn begin_batch(&mut self, kernels: Vec<crate::kernel_registry::KernelEntry>, jobs: usize)
+        -> HipResult<KernelBatch>
+    {
+        for entry in &kernels {
+            let recipe = Self::recipe_for_source(&self.arch, entry.module, entry.source(), &self.extra_flags);
+            if entry.arch != self.arch || entry.flags != recipe.flags
+                || entry.scheduler_profile != recipe.scheduler_profile || entry.symbols.is_empty()
+            {
+                return Err(hip_bridge::HipError::new(0, &format!("{}: batch recipe mismatch", entry.module)));
+            }
+        }
+        let requests = kernels.iter().flat_map(|entry| entry.symbols.iter()
+            .map(move |symbol| (entry.module, entry.source(), *symbol))).collect::<Vec<_>>();
+        self.prepare_batch(&requests, jobs)
+    }
+
+    fn prepare_batch(&mut self, kernels: &[(&str, &str, &str)], jobs: usize) -> HipResult<KernelBatch> {
+        if jobs == 0 {
+            return Err(hip_bridge::HipError::new(0, "JIT batch jobs must be positive"));
+        }
+        // Refuse conflicting module identities before any lookup/publication.
+        let mut identities = HashMap::new();
+        for &(name, source, symbol) in kernels {
+            if !valid_identifier(name) || !valid_identifier(symbol) {
+                return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+            }
+            let hash = self.cache_hash(name, source);
+            if identities.insert(name, hash.clone()).is_some_and(|prior| prior != hash) {
+                return Err(hip_bridge::HipError::new(0, &format!("{name}: conflicting batch recipes")));
+            }
+        }
+        let mut to_compile: Vec<PreparedJob> = Vec::new();
 
         for &(name, source, symbol) in kernels {
             if !valid_identifier(name) || !valid_identifier(symbol) {
@@ -1726,6 +1833,7 @@ impl KernelCompiler {
 
             if nonempty_blob(&obj_path) {
                 self.writeback_package(name, source, symbol, &obj_path, false);
+                self.ensure_radiowave_certification(name, &obj_path);
                 self.compiled.insert(name.to_string(), obj_path);
                 continue;
             }
@@ -1740,6 +1848,7 @@ impl KernelCompiler {
                         legacy_obj
                     };
                 self.writeback_package(name, source, symbol, &hit_path, false);
+                self.ensure_radiowave_certification(name, &hit_path);
                 self.compiled.insert(name.to_string(), hit_path);
                 continue;
             }
@@ -1754,76 +1863,104 @@ impl KernelCompiler {
                 });
             }
 
-            to_compile.push((name.to_string(), source.to_string(), symbol.to_string(), src_hash, module_flags));
-        }
-
-        if to_compile.is_empty() {
-            return Ok(());
-        }
-
-        let n = to_compile.len();
-        eprintln!("  compiling {n} kernels in parallel...");
-        let arch = self.arch.clone();
-        let cache_dir = self.cache_dir.clone();
-        // Writeback happens on the joining thread after each successful build.
-        let hipcc_bin = self.hipcc_bin.clone();
-        let rocm_env_root = self.rocm_env_root.clone();
-
-        // Shared counter so parallel threads can report "[i/N] name" as each one
-        // completes. Ordering follows completion (not launch) — matches the pace
-        // of hipcc finishing.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        // Spawn hipcc in parallel threads — each uses transactional publication.
-        let results: Vec<_> = to_compile
-            .into_iter()
-            .map(|(name, source, symbol, src_hash, module_flags)| {
-                let arch = arch.clone();
-                let cache_dir = cache_dir.clone();
-                let hipcc_bin = hipcc_bin.clone();
-                let rocm_env_root = rocm_env_root.clone();
-                let extra_flags = self.extra_flags.clone();
-                let done = std::sync::Arc::clone(&done);
-                let handle = thread::spawn(move || {
-                    let result = Self::hipcc_compile_publish(
-                        &hipcc_bin,
-                        rocm_env_root.as_deref(),
-                        &arch,
-                        &cache_dir,
-                        &name,
-                        &source,
-                        &src_hash,
-                        &extra_flags,
-                        &module_flags,
-                    );
-
-                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let marker = if result.is_ok() { "✓" } else { "✗" };
-                    eprintln!("  [{i:>3}/{n}] {marker} {name}");
-                    let obj_path = cache_dir.join(hot_object_name(&name, &src_hash));
-                    (name, source, symbol, obj_path, result)
-                });
-                handle
-            })
-            .collect();
-
-        let mut errors = Vec::new();
-        for handle in results {
-            let (name, source, symbol, obj_path, result) = handle.join().unwrap();
-            match result {
-                Ok(()) => {
-                    self.writeback_package(&name, &source, &symbol, &obj_path, false);
-                    self.compiled.insert(name, obj_path);
+            if let Some(job) = to_compile.iter_mut().find(|job| job.modules[0].hash == src_hash) {
+                if let Some(module) = job.modules.iter_mut().find(|module| module.name == name) {
+                    if !module.symbols.iter().any(|s| s == symbol) {
+                        module.symbols.push(symbol.to_owned());
+                    }
+                } else {
+                    job.modules.push(PreparedModule {
+                        name: name.to_owned(), hash: src_hash, symbols: vec![symbol.to_owned()],
+                    });
                 }
-                Err(e) => errors.push(e),
+            } else {
+                to_compile.push(PreparedJob {
+                    source: source.to_owned(), module_flags,
+                    modules: vec![PreparedModule {
+                        name: name.to_owned(), hash: src_hash, symbols: vec![symbol.to_owned()],
+                    }],
+                });
             }
         }
-        eprintln!("  done ({n} kernels).");
 
-        if let Some(e) = errors.into_iter().next() {
-            return Err(e);
+        let workers = jobs.min(to_compile.len());
+        let queue = Arc::new(Mutex::new(to_compile.into_iter()));
+        let mut batch = KernelBatch { handles: Vec::with_capacity(workers) };
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let arch = self.arch.clone();
+            let cache_dir = self.cache_dir.clone();
+            let hipcc_bin = self.hipcc_bin.clone();
+            let rocm_env_root = self.rocm_env_root.clone();
+            let extra_flags = self.extra_flags.clone();
+            let handle = thread::Builder::new().name("hipfire-jit".to_owned()).spawn(move || {
+                let mut completed = Vec::new();
+                loop {
+                    let job = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                    let Some(job) = job else { break; };
+                    let module = &job.modules[0];
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::hipcc_compile_publish(&hipcc_bin, rocm_env_root.as_deref(),
+                            &arch, &cache_dir, &module.name, &job.source, &module.hash,
+                            &extra_flags, &job.module_flags)
+                    })).unwrap_or_else(|panic| {
+                        let reason = panic.downcast_ref::<&str>().copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic");
+                        Err(hip_bridge::HipError::new(0,
+                            &format!("{}: JIT worker panicked: {reason}", module.name)))
+                    });
+                    completed.push(CompletedJob { job, result });
+                }
+                completed
+            }).map_err(|e| hip_bridge::HipError::new(0, &format!("starting JIT worker: {e}")))?;
+            batch.handles.push(handle);
         }
-        Ok(())
+        Ok(batch)
+    }
+
+    /// Join every worker before publishing results on the compiler owner thread.
+    pub fn finish_batch(&mut self, mut batch: KernelBatch) -> HipResult<()> {
+        let mut error = None;
+        for handle in batch.handles.drain(..) {
+            match handle.join() {
+                Ok(completed) => for CompletedJob { job, result } in completed {
+                    if let Err(e) = result {
+                        if error.is_none() { error = Some(e); }
+                        continue;
+                    }
+                    let first = &job.modules[0];
+                    let artifact = self.cache_dir.join(hot_object_name(&first.name, &first.hash));
+                    for module in job.modules {
+                        let object = self.cache_dir.join(hot_object_name(&module.name, &module.hash));
+                        if object != artifact {
+                            if let Err(e) = publish_pair(&self.cache_dir,
+                                &hot_stem(&module.name, &module.hash), &artifact, &module.hash, false)
+                            {
+                                if error.is_none() {
+                                    error = Some(hip_bridge::HipError::new(0, &format!("{}: alias publication: {e}", module.name)));
+                                }
+                                continue;
+                            }
+                            // Certification needs the source next to each artifact alias.
+                            if let Err(e) = std::fs::write(object.with_extension("hip"), &job.source) {
+                                if error.is_none() { error = Some(hip_bridge::HipError::new(0, &format!("{}: alias source: {e}", module.name))); }
+                                continue;
+                            }
+                        }
+                        self.ensure_radiowave_certification(&module.name, &object);
+                        for symbol in module.symbols {
+                            self.writeback_package(&module.name, &job.source, &symbol, &object, false);
+                        }
+                        self.compiled.insert(module.name, object);
+                    }
+                },
+                Err(_) => {
+                    if error.is_none() { error = Some(hip_bridge::HipError::new(0, "JIT worker panicked outside compilation")); }
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -3081,5 +3218,141 @@ mod tests {
         std::fs::write(pack.join("beta.index.json"), &beta_index).unwrap();
         assert!(verify(None).is_ok());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_batch_identity_exports_hits_and_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("bounded_batch");
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        let mut expected = None;
+        for jobs in [1, 3] {
+            let arm = root.join(format!("{arch}-jobs{jobs}"));
+            let mut compiler = prebuilt_gate_compiler(&arm, true);
+            compiler.arch = arch.to_owned();
+            let inner = std::env::var_os("HIPFIRE_TEST_REAL_HIPCC")
+                .map(PathBuf::from).unwrap_or_else(|| compiler.hipcc_bin.clone());
+            let log = arm.join("events");
+            let wrapper = arm.join("timed-hipcc");
+            std::fs::write(&wrapper, format!(
+                "#!/bin/sh\ncase \" $* \" in *' -o '*) ;; *) exec '{}' \"$@\" ;; esac\nprintf 'start %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\n'{}' \"$@\"\nstatus=$?\nprintf 'end %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\nexit \"$status\"\n",
+                inner.display(), log.display(), inner.display(), log.display())).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            compiler.hipcc_bin = wrapper;
+            let sources = [
+                "extern \"C\" __global__ void first() {} extern \"C\" __global__ void second() {}",
+                "extern \"C\" __global__ void third() {}",
+                "extern \"C\" __global__ void fourth() {}",
+            ];
+            let requests = [
+                ("alpha", sources[0], "first"), ("alpha", sources[0], "second"),
+                ("alpha", sources[0], "first"), ("alias", sources[0], "second"),
+                ("beta", sources[1], "third"), ("gamma", sources[2], "fourth"),
+            ];
+            // Exercise the public registry contract as well as tuple preparation.
+            let recipe = KernelCompiler::recipe_for_source(arch, "alpha", sources[0], "");
+            let entry = crate::kernel_registry::KernelEntry {
+                arch, module: "alpha", symbols: &["first", "second"],
+                source: std::borrow::Cow::Borrowed(sources[0]),
+                flags: recipe.flags, scheduler_profile: recipe.scheduler_profile,
+            };
+            let empty = compiler.begin_batch(vec![entry], 0);
+            assert!(empty.is_err());
+            let entries = [
+                ("alpha", sources[0], &["first", "second", "first"][..]),
+                ("alias", sources[0], &["second"][..]),
+                ("beta", sources[1], &["third"][..]),
+                ("gamma", sources[2], &["fourth"][..]),
+            ].into_iter().map(|(module, source, symbols)| {
+                let recipe = KernelCompiler::recipe_for_source(arch, module, source, "");
+                crate::kernel_registry::KernelEntry {
+                    arch, module, symbols, source: std::borrow::Cow::Borrowed(source),
+                    flags: recipe.flags, scheduler_profile: recipe.scheduler_profile,
+                }
+            }).collect();
+            let batch = compiler.begin_batch(entries, jobs).unwrap();
+            assert_eq!(batch.handles.len(), jobs);
+            compiler.finish_batch(batch).unwrap();
+            let mut events = std::fs::read_to_string(&log).unwrap().lines().map(|line| {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                (parts[1].parse::<u64>().unwrap(), parts[0] == "start")
+            }).collect::<Vec<_>>();
+            events.sort_by_key(|event| event.0);
+            assert_eq!(events.iter().filter(|event| event.1).count(), 3);
+            let mut active = 0;
+            for (_, start) in events {
+                if start { active += 1; } else { active -= 1; }
+                assert!(active <= jobs);
+            }
+            assert_eq!(active, 0);
+            let mut identities = Vec::new();
+            for module in ["alpha", "alias", "beta", "gamma"] {
+                for extension in ["hsaco", "hash", "index.json"] {
+                    identities.push(std::fs::read(arm.join("cold").join(format!("{module}.{extension}"))).unwrap());
+                }
+            }
+            if let Some(expected) = &expected { assert_eq!(&identities, expected); }
+            else { expected = Some(identities); }
+            let index: PackIndex = serde_json::from_slice(
+                &std::fs::read(arm.join("cold/alpha.index.json")).unwrap()).unwrap();
+            assert!(index.symbols.contains(&"first".to_owned()));
+            assert!(index.symbols.contains(&"second".to_owned()));
+            if std::env::var_os("HIPFIRE_TEST_REAL_HIPCC").is_some() {
+                for &(module, _, symbol) in &requests {
+                    let object = &compiler.compiled[module];
+                    let code = std::fs::read(object).unwrap();
+                    let manifest = std::fs::read_to_string(object.with_extension("radiowave.json")).unwrap();
+                    let certification = CodeObjectCertification::from_json(&code, &manifest).unwrap();
+                    assert!(certification.kernel(symbol).is_some(), "missing export {symbol}");
+                }
+            }
+            let before = std::fs::read(&log).unwrap();
+            let batch = compiler.prepare_batch(&requests, jobs).unwrap();
+            assert!(batch.handles.is_empty());
+            compiler.finish_batch(batch).unwrap();
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+            compiler.cold_dir = None;
+            let batch = compiler.prepare_batch(&requests, jobs).unwrap();
+            assert!(batch.handles.is_empty());
+            compiler.finish_batch(batch).unwrap();
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+            eprintln!("{arch}: jobs={jobs}, compiler starts=3, aliases=4, objects/hash/index identical, installed/hot starts=0");
+        }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_joins_all_handles_on_error_panic_and_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for finish in [false, true] {
+            let joined = Arc::new(AtomicUsize::new(0));
+            let mut handles = vec![thread::spawn(|| -> Vec<CompletedJob> { panic!("test worker"); })];
+            for _ in 0..3 {
+                let joined = Arc::clone(&joined);
+                handles.push(thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(20));
+                    joined.fetch_add(1, Ordering::SeqCst);
+                    vec![CompletedJob {
+                        job: PreparedJob { source: String::new(), module_flags: vec![], modules: vec![] },
+                        result: Err(hip_bridge::HipError::new(0, "test compile failure")),
+                    }]
+                }));
+            }
+            let batch = KernelBatch { handles };
+            if finish {
+                assert!(test_compiler("", "").finish_batch(batch).is_err());
+            } else { drop(batch); }
+            assert_eq!(joined.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[test]
+    fn batch_refuses_zero_jobs_and_conflicting_recipes() {
+        let mut compiler = test_compiler("", "");
+        assert!(compiler.prepare_batch(&[], 0).is_err());
+        assert!(compiler.prepare_batch(&[("one", "first", "one"), ("one", "second", "two")], 2).is_err());
+        assert!(compiler.compiled.is_empty());
     }
 }
