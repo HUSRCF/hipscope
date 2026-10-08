@@ -28,6 +28,13 @@ pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_millis(3500);
 const BUNDLED_REGISTRY: &str = include_str!("../../../registry/v1.json");
 
+pub const FLASH_NEXT_XTS_LEGACY_FILE: &str = "qwen3.8-flash-next-gptq3.mq4";
+pub const FLASH_NEXT_XTS_CANONICAL_FILE: &str = "qwen3.8-flash-next.mq4-xts";
+const FLASH_NEXT_XTS_REPO: &str = "hipfire-models/qwen3.8-flash-next";
+const FLASH_NEXT_XTS_SIZE: u64 = 125288544792;
+const FLASH_NEXT_XTS_SHA256: &str =
+    "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972";
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("failed to read {path}: {source}")]
@@ -252,6 +259,18 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Exact XTS artifact identity, including the two admitted filename spellings.
+    /// This selection has no filesystem side effects; CLI migration verifies bytes.
+    pub fn is_flash_next_xts(&self) -> bool {
+        self.repo == FLASH_NEXT_XTS_REPO
+            && self.size_bytes == Some(FLASH_NEXT_XTS_SIZE)
+            && self.sha256.as_deref() == Some(FLASH_NEXT_XTS_SHA256)
+            && matches!(
+                self.file.as_str(),
+                FLASH_NEXT_XTS_LEGACY_FILE | FLASH_NEXT_XTS_CANONICAL_FILE
+            )
+    }
+
     /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
     /// `general` falls back to `recommended_settings` (the default profile)
     /// when no explicit profile map is present. Unknown names return `None`.
@@ -348,6 +367,7 @@ impl RegistryV1 {
                 message: error.to_string(),
             })?;
         registry.validate(&source_name)?;
+        registry.normalize_flash_next_xts();
         // An alias is non-authoritative convenience data. Match v1 behavior by
         // dropping dangling redirects instead of rejecting an otherwise valid
         // registry.
@@ -355,6 +375,15 @@ impl RegistryV1 {
             .aliases
             .retain(|_, target| registry.models.contains_key(target));
         Ok(registry)
+    }
+
+    fn normalize_flash_next_xts(&mut self) {
+        for entry in self.models.values_mut() {
+            if entry.is_flash_next_xts() && entry.file != FLASH_NEXT_XTS_CANONICAL_FILE {
+                entry.file.clear();
+                entry.file.push_str(FLASH_NEXT_XTS_CANONICAL_FILE);
+            }
+        }
     }
 
     pub fn validate(&self, source_name: &str) -> Result<()> {
@@ -463,19 +492,26 @@ impl RegistryV1 {
         self.models
             .iter()
             .find_map(|(tag, entry)| {
-                (entry.file == normalized || entry.file == input).then(|| tag.clone())
+                (entry.file == normalized
+                    || entry.file == input
+                    || (input == FLASH_NEXT_XTS_LEGACY_FILE && entry.is_flash_next_xts()))
+                .then(|| tag.clone())
             })
             .unwrap_or(normalized)
     }
 
-    /// Exact `entry.file` match for callers that already established the input
+    /// Exact bare filename match for callers that already established the input
     /// is the installed artifact (e.g. via canonical path comparison against
-    /// the models directory). Unlike [`RegistryV1::model`], this never applies
-    /// tag/alias normalization: `file_name` must be the bare file as stored.
+    /// the models directory). The pinned XTS legacy basename also matches its
+    /// normalized entry. Unlike [`RegistryV1::model`], no tag/alias normalization
+    /// is applied.
     pub fn entry_for_file(&self, file_name: &str) -> Option<(&str, &ModelEntry)> {
         self.models
             .iter()
-            .find(|(_, entry)| entry.file == file_name)
+            .find(|(_, entry)| {
+                entry.file == file_name
+                    || (file_name == FLASH_NEXT_XTS_LEGACY_FILE && entry.is_flash_next_xts())
+            })
             .map(|(tag, entry)| (tag.as_str(), entry))
     }
 
@@ -731,19 +767,23 @@ fn prefer_bundled_if_newer(
 }
 
 pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
+    let url = env::var("HIPFIRE_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.into());
+    let fetch = env::var_os("HIPFIRE_NO_REGISTRY_FETCH").as_deref() != Some("1".as_ref());
+    load_with_options(paths, fetch.then_some(url.as_str()))
+}
+
+fn load_with_options(paths: &RegistryPaths, url: Option<&str>) -> LoadedRegistry {
     let mut warnings = Vec::new();
     let bundled = bundled().expect("checked-in registry/v1.json must validate");
-    if env::var_os("HIPFIRE_NO_REGISTRY_FETCH").as_deref() == Some("1".as_ref()) {
+    let Some(url) = url else {
         return LoadedRegistry {
             registry: bundled,
             source: RegistrySource::Bundled,
             warnings,
         };
-    }
-
-    let url = env::var("HIPFIRE_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.into());
+    };
     let now = epoch_millis();
-    let cache = read_cache(&paths.cache, &url, &mut warnings);
+    let cache = read_cache(&paths.cache, url, &mut warnings);
     if cache
         .as_ref()
         .is_some_and(|cache| cache_is_fresh(cache, now, REGISTRY_CACHE_TTL))
@@ -760,7 +800,7 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
         Ok(registry) => {
             let cache_file = RegistryCache {
                 fetched_at: now,
-                url,
+                url: url.to_owned(),
                 registry: registry.clone(),
             };
             if let Err(error) = write_cache(&paths.cache, &cache_file) {
@@ -815,6 +855,7 @@ fn read_cache(path: &Path, url: &str, warnings: &mut Vec<String>) -> Option<Regi
         warnings.push(error.to_string());
         return None;
     }
+    cache.registry.normalize_flash_next_xts();
     cache
         .registry
         .aliases
@@ -881,6 +922,213 @@ fn epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flash_next_wire_registry(stamp: &str) -> RegistryV1 {
+        let mut registry: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        registry.generated_at = stamp.into();
+        registry.models.retain(|tag, _| {
+            matches!(
+                tag.as_str(),
+                "qwen3.8:flash-next" | "qwen3.8:flash-next-mq4"
+                    | "qwen3.8:flash-next-gptq3" | "qwen3.8:flash-next-mq4-xts"
+            )
+        });
+        registry.aliases.clear();
+        registry.aliases.insert("fixture".into(), "qwen3.8:flash-next".into());
+        registry
+    }
+
+    fn assert_flash_next_xts(registry: &RegistryV1) {
+        for tag in [
+            "qwen3.8:flash-next", "qwen3.8:flash-next-mq4",
+            "qwen3.8:flash-next-gptq3", "qwen3.8:flash-next-mq4-xts",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            assert!(entry.is_flash_next_xts(), "{tag}");
+            assert_eq!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE, "{tag}");
+            assert_eq!(entry.arch_id, Some(16));
+            assert_eq!(entry.quant.as_deref(), Some("mq4"));
+        }
+    }
+
+    #[test]
+    fn flash_next_xts_bundle_preserves_wire_compatibility_and_normalizes_locally() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        for tag in [
+            "qwen3.8:flash-next", "qwen3.8:flash-next-mq4", "qwen3.8:flash-next-gptq3",
+        ] {
+            assert_eq!(wire.models[tag].file, FLASH_NEXT_XTS_LEGACY_FILE);
+            assert!(wire.models[tag].desc.contains("MQ4 XTS"));
+            assert!(!wire.models[tag].desc.contains("GPTQ3"));
+        }
+        assert_eq!(
+            wire.models["qwen3.8:flash-next-mq4-xts"].file,
+            FLASH_NEXT_XTS_CANONICAL_FILE
+        );
+        let parsed = bundled().unwrap();
+        assert_flash_next_xts(&parsed);
+        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
+        let (short_tag, short_entry) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(short_tag, "qwen3.8:flash-next");
+        assert_eq!(short_entry.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        assert!(short_entry.desc.starts_with("Qwen3.8-Flash-Next MQ4 XTS"));
+        assert!(wire.models.values().all(|entry| !entry.desc.to_ascii_lowercase().contains("gptq3")));
+        for (tag, entry) in &wire.models {
+            let mut expected = entry.clone();
+            if expected.is_flash_next_xts() {
+                expected.file = FLASH_NEXT_XTS_CANONICAL_FILE.into();
+            }
+            assert_eq!(&parsed.models[tag], &expected, "{tag}: only filename may change");
+        }
+        assert!(!parsed.models["qwen3.8:flash-next-rtn-asym"].is_flash_next_xts());
+        assert_eq!(
+            parsed.models["qwen3.8:flash-next-rtn-asym"].file,
+            "qwen3.8-flash-next.mq4"
+        );
+    }
+
+    #[test]
+    fn flash_next_xts_normalization_requires_the_complete_pin_and_exact_filename() {
+        let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        let original = wire.models["qwen3.8:flash-next"].clone();
+        assert!(original.is_flash_next_xts());
+        for mismatch in 0..7 {
+            let mut entry = original.clone();
+            match mismatch {
+                0 => entry.repo = "other/qwen3.8-flash-next".into(),
+                1 => entry.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1),
+                2 => entry.sha256 = Some("a".repeat(64)),
+                3 => entry.file = "qwen3.8-flash-next.mq4".into(),
+                4 => entry.file = format!("subdir/{FLASH_NEXT_XTS_LEGACY_FILE}"),
+                5 => entry.sha256 = None,
+                6 => entry.size_bytes = None,
+                _ => unreachable!(),
+            }
+            assert!(!entry.is_flash_next_xts());
+            let mut changed = wire.clone();
+            changed.models.insert("qwen3.8:flash-next".into(), entry.clone());
+            let parsed = RegistryV1::parse(&serde_json::to_string(&changed).unwrap(), "fixture").unwrap();
+            assert_eq!(parsed.models["qwen3.8:flash-next"], entry);
+        }
+        let parsed = RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "fixture").unwrap();
+        assert_eq!(parsed.model("fixture").unwrap().1.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        let reparsed = RegistryV1::parse(&serde_json::to_string(&parsed).unwrap(), "fixture").unwrap();
+        assert_eq!(parsed, reparsed);
+        assert!(parsed.model(FLASH_NEXT_XTS_LEGACY_FILE).unwrap().1.is_flash_next_xts());
+        assert!(parsed.entry_for_file(FLASH_NEXT_XTS_LEGACY_FILE).unwrap().1.is_flash_next_xts());
+        for path in [
+            format!("./{FLASH_NEXT_XTS_LEGACY_FILE}"),
+            format!("/tmp/{FLASH_NEXT_XTS_LEGACY_FILE}"),
+        ] {
+            assert!(parsed.model(&path).is_none());
+            assert!(parsed.entry_for_file(&path).is_none());
+        }
+        let mut vintage = wire.clone();
+        vintage.models.remove("qwen3.8:flash-next-mq4-xts");
+        let parsed = RegistryV1::parse(&serde_json::to_string(&vintage).unwrap(), "v0.4.1 remote").unwrap();
+        for entry in parsed.models.values() {
+            assert!(entry.is_flash_next_xts());
+            assert_eq!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        }
+        let mut invalid = wire;
+        invalid.models.get_mut("qwen3.8:flash-next").unwrap().sha256 = Some("8b15b6".into());
+        assert!(RegistryV1::parse(&serde_json::to_string(&invalid).unwrap(), "fixture").is_err());
+    }
+
+    struct RegistryTestDir(PathBuf);
+
+    impl RegistryTestDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = env::temp_dir().join(format!(
+                "hipfire-registry-{}-{}-{}", std::process::id(), epoch_millis(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for RegistryTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn serve_registry_once(registry: &RegistryV1) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/alternate-registry.json", listener.local_addr().unwrap());
+        let body = serde_json::to_string(registry).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            ).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn flash_next_xts_normalizes_bundle_remote_fresh_and_stale_cache_and_alternate_url() {
+        let dir = RegistryTestDir::new();
+        let paths = RegistryPaths { cache: dir.0.join("registry.cache.json") };
+        let offline = load_with_options(&paths, None);
+        assert_eq!(offline.source, RegistrySource::Bundled);
+        assert_flash_next_xts(&offline.registry);
+        assert!(!paths.cache.exists(), "bundle-only must not fetch or write cache");
+
+        let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        let (url, server) = serve_registry_once(&wire);
+        let remote = load_with_options(&paths, Some(&url));
+        server.join().unwrap();
+        assert_eq!(remote.source, RegistrySource::Network);
+        assert_flash_next_xts(&remote.registry);
+        let cached = load_with_options(&paths, Some(&url));
+        assert_eq!(cached.source, RegistrySource::Cache);
+        assert_flash_next_xts(&cached.registry);
+
+        // Simulate a pre-upgrade cache: deserialization alone has not normalized it.
+        let legacy_cache = RegistryCache {
+            fetched_at: epoch_millis(), url: url.clone(), registry: wire.clone()
+        };
+        write_cache(&paths.cache, &legacy_cache).unwrap();
+        let cached = load_with_options(&paths, Some(&url));
+        assert_eq!(cached.source, RegistrySource::Cache);
+        assert_flash_next_xts(&cached.registry);
+        assert!(cached.registry.model("fixture").unwrap().1.is_flash_next_xts());
+
+        let mut stale = legacy_cache;
+        stale.fetched_at = 0;
+        write_cache(&paths.cache, &stale).unwrap();
+        let loaded = load_with_options(&paths, Some(&url));
+        assert_eq!(loaded.source, RegistrySource::StaleCache);
+        assert_flash_next_xts(&loaded.registry);
+        assert!(!loaded.warnings.is_empty());
+
+        let (alternate, server) = serve_registry_once(&wire);
+        assert_ne!(url, alternate);
+        let loaded = load_with_options(&paths, Some(&alternate));
+        server.join().unwrap();
+        assert_eq!(loaded.source, RegistrySource::Network, "cache is URL-bound");
+        assert_flash_next_xts(&loaded.registry);
+        let offline = load_with_options(&paths, None);
+        assert_eq!(offline.source, RegistrySource::Bundled, "disabled fetch ignores cache");
+
+        let old_wire = flash_next_wire_registry("2000-01-01T00:00:00Z");
+        let (old_url, server) = serve_registry_once(&old_wire);
+        let loaded = load_with_options(&paths, Some(&old_url));
+        server.join().unwrap();
+        assert_eq!(loaded.source, RegistrySource::Bundled, "newer bundle wins");
+        assert_flash_next_xts(&loaded.registry);
+        assert!(loaded.warnings.iter().any(|warning| warning.contains("newer")));
+    }
 
     #[test]
     fn config_layer_omits_universal_q8_fallback_but_lowers_model_opinions() {

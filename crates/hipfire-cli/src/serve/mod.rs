@@ -1326,7 +1326,7 @@ pub(crate) fn serve_foreground(
     let prewarm_path = if args.no_prewarm {
         None
     } else {
-        find_model_path(paths, &registry, &default_model)
+        crate::resolve_model_path(paths, &registry, &default_model)?
     };
     let engine = spawner.spawn(prewarm_path.as_deref())?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
@@ -1733,7 +1733,7 @@ impl ServeRuntime {
         let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
             .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
             .unwrap_or((None, None));
-        let mut path = find_model_path(&self.paths, &self.registry, model);
+        let mut path = crate::resolve_model_path(&self.paths, &self.registry, model)?;
         if path.is_none() && entry.is_some() {
             if origin == ModelOrigin::Request && !self.request_policy.allow_pull {
                 return Err(ModelNotFound(format!(
@@ -1749,7 +1749,8 @@ impl ServeRuntime {
                     force: false,
                 },
             )?;
-            path = entry.map(|entry| self.paths.models.join(&entry.file));
+            // pull has already verified the installed payload; avoid a second hash.
+            path = find_model_path(&self.paths, &self.registry, model);
         }
         let path = path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
@@ -1927,7 +1928,7 @@ impl ServeRuntime {
         let Ok(target) = fs::canonicalize(path) else {
             return false;
         };
-        let same = |candidate: &Path| fs::canonicalize(candidate).is_ok_and(|c| c == target);
+        let same = |candidate: &Path| crate::same_installed_file(candidate, &target);
         fs::canonicalize(&self.paths.models).is_ok_and(|models| target.starts_with(models))
             || entry.is_some_and(|entry| same(&self.paths.models.join(&entry.file)))
             || crate::local_model_paths(&self.paths, &self.registry)

@@ -385,6 +385,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("topk_logsumexp_batched", kernels::TOPK_LOGSUMEXP_BATCHED_SRC, ["topk_logsumexp_batched_f32"]);
     }
     if arch == "gfx1201" {
+        // Dense 27B DFlash cold helpers; retain runtime source preambles and
+        // historical gfx1100 module/symbol names on gfx1201.
+        add!("dflash_hidden_commit5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("dflash_hidden_scatter5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("gated_norm_mq_rotate_f16", crate::mq_f16_residual_producers::GATED_NORM_F16_SRC, ["gated_norm_mq_rotate_awq_f16_batched_gfx1100", "gated_norm_mq_rotate_f16_batched_gfx1100"]);
+        add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
+        add!("sigmoid_mul_mq_rotate_f16", crate::mq_f16_residual_producers::SIGMOID_MUL_F16_SRC, ["sigmoid_mul_mq_rotate_awq_f16_batched_gfx1100", "sigmoid_mul_mq_rotate_f16_batched_gfx1100"]);
+        add!("dflash_gdn_replay_pre_ml_from", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC, ["dflash_gdn_replay_pre_ml_from"]);
+        add!("gated_delta_net_q8_fast_ml_from", crate::dflash_gdn_replay::GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC, ["gated_delta_net_q8_fast_ml_from"]);
+        add!("attention_verify_gqa_gfx1201", kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC, ["attention_verify_gqa_q8_gfx1201", "attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]);
         add!("attention_flash_fp8_e4m3_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC), ["attention_flash_fp8_e4m3_tile_batched", "attention_flash_q8_0_tile_batched"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
@@ -407,6 +417,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("topk_values_fixup_f32", crate::select_regrid::TOPK_VALUES_FIXUP_SRC, ["topk_values_fixup_f32"]);
     }
     if arch == "gfx1100" {
+        add!("attention_verify_gqa_gfx1100", kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC, ["attention_verify_gqa_q8_gfx1100", "attention_verify_gqa_q8_rows_gfx1100", "attention_verify_reduce_gfx1100"]);
         add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100"]);
         add!("attention_flash_q8_0_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC), ["attention_flash_q8_0_tile_batched"]);
         add!("attention_flash_q8_0_tile_gqa_gfx1100", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, ["attention_flash_q8_0_tile_gqa_gfx1100"]);
@@ -1197,9 +1208,9 @@ mod tests {
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
         // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
         // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
-        // prepass `logit_penalty_table`. Those 124 keys are additional to
-        // P0's 92.
-        assert_eq!(registry.len(), count + 124, "unexpected gfx1201 inventory size");
+        // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
+        // helpers. Those 132 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 132, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -1323,6 +1334,59 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn dense_dflash_cold_helpers_preserve_runtime_identity() {
+        let cross_admitted = [
+            "dflash_hidden_commit5_gfx1100",
+            "dflash_hidden_scatter5_gfx1100",
+            "gated_norm_mq_rotate_f16",
+            "fused_silu_mul_mq_rotate_f16",
+            "sigmoid_mul_mq_rotate_f16",
+        ];
+        for module in cross_admitted {
+            let entry = lookup("gfx1201", module, "").unwrap();
+            let original = lookup("gfx1100", module, "").unwrap();
+            assert_eq!(entry.source(), original.source(), "{module}");
+            assert_eq!(entry.symbols, original.symbols, "{module}");
+        }
+        let exact = [
+            ("gfx1201", "dflash_gdn_replay_pre_ml_from",
+                crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC,
+                &["dflash_gdn_replay_pre_ml_from"][..]),
+            ("gfx1201", "gated_delta_net_q8_fast_ml_from",
+                crate::dflash_gdn_replay::GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC,
+                &["gated_delta_net_q8_fast_ml_from"][..]),
+            ("gfx1201", "attention_verify_gqa_gfx1201",
+                kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC,
+                &["attention_verify_gqa_q8_gfx1201", "attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"][..]),
+            ("gfx1100", "attention_verify_gqa_gfx1100",
+                kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
+                &["attention_verify_gqa_q8_gfx1100", "attention_verify_gqa_q8_rows_gfx1100", "attention_verify_reduce_gfx1100"][..]),
+        ];
+        for (arch, module, source, symbols) in exact {
+            let entry = lookup(arch, module, "").unwrap();
+            assert_eq!(entry.source(), source, "{module}");
+            assert_eq!(entry.symbols, symbols, "{module}");
+            let other = if arch == "gfx1201" { "gfx1100" } else { "gfx1201" };
+            assert!(lookup(other, module, "").is_err());
+        }
+        let modules = cross_admitted.into_iter()
+            .chain(exact.into_iter().map(|(_, module, _, _)| module));
+        for module in modules {
+            for arch in ["gfx1151", "gfx906", "gfx942"] {
+                assert!(lookup(arch, module, "").is_err(), "{arch}: leaked {module}");
+            }
+            let arch = if module == "attention_verify_gqa_gfx1100" { "gfx1100" } else { "gfx1201" };
+            for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+                let entry = lookup(arch, module, extra_flags).unwrap();
+                let recipe = KernelCompiler::recipe_for_source(arch, module, entry.source(), extra_flags);
+                assert_eq!(entry.flags, recipe.flags, "{module}");
+                assert_eq!(entry.scheduler_profile, recipe.scheduler_profile, "{module}");
+                assert_eq!(entry.scheduler_profile.as_deref(), Some("default"), "{module}");
+            }
+        }
+    }
+
 
     /// Every module a kernel-load trace loaded (rows: arch, module, symbols the
     /// run resolved) is in that arch's installer inventory and exports every

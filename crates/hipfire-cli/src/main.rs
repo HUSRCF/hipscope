@@ -479,6 +479,9 @@ struct RunArgs {
     /// Emit one JSON result object.
     json: bool,
     #[arg(long)]
+    /// Print authoritative generation metrics on stderr (except with --json).
+    stats: bool,
+    #[arg(long)]
     /// Buffer visible output instead of streaming it.
     no_stream: bool,
 }
@@ -1830,8 +1833,12 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
     let destination = paths.models.join(&entry.file);
+    let migrated = if args.force { None } else { migrate_flash_next_xts(paths, entry)? };
     let needs_base = if args.force {
         true
+    } else if let Some(path) = migrated {
+        eprintln!("Already downloaded: {}", path.display());
+        false
     } else if destination.exists() {
         if existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes) {
             eprintln!("Already downloaded: {}", destination.display());
@@ -1853,6 +1860,13 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
             entry.size_bytes,
             false,
         )?;
+        if entry.is_flash_next_xts() {
+            // The download has already verified the canonical payload.
+            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            if install_verified_link(&destination, &legacy)? && !same_installed_file(&destination, &legacy) {
+                verified_metadata(&legacy, entry.sha256.as_deref().expect("pinned digest"), entry.size_bytes.expect("pinned size"))?;
+            }
+        }
     }
     for (label, sidecar) in [
         ("TriAttention", entry.triattn.as_ref()),
@@ -1927,6 +1941,9 @@ pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
     )
 }
 
+#[cfg(test)]
+thread_local! { static DOWNLOAD_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub(crate) fn download_verified(
     url: &str,
     destination: &Path,
@@ -1934,6 +1951,8 @@ pub(crate) fn download_verified(
     expected_size: Option<u64>,
     quiet: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    DOWNLOAD_INVOCATIONS.with(|count| count.set(count.get() + 1));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(24 * 60 * 60)))
         .http_status_as_error(false)
@@ -2293,9 +2312,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
-    let mut model_path = find_model_path(paths, registry, &args.model);
+    let mut model_path = resolve_model_path(paths, registry, &args.model)?;
     if model_path.is_none() {
-        if let Some(entry) = entry {
+        if entry.is_some() {
             eprintln!(
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
@@ -2307,7 +2326,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                     force: false,
                 },
             )?;
-            model_path = Some(paths.models.join(&entry.file));
+            // pull already verified either the downloaded canonical or legacy fallback.
+            model_path = find_model_path(paths, registry, &args.model);
         }
     }
     let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
@@ -2385,6 +2405,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             max_tokens,
             args.json,
             args.no_stream,
+            args.stats,
         );
     }
 
@@ -2575,6 +2596,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         println!("{content}");
     } else {
         println!();
+    }
+    if args.stats && !args.json {
+        eprintln!("{}", format_run_stats(done.get("tokens").and_then(serde_json::Value::as_u64), &done));
     }
     let _ = engine.unload();
     Ok(())
@@ -2803,6 +2827,25 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.dspark_conf_threshold.is_some()
 }
 
+fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String {
+    let metric = |key: &str, precision: usize| {
+        timings.get(key).and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| format!("{value:.precision$}"))
+            .unwrap_or_else(|| "n/a".to_owned())
+    };
+    let mut footer = format!("[stats] tokens={} decode={} tok/s ttft={} ms",
+        tokens.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
+        metric("decode_tok_s", 2), metric("ttft_ms", 1));
+    let routes = ["dflash", "mtp", "mtp_ngram"];
+    let has_route = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool).is_some());
+    let speculative = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
+    if (!has_route || speculative) && timings.get("tau").is_some_and(|value| !value.is_null()) {
+        footer.push_str(&format!(" tau={}", metric("tau", 2)));
+    }
+    footer
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_via_http(
     host: &str,
@@ -2819,6 +2862,7 @@ fn run_via_http(
     max_tokens: u64,
     json: bool,
     no_stream: bool,
+    stats: bool,
 ) -> Result<()> {
     let mut messages = Vec::new();
     if let Some(system) = system {
@@ -2837,6 +2881,10 @@ fn run_via_http(
     insert_optional_f64(&mut body, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut body, "repeat_penalty", repeat_penalty);
     let timeout = Duration::from_secs(60 * 60);
+    let stats = stats && !json;
+    if stats && !no_stream {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
     if json || no_stream {
         let response = complete_openai_chat(host, port, body, timeout)?;
         let content = response
@@ -2855,10 +2903,18 @@ fn run_via_http(
             );
         } else {
             println!("{content}");
+            if stats {
+                eprintln!("{}", format_run_stats(
+                    response.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_u64),
+                    &response["timings"],
+                ));
+            }
         }
         return Ok(());
     }
 
+    let mut tokens = None;
+    let mut timings = serde_json::Value::Null;
     stream_openai_chat(
         host,
         port,
@@ -2870,17 +2926,22 @@ fn run_via_http(
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
-                OpenAiSseEvent::Role { .. }
-                | OpenAiSseEvent::ToolCall { .. }
-                | OpenAiSseEvent::Finish { .. }
-                | OpenAiSseEvent::Usage { .. }
-                | OpenAiSseEvent::Done => {}
+                OpenAiSseEvent::Finish { timings: value, .. } if stats => {
+                    timings = value.unwrap_or(serde_json::Value::Null);
+                }
+                OpenAiSseEvent::Usage { usage } if stats => {
+                    tokens = usage.get("completion_tokens").and_then(serde_json::Value::as_u64);
+                }
+                _ => {}
             }
             Ok(())
         },
         || false,
     )?;
     println!();
+    if stats {
+        eprintln!("{}", format_run_stats(tokens, &timings));
+    }
     Ok(())
 }
 
@@ -3129,11 +3190,128 @@ pub(crate) fn registry_entry_for_path<'registry>(
     if input.contains('/') || input.contains('\\') || candidate.is_file() {
         let canonical_input = fs::canonicalize(candidate).ok()?;
         return registry.models.iter().find_map(|(tag, entry)| {
-            let canonical_installed = fs::canonicalize(paths.models.join(&entry.file)).ok()?;
-            (canonical_installed == canonical_input).then(|| (tag.as_str(), entry))
+            let installed = paths.models.join(&entry.file);
+            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            (same_installed_file(&installed, &canonical_input)
+                || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input)))
+                .then(|| (tag.as_str(), entry))
         });
     }
     registry.model(input)
+}
+
+pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => same_artifact_metadata(&a, &b),
+        _ => false,
+    }
+}
+
+/// Fallible pinned migration stays outside generic, cheap local discovery.
+pub(crate) fn resolve_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Result<Option<PathBuf>> {
+    let explicit = Path::new(model);
+    let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
+        catalog.catalog.model(model).is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
+    });
+    if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
+        if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
+            return migrate_flash_next_xts(paths, entry);
+        }
+    }
+    Ok(find_model_path(paths, registry, model))
+}
+
+fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<PathBuf>> {
+    if !entry.is_flash_next_xts() { return Ok(None); }
+    migrate_verified_artifact(
+        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
+        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
+        entry.sha256.as_deref().expect("pinned digest"),
+        entry.size_bytes.expect("pinned size"),
+    )
+}
+
+fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino() && a.len() == b.len()
+            && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
+    }
+    #[cfg(not(unix))] { a.len() == b.len() && a.modified().ok() == b.modified().ok() }
+}
+
+fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, fs::Metadata)> {
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() != size { bail!("size mismatch: {}", path.display()); }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 { break; }
+        hasher.update(&buffer[..n]);
+    }
+    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(digest) {
+        bail!("SHA-256 mismatch: {}", path.display());
+    }
+    let after = file.metadata()?;
+    let current = fs::metadata(path)?;
+    if !same_artifact_metadata(&before, &after) || !same_artifact_metadata(&before, &current) {
+        bail!("artifact changed during verification: {}", path.display());
+    }
+    Ok((file, before))
+}
+
+// Never copy or move payloads. Unsupported/read-only link installation leaves
+// the verified source usable. Existing destinations are handled by the caller.
+fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
+        Err(_) => {}
+    }
+    #[cfg(unix)] {
+        let target = fs::canonicalize(source)?;
+        match std::os::unix::fs::symlink(target, destination) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
+            Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_verified_artifact(old: &Path, canonical: &Path, digest: &str, size: u64) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(canonical) {
+        Ok(_) => {
+            verified_metadata(canonical, digest, size)?;
+            return Ok(Some(canonical.to_owned()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(old) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    // Keep the opened inode alive until installation and stability checks finish.
+    let (_file, verified) = verified_metadata(old, digest, size)?;
+    if install_verified_link(old, canonical)? {
+        let installed = fs::metadata(canonical)?;
+        if !same_artifact_metadata(&verified, &installed) {
+            // A concurrent installer won: verify its bytes, never clobber it.
+            verified_metadata(canonical, digest, size)?;
+        }
+        if !same_artifact_metadata(&verified, &fs::metadata(old)?) {
+            bail!("artifact changed during migration: {}", old.display());
+        }
+        return Ok(Some(canonical.to_owned()));
+    }
+    if !same_artifact_metadata(&verified, &fs::metadata(old)?) {
+        bail!("artifact changed during migration: {}", old.display());
+    }
+    Ok(Some(old.to_owned()))
 }
 
 pub(crate) fn find_model_path(
@@ -3151,6 +3329,10 @@ pub(crate) fn find_model_path(
                 return fs::canonicalize(path).ok().or_else(|| Some(path.clone()));
             }
         }
+    }
+    if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
+        return [entry.file.as_str(), hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE]
+            .into_iter().map(|file| paths.models.join(file)).find(|path| path.is_file());
     }
     // An exact on-disk spelling outranks a registry alias that would rewrite it.
     // The registry maps a model NAME to its canonical FILE, which is what makes
@@ -5493,7 +5675,7 @@ fn open_bench_engine(
     let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
         .unwrap_or((None, None));
-    let mut path = find_model_path(paths, &registry, &args.model);
+    let mut path = resolve_model_path(paths, &registry, &args.model)?;
     if path.is_none() && entry.is_some() {
         pull_command(
             paths,
@@ -5502,7 +5684,8 @@ fn open_bench_engine(
                 force: false,
             },
         )?;
-        path = entry.as_ref().map(|entry| paths.models.join(&entry.file));
+        // Do not hash a payload twice after a verified pull.
+        path = find_model_path(paths, &registry, &args.model);
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
@@ -7955,6 +8138,125 @@ mod tests {
             config,
         }
     }
+    #[test]
+    fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {
+        assert_eq!(format_run_stats(Some(256), &serde_json::json!({
+            "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
+        })), "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15");
+        assert_eq!(format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
+        assert_eq!(format_run_stats(Some(0), &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})),
+            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a");
+        assert_eq!(format_run_stats(None, &serde_json::json!({
+            "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
+        })), "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
+        assert_eq!(format_run_stats(Some(1), &serde_json::json!({
+            "tau":1, "dflash":false, "mtp":false
+        })), "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms");
+    }
+
+    #[test]
+    fn verified_migration_zero_transfer_race_and_corruption() {
+        let paths = test_paths("verified-migration");
+        fs::create_dir_all(&paths.models).unwrap();
+        let old = paths.models.join("old");
+        let new = paths.models.join("new");
+        let sidecar = paths.models.join("sidecar");
+        let bytes = b"tiny XTS fixture";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        fs::write(&old, bytes).unwrap();
+        fs::write(&sidecar, b"preserved").unwrap();
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let (old, new, digest) = (old.clone(), new.clone(), digest.clone());
+            joins.push(std::thread::spawn(move || {
+                DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+                let result = migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64);
+                DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 0));
+                result
+            }));
+        }
+        for join in joins { assert_eq!(join.join().unwrap().unwrap(), Some(new.clone())); }
+        assert!(same_installed_file(&old, &new));
+        assert_eq!(fs::read(&sidecar).unwrap(), b"preserved");
+        assert_eq!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(), Some(new.clone()));
+        fs::remove_file(&new).unwrap();
+        fs::write(&old, vec![b'x'; bytes.len()]).unwrap();
+        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        assert!(!new.exists());
+        fs::write(&old, bytes).unwrap();
+        fs::write(&new, vec![b'x'; bytes.len()]).unwrap();
+        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_migration_preserves_external_symlink() {
+        let paths = test_paths("migration-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let external = paths.root.join("external");
+        let old = paths.models.join("old");
+        let new = paths.models.join("new");
+        fs::write(&external, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&external, &old).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(migrate_verified_artifact(&old, &new, &digest, 7).unwrap(), Some(new.clone()));
+        assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(new).unwrap(), b"fixture");
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+    #[test]
+    fn pinned_migration_never_selects_rtn_and_link_failure_keeps_old_path() {
+        let paths = test_paths("migration-fallback");
+        fs::create_dir_all(&paths.models).unwrap();
+        let old = paths.models.join("old");
+        fs::write(&old, b"fixture").unwrap();
+        let unavailable = paths.root.join("missing-parent/canonical");
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(), Some(old.clone()));
+        #[cfg(target_os = "linux")] {
+            // procfs does not permit arbitrary new links even for root.
+            let read_only = Path::new("/proc").join(paths.root.file_name().unwrap());
+            assert_eq!(migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(), Some(old.clone()));
+            assert_eq!(fs::read(&old).unwrap(), b"fixture");
+        }
+        let registry = hipfire_registry::bundled().unwrap();
+        let (_, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        assert!(entry.is_flash_next_xts());
+        let rtn = paths.models.join("qwen3.8-flash-next.mq4");
+        fs::write(&rtn, b"historical RTN").unwrap();
+        assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
+        assert_eq!(resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(), None);
+        let (_, rtn_entry) = registry.model("qwen3.8:flash-next-rtn-asym").unwrap();
+        assert!(!rtn_entry.is_flash_next_xts());
+        assert_eq!(migrate_flash_next_xts(&paths, rtn_entry).unwrap(), None);
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_migration_cross_device_uses_symlink_without_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let paths = test_paths("migration-cross-device");
+        fs::create_dir_all(&paths.models).unwrap();
+        let shared = Path::new("/dev/shm");
+        if !shared.is_dir() || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev() {
+            fs::remove_dir_all(paths.root).unwrap();
+            return;
+        }
+        let old = paths.models.join("old");
+        fs::write(&old, b"fixture").unwrap();
+        let canonical = shared.join(paths.root.file_name().unwrap());
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(), Some(canonical.clone()));
+        assert!(fs::symlink_metadata(&canonical).unwrap().file_type().is_symlink());
+        assert!(same_installed_file(&old, &canonical));
+        fs::remove_file(canonical).unwrap();
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+
 
     fn idle_test_meta() -> ServeMeta {
         ServeMeta {
@@ -14123,6 +14425,7 @@ mod tests {
             system: None,
             image: None,
             json: false,
+            stats: false,
             no_stream: false,
         };
         let without_head = RunArgs {

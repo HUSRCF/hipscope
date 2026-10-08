@@ -93,6 +93,66 @@ def test_committed_v1_is_reproducible_from_models_json(monkeypatch):
     assert built == committed, "registry/v1.json is stale; re-run scripts/registry_gen.py"
 
 
+def test_flash_next_xts_wire_contract():
+    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+    errors = []
+    rg.validate_flash_next_xts(models, errors)
+    assert not errors, "\n".join(errors)
+    for file in (rg.FLASH_NEXT_XTS_LEGACY_FILE, rg.FLASH_NEXT_XTS_CANONICAL_FILE):
+        assert rg.quant_for(file) == "mq4"
+        assert rg.arch_id_for("qwen3.8:flash-next", {"file": file}) == 16
+    rtn = models["qwen3.8:flash-next-rtn-asym"]
+    assert rtn["file"] == "qwen3.8-flash-next.mq4"
+    assert rtn["sha256"] != rg.FLASH_NEXT_XTS_SHA256
+    v1 = _load(REPO_ROOT / "registry" / "v1.json")
+    assert v1["aliases"]["qwen3.8:flash"] == "qwen3.8:flash-next"
+    assert models["qwen3.8:flash-next"]["desc"].startswith("Qwen3.8-Flash-Next MQ4 XTS")
+    assert all("gptq3" not in entry["desc"].lower() for entry in models.values())
+
+
+@pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-rtn-asym"])
+def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
+    v1 = _load(REPO_ROOT / "registry" / "v1.json")
+    curated = _load(REPO_ROOT / "registry" / "models.json")
+    trees = _trees_from(v1)
+    monkeypatch.setattr(rg, "repo_tree", lambda repo, token: trees[repo])
+    monkeypatch.setattr(rg, "log", lambda msg: None)
+    if target is None:
+        del curated["aliases"]["qwen3.8:flash"]
+    else:
+        curated["aliases"]["qwen3.8:flash"] = target
+    registry, errors = rg.build_registry(curated, None)
+    assert registry is None
+    assert any("qwen3.8:flash must alias" in error for error in errors)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("file", rg.FLASH_NEXT_XTS_CANONICAL_FILE),
+    ("repo", "other/flash-next"),
+    ("sha256", "a" * 64),
+    ("size_bytes", rg.FLASH_NEXT_XTS_SIZE - 1),
+    ("arch_id", 5),
+    ("quant", "mq6"),
+    ("desc", "GPTQ3"),
+    ("recommended_settings", {"temperature": 0.5}),
+])
+def test_flash_next_xts_invariants_reject_drift(key, value):
+    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+    models["qwen3.8:flash-next"][key] = value
+    errors = []
+    rg.validate_flash_next_xts(models, errors)
+    assert errors
+
+
+def test_flash_next_xts_requires_both_names_and_new_tag():
+    for tag in rg.FLASH_NEXT_XTS_WIRE_FILES:
+        models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+        del models[tag]
+        errors = []
+        rg.validate_flash_next_xts(models, errors)
+        assert any("missing" in error for error in errors)
+
+
 def _rust_str_list(name: str) -> set[str]:
     src = (REPO_ROOT / "crates" / "hipfire-config" / "src" / "lib.rs").read_text()
     m = re.search(rf"const {name}: &\[&str\] = &\[(.*?)\];", src, re.S)

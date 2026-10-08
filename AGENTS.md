@@ -650,23 +650,32 @@ against the A3B MoE DFlash perfmaxx line.
 
 ### Pinned Flash-Next bench fixture
 
-The canonical Flash-Next trunk is whichever local artifact byte-matches
-`qwen3.8-flash-next-gptq3.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
-(registry tags `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4` and
-`qwen3.8:flash-next-gptq3`, since 2026-10-02):
+The canonical Flash-Next trunk (MQ4 XTS) is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq4-xts` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next-mq4-xts`; existing tags
+`qwen3.8:flash-next`, `qwen3.8:flash-next-mq4` and
+`qwen3.8:flash-next-gptq3` resolve to the same pinned bytes).
+The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
 
 - HF repo: `hipfire-models/qwen3.8-flash-next`
-- HF / local file: `qwen3.8-flash-next-gptq3.mq4`
+- HF / local file: `qwen3.8-flash-next.mq4-xts`
 - File size: `125288544792`
 - SHA-256: `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`
 - MD5: `be007fc3219e9f6cdb1d4dfa8380625f`
-- Recipe: the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
+- Recipe: MQ4 XTS, the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
   MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows,
   128 shards, external-resident, 54,400,261,120 B), with the routed experts
   symmetric and GPTQ3-solved on the 262,144-token calibration corpus (no AWQ;
   553/25,088 experts keep RTN). All 1227 non-expert tensors are byte-identical
   to the prior pin. Needs a build at or after `cb566dab9` (qt=54 I64 metadata
   records); validated on `fe77c0837`.
+
+The old filename `qwen3.8-flash-next-gptq3.mq4` remains a byte-identical alias
+through the 0.4.x line and at least 90 days. During that window, existing tags
+retain the old remote-registry wire filename for old clients; upgraded clients
+normalize this exact repo/size/SHA-256 pin to the canonical filename and migrate
+verified local bytes without downloading or copying the payload. The old HF
+object remains until explicit EOL approval. This is naming, not a recipe change.
 
 Before reporting Flash-Next results, verify the candidate trunk with
 `sha256sum` and require the digest above.

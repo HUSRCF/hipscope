@@ -21,10 +21,27 @@
 use hip_bridge::{DeviceBuffer, Event, HipError, HipResult};
 use rdna_compute::Gpu;
 
-/// `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD=1` opts in to the fenced asynchronous upload
-/// for a deferred PLE stage; unset or `0` keeps the blocking upload. Default
-/// off (warm-cache and cache-quality identity unconfirmed on the RC4c gate).
+/// `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD` selects the fenced asynchronous upload for
+/// a deferred PLE stage. Default on (identity-gated: warm-cache and
+/// cache-quality outputs were byte-identical to the blocking upload on the
+/// RC4 gate); `=0` opts out to the blocking upload, `=1` forces it on. Graph
+/// capture and the device-token branch stay blocking regardless
+/// ([`ple_async_upload`]).
 pub const PLE_ASYNC_UPLOAD_ENV: &str = "HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD";
+
+/// Default of [`PLE_ASYNC_UPLOAD_ENV`] when it is unset or not `0`/`1`.
+pub(crate) const PLE_ASYNC_UPLOAD_DEFAULT: bool = true;
+
+/// Resolves [`PLE_ASYNC_UPLOAD_ENV`] from its process-snapshot value with the
+/// strict `developer_bool` table: `"1"` on, `"0"` off, anything else (absent,
+/// empty, other spelling) [`PLE_ASYNC_UPLOAD_DEFAULT`].
+pub(crate) fn ple_async_upload_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        Some("1") => true,
+        Some("0") => false,
+        _ => PLE_ASYNC_UPLOAD_DEFAULT,
+    }
+}
 
 /// Whether an asynchronous copy may still read the staging bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,5 +285,15 @@ mod tests {
                 enabled && !device_token && deferred && !capturing,
             );
         }
+    }
+
+    #[test]
+    fn async_upload_default_is_on_and_zero_opts_out() {
+        assert!(PLE_ASYNC_UPLOAD_DEFAULT);
+        assert!(ple_async_upload_enabled(None), "unset");
+        assert!(!ple_async_upload_enabled(Some("0")), "=0 opts out");
+        assert!(ple_async_upload_enabled(Some("1")), "=1 forces on");
+        assert!(ple_async_upload_enabled(Some("")), "empty falls back to default");
+        assert!(ple_async_upload_enabled(Some("true")), "strict table: other spelling is default");
     }
 }

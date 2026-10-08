@@ -53,6 +53,20 @@ SCHEMA_VERSION = 1
 # truth. Disagreement beyond this fraction means the curated entry is stale
 # (wrong file / re-quantized upload) — fail so a human reconciles it.
 SIZE_TOLERANCE = 0.25
+# Keep old-client wire defaults through 0.4.x and at least 90 days. Upgraded
+# clients normalize this exact pin locally; the generator must never rename
+# the existing public tags or silently admit a replacement payload.
+FLASH_NEXT_XTS_REPO = "hipfire-models/qwen3.8-flash-next"
+FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
+FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
+FLASH_NEXT_XTS_SHA256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+FLASH_NEXT_XTS_SIZE = 125288544792
+FLASH_NEXT_XTS_WIRE_FILES = {
+    "qwen3.8:flash-next": FLASH_NEXT_XTS_LEGACY_FILE,
+    "qwen3.8:flash-next-mq4": FLASH_NEXT_XTS_LEGACY_FILE,
+    "qwen3.8:flash-next-gptq3": FLASH_NEXT_XTS_LEGACY_FILE,
+    "qwen3.8:flash-next-mq4-xts": FLASH_NEXT_XTS_CANONICAL_FILE,
+}
 # Known weight-file quant suffixes (see docs/MODELS.md). Anything else is an
 # error: a new format must be added here deliberately, not silently passed.
 KNOWN_QUANTS = {
@@ -385,6 +399,54 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
         errors.append(f"superset violation at {path}: {old!r} != {new!r}")
 
 
+def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
+    """Pin both published spellings and preserve old clients' wire defaults."""
+    if not any(tag in models for tag in FLASH_NEXT_XTS_WIRE_FILES) and not any(
+        entry.get("repo") == FLASH_NEXT_XTS_REPO for entry in models.values()
+    ):
+        # build_registry also serves small, unrelated fixture/custom catalogs.
+        return
+    for tag, file in FLASH_NEXT_XTS_WIRE_FILES.items():
+        entry = models.get(tag)
+        if entry is None:
+            errors.append(f"{tag}: required Flash-Next XTS compatibility tag is missing")
+            continue
+        expected = {
+            "repo": FLASH_NEXT_XTS_REPO,
+            "file": file,
+            "sha256": FLASH_NEXT_XTS_SHA256,
+            "size_bytes": FLASH_NEXT_XTS_SIZE,
+            "arch_id": 16,
+            "quant": "mq4",
+        }
+        for key, value in expected.items():
+            if entry.get(key) != value:
+                errors.append(f"{tag}: XTS invariant {key} must be {value!r}")
+        desc = entry.get("desc", "")
+        if "MQ4 XTS" not in desc or "GPTQ3" in desc:
+            errors.append(f"{tag}: user-facing recipe must be named MQ4 XTS")
+
+    # Renaming must not change load defaults, settings, sidecars or identity.
+    base = models.get("qwen3.8:flash-next")
+    if base is not None:
+        contract = {key: value for key, value in base.items() if key != "file"}
+        for tag in FLASH_NEXT_XTS_WIRE_FILES:
+            entry = models.get(tag)
+            if entry is not None:
+                other = {key: value for key, value in entry.items() if key != "file"}
+                if other != contract:
+                    errors.append(f"{tag}: XTS rename changed non-filename metadata")
+
+    for tag, entry in models.items():
+        if entry.get("repo") == FLASH_NEXT_XTS_REPO and entry.get("file") in (
+            FLASH_NEXT_XTS_LEGACY_FILE, FLASH_NEXT_XTS_CANONICAL_FILE
+        ):
+            if (entry.get("sha256"), entry.get("size_bytes")) != (
+                FLASH_NEXT_XTS_SHA256, FLASH_NEXT_XTS_SIZE
+            ):
+                errors.append(f"{tag}: published XTS filename has a different content pin")
+
+
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
@@ -421,6 +483,8 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
+    if FLASH_NEXT_XTS_REPO in repos and aliases.get("qwen3.8:flash") != "qwen3.8:flash-next":
+        errors.append("qwen3.8:flash must alias qwen3.8:flash-next (MQ4 XTS)")
     # Image-component (diffusion) repos publish AFTER their packs exist, so a
     # missing repo is expected until the first upload: sizes/digests stay TBD
     # on those entries. Fail-closed stays for text-model repos, where a probe
@@ -557,6 +621,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     # Strict-superset guarantee — the whole point of v1 back-compat.
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
+    validate_flash_next_xts(out_models, errors)
 
     if errors:
         return None, errors

@@ -44,7 +44,13 @@ pub fn strict_whole_file_difference(native_elf: &[u8], oracle_elf: &[u8], native
 
 /// The `.comment` the native writer must stamp: the only ELF content excluded
 /// from the comparison against the oracle (its content is checked against this).
-fn native_comment() -> Vec<u8> { format!("hipfire peacemaker native-emit {}\0", env!("CARGO_PKG_VERSION")).into_bytes() }
+/// The version is hipfire-isa's (the writer's), read from its exported
+/// `native::VERSION`, not `CARGO_PKG_VERSION` of whichever crate includes this
+/// support file (hipfire-rip includes it by `#[path]`).
+fn native_comment() -> Vec<u8> {
+    let isa_version = hipfire_isa::native::VERSION.split_whitespace().nth(1).expect("hipfire-isa native::VERSION carries the crate version");
+    format!("hipfire peacemaker native-emit {isa_version}\0").into_bytes()
+}
 
 const SHT_NOBITS: u64 = 8;
 const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";

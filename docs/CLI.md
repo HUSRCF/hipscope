@@ -22,6 +22,15 @@ payload into `~/.hipfire/registry.cache.json` (24h). Offline or invalid remote
 payloads fall back to cache then the embedded registry. Pin the bundle with
 `HIPFIRE_NO_REGISTRY_FETCH=1`.
 
+Flash-Next MQ4 XTS tags (short name `qwen3.8:flash`, alias for
+`qwen3.8:flash-next`) automatically migrate the exact SHA-verified installed
+`qwen3.8-flash-next-gptq3.mq4` to `qwen3.8-flash-next.mq4-xts` by a no-clobber
+hardlink, preserving the old name. External-storage symlinks are preserved;
+when linking is unsupported or read-only, the verified old path is used.
+This does not download or copy the payload. Conflicting canonical files fail
+clearly; the historical RTN `.mq4` artifact is never migrated. See
+[MODELS.md](MODELS.md#qwen-38-flash-next-mq4-xts) for the compatibility window.
+
 ## Inference
 
 | Command | Purpose |
@@ -57,12 +66,21 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also on `serve`. |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
+| `--stats` | Emit one statistics footer on stderr after successful generation (local or HTTP, streaming or `--no-stream`); generated stdout is unchanged. Suppressed with `--json` and on failed/aborted generation. |
 
 Resolution ladder for speculation: **env > CLI flag > per-model > global**.
 `dflash_mode` itself defaults to **`off`** — see [CONFIG.md](CONFIG.md#speculative-decode). Pulling a draft does not enable DFlash.
 
+`--stats` example: `[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15`.
+`tokens` counts committed daemon completion IDs, including reasoning, not
+printed characters. `decode` is decode throughput, not wall-inclusive `tok_s`;
+`ttft` is time to first token. `tau` is included only for speculation when
+available. Missing, invalid or nonfinite metrics show `n/a`, never a substituted
+wall rate or zero. A continuous-batch response may legitimately have `decode=n/a`.
+
 ```bash
 hipfire run qwen3.5:9b "What's 2+2?"
+hipfire run qwen3.5:9b "What's 2+2?" --stats
 hipfire run qwen3.5:9b --spec ngram "Repeat verbatim: ..."
 hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn

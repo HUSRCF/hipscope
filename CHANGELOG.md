@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.4.1.1 — release draft
+
+Public release/tag: **v0.4.1.1**; Cargo workspace/package version: **0.4.1+patch.1**. Cargo build metadata does not give this patch higher SemVer precedence than 0.4.1. Managed installs select the public Git tag with `hipfire update --tag v0.4.1.1`; update resolves Git revisions, not a SemVer latest-release ranking.
+
+### Patch changes
+- **Flash-Next MQ4 XTS naming, without changing model bytes:** the canonical filename is `qwen3.8-flash-next.mq4-xts`, with explicit tag `qwen3.8:flash-next-mq4-xts`. Upgraded clients normalize only the exact repository/size/SHA-bound entry, whether bundled, fetched or cached. Existing `flash-next`, `flash-next-mq4` and `flash-next-gptq3` wire entries retain `qwen3.8-flash-next-gptq3.mq4` through 0.4.x and at least 90 days, so old clients do not re-download. The legacy name remains valid; this is the MQ4 XTS recipe, not a new quantization.
+  - The short alias `qwen3.8:flash` resolves to `qwen3.8:flash-next`; user-facing descriptions call it Qwen3.8-Flash-Next MQ4 XTS. The legacy `-gptq3` model tag still works; no incompatible hidden/deprecated wire fields are added.
+  - Upgraded CLI clients automatically reuse SHA-verified local legacy bytes via a hardlink, symlink fallback, or verified old-path fallback, with no model transfer or duplicate payload copy. Legacy bytes remain available; pin mismatches and conflicting canonical files fail rather than silently downloading. Old runtimes do not gain this migration merely by refreshing their registry.
+- **Tokenizer differential correctness:** HF-aligned byte-BPE whitespace boundaries and embedded Split patterns, MiniMax inverted/removed Split behavior, Unicode 9 NFC parity, North-Mini-Code right-aligned digit splitting, and LFM2.5-MoE whole-token precedence. The HF oracle stays dev-only. These fixes also affect shared Qwen/Flash-Next tokenizer paths and can change text-derived prompt IDs; fixed-ID KLD and kernel-object pins are not silently repinned or presented as tokenizer evidence. The v0.4.1 tokenizer entry below preserves the landed fixes' detailed historical evidence.
+- **Nine existing DFlash helper kernels added to packs:** eight on gfx1201 and `attention_verify_gqa_gfx1100` on gfx1100, with exact runtime sources, exports, flags and profile identity; no HIP arithmetic changes. Cold-trace admission regressions cover the additions, while gfx1151/gfx906/gfx942 admission is unchanged. This closes the known dense-27B DFlash first-run JIT inventory gaps on gfx1201/gfx1100; final installed-pack zero-JIT evidence is pending below. No warmed-throughput improvement is claimed.
+- **Correct `mtp_sampled` documentation:** default-on native Qwen4 sampled MTP supports repeat/presence/frequency penalties using the same AR history, penalty window and sampling policy for target verification and draft probabilities. Distribution preservation does not promise identical seeded sampled streams. `HIPFIRE_MTP_SAMPLED=0` keeps sampled requests on AR; unsupported DFlash/other-drafter penalties still fall back to AR. No sampled routing code changes in this patch.
+- **Qwen4 PLE async upload defaults on:** `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD=0` restores blocking deferred-PLE upload. Fencing, graph capture and device-token paths are unchanged. No speedup is claimed; final patch identity evidence is pending below. The v0.4.1 default-off entry remains as history.
+- **`hipfire run --stats`:** one stderr footer reports authoritative committed token count, decode tok/s and TTFT, with optional τ. Unavailable metrics show `n/a`, never a wall-clock-rate substitute. Local and HTTP streaming/nonstreaming paths are supported; `--json` remains unchanged and suppresses the footer.
+
+### Measured evidence — awaiting final candidate
+
+This is a release draft, not a completed hardware-validation claim. Fill the table from the immutable candidate's receipts before publication; earlier warm-cache or RC4 results do not substitute for final cold-pack or PLE gates.
+
+| Gate | Candidate / hardware / inputs | Measured result | Evidence |
+|---|---|---|---|
+| Tokenizer differential oracle and CPU integration | Awaiting final candidate | Not yet recorded | — |
+| Flash-Next local migration and registry compatibility | Awaiting final candidate | Zero-transfer/conflict/race receipts not yet recorded | — |
+| Cold installed-pack DFlash, graph and eager | gfx1201 / gfx1100; empty JIT cache | Zero-new-JIT result not yet recorded | — |
+| Adjacent pack regression | gfx1151 | Not yet recorded | — |
+| PLE blocking/async full-logit and session identity | gfx1151; three campaigns | Not yet recorded; no speed claim | — |
+| Quality pins, serving battery/chain and stats | Final scoped card/model cells | Not yet recorded | — |
+| Kernel packs and source/binary provenance | All five admitted pack architectures | Candidate SHA, asset hashes and manifests not yet recorded | — |
+
 ## v0.4.1 — 2026-10-07
 
 ### Release summary

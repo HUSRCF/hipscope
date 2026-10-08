@@ -3,18 +3,24 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-08-24 against the published Qwen3.8 MQ V2 ladder.
+**Last checked:** 2026-10-07 for the Flash-Next MQ4 XTS naming contract.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
 | Concept | Meaning |
 |---|---|
-| Registry tag | Pull/list name resolved through the bundled v1 registry (+ aliases). |
-| Default artifact | `file` field — what `hipfire pull <tag>` fetches into `~/.hipfire/models/`. |
+| Registry tag | Pull/list name resolved through the bundled v1 registry or a refreshed remote/cache registry (+ aliases). |
+| Default artifact | Validated registry `file` field — what `hipfire pull <tag>` fetches into `~/.hipfire/models/`; upgraded clients normalize the exact Flash-Next XTS pin as described below. |
 | Runtime support | Whether the daemon/loader/arch crate can load and run the artifact shape (`arch_id`, kernels, Cargo features). Source-of-truth: runtime crates + [`architecture-ids.md`](architecture-ids.md). |
 | Admission | Explicit product decision in [`admissions.yml`](admissions.yml). Schema v2 holds exactly one evidence-bound record; no inferred admissions beyond that row. |
 
 `hipfire list -r` prints the live registry plus local availability. Prefer that command when sizes change; this page is a checked narrative, not a second registry.
+
+The binary embeds `registry/v1.json` and may refresh the remote registry into
+`~/.hipfire/registry.cache.json` (24-hour TTL). Offline or invalid remote
+payloads fall back to cache then the bundle; `HIPFIRE_NO_REGISTRY_FETCH=1`
+forces the bundle. The Flash-Next pin-bound normalization applies to bundled,
+remote and cached entries alike.
 
 ---
 
@@ -98,6 +104,33 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.8:27b-mq6-pro` | `qwen3.8-27b.mq6-pro` | 22.17 | 24 | q8 | MQ6V2 Pro |
 
 MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Legacy `qwen3.8:27b-fast` / `qwen3.8:fast` alias to `qwen3.8:27b-mq4-xt`. Reasoning contract: [`CONFIG.md`](CONFIG.md) (effort is semantic only; named `thinking_budget` dropped on this family).
+
+### Qwen 3.8 Flash-Next (MQ4 XTS)
+
+| Tag | File (wire registry) | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `qwen3.8:flash-next-mq4-xts` | `qwen3.8-flash-next.mq4-xts` | 125.3 | 128 | MQ4 XTS; canonical pinned arch 16 fixture |
+| `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4`, `qwen3.8:flash-next-gptq3` | `qwen3.8-flash-next-gptq3.mq4` | 125.3 | 128 | Compatibility names for the same MQ4 XTS bytes |
+
+The short user-facing name is `qwen3.8:flash`, an alias for `qwen3.8:flash-next`.
+For example: `hipfire pull qwen3.8:flash` and
+`hipfire run qwen3.8:flash "hello" --stats`.
+
+The canonical filename is `qwen3.8-flash-next.mq4-xts`. Upgraded clients
+normalize only entries from `hipfire-models/qwen3.8-flash-next` with size
+`125288544792` and SHA-256
+`8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`.
+The old filename and tags remain valid through 0.4.x and at least 90 days;
+existing tags keep the old wire filename so old clients do not re-download.
+The old HF object remains until explicit EOL approval.
+
+Installed legacy bytes are SHA-verified and linked to the canonical local
+name automatically, preserving the old link and external storage targets.
+Unsupported/read-only linking uses the verified old path without a download
+or payload copy; a conflicting canonical file fails rather than being replaced.
+The historical RTN-asymmetric `qwen3.8-flash-next.mq4`
+(`qwen3.8:flash-next-rtn-asym`) is a different artifact and is never migrated.
+Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-next-bench-fixture).
 
 ### DFlash draft artifacts (registry)
 

@@ -14,7 +14,7 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
 use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
-use crate::ple_stage::{ple_async_upload, PleHostStage, PLE_ASYNC_UPLOAD_ENV};
+use crate::ple_stage::{ple_async_upload, ple_async_upload_enabled, PleHostStage, PLE_ASYNC_UPLOAD_ENV};
 use crate::program::{
     execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
     Qwen4AttentionWeights, Qwen4GdnWeights, Qwen4HyperReadWeights, Qwen4HyperWeights,
@@ -2302,7 +2302,11 @@ impl Qwen4GpuForward {
             uploaded_id_rows: 0,
             host_ple: PleHostStage::new(
                 host_ple_bytes,
-                hipfire_config::developer_bool(PLE_ASYNC_UPLOAD_ENV, false),
+                ple_async_upload_enabled(
+                    hipfire_config::developer_var(PLE_ASYNC_UPLOAD_ENV)
+                        .ok()
+                        .as_deref(),
+                ),
             ),
             ple_lookahead: Vec::new(),
             ple_ahead: None,
