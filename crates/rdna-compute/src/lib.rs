@@ -8,6 +8,7 @@ pub mod arch_caps;
 pub mod attention;
 pub mod cdna;
 mod compiler;
+pub mod compile_jobs;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
