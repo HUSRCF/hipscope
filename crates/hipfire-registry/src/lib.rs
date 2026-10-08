@@ -1065,7 +1065,8 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).unwrap();
+            let read = socket.read(&mut request).unwrap();
+            assert!(read > 0, "client sent no request");
             write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
