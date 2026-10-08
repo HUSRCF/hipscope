@@ -306,6 +306,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_MTP_TRACE=1` | Per-cycle MTP draft/verify trace on stderr. |
 | `HIPFIRE_DEBUG_POOL_INVARIANTS=1` | Multi-slot engine: assert page-pool / slot-lease invariants after every scheduler tick (debug; slow). |
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
+| `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): one `HIPFIRE_MODULE_LOAD_AUDIT` stderr line per HIP module load (module, symbol, source SHA-256, recipe flags), per `hipModuleLoad`/`hipModuleLoadData` (handle, path or image FNV-1a) and per resolved symbol, for offline route-closure audits of `kernel_registry::route_entries`. Never set in production or timing runs. |
 
 #### Logical GPU emulation (developer-only)
 
@@ -1394,6 +1395,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MODELS_DIR` | autoresearch/ar/gate/run.py, benchmarks/quality-baselines/harness/spe_ablation.sh | stable |
 | `HIPFIRE_MODEL_PATH` | autoresearch/ar/census.py | harness |
 | `HIPFIRE_MODEL_STORE` | scripts/baseline_quant_smoke.sh | harness |
+| `HIPFIRE_MODULE_LOAD_AUDIT` | crates/hip-bridge/src/ffi.rs, crates/rdna-compute/src/scratch.rs | developer |
 | `HIPFIRE_MOE_AWQ` | crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
 | `HIPFIRE_MOE_BUCKETED` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_MOE_BYPASS` | crates/hipfire-arch-gemma4/src/lowered.rs | developer |
