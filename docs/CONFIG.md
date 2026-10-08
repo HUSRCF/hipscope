@@ -725,6 +725,13 @@ LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
 hits; edited or mismatched history falls back to a plain retokenized render
 (cold or checkpoint path) instead of replaying stale tokens.
 
+Tool argument replay is on by default (`HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out).
+It restores original producer argument ordering, not lexical sorting, on the last
+echoed Qwen4 or dense Qwen assistant tool turn in the active committed conversation. Typed
+values and byte-identical echoes are unchanged. A repaired render is accepted
+only if it strictly extends every committed token; otherwise the original safe
+miss remains. This does not enable retired-MTP continuation or cross-session reuse.
+
 Multi-turn DFlash and the prefix cache: when a DFlash turn ends on EOS (or the
 think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
 state and replays only the consumed prefix so the prompt/prefix cache stays

@@ -3835,16 +3835,6 @@ pub fn generate(
             // Qwen3.8 re-emits the empty-think block. Prepend the primer THIS
             // turn's cold render emitted only when the template does not, so
             // the spliced stream byte-matches `conversation_tokens`.
-            let primer: Vec<u32> = {
-                let im_start = tokenizer.special_token_id("<|im_start|>");
-                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
-                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= new_tokens.len() => {
-                        new_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                }
-            };
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
@@ -3856,29 +3846,17 @@ pub fn generate(
                 reasoning_strength: None,
                 reasoning_effort,
             };
-            let primer: Vec<u32> =
-                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
-                    Vec::new()
-                } else {
-                    primer
-                };
-            let cache_ref = &mut m.asst_turn_cache;
-            let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            let built = crate::qwen::qwen_jinja_cached_history_tokens(
                 &frame,
+                &mut m.asst_turn_cache,
+                &new_tokens,
                 history,
                 tools,
-                |msg| {
-                    let hit = crate::qwen::qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
-                    if trace_cache {
-                        let normalized =
-                            crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
-                        let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                        eprintln!(
-                            "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
-                        );
-                    }
-                    hit
+                "dense-ar",
+                if m.state.as_ref().is_some_and(|s| s.arch_key() == "qwen35") {
+                    Some(&m.conversation_tokens)
+                } else {
+                    None
                 },
             );
             match built {

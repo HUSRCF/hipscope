@@ -2578,6 +2578,138 @@ pub fn qwen_jinja_lookup_turn(
     })
 }
 
+/// Reorder containers without changing any request value or array position.
+fn qwen_reorder_json_like(
+    current: &serde_json::Value,
+    producer: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match (current, producer) {
+        (Value::Object(c), Value::Object(p)) => {
+            if c.len() != p.len() { return None; }
+            let mut ordered = serde_json::Map::new();
+            for (key, value) in p {
+                ordered.insert(key.clone(), qwen_reorder_json_like(c.get(key)?, value)?);
+            }
+            Some(Value::Object(ordered))
+        }
+        (Value::Array(c), Value::Array(p)) if c.len() == p.len() => {
+            c.iter().zip(p).map(|(c, p)| qwen_reorder_json_like(c, p))
+                .collect::<Option<Vec<_>>>().map(Value::Array)
+        }
+        _ if current == producer => Some(current.clone()),
+        _ => None,
+    }
+}
+
+fn qwen_json_order_matches(current: &serde_json::Value, ordered: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (current, ordered) {
+        (Value::Object(c), Value::Object(o)) => c.len() == o.len()
+            && c.iter().zip(o).all(|((ck, cv), (ok, ov))| {
+                ck == ok && qwen_json_order_matches(cv, ov)
+            }),
+        (Value::Array(c), Value::Array(o)) => c.len() == o.len()
+            && c.iter().zip(o).all(|(c, o)| qwen_json_order_matches(c, o)),
+        _ => current == ordered,
+    }
+}
+
+fn qwen_tool_argument_order_history(
+    frame: &hipfire_runtime::prompt_frame::JinjaChatFrame,
+    producer_prefix: &[u32],
+    hist: &[hipfire_runtime::prompt_frame::Message],
+) -> Option<Vec<hipfire_runtime::prompt_frame::Message>> {
+    use hipfire_runtime::prompt_frame::Role;
+    use hipfire_runtime::tool_call::{Qwen35XmlParser, ToolCallParser};
+    use serde_json::Value;
+    let index = hist.iter().rposition(|m| m.role == Role::Assistant)?;
+    let echoed = &hist[index];
+    if echoed.tool_calls.is_empty() { return None; }
+    let tok = frame.tokenizer;
+    let start = tok.special_token_id("<|im_start|>")?;
+    let end = tok.special_token_id("<|im_end|>")?;
+    let opener = tok.encode("<|im_start|>assistant\n");
+    let envelope = producer_prefix.iter().rposition(|&id| id == start)?;
+    let terminal = producer_prefix.iter().rposition(|&id| id == end)?;
+    let trailer = &producer_prefix[terminal + 1..];
+    if terminal < envelope + opener.len()
+        || !producer_prefix[envelope..].starts_with(&opener)
+        || (!trailer.is_empty() && trailer != tok.encode("\n")) {
+        return None;
+    }
+    let body = tok.decode(&producer_prefix[envelope + opener.len()..terminal]);
+    let body = strip_think_for_fingerprint(&body);
+    // The shared parser is deliberately tolerant. Reject its incomplete,
+    // duplicate-key and JSON-fallback shapes before trusting its traversal.
+    let count = body.matches("<tool_call>").count();
+    if count == 0 || count != body.matches("</tool_call>").count()
+        || count != body.matches("<function=").count()
+        || count != body.matches("</function>").count()
+        || body.matches("<parameter=").count() != body.matches("</parameter>").count() {
+        return None;
+    }
+    let parsed = Qwen35XmlParser::new().parse(&body);
+    if parsed.tool_calls.len() != echoed.tool_calls.len() || count != parsed.tool_calls.len() {
+        return None;
+    }
+    let mut arguments = Vec::with_capacity(count);
+    for ((original, call), block) in echoed.tool_calls.iter().zip(&parsed.tool_calls)
+        .zip(body.split("<tool_call>").skip(1)) {
+        if original.name != call.name || call.repaired { return None; }
+        let current = original.arguments.as_object()?;
+        let producer = call.arguments.as_object()?;
+        if current.len() != producer.len()
+            || block.split("</tool_call>").next()?.matches("<parameter=").count() != producer.len() {
+            return None;
+        }
+        let mut ordered = serde_json::Map::new();
+        for (key, captured) in producer {
+            let value = current.get(key)?;
+            let captured = captured.as_str()?;
+            let reordered = match value {
+                Value::Object(_) | Value::Array(_) => {
+                    let structured: Value = serde_json::from_str(captured).ok()?;
+                    qwen_reorder_json_like(value, &structured)?
+                }
+                // XML strings are not typed API values. Preserve them verbatim;
+                // the final token-prefix check authorizes the render.
+                _ => value.clone(),
+            };
+            ordered.insert(key.clone(), reordered);
+        }
+        arguments.push(Value::Object(ordered));
+    }
+    let changed = echoed.tool_calls.iter().zip(&arguments)
+        .any(|(c, a)| !qwen_json_order_matches(&c.arguments, a));
+    if !changed { return None; }
+    let mut repaired = hist.to_vec();
+    for (call, args) in repaired[index].tool_calls.iter_mut().zip(arguments) {
+        call.arguments = args;
+    }
+    Some(repaired)
+}
+
+fn qwen_accept_tool_argument_replay(
+    frame: &hipfire_runtime::prompt_frame::JinjaChatFrame,
+    hist: &[hipfire_runtime::prompt_frame::Message],
+    prefix: &[u32],
+    baseline: Vec<u32>,
+    mut render: impl FnMut(&[hipfire_runtime::prompt_frame::Message]) -> Result<Vec<u32>, String>,
+) -> Vec<u32> {
+    if prefix.is_empty() || (baseline.len() > prefix.len() && baseline.starts_with(prefix)) {
+        return baseline;
+    }
+    if let Some(history) = qwen_tool_argument_order_history(frame, prefix, hist) {
+        if let Ok(candidate) = render(&history) {
+            if candidate.len() > prefix.len() && candidate.starts_with(prefix) {
+                return candidate;
+            }
+        }
+    }
+    baseline
+}
+
 /// Render the multi-turn Jinja history with the verbatim assistant-turn token
 /// splice (item-#37 machinery), shared by the MTP/DFlash route and the Qwen4
 /// AR route so both build byte-identical turn-N prompts from one
@@ -2594,6 +2726,7 @@ pub fn qwen_jinja_cached_history_tokens(
     hist: &[hipfire_runtime::prompt_frame::Message],
     tools: Option<&[serde_json::Value]>,
     trace_label: &str,
+    producer_prefix: Option<&[u32]>,
 ) -> Result<Vec<u32>, String> {
     let tok = frame.tokenizer;
     let im_start = tok.special_token_id("<|im_start|>");
@@ -2615,7 +2748,8 @@ pub fn qwen_jinja_cached_history_tokens(
         .ok()
         .as_deref()
         == Some("1");
-    hipfire_runtime::prompt_frame::build_cached_history_jinja(frame, hist, tools, |msg| {
+    let mut render = |history: &[hipfire_runtime::prompt_frame::Message]| {
+    hipfire_runtime::prompt_frame::build_cached_history_jinja(frame, history, tools, |msg| {
         let hit = qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer);
         if trace_cache {
             let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
@@ -2630,6 +2764,13 @@ pub fn qwen_jinja_cached_history_tokens(
         }
         hit
     })
+    };
+    let baseline = render(hist)?;
+    let Some(prefix) = producer_prefix.filter(|p| !p.is_empty()) else { return Ok(baseline); };
+    if !hipfire_config::developer_bool("HIPFIRE_QWEN4_TOOL_ARG_REPLAY", true) {
+        return Ok(baseline);
+    }
+    Ok(qwen_accept_tool_argument_replay(frame, hist, prefix, baseline, render))
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -3041,6 +3182,11 @@ pub fn generate_dflash(
                 hist,
                 tools,
                 "dflash",
+                if qwen4_native_mtp || m.state.as_ref().is_some_and(|s| s.arch_key() == "qwen35") {
+                    Some(&m.conversation_tokens)
+                } else {
+                    None
+                },
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -7760,6 +7906,128 @@ mod qwen_history_chain_tests {
         }
     }
 
+    #[test]
+    fn tool_argument_reorder_nested_and_typed_values() {
+        let current: serde_json::Value = serde_json::from_str(
+            r#"{"b":[{"y":null,"x":true},7],"a":{"z":"{\"x\":1}\n雪","k":2}}"#).unwrap();
+        let producer: serde_json::Value = serde_json::from_str(
+            r#"{"a":{"k":2,"z":"{\"x\":1}\n雪"},"b":[{"x":true,"y":null},7]}"#).unwrap();
+        let ordered = super::qwen_reorder_json_like(&current, &producer).unwrap();
+        assert_eq!(current, ordered);
+        assert_eq!(serde_json::to_string(&ordered).unwrap(), serde_json::to_string(&producer).unwrap());
+        assert_eq!(super::qwen_reorder_json_like(&producer, &producer), Some(producer.clone()));
+        for bad in [
+            r#"{"a":{"k":2},"b":[{"x":true,"y":null},7]}"#,
+            r#"{"a":{"k":2,"z":"{\"x\":1}\n雪","extra":0},"b":[{"x":true,"y":null},7]}"#,
+            r#"{"a":{"k":2,"z":"{\"x\":1}\n雪"}}"#,
+            r#"{"a":{"k":2,"z":"{\"x\":1}\n雪"},"b":[7,{"x":true,"y":null}]}"#,
+            r#"{"a":{"k":2,"z":"{\"x\":1}\n雪"},"b":[{"x":"true","y":null},7],"extra":0}"#,
+        ] {
+            let bad = serde_json::from_str(bad).unwrap();
+            assert!(super::qwen_reorder_json_like(&current, &bad).is_none());
+        }
+    }
+
+    #[test]
+    fn tool_argument_history_fail_closed_and_exact_extension() {
+        use hipfire_runtime::prompt_frame::ToolCall;
+        let tok = tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &tok, template: "", system: None, user: "",
+            enable_thinking: false, bos_token: None,
+            reasoning_strength: None, reasoning_effort: None,
+        };
+        let body = "<|im_start|>assistant\n<tool_call><function=f><parameter=a>\ntrue\n</parameter><parameter=b>\n{\"x\":1,\"y\":null}\n</parameter></function></tool_call><|im_end|>";
+        let prefix = tok.encode(body);
+        let mut assistant = msg(Role::Assistant, "");
+        assistant.tool_calls.push(ToolCall {
+            id: None, name: "f".into(),
+            arguments: serde_json::from_str(r#"{"b":{"y":null,"x":1},"a":true}"#).unwrap(),
+            rendered_body: None,
+        });
+        let hist = vec![assistant.clone(), msg(Role::Tool, "ok")];
+        let repaired = super::qwen_tool_argument_order_history(&frame, &prefix, &hist).unwrap();
+        // Qwen4 commits the terminator; dense AR also consumes ChatML's newline.
+        let dense_prefix = tok.encode(&format!("{body}\n"));
+        let dense_repaired = super::qwen_tool_argument_order_history(&frame, &dense_prefix, &hist).unwrap();
+        assert_eq!(serde_json::to_string(&dense_repaired[0].tool_calls[0].arguments).unwrap(),
+            serde_json::to_string(&repaired[0].tool_calls[0].arguments).unwrap());
+        for (label, producer) in [("qwen4-ar", &prefix), ("dense-ar", &dense_prefix)] {
+            let mut candidate = producer.clone(); candidate.push(100);
+            assert_eq!(super::qwen_accept_tool_argument_replay(&frame, &hist, producer,
+                vec![99], |_| Ok(candidate.clone())), candidate, "{label}");
+        }
+        assert_eq!(repaired[0].tool_calls[0].arguments, assistant.tool_calls[0].arguments);
+        assert_eq!(serde_json::to_string(&repaired[0].tool_calls[0].arguments).unwrap(),
+            r#"{"a":true,"b":{"x":1,"y":null}}"#);
+        assert!(super::qwen_tool_argument_order_history(&frame, &prefix, &repaired).is_none());
+        let baseline = vec![99, 98];
+        let mut extension = prefix.clone(); extension.push(100);
+        let accept = |candidate: Result<Vec<u32>, String>| {
+            super::qwen_accept_tool_argument_replay(&frame, &hist, &prefix,
+                baseline.clone(), |_| candidate.clone())
+        };
+        assert_eq!(accept(Ok(extension.clone())), extension);
+        assert_eq!(accept(Ok(prefix.clone())), baseline);
+        assert_eq!(accept(Ok(vec![0; prefix.len() + 1])), baseline);
+        assert_eq!(accept(Err("render doubt".into())), baseline);
+        assert_eq!(super::qwen_accept_tool_argument_replay(&frame, &hist, &prefix,
+            extension.clone(), |_| panic!("exact echoes must not render twice")), extension);
+        for arguments in [r#"{"a":true}"#, r#"{"a":true,"b":{"x":1}}"#,
+            r#"{"a":true,"b":{"x":1,"y":null,"z":2}}"#, r#"{"a":true,"b":{"x":1,"y":null},"z":0}"#] {
+            let mut bad = hist.clone();
+            bad[0].tool_calls[0].arguments = serde_json::from_str(arguments).unwrap();
+            assert!(super::qwen_tool_argument_order_history(&frame, &prefix, &bad).is_none());
+        }
+        for malformed in [body.replace("</parameter>", ""), body.replace("</function>", ""),
+            body.replace("</tool_call>", ""), body.replace("<parameter=a>", "<parameter=b>"),
+            body.replace("<function=f>", "<function=other>")] {
+            assert!(super::qwen_tool_argument_order_history(&frame, &tok.encode(&malformed), &hist).is_none());
+        }
+        let mut bad = hist.clone(); bad[0].tool_calls.push(assistant.tool_calls[0].clone());
+        assert!(super::qwen_tool_argument_order_history(&frame, &prefix, &bad).is_none());
+        let mut two = hist.clone();
+        let mut second = assistant.tool_calls[0].clone(); second.name = "g".into();
+        two[0].tool_calls.push(second);
+        let pair = body.replace("</tool_call>", "</tool_call><tool_call><function=g><parameter=a>\ntrue\n</parameter><parameter=b>\n{\"x\":1,\"y\":null}\n</parameter></function></tool_call>");
+        let pair_ids = tok.encode(&pair);
+        assert!(super::qwen_tool_argument_order_history(&frame, &pair_ids, &two).is_some());
+        two[0].tool_calls.swap(0, 1);
+        assert!(super::qwen_tool_argument_order_history(&frame, &pair_ids, &two).is_none());
+    }
+
+    #[test]
+    fn tool_argument_render_preserves_reasoning_and_content() {
+        use hipfire_runtime::prompt_frame::ToolCall;
+        let tok = tokenizer();
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.reasoning_content is defined %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}{% for c in m.tool_calls %}<tool_call><function={{ c.name }}>{% for k,v in c.arguments.items() %}<parameter={{ k }}>\n{{ v }}\n</parameter>{% endfor %}</function></tool_call>{% endfor %}<|im_end|>{% endfor %}<|im_start|>assistant\n";
+        let frame = JinjaChatFrame {
+            tokenizer: &tok, template, system: None, user: "",
+            enable_thinking: false, bos_token: None,
+            reasoning_strength: None, reasoning_effort: None,
+        };
+        let mut assistant = msg(Role::Assistant, "prose");
+        assistant.reasoning_content = Some("reason".into());
+        assistant.tool_calls.push(ToolCall { id: None, name: "f".into(),
+            arguments: serde_json::from_str(r#"{"a":"雪\nline","b":"{\"x\":1}"}"#).unwrap(),
+            rendered_body: None });
+        let prefix = tok.encode("<|im_start|>assistant\n<think>reason</think>prose<tool_call><function=f><parameter=a>\n雪\nline\n</parameter><parameter=b>\n{\"x\":1}\n</parameter></function></tool_call><|im_end|>");
+        let mut hist = vec![assistant, msg(Role::Tool, "ok")];
+        hist[0].tool_calls[0].arguments = serde_json::from_str(r#"{"b":"{\"x\":1}","a":"雪\nline"}"#).unwrap();
+        let render = |h: &[Message]| frame.render_messages(h, None, None).map(|s| tok.encode(&s));
+        let baseline = render(&hist).unwrap();
+        let repaired = super::qwen_accept_tool_argument_replay(&frame, &hist, &prefix, baseline.clone(), render);
+        assert!(repaired.len() > prefix.len() && repaired.starts_with(&prefix));
+        for reasoning in [false, true] {
+            let mut edited = hist.clone();
+            if reasoning { edited[0].reasoning_content = Some("edited".into()); }
+            else { edited[0].content = "edited".into(); }
+            let baseline = render(&edited).unwrap();
+            assert_eq!(super::qwen_accept_tool_argument_replay(&frame, &edited, &prefix,
+                baseline.clone(), render), baseline);
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Route {
         Mtp,
@@ -7858,7 +8126,7 @@ mod qwen_history_chain_tests {
             history.push(msg(Role::User, user));
             let cold = tok.encode(&frame.render_messages(&history, None, None).unwrap());
             let prompt =
-                qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, &history, None, label)
+                qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, &history, None, label, None)
                     .unwrap();
             // Every earlier turn hits: its entry is still cached AND its
             // emitted byte-level IDs (absent from any canonical re-encode,
@@ -8089,6 +8357,7 @@ pub fn generate_qwen4_ar(
                             hist,
                             tools,
                             "qwen4-ar",
+                            Some(&m.conversation_tokens),
                         ) {
                             Ok(spliced) => spliced,
                             Err(e) => {
