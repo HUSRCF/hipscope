@@ -3182,11 +3182,8 @@ pub fn generate_dflash(
                 hist,
                 tools,
                 "dflash",
-                if qwen4_native_mtp || m.state.as_ref().is_some_and(|s| s.arch_key() == "qwen35") {
-                    Some(&m.conversation_tokens)
-                } else {
-                    None
-                },
+                // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
+                Some(&m.conversation_tokens),
             ) {
                 Ok(v) => v,
                 Err(e) => {

@@ -3853,11 +3853,8 @@ pub fn generate(
                 history,
                 tools,
                 "dense-ar",
-                if m.state.as_ref().is_some_and(|s| s.arch_key() == "qwen35") {
-                    Some(&m.conversation_tokens)
-                } else {
-                    None
-                },
+                // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
+                Some(&m.conversation_tokens),
             );
             match built {
                 Ok(t) => t,
