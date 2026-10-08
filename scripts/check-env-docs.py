@@ -27,6 +27,9 @@ BOOTSTRAP_ENV = {
     "HIPFIRE_KERNEL_CACHE",
     "HIPFIRE_SPILL_DIR",
     "HIPFIRE_QUANT_DIAG_PATH",
+    # Test-harness marker read by the shared ROCm resolver (crates/rocm.rs);
+    # only #[test] code calls it, it never affects runtime behaviour.
+    "HIPFIRE_TEST_REQUIRE_ROCM",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").
