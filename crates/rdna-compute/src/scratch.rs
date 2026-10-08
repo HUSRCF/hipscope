@@ -477,6 +477,32 @@ pub(crate) fn module_load_or_recompile(
     symbol: &str,
     obj_path: &str,
 ) -> HipResult<Module> {
+    if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+        // Developer-only route-closure audit (default off): source/recipe
+        // identity of every HIP module, whichever loader reached it; the
+        // hip-bridge lines that follow carry the handle and resolved symbols.
+        use sha2::{Digest, Sha256};
+        let recipe = crate::compiler::KernelCompiler::recipe_for_source(
+            compiler.arch(),
+            module_name,
+            source,
+            &compiler.extra_flags,
+        );
+        let digest = Sha256::digest(source.as_bytes());
+        let source_sha256: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        eprintln!(
+            "HIPFIRE_MODULE_LOAD_AUDIT\thip\t{}",
+            serde_json::json!({
+                "arch": compiler.arch(),
+                "module": module_name,
+                "symbol": symbol,
+                "source_sha256": source_sha256,
+                "flags": recipe.flags,
+                "scheduler_profile": recipe.scheduler_profile,
+                "object": obj_path,
+            })
+        );
+    }
     match hip.module_load(obj_path) {
         Ok(m) => Ok(m),
         Err(e) if e.code == HIP_ERROR_INVALID_IMAGE => {
