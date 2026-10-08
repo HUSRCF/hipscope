@@ -1485,8 +1485,9 @@ impl MtpGpuState {
         Ok(())
     }
 
-    /// Context-arena bytes still unmapped below capacity (0 for legacy).
-    fn context_growth_bytes(&self) -> u64 {
+    /// Context-arena bytes still unmapped below `through` tokens (at most
+    /// capacity; 0 for legacy).
+    fn context_growth_bytes(&self, through: usize) -> u64 {
         if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
             return 0;
         }
@@ -1499,7 +1500,10 @@ impl MtpGpuState {
         .iter()
         .map(|tensor| tensor.byte_size() as u64)
         .sum();
-        capacity * self.full_capacity.saturating_sub(self.mapped_tokens) as u64
+        capacity
+            * through
+                .min(self.full_capacity)
+                .saturating_sub(self.mapped_tokens) as u64
             / self.full_capacity as u64
     }
 
@@ -1768,8 +1772,8 @@ impl Qwen4MtpGpu {
     }
 
     /// See [`MtpGpuState::context_growth_bytes`].
-    pub(crate) fn context_growth_bytes(&self) -> u64 {
-        self.state.context_growth_bytes()
+    pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
+        self.state.context_growth_bytes(through)
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)

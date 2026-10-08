@@ -1263,7 +1263,8 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
         &config,
     )?;
     let backend = Qwen4KvBackend::automatic(gpu);
-    let max_seq = crate::QWEN4_DEFAULT_CONTEXT.min(config.max_position_embeddings);
+    // The oracle's own context: its prompts stay far below it.
+    let max_seq = 32768.min(config.max_position_embeddings);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         config.clone(),
         transaction,

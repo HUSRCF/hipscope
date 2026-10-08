@@ -2957,6 +2957,9 @@ impl Qwen4GpuForward {
         // before any view, capture or record exists. Neither grows while a
         // capture or record is armed; a failure leaves the position
         // unpublished and already mapped pages owned.
+        // Session snapshots yield to context growth (only at a growth
+        // boundary; no query on the steady path).
+        bundle.release_session_for_growth(gpu, end_position);
         let mapped_before = bundle.state.mapped_context_tokens();
         bundle
             .state
