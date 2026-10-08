@@ -3064,6 +3064,35 @@ mod tests {
     }
 
     #[test]
+    fn gfx11_residual_mmq_pack_admits_every_fallback_symbol() {
+        let root = temp_root("residual_mmq_fallback");
+        for arch in ["gfx1100", "gfx1151"] {
+            let extra_flags = "-DIU4_A4_CANDIDATES=2";
+            let entry = crate::kernel_registry::lookup(
+                arch, "gemm_mq4g256v2_residual_mmq", extra_flags,
+            ).unwrap();
+            let compiler = test_compiler(extra_flags, "hipcc 7.16");
+            let dir = root.join(arch);
+            std::fs::create_dir_all(&dir).unwrap();
+            let object = dir.join(format!("{}.hsaco", entry.module));
+            std::fs::write(&object, b"INDEX ADMISSION TEST").unwrap();
+            let symbols = entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect();
+            let mut compiler = compiler;
+            compiler.arch = arch.to_owned();
+            let index = compiler.pack_index(entry.module, entry.source(), symbols, &object).unwrap();
+            std::fs::write(dir.join(format!("{}.hash", entry.module)), &index.packaging_key).unwrap();
+            publish_index(&dir, &index).unwrap();
+            for symbol in entry.symbols {
+                assert_eq!(
+                    compiler.indexed_object(&dir, entry.module, entry.source(), symbol).unwrap(),
+                    Some(object.clone()), "{arch}: {symbol}",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn indexed_package_rejects_wrong_object_symbol_source_and_identity() {
         let root = temp_root("indexed_negative");
         let source = "__global__ void rmsnorm_f32() {}";

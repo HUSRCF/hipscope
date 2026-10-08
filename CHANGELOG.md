@@ -4,6 +4,14 @@
 
 - **ROCm 10.1 bring-up (HIP 7.16 / clang 24):** shared `ROCM_PATH` resolver, strict ROCm oracles (missing tools fail unless `HIPFIRE_TEST_REQUIRE_ROCM=0` explicitly marks a no-ROCm host), HIP code object v6 and a new JIT cache ABI. Remove `restrict` from both gfx1201 FP8 producer-pack helpers' cross-thread shared scratch, preserving the post-barrier row-scale broadcast without disabling load-PRE globally. Fresh-hipcc SiLU oracles select committed clang-23 or clang-24 goldens by compiler major and fail clearly for unknown toolchains; native builders retain their original DAGs. PeaceMaker's native writer identity now names the oracle-verified lld 24 layout while keeping its 0.4.1 ELF stamp and committed bundle bytes stable. Quality pins in `AGENTS.md` are re-measured on ROCm 10.1; HIP 7.15 values remain historical. Halo pins explicitly require a warm kernel cache: cold-JIT runs can differ in chunk 0, and this bring-up does not claim to fix that path.
 - **Host-scaled kernel-pack builds:** compile independent modules with one compiler per worker, reserving one core per eight and bounding workers by available RAM (~1.5 GiB/job). `HIPFIRE_PACK_JOBS` overrides the budget; `scripts/build-kernel-pack.sh --jobs N` shares it across concurrent architectures without multiplying CPU usage. Kernel sources, compiler recipes and package formats are unchanged.
+- **gfx11 IU4 opt-out packs:** package `gemm_mq4g256v2_residual_mmq` on gfx1100/gfx1151 with its exact runtime source and all Q8_1/X128 exports, so `HIPFIRE_IU4_PREFILL=0` does not need a first-run JIT for this module. The default IU4 objects, compiler flags and kernel math are unchanged.
+- **Qwen4 and dense Qwen tool argument replay is on by default:**
+  restores producer ordering for reordered echoes on Qwen4 and dense Qwen3.8,
+  preserving typed values through one shared renderer.
+  `HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out; only exact extensions of the active committed
+  token record are accepted. Byte-identical echoes and retired-MTP guards remain
+  unchanged; uncertain candidates retain the safe miss. No measured speed claim.
+
 
 ## v0.4.1.1 — release draft
 

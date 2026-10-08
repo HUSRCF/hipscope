@@ -378,6 +378,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, ["gated_delta_net_q8_fast", "gated_delta_net_q8_fast_independent_masked"]);
         add!("gdn_chunk_prep_gfx11", kernels::GDN_CHUNK_PREP_GFX11_SRC, ["gdn_chunk_prep_gfx11"]);
         add!("gemm_gate_up_mq4g256v2_wmma", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC, ["gemm_gate_up_mq4g256v2_wmma"]);
+        // HIPFIRE_IU4_PREFILL=0 uses the Q8_1 MMQ source unchanged; both
+        // X128 and per-32 exports share this object and compiler recipe.
+        add!("gemm_mq4g256v2_residual_mmq", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC, [
+            "gemm_mq4g256v2_residual_mmq", "gemm_mq4g256v2_residual_mmq_full_add",
+            "gemm_mq4g256v2_residual_mmq_full_set", "gemm_mq4g256v2_residual_mmq_x128",
+            "gemm_mq4g256v2_residual_mmq_full_add_x128", "gemm_mq4g256v2_residual_mmq_full_set_x128",
+            "quantize_q8_1_mmq_ds4", "quantize_q8_1_mmq_ds4_x128",
+        ]);
         add!("gemm_mq4g256v2_residual_wmma", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC, ["gemm_mq4g256v2_residual_wmma"]);
         add!("gemm_qkv_mq4g256v2_wmma", kernels::GEMM_QKV_MQ4G256V2_WMMA_SRC, ["gemm_qkv_mq4g256v2_wmma"]);
         add!("gemm_qkvza_mq4g256v2_wmma", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_SRC, ["gemm_qkvza_mq4g256v2_wmma"]);
@@ -1587,6 +1595,31 @@ mod tests {
         );
         for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
             assert!(!entries(arch, "").unwrap().iter().any(|entry| entry.module == module));
+        }
+    }
+
+    #[test]
+    fn gfx11_residual_mmq_fallback_preserves_runtime_identity() {
+        let module = "gemm_mq4g256v2_residual_mmq";
+        for arch in ["gfx1100", "gfx1151"] {
+            for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+                let entry = lookup(arch, module, extra_flags).unwrap();
+                assert_eq!(entry.source(), kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC);
+                assert_eq!(entry.symbols, [
+                    module, "gemm_mq4g256v2_residual_mmq_full_add",
+                    "gemm_mq4g256v2_residual_mmq_full_set", "gemm_mq4g256v2_residual_mmq_x128",
+                    "gemm_mq4g256v2_residual_mmq_full_add_x128",
+                    "gemm_mq4g256v2_residual_mmq_full_set_x128",
+                    "quantize_q8_1_mmq_ds4", "quantize_q8_1_mmq_ds4_x128",
+                ]);
+                let recipe = KernelCompiler::recipe_for_source(arch, module, entry.source(), extra_flags);
+                assert_eq!(entry.flags, recipe.flags);
+                assert_eq!(entry.scheduler_profile, recipe.scheduler_profile);
+                assert_eq!(entry.scheduler_profile.as_deref(), Some("default"));
+            }
+        }
+        for arch in ["gfx1201", "gfx906", "gfx942"] {
+            assert!(lookup(arch, module, "").is_err(), "{arch}: admitted RDNA3-only MMQ");
         }
     }
 
