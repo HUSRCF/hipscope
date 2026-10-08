@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.0" src="https://img.shields.io/badge/stable-v0.4.0-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.0-f04b24?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.1" src="https://img.shields.io/badge/stable-v0.4.1-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.1-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="82 curated model entries" src="https://img.shields.io/badge/registry-82%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -33,6 +33,13 @@ hipfire chat qwen3.8:27b-mq4-xts
 That pulls about 15 GB and wants a 24 GB+ card or Strix Halo. On smaller cards,
 start with `qwen3.5:4b` (or `qwen3.5:9b`) in the same commands.
 
+Qwen3.8 Flash-Next (MoE, up to 262K context on one R9700 or Strix Halo):
+
+```bash
+hipfire pull qwen3.8:flash-next
+hipfire serve qwen3.8:flash-next -d
+```
+
 One-shot inference uses the same model registry and serving stack:
 
 ```bash
@@ -49,26 +56,37 @@ hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
 only by default; set `serve.host` to listen on other interfaces).
 
-Current stable release: **[v0.4.0](https://github.com/warpfront/hipfire/releases/tag/v0.4.0)**.
+Current stable release: **[v0.4.1](https://github.com/warpfront/hipfire/releases/tag/v0.4.1)**.
 
-**Flagship: Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (symmetric MQ4V2 XT with
-per-group AWQ and GPTQ scale refits). `hipfire pull qwen3.8:27b-mq4-xts`
-fetches the target plus its DFlash draft sidecar. On v0.4.0 it gets:
+**Qwen3.8 Flash-Next `qwen3.8:flash-next` on Strix Halo (gfx1151).** Single
+stream, median of 3 fresh processes:
 
-- **Prefill on one R9700 (gfx1201):** pp8192 ≈ 5,120 tok/s with native fp8 KV
-  as the `auto` default, and 4,464 / 3,804 / 2,940 tok/s at 32K / 64K / 128K.
-- **gfx11 prefill:** pp8192 ≈ 2,985 tok/s on the 7900 XTX and 1,141 tok/s on
-  Strix Halo; FA2 now covers prompts past 32K.
-- **Speculative decode:** the model's MTP head is on by default when present
-  (codeedit 39.3 → 68.1 tok/s on the R9700, same text), and VerifyAttn speeds up
-  long-context DFlash/MTP verify (Halo at 32K: DFlash 9.6 → 27.0 tok/s).
+- **Decode:** 58.7 tok/s greedy with native MTP; 56.98 tok/s sampled with a
+  presence penalty.
+- **Prefill:** 2,072.9 tok/s at pp8192 and 1,776.5 tok/s on a 32K prompt.
+- **Decode holds at depth:** 51.6 / 58.9 / 52.6 tok/s at 8K / 32K / 128K
+  (Ciru prompt files).
+- **Tool use:** the 15 hard tool-calling tasks (TC70–84) score 23/30 in
+  162.9 s (median of 3 seeds); HermesAgent-20 scores 95 / 96.
 
-Also in v0.4.0: **Qwen3.8 Flash-Next** MoE at its full **262K** context on one
-R9700 (tp=1, host-mapped experts) and on Strix Halo; **prebuilt kernel packs**
-in the installer; and serve/API hardening (loopback bind by default, daemon
-respawn, SIGTERM drain, typed errors). Numbers are self-measured on ROCm 10.0;
-fixtures and methods are in the release notes. See [CHANGELOG.md](CHANGELOG.md)
-and the [v0.4.0 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.0).
+**Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (MQ4 XTS) on 7900 XTX / R9700 / Strix Halo,
+median of 3:
+
+| | 7900 XTX | R9700 | Strix Halo |
+|---|---:|---:|---:|
+| pp8192, prompt tok/s | 3,021.5 | 5,166.1 | 1,192.7 |
+| Native MTP decode, tok/s (greedy, 8 mixed prompts) | 87.5 | 68.0 | 27.5 |
+| DFlash decode (opt-in), tok/s (greedy, 8 mixed prompts) | 131.7 | 123.3 | 43.2 |
+
+On code prompts, DFlash on the R9700 reaches a median of 238.7 tok/s.
+
+Also in v0.4.1: an engine-owned **session cache** for Flash-Next prompt reuse
+(building on @fivetide's #825 / #826), **exact tokenization** matching Hugging
+Face byte-BPE whitespace handling, and **PeaceMaker** kernels for Flash-Next.
+Numbers are self-measured; fixtures and methods are in the release notes. See
+[CHANGELOG.md](CHANGELOG.md), the
+[v0.4.1 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.1),
+and [hipfire.dev/benchmarks/0.4.1](https://hipfire.dev/benchmarks/0.4.1).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -155,7 +173,7 @@ The registry currently contains 80 curated model entries. Run
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
 | Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (symmetric XT, flagship), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
-| Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (canonical); 262K context on one R9700 (gfx1201, tp=1, routed experts host-mapped) and on Strix Halo (gfx1151) |
+| Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (canonical, MQ4 XTS); 262K context on one R9700 (gfx1201, tp=1, routed experts host-mapped) and on Strix Halo (gfx1151) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | Ornith 1.5 | `ornith-1.5:35b-a3b` (MQ4 default), `ornith-1.5:35b-a3b-mq4r` / `ornith-1.5:fast` (MQ4R) |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
