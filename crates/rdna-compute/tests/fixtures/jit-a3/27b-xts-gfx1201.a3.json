@@ -4859,15 +4859,6 @@
    "requests": 8,
    "env_overrides": {}
   },
-  "mtp-fallback": {
-   "run": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/a3/sweep-27b-gfx1201-mtp-fallback",
-   "binary_sha256": "c7db15d71ca0e181265169482cc6e175194a5197babd5a346e5d5ae1f07b7b1d",
-   "load": {
-    "max_seq": 4096
-   },
-   "requests": 2,
-   "env_overrides": {}
-  },
   "mtp-long": {
    "run": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/a3/sweep-27b-gfx1201-mtp-long",
    "binary_sha256": "a1d9c3bac12ae7003f2db889212bc6b79d0e46597e34e7214caeb321a018dae2",
