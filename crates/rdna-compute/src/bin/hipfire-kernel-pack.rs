@@ -11,6 +11,37 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const BYTES_PER_JOB: u64 = 1536 * 1024 * 1024;
+
+fn worker_count(cores: usize, available_bytes: Option<u64>, override_jobs: Option<&str>) -> Result<usize, String> {
+    let cores = cores.max(1);
+    let requested = match override_jobs {
+        Some(value) => value.parse::<usize>().ok().filter(|&jobs| jobs > 0)
+            .ok_or("HIPFIRE_PACK_JOBS must be a positive integer")?,
+        None => cores.saturating_sub((cores / 8).max(1)).max(1),
+    };
+    // Unknown memory availability is conservative rather than launching dozens
+    // of clang processes on a host whose RAM budget we cannot determine.
+    let memory_jobs = available_bytes.map(|bytes| (bytes / BYTES_PER_JOB).max(1) as usize).unwrap_or(1);
+    Ok(requested.min(cores).min(memory_jobs))
+}
+
+fn available_memory(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
+    })
+}
+
+fn host_jobs() -> Result<usize, String> {
+    let cores = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+    let memory = std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|text| available_memory(&text));
+    let override_jobs = hipfire_config::developer_var("HIPFIRE_PACK_JOBS").ok();
+    worker_count(cores, memory, override_jobs.as_deref())
+}
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -35,8 +66,12 @@ fn run() -> Result<(), String> {
                 }
                 jobs.push((module.to_owned(), symbols, PathBuf::from(source)));
             }
+            "--print-jobs" => {
+                println!("{}", host_jobs()?);
+                return Ok(());
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: hipfire-kernel-pack --arch gfx1201 --output <arch-dir> [--registry registry.tsv] [--kernel module:symbol[,symbol...]:effective-source.hip ...] [--extra-flags flags]");
+                eprintln!("Usage: hipfire-kernel-pack --arch gfx1201 --output <arch-dir> [--registry registry.tsv] [--kernel module:symbol[,symbol...]:effective-source.hip ...] [--extra-flags flags]\nHIPFIRE_PACK_JOBS overrides host-scaled workers (bounded by cores and available RAM); --print-jobs prints this budget.");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}")),
@@ -78,15 +113,53 @@ fn run() -> Result<(), String> {
     if output.file_name().and_then(|s| s.to_str()) != Some(arch.as_str()) {
         return Err(format!("--output must end in architecture directory {arch}"));
     }
-    let mut compiler = rdna_compute::KernelCompiler::new(&arch, extra_flags)
-        .map_err(|e| e.to_string())?;
-    for (module, symbols, source_path) in jobs {
-        let source = std::fs::read_to_string(&source_path)
-            .map_err(|e| format!("{}: {e}", source_path.display()))?;
-        let object = compiler.pack_to(&module, &source, &symbols, &output)
-            .map_err(|e| format!("{module}: {e}"))?;
-        eprintln!("packaged {module} [{}] at {}", symbols.join(","), object.display());
+    // Each module has its own atomic object/hash/index publication. Keep repeat
+    // requests on one worker to preserve their serial last-writer semantics.
+    let mut module_groups = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, (module, _, _)) in jobs.iter().enumerate() {
+        let group = *module_groups.entry(module.as_str()).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(index);
     }
+    let workers = host_jobs()?.min(groups.len());
+    eprintln!("packaging {} modules with {workers} workers", jobs.len());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| -> Result<(), String> {
+                let mut compiler = rdna_compute::KernelCompiler::new(&arch, extra_flags.clone())
+                    .map_err(|e| e.to_string())?;
+                while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    for &index in group {
+                        let (module, symbols, source_path) = &jobs[index];
+                        let source = std::fs::read_to_string(source_path)
+                            .map_err(|e| format!("{}: {e}", source_path.display()))?;
+                        let object = compiler.pack_to(module, &source, symbols, &output)
+                            .map_err(|e| format!("{module}: {e}"))?;
+                        eprintln!("packaged {module} [{}] at {}", symbols.join(","), object.display());
+                    }
+                }
+                Ok(())
+            }));
+        }
+        let mut error = None;
+        // Join every worker even after failure; no background compile survives
+        // the error. The release wrapper only manifests a successful arch.
+        for handle in handles {
+            match handle.join().map_err(|_| "pack worker panicked".to_owned()).and_then(|result| result) {
+                Ok(()) => {}
+                Err(message) => { error.get_or_insert(message); }
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })?;
     Ok(())
 }
 
@@ -97,5 +170,37 @@ fn main() -> ExitCode {
             eprintln!("hipfire-kernel-pack: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_reserve_scales_and_never_removes_last_worker() {
+        for (cores, expected) in [(1, 1), (8, 7), (16, 14), (64, 56)] {
+            assert_eq!(worker_count(cores, Some(u64::MAX), None).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn memory_and_cpu_bound_overrides() {
+        assert_eq!(worker_count(64, Some(3 * BYTES_PER_JOB), None).unwrap(), 3);
+        assert_eq!(worker_count(64, Some(0), None).unwrap(), 1);
+        assert_eq!(worker_count(64, None, None).unwrap(), 1);
+        assert_eq!(worker_count(8, Some(u64::MAX), Some("100")).unwrap(), 8);
+        assert_eq!(worker_count(64, Some(3 * BYTES_PER_JOB), Some("20")).unwrap(), 3);
+        assert_eq!(worker_count(64, Some(u64::MAX), Some("1")).unwrap(), 1);
+        for value in ["0", "-1", "no", ""] {
+            assert!(worker_count(64, Some(u64::MAX), Some(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_available_not_unused_memory() {
+        assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n"), Some(2 * BYTES_PER_JOB));
+        assert_eq!(available_memory("MemFree: 100 kB\n"), None);
+        assert_eq!(available_memory("MemAvailable: invalid kB\n"), None);
     }
 }

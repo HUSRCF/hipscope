@@ -381,6 +381,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | DeepSeek4 calibration-only dump of P1 projection inputs in `collect_e8_hessian` format; direct evaluator flag `--dump-dense-acts` is preferred. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Compatibility alias for `diagnostic.compiler.hipcc_extra_flags` |
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
+| `HIPFIRE_PACK_JOBS` | Kernel-pack builder only: positive worker count, bounded by CPU affinity and available RAM (~1.5 GiB/job). Defaults to `available_parallelism()` minus a reserve of at least one core (one per eight cores). `build-kernel-pack.sh` treats this as the total budget shared by concurrent architectures. |
 | `HIPFIRE_NO_DEVICE_COMPILER=1` | Require verified installed kernel objects instead of JIT; a missing/stale index, wrong symbol/source/flags/profile/ABI/toolchain identity or object SHA-256 fails before HIP loads it. Hot JIT keys remain toolchain-specific. |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
@@ -390,6 +391,13 @@ matching source revision with hipcc available, and install the resulting
 `kernels/compiled/gfx1201/` directory beside the daemon executable. Native
 installers and container/Nix builds perform this registry packaging directly.
 Do not copy bare `.hsaco` or `.hash` files from older installations.
+
+Pack compilation uses one compiler per worker and leaves source, flags, objects
+and index contents unchanged. `hipfire-kernel-pack --print-jobs` prints the
+current host budget; `HIPFIRE_PACK_JOBS=1` selects serial compilation.
+For release tarballs, `scripts/build-kernel-pack.sh --tag TAG --jobs 3
+gfx1201 gfx1100 gfx1151` builds up to three architectures concurrently, splitting
+the total CPU/RAM budget between them rather than launching three full pools.
 
 To build a compiler-free `gfx1201` RMSNorm package for the production
 `Gpu::rmsnorm_f32` route, run
@@ -1318,6 +1326,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_PACK_JOBS` | crates/rdna-compute/src/bin/hipfire-kernel-pack.rs, scripts/build-kernel-pack.sh | developer |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
