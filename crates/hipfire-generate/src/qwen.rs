@@ -2618,11 +2618,14 @@ fn qwen_tool_argument_order_history(
     let end = tok.special_token_id("<|im_end|>")?;
     let opener = tok.encode("<|im_start|>assistant\n");
     let envelope = producer_prefix.iter().rposition(|&id| id == start)?;
-    if !producer_prefix[envelope..].starts_with(&opener)
-        || producer_prefix.last().copied() != Some(end) {
+    let terminal = producer_prefix.iter().rposition(|&id| id == end)?;
+    let trailer = &producer_prefix[terminal + 1..];
+    if terminal < envelope + opener.len()
+        || !producer_prefix[envelope..].starts_with(&opener)
+        || (!trailer.is_empty() && trailer != tok.encode("\n")) {
         return None;
     }
-    let body = tok.decode(&producer_prefix[envelope + opener.len()..producer_prefix.len() - 1]);
+    let body = tok.decode(&producer_prefix[envelope + opener.len()..terminal]);
     let body = strip_think_for_fingerprint(&body);
     // The shared parser is deliberately tolerant. Reject its incomplete,
     // duplicate-key and JSON-fallback shapes before trusting its traversal.
@@ -3166,7 +3169,11 @@ pub fn generate_dflash(
                 hist,
                 tools,
                 "dflash",
-                if qwen4_native_mtp { Some(&m.conversation_tokens) } else { None },
+                if qwen4_native_mtp || m.state.as_ref().is_some_and(|s| s.arch_key() == "qwen35") {
+                    Some(&m.conversation_tokens)
+                } else {
+                    None
+                },
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -7927,6 +7934,16 @@ mod qwen_history_chain_tests {
         });
         let hist = vec![assistant.clone(), msg(Role::Tool, "ok")];
         let repaired = super::qwen_tool_argument_order_history(&frame, &prefix, &hist).unwrap();
+        // Qwen4 commits the terminator; dense AR also consumes ChatML's newline.
+        let dense_prefix = tok.encode(&format!("{body}\n"));
+        let dense_repaired = super::qwen_tool_argument_order_history(&frame, &dense_prefix, &hist).unwrap();
+        assert_eq!(serde_json::to_string(&dense_repaired[0].tool_calls[0].arguments).unwrap(),
+            serde_json::to_string(&repaired[0].tool_calls[0].arguments).unwrap());
+        for (label, producer) in [("qwen4-ar", &prefix), ("dense-ar", &dense_prefix)] {
+            let mut candidate = producer.clone(); candidate.push(100);
+            assert_eq!(super::qwen_accept_tool_argument_replay(&frame, &hist, producer,
+                vec![99], |_| Ok(candidate.clone())), candidate, "{label}");
+        }
         assert_eq!(repaired[0].tool_calls[0].arguments, assistant.tool_calls[0].arguments);
         assert_eq!(serde_json::to_string(&repaired[0].tool_calls[0].arguments).unwrap(),
             r#"{"a":true,"b":{"x":1,"y":null}}"#);
