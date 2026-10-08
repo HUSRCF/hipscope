@@ -2602,6 +2602,19 @@ fn qwen_reorder_json_like(
     }
 }
 
+fn qwen_json_order_matches(current: &serde_json::Value, ordered: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (current, ordered) {
+        (Value::Object(c), Value::Object(o)) => c.len() == o.len()
+            && c.iter().zip(o).all(|((ck, cv), (ok, ov))| {
+                ck == ok && qwen_json_order_matches(cv, ov)
+            }),
+        (Value::Array(c), Value::Array(o)) => c.len() == o.len()
+            && c.iter().zip(o).all(|(c, o)| qwen_json_order_matches(c, o)),
+        _ => current == ordered,
+    }
+}
+
 fn qwen_tool_argument_order_history(
     frame: &hipfire_runtime::prompt_frame::JinjaChatFrame,
     producer_prefix: &[u32],
@@ -2668,7 +2681,7 @@ fn qwen_tool_argument_order_history(
         arguments.push(Value::Object(ordered));
     }
     let changed = echoed.tool_calls.iter().zip(&arguments)
-        .any(|(c, a)| serde_json::to_string(&c.arguments).ok() != serde_json::to_string(a).ok());
+        .any(|(c, a)| !qwen_json_order_matches(&c.arguments, a));
     if !changed { return None; }
     let mut repaired = hist.to_vec();
     for (call, args) in repaired[index].tool_calls.iter_mut().zip(arguments) {
