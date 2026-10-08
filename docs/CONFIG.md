@@ -725,8 +725,8 @@ LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
 hits; edited or mismatched history falls back to a plain retokenized render
 (cold or checkpoint path) instead of replaying stale tokens.
 
-Developer flag `HIPFIRE_QWEN4_TOOL_ARG_REPLAY=1` (default off; `=0` kill switch)
-restores original producer argument ordering, not lexical sorting, on the last
+Tool argument replay is on by default (`HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out).
+It restores original producer argument ordering, not lexical sorting, on the last
 echoed Qwen4 or dense Qwen assistant tool turn in the active committed conversation. Typed
 values and byte-identical echoes are unchanged. A repaired render is accepted
 only if it strictly extends every committed token; otherwise the original safe
