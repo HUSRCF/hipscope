@@ -21,7 +21,9 @@ use core::mem::size_of;
 mod sys {
     use core::ffi::c_void;
     extern "C" {
-        pub fn open(path: *const u8, flags: i32) -> i32;
+        // Must match libc's variadic C signature exactly; rustc >= 1.99 rejects a
+        // mismatched declaration of a symbol the standard library also uses.
+        pub fn open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
         pub fn close(fd: i32) -> i32;
         pub fn ioctl(fd: i32, request: u64, arg: *mut c_void) -> i32;
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
@@ -220,7 +222,7 @@ impl Bo {
 
 impl Device {
     pub fn open() -> Result<Device, String> {
-        let fd = unsafe { sys::open(b"/dev/accel/accel0\0".as_ptr(), sys::O_RDWR | sys::O_CLOEXEC) };
+        let fd = unsafe { sys::open(c"/dev/accel/accel0".as_ptr(), sys::O_RDWR | sys::O_CLOEXEC) };
         if fd < 0 {
             return Err(format!("open /dev/accel/accel0: errno={}", errno()));
         }

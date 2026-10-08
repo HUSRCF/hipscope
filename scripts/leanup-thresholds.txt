@@ -44,7 +44,12 @@ required_features_daemon    == 0
 # 355eeb987) added the daemon load warnings for deprecated KV names and PFlash
 # plus their lifecycle markers (+23 lines, 5358 -> 5381 on land); fold/flash-next
 # took 4 back. The warnings go with the surfaces they announce in 0.5.0.
-daemon_lines                <= 5377
+# RATCHET-RAISE 5377 -> 5392: 0.4.1 landed the engine-owned session cache
+# (231935f6a3, #825/#826), the Qwen4 unload-first lifecycle fix (a31e438c73) and
+# the Qwen4 think-budget/EOS serve fixes (163d26d5b0, 325f31cc1a); e4d816e6b2
+# already removed formatter churn. v0.4.1 shipped at 5392 with CI red on this
+# ratchet; recorded here in 0.4.1.1 rather than masking the gate.
+daemon_lines                <= 5392
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -52,7 +57,10 @@ daemon_lines                <= 5377
 # RATCHET-RAISE 61 -> 63: `rdna-compute/verify_attn_oracle` (VerifyAttn byte oracle, gfx1201/gfx1100)
 # and `hipfire-arch-qwen35/mq4_prefill_state_oracle` (#794 cross-process state oracle), test-only
 # correctness oracles that their gates and docs invoke without `--features lab`.
-ungated_examples            <= 63
+# RATCHET-RAISE 63 -> 64: v0.4.1 shipped at 64 (CI red on this ratchet); the
+# 0.4.1 cycle added QSA/PM oracles in rdna-compute/examples that their gates
+# invoke. Pay down by gating archived probes behind `lab` in 0.4.2.
+ungated_examples            <= 64
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is
