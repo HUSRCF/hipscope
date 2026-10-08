@@ -241,7 +241,7 @@ pub(crate) fn hc_down_tile_selected(
 /// gfx1201's symmetric MoE uses the native image even when the gfx1151
 /// native-image kill switch is off.
 pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
-    arch == "gfx1201" || enabled
+    arch == "gfx1201" || (arch == "gfx1151" && enabled)
 }
 /// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
 /// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
@@ -45392,7 +45392,7 @@ impl Gpu {
     pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
         let arch = self.qwen4_moe_sym_arch_index()?;
         let h = host_mapped as usize;
-        Some(if qwen4_moe_sym_native_selected(self.arch.as_str(), *QWEN4_MOE_SYM_PM) {
+        Some(if qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM) {
             let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
                 2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
                 4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
@@ -45912,7 +45912,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
         let arch = self.qwen4_moe_sym_arch(what)?;
-        let pm = qwen4_moe_sym_native_selected(self.arch.as_str(), *QWEN4_MOE_SYM_PM);
+        let pm = qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM);
         // Row blocks per workgroup: the down symbol and grid.x both come from
         // this one value, so a launch never covers fewer rows than `m`.
         let rr = if down { self.qwen4_moe_sym_down_rr()? } else { 1 };
