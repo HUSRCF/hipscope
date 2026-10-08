@@ -3,6 +3,7 @@
 ## Unreleased (0.4.2)
 
 - ROCm 10.1 preparation pins HIP code object v6 and increments the JIT cache ABI. Oracle tools share `ROCM_PATH`, else `/opt/rocm`, with LLVM tools under `lib/llvm/bin`; missing tools fail unless `HIPFIRE_TEST_REQUIRE_ROCM=0` explicitly marks a no-ROCm test host. Historical fixture provenance is unchanged.
+- Fix gfx1201 native FP8 prefill under clang 24 by removing `restrict` from both producer-pack helpers' cross-thread shared scratch. This preserves the post-barrier row-scale broadcast for every fused producer without disabling load-PRE globally; ROCm 10.1 WT2/code24 KLD pins are restored.
 
 ## v0.4.1.1 — release draft
 

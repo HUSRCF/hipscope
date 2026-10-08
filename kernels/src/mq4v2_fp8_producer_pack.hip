@@ -91,13 +91,16 @@ __device__ inline float fp8stream_row_scale_from_absmax(float amax) {
 // (`[K/256,2]`), and `scale_slot` follow the standalone pack layout for
 // row n. Reduces `row_amax` (the caller's per-thread finite absmax over the
 // exact values it stored) with the standalone fmaxf order.
+// Shared scratch is deliberately not restrict-qualified: other threads
+// publish through it across barriers. Clang 24 can otherwise forward a
+// stale per-thread value instead of reloading the broadcast row scale.
 __device__ inline void fp8stream_pack_row_from_f32(
     const float* __restrict__ x_row,
     unsigned char* __restrict__ out_row,
     float* __restrict__ sums_row,
     float* __restrict__ scale_slot,
     float row_amax,
-    float* __restrict__ smem8,
+    float* smem8,
     int K,
     int tid,
     int lane,
@@ -163,7 +166,7 @@ __device__ inline void fp8stream_pack_row_inreg(
     float* __restrict__ sums_row,
     float* __restrict__ scale_slot,
     float row_amax,
-    float* __restrict__ smem8,
+    float* smem8,
     int K, int lane, int wave, int first_group, int group_stride,
     int row_scale_shift) {
     row_amax = fp8stream_wave_max(row_amax);
