@@ -175,7 +175,7 @@ fn gfx1100_silu_region_matches_fresh_hipcc_object() {
     let listing = String::from_utf8(dis.stdout).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let slice = region::slice_silu_gfx11(&listing, "gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11").unwrap();
-    assert_eq!(slice, region::body_of(region::SILU_GOLDEN_GFX1100));
+    assert_eq!(slice, region::body_of(rocm::silu_golden(true)));
     // expf range reduction and the IEEE division, every select mask an SGPR.
     let r = region::Region::silu_gfx1100().unwrap();
     let m = r.mnemonics();

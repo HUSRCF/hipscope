@@ -2,8 +2,7 @@
 
 ## Unreleased (0.4.2)
 
-- ROCm 10.1 preparation pins HIP code object v6 and increments the JIT cache ABI. Oracle tools share `ROCM_PATH`, else `/opt/rocm`, with LLVM tools under `lib/llvm/bin`; missing tools fail unless `HIPFIRE_TEST_REQUIRE_ROCM=0` explicitly marks a no-ROCm test host. Historical fixture provenance is unchanged.
-- Fix gfx1201 native FP8 prefill under clang 24 by removing `restrict` from both producer-pack helpers' cross-thread shared scratch. This preserves the post-barrier row-scale broadcast for every fused producer without disabling load-PRE globally; ROCm 10.1 WT2/code24 KLD pins are restored.
+- **ROCm 10.1 bring-up (HIP 7.16 / clang 24):** shared `ROCM_PATH` resolver, strict ROCm oracles (missing tools fail unless `HIPFIRE_TEST_REQUIRE_ROCM=0` explicitly marks a no-ROCm host), HIP code object v6 and a new JIT cache ABI. Remove `restrict` from both gfx1201 FP8 producer-pack helpers' cross-thread shared scratch, preserving the post-barrier row-scale broadcast without disabling load-PRE globally. Fresh-hipcc SiLU oracles select committed clang-23 or clang-24 goldens by compiler major and fail clearly for unknown toolchains; native builders retain their original DAGs. PeaceMaker's native writer identity now names the oracle-verified lld 24 layout while keeping its 0.4.1 ELF stamp and committed bundle bytes stable. Quality pins in `AGENTS.md` are re-measured on ROCm 10.1; HIP 7.15 values remain historical. Halo pins explicitly require a warm kernel cache: cold-JIT runs can differ in chunk 0, and this bring-up does not claim to fix that path.
 
 ## v0.4.1.1 — release draft
 

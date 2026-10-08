@@ -14,6 +14,23 @@
 
 <!-- hand-written: what not to do here; traps a reader will hit. -->
 
+- Fresh-hipcc SiLU oracle fixtures are keyed by the shared ROCm resolver's
+  clang major (23 or 24); other majors fail rather than reuse a foreign golden.
+  Keep the original clang-23 region templates: the native builders still use
+  those DAGs. To regenerate an oracle fixture, follow the hipcc compilation,
+  unbundling and disassembly procedure in `tests/gfx11_builder.rs` or
+  `tests/iu4_gemm_shape.rs`, then capture `hipfire-isa region-import --arch
+  gfx1100|gfx1201 --disassembly FILE` stdout in the corresponding
+  `kernels/*.silu.clang24.region.s` file (the comparison against clang 23 is
+  expected to fail). Include the ROCm/HIP/clang provenance as a `;` comment.
+- `native::VERSION` describes the lld 24 layout verified by `native_identity`;
+  it is not the ELF `.comment` stamp. `NATIVE_COMMENT` keeps version 0.4.1.
+  Re-emission via `hipfire-isa emit ... --bundle FILE` therefore preserves the
+  committed bundle bytes. Most committed bundles use `--host-target
+  host-x86_64-unknown-linux-gnu-`; the separate A4-fusion and gfx1151 MQ6 bundles
+  use the default spelling without the trailing hyphen. The `_b1_control` object intentionally
+  preserves an older instruction schedule, not the current builder's module.
+
 ## Crate map
 
 <!-- crate-map:generated:begin -->

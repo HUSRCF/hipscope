@@ -1,9 +1,8 @@
 [package]
 name = "hipfire-isa"
 # Pinned, not workspace: the crate version is embedded in every native-emitted
-# code object (ELF comment + builder proof). The 0.4.1.1 patch changes no ISA
-# code, so keep 0.4.1 to keep committed .hxaco bundles and pack identities
-# byte-identical. Bump together with an intentional re-emission.
+# code object (ELF comment + builder proof). Keep the 0.4.1 stamp stable;
+# the 0.4.2 re-emission updates the native layout string to ld.lld 24.
 version = "0.4.1"
 edition.workspace = true
 license.workspace = true

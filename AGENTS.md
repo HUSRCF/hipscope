@@ -597,16 +597,46 @@ code24 `heldout-code24.gptqsym.kldref.bin` (sha256
 A change that claims to be bit-exact must reproduce its arch's `.kldseq`
 byte for byte. A change that moves a pin on purpose re-pins it here.
 
+Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
+code object v6). Each pin is reproduced in two fresh processes with separate
+HOME directories. gfx1201/gfx1100 use empty kernel caches; gfx1201 repeats
+use different R9700 cards. gfx1100/gfx1151 run serialized under the hipx timing
+lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
+reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
+can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
+The gfx1201 KLD values remain unchanged at six decimals; their ROCm 10.1 sequence hashes
+are the expected re-pins, including the repaired native-FP8 producer route.
+
 | Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
 |---|---|---|---:|---|
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898` |
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a` |
-| gfx1100 | A4 (default), `--kv-mode q8` | WT2 | 0.068687 | `ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd` |
-| gfx1100 | A4 (default), `--kv-mode q8` | code24 | 0.052666 | `a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.068955 | `c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.051358 | `04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+
+Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
+(`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
+(`4e78f8e4…`) and 0.050338 (`9caca85b…`). Only sequence 0 differed.
+After one cache-populating WT2 run, both scored warm WT2 runs reproduced
+`2355f76c…`; code24 warmup and both scored warm runs reproduced `9caca85b…`.
+This ties the observed instability to the cold-JIT path; its root cause is
+not established, and empty-cache Halo determinism is not claimed.
+
+Historical HIP 7.15 pins (same row order as above): KLD
+`0.069571 / 0.052119 / 0.041859 / 0.029867 / 0.068687 / 0.052666 / 0.068955 / 0.051358`;
+`.kldseq` SHA-256 respectively:
+`483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898`,
+`6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a`,
+`19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508`,
+`5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a`,
+`ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd`,
+`a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f`,
+`c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2`,
+`04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308`.
 
 Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
 (`hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`, registry tag

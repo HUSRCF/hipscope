@@ -23,7 +23,7 @@ use peacemaker_ir::inst::Arch as IrArch;
 use std::collections::HashMap;
 
 /// Provenance of the native writer, recorded as its tool identity.
-pub const VERSION: &str = concat!("hipfire-isa ", env!("CARGO_PKG_VERSION"), " native code object v6 writer (ld.lld 23.0.0 layout)");
+pub const VERSION: &str = concat!("hipfire-isa ", env!("CARGO_PKG_VERSION"), " native code object v6 writer (ld.lld 24.0.0 layout)");
 /// `clang-offload-bundler`'s host entry spelling; ROCm `hipcc` (and the
 /// committed `.hxaco` bundles) use the trailing-hyphen form instead.
 pub const DEFAULT_HOST_TARGET: &str = "host-x86_64-unknown-linux-gnu";

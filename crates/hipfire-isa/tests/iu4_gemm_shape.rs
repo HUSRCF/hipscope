@@ -172,5 +172,5 @@ fn silu_region_matches_fresh_hipcc_object() {
     let dis = Command::new(&objdump).args(["-d", "--mcpu=gfx1201"]).arg(&co).output().unwrap();
     let listing = String::from_utf8(dis.stdout).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(region::slice_silu(&listing, "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3").unwrap(), region::golden_body());
+    assert_eq!(region::slice_silu(&listing, "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3").unwrap(), region::body_of(rocm::silu_golden(false)));
 }
