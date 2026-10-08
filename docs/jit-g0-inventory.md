@@ -78,7 +78,7 @@ Owned helper directories `/home/kaden/qcal/release-0.4.2/jit-peacemaker/` and `/
 
 Seven pure tests are added at `/home/kaden/ClaudeCode/warpfront/wt-jit/crates/rdna-compute/tests/jit_g0_route_data.rs`, with six manifests, two header fixtures and the24-source fixture under `/home/kaden/ClaudeCode/warpfront/wt-jit/crates/rdna-compute/tests/fixtures/jit-g0/`. They cover baseline factories/recipe identities/embedded exports, all24 cold sources, header quant/shapes and separated defaults, full-recipe alias union, conflicting public-entry image refusal, existing architecture/shape-selector constants, and G0-pass versus A3-readiness/excluded-fixture distinctions. They do not initialize HIP or add a model-route execution runtime.
 
-**Rust tests were not run by this worker**; main owns the shared verification. Suggested CPU-hidden command:
+**Verified on Main's explicit follow-up assignment: 7 passed, 0 failed (0.03 s)**, CPU-hidden, release/locked, `-j 28`, target-jit. Main supplied two type corrections; the remaining failure was a mis-keyed test lookup: serial/spec arms use `entries_ref`, not inline `entries`. The test now resolves those named manifest fields and validates every referenced recipe without skipping or weakening assertions. Passing output: `artifact://119879`. Exact command:
 
 ```sh
 env ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/home/kaden/qcal/release-0.4.2/target-jit cargo test --release --locked --manifest-path /home/kaden/ClaudeCode/warpfront/wt-jit/Cargo.toml -j 28 -p rdna-compute --features deltanet --test jit_g0_route_data

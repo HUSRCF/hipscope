@@ -44,7 +44,16 @@ fn six_header_specific_recipes_match_baseline_factories() {
         assert_eq!(manifest["mixed_fixture_role"], "superset only; not default route membership");
         let corpus = kernel_registry::corpus_entries(arch, "-DIU4_A4_CANDIDATES=2").unwrap();
         let sets = std::iter::once(&manifest["default_entries"]).chain(
-            manifest["alternate_arms"].as_array().unwrap().iter().map(|arm| &arm["entries"]));
+            manifest["alternate_arms"].as_array().unwrap().iter().map(|arm| {
+                if let Some(entries) = arm.get("entries") {
+                    entries
+                } else {
+                    let reference = arm["entries_ref"].as_str().unwrap_or_else(||
+                        panic!("{name}: arm {} has neither entries nor entries_ref", arm["name"]));
+                    manifest.get(reference).unwrap_or_else(||
+                        panic!("{name}: arm {} references missing field {reference}", arm["name"]))
+                }
+            }));
         for entries in sets {
             let entries = entries.as_array().unwrap();
             validate_public_entries(entries).unwrap();
@@ -58,7 +67,7 @@ fn six_header_specific_recipes_match_baseline_factories() {
                     assert_eq!(format!("{:x}", Sha256::digest(oracle.source().as_bytes())), entry["sha256"]);
                     let recipe = KernelCompiler::recipe_for_source(arch, module, oracle.source(), "-DIU4_A4_CANDIDATES=2");
                     assert_eq!(serde_json::to_value(&recipe.flags).unwrap(), entry["flags"]);
-                    assert_eq!(recipe.scheduler_profile, entry["scheduler_profile"].as_str().unwrap());
+                    assert_eq!(recipe.scheduler_profile.as_deref(), entry["scheduler_profile"].as_str());
                     assert_eq!(recipe.cache_abi as u64, entry["cache_abi"].as_u64().unwrap());
                     let required = strings(&entry["symbols"]);
                     let missing: BTreeSet<_> = required.iter().copied()
@@ -170,7 +179,7 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
             .any(|arm| arm["name"] == "serial-compiler-kill-arm"
                 && arm["entries_ref"] == "default_entries"));
         assert!(m["explicit_spec_inventory_role"].as_str().unwrap().contains("superset"));
-        if name == "flash-next-gfx1100.routes.json" {
+        if *name == "flash-next-gfx1100.routes.json" {
             assert!(m["g0_fixture_exclusion"].as_str().unwrap().contains("not admissible"));
         } else {
             assert!(m["g0_fixture_exclusion"].is_null());
