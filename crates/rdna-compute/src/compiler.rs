@@ -47,44 +47,7 @@ impl Drop for KernelBatch {
     }
 }
 
-// TEMPORARY A1 shim: replace with compile_jobs::host_compile_job_budget at merge.
-fn host_compile_job_budget() -> Result<usize, String> {
-    let cores = thread::available_parallelism().map_err(|e| e.to_string())?.get();
-    let requested = match hipfire_config::developer_var("HIPFIRE_JIT_JOBS") {
-        Ok(value) => value.parse::<usize>().ok().filter(|n| *n > 0)
-            .ok_or_else(|| "HIPFIRE_JIT_JOBS must be a positive integer".to_owned())?,
-        Err(std::env::VarError::NotPresent) => cores.saturating_sub((cores / 8).max(1)).max(1),
-        Err(error) => return Err(error.to_string()),
-    };
-    let available = std::fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
-        text.lines().find_map(|line| line.strip_prefix("MemAvailable:")
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(|value| value.saturating_mul(1024)))
-    });
-    let mut available = available;
-    if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) {
-            let mut path = PathBuf::from("/sys/fs/cgroup").join(group.trim_start_matches('/'));
-            loop {
-                if let (Ok(limit), Ok(current)) = (
-                    std::fs::read_to_string(path.join("memory.max")),
-                    std::fs::read_to_string(path.join("memory.current")),
-                ) {
-                    if let (Ok(limit), Ok(current)) = (limit.trim().parse::<u64>(), current.trim().parse::<u64>()) {
-                        let free = limit.saturating_sub(current);
-                        available = Some(available.map_or(free, |host| host.min(free)));
-                    }
-                }
-                if path == Path::new("/sys/fs/cgroup") || !path.pop() { break; }
-            }
-        }
-    }
-    let Some(available) = available else { return Ok(1); };
-    let memory_jobs = available.saturating_sub(1024 * 1024 * 1024) / (1536 * 1024 * 1024);
-    if memory_jobs == 0 { return Err("insufficient memory for one JIT compiler".to_owned()); }
-    Ok(requested.min(cores).min(memory_jobs.min(usize::MAX as u64) as usize))
-}
+use crate::compile_jobs::host_compile_job_budget;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
