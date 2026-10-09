@@ -1363,6 +1363,7 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/verify_twins.rs", function: "stage_attention_fp8_e4m3_kv_batched_segs", occurrences: 1, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_f16_windowed", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
     Site { file: "rdna-compute/src/dflash_gdn_replay.rs", function: "gdn_replay_ml_eligible", occurrences: 1, decisions: &["dflash-gdn-replay-multilayer"] },
+    Site { file: "rdna-compute/src/dflash_gdn_replay.rs", function: "dflash_gdn_replay_scratch_order", occurrences: 3, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq6g256v2_hcw_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "gemm_bf16_xf16_f16_wmma", occurrences: 4, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "hc_down_tile_selected", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
