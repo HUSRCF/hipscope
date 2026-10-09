@@ -5,10 +5,10 @@ use crate::reg::Live;
 use crate::kernels::common::{op, mem, smem, srd_tail, v, vr, sr};
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    Err("QKVZA admission requires the real-H2 G0 region oracle and checked final crosslane reduction; no certified twin is available".into())
+    Err("QKVZA admission requires the real-H2 G0 region byte oracle; no certified twin is available".into())
 }
 
-/// Four contiguous groups, one activation quad, and 32 lane outputs.
+/// Four contiguous groups, one activation quad, and 32 reduced lane outputs.
 /// The symbol and ABI deliberately differ from the production projection.
 fn build_g0() -> Result<Emitted, String> {
     let mut regs = RegPlan::new(32, 16)?;
@@ -76,6 +76,24 @@ fn build_g0() -> Result<Emitted, String> {
     op(&mut b, "v_add_f32_e32 v4, v4, v5", &[v(4)], &[v(4), v(5)])?;
     op(&mut b, "v_add_f32_e32 v22, v6, v7", &[v(22)], &[v(6), v(7)])?;
     op(&mut b, "v_add_f32_e32 v4, v4, v22", &[v(4)], &[v(4), v(22)])?;
+    // clang24's shfl-down16 sets lane bit 4; out-of-range lanes read themselves.
+    b.ds_crosslane(Instruction::new(
+        "ds_swizzle_b32 v21, v4 offset:0x20f",
+        vec![v(21)], vec![v(4)],
+    ).memory(MemoryClass::DsLoad))?;
+    b.wait(crate::ledger::Counter::Ds, 0)?;
+    op(&mut b, "v_add_f32_e32 v4, v4, v21", &[v(4)], &[v(4), v(21)])?;
+    for offset in [8, 4, 2, 1] {
+        op(&mut b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v0", 32 - offset), &[], &[v(0)])?;
+        op(&mut b, format!("v_cndmask_b32_e64 v22, 0, {offset}, vcc_lo"), &[v(22)], &[])?;
+        op(&mut b, "v_add_lshl_u32 v22, v22, v0, 2", &[v(22)], &[v(22), v(0)])?;
+        b.ds_crosslane(Instruction::new(
+            "ds_bpermute_b32 v21, v22, v4",
+            vec![v(21)], vec![v(22), v(4)],
+        ).memory(MemoryClass::DsLoad))?;
+        b.wait(crate::ledger::Counter::Ds, 0)?;
+        op(&mut b, "v_add_f32_e32 v4, v4, v21", &[v(4)], &[v(4), v(21)])?;
+    }
     mem(&mut b, "global_store_b32 v1, v4, s[10:11]", &[], &[v(1), v(4), sr(10, 2)], MemoryClass::VmemStore)?;
     b.control(Instruction::new("s_endpgm", vec![], vec![]))?;
     b.finish()

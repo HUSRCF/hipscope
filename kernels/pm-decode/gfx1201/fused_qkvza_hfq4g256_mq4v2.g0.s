@@ -182,6 +182,33 @@ pm_decode_qkvza_g0:
 	v_add_f32_e32 v4, v4, v5
 	v_add_f32_e32 v22, v6, v7
 	v_add_f32_e32 v4, v4, v22
+	ds_swizzle_b32 v21, v4 offset:0x20f
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v4, v4, v21
+	v_cmp_gt_u32_e32 vcc_lo, 24, v0
+	v_cndmask_b32_e64 v22, 0, 8, vcc_lo
+	v_add_lshl_u32 v22, v22, v0, 2
+	ds_bpermute_b32 v21, v22, v4
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v4, v4, v21
+	v_cmp_gt_u32_e32 vcc_lo, 28, v0
+	v_cndmask_b32_e64 v22, 0, 4, vcc_lo
+	v_add_lshl_u32 v22, v22, v0, 2
+	ds_bpermute_b32 v21, v22, v4
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v4, v4, v21
+	v_cmp_gt_u32_e32 vcc_lo, 30, v0
+	v_cndmask_b32_e64 v22, 0, 2, vcc_lo
+	v_add_lshl_u32 v22, v22, v0, 2
+	ds_bpermute_b32 v21, v22, v4
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v4, v4, v21
+	v_cmp_gt_u32_e32 vcc_lo, 31, v0
+	v_cndmask_b32_e64 v22, 0, 1, vcc_lo
+	v_add_lshl_u32 v22, v22, v0, 2
+	ds_bpermute_b32 v21, v22, v4
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v4, v4, v21
 	global_store_b32 v1, v4, s[10:11]
 	s_endpgm
 .Lpm_decode_qkvza_g0_end:
