@@ -16,13 +16,16 @@ const SWIZZLE16: &str = "ds_swizzle_b32 v2, v1 offset:swizzle(BITMASK_PERM,\"1pp
 
 /// `out[lane] = in[src(lane)]` through one checked crosslane exchange.
 fn probe(crosslane: &str, with_wait: bool) -> Result<hipfire_isa::Emitted, String> {
+    probe_with(crosslane, with_wait, KernargLayout::new(16).pointer("in", 0).pointer("out", 8))
+}
+fn probe_with(crosslane: &str, with_wait: bool, kernargs: KernargLayout) -> Result<hipfire_isa::Emitted, String> {
     let mut regs = RegPlan::new(8, 8)?;
     let lane = regs.v::<1>("lane", 0, Live::Whole)?;
     let data = regs.v::<1>("data", 1, Live::Whole)?;
     let out = regs.v::<1>("out", 2, Live::Whole)?;
     let ptrs = regs.s::<4>("ptrs", 0, Live::Whole)?;
     let spec = KernelSpec { kernel_id: "bpermute_probe".into(), variant: "shfl16".into(), arch: Arch::Gfx1201,
-        symbol: "bpermute_probe".into(), kernargs: KernargLayout::new(16).pointer("in", 0).pointer("out", 8),
+        symbol: "bpermute_probe".into(), kernargs,
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false };
     let mut b = Builder::new(spec, regs);
     b.push(Instruction::new("s_load_b128 s[0:3], s[0:1], 0x0", vec![ptrs.reg()], vec![ptrs.reg()]).memory(MemoryClass::SmemLoad))?;
@@ -107,4 +110,25 @@ fn crosslane_still_refuses_lds_memory_forms() {
         assert!(b.ds_crosslane(Instruction::new(text, vec![d.reg()], vec![a.reg()]).memory(MemoryClass::DsLoad)).is_err(), "{text}");
     }
     assert!(b.ds_crosslane(Instruction::new("ds_bpermute_b32 v1, v0, v0", vec![d.reg()], vec![a.reg()])).is_err(), "memory class required");
+}
+
+/// The frozen `.actual_access` of a twinned hipcc pointer is emitted in LLVM's
+/// key order, survives the native writer and M7's byte-exact re-emission, and
+/// a plain pointer's metadata text is unchanged.
+#[test]
+fn pointer_actual_access_metadata() {
+    use hipfire_isa::plan::Access;
+    let plain = probe(BPERMUTE16, true).unwrap();
+    assert!(!plain.s_text.contains(".actual_access"));
+    assert!(plain.s_text.contains("      - .address_space: global\n        .name: in\n"));
+    let layout = KernargLayout::new(16).pointer_access("in", 0, Access::ReadOnly).pointer_access("out", 8, Access::WriteOnly);
+    let e = probe_with(BPERMUTE16, true, layout).unwrap();
+    assert!(e.s_text.contains("      - .actual_access: read_only\n        .address_space: global\n        .name: in\n"), "{}", e.s_text);
+    assert!(e.s_text.contains("      - .actual_access: write_only\n        .address_space: global\n        .name: out\n"));
+    let summary = assemble_and_m7(&e, "access");
+    assert_eq!(summary["obligations"], serde_json::json!({}));
+    let elf = hipfire_isa::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
+    for needle in [&b".actual_access"[..], b"read_only", b"write_only"] {
+        assert!(elf.windows(needle.len()).any(|w| w == needle), "{}", String::from_utf8_lossy(needle));
+    }
 }
