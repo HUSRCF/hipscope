@@ -114,8 +114,11 @@ pub enum RequestStepKind {
     /// One ordinary autoregressive decode row (the pending seed).
     Ar,
     /// Speculative verify: `[seed, draft_1..draft_len]`, `draft_len + 1` rows.
-    /// Only the seed is host-known at plan time; the executor writes the
-    /// draft token ids it owns into its row staging before the forward.
+    /// Only the seed is host-known at plan time: rows past it hold host-only
+    /// seed placeholders that must never be executed or captured. The
+    /// executor replaces every Verify range with its epoch-tagged
+    /// `[seed, candidates…]` (exactly `draft_len + 1`) before provision and
+    /// fails closed if that draft is absent or stale.
     Verify { draft_len: usize },
     /// Prompt chunk prefill.
     Prefill,
@@ -365,6 +368,38 @@ impl BatchPlanner {
     ) -> Result<(), String> {
         if work_epochs.len() != work.len() {
             return Err("publish: epochs must align with work".into());
+        }
+        // Validate the whole commit before mutating anything: every planned
+        // owner must still be admitted at the same generation, prefill takes
+        // must fit, and every non-prefill request needs exactly its own
+        // advance. Advances for unplanned epochs are rejected.
+        for rr in &plan.requests {
+            if !rr.epoch.is_admitted() {
+                return Err(format!("publish: unadmitted epoch {:?}", rr.epoch));
+            }
+            let i = work_epochs
+                .iter()
+                .position(|x| *x == rr.epoch)
+                .ok_or_else(|| format!("publish: stale or unknown epoch {:?}", rr.epoch))?;
+            let n_adv = advances.iter().filter(|a| a.epoch == rr.epoch).count();
+            match rr.kind {
+                RequestStepKind::Prefill => {
+                    if work[i].remaining_prompt.len() < rr.rows.len || n_adv != 0 {
+                        return Err(format!("publish: invalid prefill commit for {:?}", rr.epoch));
+                    }
+                }
+                _ => {
+                    if n_adv != 1 {
+                        return Err(format!("publish: {n_adv} advances for {:?}", rr.epoch));
+                    }
+                }
+            }
+        }
+        if let Some(a) = advances
+            .iter()
+            .find(|a| !plan.requests.iter().any(|r| r.epoch == a.epoch))
+        {
+            return Err(format!("publish: advance for unplanned epoch {:?}", a.epoch));
         }
         for rr in &plan.requests {
             let i = work_epochs
