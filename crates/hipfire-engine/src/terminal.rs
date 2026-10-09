@@ -918,6 +918,59 @@ pub fn adopt_singleton_transfer(id: &str, attempt_id: u64, transfer: SingletonTr
     true
 }
 
+/// Inverse of [`batch_handoff_to_singleton_and_clear`]: move a live singleton
+/// transaction (`gen_start` already on the wire) into a fresh batch admission
+/// for the same exact key, so a VMM batch lane can continue it without a
+/// second start.
+///
+/// Under the terminal→batch lock order: the active singleton must match the
+/// key and not have claimed its terminal; any adopted handoff tombstone for
+/// the key (the singleton itself came from a batch handoff) is consumed; a
+/// latched Abort decision becomes the batch entry's `abort_latched`. The new
+/// entry is `Queued`; the caller binds its lane owner
+/// ([`batch_bind_active`], via the scheduler's `adopt_running`). The singleton
+/// transaction is closed so the outer guard's [`clear_terminal_control`] is
+/// a no-op for it.
+pub fn singleton_handoff_to_batch(id: &str, attempt_id: u64) -> Option<BatchGeneration> {
+    let terminal_cell = terminal_control();
+    let mut terminal = terminal_cell.mu.lock().unwrap();
+    let batch_cell = batch_terminal_control();
+    let mut batch = batch_cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    let active = terminal.active.as_ref()?;
+    if active.id != id || active.attempt_id != attempt_id || active.terminal_claimed {
+        return None;
+    }
+    if batch.entries.contains_key(&key) {
+        return None;
+    }
+    if let Some(handoff) = batch.handoffs.get(&key) {
+        if !handoff.adopted {
+            return None;
+        }
+        batch.handoffs.remove(&key);
+    }
+    let abort_latched = matches!(active.decision, Some(TerminalControlDecision::Abort));
+    batch.next_generation = batch.next_generation.checked_add(1).unwrap_or(1);
+    let generation = BatchGeneration(batch.next_generation);
+    batch.entries.insert(
+        key,
+        BatchRegistryEntry {
+            state: BatchRegistryState::Queued,
+            abort_latched,
+            commit_latched: false,
+            terminal_claimed: false,
+            generation,
+            pending_done: None,
+            deadline: None,
+        },
+    );
+    terminal.active = None;
+    terminal_cell.cv.notify_all();
+    batch_cell.cv.notify_all();
+    Some(generation)
+}
+
 /// Transfer an exact batch admission to the sequential singleton. The
 /// handoff is adopted while both ownership cells remain serialized; its
 /// tombstone is released with the eventual singleton cleanup.

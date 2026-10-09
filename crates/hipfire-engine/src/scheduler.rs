@@ -299,6 +299,54 @@ impl ContinuousBatchScheduler {
         Some((key, ticket))
     }
 
+    /// Install an already-started request (a singleton generation promoted
+    /// into the batch via `singleton_handoff_to_batch`) directly as a Running
+    /// lane. Unlike [`Self::enqueue`] + [`Self::try_assign_one`] it never
+    /// passes through the inbox, so the driver neither re-announces nor
+    /// re-prefills it. `progress` carries the lane's wire/host progress
+    /// (positions, emitted tokens, filter offset, RNG, timings); its key and
+    /// ticket are overwritten. Returns the bound ticket, or `None` (nothing
+    /// installed) when no lane is free, the cohort differs, or the admission
+    /// is not current.
+    pub fn adopt_running(
+        &mut self,
+        req: BatchPendingRequest,
+        progress: QwenBatchLane,
+    ) -> Option<LaneTicket> {
+        let key = req.key.clone();
+        let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
+        let sampling_key = req.sampling.key();
+        if self.cohort_key.as_ref().is_some_and(|c| c != &sampling_key)
+            || self.pending.contains_key(&key)
+            || self.inbox.contains(&key)
+            || !batch_is_current(&key.id, key.attempt_id, req.admission)
+        {
+            return None;
+        }
+        let ticket = LaneTicket {
+            lane: lane_idx,
+            generation: self.next_generation,
+            admission: req.admission,
+        };
+        if !batch_transition_to_queued(&key.id, key.attempt_id, req.admission)
+            || !batch_bind_active(&key.id, key.attempt_id, req.admission, ticket)
+        {
+            return None;
+        }
+        self.next_generation += 1;
+        self.pending_sampling.insert(key.clone(), req.sampling.clone());
+        self.pending.insert(key.clone(), req);
+        self.lanes[lane_idx] = BatchLane::Running(QwenBatchLane {
+            key,
+            ticket,
+            ..progress
+        });
+        if self.cohort_key.is_none() {
+            self.cohort_key = Some(sampling_key);
+        }
+        Some(ticket)
+    }
+
     pub fn mark_awaiting_commit(&mut self, lane: usize, pending_done: serde_json::Value) -> bool {
         if lane >= self.lanes.len() {
             return false;
