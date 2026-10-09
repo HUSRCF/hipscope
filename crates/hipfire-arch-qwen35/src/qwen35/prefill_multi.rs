@@ -90,21 +90,43 @@ pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
 }
 
 /// May an aggregate chunk of 64+ rows run on this target? The wide route is
-/// exact only for a dense MQ4G256V2 trunk and head on the exact gfx1201
-/// verify GEMMs: every projection of every layer and the lm_head must be
-/// MQ4G256V2 (no MoE, Lloyd, MQ3/MQ6, Q8 or other dtypes), and the device's
-/// effective cap must exceed the product cap.
+/// exact only when (a) the device's effective cap exceeds the product cap,
+/// (b) every singleton arm it must match runs the one-tile F16-WMMA chain the
+/// exact wide kernels reproduce ([`Gpu::mq4_verify_singleton_chain`]: refused
+/// under `HIPFIRE_FP16=0`, `HIPFIRE_LM_HEAD_WMMA=0`,
+/// `HIPFIRE_HFQ4G256_LDSSTAGE=1`), and (c) the trunk and head are dense
+/// MQ4G256V2: every projection of every layer and the lm_head (no MoE,
+/// Lloyd, MQ3/MQ6, Q8 or other dtypes), with `w_down.k == hidden_dim` (the
+/// `SingletonWmma` FFN-down shape). Decided before any request state is
+/// written; a refusal keeps the cap at [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
 pub fn multi_chunk_wide_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+    multi_chunk_wide_route(&gpu.arch, &gpu.flags) && multi_chunk_dense_mq4v2_target(weights, config)
+}
+
+/// The device/flag half of [`multi_chunk_wide_admitted`] (no device needed).
+fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> bool {
+    Gpu::mq4_verify_chunk_rows_for(arch, flags).clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
+        > MULTI_CHUNK_PRODUCT_MAX_ROWS
+        && Gpu::mq4_verify_singleton_chain_for(arch, flags)
+}
+
+/// The target half of [`multi_chunk_wide_admitted`].
+fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
     use rdna_compute::DType::MQ4G256V2;
-    multi_chunk_row_cap(gpu) > MULTI_CHUNK_PRODUCT_MAX_ROWS
-        && config.num_experts == 0
+    config.num_experts == 0
         && weights.output.gpu_dtype == MQ4G256V2
         && weights.layers.iter().all(|l| match l {
-            LayerWeights::DeltaNet(d) => [&d.wqkv, &d.wz, &d.w_alpha, &d.w_beta, &d.wo, &d.w_gate, &d.w_up, &d.w_down]
-                .iter()
-                .all(|w| w.gpu_dtype == MQ4G256V2),
+            LayerWeights::DeltaNet(d) => {
+                d.w_down.k == config.hidden_dim
+                    && [&d.wqkv, &d.wz, &d.w_alpha, &d.w_beta, &d.wo, &d.w_gate, &d.w_up, &d.w_down]
+                        .iter()
+                        .all(|w| w.gpu_dtype == MQ4G256V2)
+            }
             LayerWeights::FullAttn(f) => {
-                [&f.wq, &f.wk, &f.wv, &f.wo, &f.w_gate, &f.w_up, &f.w_down].iter().all(|w| w.gpu_dtype == MQ4G256V2)
+                f.w_down.k == config.hidden_dim
+                    && [&f.wq, &f.wk, &f.wv, &f.wo, &f.w_gate, &f.w_up, &f.w_down]
+                        .iter()
+                        .all(|w| w.gpu_dtype == MQ4G256V2)
             }
             _ => false,
         })
@@ -115,11 +137,11 @@ pub fn multi_chunk_wide_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qw
 /// [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] (a scratch sized for the wide route may
 /// serve a target that cannot take it).
 pub fn multi_chunk_pack_cap(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, cap: usize) -> usize {
-    if multi_chunk_wide_admitted(gpu, weights, config) {
-        cap.min(MULTI_CHUNK_MAX_ROWS)
-    } else {
-        cap.min(MULTI_CHUNK_PRODUCT_MAX_ROWS)
-    }
+    pack_cap_for(multi_chunk_wide_admitted(gpu, weights, config), cap)
+}
+
+fn pack_cap_for(wide_admitted: bool, cap: usize) -> usize {
+    cap.min(if wide_admitted { MULTI_CHUNK_MAX_ROWS } else { MULTI_CHUNK_PRODUCT_MAX_ROWS })
 }
 
 /// Pack whole lanes, in order, into trunk chunks of at most
@@ -366,10 +388,11 @@ pub fn forward_prefill_batch_multi(
     }
     // Aggregate 64+ rows: the default projection route is quantized and not
     // the singleton's arithmetic; only the exact verify GEMMs of a dense
-    // MQ4G256V2 target reproduce it. Refused before any state write.
+    // MQ4G256V2 target whose singleton runs the one-tile F16-WMMA chain
+    // reproduce it. Refused before any state write.
     let wide = total > MULTI_CHUNK_PRODUCT_MAX_ROWS;
     if wide && !multi_chunk_wide_admitted(gpu, weights, config) {
-        return refuse("64+ rows need the exact wide verify route on a dense MQ4G256V2 gfx1201 target");
+        return refuse("64+ rows need the exact wide verify route: a dense MQ4G256V2 gfx1201 target whose singleton runs the one-tile F16-WMMA chain");
     }
     let math = if wide { DenseBatchMath::SingletonWmma } else { DenseBatchMath::Product };
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
@@ -748,7 +771,39 @@ pub fn forward_prefill_batch_multi(
 
 #[cfg(test)]
 mod pack_tests {
-    use super::{pack_whole_lanes, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS};
+    use super::{multi_chunk_wide_route, pack_whole_lanes, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS};
+    use rdna_compute::FeatureFlags;
+
+    /// gfx1201 defaults with `HIPFIRE_CB_VERIFY_CHUNK128=1` (the env default of
+    /// `HIPFIRE_WMMA_BATCH_TILES` on gfx1201 is on).
+    fn chunk128_flags() -> FeatureFlags {
+        let mut f = FeatureFlags::for_test("gfx1201");
+        f.cb_verify_chunk128 = true;
+        f.wmma_batch_tiles = true;
+        f
+    }
+
+    /// Every switch that moves a singleton (`<= 63`-row) dense MQ4G256V2 arm
+    /// off the one-tile F16-WMMA chain the wide kernels reproduce.
+    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 4] = [
+        ("HIPFIRE_FP16=0", |f| f.fp16_disabled = true),
+        ("HIPFIRE_LM_HEAD_WMMA=0", |f| f.lm_head_wmma_disabled = true),
+        ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| f.hfq4g256_ldsstage_wmma = true),
+        ("HIPFIRE_WMMA_BATCH_TILES=0", |f| f.wmma_batch_tiles = false),
+    ];
+
+    #[test]
+    fn wide_route_admitted_by_default_refused_under_each_singleton_switch() {
+        assert!(multi_chunk_wide_route("gfx1201", &chunk128_flags()));
+        // The chunk128 flag off, or another arch, never opens the wide route.
+        assert!(!multi_chunk_wide_route("gfx1201", &FeatureFlags::for_test("gfx1201")));
+        assert!(!multi_chunk_wide_route("gfx1100", &chunk128_flags()));
+        for (name, set) in SINGLETON_ARM_SWITCHES {
+            let mut f = chunk128_flags();
+            set(&mut f);
+            assert!(!multi_chunk_wide_route("gfx1201", &f), "{name} must refuse wide admission");
+        }
+    }
 
     fn pack(rows: &[usize], cap: usize) -> Vec<std::ops::Range<usize>> {
         let mut out = Vec::new();

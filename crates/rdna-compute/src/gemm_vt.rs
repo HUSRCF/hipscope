@@ -424,13 +424,49 @@ impl Gpu {
     /// gfx1201 when `HIPFIRE_CB_VERIFY_CHUNK128` (default off) and
     /// `HIPFIRE_WMMA_BATCH_TILES` are both on, otherwise the historical 63.
     /// Admission of a particular target (dense MQ4V2 projections and head
-    /// only) stays with the caller.
+    /// only, singleton chain per [`Self::mq4_verify_singleton_chain`]) stays
+    /// with the caller.
     pub fn mq4_verify_chunk_rows(&self) -> usize {
-        if self.arch == "gfx1201" && self.flags.cb_verify_chunk128 && self.flags.wmma_batch_tiles {
+        Self::mq4_verify_chunk_rows_for(&self.arch, &self.flags)
+    }
+
+    /// [`Self::mq4_verify_chunk_rows`] of an `arch` / flag set (no device).
+    pub fn mq4_verify_chunk_rows_for(arch: &str, flags: &crate::FeatureFlags) -> usize {
+        if arch == "gfx1201" && flags.cb_verify_chunk128 && flags.wmma_batch_tiles {
             VERIFY_EXACT_MAX_ROWS
         } else {
             VERIFY_NARROW_CHUNK_ROWS
         }
+    }
+
+    /// Does every singleton dense MQ4G256V2 dispatch below 64 rows run the
+    /// one-tile F16-input / f32-WMMA chain (or its byte-identical `_vt`
+    /// twin) that the exact wide kernels reproduce? Read-only, from the flags
+    /// the dispatches themselves consult:
+    ///
+    /// - `gemm_mq4g256v2_batched_lmhead`'s `wmma_eligible` gate:
+    ///   `HIPFIRE_FP16=0` (`fp16_disabled`) or `HIPFIRE_LM_HEAD_WMMA=0`
+    ///   (`lm_head_wmma_disabled`) sends the head to the scalar
+    ///   `gemm_mq4g256v2_xbatch`.
+    /// - `HIPFIRE_HFQ4G256_LDSSTAGE=1` (`hfq4g256_ldsstage_wmma`): gate/up,
+    ///   residual (wo/down, the S4 F16 producers) and the WMMA lm_head take
+    ///   `_ldsstage` at `N <= LDSSTAGE_MAX_BATCH`, `K % 512 == 0`.
+    /// - `HIPFIRE_WMMA_BATCH_TILES=0`: no wide kernels at all.
+    ///
+    /// The other arms of those dispatches (A8, IU4 W4A4, FP8, the BT/QKV
+    /// weight-reuse tiles) switch only at `>= 64` rows, which no singleton
+    /// verify reaches.
+    pub fn mq4_verify_singleton_chain(&self) -> bool {
+        Self::mq4_verify_singleton_chain_for(&self.arch, &self.flags)
+    }
+
+    /// [`Self::mq4_verify_singleton_chain`] of an `arch` / flag set (no device).
+    pub fn mq4_verify_singleton_chain_for(arch: &str, flags: &crate::FeatureFlags) -> bool {
+        arch == "gfx1201"
+            && flags.wmma_batch_tiles
+            && !flags.fp16_disabled
+            && !flags.lm_head_wmma_disabled
+            && !flags.hfq4g256_ldsstage_wmma
     }
 
     /// Whether the wide verify kernels run from the PeaceMaker bundle
