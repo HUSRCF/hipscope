@@ -429,6 +429,10 @@ pub(crate) fn drain_qwen_batch_inbox(
     route: GenerationRoute,
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
+    // `false`: the caller emits `gen_start` itself once it decides batch vs
+    // singleton (VMM route), so a lonely arrival can still take the
+    // singleton route without a second start.
+    announce_on_enqueue: bool,
 ) -> Result<Option<DaemonMsg>, String> {
     let mut barrier: Option<DaemonMsg> = None;
         loop {
@@ -683,7 +687,7 @@ pub(crate) fn drain_qwen_batch_inbox(
                             );
                             continue;
                         }
-                        {
+                        if announce_on_enqueue {
                             let _scope =
                                 BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
                             crate::ar::emit_generation_start(
@@ -974,6 +978,7 @@ pub fn drive_qwen_continuous_batch(
             route,
             stdout,
             inbox,
+            true,
         ) {
             Ok(b) => b,
             Err(reason) => return fail_all(sched, gpu, batch_state, stdout, reason),
@@ -1606,6 +1611,27 @@ pub fn drive_qwen_vmm_continuous_batch(
     let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
         .map(|_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()))
         .collect();
+    // Attempts whose `gen_start` is already on the wire: the request the
+    // daemon enqueued before entering this driver, and every request this
+    // driver has assigned to a batch lane. The drain does NOT announce
+    // (`announce_on_enqueue=false`), so an arrival that turns out lonely at
+    // assignment can still take the singleton route with exactly one start.
+    let announced: std::cell::RefCell<std::collections::HashSet<AttemptKey>> =
+        std::cell::RefCell::new(
+            sched
+                .inbox
+                .iter()
+                .cloned()
+                .chain(sched.lanes.iter().filter_map(|l| l.key().cloned()))
+                .collect(),
+        );
+    let announce = |stdout: &mut std::io::Stdout, key: &AttemptKey, admission: BatchGeneration| {
+        if announced.borrow_mut().insert(key.clone()) {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_generation_start(route, stdout, &key.id, false);
+        }
+    };
 
     // Fail closed: retire and free every request owner, emit one keyed GPU
     // error per live/queued attempt, and fail the scheduler. The resident
@@ -1655,6 +1681,7 @@ pub fn drive_qwen_vmm_continuous_batch(
         };
         let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
         for (key, admission) in &uniq {
+            announce(stdout, key, *admission);
             let _scope =
                 BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, *admission);
             crate::common::emit_fail_closed_error_for_route(
@@ -1743,6 +1770,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
         }
         for (key, admission) in queued_abort {
+            announce(stdout, &key, admission);
             let _scope =
                 BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
@@ -1790,6 +1818,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 route,
                 stdout,
                 inbox,
+                false,
             )
         };
         let barrier = match drained {
@@ -1807,7 +1836,15 @@ pub fn drive_qwen_vmm_continuous_batch(
             let Some(pending_req) = sched.pending.get(&key).cloned() else {
                 continue;
             };
-            if pending_req.started_in_think {
+            // A request with no live batch peer and nothing queued behind it
+            // is lonely: if its start is not yet announced it takes the
+            // unchanged singleton route (exact singleton arithmetic and its
+            // MTP/DFlash speculation), like a lonely request at daemon
+            // dispatch. Think-open prompts are sequential barriers.
+            let lonely = !epochs.iter().any(|e| e.is_admitted())
+                && sched.inbox.is_empty()
+                && !announced.borrow().contains(&key);
+            if pending_req.started_in_think || lonely {
                 let handoff = match handoff_started_in_think(
                     sched,
                     lane_idx,
@@ -1872,6 +1909,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             if let Err(e) = admitted {
                 // Per-admission refusal (capacity/budget): this request
                 // fails visibly; peers keep running.
+                announce(stdout, &key, ticket.admission);
                 {
                     let _scope = BatchAttemptScope::enter_for_generation(
                         &key.id,
@@ -1892,6 +1930,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
                 continue;
             }
+            announce(stdout, &key, ticket.admission);
             epochs[lane_idx] = epoch;
             work[lane_idx] = PendingWork {
                 remaining_prompt: prompt_tokens,
