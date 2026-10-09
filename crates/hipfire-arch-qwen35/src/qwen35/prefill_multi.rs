@@ -18,10 +18,26 @@
 //! row count as for one request's rows: true while every count is in
 //! `2..64` (the gfx12 projection GEMMs are row-count independent there —
 //! CbSpec probe — and every n-dependent route switch is at >= 64 rows).
+//!
+//! DFlash chain-verify requests (`MultiChunkRequest::fusion == ChainVerify`,
+//! with their own hidden ring and tape) keep every route that depends on the
+//! request's own row count request-sized: GDN pre/tape fusion and FA prep use
+//! the request's `fusion`, and a layer where any request's singleton would
+//! take the ChainVerify S4 residual arm (`1..=16` rows) runs its output
+//! projection + FFN per request view instead of at the combined count.
 
 use super::*;
 
 /// One request's rows of a multi-request chunk.
+///
+/// `fusion` is the request's own [`DflashFusionCtx`]: `Off` for MTP verify and
+/// ordinary rows, `ChainVerify` for a DFlash chain verify block. Every
+/// route-sensitive stage (GDN pre/tape fusion, FA prep, the S4 residual arm)
+/// runs with this request's `fusion` and its own row count, exactly as the
+/// singleton verify forward over these rows alone. `hidden_rb`, when set, is
+/// this request's DFlash extraction ring: the post-layer residual rows of
+/// each extract layer are staged and committed (head advanced by the
+/// request's row count) exactly as the singleton verify does.
 pub struct MultiChunkRequest<'a> {
     pub tokens: &'a [u32],
     pub start_pos: usize,
@@ -30,11 +46,53 @@ pub struct MultiChunkRequest<'a> {
     /// Rollback tape for this request's rows (the singleton verify's
     /// `gdn_tape`, offset 0); `None` = no capture.
     pub gdn_tape: Option<&'a crate::speculative::GdnTape>,
+    /// `Off` (MTP / plain rows) or `ChainVerify` (DFlash chain verify).
+    pub fusion: DflashFusionCtx,
+    /// This request's hidden-state ring (DFlash extract layers); `None` = no
+    /// capture. Its staging must hold the request's rows (`max_batch >= n`).
+    pub hidden_rb: Option<&'a mut HiddenStateRingBuffer>,
 }
 
 /// The largest combined row count: below every n-dependent kernel/route
 /// switch of the shared stages (`>= 64` rows).
 pub const MULTI_CHUNK_MAX_ROWS: usize = 63;
+
+/// Pack whole lanes, in order, into trunk chunks of at most
+/// `min(max_rows, MULTI_CHUNK_MAX_ROWS)` rows: `rows[i]` is lane `i`'s row
+/// count. `out` receives one lane-index range per chunk (cleared first; no
+/// allocation when `out` already has capacity). A lane is never split, padded
+/// or reordered, and a chunk never reaches 64 rows: e.g. eight 16-row lanes
+/// pack as `[0..3, 3..6, 6..8]` (48 + 48 + 32 rows). Errors (leaving `out`
+/// empty) when a lane has fewer than [`MIN_BATCH`] rows or more rows than one
+/// chunk can hold.
+pub fn pack_whole_lanes(
+    rows: &[usize],
+    max_rows: usize,
+    out: &mut Vec<std::ops::Range<usize>>,
+) -> Result<(), String> {
+    out.clear();
+    let cap = max_rows.min(MULTI_CHUNK_MAX_ROWS);
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, &n) in rows.iter().enumerate() {
+        if n < MIN_BATCH || n > cap {
+            out.clear();
+            return Err(format!(
+                "pack_whole_lanes: lane {i} has {n} rows, outside {MIN_BATCH}..={cap}"
+            ));
+        }
+        if acc + n > cap {
+            out.push(start..i);
+            start = i;
+            acc = 0;
+        }
+        acc += n;
+    }
+    if start < rows.len() {
+        out.push(start..rows.len());
+    }
+    Ok(())
+}
 
 /// Most requests (segments) one twin launch carries: every request has at
 /// least [`MIN_BATCH`] rows.
@@ -157,12 +215,52 @@ fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usi
     }
 }
 
+/// Does any request's singleton run the ChainVerify S4 residual arm for a
+/// consumer of dtype `w_dtype` at its own row count? Then the output
+/// projection and FFN of that layer cannot be run at the combined row count
+/// (`s4_residual_fast` admits only `1..=16` rows).
+fn any_lane_s4(gpu: &Gpu, reqs: &[MultiChunkRequest<'_>], w_dtype: rdna_compute::DType) -> bool {
+    reqs.iter()
+        .any(|r| s4_residual_fast(gpu, r.fusion, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
+}
+
+/// Capture the post-layer residual rows of every request whose ring extracts
+/// `layer_idx` (the singleton's post-FFN `write_chunk_rows` of `x_batch`).
+fn capture_layer_rows(
+    gpu: &mut Gpu,
+    reqs: &[MultiChunkRequest<'_>],
+    views: &[std::mem::ManuallyDrop<PrefillBatchScratch>],
+    layer_idx: usize,
+) -> HipResult<()> {
+    for (r, view) in reqs.iter().zip(views) {
+        if let Some(rb) = r.hidden_rb.as_deref() {
+            if let Some(slot) = rb.extract_slot(layer_idx) {
+                rb.write_chunk_rows(gpu, slot, &view.x_batch, r.tokens.len())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run every request's rows through one trunk forward, per request
 /// byte-identical to `forward_prefill_batch_with_pbs_opts` over its rows
-/// (no tape, no tree, no hidden ring, `DflashFusionCtx::Off`). With
-/// `hidden_out`, writes post-output-norm hidden rows `[total x dim]` in
+/// with the request's own `fusion`, `gdn_tape` (offset 0) and `hidden_rb`.
+/// With `hidden_out`, writes post-output-norm hidden rows `[total x dim]` in
 /// request order (`HiddenCapture::Verify`, as the singleton verify).
-/// Refuses (before any launch) what it cannot reproduce exactly.
+///
+/// Shared across requests: embedding, the norm/rotate + input projection
+/// GEMMs, and (only when no request's singleton takes the ChainVerify S4
+/// residual arm / gfx1100 F16 projection route at its own row count) the
+/// output projection + FFN. Per request: positions, GDN pre/tape + recurrence,
+/// FA prep/KV write/attend with that request's fusion flags, and the ring
+/// capture. A layer where any request would select a ChainVerify route at its
+/// own `n` runs those stages on every request's row view with its own
+/// `fusion` and `n` (MTP views with `Off`), never at the combined count.
+///
+/// Every precondition (rows `2..=63` per request and in total, capacities,
+/// ring/tape bounds, Q8+EF DeltaNet, uncompacted Q8/fp8 KV, no capture or
+/// recording) is checked before any request state is mutated; the request is
+/// refused before the first launch otherwise.
 pub fn forward_prefill_batch_multi(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -182,6 +280,7 @@ pub fn forward_prefill_batch_multi(
         return refuse("graph capture / replay recording is not supported");
     }
     let arch = gpu.arch.clone();
+    let mut kv_ends = Vec::with_capacity(reqs.len());
     for r in reqs.iter() {
         let n = r.tokens.len();
         // The singleton runs n == 1 through forward_scratch, not this body.
@@ -202,6 +301,21 @@ pub fn forward_prefill_batch_multi(
         if r.gdn_tape.is_some_and(|t| t.max_n < n) {
             return refuse("GDN tape smaller than the request's rows");
         }
+        if let Some(rb) = r.hidden_rb.as_deref() {
+            // The singleton verify stages `n` rows per extract layer and
+            // commits them; a ring it would write straight (n > staging) or
+            // cannot hold the rows is not reproduced here.
+            if rb.hidden_dim != config.dim
+                || rb.layer_bufs.len() != rb.extract_layers.len()
+                || rb.staging_bufs.len() != rb.extract_layers.len()
+                || rb.extract_layers.iter().any(|&l| l >= config.n_layers)
+                || n > rb.max_batch
+                || n > rb.max_positions
+            {
+                return refuse("hidden ring layers/dimension/staging cannot hold the request's rows");
+            }
+        }
+        kv_ends.push(checked_kv_end(r.start_pos, n, "forward_prefill_batch_multi")?);
     }
     if !weights.layers.iter().all(|l| match l {
         LayerWeights::DeltaNet(_) => true,
@@ -210,8 +324,8 @@ pub fn forward_prefill_batch_multi(
     }) {
         return refuse("only dense DeltaNet / batched FullAttention layers");
     }
-    for r in reqs.iter_mut() {
-        let end = checked_kv_end(r.start_pos, r.tokens.len(), "forward_prefill_batch_multi")?;
+    // Capacity/mapping (warms mapped KV; no request state is written).
+    for (r, &end) in reqs.iter_mut().zip(&kv_ends) {
         release_widened_pbs_for_kv_growth(gpu, r.kv_cache, config, s, end)?;
         r.kv_cache.ensure_mapped_capacity(gpu, end)?;
         r.kv_cache.require_mapped_capacity(end)?;
@@ -223,7 +337,11 @@ pub fn forward_prefill_batch_multi(
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
-    let fusion = DflashFusionCtx::Off;
+    // Fusion of every stage run once over the combined rows: those stages
+    // read `fusion` only through the gfx1100 F16 projection route (checked
+    // per request below, which switches them to per-request views) and the
+    // S4 arm (checked per layer), so `Off` is the singleton's route for them.
+    let shared_fusion = DflashFusionCtx::Off;
     let sem = BatchSemantics::Sequential;
     // Request row ranges in the shared scratch.
     let mut offs = Vec::with_capacity(reqs.len());
@@ -233,6 +351,9 @@ pub fn forward_prefill_batch_multi(
         off += r.tokens.len();
     }
     let views: Vec<_> = reqs.iter().zip(&offs).map(|(r, &o)| rows_view(pbs, config, o, r.tokens.len())).collect();
+    // Any request on the ChainVerify gfx1100 F16 projection route at its own
+    // row count: the projection/FFN input stages run per request view.
+    let split_proj = reqs.iter().any(|r| mq_f16_projection_fast_route(gpu, r.fusion, r.tokens.len(), dim));
 
     let tokens: Vec<u32> = reqs.iter().flat_map(|r| r.tokens.iter().copied()).collect();
     batch_chunk_embed_tokens(gpu, weights, &tokens, s, pbs, total, dim, dim * 4, true, false, false, None, None)?;
@@ -296,12 +417,22 @@ pub fn forward_prefill_batch_multi(
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // batch_chunk_delta_net_attn, non chunk-scan arm (n < 64).
-                batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, total, dim, q8_wmma_arch, fusion, None)?;
+                if split_proj {
+                    for (r, view) in reqs.iter().zip(&views) {
+                        batch_chunk_delta_net_input_projection(
+                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion, None,
+                        )?;
+                    }
+                } else {
+                    batch_chunk_delta_net_input_projection(
+                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None,
+                    )?;
+                }
                 for (r, view) in reqs.iter_mut().zip(&views) {
                     let n = r.tokens.len();
                     let parents = batch_chunk_delta_net_pre_gdn(
                         gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape, 0,
-                        delta_layer_idx, fusion,
+                        delta_layer_idx, r.fusion,
                     )?;
                     if parents.is_some() {
                         return refuse("tree recurrence in a linear verify");
@@ -322,39 +453,68 @@ pub fn forward_prefill_batch_multi(
                         d.ef_residual(delta_layer_idx),
                     )?;
                 }
-                batch_chunk_delta_net_output_projection(
-                    gpu,
-                    layer,
-                    config,
-                    pbs,
-                    total,
-                    n_v_heads,
-                    q8_wmma_arch,
-                    arch_has_wmma,
-                    BatchEpilogue::Residual,
-                    fusion,
-                    GdnScanOut::F32,
-                )?;
-                batch_chunk_delta_net_ffn(
-                    gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma, BatchEpilogue::Residual,
-                    fusion,
-                )?;
+                if split_proj
+                    || any_lane_s4(gpu, reqs, layer.wo.gpu_dtype)
+                    || any_lane_s4(gpu, reqs, layer.w_down.gpu_dtype)
+                {
+                    for (r, view) in reqs.iter().zip(&views) {
+                        let n = r.tokens.len();
+                        batch_chunk_delta_net_output_projection(
+                            gpu,
+                            layer,
+                            config,
+                            view,
+                            n,
+                            n_v_heads,
+                            q8_wmma_arch,
+                            arch_has_wmma,
+                            BatchEpilogue::Residual,
+                            r.fusion,
+                            GdnScanOut::F32,
+                        )?;
+                        batch_chunk_delta_net_ffn(
+                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                            BatchEpilogue::Residual, r.fusion,
+                        )?;
+                    }
+                } else {
+                    batch_chunk_delta_net_output_projection(
+                        gpu,
+                        layer,
+                        config,
+                        pbs,
+                        total,
+                        n_v_heads,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        shared_fusion,
+                        GdnScanOut::F32,
+                    )?;
+                    batch_chunk_delta_net_ffn(
+                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                        BatchEpilogue::Residual, shared_fusion,
+                    )?;
+                }
+                capture_layer_rows(gpu, reqs, &views, layer_idx)?;
                 delta_layer_idx += 1;
             }
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
                 // batch_chunk_full_attn_attn with the per-request flags each
                 // request's own singleton chunk computes (all n < 64).
-                let gfx12_fa_prep = gpu.arch == "gfx1201"
-                    && gpu.flags.gfx12_fa_prep_fused
-                    && !gpu.flags.rope_interleaved_legacy
-                    && !hipfire_runtime::triattn::tap_enabled()
-                    && config.head_dim == 256
-                    && (config.n_heads, config.n_kv_heads) == (24, 4)
-                    && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64;
-                batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, total, dim, q8_wmma_arch, fusion)?;
+                if split_proj {
+                    for (r, view) in reqs.iter().zip(&views) {
+                        batch_chunk_full_attn_input_projection(
+                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion,
+                        )?;
+                    }
+                } else {
+                    batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion)?;
+                }
                 for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                     let n = r.tokens.len();
                     let max_ctx_len = r.start_pos + n;
+                    let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
                     let multirow = q8_multirow_attn_admitted(
                         gpu.arch_caps.arch(),
                         r.kv_cache.quant_q8,
@@ -369,7 +529,7 @@ pub fn forward_prefill_batch_multi(
                     );
                     batch_chunk_full_attn_prepare(
                         gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None,
-                        kv_layer_idx, layer_idx, fusion, gfx12_fa_prep, false, false,
+                        kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
                     )?;
                     if twin {
                         // The singleton attend's paired write; the attention
@@ -406,22 +566,48 @@ pub fn forward_prefill_batch_multi(
                         cap,
                     )?;
                 }
-                batch_chunk_full_attn_output_projection(
-                    gpu,
-                    layer,
-                    pbs,
-                    total,
-                    q8_wmma_arch,
-                    arch_has_wmma,
-                    BatchEpilogue::Residual,
-                    fusion,
-                    false,
-                    None,
-                )?;
-                batch_chunk_full_attn_ffn(
-                    gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma, BatchEpilogue::Residual,
-                    fusion,
-                )?;
+                if split_proj
+                    || any_lane_s4(gpu, reqs, layer.wo.gpu_dtype)
+                    || any_lane_s4(gpu, reqs, layer.w_down.gpu_dtype)
+                {
+                    for (r, view) in reqs.iter().zip(&views) {
+                        let n = r.tokens.len();
+                        batch_chunk_full_attn_output_projection(
+                            gpu,
+                            layer,
+                            view,
+                            n,
+                            q8_wmma_arch,
+                            arch_has_wmma,
+                            BatchEpilogue::Residual,
+                            r.fusion,
+                            false,
+                            None,
+                        )?;
+                        batch_chunk_full_attn_ffn(
+                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                            BatchEpilogue::Residual, r.fusion,
+                        )?;
+                    }
+                } else {
+                    batch_chunk_full_attn_output_projection(
+                        gpu,
+                        layer,
+                        pbs,
+                        total,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        shared_fusion,
+                        false,
+                        None,
+                    )?;
+                    batch_chunk_full_attn_ffn(
+                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
+                        BatchEpilogue::Residual, shared_fusion,
+                    )?;
+                }
+                capture_layer_rows(gpu, reqs, &views, layer_idx)?;
                 kv_layer_idx += 1;
             }
             _ => return refuse("layer type mismatch"),
@@ -441,5 +627,13 @@ pub fn forward_prefill_batch_multi(
         true,
         &ctx,
     )?;
+    // The singleton chunk loop's per-chunk ring finish: scatter this
+    // request's staged rows to its ring head and advance by its row count.
+    for r in reqs.iter_mut() {
+        let n = r.tokens.len();
+        if let Some(rb) = r.hidden_rb.as_deref_mut() {
+            rb.finish_prefill_chunk(gpu, n)?;
+        }
+    }
     Ok(())
 }
