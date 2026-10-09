@@ -472,14 +472,14 @@ gemv_mq4g256v2_residual:
 	s_wait_loadcnt 0x0
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
 	v_cndmask_b32_e32 v34, v7, v6, vcc_lo
-	v_bfe_u32 v35, v17, 0, 4
-	v_cvt_f32_ubyte0_e32 v35, v35
-	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 4, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_fmac_f32_e32 v33, v9, v36
+	v_mul_f32_e32 v33, v9, v36
+	v_bfe_u32 v35, v17, 0, 4
+	v_cvt_f32_ubyte0_e32 v35, v35
+	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fmac_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 8, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
@@ -566,14 +566,14 @@ gemv_mq4g256v2_residual:
 	s_wait_loadcnt 0x0
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
 	v_cndmask_b32_e32 v34, v7, v6, vcc_lo
-	v_bfe_u32 v35, v17, 0, 4
-	v_cvt_f32_ubyte0_e32 v35, v35
-	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 4, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_fmac_f32_e32 v33, v9, v36
+	v_mul_f32_e32 v33, v9, v36
+	v_bfe_u32 v35, v17, 0, 4
+	v_cvt_f32_ubyte0_e32 v35, v35
+	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fmac_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 8, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
@@ -660,14 +660,14 @@ gemv_mq4g256v2_residual:
 	s_wait_loadcnt 0x0
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
 	v_cndmask_b32_e32 v34, v7, v6, vcc_lo
-	v_bfe_u32 v35, v17, 0, 4
-	v_cvt_f32_ubyte0_e32 v35, v35
-	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 4, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_fmac_f32_e32 v33, v9, v36
+	v_mul_f32_e32 v33, v9, v36
+	v_bfe_u32 v35, v17, 0, 4
+	v_cvt_f32_ubyte0_e32 v35, v35
+	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fmac_f32_e32 v33, v8, v36
 	v_bfe_u32 v35, v17, 8, 4
 	v_cvt_f32_ubyte0_e32 v35, v35
 	v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]

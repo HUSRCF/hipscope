@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791509486,
+  "generated_unix_seconds": 1791509705,
   "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
   "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
   "arch": "gfx1201",
@@ -18,9 +18,9 @@
     "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
-  "source_sha256": "a55c6de39c90a3e24a5adcbb349e85c72aeb2ab126862889a0ca03e97c57ac4d",
+  "source_sha256": "6f433f74d52bd02684bcb4e30d0c023649abf35280a2f1b149244b6705c4854b",
   "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "output_sha256": "2f7ad25137cab2ef2c194cd7f82be9db891520811fd9891099e9ca0051cf00a1",
+  "output_sha256": "889cab2b8e7301e00eb14fd53ff2017818652e5cefaed031f45a2569344ae30d",
   "inspection": {
     "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
     "identity": {
@@ -103,8 +103,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "b574f33f47a03f3670f79fce4b84ea98a1191576",
-      "proof_sha256": "77aa85b997a56c719b970c05d02b183a4c763a52302c68bd818d8b4c7d233d23"
+      "builder_git_sha": "4867919a20fcc67b4ae76cb252d27b1129d44661",
+      "proof_sha256": "c0ec7306053cf08642ec4ee6a9dc32b4253d396c4c8c4b02e26446e253068298"
     },
     "tools": [
       {
@@ -120,11 +120,11 @@
           "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "c10d919496c9d6bafdddce4629947ff7a4984d5573dd22b7fdd980b26b16073f"
+        "sha256": "dd591426538eb9d466f103b5abadfe815f49c21b3a3b3296d1715a71d31703ef"
       }
     ],
-    "s_text_sha256": "a55c6de39c90a3e24a5adcbb349e85c72aeb2ab126862889a0ca03e97c57ac4d",
-    "text_section_sha256": "cb0d882213b35542733fe17deec41b04b2355eb861911072962c0029427ebc3b",
+    "s_text_sha256": "6f433f74d52bd02684bcb4e30d0c023649abf35280a2f1b149244b6705c4854b",
+    "text_section_sha256": "e794a224f472c80db9f778f689dbb646ebfc0981f5d4e25ad86e35af22c017a1",
     "shape_contract": {
       "counts": {},
       "end_label": null,
