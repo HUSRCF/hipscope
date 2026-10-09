@@ -483,27 +483,32 @@ amdhsa.kernels:
         .offset: 24
         .size: 8
         .value_kind: global_buffer
-      - .address_space: global
+      - .actual_access: read_only
+        .address_space: global
         .name: x
         .offset: 32
         .size: 8
         .value_kind: global_buffer
-      - .address_space: global
+      - .actual_access: write_only
+        .address_space: global
         .name: y_qkv
         .offset: 40
         .size: 8
         .value_kind: global_buffer
-      - .address_space: global
+      - .actual_access: write_only
+        .address_space: global
         .name: y_z
         .offset: 48
         .size: 8
         .value_kind: global_buffer
-      - .address_space: global
+      - .actual_access: write_only
+        .address_space: global
         .name: y_beta
         .offset: 56
         .size: 8
         .value_kind: global_buffer
-      - .address_space: global
+      - .actual_access: write_only
+        .address_space: global
         .name: y_alpha
         .offset: 64
         .size: 8

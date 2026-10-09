@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791509199,
+  "generated_unix_seconds": 1791509324,
   "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.s",
   "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.hxaco",
   "arch": "gfx1201",
@@ -18,9 +18,9 @@
     "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
-  "source_sha256": "82773a8ecd8ee1aa7e854191a3982630c125284c782461f0857409278ba98947",
+  "source_sha256": "7449c780269c193b27c2d2a51e096948f25d77358d1ec3aa1732650b3c60f233",
   "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "output_sha256": "218d68ec54d6c0b16bc5f5b29175b068454b5607afb0cbd36902943aa3560593",
+  "output_sha256": "e9cce7cf5d7b8c43d73409e408ed3d185802fc3f8d1d1dce59015ea5cf654c04",
   "inspection": {
     "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
     "identity": {
@@ -76,35 +76,35 @@
             "size": 8,
             "value_kind": "global_buffer",
             "address_space": "global",
-            "actual_access": null
+            "actual_access": "read_only"
           },
           {
             "offset": 40,
             "size": 8,
             "value_kind": "global_buffer",
             "address_space": "global",
-            "actual_access": null
+            "actual_access": "write_only"
           },
           {
             "offset": 48,
             "size": 8,
             "value_kind": "global_buffer",
             "address_space": "global",
-            "actual_access": null
+            "actual_access": "write_only"
           },
           {
             "offset": 56,
             "size": 8,
             "value_kind": "global_buffer",
             "address_space": "global",
-            "actual_access": null
+            "actual_access": "write_only"
           },
           {
             "offset": 64,
             "size": 8,
             "value_kind": "global_buffer",
             "address_space": "global",
-            "actual_access": null
+            "actual_access": "write_only"
           },
           {
             "offset": 72,
@@ -166,8 +166,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "9fb7486ae949f07e3f92c2f6ec31926c2b5f98a3",
-      "proof_sha256": "01d4e0156754931055bf7a9c1fe0049180d943f5bfecfca9c42e6a272a13fa5e"
+      "builder_git_sha": "7325de31a35b22ff4ee469b202503d50e97bbd3f",
+      "proof_sha256": "6fd5a2d74bdd05dea8c439c0495d538b4fa192a0bf0efb30671c84a44438903e"
     },
     "tools": [
       {
@@ -183,10 +183,10 @@
           "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "ab3891b837030204833fc2b802f76e672fa345743598137953cc6fcebda14550"
+        "sha256": "1dcaf30adba730273128f4ac2fa925cca9307dd194a19ae2aa449d323028f0c4"
       }
     ],
-    "s_text_sha256": "82773a8ecd8ee1aa7e854191a3982630c125284c782461f0857409278ba98947",
+    "s_text_sha256": "7449c780269c193b27c2d2a51e096948f25d77358d1ec3aa1732650b3c60f233",
     "text_section_sha256": "b086d97c88746434255ee523176b812f75809248dcaf0b2cb68e1b36b5671b52",
     "shape_contract": {
       "counts": {},

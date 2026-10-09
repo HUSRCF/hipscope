@@ -2,15 +2,15 @@
   "module": "fused_qkvza_hfq4g256_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "9fb7486ae949f07e3f92c2f6ec31926c2b5f98a3",
-  "s_text_sha256": "82773a8ecd8ee1aa7e854191a3982630c125284c782461f0857409278ba98947",
+  "builder_git_sha": "7325de31a35b22ff4ee469b202503d50e97bbd3f",
+  "s_text_sha256": "7449c780269c193b27c2d2a51e096948f25d77358d1ec3aa1732650b3c60f233",
   "kernels": [
     {
       "kernel_id": "pm_decode_fused_qkvza_hfq4g256_mq4v2",
       "variant": "four_stream",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "9fb7486ae949f07e3f92c2f6ec31926c2b5f98a3",
+      "builder_git_sha": "7325de31a35b22ff4ee469b202503d50e97bbd3f",
       "reg_plan": [
         {
           "name": "lane",
@@ -490,7 +490,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "82773a8ecd8ee1aa7e854191a3982630c125284c782461f0857409278ba98947"
+      "s_text_sha256": "7449c780269c193b27c2d2a51e096948f25d77358d1ec3aa1732650b3c60f233"
     }
   ]
 }
