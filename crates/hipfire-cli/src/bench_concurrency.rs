@@ -681,7 +681,8 @@ impl ConcurrencyBackend for DaemonDriver {
 
     fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
         check_k(self, k)?;
-        // The batch route rejects multi-turn (`batch_messages_are_single_user`),
+        // The fixed-lane batch route rejects multi-turn
+        // (`batch_messages_are_single_user`; the VMM route batches text chats),
         // so this arm is sequential by construction on this backend. Report it
         // rather than pretending it batched.
         let _ = workload;

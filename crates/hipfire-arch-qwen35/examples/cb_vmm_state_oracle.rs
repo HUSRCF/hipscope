@@ -4,7 +4,21 @@
 //!
 //! cb_vmm_state_oracle <model> --ks 1,2,3,4,5,6,7,8 --contexts 512,8192,32768
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
-//!     [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]
+//!     [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N]
+//!     [--spec off|mtp|dflash|mixed] [--mtp-head <path>]
+//!     [--dflash-draft <path>] [--dflash-probe-window <N>]
+//!
+//! DFlash Gate 0 (`--spec dflash|mixed`): a one-window replay probe. For each
+//! lane the isolated singleton `DflashSpeculator` (prefill + `N` full-block
+//! windows, then one window with output budget `E`) is the reference; the
+//! same pre-window state is rebuilt per lane and the window is replayed as
+//! 1/2/3(/4) lanes through one `forward_prefill_batch_multi` (ChainVerify
+//! fusion + per-lane hidden ring + tape), one shared head, and
+//! `dflash_greedy_accept_commit_parts`. Raw named byte arrays (trunk/draft
+//! state, verify rows, tape, ring, KV rows) are compared with first-byte
+//! difference reporting. `--dflash-probe-window N` = number of full windows
+//! run before the probed one (0 = the prefill boundary). `--phase probe`
+//! skips the AR singleton/controls/batch phases (probe only).
 //!
 //! `--contexts` are test prefix lengths, never max_seq overrides: the model
 //! loads through the production `load_qwen35_bundle` with automatic VMM
@@ -27,6 +41,19 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit, VmmRoute};
+use hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine;
+use hipfire_arch_qwen35::mtp_head::{load_mtp_head, MtpKvMode, Qwen35MtpHead};
+use hipfire_arch_qwen35::mtp_spec::cb::{mtp_cb_cycle, MtpCbLane, MtpCbScratch};
+use hipfire_arch_qwen35::mtp_spec::{prefill_trunk_and_mtp_cache, MtpPromptRoute, MtpSamplingConfig, MtpSpecState};
+use hipfire_arch_qwen35::mtp_speculator::Qwen35MtpDrafter;
+use hipfire_arch_qwen35::dflash_cb::{dflash_cb_draft, dflash_cb_head_argmax, dflash_lane_draft, DflashCbDraftLane, DflashCbScratch, DflashVmmLaneState};
+use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, load_dflash_state, DflashSpeculator, DflashState};
+use hipfire_arch_qwen35::qwen35::prefill::multi::{forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_ROWS};
+use hipfire_arch_qwen35::speculative::{
+    dflash_greedy_accept_commit_parts, DflashCbDraft, DflashTargetParts, DflashVerifyOutput, ModelSlot, VerifyScratch,
+};
+use hipfire_runtime::dflash::{ring_segments, DraftCtxMode};
+use hipfire_runtime::spec::{MtpDrafter, PrefillOutcome, SpecRequestConfig, Speculator};
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
@@ -54,6 +81,26 @@ published. Write a careful explanation of how a merge sort splits, recurses and 
 then implement it in Rust with tests, and finally discuss its cache behaviour on large \
 inputs compared with an in-place quicksort.\n";
 
+/// `--spec`: which speculative phases run after the AR phases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpecMode {
+    Off,
+    Mtp,
+    Dflash,
+    /// MTP singleton/batched phase plus the DFlash Gate 0 probe (the real
+    /// mixed MTP+DFlash executor cases need the VMM DFlash engine).
+    Mixed,
+}
+
+impl SpecMode {
+    fn mtp(self) -> bool {
+        matches!(self, SpecMode::Mtp | SpecMode::Mixed)
+    }
+    fn dflash(self) -> bool {
+        matches!(self, SpecMode::Dflash | SpecMode::Mixed)
+    }
+}
+
 struct Args {
     model: String,
     ks: Vec<usize>,
@@ -68,6 +115,16 @@ struct Args {
     stop_repeats: usize,
     /// Sequential 2-request cycles for the memory-drift check (0 = off).
     drift_cycles: usize,
+    /// Speculative phases (`--spec off|mtp|dflash|mixed`).
+    spec: SpecMode,
+    /// Run the singleton AR reference + controls (false for `--phase probe`).
+    ar_phase: bool,
+    /// DFlash draft artifact (`--dflash-draft`), required by dflash/mixed.
+    dflash_draft: Option<PathBuf>,
+    /// Gate 0: full windows run before the probed window (0 = prefill boundary).
+    dflash_probe_window: Option<usize>,
+    /// MTP head sidecar (default: model path with extension `mtp`).
+    mtp_head: Option<PathBuf>,
 }
 
 fn parse_list(s: &str) -> Result<Vec<usize>> {
@@ -85,10 +142,15 @@ fn parse_args() -> Result<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: cb_vmm_state_oracle <model> --ks 1,..,8 --contexts 512,8192,32768 \
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
-                 [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]";
+                 [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N] \
+                 [--spec off|mtp|dflash|mixed] [--mtp-head <path>] \
+                 [--dflash-draft <path>] [--dflash-probe-window <N>]";
     let mut batch = true;
     let mut stop_repeats = 1usize;
     let mut drift_cycles = 0usize;
+    let (mut spec, mut mtp_head) = (SpecMode::Off, None);
+    let mut ar_phase = true;
+    let (mut dflash_draft, mut dflash_probe_window) = (None, None);
     let model = raw.first().ok_or(usage)?.clone();
     let (mut ks, mut contexts, mut steps, mut out, mut short, mut artifacts) =
         (None, None, None, None, 256usize, None);
@@ -104,13 +166,27 @@ fn parse_args() -> Result<Args> {
             "--artifacts" => artifacts = Some(PathBuf::from(val)),
             "--stop-repeats" => stop_repeats = val.parse::<usize>()?.max(1),
             "--drift-cycles" => drift_cycles = val.parse()?,
-            "--phase" => {
-                batch = match val.as_str() {
-                    "all" => true,
-                    "singleton" => false,
+            "--spec" => {
+                spec = match val.as_str() {
+                    "off" => SpecMode::Off,
+                    "mtp" => SpecMode::Mtp,
+                    "dflash" => SpecMode::Dflash,
+                    "mixed" => SpecMode::Mixed,
                     _ => return Err(usage.into()),
                 }
             }
+            "--mtp-head" => mtp_head = Some(PathBuf::from(val)),
+            "--dflash-draft" => dflash_draft = Some(PathBuf::from(val)),
+            "--dflash-probe-window" => dflash_probe_window = Some(val.parse::<usize>()?),
+            "--phase" => match val.as_str() {
+                "all" => batch = true,
+                "singleton" => batch = false,
+                "probe" => {
+                    batch = false;
+                    ar_phase = false;
+                }
+                _ => return Err(usage.into()),
+            },
             other => return Err(format!("unknown flag {other}; {usage}").into()),
         }
         i += 2;
@@ -131,7 +207,21 @@ fn parse_args() -> Result<Args> {
     if steps < 8 {
         return Err("--steps must be >= 8 (negative controls need 8 steps)".into());
     }
-    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles })
+    if spec.dflash() {
+        let draft = dflash_draft.as_ref().ok_or("--spec dflash|mixed requires --dflash-draft <path>")?;
+        if !draft.is_file() {
+            return Err(format!("--dflash-draft {} is not a file", draft.display()).into());
+        }
+    } else if dflash_draft.is_some() || dflash_probe_window.is_some() {
+        return Err("--dflash-draft / --dflash-probe-window require --spec dflash|mixed".into());
+    }
+    if !ar_phase && spec != SpecMode::Dflash {
+        return Err("--phase probe requires --spec dflash (the MTP phase compares against the AR singleton traces)".into());
+    }
+    Ok(Args {
+        model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles,
+        spec, ar_phase, dflash_draft, dflash_probe_window, mtp_head,
+    })
 }
 
 /// One isolated request fixture: request-unique prompt at an exact length.
@@ -284,6 +374,7 @@ impl Ctx {
     }
     fn reset(&mut self) -> Result<()> {
         self.b.dn_state.reset(&mut self.gpu)?;
+        pin_gdn_frame(&self.b.dn_state);
         self.gpu.hip.device_synchronize()?;
         Ok(())
     }
@@ -362,6 +453,17 @@ impl Ctx {
         }
         self.gpu.hip.device_synchronize()?;
         Ok(())
+    }
+}
+
+/// With GDN error feedback off (`HIPFIRE_DN_STATE_EF=0`), Q8 DeltaNet requant
+/// rounds stochastically off a process-global frame counter, so a request's
+/// bytes depend on the counter at its start. Every reference run and every
+/// executor request starts at frame 0 (the executor threads its frame per
+/// request from admission). With EF on the counter is unused: no-op.
+fn pin_gdn_frame(dn: &DeltaNetState) {
+    if dn.s_ef_residual.is_empty() {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
     }
 }
 
@@ -489,6 +591,8 @@ fn replay(ctx: &mut Ctx, f: &Fixture, steps: usize, reference: &Trace, perturb: 
     for s in 1..=steps {
         if s == 1 && matches!(perturb, Perturb::RejectedTailMasked | Perturb::RejectedTailRead) {
             let snap = ctx.snapshot_dn()?;
+            // Spec rollback also restores the stochastic-requant frame (EF off).
+            let frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
             ctx.poison_kv(position, position + 4)?;
             // Drafts that the target will reject: off-by-one token ids.
             let block = [seed, seed.wrapping_add(1) % 1000, 17, 23];
@@ -499,6 +603,7 @@ fn replay(ctx: &mut Ctx, f: &Fixture, steps: usize, reference: &Trace, perturb: 
                 seed = argmax(&ctx.logits()?)?;
             } else {
                 ctx.restore_dn(&snap)?;
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame);
             }
         }
         let pos = if perturb == Perturb::RowSlot && s == 1 { position + 1 } else { position };
@@ -580,6 +685,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
         "kv_fp8": kv.quant_fp8,
         "kv_q8": kv.quant_q8,
         "dn_quant": format!("{:?}", b.dn_state.quant),
+        "dn_state_ef": !b.dn_state.s_ef_residual.is_empty(),
         "arch": gpu.arch.clone(),
         "qwen_default_q8": qwen_default_q8,
     });
@@ -770,6 +876,8 @@ fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> 
         rng_state: 0,
         history: vec![],
     };
+    // Same starting requant frame as the singleton reference (EF-off only).
+    pin_gdn_frame(&ctx.b.dn_state);
     let st = Qwen35RequestState::new_like(
         &mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, &ctx.b.dn_state, r.epoch, r.slot, init,
     )?;
@@ -1389,6 +1497,2025 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
     Ok((Value::Object(out), pass))
 }
 
+// ── Spec phase: isolated singleton MTP references (§4.3, §7 item 2) ─────
+//
+// The reference is the default singleton MTP route: `Qwen35MtpDrafter` on a
+// `ModelSlot` driven exactly like `MtpSpeculator` (k = min(max_emit-1,
+// proposal_capacity), eos from the target, greedy). Per cycle it records the
+// window (position, seed, k, committed, accepted, drafted) and a sha256
+// digest of the state the cycle wrote: trunk KV rows [start, end), DeltaNet
+// S/scales/EF/conv, MTP-head KV rows [start, end) and prev_hidden. Full state
+// bytes are kept at prefill, final, and the first full/partial/zero-accept
+// cycle. Rejected rows past the committed watermark are never compared.
+
+#[derive(Clone)]
+struct SpecCycle {
+    position: usize,
+    seed: u32,
+    k: usize,
+    committed: Vec<u32>,
+    accepted: usize,
+    drafted: usize,
+    class: &'static str,
+    delta_sha256: String,
+}
+
+struct SpecTrace {
+    /// Picks in order: prefill token, then every committed id.
+    emitted: Vec<u32>,
+    cycles: Vec<SpecCycle>,
+    finish: String,
+    position: usize,
+    pending_seed: u32,
+    states: Vec<(String, PathBuf)>,
+}
+
+fn spec_class(w: &hipfire_runtime::spec::MtpWindow) -> &'static str {
+    match (w.drafts_generated, w.accepted) {
+        (0, _) => "ar",
+        (d, a) if a == d => "full",
+        (_, 0) => "zero",
+        _ => "partial",
+    }
+}
+
+fn mtp_row_bytes(st: &hipfire_arch_qwen35::mtp_spec::MtpSpecState) -> usize {
+    st.mtp_kv.n_head_kv * (st.mtp_kv.head_dim / 32) * 34
+}
+
+/// MTP head state: KV rows [from, to) (K then V), prev_hidden, its position.
+fn mtp_state_bytes(gpu: &Gpu, st: &MtpSpecState, from: usize, to: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    gpu.hip.device_synchronize()?;
+    let row = mtp_row_bytes(st);
+    let mut out = Vec::new();
+    for (side, bufs) in [("k", &st.mtp_kv.inner.k_gpu), ("v", &st.mtp_kv.inner.v_gpu)] {
+        for (i, t) in bufs.iter().enumerate().filter(|(_, t)| t.buf.size() >= row) {
+            out.push((format!("mtp.{side}{i}"), read_dev(gpu, t, from * row, (to - from) * row)?));
+        }
+    }
+    let ph = st.prev_hidden.byte_size().min(st.prev_hidden.buf.size());
+    out.push(("mtp.prev_hidden".into(), read_dev(gpu, &st.prev_hidden, 0, ph)?));
+    out.push(("mtp.prev_hidden_pos".into(), (st.prev_hidden_pos.map_or(u64::MAX, |p| p as u64)).to_le_bytes().to_vec()));
+    Ok(out)
+}
+
+/// Trunk KV rows [from, to) plus whole DeltaNet state.
+fn trunk_rows_bytes(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState, from: usize, to: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let (kr, vr) = kv_row_bytes(kv)?;
+    for (name, bytes) in state_bytes(gpu, config, kv, dn, 0)? {
+        if !name.ends_with(".k") && !name.ends_with(".v") {
+            out.push((name, bytes));
+        }
+    }
+    for (layer, ty) in config.layer_types.iter().enumerate() {
+        if *ty == LayerType::FullAttention {
+            out.push((format!("L{layer:02}.k[{from}..{to})"), read_dev(gpu, &kv.k_gpu[layer], from * kr, (to - from) * kr)?));
+            out.push((format!("L{layer:02}.v[{from}..{to})"), read_dev(gpu, &kv.v_gpu[layer], from * vr, (to - from) * vr)?));
+        }
+    }
+    Ok(out)
+}
+
+/// Delta digest of one cycle: trunk rows [from, to), DeltaNet, MTP rows [from, to).
+fn cycle_digest(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState, st: &MtpSpecState, from: usize, to: usize) -> Result<String> {
+    let mut delta = trunk_rows_bytes(gpu, config, kv, dn, from, to)?;
+    delta.extend(mtp_state_bytes(gpu, st, from, to)?);
+    Ok(digest(&delta))
+}
+
+fn digest(items: &[(String, Vec<u8>)]) -> String {
+    let mut h = Sha256::new();
+    for (n, b) in items {
+        h.update(n.as_bytes());
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Full committed state at `pos`: trunk KV prefix, DeltaNet, MTP head prefix.
+fn spec_full_state(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState, st: &MtpSpecState, pos: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut v = state_bytes(gpu, config, kv, dn, pos)?;
+    v.extend(mtp_state_bytes(gpu, st, 0, pos)?);
+    Ok(v)
+}
+
+fn slot_full_state(gpu: &Gpu, slot: &ModelSlot, d: &Qwen35MtpDrafter, pos: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let st = d.mtp_live_state().ok_or("MTP state not allocated")?;
+    spec_full_state(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, st, pos)
+}
+
+/// One isolated singleton MTP greedy run (`budget` picks, `eos`).
+fn spec_run(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, dir: Option<&Path>) -> Result<SpecTrace> {
+    d.configure_request(SpecRequestConfig::default());
+    let seed0 = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let mut tr = SpecTrace { emitted: vec![seed0], cycles: vec![], finish: String::new(), position: f.prefix, pending_seed: seed0, states: vec![] };
+    let mut history = f.tokens.clone();
+    history.push(seed0);
+    let save = |gpu: &Gpu, slot: &ModelSlot, d: &Qwen35MtpDrafter, tr: &mut SpecTrace, stage: &str| -> Result<()> {
+        if let Some(dir) = dir {
+            for (name, bytes) in slot_full_state(gpu, slot, d, tr.position)? {
+                let p = dir.join(stage).join(format!("{name}.bin"));
+                write_art(&p, &bytes)?;
+                tr.states.push((format!("{stage}/{name}"), p));
+            }
+        }
+        Ok(())
+    };
+    save(gpu, slot, d, &mut tr, "prefill")?;
+    let mut first_of: Vec<&'static str> = Vec::new();
+    tr.finish = if seed0 == eos { "stop".into() } else { String::new() };
+    while tr.finish.is_empty() {
+        if tr.emitted.len() >= budget {
+            tr.finish = "length".into();
+            break;
+        }
+        let max_emit = budget - tr.emitted.len();
+        let k = max_emit.saturating_sub(1).min(d.proposal_capacity());
+        let start = tr.position;
+        let w = d.mtp_step(gpu, slot, start, tr.pending_seed, &history, k, eos, None)?;
+        if w.committed.is_empty() || w.committed.len() > max_emit {
+            return Err(format!("MTP window committed {} with max_emit {max_emit}", w.committed.len()).into());
+        }
+        let class = spec_class(&w);
+        let end = start + w.committed.len();
+        let st = d.mtp_live_state().ok_or("MTP state not allocated")?;
+        let delta_sha256 = cycle_digest(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, st, start, end)?;
+        tr.cycles.push(SpecCycle {
+            position: start, seed: tr.pending_seed, k, committed: w.committed.clone(), accepted: w.accepted,
+            drafted: w.drafts_generated, class, delta_sha256,
+        });
+        tr.emitted.extend_from_slice(&w.committed);
+        history.extend_from_slice(&w.committed);
+        tr.position = end;
+        tr.pending_seed = *w.committed.last().unwrap();
+        if w.committed.contains(&eos) {
+            tr.finish = "stop".into();
+        }
+        if !first_of.contains(&class) && class != "ar" {
+            first_of.push(class);
+            let stage = format!("first_{class}_cycle{}", tr.cycles.len() - 1);
+            save(gpu, slot, d, &mut tr, &stage)?;
+        }
+    }
+    save(gpu, slot, d, &mut tr, "final")?;
+    Ok(tr)
+}
+
+/// Byte/ID comparison of a replayed trace against the reference trace.
+fn spec_compare(reference: &SpecTrace, got: &SpecTrace, got_states: &[(String, Vec<u8>)]) -> Result<Diff> {
+    let mut d = Diff::default();
+    d.ids("emitted", &reference.emitted, &got.emitted);
+    d.ids("position", &[reference.position as u32], &[got.position as u32]);
+    d.ids("pending_seed", &[reference.pending_seed], &[got.pending_seed]);
+    d.check("finish", reference.finish.as_bytes(), got.finish.as_bytes());
+    let n = reference.cycles.len().max(got.cycles.len());
+    for c in 0..n {
+        match (reference.cycles.get(c), got.cycles.get(c)) {
+            (Some(a), Some(b)) => {
+                let wa = [a.position as u32, a.seed, a.k as u32, a.accepted as u32, a.drafted as u32];
+                let wb = [b.position as u32, b.seed, b.k as u32, b.accepted as u32, b.drafted as u32];
+                d.ids(&format!("cycle{c}.window"), &wa, &wb);
+                d.ids(&format!("cycle{c}.committed"), &a.committed, &b.committed);
+                d.check(&format!("cycle{c}.delta_sha256"), a.delta_sha256.as_bytes(), b.delta_sha256.as_bytes());
+            }
+            _ => d.differing_items.push(format!("cycle{c}: present in only one trace")),
+        }
+    }
+    for (name, bytes) in got_states {
+        match reference.states.iter().find(|(n, _)| n == name) {
+            Some((_, p)) => d.check(name, &fs::read(p)?, bytes),
+            None => d.differing_items.push(format!("{name}: missing in reference")),
+        }
+    }
+    Ok(d)
+}
+
+/// Run `f` again in memory and collect the same stage states for comparison.
+fn spec_replay(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, reference: &SpecTrace) -> Result<Diff> {
+    // Intermediate saved stages are re-derived by a replay stopped there.
+    let stages: std::collections::BTreeSet<String> =
+        reference.states.iter().map(|(n, _)| n.split('/').next().unwrap().to_string()).collect();
+    let mut states = Vec::new();
+    for stage in stages.iter().filter(|s| s.as_str() != "final") {
+        let stop_after = if stage == "prefill" { 0 } else { stage.rsplit("cycle").next().unwrap().parse::<usize>()? + 1 };
+        let pos = spec_partial(gpu, slot, d, f, budget, eos, stop_after)?;
+        for (name, bytes) in slot_full_state(gpu, slot, d, pos)? {
+            states.push((format!("{stage}/{name}"), bytes));
+        }
+    }
+    let got = spec_run(gpu, slot, d, f, budget, eos, None)?;
+    for (name, bytes) in slot_full_state(gpu, slot, d, got.position)? {
+        states.push((format!("final/{name}"), bytes));
+    }
+    spec_compare(reference, &got, &states)
+}
+
+/// Run `f` for `cycles` windows (0 = prefill only); returns the committed position.
+fn spec_partial(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, cycles: usize) -> Result<usize> {
+    d.configure_request(SpecRequestConfig::default());
+    let mut seed = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let (mut pos, mut emitted) = (f.prefix, 1usize);
+    let mut history = f.tokens.clone();
+    history.push(seed);
+    let mut c = 0;
+    while c < cycles && emitted < budget && seed != eos {
+        let max_emit = budget - emitted;
+        let k = max_emit.saturating_sub(1).min(d.proposal_capacity());
+        let w = d.mtp_step(gpu, slot, pos, seed, &history, k, eos, None)?;
+        emitted += w.committed.len();
+        history.extend_from_slice(&w.committed);
+        pos += w.committed.len();
+        seed = *w.committed.last().unwrap();
+        c += 1;
+        if w.committed.contains(&eos) {
+            break;
+        }
+    }
+    Ok(pos)
+}
+
+fn spec_trace_json(t: &SpecTrace) -> Value {
+    let count = |c: &str| t.cycles.iter().filter(|x| x.class == c).count();
+    json!({
+        "picks": t.emitted.len(), "cycles": t.cycles.len(), "finish": t.finish, "position": t.position,
+        "pending_seed": t.pending_seed,
+        "classes": {"full": count("full"), "partial": count("partial"), "zero": count("zero"), "ar": count("ar")},
+        "accepted_total": t.cycles.iter().map(|c| c.accepted).sum::<usize>(),
+        "emitted": t.emitted,
+        "windows": t.cycles.iter().map(|c| json!([c.position, c.k, c.accepted, c.drafted, c.class, c.committed])).collect::<Vec<_>>(),
+    })
+}
+
+/// Spec phase: per fixture an isolated singleton MTP reference (artifacts),
+/// its determinism self-test, and the derived EOS-in-draft and
+/// max_tokens-mid-draft variants. Returns (report, pass).
+fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ar_refs: &[Trace]) -> Result<(Value, bool)> {
+    let Ctx { mut gpu, b } = ctx;
+    let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model)).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
+    let head_path = args.mtp_head.clone().unwrap_or_else(|| Path::new(&args.model).with_extension("mtp"));
+    let max_prefix = fx.iter().map(|f| f.prefix).max().unwrap_or(0);
+    let cap = max_prefix + args.steps + 64;
+    let head = load_mtp_head(&head_path, &mut gpu, cap)?;
+    let k = hipfire_runtime::config::get().mtp_k.clamp(1, 10);
+    let mut d = Qwen35MtpDrafter::new(head, k, cap);
+    let budget = args.steps + 1;
+    let eos = slot.config.eos_token;
+    let mut pass = true;
+    let mut rows = Vec::new();
+    // Every reference trace with its run parameters, for the batched cases.
+    let mut refs: Vec<(usize, usize, u32, SpecTrace)> = Vec::new(); // (fixture, budget, eos, trace)
+    let (mut eos_ref, mut clip_ref) = (vec![None; fx.len()], vec![None; fx.len()]);
+    for f in fx {
+        let dir = args.artifacts.join("spec_mtp").join(f.name());
+        let t0 = std::time::Instant::now();
+        let tr = spec_run(&mut gpu, &mut slot, &mut d, f, budget, eos, Some(&dir))?;
+        let fi = rows.len();
+        let secs = t0.elapsed().as_secs_f64();
+        let det = spec_replay(&mut gpu, &mut slot, &mut d, f, budget, eos, &tr)?;
+        pass &= det.exact();
+        let mut row = json!({"fixture": f.name(), "k": k, "record_seconds": secs, "reference": spec_trace_json(&tr), "determinism": det.json()});
+        eprintln!("spec {}: picks={} cycles={} classes={} determinism exact={} ({secs:.1}s)", f.name(), tr.emitted.len(), tr.cycles.len(), row["reference"]["classes"], det.exact());
+        // EOS inside a draft: the 2nd committed id of the first window that
+        // accepted >=2 drafts becomes the stop id.
+        if let Some((ci, c)) = tr.cycles.iter().enumerate().find(|(_, c)| c.accepted >= 2) {
+            let stop = c.committed[1];
+            let vdir = args.artifacts.join("spec_mtp").join(format!("{}_eos", f.name()));
+            let v = spec_run(&mut gpu, &mut slot, &mut d, f, budget, stop, Some(&vdir))?;
+            let first = tr.emitted.iter().position(|&t| t == stop).unwrap() + 1;
+            let ok = v.finish == "stop" && v.emitted.len() == first && v.emitted[..] == tr.emitted[..first];
+            pass &= ok;
+            eprintln!("spec {} eos_in_draft: stop={stop} cycle={ci} picks={} expected {first} -> {}", f.name(), v.emitted.len(), if ok { "OK" } else { "FAIL" });
+            row["eos_in_draft"] = json!({"stop": stop, "cycle": ci, "ok": ok, "trace": spec_trace_json(&v)});
+            eos_ref[fi] = Some(refs.len());
+            refs.push((fi, budget, stop, v));
+        } else {
+            row["eos_in_draft"] = json!({"skipped": "no window accepted >=2 drafts"});
+        }
+        // max_tokens clipping mid-draft: budget ends one pick into a window
+        // that committed >=3, so k shrinks below the drafter's capacity.
+        if let Some((ci, _)) = tr.cycles.iter().enumerate().find(|(_, c)| c.committed.len() >= 3) {
+            let before: usize = 1 + tr.cycles[..ci].iter().map(|c| c.committed.len()).sum::<usize>();
+            let clip = before + 2;
+            let vdir = args.artifacts.join("spec_mtp").join(format!("{}_clip", f.name()));
+            let v = spec_run(&mut gpu, &mut slot, &mut d, f, clip, eos, Some(&vdir))?;
+            let last = v.cycles.last();
+            let ok = v.finish == "length" && v.emitted.len() == clip && v.emitted[..] == tr.emitted[..clip]
+                && last.is_some_and(|c| c.k < k);
+            pass &= ok;
+            eprintln!("spec {} max_tokens_mid_draft: budget={clip} picks={} last_k={:?} -> {}", f.name(), v.emitted.len(), last.map(|c| c.k), if ok { "OK" } else { "FAIL" });
+            row["max_tokens_mid_draft"] = json!({"budget": clip, "cycle": ci, "ok": ok, "trace": spec_trace_json(&v)});
+            clip_ref[fi] = Some(refs.len());
+            refs.push((fi, clip, eos, v));
+        } else {
+            row["max_tokens_mid_draft"] = json!({"skipped": "no window committed >=3"});
+        }
+        rows.push(row);
+        refs.push((fi, budget, eos, tr));
+    }
+    let main_ref: Vec<usize> = (0..fx.len())
+        .map(|i| refs.iter().position(|(f, b, e, _)| *f == i && *b == budget && *e == eos).unwrap())
+        .collect();
+    let classes_seen: Vec<&str> = ["full", "partial", "zero"]
+        .into_iter()
+        .filter(|c| rows.iter().any(|r| r["reference"]["classes"][*c].as_u64().unwrap_or(0) > 0))
+        .collect();
+    Box::new(d).mtp_free(&mut gpu);
+
+    // ── Batched: mtp_cb_cycle lanes vs the isolated singleton references ──
+    let head_b = load_mtp_head(&head_path, &mut gpu, cap)?;
+    let mut cases = Vec::new();
+    let run = |gpu: &mut Gpu, slot: &mut ModelSlot, name: String, lanes: Vec<LaneSpec>, cases: &mut Vec<Value>, pass: &mut bool| -> Result<()> {
+        let (j, ok) = spec_batch_case(gpu, slot, &head_b, k, fx, &refs, &lanes, &name)?;
+        eprintln!("spec batch {name}: exact={ok}");
+        *pass &= ok;
+        cases.push(j);
+        Ok(())
+    };
+    for &kk in &args.ks {
+        let lanes = (0..kk.min(fx.len())).map(|i| LaneSpec { reference: main_ref[i], drop_after: None }).collect();
+        run(&mut gpu, &mut slot, format!("k{kk}"), lanes, &mut cases, &mut pass)?;
+    }
+    // Mixed: EOS-inside-draft lanes, max_tokens-mid-draft lanes (k below
+    // capacity, k=0 seed-only rows at the budget edge) and plain lanes.
+    let mixed: Vec<LaneSpec> = (0..fx.len().min(8))
+        .map(|i| {
+            let r = match i % 3 {
+                0 => eos_ref[i],
+                1 => clip_ref[i],
+                _ => None,
+            };
+            LaneSpec { reference: r.unwrap_or(main_ref[i]), drop_after: None }
+        })
+        .collect();
+    run(&mut gpu, &mut slot, "eos_clip_mix".into(), mixed, &mut cases, &mut pass)?;
+    // Cancel: lane 0 is retired after 3 cycles; survivors must stay exact.
+    let cancel: Vec<LaneSpec> = (0..fx.len().min(4))
+        .map(|i| LaneSpec { reference: main_ref[i], drop_after: (i == 0).then_some(3) })
+        .collect();
+    run(&mut gpu, &mut slot, "cancel".into(), cancel, &mut cases, &mut pass)?;
+    head_b.free_gpu(&mut gpu);
+
+    // ── Executor: Verify rows through provision/forward/commit (Slice2A) ──
+    let mut exec_cases = Vec::new();
+    let exec = spec_exec_cases(&mut gpu, &mut slot, args, fx, &refs, &main_ref, &eos_ref, &clip_ref, ar_refs, &head_path, cap, k, &mut exec_cases);
+    match exec {
+        Ok(ok) => pass &= ok,
+        Err(e) => {
+            pass = false;
+            exec_cases.push(json!({"case": "executor", "error": e.to_string()}));
+        }
+    }
+    let report = json!({
+        "route": "reference: singleton Qwen35MtpDrafter on ModelSlot (MtpSpeculator k/eos contract), greedy; \
+                  batch: mtp_spec::cb::mtp_cb_cycle over per-request KV/DN/MTP state; executor: Qwen35VmmStore \
+                  (VmmRoute::Exact) + VmmSpecEngine, Verify rows through provision/forward/commit",
+        "head": head_path, "k": k, "budget_picks": budget, "accept_classes_seen": classes_seen,
+        "fixtures": rows, "batch_cases": cases, "executor_cases": exec_cases,
+    });
+    Ok((report, pass && classes_seen.len() == 3))
+}
+
+/// One executor lane: a spec lane reproducing `refs[reference]` (optionally
+/// finishing on a stop id inside a window), or the AR lane reproducing a
+/// singleton AR trace.
+struct ExecLane {
+    epoch: RequestEpoch,
+    slot: usize,
+    /// Spec lane: index into refs. AR lane: None.
+    reference: Option<usize>,
+    ar: Option<usize>,
+    stop: Option<u32>,
+    budget: usize,
+    tr: SpecTrace,
+    ar_picks: Vec<u32>,
+    fed: usize,
+    diff: Diff,
+    done: bool,
+    cancelled: bool,
+}
+
+fn exec_stage(st: &Qwen35RequestState, slot: &ModelSlot, gpu: &Gpu, pos: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let m = st.mtp.as_ref().ok_or("spec lane has no MTP state")?;
+    spec_full_state(gpu, &slot.config, &st.kv, &st.dn, m, pos)
+}
+
+fn exec_plan(store: &Qwen35VmmStore, gpu: &Gpu, slot: &ModelSlot, fx: &[Fixture], lanes: &[ExecLane], k: usize, only: Option<usize>) -> Result<BatchStepPlan> {
+    let mut plan = BatchStepPlan::default();
+    plan.batch.m_per_slot = vec![0; EXEC_WIDTH];
+    let push = |plan: &mut BatchStepPlan, epoch: RequestEpoch, s: usize, toks: &[u32], pos0: usize, kind: RequestStepKind| {
+        let begin = plan.batch.tokens.len();
+        for (j, &t) in toks.iter().enumerate() {
+            plan.batch.tokens.push(t);
+            plan.batch.positions.push((pos0 + j) as i32);
+            plan.batch.row_slot.push(s as i32);
+        }
+        plan.batch.m_per_slot[s] = toks.len();
+        plan.requests.push(RequestRows { epoch, rows: RowRange { begin, len: toks.len() }, kind });
+        match kind {
+            RequestStepKind::Verify { .. } => plan.verify_rows += toks.len(),
+            RequestStepKind::Prefill => plan.prefill_rows += toks.len(),
+            _ => plan.decode_rows += toks.len(),
+        }
+    };
+    let mut order: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done && only.is_none_or(|o| o == i)).collect();
+    order.sort_by_key(|&i| lanes[i].slot);
+    for i in order {
+        let l = &lanes[i];
+        let st = store.request_state(&l.epoch).ok_or("lane missing from store")?;
+        if let Some(ai) = l.ar {
+            let f = &fx[ai];
+            if l.fed < f.prefix {
+                let n = store.exact_prefill_chunk_len(gpu, &slot.weights, &slot.config, &l.epoch, f.prefix - l.fed)?;
+                push(&mut plan, l.epoch, l.slot, &f.tokens[l.fed..l.fed + n], l.fed, RequestStepKind::Prefill);
+            } else {
+                push(&mut plan, l.epoch, l.slot, &[st.pending_seed.ok_or("AR seed")?], st.position, RequestStepKind::Ar);
+            }
+        } else {
+            let max_emit = l.budget - l.tr.emitted.len();
+            let kk = max_emit.saturating_sub(1).min(k);
+            let mut toks = vec![st.pending_seed.ok_or("spec seed")?];
+            toks.extend(std::iter::repeat_n(0u32, kk));
+            push(&mut plan, l.epoch, l.slot, &toks, st.position, RequestStepKind::Verify { draft_len: kk });
+        }
+    }
+    Ok(plan)
+}
+
+const EXEC_WIDTH: usize = 9;
+
+/// Publish one committed step into the lanes (window, digest, stage bytes).
+#[allow(clippy::too_many_arguments)]
+fn exec_absorb(gpu: &Gpu, slot: &ModelSlot, store: &Qwen35VmmStore, fx: &[Fixture], refs: &[(usize, usize, u32, SpecTrace)], ar_refs: &[Trace], lanes: &mut [ExecLane], plan: &BatchStepPlan, advances: &[hipfire_runtime::slot_batch::RequestAdvance], k: usize, prior: &[(usize, u32)]) -> Result<()> {
+    let eos = slot.config.eos_token;
+    for rr in &plan.requests {
+        let i = lanes.iter().position(|l| l.epoch == rr.epoch).ok_or("plan epoch not a lane")?;
+        let lane = &mut lanes[i];
+        if let Some(ai) = lane.ar {
+            if rr.kind == RequestStepKind::Prefill {
+                lane.fed += rr.rows.len;
+                if lane.fed == fx[ai].prefix {
+                    let st = store.request_state(&lane.epoch).ok_or("lane vanished")?;
+                    let now = state_bytes(gpu, &slot.config, &st.kv, &st.dn, lane.fed)?;
+                    state_cmp(&mut lane.diff, "prefill", &now, &ar_refs[ai])?;
+                }
+            }
+        }
+    }
+    for a in advances {
+        let i = lanes.iter().position(|l| l.epoch == a.epoch).ok_or("advance epoch not a lane")?;
+        let lane = &mut lanes[i];
+        let st = store.request_state(&a.epoch).ok_or("lane vanished")?;
+        if let Some(ai) = lane.ar {
+            lane.ar_picks.extend_from_slice(&a.committed_ids);
+            if lane.ar_picks.len() >= lane.budget {
+                lane.done = true;
+                let t = &ar_refs[ai];
+                let picks: Vec<u32> = t.committed.iter().copied().chain([t.pending_seed]).collect();
+                lane.diff.ids("ar_picks", &picks, &lane.ar_picks);
+                lane.diff.ids("position", &[t.position as u32], &[st.position as u32]);
+                let now = state_bytes(gpu, &slot.config, &st.kv, &st.dn, st.position)?;
+                state_cmp(&mut lane.diff, "final", &now, t)?;
+            }
+            continue;
+        }
+        let reference = &refs[lane.reference.unwrap()].3;
+        let (start, seed) = prior[i];
+        let max_emit = lane.budget - lane.tr.emitted.len();
+        let kk = max_emit.saturating_sub(1).min(k);
+        let end = start + a.committed_ids.len();
+        if st.position != end || a.committed_position != end {
+            lane.diff.differing_items.push(format!("cycle{}: watermark store {} advance {} expected {end}", lane.tr.cycles.len(), st.position, a.committed_position));
+        }
+        let m = st.mtp.as_ref().ok_or("spec lane has no MTP state")?;
+        let delta_sha256 = cycle_digest(gpu, &slot.config, &st.kv, &st.dn, m, start, end)?;
+        let drafted = a.verified_rows.saturating_sub(1);
+        let class = spec_class(&hipfire_runtime::spec::MtpWindow { committed: a.committed_ids.clone(), accepted: a.accepted_drafts, drafts_generated: drafted });
+        lane.tr.cycles.push(SpecCycle { position: start, seed, k: kk, committed: a.committed_ids.clone(), accepted: a.accepted_drafts, drafted, class, delta_sha256 });
+        lane.tr.emitted.extend_from_slice(&a.committed_ids);
+        lane.tr.position = end;
+        lane.tr.pending_seed = *a.committed_ids.last().ok_or("empty advance")?;
+        if st.pending_seed != Some(lane.tr.pending_seed) {
+            lane.diff.differing_items.push(format!("cycle{}: store pending_seed {:?}", lane.tr.cycles.len() - 1, st.pending_seed));
+        }
+        let stage = format!("first_{class}_cycle{}", lane.tr.cycles.len() - 1);
+        if lane.stop.is_none() && has_stage(reference, &stage) {
+            let now = exec_stage(st, slot, gpu, end)?;
+            stage_check(&mut lane.diff, reference, &stage, now)?;
+        }
+        if a.finish.as_deref() == Some("stop") || a.committed_ids.contains(&eos) {
+            lane.tr.finish = "stop".into();
+        } else if lane.tr.emitted.len() >= lane.budget {
+            lane.tr.finish = "length".into();
+        }
+        lane.done = !lane.tr.finish.is_empty();
+    }
+    Ok(())
+}
+
+/// Final comparison of an executor lane against its reference.
+fn exec_finish(gpu: &Gpu, slot: &ModelSlot, store: &Qwen35VmmStore, refs: &[(usize, usize, u32, SpecTrace)], lane: &mut ExecLane) -> Result<()> {
+    let Some(ri) = lane.reference else { return Ok(()) };
+    let reference = &refs[ri].3;
+    if lane.cancelled || lane.stop.is_some() {
+        // Committed prefix must match the plain reference cycle by cycle.
+        for (c, b) in lane.tr.cycles.iter().enumerate() {
+            match reference.cycles.get(c) {
+                Some(a) => {
+                    lane.diff.ids(&format!("cycle{c}.committed"), &a.committed, &b.committed);
+                    lane.diff.check(&format!("cycle{c}.delta_sha256"), a.delta_sha256.as_bytes(), b.delta_sha256.as_bytes());
+                }
+                None => lane.diff.differing_items.push(format!("cycle{c}: beyond reference")),
+            }
+        }
+        if let Some(stop) = lane.stop {
+            // Finishes on the first window committing `stop`, never earlier.
+            let first = lane.tr.cycles.iter().position(|c| c.committed.contains(&stop));
+            let ok = lane.tr.finish == "stop" && first == Some(lane.tr.cycles.len() - 1);
+            if !ok {
+                lane.diff.differing_items.push(format!("stop {stop}: finish {:?} at cycle {:?} of {}", lane.tr.finish, first, lane.tr.cycles.len()));
+            }
+        }
+        return Ok(());
+    }
+    let st = store.request_state(&lane.epoch).ok_or("lane vanished")?;
+    let now = exec_stage(st, slot, gpu, lane.tr.position)?;
+    stage_check(&mut lane.diff, reference, "final", now)?;
+    let d2 = spec_compare(reference, &lane.tr, &[])?;
+    lane.diff.compared_items += d2.compared_items;
+    lane.diff.compared_bytes += d2.compared_bytes;
+    lane.diff.differing_items.extend(d2.differing_items);
+    Ok(())
+}
+
+/// Executor Verify-row cases. Returns pass.
+#[allow(clippy::too_many_arguments)]
+fn spec_exec_cases(gpu: &mut Gpu, slot: &mut ModelSlot, args: &Args, fx: &[Fixture], refs: &[(usize, usize, u32, SpecTrace)], main_ref: &[usize], eos_ref: &[Option<usize>], clip_ref: &[Option<usize>], ar_refs: &[Trace], head_path: &Path, cap: usize, k: usize, out: &mut Vec<Value>) -> Result<bool> {
+    if let Some(pbs) = slot.scratch.widened_prefill_batch.borrow_mut().take() {
+        pbs.free_gpu(gpu)?;
+    }
+    // The reference/mtp_cb phases freed their owners into the GpuPool free
+    // list; VMM mapping draws on device free memory, so return them first.
+    gpu.drain_pool();
+    let free = free_vram(gpu)?;
+    let budget_kv = free.saturating_sub(6 << 30);
+    eprintln!("spec exec store: width={EXEC_WIDTH} free_vram={free} kv_budget={budget_kv}");
+    let mut store = Qwen35VmmStore::new(gpu, &slot.config, &slot.kv_cache, EXEC_WIDTH, EXEC_WIDTH * (k + 1), budget_kv, VmmRoute::Exact)?;
+    let head = load_mtp_head(head_path, gpu, cap)?;
+    let route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+    let engine = VmmSpecEngine::new(gpu, &slot.config, head, k, EXEC_WIDTH, route)?;
+    if store.install_spec(engine).is_err() {
+        return Err("install_spec refused".into());
+    }
+    let ar_budget = args.steps + 1;
+    let mut pass = true;
+    let mut tag = 70_000u64;
+    let mut case = |gpu: &mut Gpu, slot: &mut ModelSlot, store: &mut Qwen35VmmStore, name: &str, spec: Vec<(usize, Option<u32>)>, ar: Option<usize>, controls: bool| -> Result<bool> {
+        let mut lanes: Vec<ExecLane> = Vec::new();
+        let mut ctl = serde_json::Map::new();
+        let res = (|| -> Result<()> {
+            for (s, &(ri, stop)) in spec.iter().enumerate() {
+                tag += 1;
+                let (fi, budget, _, ref reference) = refs[ri];
+                let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+                let init = VmmRequestInit { prompt_len: fx[fi].prefix, stop_ids: stop.into_iter().collect(), sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+                let o = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, s, init)?;
+                store.admit(o).map_err(|(o, e)| { let _ = o.free_gpu(gpu); e })?;
+                let seed = match store.spec_prefill(gpu, &slot.weights, &slot.config, &slot.scratch, &epoch, &fx[fi].tokens, SpecRequestConfig::default()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        store.retire(&epoch)?.free_gpu(gpu)?;
+                        return Err(e.into());
+                    }
+                };
+                let mut diff = Diff::default();
+                diff.ids("prefill_seed", &[reference.emitted[0]], &[seed]);
+                let st = store.request_state(&epoch).ok_or("lane")?;
+                stage_check(&mut diff, reference, "prefill", exec_stage(st, slot, gpu, fx[fi].prefix)?)?;
+                let tr = SpecTrace { emitted: vec![seed], cycles: vec![], finish: String::new(), position: fx[fi].prefix, pending_seed: seed, states: vec![] };
+                let done = seed == slot.config.eos_token || budget <= 1;
+                lanes.push(ExecLane { epoch, slot: s, reference: Some(ri), ar: None, stop, budget, tr, ar_picks: vec![], fed: 0, diff, done, cancelled: false });
+            }
+            if let Some(ai) = ar {
+                tag += 1;
+                let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+                let init = VmmRequestInit { prompt_len: fx[ai].prefix, stop_ids: vec![], sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+                pin_gdn_frame(&slot.dn_state);
+                let o = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, EXEC_WIDTH - 1, init)?;
+                store.admit(o).map_err(|(o, e)| { let _ = o.free_gpu(gpu); e })?;
+                let tr = SpecTrace { emitted: vec![], cycles: vec![], finish: String::new(), position: 0, pending_seed: 0, states: vec![] };
+                lanes.push(ExecLane { epoch, slot: EXEC_WIDTH - 1, reference: None, ar: Some(ai), stop: None, budget: ar_budget, tr, ar_picks: vec![], fed: 0, diff: Diff::default(), done: false, cancelled: false });
+            }
+            let mut step = 0usize;
+            loop {
+                if controls && step == 3 {
+                    exec_controls(gpu, slot, store, fx, &mut lanes, k, &mut ctl)?;
+                }
+                let plan = exec_plan(store, gpu, slot, fx, &lanes, k, None)?;
+                if plan.requests.is_empty() {
+                    return Ok(());
+                }
+                let prior: Vec<(usize, u32)> = lanes
+                    .iter()
+                    .map(|l| store.request_state(&l.epoch).map_or((0, 0), |s| (s.position, s.pending_seed.unwrap_or(0))))
+                    .collect();
+                let advances = {
+                    let mut ex = store.executor(&slot.weights, &slot.config, &slot.scratch);
+                    ex.provision_step(gpu, &plan)?;
+                    let o = ex.forward_step(gpu, &plan)?;
+                    ex.commit_step(gpu, &plan, o)?
+                };
+                exec_absorb(gpu, slot, store, fx, refs, ar_refs, &mut lanes, &plan, &advances, k, &prior)?;
+                step += 1;
+            }
+        })();
+        let mut rows = Vec::new();
+        let mut ok = res.is_ok();
+        for lane in lanes.iter_mut() {
+            if res.is_ok() && store.request_state(&lane.epoch).is_some() {
+                exec_finish(gpu, slot, store, refs, lane)?;
+            }
+            ok &= lane.diff.exact();
+            rows.push(json!({
+                "slot": lane.slot,
+                "lane": if lane.ar.is_some() { "ar".to_string() } else { fx[refs[lane.reference.unwrap()].0].name() },
+                "stop": lane.stop, "cancelled": lane.cancelled,
+                "finish": if lane.ar.is_some() { json!(if lane.done { "length" } else { "" }) } else { json!(lane.tr.finish) },
+                "picks": if lane.ar.is_some() { lane.ar_picks.len() } else { lane.tr.emitted.len() },
+                "cycles": lane.tr.cycles.len(),
+                "ks_used": lane.tr.cycles.iter().map(|c| c.k).collect::<std::collections::BTreeSet<_>>(),
+                "exact": lane.diff.exact(), "diff": lane.diff.json(),
+            }));
+        }
+        for lane in &lanes {
+            if store.request_state(&lane.epoch).is_some() {
+                store.retire(&lane.epoch)?.free_gpu(gpu)?;
+            }
+        }
+        let ctl_ok = ctl.values().all(|v| v["ok"].as_bool().unwrap_or(true));
+        if controls {
+            ok &= ctl_ok && ctl.len() >= 5;
+        }
+        eprintln!("spec exec {name}: exact={ok}{}", if controls { format!(" controls_ok={ctl_ok}") } else { String::new() });
+        let mut j = json!({"case": name, "exact": ok, "lanes": rows});
+        if controls {
+            j["controls"] = Value::Object(ctl);
+        }
+        if let Err(e) = res {
+            j["error"] = json!(e.to_string());
+        }
+        out.push(j);
+        Ok(ok)
+    };
+    for &kk in &args.ks {
+        let n = kk.min(fx.len()).min(EXEC_WIDTH - 1);
+        let lanes: Vec<(usize, Option<u32>)> = (0..n).map(|i| (main_ref[i], None)).collect();
+        // Mixed AR+MTP: an AR request shares every step (prefill chunks, then AR rows).
+        pass &= case(gpu, slot, &mut store, &format!("exec_k{kk}"), lanes, Some(kk % fx.len()), false)?;
+    }
+    let mixed: Vec<(usize, Option<u32>)> = (0..fx.len().min(EXEC_WIDTH - 1))
+        .map(|i| match i % 3 {
+            0 => eos_ref[i].map_or((main_ref[i], None), |r| (main_ref[i], Some(refs[r].2))),
+            1 => (clip_ref[i].unwrap_or(main_ref[i]), None),
+            _ => (main_ref[i], None),
+        })
+        .collect();
+    pass &= case(gpu, slot, &mut store, "exec_stop_clip_mix", mixed, None, false)?;
+    let ctl_lanes: Vec<(usize, Option<u32>)> = (0..fx.len().min(4)).map(|i| (main_ref[i], None)).collect();
+    pass &= case(gpu, slot, &mut store, "exec_controls", ctl_lanes, Some(0), true)?;
+    store.free_gpu(gpu)?;
+    Ok(pass)
+}
+
+fn ctl_record(map: &mut serde_json::Map<String, Value>, name: &str, ok: bool, detail: Value) {
+    eprintln!("spec exec control {name}: {}", if ok { "OK" } else { "FAIL" });
+    map.insert(name.into(), json!({"ok": ok, "detail": detail}));
+}
+
+/// Executor spec controls on live lanes 0 and 1 (both spec lanes):
+/// stale-epoch provision refused; abort after provision drops the draft and
+/// leaves the lane live (it must stay byte-exact); a forwarded Verify step
+/// committed with a stale epoch or a forged step id is refused; aborting it
+/// (cancel during verify) poisons that lane only, which is then retired.
+fn exec_controls(gpu: &mut Gpu, slot: &mut ModelSlot, store: &mut Qwen35VmmStore, fx: &[Fixture], lanes: &mut [ExecLane], k: usize, map: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let live: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done && lanes[i].ar.is_none()).collect();
+    if live.len() < 2 {
+        ctl_record(map, "setup", false, json!("fewer than two live spec lanes at step 3"));
+        return Ok(());
+    }
+    let (a, b) = (live[0], live[1]);
+    let ex = |store: &mut Qwen35VmmStore, slot: &ModelSlot, gpu: &mut Gpu, plan: &BatchStepPlan| -> std::result::Result<(), String> {
+        store.executor(&slot.weights, &slot.config, &slot.scratch).provision_step(gpu, plan)
+    };
+    // Stale epoch at provision.
+    let mut p = exec_plan(store, gpu, slot, fx, lanes, k, Some(b))?;
+    p.requests[0].epoch.owner_generation += 1;
+    let r = ex(store, slot, gpu, &p);
+    if r.is_ok() {
+        store.abort_step(&p);
+    }
+    ctl_record(map, "neg_stale_epoch_provision", r.is_err(), json!(r.err()));
+    // Abort after provision: drafts dropped, lane b stays live (not poisoned).
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(b))?;
+    let r = ex(store, slot, gpu, &p);
+    store.abort_step(&p);
+    let live_b = store.request_state(&lanes[b].epoch).is_some_and(|s| !s.poisoned);
+    ctl_record(map, "abort_after_provision_keeps_lane", r.is_ok() && live_b, json!({"provision": r.err(), "live": live_b}));
+    // Forwarded Verify step for lane a, then stale commits, then cancel.
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(a))?;
+    let (stale, forged) = {
+        let mut e = store.executor(&slot.weights, &slot.config, &slot.scratch);
+        e.provision_step(gpu, &p)?;
+        let o = e.forward_step(gpu, &p)?;
+        let mut ps = p.clone();
+        ps.requests[0].epoch.owner_generation += 1;
+        let stale = e.commit_step(gpu, &ps, StepOutput { step_id: o.step_id, target_picks: o.target_picks.clone() }).map(|_| ());
+        let forged = e.commit_step(gpu, &p, StepOutput { step_id: o.step_id + 1, target_picks: o.target_picks.clone() }).map(|_| ());
+        (stale, forged)
+    };
+    store.abort_step(&p);
+    ctl_record(map, "neg_stale_epoch_commit", stale.is_err(), json!(stale.err()));
+    ctl_record(map, "neg_forged_step_commit", forged.is_err(), json!(forged.err()));
+    let poisoned_a = store.request_state(&lanes[a].epoch).is_some_and(|s| s.poisoned);
+    let others_ok = lanes.iter().enumerate().filter(|(i, l)| *i != a && !l.done).all(|(_, l)| store.request_state(&l.epoch).is_some_and(|s| !s.poisoned));
+    ctl_record(map, "cancel_during_verify_poisons_only_that_lane", poisoned_a && others_ok, json!({"poisoned": poisoned_a, "others_live": others_ok}));
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(a))?;
+    let r = ex(store, slot, gpu, &p);
+    if r.is_ok() {
+        store.abort_step(&p);
+    }
+    ctl_record(map, "neg_poisoned_provision", r.is_err(), json!(r.err()));
+    store.retire(&lanes[a].epoch)?.free_gpu(gpu)?;
+    lanes[a].cancelled = true;
+    lanes[a].done = true;
+    lanes[a].tr.finish = "cancelled".into();
+    Ok(())
+}
+
+/// One batched lane: which reference it must reproduce, optional retire.
+struct LaneSpec {
+    reference: usize,
+    drop_after: Option<usize>,
+}
+
+struct Lane {
+    rs: Qwen35RequestState,
+    st: MtpSpecState,
+    tr: SpecTrace,
+    history: Vec<u32>,
+    budget: usize,
+    eos: u32,
+    diff: Diff,
+    done: bool,
+    cancelled: bool,
+}
+
+fn stage_check(d: &mut Diff, reference: &SpecTrace, stage: &str, states: Vec<(String, Vec<u8>)>) -> Result<()> {
+    for (name, bytes) in states {
+        let key = format!("{stage}/{name}");
+        match reference.states.iter().find(|(n, _)| *n == key) {
+            Some((_, p)) => d.check(&key, &fs::read(p)?, &bytes),
+            None => d.differing_items.push(format!("{key}: missing in reference")),
+        }
+    }
+    Ok(())
+}
+
+fn has_stage(reference: &SpecTrace, stage: &str) -> bool {
+    reference.states.iter().any(|(n, _)| n.starts_with(&format!("{stage}/")))
+}
+
+/// Open a request lane: private VMM KV + DeltaNet + MTP state, prefilled by
+/// the singleton MTP prompt fill exactly as `Qwen35MtpDrafter::mtp_prefill`
+/// (cold: DN and MTP state reset, greedy request installed).
+fn lane_open(gpu: &mut Gpu, slot: &mut ModelSlot, head: &Qwen35MtpHead, k: usize, f: &Fixture, budget: usize, eos: u32, tag: u64) -> Result<Lane> {
+    let init = VmmRequestInit { prompt_len: f.prefix, stop_ids: vec![], sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+    let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+    let mut rs = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, 0, init)?;
+    std::mem::swap(&mut slot.kv_cache, &mut rs.kv);
+    std::mem::swap(&mut slot.dn_state, &mut rs.dn);
+    let result = (|| -> Result<(MtpSpecState, u32)> {
+        let mut st = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(gpu, slot, head, k, k, MtpKvMode::Q8)?;
+        if let Some(cvs) = head.weights.compressed_vocab_size {
+            st.mtp_scratch.ensure_compressed_logits(gpu, cvs)?;
+            st.ensure_compressed_lm_logits(gpu, cvs)?;
+        }
+        // `apply_request(SpecRequestConfig::default())`: greedy, penalties off.
+        let cfg = SpecRequestConfig::default();
+        st.set_sampling(
+            MtpSamplingConfig {
+                temp: cfg.temp, top_k: cfg.top_k_cut(), top_p: cfg.top_p.min(1.0), min_p: cfg.min_p,
+                repeat_penalty: cfg.repeat_penalty, repeat_window: 0,
+                presence_penalty: cfg.presence_penalty, frequency_penalty: cfg.frequency_penalty,
+            },
+            cfg.rng_seed,
+        );
+        st.penalty = hipfire_runtime::spec_sampling::PenaltyHistory::new(0);
+        slot.dn_state.reset(gpu)?;
+        slot.kv_cache.compact_offset = 0;
+        st.reset(gpu)?;
+        let route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+        prefill_trunk_and_mtp_cache(gpu, slot, head, &mut st, &f.tokens, 0, route)?;
+        gpu.hip.device_synchronize()?;
+        let seed = argmax(&read_dev(gpu, &slot.scratch.logits, 0, slot.config.vocab_size * 4)?)?;
+        Ok((st, seed))
+    })();
+    std::mem::swap(&mut slot.kv_cache, &mut rs.kv);
+    std::mem::swap(&mut slot.dn_state, &mut rs.dn);
+    let (st, seed) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            rs.free_gpu(gpu)?;
+            return Err(e);
+        }
+    };
+    let mut history = f.tokens.clone();
+    history.push(seed);
+    let finish = if seed == eos { "stop".to_string() } else { String::new() };
+    let tr = SpecTrace { emitted: vec![seed], cycles: vec![], finish, position: f.prefix, pending_seed: seed, states: vec![] };
+    let done = !tr.finish.is_empty();
+    Ok(Lane { rs, st, tr, history, budget, eos, diff: Diff::default(), done, cancelled: false })
+}
+
+/// One batched case: open every lane, run shared `mtp_cb_cycle`s until all
+/// finish, compare each lane's windows, ids, per-cycle state digests and
+/// stage state bytes with its isolated singleton reference.
+fn spec_batch_case(gpu: &mut Gpu, slot: &mut ModelSlot, head: &Qwen35MtpHead, k: usize, fx: &[Fixture], refs: &[(usize, usize, u32, SpecTrace)], specs: &[LaneSpec], name: &str) -> Result<(Value, bool)> {
+    let mut lanes: Vec<Lane> = Vec::with_capacity(specs.len());
+    let mut result = (|| -> Result<()> {
+        for (i, s) in specs.iter().enumerate() {
+            let (fi, budget, eos, ref reference) = refs[s.reference];
+            let mut lane = lane_open(gpu, slot, head, k, &fx[fi], budget, eos, 50_000 + i as u64)?;
+            let st = spec_full_state(gpu, &slot.config, &lane.rs.kv, &lane.rs.dn, &lane.st, lane.tr.position)?;
+            stage_check(&mut lane.diff, reference, "prefill", st)?;
+            lanes.push(lane);
+        }
+        let cb = MtpCbScratch::new(gpu, &slot.config, specs.len() * (k + 1))?;
+        let run = (|| -> Result<()> {
+            loop {
+                let active: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done).collect();
+                if active.is_empty() {
+                    return Ok(());
+                }
+                let results = {
+                    let mut cbl: Vec<MtpCbLane> = Vec::with_capacity(active.len());
+                    for lane in lanes.iter_mut().filter(|l| !l.done) {
+                        let max_emit = lane.budget - lane.tr.emitted.len();
+                        let kk = max_emit.saturating_sub(1).min(k);
+                        cbl.push(MtpCbLane {
+                            kv_cache: &mut lane.rs.kv, dn_state: &mut lane.rs.dn, state: &mut lane.st,
+                            cur_pos: lane.tr.position, last_committed: lane.tr.pending_seed,
+                            emitted: &lane.history, eos_token_id: lane.eos, k: kk,
+                        });
+                    }
+                    mtp_cb_cycle(gpu, &slot.weights, &slot.config, &mut slot.scratch, head, &cb, &mut cbl)?.0
+                };
+                for (&i, w) in active.iter().zip(results) {
+                    let lane = &mut lanes[i];
+                    let reference = &refs[specs[i].reference].3;
+                    let max_emit = lane.budget - lane.tr.emitted.len();
+                    let kk = max_emit.saturating_sub(1).min(k);
+                    if w.committed.is_empty() || w.committed.len() > max_emit {
+                        return Err(format!("lane {i}: committed {} with max_emit {max_emit}", w.committed.len()).into());
+                    }
+                    let start = lane.tr.position;
+                    let end = start + w.committed.len();
+                    let class = spec_class(&hipfire_runtime::spec::MtpWindow {
+                        committed: w.committed.clone(), accepted: w.accept_count, drafts_generated: w.drafts_generated,
+                    });
+                    let delta_sha256 = cycle_digest(gpu, &slot.config, &lane.rs.kv, &lane.rs.dn, &lane.st, start, end)?;
+                    lane.tr.cycles.push(SpecCycle {
+                        position: start, seed: lane.tr.pending_seed, k: kk, committed: w.committed.clone(),
+                        accepted: w.accept_count, drafted: w.drafts_generated, class, delta_sha256,
+                    });
+                    lane.tr.emitted.extend_from_slice(&w.committed);
+                    lane.history.extend_from_slice(&w.committed);
+                    lane.tr.position = end;
+                    lane.tr.pending_seed = *w.committed.last().unwrap();
+                    let c = lane.tr.cycles.len() - 1;
+                    let stage = format!("first_{class}_cycle{c}");
+                    if has_stage(reference, &stage) {
+                        let st = spec_full_state(gpu, &slot.config, &lane.rs.kv, &lane.rs.dn, &lane.st, end)?;
+                        stage_check(&mut lane.diff, reference, &stage, st)?;
+                    }
+                    if w.committed.contains(&lane.eos) {
+                        lane.tr.finish = "stop".into();
+                    } else if lane.tr.emitted.len() >= lane.budget {
+                        lane.tr.finish = "length".into();
+                    }
+                    if specs[i].drop_after == Some(lane.tr.cycles.len()) && lane.tr.finish.is_empty() {
+                        lane.cancelled = true;
+                        lane.tr.finish = "cancelled".into();
+                    }
+                    lane.done = !lane.tr.finish.is_empty();
+                }
+            }
+        })();
+        cb.free_gpu(gpu)?;
+        run
+    })();
+    let mut rows = Vec::new();
+    let mut all = true;
+    let mut mixed_k = false;
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let (fi, budget, eos, ref reference) = refs[specs[i].reference];
+        if result.is_ok() && !lane.cancelled {
+            let st = spec_full_state(gpu, &slot.config, &lane.rs.kv, &lane.rs.dn, &lane.st, lane.tr.position)?;
+            stage_check(&mut lane.diff, reference, "final", st)?;
+            let d2 = spec_compare(reference, &lane.tr, &[])?;
+            lane.diff.compared_items += d2.compared_items;
+            lane.diff.compared_bytes += d2.compared_bytes;
+            lane.diff.differing_items.extend(d2.differing_items);
+        } else if lane.cancelled {
+            // Cancelled lane: its committed prefix must still match.
+            let n = lane.tr.cycles.len();
+            for c in 0..n {
+                let (a, b) = (&reference.cycles[c], &lane.tr.cycles[c]);
+                lane.diff.ids(&format!("cycle{c}.committed"), &a.committed, &b.committed);
+                lane.diff.check(&format!("cycle{c}.delta_sha256"), a.delta_sha256.as_bytes(), b.delta_sha256.as_bytes());
+            }
+        }
+        mixed_k |= lane.tr.cycles.iter().any(|c| c.k < k);
+        let exact = lane.diff.exact();
+        all &= exact;
+        rows.push(json!({
+            "lane": i, "fixture": fx[fi].name(), "budget": budget, "eos": eos, "cancelled": lane.cancelled,
+            "finish": lane.tr.finish, "picks": lane.tr.emitted.len(), "cycles": lane.tr.cycles.len(),
+            "ks_used": lane.tr.cycles.iter().map(|c| c.k).collect::<std::collections::BTreeSet<_>>(),
+            "classes": spec_trace_json(&lane.tr)["classes"], "exact": exact, "diff": lane.diff.json(),
+        }));
+    }
+    for lane in lanes {
+        lane.st.free_gpu(gpu);
+        if let Err(e) = lane.rs.free_gpu(gpu) {
+            result = result.and(Err(e.into()));
+        }
+    }
+    let ok = result.is_ok() && all;
+    let mut j = json!({"case": name, "lanes": specs.len(), "exact": ok, "mixed_k": mixed_k, "requests": rows});
+    if let Err(e) = result {
+        j["error"] = json!(e.to_string());
+    }
+    Ok((j, ok))
+}
+
+// ── DFlash Gate 0: one-window replay probe ───────────────────────────
+//
+// Question answered: is a DFlash chain-verify window, replayed as 1..4 lanes of
+// ONE shared multi-request trunk forward (ChainVerify fusion, per-lane hidden
+// ring + tape) + ONE shared head + the extracted greedy accept consumer,
+// byte-identical (verify rows, KV rows, DeltaNet, tape, ring, draft state,
+// committed ids) to the isolated singleton `DflashSpeculator` window?
+//
+// Every lane's pre-window state is produced by the SAME deterministic
+// singleton trajectory (prefill + `--dflash-probe-window` full windows) on
+// that lane's own VMM KV/DeltaNet, then its draft owners are moved out with
+// `take_vmm_lane`/`from_snapshot`. The pre-window bytes of every lane are
+// compared with a separately produced reference trajectory (determinism +
+// lossless-transfer check) before the window is replayed.
+
+type Named = Vec<(String, Vec<u8>)>;
+type Frozen = Vec<(String, PathBuf)>;
+
+/// Output budget of the full windows that precede the probed one (a full
+/// block, no budget clamp).
+const PRE_WINDOW_EMIT: usize = 1 << 20;
+
+fn le_u64s(v: &[u64]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Device read that tolerates zero-length spans.
+fn rd(gpu: &Gpu, t: &GpuTensor, offset: usize, bytes: usize) -> Result<Vec<u8>> {
+    if bytes == 0 {
+        return Ok(Vec::new());
+    }
+    read_dev(gpu, t, offset, bytes)
+}
+
+fn art_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
+}
+
+fn freeze(dir: &Path, set: &Named) -> Result<Frozen> {
+    let mut out = Vec::with_capacity(set.len());
+    for (name, bytes) in set {
+        let p = dir.join(format!("{}.bin", art_name(name)));
+        write_art(&p, bytes)?;
+        out.push((name.clone(), p));
+    }
+    Ok(out)
+}
+
+/// Byte-compare `cand` against the frozen reference arrays (both directions:
+/// an array present on one side only is a difference).
+fn cmp_frozen(d: &mut Diff, stage: &str, frozen: &Frozen, cand: &Named) -> Result<()> {
+    for (name, bytes) in cand {
+        let key = format!("{stage}/{name}");
+        match frozen.iter().find(|(n, _)| n == name) {
+            Some((_, p)) => d.check(&key, &fs::read(p)?, bytes),
+            None => d.differing_items.push(format!("{key}: missing in reference")),
+        }
+    }
+    for (name, _) in frozen {
+        if !cand.iter().any(|(n, _)| n == name) {
+            d.differing_items.push(format!("{stage}/{name}: missing in candidate"));
+        }
+    }
+    Ok(())
+}
+
+/// Live span of a draft context ring: the last `min(rows, modulus)` rows
+/// ending at `rows`, in logical order (slot = row % modulus; identity when
+/// `modulus == usize::MAX`). Empty when the tensor cannot hold the span
+/// (an unused allocation).
+fn ring_span(gpu: &Gpu, t: &GpuTensor, row_bytes: usize, rows: usize, modulus: usize) -> Result<Vec<u8>> {
+    let start = rows.saturating_sub(modulus);
+    if t.buf.size() < rows.min(modulus) * row_bytes {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity((rows - start) * row_bytes);
+    for (_row0, slot0, len) in ring_segments(start, rows, modulus) {
+        out.extend(rd(gpu, t, slot0 * row_bytes, len * row_bytes)?);
+    }
+    Ok(out)
+}
+
+/// Lane/singleton draft + ring state that survives between windows: hidden
+/// ring cursors and live rows in logical order, `TargetHiddenLog` cursors and
+/// absolute positions, valid spans of the draft context rings
+/// (`target_hidden`, projection, per-layer K/V, windowed full-layer K/V),
+/// host-shadow length, and checkpoint positions. Never the unwritten parts of
+/// an allocation.
+fn df_arrays(gpu: &Gpu, df: &DflashState, ckpt: &[usize]) -> Result<Named> {
+    gpu.hip.device_synchronize()?;
+    let mut out: Named = Vec::new();
+    let rb = &df.hidden_rb;
+    let live = rb.written.min(rb.max_positions);
+    out.push(("ring.cursors".into(), le_u64s(&[rb.head as u64, rb.written as u64, live as u64, rb.max_positions as u64])));
+    let row = rb.hidden_dim * 4;
+    let s = (rb.head + rb.max_positions - live) % rb.max_positions;
+    let first = live.min(rb.max_positions - s);
+    for (i, t) in rb.layer_bufs.iter().enumerate() {
+        let mut v = rd(gpu, t, s * row, first * row)?;
+        v.extend(rd(gpu, t, 0, (live - first) * row)?);
+        out.push((format!("ring.L{:02}", rb.extract_layers[i]), v));
+    }
+    let sc = &df.draft_scratch;
+    let th = &sc.thlog;
+    let (uploaded, proj, full) = (th.uploaded_rows(), th.proj_cached_rows(), th.full_cached_rows());
+    out.push(("thlog.cursors".into(), le_u64s(&[uploaded as u64, proj as u64, full as u64])));
+    out.push(("thlog.abs_positions".into(), th.abs_positions().iter().flat_map(|p| p.to_le_bytes()).collect()));
+    let (w, wf) = match sc.ctx_mode {
+        DraftCtxMode::Legacy => (usize::MAX, usize::MAX),
+        DraftCtxMode::Windowed { w, w_full } => (w, w_full),
+    };
+    let (h, ne, kvd) = (df.draft_config.hidden, df.draft_config.num_extract(), df.draft_config.kv_dim());
+    out.push(("draft.target_hidden".into(), ring_span(gpu, &sc.target_hidden, ne * h * 4, uploaded, w)?));
+    out.push(("draft.target_hidden_proj".into(), ring_span(gpu, &sc.target_hidden_proj, h * 4, proj, w)?));
+    let n_l = sc.k_ctx_cached.len();
+    for l in 0..n_l {
+        // Windowed mode: the last layer's K/V live in the full-layer rings.
+        if sc.k_full_cached.is_some() && l + 1 == n_l {
+            continue;
+        }
+        out.push((format!("draft.k_ctx.L{l:02}"), ring_span(gpu, &sc.k_ctx_cached[l], kvd * 4, proj, w)?));
+        out.push((format!("draft.v_ctx.L{l:02}"), ring_span(gpu, &sc.v_ctx_cached[l], kvd * 4, proj, w)?));
+    }
+    if let (Some(k), Some(v)) = (&sc.k_full_cached, &sc.v_full_cached) {
+        out.push(("draft.k_full".into(), ring_span(gpu, k, kvd * 4, full, wf)?));
+        out.push(("draft.v_full".into(), ring_span(gpu, v, kvd * 4, full, wf)?));
+    }
+    out.push(("draft.sizes".into(), le_u64s(&[df.target_hidden_host.len() as u64, df.ctx_capacity as u64, df.block_size as u64])));
+    out.push(("checkpoints.positions".into(), le_u64s(&ckpt.iter().map(|&p| p as u64).collect::<Vec<_>>())));
+    Ok(out)
+}
+
+/// Per-window arrays that survive the accept: the verify post-norm hidden and
+/// logits rows, packed argmax, ring staging rows of the actual `b`, every
+/// tape layer's qkv/alpha/beta rows, and every KV row the verify wrote
+/// (`[pos, pos+b)`, including the rejected tail).
+fn window_arrays(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, df: &DflashState, pos: usize, b: usize) -> Result<Named> {
+    gpu.hip.device_synchronize()?;
+    let (dim, vocab) = (config.dim, config.vocab_size);
+    let vs = &df.verify_scratch;
+    let mut out: Named = vec![
+        ("verify.final_hidden".into(), rd(gpu, &vs.final_hidden, 0, b * dim * 4)?),
+        ("verify.logits".into(), rd(gpu, &vs.logits, 0, b * vocab * 4)?),
+        ("verify.argmax".into(), rd(gpu, &vs.argmax, 0, b * 4)?),
+    ];
+    let rb = &df.hidden_rb;
+    for (i, t) in rb.staging_bufs.iter().enumerate() {
+        out.push((format!("ring.staging.L{:02}", rb.extract_layers[i]), rd(gpu, t, 0, b * rb.hidden_dim * 4)?));
+    }
+    let tp = &df.gdn_tape;
+    for i in 0..tp.qkv_bufs.len() {
+        out.push((format!("tape.{i:02}.qkv"), rd(gpu, &tp.qkv_bufs[i], 0, b * tp.qkv_dim * 4)?));
+        out.push((format!("tape.{i:02}.alpha"), rd(gpu, &tp.alpha_bufs[i], 0, b * tp.n_v_heads * 4)?));
+        out.push((format!("tape.{i:02}.beta"), rd(gpu, &tp.beta_bufs[i], 0, b * tp.n_v_heads * 4)?));
+    }
+    let (kr, vr) = kv_row_bytes(kv)?;
+    for (layer, ty) in config.layer_types.iter().enumerate() {
+        if *ty == LayerType::FullAttention {
+            out.push((format!("kv_verify.L{layer:02}.k"), rd(gpu, &kv.k_gpu[layer], pos * kr, b * kr)?));
+            out.push((format!("kv_verify.L{layer:02}.v"), rd(gpu, &kv.v_gpu[layer], pos * vr, b * vr)?));
+        }
+    }
+    Ok(out)
+}
+
+/// Committed target state at `rows` plus the lane's draft/ring state.
+fn full_state(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState, lane: &DflashVmmLaneState, rows: usize) -> Result<Named> {
+    let mut v = state_bytes(gpu, config, kv, dn, rows)?;
+    let ck: Vec<usize> = lane.checkpoints.iter().map(|(p, _)| *p).collect();
+    v.extend(df_arrays(gpu, &lane.df, &ck)?);
+    Ok(v)
+}
+
+/// State a refused shared trunk must leave untouched: the committed target
+/// prefix + DeltaNet and the lane's hidden ring (the draft owners already ran
+/// their own draft before the refusal, so they are excluded).
+fn refusal_state(gpu: &Gpu, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState, lane: &DflashVmmLaneState, rows: usize) -> Result<Named> {
+    let mut v = state_bytes(gpu, config, kv, dn, rows)?;
+    let ck: Vec<usize> = Vec::new();
+    v.extend(df_arrays(gpu, &lane.df, &ck)?.into_iter().filter(|(n, _)| n.starts_with("ring.")));
+    Ok(v)
+}
+
+fn dflash_of(d: &mut Box<dyn Speculator>) -> Result<&mut DflashSpeculator> {
+    let any = d.drafter_any_mut().ok_or("speculator exposes no concrete drafter (not DFlash?)")?;
+    any.downcast_mut::<DflashSpeculator>().ok_or_else(|| Box::<dyn Error>::from("speculator is not a DflashSpeculator"))
+}
+
+struct G0Cfg {
+    /// Full windows run before the probed window.
+    windows: usize,
+    /// Configured (full) block size of the loaded draft.
+    block: usize,
+    dir: PathBuf,
+}
+
+struct Walked {
+    position: usize,
+    seed: u32,
+    history: Vec<u32>,
+}
+
+/// The singleton trajectory: cold prefill through the production
+/// `Speculator::prefill`, then `windows` full-block `Speculator::step`s.
+fn dflash_walk(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, f: &Fixture, windows: usize) -> Result<Walked> {
+    // `DeltaNetSnapshot` copies by tensor allocation size (`save_from`: src
+    // size, `restore_to`: snapshot size), so its buffers must be exactly the
+    // sizes of the DeltaNet that runs. A fresh request DN's pooled tensors can
+    // be larger than the resident one's (`Qwen35RequestState::copy_dn_from`
+    // documents it): re-size the speculator's live state from the DN about
+    // to run by moving it out and back (`take_vmm_lane` allocates its
+    // replacement from the `dn` passed) and dropping the moved-out copy.
+    let resized = dflash_of(d)?.take_vmm_lane(gpu, &slot.config, &slot.dn_state, 0)?;
+    resized.free_gpu(gpu);
+    d.configure_request(SpecRequestConfig::default());
+    slot.dn_state.reset(gpu)?;
+    slot.kv_cache.compact_offset = 0;
+    pin_gdn_frame(&slot.dn_state);
+    let first = match d.prefill(gpu, &mut *slot, &f.tokens, &f.tokens, 0, false, None, &|| false)? {
+        PrefillOutcome::Ready { first_token } => first_token,
+        PrefillOutcome::Aborted => return Err("DFlash prefill aborted".into()),
+    };
+    let mut history = f.tokens.clone();
+    history.push(first);
+    let (mut position, mut seed) = (f.prefix, first);
+    for _ in 0..windows {
+        let s = d.step(gpu, &mut *slot, position, seed, &history, None, 0.0, PRE_WINDOW_EMIT)?;
+        history.extend_from_slice(&s.emit);
+        position += s.emit.len();
+        seed = s.next_seed;
+    }
+    Ok(Walked { position, seed, history })
+}
+
+/// Move the speculator's live draft owners out as a lane (`take_vmm_lane` +
+/// `from_snapshot`); returns the lane and the snapshot's reported rows.
+fn take_lane(gpu: &mut Gpu, slot: &ModelSlot, d: &mut Box<dyn Speculator>, position: usize) -> Result<(DflashVmmLaneState, usize)> {
+    let snap = dflash_of(d)?.take_vmm_lane(gpu, &slot.config, &slot.dn_state, position)?;
+    let rows = snap.rows();
+    Ok((DflashVmmLaneState::from_snapshot(snap), rows))
+}
+
+fn ctx_mode_str(df: &DflashState) -> String {
+    match df.draft_scratch.ctx_mode {
+        DraftCtxMode::Legacy => "Legacy".into(),
+        DraftCtxMode::Windowed { w, w_full } => format!("Windowed w={w} w_full={w_full}"),
+    }
+}
+
+/// Frozen pre-window bytes of one fixture's singleton trajectory.
+struct PreRef {
+    frozen: Frozen,
+    position: usize,
+    seed: u32,
+    rows: usize,
+    ctx_mode: String,
+}
+
+/// Frozen outputs of the isolated singleton probed window of `(fixture, E)`.
+struct PostRef {
+    frozen: Frozen,
+    position: usize,
+    seed: u32,
+    b: usize,
+    emit: Vec<u32>,
+    next_seed: u32,
+    accepted: usize,
+    proposed: usize,
+    new_pos: usize,
+    step_ms: f64,
+    /// Verify route the singleton took (`graph_replay`/`graph_capture`/`eager_warmup`; graph path only when HIPFIRE_VERIFY_GRAPH admits it).
+    route_hint: &'static str,
+}
+
+#[derive(Default)]
+struct G0Refs {
+    pre: std::collections::HashMap<usize, PreRef>,
+    post: std::collections::HashMap<(usize, usize), PostRef>,
+    draft: std::collections::HashMap<usize, DraftRef>,
+}
+
+fn ensure_pre(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, fi: usize) -> Result<()> {
+    if refs.pre.contains_key(&fi) {
+        return Ok(());
+    }
+    eprintln!("gate0 trace: ref_pre walk {}", fx[fi].name());
+    let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
+    let (lane, rows) = take_lane(gpu, slot, d, w.position)?;
+    let set = full_state(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, &lane, w.position);
+    let ctx_mode = ctx_mode_str(&lane.df);
+    lane.free_gpu(gpu);
+    let frozen = freeze(&cfg.dir.join(format!("ref_pre_{}", fx[fi].name())), &set?)?;
+    refs.pre.insert(fi, PreRef { frozen, position: w.position, seed: w.seed, rows, ctx_mode });
+    Ok(())
+}
+
+fn ensure_post(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, fi: usize, e: usize) -> Result<()> {
+    if refs.post.contains_key(&(fi, e)) {
+        return Ok(());
+    }
+    eprintln!("gate0 trace: ref_post walk {} e={e}", fx[fi].name());
+    let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
+    let b = cfg.block.min(e.max(2));
+    // Which verify body the singleton takes for this window (graph cache is
+    // empty after every `take_vmm_lane`, so this is deterministic in N).
+    let route_hint = if gpu.graphs.verify_has_graph(b) {
+        "graph_replay"
+    } else if gpu.graphs.verify_needs_warmup(b) {
+        "eager_warmup"
+    } else {
+        "graph_capture"
+    };
+    let t0 = std::time::Instant::now();
+    let s = d.step(gpu, &mut *slot, w.position, w.seed, &w.history, None, 0.0, e)?;
+    gpu.hip.device_synchronize()?;
+    let step_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let new_pos = w.position + s.emit.len();
+    // Target side (singleton owners) before the draft owners move out.
+    let mut set = state_bytes(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, new_pos)?;
+    let (lane, _rows) = take_lane(gpu, slot, d, new_pos)?;
+    let df_set = (|| -> Result<Named> {
+        let ck: Vec<usize> = lane.checkpoints.iter().map(|(p, _)| *p).collect();
+        let mut v = df_arrays(gpu, &lane.df, &ck)?;
+        v.extend(window_arrays(gpu, &slot.config, &slot.kv_cache, &lane.df, w.position, b)?);
+        Ok(v)
+    })();
+    lane.free_gpu(gpu);
+    set.extend(df_set?);
+    let frozen = freeze(&cfg.dir.join(format!("ref_post_{}_e{e}", fx[fi].name())), &set)?;
+    refs.post.insert(
+        (fi, e),
+        PostRef {
+            frozen,
+            position: w.position,
+            seed: w.seed,
+            b,
+            emit: s.emit.to_vec(),
+            next_seed: s.next_seed,
+            accepted: s.accepted,
+            proposed: s.proposed,
+            new_pos,
+            step_ms,
+            route_hint,
+        },
+    );
+    Ok(())
+}
+
+/// One batched lane between open and compare.
+struct LaneRun {
+    fi: usize,
+    e: usize,
+    b: usize,
+    rs: Qwen35RequestState,
+    lane: DflashVmmLaneState,
+    position: usize,
+    seed: u32,
+    draft: Option<DflashCbDraft>,
+    snapshot_rows: usize,
+    pre_diff: Diff,
+    post_diff: Diff,
+}
+
+/// Open a lane: its own VMM KV/DeltaNet runs the singleton trajectory to the
+/// pre-window state; the draft owners are then moved out into the lane. The
+/// pre-window bytes are compared with the fixture's frozen reference.
+#[allow(clippy::too_many_arguments)]
+fn g0_lane_open(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &G0Refs, fi: usize, e: usize, tag: u64) -> Result<LaneRun> {
+    let f = &fx[fi];
+    let init = VmmRequestInit { prompt_len: f.prefix, stop_ids: vec![], sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+    let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+    let mut rs = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, 0, init)?;
+    std::mem::swap(&mut slot.kv_cache, &mut rs.kv);
+    std::mem::swap(&mut slot.dn_state, &mut rs.dn);
+    {
+        let all = |dn: &DeltaNetState| -> Vec<usize> {
+            dn.s_matrices.iter().chain(&dn.s_scales).chain(&dn.conv_states).chain(&dn.s_ef_residual).map(|t| t.buf.size()).collect()
+        };
+        // After the swap above: slot.dn_state is the request owner, rs.dn the resident native one.
+        let (nat, req) = (all(&rs.dn), all(&slot.dn_state));
+        let bad: Vec<(usize, usize, usize)> = nat.iter().zip(&req).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, b))| (i, *a, *b)).collect();
+        eprintln!("gate0 trace: DN tensors native={} request={} mismatching(idx,native,request)={:?}", nat.len(), req.len(), &bad[..bad.len().min(8)]);
+    }
+    eprintln!("gate0 trace: lane walk {} (request-owned KV/DN swapped in)", f.name());
+    let walked = dflash_walk(gpu, slot, d, f, cfg.windows);
+    std::mem::swap(&mut slot.kv_cache, &mut rs.kv);
+    std::mem::swap(&mut slot.dn_state, &mut rs.dn);
+    let w = match walked {
+        Ok(w) => w,
+        Err(err) => {
+            rs.free_gpu(gpu)?;
+            return Err(err);
+        }
+    };
+    // The lane moves out with the singleton's NATIVE DeltaNet sizing: every
+    // replacement state `take_vmm_lane` allocates is sized from the `dn`
+    // passed here, so the resident `slot.dn_state` (not the swapped request
+    // owner) keeps all trajectories' snapshots interchangeable.
+    let (lane, snapshot_rows) = match take_lane(gpu, slot, d, w.position) {
+        Ok(v) => v,
+        Err(err) => {
+            rs.free_gpu(gpu)?;
+            return Err(err);
+        }
+    };
+    let pre_set = match full_state(gpu, &slot.config, &rs.kv, &rs.dn, &lane, w.position) {
+        Ok(v) => v,
+        Err(err) => {
+            lane.free_gpu(gpu);
+            rs.free_gpu(gpu)?;
+            return Err(err);
+        }
+    };
+    let pr = &refs.pre[&fi];
+    let mut pre_diff = Diff::default();
+    pre_diff.ids("pre.position_seed_rows", &[pr.position as u32, pr.seed, pr.rows as u32], &[w.position as u32, w.seed, snapshot_rows as u32]);
+    if let Err(err) = cmp_frozen(&mut pre_diff, "pre", &pr.frozen, &pre_set) {
+        lane.free_gpu(gpu);
+        rs.free_gpu(gpu)?;
+        return Err(err);
+    }
+    Ok(LaneRun {
+        fi,
+        e,
+        b: cfg.block.min(e.max(2)),
+        rs,
+        lane,
+        position: w.position,
+        seed: w.seed,
+        draft: None,
+        snapshot_rows,
+        pre_diff,
+        post_diff: Diff::default(),
+    })
+}
+
+fn free_lanes(gpu: &mut Gpu, lanes: Vec<LaneRun>) -> Result<()> {
+    let mut res = Ok(());
+    for l in lanes {
+        l.lane.free_gpu(gpu);
+        if let Err(e) = l.rs.free_gpu(gpu) {
+            res = Err(e.into());
+        }
+    }
+    res
+}
+
+struct WindowOut {
+    /// `Some(reason)` when the shared trunk refused before launching.
+    refused: Option<String>,
+    results: Vec<hipfire_arch_qwen35::speculative::SpecStepResult>,
+    ms: f64,
+}
+
+/// Replay one window as lanes of one shared trunk: per-lane singleton draft
+/// and pre-verify DeltaNet snapshot, ONE `forward_prefill_batch_multi`
+/// (per-lane fusion/ring/tape), ONE shared head, picks and rows copied into
+/// each lane's own verify scratch, then the per-lane greedy accept consumer.
+fn dflash_window(
+    gpu: &mut Gpu,
+    slot: &ModelSlot,
+    lanes: &mut [LaneRun],
+    vs: &VerifyScratch,
+    mc: &MultiChunkScratch,
+    fusion: qwen35::DflashFusionCtx,
+) -> Result<WindowOut> {
+    let (dim, vocab) = (slot.config.dim, slot.config.vocab_size);
+    for l in lanes.iter_mut() {
+        let mark = l.lane.df.draft_scratch.thlog.mark();
+        let compact = l.rs.kv.compact_offset as i32;
+        let drafted = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut l.lane.df, l.position, l.seed, l.b)?;
+        // The singleton saves the pre-verify DeltaNet state right after the draft.
+        l.lane.df.target_snap.save_from(&l.rs.dn, gpu)?;
+        l.draft = Some(DflashCbDraft { position: l.position, seed: l.seed, verify_tokens: drafted, max_accept: l.e - 1, thlog_mark: mark });
+    }
+    gpu.hip.device_synchronize()?;
+    let t0 = std::time::Instant::now();
+    let fw = {
+        let mut reqs: Vec<MultiChunkRequest<'_>> = Vec::with_capacity(lanes.len());
+        for l in lanes.iter_mut() {
+            let LaneRun { rs, lane, draft, position, .. } = l;
+            let tokens: &[u32] = &draft.as_ref().ok_or("lane not drafted")?.verify_tokens;
+            reqs.push(MultiChunkRequest {
+                tokens,
+                start_pos: *position,
+                kv_cache: &mut rs.kv,
+                dn_state: &mut rs.dn,
+                gdn_tape: Some(&lane.df.gdn_tape),
+                fusion,
+                hidden_rb: Some(&mut lane.df.hidden_rb),
+            });
+        }
+        forward_prefill_batch_multi(gpu, &slot.weights, &slot.config, &slot.scratch, mc, &mut reqs, Some(&vs.final_hidden))
+    };
+    if let Err(e) = fw {
+        return Ok(WindowOut { refused: Some(e.to_string()), results: vec![], ms: 0.0 });
+    }
+    let total: usize = lanes.iter().map(|l| l.b).sum();
+    let picks = dflash_cb_head_argmax(gpu, &slot.weights, &slot.config, vs, total)?;
+    let mut row = 0usize;
+    for l in lanes.iter() {
+        let v = &l.lane.df.verify_scratch;
+        gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &vs.final_hidden.buf, row * dim * 4, l.b * dim * 4)?;
+        gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &vs.logits.buf, row * vocab * 4, l.b * vocab * 4)?;
+        gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &vs.argmax.buf, row * 4, l.b * 4)?;
+        row += l.b;
+    }
+    let mut results = Vec::with_capacity(lanes.len());
+    let mut row = 0usize;
+    for l in lanes.iter_mut() {
+        let verified = DflashVerifyOutput { argmax_per_pos: picks[row..row + l.b].to_vec(), logits_per_pos: Vec::new() };
+        row += l.b;
+        let mut tp = DflashTargetParts { weights: &slot.weights, config: &slot.config, kv_cache: &mut l.rs.kv, dn_state: &mut l.rs.dn, scratch: &slot.scratch };
+        let draft = l.draft.as_ref().ok_or("lane not drafted")?;
+        results.push(dflash_greedy_accept_commit_parts(gpu, &mut tp, &mut l.lane.df, draft, &verified)?);
+    }
+    gpu.hip.device_synchronize()?;
+    Ok(WindowOut { refused: None, results, ms: t0.elapsed().as_secs_f64() * 1e3 })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum G0Expect {
+    /// Must reproduce every singleton byte.
+    Exact,
+    /// The shared trunk must refuse before mutating any lane.
+    Refused,
+    /// Diagnostic only (e.g. the Off-fusion transplant the plan abandons).
+    Info,
+}
+
+fn class_of(accepted: usize, b: usize) -> &'static str {
+    if accepted == 0 {
+        "zero"
+    } else if accepted + 1 == b {
+        "full"
+    } else {
+        "partial"
+    }
+}
+
+/// One Gate 0 case: lanes `(fixture, E)` replayed together. Returns the case
+/// receipt and whether it met its expectation.
+#[allow(clippy::too_many_arguments)]
+fn g0_case(
+    gpu: &mut Gpu,
+    slot: &mut ModelSlot,
+    d: &mut Box<dyn Speculator>,
+    cfg: &G0Cfg,
+    fx: &[Fixture],
+    refs: &mut G0Refs,
+    vs: &VerifyScratch,
+    mc: &MultiChunkScratch,
+    name: &str,
+    specs: &[(usize, usize)],
+    fusion: qwen35::DflashFusionCtx,
+    expect: G0Expect,
+) -> Result<(Value, bool)> {
+    let t0 = std::time::Instant::now();
+    for &(fi, e) in specs {
+        ensure_pre(gpu, slot, d, cfg, fx, refs, fi)?;
+        if expect != G0Expect::Refused {
+            ensure_post(gpu, slot, d, cfg, fx, refs, fi, e)?;
+        }
+    }
+    let mut lanes: Vec<LaneRun> = Vec::with_capacity(specs.len());
+    let mut open_err = None;
+    for (i, &(fi, e)) in specs.iter().enumerate() {
+        match g0_lane_open(gpu, slot, d, cfg, fx, refs, fi, e, 70_000 + i as u64) {
+            Ok(l) => lanes.push(l),
+            Err(err) => {
+                open_err = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = open_err {
+        free_lanes(gpu, lanes)?;
+        return Err(err);
+    }
+    let rows_total: usize = lanes.iter().map(|l| l.b).sum();
+    let mut refusal_unchanged: Option<Diff> = None;
+    let body = (|| -> Result<WindowOut> {
+        // State a refused trunk must leave untouched (target + ring/draft).
+        let before: Vec<Named> = if expect == G0Expect::Refused {
+            let mut v = Vec::new();
+            for l in &lanes {
+                v.push(refusal_state(gpu, &slot.config, &l.rs.kv, &l.rs.dn, &l.lane, l.position)?);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        let out = dflash_window(gpu, slot, &mut lanes, vs, mc, fusion)?;
+        if expect == G0Expect::Refused && out.refused.is_some() {
+            let mut dd = Diff::default();
+            for (i, l) in lanes.iter().enumerate() {
+                let after = refusal_state(gpu, &slot.config, &l.rs.kv, &l.rs.dn, &l.lane, l.position)?;
+                for ((na, ba), (_, bb)) in before[i].iter().zip(&after) {
+                    dd.check(&format!("lane{i}/{na}"), ba, bb);
+                }
+            }
+            refusal_unchanged = Some(dd);
+        }
+        Ok(out)
+    })();
+    let mut lane_json = Vec::new();
+    let mut exact = true;
+    let mut note = None;
+    let mut refused = None;
+    let mut ms = 0.0;
+    let mut err_text = None;
+    match body {
+        Ok(out) => {
+            refused = out.refused.clone();
+            ms = out.ms;
+            if out.refused.is_none() {
+                for (i, l) in lanes.iter_mut().enumerate() {
+                    let r = &out.results[i];
+                    let pr = &refs.post[&(l.fi, l.e)];
+                    let new_pos = l.position + r.accepted + 1;
+                    let mut ref_committed = vec![pr.seed];
+                    ref_committed.extend_from_slice(&pr.emit);
+                    l.post_diff.ids("committed", &ref_committed, &r.committed);
+                    l.post_diff.ids(
+                        "window",
+                        &[pr.accepted as u32, pr.next_seed, pr.b as u32, pr.new_pos as u32, pr.position as u32],
+                        &[r.accepted as u32, r.bonus_token, l.b as u32, new_pos as u32, l.position as u32],
+                    );
+                    let post = (|| -> Result<Named> {
+                        let mut v = full_state(gpu, &slot.config, &l.rs.kv, &l.rs.dn, &l.lane, new_pos)?;
+                        v.extend(window_arrays(gpu, &slot.config, &l.rs.kv, &l.lane.df, l.position, l.b)?);
+                        Ok(v)
+                    })();
+                    match post {
+                        Ok(post) => {
+                            if let Err(e) = cmp_frozen(&mut l.post_diff, "post", &pr.frozen, &post) {
+                                err_text = Some(e.to_string());
+                            }
+                        }
+                        Err(e) => err_text = Some(e.to_string()),
+                    }
+                    lane_json.push(json!({
+                        "lane": i, "fixture": fx[l.fi].name(), "prefix": fx[l.fi].prefix, "e": l.e, "b": l.b,
+                        "position": l.position, "accepted": r.accepted, "class": class_of(r.accepted, l.b),
+                        "snapshot_rows": l.snapshot_rows, "ref_proposed": pr.proposed, "ref_step_ms": pr.step_ms, "singleton_verify_route_hint": pr.route_hint,
+                        "pre": l.pre_diff.json(), "post": l.post_diff.json(),
+                    }));
+                    println!(
+                        "gate0 {name} lane{i} {} E={} B={} accepted={} class={} pre_diffs={} post_diffs={} (route {})",
+                        fx[l.fi].name(), l.e, l.b, r.accepted, class_of(r.accepted, l.b),
+                        l.pre_diff.differing_items.len(), l.post_diff.differing_items.len(), pr.route_hint
+                    );
+                    for it in l.pre_diff.differing_items.iter().chain(l.post_diff.differing_items.iter()).take(60) {
+                        println!("gate0 {name} lane{i} DIFF {it}");
+                    }
+                    exact &= l.pre_diff.exact() && l.post_diff.exact();
+                }
+            } else {
+                for (i, l) in lanes.iter().enumerate() {
+                    lane_json.push(json!({
+                        "lane": i, "fixture": fx[l.fi].name(), "e": l.e, "b": l.b, "pre": l.pre_diff.json(),
+                    }));
+                    exact &= l.pre_diff.exact();
+                }
+            }
+        }
+        Err(e) => {
+            err_text = Some(e.to_string());
+            exact = false;
+        }
+    }
+    let unchanged = refusal_unchanged.as_ref().map(|d| d.exact());
+    let ok = err_text.is_none()
+        && match expect {
+            G0Expect::Exact => refused.is_none() && exact,
+            G0Expect::Refused => refused.is_some() && unchanged == Some(true) && lanes.iter().all(|l| l.pre_diff.exact()),
+            G0Expect::Info => true,
+        };
+    if expect == G0Expect::Info {
+        note = Some("diagnostic only: Off-fusion transplant is expected to differ on gfx1201 (plan Gate 0); result does not gate");
+    }
+    free_lanes(gpu, lanes)?;
+    eprintln!(
+        "gate0 case {name}: rows={rows_total} fusion={fusion:?} expect={} refused={} exact={exact} -> {}",
+        match expect { G0Expect::Exact => "exact", G0Expect::Refused => "refused", G0Expect::Info => "info" },
+        refused.is_some(),
+        if ok { "OK" } else { "FAIL" }
+    );
+    let j = json!({
+        "case": name,
+        "rows_total": rows_total,
+        "fusion": format!("{fusion:?}"),
+        "expect": match expect { G0Expect::Exact => "exact", G0Expect::Refused => "refused", G0Expect::Info => "info" },
+        "refused": refused,
+        "refusal_state_unchanged": refusal_unchanged.as_ref().map(|d| d.json()),
+        "exact": exact,
+        "ok": ok,
+        "note": note,
+        "error": err_text,
+        "shared_window_ms": ms,
+        "case_wall_s": t0.elapsed().as_secs_f64(),
+        "lanes": lane_json,
+    });
+    Ok((j, ok))
+}
+
+/// Frozen singleton draft of one fixture's pre-window state: the drafted
+/// `[seed, candidates..]` tokens and the lane's draft/ring state right after
+/// the isolated `dflash_lane_draft` (K/V rings, projection cache, thlog).
+struct DraftRef {
+    frozen: Frozen,
+    tokens: Vec<u32>,
+}
+
+fn ensure_draft_ref(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, fi: usize) -> Result<()> {
+    if refs.draft.contains_key(&fi) {
+        return Ok(());
+    }
+    eprintln!("draftbatch trace: ref_draft walk {}", fx[fi].name());
+    let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
+    let (mut lane, _rows) = take_lane(gpu, slot, d, w.position)?;
+    let compact = slot.kv_cache.compact_offset as i32;
+    let r = (|| -> Result<(Vec<u32>, Named)> {
+        let tokens = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut lane.df, w.position, w.seed, cfg.block)?;
+        gpu.hip.device_synchronize()?;
+        let ck: Vec<usize> = lane.checkpoints.iter().map(|(p, _)| *p).collect();
+        Ok((tokens, df_arrays(gpu, &lane.df, &ck)?))
+    })();
+    lane.free_gpu(gpu);
+    let (tokens, set) = r?;
+    let frozen = freeze(&cfg.dir.join(format!("ref_draft_{}", fx[fi].name())), &set)?;
+    refs.draft.insert(fi, DraftRef { frozen, tokens });
+    Ok(())
+}
+
+/// One batched-draft case: lanes `specs` (fixtures) are opened at their
+/// pre-window state (each compared with the frozen singleton pre-state), then
+/// drafted together by `dflash_cb_draft` (`min_lanes`: fewest lanes of a chunk
+/// that take the batched forward; `batched=false` is the per-lane singleton
+/// call). Every lane's tokens and post-draft draft state must equal the
+/// isolated singleton draft byte for byte. Returns `(receipt, ok, draft_ms)`.
+#[allow(clippy::too_many_arguments)]
+fn draft_case(
+    gpu: &mut Gpu,
+    slot: &mut ModelSlot,
+    d: &mut Box<dyn Speculator>,
+    cfg: &G0Cfg,
+    fx: &[Fixture],
+    refs: &mut G0Refs,
+    name: &str,
+    specs: &[usize],
+    min_lanes: usize,
+    batched: bool,
+    expect_batched_lanes: usize,
+) -> Result<(Value, bool, f64)> {
+    let t_case = std::time::Instant::now();
+    for &fi in specs {
+        ensure_pre(gpu, slot, d, cfg, fx, refs, fi)?;
+        ensure_draft_ref(gpu, slot, d, cfg, fx, refs, fi)?;
+    }
+    let mut lanes: Vec<LaneRun> = Vec::with_capacity(specs.len());
+    let mut open_err = None;
+    for (i, &fi) in specs.iter().enumerate() {
+        match g0_lane_open(gpu, slot, d, cfg, fx, refs, fi, 64, 80_000 + i as u64) {
+            Ok(l) => lanes.push(l),
+            Err(err) => {
+                open_err = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = open_err {
+        free_lanes(gpu, lanes)?;
+        return Err(err);
+    }
+    let mut cb = match DflashCbScratch::new(gpu, &slot.config, MULTI_CHUNK_MAX_ROWS) {
+        Ok(cb) => cb,
+        Err(e) => {
+            free_lanes(gpu, lanes)?;
+            return Err(e.into());
+        }
+    };
+    cb.draft_min_lanes = min_lanes;
+    let body = (|| -> Result<(Vec<Vec<u32>>, f64)> {
+        gpu.hip.device_synchronize()?;
+        let t0 = std::time::Instant::now();
+        let toks = {
+            let mut dl: Vec<DflashCbDraftLane<'_>> = lanes
+                .iter_mut()
+                .map(|l| DflashCbDraftLane { state: &mut l.lane, position: l.position, seed: l.seed, b: l.b, compact_offset: l.rs.kv.compact_offset as i32 })
+                .collect();
+            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut cb, &mut dl, batched)?
+        };
+        gpu.hip.device_synchronize()?;
+        Ok((toks, t0.elapsed().as_secs_f64() * 1e3))
+    })();
+    let mut lane_json = Vec::new();
+    let mut exact = true;
+    let mut err_text = None;
+    let mut ms = 0.0;
+    let stats = cb.draft_stats;
+    match body {
+        Ok((toks, t)) => {
+            ms = t;
+            for (i, l) in lanes.iter_mut().enumerate() {
+                let dr = &refs.draft[&l.fi];
+                l.post_diff.ids("draft.tokens", &dr.tokens, &toks[i]);
+                let post = (|| -> Result<Named> {
+                    let ck: Vec<usize> = l.lane.checkpoints.iter().map(|(p, _)| *p).collect();
+                    df_arrays(gpu, &l.lane.df, &ck)
+                })();
+                match post {
+                    Ok(post) => {
+                        if let Err(e) = cmp_frozen(&mut l.post_diff, "post_draft", &dr.frozen, &post) {
+                            err_text = Some(e.to_string());
+                        }
+                    }
+                    Err(e) => err_text = Some(e.to_string()),
+                }
+                lane_json.push(json!({
+                    "lane": i, "fixture": fx[l.fi].name(), "prefix": fx[l.fi].prefix, "b": l.b, "position": l.position,
+                    "tokens": toks[i], "pre": l.pre_diff.json(), "post_draft": l.post_diff.json(),
+                }));
+                println!(
+                    "draftbatch {name} lane{i} {} B={} pre_diffs={} draft_diffs={}",
+                    fx[l.fi].name(), l.b, l.pre_diff.differing_items.len(), l.post_diff.differing_items.len()
+                );
+                for it in l.pre_diff.differing_items.iter().chain(l.post_diff.differing_items.iter()).take(40) {
+                    println!("draftbatch {name} lane{i} DIFF {it}");
+                }
+                exact &= l.pre_diff.exact() && l.post_diff.exact();
+            }
+        }
+        Err(e) => {
+            err_text = Some(e.to_string());
+            exact = false;
+        }
+    }
+    let went_batched = stats.0 == expect_batched_lanes;
+    let ok = err_text.is_none() && exact && went_batched;
+    cb.free_gpu(gpu)?;
+    free_lanes(gpu, lanes)?;
+    eprintln!(
+        "draftbatch case {name}: lanes={} batched_lanes={} chunks={} (expected batched lanes {expect_batched_lanes}) draft_ms={ms:.2} exact={exact} -> {}",
+        specs.len(), stats.0, stats.1, if ok { "OK" } else { "FAIL" }
+    );
+    let j = json!({
+        "case": name, "lanes": specs.len(), "min_lanes": min_lanes, "batched": batched,
+        "batched_lanes": stats.0, "batched_chunks": stats.1, "expected_batched_lanes": expect_batched_lanes,
+        "exact": exact, "ok": ok, "error": err_text, "draft_ms": ms, "case_wall_s": t_case.elapsed().as_secs_f64(),
+        "per_lane": lane_json,
+    });
+    Ok((j, ok, ms))
+}
+
+/// Gate-0-style cases of the batched DFlash draft: 1..4 lanes (batched
+/// forward proven down to one lane with `min_lanes = 1`), the production
+/// chunking (`min_lanes = 2`: four lanes are a three-lane chunk plus a
+/// singleton lane), and the timing of eight lanes per step, serial vs
+/// batched (draft ms only; separate fresh lane sets, best of two).
+fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs) -> Result<(Vec<Value>, bool)> {
+    let n = fx.len();
+    let fxl = |k: usize| -> Vec<usize> { (0..k).map(|i| i % n).collect() };
+    // (name, lanes, min_lanes, expected batched lanes)
+    let cases: Vec<(&str, usize, usize, usize)> = vec![
+        ("draft_n1_batched16", 1, 1, 1),
+        ("draft_n2", 2, 1, 2),
+        ("draft_n3", 3, 1, 3),
+        ("draft_n4_min1", 4, 1, 4),
+        ("draft_n4_prod", 4, 2, 3),
+    ];
+    let mut rows = Vec::new();
+    let mut pass = true;
+    for (name, k, min_lanes, expect) in cases {
+        match draft_case(gpu, slot, d, cfg, fx, refs, name, &fxl(k), min_lanes, true, expect) {
+            Ok((j, ok, _)) => {
+                pass &= ok;
+                rows.push(j);
+            }
+            Err(e) => {
+                eprintln!("draftbatch case {name}: ERROR {e}");
+                rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                return Ok((rows, false));
+            }
+        }
+    }
+    let mut serial = Vec::new();
+    let mut batched = Vec::new();
+    for rep in 0..2 {
+        for (is_batched, sink) in [(false, &mut serial), (true, &mut batched)] {
+            let name = format!("draft_n8_{}_rep{rep}", if is_batched { "batched" } else { "serial" });
+            match draft_case(gpu, slot, d, cfg, fx, refs, &name, &fxl(8), 2, is_batched, if is_batched { 8 } else { 0 }) {
+                Ok((j, ok, ms)) => {
+                    pass &= ok;
+                    sink.push(ms);
+                    rows.push(j);
+                }
+                Err(e) => {
+                    eprintln!("draftbatch case {name}: ERROR {e}");
+                    rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                    return Ok((rows, false));
+                }
+            }
+        }
+    }
+    let best = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    println!(
+        "draftbatch timing 8 lanes/step: serial {:.2} ms (runs {:?}) batched {:.2} ms (runs {:?})",
+        best(&serial), serial, best(&batched), batched
+    );
+    rows.push(json!({"case": "draft_n8_timing", "serial_ms": serial, "batched_ms": batched, "serial_best_ms": best(&serial), "batched_best_ms": best(&batched)}));
+    Ok((rows, pass))
+}
+
+fn file_sha(p: &Path) -> Result<(u64, String)> {
+    use std::io::Read;
+    let mut f = fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut n = 0u64;
+    loop {
+        let r = f.read(&mut buf)?;
+        if r == 0 {
+            break;
+        }
+        h.update(&buf[..r]);
+        n += r as u64;
+    }
+    Ok((n, h.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+}
+
+/// Gate 0 phase. Consumes the bundle (as a `ModelSlot`) and returns it.
+fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Result<(Ctx, Value, bool)> {
+    let draft_path = args.dflash_draft.as_ref().ok_or("--dflash-draft required")?;
+    let windows = args.dflash_probe_window.unwrap_or(0);
+    let Ctx { mut gpu, b } = ctx;
+    let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model)).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
+    if slot.config.num_experts > 0 {
+        return Err("DFlash Gate 0 covers dense targets only (MoE uses the draft FFN graph route)".into());
+    }
+    if let Some(pbs) = slot.scratch.widened_prefill_batch.borrow_mut().take() {
+        pbs.free_gpu(&mut gpu)?;
+    }
+    let ctx_cap = ack["max_seq_bound"].as_u64().ok_or("loaded ack has no max_seq_bound")? as usize;
+    let kv_q8 = {
+        let kv = &slot.kv_cache;
+        kv.quant_q8 && !kv.quant_fwht && !kv.quant_asym2 && !kv.quant_asym3 && !kv.quant_asym4 && matches!(kv.v_mode, hipfire_runtime::llama::VMode::Q8)
+    };
+    let draft_str = draft_path.to_str().ok_or("--dflash-draft is not UTF-8")?;
+    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, true, false)?;
+    eprintln!("gate0: DFlash draft loaded: layers={} hidden={} block={}", df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size);
+    let mut d: Box<dyn Speculator> = build_dflash_speculator(df, true, false);
+    let block = d.block_size();
+    let (draft_bytes, draft_sha) = file_sha(draft_path)?;
+    let cfg = G0Cfg { windows, block, dir: args.artifacts.join("dflash_gate0") };
+    fs::create_dir_all(&cfg.dir)?;
+    let (dim, vocab) = (slot.config.dim, slot.config.vocab_size);
+    let vs = VerifyScratch::new(&mut gpu, MULTI_CHUNK_MAX_ROWS, dim, vocab, dim.next_power_of_two())?;
+    let mc = MultiChunkScratch::new(&mut gpu, &slot.config, MULTI_CHUNK_MAX_ROWS)?;
+
+    use qwen35::DflashFusionCtx::{ChainVerify, Off};
+    let n = fx.len();
+    let fxi = |v: &[(usize, usize)]| -> Vec<(usize, usize)> { v.iter().map(|&(f, e)| (f % n, e)).collect() };
+    // (name, lanes (fixture, E), fusion, expectation). E >= 16 is a full
+    // block; E < 16 is a budget tail with B = max(E, 2).
+    let cases: Vec<(&str, Vec<(usize, usize)>, qwen35::DflashFusionCtx, G0Expect)> = vec![
+        ("c1_16", fxi(&[(0, 64)]), ChainVerify, G0Expect::Exact),
+        ("c2_16x2", fxi(&[(0, 64), (1, 64)]), ChainVerify, G0Expect::Exact),
+        ("c3_16x3", fxi(&[(0, 64), (1, 64), (2, 64)]), ChainVerify, G0Expect::Exact),
+        ("c4_63_16x3_15", fxi(&[(0, 64), (1, 64), (2, 64), (3, 15)]), ChainVerify, G0Expect::Exact),
+        ("tail_47_16x2_15", fxi(&[(0, 64), (1, 64), (2, 15)]), ChainVerify, G0Expect::Exact),
+        ("tail_budget_E1_E2_E3", fxi(&[(0, 1), (1, 2), (2, 3)]), ChainVerify, G0Expect::Exact),
+        ("tail_E17_E15_E9", fxi(&[(0, 17), (1, 15), (2, 9)]), ChainVerify, G0Expect::Exact),
+        ("ctl_illegal_64", fxi(&[(0, 64), (1, 64), (2, 64), (3, 64)]), ChainVerify, G0Expect::Refused),
+        ("ctl_off_transplant_16x2", fxi(&[(0, 64), (1, 64)]), Off, G0Expect::Info),
+    ];
+    let mut refs = G0Refs::default();
+    let mut rows = Vec::new();
+    let mut pass = true;
+    let mut run_err = None;
+    // CB_ORACLE_DRAFT_ONLY=1 skips the shared-trunk Gate 0 cases and runs the batched-draft cases only.
+    let draft_only = std::env::var_os("CB_ORACLE_DRAFT_ONLY").is_some();
+    for (name, specs, fusion, expect) in cases.iter().filter(|_| !draft_only) {
+        match g0_case(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs, &vs, &mc, name, specs, *fusion, *expect) {
+            Ok((j, ok)) => {
+                pass &= ok;
+                rows.push(j);
+            }
+            Err(e) => {
+                eprintln!("gate0 case {name}: ERROR {e}");
+                rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                pass = false;
+                run_err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let mut draft_rows = Vec::new();
+    if run_err.is_none() {
+        match draft_batch_cases(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs) {
+            Ok((r, ok)) => {
+                pass &= ok;
+                draft_rows = r;
+            }
+            Err(e) => {
+                eprintln!("draftbatch: ERROR {e}");
+                run_err = Some(e.to_string());
+                pass = false;
+            }
+        }
+    }
+    let env_keys = [
+        "HIPFIRE_VERIFY_GRAPH", "HIPFIRE_GRAPH", "HIPFIRE_CB_SEG_TWINS", "HIPFIRE_DFLASH_WINDOW", "HIPFIRE_DFLASH_CTX_CAP",
+        "HIPFIRE_DFLASH_ADAPTIVE_B", "HIPFIRE_DFLASH_CKPT_RESUME", "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA", "HIPFIRE_SPEC_PHASES",
+        "HIPFIRE_DN_STATE_EF", "HIPFIRE_DN_SNAPSHOT_FLIP", "HIPFIRE_CB_DFLASH_DRAFT_BATCH", "HIPFIRE_WMMA_BATCH_TILES",
+    ];
+    let env: serde_json::Map<String, Value> = env_keys.iter().map(|k| (k.to_string(), json!(std::env::var(k).ok()))).collect();
+    let mut pre_keys: Vec<usize> = refs.pre.keys().copied().collect();
+    pre_keys.sort_unstable();
+    let pre_json: Vec<Value> = pre_keys
+        .iter()
+        .map(|fi| {
+            let p = &refs.pre[fi];
+            json!({"fixture": fx[*fi].name(), "position": p.position, "pending_seed": p.seed, "snapshot_rows": p.rows, "draft_ctx_mode": p.ctx_mode})
+        })
+        .collect();
+    let report = json!({
+        "probe_window": windows,
+        "block": block,
+        "multi_chunk_max_rows": MULTI_CHUNK_MAX_ROWS,
+        "draft": {"path": draft_path, "bytes": draft_bytes, "sha256": draft_sha},
+        "draft_ctx_capacity": ctx_cap,
+        "env": env,
+        "arch": gpu.arch.clone(),
+        "fixtures": pre_json,
+        "cases": rows,
+        "draft_batch": draft_rows,
+        "error": run_err,
+        "unexercised": {
+            "dflash_executor_k1_8": "needs the VMM DFlash engine (slices C/D); not part of Gate 0",
+            "mixed_mtp_dflash_trunk": "MTP lanes (fusion=Off) in a shared DFlash chunk need the tagged driver (slice C)",
+            "terminal_prefix_repair_and_promotion": "slice C/D",
+            "phase_costs": "HIPFIRE_SPEC_PHASES / matched timing is reviewer-owned; shared_window_ms/ref_step_ms here are uncontrolled single runs, not a speed claim",
+        },
+        "pass": pass,
+    });
+    // Cleanup (free before returning the bundle).
+    vs.free_gpu(&mut gpu);
+    if let Err(e) = mc.free_gpu(&mut gpu) {
+        eprintln!("gate0: free multi scratch: {e}");
+    }
+    d.free(&mut gpu);
+    let b = slot.into_bundle();
+    Ok((Ctx { gpu, b }, report, pass))
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     if args.artifacts.exists() {
@@ -1413,8 +3540,9 @@ fn main() -> Result<()> {
 
     // ── Singleton phase: references + determinism self-test ──────────
     let mut refs = Vec::with_capacity(fx.len());
-    let mut singleton = Vec::new();
     let mut pass = true;
+    if args.ar_phase {
+    let mut singleton = Vec::new();
     for f in &fx {
         let t0 = std::time::Instant::now();
         let tr = record(&mut ctx, f, args.steps, &args.artifacts.join("singleton").join(f.name()))?;
@@ -1461,6 +3589,7 @@ fn main() -> Result<()> {
         control("neg_epoch", d, false);
     }
     report["controls"] = Value::Object(controls);
+    }
     if args.batch {
         let (batch, ok) = batch_phase(&mut ctx, &args, &fx, &refs)?;
         // Isolation (batch == isolated executor, controls) and route
@@ -1471,6 +3600,37 @@ fn main() -> Result<()> {
         report["route_exact_vs_singleton"] = json!(route);
         report["batch"] = batch;
         pass &= ok && route;
+    }
+    if args.spec.dflash() {
+        // The DFlash probe turns the bundle into a ModelSlot and back.
+        match dflash_probe_phase(ctx, &args, &fx, &ack) {
+            Ok((c, probe, ok)) => {
+                ctx = c;
+                report["dflash_gate0"] = probe;
+                report["dflash_executor"] = json!({
+                    "status": "unexercised",
+                    "reason": "the k=1..8 DFlash executor cases need the VMM DFlash engine (slices C/D); only the Gate 0 replay probe ran",
+                });
+                pass &= ok;
+            }
+            Err(e) => {
+                report["dflash_gate0"] = json!({"error": e.to_string()});
+                report["pass"] = json!(false);
+                fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+                eprintln!("wrote {} pass=false (DFlash Gate 0 error: {e})", args.out.display());
+                return Err(e);
+            }
+        }
+    }
+    if args.spec.mtp() {
+        // Last: the spec phase turns the bundle into a ModelSlot.
+        let (spec, ok) = spec_phase(ctx, &args, &fx, &refs)?;
+        report["spec_mtp"] = spec;
+        pass &= ok;
+        report["pass"] = json!(pass);
+        fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+        eprintln!("wrote {} pass={pass}", args.out.display());
+        return if pass { Ok(()) } else { Err("oracle FAILED (see report)".into()) };
     }
     report["pass"] = json!(pass);
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;

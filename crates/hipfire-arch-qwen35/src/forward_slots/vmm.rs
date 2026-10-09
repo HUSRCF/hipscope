@@ -50,6 +50,8 @@ use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
 use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 mod exact;
+pub mod spec;
+pub mod dflash;
 
 
 /// Load-time admission for the VMM executor on this resident model: the
@@ -222,6 +224,20 @@ pub struct Qwen35RequestState {
     /// Penalty history (the singleton route's sampling scope). The executor
     /// appends every committed id.
     pub history: Vec<u32>,
+    /// MTP drafter state of a spec lane (`spec::spec_prefill`); `None` for
+    /// an AR lane.
+    pub mtp: Option<crate::mtp_spec::MtpSpecState>,
+    /// Draft of a planned Verify step (provision → commit/abort).
+    pub(super) spec_draft: Option<crate::mtp_spec::MtpDraftOutput>,
+    /// Verify outcome of a forwarded Verify step (forward → commit/abort).
+    pub(super) spec_verified: Option<crate::mtp_spec::cb::MtpCbVerified>,
+    /// DFlash lane state (`dflash::dflash_prefill` / `dflash_adopt`); `None`
+    /// unless the request is a DFlash spec lane. A request holds MTP
+    /// (`mtp`) or DFlash, never both.
+    pub dflash: Option<crate::dflash_cb::DflashVmmLaneState>,
+    /// Draft of a planned DFlash Verify step (provision → commit/abort);
+    /// the verify outcome waits in `dflash.picks`.
+    pub(super) dflash_draft: Option<crate::speculative::DflashCbDraft>,
 }
 
 /// Admission inputs of one request, as the singleton route would hold them.
@@ -300,6 +316,11 @@ impl Qwen35RequestState {
             sampler: init.sampler,
             rng_state: init.rng_state,
             history: init.history,
+            mtp: None,
+            spec_draft: None,
+            spec_verified: None,
+            dflash: None,
+            dflash_draft: None,
         })
     }
 
@@ -356,7 +377,38 @@ impl Qwen35RequestState {
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         let r = self.kv.release_vmm_after(gpu, None).map_err(|e| e.to_string());
         self.dn.free_gpu(gpu);
+        if let Some(mtp) = self.mtp {
+            mtp.free_gpu(gpu);
+        }
+        if let Some(lane) = self.dflash {
+            lane.free_gpu(gpu);
+        }
         r
+    }
+}
+
+/// A finished conversation kept for prefix reuse: the owner that served it
+/// (KV + DeltaNet at `tokens.len()`, every token forwarded including the
+/// ChatML trailer), its token stream and its DeltaNet resume checkpoints —
+/// exactly what the singleton route keeps resident in the bundle
+/// (`conversation_tokens`, `prefill_checkpoints`) after a turn.
+pub struct VmmPrefixEntry {
+    pub state: Qwen35RequestState,
+    pub tokens: Vec<u32>,
+    pub checkpoints: Vec<(usize, crate::speculative::DeltaNetSnapshot)>,
+    /// Attempt whose client commit is outstanding; not reusable (and dropped
+    /// on abort) until it commits.
+    pub pending: Option<(String, u64)>,
+    /// Recency stamp (higher = more recent) for eviction.
+    pub stamp: u64,
+}
+
+impl VmmPrefixEntry {
+    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
+        for (_, snap) in self.checkpoints {
+            snap.free_gpu(gpu);
+        }
+        self.state.free_gpu(gpu)
     }
 }
 
@@ -440,6 +492,15 @@ pub struct Qwen35VmmStore {
     /// Shared physical KV budget across every request owner.
     kv_budget_bytes: usize,
     route: VmmRoute,
+    /// MTP engine of spec lanes (`install_spec`); `None` = AR lanes only.
+    spec: Option<spec::VmmSpecEngine>,
+    /// Retained conversations for prefix reuse (VMM route continuity); the
+    /// generate crate owns the policy. Freed with the store.
+    pub prefix_pool: Vec<VmmPrefixEntry>,
+    /// DFlash engine of DFlash spec lanes (`install_dflash`); `None` = no
+    /// DFlash lanes. May coexist with the MTP engine: a request is one or
+    /// the other.
+    dflash_engine: Option<dflash::VmmDflashEngine>,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -615,6 +676,9 @@ impl Qwen35VmmStore {
             mapped_high_water: 0,
             kv_budget_bytes,
             route,
+            spec: None,
+            prefix_pool: Vec::new(),
+            dflash_engine: None,
         })
     }
 
@@ -694,11 +758,14 @@ impl Qwen35VmmStore {
 
     /// Abandon a provisioned/forwarded step. A forwarded step already wrote
     /// device state, which is not atomic: every participant is poisoned and
-    /// must be retired; its tokens are never committed.
+    /// must be retired; its tokens are never committed. Verify drafts and
+    /// outcomes of the plan are dropped (a provisioned-only draft touched
+    /// no committed state, so its lane stays live).
     pub fn abort_step(&mut self, plan: &BatchStepPlan) {
         if let Phase::Forwarded(..) = self.phase {
             self.poison(plan);
         }
+        self.spec_clear_planned(plan);
         self.phase = Phase::Idle;
     }
 
@@ -752,12 +819,16 @@ impl Qwen35VmmStore {
         }
     }
 
-    /// Physically mapped KV bytes summed over admitted request owners.
+    /// Physically mapped KV bytes summed over admitted request owners and
+    /// retained prefix entries.
     pub fn mapped_kv_bytes(&self) -> Result<usize, String> {
         let n_kv = self.kv_layer_ids.len();
         let mut total = 0usize;
         for s in self.slots.iter().flatten() {
             total += owner_mapped_bytes(&s.kv, n_kv)?;
+        }
+        for e in &self.prefix_pool {
+            total += owner_mapped_bytes(&e.state.kv, n_kv)?;
         }
         Ok(total)
     }
@@ -766,6 +837,11 @@ impl Qwen35VmmStore {
         let mut first: Option<String> = None;
         for s in self.slots.into_iter().flatten() {
             if let Err(e) = s.free_gpu(gpu) {
+                first.get_or_insert(e);
+            }
+        }
+        for e in self.prefix_pool {
+            if let Err(e) = e.free_gpu(gpu) {
                 first.get_or_insert(e);
             }
         }
@@ -778,6 +854,12 @@ impl Qwen35VmmStore {
         let _ = gpu.free_tensor(self.hidden_out);
         if let Some(t) = self.rows_tables {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(engine) = self.spec {
+            engine.free_gpu(gpu);
+        }
+        if let Some(engine) = self.dflash_engine {
+            engine.free_gpu(gpu);
         }
         if let Err(e) = self.pbs.free_gpu(gpu) {
             first.get_or_insert(e.to_string());
@@ -814,6 +896,7 @@ impl Qwen35VmmExecutor<'_> {
     /// its rows will write. Mapping/growth happens here, never inside a
     /// forward or capture. Fails closed per request bound (no OOM midstep).
     pub fn provision_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
+        let (weights, config) = (self.weights, self.config);
         let st = &mut *self.store;
         if !matches!(st.phase, Phase::Idle) {
             return Err("provision_step: previous step not committed or aborted".into());
@@ -852,11 +935,12 @@ impl Qwen35VmmExecutor<'_> {
         for r in &plan.requests {
             match r.kind {
                 RequestStepKind::Ar | RequestStepKind::Prefill => {}
-                RequestStepKind::Verify { .. } | RequestStepKind::Forced => {
-                    return Err(format!(
-                        "provision_step: {:?} rows need the slice-2 verify executor",
-                        r.kind
-                    ));
+                RequestStepKind::Verify { draft_len } => {
+                    let seed = b.tokens.get(r.rows.begin).copied().unwrap_or(u32::MAX);
+                    st.spec_check_verify(r, draft_len, seed)?;
+                }
+                RequestStepKind::Forced => {
+                    return Err("provision_step: Forced rows are not admitted on the VMM executor".into());
                 }
             }
             let state = st
@@ -1001,6 +1085,8 @@ impl Qwen35VmmExecutor<'_> {
             validate_vmm_rows(table, &b.row_slot, &b.positions, &st.row_gen)
                 .map_err(|e| format!("provision_step: layer {}: {e}", st.kv_layer_ids[l]))?;
         }
+        // Verify requests: their epoch-tagged drafts (singleton drafter).
+        st.spec_draft_planned(gpu, weights, config, plan)?;
         st.phase = Phase::Provisioned(StepKey::of(plan));
         Ok(())
     }
@@ -1052,8 +1138,9 @@ impl Qwen35VmmExecutor<'_> {
         let decode: Vec<usize> = (0..plan.requests.len())
             .filter(|&i| plan.requests[i].kind == RequestStepKind::Ar)
             .collect();
+        let is_verify = |i: usize| matches!(plan.requests[i].kind, RequestStepKind::Verify { .. });
         let prefill: Vec<usize> = (0..plan.requests.len())
-            .filter(|&i| plan.requests[i].kind != RequestStepKind::Ar)
+            .filter(|&i| plan.requests[i].kind != RequestStepKind::Ar && !is_verify(i))
             .collect();
         let split = !decode.is_empty() && !prefill.is_empty();
         st.hidden_split = split;
@@ -1068,10 +1155,13 @@ impl Qwen35VmmExecutor<'_> {
         } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
             run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
-        } else {
-            let all: Vec<usize> = (0..plan.requests.len()).collect();
+        } else if !decode.is_empty() || !prefill.is_empty() {
+            let all: Vec<usize> = (0..plan.requests.len()).filter(|&i| !is_verify(i)).collect();
             run_pass(gpu, st, weights, config, s, plan, &all, false, &mut picks)?;
         }
+        // Verify requests: their own shared verify trunk + head (singleton
+        // verify arithmetic per request; picks stay with the request state).
+        st.spec_verify_planned(gpu, weights, config, s, plan)?;
         gpu.hip.device_synchronize()?;
         Ok(picks)
     }
@@ -1265,10 +1355,11 @@ impl Qwen35VmmExecutor<'_> {
     /// the KV frontier only; the transport drains their prompt).
     pub fn commit_step(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
         plan: &BatchStepPlan,
         output: StepOutput,
     ) -> Result<Vec<RequestAdvance>, String> {
+        let (weights, config, scratch) = (self.weights, self.config, self.scratch);
         let st = &mut *self.store;
         match &st.phase {
             Phase::Forwarded(k, id) if *k == StepKey::of(plan) && *id == output.step_id => {}
@@ -1290,6 +1381,22 @@ impl Qwen35VmmExecutor<'_> {
         }
         let mut out = Vec::with_capacity(plan.requests.len());
         for r in &plan.requests {
+            if matches!(r.kind, RequestStepKind::Verify { .. }) {
+                // Accept/repair then publish this request's window. A
+                // failure leaves device state untrusted: poison the step.
+                match st.spec_commit_verify(gpu, weights, config, scratch, &r.epoch) {
+                    Ok(a) => {
+                        out.push(a);
+                        continue;
+                    }
+                    Err(e) => {
+                        st.poison(plan);
+                        st.spec_clear_planned(plan);
+                        st.phase = Phase::Idle;
+                        return Err(e);
+                    }
+                }
+            }
             let head = st.wants_head(r);
             let s = st
                 .slots

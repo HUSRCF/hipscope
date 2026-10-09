@@ -59,6 +59,10 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
 use rdna_compute::norm::GdnScanOut;
 
+/// Multi-request batched prefill chunk (cross-request speculative verify).
+#[path = "prefill_multi.rs"]
+pub mod multi;
+
 /// Producer-emitted A8 RMSNorm/FWHT, selected only for uniform MQ4v2 weights.
 #[allow(clippy::too_many_arguments)]
 fn try_a8_rmsnorm_prepared(
@@ -9376,6 +9380,22 @@ fn batch_chunk_fa_attend_a4(
     Ok(prep)
 }
 
+/// The gfx1201 fused FA-prep route (non-fp8q half): exact gfx1201, kill
+/// switch clear, never DFlash chain verify, GQA 24/4 HD256 with a 64-wide
+/// rotary. Shared by [`batch_chunk_full_attn_attn`] and the multi-request
+/// chunk, which evaluates it per request with that request's `fusion`/`n`.
+fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
+    gpu.arch == "gfx1201"
+        && gpu.flags.gfx12_fa_prep_fused
+        && fusion != DflashFusionCtx::ChainVerify
+        && !gpu.flags.rope_interleaved_legacy
+        && !hipfire_runtime::triattn::tap_enabled()
+        && config.head_dim == 256
+        && (config.n_heads, config.n_kv_heads) == (24, 4)
+        && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64
+        && n > 0
+}
+
 pub(crate) fn batch_chunk_full_attn_attn(
     gpu: &mut Gpu,
     fa_attn_multirow: bool,
@@ -9404,15 +9424,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // launch covers all N tokens at once.
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
-    let gfx12_fa_prep = gpu.arch == "gfx1201"
-        && gpu.flags.gfx12_fa_prep_fused
-        && fusion != DflashFusionCtx::ChainVerify
-        && !gpu.flags.rope_interleaved_legacy
-        && !hipfire_runtime::triattn::tap_enabled()
-        && config.head_dim == 256
-        && (config.n_heads, config.n_kv_heads) == (24, 4)
-        && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64
-        && n > 0;
+    let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, fusion, n);
     let gfx12_fa_prep_fp8q = gfx12_fa_prep
         && gpu.flags.gfx12_fa_prep_fp8q
         && gpu.flags.attn_qresident

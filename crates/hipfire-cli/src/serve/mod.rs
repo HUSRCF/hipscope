@@ -266,6 +266,9 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_effort_native: bool,
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
+    /// Daemon load ack reported `continuous_batch_route == "vmm"`: the VMM
+    /// batch route renders multi-turn text chats, so HTTP admission may batch them.
+    pub(crate) continuous_batch_vmm: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
@@ -928,14 +931,18 @@ impl Drop for AdmissionGuard {
 /// and synchronous; model arch is taken from `current_arch` when available,
 /// otherwise inferred from the requested model name containing `qwen` or `lfm`.
 ///
-/// Message-shape gate matches daemon admission: absent/empty `messages` are
-/// eligible; otherwise only exactly one `user` message with plain string
-/// content (no tool_calls, no multipart/array content).
+/// Message-shape gate: absent/empty `messages` are eligible. Fixed-lane route
+/// (`vmm_route == false`) admits exactly one `user` message with plain string
+/// content (no tool_calls, no multipart/array content) and no `stop`,
+/// matching daemon admission. The VMM route (`vmm_route == true`) admits
+/// multi-turn text chats via `batch_messages_are_text_chat`, with or without
+/// `stop` (its lanes run the singleton's stop matcher).
 pub(crate) fn is_batch_eligible_request(
     body: &serde_json::Value,
     tp: Option<u64>,
     current_arch: Option<&str>,
     daemon_batch_capable: bool,
+    vmm_route: bool,
 ) -> bool {
     if !daemon_batch_capable {
         return false;
@@ -978,11 +985,15 @@ pub(crate) fn is_batch_eligible_request(
     if body.get("image_base64").is_some() {
         return false;
     }
-    // Message history must match daemon single-user plain-string shape.
-    if !batch_messages_are_single_user(body) {
+    // Message history shape depends on the batch route.
+    if !(if vmm_route {
+        batch_messages_are_text_chat(body)
+    } else {
+        batch_messages_are_single_user(body)
+    }) {
         return false;
     }
-    if body.get("stop").is_some() {
+    if !vmm_route && body.get("stop").is_some() {
         return false;
     }
     // Speculation / adaptive / prefix behavior disqualifies.
@@ -1038,6 +1049,35 @@ pub(crate) fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
         // Arrays (multipart/text+image), objects, numbers, bool, null.
         Some(_) => false,
     }
+}
+
+/// VMM-route message shape: absent/empty `messages`, or every entry a
+/// `system`/`user`/`assistant` turn with plain string content and no non-empty
+/// `tool_calls`. Multi-turn text chats render through the same Jinja template
+/// on the VMM batch route. Tool turns/tool_calls (grammar-constrained sampling
+/// and the tool parser are not per-row in the batch executor) and
+/// multipart/image content (vision path) stay sequential.
+pub(crate) fn batch_messages_are_text_chat(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    arr.iter().all(|m| {
+        if !matches!(
+            m.get("role").and_then(|v| v.as_str()),
+            Some("system" | "user" | "assistant")
+        ) {
+            return false;
+        }
+        if let Some(tc) = m.get("tool_calls") {
+            if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+                return false;
+            }
+        }
+        matches!(m.get("content"), Some(serde_json::Value::String(_)))
+    })
 }
 
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
@@ -1504,6 +1544,7 @@ pub(crate) fn serve_foreground(
             current_reasoning_effort_native: false,
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
+            continuous_batch_vmm: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
@@ -1904,6 +1945,10 @@ impl ServeRuntime {
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            self.continuous_batch_vmm = loaded
+                .get("continuous_batch_route")
+                .and_then(serde_json::Value::as_str)
+                == Some("vmm");
             self.current_max_seq = loaded
                 .get("max_seq")
                 .and_then(serde_json::Value::as_u64)
@@ -1997,6 +2042,7 @@ impl ServeRuntime {
         self.current_reasoning_effort_native = false;
         self.current_reasoning_efforts = Vec::new();
         self.continuous_batch_capable = false;
+        self.continuous_batch_vmm = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
         self.resident_model = None;
@@ -2745,7 +2791,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Eligible: absent messages (prompt path) for Qwen.
         let body = serde_json::json!({"model":"qwen3.5:7b","prompt":"hi"});
@@ -2753,7 +2800,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Eligible: empty messages array for Qwen.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[]});
@@ -2761,7 +2809,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Tools disqualify.
         let body = serde_json::json!({"model":"qwen3.5:7b","tools":[{"type":"function","function":{"name":"x"}}]});
@@ -2769,7 +2818,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Image / multipart content disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
@@ -2777,7 +2827,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Multipart text-only array content also disqualifies (must be plain string).
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
@@ -2785,7 +2836,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // system+user history disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
@@ -2796,7 +2848,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // user+assistant multi-turn disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
@@ -2807,7 +2860,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Tool-call content on the sole message disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{
@@ -2819,7 +2873,8 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Qwen tp=4 pure EP is eligible when daemon admits batch.
         let body =
@@ -2828,7 +2883,8 @@ mod tests {
             &body,
             Some(4),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Qwen tp=2 (and any non-1/non-4) disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b"});
@@ -2836,7 +2892,8 @@ mod tests {
             &body,
             Some(2),
             Some("qwen35"),
-            true
+            true,
+            false
         ));
         // Non-qwen disqualifies.
         let body = serde_json::json!({"model":"deepseek4:671b"});
@@ -2844,7 +2901,8 @@ mod tests {
             &body,
             Some(1),
             Some("deepseek4"),
-            true
+            true,
+            false
         ));
         // Daemon load says batch incapable: HTTP admission must not invent it.
         let body =
@@ -2853,6 +2911,7 @@ mod tests {
             &body,
             Some(1),
             Some("qwen35"),
+            false,
             false
         ));
         // Eligible: tp=1 LFM2 dense with one plain user string when daemon admits batch.
@@ -2862,7 +2921,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Eligible: absent messages for LFM.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","prompt":"hi"});
@@ -2870,7 +2930,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Eligible: empty messages for LFM.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[]});
@@ -2878,7 +2939,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects system+user the same way.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
@@ -2889,7 +2951,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects user+assistant.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
@@ -2900,7 +2963,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects tool-call content.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{
@@ -2912,7 +2976,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM rejects image/multipart content.
         let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":[
@@ -2923,7 +2988,8 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // LFM tp=4 disqualifies (dense remains tp=1 only).
         let body =
@@ -2932,7 +2998,8 @@ mod tests {
             &body,
             Some(4),
             Some("lfm2"),
-            true
+            true,
+            false
         ));
         // Daemon load says batch incapable: LFM HTTP admission must not invent it.
         let body =
@@ -2941,8 +3008,64 @@ mod tests {
             &body,
             Some(1),
             Some("lfm2"),
+            false,
             false
         ));
+    }
+
+    #[test]
+    fn batch_eligibility_vmm_route_admits_text_chat() {
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"again"}
+        ]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true,
+            true
+        ));
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_messages_text_chat_shape() {
+        assert!(batch_messages_are_text_chat(&serde_json::json!({})));
+        assert!(batch_messages_are_text_chat(
+            &serde_json::json!({"messages":[]})
+        ));
+        assert!(batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[
+                {"role":"system","content":"sys"},
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello","tool_calls":[]},
+                {"role":"user","content":"again"}
+            ]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"},{"role":"tool","content":"r"}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"assistant","content":"x","tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":[{"role":"user"}]
+        })));
+        assert!(!batch_messages_are_text_chat(&serde_json::json!({
+            "messages":"hi"
+        })));
     }
 
     #[test]
@@ -3076,6 +3199,7 @@ mod tests {
             current_reasoning_effort_native: true,
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,
+            continuous_batch_vmm: false,
             current_max_seq: 32768,
             cache_capable: true,
             kv_override: Some("q8".to_owned()),

@@ -102,6 +102,10 @@ use hipfire_runtime::llama::KvCache;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+/// Cross-request batched MTP cycle (continuous batching).
+#[path = "mtp_cb.rs"]
+pub mod cb;
+
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
 
 /// Sampling configuration matching the Unsloth-recommended MTP defaults
@@ -1849,17 +1853,48 @@ pub(crate) fn mtp_verify_accept(
     cur_pos: usize,
     eos_token_id: u32,
 ) -> HipResult<MtpVerifyAccepted> {
+    mtp_verify_accept_impl(
+        gpu, w_out, dim, vocab, state, n_verify, candidates, drafts_generated, use_sampling, sampling,
+        draft_probs, draft_softmaxes, is_external, use_device_token_chain, cur_pos, eos_token_id, false,
+    )
+}
+
+/// [`mtp_verify_accept`] with the head evaluation optional: `head_ready`
+/// means the caller already wrote this window's verify-head logits into
+/// `state.verify_logits` rows `0..n_verify` (cross-request batched head).
+#[allow(clippy::too_many_arguments)]
+fn mtp_verify_accept_impl(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    dim: usize,
+    vocab: usize,
+    state: &mut MtpSpecState,
+    n_verify: usize,
+    candidates: &[u32],
+    drafts_generated: usize,
+    use_sampling: bool,
+    sampling: MtpSamplingConfig,
+    draft_probs: &[f32],
+    draft_softmaxes: &[Vec<f32>],
+    is_external: bool,
+    use_device_token_chain: bool,
+    cur_pos: usize,
+    eos_token_id: u32,
+    head_ready: bool,
+) -> HipResult<MtpVerifyAccepted> {
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    mtp_trunk_verify_lm_head(
-        gpu,
-        w_out,
-        &state.verify_hidden,
-        &state.verify_rot,
-        &logits_view,
-        n_verify,
-        dim,
-        vocab,
-    )?;
+    if !head_ready {
+        mtp_trunk_verify_lm_head(
+            gpu,
+            w_out,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )?;
+    }
 
     // Exact-AR penalties on every verify row the verdict can read (incl. the
     // bonus row), before softmax (sampled) or argmax (greedy). No-op, no
@@ -1979,7 +2014,7 @@ fn mtp_accept_and_rollback(
     config: &Qwen35Config,
     kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    scratch: &Qwen35Scratch,
     state: &mut MtpSpecState,
     n_verify: usize,
     verify_tokens: &[u32],
@@ -1995,13 +2030,14 @@ fn mtp_accept_and_rollback(
     tape_captured: bool,
     cur_pos: usize,
     eos_token_id: u32,
+    head_ready: bool,
 ) -> HipResult<MtpSpecResult> {
     let trunk_weights: &Qwen35Weights = weights;
     let MtpVerifyAccepted {
         committed,
         accept_count,
         hit_eos,
-    } = mtp_verify_accept(
+    } = mtp_verify_accept_impl(
         gpu,
         &trunk_weights.output,
         config.dim,
@@ -2018,6 +2054,7 @@ fn mtp_accept_and_rollback(
         use_device_token_chain,
         cur_pos,
         eos_token_id,
+        head_ready,
     )?;
     let advance = committed.len();
 
@@ -2080,7 +2117,7 @@ fn mtp_shared_verify_accept_rollback_inner(
     config: &Qwen35Config,
     kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    scratch: &Qwen35Scratch,
     state: &mut MtpSpecState,
     cur_pos: usize,
     last_committed: u32,
@@ -2173,6 +2210,7 @@ fn mtp_shared_verify_accept_rollback_inner(
         tape_captured,
         cur_pos,
         eos_token_id,
+        false,
     )
 }
 
@@ -2678,8 +2716,9 @@ pub fn prefill_trunk_and_mtp_cache(
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
-/// after each trunk chunk and its MTP fill commit, with the exclusive end
-/// position of the committed prefix (`start_pos + tokens_written_so_far`).
+/// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
+/// state and the exclusive end position of the committed prefix
+/// (`start_pos + tokens_written_so_far`).
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -2693,10 +2732,45 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    on_committed_boundary: F,
+) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+{
+    let mut parts = MtpPrefillTarget {
+        weights: &target.weights,
+        config: &target.config,
+        kv_cache: &mut target.kv_cache,
+        dn_state: &mut target.dn_state,
+        scratch: &target.scratch,
+    };
+    prefill_trunk_and_mtp_cache_parts(gpu, &mut parts, head, state, prompt_tokens, start_pos, route, on_committed_boundary)
+}
+
+/// The trunk owners a prompt prefill writes: a [`ModelSlot`]'s, or a
+/// continuous-batching request's own KV/DeltaNet over the shared weights.
+pub struct MtpPrefillTarget<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+    pub kv_cache: &'a mut KvCache,
+    pub dn_state: &'a mut DeltaNetState,
+    pub scratch: &'a Qwen35Scratch,
+}
+
+/// [`prefill_trunk_and_mtp_cache_with_boundary`] over explicit trunk owners.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_parts<F>(
+    gpu: &mut Gpu,
+    target: &mut MtpPrefillTarget<'_>,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    route: MtpPromptRoute,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -2880,7 +2954,7 @@ where
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target, committed_pos)?;
+            on_committed_boundary(gpu, target.dn_state, committed_pos)?;
             off = end;
         }
 

@@ -59,3 +59,7 @@ pub mod redline;
 
 /// Continuous-batch drivers and their admission predicates.
 pub mod batch;
+
+/// VMM batch route: per-request singleton semantics on batch lanes —
+/// conversation continuity (prefix pool) and think control.
+pub mod vmm_conv;

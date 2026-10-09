@@ -826,6 +826,32 @@ pub fn batch_messages_are_single_user(msg: &serde_json::Value) -> bool {
     true
 }
 
+/// VMM batch route message shape: a text chat of any length. Every turn is
+/// `system`/`user`/`assistant` with plain string content, rendered through
+/// the model's Jinja template exactly as the singleton route renders it.
+/// Still sequential, with their reasons:
+/// - `tool` turns and non-empty `tool_calls`: tool replay needs the
+///   singleton's grammar-constrained CPU sampling and tool-call parser,
+///   which the batch executor does not run per row;
+/// - multipart / image content: the vision path.
+pub fn batch_messages_are_text_chat(msg: &serde_json::Value) -> bool {
+    let Some(messages) = msg.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    arr.iter().all(|m| {
+        matches!(
+            m.get("role").and_then(|v| v.as_str()),
+            Some("system" | "user" | "assistant")
+        ) && m.get("content").is_some_and(|v| v.is_string())
+            && !m
+                .get("tool_calls")
+                .is_some_and(|tc| tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object())
+    })
+}
+
 pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize {
     params
         .and_then(|v| v.get("continuous_batch_size"))

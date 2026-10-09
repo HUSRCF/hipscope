@@ -3798,11 +3798,15 @@ pub fn generate(
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
     // model's trained template) instead of the ChatScaffold `build_cached_history`,
     // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
+    // VMM batch route: conversations finished on batch lanes (or parked
+    // between singleton turns) are kept in the store's prefix pool; one of
+    // them may be this request's resident conversation.
+    let vmm_pool = jinja_active && tools.is_none() && crate::vmm_conv::pool_active(m);
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
-        && !m.conversation_tokens.is_empty();
+        && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -3919,6 +3923,19 @@ pub fn generate(
                 },
             )
         };
+        if vmm_pool {
+            // Make the kept conversation this render reuses most resident
+            // (parking the current one); the decision below is unchanged.
+            crate::vmm_conv::singleton_adopt(
+                &mut m.state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                gpu,
+                &rendered,
+            );
+        }
         // LCP detection vs m.conversation_tokens.
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -4999,19 +5016,13 @@ pub fn generate(
             // Promote at this committed boundary — `next_token` is the
             // pending seed, not yet fed — instead of making the peer wait
             // for this whole generation. Features the batch lane does not
-            // carry (grammar, budget alerts, think latches, stop strings,
-            // logprobs, eviction/adaptive KV) keep the request here.
+            // carry (grammar, budget alerts, logprobs, eviction/adaptive KV)
+            // keep the request here; think budgets/latches continue per lane
+            // (`vmm_conv::ThinkCtl`) and stop strings in the moved producer.
             if let Some(permit) = crate::batch::promotion_permit().filter(|_| {
                 crate::batch::promotion_wanted(generated)
                     && !grammar_active
                     && budget_alert_at_tok == 0
-                    && !force_answer_latched
-                    && latch_gen_mark.is_none()
-                    && max_think_tokens == 0
-                    && max_total_think == 0
-                    && think_count == 0
-                    && total_think_tokens == 0
-                    && stop.is_empty()
                     && logprobs_top_k.is_none()
                     && m.eviction.is_none()
                     && m.kv_adaptive.is_none()
@@ -5054,12 +5065,13 @@ pub fn generate(
                 };
                 match crate::batch::promote_singleton(gpu, boundary) {
                     Ok((pending, progress, state)) => {
-                        // The bundle now holds a fresh owner: its cached
-                        // conversation is gone with the swapped KV/DN.
+                        // The bundle now holds a fresh owner: its conversation
+                        // (tokens + resume checkpoints) moves with the swapped
+                        // KV/DN into the lane, which keeps it for the next turn.
+                        // The assistant-turn cache is not tied to an owner.
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                        let checkpoints = std::mem::take(&mut m.prefill_checkpoints);
                         crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
                         if let Some(spec) = m.speculator.as_mut() {
                             if let Err(e) = spec.reset(gpu) {
@@ -5084,6 +5096,21 @@ pub fn generate(
                             loop_guard,
                             kind: crate::batch::PromotedDecode::Ar,
                             seed_emitted: false,
+                            conv: crate::vmm_conv::PromotedConv {
+                                think: Some(crate::vmm_conv::ThinkCtl {
+                                    max_think_tokens,
+                                    max_total_think,
+                                    post_latch_budget: post_latch_answer_budget,
+                                    think_count,
+                                    prev_in_think,
+                                    total_think_tokens,
+                                    force_answer_latched,
+                                    latch_gen_mark,
+                                }),
+                                checkpoints,
+                                cached_tokens: cached_tokens_count,
+                                prefill_tokens,
+                            },
                         });
                         return;
                     }

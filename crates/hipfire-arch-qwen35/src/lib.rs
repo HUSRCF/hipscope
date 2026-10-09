@@ -52,6 +52,11 @@ pub mod dflash_slot;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
+/// Minimal DFlash batched-lane seam (lane state wrapper, lane draft, shared
+/// verify head) used by the Gate 0 replay probe. Deltanet-gated like
+/// `dflash_spec`.
+#[cfg(feature = "deltanet")]
+pub mod dflash_cb;
 /// Retained-PM4 route state for the fixed B=16 DFlash2 target-verify forward
 /// (`DflashVerifyPm4`). Owns the phase machine, admission binding, and
 /// route-proof counters; `speculative` owns the GPU half.

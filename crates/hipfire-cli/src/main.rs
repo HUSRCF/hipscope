@@ -12305,6 +12305,7 @@ mod tests {
                     current_reasoning_effort_native: false,
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
+                    continuous_batch_vmm: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,

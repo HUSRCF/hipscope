@@ -458,11 +458,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
             fill_tokens,
             start_pos,
             prompt_route,
-            |gpu, slot, position| {
+            |gpu, dn_state, position| {
                 if checkpoint_resume {
                     take_dn_checkpoint(
                         &mut checkpoints,
-                        &slot.dn_state,
+                        dn_state,
                         gpu,
                         position,
                         checkpoint_interval,
@@ -920,4 +920,41 @@ pub fn build_qwen35_mtp_speculator(
         max_n,
         ctx_capacity,
     )))
+}
+
+/// A continuous-batching spec lane's MTP state, allocated and configured
+/// exactly as [`Qwen35MtpDrafter`] does for a request on the singleton
+/// route (`ensure_state` + `configure_request`, no n-gram modifier): verify
+/// capacity `max_n`, Q8 head KV, the compressed-vocab scratches when the
+/// head ships them, then the request's sampling and penalty window against
+/// the AR repeat capacity `ar_cap`. `dn` sizes the trunk snapshot.
+pub fn new_qwen35_mtp_lane_state(
+    gpu: &mut Gpu,
+    config: &crate::qwen35::Qwen35Config,
+    dn: &crate::qwen35::DeltaNetState,
+    head: &Qwen35MtpHead,
+    max_n: usize,
+    request: SpecRequestConfig,
+    ar_cap: usize,
+) -> Result<MtpSpecState, String> {
+    let max_n = max_n.clamp(1, 8);
+    let mut st =
+        MtpSpecState::new_for_components_with_verify_capacity(gpu, config, dn, head, max_n, max_n, MtpKvMode::Q8)
+            .map_err(|e| format!("alloc MtpSpecState: {e}"))?;
+    if let Some(cvs) = head.weights.compressed_vocab_size {
+        let compressed = st
+            .mtp_scratch
+            .ensure_compressed_logits(gpu, cvs)
+            .map_err(|e| format!("alloc logits_compressed: {e}"))
+            .and_then(|_| {
+                st.ensure_compressed_lm_logits(gpu, cvs)
+                    .map_err(|e| format!("alloc mtp_lm_logits_compressed: {e}"))
+            });
+        if let Err(error) = compressed {
+            st.free_gpu(gpu);
+            return Err(error);
+        }
+    }
+    Qwen35MtpDrafter::apply_request(&mut st, request, ar_cap);
+    Ok(st)
 }

@@ -4523,6 +4523,27 @@ pub fn generate_spec(
                             .as_any_mut()
                             .downcast_mut::<speculative::ModelSlot>()
                             .ok_or("spec target is not a qwen35 ModelSlot")?;
+                        // A DFlash drafter's lane (draft K/V, hidden ring,
+                        // checkpoints, cursors) moves into the batch lane.
+                        // Capture BEFORE the irreversible target transfer
+                        // below; a refused promotion restores it.
+                        let df_snap = if permit.dflash_lane {
+                            match spec
+                                .drafter_any_mut()
+                                .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+                            {
+                                Some(df) => match df.take_vmm_lane(gpu, &ms.config, &ms.dn_state, position) {
+                                    Ok(snap) => Some(snap),
+                                    Err(e) => {
+                                        eprintln!("[vmm-promote] id={id} no DFlash lane state ({e}); continues as AR");
+                                        None
+                                    }
+                                },
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
                         let mut conversation = Vec::with_capacity(prompt_tokens.len() + emitted.len());
                         conversation.extend_from_slice(&prompt_tokens);
                         conversation.extend_from_slice(&emitted);
@@ -4546,10 +4567,34 @@ pub fn generate_spec(
                             first_token_at: Some(t_prefill),
                             started_in_think: promo_started_in_think,
                         };
-                        crate::batch::promote_singleton(gpu, boundary).map(|p| (p, producer))
+                        match crate::batch::promote_singleton(gpu, boundary) {
+                            Ok(p) => Ok((p, producer, df_snap)),
+                            Err(e) => {
+                                if let Some(snap) = df_snap {
+                                    let restored = spec
+                                        .drafter_any_mut()
+                                        .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+                                        .ok_or_else(|| {
+                                            "speculator is not a DFlashSpeculator".to_string()
+                                        });
+                                    match restored {
+                                        Ok(df) => {
+                                            if let Err(re) = df.restore_vmm_lane(gpu, snap) {
+                                                eprintln!("[vmm-promote] id={id} DFlash lane restore failed: {re}");
+                                            }
+                                        }
+                                        Err(re) => {
+                                            eprintln!("[vmm-promote] id={id} DFlash lane restore failed: {re}");
+                                            snap.free_gpu(gpu);
+                                        }
+                                    }
+                                }
+                                Err(e)
+                            }
+                        }
                     });
                 match promoted {
-                    Ok(((pending, progress, state), producer)) => {
+                    Ok(((pending, progress, state), producer, df_snap)) => {
                         // The target now holds fresh owners: host caches and
                         // the speculator's draft state belong to the moved
                         // KV/DN, so drop them (the guard restores the bundle).
@@ -4558,6 +4603,27 @@ pub fn generate_spec(
                         m.asst_turn_cache.clear();
                         free_checkpoints(&mut m.prefill_checkpoints, gpu);
                         free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        // A drafter's state continues in a spec lane: copy it
+                        // out before the reset below drops it. DFlash's lane
+                        // was already moved out before the transfer.
+                        let kind = if let Some(snap) = df_snap {
+                            crate::batch::PromotedDecode::Dflash(snap)
+                        } else if permit.dflash_lane && spec.name() == "dflash" {
+                            eprintln!("[vmm-promote] id={id} DFlash lane state unavailable; continues as AR");
+                            crate::batch::PromotedDecode::Ar
+                        } else {
+                            match hipfire_arch_qwen35::forward_slots::vmm::spec::MtpLaneSnapshot::capture(
+                                gpu,
+                                &mut **spec,
+                                position,
+                            ) {
+                                Ok(snap) => crate::batch::PromotedDecode::Mtp(snap),
+                                Err(e) => {
+                                    eprintln!("[vmm-promote] id={id} no MTP lane state ({e}); continues as AR");
+                                    crate::batch::PromotedDecode::Ar
+                                }
+                            }
+                        };
                         if let Err(e) = spec.reset(gpu) {
                             eprintln!("[vmm-promote] speculator reset after promotion: {e}");
                         }
@@ -4574,8 +4640,9 @@ pub fn generate_spec(
                             loop_guard: hipfire_runtime::loop_guard::LoopGuard::from_config(
                                 hipfire_runtime::config::get(),
                             ),
-                            kind: crate::batch::PromotedDecode::Ar,
+                            kind,
                             seed_emitted: true,
+                            conv: Default::default(),
                         });
                         drop(guard);
                         return None;
