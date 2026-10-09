@@ -128,7 +128,24 @@ fn pointer_actual_access_metadata() {
     let summary = assemble_and_m7(&e, "access");
     assert_eq!(summary["obligations"], serde_json::json!({}));
     let elf = hipfire_isa::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
-    for needle in [&b".actual_access"[..], b"read_only", b"write_only"] {
-        assert!(elf.windows(needle.len()).any(|w| w == needle), "{}", String::from_utf8_lossy(needle));
+    // Golden against a real hipcc (clang) gfx1201 object: the NT_AMDGPU_METADATA
+    // MessagePack of an access-annotated pointer arg is the same key/value byte
+    // run in both: fixstr `.actual_access`, fixstr value, then `.address_space: global`.
+    let hipcc = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../peacemaker-lift/tests/fixtures/kt48/hipcc.co")).unwrap();
+    let run = |value: &str| -> Vec<u8> {
+        let mut v = vec![0xa0 | 14];
+        v.extend_from_slice(b".actual_access");
+        v.push(0xa0 | value.len() as u8);
+        v.extend_from_slice(value.as_bytes());
+        v.push(0xa0 | 14);
+        v.extend_from_slice(b".address_space");
+        v.push(0xa0 | 6);
+        v.extend_from_slice(b"global");
+        v
+    };
+    for value in ["read_only", "write_only"] {
+        let needle = run(value);
+        assert!(hipcc.windows(needle.len()).any(|w| w == needle), "hipcc object lacks {value} run");
+        assert!(elf.windows(needle.len()).any(|w| w == needle), "native object differs from hipcc for {value}");
     }
 }
