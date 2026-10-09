@@ -12,7 +12,9 @@
 //! row segment per `blockIdx.z`, taking that segment's pointers and row
 //! count from a table, with the singleton launch's grid x/y and block. Each
 //! segment is therefore the singleton launch by construction; ragged
-//! segments size grid y to the longest and exit the surplus blocks.
+//! segments size grid y to the longest and exit the surplus blocks. A twin
+//! may carry checked source edits that change only operand loads, never an
+//! arithmetic operation or its order (`ATTN_FP8_LOAD_EDITS`).
 //!
 //! Use: `stage_*_segs` validates and uploads the tables (outside graph
 //! capture), `*_segs` launches from a staged table.
@@ -29,15 +31,87 @@ fn seg_err(msg: impl AsRef<str>) -> HipError {
 
 /// Rewrite the singleton entry `extern "C" __global__ void {kernel}(` (it
 /// must occur exactly once) into `__device__ __forceinline__ void
-/// {kernel}_seg_body(` and append the wrapper selected by `twin_define`.
-pub fn seg_twin_source(src: &str, kernel: &str, twin_define: &str) -> HipResult<String> {
+/// {kernel}_seg_body(`, apply `edits` (each `from` must occur exactly once)
+/// and append the wrapper selected by `twin_define`.
+pub fn seg_twin_source(src: &str, kernel: &str, twin_define: &str, edits: &[(&str, &str)]) -> HipResult<String> {
     let entry = format!("extern \"C\" __global__ void {kernel}(");
     if src.matches(&entry).count() != 1 {
         return Err(seg_err(format!("segment twin {kernel}: entry `{entry}` not found exactly once")));
     }
-    let body = src.replacen(&entry, &format!("__device__ __forceinline__ void {kernel}_seg_body("), 1);
+    let mut body = src.replacen(&entry, &format!("__device__ __forceinline__ void {kernel}_seg_body("), 1);
+    for (from, to) in edits {
+        if body.matches(from).count() != 1 {
+            return Err(seg_err(format!("segment twin {kernel}: checked edit `{from}` not found exactly once")));
+        }
+        body = body.replacen(from, to, 1);
+    }
     Ok(format!("#define {twin_define} 1\n{body}\n{SEG_TWINS_SRC}"))
 }
+
+/// The fp8 scalar-batched attention's two inner loops issue one dependent
+/// global byte load per step, so the singleton is load-latency bound. These
+/// edits keep every arithmetic operation and its order (same expressions,
+/// same sequential accumulation) and change only how the operands are
+/// loaded: K codes in 8-byte words (when aligned), V codes and scales
+/// hoisted eight positions ahead of their in-order accumulation.
+const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
+    (
+        "        for (int j = 0; j < head_dim; j++)\n            dot += q_shared[j] * (ks * hipfire_fp8_e4m3_to_f32_batched(kc[j]));\n",
+        "        if ((head_dim & 7) == 0 && (((unsigned long long)kc) & 7) == 0) {
+            const uint2* kc8 = (const uint2*)kc;
+            const int words = head_dim >> 3;
+            for (int c = 0; c < words; c += 4) {
+                uint2 w[4];
+                #pragma unroll
+                for (int u = 0; u < 4; u++) w[u] = (c + u < words) ? kc8[c + u] : make_uint2(0u, 0u);
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    if (c + u < words) {
+                        #pragma unroll
+                        for (int b = 0; b < 8; b++) {
+                            const int j = ((c + u) << 3) + b;
+                            const unsigned int word = b < 4 ? w[u].x : w[u].y;
+                            const unsigned char code = (unsigned char)(word >> ((b & 3) * 8));
+                            dot += q_shared[j] * (ks * hipfire_fp8_e4m3_to_f32_batched(code));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int j = 0; j < head_dim; j++)
+                dot += q_shared[j] * (ks * hipfire_fp8_e4m3_to_f32_batched(kc[j]));
+        }
+",
+    ),
+    (
+        "        for (int t = 0; t < eff_seq_len; t++) {
+            const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+            const float vs = (float)*((const _Float16*)(vrow + scale_off));
+            val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+        }
+",
+        "        int t = 0;
+        for (; t + 8 <= eff_seq_len; t += 8) {
+            float vsu[8];
+            unsigned char vbu[8];
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t + u, per_pos_bytes);
+                vsu[u] = (float)*((const _Float16*)(vrow + scale_off));
+                vbu[u] = vrow[k_head_off + d];
+            }
+            #pragma unroll
+            for (int u = 0; u < 8; u++)
+                val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
+        }
+        for (; t < eff_seq_len; t++) {
+            const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+            const float vs = (float)*((const _Float16*)(vrow + scale_off));
+            val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+        }
+",
+    ),
+];
 
 /// `HfAttnFp8Seg`: one request's `attention_fp8_e4m3_kv_batched` launch.
 #[repr(C)]
@@ -63,7 +137,7 @@ pub fn seg_twin_module_source(twin: &str) -> HipResult<String> {
             // stripped and prepended.
             let stripped = kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
             let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            seg_twin_source(&src, "attention_fp8_e4m3_kv_batched", "HIPFIRE_SEGS_ATTN_FP8")
+            seg_twin_source(&src, "attention_fp8_e4m3_kv_batched", "HIPFIRE_SEGS_ATTN_FP8", ATTN_FP8_LOAD_EDITS)
         }
         other => Err(seg_err(format!("unknown segment twin {other}"))),
     }
