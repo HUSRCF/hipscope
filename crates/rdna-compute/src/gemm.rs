@@ -10080,7 +10080,7 @@ impl Gpu {
                 Ok(path) => {
                     let image = std::fs::read(&path)
                         .map_err(|e| hip_bridge::HipError::new(0, &format!("F2: bundle {path}: {e}")))?;
-                    self.ensure_embedded_kernel(GEMM_MODULE, &image, symbol)?;
+                    self.ensure_embedded_kernel(GEMM_MODULE, std::sync::Arc::<[u8]>::from(image), symbol)?;
                 }
                 Err(_) => self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?,
             }

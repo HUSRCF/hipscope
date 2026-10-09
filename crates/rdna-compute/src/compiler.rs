@@ -13,6 +13,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use crate::code_object::CodeObjectRegistry;
 use std::process::Command;
 use std::thread;
 
@@ -379,6 +381,8 @@ pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
     compiled: HashMap<String, PathBuf>,
+    /// Admitted in-memory code objects, bound once per successful load.
+    code_objects: CodeObjectRegistry,
     /// Lookup directory for pre-compiled blobs (hot when seeded, else cold).
     precompiled_dir: Option<PathBuf>,
     /// Persistent install dir (`kernels/compiled/{arch}`). Writeback target;
@@ -604,6 +608,7 @@ impl KernelCompiler {
             cache_dir,
             arch: arch.to_string(),
             compiled: HashMap::new(),
+            code_objects: CodeObjectRegistry::default(),
             precompiled_dir,
             cold_dir,
             has_hipcc,
@@ -621,16 +626,15 @@ impl KernelCompiler {
         &self.compiled
     }
 
-    /// Register `func_name` as an additional key pointing at an already-compiled
-    /// artifact. `compiled_kernels()` is keyed by MODULE name, but the retained-PM4
-    /// capture resolves a launched FUNCTION name; for arch-variant kernels (e.g.
-    /// `gemv_hfq4g256_residual`, whose module is `gemv_hfq4g256_residual_rdna3` on
-    /// RDNA3) the two differ, so without this alias the capture cannot find the
-    /// owning `.hsaco` and the retained replay route fails closed. Additive and
-    /// idempotent: never overwrites an existing key, so module-name lookups and
-    /// the default-arch (module == func) case are unchanged.
-    pub fn register_func_artifact(&mut self, func_name: &str, path: PathBuf) {
-        self.compiled.entry(func_name.to_string()).or_insert(path);
+    /// Module/function → admitted code-object bindings shared by every loader
+    /// (hipcc cache and embedded images). Recording resolves launched
+    /// functions here; it never reopens a file.
+    pub fn code_objects(&self) -> &CodeObjectRegistry {
+        &self.code_objects
+    }
+
+    pub(crate) fn code_objects_mut(&mut self) -> &mut CodeObjectRegistry {
+        &mut self.code_objects
     }
 
     fn module_flags_for(
@@ -1836,6 +1840,7 @@ mod tests {
             cache_dir: PathBuf::from(".test-cache"),
             arch: "gfx1151".to_string(),
             compiled: HashMap::new(),
+            code_objects: CodeObjectRegistry::default(),
             precompiled_dir: None,
             cold_dir: None,
             has_hipcc: false,

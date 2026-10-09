@@ -441,13 +441,6 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
-    // Alias the launched function name to this arch's compiled artifact so the
-    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
-    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
-    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
-    if func_name != module_name {
-        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
-    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
@@ -459,16 +452,37 @@ pub(crate) fn compile_and_load_kernel(
         );
         hip_bridge::HipError::new(error.code, &context)
     })?;
+    // Bind the launched function name to its module's admitted image so the
+    // recorder resolves it even when the arch-selected module name differs
+    // (e.g. gemv_hfq4g256_residual launched from gemv_hfq4g256_residual_rdna3).
+    bind_loaded_function(compiler, module_name, func_name)?;
     functions.insert(func_name.to_string(), func);
     Ok(())
 }
 
-/// Load a compiled module, self-healing a stale/invalid cached image. If
-/// `hipModuleLoad` rejects the `.hsaco` as an invalid device image
-/// (`HIP_ERROR_INVALID_IMAGE`) — e.g. a cross-build blob left in a shared
-/// `.hipfire_kernels` cache — evict it, recompile from source, and retry once.
-/// Any other error propagates unchanged. (Fix for the bench/run "device kernel
-/// image is invalid" crash when two daemon builds share a cwd kernel cache.)
+/// Bind `func_name` to the artifact already admitted for `module_name`.
+pub(crate) fn bind_loaded_function(
+    compiler: &mut crate::compiler::KernelCompiler,
+    module_name: &str,
+    func_name: &str,
+) -> HipResult<()> {
+    let registry = compiler.code_objects_mut();
+    let artifact = registry.module(module_name).cloned().ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("module {module_name:?} has no admitted code object"))
+    })?;
+    registry
+        .bind_function(func_name, &artifact)
+        .map_err(|reason| hip_bridge::HipError::new(0, &reason))
+}
+
+/// Load a compiled module from its immutable image, self-healing a
+/// stale/invalid cached image. The cache file is read once; HIP loads those
+/// exact bytes and the same bytes are admitted as the module's code object.
+/// If HIP rejects the image as invalid (`HIP_ERROR_INVALID_IMAGE`) — e.g. a
+/// cross-build blob left in a shared `.hipfire_kernels` cache — evict it,
+/// recompile from source, and retry once. Any other error propagates
+/// unchanged. (Fix for the bench/run "device kernel image is invalid" crash
+/// when two daemon builds share a cwd kernel cache.)
 pub(crate) fn module_load_or_recompile(
     hip: &HipRuntime,
     compiler: &mut crate::compiler::KernelCompiler,
@@ -477,18 +491,31 @@ pub(crate) fn module_load_or_recompile(
     symbol: &str,
     obj_path: &str,
 ) -> HipResult<Module> {
-    match hip.module_load(obj_path) {
-        Ok(m) => Ok(m),
+    let read = |path: &std::path::Path| -> HipResult<std::sync::Arc<[u8]>> {
+        std::fs::read(path).map(Into::into).map_err(|error| {
+            hip_bridge::HipError::new(0, &format!("read {}: {error}", path.display()))
+        })
+    };
+    let mut path = std::path::PathBuf::from(obj_path);
+    let mut image = read(&path)?;
+    let module = match hip.module_load_data(&image) {
+        Ok(m) => m,
         Err(e) if e.code == HIP_ERROR_INVALID_IMAGE => {
             eprintln!(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            let fresh = compiler.recompile(module_name, source, symbol)?;
-            hip.module_load(fresh.to_str().unwrap())
+            path = compiler.recompile(module_name, source, symbol)?;
+            image = read(&path)?;
+            hip.module_load_data(&image)?
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+    compiler
+        .code_objects_mut()
+        .admit_module(module_name, crate::code_object::CodeObjectArtifact::hip_file(&path, image))
+        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+    Ok(module)
 }
 
 /// Launch a kernel, routing through the blob path when graph capture, replay
@@ -535,7 +562,7 @@ pub(crate) fn launch_maybe_blob(
             // `Gpu::launch_maybe_blob_bound`.
             let artifact = compiler
                 .as_ref()
-                .and_then(|c| crate::dispatch::recorded_launch_artifact(c, func_name));
+                .and_then(|c| crate::dispatch::recorded_launch_path(c, func_name));
             replay.as_mut().unwrap().record_hip_launch_typed_bound(
                 hip,
                 func_name,
