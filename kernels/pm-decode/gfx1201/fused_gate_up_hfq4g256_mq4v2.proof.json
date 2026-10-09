@@ -1,0 +1,352 @@
+{
+  "module": "fused_gate_up_hfq4g256_mq4v2",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "unknown",
+  "s_text_sha256": "c524f2dbaf7a6949396286eebf229df144d5397f6803f8ecf54976eecb9b0e6c",
+  "kernels": [
+    {
+      "kernel_id": "fused_gate_up_hfq4g256_mq4v2",
+      "variant": "gfx1201",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "reg_plan": [
+        {
+          "name": "lane",
+          "kind": "v",
+          "base": 0,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scratch",
+          "kind": "v",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "x_lo",
+          "kind": "v",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "x_hi",
+          "kind": "v",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "levels_lo",
+          "kind": "v",
+          "base": 16,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "levels_hi",
+          "kind": "v",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "accumulators",
+          "kind": "v",
+          "base": 24,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "addresses",
+          "kind": "v",
+          "base": 28,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "abi",
+          "kind": "s",
+          "base": 0,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "pointers0",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "pointers1",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "resource",
+          "kind": "s",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "shape",
+          "kind": "s",
+          "base": 16,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "loop",
+          "kind": "s",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "masks",
+          "kind": "s",
+          "base": 24,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "temps",
+          "kind": "s",
+          "base": 28,
+          "len": 4,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 32,
+      "next_free_sgpr": 32,
+      "waits": [
+        {
+          "pc_index": 4,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s[16:19]"
+            }
+          }
+        },
+        {
+          "pc_index": 39,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[6:7]"
+            }
+          }
+        },
+        {
+          "pc_index": 45,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 90,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[6:7]"
+            }
+          }
+        },
+        {
+          "pc_index": 96,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 141,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[6:7]"
+            }
+          }
+        },
+        {
+          "pc_index": 147,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 192,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[6:7]"
+            }
+          }
+        },
+        {
+          "pc_index": 198,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 241,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 248,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 255,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 262,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 269,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 277,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 33,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 84,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 91,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 135,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 142,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 186,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 193,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 244,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 251,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 258,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 265,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [
+        {
+          "head": ".Lgate_up_groups",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "c524f2dbaf7a6949396286eebf229df144d5397f6803f8ecf54976eecb9b0e6c"
+    }
+  ]
+}

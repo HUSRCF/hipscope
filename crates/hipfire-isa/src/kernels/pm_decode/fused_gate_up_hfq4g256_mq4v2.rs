@@ -1,10 +1,16 @@
 //! Exact gfx1201 gate/up projection arithmetic, frozen to clang24 MQ4v2.
+//! The 52-byte ABI, 32-thread launcher and zero LDS are inherited unchanged.
+//! Independent group streams own g%4; each group's ordered eight-term DAG
+//! is followed by the pairwise fold and shuffle-down 16,8,4,2,1. Gate and up
+//! remain separate projections: this symbol performs no SiLU.
 use crate::{Arch, Builder, Emitted, KernelSpec, KernargLayout, RegPlan};
 use crate::insn::MemoryClass;
 use crate::kernels::common::{mem, op, s, smem, sr, v, vr};
 use crate::reg::Live;
+use crate::plan::Access;
 
 const SYMBOL: &str = "fused_gate_up_mq4g256v2";
+#[cfg(all(test, feature = "toolchain"))]
 const G0_SYMBOL: &str = "fused_gate_up_mq4g256v2_g0";
 
 fn builder(symbol: &str) -> Result<Builder, String> {
@@ -13,8 +19,11 @@ fn builder(symbol: &str) -> Result<Builder, String> {
         variant: "gfx1201".into(), arch: Arch::Gfx1201,
         symbol: symbol.into(),
         kernargs: KernargLayout::new(52)
-            .pointer("A_gate", 0).pointer("A_up", 8).pointer("x", 16)
-            .pointer("y_gate", 24).pointer("y_up", 32)
+            .pointer_access("A_gate", 0, Access::ReadOnly)
+            .pointer_access("A_up", 8, Access::ReadOnly)
+            .pointer_access("x", 16, Access::ReadOnly)
+            .pointer_access("y_gate", 24, Access::WriteOnly)
+            .pointer_access("y_up", 32, Access::WriteOnly)
             .hidden("gate_m", 40, 4, "by_value")
             .hidden("up_m", 44, 4, "by_value")
             .hidden("K", 48, 4, "by_value"),
@@ -57,6 +66,7 @@ fn group_arithmetic(b: &mut Builder, accumulator: u8) -> Result<(), String> {
        &[v(accumulator)], &[v(accumulator), v(6)])
 }
 
+#[cfg(all(test, feature = "toolchain"))]
 /// G0 only: one 136-byte group and 256 input floats, producing all 32
 /// post-reduction lane values in y_gate. Lane zero is the one-group dot.
 fn build_region() -> Result<Emitted, String> {
@@ -120,7 +130,92 @@ fn reduce(b: &mut Builder) -> Result<(), String> {
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    Err(format!("{SYMBOL}: G0 real-tensor region gate has not passed"))
+    let mut b = builder(SYMBOL)?;
+    smem(&mut b, 4, 4, 0, 0)?;
+    smem(&mut b, 8, 4, 0, 16)?;
+    smem(&mut b, 16, 4, 0, 32)?;
+    smem(&mut b, 28, 1, 0, 48)?;
+    // gfx12's workgroup ID x is supplied in ttmp9, not in the user SGPRs.
+    op(&mut b, "s_cmp_lt_i32 ttmp9, s18", &[], &[s(18)])?;
+    op(&mut b, "s_cselect_b32 s20, 0, s18", &[s(20)], &[s(18)])?;
+    op(&mut b, "s_cselect_b32 s4, s4, s6", &[s(4)], &[s(4), s(6)])?;
+    op(&mut b, "s_cselect_b32 s5, s5, s7", &[s(5)], &[s(5), s(7)])?;
+    op(&mut b, "s_cselect_b32 s10, s10, s16", &[s(10)], &[s(10), s(16)])?;
+    op(&mut b, "s_cselect_b32 s11, s11, s17", &[s(11)], &[s(11), s(17)])?;
+    op(&mut b, "s_sub_co_i32 s30, ttmp9, s20", &[s(30)], &[s(20)])?;
+    op(&mut b, "s_ashr_i32 s31, s30, 31", &[s(31)], &[s(30)])?;
+    // K is host-admitted as a positive multiple of 256.
+    op(&mut b, "s_ashr_i32 s21, s28, 8", &[s(21)], &[s(28)])?;
+    op(&mut b, "s_mul_i32 s22, s21, 0x88", &[s(22)], &[s(21)])?;
+    op(&mut b, "s_ashr_i32 s23, s22, 31", &[s(23)], &[s(22)])?;
+    op(&mut b, "s_mul_u64 s[22:23], s[22:23], s[30:31]",
+        &[sr(22, 2)], &[sr(22, 2), sr(30, 2)])?;
+    op(&mut b, "s_add_nc_u64 s[12:13], s[4:5], s[22:23]",
+        &[sr(12, 2)], &[sr(4, 2), sr(22, 2)])?;
+    op(&mut b, "s_and_b32 s13, s13, 0xffff", &[s(13)], &[s(13)])?;
+    op(&mut b, "s_mov_b32 s14, -1", &[s(14)], &[])?;
+    op(&mut b, "s_mov_b32 s15, 0x31004000", &[s(15)], &[])?;
+    op(&mut b, "v_lshlrev_b32_e32 v1, 2, v0", &[v(1)], &[v(0)])?;
+    op(&mut b, "v_lshlrev_b32_e32 v2, 5, v0", &[v(2)], &[v(0)])?;
+    for accumulator in 24..28 {
+        op(&mut b, format!("v_mov_b32_e32 v{accumulator}, 0"),
+           &[v(accumulator)], &[])?;
+    }
+    for register in [20, 22, 23] {
+        op(&mut b, format!("s_mov_b32 s{register}, 0"), &[s(register)], &[])?;
+    }
+    // Sequential scheduling of four independent group streams preserves
+    // their DAG and tail ownership without sharing or reassociating sums.
+    b.loop_(".Lgate_up_groups", |b| {
+        for accumulator in 24..28 {
+            op(b, "s_cmp_lt_u32 s20, s21", &[], &[s(20), s(21)])?;
+            op(b, "s_cbranch_scc0 .Lgate_up_fold", &[], &[])?;
+            load_group(b)?;
+            group_arithmetic(b, accumulator)?;
+            b.wait_all()?;
+            op(b, "s_add_co_i32 s20, s20, 1", &[s(20)], &[s(20)])?;
+            op(b, "s_add_co_i32 s22, s22, 0x88", &[s(22)], &[s(22)])?;
+            op(b, "s_add_co_i32 s23, s23, 0x400", &[s(23)], &[s(23)])?;
+        }
+        op(b, "s_branch .Lgate_up_groups", &[], &[])
+    })?;
+    b.label(".Lgate_up_fold")?;
+    op(&mut b, "v_add_f32_e32 v24, v24, v25", &[v(24)], &[v(24), v(25)])?;
+    // Incumbent's second pair is acc3 + acc2 (the original operand order).
+    op(&mut b, "v_add_f32_e32 v26, v27, v26", &[v(26)], &[v(27), v(26)])?;
+    op(&mut b, "v_add_f32_e32 v24, v24, v26", &[v(24)], &[v(24), v(26)])?;
+    reduce(&mut b)?;
+    op(&mut b, "v_cmpx_eq_u32_e32 0, v0", &[], &[v(0)])?;
+    op(&mut b, "s_cbranch_execz .Lgate_up_end", &[], &[])?;
+    op(&mut b, "s_lshl_b64 s[30:31], s[30:31], 2",
+        &[sr(30, 2)], &[sr(30, 2)])?;
+    op(&mut b, "s_add_nc_u64 s[10:11], s[10:11], s[30:31]",
+        &[sr(10, 2)], &[sr(10, 2), sr(30, 2)])?;
+    op(&mut b, "v_mov_b32_e32 v3, 0", &[v(3)], &[])?;
+    mem(&mut b, "global_store_b32 v3, v24, s[10:11]",
+        &[], &[v(3), v(24), sr(10, 2)], MemoryClass::VmemStore)?;
+    b.wait_all()?;
+    b.label(".Lgate_up_end")?;
+    op(&mut b, "s_endpgm", &[], &[])?;
+    Ok(vec![b.finish()?])
+}
+
+/// The raw-buffer resource and device scope match the frozen incumbent.
+fn load_group(b: &mut Builder) -> Result<(), String> {
+    op(b, "v_mov_b32_e32 v3, s22", &[v(3)], &[s(22)])?;
+    op(b, "v_add_nc_u32_e32 v28, s22, v1", &[v(28)], &[s(22), v(1)])?;
+    op(b, "v_add_nc_u32_e32 v29, s23, v2", &[v(29)], &[s(23), v(2)])?;
+    mem(b, "buffer_load_b64 v[6:7], v3, s[12:15], null offen scope:SCOPE_DEV",
+        &[vr(6, 2)], &[v(3), sr(12, 4)], MemoryClass::VmemLoad)?;
+    op(b, "v_cmp_lt_u32_e64 s24, v0, 16", &[s(24)], &[v(0)])?;
+    op(b, "v_cndmask_b32_e64 v5, v7, v6, s24",
+        &[v(5)], &[v(7), v(6), s(24)])?;
+    mem(b, "buffer_load_b32 v4, v28, s[12:15], null offen offset:8 scope:SCOPE_DEV",
+        &[v(4)], &[v(28), sr(12, 4)], MemoryClass::VmemLoad)?;
+    mem(b, "global_load_b128 v[8:11], v29, s[8:9]",
+        &[vr(8, 4)], &[v(29), sr(8, 2)], MemoryClass::VmemLoad)?;
+    mem(b, "global_load_b128 v[12:15], v29, s[8:9] offset:16",
+        &[vr(12, 4)], &[v(29), sr(8, 2)], MemoryClass::VmemLoad)
 }
 
 #[cfg(all(test, feature = "toolchain"))]
@@ -155,5 +250,26 @@ mod tests {
         println!("gate_up G0 M7: {m7}");
         assert_eq!(m7["lift"], "byte-exact");
         assert_eq!(m7["obligations"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn production_projection_m7() {
+        let emitted = build_gfx1201().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].shape.barriers, 0);
+        assert!(emitted[0].proof.lds_slots.is_empty());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/pm-decode/gfx1201");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("fused_gate_up_hfq4g256_mq4v2.test-{}.co",
+            std::process::id()));
+        let elf = crate::native::assemble(&emitted[0].s_text, Arch::Gfx1201).unwrap();
+        std::fs::write(&path, elf).unwrap();
+        let m7 = crate::pm_check::m7(&path, "gfx1201", SYMBOL).unwrap();
+        println!("gate_up production M7: {m7}");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(m7["lift"], "byte-exact");
+        assert_eq!(m7["obligations"], serde_json::json!({}));
+        assert_eq!(m7["ambiguous_delays"], 0);
     }
 }
