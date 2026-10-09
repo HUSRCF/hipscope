@@ -54,6 +54,144 @@ impl MtpCbScratch {
     }
 }
 
+/// One lane's draft request.
+pub struct MtpCbDraftLane<'a> {
+    pub state: &'a mut MtpSpecState,
+    pub cur_pos: usize,
+    pub last_committed: u32,
+    /// Emitted history ending in `last_committed` (penalty window).
+    pub emitted: &'a [u32],
+    pub k: usize,
+}
+
+/// Does this lane's singleton draft take the greedy full-vocab
+/// device-token-chain loop (no proposal graph) whose head the batched
+/// drafter shares?
+fn draft_batchable(gpu: &Gpu, weights: &Qwen35Weights, head: &Qwen35MtpHead, lane: &MtpCbDraftLane<'_>) -> bool {
+    let st = &*lane.state;
+    lane.k.min(st.max_n) > 0
+        && head.weights.lm_head_draft.is_none()
+        && st.sampling.is_greedy()
+        && st.p_min <= 0.0
+        && mtp_device_token_chain_enabled_from_env()
+        && mtp_device_token_chain_eligible_for(weights.embd_format, false, false)
+        && weights.output.gpu_dtype == DType::MQ4G256V2
+        && gpu.arch_caps.is_gfx1201()
+}
+
+/// Draft phase of many lanes, step-synchronous: at each draft step every
+/// lane runs its own singleton head block, norm and lm_head input rotate,
+/// then ONE multi-column lm_head (the PM twin of the singleton
+/// `gemv_mq4g256v2_multirow_r2`, column-identical) over all lanes, then
+/// each lane's own argmax into its device token chain. Per lane this is
+/// the singleton greedy full-vocab device-chain draft; lanes outside that
+/// mode draft alone ([`mtp_cb_draft`]). `cb.rot`/`cb.logits` are free
+/// before verify and stage the head columns.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_cb_draft_batched(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    head: &Qwen35MtpHead,
+    cb: &MtpCbScratch,
+    lanes: &mut [MtpCbDraftLane<'_>],
+) -> HipResult<Vec<MtpDraftOutput>> {
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+    let dim = config.dim;
+    let vocab = config.vocab_size;
+    let batched: Vec<bool> = lanes.iter().map(|l| draft_batchable(gpu, weights, head, l)).collect();
+    let group: Vec<usize> = (0..lanes.len()).filter(|&i| batched[i]).collect();
+    let mut out: Vec<Option<MtpDraftOutput>> = (0..lanes.len()).map(|_| None).collect();
+    if group.len() >= 2 && group.len() <= cb.max_rows {
+        let n_k: Vec<usize> = group.iter().map(|&i| lanes[i].k.min(lanes[i].state.max_n)).collect();
+        for &i in &group {
+            let l = &mut lanes[i];
+            l.state.penalty.begin_window(l.emitted);
+            let seed = l.last_committed as i32;
+            gpu.hip.memcpy_htod(&l.state.mtp_token_chain.buf, &seed.to_ne_bytes())?;
+        }
+        let out_w = &weights.output;
+        let k_max = n_k.iter().copied().max().unwrap_or(0);
+        for k in 0..k_max {
+            let act: Vec<usize> = (0..group.len()).filter(|&g| n_k[g] > k).collect();
+            for (col, &g) in act.iter().enumerate() {
+                let cur_pos = lanes[group[g]].cur_pos;
+                let st = &mut *lanes[group[g]].state;
+                let token_slot = st.mtp_token_chain.sub_offset(k, 1);
+                embed_device_token_into(gpu, weights, &st.mtp_token_embed, &token_slot, dim)?;
+                let prev = if k == 0 { st.prev_hidden.sub_offset(0, dim) } else { st.mtp_t_outs.sub_offset((k - 1) * dim, dim) };
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &st.mtp_scratch,
+                    &mut st.mtp_kv,
+                    0,
+                    &prev,
+                    Some(&st.mtp_token_embed),
+                    cur_pos + k,
+                    weights,
+                )?;
+                gpu.rmsnorm_f32(&st.mtp_scratch.t_mtp_out, &head.weights.shared_head_norm, &st.mtp_scratch.tmp, head.config.rms_norm_eps)?;
+                // weight_gemv's MQ4 input rotate, into this lane's column.
+                let col_x = cb.rot.sub_offset(col * dim, dim);
+                llama::rotate_x_mq_for(gpu, out_w, &st.mtp_scratch.tmp, &col_x, out_w.k)?;
+            }
+            let mut c0 = 0usize;
+            while c0 < act.len() {
+                let c1 = (c0 + rdna_compute::pm_xbatch::PM_XBATCH_MAX).min(act.len());
+                hipfire_dispatch::ops::pm_xbatch::multirow_r2(
+                    gpu,
+                    &out_w.buf,
+                    &cb.rot.sub_offset(c0 * dim, (c1 - c0) * dim),
+                    &cb.logits.sub_offset(c0 * vocab, (c1 - c0) * vocab),
+                    vocab,
+                    dim,
+                    c1 - c0,
+                )?;
+                c0 = c1;
+            }
+            for (col, &g) in act.iter().enumerate() {
+                let st = &mut *lanes[group[g]].state;
+                let argmax_view = st.mtp_lm_argmax.sub_offset(0, 1);
+                let logits = cb.logits.sub_offset(col * vocab, vocab);
+                gpu.argmax_token_chain_f32(&logits, &argmax_view, &st.mtp_token_chain, None, vocab, k + 1)?;
+                if k + 1 < n_k[g] {
+                    gpu.memcpy_dtod_at_auto(&st.mtp_t_outs.buf, k * dim * 4, &st.mtp_scratch.t_mtp_out.buf, 0, dim * 4)?;
+                }
+            }
+        }
+        for (g, &i) in group.iter().enumerate() {
+            let l = &mut lanes[i];
+            let n = n_k[g];
+            let mut host = vec![0i32; n];
+            {
+                let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n * 4) };
+                gpu.hip.memcpy_dtoh(bytes, &l.state.mtp_token_chain.sub_offset(1, n).buf)?;
+            }
+            out[i] = Some(MtpDraftOutput {
+                candidates: host.into_iter().map(|t| t as u32).collect(),
+                drafts_generated: n,
+                chain_truncated: false,
+                use_sampling: false,
+                sampling: l.state.sampling,
+                draft_probs: Vec::new(),
+                draft_softmaxes: Vec::new(),
+                use_device_token_chain: true,
+                cur_pos: l.cur_pos,
+                last_committed: l.last_committed,
+            });
+        }
+    }
+    for (i, l) in lanes.iter_mut().enumerate() {
+        if out[i].is_none() {
+            out[i] = Some(mtp_cb_draft(gpu, weights, config, head, l.state, l.cur_pos, l.last_committed, l.emitted, l.k)?);
+        }
+    }
+    Ok(out.into_iter().map(|d| d.expect("every lane drafted")).collect())
+}
+
 /// One request's window in a CB cycle: its trunk owners, its MTP drafter
 /// state, and the `mtp_step` arguments.
 pub struct MtpCbLane<'a> {
@@ -287,20 +425,19 @@ pub fn mtp_cb_cycle(
         Ok(())
     };
     let mut t = Instant::now();
-    let mut drafts = Vec::with_capacity(lanes.len());
-    for lane in lanes.iter_mut() {
-        drafts.push(mtp_cb_draft(
-            gpu,
-            weights,
-            config,
-            head,
-            lane.state,
-            lane.cur_pos,
-            lane.last_committed,
-            lane.emitted,
-            lane.k,
-        )?);
-    }
+    let drafts = {
+        let mut dl: Vec<MtpCbDraftLane<'_>> = lanes
+            .iter_mut()
+            .map(|l| MtpCbDraftLane {
+                state: &mut *l.state,
+                cur_pos: l.cur_pos,
+                last_committed: l.last_committed,
+                emitted: l.emitted,
+                k: l.k,
+            })
+            .collect();
+        mtp_cb_draft_batched(gpu, weights, config, head, cb, &mut dl)?
+    };
     mark(gpu, &mut timing.draft_us, &mut t)?;
     let mut vlanes: Vec<MtpCbVerifyLane<'_>> = lanes
         .iter_mut()

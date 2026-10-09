@@ -15,7 +15,10 @@
 
 use super::{Qwen35RequestState, Qwen35VmmStore, VMM_MAP_DEVICE_RESERVE_BYTES};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
-use crate::mtp_spec::cb::{mtp_cb_accept, mtp_cb_draft, mtp_cb_verify, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane};
+use crate::mtp_spec::cb::{
+    mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane,
+};
+use crate::mtp_spec::MtpDraftOutput;
 use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
 use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
@@ -305,32 +308,44 @@ impl Qwen35VmmStore {
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
         let Self { slots, spec, .. } = self;
-        let mut r = Ok(());
-        for req in &plan.requests {
-            let RequestStepKind::Verify { draft_len } = req.kind else {
-                continue;
-            };
-            let engine = spec.as_ref().expect("checked at provision");
-            let s = slots.iter_mut().flatten().find(|s| s.epoch == req.epoch).expect("checked at provision");
-            let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } = s;
-            match mtp_cb_draft(
-                gpu,
-                weights,
-                config,
-                &engine.head,
-                mtp.as_mut().expect("checked"),
-                *position,
-                pending_seed.expect("checked"),
-                history,
-                draft_len,
-            ) {
-                Ok(d) => *spec_draft = Some(d),
-                Err(e) => {
-                    r = Err(format!("provision_step: draft for {:?}: {e}", req.epoch));
-                    break;
-                }
+        let engine = spec.as_ref().expect("checked at provision");
+        let planned: Vec<(RequestEpoch, usize)> = plan
+            .requests
+            .iter()
+            .filter_map(|r| match r.kind {
+                RequestStepKind::Verify { draft_len } => Some((r.epoch, draft_len)),
+                _ => None,
+            })
+            .collect();
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> = planned.iter().map(|_| None).collect();
+        for s in slots.iter_mut().flatten() {
+            if let Some(i) = planned.iter().position(|(e, _)| *e == s.epoch) {
+                owners[i] = Some(s);
             }
         }
+        let mut lanes = Vec::with_capacity(planned.len());
+        let mut outs: Vec<&mut Option<MtpDraftOutput>> = Vec::with_capacity(planned.len());
+        for (o, &(_, draft_len)) in owners.into_iter().zip(&planned) {
+            let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } =
+                o.expect("checked at provision");
+            lanes.push(MtpCbDraftLane {
+                state: mtp.as_mut().expect("checked at provision"),
+                cur_pos: *position,
+                last_committed: pending_seed.expect("checked at provision"),
+                emitted: history,
+                k: draft_len,
+            });
+            outs.push(spec_draft);
+        }
+        let r = match mtp_cb_draft_batched(gpu, weights, config, &engine.head, &engine.cb, &mut lanes) {
+            Ok(drafts) => {
+                for (slot, d) in outs.into_iter().zip(drafts) {
+                    *slot = Some(d);
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("provision_step: draft: {e}")),
+        };
         if r.is_err() {
             self.spec_clear_planned(plan);
         }
