@@ -88,7 +88,7 @@ impl Qwen35VmmStore {
 
     /// Map KV positions `[0, end)` of `epoch` against the shared physical
     /// budget and the device's free memory (as `provision_step`).
-    fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
+    pub(super) fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
         let mapped_total = self.mapped_kv_bytes()?;
         let device_room = gpu
             .hip
@@ -148,7 +148,7 @@ impl Qwen35VmmStore {
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("spec prefill: unknown epoch {epoch:?}"))?;
         let r = (|| -> Result<u32, String> {
-            if s.position != 0 || s.mtp.is_some() {
+            if s.position != 0 || s.mtp.is_some() || s.dflash.is_some() {
                 return Err("spec prefill: lane is not fresh".into());
             }
             // AR's penalty window bound: this scratch's `repeat_buf` (the
@@ -228,7 +228,7 @@ impl Qwen35VmmStore {
             .flatten()
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("spec adopt: unknown epoch {epoch:?}"))?;
-        if s.mtp.is_some() || s.pending_seed.is_none() || s.position != snap.rows {
+        if s.mtp.is_some() || s.dflash.is_some() || s.pending_seed.is_none() || s.position != snap.rows {
             return Err(format!(
                 "spec adopt: lane position {} / snapshot rows {} / seed {:?}",
                 s.position, snap.rows, s.pending_seed
@@ -268,14 +268,26 @@ impl Qwen35VmmStore {
     }
 
     // ── RequestStepKind::Verify rows through provision → forward → commit ──
+    //
+    // A Verify request is tagged by its lane state: `mtp` (the MTP engine) or
+    // `dflash` (the DFlash engine). Each tag's lanes run their own draft,
+    // shared trunk + head and accept consumer; a step may carry both tags,
+    // each tag's whole lanes packing into its own `<= 63`-row trunk chunks.
 
-    /// Provision gate of one planned Verify request: a live spec lane, its
-    /// seed in the first row, `draft_len` within the engine window.
+    fn is_mtp_lane(&self, epoch: &RequestEpoch) -> bool {
+        self.request_state(epoch).is_some_and(|s| s.mtp.is_some())
+    }
+
+    /// Provision gate of one planned Verify request: a live spec lane (MTP or
+    /// DFlash), its seed in the first row, rows within the lane's window.
     pub(super) fn spec_check_verify(&self, r: &RequestRows, draft_len: usize, seed_row_token: u32) -> Result<(), String> {
-        let engine = self.spec.as_ref().ok_or("provision_step: Verify rows need the staged MTP engine")?;
         let s = self
             .request_state(&r.epoch)
             .ok_or_else(|| format!("provision_step: stale or unknown epoch {:?}", r.epoch))?;
+        if s.dflash.is_some() {
+            return self.dflash_check_verify(s, r, draft_len, seed_row_token);
+        }
+        let engine = self.spec.as_ref().ok_or("provision_step: Verify rows need the staged MTP engine")?;
         if s.mtp.is_none() || s.spec_draft.is_some() || s.spec_verified.is_some() {
             return Err(format!("provision_step: {:?} is not an idle spec lane", r.epoch));
         }
@@ -297,9 +309,9 @@ impl Qwen35VmmStore {
     /// Provision: draft every planned Verify request (epoch-tagged: held in
     /// its own state until commit/abort). The verify rows the executor runs
     /// are `[seed, candidates…]` of this draft; planned rows past them are
-    /// host-only placeholders. A draft touches only uncommitted MTP head
-    /// rows, so a failure drops every draft of the plan and maps nothing
-    /// else.
+    /// host-only placeholders. A draft touches only uncommitted drafter state
+    /// (MTP head rows / DFlash draft scratch), so a failure drops every draft
+    /// of the plan and maps nothing else.
     pub(super) fn spec_draft_planned(
         &mut self,
         gpu: &mut Gpu,
@@ -310,16 +322,35 @@ impl Qwen35VmmStore {
         if !plan.requests.iter().any(|r| matches!(r.kind, RequestStepKind::Verify { .. })) {
             return Ok(());
         }
-        let Self { slots, spec, .. } = self;
-        let engine = spec.as_ref().expect("checked at provision");
+        let r = self
+            .dflash_draft_planned(gpu, weights, config, plan)
+            .and_then(|()| self.mtp_draft_planned(gpu, weights, config, plan));
+        if r.is_err() {
+            self.spec_clear_planned(plan);
+        }
+        r
+    }
+
+    fn mtp_draft_planned(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        plan: &BatchStepPlan,
+    ) -> Result<(), String> {
         let planned: Vec<(RequestEpoch, usize)> = plan
             .requests
             .iter()
             .filter_map(|r| match r.kind {
-                RequestStepKind::Verify { draft_len } => Some((r.epoch, draft_len)),
+                RequestStepKind::Verify { draft_len } if self.is_mtp_lane(&r.epoch) => Some((r.epoch, draft_len)),
                 _ => None,
             })
             .collect();
+        if planned.is_empty() {
+            return Ok(());
+        }
+        let Self { slots, spec, .. } = self;
+        let engine = spec.as_ref().expect("checked at provision");
         let mut owners: Vec<Option<&mut Qwen35RequestState>> = planned.iter().map(|_| None).collect();
         for s in slots.iter_mut().flatten() {
             if let Some(i) = planned.iter().position(|(e, _)| *e == s.epoch) {
@@ -340,7 +371,7 @@ impl Qwen35VmmStore {
             });
             outs.push(spec_draft);
         }
-        let r = match mtp_cb_draft_batched(gpu, weights, config, &engine.head, &engine.cb, &mut lanes) {
+        match mtp_cb_draft_batched(gpu, weights, config, &engine.head, &engine.cb, &mut lanes) {
             Ok(drafts) => {
                 for (slot, d) in outs.into_iter().zip(drafts) {
                     *slot = Some(d);
@@ -348,16 +379,25 @@ impl Qwen35VmmStore {
                 Ok(())
             }
             Err(e) => Err(format!("provision_step: draft: {e}")),
-        };
-        if r.is_err() {
-            self.spec_clear_planned(plan);
         }
-        r
     }
 
-    /// Forward: verify every planned Verify request in one shared trunk +
-    /// head pass ([`mtp_cb_verify`]); outcomes wait in each state for commit.
+    /// Forward: verify every planned Verify request — each tag in its own
+    /// shared trunk + head pass ([`mtp_cb_verify`] / `dflash_cb_verify`);
+    /// outcomes wait in each state for commit.
     pub(super) fn spec_verify_planned(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        scratch: &Qwen35Scratch,
+        plan: &BatchStepPlan,
+    ) -> hip_bridge::HipResult<()> {
+        self.dflash_verify_planned(gpu, weights, config, scratch, plan)?;
+        self.mtp_verify_planned(gpu, weights, config, scratch, plan)
+    }
+
+    fn mtp_verify_planned(
         &mut self,
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
@@ -368,7 +408,7 @@ impl Qwen35VmmStore {
         let epochs: Vec<RequestEpoch> = plan
             .requests
             .iter()
-            .filter(|r| matches!(r.kind, RequestStepKind::Verify { .. }))
+            .filter(|r| matches!(r.kind, RequestStepKind::Verify { .. }) && self.is_mtp_lane(&r.epoch))
             .map(|r| r.epoch)
             .collect();
         if epochs.is_empty() {
@@ -416,6 +456,9 @@ impl Qwen35VmmStore {
         scratch: &Qwen35Scratch,
         epoch: &RequestEpoch,
     ) -> Result<RequestAdvance, String> {
+        if self.request_state(epoch).is_some_and(|s| s.dflash.is_some()) {
+            return self.dflash_commit_verify(gpu, weights, config, scratch, epoch);
+        }
         let eos = config.eos_token;
         let s = self
             .slots
@@ -464,6 +507,11 @@ impl Qwen35VmmStore {
             if let Some(s) = self.request_state_mut(&r.epoch) {
                 s.spec_draft = None;
                 s.spec_verified = None;
+                s.dflash_draft = None;
+                if let Some(lane) = s.dflash.as_mut() {
+                    lane.verified = false;
+                    lane.picks.clear();
+                }
             }
         }
     }

@@ -51,6 +51,7 @@ use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 mod exact;
 pub mod spec;
+pub mod dflash;
 
 
 /// Load-time admission for the VMM executor on this resident model: the
@@ -230,6 +231,13 @@ pub struct Qwen35RequestState {
     pub(super) spec_draft: Option<crate::mtp_spec::MtpDraftOutput>,
     /// Verify outcome of a forwarded Verify step (forward → commit/abort).
     pub(super) spec_verified: Option<crate::mtp_spec::cb::MtpCbVerified>,
+    /// DFlash lane state (`dflash::dflash_prefill` / `dflash_adopt`); `None`
+    /// unless the request is a DFlash spec lane. A request holds MTP
+    /// (`mtp`) or DFlash, never both.
+    pub dflash: Option<crate::dflash_cb::DflashVmmLaneState>,
+    /// Draft of a planned DFlash Verify step (provision → commit/abort);
+    /// the verify outcome waits in `dflash.picks`.
+    pub(super) dflash_draft: Option<crate::speculative::DflashCbDraft>,
 }
 
 /// Admission inputs of one request, as the singleton route would hold them.
@@ -311,6 +319,8 @@ impl Qwen35RequestState {
             mtp: None,
             spec_draft: None,
             spec_verified: None,
+            dflash: None,
+            dflash_draft: None,
         })
     }
 
@@ -369,6 +379,9 @@ impl Qwen35RequestState {
         self.dn.free_gpu(gpu);
         if let Some(mtp) = self.mtp {
             mtp.free_gpu(gpu);
+        }
+        if let Some(lane) = self.dflash {
+            lane.free_gpu(gpu);
         }
         r
     }
@@ -484,6 +497,10 @@ pub struct Qwen35VmmStore {
     /// Retained conversations for prefix reuse (VMM route continuity); the
     /// generate crate owns the policy. Freed with the store.
     pub prefix_pool: Vec<VmmPrefixEntry>,
+    /// DFlash engine of DFlash spec lanes (`install_dflash`); `None` = no
+    /// DFlash lanes. May coexist with the MTP engine: a request is one or
+    /// the other.
+    dflash_engine: Option<dflash::VmmDflashEngine>,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -661,6 +678,7 @@ impl Qwen35VmmStore {
             route,
             spec: None,
             prefix_pool: Vec::new(),
+            dflash_engine: None,
         })
     }
 
@@ -838,6 +856,9 @@ impl Qwen35VmmStore {
             let _ = gpu.free_tensor(t);
         }
         if let Some(engine) = self.spec {
+            engine.free_gpu(gpu);
+        }
+        if let Some(engine) = self.dflash_engine {
             engine.free_gpu(gpu);
         }
         if let Err(e) = self.pbs.free_gpu(gpu) {
