@@ -49,6 +49,8 @@ use rdna_compute::attention::{VmmFlashDecodePlan, VmmKvFormat, VmmKvSide};
 use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
 use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
+mod exact;
+
 
 /// Load-time admission for the VMM executor on this resident model: the
 /// exact predicates `forward_step` enforces (Q8_0 embedding table, an
@@ -60,7 +62,11 @@ pub fn vmm_executor_supports(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     kv: &KvCache,
+    route: VmmRoute,
 ) -> Result<(), String> {
+    if route == VmmRoute::Exact {
+        exact::supports(gpu, weights)?;
+    }
     if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
         return Err("VMM executor: embedding table must be Q8_0".into());
     }
@@ -199,6 +205,10 @@ pub struct Qwen35RequestState {
     /// Total prompt rows; the Prefill chunk ending here carries the head
     /// and commits the first generated id.
     pub prompt_len: usize,
+    /// Request-local GatedDeltaNet stochastic-rounding frame (used only
+    /// when error feedback is off; the exact route swaps it in around this
+    /// request's recurrence so its frame sequence is its own).
+    pub gdn_frame: u32,
     /// Ids that finish the request with `finish = Some("stop")`.
     pub stop_ids: Vec<u32>,
     /// The singleton route's sampler config for this request. The driver
@@ -280,6 +290,7 @@ impl Qwen35RequestState {
             dn,
             position: 0,
             pending_seed: None,
+            gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
             poisoned: false,
             prompt_len: init.prompt_len,
             stop_ids: init.stop_ids,
@@ -380,6 +391,19 @@ pub struct Qwen35VmmStore {
     mapped_high_water: usize,
     /// Shared physical KV budget across every request owner.
     kv_budget_bytes: usize,
+    route: VmmRoute,
+}
+
+/// Arithmetic of a VMM batched step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmRoute {
+    /// Byte-identical per request to the default (lowered) singleton route:
+    /// batched exact plain projections, every other super-op is the
+    /// singleton binding per request, prefill is the singleton prefill.
+    Exact,
+    /// The shared slots body (WMMA projections, batched prefill). Opt-in
+    /// only (HIPFIRE_SERVE_BATCH_NONEXACT); never default.
+    Nonexact,
 }
 
 /// Loaded-ack receipt of the actual per-request KV owners.
@@ -393,14 +417,30 @@ pub struct VmmBatchReceipt {
 }
 
 impl Qwen35VmmStore {
-    /// Whether this executor's arithmetic is byte-identical to the isolated
-    /// singleton route. It is NOT: the oracle (cb_vmm_state_oracle at
-    /// 8a4589a905) shows every request isolated-exact (no co-batch
-    /// dependence, k=1..3, stop/cancel/slot reuse) but the slots body's
-    /// prefill (DeltaNet/conv state from layer 0) and decode projections use
-    /// other kernels than the singleton route. Callers must therefore admit
-    /// it only under the explicit nonexact opt-in (HIPFIRE_SERVE_BATCH_NONEXACT).
-    pub const ROUTE_EXACT: bool = false;
+    /// Which arithmetic this store runs: [`VmmRoute::Exact`] (byte-identical
+    /// per request to the default singleton route) or the explicitly
+    /// nonexact slots body.
+    pub fn route(&self) -> VmmRoute {
+        self.route
+    }
+
+    /// The singleton route's prefill chunk length for `epoch` with
+    /// `remaining` prompt rows. On the exact route every Prefill row range
+    /// must have exactly this length (the planner uses it as the request's
+    /// chunk maximum); chunk boundaries change the DeltaNet requant cadence.
+    pub fn exact_prefill_chunk_len(
+        &self,
+        gpu: &Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        epoch: &RequestEpoch,
+        remaining: usize,
+    ) -> Result<usize, String> {
+        let st = self
+            .request_state(epoch)
+            .ok_or_else(|| format!("exact_prefill_chunk_len: unknown epoch {epoch:?}"))?;
+        exact::prefill_chunk_len(gpu, weights, config, st, remaining)
+    }
 
     /// `template_kv` is the resident singleton KV owner; it fixes the
     /// format every request owner uses (no override of mode or bound).
@@ -411,6 +451,7 @@ impl Qwen35VmmStore {
         max_slots: usize,
         row_budget: usize,
         kv_budget_bytes: usize,
+        route: VmmRoute,
     ) -> Result<Self, String> {
         if max_slots < 2 || row_budget < max_slots {
             return Err(format!(
@@ -494,6 +535,7 @@ impl Qwen35VmmStore {
             max_seq_bound: template_kv.vmm_logical_bound(),
             mapped_high_water: 0,
             kv_budget_bytes,
+            route,
         })
     }
 
@@ -752,6 +794,21 @@ impl Qwen35VmmExecutor<'_> {
                     state.prompt_len, r.epoch
                 ));
             }
+            if st.route == VmmRoute::Exact && r.kind == RequestStepKind::Prefill {
+                let want = exact::prefill_chunk_len(
+                    gpu,
+                    self.weights,
+                    self.config,
+                    state,
+                    state.prompt_len - state.position,
+                )?;
+                if r.rows.len != want {
+                    return Err(format!(
+                        "provision_step: exact route prefill chunk for {:?} is {} rows, singleton route uses {want}",
+                        r.epoch, r.rows.len
+                    ));
+                }
+            }
             if r.kind == RequestStepKind::Ar && r.rows.len != 1 {
                 return Err("provision_step: AR request must contribute one row".into());
             }
@@ -899,7 +956,13 @@ impl Qwen35VmmExecutor<'_> {
         st.hidden_split = split;
         st.pending_rng.clear();
         let mut picks = vec![u32::MAX; plan.total_rows()];
-        if split {
+        if st.route == VmmRoute::Exact {
+            st.hidden_split = false;
+            exact::decode(gpu, st, weights, config, s, plan, &decode, &mut picks)?;
+            for &i in &prefill {
+                exact::prefill(gpu, st, weights, config, s, plan, i, &mut picks)?;
+            }
+        } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
             run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
         } else {
@@ -1040,41 +1103,55 @@ fn run_pass(
         return Ok(());
     }
     final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
-    // Pick with the singleton route's own sampler (`sampler::sample`: same
-    // kernel, same scratch window cap, same penalty/blocked-token order) on
-    // each request's logits row, its own history/config and a COPY of its
-    // RNG; the advanced RNG is published only by commit.
     for &i in members {
-        let r = &plan.requests[i];
-        if !st.wants_head(r) {
-            continue;
-        }
-        let state = st
-            .slots
-            .iter()
-            .flatten()
-            .find(|x| x.epoch == r.epoch)
-            .expect("provisioned epoch");
-        let view = st
-            .logits
-            .sub_offset(state.slot * config.vocab_size, config.vocab_size);
-        let mut rng = state.rng_state;
-        let id = hipfire_runtime::sampler::sample(
-            gpu,
-            &view,
-            &s.sample_buf,
-            &s.repeat_buf,
-            config.vocab_size,
-            &state.history,
-            &state.sampler,
-            &mut rng,
-        );
-        if id as usize >= config.vocab_size {
-            return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
-        }
-        picks[r.rows.begin + r.rows.len - 1] = id;
-        st.pending_rng.push((r.epoch, rng));
+        sample_head(gpu, st, config, s, plan, i, picks)?;
     }
+    Ok(())
+}
+
+/// Pick plan request `i`'s head row from its `logits` row with the singleton
+/// route's own sampler (`sampler::sample`: same kernel, same scratch window
+/// cap, same penalty/blocked-token order), its own history/config and a COPY
+/// of its RNG; the advanced RNG is published only by commit. No-op for a
+/// request without a head this step.
+fn sample_head(
+    gpu: &mut Gpu,
+    st: &mut Qwen35VmmStore,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    plan: &BatchStepPlan,
+    i: usize,
+    picks: &mut [u32],
+) -> HipResult<()> {
+    let r = &plan.requests[i];
+    if !st.wants_head(r) {
+        return Ok(());
+    }
+    let state = st
+        .slots
+        .iter()
+        .flatten()
+        .find(|x| x.epoch == r.epoch)
+        .expect("provisioned epoch");
+    let view = st
+        .logits
+        .sub_offset(state.slot * config.vocab_size, config.vocab_size);
+    let mut rng = state.rng_state;
+    let id = hipfire_runtime::sampler::sample(
+        gpu,
+        &view,
+        &s.sample_buf,
+        &s.repeat_buf,
+        config.vocab_size,
+        &state.history,
+        &state.sampler,
+        &mut rng,
+    );
+    if id as usize >= config.vocab_size {
+        return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
+    }
+    picks[r.rows.begin + r.rows.len - 1] = id;
+    st.pending_rng.push((r.epoch, rng));
     Ok(())
 }
 

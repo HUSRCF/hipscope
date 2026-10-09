@@ -37527,6 +37527,23 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
+    /// Plain `Y = W·X` over `batch_size` rows with the x-batched scalar V2
+    /// GEMV (chunks of 4). Each row is byte-identical to the singleton
+    /// `gemv_mq4g256v2` on that row (same per-row accumulation order), on
+    /// every architecture — unlike [`Self::gemm_mq4g256v2`], which routes
+    /// WMMA arches through a different reduction.
+    pub fn gemv_mq4g256v2_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
+    }
+
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
     /// row once for up to four input rows, keeping the scalar kernel's per-row
     /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.
