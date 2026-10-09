@@ -28,7 +28,8 @@ pub fn redline_capture_json(
                 .map(|launch| {
                     serde_json::json!({
                         "kernel": launch.kernel.as_str(),
-                        "artifact": launch.artifact.as_ref().map(|path| path.display().to_string()),
+                        "artifact": launch.artifact.as_ref().map(|artifact| artifact.to_string()),
+                        "code_object": launch.artifact.as_ref().map(|artifact| artifact.provenance_json()),
                         "grid": launch.grid,
                         "block": launch.block,
                         "shared_mem": launch.shared_mem,

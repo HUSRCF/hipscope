@@ -62,6 +62,9 @@ fn gfx1151_uses_the_gfx11_encoding_table() {
     assert_eq!(encoding.matches("encoding: [").count(), file.lines().count());
 }
 
+/// gfx12 LOADcnt retires buffer and global loads in one issue order (one
+/// `VMEM_ACCESS` event); a flat load in the window, or gfx11 SMEM sharing
+/// LGKMcnt with DS, forces a full drain.
 #[test]
 fn mixed_memory_families_and_gfx11_lgkm_force_zero_wait() {
     let v = |base| RegRef { kind: Kind::V, base, len: 1 };
@@ -69,7 +72,11 @@ fn mixed_memory_families_and_gfx11_lgkm_force_zero_wait() {
     let mut gfx12 = Ledger::default();
     gfx12.record(Arch::Gfx1201, &Instruction::new("buffer_load_b32", vec![v(1)], vec![]).memory(MemoryClass::VmemLoad));
     gfx12.record(Arch::Gfx1201, &Instruction::new("global_load_b32", vec![v(2)], vec![]).memory(MemoryClass::VmemLoad));
-    assert_eq!(gfx12.required(&Instruction::new("v_add", vec![v(3)], vec![v(1)]))[0].1, 0);
+    assert_eq!(gfx12.required(&Instruction::new("v_add", vec![v(3)], vec![v(1)]))[0].1, 1);
+    let mut flat = Ledger::default();
+    flat.record(Arch::Gfx1201, &Instruction::new("buffer_load_b32", vec![v(1)], vec![]).memory(MemoryClass::VmemLoad));
+    flat.record(Arch::Gfx1201, &Instruction::new("flat_load_b32", vec![v(2)], vec![]).memory(MemoryClass::VmemLoad));
+    assert_eq!(flat.required(&Instruction::new("v_add", vec![v(3)], vec![v(1)]))[0].1, 0);
 
     let mut gfx11 = Ledger::default();
     gfx11.record(Arch::Gfx1100, &Instruction::new("s_load_b32", vec![s(0)], vec![]).memory(MemoryClass::SmemLoad));

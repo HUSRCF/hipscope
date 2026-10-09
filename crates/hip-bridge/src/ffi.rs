@@ -216,6 +216,26 @@ fn fault_spec() -> Option<Option<String>> {
     hipfire_config::active_process_config().map(|config| config.legacy_value("HIPFIRE_FAULT_HIP"))
 }
 
+/// Developer-only module-load audit (`HIPFIRE_MODULE_LOAD_AUDIT=1`, default
+/// off): one stderr line per `hipModuleLoad`/`hipModuleLoadData`/
+/// `hipModuleGetFunction`, keyed by the opaque module handle, so an offline
+/// route-closure audit can attribute every resolved symbol to its loaded
+/// image. Read per call from the installed process config (module loads are
+/// cold-path); nothing is logged before the config is installed.
+fn module_load_audit_enabled() -> bool {
+    hipfire_config::active_process_config()
+        .and_then(|config| config.legacy_value("HIPFIRE_MODULE_LOAD_AUDIT"))
+        .as_deref()
+        == Some("1")
+}
+
+/// FNV-1a 64 over an embedded image; identifies the image in the audit line.
+fn module_image_fnv64(image: &[u8]) -> u64 {
+    image.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Arm `count` injected failures for one fault class (`upload`, `launch`,
 /// `sync`), or disarm with `count == 0`. This is the test-facing arming API:
 /// it writes the atomics directly, so no process-global environment state is
@@ -2015,6 +2035,9 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_load)(&mut module, c_path.as_ptr()) };
         self.check(code, "hipModuleLoad")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tload\t{:p}\t{path}", module);
+        }
         Ok(Module(module))
     }
 
@@ -2026,6 +2049,14 @@ impl HipRuntime {
             // unsafe fn caller's contract when applicable.
             unsafe { (self.fn_module_load_data)(&mut module, image.as_ptr() as *const c_void) };
         self.check(code, "hipModuleLoadData")?;
+        if module_load_audit_enabled() {
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tload_data\t{:p}\t{}\t{:016x}",
+                module,
+                image.len(),
+                module_image_fnv64(image)
+            );
+        }
         Ok(Module(module))
     }
 
@@ -2038,6 +2069,9 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t{:p}\t{name}", module.0);
+        }
         Ok(Function(func))
     }
 

@@ -2521,6 +2521,305 @@ pub fn load_model_with_gemma4_drafter(
     loaded
 }
 
+// ─── Planned-route kernel preload ────────────────────────────────────
+
+/// Host RAM a compile worker never takes: the shared 1-GiB safety reserve.
+const ROUTE_COMPILE_SAFETY_RESERVE: u64 = 1 << 30;
+/// Extra host RAM kept free while workers overlap the weight load, for the
+/// loader's own read/staging/upload buffers.
+const ROUTE_LOAD_STAGING_RESERVE: u64 = 2 << 30;
+
+/// Effective load policy the kernel route planner needs, resolved from the
+/// admitted request before any GPU allocation.
+struct RouteRequest<'a> {
+    path: &'a str,
+    source: &'a ModelSource,
+    pp: usize,
+    max_seq: usize,
+    draft_path: Option<&'a str>,
+    mtp_path: Option<&'a Path>,
+    vision_path: Option<&'a Path>,
+    vision_mode: &'a str,
+    kv_mode_override: Option<&'a str>,
+    kv_k_override: Option<&'a str>,
+    kv_v_override: Option<&'a str>,
+    qwen_default_q8: bool,
+    kv_adaptive_override: Option<&'a str>,
+    state_quant_override: Option<&'a str>,
+    cask: &'a CaskConfig,
+    spec: SpecLoadCfg,
+}
+
+/// A begun route: the speculative route its plan was resolved for, checked
+/// against the loaded model before the route is sealed.
+struct PlannedRoute {
+    spec: rdna_compute::kernel_registry::KernelSpecRoute,
+}
+
+/// Resolve this load's kernel route plan from header metadata and the
+/// carrier's own policy resolvers. `Err` is the refusal reason: the route is
+/// outside every closed plan and keeps lazy kernel loading.
+fn resolve_route_plan(
+    req: &RouteRequest<'_>,
+    gpu: &Gpu,
+) -> Result<
+    (
+        rdna_compute::kernel_registry::RouteKernelPlan,
+        rdna_compute::kernel_registry::KernelSpecRoute,
+    ),
+    String,
+> {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    use rdna_compute::kernel_registry::{KernelSpecRoute, KernelTensorMeta, RouteKernelInput};
+    let ModelSource::Hfq(hfq) = req.source else {
+        return Err("safetensors directory source".into());
+    };
+    // Only the Qwen3.5 dense carrier has closed plans; it shares this policy.
+    if hfq.arch_id != 5 {
+        return Err(format!("model arch {}", hfq.arch_id));
+    }
+    if req.pp != 1 {
+        return Err(format!("pp={}", req.pp));
+    }
+    if req.cask.sidecar.is_some() {
+        return Err("CASK/TriAttention eviction sidecar".into());
+    }
+    let adaptive = req
+        .kv_adaptive_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
+    if !matches!(adaptive.as_str(), "" | "off") {
+        return Err(format!("kv_adaptive={adaptive}"));
+    }
+    if req.draft_path.is_some() {
+        return Err("DFlash draft".into());
+    }
+    if req.spec.ngram_draft == Some(true) {
+        return Err("n-gram drafter".into());
+    }
+    // `finish_qwen35_load` gives a `<stem>-dspark.<ext>` sibling precedence.
+    let base = Path::new(req.path);
+    if req.spec.dspark != Some(false) {
+        if let (Some(parent), Some(stem), Some(ext)) =
+            (base.parent(), base.file_stem(), base.extension())
+        {
+            let sidecar = parent.join(format!(
+                "{}-dspark.{}",
+                stem.to_string_lossy(),
+                ext.to_string_lossy()
+            ));
+            if sidecar.exists() {
+                return Err("DSpark sidecar".into());
+            }
+        }
+    }
+    if req.vision_path.is_some()
+        || hfq
+            .find_tensor_info("model.visual.patch_embed.proj.weight")
+            .is_some()
+        || (req.vision_mode != "off"
+            && hipfire_runtime::sidecar::resolve_vl_sidecar(req.path).is_some())
+    {
+        return Err("vision tower".into());
+    }
+    let config = <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
+        .map_err(|e| e.to_string())?;
+    // Same K/V resolution as the qwen35 HFQ carrier (adaptive/CASK refused above).
+    let mode_raw = req
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let native_eligible = kv_mode::qwen35_native_eligible(
+        gpu.arch.as_str(),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        req.pp,
+        false,
+        false,
+    );
+    let policy =
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
+    let pair = kv_mode::resolve_kv_pair(
+        &mode_raw,
+        req.kv_k_override.filter(|s| !s.is_empty()),
+        req.kv_v_override.filter(|s| !s.is_empty()),
+        &policy,
+        gpu.arch.as_str(),
+        req.qwen_default_q8,
+    )
+    .map_err(|e| e.to_string())?;
+    let (kv_k, kv_v) = match pair {
+        kv_mode::KvPair::Native(k) => {
+            let name = kv_mode::qwen_k_display_name(k);
+            (name, name)
+        }
+        kv_mode::KvPair::Split(k, v) => {
+            (kv_mode::qwen_k_display_name(k), kv_mode::qwen_v_display_name(v))
+        }
+    };
+    let state_quant = match parse_state_quant(req.state_quant_override)? {
+        StateQuant::Q8 => "q8",
+        StateQuant::FP32 => "fp32",
+        StateQuant::Q4 => "q4",
+    };
+    // Native MTP head, in the loader's order: bundled trailer, then sidecar.
+    // A head that later fails its trunk check falls back to AR, a subset of
+    // the MTP plan.
+    let head = if req.spec.mtp == Some(false) {
+        None
+    } else {
+        match hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(base) {
+            Ok(Some(offset)) => Some(HfqFile::open_at_offset(base, offset)),
+            Ok(None) => {
+                let sidecar = req
+                    .mtp_path
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| base.with_extension("mtp"));
+                sidecar.exists().then(|| HfqFile::open(&sidecar))
+            }
+            Err(e) => return Err(format!("bundled MTP trailer unreadable: {e}")),
+        }
+        .transpose()
+        .map_err(|e| format!("MTP head header: {e}"))?
+    };
+    let spec = if head.is_some() {
+        KernelSpecRoute::NativeMtp
+    } else {
+        KernelSpecRoute::Ar
+    };
+    let mut owned = hipfire_runtime::loader_api::header_tensor_meta(hfq);
+    if let Some(head) = &head {
+        owned.extend(hipfire_runtime::loader_api::header_tensor_meta(head));
+    }
+    let tensors: Vec<KernelTensorMeta<'_>> = owned
+        .iter()
+        .map(|t| KernelTensorMeta {
+            name: &t.name,
+            dtype: t.dtype,
+            shape: &t.shape,
+        })
+        .collect();
+    let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
+        arch: gpu.arch.as_str(),
+        model_arch: hfq.arch_id,
+        tensors: &tensors,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        max_seq: req.max_seq,
+        prefill_chunk_rows: qwen35::prefill::prefill_chunk_rows_requested(gpu),
+        kv_k,
+        kv_v,
+        state_quant,
+        spec,
+        host_mapped_experts: false,
+        // Closed plans cover both direct and retained-replay decode.
+        retained_decode: true,
+        hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
+        flags: &gpu.flags,
+    })
+    .map_err(|e| format!("{e:?}"))?;
+    Ok((plan, spec))
+}
+
+/// Start a planner-closed route's kernel load: the bounded batch compile
+/// overlaps the weight load when the host budget admits a worker alongside
+/// it; otherwise the whole plan is compiled and loaded before any weight
+/// allocation. A load no budget admits fails here, before destructive work.
+/// Refused routes reset to lazy loading and return `None`.
+fn begin_route_kernels(
+    req: &RouteRequest<'_>,
+    gpu: &mut Gpu,
+) -> Result<Option<PlannedRoute>, String> {
+    use rdna_compute::compile_jobs::{compile_job_budget, host_available_memory, parse_job_override};
+    gpu.abort_route_kernel_load()
+        .map_err(|e| format!("kernel route reset: {e}"))?;
+    let (plan, spec) = match resolve_route_plan(req, gpu) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            eprintln!("  kernels: no closed route plan ({reason}); loading kernels lazily");
+            return Ok(None);
+        }
+    };
+    let cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
+    let override_jobs = parse_job_override(
+        "HIPFIRE_JIT_JOBS",
+        hipfire_config::developer_var("HIPFIRE_JIT_JOBS").ok().as_deref(),
+    )?;
+    let available = host_available_memory();
+    let modules = plan.entries.len();
+    let overlap = compile_job_budget(
+        cores,
+        available,
+        ROUTE_COMPILE_SAFETY_RESERVE + ROUTE_LOAD_STAGING_RESERVE,
+        override_jobs,
+    );
+    let started = std::time::Instant::now();
+    match overlap {
+        Ok(jobs) => {
+            gpu.begin_route_kernel_load(plan, jobs)
+                .map_err(|e| format!("kernel route compile: {e}"))?;
+            eprintln!(
+                "  kernels: {spec:?} route plan ({modules} modules), compiling with up to {jobs} jobs during weight load"
+            );
+        }
+        Err(overlap) => {
+            let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
+                .map_err(|e| {
+                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
+                })?;
+            gpu.begin_route_kernel_load(plan, jobs)
+                .and_then(|()| gpu.ensure_route_modules_preloaded())
+                .map_err(|e| {
+                    let _ = gpu.abort_route_kernel_load();
+                    format!("kernel route compile: {e}")
+                })?;
+            eprintln!(
+                "  kernels: {spec:?} route plan ({modules} modules) loaded before weights with {jobs} jobs in {:.2}s ({overlap})",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    Ok(Some(PlannedRoute { spec }))
+}
+
+/// Seal a begun route once the model loaded: every planned module is on the
+/// GPU before ready, and an unplanned kernel can no longer compile or load.
+/// A model that resolved outside the plan returns to lazy loading instead.
+fn finish_route_kernels(
+    planned: PlannedRoute,
+    model: &LoadedModel,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    use rdna_compute::kernel_registry::KernelSpecRoute;
+    let mismatch = if model.kv_adaptive.is_some() {
+        Some("adaptive KV engaged")
+    } else if model.eviction.is_some() {
+        Some("eviction engaged")
+    } else if model.speculator.is_some()
+        && !(planned.spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
+    {
+        Some("a speculator outside the plan")
+    } else {
+        None
+    };
+    if let Some(why) = mismatch {
+        eprintln!("  kernels: loaded model left the planned route ({why}); loading kernels lazily");
+        return gpu
+            .abort_route_kernel_load()
+            .map_err(|e| format!("kernel route compile: {e}"));
+    }
+    gpu.finish_route_kernel_load()
+        .map_err(|e| format!("kernel route preload: {e}"))?;
+    eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
+    Ok(())
+}
+
 /// Consume an already-admitted source: the retained [`SourceAdmission`] handle
 /// plus its resolved carrier. Destructive work — VMM readiness, carrier load
 /// with its allocations and collectives — begins here, only after admission has
@@ -2565,6 +2864,30 @@ pub fn load_admitted_with_gemma4_drafter(
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
     };
+    // Planner-closed routes start their bounded kernel compile now, overlapped
+    // with the non-dispatching weight load, and preload every planned module
+    // before the first dispatch. Refused routes keep lazy loading.
+    let planned_route = begin_route_kernels(
+        &RouteRequest {
+            path,
+            source: &source,
+            pp,
+            max_seq,
+            draft_path,
+            mtp_path,
+            vision_path: vision_path.as_deref(),
+            vision_mode: &vision_mode,
+            kv_mode_override,
+            kv_k_override,
+            kv_v_override: kv_v.as_deref(),
+            qwen_default_q8,
+            kv_adaptive_override,
+            state_quant_override,
+            cask,
+            spec,
+        },
+        gpu,
+    )?;
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -2598,7 +2921,25 @@ pub fn load_admitted_with_gemma4_drafter(
         // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
         xdna: None,
     };
-    let mut result = carrier.load(source, &mut ctx)?;
+    let mut result = match carrier.load(source, &mut ctx) {
+        Ok(result) => result,
+        Err(error) => {
+            // The carrier already unwound its resources; join any compile
+            // workers so none outlives the refused load.
+            return Err(match ctx.gpu.abort_route_kernel_load() {
+                Ok(()) => error,
+                Err(e) => format!("{error}; kernel compile cleanup also failed: {e}"),
+            });
+        }
+    };
+    if let Some(planned) = planned_route {
+        if let Err(error) = finish_route_kernels(planned, &result, ctx.gpu) {
+            return Err(match unload_model(result, ctx.gpu) {
+                Ok(()) => error,
+                Err(e) => format!("{error}; cleanup also failed: {e}"),
+            });
+        }
+    }
     result.sequence = sequence.map(|mut s| {
         if let Some(measured) = ctx.sequence {
             s.card_cap = measured.card_cap;
@@ -4246,6 +4587,10 @@ pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), Stri
 // ─── Unload ───────────────────────────────────────────────────────────
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    // The next load (or none) starts lazy; a sealed route never outlives its model.
+    if let Err(e) = gpu.abort_route_kernel_load() {
+        eprintln!("  kernels: route reset on unload: {e}");
+    }
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
     // per-rank weight / state / partial. Free per-rank weights → state → partials

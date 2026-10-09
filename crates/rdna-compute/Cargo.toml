@@ -859,3 +859,15 @@ required-features = ["lab"]
 [[example]]
 name = "qsa_pm_check"
 required-features = ["lab"]
+
+[[example]]
+name = "pm_residual_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_decode_twins"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_xbatch_oracle"
+required-features = ["lab"]

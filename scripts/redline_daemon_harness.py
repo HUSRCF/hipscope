@@ -658,7 +658,16 @@ def main():
             "meaningless; re-enable EF or use fp32 plus HIPFIRE_DETERMINISTIC=1."
         ),
     )
-    parser.add_argument("--max-seq", type=int, default=2048)
+    parser.add_argument(
+        "--max-seq",
+        type=int,
+        default=None,
+        help=(
+            "Explicit bounded-test sequence pin. Omit to validate the production "
+            "load: no max_seq key is sent and the daemon picks its model bound "
+            "(the loaded ack, archived in the report, records the result)."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
     parser.add_argument(
@@ -816,7 +825,7 @@ def main():
     daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode, extra_env)
     try:
         load_params = {
-            "max_seq": args.max_seq,
+            **({"max_seq": args.max_seq} if args.max_seq is not None else {}),
             "kv_mode": args.kv_mode,
             "dflash_mode": "on" if (args.dflash_verify_shadow or args.dflash_cycle) else "off",
             "dspark_mode": "on" if args.dspark_verify_shadow else "off",
@@ -839,6 +848,7 @@ def main():
                 "params": load_body,
             }
         )
+        report["load_request"] = load_body
         if loaded.get("type") != "loaded":
             raise RuntimeError(f"unexpected load response: {loaded}")
         report["loaded"] = loaded

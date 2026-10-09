@@ -16,8 +16,6 @@
 //! selection disables the automatic default.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use hip_bridge::memory_effects::{self, MemoryEffects};
 use hip_bridge::HipRuntime;
@@ -35,6 +33,7 @@ use redline_dispatch::{
     ResourceBinding, ResourceId,
 };
 
+use crate::code_object::{CodeObjectId, RecordedArtifact};
 use crate::dispatch::VmmResourceMove;
 
 pub(crate) mod railgun_shadow;
@@ -571,44 +570,36 @@ impl Pm4Commands {
     }
 }
 
-/// Load exact-object Radiowave certifications once per retained tape.
-/// Missing, malformed, or hash-stale manifests are omitted and therefore
-/// retain the conservative scalar-cache acquire.
+/// Collect the exact-object Radiowave certifications of a retained tape's
+/// admitted images. Certification was verified once at module admission;
+/// missing, malformed, or hash-stale manifests left none and therefore retain
+/// the conservative scalar-cache acquire.
 fn radiowave_certifications(
     recorded: &[RecordedHipLaunch],
     prefix: usize,
-) -> BTreeMap<PathBuf, CodeObjectCertification> {
+) -> BTreeMap<CodeObjectId, CodeObjectCertification> {
     let mut certifications = BTreeMap::new();
-    let mut attempted = BTreeSet::new();
     for launch in recorded.iter().take(prefix) {
         let Some(artifact) = launch.artifact.as_ref() else {
             continue;
         };
-        if !attempted.insert(artifact.clone()) {
-            continue;
-        }
-        if let Some(certification) = load_radiowave_certification(artifact) {
-            certifications.insert(artifact.clone(), certification);
+        if let Some(certification) = artifact.radiowave() {
+            certifications
+                .entry(artifact.id())
+                .or_insert_with(|| certification.clone());
         }
     }
     certifications
 }
 
-fn load_radiowave_certification(artifact: &Path) -> Option<CodeObjectCertification> {
-    let manifest = artifact.with_extension("radiowave.json");
-    let code = std::fs::read(artifact).ok()?;
-    let encoded = std::fs::read_to_string(manifest).ok()?;
-    CodeObjectCertification::from_json(&code, &encoded).ok()
-}
-
 fn radiowave_vmem_only_consumer(
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     let Some(artifact) = launch.artifact.as_ref() else {
         return false;
     };
-    certifications.get(artifact).is_some_and(|certification| {
+    certifications.get(&artifact.id()).is_some_and(|certification| {
         certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
     })
 }
@@ -616,15 +607,11 @@ fn radiowave_vmem_only_consumer(
 /// Where Redline's resource effects for `launch` came from: the object's
 /// Radiowave sidecar, the name-keyed `pointer_effects` table, or neither
 /// (railgun shadow report).
-fn redline_effect_source(
-    certifications: &BTreeMap<PathBuf, Option<CodeObjectCertification>>,
-    launch: &RecordedHipLaunch,
-) -> String {
+fn redline_effect_source(launch: &RecordedHipLaunch) -> String {
     let radiowave = launch
         .artifact
         .as_ref()
-        .and_then(|artifact| certifications.get(artifact))
-        .and_then(Option::as_ref)
+        .and_then(|artifact| artifact.radiowave())
         .is_some_and(|certification| certification.argument_effects(&launch.kernel).is_some());
     if radiowave {
         "radiowave"
@@ -639,7 +626,7 @@ fn redline_effect_source(
 fn pm4_vmem_acquire_enabled(
     architecture: Pm4Architecture,
     configured: bool,
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     pm4_vmem_acquire_arch_enabled(architecture, configured)
@@ -673,7 +660,7 @@ fn pm4_gfx12_vmem_acquire_from_value(value: Option<String>) -> bool {
 /// Legacy flag (which `pm4_vmem_acquire_arch_enabled` keeps gfx12-excluded).
 fn pm4_gfx12_vmem_acquire_enabled(
     configured: bool,
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     configured && radiowave_vmem_only_consumer(certifications, launch)
@@ -3699,7 +3686,9 @@ pub struct G0Launch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedHipLaunch {
     pub kernel: String,
-    pub artifact: Option<PathBuf>,
+    /// Admitted code object that owns the launched symbol; replay loads its
+    /// retained bytes, never a file.
+    pub artifact: Option<RecordedArtifact>,
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub shared_mem: u32,
@@ -5100,7 +5089,6 @@ pub struct ReplayController {
     auto_lifecycle: bool,
     forward_eligible: bool,
     replay_observation: ReplayObservation,
-    radiowave_effect_certifications: BTreeMap<PathBuf, Option<CodeObjectCertification>>,
     radiowave_effect_launches: usize,
     fallback_effect_launches: usize,
     unknown_effect_launches: usize,
@@ -5217,7 +5205,6 @@ impl ReplayController {
             auto_lifecycle: false,
             forward_eligible: true,
             replay_observation: ReplayObservation::default(),
-            radiowave_effect_certifications: BTreeMap::new(),
             unknown_effect_launches: 0,
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
@@ -5342,7 +5329,6 @@ impl ReplayController {
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
         self.replay_observation = ReplayObservation::default();
-        self.radiowave_effect_certifications.clear();
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
@@ -5605,13 +5591,10 @@ impl ReplayController {
                 continue;
             }
             let artifact = launch.artifact.as_ref().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            let bytes: Arc<[u8]> = std::fs::read(artifact)
-                .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                .into();
-            let executable = Executable::load(&device, bytes)
-                .map_err(|error| format!("load {}: {error}", artifact.display()))?;
+            let executable = Executable::load(&device, artifact.image().clone())
+                .map_err(|error| format!("load {artifact}: {error}"))?;
             let symbol = format!("{}.kd", launch.kernel);
             let kernel = executable
                 .kernel(&symbol)
@@ -5689,27 +5672,25 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
-        let mut executables = BTreeMap::<PathBuf, Executable>::new();
-        let mut kernels = BTreeMap::<(PathBuf, String), Kernel>::new();
+        let mut executables = BTreeMap::<CodeObjectId, Executable>::new();
+        let mut kernels = BTreeMap::<(CodeObjectId, String), Kernel>::new();
         let mut dispatches = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
-            let artifact = launch.artifact.clone().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+            let artifact = launch.artifact.as_ref().ok_or_else(|| {
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            if !executables.contains_key(&artifact) {
-                let bytes: Arc<[u8]> = std::fs::read(&artifact)
-                    .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                    .into();
-                let executable = Executable::load(&device, bytes)
-                    .map_err(|error| format!("load {}: {error}", artifact.display()))?;
-                executables.insert(artifact.clone(), executable);
+            let id = artifact.id();
+            if !executables.contains_key(&id) {
+                let executable = Executable::load(&device, artifact.image().clone())
+                    .map_err(|error| format!("load {artifact}: {error}"))?;
+                executables.insert(id, executable);
             }
             let symbol = format!("{}.kd", launch.kernel);
-            let key = (artifact.clone(), symbol.clone());
+            let key = (id, symbol.clone());
             if !kernels.contains_key(&key) {
-                let kernel = executables[&artifact]
+                let kernel = executables[&id]
                     .kernel(&symbol)
                     .map_err(|error| format!("resolve {symbol}: {error}"))?;
                 kernels.insert(key.clone(), kernel);
@@ -5943,8 +5924,8 @@ impl ReplayController {
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
-        let mut executables = BTreeMap::<PathBuf, Executable>::new();
-        let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
+        let mut executables = BTreeMap::<CodeObjectId, Executable>::new();
+        let mut resolved = BTreeMap::<(CodeObjectId, String), Kernel>::new();
         let mut kernels = Vec::with_capacity(prefix);
         let mut kernargs = Vec::with_capacity(prefix);
         let mut geometries = Vec::with_capacity(prefix);
@@ -5953,21 +5934,19 @@ impl ReplayController {
         let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
-            let artifact = launch.artifact.clone().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+            let artifact = launch.artifact.as_ref().ok_or_else(|| {
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            if !executables.contains_key(&artifact) {
-                let bytes: Arc<[u8]> = std::fs::read(&artifact)
-                    .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                    .into();
-                let executable = Executable::load(&device, bytes)
-                    .map_err(|error| format!("load {}: {error}", artifact.display()))?;
-                executables.insert(artifact.clone(), executable);
+            let id = artifact.id();
+            if !executables.contains_key(&id) {
+                let executable = Executable::load(&device, artifact.image().clone())
+                    .map_err(|error| format!("load {artifact}: {error}"))?;
+                executables.insert(id, executable);
             }
             let symbol = format!("{}.kd", launch.kernel);
-            let key = (artifact.clone(), symbol.clone());
+            let key = (id, symbol.clone());
             if !resolved.contains_key(&key) {
-                let kernel = executables[&artifact]
+                let kernel = executables[&id]
                     .kernel(&symbol)
                     .map_err(|error| format!("resolve {symbol}: {error}"))?;
                 resolved.insert(key.clone(), kernel);
@@ -6071,7 +6050,7 @@ impl ReplayController {
                 .recorded
                 .iter()
                 .take(prefix)
-                .filter_map(|launch| launch.artifact.as_ref())
+                .filter_map(|launch| launch.artifact.as_ref().map(|artifact| artifact.id()))
                 .collect::<BTreeSet<_>>();
             let vmem_launches = self
                 .recorded
@@ -6306,7 +6285,7 @@ impl ReplayController {
                     }
                     if shadow_on {
                         shadow_decisions.push(railgun::shadow::RedlineDecision {
-                            effects: redline_effect_source(&self.radiowave_effect_certifications, current_launch),
+                            effects: redline_effect_source(current_launch),
                             resource_independent: resources_independent,
                             name_acquire: self.pm4_mid_acquire_policy.acquire_between(previous, current),
                             pre_dispatch_name: gfx12_pre_dispatch_acquire,
@@ -6316,7 +6295,7 @@ impl ReplayController {
                     resource_frontier.advance(&self.recorded[index], false);
                     if shadow_on {
                         shadow_decisions.push(railgun::shadow::RedlineDecision {
-                            effects: redline_effect_source(&self.radiowave_effect_certifications, &self.recorded[index]),
+                            effects: redline_effect_source(&self.recorded[index]),
                             ..Default::default()
                         });
                     }
@@ -7245,7 +7224,7 @@ impl ReplayController {
         &mut self,
         hip: &HipRuntime,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -7258,28 +7237,21 @@ impl ReplayController {
         if !self.is_recording() {
             return;
         }
-        let certified_effects = artifact.as_ref().and_then(|artifact| {
-            if !self.radiowave_effect_certifications.contains_key(artifact) {
-                let certification = load_radiowave_certification(artifact);
-                self.radiowave_effect_certifications
-                    .insert(artifact.clone(), certification);
-            }
-            self.radiowave_effect_certifications
-                .get(artifact)
-                .and_then(Option::as_ref)
-                .and_then(|certification| certification.argument_effects(kernel))
-                .map(|effects| {
-                    effects
-                        .into_iter()
-                        .map(|(offset, access)| match access {
-                            KernelArgumentAccess::ReadOnly => read(offset),
-                            KernelArgumentAccess::WriteOnly | KernelArgumentAccess::ReadWrite => {
-                                write(offset)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-        });
+        let certified_effects = artifact
+            .as_ref()
+            .and_then(|artifact| artifact.radiowave())
+            .and_then(|certification| certification.argument_effects(kernel))
+            .map(|effects| {
+                effects
+                    .into_iter()
+                    .map(|(offset, access)| match access {
+                        KernelArgumentAccess::ReadOnly => read(offset),
+                        KernelArgumentAccess::WriteOnly | KernelArgumentAccess::ReadWrite => {
+                            write(offset)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
         let certified = certified_effects.is_some();
         let accesses =
             recorded_resource_accesses(hip, kernel, kernarg, certified_effects.as_deref());
@@ -7310,7 +7282,7 @@ impl ReplayController {
         );
         if self.recorded.len() > before {
             if let Some(shadow) = self.railgun_shadow.as_mut() {
-                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_deref());
+                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_ref()).map(|artifact| artifact.id());
                 shadow.observe(hip, compiler, kernel, artifact, grid, block, shared_mem, kernarg, declared_words);
             }
         }
@@ -7320,7 +7292,7 @@ impl ReplayController {
     fn record_hip_launch(
         &mut self,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -7342,7 +7314,7 @@ impl ReplayController {
     fn record_hip_launch_with_accesses(
         &mut self,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -8411,10 +8383,14 @@ mod tests {
         };
         let certifications = BTreeMap::new();
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
-        launch.artifact = Some("/missing/kernel.hsaco".into());
+        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
+            "m",
+            (b"uncertified" as &'static [u8]).into(),
+            None,
+        )));
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
 
-        let artifact = PathBuf::from("/certified/fused_rmsnorm_mq_rotate.hsaco");
+        let artifact = "native:m";
         let manifest = format!(
             r#"{{
                 "schema_version": 3,
@@ -8445,13 +8421,27 @@ mod tests {
                     }}]
                 }}
             }}"#,
-            artifact.display()
+            artifact
         );
-        let certification = CodeObjectCertification::from_json(&[], &manifest).unwrap();
-        let certifications = BTreeMap::from([(artifact.clone(), certification)]);
-        launch.artifact = Some(artifact);
+        let certified = |manifest: Option<&str>| {
+            std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded("m", (&[] as &'static [u8]).into(), manifest))
+        };
+        // The certification travels with the admitted image, keyed by digest.
+        launch.artifact = Some(certified(Some(&manifest)));
+        let certifications = radiowave_certifications(std::slice::from_ref(&launch), 1);
+        assert_eq!(certifications.len(), 1);
         assert!(radiowave_vmem_only_consumer(&certifications, &launch));
+        assert_eq!(redline_effect_source(&launch), "none", "vmem_only alone declares no argument effects");
         launch.kernel = "unknown_kernel".to_owned();
+        assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
+        // A manifest that does not bind this image's hash certifies nothing.
+        launch.kernel = "fused_rmsnorm_mq_rotate".to_owned();
+        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
+            "m",
+            (b"other" as &'static [u8]).into(),
+            Some(&manifest),
+        )));
+        assert!(radiowave_certifications(std::slice::from_ref(&launch), 1).is_empty());
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
     }
 

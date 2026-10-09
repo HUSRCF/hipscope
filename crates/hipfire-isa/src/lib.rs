@@ -9,7 +9,7 @@
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
 pub mod author; pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile; pub mod native;
-pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod iu4_v2b_a4; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; pub mod qwen4_mq6_x4; pub mod qwen4_mq6_x4_gfx11_hcw; pub mod qwen4_mq6_x4_gfx11; pub mod gemm_uk; #[path = "qsa_gather.rip.rs"] pub mod qsa_gather; #[path = "qsa_score.rip.rs"] pub mod qsa_score; #[path = "qsa_topk.rip.rs"] pub mod qsa_topk; pub mod qsa_select; }
+pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod iu4_v2b_a4; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; pub mod qwen4_mq6_x4; pub mod qwen4_mq6_x4_gfx11_hcw; pub mod qwen4_mq6_x4_gfx11; pub mod gemm_uk; #[path = "qsa_gather.rip.rs"] pub mod qsa_gather; #[path = "qsa_score.rip.rs"] pub mod qsa_score; #[path = "qsa_topk.rip.rs"] pub mod qsa_topk; pub mod qsa_select; pub mod pm_decode; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
@@ -145,9 +145,10 @@ impl Builder {
  fn ds_store_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsStore)||!insn.mnemonic().starts_with("ds_store"){return Err("ds_store requires an LDS store instruction".into())}let old=self.lds.clone();self.lds.store(slot)?;self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
  pub fn ds_load(&mut self,slot:usize,insn:Instruction)->Result<(),String>{self.untyped()?;self.ds_load_slot(slot,insn)}
  fn ds_load_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsLoad)||!insn.mnemonic().starts_with("ds_load"){return Err("ds_load requires an LDS load instruction".into())}let old=self.lds.clone();self.lds.load(slot)?;self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
- /// Cross-lane exchange on the LDS crossbar (`ds_swizzle_b32`): it counts on
- /// LGKM like a DS load but reads and writes no LDS memory, so it carries no slot.
- pub fn ds_crosslane(&mut self,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsLoad)||insn.mnemonic()!="ds_swizzle_b32"{return Err("ds_crosslane requires a ds_swizzle_b32 DS-load-class instruction".into())}self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;result}
+ /// Cross-lane exchange on the LDS crossbar (`ds_swizzle_b32`, or `ds_bpermute_b32`
+ /// with its lane-byte address and data VGPR uses): it counts on LGKM like a DS load
+ /// but reads and writes no LDS memory, so it carries no slot.
+ pub fn ds_crosslane(&mut self,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsLoad)||!matches!(insn.mnemonic(),"ds_swizzle_b32"|"ds_bpermute_b32"){return Err("ds_crosslane requires a ds_swizzle_b32 or ds_bpermute_b32 DS-load-class instruction".into())}self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;result}
  pub fn vopd(&mut self,x:vopd::VopdOp,y:vopd::VopdOp)->Result<(),String>{let insn=vopd::packet(self.spec.arch,x,y)?;self.push(insn)}
  pub fn vopd_ff<const DX:u8,const DY:u8,const AX:u8,const AY:u8,const BX:u8,const BY:u8>(&mut self,x:vopd::VopdF32Op<reg::Vp<DX>,vopd::Src0<AX>,reg::Vb<BX>>,y:vopd::VopdF32Op<reg::Vp<DY>,vopd::Src0<AY>,reg::Vb<BY>>)->Result<(),String> where reg::Vp<DX>:reg::OppositeParity<DY>,reg::Vb<AX>:reg::DistinctBanks<AY>,reg::Vb<BX>:reg::DistinctBanks<BY>{self.push(vopd::typed(self.spec.arch,x,y)?)}
  pub fn vopd_ff_shared_src1<const DX:u8,const DY:u8,const AX:u8,const AY:u8>(&mut self,x:vopd::VopdF32Op<reg::Vp<DX>,vopd::Src0<AX>,V<1>>,y:vopd::VopdF32Op<reg::Vp<DY>,vopd::Src0<AY>,V<1>>)->Result<(),String> where reg::Vp<DX>:reg::OppositeParity<DY>,reg::Vb<AX>:reg::DistinctBanks<AY>{self.push(vopd::shared_src1(self.spec.arch,x,y)?)}

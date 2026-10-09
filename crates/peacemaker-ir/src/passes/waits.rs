@@ -14,8 +14,11 @@
 //!   `n` units remain. `Km` and `Store` are out of order and retire only at
 //!   `n = 0`; gfx11 `Lgkm` retires partially when all outstanding events
 //!   belong to the in-order LDS family, but not when SMEM shares the counter.
-//!   `Load` retires partially only within one family (buffer vs global, the
-//!   `ledger.rs` rule kept from `ledger_replay.rs:45-61`).
+//!   `Load` (gfx12 LOADcnt) retires partially only within one in-order class:
+//!   BUFFER and GLOBAL loads form one class (ROCm 10.0 `SIInsertWaitcnts.cpp`
+//!   maps both to LOAD_CNT's single `VMEM_ACCESS` event, so
+//!   `counterOutOfOrder(LOAD_CNT)` is false); flat, scratch and image loads
+//!   stay separate classes (the `ledger.rs` / `ledger_replay.rs` rule).
 //! * Hazard: touching `defs` of a pending load (RAW/WAW), or redefining
 //!   `src_locks` of a pending store (WAR), before retirement is a finding.
 //!   Store locks are `Effects.uses` (the `ledger.rs` rule); the WAR def set
@@ -129,12 +132,15 @@ fn is_tracked(class: MemClass) -> bool {
     )
 }
 
-/// Load-counter family for the in-order rule: buffer vs everything else,
-/// from the encoding form (the `ledger.rs` family rule).
+/// Load-counter in-order class from the encoding form: gfx12 BUFFER and
+/// GLOBAL loads share LOADcnt's `VMEM_ACCESS` event; flat, scratch and image
+/// stay separate (the `ledger.rs` order-class rule).
 fn family_of(inst: &Inst) -> &'static str {
     match inst.form {
-        crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer) => "buffer",
-        crate::inst::Form::Vmem(_) => "global",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer | crate::inst::VmemForm::Global) => "vmem_read",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Scratch) => "scratch",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Flat) => "flat",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Image) => "image",
         crate::inst::Form::Ds => "ds",
         crate::inst::Form::Smem => "smem",
         _ => "scalar",
@@ -1123,31 +1129,25 @@ mod c5_tests {
         assert!(!ok(&other));
     }
 
-    /// Linear `mixed_vmem_loads_require_zero_wait`, typed.
+    /// gfx12 LOADcnt: BUFFER and GLOBAL loads are one in-order class, so a
+    /// positive wait retires exactly the oldest of a mixed window; a wait that
+    /// leaves the consumed load among the youngest `n` is still a hazard, and
+    /// a FLAT load in the window keeps the full-drain rule.
     #[test]
-    fn mixed_vmem_loads_need_zero_wait() {
-        let mixed = body_of(vec![
-            mi("buffer_load_b32",
-                vec![v(0, 2), v(8, 2), s(4, 4), s(9, 1), Operand::Vmem(VmemToken::Offen)],
-            ),
-            mi("global_load_b64", vec![v(2, 1), v(8, 2), s(4, 2)]),
-            mk("s_wait_loadcnt", vec![sopp(1)], wait_mods(Some(1), None, None, None)),
-            vadd(3, 0, 4),
+    fn mixed_buffer_global_loads_retire_in_issue_order() {
+        let window = |wait: i16, consume: u16| body_of(vec![
+            buffer_load(0, 8),
+            mi("global_load_b32", vec![v(1, 1), v(8, 2), s(4, 2)]),
+            buffer_load(2, 8),
+            mk("s_wait_loadcnt", vec![sopp(wait)], wait_mods(Some(wait as u8), None, None, None)),
+            vadd(3, consume, 4),
         ]);
-        assert!(!ok(&mixed));
-        let mut zero = body_of(vec![
-            mi("buffer_load_b32",
-                vec![v(0, 2), v(8, 2), s(4, 4), s(9, 1), Operand::Vmem(VmemToken::Offen)],
-            ),
-            mi("global_load_b64", vec![v(2, 1), v(8, 2), s(4, 2)]),
-            mk("s_wait_loadcnt", vec![sopp(0)], wait_mods(Some(0), None, None, None)),
-            vadd(3, 0, 4),
-        ]);
-        assert!(ok(&zero));
-        // Same-family loads still retire partially: oldest of two globals.
-        zero.layout.pop();
-        let tail = vadd(3, 0, 4);
-        let _ = tail;
+        assert!(ok(&window(2, 0)), "loadcnt 2 retires the oldest (buffer v0)");
+        assert!(!ok(&window(2, 1)), "the global v1 is still among the youngest two");
+        assert!(ok(&window(1, 1)));
+        assert!(!ok(&window(1, 2)), "insufficient wait for the youngest buffer v2");
+        assert!(ok(&window(0, 2)));
+        // Same-class loads still retire partially: oldest of two globals.
         let same = body_of(vec![
             mi("global_load_b64", vec![v(0, 1), v(8, 2), s(4, 2)]),
             mi("global_load_b64", vec![v(1, 2), v(9, 2), s(4, 2)]),
@@ -1155,6 +1155,13 @@ mod c5_tests {
             vadd(3, 0, 4),
         ]);
         assert!(ok(&same));
+        let flat = body_of(vec![
+            buffer_load(0, 8),
+            mi("flat_load_b32", vec![v(1, 1), v(8, 2)]),
+            mk("s_wait_loadcnt", vec![sopp(1)], wait_mods(Some(1), None, None, None)),
+            vadd(3, 0, 4),
+        ]);
+        assert!(!ok(&flat), "a flat load is not in the BUFFER/GLOBAL class");
     }
 
     // ---- KT48 T6 gate ----

@@ -422,32 +422,163 @@ pub struct ScratchState {
     /// it (same-stream ordering), so no init is needed.
     pub fa2_fp8_q_scratch: Option<DeviceBuffer>,
     pub fa2_fp8_q_scratch_bytes: usize,
+    /// Planned-route module barrier (`Gpu::begin_route_kernel_load`). Lives
+    /// here so the scratch helpers' `compile_and_load_kernel` calls drain it
+    /// too; `Idle` keeps today's lazy loading exactly.
+    pub(crate) route_load: RouteLoad,
+    /// `FeatureFlags::pm_decode` snapshot for the load funnel: accepted
+    /// [`crate::pm_decode_twins`] replace their HIP modules (exact gfx1201).
+    pub(crate) pm_decode: bool,
+}
+
+// ── Planned-route kernel barrier ─────────────────────────────────────────
+
+/// Load-time kernel state of a planner-closed route.
+///
+/// `Pending` holds the frozen plan while its missing HIP modules compile on
+/// CPU workers; nothing of it is on the GPU yet. The first kernel request or
+/// launch drains it ([`prepare_route_modules`]) into `Prepared`: every
+/// planned HIP and embedded image loaded and every planned symbol bound.
+/// `Sealed` follows a successful model load: an unplanned module request then
+/// fails instead of compiling or loading between dispatches.
+#[derive(Default)]
+pub(crate) enum RouteLoad {
+    #[default]
+    Idle,
+    Pending {
+        plan: crate::kernel_registry::RouteKernelPlan,
+        batch: Option<crate::compiler::KernelBatch>,
+    },
+    Prepared,
+    Sealed,
+}
+
+impl RouteLoad {
+    /// Planned modules are not yet loaded: raw launches must refuse.
+    pub(crate) fn pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
+/// Drain a pending route plan: join the whole compile batch, then load every
+/// planned HIP and embedded module and bind every planned symbol to it. All
+/// on the GPU owner thread, before the first dispatch. Planned bindings
+/// replace any same-named function cached by an earlier load, so one entry
+/// name resolves to the one image this plan selected. Idempotent; a no-op
+/// unless `Pending`. On error the route returns to `Idle` (the caller's load
+/// fails and unwinds).
+pub(crate) fn prepare_route_modules(
+    route: &mut RouteLoad,
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
+) -> HipResult<()> {
+    if !route.pending() {
+        return Ok(());
+    }
+    let RouteLoad::Pending { plan, batch } = std::mem::take(route) else {
+        unreachable!("checked pending");
+    };
+    if let Some(batch) = batch {
+        compiler.finish_batch(batch)?;
+    }
+    for entry in &plan.entries {
+        match entry {
+            crate::kernel_registry::PlannedKernel::Hip(entry) => {
+                for &symbol in entry.symbols {
+                    load_kernel_module(
+                        compiler, hip, modules, functions, pm_decode, entry.module, entry.source(), symbol,
+                    )?;
+                }
+            }
+            crate::kernel_registry::PlannedKernel::Embedded { module, image, radiowave_json, symbols } => {
+                for &symbol in *symbols {
+                    load_embedded_module(
+                        compiler, hip, modules, functions, module, image, *radiowave_json, symbol,
+                    )?;
+                }
+            }
+        }
+    }
+    *route = RouteLoad::Prepared;
+    Ok(())
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
 
 /// Compile and load a kernel, caching the result in `modules`/`functions`.
+///
+/// A pending planned route is drained first, before the cached-function
+/// early return, so no request can run ahead of the whole-plan barrier. A
+/// sealed route refuses an unplanned module instead of compiling or loading
+/// it between dispatches.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_and_load_kernel(
     compiler: &mut crate::compiler::KernelCompiler,
     hip: &HipRuntime,
     modules: &mut HashMap<String, Module>,
     functions: &mut HashMap<String, Function>,
+    route: &mut RouteLoad,
+    pm_decode: bool,
     module_name: &str,
     source: &str,
     func_name: &str,
 ) -> HipResult<()> {
+    prepare_route_modules(route, compiler, hip, modules, functions, pm_decode)?;
     if functions.contains_key(func_name) {
         return Ok(());
     }
+    if matches!(route, RouteLoad::Sealed) {
+        return Err(unplanned_route_kernel(module_name, func_name));
+    }
+    load_kernel_module(compiler, hip, modules, functions, pm_decode, module_name, source, func_name)
+}
+
+/// Error for a kernel outside a sealed route plan.
+pub(crate) fn unplanned_route_kernel(module_name: &str, func_name: &str) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(
+        0,
+        &format!(
+            "kernel {func_name:?} (module {module_name:?}) is outside this load's planned kernel \
+             route; refusing a post-ready compile/module load"
+        ),
+    )
+}
+
+/// Resolve, load and bind one symbol, always (re)binding `func_name`. With
+/// `pm_decode` on exact gfx1201 an accepted [`crate::pm_decode_twins`] module
+/// loads its embedded image instead: verified once at module admission
+/// (fail closed), and hipcc is never invoked for it.
+#[allow(clippy::too_many_arguments)]
+fn load_kernel_module(
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
+    module_name: &str,
+    source: &str,
+    func_name: &str,
+) -> HipResult<()> {
+    if let Some(twin) = crate::pm_decode_twins::pm_decode_module(compiler.arch(), pm_decode, module_name) {
+        if !modules.contains_key(module_name) {
+            twin.verify(source, func_name)
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            // `load_embedded_module` re-checks the image digest at admission.
+        } else if !twin.symbols.contains(&func_name) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("pm_decode twin {module_name}: symbol {func_name:?} is not an accepted export"),
+            ));
+        }
+        return load_embedded_module(
+            compiler, hip, modules, functions, twin.module, twin.image, Some(twin.radiowave_json), func_name,
+        );
+    }
     let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
-    // Alias the launched function name to this arch's compiled artifact so the
-    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
-    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
-    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
-    if func_name != module_name {
-        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
-    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
@@ -459,16 +590,98 @@ pub(crate) fn compile_and_load_kernel(
         );
         hip_bridge::HipError::new(error.code, &context)
     })?;
+    // Bind the launched function name to its module's admitted image so the
+    // recorder resolves it even when the arch-selected module name differs
+    // (e.g. gemv_hfq4g256_residual launched from gemv_hfq4g256_residual_rdna3).
+    bind_loaded_function(compiler, module_name, func_name)?;
     functions.insert(func_name.to_string(), func);
     Ok(())
 }
 
-/// Load a compiled module, self-healing a stale/invalid cached image. If
-/// `hipModuleLoad` rejects the `.hsaco` as an invalid device image
-/// (`HIP_ERROR_INVALID_IMAGE`) — e.g. a cross-build blob left in a shared
-/// `.hipfire_kernels` cache — evict it, recompile from source, and retry once.
-/// Any other error propagates unchanged. (Fix for the bench/run "device kernel
-/// image is invalid" crash when two daemon builds share a cwd kernel cache.)
+/// Load an embedded native image as `module_name` (once, admitted as that
+/// module's in-memory code object; no file is written), then resolve and
+/// (re)bind `func_name` to it. A module already bound to a different image
+/// is refused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_embedded_module(
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    module_name: &'static str,
+    image: &'static [u8],
+    radiowave_json: Option<&str>,
+    func_name: &str,
+) -> HipResult<()> {
+    if !modules.contains_key(module_name) {
+        // An accepted pm_decode twin is re-verified against its pinned digest
+        // at admission, whichever path (lazy funnel or route preload) loads it.
+        let twin = crate::pm_decode_twins::GFX1201_TWINS.iter().find(|t| t.image.as_ptr() == image.as_ptr());
+        if let Some(twin) = twin {
+            twin.verify_image().map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        }
+        if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+            // Developer-only route-closure audit: every embedded image load,
+            // with the accepted pm_decode identities when it is a twin.
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tembedded\t{}",
+                serde_json::json!({
+                    "arch": compiler.arch(),
+                    "module": module_name,
+                    "symbol": func_name,
+                    "origin": "native_embedded",
+                    "image_sha256": crate::code_object::CodeObjectId::of(image).to_hex(),
+                    "pm_decode_accepted_elf_sha256": twin.map(|t| crate::pm_decode_twins::hex(&t.accepted_elf_sha256)),
+                    "pm_decode_source_sha256": twin.map(|t| crate::pm_decode_twins::hex(&t.source_sha256)),
+                })
+            );
+        }
+        let module = hip.module_load_data(image)?;
+        compiler
+            .code_objects_mut()
+            .admit_module(
+                module_name,
+                crate::code_object::CodeObjectArtifact::native_embedded(module_name, image.into(), radiowave_json),
+            )
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        modules.insert(module_name.to_owned(), module);
+    } else if let Some(bound) = compiler.code_objects().module(module_name) {
+        if bound.id() != crate::code_object::CodeObjectId::of(image) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("module {module_name:?} is bound to image {} and a different image was requested", bound.id()),
+            ));
+        }
+    }
+    let func = hip.module_get_function(&modules[module_name], func_name)?;
+    bind_loaded_function(compiler, module_name, func_name)?;
+    functions.insert(func_name.to_owned(), func);
+    Ok(())
+}
+
+/// Bind `func_name` to the artifact already admitted for `module_name`.
+pub(crate) fn bind_loaded_function(
+    compiler: &mut crate::compiler::KernelCompiler,
+    module_name: &str,
+    func_name: &str,
+) -> HipResult<()> {
+    let registry = compiler.code_objects_mut();
+    let artifact = registry.module(module_name).cloned().ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("module {module_name:?} has no admitted code object"))
+    })?;
+    registry
+        .bind_function(func_name, &artifact)
+        .map_err(|reason| hip_bridge::HipError::new(0, &reason))
+}
+
+/// Load a compiled module from its immutable image, self-healing a
+/// stale/invalid cached image. The cache file is read once; HIP loads those
+/// exact bytes and the same bytes are admitted as the module's code object.
+/// If HIP rejects the image as invalid (`HIP_ERROR_INVALID_IMAGE`) — e.g. a
+/// cross-build blob left in a shared `.hipfire_kernels` cache — evict it,
+/// recompile from source, and retry once. Any other error propagates
+/// unchanged. (Fix for the bench/run "device kernel image is invalid" crash
+/// when two daemon builds share a cwd kernel cache.)
 pub(crate) fn module_load_or_recompile(
     hip: &HipRuntime,
     compiler: &mut crate::compiler::KernelCompiler,
@@ -477,18 +690,57 @@ pub(crate) fn module_load_or_recompile(
     symbol: &str,
     obj_path: &str,
 ) -> HipResult<Module> {
-    match hip.module_load(obj_path) {
-        Ok(m) => Ok(m),
+    if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+        // Developer-only route-closure audit (default off): source/recipe
+        // identity of every HIP module, whichever loader reached it; the
+        // hip-bridge lines that follow carry the handle and resolved symbols.
+        use sha2::{Digest, Sha256};
+        let recipe = crate::compiler::KernelCompiler::recipe_for_source(
+            compiler.arch(),
+            module_name,
+            source,
+            &compiler.extra_flags,
+        );
+        let digest = Sha256::digest(source.as_bytes());
+        let source_sha256: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        eprintln!(
+            "HIPFIRE_MODULE_LOAD_AUDIT\thip\t{}",
+            serde_json::json!({
+                "arch": compiler.arch(),
+                "module": module_name,
+                "symbol": symbol,
+                "source_sha256": source_sha256,
+                "flags": recipe.flags,
+                "scheduler_profile": recipe.scheduler_profile,
+                "object": obj_path,
+            })
+        );
+    }
+    let read = |path: &std::path::Path| -> HipResult<std::sync::Arc<[u8]>> {
+        std::fs::read(path).map(Into::into).map_err(|error| {
+            hip_bridge::HipError::new(0, &format!("read {}: {error}", path.display()))
+        })
+    };
+    let mut path = std::path::PathBuf::from(obj_path);
+    let mut image = read(&path)?;
+    let module = match hip.module_load_data(&image) {
+        Ok(m) => m,
         Err(e) if e.code == HIP_ERROR_INVALID_IMAGE => {
             eprintln!(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            let fresh = compiler.recompile(module_name, source, symbol)?;
-            hip.module_load(fresh.to_str().unwrap())
+            path = compiler.recompile(module_name, source, symbol)?;
+            image = read(&path)?;
+            hip.module_load_data(&image)?
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+    compiler
+        .code_objects_mut()
+        .admit_module(module_name, crate::code_object::CodeObjectArtifact::hip_file(&path, image))
+        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+    Ok(module)
 }
 
 /// Launch a kernel, routing through the blob path when graph capture, replay
@@ -1186,6 +1438,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "convert_f32_to_f16",
             kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
             "convert_f32_to_f16",
@@ -1298,6 +1552,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "convert_f32_to_f16",
             kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
             "convert_f32_to_f16",
@@ -1365,6 +1621,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "pack_f32_to_fp8_gfx12",
             kernels::PACK_F32_TO_FP8_GFX12_SRC,
             "pack_f32_to_fp8_gfx12",
@@ -1520,7 +1778,9 @@ impl ScratchState {
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
         let mut row_scale_shift = crate::gemv::fp8_row_scale_shift()?;
-        compile_and_load_kernel(compiler, hip, modules, functions, module, ksrc, symbol)?;
+        compile_and_load_kernel(
+            compiler, hip, modules, functions, &mut self.route_load, self.pm_decode, module, ksrc, symbol,
+        )?;
 
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
 
@@ -1654,6 +1914,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
             "quantize_q8_1_mmq_ds4",
@@ -1739,6 +2001,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC,
             "quantize_q8_1_mmq_ds4_x128",
@@ -1825,6 +2089,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq_iu4",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
             "quantize_int4_mmq_ds128",
@@ -2035,7 +2301,12 @@ impl ScratchState {
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
         compile_and_load_kernel(
-            compiler, hip, modules, functions,
+            compiler,
+            hip,
+            modules,
+            functions,
+            &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq_i8_gfx12",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
             "quantize_int8_mmq_ds128",
@@ -2568,6 +2839,8 @@ impl ScratchState {
             hip,
             modules,
             functions,
+            &mut self.route_load,
+            self.pm_decode,
             "mq_rotate_x_dual_fp8_gfx12",
             kernels::MQ_ROTATE_X_DUAL_FP8_GFX12_SRC,
             "mq_rotate_x_dual_fp8_gfx12",

@@ -1076,6 +1076,19 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
         if size == 0 || size > 16 || !size.is_power_of_two() { return Err(bad_operand(row.name, text, "invalid swap group size")); }
         return Ok(Operand::Imm(ImmField::DsOffset(0x1f | size << 10)));
     }
+    if let Some(inner) = text.strip_prefix("offset:swizzle(BITMASK_PERM,\"").and_then(|s| s.strip_suffix("\")")) {
+        // llvm-objdump's spelling of an and/or/xor bitmask swizzle: five lane-id
+        // bits, MSB first; '0'/'1' force the bit, 'p' preserves it, 'i' inverts it.
+        if row.name != "ds_swizzle_b32" { return Err(bad_operand(row.name, text, "swizzle on non-swizzle opcode")); }
+        if inner.len() != 5 { return Err(bad_operand(row.name, text, "bitmask perm needs five lane bits")); }
+        let (mut and, mut or, mut xor) = (0u16, 0u16, 0u16);
+        for (i, c) in inner.bytes().enumerate() {
+            let bit = 1u16 << (4 - i);
+            match c { b'0' => {}, b'1' => or |= bit, b'p' => and |= bit, b'i' => { and |= bit; xor |= bit }
+                _ => return Err(bad_operand(row.name, text, "bitmask perm lane bit must be 0, 1, p or i")) }
+        }
+        return Ok(Operand::Imm(ImmField::DsOffset(and | or << 5 | xor << 10)));
+    }
     if let Some((kind, value)) = text.split_once(':') {
         // VMEM offsets are signed 24-bit (`offset:-48` occurs in hipcc's
         // own `.s`); DS offsets are unsigned.

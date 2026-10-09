@@ -5204,16 +5204,11 @@ fn main() {
             }
 
             "profile" => {
-                // Precompile kernels for common configurations so we have something to profile.
-                // If a model is loaded its kernels are already compiled; this fills in the rest.
-                // Cover all KV modes × weight formats × head_dims to catch all kernel variants.
-                #[cfg(feature = "deltanet")]
-                for kv in &["q8"] {
-                    for wq in &["hfq4", "hfq6", "q8"] {
-                        for hd in &[128usize, 256] {
-                            let _ = gpu.precompile_qwen35(wq, kv, *hd);
-                        }
-                    }
+                // Compile the arch's registry inventory into the kernel cache so
+                // the profiler has every packaged kernel, not only this model's.
+                // CPU-only: no module is loaded and a loaded route is untouched.
+                if let Err(e) = gpu.precompile_registry() {
+                    eprintln!("profile: registry precompile incomplete: {e}");
                 }
                 let (cap, kernels) = gpu.profile();
                 let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();

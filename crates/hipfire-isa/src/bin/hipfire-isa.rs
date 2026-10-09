@@ -24,7 +24,7 @@ fn probe(arch:Arch)->Result<Emitted,String>{
  b.finish()
 }
 const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
-const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)";
+const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       hipfire-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
 fn iu4_gemm(fold:&str,tile:&str,cacc:&str,epi:&str,act:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -127,6 +127,13 @@ fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let emitted=fp8_gemm::emit(Spec{arch,act_scale:scale,epi:epi.parse()?})?;
  Ok((emitted.s_text,serde_json::to_vec_pretty(&emitted.proof).map_err(|e|e.to_string())?))
 }
+/// A PM decode twin module (`kernels::pm_decode`): every frozen export of the
+/// HIP module combined into one code object source and proof.
+fn pm_decode(module:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ if arch!=Arch::Gfx1201 {return Err(format!("pm_decode_{module} is exact-gfx1201 only"))}
+ let (_,text,proof)=hipfire_isa::kernels::pm_decode::emit_module(module)?;
+ Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
+}
 /// Re-slice the SiLU region from a hipcc disassembly and require it to equal
 /// the committed golden the gate/up epilogue instantiates.
 fn region_import(mut args:impl Iterator<Item=String>)->Result<(),String>{
@@ -183,7 +190,7 @@ fn gdn_region_import(object:&str,write:bool,provenance:&str)->Result<(),String>{
  if !write {eprintln!("region-import: gdn_chunk_prep ({sha}) regions match the committed goldens")}
  Ok(())
 }
-fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.next();if command.as_deref()==Some("region-import"){return region_import(args)}if command.as_deref()!=Some("emit"){return Err(format!("{USAGE}\n{NATIVE_USAGE}"))}let mut kernel=None;let mut arch=None;let mut out=None;let mut proof=None;let mut variant=None;let (mut fold,mut tile,mut cacc,mut epi,mut scale,mut alayout)=(None,None,None,None,None,None);let (mut co,mut bundle,mut host)=(None,None,hipfire_isa::native::DEFAULT_HOST_TARGET.to_owned());while let Some(flag)=args.next(){let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--kernel"=>kernel=Some(value),"--arch"=>arch=Some(value.parse::<Arch>()?),"--out"=>out=Some(value),"--proof"=>proof=Some(value),"--variant"=>variant=Some(value),"--fold"=>fold=Some(value),"--tile"=>tile=Some(value),"--cacc"=>cacc=Some(value),"--epi"=>epi=Some(value),"--scale"=>scale=Some(value),"--alayout"=>alayout=Some(value),"--co"=>co=Some(value),"--bundle"=>bundle=Some(value),"--host-target"=>host=value,_=>return Err(format!("unknown flag {flag}"))}}
+fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.next();if command.as_deref()==Some("region-import"){return region_import(args)}if command.as_deref()!=Some("emit"){return Err(format!("{USAGE}\n{NATIVE_USAGE}"))}let mut kernel=None;let mut arch=None;let mut out=None;let mut proof=None;let mut variant=None;let (mut fold,mut tile,mut cacc,mut epi,mut scale,mut alayout)=(None,None,None,None,None,None);let (mut co,mut bundle,mut host)=(None,None,hipfire_isa::native::DEFAULT_HOST_TARGET.to_owned());let (mut shape,mut m7)=(None::<String>,None::<String>);while let Some(flag)=args.next(){let value=args.next().ok_or_else(||format!("missing value after {flag}"))?;match flag.as_str(){"--kernel"=>kernel=Some(value),"--arch"=>arch=Some(value.parse::<Arch>()?),"--out"=>out=Some(value),"--proof"=>proof=Some(value),"--variant"=>variant=Some(value),"--fold"=>fold=Some(value),"--tile"=>tile=Some(value),"--cacc"=>cacc=Some(value),"--epi"=>epi=Some(value),"--scale"=>scale=Some(value),"--alayout"=>alayout=Some(value),"--co"=>co=Some(value),"--bundle"=>bundle=Some(value),"--host-target"=>host=value,"--shape"=>shape=Some(value),"--m7"=>m7=Some(value),_=>return Err(format!("unknown flag {flag}"))}}
  let kernel=kernel.ok_or("missing --kernel")?;let arch=arch.ok_or("missing --arch")?;
  let (text,proof_json)=match kernel.as_str(){
   "fold_magic"=>{if let Some(var)=variant {if var!="probe" {return Err("fold_magic supports only variant probe".into())}}let emitted=probe(arch)?;(emitted.s_text,serde_json::to_vec_pretty(&emitted.proof).map_err(|e|e.to_string())?)}
@@ -198,12 +205,31 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
+  k if k.starts_with("pm_decode_")=>pm_decode(&k["pm_decode_".len()..],arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
+ let pm_module=kernel.strip_prefix("pm_decode_");
+ if pm_module.is_none()&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>".into())}
+ if pm_module.is_some()&&co.is_none() {return Err("pm_decode emission requires --co (M7 certifies the linked object)".into())}
  // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
  if co.is_some()||bundle.is_some(){
   let elf=hipfire_isa::native::assemble(&text,arch)?;
-  if let Some(path)=co{fs::write(&path,&elf).map_err(|e|format!("{path}: {e}"))?}
+  if let Some(path)=&co{fs::write(path,&elf).map_err(|e|format!("{path}: {e}"))?}
   if let Some(path)=bundle{fs::write(&path,hipfire_isa::native::bundle(&elf,arch,&host)).map_err(|e|format!("{path}: {e}"))?}
+ }
+ // PM decode twins: M7 (lift byte-exact, obligations {}, no ambiguous delays) on every export of the linked object.
+ #[cfg(not(feature="toolchain"))]
+ if pm_module.is_some() {return Err("pm_decode emission certifies with M7: build hipfire-isa with --features toolchain".into())}
+ #[cfg(feature="toolchain")]
+ if let Some(module)=pm_module {
+  let path=co.as_deref().ok_or("missing --co")?;
+  let mut receipts=serde_json::Map::new();
+  for &symbol in hipfire_isa::kernels::pm_decode::module(module)?.symbols {
+   receipts.insert(symbol.to_owned(),hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),symbol)?);
+  }
+  let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+  println!("{}",String::from_utf8_lossy(&receipts));
+  if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
+  if let Some(file)=&shape {fs::write(file,serde_json::to_vec_pretty(&hipfire_isa::kernels::pm_decode::shape_contract(module)?).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?}
  }
  fs::write(out.ok_or("missing --out")?,text).map_err(|e|e.to_string())?;fs::write(proof.ok_or("missing --proof")?,proof_json).map_err(|e|e.to_string())?;Ok(())}
 fn main(){if let Err(e)=run(){eprintln!("hipfire-isa: {e}");std::process::exit(1)}}

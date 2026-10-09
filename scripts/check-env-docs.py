@@ -30,6 +30,9 @@ BOOTSTRAP_ENV = {
     # Test-harness marker read by the shared ROCm resolver (crates/rocm.rs);
     # only #[test] code calls it, it never affects runtime behaviour.
     "HIPFIRE_TEST_REQUIRE_ROCM",
+    # Test-only real-compiler path for the bounded-executor CPU gate in
+    # rdna-compute compiler.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_TEST_REAL_HIPCC",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").

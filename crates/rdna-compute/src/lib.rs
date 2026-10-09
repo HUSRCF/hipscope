@@ -7,7 +7,9 @@
 pub mod arch_caps;
 pub mod attention;
 pub mod cdna;
+pub mod code_object;
 mod compiler;
+pub mod compile_jobs;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
@@ -38,6 +40,7 @@ pub mod mq_f16_residual_producers;
 #[cfg(feature = "deltanet")]
 pub mod fn_gdn_dense;
 pub mod norm;
+pub mod pm_decode_twins;
 pub mod page_pool;
 pub mod pool;
 pub mod profile;
