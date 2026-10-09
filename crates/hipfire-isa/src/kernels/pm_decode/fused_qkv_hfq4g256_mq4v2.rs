@@ -111,42 +111,59 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
         op(b, format!("v_cndmask_b32_e64 v{header}, v{}, v{header}, vcc_lo", header + 1),
             &[v(header)], &[v(header), v(header + 1)])?;
     }
-    for term in [1u8, 0, 2, 3, 4, 5, 6, 7] {
-        for stream in 0..4u8 {
-            let weight = 20 + stream;
-            let packed = 4 + stream;
-            op(b, format!("v_bfe_u32 v{weight}, v{packed}, {}, 4", term * 4),
-                &[v(weight)], &[v(packed)])?;
-        }
-        for stream in 0..4u8 {
-            let weight = 20 + stream;
-            op(b, format!("v_cvt_f32_ubyte0_e32 v{weight}, v{weight}"),
-                &[v(weight)], &[v(weight)])?;
-        }
-        for stream in 0..4u8 {
-            let weight = 20 + stream;
-            let header = 8 + stream * 2;
-            op(b, format!("v_fma_mix_f32 v{weight}, v{header}, v{weight}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
-                &[v(weight)], &[v(header), v(weight)])?;
-        }
-        for stream in 0..4u8 {
-            let dot = 16 + stream;
-            let weight = 20 + stream;
-            let x = 32 + stream * 8 + term;
-            if term == 1 {
-                op(b, format!("v_mul_f32_e32 v{dot}, v{weight}, v{x}"),
-                    &[v(dot)], &[v(weight), v(x)])?;
-            } else {
-                op(b, format!("v_fmac_f32_e32 v{dot}, v{weight}, v{x}"),
-                    &[v(dot)], &[v(dot), v(weight), v(x)])?;
-            }
+    // Even streams lead their odd partner by one term. This keeps both
+    // source banks distinct without changing either stream's dot DAG.
+    quad_weights(b, &[(0, 1), (2, 1)])?;
+    for stream in [0u8, 2] {
+        op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", 16 + stream, 20 + stream, 33 + stream * 8),
+            &[v(16 + stream)], &[v(20 + stream), v(33 + stream * 8)])?;
+    }
+    for (lead, lag) in [(0u8, 1u8), (2, 0), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6)] {
+        quad_weights(b, &[(0, lead), (1, lag), (2, lead), (3, lag)])?;
+        for stream in [0u8, 2] {
+            use crate::vopd::{Operand, VopdF32, VopdOp};
+            b.vopd(
+                VopdOp { op: VopdF32::Fmac, dst: 16 + stream,
+                    src0: Operand::V(20 + stream), src1: 32 + stream * 8 + lead },
+                VopdOp { op: if lag == 1 { VopdF32::Mul } else { VopdF32::Fmac },
+                    dst: 17 + stream, src0: Operand::V(21 + stream),
+                    src1: 40 + stream * 8 + lag },
+            )?;
         }
     }
-    for stream in 0..4u8 {
-        let acc = 26 + stream;
-        let dot = 16 + stream;
-        op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v{dot}"),
-            &[v(acc)], &[v(acc), v(dot)])?;
+    quad_weights(b, &[(1, 7), (3, 7)])?;
+    for stream in [1u8, 3] {
+        op(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", 16 + stream, 20 + stream, 39 + stream * 8),
+            &[v(16 + stream)], &[v(16 + stream), v(20 + stream), v(39 + stream * 8)])?;
+    }
+    for stream in [0u8, 2] {
+        use crate::vopd::{Operand, VopdF32, VopdOp};
+        b.vopd(
+            VopdOp { op: VopdF32::Add, dst: 26 + stream,
+                src0: Operand::V(26 + stream), src1: 16 + stream },
+            VopdOp { op: VopdF32::Add, dst: 27 + stream,
+                src0: Operand::V(27 + stream), src1: 17 + stream },
+        )?;
+    }
+    Ok(())
+}
+
+fn quad_weights(b: &mut Builder, terms: &[(u8, u8)]) -> Result<(), String> {
+    for &(stream, term) in terms {
+        let weight = 20 + stream;
+        op(b, format!("v_bfe_u32 v{weight}, v{}, {}, 4", 4 + stream, term * 4),
+            &[v(weight)], &[v(4 + stream)])?;
+    }
+    for &(stream, _) in terms {
+        let weight = 20 + stream;
+        op(b, format!("v_cvt_f32_ubyte0_e32 v{weight}, v{weight}"),
+            &[v(weight)], &[v(weight)])?;
+    }
+    for &(stream, _) in terms {
+        let weight = 20 + stream;
+        let header = 8 + stream * 2;
+        op(b, format!("v_fma_mix_f32 v{weight}, v{header}, v{weight}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
+            &[v(weight)], &[v(header), v(weight)])?;
     }
     Ok(())
 }
@@ -358,8 +375,10 @@ mod tests {
             .filter(|line| line.contains("buffer_load_") || line.contains("global_load_"))
             .count();
         assert_eq!(issued_before_wait, 18, "quad loads must overlap before the first wait");
+        assert_eq!(quad.matches(" :: ").count(), 16);
         for stream in 0..4u8 {
-            assert!(quad.contains(&format!("v_mul_f32_e32 v{}, v{}, v{}",
+            let mnemonic = if stream % 2 == 0 { "v_mul_f32_e32" } else { "v_dual_mul_f32" };
+            assert!(quad.contains(&format!("{mnemonic} v{}, v{}, v{}",
                 16 + stream, 20 + stream, 33 + stream * 8)));
         }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
