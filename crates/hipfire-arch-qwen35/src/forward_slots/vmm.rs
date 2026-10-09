@@ -372,6 +372,9 @@ pub struct Qwen35VmmStore {
     skip: Vec<bool>,
     /// RNG states produced by the forwarded step, published by commit.
     pending_rng: Vec<(RequestEpoch, u32)>,
+    /// Plan-ordered pre-norm hidden rows of a split (decode + prefill) step.
+    hidden_out: GpuTensor,
+    hidden_split: bool,
     /// Resolved logical context bound shared by every request owner.
     max_seq_bound: usize,
     mapped_high_water: usize,
@@ -424,7 +427,7 @@ impl Qwen35VmmStore {
                 template_kv.vmm_logical_bound(),
             )
             .map_err(|e| format!("VMM executor: {e}"))?;
-        let result = (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor)> {
+        let result = (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor, GpuTensor)> {
             let mut descs = Vec::with_capacity(kv_layer_ids.len());
             for _ in &kv_layer_ids {
                 descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
@@ -438,9 +441,10 @@ impl Qwen35VmmStore {
                 .max(worst.partial_floats_per_row);
             let partials = gpu.zeros(&[floats], DType::F32)?;
             let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
-            Ok((descs, row_slot, partials, logits))
+            let hidden_out = gpu.zeros(&[row_budget * config.dim], DType::F32)?;
+            Ok((descs, row_slot, partials, logits, hidden_out))
         })();
-        let (descs_dev, row_slot_dev, flash_partials, logits) =
+        let (descs_dev, row_slot_dev, flash_partials, logits, hidden_out) =
             result.map_err(|e| format!("VMM executor scratch: {e}"))?;
         // Plain trunk rows only: no GDN S-tape (that is a verify/tree cost).
         let pbs = match PrefillBatchScratch::new_opt(gpu, config, row_budget, false) {
@@ -452,6 +456,7 @@ impl Qwen35VmmStore {
                 let _ = gpu.free_tensor(row_slot_dev);
                 let _ = gpu.free_tensor(flash_partials);
                 let _ = gpu.free_tensor(logits);
+                let _ = gpu.free_tensor(hidden_out);
                 return Err(format!("VMM executor pbs: {e}"));
             }
         };
@@ -475,6 +480,8 @@ impl Qwen35VmmStore {
             row_slot_host: Vec::with_capacity(row_budget),
             skip: vec![false; max_slots],
             pending_rng: Vec::with_capacity(max_slots),
+            hidden_out,
+            hidden_split: false,
             max_seq_bound: template_kv.vmm_logical_bound(),
             mapped_high_water: 0,
             kv_budget_bytes,
@@ -576,7 +583,11 @@ impl Qwen35VmmStore {
     /// Pre-final-norm residual rows `[rows x dim]` f32 of the last forward
     /// (`pbs.x_batch`), valid until the next `forward_step`.
     pub fn hidden(&self) -> &GpuTensor {
-        &self.pbs.x_batch
+        if self.hidden_split {
+            &self.hidden_out
+        } else {
+            &self.pbs.x_batch
+        }
     }
 
     /// Per-slot last-row logits `[max_slots x vocab]` f32 of the last
@@ -634,6 +645,7 @@ impl Qwen35VmmStore {
         let _ = gpu.free_tensor(self.row_slot_dev);
         let _ = gpu.free_tensor(self.flash_partials);
         let _ = gpu.free_tensor(self.logits);
+        let _ = gpu.free_tensor(self.hidden_out);
         if let Err(e) = self.pbs.free_gpu(gpu) {
             first.get_or_insert(e.to_string());
         }
@@ -824,10 +836,14 @@ impl Qwen35VmmExecutor<'_> {
         Ok(())
     }
 
-    /// One shared trunk forward over every planned row, then one argmax per
-    /// AR request. Waits for completion (the pick download synchronizes) so
-    /// commit can release leases safely. On error the step is aborted and
-    /// every participant poisoned.
+    /// The step's trunk forward(s), then one pick per head request. AR rows
+    /// and prefill rows run as two separate passes when both are present:
+    /// the projection kernels select their arithmetic by row count, so a
+    /// decode row co-batched with a prefill chunk would take the large-M
+    /// tile route and its result would depend on another request's prompt.
+    /// Waits for completion (the pick download synchronizes) so commit can
+    /// release leases safely. On error the step is aborted and every
+    /// participant poisoned.
     pub fn forward_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<StepOutput, String> {
         let key = StepKey::of(plan);
         match &self.store.phase {
@@ -852,21 +868,11 @@ impl Qwen35VmmExecutor<'_> {
     }
 
     fn forward_inner(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> HipResult<Vec<u32>> {
-        let st = &mut *self.store;
         let (weights, config, s) = (self.weights, self.config, self.scratch);
-        let b = &plan.batch;
-        let n = b.total_rows();
-        let dim = config.dim;
+        let st = &mut *self.store;
         if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
             return Err(HipError::new(0, "VMM executor: embedding table must be Q8_0"));
         }
-        // Inputs (outside any capture: host sources are temporaries).
-        let to_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
-        st.row_slot_host.clear();
-        st.row_slot_host.extend(b.tokens.iter().map(|&t| t as i32));
-        gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &to_bytes(&st.row_slot_host))?;
-        gpu.hip.memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
-        gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
         let ms = st.max_slots;
         for (l, dev) in st.descs_dev.iter().enumerate() {
             gpu.hip.memcpy_htod(
@@ -874,45 +880,105 @@ impl Qwen35VmmExecutor<'_> {
                 VmmKvSlotDesc::as_bytes(&st.descs_host[l * ms..(l + 1) * ms]),
             )?;
         }
-        gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+        let decode: Vec<usize> = (0..plan.requests.len())
+            .filter(|&i| plan.requests[i].kind == RequestStepKind::Ar)
+            .collect();
+        let prefill: Vec<usize> = (0..plan.requests.len())
+            .filter(|&i| plan.requests[i].kind != RequestStepKind::Ar)
+            .collect();
+        let split = !decode.is_empty() && !prefill.is_empty();
+        st.hidden_split = split;
+        st.pending_rng.clear();
+        let mut picks = vec![u32::MAX; plan.total_rows()];
+        if split {
+            run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
+            run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
+        } else {
+            let all: Vec<usize> = (0..plan.requests.len()).collect();
+            run_pass(gpu, st, weights, config, s, plan, &all, false, &mut picks)?;
+        }
+        gpu.hip.device_synchronize()?;
+        Ok(picks)
+    }
+}
 
-        let n_slots = b.m_per_slot.len();
-        let mut dn: Vec<Option<&DeltaNetState>> = vec![None; n_slots];
-        for state in st.slots.iter().flatten() {
-            if state.slot < n_slots && b.m_per_slot[state.slot] > 0 {
-                dn[state.slot] = Some(&state.dn);
-            }
+/// One trunk forward over the rows of `members` (indices into
+/// `plan.requests`, slot order), then their heads. With `split`, the pass's
+/// hidden rows are copied to their plan rows in `hidden_out`.
+#[allow(clippy::too_many_arguments)]
+fn run_pass(
+    gpu: &mut Gpu,
+    st: &mut Qwen35VmmStore,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    plan: &BatchStepPlan,
+    members: &[usize],
+    split: bool,
+    picks: &mut [u32],
+) -> HipResult<()> {
+    let pb = &plan.batch;
+    let n_slots = pb.m_per_slot.len();
+    let dim = config.dim;
+    // Sub-batch in slot order: (request index, row offset in this pass).
+    let mut b = hipfire_runtime::slot_batch::SlotBatch::default();
+    b.m_per_slot = vec![0; n_slots];
+    let mut offs: Vec<(usize, usize)> = Vec::with_capacity(members.len());
+    for &i in members {
+        let r = &plan.requests[i];
+        offs.push((i, b.tokens.len()));
+        let rows = r.rows.begin..r.rows.begin + r.rows.len;
+        b.tokens.extend_from_slice(&pb.tokens[rows.clone()]);
+        b.positions.extend_from_slice(&pb.positions[rows.clone()]);
+        b.row_slot.extend_from_slice(&pb.row_slot[rows]);
+        b.m_per_slot[pb.row_slot[r.rows.begin] as usize] = r.rows.len;
+    }
+    let n = b.total_rows();
+    let to_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
+    st.row_slot_host.clear();
+    st.row_slot_host.extend(b.tokens.iter().map(|&t| t as i32));
+    gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &to_bytes(&st.row_slot_host))?;
+    gpu.hip.memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
+    gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
+    gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+
+    let mut dn: Vec<Option<&DeltaNetState>> = vec![None; n_slots];
+    for state in st.slots.iter().flatten() {
+        if state.slot < n_slots && b.m_per_slot[state.slot] > 0 {
+            dn[state.slot] = Some(&state.dn);
         }
-        let dn = DnTable(dn);
-        let max_ctx_len = (b.positions.iter().copied().max().unwrap_or(0) as usize + 1).max(1);
-        let format = st.format;
-        let flash = gpu.vmm_flash_decode_plan(
-            format,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            st.model_max_seq,
-            max_ctx_len,
-        )?;
-        if flash.partial_floats_per_row > st.flash_partials.numel() {
-            return Err(HipError::new(0, "VMM executor: flash partials undersized for this step"));
-        }
+    }
+    let dn = DnTable(dn);
+    let max_ctx_len = (b.positions.iter().copied().max().unwrap_or(0) as usize + 1).max(1);
+    let format = st.format;
+    let flash = gpu.vmm_flash_decode_plan(
+        format,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        st.model_max_seq,
+        max_ctx_len,
+    )?;
+    if flash.partial_floats_per_row > st.flash_partials.numel() {
+        return Err(HipError::new(0, "VMM executor: flash partials undersized for this step"));
+    }
+    let tier = SlotKvTier {
+        mode: mode_of(format),
+        givens_cos: None,
+        givens_sin: None,
+        fwht_signs1: None,
+        fwht_signs2: None,
+    };
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    {
         let partials = &st.flash_partials;
         let descs_dev = &st.descs_dev;
         let row_slot_dev = &st.row_slot_dev;
-        let tier = SlotKvTier {
-            mode: mode_of(format),
-            givens_cos: None,
-            givens_sin: None,
-            fwht_signs1: None,
-            fwht_signs2: None,
-        };
-        let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
         run_layers_slots(
             gpu,
             weights,
             config,
-            b,
+            &b,
             &dn,
             |kv_layer_idx| {
                 LayerKvAddr::Vmm(VmmLayerKv {
@@ -934,62 +1000,76 @@ impl Qwen35VmmExecutor<'_> {
             config.n_layers,
             None,
         )?;
-
-        // Head only for rows that pick: AR rows and the chunk completing a
-        // prompt. Other prefill chunks' last-row logits would be discarded
-        // work that re-reads the whole lm_head.
-        st.skip.clear();
-        st.skip.resize(n_slots, true);
-        for r in &plan.requests {
-            if st.wants_head(r) {
-                let slot = b.row_slot[r.rows.begin] as usize;
-                st.skip[slot] = false;
-            }
+    }
+    drop(dn);
+    if split {
+        let row_bytes = dim * 4;
+        for &(i, off) in &offs {
+            let r = &plan.requests[i];
+            gpu.memcpy_dtod_at_auto(
+                &st.hidden_out.buf,
+                r.rows.begin * row_bytes,
+                &st.pbs.x_batch.buf,
+                off * row_bytes,
+                r.rows.len * row_bytes,
+            )?;
         }
-        let mut picks = vec![u32::MAX; n];
-        if st.skip.iter().all(|&x| x) {
-            gpu.hip.device_synchronize()?;
-            return Ok(picks);
-        }
-        final_logits_per_slot(gpu, weights, config, b, &st.pbs, s, &st.logits, &st.skip)?;
-        // Pick with the singleton route's own sampler (`sampler::sample`:
-        // same kernel, same scratch window cap, same penalty/blocked-token
-        // order) on each request's logits row, its own history/config and a
-        // COPY of its RNG; the advanced RNG is published only by commit.
-        st.pending_rng.clear();
-        for r in &plan.requests {
-            if !st.wants_head(r) {
-                continue;
-            }
-            let state = st
-                .slots
-                .iter()
-                .flatten()
-                .find(|x| x.epoch == r.epoch)
-                .expect("provisioned epoch");
-            let view = st
-                .logits
-                .sub_offset(state.slot * config.vocab_size, config.vocab_size);
-            let mut rng = state.rng_state;
-            let id = hipfire_runtime::sampler::sample(
-                gpu,
-                &view,
-                &s.sample_buf,
-                &s.repeat_buf,
-                config.vocab_size,
-                &state.history,
-                &state.sampler,
-                &mut rng,
-            );
-            if id as usize >= config.vocab_size {
-                return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
-            }
-            picks[r.rows.begin + r.rows.len - 1] = id;
-            st.pending_rng.push((r.epoch, rng));
-        }
-        Ok(picks)
     }
 
+    // Head only for rows that pick: AR rows and the chunk completing a
+    // prompt. Other prefill chunks' last-row logits would be discarded
+    // work that re-reads the whole lm_head.
+    st.skip.clear();
+    st.skip.resize(n_slots, true);
+    for &i in members {
+        let r = &plan.requests[i];
+        if st.wants_head(r) {
+            st.skip[pb.row_slot[r.rows.begin] as usize] = false;
+        }
+    }
+    if st.skip.iter().all(|&x| x) {
+        return Ok(());
+    }
+    final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
+    // Pick with the singleton route's own sampler (`sampler::sample`: same
+    // kernel, same scratch window cap, same penalty/blocked-token order) on
+    // each request's logits row, its own history/config and a COPY of its
+    // RNG; the advanced RNG is published only by commit.
+    for &i in members {
+        let r = &plan.requests[i];
+        if !st.wants_head(r) {
+            continue;
+        }
+        let state = st
+            .slots
+            .iter()
+            .flatten()
+            .find(|x| x.epoch == r.epoch)
+            .expect("provisioned epoch");
+        let view = st
+            .logits
+            .sub_offset(state.slot * config.vocab_size, config.vocab_size);
+        let mut rng = state.rng_state;
+        let id = hipfire_runtime::sampler::sample(
+            gpu,
+            &view,
+            &s.sample_buf,
+            &s.repeat_buf,
+            config.vocab_size,
+            &state.history,
+            &state.sampler,
+            &mut rng,
+        );
+        if id as usize >= config.vocab_size {
+            return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
+        }
+        picks[r.rows.begin + r.rows.len - 1] = id;
+        st.pending_rng.push((r.epoch, rng));
+    }
+    Ok(())
+}
+
+impl Qwen35VmmExecutor<'_> {
     /// Publish the step's private frontiers. Validates the step id, the
     /// exact plan, and every epoch against the owner table before mutating
     /// anything. Returns one advance per AR request (prefill chunks advance
