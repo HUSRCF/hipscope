@@ -284,6 +284,7 @@ impl Ctx {
     }
     fn reset(&mut self) -> Result<()> {
         self.b.dn_state.reset(&mut self.gpu)?;
+        pin_gdn_frame(&self.b.dn_state);
         self.gpu.hip.device_synchronize()?;
         Ok(())
     }
@@ -362,6 +363,17 @@ impl Ctx {
         }
         self.gpu.hip.device_synchronize()?;
         Ok(())
+    }
+}
+
+/// With GDN error feedback off (`HIPFIRE_DN_STATE_EF=0`), Q8 DeltaNet requant
+/// rounds stochastically off a process-global frame counter, so a request's
+/// bytes depend on the counter at its start. Every reference run and every
+/// executor request starts at frame 0 (the executor threads its frame per
+/// request from admission). With EF on the counter is unused: no-op.
+fn pin_gdn_frame(dn: &DeltaNetState) {
+    if dn.s_ef_residual.is_empty() {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
     }
 }
 
@@ -580,6 +592,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
         "kv_fp8": kv.quant_fp8,
         "kv_q8": kv.quant_q8,
         "dn_quant": format!("{:?}", b.dn_state.quant),
+        "dn_state_ef": !b.dn_state.s_ef_residual.is_empty(),
         "arch": gpu.arch.clone(),
         "qwen_default_q8": qwen_default_q8,
     });
@@ -770,6 +783,8 @@ fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> 
         rng_state: 0,
         history: vec![],
     };
+    // Same starting requant frame as the singleton reference (EF-off only).
+    pin_gdn_frame(&ctx.b.dn_state);
     let st = Qwen35RequestState::new_like(
         &mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, &ctx.b.dn_state, r.epoch, r.slot, init,
     )?;
