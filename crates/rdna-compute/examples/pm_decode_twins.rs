@@ -14,7 +14,10 @@
 //!   captured grid/block/LDS, every pointer argument re-backed by a fresh copy
 //!   of the captured pre-launch bytes framed by guard bytes. Compares every
 //!   argument buffer (outputs, RMW state, unchanged inputs) plus guards, and
-//!   the incumbent against the captured callsite output.
+//!   the incumbent against the captured callsite output. `--edges` adds
+//!   admitted shapes derived from the same real tensors: K = 1..9 groups,
+//!   real K-256 and K (quad/tail 0..3), and row counts 1/2/3/31/32/33/65 or
+//!   per-matrix routing patterns, at the unchanged launcher grid rule.
 //! - `region`: an author's G0 micro ABI. The reference is the incumbent source
 //!   itself with exactly one insertion: before the reduction (`pre`) or before
 //!   the `tid == 0` epilogue (`post`) every lane stores its value and returns.
@@ -495,58 +498,84 @@ fn arg_len(s: &ModuleSpec, kernarg: &[u8], a: Arg) -> usize {
     }
 }
 
-fn build_arm(gpu: &Gpu, s: &ModuleSpec, cap: &Capture, kernarg_size: usize, perturb: Option<(usize, usize)>) -> Result<Arm> {
-    let mut kernarg = cap.kernarg.clone();
-    if kernarg.len() < kernarg_size {
-        return Err(format!("captured kernarg {} < segment {kernarg_size}", kernarg.len()));
-    }
+/// One launch's complete input: kernarg template (pointer slots are re-bound),
+/// pre-launch bytes for every pointer argument, and launcher geometry.
+struct Launch {
+    kernarg: Vec<u8>,
+    args: Vec<(Arg, Vec<u8>)>,
+    grid: [u32; 3],
+    block: [u32; 3],
+    lds: u32,
+}
+
+fn build_arm(gpu: &Gpu, s: &ModuleSpec, l: &Launch, perturb: Option<(usize, usize)>) -> Result<Arm> {
+    let mut kernarg = l.kernarg.clone();
     let mut bufs = Vec::new();
-    for &a in s.args {
-        let len = arg_len(s, &cap.kernarg, a);
-        let mut framed = vec![GUARD_BYTE; GUARD + len + GUARD];
-        let mut pre = cap.arg(a.ptr(), "pre")?;
+    for (a, pre) in &l.args {
+        let len = arg_len(s, &l.kernarg, *a);
         if pre.len() != len {
             return Err(format!("arg{}: {} bytes, expected {len}", a.ptr(), pre.len()));
         }
+        let mut framed = vec![GUARD_BYTE; GUARD + len + GUARD];
+        framed[GUARD..GUARD + len].copy_from_slice(pre);
         if let Some((off, byte)) = perturb {
             if off == a.ptr() {
-                pre[byte] ^= 0x10;
+                framed[GUARD + byte] ^= 0x10;
             }
         }
-        framed[GUARD..GUARD + len].copy_from_slice(&pre);
         let d = Dev::upload(gpu, &framed)?;
         wr_u64(&mut kernarg, a.ptr(), d.va(GUARD));
-        bufs.push((a, len, d));
+        bufs.push((*a, len, d));
     }
     Ok(Arm { bufs, kernarg: pad16(kernarg) })
 }
 
-fn run_full(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &Candidate, perturb: Option<(usize, usize)>, flip_output: bool) -> Result<(usize, Value)> {
-    let mut hip = build_arm(gpu, s, cap, inc.kernarg_size, None)?;
-    let mut pm = build_arm(gpu, s, cap, inc.kernarg_size, perturb)?;
+/// Launch incumbent and candidate on identical copies; returns (mismatch
+/// bytes, per-buffer json, incumbent post bytes per arg).
+fn launch_pair(gpu: &mut Gpu, s: &ModuleSpec, cand: &Candidate, l: &Launch, perturb: Option<(usize, usize)>, flip_output: bool) -> Result<(usize, Vec<Value>, Vec<Vec<u8>>)> {
+    let mut hip = build_arm(gpu, s, l, None)?;
+    let mut pm = build_arm(gpu, s, l, perturb)?;
     gpu.hip.device_synchronize().map_err(err)?;
-    gpu.launch_kernel_blob(s.symbol, cap.grid, cap.block, cap.lds, &mut hip.kernarg).map_err(err)?;
+    gpu.launch_kernel_blob(s.symbol, l.grid, l.block, l.lds, &mut hip.kernarg).map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
-    launch_candidate(gpu, cand, cap.grid, cap.block, cap.lds, &mut pm.kernarg)?;
+    launch_candidate(gpu, cand, l.grid, l.block, l.lds, &mut pm.kernarg)?;
     gpu.hip.device_synchronize().map_err(err)?;
     let mut total = 0;
     let mut rows = Vec::new();
-    let mut callsite_mismatch = 0;
+    let mut posts = Vec::new();
+    let mut flipped = false;
     for ((a, len, dh), (_, _, dp)) in hip.bufs.iter().zip(&pm.bufs) {
         let fh = dh.download(gpu, GUARD + len + GUARD)?;
         let mut fp = dp.download(gpu, GUARD + len + GUARD)?;
-        if flip_output && matches!(a, Arg::Y { .. }) && *len > 0 && total == 0 {
+        if flip_output && !flipped && matches!(a, Arg::Y { .. }) && *len > 0 {
             fp[GUARD] ^= 0x01;
+            flipped = true;
         }
         let (n, v) = cmp_json(&format!("arg{}+guards", a.ptr()), &fh, &fp, ("hipcc", "pm"));
         total += n;
         rows.push(v);
-        let guard_ok = fh[..GUARD].iter().chain(&fh[GUARD + len..]).all(|&b| b == GUARD_BYTE);
-        if !guard_ok {
+        if !fh[..GUARD].iter().chain(&fh[GUARD + len..]).all(|&b| b == GUARD_BYTE) {
             return Err(format!("incumbent wrote outside arg{} extent", a.ptr()));
         }
-        let post = cap.arg(a.ptr(), "post")?;
-        callsite_mismatch += compare(&fh[GUARD..GUARD + len], &post).mismatches;
+        posts.push(fh[GUARD..GUARD + len].to_vec());
+    }
+    Ok((total, rows, posts))
+}
+
+fn captured_launch(s: &ModuleSpec, cap: &Capture, kernarg_size: usize) -> Result<Launch> {
+    if cap.kernarg.len() < kernarg_size {
+        return Err(format!("captured kernarg {} < segment {kernarg_size}", cap.kernarg.len()));
+    }
+    let args = s.args.iter().map(|&a| cap.arg(a.ptr(), "pre").map(|b| (a, b))).collect::<Result<_>>()?;
+    Ok(Launch { kernarg: cap.kernarg.clone(), args, grid: cap.grid, block: cap.block, lds: cap.lds })
+}
+
+fn run_full(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &Candidate, perturb: Option<(usize, usize)>, flip_output: bool) -> Result<(usize, Value)> {
+    let l = captured_launch(s, cap, inc.kernarg_size)?;
+    let (total, rows, posts) = launch_pair(gpu, s, cand, &l, perturb, flip_output)?;
+    let mut callsite_mismatch = 0;
+    for ((a, _), post) in l.args.iter().zip(&posts) {
+        callsite_mismatch += compare(post, &cap.arg(a.ptr(), "post")?).mismatches;
     }
     Ok((
         total,
@@ -559,6 +588,96 @@ fn run_full(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand:
             "mismatch_bytes": total,
         }),
     ))
+}
+
+/// Launcher geometry for a derived shape: one workgroup per output row for the
+/// fused projections; two rows per workgroup for residual / multirow-r2.
+fn edge_grid(s: &ModuleSpec, ms: &[usize]) -> [u32; 3] {
+    let total: usize = ms.iter().sum();
+    let x = match s.region {
+        RegionAbi::ResidualRecords | RegionAbi::MultirowPair => total.div_ceil(2),
+        _ => total,
+    };
+    [x as u32, 1, 1]
+}
+
+/// Admitted edge shapes derived from the real tensors: group counts covering
+/// quads 0/1/2+ with tail 0/1/2/3 plus the real K-1 group / K, and row counts
+/// 1, 2/3 (odd row-pair tails), 31/32/33 and per-matrix routing.
+fn run_edges(gpu: &mut Gpu, s: &ModuleSpec, cap: &Capture, cand: &Candidate) -> Result<(usize, Value)> {
+    let real_groups = rd_i32(&cap.kernarg, s.k) as usize / 256;
+    let mut gs: Vec<usize> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, real_groups - 1, real_groups];
+    gs.retain(|&g| g >= 1 && g <= real_groups);
+    gs.sort_unstable();
+    gs.dedup();
+    let weights: Vec<(Arg, usize)> = s
+        .args
+        .iter()
+        .filter_map(|&a| if let Arg::Weight { m, .. } = a { Some((a, m)) } else { None })
+        .collect();
+    let real_rows: Vec<usize> = weights.iter().map(|&(_, m)| rd_i32(&cap.kernarg, m) as usize).collect();
+    let nw = weights.len();
+    let patterns: Vec<Vec<usize>> = if nw == 1 {
+        [1, 2, 3, 31, 32, 33, 65].iter().map(|&m| vec![m]).collect()
+    } else {
+        let base: &[[usize; 4]] = &[
+            [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1],
+            [1, 1, 1, 1], [31, 32, 33, 1], [33, 1, 2, 31], [3, 0, 5, 0], [32, 32, 32, 32],
+        ];
+        let mut v: Vec<Vec<usize>> = base.iter().map(|p| p[..nw].to_vec()).filter(|p| p.iter().any(|&m| m > 0)).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let wbytes: Vec<Vec<u8>> = weights.iter().map(|(a, _)| cap.arg(a.ptr(), "pre")).collect::<Result<_>>()?;
+    let xa = s.args.iter().copied().find(|a| matches!(a, Arg::X { .. })).unwrap();
+    let x = cap.arg(xa.ptr(), "pre")?;
+    let mut total = 0;
+    let mut shapes = Vec::new();
+    for &g in &gs {
+        for pat in &patterns {
+            let ms: Vec<usize> = pat.iter().zip(&real_rows).map(|(&m, &r)| m.min(r)).collect();
+            if ms.iter().all(|&m| m == 0) {
+                continue;
+            }
+            let mut kernarg = cap.kernarg.clone();
+            wr_i32(&mut kernarg, s.k, (g * 256) as i32);
+            for (&(_, moff), &m) in weights.iter().zip(&ms) {
+                wr_i32(&mut kernarg, moff, m as i32);
+            }
+            let real_row_bytes = real_groups * 136;
+            let mut args = Vec::new();
+            for &a in s.args {
+                let bytes = match a {
+                    Arg::Weight { ptr, .. } => {
+                        let wi = weights.iter().position(|(w, _)| w.ptr() == ptr).unwrap();
+                        let mut b = Vec::with_capacity(ms[wi] * g * 136);
+                        for r in 0..ms[wi] {
+                            b.extend_from_slice(&wbytes[wi][r * real_row_bytes..][..g * 136]);
+                        }
+                        b
+                    }
+                    Arg::X { .. } => x[..g * 1024].to_vec(),
+                    Arg::Y { ptr, m } => {
+                        let rows = rd_i32(&kernarg, m) as usize;
+                        let mut pre = cap.arg(ptr, "pre")?;
+                        pre.truncate(rows * 4);
+                        pre
+                    }
+                };
+                args.push((a, bytes));
+            }
+            let l = Launch { kernarg, args, grid: edge_grid(s, &ms), block: cap.block, lds: cap.lds };
+            let (n, rows, _) = launch_pair(gpu, s, cand, &l, None, false)?;
+            total += n;
+            let mut shape = json!({"groups": g, "K": g * 256, "rows": ms, "grid": l.grid, "mismatch_bytes": n});
+            if n > 0 {
+                shape["buffers"] = json!(rows);
+            }
+            shapes.push(shape);
+        }
+    }
+    Ok((total, json!({"mode": "edges", "shapes": shapes.len(), "mismatch_bytes": total, "results": shapes})))
 }
 
 // ---------------------------------------------------------------------------
@@ -864,11 +983,12 @@ struct Opts {
     row_stride: usize,
     inventory: PathBuf,
     label: String,
+    edges: bool,
 }
 
 fn parse() -> Result<Opts> {
     let mut a = std::env::args().skip(1);
-    let cmd = a.next().ok_or("usage: pm_decode_twins <region|full|selftest> --module M --capture DIR [--candidate CO --symbol S] [--stage pre|post] [--row-stride N] [--label L]")?;
+    let cmd = a.next().ok_or("usage: pm_decode_twins <region|full|selftest> --module M --capture DIR [--candidate CO --symbol S] [--stage pre|post] [--row-stride N] [--edges] [--label L]")?;
     let mut o = Opts {
         cmd,
         module: String::new(),
@@ -879,8 +999,13 @@ fn parse() -> Result<Opts> {
         row_stride: 1,
         inventory: PathBuf::from(INVENTORY),
         label: String::new(),
+        edges: false,
     };
     while let Some(k) = a.next() {
+        if k == "--edges" {
+            o.edges = true;
+            continue;
+        }
         let v = a.next().ok_or(format!("{k} needs a value"))?;
         match k.as_str() {
             "--module" => o.module = v,
@@ -950,7 +1075,14 @@ fn run() -> Result<usize> {
             let cand = load_candidate(&gpu, path, sym)?;
             report["candidate"] = json!({"path": cand.path.display().to_string(), "sha256": cand.sha256, "symbol": sym});
             let (n, v) = if o.cmd == "full" {
-                run_full(&mut gpu, s, &inc, &cap, &cand, None, false)?
+                let (n, mut v) = run_full(&mut gpu, s, &inc, &cap, &cand, None, false)?;
+                if o.edges {
+                    let (ne, ve) = run_edges(&mut gpu, s, &cap, &cand)?;
+                    v["edges"] = ve;
+                    (n + ne, v)
+                } else {
+                    (n, v)
+                }
             } else {
                 let stage = o.stage.unwrap_or(s.default_stage);
                 region(&mut gpu, s, &inc, &cap, &cand, stage, o.row_stride, &report_dir)?
@@ -969,12 +1101,14 @@ fn run() -> Result<usize> {
             let wptr = s.args[0].ptr();
             let (perturbed, v1) = run_full(&mut gpu, s, &inc, &cap, &cand, Some((wptr, 8)), false)?;
             let (flipped, v2) = run_full(&mut gpu, s, &inc, &cap, &cand, None, true)?;
+            let (edge_diff, v3) = run_edges(&mut gpu, s, &cap, &cand)?;
             report["result"] = json!({
                 "hipcc_vs_hipcc": v0,
                 "perturbed_weight_byte": {"arg": wptr, "byte": 8, "xor": "0x10", "detected": perturbed > 0, "result": v1},
                 "flipped_output_byte": {"detected": flipped == 1, "result": v2},
+                "hipcc_vs_hipcc_edges": v3,
             });
-            usize::from(clean != 0) + usize::from(perturbed == 0) + usize::from(flipped != 1)
+            usize::from(clean != 0) + usize::from(perturbed == 0) + usize::from(flipped != 1) + usize::from(edge_diff != 0)
         }
         other => return Err(format!("unknown command {other}")),
     };
