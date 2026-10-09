@@ -627,6 +627,9 @@ impl Qwen4Config {
 /// needed when it does not.
 pub const QWEN4_MAX_CONTEXT: usize = 262_144;
 
+/// Context a Qwen4 load gets when `max_seq` is omitted.
+pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;
+
 pub(crate) fn compact_test_config() -> Qwen4Config {
     let layers: Vec<_> = (0..48)
         .map(|idx| {

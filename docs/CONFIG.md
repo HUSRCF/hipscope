@@ -450,9 +450,37 @@ gathered-attention workspace reserve address space for `max_seq` and map
 pages as forwards touch rows, before any capture or Redline record. Committed
 context then tracks the tokens touched, not `max_seq`: the load logs
 `qwen4 QSA context: … MiB virtual …, … MiB committed at load`, and each
-growth logs `qwen4 QSA context mapped for N tokens`. The `auto` expert reserve
-charges only committed bytes. Mapped pages stay owned until unload, and VMM is
-not eviction.
+growth logs `qwen4 QSA context mapped for N tokens`. Mapped pages stay owned
+until unload, and VMM is not eviction.
+
+Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
+**automatic** under VMM (legacy storage refuses it and needs an explicit
+value). The context is the model's `max_position_embeddings` (at most
+262,144), capped by **card capacity**: after every load allocation the carrier
+measures free device memory and finds the largest context whose remaining VMM
+growth (target and MTP QSA pages, gathered workspace), native MTP request
+buffers and a 2 GiB headroom fit. The load logs one `qwen4 memory admission`
+line with those numbers, and the daemon logs `max_seq: N (bound=model|card;
+model_ctx=…, card_cap=…)`. An explicit `max_seq` that cannot grow refuses at
+load, naming the largest one that fits (with `memory.oom_guard` off it loads
+and only warns). Before any allocation, a fully resident load that does not
+fit free device memory refuses the same way. The session cache is not
+charged: its snapshots yield to context growth (see
+`memory.session_cache_bytes`). On a discrete GPU an omitted Qwen4 `max_seq`
+stays 32768 and an explicit one is not checked at load.
+
+**Free device memory on unified memory.** Every free-memory sizing site
+(this admission, expert placement, the dense Qwen card bound below, VMM KV
+provisioning, prefill rungs, the session cache) reads `Gpu::device_mem_info`.
+A discrete GPU, or an APU whose device pool is its BIOS carve-out, gets
+`hipMemGetInfo` unchanged. An APU that allocates from GTT (device pool larger
+than `mem_info_vram_total`, e.g. Strix Halo with a 1 GiB carve-out and a
+120 GiB `ttm.pages_limit`) gets `min(hipMemGetInfo free, MemAvailable + TTM
+page-pool estimate)`: `hipMemGetInfo` there is TTM's cap minus live GTT and
+ignores host RAM pressure, while freed GTT pages parked in TTM's pool are
+outside `MemAvailable` but are what the next GTT allocation takes first. An
+unreadable `MemAvailable` fails the query (callers refuse rather than size
+blind).
 
 For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
 preflights projected model fit before tearing down a resident model. After
@@ -702,7 +730,9 @@ Two checks exist; only one is gated:
   overshoot is a desktop-killing OOM), **off** for discrete GPUs (overshoot is
   a failed `hipMalloc`), and for GPU-less processes by host swap state (no
   swap → on). Explicit `true`/`false` force either way; `auto` logs its
-  decision once.
+  decision once. In a unified-memory process the room it checks is
+  `MemAvailable` plus TTM's page-pool estimate (freed GTT pages the next GTT
+  allocation takes first).
 - **R9700 deployment-target VRAM budget** (32 GiB class ceiling in
   `preflight_alloc`) — **always runs**, on every arch, whether the host
   headroom guard is active or not. A configuration that does not fit the
@@ -716,7 +746,7 @@ Two checks exist; only one is gated:
 |---|---|---|
 | `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
 | `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
-| `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget (a ceiling, not a reservation) of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Snapshots take free device memory only while the context does not need it: they are skipped or evicted before VMM context growth would run short. Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
 
 Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus

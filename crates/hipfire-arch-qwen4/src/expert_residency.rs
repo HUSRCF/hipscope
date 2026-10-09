@@ -14,6 +14,9 @@
 
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
+use rdna_compute::uma_memory::{
+    amdgpu_gtt_used_bytes, read_sysfs_u64, TTM_PAGES_LIMIT, TTM_PAGE_BYTES,
+};
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
@@ -312,118 +315,26 @@ pub fn check_host_ram(
     Ok(())
 }
 
-/// TTM's page limit, in pages, which caps every GTT allocation on the host.
-const TTM_PAGES_LIMIT: &str = "/sys/module/ttm/parameters/pages_limit";
-
-/// TTM's page pool cap, in pages. Freed GTT pages past it go back to the
-/// kernel at once.
-const TTM_PAGE_POOL_SIZE: &str = "/sys/module/ttm/parameters/page_pool_size";
-
-/// TTM's page size on x86_64, the only host ROCm supports for discrete GPUs.
-const TTM_PAGE_BYTES: u64 = 4096;
-
-/// Host memory outside every `/proc/meminfo` counter that is not TTM's pool:
-/// other drivers' pages, DMA buffers, firmware. [`ttm_pool_estimate`] never
-/// counts this much as pool. Measured on the 5-card gfx1201 host with the
-/// pool empty and 46.2 GiB of live GTT: 2.76 GiB.
-pub const UNTRACKED_KERNEL_BYTES: u64 = 4 << 30;
-
-/// `/proc/meminfo` fields, in bytes, that together account for every
-/// allocated page except driver pages (TTM's pool and live GTT among them).
-/// Subset fields (`Shmem`, `Mlocked`, `AnonHugePages`, ...) are left out.
-const MEMINFO_TRACKED: &[&str] = &[
-    "MemFree",
-    "Buffers",
-    "Cached",
-    "SwapCached",
-    "AnonPages",
-    "Slab",
-    "KernelStack",
-    "ShadowCallStack",
-    "PageTables",
-    "SecPageTables",
-    "VmallocUsed",
-    "Percpu",
-    "Hugetlb",
-    "Zswap",
-    "Unaccepted",
-    "Balloon",
-];
-
 fn host_mapped_is_gtt() -> bool {
     std::env::var("HSA_USERPTR_FOR_PAGED_MEM").is_ok_and(|value| value.trim() == "0")
 }
 
-fn read_u64(path: &std::path::Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// `mem_info_gtt_used` summed over every amdgpu device. Host allocations may
-/// count against another device than the one the process runs on (on a
-/// 5-card gfx1201 host, a card-2 process's host-mapped experts show in card
-/// 0's `mem_info_gtt_used`).
-fn amdgpu_gtt_used_bytes() -> Option<u64> {
-    let mut used_bytes = 0u64;
-    for card in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
-        let name = card.file_name();
-        let is_card = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("card"))
-            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
-        if is_card {
-            used_bytes += read_u64(&card.path().join("device/mem_info_gtt_used")).unwrap_or(0);
-        }
-    }
-    Some(used_bytes)
-}
-
-/// Estimate of the freed GTT pages TTM keeps in its page pool, from
-/// `/proc/meminfo` text, the GTT amdgpu devices hold, and TTM's
-/// `page_pool_size` in pages.
-///
-/// The pool is invisible to an unprivileged process: its pages are in no
-/// `/proc/meminfo` counter, so `MemAvailable` excludes them, and
-/// `mem_info_gtt_used` drops them when their buffer is freed (only root's
-/// `/sys/kernel/debug/ttm/page_pool` reads it). It is `MemTotal` minus every
-/// tracked counter, minus the live GTT and [`UNTRACKED_KERNEL_BYTES`], capped
-/// at `page_pool_size`. `None` when a field is missing.
-pub fn ttm_pool_estimate_from(meminfo: &str, gtt_used: u64, pool_size_pages: u64) -> Option<u64> {
-    let field = |key: &str| -> Option<u64> {
-        meminfo.lines().find_map(|line| {
-            let rest = line.strip_prefix(key)?.strip_prefix(':')?;
-            Some(rest.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
-        })
-    };
-    let total = field("MemTotal")?;
-    field("MemFree")?;
-    let tracked: u64 = MEMINFO_TRACKED.iter().filter_map(|key| field(key)).sum::<u64>()
-        + field("KReclaimable")?.saturating_sub(field("SReclaimable")?);
-    let untracked = total
-        .saturating_sub(tracked)
-        .saturating_sub(gtt_used)
-        .saturating_sub(UNTRACKED_KERNEL_BYTES);
-    Some(untracked.min(pool_size_pages.saturating_mul(TTM_PAGE_BYTES)))
-}
-
-/// Host RAM held in TTM's page pool that the host-mapped experts can take.
-/// amdgpu parks the write-combined and uncached pages of freed GTT buffers
-/// there, up to `page_pool_size` (half of RAM by default), so a Flash-Next
-/// process that exits leaves its host-mapped experts' pages in it. A new
-/// GTT allocation takes pages from the pool first, and TTM's shrinker frees
-/// it under memory pressure (`echo 2 | sudo tee /proc/sys/vm/drop_caches`
-/// empties it at once). 0 unless host-mapped memory is GTT-backed
+/// Host RAM held in TTM's page pool that the host-mapped experts can take
+/// ([`rdna_compute::uma_memory::ttm_pool_bytes`]). amdgpu parks the
+/// write-combined and uncached pages of freed GTT buffers there, up to
+/// `page_pool_size` (half of RAM by default), so a Flash-Next process that
+/// exits leaves its host-mapped experts' pages in it. A new GTT allocation
+/// takes pages from the pool first, and TTM's shrinker frees it under memory
+/// pressure (`echo 2 | sudo tee /proc/sys/vm/drop_caches` empties it at
+/// once). 0 unless host-mapped memory is GTT-backed
 /// (`HSA_USERPTR_FOR_PAGED_MEM=0`), or when sysfs or `/proc/meminfo` is
-/// unreadable.
+/// unreadable. Unified-memory sizing counts the pool through
+/// `Gpu::device_mem_info` instead.
 pub fn ttm_pool_estimate() -> u64 {
     if !host_mapped_is_gtt() {
         return 0;
     }
-    let estimate = || -> Option<u64> {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let pool_size_pages = read_u64(TTM_PAGE_POOL_SIZE.as_ref())?;
-        ttm_pool_estimate_from(&meminfo, amdgpu_gtt_used_bytes()?, pool_size_pages)
-    };
-    estimate().unwrap_or(0)
+    rdna_compute::uma_memory::ttm_pool_bytes()
 }
 
 /// GTT room on the host: TTM's cap and what amdgpu devices already hold.
@@ -441,7 +352,7 @@ pub fn gtt_budget() -> Option<GttBudget> {
     if !host_mapped_is_gtt() {
         return None;
     }
-    let limit_bytes = read_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
+    let limit_bytes = read_sysfs_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
     Some(GttBudget { limit_bytes, used_bytes: amdgpu_gtt_used_bytes()? })
 }
 
@@ -478,6 +389,7 @@ mod tests {
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use rdna_compute::tensor_ops::QsaKvFormat::{self, F32};
     use rdna_compute::DType;
+    use rdna_compute::uma_memory::ttm_pool_estimate_from;
 
     fn entry(name: &str, layer: usize) -> WeightEntry {
         let mut entry =
@@ -822,25 +734,6 @@ mod tests {
             ("Slab", slab),
             ("SReclaimable", sreclaim),
         ])
-    }
-
-    #[test]
-    fn ttm_pool_estimate_credits_only_untracked_pages_past_the_baseline() {
-        const POOL_PAGES: u64 = 16_108_144;
-        let gtt = 5 * (16 << 20);
-        let mib = |bytes: u64| bytes >> 20;
-        // The measured baseline (2.76 GiB, pool empty) is never credited.
-        assert_eq!(ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, POOL_PAGES), Some(0));
-        // The reported leftover: 15,292,712 pool pages (59,737 MiB).
-        let pool = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, POOL_PAGES).unwrap();
-        assert_eq!(mib(pool), 59_737 + 2826 - (UNTRACKED_KERNEL_BYTES >> 20));
-        // Capped at page_pool_size.
-        let capped = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, 1 << 20).unwrap();
-        assert_eq!(capped, (1 << 20) * TTM_PAGE_BYTES);
-        // Live GTT (another host-mapped Flash-Next) is not pool.
-        let live = ttm_pool_estimate_from(&gfx1201_host(0, 2826), 46 << 30, POOL_PAGES);
-        let held = ttm_pool_estimate_from(&gfx1201_host(46 << 10, 2826), 46 << 30, POOL_PAGES);
-        assert_eq!((live, held), (Some(0), Some(0)));
     }
 
     #[test]

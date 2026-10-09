@@ -2474,7 +2474,7 @@ pub fn load_model_with_gemma4_drafter(
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
-            free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+            free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         crate::admission::SourceAdmissionOptions {
             spec,

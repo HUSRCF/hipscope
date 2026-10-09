@@ -434,9 +434,8 @@ impl Carrier for Qwen4Carrier {
             ctx.gpu.device_id,
         );
         let session_budget = hipfire_config::memory::session_cache_bytes();
-        // An automatic context (omitted max_seq) is sized after load from
-        // what is left (card_cap), so expert placement charges its first
-        // chunk only, as unified memory does.
+        // An automatic context (omitted max_seq; unified memory only) is
+        // sized after load from what is left (card_cap).
         let automatic = ctx.sequence.is_some_and(|sequence| sequence.automatic);
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
@@ -476,16 +475,15 @@ impl Carrier for Qwen4Carrier {
         let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
             let (free, _) = ctx
                 .gpu
-                .hip
-                .get_vram_info()
-                .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
+                .device_mem_info()
+                .map_err(|error| format!("qwen4: device memory query: {error}"))?;
             let (non_expert, layer_experts) = residency::resident_split(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
             let chunk_rows =
                 hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
             let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
                 backend,
-                use_ranges || automatic,
+                use_ranges,
                 ctx.max_seq,
                 chunk_rows,
                 vmm_granularity,
@@ -540,10 +538,36 @@ impl Carrier for Qwen4Carrier {
         // Unset on a discrete card: fully resident only where every routed
         // expert, the non-expert weights and the `auto` reserve fit in free
         // VRAM; otherwise `auto` (an unconditional resident load would fail
-        // `hipMalloc` part-way). Unified memory keeps the resident load.
+        // `hipMalloc` part-way). Unified memory keeps the resident load, but
+        // refuses it up front (with `memory.oom_guard`) when it does not fit
+        // the free device memory, GTT clamped to host RAM: an overshoot there
+        // reaches the global OOM killer.
         let mut measured = None;
         let mut unset_note = String::new();
         let placement = if use_ranges {
+            if explicit.is_none() {
+                let (free, non_expert, _, reserve, ..) = auto_inputs()?;
+                let experts = residency::routed_expert_bytes(&manifest.weights, bytes_of)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
+                let detail = format!(
+                    "{} MiB routed experts + {} MiB non-expert weights + {} MiB reserve {} {} MiB free device memory",
+                    experts / MIB,
+                    non_expert / MIB,
+                    reserve / MIB,
+                    if fits { "fit in" } else { "exceed" },
+                    free / MIB
+                );
+                if !fits {
+                    if hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) {
+                        return Err(format!(
+                            "qwen4: unified memory cannot hold the resident load ({detail}); free host memory"
+                        ));
+                    }
+                    eprintln!("  qwen4: {detail} (memory.oom_guard off: loading anyway)");
+                }
+                unset_note = format!(" ({detail})");
+            }
             explicit
         } else {
             residency::resolve_expert_vram_layers(explicit, || {
@@ -742,12 +766,15 @@ impl Carrier for Qwen4Carrier {
                 return Err(format!("qwen4: MTP setup failed: {detail}"));
             }
         }
-        // Admit what requests commit after load (VMM context and gather
+        // Unified memory (the only place admission resolves a sequence):
+        // admit what requests commit after load (VMM context and gather
         // pages, native MTP request buffers) against the device memory the
-        // load left free: an automatic context is the model's, capped by
-        // what fits (card_cap); an explicit one must fit whole. The session
-        // cache is not charged: its snapshots yield to context growth.
-        let admission = (|| -> Result<crate::admission::Qwen4MemoryAdmission, String> {
+        // load left free (`device_mem_info`: GTT clamped to host RAM): an
+        // automatic context is the model's, capped by what fits (card_cap);
+        // an explicit one must fit whole. The session cache is not charged:
+        // its snapshots yield to context growth. A discrete GPU keeps its
+        // requested context unchecked, as before.
+        let admission = ctx.sequence.is_some().then(|| -> Result<crate::admission::Qwen4MemoryAdmission, String> {
             let mtp_request = if native_mtp {
                 let config = &bundle.config;
                 hipfire_arch_qwen4::mtp_spec::native_mtp_request_bytes(
@@ -765,9 +792,8 @@ impl Carrier for Qwen4Carrier {
             };
             let (free, _) = ctx
                 .gpu
-                .hip
-                .get_vram_info()
-                .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
+                .device_mem_info()
+                .map_err(|error| format!("qwen4: device memory query: {error}"))?;
             let gpu = &*ctx.gpu;
             crate::admission::qwen4_memory_admission(
                 ctx.max_seq,
@@ -777,9 +803,10 @@ impl Carrier for Qwen4Carrier {
                 crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
                 |tokens| bundle.context_growth_bytes(gpu, tokens),
             )
-        })();
+        });
         let max_seq = match admission {
-            Ok(admission) => {
+            None => ctx.max_seq,
+            Some(Ok(admission)) => {
                 eprintln!(
                     "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context + {} MiB gather workspace + {} MiB MTP request) + {} MiB headroom; card_cap {} tokens",
                     admission.free / MIB,
@@ -796,11 +823,11 @@ impl Carrier for Qwen4Carrier {
                 }
                 admission.max_seq
             }
-            Err(error) if automatic || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) => {
+            Some(Err(error)) if automatic || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) => {
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(error);
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 eprintln!("  {error} (memory.oom_guard off: loading anyway)");
                 ctx.max_seq
             }

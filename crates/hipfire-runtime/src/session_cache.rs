@@ -218,11 +218,11 @@ fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
 }
 
 /// Whether `need` more device bytes leave the guard's headroom free, in the
-/// pool the device allocates from (`hipMemGetInfo`: VRAM, or a unified-memory
-/// APU's carve-out, which host `MemAvailable` does not see); `None` when the
-/// free-memory query itself fails.
+/// pool the device allocates from (`Gpu::device_mem_info`: VRAM, a
+/// unified-memory APU's carve-out, or its GTT clamped to `MemAvailable` plus
+/// TTM's page pool); `None` when the free-memory query itself fails.
 fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
-    let (free, _) = gpu.hip.get_vram_info().ok()?;
+    let (free, _) = gpu.device_mem_info().ok()?;
     let headroom = if gpu.is_uma() {
         UMA_DEVICE_HEADROOM
     } else {

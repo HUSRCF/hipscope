@@ -2117,7 +2117,7 @@ fn main() {
                         cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
-                        free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+                        free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
                     qwen4_admission_options,

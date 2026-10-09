@@ -1016,10 +1016,17 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    // Qwen4 sequence on a unified-memory APU: an omitted max_seq is automatic
+    // (the model's context, capped by the measured card capacity at load);
+    // explicit values are honored within the limits below. A discrete GPU
+    // keeps the default context for an omitted max_seq and no sequence.
+    let unified_memory = hipfire_config::is_unified_memory_arch(gpu_arch);
+    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 && !unified_memory {
+        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    } else {
+        max_seq
+    };
     let mut qwen35_ep_experts = None;
-    // Qwen4 sequence: an omitted max_seq is automatic (the model's context,
-    // capped by the measured card capacity at load); explicit values are
-    // honored within the limits below.
     let mut qwen4_sequence = None;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
@@ -1049,13 +1056,15 @@ pub fn admit_source_with_options(
             ));
         }
         let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
-        qwen4_sequence = Some(SequenceResolution {
-            max_seq: if max_seq == 0 { model_ctx } else { max_seq },
-            bound: if max_seq == 0 { "pending" } else { "user" },
-            model_ctx,
-            card_cap: 0,
-            kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
-        });
+        if unified_memory {
+            qwen4_sequence = Some(SequenceResolution {
+                max_seq: if max_seq == 0 { model_ctx } else { max_seq },
+                bound: if max_seq == 0 { "pending" } else { "user" },
+                model_ctx,
+                card_cap: 0,
+                kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
+            });
+        }
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors

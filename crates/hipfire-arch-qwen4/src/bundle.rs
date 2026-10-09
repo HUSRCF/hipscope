@@ -664,7 +664,7 @@ impl Qwen4Bundle {
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
-        let (free, _) = gpu.hip.get_vram_info().map_err(BundleError::Hip)?;
+        let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
         let max_chunk = qwen4_prefill_chunk_rungs(requested)
             .find(|&rows| {
                 qwen4_forward_device_bytes(&self.config, rows)

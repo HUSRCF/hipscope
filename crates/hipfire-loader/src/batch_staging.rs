@@ -540,7 +540,7 @@ fn stage_qwen_vmm_batch(
     // transient allocations. Admission/provision refuse past it.
     const KV_HEADROOM: usize = 1 << 30;
     loop {
-        let free = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
+        let free = gpu.device_mem_info().map(|(f, _)| f).unwrap_or(0);
         let kv_budget_bytes = free.saturating_sub(KV_HEADROOM);
         match hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::new(
             gpu,

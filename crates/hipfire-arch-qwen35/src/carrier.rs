@@ -70,7 +70,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.hip.get_vram_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let (free, _) = ctx.gpu.device_mem_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
             let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
                 &config, &ctx.gpu.arch,
             ).ok_or("Qwen minimum PBS sizing overflow")?;

@@ -1378,9 +1378,7 @@ fn admit_compressor_growth(
         checked_add_growth(&mut growth_bytes, bytes, "idx_scores_batch")?;
     }
 
-    let (free_bytes, total_bytes) = gpu
-        .hip
-        .get_vram_info()
+    let (free_bytes, total_bytes) = gpu.device_mem_info()
         .map_err(|e| format!("query VRAM before DeepSeek V4 cache growth: {e:?}"))?;
     let required_with_headroom = growth_bytes
         .checked_add(COMPRESSOR_GROWTH_HEADROOM_BYTES)
