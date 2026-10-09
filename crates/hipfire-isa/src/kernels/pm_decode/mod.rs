@@ -10,6 +10,7 @@ pub mod fused_qkv_hfq4g256_mq4v2;
 pub mod fused_qkvza_hfq4g256_mq4v2;
 pub mod gemv_hfq4g256_residual_mq4v2;
 pub mod gemv_hfq4g256_multirow_default_mq4v2;
+pub mod gemv_hfq4g256_residual_xbatch_mq4v2;
 
 use crate::Emitted;
 use super::iu4_gemm::ModuleProof;
@@ -22,13 +23,15 @@ pub struct Module {
     pub build: fn() -> Result<Vec<Emitted>, String>,
 }
 
-/// Every twinned module, in PLAN W1 order.
-pub const MODULES: [Module; 5] = [
+/// Every PM decode module: the five W1 twins in PLAN W1 order, then new
+/// batched symbols that replace no incumbent export.
+pub const MODULES: [Module; 6] = [
     Module { name: "fused_gate_up_hfq4g256_mq4v2", symbols: &["fused_gate_up_mq4g256v2"], build: fused_gate_up_hfq4g256_mq4v2::build_gfx1201 },
     Module { name: "gemv_hfq4g256_residual_mq4v2", symbols: &["gemv_mq4g256v2_residual"], build: gemv_hfq4g256_residual_mq4v2::build_gfx1201 },
     Module { name: "fused_qkvza_hfq4g256_mq4v2", symbols: &["fused_qkvza_mq4g256v2"], build: fused_qkvza_hfq4g256_mq4v2::build_gfx1201 },
     Module { name: "gemv_hfq4g256_multirow_default_mq4v2", symbols: &["gemv_mq4g256v2_multirow_r2"], build: gemv_hfq4g256_multirow_default_mq4v2::build_gfx1201 },
     Module { name: "fused_qkv_hfq4g256_mq4v2", symbols: &["fused_qkv_mq4g256v2"], build: fused_qkv_hfq4g256_mq4v2::build_gfx1201 },
+    Module { name: "gemv_hfq4g256_residual_xbatch_mq4v2", symbols: &["gemv_mq4g256v2_residual_xbatch"], build: gemv_hfq4g256_residual_xbatch_mq4v2::build_gfx1201 },
 ];
 
 pub fn module(name: &str) -> Result<&'static Module, String> {
