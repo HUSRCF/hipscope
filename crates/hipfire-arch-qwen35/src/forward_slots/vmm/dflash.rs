@@ -33,7 +33,7 @@ use crate::dflash_spec::{
     dflash_prefill_lane_parts, dflash_repair_terminal_prefix_parts, new_dflash_lane_state,
     release_shared_dflash_weights, DflashLaneSnapshot, DflashVmmAssets, DflashWindowMark,
 };
-use crate::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS;
+use crate::qwen35::prefill::multi::{multi_chunk_row_cap, MULTI_CHUNK_MAX_LANE_ROWS};
 use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::speculative::{
     dflash_greedy_accept_commit_parts, DeltaNetSnapshot, DflashCbDraft, DflashTargetParts, DflashVerifyOutput,
@@ -45,7 +45,8 @@ use rdna_compute::Gpu;
 
 /// The store's DFlash engine: the shared draft-weight assets (one resident
 /// draft, a counted `Arc` reference) and the shared verify scratch (trunk row
-/// scratch + ONE head scratch, `<= 63` rows). Lane state is per request.
+/// scratch + ONE head scratch, up to the effective row cap: 63, or 128 with
+/// `HIPFIRE_CB_VERIFY_CHUNK128`). Lane state is per request.
 pub struct VmmDflashEngine {
     assets: DflashVmmAssets,
     cb: DflashCbScratch,
@@ -63,7 +64,9 @@ unsafe impl Send for VmmDflashEngine {}
 pub struct VmmDflashReceipt {
     /// Configured (full) verify block, e.g. 16.
     pub block_size: usize,
-    /// Rows one shared trunk chunk can hold (`<= 63`, the exactness ceiling).
+    /// Rows one shared trunk chunk can hold (the effective cap: `<= 63`, the
+    /// exactness ceiling of the product route, or up to 128 on the exact wide
+    /// verify route with `HIPFIRE_CB_VERIFY_CHUNK128`).
     pub chunk_row_limit: usize,
     /// Logical context cap of the resolved singleton draft policy.
     pub ctx_capacity: usize,
@@ -77,10 +80,11 @@ fn refuse_engine<T>(gpu: &mut Gpu, assets: DflashVmmAssets, why: String) -> Resu
 impl VmmDflashEngine {
     /// Build the engine over `assets` (`LoadedModel`'s singleton descriptor;
     /// the draft weights are shared, never reloaded). `max_rows` is the
-    /// store's planned trunk row capacity; one chunk holds `min(max_rows, 63)`
-    /// rows and must hold a full configured block. Consumes `assets`: on
-    /// every refusal the asset reference is released (the last owner frees
-    /// the raw weights) and nothing is allocated.
+    /// store's planned trunk row capacity; one chunk holds
+    /// `min(max_rows, multi_chunk_row_cap(gpu))` rows (63, or up to 128 on the
+    /// wide verify route) and must hold a full configured block. Consumes
+    /// `assets`: on every refusal the asset reference is released (the last
+    /// owner frees the raw weights) and nothing is allocated.
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen35Config,
@@ -94,10 +98,12 @@ impl VmmDflashEngine {
         if config.num_experts > 0 {
             return refuse_engine(gpu, assets, "MoE targets are not admitted".into());
         }
-        if !(2..=MULTI_CHUNK_MAX_ROWS).contains(&block) {
-            return refuse_engine(gpu, assets, format!("block {block} outside 2..={MULTI_CHUNK_MAX_ROWS}"));
+        // A lone request is the singleton's own route: at most 63 rows, whatever
+        // the aggregate cap (a 64+-row window would be the quantized route).
+        if !(2..=MULTI_CHUNK_MAX_LANE_ROWS).contains(&block) {
+            return refuse_engine(gpu, assets, format!("block {block} outside 2..={MULTI_CHUNK_MAX_LANE_ROWS}"));
         }
-        let rows = max_rows.min(MULTI_CHUNK_MAX_ROWS);
+        let rows = max_rows.min(multi_chunk_row_cap(gpu));
         if rows < block {
             return refuse_engine(gpu, assets, format!("{max_rows} planned rows cannot hold one {block}-row block"));
         }
@@ -138,7 +144,7 @@ impl VmmDflashEngine {
         self.assets.ctx_capacity
     }
 
-    /// Rows one shared trunk chunk holds (`<= 63`).
+    /// Rows one shared trunk chunk holds (the effective cap, `<= 63` or up to 128).
     pub fn max_rows(&self) -> usize {
         self.cb.max_rows()
     }
@@ -598,8 +604,9 @@ impl Qwen35VmmStore {
     }
 
     /// Forward: every planned DFlash Verify lane through the shared ChainVerify
-    /// trunk (whole lanes in `<= 63`-row chunks) and ONE head + argmax + D2H
-    /// per chunk ([`dflash_cb_verify`]). Picks wait in each lane for commit.
+    /// trunk (whole lanes in chunks of at most the effective cap: `<= 63` rows,
+    /// or up to 128 with `HIPFIRE_CB_VERIFY_CHUNK128`) and ONE head + argmax +
+    /// D2H per chunk ([`dflash_cb_verify`]). Picks wait in each lane for commit.
     pub(super) fn dflash_verify_planned(
         &mut self,
         gpu: &mut Gpu,

@@ -18,18 +18,24 @@
 //!   state; returns `[seed, candidates..]`.
 //! * [`dflash_cb_head_argmax`] — the singleton DFlash verify head
 //!   (`dflash_enqueue_verify_lm_head_argmax` + one packed i32 D2H) over the
-//!   first `rows` rows of a shared [`VerifyScratch`].
-//! * [`dflash_cb_verify`] — whole lanes packed into `<= 63`-row trunk chunks
-//!   (`forward_prefill_batch_multi`, ChainVerify fusion, each lane's own
-//!   hidden ring and tape at offset 0), ONE shared head + argmax + D2H per
-//!   chunk; each lane keeps its own picks until the greedy accept consumer.
+//!   first `rows` rows of a shared [`VerifyScratch`]; a head over 64+ rows
+//!   (a wide chunk) runs the exact singleton-WMMA head, below 64 the product
+//!   head, byte-identical per row.
+//! * [`dflash_cb_verify`] — whole lanes packed into trunk chunks of at most
+//!   the effective cap (`<= 63` rows; up to 128 with
+//!   `HIPFIRE_CB_VERIFY_CHUNK128` on an admitted dense MQ4G256V2 gfx1201
+//!   target) (`forward_prefill_batch_multi`, ChainVerify fusion, each lane's
+//!   own hidden ring and tape at offset 0), ONE shared head + argmax + D2H
+//!   per chunk; each lane keeps its own picks until the greedy accept consumer.
 
 use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{
-    forward_prefill_batch_multi, pack_whole_lanes, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_ROWS,
+    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_row_cap, pack_whole_lanes, MultiChunkRequest,
+    MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
+use crate::qwen35::prefill::DenseBatchMath;
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
@@ -257,6 +263,9 @@ pub fn dflash_lane_draft(
 /// Shared verify head: the singleton DFlash dispatcher (rotate + batched
 /// lm-head + GPU argmax) over `vs.final_hidden[0..rows]`, then one packed i32
 /// D2H. Logits land in `vs.logits[0..rows]`, picks in `vs.argmax[0..rows]`.
+/// A head over 64+ rows (only a wide chunk reaches it) uses the exact
+/// singleton-WMMA lm-head, whose rows equal the singleton head's; below 64
+/// rows the product head is the singleton's own.
 pub fn dflash_cb_head_argmax(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -268,6 +277,7 @@ pub fn dflash_cb_head_argmax(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
     let final_hidden = vs.final_hidden.sub_offset(0, rows * config.dim);
+    let math = if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS { DenseBatchMath::SingletonWmma } else { DenseBatchMath::Product };
     dflash_enqueue_verify_lm_head_argmax(
         gpu,
         &weights.output,
@@ -275,6 +285,7 @@ pub fn dflash_cb_head_argmax(
         vs,
         rows,
         config.vocab_size,
+        math,
     )?;
     dflash_download_verify_argmax(gpu, vs, rows)
 }
@@ -283,6 +294,7 @@ pub fn dflash_cb_head_argmax(
 /// head scratch (`final_hidden`/`logits`/`rot`/`argmax`, `max_rows` rows,
 /// `hidden_k = dim.next_power_of_two()` like a singleton lane's), and the
 /// reusable chunk tables. Allocated once; a cycle allocates no GPU memory.
+/// `max_rows` is the EFFECTIVE cap (63, or up to 128 on the wide verify route).
 pub struct DflashCbScratch {
     max_rows: usize,
     trunk: MultiChunkScratch,
@@ -308,9 +320,11 @@ pub struct DflashCbScratch {
 }
 
 impl DflashCbScratch {
-    /// `max_rows` is clamped to `2..=63`: one trunk chunk's rows.
+    /// `max_rows` is clamped to `2..=multi_chunk_row_cap(gpu)`: one trunk
+    /// chunk's rows (63 unless `HIPFIRE_CB_VERIFY_CHUNK128` is on, then up to
+    /// 128). The scratch stores the effective cap ([`Self::max_rows`]).
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let max_rows = max_rows.clamp(2, MULTI_CHUNK_MAX_ROWS);
+        let max_rows = max_rows.clamp(2, multi_chunk_row_cap(gpu));
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
         let head = match VerifyScratch::new(gpu, max_rows, config.dim, config.vocab_size, config.dim.next_power_of_two()) {
             Ok(h) => h,
@@ -342,7 +356,8 @@ impl DflashCbScratch {
         Ok(())
     }
 
-    /// Rows one trunk chunk can hold (`<= 63`).
+    /// Rows one trunk chunk can hold (the effective cap: `<= 63`, or up to
+    /// 128 on the wide verify route).
     pub fn max_rows(&self) -> usize {
         self.max_rows
     }
@@ -482,12 +497,13 @@ pub struct DflashCbVerifyLane<'a> {
 
 /// Verify phase over drafted lanes: the pre-verify DeltaNet snapshot of each
 /// lane (right after its draft, as the singleton), then whole lanes in order
-/// through `forward_prefill_batch_multi` chunks of at most `cb.max_rows()`
-/// rows (C1 `[16]`, C3 `[48]`, C4 `[48,16]`, C8 `[48,48,32]`) with each
-/// lane's own ChainVerify fusion, hidden ring and tape (offset 0); per chunk
-/// ONE head + GPU argmax and ONE D2H of `4 * rows` bytes. Each lane's picks
-/// land in `state.picks` (`state.verified = true`) for
-/// `dflash_greedy_accept_commit_parts`.
+/// through `forward_prefill_batch_multi` chunks of at most the packing cap
+/// ([`multi_chunk_pack_cap`] of `cb.max_rows()`: C1 `[16]`, C3 `[48]`, C4
+/// `[48,16]`, C8 `[48,48,32]` at 63 rows; C8 `[128]` with the wide route on a
+/// dense MQ4G256V2 gfx1201 target) with each lane's own ChainVerify fusion,
+/// hidden ring and tape (offset 0); per chunk ONE head + GPU argmax and ONE
+/// D2H of `4 * rows` bytes. Each lane's picks land in `state.picks`
+/// (`state.verified = true`) for `dflash_greedy_accept_commit_parts`.
 ///
 /// Everything refusable is checked before the first snapshot is saved or row
 /// launched (capture/recording, block sizes, ring/tape capacity, batched-body
@@ -511,14 +527,17 @@ pub fn dflash_cb_verify(
     if config.num_experts > 0 {
         return refuse("MoE targets are not admitted".into());
     }
+    // Effective packing cap: the scratch capacity, held to the product cap
+    // unless the wide exact route is admitted for this target.
+    let pack_cap = multi_chunk_pack_cap(gpu, weights, config, cb.max_rows);
     cb.rows.clear();
     for (i, lane) in lanes.iter().enumerate() {
         let b = lane.draft.verify_tokens.len();
         if lane.draft.verify_tokens.first() != Some(&lane.draft.seed) {
             return refuse(format!("lane {i}: window does not start with its seed"));
         }
-        if b > cb.max_rows {
-            return refuse(format!("lane {i}: {b} rows > chunk capacity {}", cb.max_rows));
+        if b > pack_cap.min(MULTI_CHUNK_MAX_LANE_ROWS) {
+            return refuse(format!("lane {i}: {b} rows > chunk capacity {pack_cap}"));
         }
         let df = &lane.state.df;
         if b > df.gdn_tape.max_n || b > df.hidden_rb.max_batch || b > df.hidden_rb.max_positions {
@@ -529,7 +548,7 @@ pub fn dflash_cb_verify(
         }
         cb.rows.push(b);
     }
-    pack_whole_lanes(&cb.rows, cb.max_rows, &mut cb.ranges).map_err(|e| HipError::new(0, &format!("dflash_cb_verify: {e}")))?;
+    pack_whole_lanes(&cb.rows, pack_cap, &mut cb.ranges).map_err(|e| HipError::new(0, &format!("dflash_cb_verify: {e}")))?;
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
