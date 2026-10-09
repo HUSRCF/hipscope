@@ -50,6 +50,11 @@ path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "cb_vmm_state_oracle"
+path = "examples/cb_vmm_state_oracle.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "qwen_dense_tp2_parity"
 path = "examples/qwen_dense_tp2_parity.rs"
 required-features = ["deltanet"]
