@@ -2,7 +2,7 @@
   "module": "fused_gate_up_hfq4g256_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "55f693fd3efadd0aad85d3a4dac420d9200edf7d",
+  "builder_git_sha": "ab08c1ad36de9b4dcf02fd7ea71b5c128f199ba5",
   "s_text_sha256": "e6ab680ea93bb2cc67c026d70ea8e0ba260a2a30831067d3994cc68512eab899",
   "kernels": [
     {
@@ -10,7 +10,7 @@
       "variant": "gfx1201",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "55f693fd3efadd0aad85d3a4dac420d9200edf7d",
+      "builder_git_sha": "ab08c1ad36de9b4dcf02fd7ea71b5c128f199ba5",
       "reg_plan": [
         {
           "name": "lane",
