@@ -5,6 +5,7 @@
 //! cb_vmm_state_oracle <model> --ks 1,2,3,4,5,6,7,8 --contexts 512,8192,32768
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
 //!     [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]
+//!     [--spec off|mtp] [--mtp-head <path>]
 //!
 //! `--contexts` are test prefix lengths, never max_seq overrides: the model
 //! loads through the production `load_qwen35_bundle` with automatic VMM
@@ -27,6 +28,10 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit, VmmRoute};
+use hipfire_arch_qwen35::mtp_head::load_mtp_head;
+use hipfire_arch_qwen35::mtp_speculator::Qwen35MtpDrafter;
+use hipfire_arch_qwen35::speculative::ModelSlot;
+use hipfire_runtime::spec::{MtpDrafter, SpecRequestConfig};
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
@@ -68,6 +73,10 @@ struct Args {
     stop_repeats: usize,
     /// Sequential 2-request cycles for the memory-drift check (0 = off).
     drift_cycles: usize,
+    /// Run the singleton MTP spec reference phase (`--spec mtp`).
+    spec_mtp: bool,
+    /// MTP head sidecar (default: model path with extension `mtp`).
+    mtp_head: Option<PathBuf>,
 }
 
 fn parse_list(s: &str) -> Result<Vec<usize>> {
@@ -85,10 +94,11 @@ fn parse_args() -> Result<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: cb_vmm_state_oracle <model> --ks 1,..,8 --contexts 512,8192,32768 \
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
-                 [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]";
+                 [--phase all|singleton] [--stop-repeats N] [--drift-cycles N] [--spec off|mtp] [--mtp-head <path>]";
     let mut batch = true;
     let mut stop_repeats = 1usize;
     let mut drift_cycles = 0usize;
+    let (mut spec_mtp, mut mtp_head) = (false, None);
     let model = raw.first().ok_or(usage)?.clone();
     let (mut ks, mut contexts, mut steps, mut out, mut short, mut artifacts) =
         (None, None, None, None, 256usize, None);
@@ -104,6 +114,14 @@ fn parse_args() -> Result<Args> {
             "--artifacts" => artifacts = Some(PathBuf::from(val)),
             "--stop-repeats" => stop_repeats = val.parse::<usize>()?.max(1),
             "--drift-cycles" => drift_cycles = val.parse()?,
+            "--spec" => {
+                spec_mtp = match val.as_str() {
+                    "mtp" => true,
+                    "off" => false,
+                    _ => return Err(usage.into()),
+                }
+            }
+            "--mtp-head" => mtp_head = Some(PathBuf::from(val)),
             "--phase" => {
                 batch = match val.as_str() {
                     "all" => true,
@@ -131,7 +149,7 @@ fn parse_args() -> Result<Args> {
     if steps < 8 {
         return Err("--steps must be >= 8 (negative controls need 8 steps)".into());
     }
-    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles })
+    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles, spec_mtp, mtp_head })
 }
 
 /// One isolated request fixture: request-unique prompt at an exact length.
@@ -1407,6 +1425,316 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
     Ok((Value::Object(out), pass))
 }
 
+// ── Spec phase: isolated singleton MTP references (§4.3, §7 item 2) ─────
+//
+// The reference is the default singleton MTP route: `Qwen35MtpDrafter` on a
+// `ModelSlot` driven exactly like `MtpSpeculator` (k = min(max_emit-1,
+// proposal_capacity), eos from the target, greedy). Per cycle it records the
+// window (position, seed, k, committed, accepted, drafted) and a sha256
+// digest of the state the cycle wrote: trunk KV rows [start, end), DeltaNet
+// S/scales/EF/conv, MTP-head KV rows [start, end) and prev_hidden. Full state
+// bytes are kept at prefill, final, and the first full/partial/zero-accept
+// cycle. Rejected rows past the committed watermark are never compared.
+
+#[derive(Clone)]
+struct SpecCycle {
+    position: usize,
+    seed: u32,
+    k: usize,
+    committed: Vec<u32>,
+    accepted: usize,
+    drafted: usize,
+    class: &'static str,
+    delta_sha256: String,
+}
+
+struct SpecTrace {
+    /// Picks in order: prefill token, then every committed id.
+    emitted: Vec<u32>,
+    cycles: Vec<SpecCycle>,
+    finish: String,
+    position: usize,
+    pending_seed: u32,
+    states: Vec<(String, PathBuf)>,
+}
+
+fn spec_class(w: &hipfire_runtime::spec::MtpWindow) -> &'static str {
+    match (w.drafts_generated, w.accepted) {
+        (0, _) => "ar",
+        (d, a) if a == d => "full",
+        (_, 0) => "zero",
+        _ => "partial",
+    }
+}
+
+fn mtp_row_bytes(st: &hipfire_arch_qwen35::mtp_spec::MtpSpecState) -> usize {
+    st.mtp_kv.n_head_kv * (st.mtp_kv.head_dim / 32) * 34
+}
+
+/// MTP head state: KV rows [from, to) (K then V), prev_hidden, its position.
+fn mtp_state_bytes(gpu: &Gpu, d: &Qwen35MtpDrafter, from: usize, to: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    gpu.hip.device_synchronize()?;
+    let st = d.mtp_live_state().ok_or("MTP state not allocated")?;
+    let row = mtp_row_bytes(st);
+    let mut out = Vec::new();
+    for (side, bufs) in [("k", &st.mtp_kv.inner.k_gpu), ("v", &st.mtp_kv.inner.v_gpu)] {
+        for (i, t) in bufs.iter().enumerate().filter(|(_, t)| t.buf.size() >= row) {
+            out.push((format!("mtp.{side}{i}"), read_dev(gpu, t, from * row, (to - from) * row)?));
+        }
+    }
+    out.push(("mtp.prev_hidden".into(), read_dev(gpu, &st.prev_hidden, 0, st.prev_hidden.byte_size())?));
+    out.push(("mtp.prev_hidden_pos".into(), (st.prev_hidden_pos.map_or(u64::MAX, |p| p as u64)).to_le_bytes().to_vec()));
+    Ok(out)
+}
+
+/// Trunk KV rows [from, to) plus whole DeltaNet state.
+fn trunk_rows_bytes(gpu: &Gpu, slot: &ModelSlot, from: usize, to: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let (kr, vr) = kv_row_bytes(&slot.kv_cache)?;
+    for (name, bytes) in state_bytes(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, 0)? {
+        if !name.ends_with(".k") && !name.ends_with(".v") {
+            out.push((name, bytes));
+        }
+    }
+    for (layer, ty) in slot.config.layer_types.iter().enumerate() {
+        if *ty == LayerType::FullAttention {
+            out.push((format!("L{layer:02}.k[{from}..{to})"), read_dev(gpu, &slot.kv_cache.k_gpu[layer], from * kr, (to - from) * kr)?));
+            out.push((format!("L{layer:02}.v[{from}..{to})"), read_dev(gpu, &slot.kv_cache.v_gpu[layer], from * vr, (to - from) * vr)?));
+        }
+    }
+    Ok(out)
+}
+
+fn digest(items: &[(String, Vec<u8>)]) -> String {
+    let mut h = Sha256::new();
+    for (n, b) in items {
+        h.update(n.as_bytes());
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Full committed state at `pos`: trunk KV prefix, DeltaNet, MTP head prefix.
+fn spec_full_state(gpu: &Gpu, slot: &ModelSlot, d: &Qwen35MtpDrafter, pos: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut v = state_bytes(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, pos)?;
+    v.extend(mtp_state_bytes(gpu, d, 0, pos)?);
+    Ok(v)
+}
+
+/// One isolated singleton MTP greedy run (`budget` picks, `eos`).
+fn spec_run(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, dir: Option<&Path>) -> Result<SpecTrace> {
+    d.configure_request(SpecRequestConfig::default());
+    let seed0 = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let mut tr = SpecTrace { emitted: vec![seed0], cycles: vec![], finish: String::new(), position: f.prefix, pending_seed: seed0, states: vec![] };
+    let mut history = f.tokens.clone();
+    history.push(seed0);
+    let save = |gpu: &Gpu, slot: &ModelSlot, d: &Qwen35MtpDrafter, tr: &mut SpecTrace, stage: &str| -> Result<()> {
+        if let Some(dir) = dir {
+            for (name, bytes) in spec_full_state(gpu, slot, d, tr.position)? {
+                let p = dir.join(stage).join(format!("{name}.bin"));
+                write_art(&p, &bytes)?;
+                tr.states.push((format!("{stage}/{name}"), p));
+            }
+        }
+        Ok(())
+    };
+    save(gpu, slot, d, &mut tr, "prefill")?;
+    let mut first_of: Vec<&'static str> = Vec::new();
+    tr.finish = if seed0 == eos { "stop".into() } else { String::new() };
+    while tr.finish.is_empty() {
+        if tr.emitted.len() >= budget {
+            tr.finish = "length".into();
+            break;
+        }
+        let max_emit = budget - tr.emitted.len();
+        let k = max_emit.saturating_sub(1).min(d.proposal_capacity());
+        let start = tr.position;
+        let w = d.mtp_step(gpu, slot, start, tr.pending_seed, &history, k, eos, None)?;
+        if w.committed.is_empty() || w.committed.len() > max_emit {
+            return Err(format!("MTP window committed {} with max_emit {max_emit}", w.committed.len()).into());
+        }
+        let class = spec_class(&w);
+        let end = start + w.committed.len();
+        let mut delta = trunk_rows_bytes(gpu, slot, start, end)?;
+        delta.extend(mtp_state_bytes(gpu, d, start, end)?);
+        tr.cycles.push(SpecCycle {
+            position: start, seed: tr.pending_seed, k, committed: w.committed.clone(), accepted: w.accepted,
+            drafted: w.drafts_generated, class, delta_sha256: digest(&delta),
+        });
+        tr.emitted.extend_from_slice(&w.committed);
+        history.extend_from_slice(&w.committed);
+        tr.position = end;
+        tr.pending_seed = *w.committed.last().unwrap();
+        if w.committed.contains(&eos) {
+            tr.finish = "stop".into();
+        }
+        if !first_of.contains(&class) && class != "ar" {
+            first_of.push(class);
+            let stage = format!("first_{class}_cycle{}", tr.cycles.len() - 1);
+            save(gpu, slot, d, &mut tr, &stage)?;
+        }
+    }
+    save(gpu, slot, d, &mut tr, "final")?;
+    Ok(tr)
+}
+
+/// Byte/ID comparison of a replayed trace against the reference trace.
+fn spec_compare(reference: &SpecTrace, got: &SpecTrace, got_states: &[(String, Vec<u8>)]) -> Result<Diff> {
+    let mut d = Diff::default();
+    d.ids("emitted", &reference.emitted, &got.emitted);
+    d.ids("position", &[reference.position as u32], &[got.position as u32]);
+    d.ids("pending_seed", &[reference.pending_seed], &[got.pending_seed]);
+    d.check("finish", reference.finish.as_bytes(), got.finish.as_bytes());
+    let n = reference.cycles.len().max(got.cycles.len());
+    for c in 0..n {
+        match (reference.cycles.get(c), got.cycles.get(c)) {
+            (Some(a), Some(b)) => {
+                let wa = [a.position as u32, a.seed, a.k as u32, a.accepted as u32, a.drafted as u32];
+                let wb = [b.position as u32, b.seed, b.k as u32, b.accepted as u32, b.drafted as u32];
+                d.ids(&format!("cycle{c}.window"), &wa, &wb);
+                d.ids(&format!("cycle{c}.committed"), &a.committed, &b.committed);
+                d.check(&format!("cycle{c}.delta_sha256"), a.delta_sha256.as_bytes(), b.delta_sha256.as_bytes());
+            }
+            _ => d.differing_items.push(format!("cycle{c}: present in only one trace")),
+        }
+    }
+    for (name, bytes) in got_states {
+        match reference.states.iter().find(|(n, _)| n == name) {
+            Some((_, p)) => d.check(name, &fs::read(p)?, bytes),
+            None => d.differing_items.push(format!("{name}: missing in reference")),
+        }
+    }
+    Ok(d)
+}
+
+/// Run `f` again in memory and collect the same stage states for comparison.
+fn spec_replay(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, reference: &SpecTrace) -> Result<Diff> {
+    // Intermediate saved stages are re-derived by a replay stopped there.
+    let stages: std::collections::BTreeSet<String> =
+        reference.states.iter().map(|(n, _)| n.split('/').next().unwrap().to_string()).collect();
+    let mut states = Vec::new();
+    for stage in stages.iter().filter(|s| s.as_str() != "final") {
+        let stop_after = if stage == "prefill" { 0 } else { stage.rsplit("cycle").next().unwrap().parse::<usize>()? + 1 };
+        let pos = spec_partial(gpu, slot, d, f, budget, eos, stop_after)?;
+        for (name, bytes) in spec_full_state(gpu, slot, d, pos)? {
+            states.push((format!("{stage}/{name}"), bytes));
+        }
+    }
+    let got = spec_run(gpu, slot, d, f, budget, eos, None)?;
+    for (name, bytes) in spec_full_state(gpu, slot, d, got.position)? {
+        states.push((format!("final/{name}"), bytes));
+    }
+    spec_compare(reference, &got, &states)
+}
+
+/// Run `f` for `cycles` windows (0 = prefill only); returns the committed position.
+fn spec_partial(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, cycles: usize) -> Result<usize> {
+    d.configure_request(SpecRequestConfig::default());
+    let mut seed = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let (mut pos, mut emitted) = (f.prefix, 1usize);
+    let mut history = f.tokens.clone();
+    history.push(seed);
+    let mut c = 0;
+    while c < cycles && emitted < budget && seed != eos {
+        let max_emit = budget - emitted;
+        let k = max_emit.saturating_sub(1).min(d.proposal_capacity());
+        let w = d.mtp_step(gpu, slot, pos, seed, &history, k, eos, None)?;
+        emitted += w.committed.len();
+        history.extend_from_slice(&w.committed);
+        pos += w.committed.len();
+        seed = *w.committed.last().unwrap();
+        c += 1;
+        if w.committed.contains(&eos) {
+            break;
+        }
+    }
+    Ok(pos)
+}
+
+fn spec_trace_json(t: &SpecTrace) -> Value {
+    let count = |c: &str| t.cycles.iter().filter(|x| x.class == c).count();
+    json!({
+        "picks": t.emitted.len(), "cycles": t.cycles.len(), "finish": t.finish, "position": t.position,
+        "pending_seed": t.pending_seed,
+        "classes": {"full": count("full"), "partial": count("partial"), "zero": count("zero"), "ar": count("ar")},
+        "accepted_total": t.cycles.iter().map(|c| c.accepted).sum::<usize>(),
+        "emitted": t.emitted,
+        "windows": t.cycles.iter().map(|c| json!([c.position, c.k, c.accepted, c.drafted, c.class, c.committed])).collect::<Vec<_>>(),
+    })
+}
+
+/// Spec phase: per fixture an isolated singleton MTP reference (artifacts),
+/// its determinism self-test, and the derived EOS-in-draft and
+/// max_tokens-mid-draft variants. Returns (report, pass).
+fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture]) -> Result<(Value, bool)> {
+    let Ctx { mut gpu, b } = ctx;
+    let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model)).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
+    let head_path = args.mtp_head.clone().unwrap_or_else(|| Path::new(&args.model).with_extension("mtp"));
+    let max_prefix = fx.iter().map(|f| f.prefix).max().unwrap_or(0);
+    let cap = max_prefix + args.steps + 64;
+    let head = load_mtp_head(&head_path, &mut gpu, cap)?;
+    let k = hipfire_runtime::config::get().mtp_k.clamp(1, 10);
+    let mut d = Qwen35MtpDrafter::new(head, k, cap);
+    let budget = args.steps + 1;
+    let eos = slot.config.eos_token;
+    let mut pass = true;
+    let mut rows = Vec::new();
+    for f in fx {
+        let dir = args.artifacts.join("spec_mtp").join(f.name());
+        let t0 = std::time::Instant::now();
+        let tr = spec_run(&mut gpu, &mut slot, &mut d, f, budget, eos, Some(&dir))?;
+        let secs = t0.elapsed().as_secs_f64();
+        let det = spec_replay(&mut gpu, &mut slot, &mut d, f, budget, eos, &tr)?;
+        pass &= det.exact();
+        let mut row = json!({"fixture": f.name(), "k": k, "record_seconds": secs, "reference": spec_trace_json(&tr), "determinism": det.json()});
+        eprintln!("spec {}: picks={} cycles={} classes={} determinism exact={} ({secs:.1}s)", f.name(), tr.emitted.len(), tr.cycles.len(), row["reference"]["classes"], det.exact());
+        // EOS inside a draft: the 2nd committed id of the first window that
+        // accepted >=2 drafts becomes the stop id.
+        if let Some((ci, c)) = tr.cycles.iter().enumerate().find(|(_, c)| c.accepted >= 2) {
+            let stop = c.committed[1];
+            let vdir = args.artifacts.join("spec_mtp").join(format!("{}_eos", f.name()));
+            let v = spec_run(&mut gpu, &mut slot, &mut d, f, budget, stop, Some(&vdir))?;
+            let first = tr.emitted.iter().position(|&t| t == stop).unwrap() + 1;
+            let ok = v.finish == "stop" && v.emitted.len() == first && v.emitted[..] == tr.emitted[..first];
+            pass &= ok;
+            eprintln!("spec {} eos_in_draft: stop={stop} cycle={ci} picks={} expected {first} -> {}", f.name(), v.emitted.len(), if ok { "OK" } else { "FAIL" });
+            row["eos_in_draft"] = json!({"stop": stop, "cycle": ci, "ok": ok, "trace": spec_trace_json(&v)});
+        } else {
+            row["eos_in_draft"] = json!({"skipped": "no window accepted >=2 drafts"});
+        }
+        // max_tokens clipping mid-draft: budget ends one pick into a window
+        // that committed >=3, so k shrinks below the drafter's capacity.
+        if let Some((ci, _)) = tr.cycles.iter().enumerate().find(|(_, c)| c.committed.len() >= 3) {
+            let before: usize = 1 + tr.cycles[..ci].iter().map(|c| c.committed.len()).sum::<usize>();
+            let clip = before + 2;
+            let vdir = args.artifacts.join("spec_mtp").join(format!("{}_clip", f.name()));
+            let v = spec_run(&mut gpu, &mut slot, &mut d, f, clip, eos, Some(&vdir))?;
+            let last = v.cycles.last();
+            let ok = v.finish == "length" && v.emitted.len() == clip && v.emitted[..] == tr.emitted[..clip]
+                && last.is_some_and(|c| c.k < k);
+            pass &= ok;
+            eprintln!("spec {} max_tokens_mid_draft: budget={clip} picks={} last_k={:?} -> {}", f.name(), v.emitted.len(), last.map(|c| c.k), if ok { "OK" } else { "FAIL" });
+            row["max_tokens_mid_draft"] = json!({"budget": clip, "cycle": ci, "ok": ok, "trace": spec_trace_json(&v)});
+        } else {
+            row["max_tokens_mid_draft"] = json!({"skipped": "no window committed >=3"});
+        }
+        rows.push(row);
+    }
+    let classes_seen: Vec<&str> = ["full", "partial", "zero"]
+        .into_iter()
+        .filter(|c| rows.iter().any(|r| r["reference"]["classes"][*c].as_u64().unwrap_or(0) > 0))
+        .collect();
+    let report = json!({
+        "route": "singleton Qwen35MtpDrafter on ModelSlot (MtpSpeculator k/eos contract), greedy",
+        "head": head_path, "k": k, "budget_picks": budget, "accept_classes_seen": classes_seen,
+        "batch_verify": "pending: executor refuses Verify rows until the Slice2A verify API lands",
+        "fixtures": rows,
+    });
+    Box::new(d).mtp_free(&mut gpu);
+    Ok((report, pass && classes_seen.len() == 3))
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     if args.artifacts.exists() {
@@ -1489,6 +1817,16 @@ fn main() -> Result<()> {
         report["route_exact_vs_singleton"] = json!(route);
         report["batch"] = batch;
         pass &= ok && route;
+    }
+    if args.spec_mtp {
+        // Last: the spec phase turns the bundle into a ModelSlot.
+        let (spec, ok) = spec_phase(ctx, &args, &fx)?;
+        report["spec_mtp"] = spec;
+        pass &= ok;
+        report["pass"] = json!(pass);
+        fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+        eprintln!("wrote {} pass={pass}", args.out.display());
+        return if pass { Ok(()) } else { Err("oracle FAILED (see report)".into()) };
     }
     report["pass"] = json!(pass);
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
