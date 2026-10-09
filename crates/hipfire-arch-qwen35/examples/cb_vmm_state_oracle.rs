@@ -501,6 +501,8 @@ fn replay(ctx: &mut Ctx, f: &Fixture, steps: usize, reference: &Trace, perturb: 
     for s in 1..=steps {
         if s == 1 && matches!(perturb, Perturb::RejectedTailMasked | Perturb::RejectedTailRead) {
             let snap = ctx.snapshot_dn()?;
+            // Spec rollback also restores the stochastic-requant frame (EF off).
+            let frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
             ctx.poison_kv(position, position + 4)?;
             // Drafts that the target will reject: off-by-one token ids.
             let block = [seed, seed.wrapping_add(1) % 1000, 17, 23];
@@ -511,6 +513,7 @@ fn replay(ctx: &mut Ctx, f: &Fixture, steps: usize, reference: &Trace, perturb: 
                 seed = argmax(&ctx.logits()?)?;
             } else {
                 ctx.restore_dn(&snap)?;
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame);
             }
         }
         let pos = if perturb == Perturb::RowSlot && s == 1 { position + 1 } else { position };
