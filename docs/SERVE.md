@@ -107,7 +107,7 @@ Config and env owners for bind, idle, queue, and body limits:
    (penalties apply as on the singleton route) and AR rows only;
    `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) is a reserved switch — no
    cross-request speculation is enabled yet. A request that is alone at
-   dispatch keeps the unchanged singleton route
+   dispatch keeps the unchanged singleton
    route (including native MTP/DFlash); requests arriving while a singleton
    generation runs wait for it to finish, so their TTFT includes that
    generation (known gap). The fixed-slot `serve.multi_slot` engine below is
