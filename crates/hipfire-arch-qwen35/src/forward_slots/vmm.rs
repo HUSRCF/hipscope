@@ -50,6 +50,7 @@ use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
 use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 mod exact;
+pub mod spec;
 
 
 /// Load-time admission for the VMM executor on this resident model: the
@@ -222,6 +223,9 @@ pub struct Qwen35RequestState {
     /// Penalty history (the singleton route's sampling scope). The executor
     /// appends every committed id.
     pub history: Vec<u32>,
+    /// MTP drafter state of a spec lane (`spec::spec_prefill`); `None` for
+    /// an AR lane.
+    pub mtp: Option<crate::mtp_spec::MtpSpecState>,
 }
 
 /// Admission inputs of one request, as the singleton route would hold them.
@@ -300,6 +304,7 @@ impl Qwen35RequestState {
             sampler: init.sampler,
             rng_state: init.rng_state,
             history: init.history,
+            mtp: None,
         })
     }
 
@@ -356,6 +361,9 @@ impl Qwen35RequestState {
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         let r = self.kv.release_vmm_after(gpu, None).map_err(|e| e.to_string());
         self.dn.free_gpu(gpu);
+        if let Some(mtp) = self.mtp {
+            mtp.free_gpu(gpu);
+        }
         r
     }
 }
@@ -440,6 +448,8 @@ pub struct Qwen35VmmStore {
     /// Shared physical KV budget across every request owner.
     kv_budget_bytes: usize,
     route: VmmRoute,
+    /// MTP engine of spec lanes (`install_spec`); `None` = AR lanes only.
+    spec: Option<spec::VmmSpecEngine>,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -615,6 +625,7 @@ impl Qwen35VmmStore {
             mapped_high_water: 0,
             kv_budget_bytes,
             route,
+            spec: None,
         })
     }
 
@@ -778,6 +789,9 @@ impl Qwen35VmmStore {
         let _ = gpu.free_tensor(self.hidden_out);
         if let Some(t) = self.rows_tables {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(engine) = self.spec {
+            engine.free_gpu(gpu);
         }
         if let Err(e) = self.pbs.free_gpu(gpu) {
             first.get_or_insert(e.to_string());

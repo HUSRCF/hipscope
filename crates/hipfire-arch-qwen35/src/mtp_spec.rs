@@ -2716,8 +2716,9 @@ pub fn prefill_trunk_and_mtp_cache(
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
-/// after each trunk chunk and its MTP fill commit, with the exclusive end
-/// position of the committed prefix (`start_pos + tokens_written_so_far`).
+/// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
+/// state and the exclusive end position of the committed prefix
+/// (`start_pos + tokens_written_so_far`).
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -2731,10 +2732,45 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    on_committed_boundary: F,
+) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+{
+    let mut parts = MtpPrefillTarget {
+        weights: &target.weights,
+        config: &target.config,
+        kv_cache: &mut target.kv_cache,
+        dn_state: &mut target.dn_state,
+        scratch: &target.scratch,
+    };
+    prefill_trunk_and_mtp_cache_parts(gpu, &mut parts, head, state, prompt_tokens, start_pos, route, on_committed_boundary)
+}
+
+/// The trunk owners a prompt prefill writes: a [`ModelSlot`]'s, or a
+/// continuous-batching request's own KV/DeltaNet over the shared weights.
+pub struct MtpPrefillTarget<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+    pub kv_cache: &'a mut KvCache,
+    pub dn_state: &'a mut DeltaNetState,
+    pub scratch: &'a Qwen35Scratch,
+}
+
+/// [`prefill_trunk_and_mtp_cache_with_boundary`] over explicit trunk owners.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_parts<F>(
+    gpu: &mut Gpu,
+    target: &mut MtpPrefillTarget<'_>,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    route: MtpPromptRoute,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -2918,7 +2954,7 @@ where
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target, committed_pos)?;
+            on_committed_boundary(gpu, target.dn_state, committed_pos)?;
             off = end;
         }
 

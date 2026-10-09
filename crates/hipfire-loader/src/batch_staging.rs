@@ -55,6 +55,9 @@ pub struct VmmStagingRequest {
     /// `Exact` (default; byte-identical to the singleton route) or
     /// `Nonexact` (only under `HIPFIRE_SERVE_BATCH_NONEXACT=1`).
     pub route: hipfire_arch_qwen35::forward_slots::vmm::VmmRoute,
+    /// Decode requests as cross-request batched MTP spec lanes when the
+    /// model serves MTP (`serve_vmm_batch.spec`, default on).
+    pub spec: bool,
 }
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
@@ -577,5 +580,51 @@ fn stage_qwen_vmm_batch(
             }
         }
     }
+    if out.vmm && req.spec {
+        stage_qwen_vmm_spec(m, gpu, requested);
+    }
     out
+}
+
+/// Per-lane context cap of VMM spec lanes: the MTP head KV is dense per
+/// lane, so the engine's head is loaded with this cap; longer requests
+/// decode as AR lanes.
+const VMM_SPEC_LANE_CAP: usize = 32768;
+
+/// Stage the VMM store's MTP engine when the resident model serves MTP: a
+/// dedicated head copy (KV sized [`VMM_SPEC_LANE_CAP`]) and the shared
+/// verify scratch. Any failure leaves AR lanes only.
+fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize) {
+    if !m.mtp_weights_present || m.mtp_mode == "off" {
+        return;
+    }
+    let cap = m.max_seq.min(VMM_SPEC_LANE_CAP);
+    let k = m.mtp_k;
+    let trunk_path = std::path::PathBuf::from(&m.model_path);
+    let Some(b) = m.qwen35_mut() else {
+        return;
+    };
+    let (head, errors) = crate::resolve_qwen35_mtp_head(
+        &trunk_path,
+        None,
+        (b.config.dim, b.config.vocab_size),
+        gpu,
+        cap,
+        None,
+    );
+    let Some(head) = head else {
+        eprintln!("[daemon] VMM spec lanes unavailable: MTP head not loaded ({}) — AR lanes", errors.join("; "));
+        return;
+    };
+    let route = hipfire_arch_qwen35::mtp_spec::MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+    match hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine::new(gpu, &b.config, head, k, lanes, route) {
+        Ok(engine) => {
+            let store = b.vmm_store.as_mut().expect("staged above");
+            match store.install_spec(engine) {
+                Ok(()) => eprintln!("[daemon] VMM spec lanes staged: MTP K={k} lane_cap={cap}"),
+                Err(engine) => engine.free_gpu(gpu),
+            }
+        }
+        Err(e) => eprintln!("[daemon] VMM spec lanes unavailable: {e} — AR lanes"),
+    }
 }

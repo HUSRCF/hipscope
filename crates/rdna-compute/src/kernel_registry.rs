@@ -1389,6 +1389,11 @@ const QWEN36_27B_GFX1201_VMM_EXACT_HIP: &[RouteHip] = &[
 /// `kernel.pm_decode` is off.
 const QWEN36_27B_GFX1201_XBATCH_HIP: &[RouteHip] = &[("gemv_mq4g256v2_xbatch", &["gemv_mq4g256v2_xbatch"])];
 
+/// Cross-request batched MTP verify additions to the native-MTP route
+/// (`verify_twins`; module name = entry name).
+const QWEN36_27B_GFX1201_SPEC_CB_HIP: &[RouteHip] =
+    &[("attention_fp8_e4m3_kv_batched_segs", &["attention_fp8_e4m3_kv_batched_segs"])];
+
 /// The gfx1201 slab IU4 MMQ bundle every 27B prefill projection selects
 /// (`gemm.rs` `g12_iu4_b1s_image`, default A4 slab route).
 const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
@@ -1426,6 +1431,7 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
             let mut hip = vec![QWEN36_27B_GFX1201_AR_HIP, QWEN36_27B_GFX1201_VMM_EXACT_HIP];
             if mtp {
                 hip.push(QWEN36_27B_GFX1201_MTP_HIP);
+                hip.push(QWEN36_27B_GFX1201_SPEC_CB_HIP);
             }
             let b1s = PlannedKernel::Embedded {
                 module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
@@ -1575,6 +1581,11 @@ fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regis
         for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP {
             all.push(entry(arch, module, symbols,
                 crate::attention::rows_batched::rows_twin_module_source(module).map_err(recipe_err)?.into(),
+                extra_flags));
+        }
+        for &(module, symbols) in QWEN36_27B_GFX1201_SPEC_CB_HIP {
+            all.push(entry(arch, module, symbols,
+                crate::verify_twins::seg_twin_module_source(module).map_err(recipe_err)?.into(),
                 extra_flags));
         }
         all.push(entry(arch, "gemv_mq4g256v2_xbatch", &["gemv_mq4g256v2_xbatch"],

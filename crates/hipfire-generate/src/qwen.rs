@@ -4558,6 +4558,19 @@ pub fn generate_spec(
                         m.asst_turn_cache.clear();
                         free_checkpoints(&mut m.prefill_checkpoints, gpu);
                         free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        // An MTP drafter's state continues in a spec lane:
+                        // copy it out before the reset below drops it.
+                        let kind = match hipfire_arch_qwen35::forward_slots::vmm::spec::MtpLaneSnapshot::capture(
+                            gpu,
+                            &mut **spec,
+                            position,
+                        ) {
+                            Ok(snap) => crate::batch::PromotedDecode::Spec(snap),
+                            Err(e) => {
+                                eprintln!("[vmm-promote] id={id} no MTP lane state ({e}); continues as AR");
+                                crate::batch::PromotedDecode::Ar
+                            }
+                        };
                         if let Err(e) = spec.reset(gpu) {
                             eprintln!("[vmm-promote] speculator reset after promotion: {e}");
                         }
@@ -4574,7 +4587,7 @@ pub fn generate_spec(
                             loop_guard: hipfire_runtime::loop_guard::LoopGuard::from_config(
                                 hipfire_runtime::config::get(),
                             ),
-                            kind: crate::batch::PromotedDecode::Ar,
+                            kind,
                             seed_emitted: true,
                         });
                         drop(guard);

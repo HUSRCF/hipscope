@@ -1493,9 +1493,8 @@ pub struct PromotionPermit {
 /// and loop guard. The VMM driver installs it as a Running lane under the
 /// same AttemptKey with no new `gen_start`.
 ///
-/// `kind` records the decode mode it continues in. Stage 1 only has exact
-/// batched AR; a spec-mode lane (stage-2 batched verification) can resume
-/// from the same state without changing this hand-off.
+/// `kind` records the decode mode it continues in: exact batched AR, or (a
+/// singleton MTP request) a spec lane carrying the drafter's state.
 pub struct PromotedRequest {
     pub pending: BatchPendingRequest,
     pub progress: QwenBatchLane,
@@ -1509,10 +1508,30 @@ pub struct PromotedRequest {
 }
 
 /// Decode mode a promoted lane continues in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromotedDecode {
     /// Continue as exact batched AR from the pending seed.
     Ar,
+    /// Continue as a spec lane with the singleton MTP drafter's state (the
+    /// driver falls back to AR when no spec lane can take it).
+    Spec(hipfire_arch_qwen35::forward_slots::vmm::spec::MtpLaneSnapshot),
+}
+
+/// The singleton MTP route's per-request speculator config for a batch
+/// request's resolved sampling (what `configure_request` installs).
+fn spec_request_config(s: &BatchSampling, rng_seed: u64) -> hipfire_runtime::spec::SpecRequestConfig {
+    hipfire_runtime::spec::SpecRequestConfig {
+        temp: s.temp,
+        top_p: s.top_p,
+        top_k: s.top_k,
+        min_p: s.min_p.unwrap_or(0.0),
+        cactus_delta: 0.0,
+        rng_seed,
+        allow_ngram_modifier: false,
+        repeat_penalty: s.repeat_penalty,
+        repeat_window: s.repeat_window,
+        presence_penalty: s.presence_penalty,
+        frequency_penalty: s.frequency_penalty,
+    }
 }
 
 thread_local! {
@@ -1770,6 +1789,7 @@ pub fn vmm_staging_request(
     vmm_batch.map(|p| hipfire_loader::batch_staging::VmmStagingRequest {
         row_budget: p.max_batch_tokens,
         route: if p.nonexact { VmmRoute::Nonexact } else { VmmRoute::Exact },
+        spec: p.spec,
     })
 }
 
@@ -1974,6 +1994,25 @@ pub fn drive_qwen_vmm_continuous_batch(
     };
     let mut work: Vec<PendingWork> = (0..batch_size).map(idle_work).collect();
     let mut epochs: Vec<RequestEpoch> = vec![IDLE; batch_size];
+    // Spec lanes: greedy requests decoded by the store's MTP engine
+    // (`spec_cycle`), each window exactly the singleton MTP route's; never
+    // planned by the AR planner. `(k, head_cap)` when the engine is staged
+    // and no n-gram modifier could change the singleton's windows.
+    let spec_engine: Option<(usize, usize)> = if params.spec
+        && !hipfire_config::mtp_ngram_enabled()
+        && !hipfire_config::mtp_ngram_enabled_for_arch(model.arch_id, &gpu.arch)
+    {
+        vmm_bundle(&mut model.state)
+            .and_then(|b| b.vmm_store.as_ref())
+            .and_then(|s| s.spec_engine())
+            .map(|e| (e.k(), e.head_cap()))
+    } else {
+        None
+    };
+    let mut spec_lane: Vec<bool> = vec![false; batch_size];
+    // First generated ids of spec lanes prefilled this iteration, emitted
+    // with this iteration's commits (the singleton emits the seed first).
+    let mut spec_seeds: Vec<hipfire_runtime::slot_batch::RequestAdvance> = Vec::new();
     let mut planner = BatchPlanner::new(
         Scheduler {
             chunk_size: row_budget,
@@ -2097,14 +2136,16 @@ pub fn drive_qwen_vmm_continuous_batch(
         let admission = pending.admission;
         let position = state.position;
         let seed = state.pending_seed;
+        let rng = state.rng_state;
+        let sampling = pending.sampling.clone();
         announced.borrow_mut().insert(key.clone());
         let mut installed: Result<usize, String> = Err("not installed".into());
-        let ticket = match (seed, kind) {
-            (None, _) => {
+        let ticket = match seed {
+            None => {
                 installed = Err("promoted request has no pending seed".into());
                 None
             }
-            (Some(_), PromotedDecode::Ar) => sched.adopt_running(pending, progress),
+            Some(_) => sched.adopt_running(pending, progress),
         };
         if let (Some(ticket), Some(seed)) = (ticket, seed) {
             let lane = ticket.lane;
@@ -2127,19 +2168,78 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             if installed.is_ok() {
                 epochs[lane] = epoch;
-                work[lane] = PendingWork {
-                    remaining_prompt: vec![seed],
-                    next_pos: position,
-                    decoding: true,
-                    ..idle_work(lane)
+                // A promoted MTP singleton continues as a spec lane when one
+                // can take it (greedy, whole budget within the lane cap).
+                let generated = match &sched.lanes[lane] {
+                    BatchLane::Running(l) => l.streamed_tokens.len(),
+                    _ => usize::MAX,
+                };
+                let adopted = match kind {
+                    PromotedDecode::Ar => false,
+                    PromotedDecode::Spec(snap) => {
+                        let fits = spec_engine.is_some_and(|(k, cap)| {
+                            sampling.temp <= 0.0
+                                && generated != usize::MAX
+                                && position + lane_max_tokens(&key, sched).saturating_sub(generated) + k + 1 <= cap
+                        });
+                        let b = vmm_bundle(&mut model.state);
+                        match (fits, b) {
+                            (true, Some(b)) => {
+                                let hipfire_arch_qwen35::Qwen35Bundle { vmm_store, config, scratch, .. } = b;
+                                let store = vmm_store.as_mut().expect("admitted above");
+                                match store.spec_adopt(gpu, config, scratch, &epoch, snap, spec_request_config(&sampling, rng as u64)) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        eprintln!("[vmm-promote] id={} spec lane refused ({e}); continuing as AR", key.id);
+                                        false
+                                    }
+                                }
+                            }
+                            _ => {
+                                snap.free_gpu(gpu);
+                                false
+                            }
+                        }
+                    }
+                };
+                spec_lane[lane] = adopted;
+                work[lane] = if adopted {
+                    PendingWork {
+                        next_pos: position,
+                        decoding: true,
+                        ..idle_work(lane)
+                    }
+                } else {
+                    PendingWork {
+                        remaining_prompt: vec![seed],
+                        next_pos: position,
+                        decoding: true,
+                        ..idle_work(lane)
+                    }
                 };
                 loop_guards[lane] = loop_guard;
                 producers[lane] = Some(producer);
                 if !seed_emitted {
-                    unemitted_seed = Some((epoch, seed));
+                    if adopted {
+                        spec_seeds.push(hipfire_runtime::slot_batch::RequestAdvance {
+                            epoch,
+                            committed_ids: vec![seed],
+                            committed_position: position,
+                            accepted_drafts: 0,
+                            verified_rows: 0,
+                            finish: None,
+                        });
+                    } else {
+                        unemitted_seed = Some((epoch, seed));
+                    }
                 }
+            } else if let PromotedDecode::Spec(snap) = kind {
+                snap.free_gpu(gpu);
             }
         } else {
+            if let PromotedDecode::Spec(snap) = kind {
+                snap.free_gpu(gpu);
+            }
             let freed = state.free_gpu(gpu);
             let why = match installed {
                 Err(e) if e != "not installed" => e,
@@ -2268,6 +2368,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
             epochs[idx] = IDLE;
             work[idx] = idle_work(idx);
+            spec_lane[idx] = false;
             let _scope =
                 BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
@@ -2352,7 +2453,15 @@ pub fn drive_qwen_vmm_continuous_batch(
                 top_k: s.top_k,
                 min_p: s.min_p,
             };
-            let admitted = (|| -> Result<(), String> {
+            // A greedy request whose whole budget fits the MTP head's lane
+            // capacity decodes as a spec lane, exactly as the singleton MTP
+            // route would serve it.
+            let spec_req = spec_engine
+                .filter(|&(k, cap)| {
+                    s.temp <= 0.0 && prompt_tokens.len() + lane_max_tokens(&key, sched) + k + 1 <= cap
+                })
+                .map(|_| spec_request_config(s, rng_state as u64));
+            let admitted = (|| -> Result<Option<u32>, String> {
                 let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
                 let state = hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
                     gpu,
@@ -2369,41 +2478,80 @@ pub fn drive_qwen_vmm_continuous_batch(
                         history: Vec::new(),
                     },
                 )?;
-                let store = b.vmm_store.as_mut().ok_or("store not staged")?;
+                let hipfire_arch_qwen35::Qwen35Bundle {
+                    vmm_store,
+                    weights,
+                    config,
+                    scratch,
+                    ..
+                } = b;
+                let store = vmm_store.as_mut().ok_or("store not staged")?;
                 store.admit(state).map_err(|(state, e)| {
                     let freed = state.free_gpu(gpu);
                     format!("{e}; free: {freed:?}")
-                })
-            })();
-            if let Err(e) = admitted {
-                // Per-admission refusal (capacity/budget): this request
-                // fails visibly; peers keep running.
-                announce(stdout, &key, ticket.admission);
-                {
-                    let _scope = BatchAttemptScope::enter_for_generation(
-                        &key.id,
-                        key.attempt_id,
-                        ticket.admission,
-                    );
-                    crate::ar::emit_generation_error(
-                        route,
-                        stdout,
-                        Some(&key.id),
-                        &format!("VMM batch admission refused: {e}"),
-                        "context_length",
-                        false,
-                        true,
-                    );
-                    let _ = stdout.flush();
+                })?;
+                let Some(request) = spec_req else {
+                    return Ok(None);
+                };
+                match store.spec_prefill(gpu, weights, config, scratch, &epoch, &prompt_tokens, request) {
+                    Ok(seed) => Ok(Some(seed)),
+                    Err(e) => {
+                        let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
+                        Err(format!("spec prefill: {e}; free: {freed:?}"))
+                    }
                 }
-                let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
-                continue;
-            }
+            })();
+            let spec_seed = match admitted {
+                Ok(seed) => seed,
+                Err(e) => {
+                    // Per-admission refusal (capacity/budget): this request
+                    // fails visibly; peers keep running.
+                    announce(stdout, &key, ticket.admission);
+                    {
+                        let _scope = BatchAttemptScope::enter_for_generation(
+                            &key.id,
+                            key.attempt_id,
+                            ticket.admission,
+                        );
+                        crate::ar::emit_generation_error(
+                            route,
+                            stdout,
+                            Some(&key.id),
+                            &format!("VMM batch admission refused: {e}"),
+                            "context_length",
+                            false,
+                            true,
+                        );
+                        let _ = stdout.flush();
+                    }
+                    let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
+                    continue;
+                }
+            };
             announce(stdout, &key, ticket.admission);
             epochs[lane_idx] = epoch;
-            work[lane_idx] = PendingWork {
-                remaining_prompt: prompt_tokens,
-                ..idle_work(lane_idx)
+            spec_lane[lane_idx] = spec_seed.is_some();
+            work[lane_idx] = match spec_seed {
+                // Prompt filled; the lane decodes by spec windows only.
+                Some(seed) => {
+                    spec_seeds.push(hipfire_runtime::slot_batch::RequestAdvance {
+                        epoch,
+                        committed_ids: vec![seed],
+                        committed_position: prompt_tokens.len(),
+                        accepted_drafts: 0,
+                        verified_rows: 0,
+                        finish: None,
+                    });
+                    PendingWork {
+                        next_pos: prompt_tokens.len(),
+                        decoding: true,
+                        ..idle_work(lane_idx)
+                    }
+                }
+                None => PendingWork {
+                    remaining_prompt: prompt_tokens,
+                    ..idle_work(lane_idx)
+                },
             };
             loop_guards[lane_idx] = hipfire_runtime::loop_guard::LoopGuard::from_config(
                 hipfire_runtime::config::get(),
@@ -2453,7 +2601,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
         }
         // ── One planned step: provision → forward → commit → publish ──
-        let eligible: Vec<bool> = (0..batch_size).map(|i| running.contains(&i)).collect();
+        let eligible: Vec<bool> = (0..batch_size).map(|i| running.contains(&i) && !spec_lane[i]).collect();
         // Exact route: every prefill chunk must be the singleton route's own
         // chunk for that request (DeltaNet requant cadence), so the planner
         // takes exactly that length or nothing.
@@ -2497,45 +2645,89 @@ pub fn drive_qwen_vmm_continuous_batch(
             Ok(p) => p,
             Err(e) => return fail_all(sched, gpu, model, &mut epochs, stdout, format!("plan: {e}")),
         };
-        if plan.requests.is_empty() {
+        // Spec lanes whose seed is already on the wire take one MTP window.
+        let spec_now: Vec<usize> = running
+            .iter()
+            .copied()
+            .filter(|&i| spec_lane[i] && !spec_seeds.iter().any(|a| a.epoch == epochs[i]))
+            .collect();
+        let mut advances = if plan.requests.is_empty() {
             planner.discard();
+            Vec::new()
+        } else {
+            let stepped = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
+                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+                let hipfire_arch_qwen35::Qwen35Bundle {
+                    vmm_store,
+                    weights,
+                    config,
+                    scratch,
+                    ..
+                } = b;
+                let store = vmm_store.as_mut().ok_or("store not staged")?;
+                let mut ex = store.executor(weights, config, scratch);
+                let out = ex
+                    .provision_step(gpu, &plan)
+                    .and_then(|()| ex.forward_step(gpu, &plan))
+                    .and_then(|o| ex.commit_step(gpu, &plan, o));
+                if out.is_err() {
+                    store.abort_step(&plan);
+                }
+                out
+            })();
+            let advances = match stepped {
+                Ok(a) => a,
+                Err(e) => {
+                    planner.discard();
+                    return fail_all(sched, gpu, model, &mut epochs, stdout, format!("step: {e}"));
+                }
+            };
+            if let Err(e) = planner.publish(&mut work, &epochs, &plan, &advances) {
+                return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
+            }
+            advances
+        };
+        if !spec_now.is_empty() {
+            let steps: Vec<hipfire_arch_qwen35::forward_slots::vmm::spec::SpecLaneStep<'_>> = spec_now
+                .iter()
+                .filter_map(|&i| match &sched.lanes[i] {
+                    BatchLane::Running(lane) => Some(hipfire_arch_qwen35::forward_slots::vmm::spec::SpecLaneStep {
+                        epoch: epochs[i],
+                        max_emit: lane_max_tokens(&lane.key, sched).saturating_sub(lane.streamed_tokens.len()),
+                        emitted: &lane.streamed_tokens,
+                    }),
+                    _ => None,
+                })
+                .filter(|s| s.max_emit > 0)
+                .collect();
+            let cycled = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
+                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+                let hipfire_arch_qwen35::Qwen35Bundle {
+                    vmm_store,
+                    weights,
+                    config,
+                    scratch,
+                    ..
+                } = b;
+                let store = vmm_store.as_mut().ok_or("store not staged")?;
+                if steps.is_empty() {
+                    return Ok(Vec::new());
+                }
+                store.spec_cycle(gpu, weights, config, scratch, &steps).map(|(a, _)| a)
+            })();
+            match cycled {
+                Ok(a) => advances.extend(a),
+                Err(e) => return fail_all(sched, gpu, model, &mut epochs, stdout, format!("spec cycle: {e}")),
+            }
+        }
+        advances.append(&mut spec_seeds);
+        if advances.is_empty() {
             std::thread::sleep(Duration::from_millis(2));
             continue;
-        }
-        let stepped = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
-            let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
-            let hipfire_arch_qwen35::Qwen35Bundle {
-                vmm_store,
-                weights,
-                config,
-                scratch,
-                ..
-            } = b;
-            let store = vmm_store.as_mut().ok_or("store not staged")?;
-            let mut ex = store.executor(weights, config, scratch);
-            let out = ex
-                .provision_step(gpu, &plan)
-                .and_then(|()| ex.forward_step(gpu, &plan))
-                .and_then(|o| ex.commit_step(gpu, &plan, o));
-            if out.is_err() {
-                store.abort_step(&plan);
-            }
-            out
-        })();
-        let advances = match stepped {
-            Ok(a) => a,
-            Err(e) => {
-                planner.discard();
-                return fail_all(sched, gpu, model, &mut epochs, stdout, format!("step: {e}"));
-            }
-        };
-        if let Err(e) = planner.publish(&mut work, &epochs, &plan, &advances) {
-            return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
         }
         // A promoted request's pending seed was picked (but not emitted) by
         // the singleton. Emit it after the step that wrote its K/V, ahead of
         // the pick that step produced — the singleton's forward→emit order.
-        let mut advances = advances;
         if let Some((ep, seed)) = unemitted_seed {
             if let Some(at) = advances.iter().position(|a| a.epoch == ep) {
                 let committed_position = advances[at].committed_position;
@@ -2720,6 +2912,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
             epochs[idx] = IDLE;
             work[idx] = idle_work(idx);
+            spec_lane[idx] = false;
             let mut envelope = pending_done.clone();
             envelope["type"] = serde_json::json!("commit_ready");
             if !sched.mark_awaiting_commit(idx, pending_done) {

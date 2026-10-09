@@ -920,6 +920,12 @@ pub trait Speculator {
     fn verify_pm4_report(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// The concrete drafter, for an arch-owned hand-off of its live state
+    /// (continuous-batching promotion of a running request). Default `None`.
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -1281,7 +1287,7 @@ fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
     max_emit.saturating_sub(1).min(arch_k)
 }
 
-impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
     fn name(&self) -> &'static str {
         self.arch.name()
     }
@@ -1415,6 +1421,10 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
         Box::new(self.arch).mtp_free_multi(gpus);
+    }
+
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.arch)
     }
 
     fn requires_greedy(&self) -> bool {
