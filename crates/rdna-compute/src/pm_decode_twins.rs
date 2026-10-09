@@ -83,24 +83,24 @@ pub static GFX1201_TWINS: &[NativeKernelBundle] = &[
         "fused_qkvza_hfq4g256_mq4v2",
         &["fused_qkvza_mq4g256v2"],
         source = "24946fc118db455e19f96b0e02fd67bb6bfaf46ed4a917e23352bef6153e1ba5",
-        image = "e9cce7cf5d7b8c43d73409e408ed3d185802fc3f8d1d1dce59015ea5cf654c04",
-        elf = "614bd3b230716617514a9ce77d9624f17c06baa7b86b84450df8270564eec2b7"
+        image = "ded83395c4dc4fe78750d1669d029f725b9b69b53216ac8d25c9de5b9e79ac7d",
+        elf = "31ac049859d799558b6f9e44176f94a68c6bfbcd3145ac23bf127b7ab4f36f38"
     ),
     twin!(
         "fused_qkv_hfq4g256_mq4v2",
         "fused_qkv_hfq4g256_mq4v2",
         &["fused_qkv_mq4g256v2"],
         source = "a0e7f85ec0a35eb777c07975cd888eb53aa21c855ae39d1c06ee02322836cd6b",
-        image = "b3304ddbda5254a5b8c70db054fb55e94e76a357028e8ea7d32343f72ef88a7c",
-        elf = "ee1062dc27b5b943a4cdec8b7819c14671f38b2a65efee4665a5f8cfc21a04a4"
+        image = "3eca4b78415b632e709b0fa31a13ecab0892a6d970e45ee94fdf391c25a5931a",
+        elf = "579a3a837d45783b5fa59e50d9dc6a3a330455e3640023c8d1e344c991b6c6bb"
     ),
     twin!(
         "fused_gate_up_hfq4g256_mq4v2",
         "fused_gate_up_hfq4g256_mq4v2",
         &["fused_gate_up_mq4g256v2"],
         source = "f61a08770f8cfdfe2be45f85ef5002d4759c1f18d815e243dc6735d2e6215930",
-        image = "78c7bfc3410d1c5c5af779ec662f2af665d9db195b59bc6fd523e5516af3034a",
-        elf = "b51911a8afb1111fc066d00f1c50331c4b24f2be1e1d2781f7e123154d23022f"
+        image = "23673ee66a0b3dc36b050b21282e4847cca468348868a7619e2ee09f7f193635",
+        elf = "1e8ca901ec0f68269c92890b5eb69b3031db346530ea480aa7ffc35c70ede5c8"
     ),
     twin!(
         "gemv_hfq4g256_multirow_default_mq4v2",
@@ -115,8 +115,8 @@ pub static GFX1201_TWINS: &[NativeKernelBundle] = &[
         "gemv_hfq4g256_residual_mq4v2",
         &["gemv_mq4g256v2_residual"],
         source = "869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e",
-        image = "889cab2b8e7301e00eb14fd53ff2017818652e5cefaed031f45a2569344ae30d",
-        elf = "bce8c097b38d110cbdbbfe56b090fd97334befdaebc763895f243c86742bc970"
+        image = "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
+        elf = "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d"
     ),
 ];
 
@@ -191,13 +191,22 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The ELF each oracle report accepted, read from the artifact directory.
-    fn accepted_elf(module: &str) -> Vec<u8> {
-        let path = format!(
-            "{}/../../kernels/pm-decode/gfx1201/{module}.co",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    /// The gfx1201 code object inside a clang offload bundle (the bytes HIP
+    /// loads), independent of any loose `.co` file next to it.
+    fn gfx1201_payload(bundle: &[u8]) -> &[u8] {
+        let u64_at = |at: usize| u64::from_le_bytes(bundle[at..at + 8].try_into().unwrap()) as usize;
+        assert_eq!(&bundle[..24], b"__CLANG_OFFLOAD_BUNDLE__");
+        let mut cursor = 32;
+        let mut found = None;
+        for _ in 0..u64_at(24) {
+            let (offset, size, len) = (u64_at(cursor), u64_at(cursor + 8), u64_at(cursor + 16));
+            let triple = &bundle[cursor + 24..cursor + 24 + len];
+            cursor += 24 + len;
+            if triple == b"hipv4-amdgcn-amd-amdhsa--gfx1201" {
+                assert!(found.replace(&bundle[offset..offset + size]).is_none(), "two gfx1201 entries");
+            }
+        }
+        found.expect("bundle has no gfx1201 entry")
     }
 
     #[test]
@@ -205,14 +214,9 @@ mod tests {
         assert_eq!(GFX1201_TWINS.len(), 5);
         for twin in GFX1201_TWINS {
             twin.verify_image().unwrap();
-            let elf = accepted_elf(twin.module);
-            let elf_sha: [u8; 32] = Sha256::digest(&elf).into();
-            assert_eq!(elf_sha, twin.accepted_elf_sha256, "{}", twin.module);
-            assert!(
-                twin.image.windows(elf.len()).any(|w| w == elf.as_slice()),
-                "{}: bundle does not carry the accepted ELF",
-                twin.module
-            );
+            let elf = gfx1201_payload(twin.image);
+            let elf_sha: [u8; 32] = Sha256::digest(elf).into();
+            assert_eq!(elf_sha, twin.accepted_elf_sha256, "{}: bundle does not carry the accepted ELF", twin.module);
             radiowave::CodeObjectCertification::from_json(twin.image, twin.radiowave_json)
                 .unwrap_or_else(|e| panic!("{}: {e}", twin.module));
             for &symbol in twin.symbols {
