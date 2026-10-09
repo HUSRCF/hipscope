@@ -25,7 +25,7 @@
 //!
 //! Comparisons are actual byte comparisons; sha256 digests are receipts only.
 
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit};
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
@@ -218,20 +218,27 @@ fn state_bytes(
     rows: usize,
 ) -> Result<Vec<(String, Vec<u8>)>> {
     gpu.hip.device_synchronize()?;
+    if dn.quant != StateQuant::Q8 {
+        return Err(format!("oracle state layout covers Q8 DeltaNet only (got {:?})", dn.quant).into());
+    }
+    // Logical Q8 layout (same as mq4_prefill_state_oracle): i8 codes and f16
+    // EF over heads×Dv², f32 scales/conv by element count. Allocation sizes
+    // may be rounded and are never compared.
+    let n = config.linear_num_value_heads * config.linear_value_head_dim.pow(2);
     let (kr, vr) = kv_row_bytes(kv)?;
     let mut out = Vec::new();
     let mut la = 0;
     for (layer, ty) in config.layer_types.iter().enumerate() {
         if *ty == LayerType::LinearAttention {
-            let whole = |t: &GpuTensor| read_dev(gpu, t, 0, t.buf.size());
-            out.push((format!("L{layer:02}.dn_s"), whole(&dn.s_matrices[la])?));
+            out.push((format!("L{layer:02}.dn_s"), read_dev(gpu, &dn.s_matrices[la], 0, n)?));
             if let Some(t) = dn.s_scales.get(la) {
-                out.push((format!("L{layer:02}.dn_scales"), whole(t)?));
+                out.push((format!("L{layer:02}.dn_scales"), read_dev(gpu, t, 0, t.numel() * 4)?));
             }
             if let Some(t) = dn.s_ef_residual.get(la) {
-                out.push((format!("L{layer:02}.dn_ef"), whole(t)?));
+                out.push((format!("L{layer:02}.dn_ef"), read_dev(gpu, t, 0, n * 2)?));
             }
-            out.push((format!("L{layer:02}.conv"), whole(&dn.conv_states[la])?));
+            let c = &dn.conv_states[la];
+            out.push((format!("L{layer:02}.conv"), read_dev(gpu, c, 0, c.numel() * 4)?));
             la += 1;
         } else {
             out.push((format!("L{layer:02}.k"), read_dev(gpu, &kv.k_gpu[layer], 0, rows * kr)?));
@@ -1138,7 +1145,10 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
         }));
     }
     out.insert("cases".into(), Value::Array(cases));
-    out.insert("route_exact_vs_singleton".into(), json!(route_exact_all));
+    let k1_route = out["executor_k1"]
+        .as_array()
+        .is_some_and(|v| v.iter().all(|e| e["vs_singleton_route"]["exact"] == json!(true)));
+    out.insert("route_exact_vs_singleton".into(), json!(route_exact_all && k1_route));
     let receipt = store.receipt()?;
     out.insert("store_receipt".into(), json!({
         "kv_backend": receipt.kv_backend, "kv_mode": receipt.kv_mode, "max_seq_bound": receipt.max_seq_bound,
@@ -1222,8 +1232,14 @@ fn main() -> Result<()> {
     report["controls"] = Value::Object(controls);
     if args.batch {
         let (batch, ok) = batch_phase(&mut ctx, &args, &fx, &refs)?;
+        // Isolation (batch == isolated executor, controls) and route
+        // exactness (executor == singleton route, §4.3 exact default) are
+        // separate verdicts; both are required for the exact-route gate.
+        let route = batch["route_exact_vs_singleton"].as_bool() == Some(true);
+        report["pass_batch_isolation"] = json!(ok);
+        report["route_exact_vs_singleton"] = json!(route);
         report["batch"] = batch;
-        pass &= ok;
+        pass &= ok && route;
     }
     report["pass"] = json!(pass);
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
