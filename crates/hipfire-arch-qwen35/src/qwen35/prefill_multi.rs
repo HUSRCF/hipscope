@@ -22,9 +22,11 @@
 //! DFlash chain-verify requests (`MultiChunkRequest::fusion == ChainVerify`,
 //! with their own hidden ring and tape) keep every route that depends on the
 //! request's own row count request-sized: GDN pre/tape fusion and FA prep use
-//! the request's `fusion`, and a layer where any request's singleton would
-//! take the ChainVerify S4 residual arm (`1..=16` rows) runs its output
-//! projection + FFN per request view instead of at the combined count.
+//! the request's `fusion`. The ChainVerify S4 residual arm (`1..=16` rows) is
+//! byte-identical to the `Off` route on exact gfx1201, so output projection +
+//! FFN run once at the combined count there; on other arches a layer where
+//! any request's singleton would take the S4 arm runs those stages per request
+//! view instead.
 
 use super::*;
 
@@ -32,9 +34,9 @@ use super::*;
 ///
 /// `fusion` is the request's own [`DflashFusionCtx`]: `Off` for MTP verify and
 /// ordinary rows, `ChainVerify` for a DFlash chain verify block. Every
-/// route-sensitive stage (GDN pre/tape fusion, FA prep, the S4 residual arm)
-/// runs with this request's `fusion` and its own row count, exactly as the
-/// singleton verify forward over these rows alone. `hidden_rb`, when set, is
+/// route-sensitive stage (GDN pre/tape fusion, FA prep; off gfx1201 also the
+/// S4 residual arm) runs with this request's `fusion` and its own row count,
+/// exactly as the singleton verify forward over these rows alone. `hidden_rb`, when set, is
 /// this request's DFlash extraction ring: the post-layer residual rows of
 /// each extract layer are staged and committed (head advanced by the
 /// request's row count) exactly as the singleton verify does.
@@ -215,13 +217,24 @@ fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usi
     }
 }
 
-/// Does any request's singleton run the ChainVerify S4 residual arm for a
-/// consumer of dtype `w_dtype` at its own row count? Then the output
-/// projection and FFN of that layer cannot be run at the combined row count
-/// (`s4_residual_fast` admits only `1..=16` rows).
+/// Must a layer's output projection and FFN run per request view because a
+/// request's singleton takes the ChainVerify S4 residual arm for a consumer of
+/// dtype `w_dtype` at its own row count (`s4_residual_fast` admits only
+/// `1..=16` rows)?
+///
+/// Never on exact gfx1201: there the S4 arm is byte-identical to the `Off`
+/// route at any row count `<= 63` (row-parallel F16 producers computing the
+/// F32 pipeline's values in-register and casting with `convert_f32_to_f16`'s
+/// cast; the same one-tile-arithmetic residual GEMM; every other n-dependent
+/// route switch is at `>= 64` rows), so the stage runs once at the combined
+/// row count. On exact gfx1100 the S4 residual GEMM picks ldsstage / split-K
+/// tiers at `n <= 16` that the `Off` route does not reproduce at larger `n`
+/// (not proven identical), so it keeps the split.
 fn any_lane_s4(gpu: &Gpu, reqs: &[MultiChunkRequest<'_>], w_dtype: rdna_compute::DType) -> bool {
-    reqs.iter()
-        .any(|r| s4_residual_fast(gpu, r.fusion, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
+    !gpu.arch_caps.is_gfx1201()
+        && reqs
+            .iter()
+            .any(|r| s4_residual_fast(gpu, r.fusion, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
 }
 
 /// Capture the post-layer residual rows of every request whose ring extracts
@@ -249,13 +262,15 @@ fn capture_layer_rows(
 /// request order (`HiddenCapture::Verify`, as the singleton verify).
 ///
 /// Shared across requests: embedding, the norm/rotate + input projection
-/// GEMMs, and (only when no request's singleton takes the ChainVerify S4
-/// residual arm / gfx1100 F16 projection route at its own row count) the
-/// output projection + FFN. Per request: positions, GDN pre/tape + recurrence,
-/// FA prep/KV write/attend with that request's fusion flags, and the ring
-/// capture. A layer where any request would select a ChainVerify route at its
-/// own `n` runs those stages on every request's row view with its own
-/// `fusion` and `n` (MTP views with `Off`), never at the combined count.
+/// GEMMs, and the output projection + FFN (on exact gfx1201, including for
+/// ChainVerify lanes, whose S4 arm equals the `Off` route; elsewhere only when
+/// no request's singleton takes the ChainVerify S4 residual arm / gfx1100 F16
+/// projection route at its own row count). Per request: positions, GDN
+/// pre/tape + recurrence, FA prep/KV write/attend with that request's fusion
+/// flags, and the ring capture. A layer where a non-gfx1201 request would
+/// select a ChainVerify route at its own `n` runs those stages on every
+/// request's row view with its own `fusion` and `n` (MTP views with `Off`),
+/// never at the combined count.
 ///
 /// Every precondition (rows `2..=63` per request and in total, capacities,
 /// ring/tape bounds, Q8+EF DeltaNet, uncompacted Q8/fp8 KV, no capture or
