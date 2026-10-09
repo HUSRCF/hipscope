@@ -1448,6 +1448,687 @@ pub fn drive_qwen_continuous_batch(
     }
     Ok(())
 }
+
+// ── VMM continuous batching (serve.vmm_batch) ───────────────────────────
+//
+// One resident Qwen35 weight set; per-request VMM KV/DeltaNet owners in
+// `Qwen35Bundle::vmm_store`; steps planned by the runtime `BatchPlanner`
+// and run through the arch executor's frozen provision/forward/commit
+// methods. Host admission/terminal authority stays the
+// `ContinuousBatchScheduler` (same AttemptKey/LaneTicket registry, same
+// commit_ready/commit/abort transaction as the fixed-lane driver).
+//
+// Stage 1 limits, enforced by `is_vmm_batch_request_eligible`: greedy with
+// neutral penalties only (the executor commits per-row argmax), AR rows only
+// (no cross-request speculation yet), and a request that is lonely at
+// dispatch stays on the unchanged singleton route (the daemon checks the
+// inbox); arrivals during a singleton generation wait for it to finish.
+
+fn vmm_bundle(
+    state: &mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
+    state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+}
+
+/// Retire one request owner from the VMM store and free its device state.
+fn vmm_retire_free(
+    model: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+) -> Result<(), String> {
+    let b = vmm_bundle(&mut model.state).ok_or("VMM batch: model is not Qwen35")?;
+    let store = b.vmm_store.as_mut().ok_or("VMM batch: store not staged")?;
+    store.retire(epoch)?.free_gpu(gpu)
+}
+
+/// VMM-route admission predicate: the fixed-lane predicate's request shape
+/// (single user turn, no tools/images/stops/adaptive/PFlash, TP1) on a model
+/// that staged `vmm_store`, restricted to stage-1 arithmetic: greedy with
+/// neutral penalties. A loaded speculator does not exclude the request —
+/// batched rows are AR, and a lonely request keeps its singleton spec route.
+pub fn is_vmm_batch_request_eligible(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    continuous_batch_size: usize,
+    serve_continuous_batch: bool,
+    pflash_active: bool,
+) -> bool {
+    let staged = m.state.as_ref().is_some_and(|s| {
+        (s.as_ref() as &dyn Any)
+            .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+            .is_some_and(|b| b.vmm_store.is_some())
+    });
+    if !staged || !serve_continuous_batch || continuous_batch_size <= 1 {
+        return false;
+    }
+    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_tools = msg
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if !batch_messages_are_single_user(msg) || has_tools || has_image || request_has_stop(msg) {
+        return false;
+    }
+    if m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+        return false;
+    }
+    if m.pp != 1 || m.ep.is_some() {
+        return false;
+    }
+    if msg.get("budget_alert_at_tok").is_some() || msg.get("budget_alert_text").is_some() {
+        return false;
+    }
+    let s = resolve_batch_sampling(msg, m);
+    s.temp <= 0.0
+        && s.repeat_penalty == 1.0
+        && s.presence_penalty == 0.0
+        && s.frequency_penalty == 0.0
+}
+
+pub fn drive_qwen_vmm_continuous_batch(
+    sched: &mut ContinuousBatchScheduler,
+    gpu: &mut rdna_compute::Gpu,
+    model: &mut LoadedModel,
+    params: VmmBatchParams,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<(), BatchDriveError> {
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
+    use hipfire_runtime::slot_batch::{BatchPlanner, RequestEpoch};
+    use rdna_compute::slot_pool::SlotId;
+
+    let batch_size = sched.max_batch;
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let route = crate::ar::GenerationRoute::QwenAr;
+    let (eos_tok, stop_ids, row_budget) = {
+        let tokenizer = model
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| BatchDriveError::Gpu("tokenizer missing".to_string()))?;
+        let im_end = tokenizer.special_token_id("<|im_end|>");
+        let b = vmm_bundle(&mut model.state)
+            .ok_or_else(|| BatchDriveError::Gpu("VMM batch model not Qwen35".to_string()))?;
+        let store = b
+            .vmm_store
+            .as_ref()
+            .ok_or_else(|| BatchDriveError::Gpu("VMM batch store not staged".to_string()))?;
+        let eos = b.config.eos_token;
+        let mut stops = vec![eos];
+        stops.extend(im_end);
+        (eos, stops, store.row_budget().min(params.max_batch_tokens.max(batch_size)))
+    };
+    let im_end_tok = stop_ids.get(1).copied().unwrap_or(eos_tok);
+    let idle_work = |i: usize| PendingWork {
+        slot: SlotId(i),
+        remaining_prompt: Vec::new(),
+        next_pos: 0,
+        decoding: false,
+        vl_prefill: None,
+        spec: SpecKind::None,
+        spec_cycles: 0,
+        spec_committed: 0,
+        spec_retire_fails: 0,
+        pos3_delta: 0,
+    };
+    const IDLE: RequestEpoch = RequestEpoch {
+        request_tag: 0,
+        owner_generation: 0,
+    };
+    let mut work: Vec<PendingWork> = (0..batch_size).map(idle_work).collect();
+    let mut epochs: Vec<RequestEpoch> = vec![IDLE; batch_size];
+    let mut planner = BatchPlanner::new(
+        Scheduler {
+            chunk_size: row_budget,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        },
+        0,
+        0,
+    );
+    let mut producers: Vec<Option<QwenArSemanticProducer>> =
+        (0..batch_size).map(|_| None).collect();
+    let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
+        .map(|_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()))
+        .collect();
+
+    // Fail closed: retire and free every request owner, emit one keyed GPU
+    // error per live/queued attempt, and fail the scheduler. The resident
+    // bundle is untouched by batch steps, so a clean free + device sync is a
+    // full rollback.
+    let fail_all = |sched: &mut ContinuousBatchScheduler,
+                    gpu: &mut rdna_compute::Gpu,
+                    model: &mut LoadedModel,
+                    epochs: &mut Vec<RequestEpoch>,
+                    stdout: &mut std::io::Stdout,
+                    reason: String|
+     -> Result<(), BatchDriveError> {
+        let mut uniq_set = std::collections::HashSet::new();
+        let mut uniq: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for lane in sched.lanes.iter() {
+            let Some(key) = lane.key() else {
+                continue;
+            };
+            let admission = match lane {
+                BatchLane::Seeding(q) | BatchLane::Running(q) => q.ticket.admission,
+                BatchLane::AwaitingClient(t) => t.ticket.admission,
+                BatchLane::Empty { .. } => continue,
+            };
+            if uniq_set.insert((key.clone(), admission)) {
+                uniq.push((key.clone(), admission));
+            }
+        }
+        for (key, request) in sched.pending.iter() {
+            if uniq_set.insert((key.clone(), request.admission)) {
+                uniq.push((key.clone(), request.admission));
+            }
+        }
+        let mut first_err: Option<String> = None;
+        for e in epochs.iter_mut() {
+            if e.is_admitted() {
+                if let Err(err) = vmm_retire_free(model, gpu, e) {
+                    first_err.get_or_insert(format!("VMM retire: {err}"));
+                }
+                *e = IDLE;
+            }
+        }
+        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = crate::common::fail_closed_device_sync(gpu);
+        let prior = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        let ep = crate::common::fail_closed_epilogue_after_sync(prior, sync);
+        for (key, admission) in &uniq {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, *admission);
+            crate::common::emit_fail_closed_error_for_route(
+                route,
+                stdout,
+                Some(&key.id),
+                &format!("VMM batch GPU error: {reason}"),
+                "gpu",
+                ep.rolled_back,
+                &ep,
+            );
+        }
+        let _ = sched.fail_all_active();
+        if !ep.rolled_back {
+            return Err(BatchDriveError::Poisoned(format!(
+                "{reason}; {}",
+                ep.context.unwrap_or_default()
+            )));
+        }
+        Err(BatchDriveError::Gpu(reason))
+    };
+
+    loop {
+        // ── Client terminal decisions (request state already retired) ──
+        let mut to_commit: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
+        for idx in 0..batch_size {
+            if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
+                let key = term.key.clone();
+                let admission = term.ticket.admission;
+                if batch_check_abort(&key.id, key.attempt_id, admission)
+                    || Instant::now() >= term.deadline
+                {
+                    to_abort.push((idx, key, admission));
+                } else if let Some(ClientTerminalDecision::Commit) =
+                    batch_poll_decision(&key.id, key.attempt_id, admission)
+                {
+                    to_commit.push((idx, key, admission, term.pending_done.clone()));
+                }
+            }
+        }
+        for (idx, key, admission) in to_abort {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key, admission);
+            producers[idx] = None;
+        }
+        for (idx, key, admission, pending_done) in to_commit {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let commit_ok = sched.commit_lane_retain_terminal(idx, &key, admission);
+            let _terminal_cleanup = BatchTerminalCleanup::new(&key, Some(admission));
+            match batch_commit_teardown_class(true, commit_ok) {
+                BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok is true"),
+                BatchCommitTeardownClass::CommitFailed => {
+                    let ep = crate::common::RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    crate::common::emit_fail_closed_error_for_route(
+                        route,
+                        stdout,
+                        Some(&key.id),
+                        "batch commit_lane failed",
+                        "internal",
+                        false,
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
+                BatchCommitTeardownClass::EmitDone => {
+                    crate::ar::emit_generation_done_value(route, stdout, &pending_done);
+                }
+            }
+            producers[idx] = None;
+        }
+        // ── Queued and running aborts ──
+        let mut queued_abort: Vec<(AttemptKey, BatchGeneration)> = Vec::new();
+        for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if let Some(request) = sched.pending.get(&key) {
+                if batch_check_abort(&key.id, key.attempt_id, request.admission) {
+                    queued_abort.push((key, request.admission));
+                }
+            }
+        }
+        for (key, admission) in queued_abort {
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
+            let _ = sched.abort_queued(&key, admission);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey, BatchGeneration)> = Vec::new();
+        for idx in 0..batch_size {
+            if let BatchLane::Running(l) = &sched.lanes[idx] {
+                if batch_check_abort(&l.key.id, l.key.attempt_id, l.ticket.admission) {
+                    running_abort.push((idx, l.key.clone(), l.ticket.admission));
+                }
+            }
+        }
+        for (idx, key, admission) in running_abort {
+            if epochs[idx].is_admitted() {
+                if let Err(e) = vmm_retire_free(model, gpu, &epochs[idx]) {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        model,
+                        &mut epochs,
+                        stdout,
+                        format!("retire lane {idx} on abort: {e}"),
+                    );
+                }
+            }
+            epochs[idx] = IDLE;
+            work[idx] = idle_work(idx);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key, admission);
+            producers[idx] = None;
+        }
+        // ── Step-boundary admission ──
+        let drained = {
+            let tokenizer = model.tokenizer.as_ref().expect("checked above");
+            drain_qwen_batch_inbox(
+                sched,
+                model,
+                batch_size,
+                is_vmm_batch_request_eligible,
+                tokenizer,
+                model.chat_template.as_ref(),
+                route,
+                stdout,
+                inbox,
+            )
+        };
+        let barrier = match drained {
+            Ok(b) => b,
+            Err(reason) => return fail_all(sched, gpu, model, &mut epochs, stdout, reason),
+        };
+        if let Some(msg) = barrier {
+            inbox.push_front(msg);
+            if sched.active_count() == 0 && sched.inbox.is_empty() {
+                return Ok(());
+            }
+        }
+        while let Some((key, ticket)) = sched.try_assign_one() {
+            let lane_idx = ticket.lane;
+            let Some(pending_req) = sched.pending.get(&key).cloned() else {
+                continue;
+            };
+            if pending_req.started_in_think {
+                let handoff = match handoff_started_in_think(
+                    sched,
+                    lane_idx,
+                    &key,
+                    &pending_req,
+                    GenerationRoute::QwenAr,
+                ) {
+                    Ok(msg) => msg,
+                    Err(reason) => {
+                        return fail_all(sched, gpu, model, &mut epochs, stdout, reason)
+                    }
+                };
+                inbox.push_front(handoff);
+                continue;
+            }
+            let prompt_tokens = pending_req.prompt_tokens.clone();
+            let epoch = RequestEpoch {
+                request_tag: ticket.generation,
+                owner_generation: ticket.generation.wrapping_add(1).max(1),
+            };
+            let admitted = (|| -> Result<(), String> {
+                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+                let state = hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
+                    gpu,
+                    &b.config,
+                    &b.kv_cache,
+                    &b.dn_state,
+                    epoch,
+                    lane_idx,
+                    prompt_tokens.len(),
+                    stop_ids.clone(),
+                )?;
+                let store = b.vmm_store.as_mut().ok_or("store not staged")?;
+                store.admit(state).map_err(|(state, e)| {
+                    let freed = state.free_gpu(gpu);
+                    format!("{e}; free: {freed:?}")
+                })
+            })();
+            if let Err(e) = admitted {
+                // Per-admission refusal (capacity/budget): this request
+                // fails visibly; peers keep running.
+                {
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id,
+                        key.attempt_id,
+                        ticket.admission,
+                    );
+                    crate::ar::emit_generation_error(
+                        route,
+                        stdout,
+                        Some(&key.id),
+                        &format!("VMM batch admission refused: {e}"),
+                        "context_length",
+                        false,
+                        true,
+                    );
+                    let _ = stdout.flush();
+                }
+                let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
+                continue;
+            }
+            epochs[lane_idx] = epoch;
+            work[lane_idx] = PendingWork {
+                remaining_prompt: prompt_tokens,
+                ..idle_work(lane_idx)
+            };
+            loop_guards[lane_idx] = hipfire_runtime::loop_guard::LoopGuard::from_config(
+                hipfire_runtime::config::get(),
+            );
+            producers[lane_idx] = Some(QwenArSemanticProducer::new_with_tool_protocol(
+                key.id.clone(),
+                false,
+                false,
+            ));
+        }
+        let running: Vec<usize> = (0..batch_size)
+            .filter(|&i| matches!(sched.lanes[i], BatchLane::Running(_)) && epochs[i].is_admitted())
+            .collect();
+        let awaiting = sched
+            .lanes
+            .iter()
+            .any(|l| matches!(l, BatchLane::AwaitingClient(_)));
+        if running.is_empty() && !awaiting && sched.inbox.is_empty() && inbox.backlog.is_empty() {
+            break;
+        }
+        if running.is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let active_now = running.len();
+        for &idx in &running {
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                lane.max_active_lanes = lane.max_active_lanes.max(active_now);
+            }
+        }
+        // ── One planned step: provision → forward → commit → publish ──
+        let eligible: Vec<bool> = (0..batch_size).map(|i| running.contains(&i)).collect();
+        let plan = match planner.plan_step(
+            &work,
+            &epochs,
+            &eligible,
+            row_budget,
+            params.prefill_min_tokens,
+        ) {
+            Ok(p) => p,
+            Err(e) => return fail_all(sched, gpu, model, &mut epochs, stdout, format!("plan: {e}")),
+        };
+        if plan.requests.is_empty() {
+            planner.discard();
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let stepped = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
+            let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+            let hipfire_arch_qwen35::Qwen35Bundle {
+                vmm_store,
+                weights,
+                config,
+                scratch,
+                ..
+            } = b;
+            let store = vmm_store.as_mut().ok_or("store not staged")?;
+            let mut ex = store.executor(weights, config, scratch);
+            let out = ex
+                .provision_step(gpu, &plan)
+                .and_then(|()| ex.forward_step(gpu, &plan))
+                .and_then(|o| ex.commit_step(gpu, &plan, o));
+            if out.is_err() {
+                store.abort_step(&plan);
+            }
+            out
+        })();
+        let advances = match stepped {
+            Ok(a) => a,
+            Err(e) => {
+                planner.discard();
+                return fail_all(sched, gpu, model, &mut epochs, stdout, format!("step: {e}"));
+            }
+        };
+        if let Err(e) = planner.publish(&mut work, &epochs, &plan, &advances) {
+            return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
+        }
+        // ── Per-request commit: one emitted token per advance ──
+        let tokenizer = model.tokenizer.as_ref().expect("checked above");
+        let mut finished: Vec<(usize, AttemptKey, BatchGeneration, serde_json::Value)> =
+            Vec::new();
+        for adv in &advances {
+            let Some(idx) = epochs.iter().position(|e| *e == adv.epoch) else {
+                continue;
+            };
+            let Some(lane_key) = sched.lanes[idx].key().cloned() else {
+                continue;
+            };
+            let max_toks = lane_max_tokens(&lane_key, sched);
+            let lane_capacity = sched.lane_capacity;
+            let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+                continue;
+            };
+            let key = lane.key.clone();
+            let admission = lane.ticket.admission;
+            if lane.prefill_done_at.is_none() {
+                lane.prefill_done_at = Some(Instant::now());
+                lane.seq_pos = lane.prompt_len;
+            }
+            let Some(producer) = producers[idx].as_mut() else {
+                continue;
+            };
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let mut stop_now = false;
+            let mut finish_flags = (false, false, false, false, false);
+            for &cur_token in &adv.committed_ids {
+                let mut future_streamed = lane.streamed_tokens.clone();
+                future_streamed.push(cur_token);
+                let all_bytes = tokenizer.decode_bytes(&future_streamed);
+                let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
+                let token_bytes = all_bytes[prev_fed..].to_vec();
+                let all_len = all_bytes.len();
+                if lane.first_token_at.is_none() {
+                    lane.first_token_at = Some(Instant::now());
+                }
+                let (conv, stream, seq, fed) = (
+                    &mut lane.conversation_tokens,
+                    &mut lane.streamed_tokens,
+                    &mut lane.seq_pos,
+                    &mut lane.bytes_fed_to_filter,
+                );
+                let stopped = match producer.commit_and_classify(
+                    stdout,
+                    cur_token,
+                    || {
+                        let pos = qwen_ar_raw_commit_token(
+                            conv,
+                            stream,
+                            seq,
+                            cur_token,
+                            QwenArRawCommitDisposition::ClassifiedVisible,
+                        );
+                        *fed = all_len;
+                        (pos, token_bytes.clone())
+                    },
+                    |_, _| {},
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpu,
+                            model,
+                            &mut epochs,
+                            stdout,
+                            format!("semantic classify lane {idx}: {e}"),
+                        )
+                    }
+                };
+                let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
+                let is_eos = cur_token == eos_tok || cur_token == im_end_tok;
+                let hit_max = lane.streamed_tokens.len() >= max_toks;
+                let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, lane_capacity)
+                    || adv.finish.as_deref() == Some("length");
+                if batch_should_finish_decode(is_eos, hit_max, hit_lane_cap, stopped, loop_hit) {
+                    stop_now = true;
+                    finish_flags = (is_eos, hit_max, hit_lane_cap, stopped, loop_hit);
+                    break;
+                }
+            }
+            if !stop_now {
+                continue;
+            }
+            let (is_eos, hit_max, hit_lane_cap, stopped, loop_hit) = finish_flags;
+            let hit_length_cap = batch_hit_length_cap(hit_max, hit_lane_cap, is_eos, stopped, loop_hit);
+            let Some(producer_owned) = producers[idx].take() else {
+                continue;
+            };
+            let (finish, _visible) = match producer_owned.finish(stdout, hit_length_cap) {
+                Ok(v) => v,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        model,
+                        &mut epochs,
+                        stdout,
+                        format!("semantic finish lane {idx}: {e}"),
+                    )
+                }
+            };
+            if !finish.wire_tool_calls.is_empty() {
+                return fail_all(
+                    sched,
+                    gpu,
+                    model,
+                    &mut epochs,
+                    stdout,
+                    format!("semantic finish lane {idx}: unexpected tool calls"),
+                );
+            }
+            let BatchLane::Running(lane) = &sched.lanes[idx] else {
+                continue;
+            };
+            let generated = lane.streamed_tokens.len();
+            let metrics = batch_lane_done_metrics(
+                lane.created_at,
+                lane.prefill_done_at,
+                lane.first_token_at,
+                Instant::now(),
+                lane.prompt_len,
+                generated,
+            );
+            let mut pending_done = qwen_ar_done_value(
+                &key.id,
+                finish.finish_reason,
+                generated,
+                metrics.tok_s,
+                lane.prompt_len,
+                metrics.prefill_ms,
+                metrics.prefill_tok_s,
+                metrics.decode_tok_s,
+                metrics.ttft_ms,
+                0,
+                "",
+            );
+            pending_done["latency_ms"] =
+                serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+            attach_continuous_batch_route_evidence(
+                &mut pending_done,
+                batch_size,
+                idx,
+                sched.lane_capacity,
+                lane.max_active_lanes.max(1),
+            );
+            pending_done["continuous_batch_route"] = serde_json::json!("vmm");
+            finished.push((idx, key, admission, pending_done));
+        }
+        // Retire finished owners before publishing commit_ready: a finished
+        // request holds no device state while it awaits the client.
+        for (idx, key, admission, pending_done) in finished {
+            if let Err(e) = vmm_retire_free(model, gpu, &epochs[idx]) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    model,
+                    &mut epochs,
+                    stdout,
+                    format!("retire lane {idx} on finish: {e}"),
+                );
+            }
+            epochs[idx] = IDLE;
+            work[idx] = idle_work(idx);
+            let mut envelope = pending_done.clone();
+            envelope["type"] = serde_json::json!("commit_ready");
+            if !sched.mark_awaiting_commit(idx, pending_done) {
+                eprintln!(
+                    "[batch][vmm] mark_awaiting_commit failed lane {idx} id={} — aborting lane",
+                    key.id
+                );
+                let _ = sched.abort_lane(idx, &key, admission);
+                producers[idx] = None;
+                continue;
+            }
+            let write_ok = {
+                let _scope =
+                    BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
+            };
+            if !write_ok {
+                let _ = sched.abort_lane(idx, &key, admission);
+                producers[idx] = None;
+            }
+        }
+    }
+    Ok(())
+}
 pub fn drive_lfm_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,

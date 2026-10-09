@@ -3721,14 +3721,30 @@ fn main() {
                     // falls through to the sequential path below instead of
                     // failing closed. The batch route above still wins when
                     // staged and requested with `serve_continuous_batch`.
+                    // VMM route (serve.vmm_batch): only when the store is
+                    // staged, and only when another batched generate is
+                    // already waiting — a lonely request keeps the unchanged
+                    // singleton route (exact singleton arithmetic/spec).
+                    let vmm_route = vmm_batch.is_some()
+                        && m.qwen35().is_some_and(|b| b.vmm_store.is_some());
                     let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
-                        is_batch_request_eligible(
-                            &msg,
-                            m,
-                            continuous_batch_size,
-                            serve_continuous_batch,
-                            pflash_active,
-                        )
+                        if vmm_route {
+                            hipfire_generate::batch::is_vmm_batch_request_eligible(
+                                &msg,
+                                m,
+                                continuous_batch_size,
+                                serve_continuous_batch,
+                                pflash_active,
+                            ) && inbox.has_pending_batch_generate()
+                        } else {
+                            is_batch_request_eligible(
+                                &msg,
+                                m,
+                                continuous_batch_size,
+                                serve_continuous_batch,
+                                pflash_active,
+                            )
+                        }
                     } else {
                         false
                     };
@@ -3895,13 +3911,25 @@ fn main() {
                                             false,
                                         );
                                     }
-                                    let drive_res = drive_qwen_continuous_batch(
-                                        sched,
-                                        &mut gpu,
-                                        m,
-                                        &mut stdout,
-                                        &mut inbox,
-                                    );
+                                    let drive_res = match vmm_batch.filter(|_| vmm_route) {
+                                        Some(params) => {
+                                            hipfire_generate::batch::drive_qwen_vmm_continuous_batch(
+                                                sched,
+                                                &mut gpu,
+                                                m,
+                                                params,
+                                                &mut stdout,
+                                                &mut inbox,
+                                            )
+                                        }
+                                        None => drive_qwen_continuous_batch(
+                                            sched,
+                                            &mut gpu,
+                                            m,
+                                            &mut stdout,
+                                            &mut inbox,
+                                        ),
+                                    };
                                     match drive_res {
                                         Ok(()) => {}
                                         Err(BatchDriveError::Gpu(e)) => {
