@@ -308,14 +308,47 @@ impl Qwen35RequestState {
     /// exact KV/DN, and this state holds what the bundle held. `position` and
     /// `pending_seed` are the caller's to exchange with its singleton frontier.
     pub fn swap_with_bundle(&mut self, bundle: &mut Qwen35Bundle) {
-        self.swap_owners(&mut bundle.kv_cache, &mut bundle.dn_state);
+        std::mem::swap(&mut self.kv, &mut bundle.kv_cache);
+        std::mem::swap(&mut self.dn, &mut bundle.dn_state);
     }
 
-    /// [`Self::swap_with_bundle`] on borrowed bundle fields (a caller that
-    /// already holds `&mut bundle.kv_cache` / `&mut bundle.dn_state`).
-    pub fn swap_owners(&mut self, kv: &mut KvCache, dn: &mut DeltaNetState) {
-        std::mem::swap(&mut self.kv, kv);
-        std::mem::swap(&mut self.dn, dn);
+    /// Copy a running singleton's DeltaNet state into this state's own
+    /// tensors (promotion into the batch; the caller then moves the KV
+    /// owner with `mem::swap`). The singleton keeps its DN objects, so
+    /// anything sized from them (the speculator's DN snapshots) stays valid;
+    /// a fresh DN's pooled buffers need not match their sizes. Does not
+    /// modify the singleton. Synchronizes before returning.
+    pub fn copy_dn_from(&mut self, gpu: &mut Gpu, dn: &DeltaNetState) -> Result<(), String> {
+        let pairs = self
+            .dn
+            .s_matrices
+            .iter()
+            .zip(&dn.s_matrices)
+            .chain(self.dn.s_scales.iter().zip(&dn.s_scales))
+            .chain(self.dn.conv_states.iter().zip(&dn.conv_states))
+            .chain(self.dn.s_ef_residual.iter().zip(&dn.s_ef_residual));
+        if self.dn.s_matrices.len() != dn.s_matrices.len()
+            || self.dn.s_scales.len() != dn.s_scales.len()
+            || self.dn.conv_states.len() != dn.conv_states.len()
+            || self.dn.s_ef_residual.len() != dn.s_ef_residual.len()
+        {
+            return Err("copy_dn_from: DeltaNet layouts differ".into());
+        }
+        for (dst, src) in pairs {
+            // Same constructor and shape on both sides; allocations may be
+            // pool-rounded differently, so copy the common buffer extent
+            // (it covers every element).
+            if dst.shape != src.shape {
+                return Err("copy_dn_from: DeltaNet tensor shapes differ".into());
+            }
+            let n = dst.buf.size().min(src.buf.size());
+            gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, n)
+                .map_err(|e| format!("copy_dn_from: {e}"))?;
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("copy_dn_from: sync: {e}"))?;
+        Ok(())
     }
 
     /// Free this owner. Every forward that read it has completed (the
