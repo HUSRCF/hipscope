@@ -273,40 +273,40 @@ macro_rules! launch_params_blob {
 }
 pub(crate) use launch_params_blob;
 
-/// Resolve the compiled artifact that owns a launched symbol.
+/// Resolve the admitted code object that owns a launched symbol.
 ///
-/// `KernelCompiler::compiled_kernels()` is keyed by module name while the
-/// recorder stores the launched *function* name, so runtime-specialized
-/// variants resolve through this one alias table. `None` means the artifact is
+/// Every loader binds the functions it loads; module-name lookup and the
+/// alias table below cover functions loaded by name through a module whose
+/// name differs (runtime-specialized variants). `None` means the owner is
 /// unknown and preparation will reject the tape rather than guess.
 pub(crate) fn recorded_launch_artifact(
     compiler: &KernelCompiler,
     func_name: &str,
-) -> Option<std::path::PathBuf> {
-    let compiled = compiler.compiled_kernels();
-    compiled
-        .get(func_name)
+) -> Option<crate::code_object::RecordedArtifact> {
+    let registry = compiler.code_objects();
+    let module = |name: &str| registry.module(name);
+    registry
+        .function(func_name)
+        .or_else(|| module(func_name))
         .or_else(|| match func_name {
-            "mq_rotate_x" => compiled.get("gemv_mq4g256"),
-            "deinterleave_f32_batched" => compiled.get("deinterleave_batched"),
+            "mq_rotate_x" => module("gemv_mq4g256"),
+            "deinterleave_f32_batched" => module("deinterleave_batched"),
             name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                compiled.get("gemv_hfq4g256_residual_scaled")
+                module("gemv_hfq4g256_residual_scaled")
             }
             "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
-                compiled.get("gemv_hfq4g256_moe_gate_up_indexed")
+                module("gemv_hfq4g256_moe_gate_up_indexed")
             }
-            name if name.starts_with("gemv_hfq4g256_multirow_r") => compiled
-                .get("gemv_hfq4g256_multirow_default")
-                .or_else(|| compiled.get("gemv_hfq4g256_multirow_rdna3")),
-            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => compiled
-                .get("gemv_hfq4g256_residual_multirow_default")
-                .or_else(|| compiled.get("gemv_hfq4g256_residual_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => module("gemv_hfq4g256_multirow_default")
+                .or_else(|| module("gemv_hfq4g256_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => module("gemv_hfq4g256_residual_multirow_default")
+                .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3")),
             _ => None,
         })
         .or_else(|| {
             func_name
                 .strip_suffix("_f32")
-                .and_then(|name| compiled.get(name))
+                .and_then(module)
         })
         .cloned()
 }
@@ -1781,6 +1781,7 @@ impl Gpu {
                 None
             };
 
+        let pm_decode = flags.pm_decode;
         Ok(Self {
             hip,
             arch,
@@ -1863,6 +1864,7 @@ impl Gpu {
                 fa2_fp8_q_scratch: None,
                 fa2_fp8_q_scratch_bytes: 0,
                 route_load: Default::default(),
+                pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
@@ -3327,6 +3329,7 @@ impl Gpu {
             &mut self.modules,
             &mut self.functions,
             &mut self.scratch.route_load,
+            self.scratch.pm_decode,
             module_name,
             source,
             func_name,
@@ -3335,28 +3338,51 @@ impl Gpu {
 
     /// Load the admitted builder bundle into the same module/function cache as
     /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
-    /// and of a working-tree-relative artifact path. Embedded images get the
-    /// same planned-route barrier as HIP modules.
+    /// and of a working-tree-relative artifact path; it is admitted as an
+    /// in-memory code object (no file is written) and every requested export
+    /// binds to that one digest. A function already bound to a different image
+    /// is rejected before the function-cache early return. Embedded images get
+    /// the same planned-route barrier as HIP modules.
     pub(crate) fn ensure_embedded_kernel(
         &mut self,
-        module_name: &str,
-        image: &[u8],
+        module_name: &'static str,
+        image: impl Into<redline_dispatch::aql::CodeObjectBytes>,
         func_name: &str,
     ) -> HipResult<()> {
         self.ensure_route_modules_preloaded()?;
+        let image = image.into();
         if self.functions.contains_key(func_name) {
-            return Ok(());
+            return self
+                .compiler
+                .code_objects()
+                .check_function_image(func_name, image.as_bytes())
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
         if matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed) {
             return Err(crate::scratch::unplanned_route_kernel(module_name, func_name));
         }
         if !self.modules.contains_key(module_name) {
-            self.modules
-                .insert(module_name.to_owned(), self.hip.module_load_data(image)?);
+            let module = self.hip.module_load_data(image.as_bytes())?;
+            self.compiler
+                .code_objects_mut()
+                .admit_module(
+                    module_name,
+                    crate::code_object::CodeObjectArtifact::native_embedded(module_name, image, None),
+                )
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            self.modules.insert(module_name.to_owned(), module);
+        } else if let Some(bound) = self.compiler.code_objects().module(module_name) {
+            if bound.id() != crate::code_object::CodeObjectId::of(image.as_bytes()) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("module {module_name:?} is bound to image {} and a different image was requested", bound.id()),
+                ));
+            }
         }
         let func = self
             .hip
             .module_get_function(&self.modules[module_name], func_name)?;
+        crate::scratch::bind_loaded_function(&mut self.compiler, module_name, func_name)?;
         self.functions.insert(func_name.to_owned(), func);
         Ok(())
     }
@@ -3418,6 +3444,7 @@ impl Gpu {
             &self.hip,
             &mut self.modules,
             &mut self.functions,
+            self.scratch.pm_decode,
         )
     }
 
@@ -4458,6 +4485,7 @@ impl Gpu {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_attn_crossover
     }
+
 
     // ── Tensor allocation ───────────────────────────────────────
 

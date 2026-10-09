@@ -128,11 +128,15 @@ fn manifest(plan: &RouteKernelPlan) -> BTreeMap<String, (String, String, Value, 
     out
 }
 
+/// The frozen A3 manifests and observed identities are the hipcc closure:
+/// the `kernel.pm_decode=false` opt-out. The default (twins on) closure is
+/// derived from it exactly in [`pm_decode_twins_replace_their_hip_route_entries`].
 fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
     let trunk = header(G0, "header-27b.json");
     let head = header(A3, "header-27b-mtp.json");
     let tensors = metas(&[&trunk, &head]);
-    let flags = builtin_flags("gfx1201");
+    let mut flags = builtin_flags("gfx1201");
+    flags.pm_decode = false;
     let plan = plan(&Load {
         arch: "gfx1201",
         model_arch: trunk.arch_id,
@@ -293,7 +297,7 @@ fn conflicting_public_entry_plans_refuse() {
     let mixed = RouteKernelPlan {
         entries: vec![
             clone("rmsnorm_f32_rowsplit", hip.source()),
-            PlannedKernel::Embedded { module: "pm_twin", image: b"x", symbols: hip.symbols },
+            PlannedKernel::Embedded { module: "pm_twin", image: b"x", radiowave_json: None, symbols: hip.symbols },
         ],
     };
     assert!(matches!(validate_route_plan(&mixed), Err(RegistryError::ConflictingPlan(_))));
@@ -302,4 +306,60 @@ fn conflicting_public_entry_plans_refuse() {
         entries: vec![clone("rmsnorm_f32_rowsplit", hip.source()), clone("rmsnorm_f32_rowsplit", hip.source())],
     };
     validate_route_plan(&same).unwrap();
+}
+
+/// Default `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP
+/// entry (same module and symbols, embedded image), the replaced HIP recipe
+/// is the exact source the oracle accepted against, nothing else changes,
+/// and the flag never reaches another architecture.
+#[test]
+fn pm_decode_twins_replace_their_hip_route_entries() {
+    use rdna_compute::pm_decode_twins::GFX1201_TWINS;
+    let trunk = header(G0, "header-27b.json");
+    let head = header(A3, "header-27b-mtp.json");
+    let tensors = metas(&[&trunk, &head]);
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        let on_flags = builtin_flags("gfx1201");
+        assert!(on_flags.pm_decode, "pm_decode must default on for exact gfx1201");
+        let mut off_flags = on_flags.clone();
+        off_flags.pm_decode = false;
+        let load = |flags| Load {
+            arch: "gfx1201",
+            model_arch: trunk.arch_id,
+            tensors: &tensors,
+            heads: (24, 4, 256),
+            kv: ("fp8", "fp8"),
+            spec,
+            flags,
+        };
+        let off_plan = plan(&load(&off_flags)).unwrap();
+        let on_plan = plan(&load(&on_flags)).unwrap();
+        validate_route_plan(&on_plan).unwrap();
+        let mut off = manifest(&off_plan);
+        let mut on = manifest(&on_plan);
+        for twin in GFX1201_TWINS {
+            let hip = off.remove(twin.module).unwrap_or_else(|| panic!("{} not in HIP route", twin.module));
+            assert_eq!(hip.0, "hip");
+            let source_hex: String = twin.source_sha256.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hip.1, source_hex, "{}: route HIP source is not the oracle's incumbent", twin.module);
+            let pm = on.remove(twin.module).unwrap();
+            assert_eq!(pm.0, "embedded", "{}", twin.module);
+            assert_eq!(pm.1, sha256(twin.image), "{}", twin.module);
+            assert_eq!(pm.4, hip.4, "{}: symbols changed", twin.module);
+        }
+        assert_eq!(off, on, "{spec:?}: pm_decode changed a non-twin entry");
+    }
+    let mut other = builtin_flags("gfx1151");
+    other.pm_decode = true;
+    let trunk_only = metas(&[&trunk]);
+    let refused = plan(&Load {
+        arch: "gfx1151",
+        model_arch: trunk.arch_id,
+        tensors: &trunk_only,
+        heads: (24, 4, 256),
+        kv: ("fp8", "fp8"),
+        spec: KernelSpecRoute::Ar,
+        flags: &other,
+    });
+    assert!(refused.is_err(), "gfx1151 has no closed 27B route");
 }

@@ -63,6 +63,18 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
         }
         for (lane,val) in values.into_iter().enumerate(){if s.exec&(1<<lane)!=0{s.put(&ops[0],lane,0,val)?;}}return Ok(());
     }
+    // Backward permute on the LDS crossbar: lane i reads DATA0 of lane ((ADDR[i]+OFFSET)/4) mod 32
+    // (high bits ignored); a disabled source lane reads 0. No LDS memory is touched.
+    if name=="ds_bpermute_b32" {
+        let offset=ops.iter().find_map(|o|if let Operand::Imm(ImmField::DsOffset(n))=o{Some(u32::from(*n))}else{None}).unwrap_or(0);
+        let mut values=[0;32];
+        for (lane,val) in values.iter_mut().enumerate() {
+            if s.exec&(1<<lane)==0 {continue;}
+            let src=(s.read(&ops[1],lane,0)?.wrapping_add(offset)/4%32) as usize;
+            *val=if s.exec&(1<<src)!=0 {s.read(&ops[2],src,0)?}else{0};
+        }
+        for (lane,val) in values.into_iter().enumerate(){if s.exec&(1<<lane)!=0{s.put(&ops[0],lane,0,val)?;}}return Ok(());
+    }
     let load=name.contains("load");
     let ds=name.starts_with("ds_");
     let buffer=name.starts_with("buffer_");
@@ -172,5 +184,22 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
         let (mut st,mut mem)=setup(0x3100_4000);
         let e=load(&mut st,&mut mem,reg(Kind::V,2,1),vec![offen(),Operand::Literal(0)]).unwrap_err();
         assert!(e.contains("unsupported buffer operand"),"{e}");
+    }
+    // ds_bpermute_b32: lane i reads DATA0 of lane (ADDR[i]+OFFSET)/4 mod 32; disabled sources read 0,
+    // disabled destinations keep their value, and LDS memory is untouched.
+    #[test] fn bpermute_reads_addressed_lane_with_exec_and_offset() {
+        let mut st=state();st.exec=0xffff_fffe; // lane 0 disabled
+        for lane in 0..32 {st.v[5][lane]=100+lane as u32;st.v[158][lane]=(((lane+8)%32)*4) as u32;st.v[4][lane]=0xdead_beef;}
+        st.v[158][1]=128+4*24+3; // high bits and low two bits are ignored: lane 24
+        st.v[158][2]=0; // disabled source lane 0 reads zero
+        let mut lds=[0x5au8;16];
+        execute("ds_bpermute_b32",&insn("ds_bpermute_b32",vec![reg(Kind::V,4,1),reg(Kind::V,158,1),reg(Kind::V,5,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!(st.v[4][0],0xdead_beef);assert_eq!(st.v[4][1],124);assert_eq!(st.v[4][2],0);
+        for lane in 3..32 {let src=(lane+8)%32;assert_eq!(st.v[4][lane],if src==0 {0} else {100+src as u32},"lane {lane}");}
+        assert_eq!(lds,[0x5a;16]);
+        // shfl-down 16 idiom with a DS offset: (lane*4 + 64)/4 mod 32 = lane+16 mod 32.
+        st.exec=u32::MAX;for lane in 0..32 {st.v[158][lane]=(lane*4) as u32;}
+        execute("ds_bpermute_b32",&insn("ds_bpermute_b32",vec![reg(Kind::V,4,1),reg(Kind::V,158,1),reg(Kind::V,5,1),Operand::Imm(ImmField::DsOffset(64))]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        for lane in 0..32 {assert_eq!(st.v[4][lane],100+((lane+16)%32) as u32,"lane {lane}");}
     }
 }

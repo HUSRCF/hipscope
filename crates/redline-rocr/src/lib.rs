@@ -48,7 +48,7 @@ pub use pm4_gfx10::{
 };
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{
-    AqlQueue, CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer, KernargPool,
+    AqlQueue, CodeObjectBytes, CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer, KernargPool,
     Kernel, KernelPm4Metadata, PciBusId, PciBusIdParseError, QueueDepthReport, QueueDepthSample,
     QueueDepthStats, QueueSet, Runtime, RuntimeError,
 };

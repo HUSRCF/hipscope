@@ -2506,23 +2506,96 @@ struct ExecutableInner {
     agent: abi::Agent,
     executable: abi::Executable,
     reader: abi::CodeObjectReader,
-    // `hsa_code_object_reader_create_from_memory` does not copy this storage.
-    _code_object: Arc<[u8]>,
+    // `hsa_code_object_reader_create_from_memory` does not copy this storage;
+    // the backing (owned or static) lives as long as the reader/executable.
+    _code_object: CodeObjectBytes,
+}
+
+#[derive(Clone)]
+enum CodeObjectBacking {
+    Static(&'static [u8]),
+    Owned(Arc<[u8]>),
+}
+
+/// Immutable code-object image: an owned `Arc` or a `'static` embedded image,
+/// plus a validated byte range. Cloning and `subimage` never copy bytes, so a
+/// bundle's ELF entry is a view sharing the original backing.
+#[derive(Clone)]
+pub struct CodeObjectBytes {
+    backing: CodeObjectBacking,
+    start: usize,
+    end: usize,
+}
+
+impl CodeObjectBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        let whole: &[u8] = match &self.backing {
+            CodeObjectBacking::Static(bytes) => bytes,
+            CodeObjectBacking::Owned(bytes) => bytes,
+        };
+        &whole[self.start..self.end]
+    }
+
+    /// A view of `range` relative to this view's bytes, sharing the backing.
+    pub fn subimage(&self, range: std::ops::Range<usize>) -> Result<Self, RuntimeError> {
+        let len = self.end - self.start;
+        if range.start > range.end || range.end > len {
+            return Err(RuntimeError::CodeObjectRangeOutOfBounds {
+                start: range.start,
+                end: range.end,
+                len,
+            });
+        }
+        Ok(Self {
+            backing: self.backing.clone(),
+            start: self.start + range.start,
+            end: self.start + range.end,
+        })
+    }
+}
+
+impl From<Arc<[u8]>> for CodeObjectBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        let end = bytes.len();
+        Self { backing: CodeObjectBacking::Owned(bytes), start: 0, end }
+    }
+}
+
+impl From<&'static [u8]> for CodeObjectBytes {
+    fn from(bytes: &'static [u8]) -> Self {
+        Self { backing: CodeObjectBacking::Static(bytes), start: 0, end: bytes.len() }
+    }
+}
+
+impl AsRef<[u8]> for CodeObjectBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl fmt::Debug for CodeObjectBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.backing {
+            CodeObjectBacking::Static(_) => "static",
+            CodeObjectBacking::Owned(_) => "owned",
+        };
+        write!(f, "CodeObjectBytes({kind}, {}..{})", self.start, self.end)
+    }
 }
 
 impl Executable {
-    pub fn load(device: &GpuDevice, code_object: Arc<[u8]>) -> Result<Self, RuntimeError> {
-        let code_object = unwrap_clang_offload_bundle(code_object)?;
-        if code_object.is_empty() {
+    pub fn load(device: &GpuDevice, image: impl Into<CodeObjectBytes>) -> Result<Self, RuntimeError> {
+        let code_object = unwrap_clang_offload_bundle(image.into())?;
+        if code_object.as_bytes().is_empty() {
             return Err(RuntimeError::EmptyCodeObject);
         }
         let symbols = &device.runtime.symbols;
         let mut reader = abi::CodeObjectReader(0);
-        // SAFETY: Arc bytes remain alive in ExecutableInner through reader use.
+        // SAFETY: the backing remains alive in ExecutableInner through reader use.
         let status = unsafe {
             (symbols.code_object_reader_create_from_memory)(
-                code_object.as_ptr().cast(),
-                code_object.len(),
+                code_object.as_bytes().as_ptr().cast(),
+                code_object.as_bytes().len(),
                 &mut reader,
             )
         };
@@ -2655,7 +2728,7 @@ impl Executable {
             (&mut metadata.dynamic_callstack as *mut bool).cast(),
         )?;
         let pm4 = parse_kernel_pm4_metadata(
-            &self.inner._code_object,
+            self.inner._code_object.as_bytes(),
             symbol_name,
             metadata.kernel_object,
         );
@@ -2674,32 +2747,33 @@ const COMPRESSED_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
 /// HIP accepts a clang offload bundle at `hipModuleLoad`, while the public HSA
 /// code-object reader accepts only the embedded AMDGPU ELF. Unwrap exactly one
 /// AMDGPU entry in-process so HIP and AQL consume byte-identical device code.
-fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeError> {
-    if code.starts_with(COMPRESSED_OFFLOAD_BUNDLE_MAGIC) {
+fn unwrap_clang_offload_bundle(code: CodeObjectBytes) -> Result<CodeObjectBytes, RuntimeError> {
+    let bytes = code.as_bytes();
+    if bytes.starts_with(COMPRESSED_OFFLOAD_BUNDLE_MAGIC) {
         return Err(RuntimeError::InvalidOffloadBundle(
             "compressed bundle (CCOB); rebuild the kernel cache so hipcc runs with \
              --no-offload-compress, or unbundle it with clang-offload-bundler",
         ));
     }
-    if !code.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
+    if !bytes.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
         return Ok(code);
     }
     let mut cursor = CLANG_OFFLOAD_BUNDLE_MAGIC.len();
-    let bundle_count = read_bundle_u64(&code, &mut cursor)?;
+    let bundle_count = read_bundle_u64(bytes, &mut cursor)?;
     let mut amdgpu = None;
     for _ in 0..bundle_count {
-        let offset = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let offset = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry offset overflows usize"))?;
-        let size = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let size = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry size overflows usize"))?;
-        let id_len = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let id_len = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry ID length overflows usize"))?;
         let id_end = cursor
             .checked_add(id_len)
             .ok_or(RuntimeError::InvalidOffloadBundle(
                 "entry ID range overflows",
             ))?;
-        let id = code
+        let id = bytes
             .get(cursor..id_end)
             .ok_or(RuntimeError::InvalidOffloadBundle("truncated entry ID"))?;
         cursor = id_end;
@@ -2708,7 +2782,7 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
             .ok_or(RuntimeError::InvalidOffloadBundle(
                 "entry payload range overflows",
             ))?;
-        if end > code.len() {
+        if end > bytes.len() {
             return Err(RuntimeError::InvalidOffloadBundle(
                 "entry payload exceeds bundle",
             ));
@@ -2727,7 +2801,8 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
     let (start, end) = amdgpu.ok_or(RuntimeError::InvalidOffloadBundle(
         "bundle contains no AMDGPU code object",
     ))?;
-    Ok(Arc::from(&code[start..end]))
+    // A view into the caller's backing: the bundle's ELF is never copied.
+    code.subimage(start..end)
 }
 
 fn read_bundle_u64(code: &[u8], cursor: &mut usize) -> Result<u64, RuntimeError> {
@@ -3081,6 +3156,11 @@ pub enum RuntimeError {
         maximum: u64,
     },
     EmptyCodeObject,
+    CodeObjectRangeOutOfBounds {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
     InvalidOffloadBundle(&'static str),
     SymbolContainsNul,
     SymbolIsNotKernel(String),
@@ -3204,6 +3284,10 @@ impl fmt::Display for RuntimeError {
                 "grid axis/total {axis} is {requested}, agent maximum is {maximum}"
             ),
             Self::EmptyCodeObject => write!(f, "HSACO code object is empty"),
+            Self::CodeObjectRangeOutOfBounds { start, end, len } => write!(
+                f,
+                "code-object view {start}..{end} is outside its {len}-byte image"
+            ),
             Self::InvalidOffloadBundle(reason) => {
                 write!(f, "invalid clang offload bundle: {reason}")
             }
@@ -3303,7 +3387,7 @@ mod tests {
         let mut blob = b"CCOB".to_vec();
         blob.extend_from_slice(&[3, 0, 1, 0]);
         blob.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
-        let err = unwrap_clang_offload_bundle(Arc::from(blob.as_slice()))
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(blob.as_slice()).into())
             .expect_err("a compressed bundle must not reach the HSA code-object reader");
         assert!(
             err.to_string().contains("CCOB"),
@@ -3314,8 +3398,92 @@ mod tests {
     #[test]
     fn plain_code_object_passes_through_unwrapped() {
         let elf: Vec<u8> = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
-        let out = unwrap_clang_offload_bundle(Arc::from(elf.as_slice())).unwrap();
-        assert_eq!(&out[..], &elf[..]);
+        let out = unwrap_clang_offload_bundle(Arc::<[u8]>::from(elf.as_slice()).into()).unwrap();
+        assert_eq!(out.as_bytes(), &elf[..]);
+    }
+
+    /// Uncompressed clang offload bundle with the given `(triple, payload)` entries.
+    fn offload_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let header: usize = CLANG_OFFLOAD_BUNDLE_MAGIC.len()
+            + 8
+            + entries.iter().map(|(id, _)| 24 + id.len()).sum::<usize>();
+        let mut out = CLANG_OFFLOAD_BUNDLE_MAGIC.to_vec();
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        let mut offset = header;
+        for (id, payload) in entries {
+            out.extend_from_slice(&(offset as u64).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(id.len() as u64).to_le_bytes());
+            out.extend_from_slice(id.as_bytes());
+            offset += payload.len();
+        }
+        for (_, payload) in entries {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    const ELF: &[u8] = &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 9, 9];
+
+    #[test]
+    fn bundle_unwrap_is_a_view_of_owned_backing_not_a_copy() {
+        let bundle: Arc<[u8]> = Arc::from(
+            offload_bundle(&[("host-x86_64-unknown-linux-gnu-", b""), ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)])
+                .as_slice(),
+        );
+        let base = bundle.as_ptr() as usize;
+        let out = unwrap_clang_offload_bundle(bundle.clone().into()).unwrap();
+        assert_eq!(out.as_bytes(), ELF);
+        let view = out.as_bytes().as_ptr() as usize;
+        assert!(view >= base && view + ELF.len() <= base + bundle.len(), "view must alias the bundle");
+        assert_eq!(Arc::strong_count(&bundle), 2, "the view retains the backing");
+        // Lifetime: dropping every other owner keeps the view's bytes valid.
+        drop(bundle);
+        assert_eq!(out.as_bytes(), ELF);
+    }
+
+    #[test]
+    fn static_and_owned_images_unwrap_identically() {
+        static BUNDLE: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]));
+        let bundle: &'static [u8] = BUNDLE.as_slice();
+        let from_static = unwrap_clang_offload_bundle(bundle.into()).unwrap();
+        let from_owned = unwrap_clang_offload_bundle(Arc::<[u8]>::from(bundle).into()).unwrap();
+        assert_eq!(from_static.as_bytes(), from_owned.as_bytes());
+        assert_eq!(from_static.as_bytes().as_ptr(), bundle[bundle.len() - ELF.len()..].as_ptr());
+    }
+
+    #[test]
+    fn multi_device_and_truncated_bundles_fail_closed() {
+        let two = offload_bundle(&[
+            ("hipv4-amdgcn-amd-amdhsa--gfx1100", ELF),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(two.as_slice()).into()).unwrap_err();
+        assert!(err.to_string().contains("multiple AMDGPU"), "{err}");
+        let one = offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        let truncated = &one[..one.len() - 1];
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(truncated).into()).unwrap_err();
+        assert!(err.to_string().contains("exceeds bundle"), "{err}");
+        let none = offload_bundle(&[("host-x86_64-unknown-linux-gnu-", ELF)]);
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(none.as_slice()).into()).unwrap_err();
+        assert!(err.to_string().contains("no AMDGPU"), "{err}");
+    }
+
+    #[test]
+    fn subimage_bounds_are_relative_and_checked() {
+        let image = CodeObjectBytes::from(ELF);
+        let inner = image.subimage(2..8).unwrap();
+        assert_eq!(inner.as_bytes(), &ELF[2..8]);
+        assert_eq!(inner.subimage(1..3).unwrap().as_bytes(), &ELF[3..5]);
+        assert_eq!(inner.subimage(6..6).unwrap().as_bytes(), &[] as &[u8]);
+        for bad in [0..7, 7..7, 4..3] {
+            let err = inner.subimage(bad.clone()).unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::CodeObjectRangeOutOfBounds { len: 6, .. }),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]

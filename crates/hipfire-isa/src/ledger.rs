@@ -15,6 +15,14 @@ pub enum Counter { Load, Store, Ds, Km, Vm, Vs, Lgkm, Exp }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryFamily { Buffer, Global, Ds, Smem, Export }
 
+/// The set of operations one counter retires in issue order. On gfx12,
+/// `buffer_load*` and `global_load*` are both LOADcnt's single `VMEM_ACCESS`
+/// event (ROCm 10.0 `SIInsertWaitcnts.cpp` `getVmemWaitEventType`,
+/// `counterOutOfOrder`), so they share one class; every other operation is
+/// ordered only within its family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderClass { Family(MemoryFamily), Gfx12VmemRead }
+
 #[derive(Clone, Debug)]
 pub struct Pending {
     pub id: u64,
@@ -23,6 +31,7 @@ pub struct Pending {
     pub src_locks: Vec<RegRef>,
     pub in_order: bool,
     pub family: MemoryFamily,
+    pub order: OrderClass,
     /// Pending on only some of the control paths that joined here.
     pub maybe: bool,
     /// Ids of the same counter slot on other joined paths (`Ledger::join`).
@@ -67,11 +76,15 @@ impl Ledger {
             MemoryClass::SmemLoad => MemoryFamily::Smem,
             MemoryClass::Export => MemoryFamily::Export,
         };
+        let mnemonic = insn.mnemonic();
+        let order = if arch.gfx12() && class == MemoryClass::VmemLoad
+            && (mnemonic.starts_with("buffer_load") || mnemonic.starts_with("global_load")) { OrderClass::Gfx12VmemRead }
+            else { OrderClass::Family(family) };
         self.pending.push(Pending {
             id: self.next_id, counter,
             defs: if load { insn.defs.clone() } else { vec![] },
             src_locks: if load { vec![] } else { insn.uses.clone() },
-            in_order, family, maybe: false, aliases: vec![],
+            in_order, family, order, maybe: false, aliases: vec![],
         });
         self.next_id += 1;
     }
@@ -90,7 +103,7 @@ impl Ledger {
             }));
             let Some(reason) = reason else { continue };
             let peers = self.pending.iter().filter(|p| p.counter == pending.counter);
-            let ordered = pending.in_order && peers.clone().all(|p| p.in_order && !p.maybe && p.family == pending.family);
+            let ordered = pending.in_order && peers.clone().all(|p| p.in_order && !p.maybe && p.order == pending.order);
             let younger = self.pending.iter().skip(index + 1).filter(|p| p.counter == pending.counter).count();
             let count = if ordered && younger <= 63 { younger as u8 } else { 0 };
             if let Some(wait) = waits.iter_mut().find(|(counter, _, _)| *counter == pending.counter) {
@@ -122,8 +135,8 @@ impl Ledger {
     /// so every id pending on either path stays pending. Ids stay unique
     /// across paths (`resume`), so an equal id is the same operation.
     ///
-    /// A counter whose pending operations are in-order loads of one family
-    /// on both paths, with equal shapes, retires them by position: the
+    /// A counter whose pending operations are in-order loads of one order
+    /// class on both paths, with equal shapes, retires them by position: the
     /// paths' operations are merged slot by slot, each slot certain and
     /// carrying both paths' ids. On any other counter (stores, SMEM and
     /// other out-of-order families, or different shapes) an operation
@@ -136,8 +149,8 @@ impl Ledger {
         for c in self.pending.iter().chain(&other.pending).map(|p| p.counter) {
             if positional.contains(&c) { continue }
             let (mine, theirs) = (on(self, c), on(other, c));
-            let family = mine.first().map(|p| p.family);
-            let slot = |p: &&Pending| p.positional() && Some(p.family) == family;
+            let order = mine.first().map(|p| p.order);
+            let slot = |p: &&Pending| p.positional() && Some(p.order) == order;
             if mine.len() == theirs.len() && mine.iter().chain(&theirs).all(slot)
                 && mine.iter().zip(&theirs).all(|(p, o)| p.defs == o.defs) {
                 positional.push(c);
@@ -279,5 +292,27 @@ mod join_tests {
                 assert_eq!(a.required(&use_v1).first().map(|w| w.1), Some(wait), "{arch:?}");
             }
         }
+    }
+
+    /// gfx12: a mixed buffer/global window waits for exactly the younger
+    /// LOADcnt operations behind the consumed load; gfx11 VMcnt and a flat
+    /// load in the window still drain to zero.
+    #[test]
+    fn gfx12_mixed_buffer_global_window_waits_by_position() {
+        let load = |text: &str, d: u8| Instruction::new(text, vec![r(Kind::V, d)], vec![r(Kind::V, 8)]).memory(MemoryClass::VmemLoad);
+        let use_of = |d: u8| Instruction::new("v_mov_b32 v40, v0", vec![r(Kind::V, 40)], vec![r(Kind::V, d)]);
+        let window = [load("buffer_load_b32 v0, v8, s[4:7], s9 offen", 0), load("global_load_b32 v1, v8, s[4:5]", 1),
+            load("buffer_load_b32 v2, v8, s[4:7], s9 offen offset:4", 2), load("global_load_b32 v3, v8, s[4:5] offset:4", 3)];
+        let mut l = Ledger::default();
+        for i in &window { l.record(Arch::Gfx1201, i) }
+        for (d, n) in [(0u8, 3u8), (1, 2), (2, 1), (3, 0)] {
+            assert_eq!(l.required(&use_of(d)).first().map(|w| (w.0, w.1)), Some((Counter::Load, n)), "v{d}");
+        }
+        let mut gfx11 = Ledger::default();
+        for i in &window { gfx11.record(Arch::Gfx1100, i) }
+        assert_eq!(gfx11.required(&use_of(0)).first().map(|w| w.1), Some(0));
+        let mut flat = Ledger::default();
+        for i in [window[0].clone(), load("flat_load_b32 v1, v[8:9]", 1)] { flat.record(Arch::Gfx1201, &i) }
+        assert_eq!(flat.required(&use_of(0)).first().map(|w| w.1), Some(0));
     }
 }

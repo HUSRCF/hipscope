@@ -38,8 +38,10 @@ impl Instruction {
             if value & !0x3f3f != 0 {return Err(format!("combined wait {value:#x} exceeds either 6-bit counter field"))}
         }
         if mnemonic.starts_with("buffer_") {
+            // The offset is one token; llvm-objdump's canonical order puts cache
+            // modifiers after it (`offen offset:136 scope:SCOPE_DEV`).
             if let Some((_,offset))=self.text.rsplit_once(" offset:") {
-                let value=imm(offset)?;
+                let value=imm(offset.split_whitespace().next().unwrap_or(""))?;
                 if value>arch.buffer_offset_max(){return Err(format!("buffer offset {value} exceeds {} field",arch.name()))}
             }
         }
@@ -179,6 +181,20 @@ impl Global {
 impl Global {
     pub fn load_b64(dst:V<2>,addr:V<1>,base:S<2>)->Instruction {
         Instruction::new(format!("global_load_b64 {}, {}, {}",dst.reg(),addr.reg(),base.reg()),vec![dst.reg()],vec![addr.reg(),base.reg()]).memory(MemoryClass::VmemLoad)
+    }
+}
+
+#[cfg(test)]
+mod buffer_offset_tests {
+    use super::*;
+    #[test]
+    fn buffer_offset_is_one_token_before_cache_modifiers() {
+        let ok=Instruction::new("buffer_load_b32 v1, v2, s[4:7], null offen offset:136 scope:SCOPE_DEV",vec![],vec![]);
+        assert!(ok.validate(Arch::Gfx1201).is_ok());
+        let big=Instruction::new("buffer_load_b32 v1, v2, s[4:7], null offen offset:8388608 scope:SCOPE_DEV",vec![],vec![]);
+        assert!(big.validate(Arch::Gfx1201).is_err());
+        let bad=Instruction::new("buffer_load_b32 v1, v2, s[4:7], null offen offset:x scope:SCOPE_DEV",vec![],vec![]);
+        assert!(bad.validate(Arch::Gfx1201).is_err());
     }
 }
 

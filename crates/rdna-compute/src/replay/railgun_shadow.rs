@@ -24,7 +24,7 @@
 //! the Redline planner).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +40,7 @@ use super::{
     Gfx11EntryAcquirePolicy, Gfx12DispatchPacing, KernargBuffer, KernargPool, Kernel, LaunchGeometry, Pm4Commands,
     RecordedHipLaunch, ReplayGridBinding, ReplayKernargBinding,
 };
+use crate::code_object::CodeObjectId;
 use crate::compiler::KernelCompiler;
 
 /// The MR inventory names programs by route (`railgun-cert` `Program`), the
@@ -80,7 +81,6 @@ const G4_MIN_TRIALS: u64 = 1 << 20;
 pub(super) struct RailgunShadow {
     config: ShadowConfig,
     corpus: Option<Result<Arc<JitCorpus>, String>>,
-    artifact_sha: HashMap<PathBuf, Result<String, String>>,
     facts: HashMap<(String, String), Result<Arc<NodeFacts>, String>>,
     launches: Vec<LaunchRecord>,
     /// SHA-256 of each launch's object (for route matching).
@@ -128,7 +128,6 @@ impl RailgunShadow {
                 backend_railgun: var("HIPFIRE_RAILGUN_BACKEND").as_deref() == Some("railgun"),
             },
             corpus: None,
-            artifact_sha: HashMap::new(),
             facts: HashMap::new(),
             launches: Vec::new(),
             artifacts: Vec::new(),
@@ -162,7 +161,7 @@ impl RailgunShadow {
         hip: &HipRuntime,
         compiler: Option<&KernelCompiler>,
         kernel: &str,
-        artifact: Option<&Path>,
+        artifact: Option<CodeObjectId>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -173,18 +172,11 @@ impl RailgunShadow {
             self.arch.get_or_insert_with(|| compiler.arch().to_owned());
             self.toolchain_pin.get_or_insert_with(|| sha256_hex(compiler.toolchain_id().as_bytes()));
         }
-        let sha = artifact.map(|path| {
-            self.artifact_sha
-                .entry(path.to_path_buf())
-                .or_insert_with(|| {
-                    std::fs::read(path).map(|bytes| sha256_hex(&bytes)).map_err(|e| format!("{}: {e}", path.display()))
-                })
-                .clone()
-        });
+        // The admitted image digest is the corpus key; no file is reopened.
+        let sha = artifact.map(|id| id.to_hex());
         let facts = match &sha {
             None => Err("the launch has no owning code object".to_owned()),
-            Some(Err(e)) => Err(e.clone()),
-            Some(Ok(sha)) => self.facts_for(sha, kernel),
+            Some(sha) => self.facts_for(sha, kernel),
         };
         let allocations = match &facts {
             Ok(f) => f
@@ -198,7 +190,7 @@ impl RailgunShadow {
                 .collect(),
             Err(_) => Vec::new(),
         };
-        self.artifacts.push(sha.and_then(Result::ok));
+        self.artifacts.push(sha);
         self.launches.push(LaunchRecord {
             symbol: kernel.to_owned(),
             grid,

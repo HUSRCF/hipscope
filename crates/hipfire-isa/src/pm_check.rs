@@ -221,8 +221,8 @@ pub fn lds_bounds_host(source: &str, symbol: &str, waves: u32, limit: u32, host_
         let mut w = Wave { v: BTreeMap::new(), s: BTreeMap::new() };
         w.v.insert(0, std::array::from_fn(|l| Some(wave * 32 + l as u32)));
         for (i, (name, ops, rest)) in lines.iter().enumerate() {
-            // ds_swizzle_b32 exchanges lanes on the LDS crossbar and touches no LDS memory.
-            if !name.starts_with("ds_") || *name == "ds_swizzle_b32" {
+            // ds_swizzle_b32 / ds_bpermute_b32 exchange lanes on the LDS crossbar and touch no LDS memory.
+            if !name.starts_with("ds_") || *name == "ds_swizzle_b32" || *name == "ds_bpermute_b32" {
                 if i < head { step(&mut w, name, ops); }
                 continue;
             }
@@ -333,6 +333,14 @@ mod tests {
     #[test]
     fn lds_free_kernel_needs_zero_allocation() {
         let free = K.replace("\tds_load_2addr_b64 v[4:7], v2 offset1:32\n", "\tds_swizzle_b32 v10, v9 offset:swizzle(BROADCAST,16,3)\n");
+        assert_eq!(lds_bounds(&free, "k", 2, 0).unwrap(), 0);
+        assert!(lds_bounds(&free, "k", 2, 1024).is_err());
+    }
+    /// ds_bpermute_b32's address operand is a lane-byte index, not an LDS
+    /// address: an LDS-free bpermute kernel bounds at 0 bytes.
+    #[test]
+    fn bpermute_is_not_an_lds_access() {
+        let free = K.replace("\tds_load_2addr_b64 v[4:7], v2 offset1:32\n", "\tds_bpermute_b32 v10, v11, v9\n");
         assert_eq!(lds_bounds(&free, "k", 2, 0).unwrap(), 0);
         assert!(lds_bounds(&free, "k", 2, 1024).is_err());
     }
