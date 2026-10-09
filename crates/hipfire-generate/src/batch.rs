@@ -1458,8 +1458,10 @@ pub fn drive_qwen_continuous_batch(
 // `ContinuousBatchScheduler` (same AttemptKey/LaneTicket registry, same
 // commit_ready/commit/abort transaction as the fixed-lane driver).
 //
-// Stage 1 limits, enforced by `is_vmm_batch_request_eligible`: greedy with
-// neutral penalties only (the executor commits per-row argmax), AR rows only
+// Stage 1 limits, enforced by `is_vmm_batch_request_eligible`: greedy
+// requests only (the executor picks with the singleton sampler incl. the
+// repeat/presence/frequency penalties; sampled-RNG equivalence has no gate
+// yet), AR rows only
 // (no cross-request speculation yet), and a request that is lonely at
 // dispatch stays on the unchanged singleton route (the daemon checks the
 // inbox); arrivals during a singleton generation wait for it to finish.
@@ -1485,8 +1487,8 @@ fn vmm_retire_free(
 
 /// VMM-route admission predicate: the fixed-lane predicate's request shape
 /// (single user turn, no tools/images/stops/adaptive/PFlash, TP1) on a model
-/// that staged `vmm_store`, restricted to stage-1 arithmetic: greedy with
-/// neutral penalties. A loaded speculator does not exclude the request —
+/// that staged `vmm_store`, restricted to stage-1 greedy requests (penalties
+/// apply exactly as on the singleton route). A loaded speculator does not exclude the request —
 /// batched rows are AR, and a lonely request keeps its singleton spec route.
 pub fn is_vmm_batch_request_eligible(
     msg: &serde_json::Value,
@@ -1520,11 +1522,7 @@ pub fn is_vmm_batch_request_eligible(
     if msg.get("budget_alert_at_tok").is_some() || msg.get("budget_alert_text").is_some() {
         return false;
     }
-    let s = resolve_batch_sampling(msg, m);
-    s.temp <= 0.0
-        && s.repeat_penalty == 1.0
-        && s.presence_penalty == 0.0
-        && s.frequency_penalty == 0.0
+    resolve_batch_sampling(msg, m).temp <= 0.0
 }
 
 pub fn drive_qwen_vmm_continuous_batch(
@@ -1562,6 +1560,20 @@ pub fn drive_qwen_vmm_continuous_batch(
         (eos, stops, store.row_budget().min(params.max_batch_tokens.max(batch_size)))
     };
     let im_end_tok = stop_ids.get(1).copied().unwrap_or(eos_tok);
+    // Unclosed-opener attractor pairs, exactly as the singleton AR route
+    // builds them (ar.rs); blocks are recomputed per step from the
+    // request's generated-only history.
+    let attractor_pairs: Vec<(u32, u32)> = {
+        let t = model.tokenizer.as_ref().expect("checked above");
+        let pair = |o: &str, c: &str| match (t.special_token_id(o), t.special_token_id(c)) {
+            (Some(o), Some(c)) => Some((o, c)),
+            _ => None,
+        };
+        pair("<tool_call>", "</tool_call>")
+            .into_iter()
+            .chain(pair("<think>", "</think>"))
+            .collect()
+    };
     let idle_work = |i: usize| PendingWork {
         slot: SlotId(i),
         remaining_prompt: Vec::new(),
@@ -1816,6 +1828,24 @@ pub fn drive_qwen_vmm_continuous_batch(
                 request_tag: ticket.generation,
                 owner_generation: ticket.generation.wrapping_add(1).max(1),
             };
+            let rng_state = match &sched.lanes[lane_idx] {
+                BatchLane::Running(l) => l.rng_state as u32,
+                _ => continue,
+            };
+            let s = &pending_req.sampling;
+            // Singleton AR sampling scope: generated tokens only (empty at
+            // the first sample), so no attractor blocks yet.
+            let sampler = hipfire_runtime::sampler::SamplerConfig {
+                temperature: s.temp,
+                top_p: s.top_p,
+                repeat_penalty: s.repeat_penalty,
+                repeat_window: s.repeat_window,
+                presence_penalty: s.presence_penalty,
+                frequency_penalty: s.frequency_penalty,
+                blocked_tokens: Vec::new(),
+                top_k: s.top_k,
+                min_p: s.min_p,
+            };
             let admitted = (|| -> Result<(), String> {
                 let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
                 let state = hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
@@ -1825,8 +1855,13 @@ pub fn drive_qwen_vmm_continuous_batch(
                     &b.dn_state,
                     epoch,
                     lane_idx,
-                    prompt_tokens.len(),
-                    stop_ids.clone(),
+                    hipfire_arch_qwen35::forward_slots::vmm::VmmRequestInit {
+                        prompt_len: prompt_tokens.len(),
+                        stop_ids: stop_ids.clone(),
+                        sampler,
+                        rng_state,
+                        history: Vec::new(),
+                    },
                 )?;
                 let store = b.vmm_store.as_mut().ok_or("store not staged")?;
                 store.admit(state).map_err(|(state, e)| {
@@ -1889,6 +1924,24 @@ pub fn drive_qwen_vmm_continuous_batch(
         for &idx in &running {
             if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
                 lane.max_active_lanes = lane.max_active_lanes.max(active_now);
+            }
+        }
+        // Singleton-equivalent attractor blocks over each request's
+        // generated-only history, recomputed before every pick.
+        if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_mut()) {
+            for &idx in &running {
+                if let Some(st) = store.request_state_mut(&epochs[idx]) {
+                    let mut blocked = std::mem::take(&mut st.sampler.blocked_tokens);
+                    blocked.clear();
+                    sampler::collect_unclosed_attractor_blocks(
+                        &st.history,
+                        &attractor_pairs,
+                        20,
+                        2,
+                        &mut blocked,
+                    );
+                    st.sampler.blocked_tokens = blocked;
+                }
             }
         }
         // ── One planned step: provision → forward → commit → publish ──
