@@ -21,21 +21,21 @@ gemv_mq4g256v2_multirow_r2_dog_g0:
 	global_load_b128 v[12:15], v1, s[6:7]
 	global_load_b128 v[16:19], v1, s[6:7] offset:16
 	s_wait_loadcnt 0x3
-	v_bfe_u32 v6, v2, 4, 4
+	v_bfe_u32 v6, v2, 0, 4
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cvt_f32_ubyte0_e32 v6, v6
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fma_mix_f32 v6, v4, v6, v4 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	s_wait_loadcnt 0x1
 	s_delay_alu instid0(VALU_DEP_1)
-	v_mul_f32_e32 v7, v13, v6
-	v_bfe_u32 v6, v2, 0, 4
+	v_mul_f32_e32 v7, v12, v6
+	v_bfe_u32 v6, v2, 4, 4
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cvt_f32_ubyte0_e32 v6, v6
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fma_mix_f32 v6, v4, v6, v4 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v7, v12, v6
+	v_fmac_f32_e32 v7, v13, v6
 	v_bfe_u32 v6, v2, 8, 4
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cvt_f32_ubyte0_e32 v6, v6
@@ -79,20 +79,20 @@ gemv_mq4g256v2_multirow_r2_dog_g0:
 	v_fma_mix_f32 v6, v4, v6, v4 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v7, v19, v6
-	v_bfe_u32 v6, v3, 0, 4
-	s_delay_alu instid0(VALU_DEP_1)
-	v_cvt_f32_ubyte0_e32 v6, v6
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fma_mix_f32 v6, v5, v6, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	s_delay_alu instid0(VALU_DEP_1)
-	v_mul_f32_e32 v8, v12, v6
 	v_bfe_u32 v6, v3, 4, 4
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cvt_f32_ubyte0_e32 v6, v6
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fma_mix_f32 v6, v5, v6, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v8, v13, v6
+	v_mul_f32_e32 v8, v13, v6
+	v_bfe_u32 v6, v3, 0, 4
+	s_delay_alu instid0(VALU_DEP_1)
+	v_cvt_f32_ubyte0_e32 v6, v6
+	s_delay_alu instid0(VALU_DEP_1)
+	v_fma_mix_f32 v6, v5, v6, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_1)
+	v_fmac_f32_e32 v8, v12, v6
 	v_bfe_u32 v6, v3, 8, 4
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cvt_f32_ubyte0_e32 v6, v6

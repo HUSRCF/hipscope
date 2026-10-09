@@ -23,9 +23,9 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
 /// M=2 and K=256 occupy the frozen by-value slots but are not shape selectors.
 /// This symbol is never returned by the production entry point.
 ///
-/// The selected clang24 tail DAG starts row0 with x1*w1, then fmac x0*w0;
-/// row1 starts x0*w0, then fmac x1*w1. Keep that distinction: even the
-/// first two terms must not be swapped under the byte-identity contract.
+/// The selected clang24 tail DAG starts row0 with x0*w0, then fmac x1*w1;
+/// row1 starts x1*w1, then fmac x0*w0. The real-H2 oracle confirmed this
+/// row mapping; swapping the first two terms changes output bits.
 pub fn build_dog_g0() -> Result<Emitted, String> {
     let mut regs = RegPlan::new(20, 10)?;
     let tid = regs.v::<1>("tid", 0, Live::Whole)?;
@@ -103,8 +103,8 @@ pub fn build_dog_g0() -> Result<Emitted, String> {
         ).memory(MemoryClass::VmemLoad))?;
     }
     for (packed, header, dot, order) in [
-        (packed0, header0, dot0, [1, 0, 2, 3, 4, 5, 6, 7]),
-        (packed1, header1, dot1, [0, 1, 2, 3, 4, 5, 6, 7]),
+        (packed0, header0, dot0, [0, 1, 2, 3, 4, 5, 6, 7]),
+        (packed1, header1, dot1, [1, 0, 2, 3, 4, 5, 6, 7]),
     ] {
         for (term, nibble) in order.into_iter().enumerate() {
             b.push(Instruction::new(
