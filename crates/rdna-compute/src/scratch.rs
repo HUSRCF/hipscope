@@ -426,6 +426,9 @@ pub struct ScratchState {
     /// here so the scratch helpers' `compile_and_load_kernel` calls drain it
     /// too; `Idle` keeps today's lazy loading exactly.
     pub(crate) route_load: RouteLoad,
+    /// `FeatureFlags::pm_decode` snapshot for the load funnel: accepted
+    /// [`crate::pm_decode_twins`] replace their HIP modules (exact gfx1201).
+    pub(crate) pm_decode: bool,
 }
 
 // ── Planned-route kernel barrier ─────────────────────────────────────────
@@ -470,6 +473,7 @@ pub(crate) fn prepare_route_modules(
     hip: &HipRuntime,
     modules: &mut HashMap<String, Module>,
     functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
 ) -> HipResult<()> {
     if !route.pending() {
         return Ok(());
@@ -485,17 +489,15 @@ pub(crate) fn prepare_route_modules(
             crate::kernel_registry::PlannedKernel::Hip(entry) => {
                 for &symbol in entry.symbols {
                     load_kernel_module(
-                        compiler, hip, modules, functions, entry.module, entry.source(), symbol,
+                        compiler, hip, modules, functions, pm_decode, entry.module, entry.source(), symbol,
                     )?;
                 }
             }
-            crate::kernel_registry::PlannedKernel::Embedded { module, image, symbols } => {
-                if !modules.contains_key(*module) {
-                    modules.insert((*module).to_owned(), hip.module_load_data(image)?);
-                }
+            crate::kernel_registry::PlannedKernel::Embedded { module, image, radiowave_json, symbols } => {
                 for &symbol in *symbols {
-                    let func = hip.module_get_function(&modules[*module], symbol)?;
-                    functions.insert(symbol.to_owned(), func);
+                    load_embedded_module(
+                        compiler, hip, modules, functions, module, image, *radiowave_json, symbol,
+                    )?;
                 }
             }
         }
@@ -519,18 +521,19 @@ pub(crate) fn compile_and_load_kernel(
     modules: &mut HashMap<String, Module>,
     functions: &mut HashMap<String, Function>,
     route: &mut RouteLoad,
+    pm_decode: bool,
     module_name: &str,
     source: &str,
     func_name: &str,
 ) -> HipResult<()> {
-    prepare_route_modules(route, compiler, hip, modules, functions)?;
+    prepare_route_modules(route, compiler, hip, modules, functions, pm_decode)?;
     if functions.contains_key(func_name) {
         return Ok(());
     }
     if matches!(route, RouteLoad::Sealed) {
         return Err(unplanned_route_kernel(module_name, func_name));
     }
-    load_kernel_module(compiler, hip, modules, functions, module_name, source, func_name)
+    load_kernel_module(compiler, hip, modules, functions, pm_decode, module_name, source, func_name)
 }
 
 /// Error for a kernel outside a sealed route plan.
@@ -544,16 +547,36 @@ pub(crate) fn unplanned_route_kernel(module_name: &str, func_name: &str) -> hip_
     )
 }
 
-/// Resolve, load and bind one symbol, always (re)binding `func_name`.
+/// Resolve, load and bind one symbol, always (re)binding `func_name`. With
+/// `pm_decode` on exact gfx1201 an accepted [`crate::pm_decode_twins`] module
+/// loads its embedded image instead: verified once at module admission
+/// (fail closed), and hipcc is never invoked for it.
+#[allow(clippy::too_many_arguments)]
 fn load_kernel_module(
     compiler: &mut crate::compiler::KernelCompiler,
     hip: &HipRuntime,
     modules: &mut HashMap<String, Module>,
     functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
     module_name: &str,
     source: &str,
     func_name: &str,
 ) -> HipResult<()> {
+    if let Some(twin) = crate::pm_decode_twins::pm_decode_module(compiler.arch(), pm_decode, module_name) {
+        if !modules.contains_key(module_name) {
+            twin.verify(source, func_name)
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            // `load_embedded_module` re-checks the image digest at admission.
+        } else if !twin.symbols.contains(&func_name) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("pm_decode twin {module_name}: symbol {func_name:?} is not an accepted export"),
+            ));
+        }
+        return load_embedded_module(
+            compiler, hip, modules, functions, twin.module, twin.image, Some(twin.radiowave_json), func_name,
+        );
+    }
     let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
     if !modules.contains_key(module_name) {
@@ -572,6 +595,67 @@ fn load_kernel_module(
     // (e.g. gemv_hfq4g256_residual launched from gemv_hfq4g256_residual_rdna3).
     bind_loaded_function(compiler, module_name, func_name)?;
     functions.insert(func_name.to_string(), func);
+    Ok(())
+}
+
+/// Load an embedded native image as `module_name` (once, admitted as that
+/// module's in-memory code object; no file is written), then resolve and
+/// (re)bind `func_name` to it. A module already bound to a different image
+/// is refused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_embedded_module(
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    module_name: &'static str,
+    image: &'static [u8],
+    radiowave_json: Option<&str>,
+    func_name: &str,
+) -> HipResult<()> {
+    if !modules.contains_key(module_name) {
+        // An accepted pm_decode twin is re-verified against its pinned digest
+        // at admission, whichever path (lazy funnel or route preload) loads it.
+        let twin = crate::pm_decode_twins::GFX1201_TWINS.iter().find(|t| t.image.as_ptr() == image.as_ptr());
+        if let Some(twin) = twin {
+            twin.verify_image().map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        }
+        if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+            // Developer-only route-closure audit: every embedded image load,
+            // with the accepted pm_decode identities when it is a twin.
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tembedded\t{}",
+                serde_json::json!({
+                    "arch": compiler.arch(),
+                    "module": module_name,
+                    "symbol": func_name,
+                    "origin": "native_embedded",
+                    "image_sha256": crate::code_object::CodeObjectId::of(image).to_hex(),
+                    "pm_decode_accepted_elf_sha256": twin.map(|t| crate::pm_decode_twins::hex(&t.accepted_elf_sha256)),
+                    "pm_decode_source_sha256": twin.map(|t| crate::pm_decode_twins::hex(&t.source_sha256)),
+                })
+            );
+        }
+        let module = hip.module_load_data(image)?;
+        compiler
+            .code_objects_mut()
+            .admit_module(
+                module_name,
+                crate::code_object::CodeObjectArtifact::native_embedded(module_name, image.into(), radiowave_json),
+            )
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        modules.insert(module_name.to_owned(), module);
+    } else if let Some(bound) = compiler.code_objects().module(module_name) {
+        if bound.id() != crate::code_object::CodeObjectId::of(image) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("module {module_name:?} is bound to image {} and a different image was requested", bound.id()),
+            ));
+        }
+    }
+    let func = hip.module_get_function(&modules[module_name], func_name)?;
+    bind_loaded_function(compiler, module_name, func_name)?;
+    functions.insert(func_name.to_owned(), func);
     Ok(())
 }
 
@@ -1355,6 +1439,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "convert_f32_to_f16",
             kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
             "convert_f32_to_f16",
@@ -1468,6 +1553,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "convert_f32_to_f16",
             kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
             "convert_f32_to_f16",
@@ -1536,6 +1622,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "pack_f32_to_fp8_gfx12",
             kernels::PACK_F32_TO_FP8_GFX12_SRC,
             "pack_f32_to_fp8_gfx12",
@@ -1692,7 +1779,7 @@ impl ScratchState {
     ) -> HipResult<Mq4v2Fp8Prepared> {
         let mut row_scale_shift = crate::gemv::fp8_row_scale_shift()?;
         compile_and_load_kernel(
-            compiler, hip, modules, functions, &mut self.route_load, module, ksrc, symbol,
+            compiler, hip, modules, functions, &mut self.route_load, self.pm_decode, module, ksrc, symbol,
         )?;
 
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
@@ -1828,6 +1915,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
             "quantize_q8_1_mmq_ds4",
@@ -1914,6 +2002,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC,
             "quantize_q8_1_mmq_ds4_x128",
@@ -2001,6 +2090,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq_iu4",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
             "quantize_int4_mmq_ds128",
@@ -2216,6 +2306,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "gemm_mq4g256v2_residual_mmq_i8_gfx12",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
             "quantize_int8_mmq_ds128",
@@ -2749,6 +2840,7 @@ impl ScratchState {
             modules,
             functions,
             &mut self.route_load,
+            self.pm_decode,
             "mq_rotate_x_dual_fp8_gfx12",
             kernels::MQ_ROTATE_X_DUAL_FP8_GFX12_SRC,
             "mq_rotate_x_dual_fp8_gfx12",

@@ -51,6 +51,11 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_G12_IU4_ISA`). Default on after byte-exact G3 and +7.04%
     /// pp8192 G4; `=0` restores hipcc K1 when that route is selected.
     pub g12_iu4_isa: bool,
+    /// Oracle-accepted decode twins (`kernel.pm_decode`, `HIPFIRE_PM_DECODE`):
+    /// exact gfx1201 loads the embedded builder images of
+    /// [`crate::pm_decode_twins`] in place of those HIP modules. Default off
+    /// during development; `=0` is the kill switch. Ignored on other arches.
+    pub pm_decode: bool,
     /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
     pub a8_prefill: bool,
     /// Fuse A8 sidecar emission into the four activation producers (default on).
@@ -693,6 +698,7 @@ impl FeatureFlags {
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
+            pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(false),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
             a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
@@ -1241,6 +1247,7 @@ impl FeatureFlags {
             // even though the process default is on.
             iu4_prefill: Some(false),
             g12_iu4_isa: false,
+            pm_decode: false,
             a8_prefill: false,
             a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
@@ -1935,6 +1942,34 @@ mod tests {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx12_fp8_stream, "arch={arch}");
         }
+    }
+
+    #[test]
+    fn pm_decode_defaults_off_and_follows_typed_key() {
+        let flags_for = |raw: Option<&str>| {
+            let mut layers = Vec::new();
+            if let Some(raw) = raw {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli("kernel.pm_decode", raw)?;
+                layers.push(NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    layer,
+                });
+            }
+            let resolved = resolve(layers)?;
+            let process = ProcessConfig::from_resolved(&resolved)?;
+            Ok::<_, hipfire_config::ConfigError>(FeatureFlags::from_process_config("gfx1201", &process))
+        };
+        // Unset: off (development default; never on by default).
+        assert!(!flags_for(None).unwrap().pm_decode);
+        assert!(!flags_for(Some("0")).unwrap().pm_decode);
+        assert!(!flags_for(Some("false")).unwrap().pm_decode);
+        assert!(flags_for(Some("1")).unwrap().pm_decode);
+        assert!(flags_for(Some("true")).unwrap().pm_decode);
+        // Invalid values are refused by the typed schema, not read as off.
+        assert!(flags_for(Some("maybe")).is_err());
+        assert!(flags_for(Some("2")).is_err());
+        assert!(!FeatureFlags::for_test("gfx1201").pm_decode);
     }
 
     #[test]

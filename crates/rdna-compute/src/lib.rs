@@ -40,6 +40,7 @@ pub mod mq_f16_residual_producers;
 #[cfg(feature = "deltanet")]
 pub mod fn_gdn_dense;
 pub mod norm;
+pub mod pm_decode_twins;
 pub mod page_pool;
 pub mod pool;
 pub mod profile;

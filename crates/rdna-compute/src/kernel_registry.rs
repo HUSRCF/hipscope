@@ -1230,6 +1230,8 @@ pub enum PlannedKernel {
     Embedded {
         module: &'static str,
         image: &'static [u8],
+        /// Radiowave manifest verified against `image` at admission.
+        radiowave_json: Option<&'static str>,
         symbols: &'static [&'static str],
     },
 }
@@ -1386,7 +1388,10 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
     if input.host_mapped_experts {
         return refuse("host-mapped experts have no closed route".into());
     }
-    let default_flags = default_feature_flags(input.arch)?;
+    // `pm_decode` is a closed route axis (accepted twins replace their HIP
+    // entries below); every other flag must be the builtin default.
+    let mut default_flags = default_feature_flags(input.arch)?;
+    default_flags.pm_decode = input.flags.pm_decode;
     if format!("{:?}", input.flags) != format!("{default_flags:?}") {
         return refuse(format!("non-default feature flags on {}", input.arch));
     }
@@ -1399,6 +1404,7 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
             let b1s = PlannedKernel::Embedded {
                 module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
                 image: crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+                radiowave_json: None,
                 symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
             };
             (hip, vec![b1s])
@@ -1413,6 +1419,24 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
     let corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
     let mut entries = embedded;
     for &(module, symbols) in hip.into_iter().flatten() {
+        if let Some(twin) =
+            crate::pm_decode_twins::pm_decode_module(input.arch, input.flags.pm_decode, module)
+        {
+            if let Some(symbol) = symbols.iter().find(|s| !twin.symbols.contains(s)) {
+                return Err(RegistryError::ConflictingPlan(format!(
+                    "module {module} symbol {symbol} has no accepted pm_decode export"
+                )));
+            }
+            if !entries.iter().any(|e| e.module() == module) {
+                entries.push(PlannedKernel::Embedded {
+                    module: twin.module,
+                    image: twin.image,
+                    radiowave_json: Some(twin.radiowave_json),
+                    symbols,
+                });
+            }
+            continue;
+        }
         let mut matches = corpus.iter().filter(|entry| entry.module == module);
         let found = matches.next().ok_or_else(|| RegistryError::UnsupportedModule {
             arch: input.arch.to_owned(),

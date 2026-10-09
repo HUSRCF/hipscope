@@ -1781,6 +1781,7 @@ impl Gpu {
                 None
             };
 
+        let pm_decode = flags.pm_decode;
         Ok(Self {
             hip,
             arch,
@@ -1863,6 +1864,7 @@ impl Gpu {
                 fa2_fp8_q_scratch: None,
                 fa2_fp8_q_scratch_bytes: 0,
                 route_load: Default::default(),
+                pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
@@ -3327,6 +3329,7 @@ impl Gpu {
             &mut self.modules,
             &mut self.functions,
             &mut self.scratch.route_load,
+            self.scratch.pm_decode,
             module_name,
             source,
             func_name,
@@ -3441,6 +3444,7 @@ impl Gpu {
             &self.hip,
             &mut self.modules,
             &mut self.functions,
+            self.scratch.pm_decode,
         )
     }
 

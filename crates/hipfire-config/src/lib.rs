@@ -2615,6 +2615,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.pm_decode",
+        "pm_decode",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_PM_DECODE",
+        "Load the oracle-accepted builder (peacemaker) twins of the decode HIP modules on exact gfx1201 instead of compiling those modules with hipcc (default off during development; HIPFIRE_PM_DECODE=0 is the kill switch). Other architectures ignore it."
+    ),
+    process_bool_field!(
         "kernel.gfx11_iu4_gridspec",
         "gfx11_iu4_gridspec",
         Kernel,
