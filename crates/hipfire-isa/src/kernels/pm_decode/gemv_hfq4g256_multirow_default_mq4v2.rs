@@ -355,10 +355,9 @@ mod tests {
         let emitted = build_dog_g0().expect("checked DOG region");
         let object = crate::native::assemble(&emitted.s_text, Arch::Gfx1201)
             .expect("native region code object");
-        let out = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../kernels/pm-decode/gfx1201/"
-        ));
+        let out = std::env::temp_dir()
+            .join(format!("hipfire-isa-g0-multirow_default-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
         let prefix = out.join(format!("{MODULE}.g0"));
         std::fs::write(prefix.with_extension("g0.s"), &emitted.s_text).unwrap();
         std::fs::write(prefix.with_extension("g0.proof.json"),
@@ -388,5 +387,6 @@ mod tests {
         assert_eq!(m7["obligations"], serde_json::json!({}));
         std::fs::write(prefix.with_extension("g0.m7.json"),
             serde_json::to_vec_pretty(&m7).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&out);
     }
 }

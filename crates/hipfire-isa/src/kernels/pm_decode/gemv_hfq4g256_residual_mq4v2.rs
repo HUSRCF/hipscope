@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn residual_dog_g0_m7() {
         let emitted=build_dog_g0().expect("checked DOG region");
-        let dir=std::path::PathBuf::from("/home/kaden/qcal/release-0.4.2/pm-decode-twins/g0");
+        let dir=std::env::temp_dir().join(format!("hipfire-isa-g0-residual-{}",std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source=dir.join("gemv_hfq4g256_residual_mq4v2.g0.s");
         let elf=dir.join("gemv_hfq4g256_residual_mq4v2.g0.co");
@@ -433,5 +433,6 @@ mod tests {
         let report=crate::pm_check::m7(&elf,"gfx1201",G0_SYMBOL).expect("M7");
         println!("{}\n{}",source.display(),report);
         assert_eq!(report["obligations"],serde_json::json!({}),"{report}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

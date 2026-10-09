@@ -324,8 +324,8 @@ mod tests {
     #[test]
     fn g0_region_m7() {
         let emitted = build_region().unwrap();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../kernels/pm-decode/gfx1201");
+        let root = std::env::temp_dir()
+            .join(format!("hipfire-isa-g0-gate_up-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let stem = root.join("fused_gate_up_hfq4g256_mq4v2.g0");
         std::fs::write(stem.with_extension("g0.s"), &emitted.s_text).unwrap();
@@ -349,6 +349,7 @@ mod tests {
         println!("gate_up G0 M7: {m7}");
         assert_eq!(m7["lift"], "byte-exact");
         assert_eq!(m7["obligations"], serde_json::json!({}));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

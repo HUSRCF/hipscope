@@ -459,13 +459,17 @@ mod tests {
     #[test]
     fn g0_quad_m7() -> Result<(), String> {
         let emitted = super::build_g0()?;
-        let base = std::path::Path::new("/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.g0");
+        let root = std::env::temp_dir()
+            .join(format!("hipfire-isa-g0-qkvza-{}", std::process::id()));
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let base = root.join("fused_qkvza_hfq4g256_mq4v2.g0");
         std::fs::write(base.with_extension("g0.s"), &emitted.s_text).map_err(|e| e.to_string())?;
         let bytes = crate::native::assemble(&emitted.s_text, crate::Arch::Gfx1201)?;
         let object = base.with_extension("g0.co");
         std::fs::write(&object, bytes).map_err(|e| e.to_string())?;
         let evidence = crate::pm_check::m7(&object, "gfx1201", "pm_decode_qkvza_g0")?;
         println!("QKVZA G0 M7: {evidence}");
+        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 }

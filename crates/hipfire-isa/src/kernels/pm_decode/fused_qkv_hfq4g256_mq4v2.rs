@@ -444,8 +444,8 @@ mod tests {
     fn g0_emit_and_m7() {
         let emitted = build_g0().expect("checked G0 emission");
         let e = &emitted[0];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../kernels/pm-decode/gfx1201");
+        let root = std::env::temp_dir()
+            .join(format!("hipfire-isa-g0-fused_qkv-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = |suffix: &str| root.join(format!("{MODULE}.g0.{suffix}"));
         std::fs::write(path("s"), &e.s_text).unwrap();
@@ -464,5 +464,6 @@ mod tests {
             .expect("G0 requires M7 obligations {}");
         println!("{m7}");
         std::fs::write(path("m7.json"), serde_json::to_vec_pretty(&m7).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
