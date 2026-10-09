@@ -867,3 +867,7 @@ required-features = ["lab"]
 [[example]]
 name = "pm_decode_twins"
 required-features = ["lab"]
+
+[[example]]
+name = "pm_xbatch_oracle"
+required-features = ["lab"]
