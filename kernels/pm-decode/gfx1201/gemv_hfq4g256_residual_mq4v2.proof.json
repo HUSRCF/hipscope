@@ -1,0 +1,660 @@
+{
+  "module": "gemv_hfq4g256_residual_mq4v2",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "b574f33f47a03f3670f79fce4b84ea98a1191576",
+  "s_text_sha256": "a55c6de39c90a3e24a5adcbb349e85c72aeb2ab126862889a0ca03e97c57ac4d",
+  "kernels": [
+    {
+      "kernel_id": "gemv_hfq4g256_residual_mq4v2",
+      "variant": "exact_four_stream",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "b574f33f47a03f3670f79fce4b84ea98a1191576",
+      "reg_plan": [
+        {
+          "name": "kernarg",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "matrix",
+          "kind": "s",
+          "base": 4,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "activation",
+          "kind": "s",
+          "base": 6,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "residual",
+          "kind": "s",
+          "base": 8,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "weight_resource",
+          "kind": "s",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar2",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar3",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar10",
+          "kind": "s",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar11",
+          "kind": "s",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar12",
+          "kind": "s",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar13",
+          "kind": "s",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar14",
+          "kind": "s",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar15",
+          "kind": "s",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar16",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar17",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar18",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar19",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar24",
+          "kind": "s",
+          "base": 24,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar25",
+          "kind": "s",
+          "base": 25,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar26",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar27",
+          "kind": "s",
+          "base": 27,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "lane",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "weight_lane_offset",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "packed_offset",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "load_offset",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "header0",
+          "kind": "v",
+          "base": 4,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "header1",
+          "kind": "v",
+          "base": 6,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "x_lo",
+          "kind": "v",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "x_hi",
+          "kind": "v",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "packed0",
+          "kind": "v",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "packed1",
+          "kind": "v",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "acc",
+          "kind": "v",
+          "base": 24,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "bcc",
+          "kind": "v",
+          "base": 28,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "dot",
+          "kind": "v",
+          "base": 32,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "selected_header",
+          "kind": "v",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "nibble",
+          "kind": "v",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "weight",
+          "kind": "v",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "shuffle_addr",
+          "kind": "v",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "shuffle_data",
+          "kind": "v",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "output_offset",
+          "kind": "v",
+          "base": 40,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "old_y",
+          "kind": "v",
+          "base": 41,
+          "len": 2,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 43,
+      "next_free_sgpr": 28,
+      "waits": [
+        {
+          "pc_index": 2,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 7,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 44,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 49,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 89,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 136,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 141,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 181,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 228,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 233,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 273,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 320,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 325,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 365,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 418,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 423,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 463,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 512,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 517,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 557,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 606,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 611,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 651,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 693,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 699,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 705,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 711,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 717,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 723,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 729,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 735,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 741,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 747,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 757,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 761,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 765,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 768,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 35,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 127,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 132,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 219,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 224,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 311,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 316,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 409,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 414,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 503,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 508,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 597,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 602,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 752,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [
+        {
+          "head": ".Lres_quad",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "a55c6de39c90a3e24a5adcbb349e85c72aeb2ab126862889a0ca03e97c57ac4d"
+    }
+  ]
+}
