@@ -174,6 +174,15 @@ pub fn pool_nonempty(m: &LoadedModel) -> bool {
     store(m).is_some_and(|s| !s.prefix_pool.is_empty())
 }
 
+/// A kept conversation awaits its client commit. The singleton serves the
+/// next request only after the previous turn's decision (its conversation
+/// and verbatim assistant turn land then); batch admission holds while
+/// this is true for the same reason — serve answers the client at
+/// `commit_ready`, so its next turn can arrive before the commit.
+pub fn pool_pending(m: &LoadedModel) -> bool {
+    store(m).is_some_and(|s| s.prefix_pool.iter().any(|e| e.pending.is_some()))
+}
+
 /// Drop the least recently stored committed entry. `false` when none.
 fn evict_one(store: &mut Qwen35VmmStore, gpu: &mut rdna_compute::Gpu) -> bool {
     let Some(i) = store

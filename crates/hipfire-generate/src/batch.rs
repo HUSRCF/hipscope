@@ -2795,7 +2795,11 @@ pub fn drive_qwen_vmm_continuous_batch(
                 return Ok(());
             }
         }
-        while let Some((key, ticket)) = sched.try_assign_one() {
+        // Admission waits for kept conversations' client decisions
+        // (`vmm_conv::pool_pending`): the singleton never renders or picks a
+        // cache before the previous turn commits.
+        let hold = keep_conversations && crate::vmm_conv::pool_pending(model);
+        while let Some((key, ticket)) = (!hold).then(|| sched.try_assign_one()).flatten() {
             let lane_idx = ticket.lane;
             let Some(pending_req) = sched.pending.get(&key).cloned() else {
                 continue;
