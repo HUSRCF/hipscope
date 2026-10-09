@@ -27,6 +27,8 @@ fn build_dog_g0() -> Result<Emitted, String> {
         regs.v::<4>(name, base, Live::Whole)?;
     }
     regs.v::<2>("results",24, Live::Whole)?;
+    regs.v::<1>("shuffle_address",26, Live::Whole)?;
+    regs.v::<1>("shuffle_result",27, Live::Whole)?;
     let mut b = Builder::new(KernelSpec {
         kernel_id: "gemv_hfq4g256_residual_mq4v2".into(), variant: "dog_g0_only".into(),
         arch: Arch::Gfx1201, symbol: G0_SYMBOL.into(),
@@ -58,6 +60,31 @@ fn build_dog_g0() -> Result<Emitted, String> {
             let weight=16+nibble;
             let (mnemonic,uses)=if step==0 {("v_mul_f32_e32",vec![V::<1>(x).reg(),V::<1>(weight).reg()])} else {("v_fmac_f32_e32",vec![V::<1>(x).reg(),V::<1>(weight).reg(),V::<1>(result).reg()])};
             b.push(Instruction::new(format!("{mnemonic} v{result}, v{x}, v{weight}"),vec![V::<1>(result).reg()],uses))?;
+        }
+    }
+    // Frozen shfl-down lowering: force bit 4 for offset 16; for subsequent
+    // steps an out-of-range source lane reads itself, not a wrapped lane.
+    for result in [24u8,25] {
+        b.ds_crosslane(Instruction::new(
+            format!("ds_swizzle_b32 v27, v{result} offset:0x20f"),
+            vec![V::<1>(27).reg()],vec![V::<1>(result).reg()],
+        ).memory(MemoryClass::DsLoad))?;
+        b.wait(crate::ledger::Counter::Ds,0)?;
+        b.push(Instruction::new(format!("v_add_f32_e32 v{result}, v{result}, v27"),
+            vec![V::<1>(result).reg()],vec![V::<1>(result).reg(),V::<1>(27).reg()]))?;
+        for offset in [8u8,4,2,1] {
+            b.push(Instruction::new(format!("v_cmp_gt_u32_e32 vcc_lo, {}, v0",32-offset),
+                vec![],vec![V::<1>(0).reg()]))?;
+            b.push(Instruction::new(format!("v_cndmask_b32_e64 v26, 0, {offset}, vcc_lo"),
+                vec![V::<1>(26).reg()],vec![]))?;
+            b.push(Instruction::new("v_add_lshl_u32 v26, v26, v0, 2",
+                vec![V::<1>(26).reg()],vec![V::<1>(26).reg(),V::<1>(0).reg()]))?;
+            b.ds_crosslane(Instruction::new(format!("ds_bpermute_b32 v27, v26, v{result}"),
+                vec![V::<1>(27).reg()],vec![V::<1>(26).reg(),V::<1>(result).reg()]
+            ).memory(MemoryClass::DsLoad))?;
+            b.wait(crate::ledger::Counter::Ds,0)?;
+            b.push(Instruction::new(format!("v_add_f32_e32 v{result}, v{result}, v27"),
+                vec![V::<1>(result).reg()],vec![V::<1>(result).reg(),V::<1>(27).reg()]))?;
         }
     }
     b.push(Instruction::new("global_store_b64 v2, v[24:25], s[6:7]",vec![],vec![V::<1>(2).reg(),V::<2>(24).reg(),S::<2>(6).reg()]).memory(MemoryClass::VmemStore))?;
