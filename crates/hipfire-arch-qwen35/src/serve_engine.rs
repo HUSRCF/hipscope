@@ -1434,9 +1434,11 @@ impl Rig {
                     },
                 )
                 .transpose()?;
+        // Capture-only: the batched verify is repaired per layer by
+        // `mtp_dn_repair_from_tape`, never by `GdnTape::replay_gdn`.
         let spec_verify_tape = if (mtp_head.is_some() && mtp_k > 0) || dflash.is_some() {
             Some(
-                crate::speculative::GdnTape::new_for_config(
+                crate::speculative::GdnTape::new_capture_only(
                     &mut gpu,
                     &config,
                     cfg.n_slots * spec_rows,

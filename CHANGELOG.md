@@ -19,6 +19,7 @@
   `HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out; only exact extensions of the active committed
   token record are accepted. Byte-identical echoes and retired-MTP guards remain
   unchanged; uncertain candidates retain the safe miss. No measured speed claim.
+- **GDN replay route no longer depends on memory pressure (exactness fix):** the gfx1201 multi-layer GDN tape replay (and the D8 snapshot-source tables) armed lazily at a tape's first accept, and an allocation failure there silently moved that tape to the per-layer replay for life, which commits different DeltaNet bytes on the production model. `GdnTape::new_for_config` now arms the tables when the tape is built, so an allocation failure refuses the lane or request at provision with a logged error; an admitted replay never falls back. The serve engine's batched verify tape, which is repaired per layer and never replayed, is built with `GdnTape::new_capture_only`. `HIPFIRE_GDN_REPLAY_ML_OFF=1` stays an explicit diagnostic opt-in and is documented as not byte-identical. `GpuPool::alloc` now returns its free lists to HIP and retries once when `hipMalloc` runs out of memory (freed scratch parked in the pool is invisible to HIP; 9 GiB in the reproduction). `DeltaNetSnapshot::new_for` frees partial buffers on a mid-way failure, and `take_dn_checkpoint` logs a skipped checkpoint and frees the snapshot when its save fails. Open: the per-layer `replay_gdn_inner` is still not byte-identical to the multi-layer replay.
 
 
 ## v0.4.1.1 — release draft

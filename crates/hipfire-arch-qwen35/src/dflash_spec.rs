@@ -227,14 +227,14 @@ fn alloc_dflash_owners(
             return Err(format!("DeltaNetSnapshot::new_for: {e}"));
         }
     };
-    let gdn_tape = match GdnTape::new_for_config(gpu, target_config, tape_max_n) {
+    let gdn_tape = match GdnTape::new_for_dflash(gpu, target_config, tape_max_n) {
         Ok(v) => v,
         Err(e) => {
             target_snap.free_gpu(gpu);
             verify_scratch.free_gpu(gpu);
             hidden_rb.free_gpu(gpu);
             draft_scratch.free_gpu(gpu);
-            return Err(format!("GdnTape::new_for_config: {e}"));
+            return Err(format!("GdnTape::new_for_dflash: {e}"));
         }
     };
     let target_hidden_host = vec![0.0f32; ring_positions * target_config.dim];

@@ -138,10 +138,30 @@ pub fn table_bytes<T: Copy>(rows: &[T]) -> &[u8] {
 }
 
 impl Gpu {
-    /// Host-side eligibility shared by both launchers: exact gfx1201, the
-    /// `HIPFIRE_GDN_REPLAY_ML_OFF` opt-out, no open Redline recording, the
-    /// fast (single-end requant) GDN kernel, head_dim 128, GQA divisibility,
-    /// and 1 <= n_steps <= 16.
+    /// Process-static part of [`Self::gdn_replay_ml_eligible`]: exact
+    /// gfx1201, the `HIPFIRE_GDN_REPLAY_ML_OFF` opt-out, the fast
+    /// (single-end requant) GDN kernel, head_dim 128 and GQA divisibility.
+    /// A replay tape arms its multi-layer tables at construction iff this
+    /// holds, so the replay route never depends on later memory pressure.
+    pub fn gdn_replay_ml_supported(
+        &self,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> bool {
+        self.arch_caps.is_gfx1201()
+            && !self.flags.gdn_replay_ml_off
+            && !crate::norm::dn_requant_per_token()
+            && key_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
+            && value_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
+            && n_key_heads > 0
+            && n_v_heads % n_key_heads == 0
+    }
+
+    /// Host-side eligibility shared by both launchers:
+    /// [`Self::gdn_replay_ml_supported`], no open Redline recording, and
+    /// 1 <= n_steps <= 16.
     pub fn gdn_replay_ml_eligible(
         &self,
         n_v_heads: usize,
@@ -150,14 +170,8 @@ impl Gpu {
         value_head_dim: usize,
         n_steps: usize,
     ) -> bool {
-        self.arch_caps.is_gfx1201()
-            && !self.flags.gdn_replay_ml_off
+        self.gdn_replay_ml_supported(n_v_heads, n_key_heads, key_head_dim, value_head_dim)
             && !self.replay.is_recording()
-            && !crate::norm::dn_requant_per_token()
-            && key_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
-            && value_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
-            && n_key_heads > 0
-            && n_v_heads % n_key_heads == 0
             && (1..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&n_steps)
     }
 

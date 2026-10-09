@@ -1409,23 +1409,30 @@ impl DeltaNetSnapshot {
     }
 
     /// Allocate backup buffers matching `state`'s shapes (incl. EF residual).
+    /// A mid-way allocation failure frees the buffers already allocated.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
-        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
-        for t in &state.s_matrices {
-            s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        let families = [
+            &state.s_matrices,
+            &state.s_scales,
+            &state.conv_states,
+            &state.s_ef_residual,
+        ];
+        let mut bufs: [Vec<DeviceBuffer>; 4] = Default::default();
+        for (i, src) in families.into_iter().enumerate() {
+            bufs[i].reserve_exact(src.len());
+            for t in src {
+                match gpu.hip.malloc(t.buf.size()) {
+                    Ok(b) => bufs[i].push(b),
+                    Err(e) => {
+                        for b in bufs.into_iter().flatten() {
+                            let _ = gpu.hip.free(b);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
         }
-        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
-        for t in &state.s_scales {
-            s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
-        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
-        for t in &state.conv_states {
-            conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
-        let mut s_ef_residual_bufs = Vec::with_capacity(state.s_ef_residual.len());
-        for t in &state.s_ef_residual {
-            s_ef_residual_bufs.push(gpu.hip.malloc(t.buf.size())?);
-        }
+        let [s_matrix_bufs, s_scale_bufs, conv_state_bufs, s_ef_residual_bufs] = bufs;
         let mut snap = Self {
             s_matrix_bufs,
             s_scale_bufs,
@@ -1749,14 +1756,78 @@ pub struct GdnTape {
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
-    /// Railgun E0 / L6c multi-layer replay state (gfx1201). `None` until the
-    /// first eligible replay arms it; `Some(None)` when arming failed (the
-    /// per-layer path then runs for the life of the tape).
-    replay_ml: std::sync::Mutex<Option<Option<GdnReplayMl>>>,
+    /// Railgun E0 / L6c multi-layer replay state (gfx1201). Armed by
+    /// [`Self::new_for_config`] whenever the process supports the route
+    /// (`Gpu::gdn_replay_ml_supported`); `None` for a capture-only tape or an
+    /// unsupported process. An admitted replay on an unarmed tape is an
+    /// error, never a silent switch to the per-layer route.
+    replay_ml: std::sync::Mutex<Option<GdnReplayMl>>,
 }
 
 impl GdnTape {
+    /// Replay tape: [`Self::new_capture_only`] plus the multi-layer replay
+    /// tables, armed here so an allocation failure refuses the tape at
+    /// provision/admission instead of changing the committed DeltaNet
+    /// numerics at a later accept. Any failure frees everything allocated
+    /// and returns the error.
     pub fn new_for_config(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        Self::new_armed(gpu, config, max_n, false)
+    }
+
+    /// DFlash replay tape: [`Self::new_for_config`] plus, when
+    /// `HIPFIRE_DN_SNAPSHOT_FLIP` is on, the D8 snapshot-source tables that
+    /// [`Self::replay_gdn_from_snapshot`] needs.
+    pub fn new_for_dflash(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        Self::new_armed(gpu, config, max_n, gpu.flags.dn_snapshot_flip)
+    }
+
+    fn new_armed(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        max_n: usize,
+        with_from: bool,
+    ) -> HipResult<Self> {
+        let mut tape = Self::new_capture_only(gpu, config, max_n)?;
+        let n_la = tape.qkv_bufs.len();
+        if n_la != 0
+            && gpu.gdn_replay_ml_supported(
+                tape.n_v_heads,
+                tape.n_key_heads,
+                tape.key_head_dim,
+                tape.value_head_dim,
+            )
+        {
+            match GdnReplayMl::arm(gpu, n_la, max_n, tape.v_dim, with_from) {
+                Ok(ml) => *tape.replay_ml.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(ml),
+                Err(e) => {
+                    eprintln!(
+                        "GdnTape: arming the multi-layer GDN replay failed ({e}); \
+                         refusing the tape (n_la={n_la} max_n={max_n} d8={with_from})"
+                    );
+                    tape.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(tape)
+    }
+
+    /// Capture-only tape: the per-layer qkv/α/β capture buffers and the
+    /// per-layer replay scratch, without the multi-layer replay tables. For
+    /// tapes that are only written by a verify forward and read by an
+    /// explicit per-layer repair (the serve engine's batched verify tape);
+    /// [`Self::replay_gdn`] on it fails wherever the multi-layer route
+    /// would be admitted. A mid-way allocation failure frees what was
+    /// allocated.
+    pub fn new_capture_only(
         gpu: &mut Gpu,
         config: &qwen35::Qwen35Config,
         max_n: usize,
@@ -1772,13 +1843,41 @@ impl GdnTape {
             .filter(|t| **t == qwen35::LayerType::LinearAttention)
             .count();
 
+        // Per layer (qkv, α, β), then the six replay scratches, in the
+        // historical allocation order.
+        let mut sizes = Vec::with_capacity(3 * n_la_layers + 6);
+        for _ in 0..n_la_layers {
+            sizes.extend([max_n * qkv_dim, max_n * n_v_heads, max_n * n_v_heads]);
+        }
+        sizes.extend([
+            max_n * k_dim,
+            max_n * k_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+            max_n * v_dim,
+        ]);
+        let mut bufs = Vec::with_capacity(sizes.len());
+        for n in sizes {
+            match gpu.alloc_tensor(&[n], rdna_compute::DType::F32) {
+                Ok(t) => bufs.push(t),
+                Err(e) => {
+                    for t in bufs {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("allocated above");
         let mut qkv_bufs = Vec::with_capacity(n_la_layers);
         let mut alpha_bufs = Vec::with_capacity(n_la_layers);
         let mut beta_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
-            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
-            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            qkv_bufs.push(next());
+            alpha_bufs.push(next());
+            beta_bufs.push(next());
         }
 
         Ok(Self {
@@ -1793,12 +1892,12 @@ impl GdnTape {
             qkv_bufs,
             alpha_bufs,
             beta_bufs,
-            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            q_raw_scratch: next(),
+            k_raw_scratch: next(),
+            v_scratch: next(),
+            q_scratch: next(),
+            k_scratch: next(),
+            attn_scratch: next(),
             replay_ml: std::sync::Mutex::new(None),
         })
     }
@@ -1818,7 +1917,7 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.q_scratch);
         let _ = gpu.free_tensor(self.k_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
-        if let Some(Some(ml)) = self
+        if let Some(ml) = self
             .replay_ml
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -1901,7 +2000,7 @@ impl GdnTape {
         Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>,
     ) {
         let n_la = self.qkv_bufs.len();
-        let row = self.max_n * self.v_dim * 4;
+        let row = ml.rows * self.v_dim * 4;
         let mut pre = Vec::with_capacity(n_la);
         let mut gdn = Vec::with_capacity(n_la);
         let mut la_idx = 0usize;
@@ -1946,10 +2045,12 @@ impl GdnTape {
 
     /// Railgun E0 / L6c: two-launch replay of every LA layer (preamble, then
     /// recurrence) over device pointer tables. Returns `Ok(false)` — the
-    /// caller then runs the per-layer launches — when the route is
+    /// caller then runs the per-layer launches — only when the route is
     /// ineligible (arch, opt-out, open Redline recording, quant/requant mode,
-    /// dims, step count) or arming failed. Byte parity with the per-layer
-    /// path is gated by `test_dflash_replay_ml`.
+    /// dims, step count). An admitted replay on a tape whose tables were not
+    /// armed at construction (a capture-only tape) is an error: the
+    /// per-layer route is not byte-identical to this one on the production
+    /// model, so it is never a silent fallback.
     fn replay_gdn_ml(
         &self,
         gpu: &mut Gpu,
@@ -1963,11 +2064,8 @@ impl GdnTape {
         }
         let n_la = self.qkv_bufs.len();
         let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
-        }
-        let Some(Some(ml)) = guard.as_mut() else {
-            return Ok(false);
+        let Some(ml) = guard.as_mut() else {
+            return Err(Self::unarmed_error("multi-layer"));
         };
         let fp = Self::replay_ml_fingerprint(weights, config, dn_state);
         if ml.fingerprint != Some(fp) {
@@ -2034,8 +2132,9 @@ impl GdnTape {
     /// load addresses changed), without the restore copy, and `snap` is not
     /// written, so it stays the pre-window state that terminal repair
     /// restores. Returns `Ok(false)` without touching any state when
-    /// [`Self::replay_from_snapshot_admits`] is false or arming failed; the
-    /// caller then restores and replays in place.
+    /// [`Self::replay_from_snapshot_admits`] is false; the caller then
+    /// restores and replays in place. An admitted call on a tape without
+    /// armed snapshot-source tables is an error and touches no state.
     #[allow(clippy::too_many_arguments)]
     pub fn replay_gdn_from_snapshot(
         &self,
@@ -2051,18 +2150,9 @@ impl GdnTape {
         }
         let n_la = self.qkv_bufs.len();
         let mut guard = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(GdnReplayMl::arm(gpu, n_la, self.max_n, self.v_dim));
-        }
-        let Some(Some(ml)) = guard.as_mut() else {
-            return Ok(false);
+        let Some(ml) = guard.as_mut().filter(|ml| ml.from.is_some()) else {
+            return Err(Self::unarmed_error("snapshot-source (D8)"));
         };
-        if ml.from.is_none() {
-            ml.from = Some(GdnReplayMlFrom::arm(gpu, n_la));
-        }
-        if !matches!(ml.from, Some(Some(_))) {
-            return Ok(false);
-        }
         let fp = {
             let mut h = Self::replay_ml_fingerprint(weights, config, dn_state);
             for buf in snap.backup_buffers() {
@@ -2071,7 +2161,7 @@ impl GdnTape {
             }
             h
         };
-        let stale = ml.from.as_ref().and_then(|f| f.as_ref()).map(|f| f.fingerprint) != Some(Some(fp));
+        let stale = ml.from.as_ref().map(|f| f.fingerprint) != Some(Some(fp));
         if stale {
             let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
             let pre: Vec<_> = pre
@@ -2095,8 +2185,8 @@ impl GdnTape {
                         .map_or(0, |b| b.as_ptr() as u64),
                 })
                 .collect();
-            let Some(Some(from)) = ml.from.as_mut() else {
-                unreachable!("armed above")
+            let Some(from) = ml.from.as_mut() else {
+                unreachable!("armed at construction")
             };
             // Tables may still be read by an in-flight replay: drain first.
             if from.fingerprint.is_some() {
@@ -2112,8 +2202,8 @@ impl GdnTape {
             )?;
             from.fingerprint = Some(fp);
         }
-        let Some(Some(from)) = ml.from.as_ref() else {
-            unreachable!("armed above")
+        let Some(from) = ml.from.as_ref() else {
+            unreachable!("armed at construction")
         };
         let hd = self.key_head_dim;
         gpu.dflash_gdn_replay_pre_ml_from(
@@ -2394,14 +2484,27 @@ impl GdnTape {
         }
         Ok(())
     }
+
+    fn unarmed_error(route: &str) -> HipError {
+        HipError::new(
+            0,
+            &format!(
+                "GdnTape: the {route} GDN replay is admitted but its tables were not armed at \
+                 construction (capture-only tape); refusing to commit DeltaNet state through \
+                 the per-layer route"
+            ),
+        )
+    }
 }
 
 /// Railgun E0 / L6c: device state of the multi-layer replay. Each LA layer
-/// owns rows `[la * max_n * v_dim, (la + 1) * max_n * v_dim)` of the q/k/v
+/// owns rows `[la * rows * v_dim, (la + 1) * rows * v_dim)` of the q/k/v
 /// preamble outputs and of the (dead) recurrence output, so all layers run
-/// concurrently without sharing scratch. `fingerprint` is `None` until the
+/// concurrently without sharing scratch. `rows` is the tape's `max_n`
+/// capped at the route's step ceiling. `fingerprint` is `None` until the
 /// tables are first written.
 struct GdnReplayMl {
+    rows: usize,
     q: GpuTensor,
     k: GpuTensor,
     v: GpuTensor,
@@ -2409,10 +2512,9 @@ struct GdnReplayMl {
     pre_table: DeviceBuffer,
     gdn_table: DeviceBuffer,
     fingerprint: Option<u64>,
-    /// Railgun D8 snapshot-source tables. `None` until the first D8 replay
-    /// arms them; `Some(None)` when arming failed (D8 then restores and
-    /// replays in place for the life of the tape).
-    from: Option<Option<GdnReplayMlFrom>>,
+    /// Railgun D8 snapshot-source tables; armed by
+    /// [`GdnTape::new_for_dflash`] when `HIPFIRE_DN_SNAPSHOT_FLIP` is on.
+    from: Option<GdnReplayMlFrom>,
 }
 
 /// Railgun D8: device tables of [`GdnTape::replay_gdn_from_snapshot`]
@@ -2427,21 +2529,22 @@ struct GdnReplayMlFrom {
 
 impl GdnReplayMlFrom {
     /// JIT both snapshot-source kernels and allocate the two tables. Any
-    /// failure frees what was allocated and returns `None`.
-    fn arm(gpu: &mut Gpu, n_la: usize) -> Option<Self> {
-        if gpu.ensure_dflash_gdn_replay_ml_from().is_err() {
-            return None;
-        }
+    /// failure frees what was allocated and returns the error.
+    fn arm(gpu: &mut Gpu, n_la: usize) -> HipResult<Self> {
+        gpu.ensure_dflash_gdn_replay_ml_from()?;
         let pre_bytes = n_la
             * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
         let gdn_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
-        let pre_table = gpu.hip.malloc(pre_bytes).ok()?;
-        let Ok(gdn_table) = gpu.hip.malloc(gdn_bytes) else {
-            let _ = gpu.hip.free(pre_table);
-            return None;
+        let pre_table = gpu.hip.malloc(pre_bytes)?;
+        let gdn_table = match gpu.hip.malloc(gdn_bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = gpu.hip.free(pre_table);
+                return Err(e);
+            }
         };
-        Some(Self {
+        Ok(Self {
             pre_table,
             gdn_table,
             fingerprint: None,
@@ -2455,22 +2558,28 @@ impl GdnReplayMlFrom {
 }
 
 impl GdnReplayMl {
-    /// Allocate scratch + tables and JIT both kernels. Any failure frees what
-    /// was allocated and returns `None`: the tape stays on the per-layer path.
-    fn arm(gpu: &mut Gpu, n_la: usize, max_n: usize, v_dim: usize) -> Option<Self> {
-        if gpu.ensure_dflash_gdn_replay_ml().is_err() {
-            return None;
-        }
-        let n = n_la * max_n * v_dim;
+    /// JIT both kernels and allocate scratch + tables, plus the D8
+    /// snapshot-source tables when `with_from`. Any failure frees what was
+    /// allocated and returns the error.
+    fn arm(
+        gpu: &mut Gpu,
+        n_la: usize,
+        max_n: usize,
+        v_dim: usize,
+        with_from: bool,
+    ) -> HipResult<Self> {
+        gpu.ensure_dflash_gdn_replay_ml()?;
+        let rows = max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS);
+        let n = n_la * rows * v_dim;
         let mut tensors = Vec::with_capacity(4);
         for _ in 0..4 {
             match gpu.alloc_tensor(&[n], DType::F32) {
                 Ok(t) => tensors.push(t),
-                Err(_) => {
+                Err(e) => {
                     for t in tensors {
                         let _ = gpu.free_tensor(t);
                     }
-                    return None;
+                    return Err(e);
                 }
             }
         }
@@ -2488,26 +2597,38 @@ impl GdnReplayMl {
                     Err(e)
                 }
             });
-        let Ok((pre_table, gdn_table)) = tables else {
-            for t in tensors {
-                let _ = gpu.free_tensor(t);
+        let (pre_table, gdn_table) = match tables {
+            Ok(t) => t,
+            Err(e) => {
+                for t in tensors {
+                    let _ = gpu.free_tensor(t);
+                }
+                return Err(e);
             }
-            return None;
         };
-        let out = tensors.pop()?;
-        let v = tensors.pop()?;
-        let k = tensors.pop()?;
-        let q = tensors.pop()?;
-        Some(Self {
-            q,
-            k,
-            v,
-            out,
+        let mut tensors = tensors.into_iter();
+        let mut next = || tensors.next().expect("allocated above");
+        let mut ml = Self {
+            rows,
+            q: next(),
+            k: next(),
+            v: next(),
+            out: next(),
             pre_table,
             gdn_table,
             fingerprint: None,
             from: None,
-        })
+        };
+        if with_from {
+            match GdnReplayMlFrom::arm(gpu, n_la) {
+                Ok(from) => ml.from = Some(from),
+                Err(e) => {
+                    ml.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ml)
     }
 
     fn free_gpu(self, gpu: &mut Gpu) {
@@ -2516,7 +2637,7 @@ impl GdnReplayMl {
         }
         let _ = gpu.hip.free(self.pre_table);
         let _ = gpu.hip.free(self.gdn_table);
-        if let Some(Some(from)) = self.from {
+        if let Some(from) = self.from {
             from.free_gpu(gpu);
         }
     }
@@ -3674,21 +3795,21 @@ pub fn dflash_greedy_accept_commit_parts(
         df.target_snap.restore_to(target.dn_state, gpu)?;
     }
     if let Some(tape) = tape {
-        let done = keep_verified
-            || (replay_from_snapshot
-                && tape.replay_gdn_from_snapshot(
+        // The tables are armed with the tape, so an admitted snapshot-source
+        // replay runs or errors; it never falls back to another route.
+        if replay_from_snapshot {
+            if !keep_verified {
+                let replayed = tape.replay_gdn_from_snapshot(
                     gpu,
                     target.weights,
                     target.config,
                     target.dn_state,
                     &df.target_snap,
                     accept_len + 1,
-                )?);
-        if !done {
-            if replay_from_snapshot {
-                // Arming the snapshot-source tables failed: restore after all.
-                df.target_snap.restore_to(target.dn_state, gpu)?;
+                )?;
+                debug_assert!(replayed, "admitted above");
             }
+        } else {
             tape.replay_gdn(
                 gpu,
                 target.weights,
@@ -7042,21 +7163,21 @@ pub fn spec_step_dflash(
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
     if let Some(tape) = gdn_tape_opt.as_deref() {
-        let done = keep_verified
-            || (replay_from_snapshot
-                && tape.replay_gdn_from_snapshot(
+        // The tables are armed with the tape, so an admitted snapshot-source
+        // replay runs or errors; it never falls back to another route.
+        if replay_from_snapshot {
+            if !keep_verified {
+                let replayed = tape.replay_gdn_from_snapshot(
                     gpu,
                     &target.weights,
                     &target.config,
                     &mut target.dn_state,
                     target_snap,
                     accept_len + 1,
-                )?);
-        if !done {
-            if replay_from_snapshot {
-                // Arming the snapshot-source tables failed: restore after all.
-                target_snap.restore_to(&mut target.dn_state, gpu)?;
+                )?;
+                debug_assert!(replayed, "admitted above");
             }
+        } else {
             tape.replay_gdn(
                 gpu,
                 &target.weights,
@@ -9678,10 +9799,17 @@ pub fn take_dn_checkpoint(
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}");
+                return;
+            }
         }
     };
-    if snap.save_from(dn, gpu).is_err() {
+    if let Err(e) = snap.save_from(dn, gpu) {
+        // A recycled slot is partially overwritten, so it cannot rejoin the
+        // ring either way: free it.
+        eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot save failed: {e}");
+        snap.free_gpu(gpu);
         return;
     }
     cks.push((pos, snap));

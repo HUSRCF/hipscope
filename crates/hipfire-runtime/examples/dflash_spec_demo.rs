@@ -2026,7 +2026,7 @@ fn main() {
     // the tape is large enough whether we run per-path DFS, batched tree,
     // or plain DFlash.
     let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
-    let mut gdn_tape = hipfire_arch_qwen35::speculative::GdnTape::new_for_config(
+    let mut gdn_tape = hipfire_arch_qwen35::speculative::GdnTape::new_for_dflash(
         &mut gpu,
         &target.config,
         tape_max_n,
