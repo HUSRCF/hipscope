@@ -1471,6 +1471,228 @@ pub fn drive_qwen_continuous_batch(
 // dispatch stays on the unchanged singleton route (the daemon checks the
 // inbox); arrivals during a singleton generation wait for it to finish.
 
+// ── Singleton → VMM batch promotion ───────────────────────────────────
+
+/// What the daemon knows about a VMM-batch-eligible singleton request that
+/// the generate loops do not: set right before `generate()` only when the
+/// request could have joined the VMM batch (store staged, request eligible),
+/// cleared right after. Its presence is the sole permission to promote.
+#[derive(Clone)]
+pub struct PromotionPermit {
+    pub original_msg: serde_json::Value,
+    pub sampling: BatchSampling,
+    pub max_tokens: usize,
+    pub max_think_tokens: usize,
+    pub client_seed: Option<u64>,
+    pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+}
+
+/// A singleton generation stopped at a committed token boundary and moved
+/// into a batch admission (`singleton_handoff_to_batch`): its KV/DN owners,
+/// pending seed, RNG and sampling history, wire progress, semantic producer
+/// and loop guard. The VMM driver installs it as a Running lane under the
+/// same AttemptKey with no new `gen_start`.
+///
+/// `kind` records the decode mode it continues in. Stage 1 only has exact
+/// batched AR; a spec-mode lane (stage-2 batched verification) can resume
+/// from the same state without changing this hand-off.
+pub struct PromotedRequest {
+    pub pending: BatchPendingRequest,
+    pub progress: QwenBatchLane,
+    pub state: hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState,
+    pub producer: QwenArSemanticProducer,
+    pub loop_guard: hipfire_runtime::loop_guard::LoopGuard,
+    pub kind: PromotedDecode,
+    /// The pending seed was already streamed to the client (spec routes
+    /// emit at pick); the AR loop emits after the forward, so it was not.
+    pub seed_emitted: bool,
+}
+
+/// Decode mode a promoted lane continues in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotedDecode {
+    /// Continue as exact batched AR from the pending seed.
+    Ar,
+}
+
+thread_local! {
+    static PROMOTION_PERMIT: std::cell::RefCell<Option<PromotionPermit>> =
+        const { std::cell::RefCell::new(None) };
+    static PROMOTED: std::cell::RefCell<Option<PromotedRequest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Daemon: grant (Some) or clear (None) promotion for the next `generate()`.
+pub fn set_promotion_permit(permit: Option<PromotionPermit>) {
+    PROMOTION_PERMIT.with(|p| *p.borrow_mut() = permit);
+}
+
+/// Generate loops: the permit, if this request may promote.
+pub(crate) fn promotion_permit() -> Option<PromotionPermit> {
+    PROMOTION_PERMIT.with(|p| p.borrow().clone())
+}
+
+/// Generate loops: promote now — a serve-batched peer is waiting, or the
+/// developer reference `HIPFIRE_VMM_PROMOTE_AT=<n>` forces promotion at the
+/// first boundary with at least `n` generated tokens (no peer needed; the
+/// promoted request then runs alone in the VMM driver).
+pub(crate) fn promotion_wanted(generated: usize) -> bool {
+    static FORCED_AT: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_VMM_PROMOTE_AT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    hipfire_engine::scheduler::queued_batch_generates() > 0 || FORCED_AT.is_some_and(|n| generated >= n)
+}
+
+pub(crate) fn put_promoted(p: PromotedRequest) {
+    PROMOTED.with(|slot| *slot.borrow_mut() = Some(p));
+}
+
+/// Daemon, after `generate()` returns: the promoted request to drive.
+pub fn take_promoted() -> Option<PromotedRequest> {
+    PROMOTED.with(|slot| slot.borrow_mut().take())
+}
+
+/// Rebuild the AR semantic producer a spec-decoded request would have had:
+/// replay its committed tokens through a fresh producer with no client
+/// output (`io::sink`). Same filter/think/tool routers over the same bytes,
+/// so its held-back text and channel state match the spec emitter's.
+/// Returns the producer and the stream byte length; `Err` when replay hits
+/// a stop (the request is finishing — keep it on its own route).
+pub(crate) fn replay_ar_producer(
+    id: &str,
+    started_in_think: bool,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    committed: &[u32],
+) -> Result<(QwenArSemanticProducer, usize), String> {
+    let mut producer = QwenArSemanticProducer::new_with_tool_protocol(id.to_string(), started_in_think, false);
+    let mut bytes = Vec::new();
+    let mut sink = std::io::sink();
+    for (i, &t) in committed.iter().enumerate() {
+        let fed = bytes.len();
+        tokenizer.decode_token_bytes_into(t, &mut bytes);
+        let stopped = producer
+            .commit_and_classify(&mut sink, t, || (i, &bytes[fed..]), |_, _| {})
+            .map_err(|e| format!("producer replay: {e}"))?;
+        if stopped {
+            return Err("producer replay reached a stop".into());
+        }
+    }
+    Ok((producer, bytes.len()))
+}
+
+/// Singleton loop state at a committed token boundary: the next row to feed
+/// is `pending_seed` at `position`.
+pub(crate) struct SingletonBoundary<'a> {
+    pub id: &'a str,
+    pub permit: PromotionPermit,
+    pub config: &'a hipfire_arch_qwen35::qwen35::Qwen35Config,
+    pub kv: &'a mut hipfire_runtime::llama::KvCache,
+    pub dn: &'a mut hipfire_arch_qwen35::qwen35::DeltaNetState,
+    pub position: usize,
+    pub pending_seed: u32,
+    pub sampler: hipfire_runtime::sampler::SamplerConfig,
+    pub rng_state: u32,
+    /// The singleton's sampling scope (penalty/attractor history).
+    pub history: Vec<u32>,
+    pub prompt_len: usize,
+    pub conversation_tokens: Vec<u32>,
+    pub streamed_tokens: Vec<u32>,
+    pub bytes_fed_to_filter: usize,
+    pub created_at: Instant,
+    pub prefill_done_at: Instant,
+    pub first_token_at: Option<Instant>,
+    pub started_in_think: bool,
+}
+
+/// Move a singleton generation into a batch admission: allocate a request
+/// owner, transfer the terminal transaction (`singleton_handoff_to_batch`),
+/// then swap the singleton's KV/DN owners into it (moves only). On `Err`
+/// nothing changed: the singleton keeps its state and transaction. The
+/// caller adds its producer and loop guard and hands the result to the
+/// daemon via [`put_promoted`]; the bundle then holds a fresh, empty owner
+/// and its conversation cache must be invalidated by the caller.
+pub(crate) fn promote_singleton(
+    gpu: &mut rdna_compute::Gpu,
+    b: SingletonBoundary<'_>,
+) -> Result<(BatchPendingRequest, QwenBatchLane, hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState), String> {
+    use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, VmmRequestInit};
+    use hipfire_runtime::slot_batch::RequestEpoch;
+    let attempt_id = active_attempt_id();
+    let placeholder = RequestEpoch {
+        request_tag: 0,
+        owner_generation: 1,
+    };
+    let mut state = Qwen35RequestState::new_like(
+        gpu,
+        b.config,
+        b.kv,
+        b.dn,
+        placeholder,
+        0,
+        VmmRequestInit {
+            prompt_len: b.position,
+            stop_ids: Vec::new(),
+            sampler: b.sampler,
+            rng_state: b.rng_state,
+            history: b.history,
+        },
+    )?;
+    if let Err(e) = state.copy_dn_from(gpu, b.dn) {
+        let freed = state.free_gpu(gpu);
+        return Err(format!("{e}; free: {freed:?}"));
+    }
+    let Some(admission) = singleton_handoff_to_batch(b.id, attempt_id) else {
+        let freed = state.free_gpu(gpu);
+        return Err(format!("terminal transaction not transferable; free: {freed:?}"));
+    };
+    std::mem::swap(&mut state.kv, b.kv);
+    // The singleton keeps its DN objects (copied above); clear them for its
+    // next request, whose KV owner is now the fresh empty one.
+    if let Err(e) = b.dn.reset(gpu) {
+        eprintln!("[vmm-promote] singleton DN reset after promotion: {e}");
+    }
+    state.position = b.position;
+    state.pending_seed = Some(b.pending_seed);
+    let key = AttemptKey::new(b.id, attempt_id);
+    let pending = BatchPendingRequest {
+        key: key.clone(),
+        admission,
+        original_msg: b.permit.original_msg,
+        prompt: String::new(),
+        prompt_tokens: Vec::new(),
+        started_in_think: b.started_in_think,
+        system: None,
+        assistant_prefix: b.permit.assistant_prefix,
+        max_think_tokens: b.permit.max_think_tokens,
+        max_tokens: b.permit.max_tokens,
+        client_seed: b.permit.client_seed,
+        sampling: b.permit.sampling.clone(),
+    };
+    let progress = QwenBatchLane {
+        key,
+        ticket: LaneTicket {
+            lane: usize::MAX,
+            generation: u64::MAX,
+            admission,
+        },
+        sampling: b.permit.sampling,
+        prompt_len: b.prompt_len,
+        seq_pos: b.position,
+        next_token: Some(b.pending_seed),
+        rng_state: u64::from(b.rng_state),
+        conversation_tokens: b.conversation_tokens,
+        streamed_tokens: b.streamed_tokens,
+        bytes_fed_to_filter: b.bytes_fed_to_filter,
+        created_at: b.created_at,
+        prefill_done_at: Some(b.prefill_done_at),
+        first_token_at: b.first_token_at,
+        max_active_lanes: 1,
+    };
+    Ok((pending, progress, state))
+}
+
 fn vmm_bundle(
     state: &mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
 ) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
@@ -1537,6 +1759,7 @@ pub fn drive_qwen_vmm_continuous_batch(
     params: VmmBatchParams,
     stdout: &mut std::io::Stdout,
     inbox: &mut DaemonInbox,
+    promoted: Option<PromotedRequest>,
 ) -> Result<(), BatchDriveError> {
     use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::slot_batch::{BatchPlanner, RequestEpoch};
@@ -1703,6 +1926,98 @@ pub fn drive_qwen_vmm_continuous_batch(
         }
         Err(BatchDriveError::Gpu(reason))
     };
+
+    let mut unemitted_seed: Option<(RequestEpoch, u32)> = None;
+    // ── Promoted singleton: install as a Running lane, no new gen_start ──
+    if let Some(p) = promoted {
+        let PromotedRequest {
+            pending,
+            progress,
+            mut state,
+            producer,
+            loop_guard,
+            kind,
+            seed_emitted,
+        } = p;
+        let key = pending.key.clone();
+        let admission = pending.admission;
+        let position = state.position;
+        let seed = state.pending_seed;
+        announced.borrow_mut().insert(key.clone());
+        let mut installed: Result<usize, String> = Err("not installed".into());
+        let ticket = match (seed, kind) {
+            (None, _) => {
+                installed = Err("promoted request has no pending seed".into());
+                None
+            }
+            (Some(_), PromotedDecode::Ar) => sched.adopt_running(pending, progress),
+        };
+        if let (Some(ticket), Some(seed)) = (ticket, seed) {
+            let lane = ticket.lane;
+            let epoch = RequestEpoch {
+                request_tag: ticket.generation,
+                owner_generation: ticket.generation.wrapping_add(1).max(1),
+            };
+            state.epoch = epoch;
+            state.slot = lane;
+            state.stop_ids = stop_ids.clone();
+            installed = match vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_mut()) {
+                None => Err("store not staged".into()),
+                Some(store) => match store.admit(state) {
+                    Ok(()) => Ok(lane),
+                    Err((state, e)) => {
+                        let freed = state.free_gpu(gpu);
+                        Err(format!("{e}; free: {freed:?}"))
+                    }
+                },
+            };
+            if installed.is_ok() {
+                epochs[lane] = epoch;
+                work[lane] = PendingWork {
+                    remaining_prompt: vec![seed],
+                    next_pos: position,
+                    decoding: true,
+                    ..idle_work(lane)
+                };
+                loop_guards[lane] = loop_guard;
+                producers[lane] = Some(producer);
+                if !seed_emitted {
+                    unemitted_seed = Some((epoch, seed));
+                }
+            }
+        } else {
+            let freed = state.free_gpu(gpu);
+            let why = match installed {
+                Err(e) if e != "not installed" => e,
+                _ => "no lane for the promoted request".to_string(),
+            };
+            installed = Err(format!("{why}; free: {freed:?}"));
+        }
+        if let Err(reason) = installed {
+            // The singleton's KV/DN left the bundle with the promotion; the
+            // request cannot continue anywhere. Fail it visibly.
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let ep = crate::common::RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            crate::common::emit_fail_closed_error_for_route(
+                route,
+                stdout,
+                Some(&key.id),
+                &format!("VMM promotion failed: {reason}"),
+                "internal",
+                false,
+                &ep,
+            );
+            let _ = stdout.flush();
+            if let Some(idx) = sched.lanes.iter().position(|l| l.key() == Some(&key)) {
+                let _ = sched.abort_lane(idx, &key, admission);
+            } else {
+                batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+            }
+        }
+    }
 
     loop {
         // ── Client terminal decisions (request state already retired) ──
@@ -2062,6 +2377,27 @@ pub fn drive_qwen_vmm_continuous_batch(
         };
         if let Err(e) = planner.publish(&mut work, &epochs, &plan, &advances) {
             return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
+        }
+        // A promoted request's pending seed was picked (but not emitted) by
+        // the singleton. Emit it after the step that wrote its K/V, ahead of
+        // the pick that step produced — the singleton's forward→emit order.
+        let mut advances = advances;
+        if let Some((ep, seed)) = unemitted_seed {
+            if let Some(at) = advances.iter().position(|a| a.epoch == ep) {
+                let committed_position = advances[at].committed_position;
+                advances.insert(
+                    at,
+                    hipfire_runtime::slot_batch::RequestAdvance {
+                        epoch: ep,
+                        committed_ids: vec![seed],
+                        committed_position,
+                        accepted_drafts: 0,
+                        verified_rows: 0,
+                        finish: None,
+                    },
+                );
+                unemitted_seed = None;
+            }
         }
         // ── Per-request commit: one emitted token per advance ──
         let tokenizer = model.tokenizer.as_ref().expect("checked above");

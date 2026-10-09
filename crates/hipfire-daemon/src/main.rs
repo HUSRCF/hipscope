@@ -1057,6 +1057,7 @@ fn main() {
     // even read the abort line until after the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
     if let Some(message) = pending_message {
+        hipfire_engine::scheduler::note_daemon_msg_queued(&message);
         let _ = msg_tx.send(message);
     }
     std::thread::spawn(move || {
@@ -1124,6 +1125,7 @@ fn main() {
                         None => DaemonMsg::Regular(msg),
                     };
 
+                    hipfire_engine::scheduler::note_daemon_msg_queued(&queued);
                     if msg_tx.send(queued).is_err() {
                         break;
                     }
@@ -3940,6 +3942,7 @@ fn main() {
                                                 params,
                                                 &mut stdout,
                                                 &mut inbox,
+                                                None,
                                             )
                                         }
                                         None => drive_qwen_continuous_batch(
@@ -4040,6 +4043,27 @@ fn main() {
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
+                    // VMM continuous batching: this request may promote itself
+                    // into the batch driver at a token boundary if a batched
+                    // peer arrives while it runs (closes the C1→C2 TTFT gap).
+                    let promotion_permit = (vmm_route
+                        && batch_scheduler.is_some()
+                        && hipfire_generate::batch::is_vmm_batch_request_eligible(
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pflash_active,
+                        ))
+                    .then(|| hipfire_generate::batch::PromotionPermit {
+                        original_msg: msg.clone(),
+                        sampling: resolve_batch_sampling(&msg, m),
+                        max_tokens,
+                        max_think_tokens,
+                        client_seed,
+                        assistant_prefix,
+                    });
+                    hipfire_generate::batch::set_promotion_permit(promotion_permit);
                     generate(
                         m,
                         &mut gpu,
@@ -4074,6 +4098,38 @@ fn main() {
                         logprobs_top_k,
                         request_seed,
                     );
+                    hipfire_generate::batch::set_promotion_permit(None);
+                    if let Some(promoted) = hipfire_generate::batch::take_promoted() {
+                        let drive_res = match (batch_scheduler.as_mut(), vmm_batch) {
+                            (Some(sched), Some(params)) => {
+                                hipfire_generate::batch::drive_qwen_vmm_continuous_batch(
+                                    sched,
+                                    &mut gpu,
+                                    m,
+                                    params,
+                                    &mut stdout,
+                                    &mut inbox,
+                                    Some(promoted),
+                                )
+                            }
+                            _ => Err(BatchDriveError::Gpu(
+                                "promoted request without a staged VMM batch route".into(),
+                            )),
+                        };
+                        match drive_res {
+                            Ok(()) => {}
+                            Err(BatchDriveError::Gpu(e)) => {
+                                eprintln!("[batch] drive failed (attested): {e}");
+                            }
+                            Err(BatchDriveError::Poisoned(e)) => {
+                                eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+                                batch_scheduler = None;
+                                continuous_batch_size = 1;
+                                batch_poisoned = Some(e);
+                                batch_clear_all_terminals();
+                            }
+                        }
+                    }
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
                     eprintln!("{marker}");

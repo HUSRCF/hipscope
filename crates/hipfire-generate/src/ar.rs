@@ -4994,6 +4994,102 @@ pub fn generate(
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
+            // VMM continuous batching: a serve-batched peer is waiting and
+            // this request may join the batch (the daemon granted a permit).
+            // Promote at this committed boundary — `next_token` is the
+            // pending seed, not yet fed — instead of making the peer wait
+            // for this whole generation. Features the batch lane does not
+            // carry (grammar, budget alerts, think latches, stop strings,
+            // logprobs, eviction/adaptive KV) keep the request here.
+            if let Some(permit) = crate::batch::promotion_permit().filter(|_| {
+                crate::batch::promotion_wanted(generated)
+                    && !grammar_active
+                    && budget_alert_at_tok == 0
+                    && !force_answer_latched
+                    && latch_gen_mark.is_none()
+                    && max_think_tokens == 0
+                    && max_total_think == 0
+                    && think_count == 0
+                    && total_think_tokens == 0
+                    && stop.is_empty()
+                    && logprobs_top_k.is_none()
+                    && m.eviction.is_none()
+                    && m.kv_adaptive.is_none()
+            }) {
+                let boundary = crate::batch::SingletonBoundary {
+                    id,
+                    permit,
+                    config,
+                    kv: &mut *kv,
+                    dn: &mut *dn,
+                    position: m.seq_pos,
+                    pending_seed: next_token,
+                    sampler: SamplerConfig {
+                        temperature: temp,
+                        top_p,
+                        repeat_penalty,
+                        repeat_window: repeat_buf_cap,
+                        presence_penalty,
+                        frequency_penalty,
+                        blocked_tokens: Vec::new(),
+                        top_k,
+                        min_p,
+                    },
+                    rng_state,
+                    // The executor's history already holds the pending seed
+                    // (pushed at its pick); the singleton pushes it when fed.
+                    history: m.conversation_tokens[ngram_scope_start..]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(next_token))
+                        .collect(),
+                    prompt_len: ngram_scope_start,
+                    conversation_tokens: m.conversation_tokens.clone(),
+                    streamed_tokens: streamed_tokens.clone(),
+                    bytes_fed_to_filter: stream_bytes.len(),
+                    created_at: t0,
+                    prefill_done_at: t_prefill,
+                    first_token_at: (generated > 0).then_some(t_prefill),
+                    started_in_think,
+                };
+                match crate::batch::promote_singleton(gpu, boundary) {
+                    Ok((pending, progress, state)) => {
+                        // The bundle now holds a fresh owner: its cached
+                        // conversation is gone with the swapped KV/DN.
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                        crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        if let Some(spec) = m.speculator.as_mut() {
+                            if let Err(e) = spec.reset(gpu) {
+                                eprintln!("[vmm-promote] speculator reset after promotion: {e}");
+                            }
+                        }
+                        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                        // A prepared PM4/AQL replay route bakes the old KV/DN
+                        // addresses (no per-call binding check): drop it so
+                        // the next singleton forward re-records on the new
+                        // owners.
+                        gpu.replay.rearm_after_layout_growth();
+                        eprintln!(
+                            "[vmm-promote] id={id} promoted from AR singleton at generated={generated} position={}",
+                            progress.seq_pos
+                        );
+                        crate::batch::put_promoted(crate::batch::PromotedRequest {
+                            pending,
+                            progress,
+                            state,
+                            producer: semantic,
+                            loop_guard,
+                            kind: crate::batch::PromotedDecode::Ar,
+                            seed_emitted: false,
+                        });
+                        return;
+                    }
+                    Err(e) => eprintln!("[vmm-promote] id={id} stays singleton: {e}"),
+                }
+            }
             // Write this token's K/V to the cache BEFORE any client-visible
             // emit so a VMM map/growth failure cannot stream a token whose
             // trunk write never committed. Successful path still advances
