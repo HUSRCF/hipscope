@@ -77,12 +77,16 @@ fn req_data(seed: u64, len: usize) -> ReqData {
 }
 
 fn new_owner(gpu: &mut Gpu, mode: KvMode) -> HipResult<KvCache> {
+    new_owner_seq(gpu, mode, MAX_SEQ)
+}
+
+fn new_owner_seq(gpu: &mut Gpu, mode: KvMode, max_seq: usize) -> HipResult<KvCache> {
     let dims = KvDims {
         layers: KvLayers::Mask(LAYERS.to_vec()),
         n_kv_heads: N_KV,
         head_dim: HD,
-        max_seq: MAX_SEQ,
-        physical_cap: Some(MAX_SEQ),
+        max_seq,
+        physical_cap: Some(max_seq),
     };
     KvCache::from_mode_with_backend(mode, KvBackend::Vmm, gpu, &dims)
 }
@@ -482,6 +486,220 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     Ok(())
 }
 
+// ---- long-context row-batched flash decode (no LDS context cap) ----------
+
+const LONG_MAX: usize = 131_072;
+const LONG_LENS: [usize; 3] = [8_192, 32_768, 100_000];
+const LONG_LAYER: usize = 1;
+const CHUNK: usize = 4096;
+
+/// Write `len` positions of one request into its VMM owner (`_vmm` writer)
+/// and a legacy contiguous reference cache (legacy writer) from the same
+/// per-chunk sources. Returns the legacy (K, V) for `LONG_LAYER`.
+#[allow(clippy::too_many_arguments)]
+fn long_fill(
+    gpu: &mut Gpu,
+    fmt: VmmKvFormat,
+    descs: &[VmmKvSlotDesc],
+    gens: &[u64],
+    slot: usize,
+    range: std::ops::Range<usize>,
+    seed: u64,
+    legacy: &(GpuTensor, GpuTensor),
+) -> HipResult<()> {
+    let kv_dim = N_KV * HD;
+    let mut r = Lcg(seed);
+    let pool_k = gpu.upload_f32(&r.vec(CHUNK * kv_dim), &[CHUNK * kv_dim])?;
+    let pool_v = gpu.upload_f32(&r.vec(CHUNK * kv_dim), &[CHUNK * kv_dim])?;
+    let d_t = gpu.upload_raw(VmmKvSlotDesc::as_bytes(descs), &[descs.len() * 32])?;
+    let mut start = range.start;
+    while start < range.end {
+        let n = CHUNK.min(range.end - start);
+        let pos: Vec<i32> = (start..start + n).map(|p| p as i32).collect();
+        let slots = vec![slot as i32; n];
+        validate_vmm_rows(descs, &slots, &pos, &vec![gens[slot]; n]).map_err(err)?;
+        let p_t = up_i32(gpu, &pos)?;
+        let s_t = up_i32(gpu, &slots)?;
+        for (side, pool, dst) in [(VmmKvSide::K, &pool_k, &legacy.0), (VmmKvSide::V, &pool_v, &legacy.1)] {
+            gpu.kv_cache_write_batched_vmm(fmt, side, pool, &p_t, N_KV, HD, n, &d_t, &s_t)?;
+            match fmt {
+                VmmKvFormat::Q8 => gpu.kv_cache_write_q8_0_batched(dst, pool, &p_t, N_KV, HD, n)?,
+                VmmKvFormat::Fp8E4M3 => gpu.kv_cache_write_fp8_e4m3_batched(dst, pool, &p_t, N_KV, HD, n)?,
+            }
+        }
+        gpu.free_tensor(p_t)?;
+        gpu.free_tensor(s_t)?;
+        start += n;
+    }
+    for t in [pool_k, pool_v, d_t] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
+/// Isolated singleton flash decode of one query row on a legacy cache.
+fn singleton_decode(
+    gpu: &mut Gpu,
+    fmt: VmmKvFormat,
+    legacy: &(GpuTensor, GpuTensor),
+    q: &[f32],
+    pos: i32,
+) -> HipResult<Vec<f32>> {
+    let tile = rdna_compute::attention::q8_flash_tile_size(&gpu.arch, N_HEADS, N_KV, HD, LONG_MAX);
+    let max_tiles = LONG_MAX.div_ceil(tile);
+    let q_t = gpu.upload_f32(q, &[q.len()])?;
+    let o_t = gpu.zeros(&[q.len()], DType::F32)?;
+    let p_t = up_i32(gpu, &[pos])?;
+    let part = gpu.zeros(&[N_HEADS * max_tiles * (2 + HD)], DType::F32)?;
+    let hint = pos as usize + 1;
+    match fmt {
+        VmmKvFormat::Q8 => gpu.attention_flash_q8_0(
+            &q_t, &legacy.0, &legacy.1, &o_t, &p_t.buf, hint, N_HEADS, N_KV, HD, LONG_MAX, &part,
+        )?,
+        VmmKvFormat::Fp8E4M3 => gpu.attention_flash_fp8_e4m3_tile(
+            &q_t, &legacy.0, &legacy.1, &o_t, &p_t.buf, hint, N_HEADS, N_KV, HD, LONG_MAX, &part, None,
+            None,
+        )?,
+    }
+    gpu.hip.device_synchronize()?;
+    let out = gpu.download_f32(&o_t)?;
+    for t in [q_t, o_t, p_t, part] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(out)
+}
+
+/// Mixed row-batched VMM flash decode over requests `descs` (one launch).
+fn vmm_flash(
+    gpu: &mut Gpu,
+    fmt: VmmKvFormat,
+    descs: &[VmmKvSlotDesc],
+    rows: &[(usize, i32)],
+    row_gen: &[u64],
+    q: &[f32],
+) -> HipResult<Vec<f32>> {
+    let pos: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let slot: Vec<i32> = rows.iter().map(|r| r.0 as i32).collect();
+    validate_vmm_rows(descs, &slot, &pos, row_gen).map_err(err)?;
+    let max_ctx = *pos.iter().max().unwrap() as usize + 1;
+    let plan = gpu.vmm_flash_decode_plan(fmt, N_HEADS, N_KV, HD, LONG_MAX, max_ctx)?;
+    let q_t = gpu.upload_f32(q, &[q.len()])?;
+    let o_t = gpu.zeros(&[q.len()], DType::F32)?;
+    let p_t = up_i32(gpu, &pos)?;
+    let s_t = up_i32(gpu, &slot)?;
+    let d_t = gpu.upload_raw(VmmKvSlotDesc::as_bytes(descs), &[descs.len() * 32])?;
+    let part = gpu.zeros(&[rows.len() * plan.partial_floats_per_row], DType::F32)?;
+    gpu.attention_flash_decode_vmm(&plan, &q_t, &o_t, &p_t, N_HEADS, N_KV, HD, rows.len(), &part, &d_t, &s_t)?;
+    gpu.hip.device_synchronize()?;
+    let out = gpu.download_f32(&o_t)?;
+    for t in [q_t, o_t, p_t, s_t, d_t, part] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(out)
+}
+
+fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
+    println!("=== long-context flash decode mode={mode:?} contexts={LONG_LENS:?} model_max_seq={LONG_MAX} ===");
+    let mut owners = vec![];
+    for _ in LONG_LENS {
+        owners.push(new_owner_seq(gpu, mode, LONG_MAX)?);
+    }
+    let fmt = owners[0].vmm_kv_format()?;
+    let row = fmt.bytes_per_token(N_KV, HD);
+    let tail = 8;
+    for (o, &len) in owners.iter_mut().zip(&LONG_LENS) {
+        o.provision_vmm_positions(gpu, len + tail, usize::MAX)?;
+    }
+    let mut descs = vec![];
+    let mut gens = vec![];
+    for o in &owners {
+        descs.push(o.vmm_slot_descs(gpu)?[LONG_LAYER]);
+        gens.push(o.vmm_owner_generation(gpu)?);
+    }
+    for (i, d) in descs.iter().enumerate() {
+        println!(
+            "    receipt req{i} len={} k_base=0x{:x} v_base=0x{:x} mapped_positions={} logical_bound={} owner_generation={}",
+            LONG_LENS[i], d.k_base, d.v_base, d.mapped_positions, d.logical_bound, d.owner_generation
+        );
+    }
+    let mut legacy = vec![];
+    for (i, &len) in LONG_LENS.iter().enumerate() {
+        let k = gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?;
+        let v = gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?;
+        legacy.push((k, v));
+        long_fill(gpu, fmt, &descs, &gens, i, 0..len, 0x100 + i as u64, &legacy[i])?;
+    }
+    gpu.hip.device_synchronize()?;
+    for (i, &len) in LONG_LENS.iter().enumerate() {
+        let o = &owners[i];
+        let same = vmm_prefix(gpu, &o.k_gpu[LONG_LAYER], len, row)? == legacy_prefix(gpu, &legacy[i].0, len, row)?
+            && vmm_prefix(gpu, &o.v_gpu[LONG_LAYER], len, row)? == legacy_prefix(gpu, &legacy[i].1, len, row)?;
+        check(same, &format!("long req{i} ({len}) KV bytes == isolated legacy"), fails);
+    }
+
+    // Mixed rows: decode tips, tile-boundary rows, position 0, and a forced
+    // 4-row verify run on the ~100K request; interleaved across requests.
+    let (x, y, z) = (LONG_LENS[0] as i32, LONG_LENS[1] as i32, LONG_LENS[2] as i32);
+    let rows: Vec<(usize, i32)> = vec![
+        (2, z - 4), (0, x - 1), (1, y - 1), (2, z - 3), (0, 4095), (2, z - 2), (1, 0),
+        (0, 4096), (2, z - 1), (2, 65_535), (1, 16_383), (2, 65_536), (1, 16_384),
+    ];
+    let qd = N_HEADS * HD;
+    let mut qr = Lcg(0xF1A5);
+    let q = qr.vec(rows.len() * qd);
+    let row_gen: Vec<u64> = rows.iter().map(|r| gens[r.0]).collect();
+    let mut want = vec![];
+    for (r, &(s, p)) in rows.iter().enumerate() {
+        want.extend(singleton_decode(gpu, fmt, &legacy[s], &q[r * qd..(r + 1) * qd], p)?);
+    }
+    let compare = |got: &[f32], label: &str, fails: &mut Vec<String>| {
+        let mut all = true;
+        for (r, &(s, p)) in rows.iter().enumerate() {
+            let ok = bits_equal(&got[r * qd..(r + 1) * qd], &want[r * qd..(r + 1) * qd]);
+            if !ok {
+                println!("    {label}: row {r} (req{s} pos {p}) differs");
+            }
+            all &= ok;
+        }
+        check(all, &format!("{label}: {} mixed rows bitwise == isolated singleton flash decode", rows.len()), fails);
+    };
+    let got = vmm_flash(gpu, fmt, &descs, &rows, &row_gen, &q)?;
+    compare(&got, "long mixed", fails);
+
+    // Poisoned rejected tail past every live query of each request.
+    for (i, &len) in LONG_LENS.iter().enumerate() {
+        let scratch = (gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?, gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?);
+        long_fill(gpu, fmt, &descs, &gens, i, len..len + tail, 0xBAD + i as u64, &scratch)?;
+        gpu.free_tensor(scratch.0)?;
+        gpu.free_tensor(scratch.1)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let got = vmm_flash(gpu, fmt, &descs, &rows, &row_gen, &q)?;
+    compare(&got, "long poisoned tail", fails);
+
+    // Negative controls on the flash path (refused before any launch).
+    let mut bad = row_gen.clone();
+    bad[0] = gens[0];
+    check(vmm_flash(gpu, fmt, &descs, &rows, &bad, &q).is_err(), "long wrong-row/epoch row refused", fails);
+    let past = [(2usize, descs[2].mapped_positions as i32)];
+    check(
+        vmm_flash(gpu, fmt, &descs, &past, &[gens[2]], &q[..qd]).is_err(),
+        "long row at mapped_positions refused",
+        fails,
+    );
+    let over = gpu.vmm_flash_decode_plan(fmt, N_HEADS, N_KV, HD, LONG_MAX, LONG_MAX + 1);
+    check(over.is_err(), "flash plan refuses max_ctx > model max_seq", fails);
+
+    for (k, v) in legacy {
+        gpu.free_tensor(k)?;
+        gpu.free_tensor(v)?;
+    }
+    for o in owners {
+        o.release_vmm_after(gpu, None)?;
+    }
+    Ok(())
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let mut gpu = Gpu::init().expect("gpu init");
@@ -495,6 +713,10 @@ fn main() {
         if let Err(e) = run(&mut gpu, mode, &mut fails) {
             println!("[FAIL] mode {mode:?} aborted: {e}");
             fails.push(format!("{mode:?} aborted: {e}"));
+        }
+        if let Err(e) = run_long(&mut gpu, mode, &mut fails) {
+            println!("[FAIL] long mode {mode:?} aborted: {e}");
+            fails.push(format!("long {mode:?} aborted: {e}"));
         }
     }
     if fails.is_empty() {
