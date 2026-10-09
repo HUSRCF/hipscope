@@ -309,6 +309,17 @@ pub struct FeatureFlags {
     /// outputs are byte-identical. N <= 16 never uses it. Default ON on exact
     /// gfx1201; `=0` restores the one-batch-tile-per-block launch.
     pub wmma_batch_tiles: bool,
+    /// `HIPFIRE_CB_VERIFY_CHUNK128=1` (default OFF) admits exact 64..=128-row
+    /// aggregated verify chunks for the continuous-batching speculative route
+    /// on exact gfx1201 (see `Gpu::mq4_verify_chunk_rows`): 128 rows through
+    /// the explicit `gemm_*_verify_exact` kernels instead of 63. `=0` keeps
+    /// the 63-row chunks and every existing route. Needs `wmma_batch_tiles`.
+    pub cb_verify_chunk128: bool,
+    /// `HIPFIRE_CB_VERIFY_PM` (default ON; only meaningful with the wide
+    /// verify route): runs the 64..=128-row exact kernels from the embedded
+    /// PeaceMaker bundle; `=0` runs their byte-identical hipcc twins. Never
+    /// selects IU4/FP8, and a missing PM image is a load error.
+    pub cb_verify_pm: bool,
     /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
     /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
     /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
@@ -886,6 +897,8 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
             wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
+            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
+            cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
@@ -1368,6 +1381,8 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkvza: false,
             gfx12_mq4v2_fp8_qkv: false,
             wmma_batch_tiles: false,
+            cb_verify_chunk128: false,
+            cb_verify_pm: true,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
@@ -1732,6 +1747,25 @@ mod tests {
         assert!(!flag("gfx1100", None));
         // The unit-test constructor stays on the historical one-tile route.
         assert!(!FeatureFlags::for_test("gfx1201").wmma_batch_tiles);
+    }
+
+    #[test]
+    fn cb_verify_chunk128_defaults_off_and_pm_defaults_on() {
+        let flags = |chunk: Option<&str>, pm: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, chunk, pm) {
+                ("HIPFIRE_CB_VERIFY_CHUNK128", Some(v), _) => Ok(v.to_owned()),
+                ("HIPFIRE_CB_VERIFY_PM", _, Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        let default = flags(None, None);
+        assert!(!default.cb_verify_chunk128);
+        assert!(default.cb_verify_pm);
+        assert!(flags(Some("1"), None).cb_verify_chunk128);
+        assert!(!flags(Some("0"), None).cb_verify_chunk128);
+        assert!(!flags(None, Some("0")).cb_verify_pm);
+        assert!(flags(None, Some("1")).cb_verify_pm);
+        assert!(!FeatureFlags::for_test("gfx1201").cb_verify_chunk128);
     }
 
     #[test]
