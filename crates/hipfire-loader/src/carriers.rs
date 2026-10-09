@@ -462,8 +462,13 @@ impl Carrier for Qwen4Carrier {
         );
         use hipfire_arch_qwen4::expert_residency as residency;
         const MIB: u64 = 1 << 20;
+        // Unified memory dropped the mapping above: size from the index.
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            if use_ranges {
+                hfq.find_tensor_info(&entry.name).map(|info| info.data_size as u64)
+            } else {
+                hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            }
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
         // per-layer expert bytes, and the reserve (with its native MTP and
