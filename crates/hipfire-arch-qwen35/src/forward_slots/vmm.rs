@@ -393,6 +393,15 @@ pub struct VmmBatchReceipt {
 }
 
 impl Qwen35VmmStore {
+    /// Whether this executor's arithmetic is byte-identical to the isolated
+    /// singleton route. It is NOT: the oracle (cb_vmm_state_oracle at
+    /// 8a4589a905) shows every request isolated-exact (no co-batch
+    /// dependence, k=1..3, stop/cancel/slot reuse) but the slots body's
+    /// prefill (DeltaNet/conv state from layer 0) and decode projections use
+    /// other kernels than the singleton route. Callers must therefore admit
+    /// it only under the explicit nonexact opt-in (HIPFIRE_SERVE_BATCH_NONEXACT).
+    pub const ROUTE_EXACT: bool = false;
+
     /// `template_kv` is the resident singleton KV owner; it fixes the
     /// format every request owner uses (no override of mode or bound).
     pub fn new(
