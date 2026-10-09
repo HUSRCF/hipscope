@@ -100,7 +100,7 @@ fn reduce(b: &mut Builder) -> Result<(), String> {
     use crate::insn::Instruction;
     use crate::ledger::Counter;
     b.ds_crosslane(Instruction::new(
-        "ds_swizzle_b32 v6, v24 offset:527",
+        "ds_swizzle_b32 v6, v24 offset:swizzle(BITMASK_PERM,\"1pppp\")",
         vec![v(6)], vec![v(24)]).memory(MemoryClass::DsLoad))?;
     b.wait(Counter::Ds, 0)?;
     op(b, "v_add_f32_e32 v24, v24, v6", &[v(24)], &[v(24), v(6)])?;

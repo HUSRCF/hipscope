@@ -62,7 +62,7 @@ fused_gate_up_mq4g256v2_g0:
 	v_add_f32_e32 v24, v24, v25
 	v_add_f32_e32 v26, v26, v27
 	v_add_f32_e32 v24, v24, v26
-	ds_swizzle_b32 v6, v24 offset:527
+	ds_swizzle_b32 v6, v24 offset:swizzle(BITMASK_PERM,"1pppp")
 	s_wait_dscnt 0x0
 	v_add_f32_e32 v24, v24, v6
 	v_cmp_lt_u32_e64 s24, v0, 24
