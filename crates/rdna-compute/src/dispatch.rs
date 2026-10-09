@@ -311,15 +311,6 @@ pub(crate) fn recorded_launch_artifact(
         .cloned()
 }
 
-/// Path view of [`recorded_launch_artifact`] for the path-keyed replay
-/// consumer; removed when replay consumes digests.
-pub(crate) fn recorded_launch_path(compiler: &KernelCompiler, func_name: &str) -> Option<std::path::PathBuf> {
-    recorded_launch_artifact(compiler, func_name).and_then(|artifact| match artifact.origin() {
-        crate::code_object::CodeObjectOrigin::HipFile(path) => Some(path.clone()),
-        crate::code_object::CodeObjectOrigin::NativeEmbedded(_) => None,
-    })
-}
-
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
 /// at N ≤ 512, 0.82-1.26× only at N ≥ 2048 with high DPM variance —
@@ -2981,7 +2972,7 @@ impl Gpu {
                         .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
                 }
                 if record {
-                    let artifact = recorded_launch_path(&self.compiler, func_name);
+                    let artifact = recorded_launch_artifact(&self.compiler, func_name);
                     self.replay.record_hip_launch_typed_bound(
                         &self.hip,
                         func_name,
@@ -3238,7 +3229,7 @@ impl Gpu {
                 .observe_g0_launch(func_name, grid, block, shared_mem, kernargs);
         }
         if self.replay.is_recording() {
-            let artifact = recorded_launch_path(&self.compiler, func_name);
+            let artifact = recorded_launch_artifact(&self.compiler, func_name);
             self.replay.record_hip_launch_typed_bound(
                 &self.hip,
                 func_name,

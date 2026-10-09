@@ -137,6 +137,27 @@ impl CodeObjectArtifact {
     }
 }
 
+/// Artifacts are equal exactly when their images are (same digest).
+impl PartialEq for CodeObjectArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for CodeObjectArtifact {}
+
+/// Diagnostic label: the HIP cache path, or the native module and digest.
+impl fmt::Display for CodeObjectArtifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.origin {
+            CodeObjectOrigin::HipFile(path) => write!(f, "{}", path.display()),
+            CodeObjectOrigin::NativeEmbedded(module) => {
+                write!(f, "native:{module}@{}", &self.id.to_hex()[..16])
+            }
+        }
+    }
+}
+
 /// Module and launched-function bindings to admitted artifacts. A name binds
 /// to exactly one digest for the lifetime of the loaded module cache.
 #[derive(Default)]

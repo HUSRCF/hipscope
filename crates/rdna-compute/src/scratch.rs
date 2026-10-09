@@ -562,7 +562,7 @@ pub(crate) fn launch_maybe_blob(
             // `Gpu::launch_maybe_blob_bound`.
             let artifact = compiler
                 .as_ref()
-                .and_then(|c| crate::dispatch::recorded_launch_path(c, func_name));
+                .and_then(|c| crate::dispatch::recorded_launch_artifact(c, func_name));
             replay.as_mut().unwrap().record_hip_launch_typed_bound(
                 hip,
                 func_name,
