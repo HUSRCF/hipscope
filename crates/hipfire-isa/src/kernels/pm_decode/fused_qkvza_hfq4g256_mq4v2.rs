@@ -31,8 +31,11 @@ fn build_projection() -> Result<Emitted, String> {
     let mut args = KernargLayout::new(92);
     for (name, offset) in [
         ("A_qkv", 0), ("A_z", 8), ("A_beta", 16), ("A_alpha", 24),
-        ("x", 32), ("y_qkv", 40), ("y_z", 48), ("y_beta", 56), ("y_alpha", 64),
     ] { args = args.pointer(name, offset); }
+    args = args.pointer_access("x", 32, crate::plan::Access::ReadOnly);
+    for (name, offset) in [("y_qkv",40),("y_z",48),("y_beta",56),("y_alpha",64)] {
+        args = args.pointer_access(name, offset, crate::plan::Access::WriteOnly);
+    }
     for (name, offset) in [("qkv_m",72),("z_m",76),("beta_m",80),("alpha_m",84),("K",88)] {
         args = args.hidden(name, offset, 4, "by_value");
     }
