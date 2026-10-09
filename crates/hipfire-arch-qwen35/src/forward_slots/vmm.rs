@@ -427,6 +427,12 @@ pub struct Qwen35VmmStore {
     pending_rng: Vec<(RequestEpoch, u32)>,
     /// Plan-ordered pre-norm hidden rows of a split (decode + prefill) step.
     hidden_out: GpuTensor,
+    /// Exact route: device row tables of the rows-batched twins (one
+    /// region per twin, per-layer for the stateful ones), staged per step.
+    pub(super) rows_tables: Option<GpuTensor>,
+    /// `(slot, epoch)` per row of the tables last uploaded: request owners
+    /// and batch rows are stable, so an unchanged row set reuses them.
+    pub(super) rows_tables_key: Vec<(usize, RequestEpoch)>,
     hidden_split: bool,
     /// Resolved logical context bound shared by every request owner.
     max_seq_bound: usize,
@@ -560,6 +566,27 @@ impl Qwen35VmmStore {
                 return Err(format!("VMM executor pbs: {e}"));
             }
         };
+        let n_dn = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+        // GDN (72 B) + conv (40 B) rows per DeltaNet layer; gated norm (24 B)
+        // and FA prep (40 B) rows are layer-independent.
+        let table_bytes = max_slots * (n_dn * (72 + 40) + 24 + 40);
+        let rows_tables = match route {
+            VmmRoute::Exact => match gpu.zeros(&[table_bytes / 4], DType::F32) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    let _ = pbs.free_gpu(gpu);
+                    for t in descs_dev {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    let _ = gpu.free_tensor(row_slot_dev);
+                    let _ = gpu.free_tensor(flash_partials);
+                    let _ = gpu.free_tensor(logits);
+                    let _ = gpu.free_tensor(hidden_out);
+                    return Err(format!("VMM executor rows tables: {e}"));
+                }
+            },
+            VmmRoute::Nonexact => None,
+        };
         let n_kv = kv_layer_ids.len();
         Ok(Self {
             max_slots,
@@ -581,6 +608,8 @@ impl Qwen35VmmStore {
             skip: vec![false; max_slots],
             pending_rng: Vec::with_capacity(max_slots),
             hidden_out,
+            rows_tables,
+            rows_tables_key: Vec::new(),
             hidden_split: false,
             max_seq_bound: template_kv.vmm_logical_bound(),
             mapped_high_water: 0,
@@ -747,6 +776,9 @@ impl Qwen35VmmStore {
         let _ = gpu.free_tensor(self.flash_partials);
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.hidden_out);
+        if let Some(t) = self.rows_tables {
+            let _ = gpu.free_tensor(t);
+        }
         if let Err(e) = self.pbs.free_gpu(gpu) {
             first.get_or_insert(e.to_string());
         }

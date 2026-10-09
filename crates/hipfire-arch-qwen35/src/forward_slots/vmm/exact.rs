@@ -277,6 +277,148 @@ fn batched_residual(gpu: &mut Gpu, st: &Qwen35VmmStore, layer: &LayerWeights, or
     Ok(())
 }
 
+/// Staged row tables of CbVmm's rows-batched twins for this step.
+struct RowTwins {
+    /// GDN + conv + gated-norm twins apply to every DeltaNet layer.
+    dn: bool,
+    /// FA prep twin applies to every FullAttention layer.
+    fa_prep: bool,
+    gdn: GpuTensor,
+    conv: GpuTensor,
+    gnorm_table: GpuTensor,
+    fa_table: GpuTensor,
+    /// Table rows per layer (the store width).
+    stride: usize,
+}
+
+impl RowTwins {
+    fn gdn_table(&self, d: usize) -> GpuTensor {
+        self.gdn.sub_offset(d * self.stride * 72 / 4, self.stride * 72 / 4)
+    }
+    fn conv_table(&self, d: usize) -> GpuTensor {
+        self.conv.sub_offset(d * self.stride * 40 / 4, self.stride * 40 / 4)
+    }
+}
+
+/// Build and upload the step's row tables: every row points straight at
+/// its own batch rows and its own request state. `None` when no twin
+/// applies (the per-row singleton bindings run instead). The GDN twin
+/// reserves consecutive requant frames in row order — exactly the frames
+/// back-to-back per-row singleton launches take when error feedback is on;
+/// with it off each request keeps its own frame, so the DN twins are used
+/// only when every row has error feedback.
+fn stage_row_twins(
+    gpu: &mut Gpu,
+    st: &mut Qwen35VmmStore,
+    config: &Qwen35Config,
+    rows: &[(usize, usize)],
+    row_scratch: &[RowScratch],
+) -> HipResult<Option<RowTwins>> {
+    use rdna_compute::attention::rows_batched::{ConvRow, FaPrepRow, GatedNormRow, GdnRow, GDN_HD};
+    let Some(all) = st.rows_tables.as_ref() else {
+        return Ok(None);
+    };
+    if !gpu.arch_caps.is_gfx1201() {
+        return Ok(None);
+    }
+    let n = rows.len();
+    let ms = st.max_slots;
+    let n_dn = config.layer_types.iter().filter(|t| **t == crate::qwen35::LayerType::LinearAttention).count();
+    let nv = config.linear_num_value_heads;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = nv * config.linear_value_head_dim;
+    let qkv_dim = 2 * k_dim + v_dim;
+    let req = |slot: usize| st.slots[slot].as_ref().expect("provisioned slot");
+    let quant = req(rows[0].0).dn.quant;
+    let dn = rows.iter().all(|&(slot, _)| {
+        let d = &req(slot).dn;
+        d.quant == quant && d.s_ef_residual.len() == n_dn && !d.s_ef_residual.is_empty()
+    }) && gdn_compact_qk_div(gpu, config, nv, quant) == Some(3)
+        && nv == 48
+        && config.linear_value_head_dim == GDN_HD
+        && config.linear_key_head_dim == GDN_HD;
+    let fa_prep = config.n_heads == 24 && config.n_kv_heads == 4 && config.head_dim == 256;
+    if !dn && !fa_prep {
+        return Ok(None);
+    }
+    let tags: Vec<u64> = rows.iter().map(|&(slot, _)| req(slot).epoch.request_tag).collect();
+    let p = &st.pbs;
+    let ptr = |t: &GpuTensor, row: usize, len: usize| t.buf.as_ptr() as u64 + (row * len * 4) as u64;
+    let conv_off = n_dn * ms * 72;
+    let gnorm_off = conv_off + n_dn * ms * 40;
+    let fa_off = gnorm_off + ms * 24;
+    let view = |off: usize, bytes: usize| all.sub_offset(off / 4, bytes / 4);
+    let t = RowTwins {
+        dn,
+        fa_prep,
+        gdn: view(0, n_dn * ms * 72),
+        conv: view(conv_off, n_dn * ms * 40),
+        gnorm_table: view(gnorm_off, ms * 24),
+        fa_table: view(fa_off, ms * 40),
+        stride: ms,
+    };
+    let key: Vec<(usize, hipfire_runtime::slot_batch::RequestEpoch)> =
+        rows.iter().map(|&(slot, _)| (slot, req(slot).epoch)).collect();
+    if st.rows_tables_key == key {
+        return Ok(Some(t));
+    }
+    st.rows_tables_key.clear();
+    let req = |slot: usize| st.slots[slot].as_ref().expect("provisioned slot");
+    let p = &st.pbs;
+    if dn {
+        for d in 0..n_dn {
+            let mut gdn_rows = Vec::with_capacity(n);
+            let mut conv_rows = Vec::with_capacity(n);
+            for (r, &(slot, _)) in rows.iter().enumerate() {
+                let s = &req(slot).dn;
+                gdn_rows.push(GdnRow {
+                    q: ptr(&p.dn_q_raw_batch, r, k_dim),
+                    k: ptr(&p.dn_k_raw_batch, r, k_dim),
+                    v: ptr(&p.dn_v_batch, r, v_dim),
+                    gate: ptr(&p.dn_alpha_batch, r, nv),
+                    beta: ptr(&p.dn_beta_batch, r, nv),
+                    s_q8: s.s_matrices[d].buf.as_ptr() as u64,
+                    s_scales: s.s_scales[d].buf.as_ptr() as u64,
+                    output: ptr(&p.dn_attn_out_batch, r, v_dim),
+                    s_ef_residual: s.s_ef_residual[d].buf.as_ptr() as u64,
+                });
+                conv_rows.push(ConvRow {
+                    q_out: ptr(&p.dn_q_raw_batch, r, k_dim),
+                    k_out: ptr(&p.dn_k_raw_batch, r, k_dim),
+                    v_out: ptr(&p.dn_v_batch, r, v_dim),
+                    input: ptr(&p.dn_qkv_batch, r, qkv_dim),
+                    state: s.conv_states[d].buf.as_ptr() as u64,
+                });
+            }
+            gpu.stage_gated_delta_net_q8_compact3_b2_rows(&t.gdn_table(d), &gdn_rows, &tags, &tags, 1, nv)?;
+            gpu.stage_conv1d_silu_split_qknorm_b256_rows(&t.conv_table(d), &conv_rows, &tags, &tags, k_dim, v_dim)?;
+        }
+        let gnorm_rows: Vec<GatedNormRow> = (0..n)
+            .map(|r| GatedNormRow {
+                x: ptr(&p.dn_attn_out_batch, r, v_dim),
+                z: ptr(&p.dn_z_batch, r, v_dim),
+                x_rot: ptr(&p.dn_normed_rot_batch, r, v_dim),
+            })
+            .collect();
+        gpu.stage_gated_norm_mq_rotate_awq_k6144_rows(&t.gnorm_table, &gnorm_rows, &tags, &tags)?;
+    }
+    if fa_prep {
+        let fa_rows: Vec<FaPrepRow> = row_scratch
+            .iter()
+            .map(|rs| FaPrepRow {
+                q_interleaved: rs.fa_q_full.buf.as_ptr() as u64,
+                q: rs.fa_q.buf.as_ptr() as u64,
+                gate: rs.fa_gate.buf.as_ptr() as u64,
+                k: rs.fa_k.buf.as_ptr() as u64,
+                pos: rs.pos_buf.as_ptr() as u64,
+            })
+            .collect();
+        gpu.stage_qwen36_27b_fa_prep_rows(&t.fa_table, &fa_rows, &tags, &tags)?;
+    }
+    st.rows_tables_key = key;
+    Ok(Some(t))
+}
+
 /// Exact decode for the AR rows of `members` (plan request indices). Rows
 /// are laid out in `pbs` in member order. Fills `picks`.
 pub(super) fn decode(
@@ -316,6 +458,7 @@ pub(super) fn decode(
     gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &slot_bytes)?;
     let max_ctx = rows.iter().map(|&(_, p)| p + 1).max().unwrap_or(1);
     let flash = gpu.vmm_flash_decode_plan(st.format, config.n_heads, config.n_kv_heads, config.head_dim, st.model_max_seq, max_ctx)?;
+    let twins = stage_row_twins(gpu, st, config, &rows, &row_scratch)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -387,20 +530,24 @@ pub(super) fn decode(
                         .iter()
                         .all(|&(slot, _)| st.slots[slot].as_ref().is_some_and(|q| q.kv.compact_offset == 0));
                 if batched_attend {
-                    for rs in &row_scratch {
-                        gpu.qwen35_fa_prep_gfx1100(
-                            &rs.fa_q_full,
-                            &rs.fa_q,
-                            &rs.fa_gate,
-                            &rs.fa_k,
-                            &l.q_norm,
-                            &l.k_norm,
-                            &rs.pos_buf,
-                            config.norm_eps,
-                            config.rope_theta,
-                            config.n_heads,
-                            config.n_kv_heads,
-                        )?;
+                    if let Some(t) = twins.as_ref().filter(|t| t.fa_prep) {
+                        gpu.qwen36_27b_fa_prep_rows(&t.fa_table, n, &l.q_norm, &l.k_norm, config.norm_eps, config.rope_theta)?;
+                    } else {
+                        for rs in &row_scratch {
+                            gpu.qwen35_fa_prep_gfx1100(
+                                &rs.fa_q_full,
+                                &rs.fa_q,
+                                &rs.fa_gate,
+                                &rs.fa_k,
+                                &l.q_norm,
+                                &l.k_norm,
+                                &rs.pos_buf,
+                                config.norm_eps,
+                                config.rope_theta,
+                                config.n_heads,
+                                config.n_kv_heads,
+                            )?;
+                        }
                     }
                     let kv_l = st
                         .kv_layer_ids
@@ -454,6 +601,47 @@ pub(super) fn decode(
                     n_v_heads,
                     n,
                 )?;
+            }
+            // The whole DeltaNet attention run on the rows twins: conv,
+            // GDN recurrence and gated-norm rotate, each one launch over all
+            // rows, the gated norm writing each row's `wo` input in place.
+            if let (true, LayerWeights::DeltaNet(l), Some(t)) = (split_dn_prep, layer, twins.as_ref()) {
+                let kinds: Vec<SuperOpKind> = program[i..end].iter().map(|o| o.kind).collect();
+                if t.dn
+                    && stage_for == Some(0)
+                    && kinds == [SuperOpKind::Attend, SuperOpKind::Recurrent, SuperOpKind::Norm]
+                    && l.wo.awq_scale.is_some()
+                    && gated_norm_mq_rotate_enabled(gpu, config, n_v_heads, &l.wo)
+                {
+                    gpu.conv1d_silu_split_qknorm_b256_rows(
+                        &t.conv_table(delta_layer_idx),
+                        n,
+                        &l.conv_weight,
+                        k_dim,
+                        v_dim,
+                        config.linear_num_key_heads,
+                        hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
+                    )?;
+                    gpu.gated_delta_net_q8_compact3_b2_rows(
+                        &t.gdn_table(delta_layer_idx),
+                        n,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                    gpu.gated_norm_mq_rotate_awq_k6144_rows(
+                        &t.gnorm_table,
+                        n,
+                        &l.norm_weight,
+                        l.wo.awq_scale.as_ref().expect("checked"),
+                        config.norm_eps,
+                    )?;
+                    staged = true;
+                    i = end;
+                    continue;
+                }
             }
             let first_op = if split_dn_prep { i + 1 } else { i };
             for (r, &(slot, pos)) in rows.iter().enumerate() {
@@ -526,25 +714,56 @@ pub(super) fn decode(
         }
     }
 
-    // Final norm + head: the singleton's rmsnorm_f32 + lm_head GEMV per row
-    // (`gemv_mq4g256v2_multirow_r2`; the PM multi-column GEMV is not
-    // byte-identical to it, so the head is not batched).
-    let mut b = hipfire_runtime::slot_batch::SlotBatch::default();
-    let n_slots = pb.m_per_slot.len();
-    b.m_per_slot = vec![0; n_slots];
-    for &(slot, pos) in &rows {
-        b.m_per_slot[slot] = 1;
-        b.tokens.push(0);
-        b.positions.push(pos as i32);
-        b.row_slot.push(slot as i32);
+    // Final norm + head. With 2+ rows on gfx1201: per row the singleton's
+    // rmsnorm_f32 + lm_head input rotate (`Step::Gemv { input: Raw }`), then
+    // the PM multi-column twin of the singleton `gemv_mq4g256v2_multirow_r2`
+    // once per run of consecutive slots. One row keeps the singleton head.
+    let out = &weights.output;
+    let vocab = config.vocab_size;
+    if n >= 2 && out.gpu_dtype == DType::MQ4G256V2 && gpu.arch_caps.is_gfx1201() {
+        for (r, rs) in row_scratch.iter().enumerate() {
+            gpu.rmsnorm_f32(&rs.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+            let ctx = DispatchCtx::new(gpu);
+            let xr = hipfire_runtime::llama::gemv_family()
+                .rotate(&ctx, gpu, &out.dispatch_ref(), &s.tmp, &RotateInputs::default())
+                .map_err(|e| HipError::new(0, &e.to_string()))?
+                .into_buf();
+            copy_row(gpu, &st.pbs.x_rot_batch, r, &xr, 0, dim)?;
+        }
+        let mut r0 = 0usize;
+        while r0 < n {
+            let mut r1 = r0 + 1;
+            while r1 < n && r1 - r0 < PM_XBATCH_MAX && rows[r1].0 == rows[r1 - 1].0 + 1 {
+                r1 += 1;
+            }
+            gpu.gemv_mq4g256v2_multirow_r2_xbatch_pm(
+                &out.buf,
+                &st.pbs.x_rot_batch.sub_offset(r0 * dim, (r1 - r0) * dim),
+                &st.logits.sub_offset(rows[r0].0 * vocab, (r1 - r0) * vocab),
+                vocab,
+                dim,
+                r1 - r0,
+            )?;
+            r0 = r1;
+        }
+    } else {
+        let mut b = hipfire_runtime::slot_batch::SlotBatch::default();
+        let n_slots = pb.m_per_slot.len();
+        b.m_per_slot = vec![0; n_slots];
+        for &(slot, pos) in &rows {
+            b.m_per_slot[slot] = 1;
+            b.tokens.push(0);
+            b.positions.push(pos as i32);
+            b.row_slot.push(slot as i32);
+        }
+        // final_logits_per_slot walks slots in order; rows are in slot order.
+        st.skip.clear();
+        st.skip.resize(n_slots, true);
+        for &(slot, _) in &rows {
+            st.skip[slot] = false;
+        }
+        final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
     }
-    // final_logits_per_slot walks slots in order; rows are in slot order.
-    st.skip.clear();
-    st.skip.resize(n_slots, true);
-    for &(slot, _) in &rows {
-        st.skip[slot] = false;
-    }
-    final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
     for &i in members {
         super::sample_head(gpu, st, config, s, plan, i, picks)?;
     }
