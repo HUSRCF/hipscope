@@ -394,7 +394,8 @@ pub(crate) fn preflight_checks(
 
     // A unified-memory APU allocates GTT, which also takes freed GTT pages
     // TTM parked in its page pool (outside MemAvailable).
-    let uma = crate::arch_caps::process_gpu_arch().is_some_and(hipfire_config::is_unified_memory_arch);
+    let uma =
+        crate::arch_caps::process_gpu_arch().is_some_and(hipfire_config::is_unified_memory_arch);
     let available = if uma {
         crate::uma_memory::host_available_bytes()
     } else {

@@ -2006,10 +2006,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
                 .and_then(|minimum| growth.checked_add(minimum))
         })
         .and_then(|needed| needed.checked_add(128 << 20))
-        .is_some_and(|needed| {
-            gpu.device_mem_info()
-                .is_ok_and(|(free, _)| free >= needed)
-        });
+        .is_some_and(|needed| gpu.device_mem_info().is_ok_and(|(free, _)| free >= needed));
     if !keep {
         if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
             old.free_gpu(gpu)?;

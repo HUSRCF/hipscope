@@ -90,7 +90,8 @@ impl Qwen35VmmStore {
     /// budget and the device's free memory (as `provision_step`).
     pub(super) fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
         let mapped_total = self.mapped_kv_bytes()?;
-        let device_room = gpu.device_mem_info()
+        let device_room = gpu
+            .device_mem_info()
             .map_err(|e| format!("spec provision: VRAM query: {e}"))?
             .0
             .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);

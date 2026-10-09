@@ -465,9 +465,11 @@ impl Carrier for Qwen4Carrier {
         // Unified memory dropped the mapping above: size from the index.
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
             if use_ranges {
-                hfq.find_tensor_info(&entry.name).map(|info| info.data_size as u64)
+                hfq.find_tensor_info(&entry.name)
+                    .map(|info| info.data_size as u64)
             } else {
-                hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+                hfq.tensor_data(&entry.name)
+                    .map(|(_, bytes)| bytes.len() as u64)
             }
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
