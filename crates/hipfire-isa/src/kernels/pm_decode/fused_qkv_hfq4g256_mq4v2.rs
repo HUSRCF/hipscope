@@ -122,6 +122,10 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
         quad_weights(b, &[(0, lead), (1, lag), (2, lead), (3, lag)])?;
         for stream in [0u8, 2] {
             use crate::vopd::{Operand, VopdF32, VopdOp};
+            // Nearest consumed mix packet is 3 VALU packets back for
+            // streams 0/1, then 2 back for 2/3 (including the first VOPD).
+            let distance = if stream == 0 { 3 } else { 2 };
+            op(b, format!("s_delay_alu instid0(VALU_DEP_{distance})"), &[], &[])?;
             b.vopd(
                 VopdOp { op: VopdF32::Fmac, dst: 16 + stream,
                     src0: Operand::V(20 + stream), src1: 32 + stream * 8 + lead },
@@ -138,6 +142,8 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
     }
     for stream in [0u8, 2] {
         use crate::vopd::{Operand, VopdF32, VopdOp};
+        // The most recent consumed dot is two VALU packets back.
+        op(b, "s_delay_alu instid0(VALU_DEP_2)", &[], &[])?;
         b.vopd(
             VopdOp { op: VopdF32::Add, dst: 26 + stream,
                 src0: Operand::V(26 + stream), src1: 16 + stream },
@@ -376,6 +382,9 @@ mod tests {
             .count();
         assert_eq!(issued_before_wait, 18, "quad loads must overlap before the first wait");
         assert_eq!(quad.matches(" :: ").count(), 16);
+        assert_eq!(quad.matches("s_delay_alu").count(), 16);
+        assert_eq!(quad.lines().find(|line| line.contains("s_wait_loadcnt")).unwrap().trim(),
+            "s_wait_loadcnt 0x11", "the oldest header needs only the first of 18 loads");
         for stream in 0..4u8 {
             let mnemonic = if stream % 2 == 0 { "v_mul_f32_e32" } else { "v_dual_mul_f32" };
             assert!(quad.contains(&format!("{mnemonic} v{}, v{}, v{}",
@@ -384,10 +393,13 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../kernels/pm-decode/gfx1201");
         std::fs::create_dir_all(&root).unwrap();
-        let object = root.join(format!("{MODULE}.co"));
+        // Concurrent crate tests must not overwrite the certified production object.
+        let object = root.join(format!("{MODULE}.test.{}.co", std::process::id()));
         let elf = crate::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
         std::fs::write(&object, elf).unwrap();
-        let m7 = crate::pm_check::m7(&object, "gfx1201", "fused_qkv_mq4g256v2").unwrap();
+        let m7 = crate::pm_check::m7(&object, "gfx1201", "fused_qkv_mq4g256v2");
+        std::fs::remove_file(&object).unwrap();
+        let m7 = m7.unwrap();
         assert_eq!(m7["obligations"], serde_json::json!({}));
         assert_eq!(m7["ambiguous_delays"], 0);
         println!("{m7}");
