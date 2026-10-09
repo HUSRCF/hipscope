@@ -245,6 +245,16 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     smem(&mut b, 12, 4, 0, 32)?;
     smem(&mut b, 16, 4, 0, 48)?;
     smem(&mut b, 20, 2, 0, 64)?;
+    // These lane-only operations overlap the outstanding kernarg loads.
+    op(&mut b, "v_lshlrev_b32_e32 v1, 2, v0", &[v(1)], &[v(0)])?;
+    op(&mut b, "v_add_nc_u32_e32 v1, 8, v1", &[v(1)], &[v(1)])?;
+    op(&mut b, "v_lshlrev_b32_e32 v2, 5, v0", &[v(2)], &[v(0)])?;
+    op(&mut b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
+    op(&mut b, "v_cndmask_b32_e64 v3, 4, 0, vcc_lo", &[v(3)], &[])?;
+    op(&mut b, "v_mov_b32_e32 v31, 0", &[v(31)], &[])?;
+    for acc in 26..30 {
+        op(&mut b, format!("v_mov_b32_e32 v{acc}, 0"), &[v(acc)], &[])?;
+    }
     b.wait_all()?;
     sop(&mut b, "s_add_co_i32 s22, s18, s19", &[22], &[18, 19])?;
     sop(&mut b, "s_add_co_i32 s23, s22, s20", &[23], &[22, 20])?;
@@ -279,15 +289,6 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     sop(&mut b, "s_mov_b32 s38, -1", &[38], &[])?;
     sop(&mut b, "s_mov_b32 s39, 0x31004000", &[39], &[])?;
     sop(&mut b, "s_mov_b32 s40, 0", &[40], &[])?;
-    op(&mut b, "v_lshlrev_b32_e32 v1, 2, v0", &[v(1)], &[v(0)])?;
-    op(&mut b, "v_add_nc_u32_e32 v1, 8, v1", &[v(1)], &[v(1)])?;
-    op(&mut b, "v_lshlrev_b32_e32 v2, 5, v0", &[v(2)], &[v(0)])?;
-    op(&mut b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
-    op(&mut b, "v_cndmask_b32_e64 v3, 4, 0, vcc_lo", &[v(3)], &[])?;
-    op(&mut b, "v_mov_b32_e32 v31, 0", &[v(31)], &[])?;
-    for acc in 26..30 {
-        op(&mut b, format!("v_mov_b32_e32 v{acc}, 0"), &[v(acc)], &[])?;
-    }
     sop(&mut b, "s_cmp_eq_u32 s34, 0", &[], &[34])?;
     op(&mut b, "s_cbranch_scc1 .Lqkv_tails", &[], &[])?;
     b.loop_(".Lqkv_quads", |b| {
