@@ -1360,6 +1360,9 @@ pub fn fail_closed_reset_target_and_spec(
         if let Err(e) = reset_qwen35_recurrent(m, gpu) {
             push_reset_err(&mut first_err, "reset_qwen35_recurrent", e);
         }
+        // Authoritative cold reset also drops every conversation the VMM
+        // batch route kept for prefix reuse.
+        crate::vmm_conv::clear(&mut m.state, gpu);
         if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
         }

@@ -1454,21 +1454,26 @@ impl DeltaNetSnapshot {
             Self::bulk_sync(gpu)?;
             return Ok(());
         }
+        // Copy the common buffer extent: a snapshot may be restored into (or
+        // saved from) a DeltaNet state other than the one it was sized from
+        // (VMM prefix reuse moves conversations between owners); shapes match
+        // and pool rounding only pads, so the common extent covers every
+        // element and never overruns either side.
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         Ok(())
     }
@@ -1529,21 +1534,22 @@ impl DeltaNetSnapshot {
             Self::bulk_sync(gpu)?;
             return Ok(());
         }
+        // Common extent (see `save_from`).
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         Ok(())
     }

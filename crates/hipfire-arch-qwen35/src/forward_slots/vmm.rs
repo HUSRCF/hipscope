@@ -374,6 +374,31 @@ impl Qwen35RequestState {
     }
 }
 
+/// A finished conversation kept for prefix reuse: the owner that served it
+/// (KV + DeltaNet at `tokens.len()`, every token forwarded including the
+/// ChatML trailer), its token stream and its DeltaNet resume checkpoints —
+/// exactly what the singleton route keeps resident in the bundle
+/// (`conversation_tokens`, `prefill_checkpoints`) after a turn.
+pub struct VmmPrefixEntry {
+    pub state: Qwen35RequestState,
+    pub tokens: Vec<u32>,
+    pub checkpoints: Vec<(usize, crate::speculative::DeltaNetSnapshot)>,
+    /// Attempt whose client commit is outstanding; not reusable (and dropped
+    /// on abort) until it commits.
+    pub pending: Option<(String, u64)>,
+    /// Recency stamp (higher = more recent) for eviction.
+    pub stamp: u64,
+}
+
+impl VmmPrefixEntry {
+    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
+        for (_, snap) in self.checkpoints {
+            snap.free_gpu(gpu);
+        }
+        self.state.free_gpu(gpu)
+    }
+}
+
 /// Slot-indexed DeltaNet view for the shared layer body.
 struct DnTable<'a>(Vec<Option<&'a DeltaNetState>>);
 
@@ -456,6 +481,9 @@ pub struct Qwen35VmmStore {
     route: VmmRoute,
     /// MTP engine of spec lanes (`install_spec`); `None` = AR lanes only.
     spec: Option<spec::VmmSpecEngine>,
+    /// Retained conversations for prefix reuse (VMM route continuity); the
+    /// generate crate owns the policy. Freed with the store.
+    pub prefix_pool: Vec<VmmPrefixEntry>,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -632,6 +660,7 @@ impl Qwen35VmmStore {
             kv_budget_bytes,
             route,
             spec: None,
+            prefix_pool: Vec::new(),
         })
     }
 
@@ -772,12 +801,16 @@ impl Qwen35VmmStore {
         }
     }
 
-    /// Physically mapped KV bytes summed over admitted request owners.
+    /// Physically mapped KV bytes summed over admitted request owners and
+    /// retained prefix entries.
     pub fn mapped_kv_bytes(&self) -> Result<usize, String> {
         let n_kv = self.kv_layer_ids.len();
         let mut total = 0usize;
         for s in self.slots.iter().flatten() {
             total += owner_mapped_bytes(&s.kv, n_kv)?;
+        }
+        for e in &self.prefix_pool {
+            total += owner_mapped_bytes(&e.state.kv, n_kv)?;
         }
         Ok(total)
     }
@@ -786,6 +819,11 @@ impl Qwen35VmmStore {
         let mut first: Option<String> = None;
         for s in self.slots.into_iter().flatten() {
             if let Err(e) = s.free_gpu(gpu) {
+                first.get_or_insert(e);
+            }
+        }
+        for e in self.prefix_pool {
+            if let Err(e) = e.free_gpu(gpu) {
                 first.get_or_insert(e);
             }
         }

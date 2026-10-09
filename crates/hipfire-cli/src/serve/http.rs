@@ -880,13 +880,20 @@ async fn handle_request(
                 let tp = runtime.tp;
                 let arch = runtime.current_arch.clone();
                 let batch_capable = runtime.continuous_batch_capable;
+                let batch_vmm = runtime.continuous_batch_vmm;
                 let multi_slot = runtime.multi_slot_enabled;
                 drop(runtime);
                 // The admission gate is transport concurrency, not a batch-mode
                 // selector. Experimental slots overlap independent requests
                 // while remaining separate from ContinuousBatchScheduler.
                 let eligible = multi_slot
-                    || is_batch_eligible_request(&body_val, tp, arch.as_deref(), batch_capable);
+                    || is_batch_eligible_request(
+                        &body_val,
+                        tp,
+                        arch.as_deref(),
+                        batch_capable,
+                        batch_vmm,
+                    );
                 let model = body_val
                     .get("model")
                     .and_then(|v| v.as_str())

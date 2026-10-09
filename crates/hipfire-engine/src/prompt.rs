@@ -42,6 +42,32 @@ pub fn qwen_jinja_reasoning(
     }
 }
 
+/// A generate request's `messages`, each non-empty content normalized the
+/// way the daemon normalizes `prompt` (`maybe_normalize_prompt`: strip
+/// trailing whitespace before `\n`, collapse 3+ newlines to 2, ...).
+/// Without it turn N's `prompt`-encoded user tokens diverge from turn N+1's
+/// history tokens and break the prefix-cache LCP. The singleton dispatch and
+/// the VMM batch admission share it so both render identical bytes.
+/// `Err` carries the serde error text.
+pub fn parse_generate_messages(
+    msg: &serde_json::Value,
+) -> Result<Option<Vec<hipfire_runtime::prompt_frame::Message>>, String> {
+    let Some(v) = msg.get("messages") else {
+        return Ok(None);
+    };
+    let mut messages: Vec<hipfire_runtime::prompt_frame::Message> =
+        serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+    for entry in &mut messages {
+        if !entry.content.is_empty() {
+            let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&entry.content);
+            if matches!(normalized, std::borrow::Cow::Owned(_)) {
+                entry.content = normalized.into_owned();
+            }
+        }
+    }
+    Ok(Some(messages))
+}
+
 /// Stateless prompt rendering for a batch lane, reusing the production
 /// `ChatFrame`/`JinjaChatFrame` path. Called with `seq_pos=0`, no tools/
 /// messages/PFlash, retains `started_in_think` for barrier gating.

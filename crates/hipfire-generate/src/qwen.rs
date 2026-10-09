@@ -4589,6 +4589,7 @@ pub fn generate_spec(
                             ),
                             kind,
                             seed_emitted: true,
+                            conv: Default::default(),
                         });
                         drop(guard);
                         return None;

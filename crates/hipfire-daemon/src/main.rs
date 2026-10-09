@@ -2991,53 +2991,23 @@ fn main() {
                     },
                     None => None,
                 };
+                // Each message's content is normalized like `prompt` (shared
+                // with the VMM batch admission so both render identical bytes).
                 let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                    match msg.get("messages") {
-                        Some(v) => match serde_json::from_value::<
-                            Vec<hipfire_runtime::prompt_frame::Message>,
-                        >(v.clone())
-                        {
-                            Ok(mut m) => {
-                                // Apply the same normalization to each message's
-                                // content that the daemon applies to `prompt` at
-                                // line 1384 (`maybe_normalize_prompt`: strip
-                                // trailing whitespace before `\n`, collapse 3+
-                                // newlines to 2, etc.). Without this, turn N's
-                                // `prompt`-encoded user tokens diverge from turn
-                                // N+1's `messages[].content`-encoded history
-                                // tokens, breaking the LCP cache on any prompt
-                                // whose raw text has trailing whitespace or
-                                // run-of-newlines patterns.
-                                for entry in &mut m {
-                                    if !entry.content.is_empty() {
-                                        let normalized =
-                                            hipfire_runtime::tokenizer::maybe_normalize_prompt(
-                                                &entry.content,
-                                            );
-                                        if matches!(normalized, std::borrow::Cow::Owned(_)) {
-                                            entry.content = normalized.into_owned();
-                                        }
-                                    }
-                                }
-                                Some(m)
-                            }
-                            Err(e) => {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!(
-                                        "invalid messages field: {}",
-                                        e.to_string().replace('"', "'"),
-                                    ),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                        },
-                        None => None,
+                    match hipfire_engine::prompt::parse_generate_messages(&msg) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                &format!("invalid messages field: {}", e.replace('"', "'")),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
                     };
                 // OpenAI `stop` (string or array form); an invalid value is rejected.
                 let Some(stop_seqs) = hipfire_generate::ar::stop_or_reject(&mut stdout, id, &msg)
@@ -3755,8 +3725,8 @@ fn main() {
                                 continue;
                             }
                         };
-                        if started_in_think {
-                            // Rendered prompts that open a think span are sequential
+                        if started_in_think && !vmm_route {
+                            // Fixed-lane route: think-open prompts are sequential
                             // barriers. Transfer any pre-latched abort exactly once
                             // (transfer retires the batch entry and holds a tombstone until singleton cleanup).
                             let _ = batch_transfer_abort_to_singleton_and_clear(
@@ -3853,7 +3823,7 @@ fn main() {
                                             hipfire_generate::ar::GenerationRoute::QwenAr,
                                             &mut stdout,
                                             id,
-                                            false,
+                                            started_in_think,
                                         );
                                     }
                                     let drive_res = hipfire_generate::batch::drive_staged_continuous_batch(
