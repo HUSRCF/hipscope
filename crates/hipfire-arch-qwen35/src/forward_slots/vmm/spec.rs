@@ -6,18 +6,16 @@
 //!
 //! A spec lane is a request decoded exactly like the singleton MTP route
 //! (`Qwen35MtpDrafter`): its prompt is filled by the singleton MTP prompt
-//! prefill on the request's own KV/DeltaNet, then every decode window is one
-//! [`mtp_cb_cycle`] lane — per-request draft, the verify trunk and head
-//! shared with every other spec lane, per-request accept/repair. Per request
+//! prefill on the request's own KV/DeltaNet, then every decode window is a
+//! `RequestStepKind::Verify` request of an executor step — per-request draft
+//! (provision), the verify trunk and head shared with every other Verify
+//! request (forward), per-request accept/repair (commit). Per request
 //! the committed ids and the full state (trunk KV, DeltaNet, MTP head KV,
 //! `prev_hidden`) equal its isolated singleton spec run (greedy).
 
 use super::{Qwen35RequestState, Qwen35VmmStore, VMM_MAP_DEVICE_RESERVE_BYTES};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
-use crate::mtp_spec::cb::{
-    mtp_cb_accept, mtp_cb_cycle, mtp_cb_draft, mtp_cb_verify, MtpCbLane, MtpCbScratch, MtpCbTiming, MtpCbVerified,
-    MtpCbVerifyLane,
-};
+use crate::mtp_spec::cb::{mtp_cb_accept, mtp_cb_draft, mtp_cb_verify, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane};
 use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
 use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
@@ -69,15 +67,6 @@ impl VmmSpecEngine {
         let _ = self.cb.free_gpu(gpu);
         self.head.free_gpu(gpu);
     }
-}
-
-/// One spec lane's window request for [`Qwen35VmmStore::spec_cycle`].
-pub struct SpecLaneStep<'a> {
-    pub epoch: RequestEpoch,
-    /// Remaining output budget (`max_tokens - generated`), >= 1.
-    pub max_emit: usize,
-    /// Emitted history ending in the pending seed (penalty window).
-    pub emitted: &'a [u32],
 }
 
 impl Qwen35VmmStore {
@@ -194,101 +183,6 @@ impl Qwen35VmmStore {
             s.poisoned = true;
         }
         r
-    }
-
-    /// One MTP window for every listed spec lane, the verify shared.
-    /// Returns one advance per lane (in order) and the cycle's phase times.
-    /// On error every listed lane is poisoned.
-    pub fn spec_cycle(
-        &mut self,
-        gpu: &mut Gpu,
-        weights: &Qwen35Weights,
-        config: &Qwen35Config,
-        scratch: &mut Qwen35Scratch,
-        lanes: &[SpecLaneStep<'_>],
-    ) -> Result<(Vec<RequestAdvance>, MtpCbTiming), String> {
-        if !matches!(self.phase, super::Phase::Idle) {
-            return Err("spec cycle during an uncommitted step".into());
-        }
-        let engine = self.spec.as_ref().ok_or("spec cycle: no MTP engine staged")?;
-        let (k_max, cap) = (engine.k, engine.head_cap());
-        let eos = config.eos_token;
-        let mut ks = Vec::with_capacity(lanes.len());
-        for l in lanes {
-            let s = self.request_state(&l.epoch).ok_or_else(|| format!("spec cycle: unknown epoch {:?}", l.epoch))?;
-            if s.mtp.is_none() || s.pending_seed.is_none() || s.poisoned || l.max_emit == 0 {
-                return Err(format!("spec cycle: {:?} is not a live spec lane with output budget", l.epoch));
-            }
-            // MtpSpeculator: k = min(max_emit - 1, proposal capacity).
-            let k = (l.max_emit - 1).min(k_max);
-            let end = s.position + k + 1;
-            if end > cap {
-                return Err(format!("spec cycle: {:?} window end {end} > MTP head capacity {cap}", l.epoch));
-            }
-            ks.push(k);
-        }
-        for (l, &k) in lanes.iter().zip(&ks) {
-            let end = self.request_state(&l.epoch).expect("checked").position + k + 1;
-            self.spec_provision(gpu, &l.epoch, end)?;
-        }
-        let Self { slots, spec, .. } = self;
-        let engine = spec.as_ref().expect("checked above");
-        // Lane order = `lanes` order; borrow each owner once.
-        let mut owners: Vec<Option<&mut Qwen35RequestState>> = lanes.iter().map(|_| None).collect();
-        for s in slots.iter_mut().flatten() {
-            if let Some(i) = lanes.iter().position(|l| l.epoch == s.epoch) {
-                owners[i] = Some(s);
-            }
-        }
-        let mut owners: Vec<&mut Qwen35RequestState> =
-            owners.into_iter().map(|o| o.expect("every lane located above")).collect();
-        let result = {
-            let mut cb_lanes: Vec<MtpCbLane<'_>> = owners
-                .iter_mut()
-                .zip(lanes)
-                .zip(&ks)
-                .map(|((s, l), &k)| {
-                    let Qwen35RequestState { kv, dn, mtp, position, pending_seed, .. } = &mut **s;
-                    MtpCbLane {
-                        kv_cache: kv,
-                        dn_state: dn,
-                        state: mtp.as_mut().expect("checked above"),
-                        cur_pos: *position,
-                        last_committed: pending_seed.expect("checked above"),
-                        emitted: l.emitted,
-                        eos_token_id: eos,
-                        k,
-                    }
-                })
-                .collect();
-            mtp_cb_cycle(gpu, weights, config, scratch, &engine.head, &engine.cb, &mut cb_lanes)
-        };
-        let (results, timing) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                for s in owners.iter_mut() {
-                    s.poisoned = true;
-                }
-                return Err(format!("spec cycle: {e}"));
-            }
-        };
-        let mut advances = Vec::with_capacity(lanes.len());
-        for ((s, l), r) in owners.iter_mut().zip(lanes).zip(results) {
-            debug_assert!(!r.committed.is_empty() && r.committed.len() <= l.max_emit);
-            s.position += r.advance;
-            s.pending_seed = r.committed.last().copied();
-            s.history.extend_from_slice(&r.committed);
-            let finish = r.committed.iter().any(|t| s.stop_ids.contains(t)).then(|| "stop".to_string());
-            advances.push(RequestAdvance {
-                epoch: l.epoch,
-                committed_ids: r.committed,
-                committed_position: s.position,
-                accepted_drafts: r.accept_count,
-                verified_rows: r.drafts_generated + 1,
-                finish,
-            });
-        }
-        Ok((advances, timing))
     }
 
     /// Continue a promoted singleton MTP request as a spec lane: its admitted

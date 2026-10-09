@@ -2645,13 +2645,52 @@ pub fn drive_qwen_vmm_continuous_batch(
             Ok(p) => p,
             Err(e) => return fail_all(sched, gpu, model, &mut epochs, stdout, format!("plan: {e}")),
         };
-        // Spec lanes whose seed is already on the wire take one MTP window.
-        let spec_now: Vec<usize> = running
-            .iter()
-            .copied()
-            .filter(|&i| spec_lane[i] && !spec_seeds.iter().any(|a| a.epoch == epochs[i]))
-            .collect();
-        let mut advances = if plan.requests.is_empty() {
+        // Spec lanes whose seed is already on the wire take one MTP window:
+        // a Verify request in the same step plan as the AR/prefill rows
+        // (`[seed, placeholders…]`, k = min(max_emit - 1, K)); the executor
+        // drafts, verifies on the shared trunk and accept/repairs it.
+        let mut step_plan = plan.clone();
+        if step_plan.requests.is_empty() {
+            step_plan.batch.m_per_slot = vec![0; batch_size];
+        }
+        if let Some((k_max, _)) = spec_engine {
+            let store = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref());
+            for &i in running.iter().filter(|&&i| spec_lane[i] && !spec_seeds.iter().any(|a| a.epoch == epochs[i])) {
+                let BatchLane::Running(lane) = &sched.lanes[i] else {
+                    continue;
+                };
+                let max_emit = lane_max_tokens(&lane.key, sched).saturating_sub(lane.streamed_tokens.len());
+                let Some(st) = store.and_then(|s| s.request_state(&epochs[i])) else {
+                    continue;
+                };
+                let (Some(seed), true) = (st.pending_seed, max_emit > 0) else {
+                    continue;
+                };
+                let k = (max_emit - 1).min(k_max);
+                let b = &mut step_plan.batch;
+                let begin = b.tokens.len();
+                for j in 0..=k {
+                    // Rows past the seed are host-only placeholders.
+                    b.tokens.push(if j == 0 { seed } else { 0 });
+                    b.positions.push((st.position + j) as i32);
+                    b.row_slot.push(i as i32);
+                }
+                if b.m_per_slot.len() <= i {
+                    b.m_per_slot.resize(i + 1, 0);
+                }
+                b.m_per_slot[i] = k + 1;
+                step_plan.verify_rows += k + 1;
+                step_plan.requests.push(hipfire_runtime::slot_batch::RequestRows {
+                    epoch: epochs[i],
+                    rows: hipfire_runtime::slot_batch::RowRange { begin, len: k + 1 },
+                    kind: hipfire_runtime::slot_batch::RequestStepKind::Verify { draft_len: k },
+                });
+            }
+            // Stable slot order.
+            let rs = step_plan.batch.row_slot.clone();
+            step_plan.requests.sort_by_key(|r| rs[r.rows.begin]);
+        }
+        let mut advances = if step_plan.requests.is_empty() {
             planner.discard();
             Vec::new()
         } else {
@@ -2667,11 +2706,11 @@ pub fn drive_qwen_vmm_continuous_batch(
                 let store = vmm_store.as_mut().ok_or("store not staged")?;
                 let mut ex = store.executor(weights, config, scratch);
                 let out = ex
-                    .provision_step(gpu, &plan)
-                    .and_then(|()| ex.forward_step(gpu, &plan))
-                    .and_then(|o| ex.commit_step(gpu, &plan, o));
+                    .provision_step(gpu, &step_plan)
+                    .and_then(|()| ex.forward_step(gpu, &step_plan))
+                    .and_then(|o| ex.commit_step(gpu, &step_plan, o));
                 if out.is_err() {
-                    store.abort_step(&plan);
+                    store.abort_step(&step_plan);
                 }
                 out
             })();
@@ -2682,44 +2721,21 @@ pub fn drive_qwen_vmm_continuous_batch(
                     return fail_all(sched, gpu, model, &mut epochs, stdout, format!("step: {e}"));
                 }
             };
-            if let Err(e) = planner.publish(&mut work, &epochs, &plan, &advances) {
-                return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
+            if plan.requests.is_empty() {
+                planner.discard();
+            } else {
+                // The planner publishes only its own (AR/prefill) requests.
+                let planned: Vec<_> = advances
+                    .iter()
+                    .filter(|a| plan.requests.iter().any(|r| r.epoch == a.epoch))
+                    .cloned()
+                    .collect();
+                if let Err(e) = planner.publish(&mut work, &epochs, &plan, &planned) {
+                    return fail_all(sched, gpu, model, &mut epochs, stdout, format!("publish: {e}"));
+                }
             }
             advances
         };
-        if !spec_now.is_empty() {
-            let steps: Vec<hipfire_arch_qwen35::forward_slots::vmm::spec::SpecLaneStep<'_>> = spec_now
-                .iter()
-                .filter_map(|&i| match &sched.lanes[i] {
-                    BatchLane::Running(lane) => Some(hipfire_arch_qwen35::forward_slots::vmm::spec::SpecLaneStep {
-                        epoch: epochs[i],
-                        max_emit: lane_max_tokens(&lane.key, sched).saturating_sub(lane.streamed_tokens.len()),
-                        emitted: &lane.streamed_tokens,
-                    }),
-                    _ => None,
-                })
-                .filter(|s| s.max_emit > 0)
-                .collect();
-            let cycled = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
-                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
-                let hipfire_arch_qwen35::Qwen35Bundle {
-                    vmm_store,
-                    weights,
-                    config,
-                    scratch,
-                    ..
-                } = b;
-                let store = vmm_store.as_mut().ok_or("store not staged")?;
-                if steps.is_empty() {
-                    return Ok(Vec::new());
-                }
-                store.spec_cycle(gpu, weights, config, scratch, &steps).map(|(a, _)| a)
-            })();
-            match cycled {
-                Ok(a) => advances.extend(a),
-                Err(e) => return fail_all(sched, gpu, model, &mut epochs, stdout, format!("spec cycle: {e}")),
-            }
-        }
         advances.append(&mut spec_seeds);
         if advances.is_empty() {
             std::thread::sleep(Duration::from_millis(2));
