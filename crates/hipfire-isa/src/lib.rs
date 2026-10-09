@@ -9,7 +9,7 @@
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
 pub mod author; pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile; pub mod native;
-pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod iu4_v2b_a4; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; pub mod qwen4_mq6_x4; pub mod qwen4_mq6_x4_gfx11_hcw; pub mod qwen4_mq6_x4_gfx11; pub mod gemm_uk; #[path = "qsa_gather.rip.rs"] pub mod qsa_gather; #[path = "qsa_score.rip.rs"] pub mod qsa_score; #[path = "qsa_topk.rip.rs"] pub mod qsa_topk; pub mod qsa_select; }
+pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod iu4_v2b_a4; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; pub mod qwen4_mq6_x4; pub mod qwen4_mq6_x4_gfx11_hcw; pub mod qwen4_mq6_x4_gfx11; pub mod gemm_uk; #[path = "qsa_gather.rip.rs"] pub mod qsa_gather; #[path = "qsa_score.rip.rs"] pub mod qsa_score; #[path = "qsa_topk.rip.rs"] pub mod qsa_topk; pub mod qsa_select; pub mod pm_decode; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
