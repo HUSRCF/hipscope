@@ -1680,6 +1680,26 @@ impl Gpu {
     }
 
     pub fn init_with_device(id: i32) -> HipResult<Self> {
+        // Honor HIPFIRE_DEVICES for every direct entry point before the HIP
+        // runtime initializes; a no-op when unset or already applied (daemon).
+        match hipfire_config::devices::apply_entry_point_device_visibility() {
+            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved { devices, visibility })) => {
+                eprintln!(
+                    "[devices] HIPFIRE_DEVICES -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
+                    devices
+                        .iter()
+                        .map(|d| format!("index {} {} {}", d.index, d.arch, d.bdf))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    visibility.rocr,
+                    visibility.hip
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(hip_bridge::HipError::new(0, &format!("HIPFIRE_DEVICES: {error}")));
+            }
+        }
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
         if count == 0 {

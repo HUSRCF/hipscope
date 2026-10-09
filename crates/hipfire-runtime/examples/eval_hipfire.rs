@@ -196,41 +196,6 @@ fn main() {
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
     // -------- GPU init --------
-    // Resolve HIPFIRE_DEVICES (index / gfxNNNN / GPU-<uuid> / PCI BDF) through the
-    // same hipfire-config resolver the daemon uses, before any GPU runtime loads.
-    // Unset keeps the default device 0; a set-but-unresolvable value is fatal.
-    // Eval harness: resolves the device but takes no daemon GPU lock.
-    {
-        let process = hipfire_config::load_local_process_config()
-            .unwrap_or_else(|e| panic!("load process config: {e}"));
-        process
-            .validate()
-            .unwrap_or_else(|e| panic!("invalid process config: {e}"));
-        let selection = hipfire_config::devices::apply_device_visibility(&process, &mut |_| {
-            Ok(hipfire_config::devices::Claim::Claimed)
-        })
-        .unwrap_or_else(|e| panic!("HIPFIRE_DEVICES: {e}"));
-        if let hipfire_config::devices::DeviceSelection::Resolved { devices, visibility } =
-            &selection
-        {
-            eprintln!(
-                "eval_hipfire: HIPFIRE_DEVICES={:?} -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
-                process.legacy_value("HIPFIRE_DEVICES").unwrap_or_default(),
-                devices
-                    .iter()
-                    .map(|d| format!("index {} {} {}", d.index, d.arch, d.bdf))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                visibility.rocr,
-                visibility.hip
-            );
-        }
-        let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&process);
-        hipfire_config::install_process_config(process)
-            .unwrap_or_else(|_| panic!("process configuration was already initialized"));
-        hipfire_runtime::config::init_with(runtime)
-            .unwrap_or_else(|_| panic!("runtime process configuration was already initialized"));
-    }
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!(
         "eval_hipfire: arch={} model={}",

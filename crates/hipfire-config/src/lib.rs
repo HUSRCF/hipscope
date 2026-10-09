@@ -4836,6 +4836,12 @@ fn migrate_legacy_aliases(
     }
 }
 
+/// Whether the legacy environment selects devices (`HIPFIRE_DEVICES` or its
+/// singular spelling `HIPFIRE_DEVICE`), without validating any other key.
+pub fn legacy_devices_env_set() -> bool {
+    env::var_os("HIPFIRE_DEVICES").is_some() || env::var_os("HIPFIRE_DEVICE").is_some()
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
