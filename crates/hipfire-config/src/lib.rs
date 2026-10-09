@@ -1143,6 +1143,33 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),
         "Maximum coexisting eligible batch lanes for serve; 1 preserves sequential behavior."
     ),
+    process_bool_field!(
+        "serve.vmm_batch",
+        "serve_vmm_batch",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_VMM_BATCH",
+        "Route eligible concurrent requests through the VMM continuous-batching executor (per-request VMM KV, one resident target). Off = existing VMM singleton route; never the fixed-slot legacy route. Developer default off until its route gates pass."
+    ),
+    process_bool_field!(
+        "serve.batch_spec",
+        "serve_batch_spec",
+        Serve,
+        true,
+        true,
+        "HIPFIRE_SERVE_BATCH_SPEC",
+        "Allow cross-request speculative verify rows on the VMM batch route; 0 disables batched speculation only and keeps singleton speculation unchanged."
+    ),
+    process_bool_field!(
+        "serve.batch_nonexact",
+        "serve_batch_nonexact",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_BATCH_NONEXACT",
+        "Permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. Always default off."
+    ),
     field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",

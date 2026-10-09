@@ -547,7 +547,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1442
+**Count:** 1447
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1327,7 +1327,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_PACK_JOBS` | crates/rdna-compute/src/bin/hipfire-kernel-pack.rs, scripts/build-kernel-pack.sh | developer |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
@@ -1541,6 +1540,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ORACLE_STATE_FP32` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_ORNITH15_MODEL` | scripts/coherence-gate-ornith15.sh | deprecated |
 | `HIPFIRE_ORNITH_FIXTURE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
+| `HIPFIRE_PACK_JOBS` | crates/rdna-compute/src/bin/hipfire-kernel-pack.rs, scripts/build-kernel-pack.sh | developer |
 | `HIPFIRE_PAGE_EVICTION` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_PARENT_ROUTE_SCALE` | crates/hipfire-arch-deepseek4/scripts/ds4_parent_route_scale_probe.sh, crates/hipfire-ds4-parent/src/moe.rs | developer |
 | `HIPFIRE_PARITY_EXTRA_MODEL` | crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs | harness |
@@ -1843,6 +1843,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_ALLOW_INCOHERENT` | scripts/serve_harness.py | harness |
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_BATCH_NONEXACT` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SERVE_BATCH_SPEC` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_GATE_DFLASH` | scripts/serve-multiturn-gate.sh | harness |
 | `HIPFIRE_SERVE_GATE_OUT` | scripts/serve-multiturn-gate.sh | harness |
 | `HIPFIRE_SERVE_GATE_PORT` | scripts/serve-loop-gate.sh | harness |
@@ -1867,6 +1869,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_STREAM_STALL_TIMEOUT_MS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_UI` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_VMM_BATCH` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SESSION_CACHE_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SESSION_CACHE_MODEL` | crates/hipfire-arch-qwen4/tests/session_cache_hw.rs | harness |
 | `HIPFIRE_SILU_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
