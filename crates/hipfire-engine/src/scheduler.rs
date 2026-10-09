@@ -1077,6 +1077,48 @@ pub struct DaemonInbox {
     pub backlog: std::collections::VecDeque<DaemonMsg>,
 }
 
+/// Serve-batched generate messages queued for the main loop (reader-sent or
+/// pushed back, not yet received). A running singleton generation polls it
+/// at token boundaries to decide whether to promote itself into the VMM
+/// batch driver; nothing else reads it.
+static QUEUED_BATCH_GENERATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn is_batch_generate(msg: &DaemonMsg) -> bool {
+    match msg {
+        DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+            v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                && parse_serve_continuous_batch(v)
+        }
+        _ => false,
+    }
+}
+
+/// Reader thread: account one message about to be sent on the inbox channel.
+pub fn note_daemon_msg_queued(msg: &DaemonMsg) {
+    if is_batch_generate(msg) {
+        QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Number of serve-batched generates waiting for the main loop.
+pub fn queued_batch_generates() -> usize {
+    QUEUED_BATCH_GENERATES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_received<T>(r: Result<DaemonMsg, T>) -> Result<DaemonMsg, T> {
+    if let Ok(msg) = &r {
+        if is_batch_generate(msg) {
+            let _ = QUEUED_BATCH_GENERATES.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+    }
+    r
+}
+
 impl DaemonInbox {
     pub fn new(rx: std::sync::mpsc::Receiver<DaemonMsg>) -> Self {
         Self {
@@ -1086,26 +1128,29 @@ impl DaemonInbox {
     }
     pub fn recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::RecvError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.recv()
+        note_received(self.rx.recv())
     }
     pub fn try_recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::TryRecvError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.try_recv()
+        note_received(self.rx.try_recv())
     }
     pub fn recv_timeout(
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<DaemonMsg, std::sync::mpsc::RecvTimeoutError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.recv_timeout(timeout)
+        note_received(self.rx.recv_timeout(timeout))
     }
     pub fn push_front(&mut self, msg: DaemonMsg) {
+        if is_batch_generate(&msg) {
+            QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.backlog.push_front(msg);
     }
     /// Non-blocking: move every already-delivered message into the backlog
