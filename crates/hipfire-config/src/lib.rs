@@ -524,8 +524,23 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
+    "auto",
+    "f32",
+    "f16",
+    "bf16",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+    "fp8",
+    "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -3556,6 +3571,49 @@ pub fn canonical_config_key(key: &str) -> Option<String> {
         .or_else(|| is_developer_key(key).then(|| key.to_owned()))
 }
 
+/// A config key that shipped in a release and was later removed from the
+/// schema. Through its deprecation window (until `ignored_until`) a config
+/// file that still sets it loads with a warning and the value is ignored;
+/// keys that never shipped stay unknown and fail the load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredConfigKey {
+    pub key: &'static str,
+    pub legacy_key: &'static str,
+    pub shipped_in: &'static str,
+    pub removed_in: &'static str,
+    pub ignored_until: &'static str,
+    pub reason: &'static str,
+}
+
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
+    key: "kernel.mw16",
+    legacy_key: "mw16",
+    shipped_in: "0.3.1",
+    removed_in: "0.4.1",
+    ignored_until: "0.5.0",
+    reason: "the MW16 GEMM experiment was removed",
+}];
+
+pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
+    RETIRED_CONFIG_KEYS
+        .iter()
+        .find(|retired| retired.key == key || retired.legacy_key == key)
+}
+
+impl RetiredConfigKey {
+    fn warning(&self, path: &Path) -> String {
+        format!(
+            "ignored {} in {}: removed in {} ({}); the setting has no effect and is \
+             accepted with this warning until {} — delete it from the file",
+            self.key,
+            path.display(),
+            self.removed_in,
+            self.reason,
+            self.ignored_until
+        )
+    }
+}
+
 pub fn developer_env_for_key(key: &str) -> Option<String> {
     key.strip_prefix(DEVELOPER_PREFIX)
         .filter(|suffix| valid_developer_suffix(suffix))
@@ -3841,7 +3899,10 @@ fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
         let Some(name) = developer_env_for_key(key) else {
             continue;
         };
-        if FIELDS.iter().any(|schema| schema.env_compat == Some(name.as_str())) {
+        if FIELDS
+            .iter()
+            .any(|schema| schema.env_compat == Some(name.as_str()))
+        {
             continue;
         }
         if let Some(value) = render_compat_value(value) {
@@ -4094,11 +4155,7 @@ pub fn mtp_ngram_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
         gpu_arch,
     )
 }
-fn mtp_ngram_enabled_for_arch_value(
-    value: Option<&str>,
-    model_arch: u32,
-    gpu_arch: &str,
-) -> bool {
+fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_arch: &str) -> bool {
     match value {
         Some("1" | "on") => true,
         Some("0" | "off") => false,
@@ -4152,9 +4209,8 @@ fn ngram_mod_triple_resolve(
     defaults: (usize, usize, usize),
     get: impl Fn(&str) -> Option<String>,
 ) -> (usize, usize, usize) {
-    let pick = |name: &str, default: usize| {
-        get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-    };
+    let pick =
+        |name: &str, default: usize| get(name).and_then(|s| s.parse().ok()).unwrap_or(default);
     (
         pick("HIPFIRE_NGRAM_MOD_N_MATCH", defaults.0),
         pick("HIPFIRE_NGRAM_MOD_N_MIN", defaults.1),
@@ -4383,12 +4439,12 @@ impl ConfigPaths {
 
 pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
     if paths.config_toml.exists() {
-        let layer = load_toml_layer(&paths.config_toml)?;
+        let (layer, warnings) = load_toml_layer_with_warnings(&paths.config_toml)?;
         return Ok(LoadedConfig {
             layer,
             path: paths.config_toml.clone(),
             format: ConfigFormat::Toml,
-            warnings: Vec::new(),
+            warnings,
         });
     }
     if paths.config_json.exists() {
@@ -4899,7 +4955,15 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
     Ok(layer)
 }
 
+/// Load a TOML config layer. Retired keys ([`RETIRED_CONFIG_KEYS`]) are
+/// dropped; use [`load_toml_layer_with_warnings`] to report them.
 pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
+    load_toml_layer_with_warnings(path).map(|(layer, _)| layer)
+}
+
+/// Load a TOML config layer, ignoring retired keys with one warning each.
+/// Every other unknown key still fails the load.
+pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
     let raw = read_string(path)?;
     let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -4916,10 +4980,17 @@ pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
     let mut flat = BTreeMap::new();
     flatten_toml("", &table, &mut flat, path)?;
     let mut layer = ConfigLayer::default();
+    let mut warnings = Vec::new();
     for (key, value) in flat {
+        if field(&key).is_none() {
+            if let Some(retired) = retired_config_key(&key) {
+                warnings.push(retired.warning(path));
+                continue;
+            }
+        }
         layer.set(&key, value)?;
     }
-    Ok(layer)
+    Ok((layer, warnings))
 }
 
 fn flatten_toml(
@@ -5434,7 +5505,10 @@ mod tests {
             values,
         };
         let table = legacy_table(&config);
-        let mut names: Vec<&str> = FIELDS.iter().filter_map(|schema| schema.env_compat).collect();
+        let mut names: Vec<&str> = FIELDS
+            .iter()
+            .filter_map(|schema| schema.env_compat)
+            .collect();
         names.extend([
             "HIPFIRE_DSPARK_Q8_WMMA",
             "HIPFIRE_NGRAM_WINDOW",
@@ -5825,6 +5899,96 @@ mod tests {
     }
 
     #[test]
+    fn retired_keys_warn_and_are_ignored() {
+        // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
+        // written by those releases must still load through the window.
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[kernel]\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let loaded = load_global(&paths).unwrap();
+            assert_eq!(loaded.format, ConfigFormat::Toml);
+            assert_eq!(
+                loaded.layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(8192))
+            );
+            assert_eq!(
+                loaded.layer.values.len(),
+                1,
+                "{name}: retired key must be dropped"
+            );
+            assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
+            let warning = &loaded.warnings[0];
+            for needle in ["kernel.mw16", "removed in 0.4.1", "until 0.5.0"] {
+                assert!(warning.contains(needle), "{name}: {warning}");
+            }
+            assert!(resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: loaded.path },
+                layer: loaded.layer,
+            }])
+            .is_ok());
+            // Setting a retired key is still refused: it has no effect.
+            assert!(matches!(
+                ConfigLayer::default().set_cli("kernel.mw16", "true"),
+                Err(ConfigError::UnknownKey(_))
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn unreleased_gfx11_iu4_swizzle_stays_unknown() {
+        // kernel.gfx11_iu4_swizzle only existed on the exp/gfx11-iu4-swizzle
+        // branch (c34c9ab3bc) and never shipped, so it is an unknown key, not
+        // a retired one. This is hipx's config written by that branch.
+        let hipx = "schema_version = 1\n\n[diagnostic]\ngemm_dump = false\n\n\
+                    [experimental.graph]\nforward = true\n\n[kernel]\n\
+                    gfx11_iu4_gridspec = true\ngfx11_iu4_shape = false\n\
+                    gfx11_iu4_swizzle = false\n\n[memory]\nmax_seq = 8192\n\n\
+                    [speculation]\ndflash = \"off\"\nmode = \"auto\"\nmtp = \"auto\"\n";
+        assert!(retired_config_key("kernel.gfx11_iu4_swizzle").is_none());
+        let root = temp_root("unreleased-swizzle");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(&paths.config_toml, hipx).unwrap();
+        match load_global(&paths) {
+            Err(ConfigError::UnknownKey(key)) => assert_eq!(key, "kernel.gfx11_iu4_swizzle"),
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+        fs::write(
+            &paths.config_toml,
+            hipx.replace("gfx11_iu4_swizzle = false\n", ""),
+        )
+        .unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retired_keys_are_not_live_schema_keys() {
+        for retired in RETIRED_CONFIG_KEYS {
+            assert!(field(retired.key).is_none(), "{} is live", retired.key);
+            assert!(
+                field(retired.legacy_key).is_none(),
+                "{} is live",
+                retired.legacy_key
+            );
+            assert!(!retired.ignored_until.is_empty() && !retired.shipped_in.is_empty());
+        }
+    }
+
+    #[test]
     fn sparse_toml_roundtrip() {
         let root = temp_root("roundtrip");
         let paths = ConfigPaths::under(&root);
@@ -6060,7 +6224,10 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")

@@ -50,8 +50,8 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
-mod serve;
 mod kernel_pack;
+mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -1833,7 +1833,11 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
     let destination = paths.models.join(&entry.file);
-    let migrated = if args.force { None } else { migrate_flash_next_xts(paths, entry)? };
+    let migrated = if args.force {
+        None
+    } else {
+        migrate_flash_next_xts(paths, entry)?
+    };
     let needs_base = if args.force {
         true
     } else if let Some(path) = migrated {
@@ -1862,9 +1866,17 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         )?;
         if entry.is_flash_next_xts() {
             // The download has already verified the canonical payload.
-            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
-            if install_verified_link(&destination, &legacy)? && !same_installed_file(&destination, &legacy) {
-                verified_metadata(&legacy, entry.sha256.as_deref().expect("pinned digest"), entry.size_bytes.expect("pinned size"))?;
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            if install_verified_link(&destination, &legacy)?
+                && !same_installed_file(&destination, &legacy)
+            {
+                verified_metadata(
+                    &legacy,
+                    entry.sha256.as_deref().expect("pinned digest"),
+                    entry.size_bytes.expect("pinned size"),
+                )?;
             }
         }
     }
@@ -2413,8 +2425,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let mut engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2598,7 +2614,13 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         println!();
     }
     if args.stats && !args.json {
-        eprintln!("{}", format_run_stats(done.get("tokens").and_then(serde_json::Value::as_u64), &done));
+        eprintln!(
+            "{}",
+            format_run_stats(
+                done.get("tokens").and_then(serde_json::Value::as_u64),
+                &done
+            )
+        );
     }
     let _ = engine.unload();
     Ok(())
@@ -2722,8 +2744,12 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -2829,17 +2855,31 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
 
 fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String {
     let metric = |key: &str, precision: usize| {
-        timings.get(key).and_then(serde_json::Value::as_f64)
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
             .filter(|value| value.is_finite() && *value >= 0.0)
             .map(|value| format!("{value:.precision$}"))
             .unwrap_or_else(|| "n/a".to_owned())
     };
-    let mut footer = format!("[stats] tokens={} decode={} tok/s ttft={} ms",
-        tokens.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
-        metric("decode_tok_s", 2), metric("ttft_ms", 1));
+    let mut footer = format!(
+        "[stats] tokens={} decode={} tok/s ttft={} ms",
+        tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        metric("decode_tok_s", 2),
+        metric("ttft_ms", 1)
+    );
     let routes = ["dflash", "mtp", "mtp_ngram"];
-    let has_route = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool).is_some());
-    let speculative = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
+    let has_route = routes.iter().any(|key| {
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+    });
+    let speculative = routes
+        .iter()
+        .any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
     if (!has_route || speculative) && timings.get("tau").is_some_and(|value| !value.is_null()) {
         footer.push_str(&format!(" tau={}", metric("tau", 2)));
     }
@@ -2904,10 +2944,15 @@ fn run_via_http(
         } else {
             println!("{content}");
             if stats {
-                eprintln!("{}", format_run_stats(
-                    response.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_u64),
-                    &response["timings"],
-                ));
+                eprintln!(
+                    "{}",
+                    format_run_stats(
+                        response
+                            .pointer("/usage/completion_tokens")
+                            .and_then(serde_json::Value::as_u64),
+                        &response["timings"],
+                    )
+                );
             }
         }
         return Ok(());
@@ -2930,7 +2975,9 @@ fn run_via_http(
                     timings = value.unwrap_or(serde_json::Value::Null);
                 }
                 OpenAiSseEvent::Usage { usage } if stats => {
-                    tokens = usage.get("completion_tokens").and_then(serde_json::Value::as_u64);
+                    tokens = usage
+                        .get("completion_tokens")
+                        .and_then(serde_json::Value::as_u64);
                 }
                 _ => {}
             }
@@ -3083,6 +3130,17 @@ pub(crate) fn resolved_for_model(
     entry: Option<&ModelEntry>,
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
+    // config.toml warnings name retired keys the load ignored. serve resolves
+    // per model load, so report them once per process; legacy JSON migration
+    // notes stay with the `config` commands.
+    if loaded.format == ConfigFormat::Toml {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            for warning in &loaded.warnings {
+                eprintln!("warning: {warning}");
+            }
+        });
+    }
     let mut layers = Vec::new();
     if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
@@ -3191,10 +3249,12 @@ pub(crate) fn registry_entry_for_path<'registry>(
         let canonical_input = fs::canonicalize(candidate).ok()?;
         return registry.models.iter().find_map(|(tag, entry)| {
             let installed = paths.models.join(&entry.file);
-            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
             (same_installed_file(&installed, &canonical_input)
                 || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input)))
-                .then(|| (tag.as_str(), entry))
+            .then(|| (tag.as_str(), entry))
         });
     }
     registry.model(input)
@@ -3208,13 +3268,23 @@ pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Fallible pinned migration stays outside generic, cheap local discovery.
-pub(crate) fn resolve_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn resolve_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Result<Option<PathBuf>> {
     let explicit = Path::new(model);
     let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
-        catalog.catalog.model(model).is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
+        catalog
+            .catalog
+            .model(model)
+            .is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
     });
     if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
-        if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
+        if let Some((_, entry)) = registry
+            .model(model)
+            .filter(|(_, entry)| entry.is_flash_next_xts())
+        {
             return migrate_flash_next_xts(paths, entry);
         }
     }
@@ -3222,33 +3292,50 @@ pub(crate) fn resolve_model_path(paths: &Paths, registry: &RegistryV1, model: &s
 }
 
 fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<PathBuf>> {
-    if !entry.is_flash_next_xts() { return Ok(None); }
+    if !entry.is_flash_next_xts() {
+        return Ok(None);
+    }
     migrate_verified_artifact(
-        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
-        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
         entry.sha256.as_deref().expect("pinned digest"),
         entry.size_bytes.expect("pinned size"),
     )
 }
 
 fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino() && a.len() == b.len()
-            && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
     }
-    #[cfg(not(unix))] { a.len() == b.len() && a.modified().ok() == b.modified().ok() }
+    #[cfg(not(unix))]
+    {
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
 }
 
 fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, fs::Metadata)> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let before = file.metadata()?;
-    if !before.is_file() || before.len() != size { bail!("size mismatch: {}", path.display()); }
+    if !before.is_file() || before.len() != size {
+        bail!("size mismatch: {}", path.display());
+    }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buffer[..n]);
     }
     if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(digest) {
@@ -3270,7 +3357,8 @@ fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
         Err(_) => {}
     }
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         let target = fs::canonicalize(source)?;
         match std::os::unix::fs::symlink(target, destination) {
             Ok(()) => return Ok(true),
@@ -3281,7 +3369,12 @@ fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn migrate_verified_artifact(old: &Path, canonical: &Path, digest: &str, size: u64) -> Result<Option<PathBuf>> {
+fn migrate_verified_artifact(
+    old: &Path,
+    canonical: &Path,
+    digest: &str,
+    size: u64,
+) -> Result<Option<PathBuf>> {
     match fs::symlink_metadata(canonical) {
         Ok(_) => {
             verified_metadata(canonical, digest, size)?;
@@ -3330,9 +3423,17 @@ pub(crate) fn find_model_path(
             }
         }
     }
-    if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
-        return [entry.file.as_str(), hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE]
-            .into_iter().map(|file| paths.models.join(file)).find(|path| path.is_file());
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.is_flash_next_xts())
+    {
+        return [
+            entry.file.as_str(),
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ]
+        .into_iter()
+        .map(|file| paths.models.join(file))
+        .find(|path| path.is_file());
     }
     // An exact on-disk spelling outranks a registry alias that would rewrite it.
     // The registry maps a model NAME to its canonical FILE, which is what makes
@@ -5214,7 +5315,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .and_then(bench_prompt_warning)
             .into_iter()
             .chain(bench_power::throttle_warning(&power_runs))
-            .chain(bench_spec_warning(args.speculation.as_deref(), &spec_routes))
+            .chain(bench_spec_warning(
+                args.speculation.as_deref(),
+                &spec_routes,
+            ))
             .collect();
         if let Some(tokens) = prompt_tokens {
             eprintln!("  prompt_tokens: {tokens}");
@@ -7373,7 +7477,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    eprintln!(
+        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
+    );
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -8140,19 +8246,44 @@ mod tests {
     }
     #[test]
     fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {
-        assert_eq!(format_run_stats(Some(256), &serde_json::json!({
-            "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
-        })), "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15");
-        assert_eq!(format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
-            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
-        assert_eq!(format_run_stats(Some(0), &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})),
-            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a");
-        assert_eq!(format_run_stats(None, &serde_json::json!({
-            "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
-        })), "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
-        assert_eq!(format_run_stats(Some(1), &serde_json::json!({
-            "tau":1, "dflash":false, "mtp":false
-        })), "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms");
+        assert_eq!(
+            format_run_stats(
+                Some(256),
+                &serde_json::json!({
+                    "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
+                })
+            ),
+            "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15"
+        );
+        assert_eq!(
+            format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(0),
+                &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})
+            ),
+            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a"
+        );
+        assert_eq!(
+            format_run_stats(
+                None,
+                &serde_json::json!({
+                    "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
+                })
+            ),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(1),
+                &serde_json::json!({
+                    "tau":1, "dflash":false, "mtp":false
+                })
+            ),
+            "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms"
+        );
     }
 
     #[test]
@@ -8176,10 +8307,15 @@ mod tests {
                 result
             }));
         }
-        for join in joins { assert_eq!(join.join().unwrap().unwrap(), Some(new.clone())); }
+        for join in joins {
+            assert_eq!(join.join().unwrap().unwrap(), Some(new.clone()));
+        }
         assert!(same_installed_file(&old, &new));
         assert_eq!(fs::read(&sidecar).unwrap(), b"preserved");
-        assert_eq!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(), Some(new.clone()));
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(),
+            Some(new.clone())
+        );
         fs::remove_file(&new).unwrap();
         fs::write(&old, vec![b'x'; bytes.len()]).unwrap();
         assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
@@ -8201,7 +8337,10 @@ mod tests {
         fs::write(&external, b"fixture").unwrap();
         std::os::unix::fs::symlink(&external, &old).unwrap();
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &new, &digest, 7).unwrap(), Some(new.clone()));
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, 7).unwrap(),
+            Some(new.clone())
+        );
         assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(new).unwrap(), b"fixture");
         fs::remove_dir_all(paths.root).unwrap();
@@ -8214,11 +8353,18 @@ mod tests {
         fs::write(&old, b"fixture").unwrap();
         let unavailable = paths.root.join("missing-parent/canonical");
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(), Some(old.clone()));
-        #[cfg(target_os = "linux")] {
+        assert_eq!(
+            migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(),
+            Some(old.clone())
+        );
+        #[cfg(target_os = "linux")]
+        {
             // procfs does not permit arbitrary new links even for root.
             let read_only = Path::new("/proc").join(paths.root.file_name().unwrap());
-            assert_eq!(migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(), Some(old.clone()));
+            assert_eq!(
+                migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(),
+                Some(old.clone())
+            );
             assert_eq!(fs::read(&old).unwrap(), b"fixture");
         }
         let registry = hipfire_registry::bundled().unwrap();
@@ -8227,7 +8373,10 @@ mod tests {
         let rtn = paths.models.join("qwen3.8-flash-next.mq4");
         fs::write(&rtn, b"historical RTN").unwrap();
         assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
-        assert_eq!(resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(), None);
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
         let (_, rtn_entry) = registry.model("qwen3.8:flash-next-rtn-asym").unwrap();
         assert!(!rtn_entry.is_flash_next_xts());
         assert_eq!(migrate_flash_next_xts(&paths, rtn_entry).unwrap(), None);
@@ -8241,7 +8390,9 @@ mod tests {
         let paths = test_paths("migration-cross-device");
         fs::create_dir_all(&paths.models).unwrap();
         let shared = Path::new("/dev/shm");
-        if !shared.is_dir() || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev() {
+        if !shared.is_dir()
+            || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev()
+        {
             fs::remove_dir_all(paths.root).unwrap();
             return;
         }
@@ -8249,14 +8400,18 @@ mod tests {
         fs::write(&old, b"fixture").unwrap();
         let canonical = shared.join(paths.root.file_name().unwrap());
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(), Some(canonical.clone()));
-        assert!(fs::symlink_metadata(&canonical).unwrap().file_type().is_symlink());
+        assert_eq!(
+            migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(),
+            Some(canonical.clone())
+        );
+        assert!(fs::symlink_metadata(&canonical)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(same_installed_file(&old, &canonical));
         fs::remove_file(canonical).unwrap();
         fs::remove_dir_all(paths.root).unwrap();
     }
-
-
 
     fn idle_test_meta() -> ServeMeta {
         ServeMeta {
@@ -12619,7 +12774,11 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+        assert_eq!(
+            health["n_ctx"],
+            serde_json::json!(4096),
+            "the load ack's max_seq"
+        );
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
@@ -12628,12 +12787,18 @@ mod tests {
         assert_ne!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert!(health["model"].is_null());
-        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+        assert!(
+            health["n_ctx"].is_null(),
+            "no context is advertised with nothing resident"
+        );
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
-        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+        assert_eq!(
+            loads, 3,
+            "initial load, failed switch, reload of the old model"
+        );
     }
 
     /// A daemon that exits (crash, or a sticky GPU fault after which it exits
@@ -12662,7 +12827,10 @@ mod tests {
     #[test]
     fn serve_health_is_unhealthy_until_the_daemon_is_back() {
         let h = Task11HttpHarness::spawn("respawn-health");
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         let daemon = {
             let mut runtime = h.shared.runtime.lock().unwrap();
             std::mem::replace(
@@ -12684,7 +12852,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(health["status"], "ok");
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
@@ -12778,8 +12949,7 @@ mod tests {
         let choice = &json["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
         assert_eq!(
-            choice["message"]["tool_calls"][0]["function"]["name"],
-            "read_file",
+            choice["message"]["tool_calls"][0]["function"]["name"], "read_file",
             "{text}"
         );
     }
@@ -13483,7 +13653,10 @@ mod tests {
             bench_generate_request_reasoning("p", 128, false),
             bench_generate_request_reasoning("p", 128, true),
         ] {
-            assert_eq!(req.get("repeat_penalty").and_then(|v| v.as_f64()), Some(1.0));
+            assert_eq!(
+                req.get("repeat_penalty").and_then(|v| v.as_f64()),
+                Some(1.0)
+            );
         }
     }
 
