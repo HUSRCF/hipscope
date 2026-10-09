@@ -215,6 +215,59 @@ fn shift_row_ptr(base: *mut c_void, rows: usize, row_bytes: usize) -> *mut c_voi
     }
 }
 
+/// Per-request VMM descriptor header for the `*_vmm` module variants — see
+/// `kernels/src/kv_slot_desc_vmm.h`. Never prepended to a default or paged
+/// module, so their source bytes, JIT keys and code objects are unchanged.
+pub const KV_SLOT_DESC_VMM_H: &str = include_str!("../../../kernels/src/kv_slot_desc_vmm.h");
+
+/// `kv_cache_write_fp8_e4m3_batched_vmm` — fp8 write into per-request VMM VAs.
+pub const KV_CACHE_WRITE_FP8_E4M3_VMM_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fp8_e4m3_vmm.hip");
+
+/// Assemble a `_vmm` translation unit: rename `symbol` to `vmm_symbol`,
+/// prepend [`KV_SLOT_DESC_VMM_H`] and strip every descriptor include (the
+/// runtime compile has no `-I` to `kernels/src`). Exposed so the kernel
+/// registry can precompile the exact same module bytes.
+pub fn kv_slot_desc_vmm_source(body: &str, symbol: &str, vmm_symbol: &str) -> String {
+    let stripped = body
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm.h\"", "");
+    if symbol == vmm_symbol {
+        format!("{KV_SLOT_DESC_VMM_H}\n{stripped}")
+    } else {
+        format!("#define {symbol} {vmm_symbol}\n{KV_SLOT_DESC_VMM_H}\n{stripped}")
+    }
+}
+
+/// Which side of a request's VMM KV owner a `_vmm` write targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmKvSide {
+    K,
+    V,
+}
+
+/// KV storage formats with a validated `_vmm` descriptor implementation.
+/// Rotated (asym/fwht) and bf16 VMM variants are not implemented; callers
+/// must refuse those modes rather than fall back to a legacy arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmKvFormat {
+    /// Q8_0 blocks, `n_kv_heads * head_dim/32 * 34` bytes per token (K and V).
+    Q8,
+    /// Native E4M3FN rows with inline f16 per-head scales (gfx1201 only).
+    Fp8E4M3,
+}
+
+impl VmmKvFormat {
+    /// Per-token byte stride of one side; K and V share it for both formats.
+    pub fn bytes_per_token(self, n_kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            Self::Q8 => n_kv_heads * (head_dim / 32) * 34,
+            Self::Fp8E4M3 => fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+        }
+    }
+}
+
 /// Launch grid for the adaptive-KV transcode kernels: one block per
 /// (position, kv_head) folded into `grid.x` as `pos * n_kv_heads + h`. HIP
 /// caps `grid.y` at 65535 blocks, so the former `[n_kv_heads, n_positions]`
@@ -3622,6 +3675,230 @@ impl Gpu {
             block_cols,
             None,
             None,
+        )
+    }
+
+    /// Per-request VMM KV write (`*_vmm` modules). Row `b` quantizes
+    /// `src[b]` into the absolute VMM VA of `vmm_descs[row_slot[b]]`
+    /// (`k_base` or `v_base` by `side`) at `positions[b]`. `vmm_descs` is a
+    /// device array of [`crate::kv_slots::VmmKvSlotDesc`] for ONE KV layer;
+    /// `row_slot`/`positions` are device i32 `[batch_size]`. Arithmetic is the
+    /// legacy Q8/fp8 batched writer's; the host MUST run
+    /// [`crate::kv_slots::validate_vmm_rows`] on the uploaded contents first
+    /// (the device traps on any out-of-prefix position).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_batched_vmm(
+        &mut self,
+        format: VmmKvFormat,
+        side: VmmKvSide,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if batch_size == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let (func, grid_x): (&'static str, u32) = match format {
+            VmmKvFormat::Q8 => {
+                let f = "kv_cache_write_q8_0_batched_vmm";
+                if !self.functions.contains_key(f) {
+                    let src = kv_slot_desc_vmm_source(
+                        kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+                        "kv_cache_write_q8_0_batched",
+                        f,
+                    );
+                    self.ensure_kernel(f, &src, f)?;
+                }
+                (f, (n_kv_heads * head_dim / 32) as u32)
+            }
+            VmmKvFormat::Fp8E4M3 => {
+                let f = "kv_cache_write_fp8_e4m3_batched_vmm";
+                if !self.functions.contains_key(f) {
+                    let src = kv_slot_desc_vmm_source(KV_CACHE_WRITE_FP8_E4M3_VMM_SRC, f, f);
+                    self.ensure_kernel(f, &src, f)?;
+                }
+                (f, n_kv_heads as u32)
+            }
+        };
+        let mut null_dst: *mut c_void = std::ptr::null_mut();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs: i32;
+        let mut desc_ptr = vmm_descs.buf.as_ptr();
+        let mut rs = row_slot.buf.as_ptr();
+        let mut vb = (side == VmmKvSide::V) as i32;
+        let q8 = format == VmmKvFormat::Q8;
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base, rs_base) = (s, p, rs);
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            rs = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(9);
+            if q8 {
+                params.push(&mut null_dst as *mut _ as *mut c_void);
+            }
+            params.extend([
+                &mut s as *mut _ as *mut c_void,
+                &mut p as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut bs as *mut _ as *mut c_void,
+                &mut desc_ptr as *mut _ as *mut c_void,
+                &mut rs as *mut _ as *mut c_void,
+                &mut vb as *mut _ as *mut c_void,
+            ]);
+            let (sr, pr, rr, dr, b_len) = (s, p, rs, desc_ptr, bs);
+            self.launch_maybe_blob(
+                func,
+                [grid_x, len as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    if q8 {
+                        b.push_ptr(std::ptr::null_mut());
+                    }
+                    b.push_ptr(sr);
+                    b.push_ptr(pr);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(b_len);
+                    b.push_ptr(dr);
+                    b.push_ptr(rr);
+                    b.push_i32(vb);
+                    b
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-request VMM causal attention (`*_vmm` modules) over independent
+    /// request KV owners: row `b` attends `[0, positions[b]]` of
+    /// `vmm_descs[row_slot[b]]`. Serves decode, linear verify and prefill rows
+    /// alike (no tree bias). `max_ctx_len` MUST be `>= max(positions)+1`; it
+    /// sizes the LDS scores slice, and a context whose slice would exceed the
+    /// 64 KiB per-block limit is refused rather than launched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_batched_vmm(
+        &mut self,
+        format: VmmKvFormat,
+        q: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let block_size = (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_bytes = (max_ctx_len + block_size as usize + head_dim) * 4;
+        if shared_bytes > ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_kv_batched_vmm: context {max_ctx_len} needs {shared_bytes} B LDS \
+                     (> {ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES}); no VMM long-context kernel yet"
+                ),
+            ));
+        }
+        if batch_size > u16::MAX as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_kv_batched_vmm: batch exceeds grid.y limit",
+            ));
+        }
+        self.bind_thread()?;
+        let (symbol, vmm_symbol, body) = match format {
+            VmmKvFormat::Q8 => (
+                "attention_q8_0_kv_batched",
+                "attention_q8_0_kv_batched_vmm",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            ),
+            VmmKvFormat::Fp8E4M3 => (
+                "attention_fp8_e4m3_kv_batched",
+                "attention_fp8_e4m3_kv_batched_vmm",
+                kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC,
+            ),
+        };
+        if !self.functions.contains_key(vmm_symbol) {
+            let src = kv_slot_desc_vmm_source(body, symbol, vmm_symbol);
+            self.ensure_kernel(vmm_symbol, &src, vmm_symbol)?;
+        }
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr: *mut c_void = std::ptr::null_mut();
+        let mut v_ptr: *mut c_void = std::ptr::null_mut();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut bias_ptr: *mut c_void = std::ptr::null_mut();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_ctx_len as i32;
+        let mut sc = 1.0f32 / (head_dim as f32).sqrt();
+        let mut bstart = 0i32;
+        let mut bcols = 0i32;
+        let mut desc_ptr = vmm_descs.buf.as_ptr();
+        let mut rs_ptr = row_slot.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut bias_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bstart as *mut _ as *mut c_void,
+            &mut bcols as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
+        ];
+        let (qr, or, pr, dr, rr) = (q_ptr, out_ptr, pos_ptr, desc_ptr, rs_ptr);
+        self.launch_maybe_blob(
+            vmm_symbol,
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qr);
+                b.push_ptr(std::ptr::null_mut());
+                b.push_ptr(std::ptr::null_mut());
+                b.push_ptr(or);
+                b.push_ptr(pr);
+                b.push_ptr(std::ptr::null_mut());
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(bstart);
+                b.push_i32(bcols);
+                b.push_ptr(dr);
+                b.push_ptr(rr);
+                b
+            },
         )
     }
     /// Batched native fp8-E4M3 decode/prefill (F slice, gfx1201-only): same
