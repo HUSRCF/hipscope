@@ -2583,6 +2583,8 @@ fn main() {
                                     v["continuous_batch_route"] = serde_json::json!("vmm");
                                     v["continuous_batch_slots"] = serde_json::json!(staging.slots);
                                     v["continuous_batch_row_budget"] =
+                                        serde_json::json!(staging.row_budget);
+                                    v["continuous_batch_row_budget_requested"] =
                                         serde_json::json!(p.max_batch_tokens);
                                     v["continuous_batch_spec"] = serde_json::json!(false);
                                     v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);

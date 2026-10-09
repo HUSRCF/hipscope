@@ -43,6 +43,8 @@ pub struct BatchStaging {
     /// The VMM continuous-batching route was staged (per-request VMM KV in
     /// `Qwen35Bundle::vmm_store`, no fixed lanes).
     pub vmm: bool,
+    /// Admitted VMM step row budget (scratch-fitted `serve.max_batch_tokens`).
+    pub row_budget: usize,
 }
 
 /// Load-time request for the VMM continuous-batching route.
@@ -522,33 +524,52 @@ fn stage_qwen_vmm_batch(
         eprintln!("[daemon] VMM continuous batch unsupported for this model: {e} — existing route");
         return out;
     }
-    let row_budget = req.row_budget.max(requested);
+    // Requested trunk-row budget; when its stable scratch does not fit,
+    // halve (never below the width) and report the admitted value — the
+    // planner budget is the store's actual `row_budget()`.
+    let mut row_budget = req.row_budget.max(requested);
     // Shared physical KV budget for every request owner: free VRAM after the
     // resident model, minus fixed headroom for executor scratch and
     // transient allocations. Admission/provision refuse past it.
     const KV_HEADROOM: usize = 1 << 30;
-    let free = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
-    let kv_budget_bytes = free.saturating_sub(KV_HEADROOM);
-    match hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::new(
-        gpu,
-        &b.config,
-        &b.kv_cache,
-        requested,
-        row_budget,
-        kv_budget_bytes,
-    ) {
-        Ok(store) => {
-            b.vmm_store = Some(store);
-            out.capable = true;
-            out.vmm = true;
-            out.slots = requested;
-            out.lane_capacity = max_seq;
-            eprintln!(
-                "[daemon] VMM continuous batch staged: width={requested} row_budget={row_budget} max_seq_bound={max_seq}"
-            );
-        }
-        Err(e) => {
-            eprintln!("[daemon] VMM continuous batch unavailable: {e} — existing route");
+    loop {
+        let free = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
+        let kv_budget_bytes = free.saturating_sub(KV_HEADROOM);
+        match hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::new(
+            gpu,
+            &b.config,
+            &b.kv_cache,
+            requested,
+            row_budget,
+            kv_budget_bytes,
+        ) {
+            Ok(store) => {
+                b.vmm_store = Some(store);
+                out.capable = true;
+                out.vmm = true;
+                out.slots = requested;
+                out.lane_capacity = max_seq;
+                out.row_budget = row_budget;
+                eprintln!(
+                    "[daemon] VMM continuous batch staged: width={requested} row_budget={row_budget} (requested {}) max_seq_bound={max_seq} free_vram_mb={}",
+                    req.row_budget,
+                    free >> 20
+                );
+                break;
+            }
+            Err(e) if e.contains("out of memory") && row_budget / 2 >= requested => {
+                eprintln!(
+                    "[daemon] VMM continuous batch scratch for row_budget={row_budget} does not fit ({e}); halving"
+                );
+                row_budget /= 2;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[daemon] VMM continuous batch unavailable: {e} (row_budget={row_budget}, free_vram_mb={}) — existing route",
+                    free >> 20
+                );
+                break;
+            }
         }
     }
     out
