@@ -129,16 +129,82 @@ fn xbatch_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
 
 /// Residual projection of super-op run `ordinal` (0 = attention/DeltaNet
 /// `wo`, 1 = `w_down`): its weight and the batch buffer that stages each
-/// row's rotated input contiguously as `[n][k]` (a projection-output buffer
-/// whose rows were already copied into the singleton scratch).
+/// row's rotated input contiguously as `[n][k]` (a buffer no row scratch
+/// view aliases).
 fn residual_target<'a>(st: &'a Qwen35VmmStore, layer: &'a LayerWeights, ordinal: usize) -> HipResult<(&'a WeightTensor, &'a GpuTensor)> {
     let p = &st.pbs;
     match (layer, ordinal) {
-        (LayerWeights::DeltaNet(l), 0) => Ok((&l.wo, &p.dn_qkv_batch)),
-        (LayerWeights::FullAttn(l), 0) => Ok((&l.wo, &p.fa_q_full_batch)),
-        (LayerWeights::DeltaNet(l), 1) => Ok((&l.w_down, &p.gate_ffn_batch)),
-        (LayerWeights::FullAttn(l), 1) => Ok((&l.w_down, &p.gate_ffn_batch)),
+        (LayerWeights::DeltaNet(l), 0) => Ok((&l.wo, &p.dn_normed_rot_batch)),
+        (LayerWeights::FullAttn(l), 0) => Ok((&l.wo, &p.fa_attn_out_rot_batch)),
+        (LayerWeights::DeltaNet(l), 1) => Ok((&l.w_down, &p.ffn_hidden_batch)),
+        (LayerWeights::FullAttn(l), 1) => Ok((&l.w_down, &p.ffn_hidden_batch)),
         _ => Err(HipError::new(0, "exact VMM step: unsupported residual super-op")),
+    }
+}
+
+/// One decode row's view of the singleton scratch: the fields its binding
+/// run reads or writes as its own row of the step's batch buffers (residual
+/// stream, projection outputs, position) alias that row; every other field
+/// is the shared scratch. Removes the per-row copy in/out of those rows.
+struct RowScratch(std::mem::ManuallyDrop<Qwen35Scratch>);
+
+impl RowScratch {
+    fn new(s: &Qwen35Scratch, st: &Qwen35VmmStore, config: &Qwen35Config, r: usize) -> Self {
+        let p = &st.pbs;
+        let row = |t: &GpuTensor, len: usize| t.sub_offset(r * len, len);
+        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let nv = config.linear_num_value_heads;
+        let q_full = config.n_heads * config.head_dim * 2;
+        let kv_row = config.n_kv_heads * config.head_dim;
+        let hidden = s.gate_ffn.numel();
+        // SAFETY: a bitwise copy of the shared scratch that is never
+        // dropped (`ManuallyDrop`); only the replaced fields below are owned
+        // by this value and dropped in `Drop`. Every replacement is a
+        // non-owning alias of a live batch buffer row.
+        unsafe {
+            let mut v = std::mem::ManuallyDrop::new(std::ptr::read(s));
+            std::ptr::write(&mut v.x, row(&p.x_batch, config.dim));
+            std::ptr::write(&mut v.dn_qkv, row(&p.dn_qkv_batch, qkv_dim));
+            std::ptr::write(&mut v.dn_z, row(&p.dn_z_batch, v_dim));
+            std::ptr::write(&mut v.dn_beta, row(&p.dn_beta_batch, nv));
+            std::ptr::write(&mut v.dn_alpha, row(&p.dn_alpha_batch, nv));
+            std::ptr::write(&mut v.fa_q_full, row(&p.fa_q_full_batch, q_full));
+            std::ptr::write(&mut v.fa_k, row(&p.fa_k_batch, kv_row));
+            std::ptr::write(&mut v.fa_v, row(&p.fa_v_batch, kv_row));
+            std::ptr::write(&mut v.gate_ffn, row(&p.gate_ffn_batch, hidden));
+            std::ptr::write(&mut v.up, row(&p.up_batch, hidden));
+            std::ptr::write(&mut v.pos_buf, p.positions.sub_offset(r, 1).buf);
+            Self(v)
+        }
+    }
+}
+
+impl std::ops::Deref for RowScratch {
+    type Target = Qwen35Scratch;
+    fn deref(&self) -> &Qwen35Scratch {
+        &self.0
+    }
+}
+
+impl Drop for RowScratch {
+    fn drop(&mut self) {
+        // SAFETY: drop exactly the aliases written in `new`; the remaining
+        // fields are bitwise copies owned by the shared scratch.
+        unsafe {
+            std::ptr::drop_in_place(&mut self.0.x);
+            std::ptr::drop_in_place(&mut self.0.dn_qkv);
+            std::ptr::drop_in_place(&mut self.0.dn_z);
+            std::ptr::drop_in_place(&mut self.0.dn_beta);
+            std::ptr::drop_in_place(&mut self.0.dn_alpha);
+            std::ptr::drop_in_place(&mut self.0.fa_q_full);
+            std::ptr::drop_in_place(&mut self.0.fa_k);
+            std::ptr::drop_in_place(&mut self.0.fa_v);
+            std::ptr::drop_in_place(&mut self.0.gate_ffn);
+            std::ptr::drop_in_place(&mut self.0.up);
+            std::ptr::drop_in_place(&mut self.0.pos_buf);
+        }
     }
 }
 
@@ -202,36 +268,6 @@ fn batched_residual(gpu: &mut Gpu, st: &Qwen35VmmStore, layer: &LayerWeights, or
     Ok(())
 }
 
-/// Copy decode row `r`'s projection outputs (from super-op `ordinal`) and
-/// residual stream into the singleton scratch.
-fn copy_in(gpu: &Gpu, st: &Qwen35VmmStore, s: &Qwen35Scratch, config: &Qwen35Config, layer: &LayerWeights, ordinal: Option<usize>, r: usize) -> HipResult<()> {
-    let p = &st.pbs;
-    copy_row(gpu, &s.x, 0, &p.x_batch, r, config.dim)?;
-    match (layer, ordinal) {
-        (LayerWeights::DeltaNet(l), Some(0)) => {
-            copy_row(gpu, &s.dn_qkv, 0, &p.dn_qkv_batch, r, l.wqkv.m)?;
-            copy_row(gpu, &s.dn_z, 0, &p.dn_z_batch, r, l.wz.m)?;
-            copy_row(gpu, &s.dn_beta, 0, &p.dn_beta_batch, r, l.w_beta.m)?;
-            copy_row(gpu, &s.dn_alpha, 0, &p.dn_alpha_batch, r, l.w_alpha.m)
-        }
-        (LayerWeights::FullAttn(l), Some(0)) => {
-            copy_row(gpu, &s.fa_q_full, 0, &p.fa_q_full_batch, r, l.wq.m)?;
-            copy_row(gpu, &s.fa_k, 0, &p.fa_k_batch, r, l.wk.m)?;
-            copy_row(gpu, &s.fa_v, 0, &p.fa_v_batch, r, l.wv.m)
-        }
-        (LayerWeights::DeltaNet(l), Some(1)) => {
-            copy_row(gpu, &s.gate_ffn, 0, &p.gate_ffn_batch, r, l.w_gate.m)?;
-            copy_row(gpu, &s.up, 0, &p.up_batch, r, l.w_up.m)
-        }
-        (LayerWeights::FullAttn(l), Some(1)) => {
-            copy_row(gpu, &s.gate_ffn, 0, &p.gate_ffn_batch, r, l.w_gate.m)?;
-            copy_row(gpu, &s.up, 0, &p.up_batch, r, l.w_up.m)
-        }
-        (_, None) => Ok(()),
-        _ => Err(HipError::new(0, "exact VMM step: unsupported layer kind")),
-    }
-}
-
 /// Exact decode for the AR rows of `members` (plan request indices). Rows
 /// are laid out in `pbs` in member order. Fills `picks`.
 pub(super) fn decode(
@@ -261,7 +297,11 @@ pub(super) fn decode(
     let tokens: Vec<i32> = members.iter().map(|&i| pb.tokens[plan.requests[i].rows.begin] as i32).collect();
     let tb: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &tb)?;
+    // Row positions, uploaded once: each row's scratch view reads its own.
+    let pos_bytes: Vec<u8> = rows.iter().flat_map(|&(_, p)| (p as i32).to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&st.pbs.positions.buf, &pos_bytes)?;
     gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+    let row_scratch: Vec<RowScratch> = (0..n).map(|r| RowScratch::new(s, st, config, r)).collect();
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -289,14 +329,12 @@ pub(super) fn decode(
                 if !staged {
                     // Directly after its projection (down after gate+up):
                     // stage from that projection's batched outputs.
-                    for r in 0..n {
-                        copy_in(gpu, st, s, config, layer, Some(ordinal), r)?;
-                        stage_residual_input(gpu, st, s, config, layer, ordinal, r)?;
+                    for (r, rs) in row_scratch.iter().enumerate() {
+                        stage_residual_input(gpu, st, rs, config, layer, ordinal, r)?;
                     }
                 }
                 batched_residual(gpu, st, layer, ordinal, n)?;
-                // Projection-output batch rows now hold staged inputs; later
-                // runs of this layer copy only the residual stream.
+                // Later runs of this layer start from the residual stream.
                 last_proj = None;
                 staged = false;
                 i += 1;
@@ -310,8 +348,7 @@ pub(super) fn decode(
                 .then_some(last_proj)
                 .flatten();
             for (r, &(slot, pos)) in rows.iter().enumerate() {
-                copy_in(gpu, st, s, config, layer, last_proj, r)?;
-                gpu.hip.memcpy_htod(&s.pos_buf, &(pos as i32).to_ne_bytes())?;
+                let rs = &row_scratch[r];
                 let req = st.slots[slot].as_mut().expect("provisioned slot");
                 let frame = req.dn.s_ef_residual.is_empty().then(|| {
                     let g = rdna_compute::norm::gdn_requant_frame_checkpoint();
@@ -322,7 +359,7 @@ pub(super) fn decode(
                     let ctx = DispatchCtx::new(gpu);
                     let mut bind = Qwen35Bindings {
                         layer,
-                        s,
+                        s: rs,
                         config,
                         kv_cache: &mut req.kv,
                         dn_state: &req.dn,
@@ -347,9 +384,8 @@ pub(super) fn decode(
                     rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
                 }
                 if let Some(ordinal) = stage_for {
-                    stage_residual_input(gpu, st, s, config, layer, ordinal, r)?;
+                    stage_residual_input(gpu, st, rs, config, layer, ordinal, r)?;
                 }
-                copy_row(gpu, &st.pbs.x_batch, r, &s.x, 0, dim)?;
             }
             staged = stage_for.is_some();
             i = end;
@@ -359,7 +395,9 @@ pub(super) fn decode(
         }
     }
 
-    // Final norm + head: the singleton's rmsnorm_f32 + lm_head GEMV per row.
+    // Final norm + head: the singleton's rmsnorm_f32 + lm_head GEMV per row
+    // (`gemv_mq4g256v2_multirow_r2`; the PM multi-column GEMV is not
+    // byte-identical to it, so the head is not batched).
     let mut b = hipfire_runtime::slot_batch::SlotBatch::default();
     let n_slots = pb.m_per_slot.len();
     b.m_per_slot = vec![0; n_slots];
