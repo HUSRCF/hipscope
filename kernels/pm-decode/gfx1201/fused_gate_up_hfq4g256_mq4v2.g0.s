@@ -56,6 +56,43 @@ fused_gate_up_mq4g256v2_g0:
 	v_fmac_f32_e32 v6, v14, v22
 	v_fmac_f32_e32 v6, v15, v23
 	v_add_f32_e32 v24, v24, v6
+	v_mov_b32_e32 v25, 0
+	v_mov_b32_e32 v26, 0
+	v_mov_b32_e32 v27, 0
+	v_add_f32_e32 v24, v24, v25
+	v_add_f32_e32 v26, v26, v27
+	v_add_f32_e32 v24, v24, v26
+	ds_swizzle_b32 v6, v24 offset:527
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v24, v24, v6
+	v_cmp_lt_u32_e64 s24, v0, 24
+	s_wait_alu depctr_va_sdst(0)
+	v_cndmask_b32_e64 v3, 0, 8, s24
+	v_add_lshl_u32 v3, v3, v0, 2
+	ds_bpermute_b32 v6, v3, v24
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v24, v24, v6
+	v_cmp_lt_u32_e64 s24, v0, 28
+	s_wait_alu depctr_va_sdst(0)
+	v_cndmask_b32_e64 v3, 0, 4, s24
+	v_add_lshl_u32 v3, v3, v0, 2
+	ds_bpermute_b32 v6, v3, v24
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v24, v24, v6
+	v_cmp_lt_u32_e64 s24, v0, 30
+	s_wait_alu depctr_va_sdst(0)
+	v_cndmask_b32_e64 v3, 0, 2, s24
+	v_add_lshl_u32 v3, v3, v0, 2
+	ds_bpermute_b32 v6, v3, v24
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v24, v24, v6
+	v_cmp_lt_u32_e64 s24, v0, 31
+	s_wait_alu depctr_va_sdst(0)
+	v_cndmask_b32_e64 v3, 0, 1, s24
+	v_add_lshl_u32 v3, v3, v0, 2
+	ds_bpermute_b32 v6, v3, v24
+	s_wait_dscnt 0x0
+	v_add_f32_e32 v24, v24, v6
 	global_store_b32 v1, v24, s[10:11]
 	s_wait_storecnt 0x0
 	s_endpgm

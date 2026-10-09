@@ -58,7 +58,7 @@ fn group_arithmetic(b: &mut Builder, accumulator: u8) -> Result<(), String> {
 }
 
 /// G0 only: one 136-byte group and 256 input floats, producing all 32
-/// lane partials in y_gate. This is deliberately not a projection twin.
+/// post-reduction lane values in y_gate. Lane zero is the one-group dot.
 fn build_region() -> Result<Emitted, String> {
     let mut b = builder(G0_SYMBOL)?;
     smem(&mut b, 4, 2, 0, 0)?;
@@ -80,11 +80,43 @@ fn build_region() -> Result<Emitted, String> {
         &[vr(12, 4)], &[v(2), sr(8, 2)], MemoryClass::VmemLoad)?;
     op(&mut b, "v_mov_b32_e32 v24, 0", &[v(24)], &[])?;
     group_arithmetic(&mut b, 24)?;
+    for register in 25..28 {
+        op(&mut b, format!("v_mov_b32_e32 v{register}, 0"), &[v(register)], &[])?;
+    }
+    op(&mut b, "v_add_f32_e32 v24, v24, v25", &[v(24)], &[v(24), v(25)])?;
+    op(&mut b, "v_add_f32_e32 v26, v26, v27", &[v(26)], &[v(26), v(27)])?;
+    op(&mut b, "v_add_f32_e32 v24, v24, v26", &[v(24)], &[v(24), v(26)])?;
+    reduce(&mut b)?;
     mem(&mut b, "global_store_b32 v1, v24, s[10:11]",
         &[], &[v(1), v(24), sr(10, 2)], MemoryClass::VmemStore)?;
     b.wait_all()?;
     op(&mut b, "s_endpgm", &[], &[])?;
     b.finish()
+}
+
+/// The incumbent shuffle-down keeps the source lane itself when it would
+/// cross the wave boundary; in particular the swizzle forces bit 4 to one.
+fn reduce(b: &mut Builder) -> Result<(), String> {
+    use crate::insn::Instruction;
+    use crate::ledger::Counter;
+    b.ds_crosslane(Instruction::new(
+        "ds_swizzle_b32 v6, v24 offset:527",
+        vec![v(6)], vec![v(24)]).memory(MemoryClass::DsLoad))?;
+    b.wait(Counter::Ds, 0)?;
+    op(b, "v_add_f32_e32 v24, v24, v6", &[v(24)], &[v(24), v(6)])?;
+    for offset in [8, 4, 2, 1] {
+        op(b, format!("v_cmp_lt_u32_e64 s24, v0, {}", 32 - offset),
+            &[s(24)], &[v(0)])?;
+        op(b, format!("v_cndmask_b32_e64 v3, 0, {offset}, s24"),
+            &[v(3)], &[s(24)])?;
+        op(b, "v_add_lshl_u32 v3, v3, v0, 2",
+            &[v(3)], &[v(3), v(0)])?;
+        b.ds_crosslane(Instruction::new("ds_bpermute_b32 v6, v3, v24",
+            vec![v(6)], vec![v(3), v(24)]).memory(MemoryClass::DsLoad))?;
+        b.wait(Counter::Ds, 0)?;
+        op(b, "v_add_f32_e32 v24, v24, v6", &[v(24)], &[v(24), v(6)])?;
+    }
+    Ok(())
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
@@ -107,7 +139,8 @@ mod tests {
             serde_json::to_vec_pretty(&emitted.proof).unwrap()).unwrap();
         let shape = serde_json::json!({
             "symbol": G0_SYMBOL,
-            "counts": {"v_fma_mix_f32": 8, "v_fmac_f32_e32": 7},
+            "counts": {"v_fma_mix_f32": 8, "v_fmac_f32_e32": 7,
+                       "ds_swizzle_b32": 1, "ds_bpermute_b32": 4},
             "forbidden": ["scratch_*", "s_waitcnt", "v_wmma_*"],
             "vgpr_max": 32, "sgpr_max": 32,
             "require_wave32": true, "require_zero_spills": true,

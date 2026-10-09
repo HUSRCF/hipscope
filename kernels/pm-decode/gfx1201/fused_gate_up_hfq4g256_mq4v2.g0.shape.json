@@ -1,5 +1,7 @@
 {
   "counts": {
+    "ds_bpermute_b32": 4,
+    "ds_swizzle_b32": 1,
     "v_fma_mix_f32": 8,
     "v_fmac_f32_e32": 7
   },
