@@ -1,0 +1,33 @@
+{
+  "scope": "standalone gfx1201 production-symbol twin; not serving-route promotion or performance acceptance",
+  "module": "fused_qkvza_hfq4g256_mq4v2",
+  "symbol": "fused_qkvza_mq4g256v2",
+  "arch": "gfx1201",
+  "source_commit": "7325de31a35b22ff4ee469b202503d50e97bbd3f",
+  "incumbent_recipe_sha256": "24946fc118db455e19f96b0e02fd67bb6bfaf46ed4a917e23352bef6153e1ba5",
+  "hashes": {
+    "s_text": "7449c780269c193b27c2d2a51e096948f25d77358d1ec3aa1732650b3c60f233",
+    "proof": "6fd5a2d74bdd05dea8c439c0495d538b4fa192a0bf0efb30671c84a44438903e",
+    "shape": "b35a4773a2732745a94a26701f0a4396c00e24b83ae1c7143a8d67619d8e0257",
+    "radiowave": "fd72ecb7f148d050adcf63d950f9073ff46838d46b7a97670782de790a43aee7",
+    "co": "614bd3b230716617514a9ce77d9624f17c06baa7b86b84450df8270564eec2b7",
+    "hxaco": "e9cce7cf5d7b8c43d73409e408ed3d185802fc3f8d1d1dce59015ea5cf654c04"
+  },
+  "abi": {"kernarg_bytes": 92, "kernarg_align": 8, "wavefront": 32, "block": [32,1,1], "fixed_lds": 0, "dynamic_lds": 0, "private_segment": 0},
+  "m7": {"lift": "byte-exact", "obligations": {}, "ambiguous_delays": 0, "instructions": 401},
+  "oracle": {
+    "owner": "PmOracle",
+    "reports": [
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkvza_hfq4g256_mq4v2/full-occ0-614bd3b230716617/report.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkvza_hfq4g256_mq4v2/full-occ47-614bd3b230716617/report.json"
+    ],
+    "mismatch_bytes": 0,
+    "all_nine_buffers_and_guards": true,
+    "edge_shapes_per_capture": 99,
+    "edge_group_counts": [1,2,3,4,5,6,7,8,9,19,20]
+  },
+  "emission": {"single_fresh_process_real_seconds": 0.01, "includes_native_link_and_m7": true, "gpus_hidden": true, "evidence": "GNU time -p; real 0.01, user 0.01, sys 0.00", "performance_claim": false},
+  "hipcc_inventory_median_seconds": 0.3641493969989824,
+  "removed_hip_modules": 0,
+  "removal_note": "One complete selected export is authored; routing and pack removal remain Main-owned integration gates."
+}
