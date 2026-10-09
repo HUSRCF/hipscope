@@ -27,6 +27,9 @@ pub struct MultiChunkRequest<'a> {
     pub start_pos: usize,
     pub kv_cache: &'a mut llama::KvCache,
     pub dn_state: &'a mut DeltaNetState,
+    /// Rollback tape for this request's rows (the singleton verify's
+    /// `gdn_tape`, offset 0); `None` = no capture.
+    pub gdn_tape: Option<&'a crate::speculative::GdnTape>,
 }
 
 /// The largest combined row count: below every n-dependent kernel/route
@@ -128,6 +131,9 @@ pub fn forward_prefill_batch_multi(
         if !(kv.quant_q8 || kv.quant_fp8) || kv.compact_offset != 0 {
             return refuse("KV must be uncompacted Q8 or fp8");
         }
+        if r.gdn_tape.is_some_and(|t| t.max_n < n) {
+            return refuse("GDN tape smaller than the request's rows");
+        }
     }
     if !weights.layers.iter().all(|l| match l {
         LayerWeights::DeltaNet(_) => true,
@@ -167,7 +173,8 @@ pub fn forward_prefill_batch_multi(
     }
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
-    let ctx = DispatchCtx::new(gpu).with_workload(prefill_dispatch_workload(hidden_out.is_some(), false, false));
+    let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
+    let ctx = DispatchCtx::new(gpu).with_workload(prefill_dispatch_workload(hidden_out.is_some(), tapes, false));
 
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
@@ -179,7 +186,7 @@ pub fn forward_prefill_batch_multi(
                 for (r, view) in reqs.iter_mut().zip(&views) {
                     let n = r.tokens.len();
                     let parents = batch_chunk_delta_net_pre_gdn(
-                        gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, None, 0,
+                        gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape, 0,
                         delta_layer_idx, fusion,
                     )?;
                     if parents.is_some() {
