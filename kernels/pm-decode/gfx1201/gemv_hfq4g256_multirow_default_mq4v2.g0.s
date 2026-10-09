@@ -6,19 +6,19 @@
 .p2align 8
 .type gemv_mq4g256v2_multirow_r2_dog_g0,@function
 gemv_mq4g256v2_multirow_r2_dog_g0:
-	s_load_b128 s[4:7], s[0:1], 0
-	s_load_b64 s[8:9], s[0:1], 16
+	s_load_b128 s[4:7], s[0:1], 0x0
+	s_load_b64 s[8:9], s[0:1], 0x10
 	v_lshrrev_b32_e32 v1, 4, v0
 	s_delay_alu instid0(VALU_DEP_1)
 	v_lshlrev_b32_e32 v1, 2, v1
 	s_wait_kmcnt 0x0
-	global_load_b32 v4, v1, s[4:5] offset:0
+	global_load_b32 v4, v1, s[4:5]
 	global_load_b32 v5, v1, s[4:5] offset:136
 	v_lshlrev_b32_e32 v1, 2, v0
 	global_load_b32 v2, v1, s[4:5] offset:8
 	global_load_b32 v3, v1, s[4:5] offset:144
 	v_lshlrev_b32_e32 v1, 5, v0
-	global_load_b128 v[12:15], v1, s[6:7] offset:0
+	global_load_b128 v[12:15], v1, s[6:7]
 	global_load_b128 v[16:19], v1, s[6:7] offset:16
 	s_wait_loadcnt 0x3
 	v_bfe_u32 v6, v2, 4, 4
@@ -136,7 +136,7 @@ gemv_mq4g256v2_multirow_r2_dog_g0:
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v8, v19, v6
 	v_lshlrev_b32_e32 v1, 2, v0
-	global_store_b32 v1, v7, s[8:9] offset:0
+	global_store_b32 v1, v7, s[8:9]
 	global_store_b32 v1, v8, s[8:9] offset:128
 	s_wait_storecnt 0x0
 	s_endpgm

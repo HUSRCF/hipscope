@@ -66,11 +66,11 @@ pub fn build_dog_g0() -> Result<Emitted, String> {
     );
     b.enable_delay_alu();
     b.push(Instruction::new(
-        "s_load_b128 s[4:7], s[0:1], 0",
+        "s_load_b128 s[4:7], s[0:1], 0x0",
         vec![a_x.reg()], vec![args.reg()],
     ).memory(MemoryClass::SmemLoad))?;
     b.push(Instruction::new(
-        "s_load_b64 s[8:9], s[0:1], 16",
+        "s_load_b64 s[8:9], s[0:1], 0x10",
         vec![y.reg()], vec![args.reg()],
     ).memory(MemoryClass::SmemLoad))?;
     // Each subgroup of 16 lanes selects its own packed half scale/zero.
@@ -80,7 +80,8 @@ pub fn build_dog_g0() -> Result<Emitted, String> {
         vec![addr.reg()], vec![addr.reg()]))?;
     for (header, offset) in [(header0, 0), (header1, 136)] {
         b.push(Instruction::new(
-            format!("global_load_b32 {}, v1, s[4:5] offset:{offset}", header.reg()),
+            if offset == 0 { format!("global_load_b32 {}, v1, s[4:5]", header.reg()) }
+            else { format!("global_load_b32 {}, v1, s[4:5] offset:{offset}", header.reg()) },
             vec![header.reg()], vec![addr.reg(), crate::S::<2>(4).reg()],
         ).memory(MemoryClass::VmemLoad))?;
     }
@@ -96,7 +97,8 @@ pub fn build_dog_g0() -> Result<Emitted, String> {
         vec![addr.reg()], vec![tid.reg()]))?;
     for (x, offset) in [(x_lo, 0), (x_hi, 16)] {
         b.push(Instruction::new(
-            format!("global_load_b128 {}, v1, s[6:7] offset:{offset}", x.reg()),
+            if offset == 0 { format!("global_load_b128 {}, v1, s[6:7]", x.reg()) }
+            else { format!("global_load_b128 {}, v1, s[6:7] offset:{offset}", x.reg()) },
             vec![x.reg()], vec![addr.reg(), crate::S::<2>(6).reg()],
         ).memory(MemoryClass::VmemLoad))?;
     }
@@ -127,7 +129,8 @@ pub fn build_dog_g0() -> Result<Emitted, String> {
         vec![addr.reg()], vec![tid.reg()]))?;
     for (dot, offset) in [(dot0, 0), (dot1, 128)] {
         b.push(Instruction::new(
-            format!("global_store_b32 v1, {}, s[8:9] offset:{offset}", dot.reg()),
+            if offset == 0 { format!("global_store_b32 v1, {}, s[8:9]", dot.reg()) }
+            else { format!("global_store_b32 v1, {}, s[8:9] offset:{offset}", dot.reg()) },
             vec![], vec![addr.reg(), dot.reg(), y.reg()],
         ).memory(MemoryClass::VmemStore))?;
     }

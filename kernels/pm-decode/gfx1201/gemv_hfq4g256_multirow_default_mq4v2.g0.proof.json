@@ -3,7 +3,7 @@
   "variant": "dog-g0-not-production",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "279b6d021a7bf1f7cc0eec742d7bd0c18f4ef761",
+  "builder_git_sha": "unknown",
   "reg_plan": [
     {
       "name": "tid",
@@ -422,5 +422,5 @@
     "s_waitcnt (gfx12)",
     "scratch_*"
   ],
-  "s_text_sha256": "a78b40baaa929ccc39b63139fcdc77c8b7bf25d4113dfe442b99b340e260fb21"
+  "s_text_sha256": "90146bbdd01a84971f51d914a16a017b868a1b543bd5059302dae5fa434e9367"
 }
