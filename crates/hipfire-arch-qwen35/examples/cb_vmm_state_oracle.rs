@@ -28,6 +28,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit, VmmRoute};
+use hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine;
 use hipfire_arch_qwen35::mtp_head::{load_mtp_head, MtpKvMode, Qwen35MtpHead};
 use hipfire_arch_qwen35::mtp_spec::cb::{mtp_cb_cycle, MtpCbLane, MtpCbScratch};
 use hipfire_arch_qwen35::mtp_spec::{prefill_trunk_and_mtp_cache, MtpPromptRoute, MtpSamplingConfig, MtpSpecState};
@@ -1681,7 +1682,7 @@ fn spec_trace_json(t: &SpecTrace) -> Value {
 /// Spec phase: per fixture an isolated singleton MTP reference (artifacts),
 /// its determinism self-test, and the derived EOS-in-draft and
 /// max_tokens-mid-draft variants. Returns (report, pass).
-fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture]) -> Result<(Value, bool)> {
+fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ar_refs: &[Trace]) -> Result<(Value, bool)> {
     let Ctx { mut gpu, b } = ctx;
     let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model)).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
     let head_path = args.mtp_head.clone().unwrap_or_else(|| Path::new(&args.model).with_extension("mtp"));
@@ -1785,16 +1786,391 @@ fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture]) -> Result<(Value, bool)> {
         .map(|i| LaneSpec { reference: main_ref[i], drop_after: (i == 0).then_some(3) })
         .collect();
     run(&mut gpu, &mut slot, "cancel".into(), cancel, &mut cases, &mut pass)?;
+    head_b.free_gpu(&mut gpu);
+
+    // ── Executor: Verify rows through provision/forward/commit (Slice2A) ──
+    let mut exec_cases = Vec::new();
+    let exec = spec_exec_cases(&mut gpu, &mut slot, args, fx, &refs, &main_ref, &eos_ref, &clip_ref, ar_refs, &head_path, cap, k, &mut exec_cases);
+    match exec {
+        Ok(ok) => pass &= ok,
+        Err(e) => {
+            pass = false;
+            exec_cases.push(json!({"case": "executor", "error": e.to_string()}));
+        }
+    }
     let report = json!({
         "route": "reference: singleton Qwen35MtpDrafter on ModelSlot (MtpSpeculator k/eos contract), greedy; \
-                  batch: mtp_spec::cb::mtp_cb_cycle (shared verify trunk + head) over per-request KV/DN/MTP state",
+                  batch: mtp_spec::cb::mtp_cb_cycle over per-request KV/DN/MTP state; executor: Qwen35VmmStore \
+                  (VmmRoute::Exact) + VmmSpecEngine, Verify rows through provision/forward/commit",
         "head": head_path, "k": k, "budget_picks": budget, "accept_classes_seen": classes_seen,
-        "fixtures": rows, "batch_cases": cases,
-        "not_expressible_at_this_api": "mid-cycle cancel and stale-epoch commit need Verify rows through the executor \
-                                        provision/forward/commit (epoch-tagged); plain-AR rows co-batched with MTP lanes \
-                                        likewise. Retire-between-cycles cancel and k=0 seed-only rows are covered.",
+        "fixtures": rows, "batch_cases": cases, "executor_cases": exec_cases,
     });
     Ok((report, pass && classes_seen.len() == 3))
+}
+
+/// One executor lane: a spec lane reproducing `refs[reference]` (optionally
+/// finishing on a stop id inside a window), or the AR lane reproducing a
+/// singleton AR trace.
+struct ExecLane {
+    epoch: RequestEpoch,
+    slot: usize,
+    /// Spec lane: index into refs. AR lane: None.
+    reference: Option<usize>,
+    ar: Option<usize>,
+    stop: Option<u32>,
+    budget: usize,
+    tr: SpecTrace,
+    ar_picks: Vec<u32>,
+    fed: usize,
+    diff: Diff,
+    done: bool,
+    cancelled: bool,
+}
+
+fn exec_stage(st: &Qwen35RequestState, slot: &ModelSlot, gpu: &Gpu, pos: usize) -> Result<Vec<(String, Vec<u8>)>> {
+    let m = st.mtp.as_ref().ok_or("spec lane has no MTP state")?;
+    spec_full_state(gpu, &slot.config, &st.kv, &st.dn, m, pos)
+}
+
+fn exec_plan(store: &Qwen35VmmStore, gpu: &Gpu, slot: &ModelSlot, fx: &[Fixture], lanes: &[ExecLane], k: usize, only: Option<usize>) -> Result<BatchStepPlan> {
+    let mut plan = BatchStepPlan::default();
+    plan.batch.m_per_slot = vec![0; EXEC_WIDTH];
+    let push = |plan: &mut BatchStepPlan, epoch: RequestEpoch, s: usize, toks: &[u32], pos0: usize, kind: RequestStepKind| {
+        let begin = plan.batch.tokens.len();
+        for (j, &t) in toks.iter().enumerate() {
+            plan.batch.tokens.push(t);
+            plan.batch.positions.push((pos0 + j) as i32);
+            plan.batch.row_slot.push(s as i32);
+        }
+        plan.batch.m_per_slot[s] = toks.len();
+        plan.requests.push(RequestRows { epoch, rows: RowRange { begin, len: toks.len() }, kind });
+        match kind {
+            RequestStepKind::Verify { .. } => plan.verify_rows += toks.len(),
+            RequestStepKind::Prefill => plan.prefill_rows += toks.len(),
+            _ => plan.decode_rows += toks.len(),
+        }
+    };
+    let mut order: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done && only.is_none_or(|o| o == i)).collect();
+    order.sort_by_key(|&i| lanes[i].slot);
+    for i in order {
+        let l = &lanes[i];
+        let st = store.request_state(&l.epoch).ok_or("lane missing from store")?;
+        if let Some(ai) = l.ar {
+            let f = &fx[ai];
+            if l.fed < f.prefix {
+                let n = store.exact_prefill_chunk_len(gpu, &slot.weights, &slot.config, &l.epoch, f.prefix - l.fed)?;
+                push(&mut plan, l.epoch, l.slot, &f.tokens[l.fed..l.fed + n], l.fed, RequestStepKind::Prefill);
+            } else {
+                push(&mut plan, l.epoch, l.slot, &[st.pending_seed.ok_or("AR seed")?], st.position, RequestStepKind::Ar);
+            }
+        } else {
+            let max_emit = l.budget - l.tr.emitted.len();
+            let kk = max_emit.saturating_sub(1).min(k);
+            let mut toks = vec![st.pending_seed.ok_or("spec seed")?];
+            toks.extend(std::iter::repeat_n(0u32, kk));
+            push(&mut plan, l.epoch, l.slot, &toks, st.position, RequestStepKind::Verify { draft_len: kk });
+        }
+    }
+    Ok(plan)
+}
+
+const EXEC_WIDTH: usize = 9;
+
+/// Publish one committed step into the lanes (window, digest, stage bytes).
+#[allow(clippy::too_many_arguments)]
+fn exec_absorb(gpu: &Gpu, slot: &ModelSlot, store: &Qwen35VmmStore, fx: &[Fixture], refs: &[(usize, usize, u32, SpecTrace)], ar_refs: &[Trace], lanes: &mut [ExecLane], plan: &BatchStepPlan, advances: &[hipfire_runtime::slot_batch::RequestAdvance], k: usize, prior: &[(usize, u32)]) -> Result<()> {
+    let eos = slot.config.eos_token;
+    for rr in &plan.requests {
+        let i = lanes.iter().position(|l| l.epoch == rr.epoch).ok_or("plan epoch not a lane")?;
+        let lane = &mut lanes[i];
+        if let Some(ai) = lane.ar {
+            if rr.kind == RequestStepKind::Prefill {
+                lane.fed += rr.rows.len;
+                if lane.fed == fx[ai].prefix {
+                    let st = store.request_state(&lane.epoch).ok_or("lane vanished")?;
+                    let now = state_bytes(gpu, &slot.config, &st.kv, &st.dn, lane.fed)?;
+                    state_cmp(&mut lane.diff, "prefill", &now, &ar_refs[ai])?;
+                }
+            }
+        }
+    }
+    for a in advances {
+        let i = lanes.iter().position(|l| l.epoch == a.epoch).ok_or("advance epoch not a lane")?;
+        let lane = &mut lanes[i];
+        let st = store.request_state(&a.epoch).ok_or("lane vanished")?;
+        if let Some(ai) = lane.ar {
+            lane.ar_picks.extend_from_slice(&a.committed_ids);
+            if lane.ar_picks.len() >= lane.budget {
+                lane.done = true;
+                let t = &ar_refs[ai];
+                let picks: Vec<u32> = t.committed.iter().copied().chain([t.pending_seed]).collect();
+                lane.diff.ids("ar_picks", &picks, &lane.ar_picks);
+                lane.diff.ids("position", &[t.position as u32], &[st.position as u32]);
+                let now = state_bytes(gpu, &slot.config, &st.kv, &st.dn, st.position)?;
+                state_cmp(&mut lane.diff, "final", &now, t)?;
+            }
+            continue;
+        }
+        let reference = &refs[lane.reference.unwrap()].3;
+        let (start, seed) = prior[i];
+        let max_emit = lane.budget - lane.tr.emitted.len();
+        let kk = max_emit.saturating_sub(1).min(k);
+        let end = start + a.committed_ids.len();
+        if st.position != end || a.committed_position != end {
+            lane.diff.differing_items.push(format!("cycle{}: watermark store {} advance {} expected {end}", lane.tr.cycles.len(), st.position, a.committed_position));
+        }
+        let m = st.mtp.as_ref().ok_or("spec lane has no MTP state")?;
+        let delta_sha256 = cycle_digest(gpu, &slot.config, &st.kv, &st.dn, m, start, end)?;
+        let drafted = a.verified_rows.saturating_sub(1);
+        let class = spec_class(&hipfire_runtime::spec::MtpWindow { committed: a.committed_ids.clone(), accepted: a.accepted_drafts, drafts_generated: drafted });
+        lane.tr.cycles.push(SpecCycle { position: start, seed, k: kk, committed: a.committed_ids.clone(), accepted: a.accepted_drafts, drafted, class, delta_sha256 });
+        lane.tr.emitted.extend_from_slice(&a.committed_ids);
+        lane.tr.position = end;
+        lane.tr.pending_seed = *a.committed_ids.last().ok_or("empty advance")?;
+        if st.pending_seed != Some(lane.tr.pending_seed) {
+            lane.diff.differing_items.push(format!("cycle{}: store pending_seed {:?}", lane.tr.cycles.len() - 1, st.pending_seed));
+        }
+        let stage = format!("first_{class}_cycle{}", lane.tr.cycles.len() - 1);
+        if lane.stop.is_none() && has_stage(reference, &stage) {
+            let now = exec_stage(st, slot, gpu, end)?;
+            stage_check(&mut lane.diff, reference, &stage, now)?;
+        }
+        if a.finish.as_deref() == Some("stop") || a.committed_ids.contains(&eos) {
+            lane.tr.finish = "stop".into();
+        } else if lane.tr.emitted.len() >= lane.budget {
+            lane.tr.finish = "length".into();
+        }
+        lane.done = !lane.tr.finish.is_empty();
+    }
+    Ok(())
+}
+
+/// Final comparison of an executor lane against its reference.
+fn exec_finish(gpu: &Gpu, slot: &ModelSlot, store: &Qwen35VmmStore, refs: &[(usize, usize, u32, SpecTrace)], lane: &mut ExecLane) -> Result<()> {
+    let Some(ri) = lane.reference else { return Ok(()) };
+    let reference = &refs[ri].3;
+    if lane.cancelled || lane.stop.is_some() {
+        // Committed prefix must match the plain reference cycle by cycle.
+        for (c, b) in lane.tr.cycles.iter().enumerate() {
+            match reference.cycles.get(c) {
+                Some(a) => {
+                    lane.diff.ids(&format!("cycle{c}.committed"), &a.committed, &b.committed);
+                    lane.diff.check(&format!("cycle{c}.delta_sha256"), a.delta_sha256.as_bytes(), b.delta_sha256.as_bytes());
+                }
+                None => lane.diff.differing_items.push(format!("cycle{c}: beyond reference")),
+            }
+        }
+        if let Some(stop) = lane.stop {
+            // Finishes on the first window committing `stop`, never earlier.
+            let first = lane.tr.cycles.iter().position(|c| c.committed.contains(&stop));
+            let ok = lane.tr.finish == "stop" && first == Some(lane.tr.cycles.len() - 1);
+            if !ok {
+                lane.diff.differing_items.push(format!("stop {stop}: finish {:?} at cycle {:?} of {}", lane.tr.finish, first, lane.tr.cycles.len()));
+            }
+        }
+        return Ok(());
+    }
+    let st = store.request_state(&lane.epoch).ok_or("lane vanished")?;
+    let now = exec_stage(st, slot, gpu, lane.tr.position)?;
+    stage_check(&mut lane.diff, reference, "final", now)?;
+    let d2 = spec_compare(reference, &lane.tr, &[])?;
+    lane.diff.compared_items += d2.compared_items;
+    lane.diff.compared_bytes += d2.compared_bytes;
+    lane.diff.differing_items.extend(d2.differing_items);
+    Ok(())
+}
+
+/// Executor Verify-row cases. Returns pass.
+#[allow(clippy::too_many_arguments)]
+fn spec_exec_cases(gpu: &mut Gpu, slot: &mut ModelSlot, args: &Args, fx: &[Fixture], refs: &[(usize, usize, u32, SpecTrace)], main_ref: &[usize], eos_ref: &[Option<usize>], clip_ref: &[Option<usize>], ar_refs: &[Trace], head_path: &Path, cap: usize, k: usize, out: &mut Vec<Value>) -> Result<bool> {
+    if let Some(pbs) = slot.scratch.widened_prefill_batch.borrow_mut().take() {
+        pbs.free_gpu(gpu)?;
+    }
+    let budget_kv = free_vram(gpu)?.saturating_sub(6 << 30);
+    let mut store = Qwen35VmmStore::new(gpu, &slot.config, &slot.kv_cache, EXEC_WIDTH, EXEC_WIDTH * (k + 1), budget_kv, VmmRoute::Exact)?;
+    let head = load_mtp_head(head_path, gpu, cap)?;
+    let route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+    let engine = VmmSpecEngine::new(gpu, &slot.config, head, k, EXEC_WIDTH, route)?;
+    if store.install_spec(engine).is_err() {
+        return Err("install_spec refused".into());
+    }
+    let ar_budget = args.steps + 1;
+    let mut pass = true;
+    let mut tag = 70_000u64;
+    let mut case = |gpu: &mut Gpu, slot: &mut ModelSlot, store: &mut Qwen35VmmStore, name: &str, spec: Vec<(usize, Option<u32>)>, ar: Option<usize>, controls: bool| -> Result<bool> {
+        let mut lanes: Vec<ExecLane> = Vec::new();
+        let mut ctl = serde_json::Map::new();
+        let res = (|| -> Result<()> {
+            for (s, &(ri, stop)) in spec.iter().enumerate() {
+                tag += 1;
+                let (fi, budget, _, ref reference) = refs[ri];
+                let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+                let init = VmmRequestInit { prompt_len: fx[fi].prefix, stop_ids: stop.into_iter().collect(), sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+                let o = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, s, init)?;
+                store.admit(o).map_err(|(o, e)| { let _ = o.free_gpu(gpu); e })?;
+                let seed = store.spec_prefill(gpu, &slot.weights, &slot.config, &slot.scratch, &epoch, &fx[fi].tokens, SpecRequestConfig::default())?;
+                let mut diff = Diff::default();
+                diff.ids("prefill_seed", &[reference.emitted[0]], &[seed]);
+                let st = store.request_state(&epoch).ok_or("lane")?;
+                stage_check(&mut diff, reference, "prefill", exec_stage(st, slot, gpu, fx[fi].prefix)?)?;
+                let tr = SpecTrace { emitted: vec![seed], cycles: vec![], finish: String::new(), position: fx[fi].prefix, pending_seed: seed, states: vec![] };
+                let done = seed == slot.config.eos_token || budget <= 1;
+                lanes.push(ExecLane { epoch, slot: s, reference: Some(ri), ar: None, stop, budget, tr, ar_picks: vec![], fed: 0, diff, done, cancelled: false });
+            }
+            if let Some(ai) = ar {
+                tag += 1;
+                let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+                let init = VmmRequestInit { prompt_len: fx[ai].prefix, stop_ids: vec![], sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+                pin_gdn_frame(&slot.dn_state);
+                let o = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, EXEC_WIDTH - 1, init)?;
+                store.admit(o).map_err(|(o, e)| { let _ = o.free_gpu(gpu); e })?;
+                let tr = SpecTrace { emitted: vec![], cycles: vec![], finish: String::new(), position: 0, pending_seed: 0, states: vec![] };
+                lanes.push(ExecLane { epoch, slot: EXEC_WIDTH - 1, reference: None, ar: Some(ai), stop: None, budget: ar_budget, tr, ar_picks: vec![], fed: 0, diff: Diff::default(), done: false, cancelled: false });
+            }
+            let mut step = 0usize;
+            loop {
+                if controls && step == 3 {
+                    exec_controls(gpu, slot, store, fx, &mut lanes, k, &mut ctl)?;
+                }
+                let plan = exec_plan(store, gpu, slot, fx, &lanes, k, None)?;
+                if plan.requests.is_empty() {
+                    return Ok(());
+                }
+                let prior: Vec<(usize, u32)> = lanes
+                    .iter()
+                    .map(|l| store.request_state(&l.epoch).map_or((0, 0), |s| (s.position, s.pending_seed.unwrap_or(0))))
+                    .collect();
+                let advances = {
+                    let mut ex = store.executor(&slot.weights, &slot.config, &slot.scratch);
+                    ex.provision_step(gpu, &plan)?;
+                    let o = ex.forward_step(gpu, &plan)?;
+                    ex.commit_step(gpu, &plan, o)?
+                };
+                exec_absorb(gpu, slot, store, fx, refs, ar_refs, &mut lanes, &plan, &advances, k, &prior)?;
+                step += 1;
+            }
+        })();
+        let mut rows = Vec::new();
+        let mut ok = res.is_ok();
+        for lane in lanes.iter_mut() {
+            if res.is_ok() && store.request_state(&lane.epoch).is_some() {
+                exec_finish(gpu, slot, store, refs, lane)?;
+            }
+            ok &= lane.diff.exact();
+            rows.push(json!({
+                "slot": lane.slot,
+                "lane": if lane.ar.is_some() { "ar".to_string() } else { fx[refs[lane.reference.unwrap()].0].name() },
+                "stop": lane.stop, "cancelled": lane.cancelled,
+                "finish": if lane.ar.is_some() { json!(if lane.done { "length" } else { "" }) } else { json!(lane.tr.finish) },
+                "picks": if lane.ar.is_some() { lane.ar_picks.len() } else { lane.tr.emitted.len() },
+                "cycles": lane.tr.cycles.len(),
+                "ks_used": lane.tr.cycles.iter().map(|c| c.k).collect::<std::collections::BTreeSet<_>>(),
+                "exact": lane.diff.exact(), "diff": lane.diff.json(),
+            }));
+        }
+        for lane in &lanes {
+            if store.request_state(&lane.epoch).is_some() {
+                store.retire(&lane.epoch)?.free_gpu(gpu)?;
+            }
+        }
+        let ctl_ok = ctl.values().all(|v| v["ok"].as_bool().unwrap_or(true));
+        if controls {
+            ok &= ctl_ok && ctl.len() >= 5;
+        }
+        eprintln!("spec exec {name}: exact={ok}{}", if controls { format!(" controls_ok={ctl_ok}") } else { String::new() });
+        let mut j = json!({"case": name, "exact": ok, "lanes": rows});
+        if controls {
+            j["controls"] = Value::Object(ctl);
+        }
+        if let Err(e) = res {
+            j["error"] = json!(e.to_string());
+        }
+        out.push(j);
+        Ok(ok)
+    };
+    for &kk in &args.ks {
+        let n = kk.min(fx.len()).min(EXEC_WIDTH - 1);
+        let lanes: Vec<(usize, Option<u32>)> = (0..n).map(|i| (main_ref[i], None)).collect();
+        // Mixed AR+MTP: an AR request shares every step (prefill chunks, then AR rows).
+        pass &= case(gpu, slot, &mut store, &format!("exec_k{kk}"), lanes, Some(kk % fx.len()), false)?;
+    }
+    let mixed: Vec<(usize, Option<u32>)> = (0..fx.len().min(EXEC_WIDTH - 1))
+        .map(|i| match i % 3 {
+            0 => eos_ref[i].map_or((main_ref[i], None), |r| (main_ref[i], Some(refs[r].2))),
+            1 => (clip_ref[i].unwrap_or(main_ref[i]), None),
+            _ => (main_ref[i], None),
+        })
+        .collect();
+    pass &= case(gpu, slot, &mut store, "exec_stop_clip_mix", mixed, None, false)?;
+    let ctl_lanes: Vec<(usize, Option<u32>)> = (0..fx.len().min(4)).map(|i| (main_ref[i], None)).collect();
+    pass &= case(gpu, slot, &mut store, "exec_controls", ctl_lanes, Some(0), true)?;
+    store.free_gpu(gpu)?;
+    Ok(pass)
+}
+
+fn ctl_record(map: &mut serde_json::Map<String, Value>, name: &str, ok: bool, detail: Value) {
+    eprintln!("spec exec control {name}: {}", if ok { "OK" } else { "FAIL" });
+    map.insert(name.into(), json!({"ok": ok, "detail": detail}));
+}
+
+/// Executor spec controls on live lanes 0 and 1 (both spec lanes):
+/// stale-epoch provision refused; abort after provision drops the draft and
+/// leaves the lane live (it must stay byte-exact); a forwarded Verify step
+/// committed with a stale epoch or a forged step id is refused; aborting it
+/// (cancel during verify) poisons that lane only, which is then retired.
+fn exec_controls(gpu: &mut Gpu, slot: &mut ModelSlot, store: &mut Qwen35VmmStore, fx: &[Fixture], lanes: &mut [ExecLane], k: usize, map: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let live: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done && lanes[i].ar.is_none()).collect();
+    if live.len() < 2 {
+        ctl_record(map, "setup", false, json!("fewer than two live spec lanes at step 3"));
+        return Ok(());
+    }
+    let (a, b) = (live[0], live[1]);
+    let ex = |store: &mut Qwen35VmmStore, slot: &ModelSlot, gpu: &mut Gpu, plan: &BatchStepPlan| -> std::result::Result<(), String> {
+        store.executor(&slot.weights, &slot.config, &slot.scratch).provision_step(gpu, plan)
+    };
+    // Stale epoch at provision.
+    let mut p = exec_plan(store, gpu, slot, fx, lanes, k, Some(b))?;
+    p.requests[0].epoch.owner_generation += 1;
+    let r = ex(store, slot, gpu, &p);
+    if r.is_ok() {
+        store.abort_step(&p);
+    }
+    ctl_record(map, "neg_stale_epoch_provision", r.is_err(), json!(r.err()));
+    // Abort after provision: drafts dropped, lane b stays live (not poisoned).
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(b))?;
+    let r = ex(store, slot, gpu, &p);
+    store.abort_step(&p);
+    let live_b = store.request_state(&lanes[b].epoch).is_some_and(|s| !s.poisoned);
+    ctl_record(map, "abort_after_provision_keeps_lane", r.is_ok() && live_b, json!({"provision": r.err(), "live": live_b}));
+    // Forwarded Verify step for lane a, then stale commits, then cancel.
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(a))?;
+    let (stale, forged) = {
+        let mut e = store.executor(&slot.weights, &slot.config, &slot.scratch);
+        e.provision_step(gpu, &p)?;
+        let o = e.forward_step(gpu, &p)?;
+        let mut ps = p.clone();
+        ps.requests[0].epoch.owner_generation += 1;
+        let stale = e.commit_step(gpu, &ps, StepOutput { step_id: o.step_id, target_picks: o.target_picks.clone() }).map(|_| ());
+        let forged = e.commit_step(gpu, &p, StepOutput { step_id: o.step_id + 1, target_picks: o.target_picks.clone() }).map(|_| ());
+        (stale, forged)
+    };
+    store.abort_step(&p);
+    ctl_record(map, "neg_stale_epoch_commit", stale.is_err(), json!(stale.err()));
+    ctl_record(map, "neg_forged_step_commit", forged.is_err(), json!(forged.err()));
+    let poisoned_a = store.request_state(&lanes[a].epoch).is_some_and(|s| s.poisoned);
+    let others_ok = lanes.iter().enumerate().filter(|(i, l)| *i != a && !l.done).all(|(_, l)| store.request_state(&l.epoch).is_some_and(|s| !s.poisoned));
+    ctl_record(map, "cancel_during_verify_poisons_only_that_lane", poisoned_a && others_ok, json!({"poisoned": poisoned_a, "others_live": others_ok}));
+    let p = exec_plan(store, gpu, slot, fx, lanes, k, Some(a))?;
+    let r = ex(store, slot, gpu, &p);
+    if r.is_ok() {
+        store.abort_step(&p);
+    }
+    ctl_record(map, "neg_poisoned_provision", r.is_err(), json!(r.err()));
+    store.retire(&lanes[a].epoch)?.free_gpu(gpu)?;
+    lanes[a].cancelled = true;
+    lanes[a].done = true;
+    lanes[a].tr.finish = "cancelled".into();
+    Ok(())
 }
 
 /// One batched lane: which reference it must reproduce, optional retire.
@@ -2089,7 +2465,7 @@ fn main() -> Result<()> {
     }
     if args.spec_mtp {
         // Last: the spec phase turns the bundle into a ModelSlot.
-        let (spec, ok) = spec_phase(ctx, &args, &fx)?;
+        let (spec, ok) = spec_phase(ctx, &args, &fx, &refs)?;
         report["spec_mtp"] = spec;
         pass &= ok;
         report["pass"] = json!(pass);
