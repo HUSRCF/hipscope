@@ -1033,6 +1033,10 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // VMM continuous-batching route params, set only when the loaded model
+    // staged `Qwen35Bundle::vmm_store` (`serve.vmm_batch`). None => the
+    // existing routes, byte-identical to the flag-off daemon.
+    let mut vmm_batch: Option<hipfire_engine::scheduler::VmmBatchParams> = None;
     // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
     // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
     // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
@@ -1053,6 +1057,7 @@ fn main() {
     // even read the abort line until after the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
     if let Some(message) = pending_message {
+        hipfire_engine::scheduler::note_daemon_msg_queued(&message);
         let _ = msg_tx.send(message);
     }
     std::thread::spawn(move || {
@@ -1120,6 +1125,7 @@ fn main() {
                         None => DaemonMsg::Regular(msg),
                     };
 
+                    hipfire_engine::scheduler::note_daemon_msg_queued(&queued);
                     if msg_tx.send(queued).is_err() {
                         break;
                     }
@@ -1197,6 +1203,13 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                // Route: `VmmRoute::Exact` (byte-identical to the singleton
+                // route) by default; the non-exact shared slots body only
+                // under the explicit `HIPFIRE_SERVE_BATCH_NONEXACT=1` opt-in
+                // (PLAN §4.3). An exact route the model does not support is
+                // not staged.
+                let parsed_vmm_batch =
+                    hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
                 let experimental_multi_slot = msg
                     .get("params")
                     .and_then(|p| p.get("experimental_multi_slot"))
@@ -1347,6 +1360,7 @@ fn main() {
                     batch_scheduler = None;
                     continuous_batch_size = 1;
                     batch_poisoned = None;
+                    vmm_batch = None;
 
                     let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                     if path.is_empty() {
@@ -2354,6 +2368,14 @@ fn main() {
                             &mut m,
                             &mut gpu,
                             parsed_continuous_batch_size,
+                            parsed_vmm_batch.map(|p| hipfire_loader::batch_staging::VmmStagingRequest {
+                                row_budget: p.max_batch_tokens,
+                                route: if p.nonexact {
+                                    hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact
+                                } else {
+                                    hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+                                },
+                            }),
                         ) {
                             Ok(staging) => staging,
                             Err(stage_err) => {
@@ -2461,6 +2483,7 @@ fn main() {
                             1
                         };
                         batch_scheduler = staged_batch_scheduler;
+                        vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
                         // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
                         // no LCP prefix-cache block and always cold-prefills the full
@@ -2539,8 +2562,7 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
-                            let _ = writeln!(
-                                stdout,
+                            let mut ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
@@ -2561,6 +2583,51 @@ fn main() {
                                 max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
+                            // VMM batch route: append the actual per-request
+                            // owner receipt. Absent on every other route, so
+                            // the flag-off ack is unchanged.
+                            if let Some(p) = vmm_batch {
+                                let receipt = m
+                                    .qwen35_mut()
+                                    .and_then(|b| b.vmm_store.as_mut())
+                                    .map(|s| s.receipt());
+                                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) {
+                                    v["continuous_batch_route"] = serde_json::json!("vmm");
+                                    v["continuous_batch_slots"] = serde_json::json!(staging.slots);
+                                    v["continuous_batch_row_budget"] =
+                                        serde_json::json!(staging.row_budget);
+                                    v["continuous_batch_row_budget_requested"] =
+                                        serde_json::json!(p.max_batch_tokens);
+                                    v["continuous_batch_spec"] = serde_json::json!(false);
+                                    v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
+                                    let exact = m
+                                        .qwen35()
+                                        .and_then(|b| b.vmm_store.as_ref())
+                                        .is_some_and(|s| {
+                                            s.route()
+                                                == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+                                        });
+                                    v["continuous_batch_nonexact"] = serde_json::json!(!exact);
+                                    v["continuous_batch_exact"] = serde_json::json!(exact);
+                                    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+                                    match receipt {
+                                        Some(Ok(r)) => {
+                                            v["vmm_batch_kv_backend"] = serde_json::json!(r.kv_backend);
+                                            v["vmm_batch_kv_mode"] = serde_json::json!(r.kv_mode);
+                                            v["vmm_batch_max_seq_bound"] =
+                                                serde_json::json!(r.max_seq_bound);
+                                            v["vmm_batch_mapped_bytes"] =
+                                                serde_json::json!(r.mapped_bytes);
+                                        }
+                                        Some(Err(e)) => {
+                                            v["vmm_batch_receipt_error"] = serde_json::json!(e);
+                                        }
+                                        None => {}
+                                    }
+                                    ack = v.to_string();
+                                }
+                            }
+                            let _ = writeln!(stdout, "{ack}");
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //
@@ -3676,14 +3743,30 @@ fn main() {
                     // falls through to the sequential path below instead of
                     // failing closed. The batch route above still wins when
                     // staged and requested with `serve_continuous_batch`.
+                    // VMM route (serve.vmm_batch): only when the store is
+                    // staged, and only when another batched generate is
+                    // already waiting — a lonely request keeps the unchanged
+                    // singleton route (exact singleton arithmetic/spec).
+                    let vmm_route = vmm_batch.is_some()
+                        && m.qwen35().is_some_and(|b| b.vmm_store.is_some());
                     let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
-                        is_batch_request_eligible(
-                            &msg,
-                            m,
-                            continuous_batch_size,
-                            serve_continuous_batch,
-                            pflash_active,
-                        )
+                        if vmm_route {
+                            hipfire_generate::batch::is_vmm_batch_request_eligible(
+                                &msg,
+                                m,
+                                continuous_batch_size,
+                                serve_continuous_batch,
+                                pflash_active,
+                            ) && inbox.has_pending_batch_generate()
+                        } else {
+                            is_batch_request_eligible(
+                                &msg,
+                                m,
+                                continuous_batch_size,
+                                serve_continuous_batch,
+                                pflash_active,
+                            )
+                        }
                     } else {
                         false
                     };
@@ -3850,13 +3933,26 @@ fn main() {
                                             false,
                                         );
                                     }
-                                    let drive_res = drive_qwen_continuous_batch(
-                                        sched,
-                                        &mut gpu,
-                                        m,
-                                        &mut stdout,
-                                        &mut inbox,
-                                    );
+                                    let drive_res = match vmm_batch.filter(|_| vmm_route) {
+                                        Some(params) => {
+                                            hipfire_generate::batch::drive_qwen_vmm_continuous_batch(
+                                                sched,
+                                                &mut gpu,
+                                                m,
+                                                params,
+                                                &mut stdout,
+                                                &mut inbox,
+                                                None,
+                                            )
+                                        }
+                                        None => drive_qwen_continuous_batch(
+                                            sched,
+                                            &mut gpu,
+                                            m,
+                                            &mut stdout,
+                                            &mut inbox,
+                                        ),
+                                    };
                                     match drive_res {
                                         Ok(()) => {}
                                         Err(BatchDriveError::Gpu(e)) => {
@@ -3947,6 +4043,27 @@ fn main() {
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
+                    // VMM continuous batching: this request may promote itself
+                    // into the batch driver at a token boundary if a batched
+                    // peer arrives while it runs (closes the C1→C2 TTFT gap).
+                    let promotion_permit = (vmm_route
+                        && batch_scheduler.is_some()
+                        && hipfire_generate::batch::is_vmm_batch_request_eligible(
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pflash_active,
+                        ))
+                    .then(|| hipfire_generate::batch::PromotionPermit {
+                        original_msg: msg.clone(),
+                        sampling: resolve_batch_sampling(&msg, m),
+                        max_tokens,
+                        max_think_tokens,
+                        client_seed,
+                        assistant_prefix,
+                    });
+                    hipfire_generate::batch::set_promotion_permit(promotion_permit);
                     generate(
                         m,
                         &mut gpu,
@@ -3981,6 +4098,38 @@ fn main() {
                         logprobs_top_k,
                         request_seed,
                     );
+                    hipfire_generate::batch::set_promotion_permit(None);
+                    if let Some(promoted) = hipfire_generate::batch::take_promoted() {
+                        let drive_res = match (batch_scheduler.as_mut(), vmm_batch) {
+                            (Some(sched), Some(params)) => {
+                                hipfire_generate::batch::drive_qwen_vmm_continuous_batch(
+                                    sched,
+                                    &mut gpu,
+                                    m,
+                                    params,
+                                    &mut stdout,
+                                    &mut inbox,
+                                    Some(promoted),
+                                )
+                            }
+                            _ => Err(BatchDriveError::Gpu(
+                                "promoted request without a staged VMM batch route".into(),
+                            )),
+                        };
+                        match drive_res {
+                            Ok(()) => {}
+                            Err(BatchDriveError::Gpu(e)) => {
+                                eprintln!("[batch] drive failed (attested): {e}");
+                            }
+                            Err(BatchDriveError::Poisoned(e)) => {
+                                eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+                                batch_scheduler = None;
+                                continuous_batch_size = 1;
+                                batch_poisoned = Some(e);
+                                batch_clear_all_terminals();
+                            }
+                        }
+                    }
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
                     eprintln!("{marker}");

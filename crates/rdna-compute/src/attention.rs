@@ -11,6 +11,11 @@ use crate::GpuTensor;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 
+/// Rows-batched twins of singleton decode kernels (continuous batching);
+/// `rdna_compute::attention::rows_batched`.
+#[path = "rows_batched.rs"]
+pub mod rows_batched;
+
 /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
 /// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
 const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
@@ -213,6 +218,108 @@ fn shift_row_ptr(base: *mut c_void, rows: usize, row_bytes: usize) -> *mut c_voi
     } else {
         unsafe { (base as *mut u8).add(rows * row_bytes) as *mut c_void }
     }
+}
+
+/// Per-request VMM descriptor header for the `*_vmm` module variants — see
+/// `kernels/src/kv_slot_desc_vmm.h`. Never prepended to a default or paged
+/// module, so their source bytes, JIT keys and code objects are unchanged.
+pub const KV_SLOT_DESC_VMM_H: &str = include_str!("../../../kernels/src/kv_slot_desc_vmm.h");
+
+/// `kv_cache_write_fp8_e4m3_batched_vmm` — fp8 write into per-request VMM VAs.
+pub const KV_CACHE_WRITE_FP8_E4M3_VMM_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fp8_e4m3_vmm.hip");
+
+/// Assemble a `_vmm` translation unit: rename `symbol` to `vmm_symbol`,
+/// prepend [`KV_SLOT_DESC_VMM_H`] and strip every descriptor include (the
+/// runtime compile has no `-I` to `kernels/src`). Exposed so the kernel
+/// registry can precompile the exact same module bytes.
+pub fn kv_slot_desc_vmm_source(body: &str, symbol: &str, vmm_symbol: &str) -> String {
+    let stripped = body
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm.h\"", "");
+    if symbol == vmm_symbol {
+        format!("{KV_SLOT_DESC_VMM_H}\n{stripped}")
+    } else {
+        format!("#define {symbol} {vmm_symbol}\n{KV_SLOT_DESC_VMM_H}\n{stripped}")
+    }
+}
+
+/// Which side of a request's VMM KV owner a `_vmm` write targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmKvSide {
+    K,
+    V,
+}
+
+/// KV storage formats with a validated `_vmm` descriptor implementation.
+/// Rotated (asym/fwht) and bf16 VMM variants are not implemented; callers
+/// must refuse those modes rather than fall back to a legacy arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmKvFormat {
+    /// Q8_0 blocks, `n_kv_heads * head_dim/32 * 34` bytes per token (K and V).
+    Q8,
+    /// Native E4M3FN rows with inline f16 per-head scales (gfx1201 only).
+    Fp8E4M3,
+}
+
+impl VmmKvFormat {
+    /// Per-token byte stride of one side; K and V share it for both formats.
+    pub fn bytes_per_token(self, n_kv_heads: usize, head_dim: usize) -> usize {
+        match self {
+            Self::Q8 => n_kv_heads * (head_dim / 32) * 34,
+            Self::Fp8E4M3 => fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+        }
+    }
+}
+
+/// Row-batched VMM entry points for the singleton flash-decode bodies — see
+/// `kernels/src/attention_flash_decode_vmm_rows.hip`.
+pub const ATTENTION_FLASH_DECODE_VMM_ROWS_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_decode_vmm_rows.hip");
+
+/// Singleton flash-decode route a [`VmmFlashDecodePlan`] mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmFlashDecodeRoute {
+    /// `attention_flash_fp8_e4m3_tile_gqa_gfx1201` + `attention_flash_reduce_dsplit_gfx1201`.
+    Fp8GqaGfx1201,
+    /// `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce`.
+    Q8Generic,
+}
+
+/// Admitted geometry of one row-batched VMM flash decode
+/// ([`Gpu::vmm_flash_decode_plan`]). `max_tiles * tile_size >= max_ctx`;
+/// partials hold `partial_floats_per_row` f32 per query row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmFlashDecodePlan {
+    pub route: VmmFlashDecodeRoute,
+    pub tile_size: usize,
+    pub max_tiles: usize,
+    pub partial_floats_per_row: usize,
+}
+
+/// Assemble a row-batched VMM module from a singleton flash body: prepend
+/// the VMM descriptor header and `#define {define} 1`, rewrite the body's
+/// `extern "C" [__launch_bounds__(..)] __global__ void {kernel}(` entry into
+/// `__device__ __forceinline__ void {kernel}_vmm_row_body(` (everything else
+/// byte-identical), then append the row wrappers. Fails if the entry
+/// signature is not found, so a body change cannot silently miscompile.
+pub fn vmm_rows_source(body: &str, kernel: &str, define: &str) -> HipResult<String> {
+    let missing = || {
+        hip_bridge::HipError::new(0, &format!("vmm_rows_source: entry `{kernel}` not found"))
+    };
+    let sig = format!("__global__ void {kernel}(");
+    let at = body.find(&sig).ok_or_else(missing)?;
+    let ext = body[..at].rfind("extern \"C\"").ok_or_else(missing)?;
+    let between = body[ext + "extern \"C\"".len()..at].trim();
+    if !(between.is_empty() || (between.starts_with("__launch_bounds__(") && between.ends_with(')'))) {
+        return Err(missing());
+    }
+    Ok(format!(
+        "{KV_SLOT_DESC_VMM_H}\n#define {define} 1\n{}__device__ __forceinline__ void {kernel}_vmm_row_body({}\n{ATTENTION_FLASH_DECODE_VMM_ROWS_SRC}",
+        &body[..ext],
+        &body[at + sig.len()..],
+    ))
 }
 
 /// Launch grid for the adaptive-KV transcode kernels: one block per
@@ -3623,6 +3730,432 @@ impl Gpu {
             None,
             None,
         )
+    }
+
+    /// Per-request VMM KV write (`*_vmm` modules). Row `b` quantizes
+    /// `src[b]` into the absolute VMM VA of `vmm_descs[row_slot[b]]`
+    /// (`k_base` or `v_base` by `side`) at `positions[b]`. `vmm_descs` is a
+    /// device array of [`crate::kv_slots::VmmKvSlotDesc`] for ONE KV layer;
+    /// `row_slot`/`positions` are device i32 `[batch_size]`. Arithmetic is the
+    /// legacy Q8/fp8 batched writer's; the host MUST run
+    /// [`crate::kv_slots::validate_vmm_rows`] on the uploaded contents first
+    /// (the device traps on any out-of-prefix position).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_batched_vmm(
+        &mut self,
+        format: VmmKvFormat,
+        side: VmmKvSide,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if batch_size == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let (func, grid_x): (&'static str, u32) = match format {
+            VmmKvFormat::Q8 => {
+                let f = "kv_cache_write_q8_0_batched_vmm";
+                if !self.functions.contains_key(f) {
+                    let src = kv_slot_desc_vmm_source(
+                        kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+                        "kv_cache_write_q8_0_batched",
+                        f,
+                    );
+                    self.ensure_kernel(f, &src, f)?;
+                }
+                (f, (n_kv_heads * head_dim / 32) as u32)
+            }
+            VmmKvFormat::Fp8E4M3 => {
+                let f = "kv_cache_write_fp8_e4m3_batched_vmm";
+                if !self.functions.contains_key(f) {
+                    let src = kv_slot_desc_vmm_source(KV_CACHE_WRITE_FP8_E4M3_VMM_SRC, f, f);
+                    self.ensure_kernel(f, &src, f)?;
+                }
+                (f, n_kv_heads as u32)
+            }
+        };
+        let mut null_dst: *mut c_void = std::ptr::null_mut();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs: i32;
+        let mut desc_ptr = vmm_descs.buf.as_ptr();
+        let mut rs = row_slot.buf.as_ptr();
+        let mut vb = (side == VmmKvSide::V) as i32;
+        let q8 = format == VmmKvFormat::Q8;
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base, rs_base) = (s, p, rs);
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            rs = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(9);
+            if q8 {
+                params.push(&mut null_dst as *mut _ as *mut c_void);
+            }
+            params.extend([
+                &mut s as *mut _ as *mut c_void,
+                &mut p as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut bs as *mut _ as *mut c_void,
+                &mut desc_ptr as *mut _ as *mut c_void,
+                &mut rs as *mut _ as *mut c_void,
+                &mut vb as *mut _ as *mut c_void,
+            ]);
+            let (sr, pr, rr, dr, b_len) = (s, p, rs, desc_ptr, bs);
+            self.launch_maybe_blob(
+                func,
+                [grid_x, len as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    if q8 {
+                        b.push_ptr(std::ptr::null_mut());
+                    }
+                    b.push_ptr(sr);
+                    b.push_ptr(pr);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(b_len);
+                    b.push_ptr(dr);
+                    b.push_ptr(rr);
+                    b.push_i32(vb);
+                    b
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-request VMM causal attention (`*_vmm` modules) over independent
+    /// request KV owners: row `b` attends `[0, positions[b]]` of
+    /// `vmm_descs[row_slot[b]]`. Serves decode, linear verify and prefill rows
+    /// alike (no tree bias). `max_ctx_len` MUST be `>= max(positions)+1`; it
+    /// sizes the LDS scores slice, and a context whose slice would exceed the
+    /// 64 KiB per-block limit is refused rather than launched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_batched_vmm(
+        &mut self,
+        format: VmmKvFormat,
+        q: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let block_size = (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_bytes = (max_ctx_len + block_size as usize + head_dim) * 4;
+        if shared_bytes > ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_kv_batched_vmm: context {max_ctx_len} needs {shared_bytes} B LDS \
+                     (> {ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES}); no VMM long-context kernel yet"
+                ),
+            ));
+        }
+        if batch_size > u16::MAX as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_kv_batched_vmm: batch exceeds grid.y limit",
+            ));
+        }
+        self.bind_thread()?;
+        let (symbol, vmm_symbol, body) = match format {
+            VmmKvFormat::Q8 => (
+                "attention_q8_0_kv_batched",
+                "attention_q8_0_kv_batched_vmm",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            ),
+            VmmKvFormat::Fp8E4M3 => (
+                "attention_fp8_e4m3_kv_batched",
+                "attention_fp8_e4m3_kv_batched_vmm",
+                kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC,
+            ),
+        };
+        if !self.functions.contains_key(vmm_symbol) {
+            let src = kv_slot_desc_vmm_source(body, symbol, vmm_symbol);
+            self.ensure_kernel(vmm_symbol, &src, vmm_symbol)?;
+        }
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr: *mut c_void = std::ptr::null_mut();
+        let mut v_ptr: *mut c_void = std::ptr::null_mut();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut bias_ptr: *mut c_void = std::ptr::null_mut();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_ctx_len as i32;
+        let mut sc = 1.0f32 / (head_dim as f32).sqrt();
+        let mut bstart = 0i32;
+        let mut bcols = 0i32;
+        let mut desc_ptr = vmm_descs.buf.as_ptr();
+        let mut rs_ptr = row_slot.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut bias_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bstart as *mut _ as *mut c_void,
+            &mut bcols as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
+        ];
+        let (qr, or, pr, dr, rr) = (q_ptr, out_ptr, pos_ptr, desc_ptr, rs_ptr);
+        self.launch_maybe_blob(
+            vmm_symbol,
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qr);
+                b.push_ptr(std::ptr::null_mut());
+                b.push_ptr(std::ptr::null_mut());
+                b.push_ptr(or);
+                b.push_ptr(pr);
+                b.push_ptr(std::ptr::null_mut());
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(bstart);
+                b.push_i32(bcols);
+                b.push_ptr(dr);
+                b.push_ptr(rr);
+                b
+            },
+        )
+    }
+
+    /// Admit and size the row-batched VMM flash decode for one batch. Picks
+    /// the SAME route and tile size as the singleton decode on this device
+    /// (`attention_flash_fp8_e4m3_tile` → gfx1201 GQA pair;
+    /// `attention_flash_q8_0` → generic tile + reduce) from the model's
+    /// `model_max_seq`, so each row is bitwise equal to its isolated singleton
+    /// decode. `max_ctx` (>= every row's position + 1) sizes the partials;
+    /// routes without a VMM twin are refused, never substituted.
+    pub fn vmm_flash_decode_plan(
+        &self,
+        format: VmmKvFormat,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        model_max_seq: usize,
+        max_ctx: usize,
+    ) -> HipResult<VmmFlashDecodePlan> {
+        let refuse = |why: &str| Err(hip_bridge::HipError::new(0, &format!("VMM flash decode refused: {why}")));
+        if max_ctx == 0 || max_ctx > model_max_seq {
+            return refuse(&format!("max_ctx {max_ctx} outside 1..={model_max_seq}"));
+        }
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, model_max_seq);
+        let route = match format {
+            VmmKvFormat::Fp8E4M3 => {
+                if !fp8_decode_attn_gqa_admitted(self, n_heads, n_kv_heads, head_dim, tile_size) {
+                    return refuse("singleton fp8 decode is not the gfx1201 GQA pair here");
+                }
+                VmmFlashDecodeRoute::Fp8GqaGfx1201
+            }
+            VmmKvFormat::Q8 => {
+                let gfx1151_dpp = self.arch_caps.is_gfx1151()
+                    && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
+                        == Ok("1");
+                if gfx1151_dpp
+                    || q8_decode_attn_gqa_gfx1151_admitted(self, n_heads, n_kv_heads, head_dim, tile_size, 0)
+                {
+                    return refuse("singleton q8 decode uses a gfx1151 route without a VMM twin");
+                }
+                VmmFlashDecodeRoute::Q8Generic
+            }
+        };
+        let max_tiles = max_ctx.div_ceil(tile_size);
+        Ok(VmmFlashDecodePlan {
+            route,
+            tile_size,
+            max_tiles,
+            partial_floats_per_row: n_heads * max_tiles * (2 + head_dim),
+        })
+    }
+
+    /// Row-batched flash decode over per-request VMM KV: row `r` attends
+    /// `[0, positions[r]]` of `vmm_descs[row_slot[r]]` through the singleton
+    /// tile/reduce bodies (blockIdx.z = row). `q`/`out` are
+    /// `[rows, n_heads, head_dim]`; `partials` holds at least
+    /// `rows * plan.partial_floats_per_row` f32. No context cap beyond the
+    /// model's. Host MUST run `validate_vmm_rows` first; the device traps on
+    /// a row past its mapped prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_decode_vmm(
+        &mut self,
+        plan: &VmmFlashDecodePlan,
+        q: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rows: usize,
+        partials: &GpuTensor,
+        vmm_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if rows > u16::MAX as usize {
+            return Err(hip_bridge::HipError::new(0, "attention_flash_decode_vmm: rows exceed grid.z"));
+        }
+        if partials.byte_size() < rows * plan.partial_floats_per_row * 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_flash_decode_vmm: partials {} B < {} rows x {} f32",
+                    partials.byte_size(),
+                    rows,
+                    plan.partial_floats_per_row
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        let (tile_fn, tile_body_fn, tile_src, tile_def, reduce_fn, reduce_body_fn, reduce_src, reduce_def) =
+            match plan.route {
+                VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
+                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                    kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                    "VMM_ROWS_FP8_GQA_TILE",
+                    "attention_flash_reduce_dsplit_gfx1201_vmm",
+                    "attention_flash_reduce_dsplit_gfx1201",
+                    kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                    "VMM_ROWS_DSPLIT_REDUCE",
+                ),
+                VmmFlashDecodeRoute::Q8Generic => (
+                    "attention_flash_q8_0_tile_vmm",
+                    "attention_flash_q8_0_tile",
+                    kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                    "VMM_ROWS_Q8_TILE",
+                    "attention_flash_q8_0_reduce_vmm",
+                    "attention_flash_q8_0_reduce",
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    "VMM_ROWS_Q8_REDUCE",
+                ),
+            };
+        for (func, body_fn, src, def) in [
+            (tile_fn, tile_body_fn, tile_src, tile_def),
+            (reduce_fn, reduce_body_fn, reduce_src, reduce_def),
+        ] {
+            if !self.functions.contains_key(func) {
+                let module = vmm_rows_source(src, body_fn, def)?;
+                self.ensure_kernel(func, &module, func)?;
+            }
+        }
+        let ts = plan.tile_size;
+        let q_ptr = q.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let d_ptr = vmm_descs.buf.as_ptr();
+        let rs_ptr = row_slot.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        // Kernel max_seq only derives max_tiles (partials layout); window 0.
+        let ms = (plan.max_tiles * ts) as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let tsi = ts as i32;
+        let mt = plan.max_tiles as i32;
+        let (tile_grid, tile_block, tile_shared) = match plan.route {
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
+                [n_kv_heads as u32, plan.max_tiles.min(FP8_DECODE_GQA_GFX1201.grid_y_cap) as u32, rows as u32],
+                [256, 1, 1],
+                0u32,
+            ),
+            VmmFlashDecodeRoute::Q8Generic => (
+                [n_heads as u32, plan.max_tiles as u32, rows as u32],
+                [32, 1, 1],
+                ((ts + head_dim) * 4) as u32,
+            ),
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &p_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &tsi as *const _ as *mut c_void,
+            &d_ptr as *const _ as *mut c_void,
+            &rs_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(tile_fn, tile_grid, tile_block, tile_shared, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(q_ptr);
+            b.push_ptr(p_ptr);
+            b.push_ptr(pos_ptr);
+            b.push_i32(nh);
+            b.push_i32(nkv);
+            b.push_i32(hd);
+            b.push_i32(ms);
+            b.push_f32(sc);
+            b.push_i32(tsi);
+            b.push_ptr(d_ptr);
+            b.push_ptr(rs_ptr);
+            b
+        })?;
+        let (reduce_grid, reduce_shared) = match plan.route {
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 => ([n_heads as u32, (head_dim / 32) as u32, rows as u32], 0u32),
+            VmmFlashDecodeRoute::Q8Generic => ([n_heads as u32, 1, rows as u32], (plan.max_tiles * 4) as u32),
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &tsi as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(reduce_fn, reduce_grid, [256, 1, 1], reduce_shared, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(p_ptr);
+            b.push_ptr(o_ptr);
+            b.push_i32(nh);
+            b.push_i32(hd);
+            b.push_ptr(pos_ptr);
+            b.push_i32(tsi);
+            b.push_i32(mt);
+            b
+        })
     }
     /// Batched native fp8-E4M3 decode/prefill (F slice, gfx1201-only): same
     /// 15-arg ABI, grid [n_heads,batch_size,1] and LDS as

@@ -7055,7 +7055,7 @@ fn gdn_compact3_enabled(
         && super::config::qwen36_27b_dense_shape(config, n_v_heads)
 }
 
-fn gdn_compact_qk_div(
+pub(crate) fn gdn_compact_qk_div(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7077,7 +7077,7 @@ fn gdn_compact_qk_div(
 /// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
 /// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
 /// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
-fn gated_norm_mq_rotate_enabled(
+pub(crate) fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7115,7 +7115,7 @@ fn gated_norm_mq_rotate_enabled(
 /// path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
-fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE")
@@ -7145,7 +7145,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
-fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
+pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
@@ -7182,7 +7182,7 @@ fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
 /// the fixed-K QKVZA producer. Keep the gate deliberately narrow until exact
 /// replay and stationary product certification justify a default flip.
 #[allow(clippy::too_many_arguments)]
-fn qkvza_scalar_prep_enabled(
+pub(crate) fn qkvza_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7218,7 +7218,7 @@ fn qkvza_scalar_prep_enabled(
 /// Schedule the independent beta/alpha transforms as one extra workgroup of
 /// the following conv/QK-normalization dispatch. This keeps the hot QKVZA
 /// projection unchanged while deleting the same boundary.
-fn conv_scalar_prep_enabled(
+pub(crate) fn conv_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7245,7 +7245,7 @@ fn conv_scalar_prep_enabled(
         && conv_qknorm_enabled(gpu, config, quant)
 }
 
-fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
+pub(crate) fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
     let mode = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM").ok();
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"

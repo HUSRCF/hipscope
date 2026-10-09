@@ -1571,3 +1571,125 @@ fn lfm_fast_path_cohort_mismatch_stops() {
     let n = hipfire_engine::scheduler::lfm_fast_path_candidate_len(&sched);
     assert_eq!(n, 2);
 }
+
+// ── Singleton → batch promotion (VMM continuous batching) ────────────
+
+fn promoted_progress(key: &AttemptKey, sampling: BatchSampling) -> hipfire_engine::scheduler::QwenBatchLane {
+    hipfire_engine::scheduler::QwenBatchLane {
+        key: key.clone(),
+        ticket: hipfire_engine::terminal::LaneTicket {
+            lane: usize::MAX,
+            generation: u64::MAX,
+            admission: admission(key),
+        },
+        sampling,
+        prompt_len: 3,
+        seq_pos: 7,
+        next_token: Some(42),
+        rng_state: 99,
+        conversation_tokens: vec![1, 2, 3, 4, 5, 6, 7],
+        streamed_tokens: vec![4, 5, 6, 7],
+        bytes_fed_to_filter: 11,
+        created_at: Instant::now(),
+        prefill_done_at: Some(Instant::now()),
+        first_token_at: Some(Instant::now()),
+        max_active_lanes: 1,
+    }
+}
+
+#[test]
+fn singleton_promotion_keeps_key_and_never_reannounces() {
+    let _g = begin();
+    hipfire_engine::terminal::activate_terminal_control("promo", 3);
+    let generation =
+        hipfire_engine::terminal::singleton_handoff_to_batch("promo", 3).expect("promotion");
+    // The singleton transaction is closed; the same exact key is now a batch
+    // admission, so neither a second promotion nor a fresh announce (which
+    // would precede a second gen_start) can claim it.
+    assert_eq!(hipfire_engine::terminal::terminal_generation("promo", 3), None);
+    assert_eq!(batch_terminal_generation("promo", 3), Some(generation));
+    assert!(hipfire_engine::terminal::singleton_handoff_to_batch("promo", 3).is_none());
+    assert!(!batch_announce_terminal("promo", 3));
+    assert!(!batch_check_abort("promo", 3));
+
+    let key = AttemptKey::new("promo", 3);
+    let mut sched = ContinuousBatchScheduler::new(2, 64);
+    let ticket = sched
+        .adopt_running(req(key.clone(), sampling(0.0, 1.0)), promoted_progress(&key, sampling(0.0, 1.0)))
+        .expect("adopted");
+    assert_eq!(ticket.admission, generation);
+    match &sched.lanes[ticket.lane] {
+        BatchLane::Running(l) => {
+            assert_eq!(l.key, key);
+            assert_eq!(l.ticket, ticket);
+            assert_eq!((l.seq_pos, l.next_token, l.rng_state), (7, Some(42), 99));
+            assert_eq!(l.streamed_tokens, vec![4, 5, 6, 7]);
+            assert_eq!(l.bytes_fed_to_filter, 11);
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+    assert!(sched.inbox.is_empty(), "promotion never goes through the inbox");
+    // Exactly one wire terminal for the adopted lane.
+    let _scope = BatchAttemptScope::enter_for_generation("promo", 3, generation);
+    assert!(hipfire_engine::terminal::claim_wire_terminal("promo", 3));
+    assert!(!hipfire_engine::terminal::claim_wire_terminal("promo", 3));
+}
+
+#[test]
+fn singleton_promotion_carries_a_latched_cancel() {
+    let _g = begin();
+    hipfire_engine::terminal::activate_terminal_control("promo-cancel", 1);
+    hipfire_engine::terminal::apply_terminal_control("abort", "promo-cancel", 1);
+    let generation = hipfire_engine::terminal::singleton_handoff_to_batch("promo-cancel", 1)
+        .expect("promotion");
+    assert!(hipfire_engine::terminal::batch_check_abort("promo-cancel", 1, generation));
+    // A cancel arriving after promotion lands on the batch admission.
+    hipfire_engine::terminal::activate_terminal_control("promo-late", 2);
+    let g2 = hipfire_engine::terminal::singleton_handoff_to_batch("promo-late", 2).unwrap();
+    assert!(!hipfire_engine::terminal::batch_check_abort("promo-late", 2, g2));
+    batch_apply_terminal_control("abort", "promo-late", 2);
+    assert!(hipfire_engine::terminal::batch_check_abort("promo-late", 2, g2));
+}
+
+#[test]
+fn singleton_promotion_refuses_claimed_or_foreign_transactions() {
+    let _g = begin();
+    assert!(hipfire_engine::terminal::singleton_handoff_to_batch("none", 1).is_none());
+    hipfire_engine::terminal::activate_terminal_control("owner", 1);
+    assert!(hipfire_engine::terminal::singleton_handoff_to_batch("owner", 2).is_none());
+    assert!(hipfire_engine::terminal::claim_terminal("owner", 1));
+    assert!(hipfire_engine::terminal::singleton_handoff_to_batch("owner", 1).is_none());
+    assert_eq!(batch_terminal_generation("owner", 1), None);
+}
+
+#[test]
+fn adopt_running_refuses_cohort_mismatch_and_full_scheduler() {
+    let _g = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 64);
+    hipfire_engine::terminal::activate_terminal_control("a", 1);
+    hipfire_engine::terminal::singleton_handoff_to_batch("a", 1).unwrap();
+    let ka = AttemptKey::new("a", 1);
+    assert!(sched
+        .adopt_running(req(ka.clone(), sampling(0.0, 1.0)), promoted_progress(&ka, sampling(0.0, 1.0)))
+        .is_some());
+    // Full: no lane, nothing installed, admission left for the caller.
+    hipfire_engine::terminal::activate_terminal_control("b", 1);
+    hipfire_engine::terminal::singleton_handoff_to_batch("b", 1).unwrap();
+    let kb = AttemptKey::new("b", 1);
+    assert!(sched
+        .adopt_running(req(kb.clone(), sampling(0.0, 1.0)), promoted_progress(&kb, sampling(0.0, 1.0)))
+        .is_none());
+    assert!(!sched.pending.contains_key(&kb));
+    // Cohort mismatch on a scheduler with room.
+    let mut wide = ContinuousBatchScheduler::new(2, 64);
+    let kc = AttemptKey::new("b", 1);
+    assert!(wide
+        .adopt_running(req(kc.clone(), sampling(0.0, 1.0)), promoted_progress(&kc, sampling(0.0, 1.0)))
+        .is_some());
+    hipfire_engine::terminal::activate_terminal_control("c", 1);
+    hipfire_engine::terminal::singleton_handoff_to_batch("c", 1).unwrap();
+    let kd = AttemptKey::new("c", 1);
+    assert!(wide
+        .adopt_running(req(kd.clone(), sampling(0.0, 1.05)), promoted_progress(&kd, sampling(0.0, 1.05)))
+        .is_none());
+}

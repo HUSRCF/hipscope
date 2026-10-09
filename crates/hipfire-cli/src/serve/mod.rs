@@ -243,6 +243,19 @@ pub(crate) struct LoadedInfo {
     pub(crate) reasoning_efforts: Vec<String>,
 }
 
+/// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
+/// `enabled=false` keeps the existing VMM singleton route; `spec=false`
+/// disables only cross-request speculation; `nonexact` admits labeled
+/// non-bit-exact batched arithmetic and is always default off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VmmBatchFlags {
+    pub(crate) enabled: bool,
+    pub(crate) spec: bool,
+    pub(crate) nonexact: bool,
+    /// `serve.prefill_min_tokens`: the VMM route's rotating prefill quantum.
+    pub(crate) prefill_min_tokens: u64,
+}
+
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
@@ -266,6 +279,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
+    /// VMM continuous-batching route (`serve.vmm_batch` and its spec /
+    /// nonexact sub-switches). Projected on load only when enabled, so the
+    /// default-off wire is byte-identical to the pre-route daemon protocol.
+    pub(crate) vmm_batch: VmmBatchFlags,
     /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
     /// Projects load/generate wire markers only; CLI holds no GPU slot backend.
     pub(crate) multi_slot_enabled: bool,
@@ -1338,15 +1355,23 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
+    let mut vmm_batch = VmmBatchFlags {
+        enabled: config_bool(&global, "serve.vmm_batch")?,
+        spec: config_bool(&global, "serve.batch_spec")?,
+        nonexact: config_bool(&global, "serve.batch_nonexact")?,
+        prefill_min_tokens: 1,
+    };
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
-    // Serving cache/scheduler contract keys (spec §9.1). Read here for
-    // startup validation only; the runtime does not yet consume them.
+    // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
+    // consumes both (row budget and prefill quantum); other standard routes
+    // read them for startup validation only.
     let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
     let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
+    vmm_batch.prefill_min_tokens = prefill_min_tokens;
     // Aggregate queue byte budget and stalled-stream deadline (spec §5.3,
     // §5.4). Both are multi-slot route contracts: the standard route keeps
     // its count-only queue and its unbounded streaming wait.
@@ -1488,6 +1513,7 @@ pub(crate) fn serve_foreground(
             vision_override: args.vision.clone(),
             tp: args.tp,
             continuous_batch_size,
+            vmm_batch,
             multi_slot_enabled,
             multi_slot_slots,
             multi_slot_ctx,
@@ -1797,6 +1823,14 @@ impl ServeRuntime {
                 params["tp"] = serde_json::json!(tp);
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
+            if self.vmm_batch.enabled {
+                params["serve_vmm_batch"] = serde_json::json!({
+                    "spec": self.vmm_batch.spec,
+                    "nonexact": self.vmm_batch.nonexact,
+                    "max_batch_tokens": self.max_batch_tokens,
+                    "prefill_min_tokens": self.vmm_batch.prefill_min_tokens,
+                });
+            }
             // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
             // LoadedModel. Future continuous-batch integration is deferred.
             if self.multi_slot_enabled {
@@ -3051,6 +3085,7 @@ mod tests {
             vision_override: None,
             tp: None,
             continuous_batch_size: 1,
+            vmm_batch: VmmBatchFlags::default(),
             multi_slot_enabled: false,
             multi_slot_slots: 4,
             multi_slot_ctx: 8192,

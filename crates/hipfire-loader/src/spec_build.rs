@@ -44,6 +44,10 @@ pub struct Qwen35SlotGuard<'m> {
     // `Option` only so `Drop` can move the contents out; it is `Some` for the
     // guard's entire observable lifetime.
     parked: Option<Parked>,
+    /// The VMM continuous-batch store parked for the guard's lifetime:
+    /// `ModelSlot::from_bundle` refuses a bundle that still owns it, and the
+    /// singleton spec route never touches batch request state.
+    vmm_store: Option<hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore>,
 }
 
 // Both variants hold the same ~5.6 KB of live model state by value — that is
@@ -79,13 +83,15 @@ impl<'m> Qwen35SlotGuard<'m> {
         let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
-        let bundle = *(state_box as Box<dyn Any>)
+        let mut bundle = *(state_box as Box<dyn Any>)
             .downcast::<Qwen35Bundle>()
             .unwrap();
+        let vmm_store = bundle.vmm_store.take();
         Ok(Self {
             state_back: state,
             model_path: model_path.to_string(),
             parked: Some(Parked::Bundle(bundle)),
+            vmm_store,
         })
     }
 
@@ -119,13 +125,14 @@ impl<'m> Qwen35SlotGuard<'m> {
 
 impl Drop for Qwen35SlotGuard<'_> {
     fn drop(&mut self) {
-        let bundle = match self.parked.take() {
+        let mut bundle = match self.parked.take() {
             Some(Parked::Bundle(b)) => b,
             // slot.hfq (mmap), slot.name, slot.slot_config drop inside
             // `into_bundle`; the five live pieces go back into the bundle.
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
+        bundle.vmm_store = self.vmm_store.take();
         *self.state_back = Some(Box::new(bundle));
     }
 }

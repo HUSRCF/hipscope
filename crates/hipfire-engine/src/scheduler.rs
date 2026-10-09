@@ -299,6 +299,54 @@ impl ContinuousBatchScheduler {
         Some((key, ticket))
     }
 
+    /// Install an already-started request (a singleton generation promoted
+    /// into the batch via `singleton_handoff_to_batch`) directly as a Running
+    /// lane. Unlike [`Self::enqueue`] + [`Self::try_assign_one`] it never
+    /// passes through the inbox, so the driver neither re-announces nor
+    /// re-prefills it. `progress` carries the lane's wire/host progress
+    /// (positions, emitted tokens, filter offset, RNG, timings); its key and
+    /// ticket are overwritten. Returns the bound ticket, or `None` (nothing
+    /// installed) when no lane is free, the cohort differs, or the admission
+    /// is not current.
+    pub fn adopt_running(
+        &mut self,
+        req: BatchPendingRequest,
+        progress: QwenBatchLane,
+    ) -> Option<LaneTicket> {
+        let key = req.key.clone();
+        let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
+        let sampling_key = req.sampling.key();
+        if self.cohort_key.as_ref().is_some_and(|c| c != &sampling_key)
+            || self.pending.contains_key(&key)
+            || self.inbox.contains(&key)
+            || !batch_is_current(&key.id, key.attempt_id, req.admission)
+        {
+            return None;
+        }
+        let ticket = LaneTicket {
+            lane: lane_idx,
+            generation: self.next_generation,
+            admission: req.admission,
+        };
+        if !batch_transition_to_queued(&key.id, key.attempt_id, req.admission)
+            || !batch_bind_active(&key.id, key.attempt_id, req.admission, ticket)
+        {
+            return None;
+        }
+        self.next_generation += 1;
+        self.pending_sampling.insert(key.clone(), req.sampling.clone());
+        self.pending.insert(key.clone(), req);
+        self.lanes[lane_idx] = BatchLane::Running(QwenBatchLane {
+            key,
+            ticket,
+            ..progress
+        });
+        if self.cohort_key.is_none() {
+            self.cohort_key = Some(sampling_key);
+        }
+        Some(ticket)
+    }
+
     pub fn mark_awaiting_commit(&mut self, lane: usize, pending_done: serde_json::Value) -> bool {
         if lane >= self.lanes.len() {
             return false;
@@ -785,6 +833,28 @@ pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize 
         .unwrap_or(1) as usize
 }
 
+/// Load-time VMM continuous-batching route request (`params.serve_vmm_batch`,
+/// projected by serve only when `serve.vmm_batch` is on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmBatchParams {
+    pub spec: bool,
+    pub nonexact: bool,
+    pub max_batch_tokens: usize,
+    pub prefill_min_tokens: usize,
+}
+
+pub fn parse_vmm_batch_params(params: Option<&serde_json::Value>) -> Option<VmmBatchParams> {
+    let v = params?.get("serve_vmm_batch")?;
+    let flag = |k: &str, d: bool| v.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
+    let num = |k: &str, d: u64| v.get(k).and_then(|x| x.as_u64()).unwrap_or(d) as usize;
+    Some(VmmBatchParams {
+        spec: flag("spec", true),
+        nonexact: flag("nonexact", false),
+        max_batch_tokens: num("max_batch_tokens", 4096).max(1),
+        prefill_min_tokens: num("prefill_min_tokens", 1).max(1),
+    })
+}
+
 pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
     msg.get("params")
         .and_then(|p| p.get("serve_continuous_batch"))
@@ -1007,6 +1077,48 @@ pub struct DaemonInbox {
     pub backlog: std::collections::VecDeque<DaemonMsg>,
 }
 
+/// Serve-batched generate messages queued for the main loop (reader-sent or
+/// pushed back, not yet received). A running singleton generation polls it
+/// at token boundaries to decide whether to promote itself into the VMM
+/// batch driver; nothing else reads it.
+static QUEUED_BATCH_GENERATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn is_batch_generate(msg: &DaemonMsg) -> bool {
+    match msg {
+        DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+            v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                && parse_serve_continuous_batch(v)
+        }
+        _ => false,
+    }
+}
+
+/// Reader thread: account one message about to be sent on the inbox channel.
+pub fn note_daemon_msg_queued(msg: &DaemonMsg) {
+    if is_batch_generate(msg) {
+        QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Number of serve-batched generates waiting for the main loop.
+pub fn queued_batch_generates() -> usize {
+    QUEUED_BATCH_GENERATES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_received<T>(r: Result<DaemonMsg, T>) -> Result<DaemonMsg, T> {
+    if let Ok(msg) = &r {
+        if is_batch_generate(msg) {
+            let _ = QUEUED_BATCH_GENERATES.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+    }
+    r
+}
+
 impl DaemonInbox {
     pub fn new(rx: std::sync::mpsc::Receiver<DaemonMsg>) -> Self {
         Self {
@@ -1016,27 +1128,46 @@ impl DaemonInbox {
     }
     pub fn recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::RecvError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.recv()
+        note_received(self.rx.recv())
     }
     pub fn try_recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::TryRecvError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.try_recv()
+        note_received(self.rx.try_recv())
     }
     pub fn recv_timeout(
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<DaemonMsg, std::sync::mpsc::RecvTimeoutError> {
         if let Some(msg) = self.backlog.pop_front() {
-            return Ok(msg);
+            return note_received(Ok(msg));
         }
-        self.rx.recv_timeout(timeout)
+        note_received(self.rx.recv_timeout(timeout))
     }
     pub fn push_front(&mut self, msg: DaemonMsg) {
+        if is_batch_generate(&msg) {
+            QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.backlog.push_front(msg);
+    }
+    /// Non-blocking: move every already-delivered message into the backlog
+    /// (order preserved) and report whether one is a serve-batched generate
+    /// (`serve_continuous_batch`). The VMM route uses this to send a request
+    /// that is lonely at dispatch to the unchanged singleton route.
+    pub fn has_pending_batch_generate(&mut self) -> bool {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.backlog.push_back(msg);
+        }
+        self.backlog.iter().any(|m| match m {
+            DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+                v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                    && parse_serve_continuous_batch(v)
+            }
+            _ => false,
+        })
     }
 }
 

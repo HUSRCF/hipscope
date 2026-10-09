@@ -1085,6 +1085,7 @@ fn load_qwen35_pp(
         vision_config: None,
         vision_weights: None,
         qwen35_decode_batch: None,
+        vmm_store: None,
     };
     Ok(LoadedModel {
         state: Some(Box::new(bundle)),
@@ -1641,6 +1642,7 @@ impl Carrier for Qwen35Carrier {
                     vision_config: None,
                     vision_weights: None,
                     qwen35_decode_batch: None,
+                    vmm_store: None,
                 };
                 Ok(LoadedModel {
                     state: Some(Box::new(bundle)),

@@ -802,6 +802,20 @@ impl ModelSlot {
     /// `Qwen35Bundle` field knowledge the loader's guard previously inlined; it
     /// lives here so the loader never names the bundle's fields.
     pub fn from_bundle(bundle: Qwen35Bundle, path: &Path) -> Result<Self, (Qwen35Bundle, String)> {
+        // Batch owners (fixed-lane staging or the per-request VMM store) are
+        // outside the spec slot. Refuse WITHOUT loss rather than dropping
+        // them here: a dropped store would leak its request VMM leases and
+        // strand those requests' state. A request leaving the batch for the
+        // singleton spec route first swaps its owners into the bundle
+        // (`Qwen35RequestState::swap_with_bundle`) and the driver parks the
+        // store before entering this seam.
+        if bundle.qwen35_decode_batch.is_some() || bundle.vmm_store.is_some() {
+            return Err((
+                bundle,
+                "ModelSlot::from_bundle: batch state is staged on the bundle; park it before speculative takeover"
+                    .into(),
+            ));
+        }
         let hfq = match HfqFile::open(path) {
             Ok(h) => h,
             Err(e) => return Err((bundle, format!("reopen model: {e}"))),
@@ -816,18 +830,14 @@ impl ModelSlot {
             pp_scratch_set,
             vision_config,
             vision_weights,
-            qwen35_decode_batch,
+            qwen35_decode_batch: _,
+            vmm_store: _,
         } = bundle;
         debug_assert!(
             pp_scratch_set.is_none(),
             "ModelSlot::from_bundle: pp_scratch_set must be None (pp>1 never enters spec slot)"
         );
         let _ = pp_scratch_set;
-        debug_assert!(
-            qwen35_decode_batch.is_none(),
-            "ModelSlot::from_bundle: qwen35_decode_batch must be None (batch staging is outside spec slot)"
-        );
-        let _ = qwen35_decode_batch;
         Ok(Self {
             name: String::from("target"),
             hfq,
@@ -860,6 +870,7 @@ impl ModelSlot {
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
             qwen35_decode_batch: None,
+            vmm_store: None,
         }
     }
 }

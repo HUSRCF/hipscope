@@ -2627,8 +2627,16 @@ impl DeltaNetState {
 
     /// Free all GPU tensors. Call before drop to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        // Q8/Q4 S matrices are direct `hip.malloc` allocations (never drawn
+        // from the pool): return them to HIP, or every retired state would
+        // park its S bytes on a pool free list nothing allocates from.
+        let direct = matches!(self.quant, StateQuant::Q8 | StateQuant::Q4);
         for t in self.s_matrices {
-            let _ = gpu.free_tensor(t);
+            if direct {
+                let _ = gpu.hip.free(t.buf);
+            } else {
+                let _ = gpu.free_tensor(t);
+            }
         }
         for t in self.s_scales {
             let _ = gpu.free_tensor(t);

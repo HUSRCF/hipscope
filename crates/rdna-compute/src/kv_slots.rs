@@ -419,6 +419,119 @@ pub(crate) fn preflight_checks(
     }
 }
 
+/// Byte-identical mirror of `struct KvSlotDesc` in
+/// `kernels/src/kv_slot_desc_vmm.h` (the `_vmm` module variant). 32 bytes,
+/// 8-byte aligned. One array per KV layer, one entry per request slot.
+///
+/// Unlike [`KvSlotDesc`] the bases are ABSOLUTE device virtual addresses of a
+/// request's own VMM reservation for that layer (`KvCache` per-request
+/// owner), never offsets into a shared arena. `_vmm` kernels are launched
+/// with null K/V arena pointers and address `base + pos * stride`. Every
+/// access traps on the device unless
+/// `0 <= pos < mapped_positions <= logical_bound`; the host rejects the same
+/// conditions first in [`validate_vmm_rows`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmmKvSlotDesc {
+    /// Absolute device VA of this request's K reservation for the layer.
+    pub k_base: u64,
+    /// Absolute device VA of this request's V reservation for the layer.
+    pub v_base: u64,
+    /// Positions `[0, mapped_positions)` are physically mapped on both sides.
+    pub mapped_positions: u32,
+    /// Metadata/admission-resolved context bound for this request.
+    pub logical_bound: u32,
+    /// `Gpu::vmm_owner_generation` of the K owner; binds rows to one owner
+    /// instance so a reused slot or a stale request cannot alias a new one.
+    pub owner_generation: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<VmmKvSlotDesc>() == 32);
+const _: () = assert!(std::mem::align_of::<VmmKvSlotDesc>() == 8);
+
+impl VmmKvSlotDesc {
+    /// Masked/idle slot: every device access through it traps.
+    pub const MASKED: Self = Self {
+        k_base: 0,
+        v_base: 0,
+        mapped_positions: 0,
+        logical_bound: 0,
+        owner_generation: 0,
+    };
+
+    /// Host-side check of one row write/read at absolute `position`.
+    pub fn check_position(&self, position: i64) -> Result<(), String> {
+        if self.k_base == 0 || self.v_base == 0 || self.owner_generation == 0 {
+            return Err("VMM KV row targets a masked/unbound slot descriptor".into());
+        }
+        if self.mapped_positions > self.logical_bound {
+            return Err(format!(
+                "VMM KV descriptor mapped_positions {} exceeds logical_bound {}",
+                self.mapped_positions, self.logical_bound
+            ));
+        }
+        if position < 0 || position >= self.mapped_positions as i64 {
+            return Err(format!(
+                "VMM KV row position {position} outside mapped prefix [0, {})",
+                self.mapped_positions
+            ));
+        }
+        Ok(())
+    }
+
+    /// Raw bytes for staging upload (`descs.len() * 32`).
+    pub fn as_bytes(descs: &[Self]) -> &[u8] {
+        // SAFETY: repr(C), no padding (4 u64-aligned fields, 2 u32 packed
+        // between them), size asserted at 32 above.
+        unsafe {
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs))
+        }
+    }
+}
+
+/// Host gate run before every `_vmm` write/attention launch: each row's slot
+/// is in range, bound to the owner generation (request epoch) the planner
+/// assigned that row, and its absolute position lies in the mapped prefix.
+/// Wrong-row (row points at another request's slot) and wrong-epoch (stale
+/// generation after abort/slot reuse) both fail here.
+pub fn validate_vmm_rows(
+    descs: &[VmmKvSlotDesc],
+    row_slot: &[i32],
+    positions: &[i32],
+    row_owner_generation: &[u64],
+) -> Result<(), String> {
+    if row_slot.len() != positions.len() || row_slot.len() != row_owner_generation.len() {
+        return Err(format!(
+            "VMM KV row arrays disagree: row_slot={} positions={} generations={}",
+            row_slot.len(),
+            positions.len(),
+            row_owner_generation.len()
+        ));
+    }
+    for (row, ((&slot, &pos), &generation)) in row_slot
+        .iter()
+        .zip(positions)
+        .zip(row_owner_generation)
+        .enumerate()
+    {
+        let desc = usize::try_from(slot)
+            .ok()
+            .and_then(|s| descs.get(s))
+            .ok_or_else(|| {
+                format!("VMM KV row {row} slot {slot} outside {} descriptors", descs.len())
+            })?;
+        if desc.owner_generation != generation {
+            return Err(format!(
+                "VMM KV row {row} slot {slot} owner generation {} != row epoch generation {generation}",
+                desc.owner_generation
+            ));
+        }
+        desc.check_position(pos as i64)
+            .map_err(|e| format!("VMM KV row {row} slot {slot}: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

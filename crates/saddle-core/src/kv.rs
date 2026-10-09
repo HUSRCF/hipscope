@@ -2208,6 +2208,152 @@ impl KvCache {
         Ok(())
     }
 
+    /// Context bound a per-request VMM owner can address: positions
+    /// `[0, logical_bound)`. Never silently below the request's admitted
+    /// context — admission compares against this and refuses.
+    pub fn vmm_logical_bound(&self) -> usize {
+        self.max_seq.min(self.physical_cap)
+    }
+
+    /// `_vmm` kernel format of this per-request owner. Only Q8 (K+V Q8_0)
+    /// and native fp8 have a validated VMM descriptor implementation;
+    /// everything else is refused, never routed through a legacy arena.
+    pub fn vmm_kv_format(&self) -> HipResult<rdna_compute::attention::VmmKvFormat> {
+        use rdna_compute::attention::VmmKvFormat;
+        if !self.uses_vmm_backend() {
+            return Err(hip_bridge::HipError::new(0, "KV cache is not a VMM owner"));
+        }
+        if self.compact_offset != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM request owner was compacted; absolute VA addressing requires compact_offset == 0",
+            ));
+        }
+        match self.current_kv_mode()? {
+            KvMode::Fp8 => Ok(VmmKvFormat::Fp8E4M3),
+            KvMode::Q8 if self.v_mode == VMode::Q8 => Ok(VmmKvFormat::Q8),
+            other => Err(hip_bridge::HipError::new(
+                0,
+                &format!("KV mode {other:?} has no validated per-request VMM descriptor"),
+            )),
+        }
+    }
+
+    /// Physical bytes this owner must map to hold `positions` tokens, after
+    /// refusing anything past [`Self::vmm_logical_bound`]. Pure planning —
+    /// the admission check for one request against a shared budget.
+    pub fn vmm_admission_bytes(&self, gpu: &Gpu, positions: usize) -> HipResult<usize> {
+        self.vmm_kv_format()?;
+        let bound = self.vmm_logical_bound();
+        if positions > bound {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM admission refused: {positions} positions exceed logical bound {bound}"),
+            ));
+        }
+        self.planned_mapped_growth_bytes(gpu, positions)
+    }
+
+    /// Provision (map) this request's prefix to cover `positions` tokens,
+    /// outside graph capture, refusing — without mapping anything — if the
+    /// growth exceeds `budget_bytes` (caller's remaining shared physical
+    /// budget) or the logical bound. Growth is monotonic and keeps every
+    /// owner at its VA. Returns the mapped bytes consumed by this call.
+    pub fn provision_vmm_positions(
+        &mut self,
+        gpu: &mut Gpu,
+        positions: usize,
+        budget_bytes: usize,
+    ) -> HipResult<usize> {
+        let need = self.vmm_admission_bytes(gpu, positions)?;
+        if need > budget_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM admission refused: mapping {positions} positions needs {need} B, budget {budget_bytes} B"
+                ),
+            ));
+        }
+        if need > 0 {
+            self.ensure_mapped_capacity(gpu, positions)?;
+        }
+        Ok(need)
+    }
+
+    /// Request-wide owner generation: the registration generation of this
+    /// owner's first real K tensor. Generations are monotonic per GPU and
+    /// never reused, so it identifies this owner instance across abort and
+    /// slot reuse; every layer descriptor carries the same value.
+    pub fn vmm_owner_generation(&self, gpu: &Gpu) -> HipResult<u64> {
+        let k = self
+            .k_gpu
+            .iter()
+            .find(|t| t.buf.is_vmm_owner())
+            .ok_or_else(|| hip_bridge::HipError::new(0, "KV cache has no VMM K owner"))?;
+        gpu.vmm_owner_generation(k)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU"))
+    }
+
+    /// Per-layer VMM descriptors for this request (index = model layer;
+    /// non-KV layers are [`VmmKvSlotDesc::MASKED`]). Addresses are the
+    /// owners' stable VAs; `mapped_positions` is the actual mapped prefix
+    /// over K and V, `owner_generation` the request-wide
+    /// [`Self::vmm_owner_generation`]. A view borrows: it never transfers or clones ownership,
+    /// and is invalid after [`Self::release_vmm_after`].
+    pub fn vmm_slot_descs(
+        &self,
+        gpu: &Gpu,
+    ) -> HipResult<Vec<rdna_compute::kv_slots::VmmKvSlotDesc>> {
+        use rdna_compute::kv_slots::VmmKvSlotDesc;
+        self.vmm_kv_format()?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        let to_u32 = |v: usize, what: &str| {
+            u32::try_from(v).map_err(|_| {
+                hip_bridge::HipError::new(0, &format!("VMM {what} {v} exceeds u32"))
+            })
+        };
+        let mapped_positions = to_u32(mapped.min(self.vmm_logical_bound()), "mapped prefix")?;
+        let logical_bound = to_u32(self.vmm_logical_bound(), "logical bound")?;
+        let owner_generation = self.vmm_owner_generation(gpu)?;
+        self.k_gpu
+            .iter()
+            .zip(&self.v_gpu)
+            .map(|(k, v)| {
+                if !k.buf.is_vmm_owner() {
+                    return Ok(VmmKvSlotDesc::MASKED);
+                }
+                if !v.buf.is_vmm_owner() {
+                    return Err(hip_bridge::HipError::new(0, "VMM K owner paired with non-VMM V"));
+                }
+                gpu.vmm_owner_generation(k).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
+                })?;
+                Ok(VmmKvSlotDesc {
+                    k_base: k.buf.as_ptr() as u64,
+                    v_base: v.buf.as_ptr() as u64,
+                    mapped_positions,
+                    logical_bound,
+                    owner_generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Release the request owner once its last reader has completed:
+    /// synchronizes `completion` (the event recorded after the final step
+    /// that read or wrote this KV, including graph replays) before unmapping.
+    /// Never call with readers still in flight and no event.
+    pub fn release_vmm_after(
+        self,
+        gpu: &mut Gpu,
+        completion: Option<&hip_bridge::Event>,
+    ) -> HipResult<()> {
+        if let Some(event) = completion {
+            gpu.hip.event_synchronize(event)?;
+        }
+        self.free_gpu(gpu)
+    }
+
     /// Bytes of V-cache per token-position (all heads) for a given V mode.
     /// Q8 = n_kv_heads * (head_dim/32) * 34. Lloyd = n_kv_heads * (4 + head_dim*bits/8).
     fn v_bytes_per_pos(n_kv_heads: usize, head_dim: usize, v_mode: VMode) -> usize {

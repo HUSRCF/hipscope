@@ -4210,6 +4210,13 @@ pub fn generate_spec(
     // from `m`). The wrapper supplies the model-independent recipe as an owned
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
+    // VMM promotion needs a request whose spec emitter state an AR producer
+    // can reproduce: no tools/grammar, no stop strings, no think budget.
+    let promo_shape_ok = emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    let promo_started_in_think = matches!(
+        emit_req.assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
     let emit_ctx = hipfire_runtime::spec::SpecEmitCtx {
         tokenizer,
         eos: slot.eos_token(),
@@ -4486,6 +4493,96 @@ pub fn generate_spec(
             );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
+        }
+        // VMM continuous batching: at this committed cycle boundary (the
+        // pending seed is emitted, not yet fed), a serve-batched peer is
+        // waiting and the daemon granted a permit: discard the draft state,
+        // keep the seed, and continue this request as exact batched AR in
+        // the VMM driver instead of making the peer wait.
+        if promo_shape_ok && pending_seed_committable && semantic_stop.is_none() && m.eviction.is_none() {
+            if let Some(permit) = crate::batch::promotion_permit()
+                .filter(|_| crate::batch::promotion_wanted(generated))
+            {
+                let attempt = hipfire_engine::terminal::active_attempt_id();
+                let rng_state = request_seed_for(&AttemptKey::new(id, attempt), permit.client_seed);
+                let promoted = crate::batch::replay_ar_producer(id, promo_started_in_think, tokenizer, &emitted)
+                    .and_then(|(producer, bytes_fed)| {
+                        let s = &permit.sampling;
+                        let sampler = SamplerConfig {
+                            temperature: s.temp,
+                            top_p: s.top_p,
+                            repeat_penalty: s.repeat_penalty,
+                            repeat_window: s.repeat_window,
+                            presence_penalty: s.presence_penalty,
+                            frequency_penalty: s.frequency_penalty,
+                            blocked_tokens: Vec::new(),
+                            top_k: s.top_k,
+                            min_p: s.min_p,
+                        };
+                        let ms = slot
+                            .as_any_mut()
+                            .downcast_mut::<speculative::ModelSlot>()
+                            .ok_or("spec target is not a qwen35 ModelSlot")?;
+                        let mut conversation = Vec::with_capacity(prompt_tokens.len() + emitted.len());
+                        conversation.extend_from_slice(&prompt_tokens);
+                        conversation.extend_from_slice(&emitted);
+                        let boundary = crate::batch::SingletonBoundary {
+                            id,
+                            permit: permit.clone(),
+                            config: &ms.config,
+                            kv: &mut ms.kv_cache,
+                            dn: &mut ms.dn_state,
+                            position,
+                            pending_seed: seed_token,
+                            sampler,
+                            rng_state,
+                            history: emitted.clone(),
+                            prompt_len: prompt_tokens.len(),
+                            conversation_tokens: conversation,
+                            streamed_tokens: emitted.clone(),
+                            bytes_fed_to_filter: bytes_fed,
+                            created_at: t0,
+                            prefill_done_at: t_prefill,
+                            first_token_at: Some(t_prefill),
+                            started_in_think: promo_started_in_think,
+                        };
+                        crate::batch::promote_singleton(gpu, boundary).map(|p| (p, producer))
+                    });
+                match promoted {
+                    Ok(((pending, progress, state), producer)) => {
+                        // The target now holds fresh owners: host caches and
+                        // the speculator's draft state belong to the moved
+                        // KV/DN, so drop them (the guard restores the bundle).
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        if let Err(e) = spec.reset(gpu) {
+                            eprintln!("[vmm-promote] speculator reset after promotion: {e}");
+                        }
+                        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                        gpu.replay.rearm_after_layout_growth();
+                        eprintln!(
+                            "[vmm-promote] id={id} promoted from spec singleton at generated={generated} position={position}"
+                        );
+                        crate::batch::put_promoted(crate::batch::PromotedRequest {
+                            pending,
+                            progress,
+                            state,
+                            producer,
+                            loop_guard: hipfire_runtime::loop_guard::LoopGuard::from_config(
+                                hipfire_runtime::config::get(),
+                            ),
+                            kind: crate::batch::PromotedDecode::Ar,
+                            seed_emitted: true,
+                        });
+                        drop(guard);
+                        return None;
+                    }
+                    Err(e) => eprintln!("[vmm-promote] id={id} stays on spec: {e}"),
+                }
+            }
         }
         // Overflow guard reads the CURRENT effective width each cycle — the
         // controller may have shrunk the proposal below the full block since
