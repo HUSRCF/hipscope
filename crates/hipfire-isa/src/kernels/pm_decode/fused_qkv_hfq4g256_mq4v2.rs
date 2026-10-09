@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! QKV's gate-first, single-group diagnostic. This export is deliberately
-//! distinct from the production twin: it writes 32 lane partials to `y_q`.
-//! Its input is the first 136-byte Q group and the first 256 floats of `x`.
-//! It is not admitted by the native decode selector.
+//! Exact gfx1201 scalar QKV projection twin. Four independent group streams
+//! retain the clang24 nibble-dot DAG and tail assignment, followed by the
+//! frozen pairwise combine and shfl-down16/8/4/2/1 wave reduction.
+//! The separately named G0 export writes lane partials and is diagnostic only.
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
-use crate::insn::MemoryClass;
+use crate::insn::{Instruction, MemoryClass};
 use crate::reg::{Kind, Live};
-use crate::kernels::common::{mem, op, smem, sr, v, vr};
+use crate::kernels::common::{mem, op, s, smem, sop, sr, v, vr};
 
 const MODULE: &str = "fused_qkv_hfq4g256_mq4v2";
 const G0_SYMBOL: &str = "fused_qkv_mq4g256v2_g0_group";
@@ -43,14 +43,161 @@ fn group_dot(b: &mut Builder) -> Result<(), String> {
         op(b, format!("v_fmac_f32_e32 v24, v{}, v{}", 16 + i, 8 + i),
             &[v(24)], &[v(24), v(16 + i), v(8 + i)])?;
     }
-    // The incumbent adds the completed dot to its zero-seeded stream,
-    // independently of the seven FMAs (important for signed zero).
-    op(b, "v_mov_b32_e32 v25, 0", &[v(25)], &[])?;
-    op(b, "v_add_f32_e32 v24, v25, v24", &[v(24)], &[v(25), v(24)])
+    Ok(())
+}
+
+fn project_group(b: &mut Builder, stream: u8, tail: bool) -> Result<(), String> {
+    let offset = u32::from(stream) * 136;
+    let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+    if tail {
+        op(b, "v_add_nc_u32_e32 v4, s40, v3", &[v(4)], &[s(40), v(3)])?;
+        op(b, "v_add_nc_u32_e32 v7, s40, v1", &[v(7)], &[s(40), v(1)])?;
+        mem(b, format!("global_load_b32 v5, v4, s[32:33]{suffix}"),
+            &[v(5)], &[v(4), sr(32, 2)], MemoryClass::VmemLoad)?;
+        mem(b, format!("global_load_b32 v6, v7, s[32:33]{suffix}"),
+            &[v(6)], &[v(7), sr(32, 2)], MemoryClass::VmemLoad)?;
+    } else {
+        mem(b, format!("buffer_load_b32 v5, v3, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+            &[v(5)], &[v(3), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+        mem(b, format!("buffer_load_b32 v6, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+            &[v(6)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+    }
+    let xoff = u32::from(stream) * 1024;
+    let xsuffix = if xoff == 0 { String::new() } else { format!(" offset:{xoff}") };
+    mem(b, format!("global_load_b128 v[8:11], v2, s[10:11]{xsuffix}"),
+        &[vr(8, 4)], &[v(2), sr(10, 2)], MemoryClass::VmemLoad)?;
+    mem(b, format!("global_load_b128 v[12:15], v2, s[10:11] offset:{}", xoff + 16),
+        &[vr(12, 4)], &[v(2), sr(10, 2)], MemoryClass::VmemLoad)?;
+    group_dot(b)?;
+    let acc = 26 + stream;
+    op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v24"),
+        &[v(acc)], &[v(acc), v(24)])?;
+    b.wait_all()
+}
+
+/// This is the incumbent shfl_down semantics, including out-of-range lanes
+/// reading themselves rather than wrapping to the beginning of the wave.
+fn reduce_wave(b: &mut Builder) -> Result<(), String> {
+    op(b, "v_add_f32_e32 v24, v26, v27", &[v(24)], &[v(26), v(27)])?;
+    op(b, "v_add_f32_e32 v25, v28, v29", &[v(25)], &[v(28), v(29)])?;
+    op(b, "v_add_f32_e32 v24, v24, v25", &[v(24)], &[v(24), v(25)])?;
+    b.ds_crosslane(Instruction::new(
+        "ds_swizzle_b32 v30, v24 offset:swizzle(BITMASK_PERM,\"1pppp\")",
+        vec![v(30)], vec![v(24)]).memory(MemoryClass::DsLoad))?;
+    b.wait(crate::ledger::Counter::Ds, 0)?;
+    op(b, "v_add_f32_e32 v24, v24, v30", &[v(24)], &[v(24), v(30)])?;
+    for step in [8u8, 4, 2, 1] {
+        op(b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v0", 32 - step),
+            &[], &[v(0)])?;
+        op(b, format!("v_cndmask_b32_e64 v31, 0, {step}, vcc_lo"), &[v(31)], &[])?;
+        op(b, "v_add_lshl_u32 v31, v31, v0, 2", &[v(31)], &[v(31), v(0)])?;
+        b.ds_crosslane(Instruction::new("ds_bpermute_b32 v30, v31, v24",
+            vec![v(30)], vec![v(31), v(24)]).memory(MemoryClass::DsLoad))?;
+        b.wait(crate::ledger::Counter::Ds, 0)?;
+        op(b, "v_add_f32_e32 v24, v24, v30", &[v(24)], &[v(24), v(30)])?;
+    }
+    Ok(())
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    Err("QKV production admission requires the real-H2 G0 oracle and checked crosslane reduction".into())
+    let mut regs = RegPlan::new(32, 48)?;
+    regs.add_range("workitem", Kind::V, 0, 1, Live::Whole)?;
+    for base in 1..8 {
+        regs.add_range(&format!("address_or_packed_{base}"), Kind::V, base, 1, Live::Whole)?;
+    }
+    for base in [8, 16, 24] {
+        regs.add_range(&format!("fragment_{base}"), Kind::V, base, 8, Live::Whole)?;
+    }
+    for (base, len) in [(0, 2), (4, 4), (8, 8), (16, 8), (24, 8), (32, 8), (40, 2)] {
+        regs.add_range(&format!("scalar_{base}"), Kind::S, base, len, Live::Whole)?;
+    }
+    let mut b = Builder::new(KernelSpec {
+        kernel_id: MODULE.into(), variant: "four-stream-scalar".into(),
+        arch: Arch::Gfx1201, symbol: "fused_qkv_mq4g256v2".into(),
+        kernargs: kernargs(), user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false, workgroup_size: 32,
+        group_segment_fixed_size: 0, wave32: true, cu_mode: false,
+    }, regs);
+    smem(&mut b, 4, 4, 0, 0)?;
+    smem(&mut b, 8, 4, 0, 16)?;
+    smem(&mut b, 12, 4, 0, 32)?;
+    smem(&mut b, 16, 4, 0, 48)?;
+    smem(&mut b, 20, 2, 0, 64)?;
+    b.wait_all()?;
+    sop(&mut b, "s_add_co_i32 s22, s18, s19", &[22], &[18, 19])?;
+    sop(&mut b, "s_add_co_i32 s23, s22, s20", &[23], &[22, 20])?;
+    sop(&mut b, "s_cmp_ge_i32 ttmp9, s23", &[], &[23])?;
+    op(&mut b, "s_cbranch_scc1 .Lqkv_done", &[], &[])?;
+    sop(&mut b, "s_sub_co_i32 s30, ttmp9, s18", &[30], &[18])?;
+    sop(&mut b, "s_cmp_lt_i32 ttmp9, s18", &[], &[18])?;
+    sop(&mut b, "s_cselect_b32 s24, ttmp9, s30", &[24], &[30])?;
+    for (dst, q, k) in [(26, 4, 6), (27, 5, 7), (28, 12, 14), (29, 13, 15)] {
+        sop(&mut b, format!("s_cselect_b32 s{dst}, s{q}, s{k}"),
+            &[dst], &[q, k])?;
+    }
+    sop(&mut b, "s_sub_co_i32 s30, ttmp9, s22", &[30], &[22])?;
+    sop(&mut b, "s_cmp_lt_i32 ttmp9, s22", &[], &[22])?;
+    sop(&mut b, "s_cselect_b32 s24, s24, s30", &[24], &[24, 30])?;
+    for (dst, src) in [(26, 8), (27, 9), (28, 16), (29, 17)] {
+        sop(&mut b, format!("s_cselect_b32 s{dst}, s{dst}, s{src}"),
+            &[dst], &[dst, src])?;
+    }
+    sop(&mut b, "s_ashr_i32 s25, s24, 31", &[25], &[24])?;
+    sop(&mut b, "s_ashr_i32 s31, s21, 8", &[31], &[21])?;
+    sop(&mut b, "s_lshr_b32 s34, s31, 2", &[34], &[31])?;
+    sop(&mut b, "s_and_b32 s35, s31, 3", &[35], &[31])?;
+    sop(&mut b, "s_mul_i32 s32, s31, 0x88", &[32], &[31])?;
+    sop(&mut b, "s_ashr_i32 s33, s32, 31", &[33], &[32])?;
+    op(&mut b, "s_mul_u64 s[32:33], s[32:33], s[24:25]",
+        &[sr(32, 2)], &[sr(32, 2), sr(24, 2)])?;
+    op(&mut b, "s_add_nc_u64 s[32:33], s[26:27], s[32:33]",
+        &[sr(32, 2)], &[sr(26, 2), sr(32, 2)])?;
+    op(&mut b, "s_mov_b64 s[36:37], s[32:33]", &[sr(36, 2)], &[sr(32, 2)])?;
+    sop(&mut b, "s_and_b32 s37, s37, 0xffff", &[37], &[37])?;
+    sop(&mut b, "s_mov_b32 s38, -1", &[38], &[])?;
+    sop(&mut b, "s_mov_b32 s39, 0x31004000", &[39], &[])?;
+    sop(&mut b, "s_mov_b32 s40, 0", &[40], &[])?;
+    op(&mut b, "v_lshlrev_b32_e32 v1, 2, v0", &[v(1)], &[v(0)])?;
+    op(&mut b, "v_add_nc_u32_e32 v1, 8, v1", &[v(1)], &[v(1)])?;
+    op(&mut b, "v_lshlrev_b32_e32 v2, 5, v0", &[v(2)], &[v(0)])?;
+    op(&mut b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
+    op(&mut b, "v_cndmask_b32_e64 v3, 4, 0, vcc_lo", &[v(3)], &[])?;
+    for acc in 26..30 {
+        op(&mut b, format!("v_mov_b32_e32 v{acc}, 0"), &[v(acc)], &[])?;
+    }
+    sop(&mut b, "s_cmp_eq_u32 s34, 0", &[], &[34])?;
+    op(&mut b, "s_cbranch_scc1 .Lqkv_tails", &[], &[])?;
+    b.loop_(".Lqkv_quads", |b| {
+        for stream in 0..4 {
+            project_group(b, stream, false)?;
+        }
+        sop(b, "s_add_co_i32 s40, s40, 0x220", &[40], &[40])?;
+        op(b, "v_add_nc_u32_e32 v2, 0x1000, v2", &[v(2)], &[v(2)])?;
+        sop(b, "s_sub_co_i32 s34, s34, 1", &[34], &[34])?;
+        sop(b, "s_cmp_lg_u32 s34, 0", &[], &[34])?;
+        op(b, "s_cbranch_scc1 .Lqkv_quads", &[], &[])
+    })?;
+    b.label(".Lqkv_tails")?;
+    for stream in 0..3 {
+        sop(&mut b, format!("s_cmp_lt_u32 s35, {}", stream + 1), &[], &[35])?;
+        op(&mut b, "s_cbranch_scc1 .Lqkv_reduce", &[], &[])?;
+        project_group(&mut b, stream, true)?;
+    }
+    b.label(".Lqkv_reduce")?;
+    reduce_wave(&mut b)?;
+    op(&mut b, "v_cmpx_eq_u32_e32 0, v0", &[], &[v(0)])?;
+    op(&mut b, "s_cbranch_execz .Lqkv_done", &[], &[])?;
+    op(&mut b, "s_lshl_b64 s[24:25], s[24:25], 2",
+        &[sr(24, 2)], &[sr(24, 2)])?;
+    op(&mut b, "s_add_nc_u64 s[32:33], s[28:29], s[24:25]",
+        &[sr(32, 2)], &[sr(28, 2), sr(24, 2)])?;
+    op(&mut b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    mem(&mut b, "global_store_b32 v1, v24, s[32:33]", &[],
+        &[v(1), v(24), sr(32, 2)], MemoryClass::VmemStore)?;
+    b.wait_all()?;
+    b.label(".Lqkv_done")?;
+    op(&mut b, "s_endpgm", &[], &[])?;
+    Ok(vec![b.finish()?])
 }
 
 /// Diagnostic only: never returned from the production entry point.
@@ -92,6 +239,9 @@ pub fn build_g0() -> Result<Vec<Emitted>, String> {
     mem(&mut b, "global_load_b128 v[12:15], v3, s[6:7] offset:16", &[vr(12, 4)],
         &[v(3), sr(6, 2)], MemoryClass::VmemLoad)?;
     group_dot(&mut b)?;
+    // Keep G0 identical to the admitted zero-seeded stream update.
+    op(&mut b, "v_mov_b32_e32 v25, 0", &[v(25)], &[])?;
+    op(&mut b, "v_add_f32_e32 v24, v25, v24", &[v(24)], &[v(25), v(24)])?;
     mem(&mut b, "global_store_b32 v1, v24, s[8:9]", &[],
         &[v(1), v(24), sr(8, 2)], MemoryClass::VmemStore)?;
     b.wait_all()?;
