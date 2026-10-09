@@ -696,9 +696,15 @@ fn free_vram(gpu: &Gpu) -> Result<usize> {
 }
 
 fn new_store(ctx: &mut Ctx) -> Result<Qwen35VmmStore> {
-    // Shared physical KV budget: current free VRAM minus a 3 GiB margin for
-    // per-request DeltaNet state and transients. Not a max_seq override.
-    let budget = free_vram(&ctx.gpu)?.saturating_sub(3 << 30);
+    // The singleton phase leaves its optional widened prefill scratch cached
+    // (32K prefix); the batch route never uses it, so release it first.
+    if let Some(pbs) = ctx.b.scratch.widened_prefill_batch.borrow_mut().take() {
+        pbs.free_gpu(&mut ctx.gpu)?;
+    }
+    // Shared physical KV budget: free VRAM minus a 6 GiB margin for the
+    // store's row scratch, per-request DeltaNet state and transients. This
+    // is an admission budget, not a max_seq override.
+    let budget = free_vram(&ctx.gpu)?.saturating_sub(6 << 30);
     Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH * CHUNK, budget)?)
 }
 
