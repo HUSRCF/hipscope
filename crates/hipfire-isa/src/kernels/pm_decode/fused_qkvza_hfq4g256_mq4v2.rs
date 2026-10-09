@@ -12,13 +12,15 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
 
 fn build_projection() -> Result<Emitted, String> {
     use crate::kernels::common::sop;
-    let mut regs = RegPlan::new(32, 32)?;
+    let mut regs = RegPlan::new(76, 32)?;
     for (base, len, name) in [
         (0, 1, "lane"), (1, 1, "packed_offset"), (2, 1, "zero"),
-        (3, 1, "x_offset"), (4, 4, "streams"), (8, 4, "x_lo"),
-        (12, 4, "x_hi"), (16, 2, "headers"), (18, 1, "packed"),
-        (19, 1, "level"), (20, 1, "weight"), (21, 1, "dot"),
-        (22, 1, "pair"),
+        (3, 1, "x_offset"), (4, 4, "streams"),
+        (8, 8, "quad_x0_or_tail_x"), (16, 8, "quad_x1_or_tail_scratch"),
+        (24, 8, "quad_x2"), (32, 8, "quad_x3"),
+        (40, 8, "quad_headers_or_dots_and_dequant3"),
+        (48, 4, "quad_packed_or_dequant3"),
+        (52, 8, "dequant0"), (60, 8, "dequant1"), (68, 8, "dequant2"),
     ] { regs.add_range(name, crate::reg::Kind::V, base, len, Live::Whole)?; }
     for (base, len, name) in [
         (0, 2, "kernarg"), (4, 4, "weight_resource"), (8, 2, "x"),
@@ -94,7 +96,7 @@ fn build_projection() -> Result<Emitted, String> {
     op(&mut b, "s_cbranch_scc1 .Ltail_groups", &[], &[])?;
     b.wait_all()?;
     b.loop_(".Lquad_loop", |b| {
-        for stream in 0..4 { projection_group(b, stream, false)?; }
+        projection_quad(b)?;
         sop(b, "s_add_co_u32 s17, s17, 0x220", &[17], &[17])?;
         crate::kernels::common::add64_imm(b, 8, 4096)?;
         sop(b, "s_add_co_u32 s16, s16, 1", &[16], &[16])?;
@@ -109,7 +111,7 @@ fn build_projection() -> Result<Emitted, String> {
     for stream in 0..3 {
         sop(&mut b, format!("s_cmp_lt_u32 s15, {}", stream + 1), &[], &[15])?;
         op(&mut b, "s_cbranch_scc1 .Lfold_streams", &[], &[])?;
-        projection_group(&mut b, stream, true)?;
+        projection_group(&mut b, stream)?;
     }
     b.label(".Lfold_streams")?;
     projection_reduce(&mut b)?;
@@ -125,21 +127,139 @@ fn build_projection() -> Result<Emitted, String> {
     b.finish()
 }
 
-fn projection_group(b: &mut Builder, stream: u8, tail: bool) -> Result<(), String> {
-    use crate::kernels::common::s;
+/// Sixteen loads issue before any consumer. Nine checked progressive waits
+/// follow the incumbent producer DAG; headers and packed words become scratch
+/// only after their final dequant use. All four element-1-first folds are intact.
+fn projection_quad(b: &mut Builder) -> Result<(), String> {
+    use crate::{kernels::common::s, ledger::Counter};
+    b.clause(|b| {
+        for stream in 0..4u8 {
+            let header = 40 + stream * 2;
+            let offset = u32::from(stream) * 136;
+            let immediate = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+            mem(b, format!("buffer_load_b64 v[{header}:{}], v2, s[4:7], s17 offen{immediate} scope:SCOPE_DEV", header+1),
+                &[vr(header,2)], &[v(2),sr(4,4),s(17)], MemoryClass::VmemLoad)?;
+        }
+        for stream in 0..4u8 {
+            let packed = 48 + stream;
+            mem(b, format!("buffer_load_b32 v{packed}, v1, s[4:7], s17 offen offset:{} scope:SCOPE_DEV", u32::from(stream)*136+8),
+                &[v(packed)], &[v(1),sr(4,4),s(17)], MemoryClass::VmemLoad)?;
+        }
+        Ok(())
+    })?;
+    b.clause(|b| {
+        for half in 0..2u8 {
+            for stream in 0..4u8 {
+                let dst = 8 + stream * 8 + half * 4;
+                let offset = u32::from(stream) * 1024 + u32::from(half) * 16;
+                let immediate = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+                mem(b, format!("global_load_b128 v[{dst}:{}], v3, s[8:9]{immediate}",dst+3),
+                    &[vr(dst,4)], &[v(3),sr(8,2)], MemoryClass::VmemLoad)?;
+            }
+        }
+        Ok(())
+    })?;
+    // Explicit producer waits preserve BUFFER/GLOBAL overlap instead of the
+    // automatic ledger's conservative mixed-family drain.
+    op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
+    for pair in 0..2u8 {
+        b.wait(Counter::Load, 14-pair*2)?;
+        for stream in pair*2..pair*2+2 {
+            let dst = 40+stream;
+            let header = 40+stream*2;
+            op(b, format!("v_cndmask_b32_e64 v{dst}, v{}, v{header}, vcc_lo",header+1),
+                &[v(dst)], &[v(header+1),v(header)])?;
+        }
+    }
+    b.wait(Counter::Load, 11)?;
+    quad_extract(b, 0)?;
+    b.wait(Counter::Load, 10)?;
+    quad_extract(b, 1)?;
+    quad_dequant_pair(b, 0)?;
+    b.wait(Counter::Load, 9)?;
+    quad_extract(b, 2)?;
+    b.wait(Counter::Load, 6)?;
+    for stream in 0..2 { quad_dot_term(b, stream, 1)?; }
+    quad_extract(b, 3)?;
+    for element in [0,2,3] {
+        for stream in 0..2 { quad_dot_term(b, stream, element)?; }
+    }
+    quad_dequant_pair(b, 2)?;
+    b.wait(Counter::Load, 2)?;
+    for stream in 2..4 { quad_dot_term(b, stream, 1)?; }
+    for (element01, element23) in [(4,Some(0)),(5,Some(2)),(6,Some(3)),(7,None)] {
+        for stream in 0..2 { quad_dot_term(b, stream, element01)?; }
+        if let Some(element) = element23 {
+            for stream in 2..4 { quad_dot_term(b, stream, element)?; }
+        }
+    }
+    b.wait(Counter::Load, 1)?;
+    for element in 4..8 { quad_dot_term(b, 2, element)?; }
+    for stream in 0..2 {
+        let acc = 4+stream;
+        let dot = 40+stream;
+        op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v{dot}"), &[v(acc)], &[v(acc),v(dot)])?;
+    }
+    b.wait(Counter::Load, 0)?;
+    for element in 4..8 { quad_dot_term(b, 3, element)?; }
+    for stream in 2..4 {
+        let acc = 4+stream;
+        let dot = 40+stream;
+        op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v{dot}"), &[v(acc)], &[v(acc),v(dot)])?;
+    }
+    b.wait_all()
+}
+
+fn quad_level(stream: u8, element: u8) -> u8 {
+    if stream == 3 { 44+element } else { 52+stream*8+element }
+}
+
+fn quad_extract(b: &mut Builder, stream: u8) -> Result<(), String> {
+    let packed = 48+stream;
+    // Group 3's final nibble overwrites its packed word only after all reads.
+    for element in [1u8,0,2,3,4,5,6,7] {
+        let dst = quad_level(stream, element);
+        op(b, format!("v_bfe_u32 v{dst}, v{packed}, {}, 4",element*4), &[v(dst)], &[v(packed)])?;
+    }
+    Ok(())
+}
+
+fn quad_dequant_pair(b: &mut Builder, first: u8) -> Result<(), String> {
+    for element in [1u8,0,2,3,4,5,6,7] {
+        for stream in first..first+2 {
+            let dst = quad_level(stream, element);
+            op(b, format!("v_cvt_f32_ubyte0_e32 v{dst}, v{dst}"), &[v(dst)], &[v(dst)])?;
+        }
+    }
+    for element in [1u8,0,2,3,4,5,6,7] {
+        for stream in first..first+2 {
+            let dst = quad_level(stream, element);
+            let header = 40+stream;
+            op(b, format!("v_fma_mix_f32 v{dst}, v{header}, v{dst}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
+                &[v(dst)], &[v(header),v(dst)])?;
+        }
+    }
+    Ok(())
+}
+
+fn quad_dot_term(b: &mut Builder, stream: u8, element: u8) -> Result<(), String> {
+    let dot = 40+stream;
+    let weight = quad_level(stream, element);
+    let x = 8+stream*8+element;
+    if element == 1 {
+        op(b, format!("v_mul_f32_e32 v{dot}, v{weight}, v{x}"), &[v(dot)], &[v(weight),v(x)])
+    } else {
+        op(b, format!("v_fmac_f32_e32 v{dot}, v{weight}, v{x}"), &[v(dot)], &[v(dot),v(weight),v(x)])
+    }
+}
+
+fn projection_group(b: &mut Builder, stream: u8) -> Result<(), String> {
     let group = u32::from(stream) * 136;
     let group_offset = if group == 0 { String::new() } else { format!(" offset:{group}") };
-    if tail {
-        mem(b, format!("global_load_b64 v[16:17], v2, s[26:27]{group_offset}"),
-            &[vr(16,2)], &[v(2),sr(26,2)], MemoryClass::VmemLoad)?;
-        mem(b, format!("global_load_b32 v18, v1, s[26:27] offset:{}", group + 8),
-            &[v(18)], &[v(1),sr(26,2)], MemoryClass::VmemLoad)?;
-    } else {
-        mem(b, format!("buffer_load_b64 v[16:17], v2, s[4:7], s17 offen{group_offset} scope:SCOPE_DEV"),
-            &[vr(16,2)], &[v(2),sr(4,4),s(17)], MemoryClass::VmemLoad)?;
-        mem(b, format!("buffer_load_b32 v18, v1, s[4:7], s17 offen offset:{} scope:SCOPE_DEV", group + 8),
-            &[v(18)], &[v(1),sr(4,4),s(17)], MemoryClass::VmemLoad)?;
-    }
+    mem(b, format!("global_load_b64 v[16:17], v2, s[26:27]{group_offset}"),
+        &[vr(16,2)], &[v(2),sr(26,2)], MemoryClass::VmemLoad)?;
+    mem(b, format!("global_load_b32 v18, v1, s[26:27] offset:{}", group + 8),
+        &[v(18)], &[v(1),sr(26,2)], MemoryClass::VmemLoad)?;
     for (dst, offset) in [(8, u32::from(stream)*1024),(12,u32::from(stream)*1024+16)] {
         let immediate = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
         mem(b, format!("global_load_b128 v[{dst}:{}], v3, s[8:9]{immediate}",dst+3),
@@ -289,6 +409,17 @@ mod tests {
             ".wavefront_size: 32", ".amdhsa_float_round_mode_32 0",
             ".amdhsa_float_denorm_mode_32 3",
         ] { assert!(text.contains(field), "missing frozen contract field {field}"); }
+        let quad = text.split(".Lquad_loop:").nth(1).expect("quad label")
+            .split(".Ltail_groups:").next().expect("tail label");
+        let waits: Vec<_> = quad.lines().filter_map(|line| {
+            line.trim().strip_prefix("s_wait_loadcnt ").map(|count| {
+                u8::from_str_radix(count.strip_prefix("0x").unwrap_or(count),
+                    if count.starts_with("0x") { 16 } else { 10 }).expect("load count")
+            })
+        }).collect();
+        assert_eq!(waits, [14,12,11,10,9,6,2,1,0]);
+        assert_eq!(quad.matches("s_clause 0x7").count(), 2);
+        assert!(text.contains(".vgpr_count: 76"));
         crate::native::assemble(text, crate::Arch::Gfx1201)?;
         Ok(())
     }
