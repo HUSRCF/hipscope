@@ -23,6 +23,7 @@ pub mod flash_attn_ck;
 pub mod flux_fused;
 pub mod gap_timing;
 pub mod gemm;
+mod gemm_vt;
 mod packed_mq4;
 mod gemma4_ext;
 mod gemma4_ops;

@@ -299,6 +299,16 @@ pub struct FeatureFlags {
     /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
     /// on exact gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_qkv: bool,
+    /// `HIPFIRE_WMMA_BATCH_TILES=0` opts out of the exact-gfx1201 batch-tiled
+    /// MQ4V2 WMMA GEMMs at 16 < N < 64 (qkvza, qkv, gate_up, residual/lm_head):
+    /// one block loads and dequantizes each 16-row weight fragment once per K
+    /// step and feeds up to 4 consecutive 16-row batch tiles through independent
+    /// accumulators (the BT4 kernels), so the multi-request speculative verify
+    /// trunk shares weight bandwidth across requests. Per-(row, batch) WMMA
+    /// sequence, K order and epilogue are identical to the one-tile kernels, so
+    /// outputs are byte-identical. N <= 16 never uses it. Default ON on exact
+    /// gfx1201; `=0` restores the one-batch-tile-per-block launch.
+    pub wmma_batch_tiles: bool,
     /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
     /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
     /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
@@ -875,6 +885,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
+            wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
@@ -1356,6 +1367,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
             gfx12_mq4v2_fp8_qkv: false,
+            wmma_batch_tiles: false,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
@@ -1705,6 +1717,23 @@ mod tests {
         assert!(!test_flags.gfx12_mq4v2_fp8_qkvza);
         assert!(!test_flags.gfx12_mq4v2_fp8_qkv);
     }
+    #[test]
+    fn wmma_batch_tiles_defaults_on_gfx1201_with_opt_out() {
+        let flag = |arch: &str, v: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match (name, v) {
+                ("HIPFIRE_WMMA_BATCH_TILES", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .wmma_batch_tiles
+        };
+        assert!(flag("gfx1201", None));
+        assert!(!flag("gfx1201", Some("0")));
+        assert!(flag("gfx1201", Some("1")));
+        assert!(!flag("gfx1100", None));
+        // The unit-test constructor stays on the historical one-tile route.
+        assert!(!FeatureFlags::for_test("gfx1201").wmma_batch_tiles);
+    }
+
     #[test]
     fn gfx12_mq4v2_fp8_v2_and_gdn_pre_fused_default_on_gfx1201_with_opt_out() {
         // Default process policy: staged-tile v2 and the GDN preamble fusion

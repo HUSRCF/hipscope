@@ -312,9 +312,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, ["gated_delta_net_q8_fast"]);
         add!("gdn_pre_batched_gfx1201", include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip"), ["gdn_pre_batched_gfx1201"]);
         add!("gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx12"]);
+        add!("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"]);
         add!("gemm_hfq4g256_residual_wmma_gfx12_mq4v2", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC, ["gemm_mq4g256v2_residual_wmma_gfx12"]);
+        add!("gemm_mq4g256v2_residual_wmma_gfx12_vt", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC, ["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"]);
         add!("gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_qkv_mq4g256v2_wmma_gfx12"]);
+        add!("gemm_qkv_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"]);
         add!("gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_qkvza_mq4g256v2_wmma_gfx12"]);
+        add!("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"]);
         add!("gemv_hfq4g256_multirow_default_mq4v2", kernels::GEMV_MQ4G256V2_MULTIROW_SRC, ["gemv_mq4g256v2_multirow_r2", "gemv_mq4g256v2_multirow_r4", "gemv_mq4g256v2_multirow_r8"]);
         add!("gemv_hfq4g256_residual_mq4v2", kernels::GEMV_MQ4G256V2_RESIDUAL_SRC, ["gemv_mq4g256v2_residual"]);
         add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
@@ -1310,9 +1314,13 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("gdn_chunk_scan_bf16_mseg", &["gdn_chunk_scan_bf16_mseg"]),
     ("gdn_pre_batched_gfx1201", &["gdn_pre_batched_gfx1201"]),
     ("gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", &["gemm_gate_up_mq4g256v2_wmma_gfx12"]),
+    ("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", &["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"]),
     ("gemm_hfq4g256_residual_wmma_gfx12_mq4v2", &["gemm_mq4g256v2_residual_wmma_gfx12"]),
+    ("gemm_mq4g256v2_residual_wmma_gfx12_vt", &["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"]),
     ("gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkv_mq4g256v2_wmma_gfx12"]),
+    ("gemm_qkv_mq4g256v2_wmma_gfx12_vt", &["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"]),
     ("gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkvza_mq4g256v2_wmma_gfx12"]),
+    ("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", &["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"]),
     ("gemv_hfq4g256_multirow_default_mq4v2", &["gemv_mq4g256v2_multirow_r2"]),
     ("gemv_hfq4g256_residual_mq4v2", &["gemv_mq4g256v2_residual"]),
     ("gemv_mq4g256v2_mq4v2", &["gemv_mq4g256v2"]),
@@ -1749,8 +1757,9 @@ mod tests {
         // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
         // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
         // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
-        // helpers. Those 132 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 132, "unexpected gfx1201 inventory size");
+        // helpers and the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
+        // modules. Those 136 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 136, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

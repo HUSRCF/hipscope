@@ -11259,6 +11259,14 @@ impl Gpu {
                 alpha_m, k, batch_size, 1,
             );
         }
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_qkvza_mq4g256v2_wmma_gfx12_vt(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
+        }
         let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
@@ -32589,6 +32597,13 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, 1,
             );
         }
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_qkv_mq4g256v2_wmma_gfx12_vt(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         // Production MQ4V2 weight-reuse tile (gfx1201 QKV BT8 @ N>=96).
         // Capture/replay always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
@@ -33279,6 +33294,13 @@ impl Gpu {
         {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, 1,
+            );
+        }
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_gate_up_mq4g256v2_wmma_gfx12_vt(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
         let bt_b: usize = gfx12_bt_tile(batch_size);
@@ -35861,6 +35883,11 @@ impl Gpu {
         {
             return self
                 .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
+        }
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_mq4g256v2_residual_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size);
         }
         let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {

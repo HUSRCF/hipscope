@@ -5460,6 +5460,30 @@ pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.gfx12.hip");
+/// gfx12 MQ4V2 "verify-tile" twins of the four dense WMMA GEMMs above
+/// (qkvza / qkv / gate_up / residual+lm_head) for 16 < N < 64 rows, the
+/// multi-request speculative-verify trunk. Each source is the shared core
+/// (`gemm_mq4g256v2_wmma_gfx12_vt_core.hip`: block of waves, whole batch panel
+/// staged in LDS once per block, BT independent accumulators per wave) followed
+/// by the projection's routing/epilogue wrapper. Byte-identical per (row,
+/// batch) to the one-tile kernels by construction; symbols `*_vt{2,3,4}`
+/// (BT = ceil(N/16)), same ABI as the one-tile kernels.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx12_vt.hip"),
+);
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx12_vt.hip"),
+);
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx12_vt.hip"),
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_vt.hip"),
+);
 /// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkv WMMA — sister of
 /// GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
 /// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
