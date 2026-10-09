@@ -1,0 +1,10 @@
+{
+  "scope": "four-group lane arithmetic G0 only; not a production twin admission",
+  "symbol": "pm_decode_qkvza_g0",
+  "arch": "gfx1201",
+  "s_text_sha256": "5d8a7ed847c6be9fb3e73002335ef7030d10dd6b7ad862c0d217d81140e0a681",
+  "code_object_sha256": "4dfb4fd1fce0f013cecabc6eb6e52128c6fffa9b032ebe41602246fc35aabbc0",
+  "m7": {"ambiguous_delays": 0, "barrier_pairs": 0, "clauses": 0, "delays": 0, "instructions": 178, "lds_accesses": 0, "lds_max_known_end": 0, "lds_unknown_addresses": 0, "lift": "byte-exact", "obligations": {}, "sgpr_high_water": 12, "table": "gfx1201", "vgpr_high_water": 23, "wait_facts": 5},
+  "tensor_oracle": "not exercised",
+  "removed_modules": 0
+}
