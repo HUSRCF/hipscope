@@ -21,13 +21,13 @@
 //! or a batched-prefill-ineligible row count) runs the singleton verify.
 
 use super::*;
-use crate::qwen35::prefill::multi::{forward_prefill_batch_multi, MultiChunkRequest, MULTI_CHUNK_MAX_ROWS};
+use crate::qwen35::prefill::multi::{forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_ROWS};
 
 /// Shared verify buffers for one CB engine: trunk scratch, post-norm hidden
 /// rows, head rotation scratch and head logits, all `max_rows` rows.
 pub struct MtpCbScratch {
     pub max_rows: usize,
-    pbs: PrefillBatchScratch,
+    trunk: MultiChunkScratch,
     hidden: GpuTensor,
     rot: GpuTensor,
     logits: GpuTensor,
@@ -38,16 +38,16 @@ impl MtpCbScratch {
     /// rows runs in several shared chunks.
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
         let max_rows = max_rows.clamp(2, MULTI_CHUNK_MAX_ROWS);
-        let pbs = PrefillBatchScratch::new(gpu, config, max_rows)?;
+        let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
         let alloc = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32);
         let hidden = alloc(gpu, max_rows * config.dim)?;
         let rot = alloc(gpu, max_rows * config.dim)?;
         let logits = alloc(gpu, max_rows * config.vocab_size)?;
-        Ok(Self { max_rows, pbs, hidden, rot, logits })
+        Ok(Self { max_rows, trunk, hidden, rot, logits })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
-        self.pbs.free_gpu(gpu)?;
+        self.trunk.free_gpu(gpu)?;
         gpu.free_tensor(self.hidden)?;
         gpu.free_tensor(self.rot)?;
         gpu.free_tensor(self.logits)
@@ -177,7 +177,7 @@ pub fn mtp_cb_cycle(
                     gdn_tape: Some(&lane.state.trunk_gdn_tape),
                 });
             }
-            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.pbs, &mut reqs, Some(&cb.hidden))?;
+            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))?;
         }
         let logits = cb.logits.sub_offset(0, rows * vocab);
         mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)?;

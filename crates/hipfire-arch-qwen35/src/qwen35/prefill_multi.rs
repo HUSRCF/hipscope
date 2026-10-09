@@ -36,6 +36,73 @@ pub struct MultiChunkRequest<'a> {
 /// switch of the shared stages (`>= 64` rows).
 pub const MULTI_CHUNK_MAX_ROWS: usize = 63;
 
+/// Most requests (segments) one twin launch carries: every request has at
+/// least [`MIN_BATCH`] rows.
+const MULTI_CHUNK_MAX_SEGS: usize = MULTI_CHUNK_MAX_ROWS / MIN_BATCH;
+
+use hipfire_dispatch::ops::verify_twins::{self as seg_twins, AttnFp8Seg};
+
+/// `HIPFIRE_CB_SEG_TWINS=0` keeps every request on its own singleton
+/// launches (A/B control for the segment twins).
+static SEG_TWINS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_SEG_TWINS").map_or(true, |v| v.trim() != "0")
+});
+
+/// Shared scratch of a multi-request chunk: the row scratch every request's
+/// rows live in, and the segment-twin tables (one per FullAttention layer).
+pub struct MultiChunkScratch {
+    pub pbs: PrefillBatchScratch,
+    attn_segs: GpuTensor,
+}
+
+impl MultiChunkScratch {
+    /// `max_rows` is clamped to `MIN_BATCH..=MULTI_CHUNK_MAX_ROWS`.
+    pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
+        let rows = max_rows.clamp(MIN_BATCH, MULTI_CHUNK_MAX_ROWS);
+        let pbs = PrefillBatchScratch::new(gpu, config, rows)?;
+        let n_fa = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
+        let bytes = n_fa.max(1) * MULTI_CHUNK_MAX_SEGS * std::mem::size_of::<AttnFp8Seg>();
+        match gpu.zeros(&[bytes.div_ceil(4)], rdna_compute::DType::F32) {
+            Ok(attn_segs) => Ok(Self { pbs, attn_segs }),
+            Err(e) => {
+                let _ = pbs.free_gpu(gpu);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn max_rows(&self) -> usize {
+        self.pbs.max_batch
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        self.pbs.free_gpu(gpu)?;
+        gpu.free_tensor(self.attn_segs)
+    }
+}
+
+/// Does this request's singleton attend run `attention_fp8_e4m3_kv_batched`
+/// after `kv_cache_write_fp8_e4m3_batched` (the fp8 scalar-batched arm:
+/// gfx1201, under 64 rows, context at most the 4096 crossover)? Then the
+/// segment twin reproduces it.
+fn attn_fp8_twin_eligible(gpu: &Gpu, s: &Qwen35Scratch, kv: &llama::KvCache, start_pos: usize, n: usize) -> bool {
+    if !(gpu.arch_caps.is_gfx1201() && kv.quant_fp8 && (MIN_BATCH..64).contains(&n) && start_pos + n <= 4096) {
+        return false;
+    }
+    KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n,
+        is_tree: false,
+        ..kv.tier_inputs()
+    })
+    .is_ok_and(|p| {
+        p.attend_key == hipfire_dispatch::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+            && p.write_key == hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3Batched
+    })
+}
+
 /// Rows `[r0, r0 + n)` of `pbs` as a scratch of `n` rows. Only row-major
 /// fields are re-pointed; they alias `pbs` (never freed through the view).
 fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usize) -> std::mem::ManuallyDrop<PrefillBatchScratch> {
@@ -101,11 +168,12 @@ pub fn forward_prefill_batch_multi(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     s: &Qwen35Scratch,
-    pbs: &PrefillBatchScratch,
+    scratch: &MultiChunkScratch,
     reqs: &mut [MultiChunkRequest<'_>],
     hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let refuse = |why: &str| Err(HipError::new(0, &format!("forward_prefill_batch_multi: {why}")));
+    let pbs = &scratch.pbs;
     let total: usize = reqs.iter().map(|r| r.tokens.len()).sum();
     if reqs.is_empty() || total > MULTI_CHUNK_MAX_ROWS || total > pbs.max_batch || pbs.lean {
         return refuse("row count outside 1..=63 / scratch capacity, or lean scratch");
@@ -176,6 +244,52 @@ pub fn forward_prefill_batch_multi(
     let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
     let ctx = DispatchCtx::new(gpu).with_workload(prefill_dispatch_workload(hidden_out.is_some(), tapes, false));
 
+    // Requests whose singleton attend is the fp8 scalar-batched arm run it
+    // as one segment-twin launch per layer (tables staged up front). All
+    // twin segments share the singleton `max_seq` (`physical_cap`) word.
+    let mut twin_attn: Vec<bool> = reqs
+        .iter()
+        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len()))
+        .collect();
+    let twin_cap = reqs.iter().zip(&twin_attn).find(|(_, &t)| t).map(|(r, _)| r.kv_cache.physical_cap);
+    for (r, t) in reqs.iter().zip(twin_attn.iter_mut()) {
+        *t &= Some(r.kv_cache.physical_cap) == twin_cap;
+    }
+    let twin_ctx: Vec<usize> =
+        reqs.iter().zip(&twin_attn).filter(|(_, &t)| t).map(|(r, _)| r.start_pos + r.tokens.len()).collect();
+    let twin_rows = reqs.iter().zip(&twin_attn).filter(|(_, &t)| t).map(|(r, _)| r.tokens.len()).max().unwrap_or(0);
+    if !twin_ctx.is_empty() {
+        let mut fa_idx = 0usize;
+        for (layer_idx, ty) in config.layer_types.iter().enumerate() {
+            if *ty != LayerType::FullAttention {
+                continue;
+            }
+            let segs: Vec<AttnFp8Seg> = reqs
+                .iter()
+                .zip(&views)
+                .zip(&twin_attn)
+                .filter(|(_, &t)| t)
+                .map(|((r, view), _)| AttnFp8Seg {
+                    q: view.fa_q_batch.buf.as_ptr() as u64,
+                    k_cache: r.kv_cache.k_gpu[layer_idx].buf.as_ptr() as u64,
+                    v_cache: r.kv_cache.v_gpu[layer_idx].buf.as_ptr() as u64,
+                    out: view.fa_attn_out_batch.buf.as_ptr() as u64,
+                    positions: view.positions.buf.as_ptr() as u64,
+                    n_rows: r.tokens.len() as u64,
+                })
+                .collect();
+            seg_twins::stage_attention_fp8_segs(
+                gpu,
+                &scratch.attn_segs,
+                fa_idx * MULTI_CHUNK_MAX_SEGS,
+                &segs,
+                config.n_heads,
+                config.head_dim,
+            )?;
+            fa_idx += 1;
+        }
+    }
+
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
     for layer_idx in 0..config.n_layers {
@@ -238,7 +352,7 @@ pub fn forward_prefill_batch_multi(
                     && (config.n_heads, config.n_kv_heads) == (24, 4)
                     && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64;
                 batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, total, dim, q8_wmma_arch, fusion)?;
-                for (r, view) in reqs.iter_mut().zip(&views) {
+                for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                     let n = r.tokens.len();
                     let max_ctx_len = r.start_pos + n;
                     let multirow = q8_multirow_attn_admitted(
@@ -257,9 +371,39 @@ pub fn forward_prefill_batch_multi(
                         gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None,
                         kv_layer_idx, layer_idx, fusion, gfx12_fa_prep, false, false,
                     )?;
-                    batch_chunk_fa_attend(
-                        gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None, layer_idx, multirow,
-                        None, false,
+                    if twin {
+                        // The singleton attend's paired write; the attention
+                        // itself runs in the segment twin below.
+                        for (cache, src) in
+                            [(&r.kv_cache.k_gpu[layer_idx], &view.fa_k_batch), (&r.kv_cache.v_gpu[layer_idx], &view.fa_v_batch)]
+                        {
+                            gpu.kv_cache_write_fp8_e4m3_batched(
+                                cache,
+                                src,
+                                &view.positions,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                n,
+                            )?;
+                        }
+                    } else {
+                        batch_chunk_fa_attend(
+                            gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None, layer_idx,
+                            multirow, None, false,
+                        )?;
+                    }
+                }
+                if let Some(cap) = twin_cap.filter(|_| !twin_ctx.is_empty()) {
+                    seg_twins::attention_fp8_segs(
+                        gpu,
+                        &scratch.attn_segs,
+                        kv_layer_idx * MULTI_CHUNK_MAX_SEGS,
+                        twin_rows,
+                        &twin_ctx,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        cap,
                     )?;
                 }
                 batch_chunk_full_attn_output_projection(
