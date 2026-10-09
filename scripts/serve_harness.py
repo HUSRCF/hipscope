@@ -3961,6 +3961,165 @@ def _self_test_prefix_fanout_scheduling():
     print("serve_harness: prefix-fanout-scheduling self-test OK", flush=True)
 
 
+def _annotate_turn(row, prompt, expected):
+    """Shared battery/chain row annotation (prompt identity + retrieval)."""
+    row["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+    missing = [item for item in expected if item.lower() not in row["assistant_content"].lower()]
+    row["expected_substrings"] = expected
+    row["retrieval_missing"] = missing
+    return f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+
+
+def _concurrent_client_turns(cfg, battery, client, feedback_shape, emit):
+    """One client's independent conversation. Battery: every prompt as its own
+    request, rotated by client id so concurrent requests differ. Chain: the
+    whole battery as one sequential session (turns never overlap within a
+    client)."""
+    rows, messages, n = [], [], len(battery)
+    order = [(client + i) % n for i in range(n)] if cfg["mode"] == "battery" else list(range(n))
+    for turn, idx in enumerate(order):
+        genre, prompt, expected = battery[idx]
+        if cfg["mode"] == "battery":
+            r = send(cfg, [{"role": "user", "content": prompt}])
+        else:
+            messages.append({"role": "user", "content": prompt})
+            r = send(cfg, messages)
+            messages.append(_assistant_feedback(r, feedback_shape))
+        recall = _annotate_turn(r, prompt, expected)
+        r.update(client=client, turn=turn, prompt_index=idx, genre=genre)
+        rows.append(r)
+        emit(client, genre, turn, r, recall)
+    return rows
+
+
+_CONCURRENT_ISOLATION_FIELDS = ("content", "reasoning_content", "tool_calls", "finish", "gen")
+
+
+def _concurrent_isolation_key(cfg, row):
+    # Battery: one request per prompt. Chain: every client runs the identical
+    # session, so turn t must match turn t of the reference client.
+    return row["prompt_index"] if cfg["mode"] == "battery" else row["turn"]
+
+
+def _concurrent_terminal_failures(rows):
+    """Exactly-once terminal per request: one terminal, [DONE] seen, no stream
+    error, nothing after the terminal, a finish reason."""
+    bad = []
+    for r in rows:
+        problems = []
+        if r.get("terminal_count") != 1:
+            problems.append(f"terminal_count={r.get('terminal_count')}")
+        if not r.get("saw_done"):
+            problems.append("no [DONE]")
+        if r.get("stream_error"):
+            problems.append(f"stream_error={r.get('stream_error')!r}")
+        if r.get("post_terminal_bytes"):
+            problems.append(f"post_terminal_bytes={r.get('post_terminal_bytes')}")
+        if r.get("finish") is None:
+            problems.append("finish=None")
+        if problems:
+            bad.append(f"c{r['concurrency']}/client{r['client']}/turn{r['turn']}: " + ", ".join(problems))
+    return bad
+
+
+def _concurrent_isolation_mismatches(cfg, rows):
+    """Greedy isolation equality: every row equals the reference row for the
+    same prompt (battery) or turn (chain). Reference = the lowest concurrency
+    level's client 0 (level 1 when requested)."""
+    ref_level = min(r["concurrency"] for r in rows)
+    ref = {_concurrent_isolation_key(cfg, r): r for r in rows if r["concurrency"] == ref_level and r["client"] == 0}
+    out = []
+    for r in rows:
+        base = ref.get(_concurrent_isolation_key(cfg, r))
+        if base is None or base is r:
+            continue
+        diff = [f for f in _CONCURRENT_ISOLATION_FIELDS if r.get(f) != base.get(f)]
+        if diff:
+            out.append(f"c{r['concurrency']}/client{r['client']}/turn{r['turn']} (prompt {r['prompt_index']}) differs in {diff}")
+    return out
+
+
+def _run_concurrent_clients(cfg, args, battery, feedback_shape):
+    """`--concurrent-clients N1,N2,..`: for each level, N threads drive
+    independent conversations against the one shared server, released
+    together. Every output is recorded; terminal accounting is asserted and,
+    under greedy sampling, isolation equality across clients and levels."""
+    lock = threading.Lock()
+    rows = []
+    greedy = cfg["sampling"].get("temperature") == 0.0
+    for level in args.concurrent_clients:
+        def emit(client, genre, turn, r, recall, level=level):
+            with lock:
+                print(f"  [c{level}/client{client}][{genre}]" + turn_line(turn + 1, r, recall)[2:], flush=True)
+        print(f"### concurrent-clients={level} mode={cfg['mode']} prompts={len(battery)} ###", flush=True)
+        t0 = time.time()
+        per_client = _fanout_barrier_requests(
+            level, lambda client: _concurrent_client_turns(cfg, battery, client, feedback_shape, emit))
+        wall = time.time() - t0
+        level_rows = [r for client_rows in per_client for r in client_rows]
+        for r in level_rows:
+            r["concurrency"] = level
+        toks = sum(r.get("gen") or 0 for r in level_rows)
+        ttft = [r["ttft_s"] for r in level_rows if isinstance(r.get("ttft_s"), (int, float))]
+        print(
+            f"[concurrent-clients={level} DONE] requests={len(level_rows)} wall={wall:.2f}s "
+            f"completion_tokens={toks} aggregate={toks / wall if wall > 0 else 0:.1f}tok/s "
+            f"ttft_max={max(ttft) if ttft else 'n/a'}s",
+            flush=True,
+        )
+        rows.extend(level_rows)
+    failures = _concurrent_terminal_failures(rows)
+    if failures:
+        raise SystemExit("serve_harness: concurrent terminal accounting failed: " + "; ".join(failures[:16]))
+    if greedy:
+        mismatches = _concurrent_isolation_mismatches(cfg, rows)
+        print(f"concurrent greedy isolation: {len(rows)} rows, mismatches={len(mismatches)}", flush=True)
+        if mismatches:
+            raise SystemExit("serve_harness: concurrent greedy isolation failed: " + "; ".join(mismatches[:16]))
+    else:
+        print("concurrent isolation equality: skipped (sampled; per-request outputs recorded)", flush=True)
+    return rows
+
+
+def _self_test_concurrent_clients():
+    """Offline: scheduling, chain sequencing, terminal and isolation checks."""
+    global send
+    real_send = send
+    seen = []
+    def fake(cfg, messages, *a, **k):
+        users = [m["content"] for m in messages if m["role"] == "user"]
+        seen.append(len(users))
+        text = "ok:" + users[-1]
+        return {"assistant_content": text, "content": text, "reasoning_content": "", "tool_calls": [],
+                "finish": "stop", "gen": 3, "terminal_count": 1, "saw_done": True, "stream_error": None,
+                "post_terminal_bytes": 0, "runaway": False, "empty": False, "attractor": False,
+                "decode_tok_s": None, "ttft_s": 0.0, "ans_preview": text, "ctx": 1, "cached": 0,
+                "think_words": 0, "ans_words": 1, "prefill_ms": None, "prefill_tok_s": None, "tau": None}
+    battery = [("code", "a", []), ("prose", "b", ["ok"]), ("short", "c", [])]
+    class A: concurrent_clients = [1, 3]
+    try:
+        send = fake
+        for mode in ("battery", "chain"):
+            seen.clear()
+            cfg = {"mode": mode, "sampling": {"temperature": 0.0}}
+            rows = _run_concurrent_clients(cfg, A, battery, "rich")
+            assert len(rows) == (1 + 3) * len(battery), len(rows)
+            assert {r["concurrency"] for r in rows} == {1, 3}
+            if mode == "chain":
+                assert sorted(seen) == sorted([1, 2, 3] * 4), seen
+            else:
+                assert sorted({r["prompt_index"] for r in rows if r["concurrency"] == 3 and r["turn"] == 0}) == [0, 1, 2]
+        rows = [dict(r) for r in rows]
+        rows[-1]["terminal_count"] = 2
+        assert _concurrent_terminal_failures(rows)
+        rows[-1]["terminal_count"] = 1
+        rows[-1]["content"] = "drift"
+        assert _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+    finally:
+        send = real_send
+    print("self-test concurrent-clients: OK", flush=True)
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
@@ -3973,7 +4132,9 @@ def run(cfg, args):
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
-    if cfg["mode"] == "battery":
+    if getattr(args, "concurrent_clients", None):
+        rows = _run_concurrent_clients(cfg, args, battery, feedback_shape)
+    elif cfg["mode"] == "battery":
         for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
             r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
@@ -4279,6 +4440,10 @@ def main():
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images", "prefix-fanout"])
+    ap.add_argument("--concurrent-clients", type=_parse_fanout_clients, default=None,
+                    help="battery/chain only: comma-separated concurrent client counts, e.g. 1,2,...,8. "
+                         "One shared server; each client runs an independent conversation (chains stay "
+                         "sequential per client); greedy runs assert isolation equality.")
     ap.add_argument("--fanout-clients", type=_parse_fanout_clients, default=[1, 4, 8, 16],
                     help="Comma-separated concurrent client counts (default 1,4,8,16).")
     ap.add_argument("--fanout-shared-tokens", type=int, default=2048,
@@ -4382,6 +4547,8 @@ def main():
     )
     args = ap.parse_args()
     args.fanout_sampling_explicit = any(x == "--sampling" or x.startswith("--sampling=") for x in sys.argv[1:])
+    if args.concurrent_clients and args.mode not in ("battery", "chain"):
+        ap.error("--concurrent-clients applies to --mode battery or chain")
     if args.mode == "prefix-fanout":
         for name in ("shared_tokens", "unique_tokens", "output_tokens", "repeats"):
             if getattr(args, "fanout_" + name) < 1:
@@ -4404,6 +4571,7 @@ def main():
         _self_test_g45_torn_stream_and_error_mapping()
         _self_test_prefix_fanout_summary()
         _self_test_prefix_fanout_scheduling()
+        _self_test_concurrent_clients()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
