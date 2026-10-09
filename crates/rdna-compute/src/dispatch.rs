@@ -1442,6 +1442,7 @@ impl Gpu {
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        self.ensure_route_modules_preloaded()?;
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
         })?;
@@ -1861,6 +1862,7 @@ impl Gpu {
                 fa2_q16_scratch_bytes: 0,
                 fa2_fp8_q_scratch: None,
                 fa2_fp8_q_scratch_bytes: 0,
+                route_load: Default::default(),
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
@@ -2944,6 +2946,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
         self.hip
@@ -3045,6 +3048,7 @@ impl Gpu {
     /// Inputs/state must be restored by the caller first.
     pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("replay_recorded_hip_prefix")?;
         if count > self.replay.recorded_launches().len() {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -3087,6 +3091,7 @@ impl Gpu {
     /// between them is then a submission difference, never a patching one.
     pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("replay_recorded_hip_prefix_at")?;
         let launches = self.replay.recorded_launches();
         if count > launches.len() {
             return Err(hip_bridge::HipError::new(
@@ -3170,6 +3175,7 @@ impl Gpu {
         kernargs: &mut [u8],
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.refuse_unprepared_route("launch_kernel_blob")?;
         let func = self.functions.get(func_name).ok_or_else(|| {
             hip_bridge::HipError::new(
                 0,
@@ -3220,6 +3226,7 @@ impl Gpu {
         bindings: ReplayLaunchBindings<'_>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch.
         self.hip
             .validate_launch_grid(grid)
@@ -3294,7 +3301,20 @@ impl Gpu {
         result.map_err(|e| e.with_kernel(func_name))
     }
 
-    /// Compile and load a kernel, caching the result.
+    /// Immutable raw launch paths cannot drain the barrier; they refuse a
+    /// route whose planned modules are not yet loaded.
+    fn refuse_unprepared_route(&self, what: &str) -> HipResult<()> {
+        if self.scratch.route_load.pending() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: planned route kernels are not preloaded yet"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compile and load a kernel, caching the result. A pending planned route
+    /// is drained first (see [`Self::ensure_route_modules_preloaded`]).
     pub(crate) fn ensure_kernel(
         &mut self,
         module_name: &str,
@@ -3306,6 +3326,7 @@ impl Gpu {
             &self.hip,
             &mut self.modules,
             &mut self.functions,
+            &mut self.scratch.route_load,
             module_name,
             source,
             func_name,
@@ -3314,15 +3335,20 @@ impl Gpu {
 
     /// Load the admitted builder bundle into the same module/function cache as
     /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
-    /// and of a working-tree-relative artifact path.
+    /// and of a working-tree-relative artifact path. Embedded images get the
+    /// same planned-route barrier as HIP modules.
     pub(crate) fn ensure_embedded_kernel(
         &mut self,
         module_name: &str,
         image: &[u8],
         func_name: &str,
     ) -> HipResult<()> {
+        self.ensure_route_modules_preloaded()?;
         if self.functions.contains_key(func_name) {
             return Ok(());
+        }
+        if matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed) {
+            return Err(crate::scratch::unplanned_route_kernel(module_name, func_name));
         }
         if !self.modules.contains_key(module_name) {
             self.modules
@@ -3333,6 +3359,93 @@ impl Gpu {
             .module_get_function(&self.modules[module_name], func_name)?;
         self.functions.insert(func_name.to_owned(), func);
         Ok(())
+    }
+
+    // ── Planned-route kernel load barrier ───────────────────────────────
+
+    /// Start loading a planner-closed route's kernels: freeze the plan and
+    /// start its missing HIP compiles on at most `jobs` CPU workers, so they
+    /// overlap the caller's non-dispatching weight read/upload. Nothing is
+    /// loaded on the GPU here. Replaces any earlier route state.
+    pub fn begin_route_kernel_load(
+        &mut self,
+        plan: crate::kernel_registry::RouteKernelPlan,
+        jobs: usize,
+    ) -> HipResult<()> {
+        self.abort_route_kernel_load()?;
+        crate::kernel_registry::validate_route_plan(&plan)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
+        let hip_entries: Vec<crate::kernel_registry::KernelEntry> = plan
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::kernel_registry::PlannedKernel::Hip(entry) => {
+                    Some(crate::kernel_registry::KernelEntry {
+                        arch: entry.arch,
+                        module: entry.module,
+                        symbols: entry.symbols,
+                        source: entry.source.clone(),
+                        flags: entry.flags.clone(),
+                        scheduler_profile: entry.scheduler_profile.clone(),
+                    })
+                }
+                crate::kernel_registry::PlannedKernel::Embedded { .. } => None,
+            })
+            .collect();
+        let batch = self.compiler.begin_batch(hip_entries, jobs)?;
+        self.scratch.route_load = crate::scratch::RouteLoad::Pending {
+            plan,
+            batch: Some(batch),
+        };
+        Ok(())
+    }
+
+    /// First-dispatch barrier: join the whole planned compile batch, then
+    /// load every planned HIP and embedded module and bind every planned
+    /// symbol. Idempotent; every kernel request and mutable launch funnel
+    /// calls it, so no dispatch precedes the full plan.
+    pub fn ensure_route_modules_preloaded(&mut self) -> HipResult<()> {
+        if !self.scratch.route_load.pending() {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        crate::scratch::prepare_route_modules(
+            &mut self.scratch.route_load,
+            &mut self.compiler,
+            &self.hip,
+            &mut self.modules,
+            &mut self.functions,
+        )
+    }
+
+    /// Seal a route after its weights loaded: preload if no dispatch has yet,
+    /// then refuse any unplanned kernel compile/module load. No-op when no
+    /// route was begun (lazy loading stays).
+    pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
+        match self.scratch.route_load {
+            crate::scratch::RouteLoad::Idle | crate::scratch::RouteLoad::Sealed => Ok(()),
+            _ => {
+                self.ensure_route_modules_preloaded()?;
+                self.scratch.route_load = crate::scratch::RouteLoad::Sealed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop any route state and return to lazy loading, joining every
+    /// outstanding compile worker. Modules already loaded stay cached.
+    pub fn abort_route_kernel_load(&mut self) -> HipResult<()> {
+        match std::mem::take(&mut self.scratch.route_load) {
+            crate::scratch::RouteLoad::Pending {
+                batch: Some(batch), ..
+            } => self.compiler.finish_batch(batch),
+            _ => Ok(()),
+        }
+    }
+
+    /// True while a begun route's modules are not yet on the GPU.
+    pub fn route_kernels_pending(&self) -> bool {
+        self.scratch.route_load.pending()
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
