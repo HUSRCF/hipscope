@@ -4092,6 +4092,10 @@ fn ensure_draft_ref(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Specula
 /// that take the batched forward; `batched=false` is the per-lane singleton
 /// call). Every lane's tokens and post-draft draft state must equal the
 /// isolated singleton draft byte for byte. Returns `(receipt, ok, draft_ms)`.
+/// The cases share the probe's one `DflashCbScratch` `cb`, as the VMM DFlash
+/// engine reuses its single scratch every step; only `draft_min_lanes` is set
+/// per case and restored afterwards. (A fresh max-rows scratch per case ran the
+/// device out of memory on the wide route at probe windows >= 1.)
 #[allow(clippy::too_many_arguments)]
 fn draft_case(
     gpu: &mut Gpu,
@@ -4100,6 +4104,7 @@ fn draft_case(
     cfg: &G0Cfg,
     fx: &[Fixture],
     refs: &mut G0Refs,
+    cb: &mut DflashCbScratch,
     name: &str,
     specs: &[usize],
     min_lanes: usize,
@@ -4126,14 +4131,9 @@ fn draft_case(
         free_lanes(gpu, lanes)?;
         return Err(err);
     }
-    let mut cb = match DflashCbScratch::new(gpu, &slot.config, MULTI_CHUNK_MAX_ROWS) {
-        Ok(cb) => cb,
-        Err(e) => {
-            free_lanes(gpu, lanes)?;
-            return Err(e.into());
-        }
-    };
+    let saved_min_lanes = cb.draft_min_lanes;
     cb.draft_min_lanes = min_lanes;
+    cb.draft_stats = (0, 0);
     let body = (|| -> Result<(Vec<Vec<u32>>, f64)> {
         gpu.hip.device_synchronize()?;
         let t0 = std::time::Instant::now();
@@ -4142,7 +4142,7 @@ fn draft_case(
                 .iter_mut()
                 .map(|l| DflashCbDraftLane { state: &mut l.lane, position: l.position, seed: l.seed, b: l.b, compact_offset: l.rs.kv.compact_offset as i32 })
                 .collect();
-            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut cb, &mut dl, batched)?
+            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut *cb, &mut dl, batched)?
         };
         gpu.hip.device_synchronize()?;
         Ok((toks, t0.elapsed().as_secs_f64() * 1e3))
@@ -4191,7 +4191,7 @@ fn draft_case(
     }
     let went_batched = stats.0 == expect_batched_lanes;
     let ok = err_text.is_none() && exact && went_batched;
-    cb.free_gpu(gpu)?;
+    cb.draft_min_lanes = saved_min_lanes;
     free_lanes(gpu, lanes)?;
     eprintln!(
         "draftbatch case {name}: lanes={} batched_lanes={} chunks={} (expected batched lanes {expect_batched_lanes}) draft_ms={ms:.2} exact={exact} -> {}",
@@ -4211,7 +4211,7 @@ fn draft_case(
 /// chunking (`min_lanes = 2`: four lanes are a three-lane chunk plus a
 /// singleton lane), and the timing of eight lanes per step, serial vs
 /// batched (draft ms only; separate fresh lane sets, best of two).
-fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs) -> Result<(Vec<Value>, bool)> {
+fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, cb: &mut DflashCbScratch) -> Result<(Vec<Value>, bool)> {
     let n = fx.len();
     let fxl = |k: usize| -> Vec<usize> { (0..k).map(|i| i % n).collect() };
     // (name, lanes, min_lanes, expected batched lanes)
@@ -4225,7 +4225,7 @@ fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Specul
     let mut rows = Vec::new();
     let mut pass = true;
     for (name, k, min_lanes, expect) in cases {
-        match draft_case(gpu, slot, d, cfg, fx, refs, name, &fxl(k), min_lanes, true, expect) {
+        match draft_case(gpu, slot, d, cfg, fx, refs, cb, name, &fxl(k), min_lanes, true, expect) {
             Ok((j, ok, _)) => {
                 pass &= ok;
                 rows.push(j);
@@ -4242,7 +4242,7 @@ fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Specul
     for rep in 0..2 {
         for (is_batched, sink) in [(false, &mut serial), (true, &mut batched)] {
             let name = format!("draft_n8_{}_rep{rep}", if is_batched { "batched" } else { "serial" });
-            match draft_case(gpu, slot, d, cfg, fx, refs, &name, &fxl(8), 2, is_batched, if is_batched { 8 } else { 0 }) {
+            match draft_case(gpu, slot, d, cfg, fx, refs, cb, &name, &fxl(8), 2, is_batched, if is_batched { 8 } else { 0 }) {
                 Ok((j, ok, ms)) => {
                     pass &= ok;
                     sink.push(ms);
@@ -4397,7 +4397,7 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
     }
     let mut draft_rows = Vec::new();
     if run_err.is_none() {
-        match draft_batch_cases(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs) {
+        match draft_batch_cases(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs, &mut *sc.cb) {
             Ok((r, ok)) => {
                 pass &= ok;
                 draft_rows = r;
