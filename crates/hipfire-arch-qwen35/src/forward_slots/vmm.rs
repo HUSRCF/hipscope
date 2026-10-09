@@ -226,6 +226,10 @@ pub struct Qwen35RequestState {
     /// MTP drafter state of a spec lane (`spec::spec_prefill`); `None` for
     /// an AR lane.
     pub mtp: Option<crate::mtp_spec::MtpSpecState>,
+    /// Draft of a planned Verify step (provision → commit/abort).
+    pub(super) spec_draft: Option<crate::mtp_spec::MtpDraftOutput>,
+    /// Verify outcome of a forwarded Verify step (forward → commit/abort).
+    pub(super) spec_verified: Option<crate::mtp_spec::cb::MtpCbVerified>,
 }
 
 /// Admission inputs of one request, as the singleton route would hold them.
@@ -305,6 +309,8 @@ impl Qwen35RequestState {
             rng_state: init.rng_state,
             history: init.history,
             mtp: None,
+            spec_draft: None,
+            spec_verified: None,
         })
     }
 
@@ -705,11 +711,14 @@ impl Qwen35VmmStore {
 
     /// Abandon a provisioned/forwarded step. A forwarded step already wrote
     /// device state, which is not atomic: every participant is poisoned and
-    /// must be retired; its tokens are never committed.
+    /// must be retired; its tokens are never committed. Verify drafts and
+    /// outcomes of the plan are dropped (a provisioned-only draft touched
+    /// no committed state, so its lane stays live).
     pub fn abort_step(&mut self, plan: &BatchStepPlan) {
         if let Phase::Forwarded(..) = self.phase {
             self.poison(plan);
         }
+        self.spec_clear_planned(plan);
         self.phase = Phase::Idle;
     }
 
@@ -828,6 +837,7 @@ impl Qwen35VmmExecutor<'_> {
     /// its rows will write. Mapping/growth happens here, never inside a
     /// forward or capture. Fails closed per request bound (no OOM midstep).
     pub fn provision_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
+        let (weights, config) = (self.weights, self.config);
         let st = &mut *self.store;
         if !matches!(st.phase, Phase::Idle) {
             return Err("provision_step: previous step not committed or aborted".into());
@@ -866,11 +876,12 @@ impl Qwen35VmmExecutor<'_> {
         for r in &plan.requests {
             match r.kind {
                 RequestStepKind::Ar | RequestStepKind::Prefill => {}
-                RequestStepKind::Verify { .. } | RequestStepKind::Forced => {
-                    return Err(format!(
-                        "provision_step: {:?} rows need the slice-2 verify executor",
-                        r.kind
-                    ));
+                RequestStepKind::Verify { draft_len } => {
+                    let seed = b.tokens.get(r.rows.begin).copied().unwrap_or(u32::MAX);
+                    st.spec_check_verify(r, draft_len, seed)?;
+                }
+                RequestStepKind::Forced => {
+                    return Err("provision_step: Forced rows are not admitted on the VMM executor".into());
                 }
             }
             let state = st
@@ -1015,6 +1026,8 @@ impl Qwen35VmmExecutor<'_> {
             validate_vmm_rows(table, &b.row_slot, &b.positions, &st.row_gen)
                 .map_err(|e| format!("provision_step: layer {}: {e}", st.kv_layer_ids[l]))?;
         }
+        // Verify requests: their epoch-tagged drafts (singleton drafter).
+        st.spec_draft_planned(gpu, weights, config, plan)?;
         st.phase = Phase::Provisioned(StepKey::of(plan));
         Ok(())
     }
@@ -1066,8 +1079,9 @@ impl Qwen35VmmExecutor<'_> {
         let decode: Vec<usize> = (0..plan.requests.len())
             .filter(|&i| plan.requests[i].kind == RequestStepKind::Ar)
             .collect();
+        let is_verify = |i: usize| matches!(plan.requests[i].kind, RequestStepKind::Verify { .. });
         let prefill: Vec<usize> = (0..plan.requests.len())
-            .filter(|&i| plan.requests[i].kind != RequestStepKind::Ar)
+            .filter(|&i| plan.requests[i].kind != RequestStepKind::Ar && !is_verify(i))
             .collect();
         let split = !decode.is_empty() && !prefill.is_empty();
         st.hidden_split = split;
@@ -1082,10 +1096,13 @@ impl Qwen35VmmExecutor<'_> {
         } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
             run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
-        } else {
-            let all: Vec<usize> = (0..plan.requests.len()).collect();
+        } else if !decode.is_empty() || !prefill.is_empty() {
+            let all: Vec<usize> = (0..plan.requests.len()).filter(|&i| !is_verify(i)).collect();
             run_pass(gpu, st, weights, config, s, plan, &all, false, &mut picks)?;
         }
+        // Verify requests: their own shared verify trunk + head (singleton
+        // verify arithmetic per request; picks stay with the request state).
+        st.spec_verify_planned(gpu, weights, config, s, plan)?;
         gpu.hip.device_synchronize()?;
         Ok(picks)
     }
@@ -1279,10 +1296,11 @@ impl Qwen35VmmExecutor<'_> {
     /// the KV frontier only; the transport drains their prompt).
     pub fn commit_step(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
         plan: &BatchStepPlan,
         output: StepOutput,
     ) -> Result<Vec<RequestAdvance>, String> {
+        let (weights, config, scratch) = (self.weights, self.config, self.scratch);
         let st = &mut *self.store;
         match &st.phase {
             Phase::Forwarded(k, id) if *k == StepKey::of(plan) && *id == output.step_id => {}
@@ -1304,6 +1322,22 @@ impl Qwen35VmmExecutor<'_> {
         }
         let mut out = Vec::with_capacity(plan.requests.len());
         for r in &plan.requests {
+            if matches!(r.kind, RequestStepKind::Verify { .. }) {
+                // Accept/repair then publish this request's window. A
+                // failure leaves device state untrusted: poison the step.
+                match st.spec_commit_verify(gpu, weights, config, scratch, &r.epoch) {
+                    Ok(a) => {
+                        out.push(a);
+                        continue;
+                    }
+                    Err(e) => {
+                        st.poison(plan);
+                        st.spec_clear_planned(plan);
+                        st.phase = Phase::Idle;
+                        return Err(e);
+                    }
+                }
+            }
             let head = st.wants_head(r);
             let s = st
                 .slots

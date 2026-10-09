@@ -14,11 +14,14 @@
 
 use super::{Qwen35RequestState, Qwen35VmmStore, VMM_MAP_DEVICE_RESERVE_BYTES};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
-use crate::mtp_spec::cb::{mtp_cb_cycle, MtpCbLane, MtpCbScratch, MtpCbTiming};
+use crate::mtp_spec::cb::{
+    mtp_cb_accept, mtp_cb_cycle, mtp_cb_draft, mtp_cb_verify, MtpCbLane, MtpCbScratch, MtpCbTiming, MtpCbVerified,
+    MtpCbVerifyLane,
+};
 use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
 use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hipfire_runtime::slot_batch::{RequestAdvance, RequestEpoch};
+use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
 use hipfire_runtime::spec::{SpecRequestConfig, Speculator};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -363,6 +366,192 @@ impl Qwen35VmmStore {
             Err(e) => {
                 st.free_gpu(gpu);
                 Err(format!("spec adopt: {e}"))
+            }
+        }
+    }
+
+    // ── RequestStepKind::Verify rows through provision → forward → commit ──
+
+    /// Provision gate of one planned Verify request: a live spec lane, its
+    /// seed in the first row, `draft_len` within the engine window.
+    pub(super) fn spec_check_verify(&self, r: &RequestRows, draft_len: usize, seed_row_token: u32) -> Result<(), String> {
+        let engine = self.spec.as_ref().ok_or("provision_step: Verify rows need the staged MTP engine")?;
+        let s = self
+            .request_state(&r.epoch)
+            .ok_or_else(|| format!("provision_step: stale or unknown epoch {:?}", r.epoch))?;
+        if s.mtp.is_none() || s.spec_draft.is_some() || s.spec_verified.is_some() {
+            return Err(format!("provision_step: {:?} is not an idle spec lane", r.epoch));
+        }
+        if draft_len > engine.k || r.rows.len != draft_len + 1 {
+            return Err(format!(
+                "provision_step: Verify draft_len {draft_len} (rows {}) outside the MTP window {}",
+                r.rows.len, engine.k
+            ));
+        }
+        if s.pending_seed != Some(seed_row_token) {
+            return Err(format!("provision_step: Verify seed row {seed_row_token} != pending seed {:?}", s.pending_seed));
+        }
+        if s.position + r.rows.len > engine.head_cap() {
+            return Err(format!("provision_step: Verify window end > MTP head capacity {}", engine.head_cap()));
+        }
+        Ok(())
+    }
+
+    /// Provision: draft every planned Verify request (epoch-tagged: held in
+    /// its own state until commit/abort). The verify rows the executor runs
+    /// are `[seed, candidates…]` of this draft; planned rows past them are
+    /// host-only placeholders. A draft touches only uncommitted MTP head
+    /// rows, so a failure drops every draft of the plan and maps nothing
+    /// else.
+    pub(super) fn spec_draft_planned(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        plan: &BatchStepPlan,
+    ) -> Result<(), String> {
+        let Self { slots, spec, .. } = self;
+        let mut r = Ok(());
+        for req in &plan.requests {
+            let RequestStepKind::Verify { draft_len } = req.kind else {
+                continue;
+            };
+            let engine = spec.as_ref().expect("checked at provision");
+            let s = slots.iter_mut().flatten().find(|s| s.epoch == req.epoch).expect("checked at provision");
+            let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } = s;
+            match mtp_cb_draft(
+                gpu,
+                weights,
+                config,
+                &engine.head,
+                mtp.as_mut().expect("checked"),
+                *position,
+                pending_seed.expect("checked"),
+                history,
+                draft_len,
+            ) {
+                Ok(d) => *spec_draft = Some(d),
+                Err(e) => {
+                    r = Err(format!("provision_step: draft for {:?}: {e}", req.epoch));
+                    break;
+                }
+            }
+        }
+        if r.is_err() {
+            self.spec_clear_planned(plan);
+        }
+        r
+    }
+
+    /// Forward: verify every planned Verify request in one shared trunk +
+    /// head pass ([`mtp_cb_verify`]); outcomes wait in each state for commit.
+    pub(super) fn spec_verify_planned(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        scratch: &Qwen35Scratch,
+        plan: &BatchStepPlan,
+    ) -> hip_bridge::HipResult<()> {
+        let epochs: Vec<RequestEpoch> = plan
+            .requests
+            .iter()
+            .filter(|r| matches!(r.kind, RequestStepKind::Verify { .. }))
+            .map(|r| r.epoch)
+            .collect();
+        if epochs.is_empty() {
+            return Ok(());
+        }
+        let eos = config.eos_token;
+        let Self { slots, spec, .. } = self;
+        let engine = spec.as_ref().expect("checked at provision");
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> = epochs.iter().map(|_| None).collect();
+        for s in slots.iter_mut().flatten() {
+            if let Some(i) = epochs.iter().position(|e| *e == s.epoch) {
+                owners[i] = Some(s);
+            }
+        }
+        let mut outcomes_into: Vec<&mut Option<MtpCbVerified>> = Vec::with_capacity(epochs.len());
+        let mut lanes: Vec<MtpCbVerifyLane<'_>> = Vec::with_capacity(epochs.len());
+        for s in owners.into_iter() {
+            let s = s.ok_or_else(|| hip_bridge::HipError::new(0, "verify: planned owner vanished"))?;
+            let Qwen35RequestState { kv, dn, mtp, spec_draft, spec_verified, .. } = s;
+            let draft = spec_draft.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "verify: no draft"))?;
+            lanes.push(MtpCbVerifyLane {
+                kv_cache: kv,
+                dn_state: dn,
+                state: mtp.as_mut().expect("checked at provision"),
+                draft,
+                eos_token_id: eos,
+            });
+            outcomes_into.push(spec_verified);
+        }
+        let outcomes = mtp_cb_verify(gpu, weights, config, scratch, &engine.cb, &mut lanes)?;
+        for (slot, o) in outcomes_into.into_iter().zip(outcomes) {
+            *slot = Some(o);
+        }
+        Ok(())
+    }
+
+    /// Commit one verified request: accept/repair (shared-verify lanes) and
+    /// publish its window as the singleton would — committed ids, position,
+    /// pending seed, history.
+    pub(super) fn spec_commit_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        scratch: &Qwen35Scratch,
+        epoch: &RequestEpoch,
+    ) -> Result<RequestAdvance, String> {
+        let eos = config.eos_token;
+        let s = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.epoch == *epoch)
+            .ok_or_else(|| format!("commit_step: epoch {epoch:?} no longer owns its slot"))?;
+        let Qwen35RequestState { kv, dn, mtp, spec_draft, spec_verified, .. } = &mut *s;
+        let draft = spec_draft.take().ok_or("commit_step: verify without a draft")?;
+        let result = match spec_verified.take().ok_or("commit_step: verify without an outcome")? {
+            MtpCbVerified::Done(r) => r,
+            MtpCbVerified::Pending => {
+                let mut lane = MtpCbVerifyLane {
+                    kv_cache: kv,
+                    dn_state: dn,
+                    state: mtp.as_mut().ok_or("commit_step: lane lost its MTP state")?,
+                    draft: &draft,
+                    eos_token_id: eos,
+                };
+                mtp_cb_accept(gpu, weights, config, scratch, &mut lane).map_err(|e| format!("commit_step: accept: {e}"))?
+            }
+        };
+        s.position += result.advance;
+        s.pending_seed = result.committed.last().copied();
+        s.history.extend_from_slice(&result.committed);
+        let finish = if result.committed.iter().any(|t| s.stop_ids.contains(t)) {
+            Some("stop".to_string())
+        } else if s.position >= s.kv.vmm_logical_bound() {
+            Some("length".to_string())
+        } else {
+            None
+        };
+        Ok(RequestAdvance {
+            epoch: *epoch,
+            committed_ids: result.committed,
+            committed_position: s.position,
+            accepted_drafts: result.accept_count,
+            verified_rows: result.drafts_generated + 1,
+            finish,
+        })
+    }
+
+    /// Drop the drafts/outcomes of a plan's Verify requests (abort).
+    pub(super) fn spec_clear_planned(&mut self, plan: &BatchStepPlan) {
+        for r in &plan.requests {
+            if let Some(s) = self.request_state_mut(&r.epoch) {
+                s.spec_draft = None;
+                s.spec_verified = None;
             }
         }
     }
