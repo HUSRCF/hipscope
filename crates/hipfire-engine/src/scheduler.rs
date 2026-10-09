@@ -785,6 +785,28 @@ pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize 
         .unwrap_or(1) as usize
 }
 
+/// Load-time VMM continuous-batching route request (`params.serve_vmm_batch`,
+/// projected by serve only when `serve.vmm_batch` is on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmBatchParams {
+    pub spec: bool,
+    pub nonexact: bool,
+    pub max_batch_tokens: usize,
+    pub prefill_min_tokens: usize,
+}
+
+pub fn parse_vmm_batch_params(params: Option<&serde_json::Value>) -> Option<VmmBatchParams> {
+    let v = params?.get("serve_vmm_batch")?;
+    let flag = |k: &str, d: bool| v.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
+    let num = |k: &str, d: u64| v.get(k).and_then(|x| x.as_u64()).unwrap_or(d) as usize;
+    Some(VmmBatchParams {
+        spec: flag("spec", true),
+        nonexact: flag("nonexact", false),
+        max_batch_tokens: num("max_batch_tokens", 4096).max(1),
+        prefill_min_tokens: num("prefill_min_tokens", 1).max(1),
+    })
+}
+
 pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
     msg.get("params")
         .and_then(|p| p.get("serve_continuous_batch"))
@@ -1037,6 +1059,22 @@ impl DaemonInbox {
     }
     pub fn push_front(&mut self, msg: DaemonMsg) {
         self.backlog.push_front(msg);
+    }
+    /// Non-blocking: move every already-delivered message into the backlog
+    /// (order preserved) and report whether one is a serve-batched generate
+    /// (`serve_continuous_batch`). The VMM route uses this to send a request
+    /// that is lonely at dispatch to the unchanged singleton route.
+    pub fn has_pending_batch_generate(&mut self) -> bool {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.backlog.push_back(msg);
+        }
+        self.backlog.iter().any(|m| match m {
+            DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+                v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                    && parse_serve_continuous_batch(v)
+            }
+            _ => false,
+        })
     }
 }
 

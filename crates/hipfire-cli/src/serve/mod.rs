@@ -252,6 +252,8 @@ pub(crate) struct VmmBatchFlags {
     pub(crate) enabled: bool,
     pub(crate) spec: bool,
     pub(crate) nonexact: bool,
+    /// `serve.prefill_min_tokens`: the VMM route's rotating prefill quantum.
+    pub(crate) prefill_min_tokens: u64,
 }
 
 pub(crate) struct ServeRuntime {
@@ -1353,20 +1355,23 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
-    let vmm_batch = VmmBatchFlags {
+    let mut vmm_batch = VmmBatchFlags {
         enabled: config_bool(&global, "serve.vmm_batch")?,
         spec: config_bool(&global, "serve.batch_spec")?,
         nonexact: config_bool(&global, "serve.batch_nonexact")?,
+        prefill_min_tokens: 1,
     };
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
-    // Serving cache/scheduler contract keys (spec §9.1). Read here for
-    // startup validation only; the runtime does not yet consume them.
+    // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
+    // consumes both (row budget and prefill quantum); other standard routes
+    // read them for startup validation only.
     let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
     let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
+    vmm_batch.prefill_min_tokens = prefill_min_tokens;
     // Aggregate queue byte budget and stalled-stream deadline (spec §5.3,
     // §5.4). Both are multi-slot route contracts: the standard route keeps
     // its count-only queue and its unbounded streaming wait.
@@ -1822,6 +1827,8 @@ impl ServeRuntime {
                 params["serve_vmm_batch"] = serde_json::json!({
                     "spec": self.vmm_batch.spec,
                     "nonexact": self.vmm_batch.nonexact,
+                    "max_batch_tokens": self.max_batch_tokens,
+                    "prefill_min_tokens": self.vmm_batch.prefill_min_tokens,
                 });
             }
             // Experimental multi-slot: daemon owns SlotEngine instead of ordinary

@@ -40,6 +40,16 @@ pub struct BatchStaging {
     pub ep_slots: usize,
     /// EP lane capacity, mirrored for the receipt.
     pub ep_lane_cap: usize,
+    /// The VMM continuous-batching route was staged (per-request VMM KV in
+    /// `Qwen35Bundle::vmm_store`, no fixed lanes).
+    pub vmm: bool,
+}
+
+/// Load-time request for the VMM continuous-batching route.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VmmStagingRequest {
+    /// Global trunk-row budget per step (`serve.max_batch_tokens`).
+    pub row_budget: usize,
 }
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
@@ -77,8 +87,27 @@ pub fn stage_continuous_batch(
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     requested: usize,
+    vmm: Option<VmmStagingRequest>,
 ) -> Result<BatchStaging, String> {
     let mut out = BatchStaging::default();
+    if let Some(req) = vmm {
+        if requested > 1
+            && m.pp == 1
+            && m.ep.is_none()
+            && matches!(
+                crate::continuous_batch_route(m.arch_id),
+                Some(crate::ContinuousBatchRoute::Qwen35)
+            )
+        {
+            return Ok(stage_qwen_vmm_batch(m, gpu, requested, req));
+        }
+        eprintln!(
+            "[daemon] VMM continuous batch requested but unsupported (arch_id={} pp={} ep={}) — existing route",
+            m.arch_id,
+            m.pp,
+            m.ep.is_some()
+        );
+    }
     // ── Continuous batch staging (must be before `loaded` ack) ──
     // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
     // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
@@ -463,4 +492,56 @@ pub fn stage_continuous_batch(
         }
     }
     Ok(out)
+}
+
+/// Stage the VMM continuous-batching store beside the resident Qwen35
+/// bundle. No fixed-lane KV is allocated: request owners are created lazily
+/// at admission, shaped like the resident (VMM) singleton KV. Any failure
+/// keeps the existing singleton route (`capable == false`).
+fn stage_qwen_vmm_batch(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    requested: usize,
+    req: VmmStagingRequest,
+) -> BatchStaging {
+    let mut out = BatchStaging::default();
+    let max_seq = m.max_seq;
+    let Some(b) = m.qwen35_mut() else {
+        eprintln!("[daemon] VMM continuous batch requested but model state not Qwen35 — existing route");
+        return out;
+    };
+    if !qwen_batch_weight_formats_supported(&b.weights) {
+        eprintln!("[daemon] VMM continuous batch: weight formats unsupported — existing route");
+        return out;
+    }
+    let row_budget = req.row_budget.max(requested);
+    // Shared physical KV budget for every request owner: free VRAM after the
+    // resident model, minus fixed headroom for executor scratch and
+    // transient allocations. Admission/provision refuse past it.
+    const KV_HEADROOM: usize = 1 << 30;
+    let free = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
+    let kv_budget_bytes = free.saturating_sub(KV_HEADROOM);
+    match hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::new(
+        gpu,
+        &b.config,
+        &b.kv_cache,
+        requested,
+        row_budget,
+        kv_budget_bytes,
+    ) {
+        Ok(store) => {
+            b.vmm_store = Some(store);
+            out.capable = true;
+            out.vmm = true;
+            out.slots = requested;
+            out.lane_capacity = max_seq;
+            eprintln!(
+                "[daemon] VMM continuous batch staged: width={requested} row_budget={row_budget} max_seq_bound={max_seq}"
+            );
+        }
+        Err(e) => {
+            eprintln!("[daemon] VMM continuous batch unavailable: {e} — existing route");
+        }
+    }
+    out
 }

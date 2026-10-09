@@ -1033,6 +1033,10 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // VMM continuous-batching route params, set only when the loaded model
+    // staged `Qwen35Bundle::vmm_store` (`serve.vmm_batch`). None => the
+    // existing routes, byte-identical to the flag-off daemon.
+    let mut vmm_batch: Option<hipfire_engine::scheduler::VmmBatchParams> = None;
     // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
     // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
     // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
@@ -1197,6 +1201,8 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                let parsed_vmm_batch =
+                    hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
                 let experimental_multi_slot = msg
                     .get("params")
                     .and_then(|p| p.get("experimental_multi_slot"))
@@ -1347,6 +1353,7 @@ fn main() {
                     batch_scheduler = None;
                     continuous_batch_size = 1;
                     batch_poisoned = None;
+                    vmm_batch = None;
 
                     let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                     if path.is_empty() {
@@ -2354,6 +2361,9 @@ fn main() {
                             &mut m,
                             &mut gpu,
                             parsed_continuous_batch_size,
+                            parsed_vmm_batch.map(|p| hipfire_loader::batch_staging::VmmStagingRequest {
+                                row_budget: p.max_batch_tokens,
+                            }),
                         ) {
                             Ok(staging) => staging,
                             Err(stage_err) => {
@@ -2461,6 +2471,7 @@ fn main() {
                             1
                         };
                         batch_scheduler = staged_batch_scheduler;
+                        vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
                         // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
                         // no LCP prefix-cache block and always cold-prefills the full
@@ -2539,8 +2550,7 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
-                            let _ = writeln!(
-                                stdout,
+                            let mut ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
@@ -2561,6 +2571,41 @@ fn main() {
                                 max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
+                            // VMM batch route: append the actual per-request
+                            // owner receipt. Absent on every other route, so
+                            // the flag-off ack is unchanged.
+                            if let Some(p) = vmm_batch {
+                                let receipt = m
+                                    .qwen35_mut()
+                                    .and_then(|b| b.vmm_store.as_mut())
+                                    .map(|s| s.receipt());
+                                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) {
+                                    v["continuous_batch_route"] = serde_json::json!("vmm");
+                                    v["continuous_batch_slots"] = serde_json::json!(staging.slots);
+                                    v["continuous_batch_row_budget"] =
+                                        serde_json::json!(p.max_batch_tokens);
+                                    v["continuous_batch_spec"] = serde_json::json!(false);
+                                    v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
+                                    v["continuous_batch_nonexact"] = serde_json::json!(false);
+                                    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+                                    match receipt {
+                                        Some(Ok(r)) => {
+                                            v["vmm_batch_kv_backend"] = serde_json::json!(r.kv_backend);
+                                            v["vmm_batch_kv_mode"] = serde_json::json!(r.kv_mode);
+                                            v["vmm_batch_max_seq_bound"] =
+                                                serde_json::json!(r.max_seq_bound);
+                                            v["vmm_batch_mapped_bytes"] =
+                                                serde_json::json!(r.mapped_bytes);
+                                        }
+                                        Some(Err(e)) => {
+                                            v["vmm_batch_receipt_error"] = serde_json::json!(e);
+                                        }
+                                        None => {}
+                                    }
+                                    ack = v.to_string();
+                                }
+                            }
+                            let _ = writeln!(stdout, "{ack}");
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //

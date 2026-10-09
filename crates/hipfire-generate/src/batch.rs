@@ -408,6 +408,309 @@ pub fn is_batch_request_eligible(
     true
 }
 
+/// Batch eligibility predicate shape shared by the Qwen continuous-batch
+/// drivers (fixed-lane and VMM).
+pub(crate) type QwenBatchEligibility =
+    fn(&serde_json::Value, &LoadedModel, usize, bool, bool) -> bool;
+
+/// Drain already-delivered daemon messages into a Qwen batch scheduler at a
+/// step boundary: admit eligible generates (render once, enqueue, announce),
+/// apply terminal controls, and stop at the first message that must run
+/// outside the batch (returned as the barrier). `Err` carries a fail-all
+/// reason (think-barrier handoff failure).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_qwen_batch_inbox(
+    sched: &mut ContinuousBatchScheduler,
+    model: &LoadedModel,
+    batch_size: usize,
+    eligible: QwenBatchEligibility,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    chat_template: Option<&String>,
+    route: GenerationRoute,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<Option<DaemonMsg>, String> {
+    let mut barrier: Option<DaemonMsg> = None;
+        loop {
+            let dm = match inbox.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            let (dm, carried_admission) = match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    (DaemonMsg::Regular(json), Some(admission))
+                }
+                other => (other, None),
+            };
+            match dm {
+                DaemonMsg::RegularWithAdmission(json, admission) => {
+                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
+                    break;
+                }
+                DaemonMsg::SingletonWithAdmission(json, transfer) => {
+                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
+                    break;
+                }
+                DaemonMsg::ParseError(e) => {
+                    emit_uncorrelated_error(
+                        stdout,
+                        None,
+                        &format!("invalid JSON: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                }
+                DaemonMsg::Regular(json) => {
+                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "generate" {
+                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(0) => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate attempt_id must be nonzero",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                            Some(v) => v,
+                            None => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate missing attempt_id",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0")
+                            .to_string();
+                        let Some(admission) = carried_admission else {
+                            barrier = Some(daemon_regular_with_admission(json, None));
+                            break;
+                        };
+                        if batch_check_abort(&id, attempt_id, admission) {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
+                                stdout,
+                                &id,
+                                false,
+                            );
+                            crate::ar::emit_generation_cancel(route, stdout, &id, 0);
+                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
+                            continue;
+                        }
+                        if !eligible(
+                            &json,
+                            model,
+                            batch_size,
+                            parse_serve_continuous_batch(&json),
+                            false,
+                        ) {
+                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
+                            break;
+                        }
+                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
+                            json.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Hello")
+                                .to_string()
+                        });
+                        let system_str = json
+                            .get("system")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let assistant_prefix = match json
+                            .get("assistant_prefix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("plain")
+                        {
+                            "open_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            }
+                            "closed_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                            }
+                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        };
+                        let max_think = json
+                            .get("max_think_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let max_tokens_req = json
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(4096) as usize;
+                        let batch_messages = match json.get("messages") {
+                            Some(v) => match serde_json::from_value::<
+                                Vec<hipfire_runtime::prompt_frame::Message>,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    emit_batch_admission_error(
+                                        stdout,
+                                        &id,
+                                        attempt_id,
+                                        admission,
+                                        &format!("invalid messages field: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        let raw_effort = json
+                            .get("reasoning_effort")
+                            .or_else(|| json.get("thinking_mode"))
+                            .and_then(|v| v.as_str());
+                        let thinking_enabled =
+                            json.get("thinking_enabled").and_then(|v| v.as_bool());
+                        let (batch_enable_thinking, batch_reasoning_effort) =
+                            qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
+                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                            &prompt_str,
+                            system_str.as_deref(),
+                            assistant_prefix,
+                            tokenizer,
+                            chat_template,
+                            max_think,
+                            batch_messages.as_deref(),
+                            batch_enable_thinking,
+                            batch_reasoning_effort.as_deref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                emit_batch_admission_error(
+                                    stdout,
+                                    &id,
+                                    attempt_id,
+                                    admission,
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        if started_in_think {
+                            let handoff = match handoff_admitted_started_in_think(
+                                &id,
+                                attempt_id,
+                                admission,
+                                json,
+                                GenerationRoute::QwenAr,
+                            ) {
+                                Ok(msg) => msg,
+                                Err(reason) => {
+                                    return Err(reason)
+                                }
+                            };
+                            barrier = Some(handoff);
+                            break;
+                        }
+                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
+                            emit_batch_admission_error(
+                                stdout,
+                                &id,
+                                attempt_id,
+                                admission,
+                                "prompt exceeds lane capacity or empty",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            continue;
+                        }
+                        // Explicit wire `seed` must reach the lane RNG on the
+                        // batched route too; out-of-domain values are rejected
+                        // loudly, never silently unseeded.
+                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                            Ok(s) => s,
+                            Err(reason) => {
+                                emit_batch_admission_error(
+                                    stdout,
+                                    &id,
+                                    attempt_id,
+                                    admission,
+                                    &reason,
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        batch_transition_to_queued(&id, attempt_id, admission);
+                        let sampling = resolve_batch_sampling(&json, model);
+                        let req = BatchPendingRequest {
+                            key: AttemptKey::new(&id, attempt_id),
+                            admission,
+                            original_msg: json.clone(),
+                            prompt: prompt_str.clone(),
+                            prompt_tokens: prompt_tokens.clone(),
+                            started_in_think,
+                            system: system_str.clone(),
+                            assistant_prefix,
+                            max_think_tokens: max_think,
+                            max_tokens: max_tokens_req,
+                            client_seed,
+                            sampling,
+                        };
+                        if !sched.enqueue(req) {
+                            // Defensive: a live registry/channel already owns this
+                            // key. Do not emit a keyed error or clear the original.
+                            eprintln!(
+                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
+                            continue;
+                        }
+                        {
+                            let _scope =
+                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
+                            crate::ar::emit_generation_start(
+                                crate::ar::GenerationRoute::QwenAr,
+                                stdout,
+                                &id,
+                                started_in_think,
+                            );
+                        }
+                    } else if t == "abort" || t == "commit" {
+                        if let (Some(id), Some(aid), Some(kind)) = (
+                            json.get("id").and_then(|v| v.as_str()),
+                            json.get("attempt_id").and_then(|v| v.as_u64()),
+                            json.get("type").and_then(|v| v.as_str()),
+                        ) {
+                            batch_apply_terminal_control(kind, id, aid);
+                        }
+                    } else {
+                        barrier = Some(daemon_regular_with_admission(json, carried_admission));
+                        break;
+                    }
+                }
+            }
+        }
+    Ok(barrier)
+}
+
 pub fn drive_qwen_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,
@@ -661,284 +964,20 @@ pub fn drive_qwen_continuous_batch(
             let _ = sched.abort_lane(idx, &key, admission);
             producers[idx] = None;
         }
-        let mut barrier: Option<DaemonMsg> = None;
-        loop {
-            let dm = match inbox.try_recv() {
-                Ok(m) => m,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            };
-            let (dm, carried_admission) = match dm {
-                DaemonMsg::RegularWithAdmission(json, admission) => {
-                    (DaemonMsg::Regular(json), Some(admission))
-                }
-                other => (other, None),
-            };
-            match dm {
-                DaemonMsg::RegularWithAdmission(json, admission) => {
-                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
-                    break;
-                }
-                DaemonMsg::SingletonWithAdmission(json, transfer) => {
-                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
-                    break;
-                }
-                DaemonMsg::ParseError(e) => {
-                    emit_uncorrelated_error(
-                        stdout,
-                        None,
-                        &format!("invalid JSON: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                }
-                DaemonMsg::Regular(json) => {
-                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if t == "generate" {
-                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
-                            Some(0) => {
-                                emit_uncorrelated_error(
-                                    stdout,
-                                    json.get("id").and_then(|v| v.as_str()),
-                                    "generate attempt_id must be nonzero",
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                            Some(v) => v,
-                            None => {
-                                emit_uncorrelated_error(
-                                    stdout,
-                                    json.get("id").and_then(|v| v.as_str()),
-                                    "generate missing attempt_id",
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        let id = json
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0")
-                            .to_string();
-                        let Some(admission) = carried_admission else {
-                            barrier = Some(daemon_regular_with_admission(json, None));
-                            break;
-                        };
-                        if batch_check_abort(&id, attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
-                                stdout,
-                                &id,
-                                false,
-                            );
-                            crate::ar::emit_generation_cancel(route, stdout, &id, 0);
-                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
-                            continue;
-                        }
-                        if !is_batch_request_eligible(
-                            &json,
-                            model,
-                            batch_size,
-                            parse_serve_continuous_batch(&json),
-                            false,
-                        ) {
-                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
-                            break;
-                        }
-                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
-                            json.get("prompt")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Hello")
-                                .to_string()
-                        });
-                        let system_str = json
-                            .get("system")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let assistant_prefix = match json
-                            .get("assistant_prefix")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("plain")
-                        {
-                            "open_think" => {
-                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                            }
-                            "closed_think" => {
-                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-                            }
-                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        };
-                        let max_think = json
-                            .get("max_think_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let max_tokens_req = json
-                            .get("max_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(4096) as usize;
-                        let batch_messages = match json.get("messages") {
-                            Some(v) => match serde_json::from_value::<
-                                Vec<hipfire_runtime::prompt_frame::Message>,
-                            >(v.clone())
-                            {
-                                Ok(v) => Some(v),
-                                Err(e) => {
-                                    emit_batch_admission_error(
-                                        stdout,
-                                        &id,
-                                        attempt_id,
-                                        admission,
-                                        &format!("invalid messages field: {e}"),
-                                        "validation",
-                                        false,
-                                        false,
-                                    );
-                                    continue;
-                                }
-                            },
-                            None => None,
-                        };
-                        let raw_effort = json
-                            .get("reasoning_effort")
-                            .or_else(|| json.get("thinking_mode"))
-                            .and_then(|v| v.as_str());
-                        let thinking_enabled =
-                            json.get("thinking_enabled").and_then(|v| v.as_bool());
-                        let (batch_enable_thinking, batch_reasoning_effort) =
-                            qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
-                            &prompt_str,
-                            system_str.as_deref(),
-                            assistant_prefix,
-                            tokenizer,
-                            chat_template.as_ref(),
-                            max_think,
-                            batch_messages.as_deref(),
-                            batch_enable_thinking,
-                            batch_reasoning_effort.as_deref(),
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                emit_batch_admission_error(
-                                    stdout,
-                                    &id,
-                                    attempt_id,
-                                    admission,
-                                    &format!("render failed: {e}"),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        if started_in_think {
-                            let handoff = match handoff_admitted_started_in_think(
-                                &id,
-                                attempt_id,
-                                admission,
-                                json,
-                                GenerationRoute::QwenAr,
-                            ) {
-                                Ok(msg) => msg,
-                                Err(reason) => {
-                                    return fail_all(sched, gpu, batch_state, stdout, reason)
-                                }
-                            };
-                            barrier = Some(handoff);
-                            break;
-                        }
-                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
-                            emit_batch_admission_error(
-                                stdout,
-                                &id,
-                                attempt_id,
-                                admission,
-                                "prompt exceeds lane capacity or empty",
-                                "validation",
-                                false,
-                                false,
-                            );
-                            continue;
-                        }
-                        // Explicit wire `seed` must reach the lane RNG on the
-                        // batched route too; out-of-domain values are rejected
-                        // loudly, never silently unseeded.
-                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
-                            Ok(s) => s,
-                            Err(reason) => {
-                                emit_batch_admission_error(
-                                    stdout,
-                                    &id,
-                                    attempt_id,
-                                    admission,
-                                    &reason,
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        batch_transition_to_queued(&id, attempt_id, admission);
-                        let sampling = resolve_batch_sampling(&json, model);
-                        let req = BatchPendingRequest {
-                            key: AttemptKey::new(&id, attempt_id),
-                            admission,
-                            original_msg: json.clone(),
-                            prompt: prompt_str.clone(),
-                            prompt_tokens: prompt_tokens.clone(),
-                            started_in_think,
-                            system: system_str.clone(),
-                            assistant_prefix,
-                            max_think_tokens: max_think,
-                            max_tokens: max_tokens_req,
-                            client_seed,
-                            sampling,
-                        };
-                        if !sched.enqueue(req) {
-                            // Defensive: a live registry/channel already owns this
-                            // key. Do not emit a keyed error or clear the original.
-                            eprintln!(
-                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
-                                id, attempt_id
-                            );
-                            continue;
-                        }
-                        {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
-                                stdout,
-                                &id,
-                                started_in_think,
-                            );
-                        }
-                    } else if t == "abort" || t == "commit" {
-                        if let (Some(id), Some(aid), Some(kind)) = (
-                            json.get("id").and_then(|v| v.as_str()),
-                            json.get("attempt_id").and_then(|v| v.as_u64()),
-                            json.get("type").and_then(|v| v.as_str()),
-                        ) {
-                            batch_apply_terminal_control(kind, id, aid);
-                        }
-                    } else {
-                        barrier = Some(daemon_regular_with_admission(json, carried_admission));
-                        break;
-                    }
-                }
-            }
-        }
+        let barrier = match drain_qwen_batch_inbox(
+            sched,
+            model,
+            batch_size,
+            is_batch_request_eligible,
+            tokenizer,
+            chat_template.as_ref(),
+            route,
+            stdout,
+            inbox,
+        ) {
+            Ok(b) => b,
+            Err(reason) => return fail_all(sched, gpu, batch_state, stdout, reason),
+        };
         if let Some(msg) = barrier {
             inbox.push_front(msg);
             if sched.active_count() == 0 && sched.inbox.is_empty() {
