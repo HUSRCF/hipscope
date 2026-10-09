@@ -92,6 +92,22 @@ Config and env owners for bind, idle, queue, and body limits:
    default: one generation holds the daemon at a time and later requests wait
    in a bounded queue (`serve.max_queue`). Continuous batching covers only
    thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`).
+   The VMM continuous-batching route (`serve.vmm_batch`,
+   `HIPFIRE_SERVE_VMM_BATCH`, **default off, experimental**) instead batches
+   eligible TP1 Qwen3.5-family requests over the one resident weight set with
+   per-request VMM KV/DeltaNet owners (no fixed lanes, no second model). The
+   loaded ack then reports `continuous_batch_route: "vmm"` and the actual
+   owner receipt (`vmm_batch_kv_backend`, `vmm_batch_kv_mode`,
+   `vmm_batch_max_seq_bound`). Stage-1 limits: greedy requests only
+   (penalties apply as on the singleton route) and AR rows only;
+   `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) and
+   `serve.batch_nonexact` (`HIPFIRE_SERVE_BATCH_NONEXACT`) are reserved
+   switches — no cross-request speculation or non-exact arithmetic is enabled
+   yet. A request that is alone at dispatch keeps the unchanged singleton
+   route (including native MTP/DFlash); requests arriving while a singleton
+   generation runs wait for it to finish, so their TTFT includes that
+   generation (known gap). The fixed-slot `serve.multi_slot` engine below is
+   the legacy route.
    With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
