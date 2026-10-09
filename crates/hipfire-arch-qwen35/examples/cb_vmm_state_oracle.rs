@@ -4,6 +4,7 @@
 //!
 //! cb_vmm_state_oracle <model> --ks 1,2,3,4,5,6,7,8 --contexts 512,8192,32768
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
+//!     [--phase all|singleton]
 //!
 //! `--contexts` are test prefix lengths, never max_seq overrides: the model
 //! loads through the production `load_qwen35_bundle` with automatic VMM
@@ -25,12 +26,18 @@
 //! Comparisons are actual byte comparisons; sha256 digests are receipts only.
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
+use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit};
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::slot_batch::{
+    BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch, StepOutput,
+};
+use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::tokenizer::Tokenizer;
+use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -55,6 +62,8 @@ struct Args {
     steps: usize,
     out: PathBuf,
     artifacts: PathBuf,
+    /// Run the executor batch phase after the singleton phase.
+    batch: bool,
 }
 
 fn parse_list(s: &str) -> Result<Vec<usize>> {
@@ -71,7 +80,9 @@ fn parse_list(s: &str) -> Result<Vec<usize>> {
 fn parse_args() -> Result<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: cb_vmm_state_oracle <model> --ks 1,..,8 --contexts 512,8192,32768 \
-                 --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]";
+                 --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
+                 [--phase all|singleton]";
+    let mut batch = true;
     let model = raw.first().ok_or(usage)?.clone();
     let (mut ks, mut contexts, mut steps, mut out, mut short, mut artifacts) =
         (None, None, None, None, 256usize, None);
@@ -85,6 +96,13 @@ fn parse_args() -> Result<Args> {
             "--out" => out = Some(PathBuf::from(val)),
             "--short" => short = val.parse()?,
             "--artifacts" => artifacts = Some(PathBuf::from(val)),
+            "--phase" => {
+                batch = match val.as_str() {
+                    "all" => true,
+                    "singleton" => false,
+                    _ => return Err(usage.into()),
+                }
+            }
             other => return Err(format!("unknown flag {other}; {usage}").into()),
         }
         i += 2;
@@ -105,7 +123,7 @@ fn parse_args() -> Result<Args> {
     if steps < 8 {
         return Err("--steps must be >= 8 (negative controls need 8 steps)".into());
     }
-    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts })
+    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch })
 }
 
 /// One isolated request fixture: request-unique prompt at an exact length.
@@ -537,6 +555,593 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
     Ok((Ctx { gpu, b }, tok, ack))
 }
 
+// ── Batch phase: Qwen35VmmStore / executor (§4.2) ────────────────────
+
+/// Prefill chunk per request per step; identical in the isolated executor
+/// reference and every batch case so chunk boundaries never differ.
+const CHUNK: usize = 256;
+const WIDTH: usize = 8;
+
+enum Sink {
+    /// Isolated executor reference (k=1 on the batch route).
+    Record { dir: PathBuf, trace: Trace },
+    /// Batch request: byte-compare to the isolated executor reference (state
+    /// bleed; must be exact) and to the singleton route (route exactness).
+    Compare { b: usize, a: usize, vs_b: Diff, vs_a: Diff },
+}
+
+struct Req {
+    fx: usize,
+    epoch: RequestEpoch,
+    slot: usize,
+    /// Picks to commit (pick 0 comes from the final prompt chunk).
+    max_tokens: usize,
+    stop: Option<u32>,
+    cancel_at: Option<usize>,
+    fed: usize,
+    committed: Vec<u32>,
+    finish: Option<String>,
+    store_watermark_errors: Vec<String>,
+    sink: Sink,
+}
+
+impl Req {
+    fn new(fx: usize, tag: u64, generation: u64, slot: usize, max_tokens: usize, sink: Sink) -> Self {
+        Self {
+            fx,
+            epoch: RequestEpoch { request_tag: tag, owner_generation: generation },
+            slot,
+            max_tokens,
+            stop: None,
+            cancel_at: None,
+            fed: 0,
+            committed: Vec::new(),
+            finish: None,
+            store_watermark_errors: Vec::new(),
+            sink,
+        }
+    }
+}
+
+struct Refs<'a> {
+    b: &'a [Option<Trace>],
+    a: &'a [Trace],
+}
+
+fn state_cmp(d: &mut Diff, stage: &str, now: &[(String, Vec<u8>)], reference: &Trace) -> Result<()> {
+    for (name, bytes) in now {
+        let key = format!("{stage}/{name}");
+        match reference.states.iter().find(|(n, _)| *n == key) {
+            Some((_, p)) => d.check(&key, &fs::read(p)?, bytes),
+            None => d.differing_items.push(format!("{key}: missing in reference")),
+        }
+    }
+    Ok(())
+}
+
+/// Record or compare pick `i` (logits after the head row, hidden of that row).
+fn sink_pick(sink: &mut Sink, refs: &Refs, i: usize, logits: &[u8], hidden: &[u8]) -> Result<()> {
+    match sink {
+        Sink::Record { dir, trace } => {
+            let pl = dir.join(format!("logits_{i:04}.bin"));
+            write_art(&pl, logits)?;
+            trace.logits.push(pl);
+            if i > 0 {
+                let ph = dir.join(format!("hidden_{i:04}.bin"));
+                write_art(&ph, hidden)?;
+                trace.hidden.push(ph);
+            }
+        }
+        Sink::Compare { b, a, vs_b, vs_a } => {
+            for (d, t) in [(vs_b, refs.b[*b].as_ref().ok_or("missing isolated reference")?), (vs_a, &refs.a[*a])] {
+                match t.logits.get(i) {
+                    Some(p) => d.check(&format!("logits_{i:04}"), &fs::read(p)?, logits),
+                    None => d.differing_items.push(format!("logits_{i:04}: beyond reference")),
+                }
+                if i > 0 {
+                    d.check(&format!("hidden_{i:04}"), &fs::read(&t.hidden[i - 1])?, hidden);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sink_state(sink: &mut Sink, refs: &Refs, stage: &str, now: Vec<(String, Vec<u8>)>) -> Result<()> {
+    match sink {
+        Sink::Record { dir, trace } => {
+            for (name, bytes) in now {
+                let p = dir.join(stage).join(format!("{name}.bin"));
+                write_art(&p, &bytes)?;
+                trace.states.push((format!("{stage}/{name}"), p));
+            }
+        }
+        Sink::Compare { b, a, vs_b, vs_a } => {
+            state_cmp(vs_b, stage, &now, refs.b[*b].as_ref().ok_or("missing isolated reference")?)?;
+            state_cmp(vs_a, stage, &now, &refs.a[*a])?;
+        }
+    }
+    Ok(())
+}
+
+/// Frontier/terminal comparisons once a request stops committing.
+fn sink_finish(sink: &mut Sink, refs: &Refs, r_committed: &[u32], position: usize, pending: Option<u32>) -> Result<()> {
+    match sink {
+        Sink::Record { trace, .. } => {
+            // Reference convention: committed = fed picks, pending = last pick.
+            let (fed, last) = r_committed.split_at(r_committed.len() - 1);
+            trace.committed = fed.to_vec();
+            trace.pending_seed = last[0];
+            trace.position = position;
+            if pending != Some(last[0]) {
+                return Err("store pending_seed disagrees with last commit".into());
+            }
+        }
+        Sink::Compare { b, a, vs_b, vs_a } => {
+            for (d, t) in [(vs_b, refs.b[*b].as_ref().ok_or("missing isolated reference")?), (vs_a, &refs.a[*a])] {
+                let picks: Vec<u32> = t.committed.iter().copied().chain([t.pending_seed]).collect();
+                let n = r_committed.len().min(picks.len());
+                d.ids("committed_ids", &picks[..n], r_committed);
+                let prefix = t.position - t.committed.len();
+                d.ids("position", &[(prefix + r_committed.len() - 1) as u32], &[position as u32]);
+                d.ids("pending_seed", &[picks[r_committed.len() - 1]], &[pending.unwrap_or(u32::MAX)]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn free_vram(gpu: &Gpu) -> Result<usize> {
+    Ok(gpu.hip.get_vram_info()?.0)
+}
+
+fn new_store(ctx: &mut Ctx) -> Result<Qwen35VmmStore> {
+    // Shared physical KV budget: current free VRAM minus a 3 GiB margin for
+    // per-request DeltaNet state and transients. Not a max_seq override.
+    let budget = free_vram(&ctx.gpu)?.saturating_sub(3 << 30);
+    Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH * CHUNK, budget)?)
+}
+
+fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> Result<()> {
+    let stop = r.stop.into_iter().collect();
+    // Greedy sampler: plain argmax, the singleton reference semantics.
+    let init = VmmRequestInit {
+        prompt_len: fx[r.fx].prefix,
+        stop_ids: stop,
+        sampler: SamplerConfig::greedy(),
+        rng_state: 0,
+        history: vec![],
+    };
+    let st = Qwen35RequestState::new_like(
+        &mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, &ctx.b.dn_state, r.epoch, r.slot, init,
+    )?;
+    if let Err((st, e)) = store.admit(st) {
+        st.free_gpu(&mut ctx.gpu)?;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn retire(ctx: &mut Ctx, store: &mut Qwen35VmmStore, epoch: &RequestEpoch) -> Result<()> {
+    store.retire(epoch)?.free_gpu(&mut ctx.gpu)?;
+    Ok(())
+}
+
+/// Build the next step over every live request, in slot order.
+fn build_plan(store: &Qwen35VmmStore, fx: &[Fixture], reqs: &[Req]) -> Result<BatchStepPlan> {
+    let mut per: Vec<(usize, Vec<u32>, usize, Option<(RequestEpoch, RequestStepKind)>)> =
+        (0..WIDTH).map(|s| (s, vec![], 0, None)).collect();
+    for r in reqs.iter().filter(|r| r.finish.is_none()) {
+        let st = store.request_state(&r.epoch).ok_or("live request missing from store")?;
+        let f = &fx[r.fx];
+        let (toks, start, kind) = if r.fed < f.prefix {
+            let end = (r.fed + CHUNK).min(f.prefix);
+            (f.tokens[r.fed..end].to_vec(), r.fed, RequestStepKind::Prefill)
+        } else {
+            let seed = *r.committed.last().ok_or("decode without a pick")?;
+            (vec![seed], f.prefix + r.committed.len() - 1, RequestStepKind::Ar)
+        };
+        per[r.slot] = (r.slot, toks, start, Some((r.epoch, kind)));
+        let _ = st;
+    }
+    let triples: Vec<(SlotId, &[u32], usize)> =
+        per.iter().map(|(s, t, p, _)| (SlotId(*s), t.as_slice(), *p)).collect();
+    let batch = SlotBatch::build(&triples);
+    let mut requests = Vec::new();
+    let (mut begin, mut decode_rows, mut prefill_rows) = (0, 0, 0);
+    for (_, t, _, who) in &per {
+        if let Some((epoch, kind)) = who {
+            requests.push(RequestRows { epoch: *epoch, rows: RowRange { begin, len: t.len() }, kind: *kind });
+            match kind {
+                RequestStepKind::Ar => decode_rows += t.len(),
+                _ => prefill_rows += t.len(),
+            }
+        }
+        begin += t.len();
+    }
+    Ok(BatchStepPlan { batch, requests, decode_rows, prefill_rows, verify_rows: 0, forced_rows: 0 })
+}
+
+/// Run one planned step and publish every head into its request's sink.
+fn run_step(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [Req], refs: &Refs, plan: &BatchStepPlan) -> Result<()> {
+    let Ctx { gpu, b } = ctx;
+    let out = {
+        let mut ex = store.executor(&b.weights, &b.config, &b.scratch);
+        ex.provision_step(gpu, plan)?;
+        ex.forward_step(gpu, plan)?
+    };
+    let (vocab, dim) = (b.config.vocab_size, b.config.dim);
+    // Device heads are valid until the next forward: read before commit.
+    let mut heads = Vec::new();
+    for rr in &plan.requests {
+        let last = rr.rows.end() - 1;
+        if out.target_picks[last] != u32::MAX {
+            let slot = plan.batch.row_slot[last] as usize;
+            let l = read_dev(gpu, store.logits(), slot * vocab * 4, vocab * 4)?;
+            let h = read_dev(gpu, store.hidden(), last * dim * 4, dim * 4)?;
+            if argmax(&l)? != out.target_picks[last] {
+                return Err(format!("device pick {} != host argmax of slot logits", out.target_picks[last]).into());
+            }
+            heads.push((rr.epoch, l, h));
+        }
+    }
+    let advances = store.executor(&b.weights, &b.config, &b.scratch).commit_step(gpu, plan, out)?;
+    for rr in &plan.requests {
+        let r = reqs.iter_mut().find(|r| r.epoch == rr.epoch).ok_or("plan epoch not in case")?;
+        if rr.kind == RequestStepKind::Prefill {
+            r.fed += rr.rows.len;
+            if r.fed == fx[r.fx].prefix {
+                let st = store.request_state(&r.epoch).ok_or("request vanished")?;
+                let now = state_bytes(gpu, &b.config, &st.kv, &st.dn, r.fed)?;
+                sink_state(&mut r.sink, refs, "prefill", now)?;
+            }
+        }
+    }
+    if advances.len() != heads.len() {
+        return Err(format!("{} advances for {} heads", advances.len(), heads.len()).into());
+    }
+    for (adv, (epoch, l, h)) in advances.iter().zip(heads) {
+        if adv.epoch != epoch || adv.committed_ids.len() != 1 {
+            return Err("advance order/arity differs from plan heads".into());
+        }
+        let r = reqs.iter_mut().find(|r| r.epoch == epoch).unwrap();
+        let i = r.committed.len();
+        r.committed.push(adv.committed_ids[0]);
+        sink_pick(&mut r.sink, refs, i, &l, &h)?;
+        let st = store.request_state(&epoch).ok_or("request vanished")?;
+        let expect_pos = fx[r.fx].prefix + r.committed.len() - 1;
+        if adv.committed_position != expect_pos || st.position != expect_pos || st.pending_seed != Some(adv.committed_ids[0]) {
+            r.store_watermark_errors.push(format!(
+                "pick {i}: advance pos {} store pos {} expected {expect_pos}, pending {:?}",
+                adv.committed_position, st.position, st.pending_seed
+            ));
+        }
+        if let Some(f) = &adv.finish {
+            r.finish = Some(f.clone());
+        } else if r.committed.len() >= r.max_tokens {
+            r.finish = Some("max_tokens".into());
+        }
+    }
+    Ok(())
+}
+
+/// Retire finished/cancelled requests, publishing final comparisons.
+fn reap(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [Req], refs: &Refs, steps: usize) -> Result<()> {
+    for r in reqs.iter_mut() {
+        if r.finish.is_none() && r.cancel_at.is_some_and(|c| r.committed.len() >= c) {
+            r.finish = Some("cancelled".into());
+        }
+        let Some(fin) = r.finish.clone() else { continue };
+        let Some(st) = store.request_state(&r.epoch) else { continue };
+        if fin != "cancelled" && !r.committed.is_empty() {
+            let pos = st.position;
+            let pending = st.pending_seed;
+            if r.committed.len() == steps + 1 {
+                let now = state_bytes(&ctx.gpu, &ctx.b.config, &st.kv, &st.dn, pos)?;
+                sink_state(&mut r.sink, refs, "final", now)?;
+            }
+            sink_finish(&mut r.sink, refs, &r.committed, pos, pending)?;
+        }
+        let _ = fx;
+        retire(ctx, store, &r.epoch)?;
+    }
+    Ok(())
+}
+
+/// Admit every request, step until all finish. On any error every admitted
+/// owner is aborted/retired so the store is reusable.
+fn drive(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [Req], refs: &Refs, steps: usize, controls: Option<&mut serde_json::Map<String, Value>>) -> Result<()> {
+    let mut controls = controls;
+    let res = (|| -> Result<()> {
+        for r in reqs.iter() {
+            admit(ctx, store, fx, r)?;
+        }
+        loop {
+            reap(ctx, store, fx, reqs, refs, steps)?;
+            if reqs.iter().all(|r| r.finish.is_some()) {
+                return Ok(());
+            }
+            if let Some(map) = controls.as_deref_mut() {
+                let live: Vec<usize> = (0..reqs.len()).filter(|&i| reqs[i].finish.is_none()).collect();
+                if live.len() >= 2 && live.iter().all(|&i| reqs[i].fed == fx[reqs[i].fx].prefix && reqs[i].committed.len() >= 4) {
+                    executor_controls(ctx, store, fx, reqs, &live, map)?;
+                    controls = None;
+                    continue;
+                }
+            }
+            let plan = build_plan(store, fx, reqs)?;
+            run_step(ctx, store, fx, reqs, refs, &plan).inspect_err(|_| store.abort_step(&plan))?;
+        }
+    })();
+    if res.is_err() {
+        for r in reqs.iter() {
+            if store.request_state(&r.epoch).is_some() {
+                let _ = retire(ctx, store, &r.epoch);
+            }
+        }
+    }
+    res
+}
+
+fn expect_err(map: &mut serde_json::Map<String, Value>, name: &str, r: std::result::Result<(), String>) {
+    let ok = r.is_err();
+    eprintln!("executor control {name}: refused={ok} -> {}", if ok { "OK" } else { "FAIL" });
+    map.insert(name.into(), json!({"expected": "refused", "ok": ok, "error": r.err()}));
+}
+
+/// Executor-level negative/positive controls with two live decoding
+/// requests. Refusals must leave state untouched: the case continues and
+/// its byte comparisons cover that.
+fn executor_controls(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [Req], live: &[usize], map: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let (i0, i1) = (live[0], live[1]);
+    let base = build_plan(store, fx, reqs)?;
+    let try_plan = |ctx: &mut Ctx, store: &mut Qwen35VmmStore, plan: &BatchStepPlan| -> std::result::Result<(), String> {
+        let Ctx { gpu, b } = ctx;
+        let r = store.executor(&b.weights, &b.config, &b.scratch).provision_step(gpu, plan);
+        if r.is_ok() {
+            store.abort_step(plan); // provisioned only: no device writes, no poison
+        }
+        r
+    };
+    // row_slot: request0's AR row addressed at request1's slot.
+    let mut p = base.clone();
+    let row0 = p.requests.iter().find(|q| q.epoch == reqs[i0].epoch).unwrap().rows.begin;
+    p.batch.row_slot[row0] = reqs[i1].slot as i32;
+    expect_err(map, "neg_row_slot", try_plan(ctx, store, &p));
+    // epoch: stale owner generation.
+    let mut p = base.clone();
+    p.requests[0].epoch.owner_generation += 1;
+    expect_err(map, "neg_epoch_generation", try_plan(ctx, store, &p));
+    // rejected-tail read: poison rows past request1's frontier (masked
+    // positive control, verified by the case's exact comparison), then an
+    // AR row whose position skips onto the poisoned tail must be refused.
+    let pos1 = store.request_state(&reqs[i1].epoch).unwrap().position;
+    {
+        let Ctx { gpu, b } = ctx;
+        let st = store.request_state_mut(&reqs[i1].epoch).unwrap();
+        st.kv.ensure_mapped_capacity(gpu, pos1 + 4)?;
+        let (kr, vr) = kv_row_bytes(&st.kv)?;
+        for (layer, ty) in b.config.layer_types.iter().enumerate() {
+            if *ty == LayerType::FullAttention {
+                gpu.hip.memcpy_htod_offset(&st.kv.k_gpu[layer].buf, (pos1 + 1) * kr, &vec![0x7f; 3 * kr])?;
+                gpu.hip.memcpy_htod_offset(&st.kv.v_gpu[layer].buf, (pos1 + 1) * vr, &vec![0x7f; 3 * vr])?;
+            }
+        }
+        gpu.hip.device_synchronize()?;
+    }
+    map.insert("pos_rejected_tail_masked".into(), json!({"poisoned_rows": [pos1 + 1, pos1 + 4], "request": reqs[i1].fx, "verified_by": "case byte comparison"}));
+    let mut p = base.clone();
+    let row1 = p.requests.iter().find(|q| q.epoch == reqs[i1].epoch).unwrap().rows.begin;
+    p.batch.positions[row1] += 2;
+    expect_err(map, "neg_rejected_tail_read", try_plan(ctx, store, &p));
+    // Stale commit on a step planned for request0 only: a foreign step id
+    // must be refused. The step is then aborted after its forward, which
+    // must poison request0 (device state written, never committed) while
+    // request1 continues and must stay byte-exact over its poisoned tail.
+    let solo = build_plan(store, fx, std::slice::from_ref(&reqs[i0]))?;
+    {
+        let Ctx { gpu, b } = ctx;
+        let mut ex = store.executor(&b.weights, &b.config, &b.scratch);
+        ex.provision_step(gpu, &solo)?;
+        let out = ex.forward_step(gpu, &solo)?;
+        let forged = StepOutput { step_id: out.step_id + 1, target_picks: out.target_picks.clone() };
+        let r = ex.commit_step(gpu, &solo, forged).map(|_| ());
+        store.abort_step(&solo);
+        let ok = r.is_err();
+        eprintln!("executor control neg_stale_commit: refused={ok} -> {}", if ok { "OK" } else { "FAIL" });
+        map.insert("neg_stale_commit".into(), json!({"expected": "refused", "ok": ok, "error": r.err()}));
+    }
+    let poisoned = store.request_state(&reqs[i0].epoch).is_some_and(|s| s.poisoned)
+        && store.request_state(&reqs[i1].epoch).is_some_and(|s| !s.poisoned);
+    eprintln!("executor control poison_after_aborted_forward: {} -> {}", poisoned, if poisoned { "OK" } else { "FAIL" });
+    map.insert("poison_after_aborted_forward".into(), json!({"ok": poisoned}));
+    expect_err(map, "neg_poisoned_provision", try_plan(ctx, store, &base));
+    reqs[i0].finish = Some("cancelled".into());
+    Ok(())
+}
+
+fn diff_ok(sink: &Sink) -> (bool, bool, Value, Value) {
+    match sink {
+        Sink::Compare { vs_b, vs_a, .. } => (vs_b.exact(), vs_a.exact(), vs_b.json(), vs_a.json()),
+        Sink::Record { .. } => (true, true, Value::Null, Value::Null),
+    }
+}
+
+/// Per-case receipt; returns whether the batch-vs-isolated comparison is exact.
+fn case_json(name: &str, fx: &[Fixture], reqs: &[Req]) -> (bool, bool, Value) {
+    let (mut bleed_exact, mut route_exact) = (true, true);
+    let rows: Vec<Value> = reqs
+        .iter()
+        .map(|r| {
+            let (b, a, jb, ja) = diff_ok(&r.sink);
+            let wm = r.store_watermark_errors.is_empty();
+            bleed_exact &= b && wm;
+            route_exact &= a;
+            json!({
+                "fixture": fx[r.fx].name(), "slot": r.slot, "epoch": [r.epoch.request_tag, r.epoch.owner_generation],
+                "max_tokens": r.max_tokens, "stop": r.stop, "cancel_at": r.cancel_at,
+                "finish": r.finish, "committed": r.committed.len(),
+                "watermarks_ok": wm, "watermark_errors": r.store_watermark_errors,
+                "vs_isolated_executor": jb, "vs_singleton_route": ja,
+            })
+        })
+        .collect();
+    eprintln!("batch {name}: isolated-exact={bleed_exact} singleton-route-exact={route_exact}");
+    (bleed_exact, route_exact, json!({"case": name, "bleed_exact": bleed_exact, "route_exact": route_exact, "requests": rows}))
+}
+
+fn compare_sink(i: usize) -> Sink {
+    Sink::Compare { b: i, a: i, vs_b: Diff::default(), vs_a: Diff::default() }
+}
+
+/// Whole batch phase. Returns (report, pass).
+fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> Result<(Value, bool)> {
+    let mut store = new_store(ctx)?;
+    let steps = args.steps;
+    let mut pass = true;
+    let mut out = serde_json::Map::new();
+    // Isolated executor references (k=1 on the batch route).
+    let mut refs_b: Vec<Option<Trace>> = Vec::with_capacity(fx.len());
+    let mut isolated = Vec::new();
+    for (i, f) in fx.iter().enumerate() {
+        let dir = args.artifacts.join("executor_k1").join(f.name());
+        fs::create_dir_all(&dir)?;
+        let trace = Trace { logits: vec![], hidden: vec![], committed: vec![], position: 0, pending_seed: 0, states: vec![] };
+        let mut reqs = [Req::new(i, 1000 + i as u64, 1, i % WIDTH, steps + 1, Sink::Record { dir, trace })];
+        let none: [Option<Trace>; 0] = [];
+        let r = drive(ctx, &mut store, fx, &mut reqs, &Refs { b: &none, a: refs_a }, steps, None);
+        let [req] = reqs;
+        match (r, req.sink) {
+            (Ok(()), Sink::Record { trace, .. }) => {
+                // Isolated executor vs singleton route (route exactness at k=1).
+                let mut d = Diff::default();
+                let t = &refs_a[i];
+                for (j, p) in trace.logits.iter().enumerate() {
+                    d.check(&format!("logits_{j:04}"), &fs::read(&t.logits[j])?, &fs::read(p)?);
+                }
+                for (j, p) in trace.hidden.iter().enumerate() {
+                    d.check(&format!("hidden_{:04}", j + 1), &fs::read(&t.hidden[j])?, &fs::read(p)?);
+                }
+                for (n, p) in &trace.states {
+                    let (_, q) = t.states.iter().find(|(m, _)| m == n).ok_or("missing state")?;
+                    d.check(n, &fs::read(q)?, &fs::read(p)?);
+                }
+                d.ids("committed_ids", &t.committed, &trace.committed);
+                d.ids("position", &[t.position as u32], &[trace.position as u32]);
+                d.ids("pending_seed", &[t.pending_seed], &[trace.pending_seed]);
+                eprintln!("executor k1 {}: vs singleton route exact={}", f.name(), d.exact());
+                isolated.push(json!({"fixture": f.name(), "supported": true, "vs_singleton_route": d.json()}));
+                refs_b.push(Some(trace));
+            }
+            (Err(e), _) => {
+                eprintln!("executor k1 {}: REFUSED/FAILED: {e}", f.name());
+                isolated.push(json!({"fixture": f.name(), "supported": false, "error": e.to_string()}));
+                refs_b.push(None);
+            }
+            _ => unreachable!(),
+        }
+    }
+    out.insert("executor_k1".into(), Value::Array(isolated));
+    let refs = Refs { b: &refs_b, a: refs_a };
+    let supported: Vec<usize> = (0..fx.len()).filter(|&i| refs_b[i].is_some()).collect();
+    let mut cases = Vec::new();
+    let mut route_exact_all = true;
+    let mut run_case = |ctx: &mut Ctx, store: &mut Qwen35VmmStore, name: String, mut reqs: Vec<Req>, controls: bool, cases: &mut Vec<Value>, pass: &mut bool| -> Result<()> {
+        let mut map = serde_json::Map::new();
+        let r = drive(ctx, store, fx, &mut reqs, &refs, steps, controls.then_some(&mut map));
+        let (bleed, route, mut j) = case_json(&name, fx, &reqs);
+        route_exact_all &= route;
+        let ctl_ok = map.values().all(|v| v["ok"].as_bool().unwrap_or(true));
+        if controls {
+            j["executor_controls"] = Value::Object(map);
+        }
+        if let Err(e) = &r {
+            j["error"] = json!(e.to_string());
+        }
+        *pass &= r.is_ok() && bleed && ctl_ok && (!controls || j["executor_controls"].as_object().is_some_and(|m| m.len() >= 6));
+        cases.push(j);
+        Ok(())
+    };
+    // k = 1..8 with unequal prompts/contexts; request r uses fixture r.
+    for &k in &args.ks {
+        let chosen: Vec<usize> = (0..k).filter(|i| refs_b[*i].is_some()).collect();
+        let refused: Vec<String> = (0..k).filter(|i| refs_b[*i].is_none()).map(|i| fx[i].name()).collect();
+        if !refused.is_empty() {
+            cases.push(json!({"case": format!("k{k}"), "refused_fixtures": refused, "note": "executor refused these fixtures in isolation; case runs the remaining requests"}));
+            pass = false;
+        }
+        if chosen.is_empty() {
+            continue;
+        }
+        // max_tokens clip: unequal exits (request r stops 3r picks early).
+        let reqs = chosen.iter().map(|&i| Req::new(i, (k * 100 + i) as u64, 1, i, (steps + 1).saturating_sub(3 * i).max(2), compare_sink(i))).collect();
+        run_case(ctx, &mut store, format!("k{k}"), reqs, false, &mut cases, &mut pass)?;
+    }
+    if supported.len() >= 2 {
+        let (s0, s1) = (supported[0], supported[1]);
+        // Stop id inside the stream: first pick equal to the reference's 6th.
+        let t = refs_b[s0].as_ref().unwrap();
+        let picks: Vec<u32> = t.committed.iter().copied().chain([t.pending_seed]).collect();
+        let stop = picks[5];
+        let stop_at = picks.iter().position(|&p| p == stop).unwrap() + 1;
+        let mut a = Req::new(s0, 9001, 1, 2, steps + 1, compare_sink(s0));
+        a.stop = Some(stop);
+        let b = Req::new(s1, 9002, 1, 5, steps + 1, compare_sink(s1));
+        run_case(ctx, &mut store, "stop_id".into(), vec![a, b], false, &mut cases, &mut pass)?;
+        let got = cases.last().unwrap()["requests"][0].clone();
+        let ok = got["finish"] == json!("stop") && got["committed"] == json!(stop_at);
+        eprintln!("batch stop_id: finish={} committed={} expected {stop_at} -> {}", got["finish"], got["committed"], if ok { "OK" } else { "FAIL" });
+        pass &= ok;
+        // Cancel mid-stream: the survivor must stay byte-exact.
+        let mut a = Req::new(s0, 9101, 1, 0, steps + 1, compare_sink(s0));
+        a.cancel_at = Some(9);
+        let b = Req::new(s1, 9102, 1, 1, steps + 1, compare_sink(s1));
+        run_case(ctx, &mut store, "cancel".into(), vec![a, b], false, &mut cases, &mut pass)?;
+        // Executor controls (row_slot / epoch / rejected tail / stale commit /
+        // poison) need both requests decoding together: the two shortest.
+        let mut by_len = supported.clone();
+        by_len.sort_by_key(|&i| fx[i].prefix);
+        let (c0, c1) = (by_len[0], by_len[1]);
+        let a = Req::new(c0, 9201, 1, 3, steps + 1, compare_sink(c0));
+        let b = Req::new(c1, 9202, 1, 6, steps + 1, compare_sink(c1));
+        run_case(ctx, &mut store, "controls".into(), vec![a, b], true, &mut cases, &mut pass)?;
+        // Slot wrap/reuse: the same slots now hold new epochs (generation 2)
+        // with swapped fixtures; must still match their isolated references.
+        let a = Req::new(s1, 9201, 2, 3, steps + 1, compare_sink(s1));
+        let b = Req::new(s0, 9202, 2, 6, steps + 1, compare_sink(s0));
+        run_case(ctx, &mut store, "slot_reuse".into(), vec![a, b], false, &mut cases, &mut pass)?;
+    } else {
+        pass = false;
+    }
+    // Verify rows belong to slice 2: record the executor's current answer.
+    {
+        let probe = supported.first().copied().unwrap_or(0);
+        let r = Req::new(probe, 9301, 1, 0, steps + 1, compare_sink(probe));
+        admit(ctx, &mut store, fx, &r)?;
+        let mut p = build_plan(&store, fx, std::slice::from_ref(&r))?;
+        p.requests[0].kind = RequestStepKind::Verify { draft_len: 0 };
+        let Ctx { gpu, b } = ctx;
+        let res = store.executor(&b.weights, &b.config, &b.scratch).provision_step(gpu, &p);
+        if res.is_ok() {
+            store.abort_step(&p);
+        }
+        retire(ctx, &mut store, &r.epoch)?;
+        out.insert("spec_verify_probe".into(), json!({
+            "accepted_by_executor": res.is_ok(), "error": res.err(),
+            "note": "full/partial accept, EOS-in-draft and spec max_tokens clipping need Verify rows (Slice2A); not certified until accepted",
+        }));
+    }
+    out.insert("cases".into(), Value::Array(cases));
+    out.insert("route_exact_vs_singleton".into(), json!(route_exact_all));
+    let receipt = store.receipt()?;
+    out.insert("store_receipt".into(), json!({
+        "kv_backend": receipt.kv_backend, "kv_mode": receipt.kv_mode, "max_seq_bound": receipt.max_seq_bound,
+        "mapped_bytes": receipt.mapped_bytes, "mapped_high_water": receipt.mapped_high_water,
+    }));
+    store.free_gpu(&mut ctx.gpu)?;
+    Ok((Value::Object(out), pass))
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
     if args.artifacts.exists() {
@@ -609,6 +1214,11 @@ fn main() -> Result<()> {
         control("neg_epoch", d, false);
     }
     report["controls"] = Value::Object(controls);
+    if args.batch {
+        let (batch, ok) = batch_phase(&mut ctx, &args, &fx, &refs)?;
+        report["batch"] = batch;
+        pass &= ok;
+    }
     report["pass"] = json!(pass);
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
     eprintln!("wrote {} pass={pass}", args.out.display());
