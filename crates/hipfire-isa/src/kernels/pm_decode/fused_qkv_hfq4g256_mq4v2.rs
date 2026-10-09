@@ -79,36 +79,42 @@ fn project_group(b: &mut Builder, stream: u8) -> Result<(), String> {
 /// prove progressive waits instead of draining the counter for each group.
 /// Retain all dequantized weights; reuse dead headers and packed words to fit 80 VGPRs.
 fn project_quad(b: &mut Builder) -> Result<(), String> {
-    for stream in 0..4u8 {
-        let offset = u32::from(stream) * 136;
-        let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
-        let header = 8 + stream * 2;
-        if stream == 0 || stream == 3 {
-            mem(b, format!("buffer_load_b64 v[{header}:{}], v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV", header + 1),
-                &[vr(header, 2)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-        } else {
-            mem(b, format!("buffer_load_b32 v{header}, v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
-                &[v(header)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-            mem(b, format!("buffer_load_b32 v{}, v31, s[36:39], s40 offen offset:{} scope:SCOPE_DEV", header + 1, offset + 4),
-                &[v(header + 1)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-        }
-    }
-    for stream in 0..4u8 {
-        let offset = u32::from(stream) * 136;
-        let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
-        let packed = 20 + stream;
-        mem(b, format!("buffer_load_b32 v{packed}, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
-            &[v(packed)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-    }
-    for half in [0u8, 4] {
+    b.clause(|b| {
         for stream in 0..4u8 {
-            let base = 32 + stream * 8 + half;
-            let offset = u32::from(stream) * 1024 + u32::from(half) * 4;
+            let offset = u32::from(stream) * 136;
             let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
-            mem(b, format!("global_load_b128 v[{base}:{}], v2, s[10:11]{suffix}", base + 3),
-                &[vr(base, 4)], &[v(2), sr(10, 2)], MemoryClass::VmemLoad)?;
+            let header = 8 + stream * 2;
+            if stream == 0 || stream == 3 {
+                mem(b, format!("buffer_load_b64 v[{header}:{}], v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV", header + 1),
+                    &[vr(header, 2)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+            } else {
+                mem(b, format!("buffer_load_b32 v{header}, v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+                    &[v(header)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+                mem(b, format!("buffer_load_b32 v{}, v31, s[36:39], s40 offen offset:{} scope:SCOPE_DEV", header + 1, offset + 4),
+                    &[v(header + 1)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+            }
         }
-    }
+        for stream in 0..4u8 {
+            let offset = u32::from(stream) * 136;
+            let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+            let packed = 20 + stream;
+            mem(b, format!("buffer_load_b32 v{packed}, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+                &[v(packed)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+        }
+        Ok(())
+    })?;
+    b.clause(|b| {
+        for half in [0u8, 4] {
+            for stream in 0..4u8 {
+                let base = 32 + stream * 8 + half;
+                let offset = u32::from(stream) * 1024 + u32::from(half) * 4;
+                let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+                mem(b, format!("global_load_b128 v[{base}:{}], v2, s[10:11]{suffix}", base + 3),
+                    &[vr(base, 4)], &[v(2), sr(10, 2)], MemoryClass::VmemLoad)?;
+            }
+        }
+        Ok(())
+    })?;
     op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
     for stream in 0..4u8 {
         let header = 8 + stream * 2;
