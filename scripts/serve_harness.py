@@ -3979,12 +3979,27 @@ def _concurrent_client_turns(cfg, battery, client, feedback_shape, emit):
     order = [(client + i) % n for i in range(n)] if cfg["mode"] == "battery" else list(range(n))
     for turn, idx in enumerate(order):
         genre, prompt, expected = battery[idx]
-        if cfg["mode"] == "battery":
-            r = send(cfg, [{"role": "user", "content": prompt}])
-        else:
-            messages.append({"role": "user", "content": prompt})
-            r = send(cfg, messages)
-            messages.append(_assistant_feedback(r, feedback_shape))
+        try:
+            if cfg["mode"] == "battery":
+                r = send(cfg, [{"role": "user", "content": prompt}])
+            else:
+                messages.append({"role": "user", "content": prompt})
+                r = send(cfg, messages)
+                messages.append(_assistant_feedback(r, feedback_shape))
+        except urllib.error.HTTPError as error:
+            # Admission refusal / server error: recorded (never retried); the
+            # terminal-accounting check reports it. A chain cannot continue.
+            body = error.read().decode("utf-8", "replace")[:400]
+            r = {"http_status": error.code, "http_error": body, "stream_error": f"HTTP {error.code}: {body}",
+                 "finish": None, "terminal_count": 0, "saw_done": False, "post_terminal_bytes": 0,
+                 "content": "", "reasoning_content": "", "assistant_content": "", "tool_calls": [], "gen": 0,
+                 "runaway": False, "empty": False, "attractor": False, "decode_tok_s": None, "ttft_s": None,
+                 "ctx": 0, "cached": 0, "think_words": 0, "ans_words": 0, "prefill_ms": None,
+                 "prefill_tok_s": None, "tau": None, "ans_preview": f"<<HTTP {error.code}>>"}
+            r.update(client=client, turn=turn, prompt_index=idx, genre=genre, prompt_md5=hashlib.md5(prompt.encode("utf-8")).hexdigest())
+            rows.append(r)
+            emit(client, genre, turn, r, "")
+            break
         recall = _annotate_turn(r, prompt, expected)
         r.update(client=client, turn=turn, prompt_index=idx, genre=genre)
         rows.append(r)
