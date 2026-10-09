@@ -833,6 +833,13 @@ max_tokens = {cfg.get("max_tokens", 16384)}
 [reasoning]
 budget = {json.dumps(cfg["thinking_budget"])}
 """
+    # `--thinking off` must disable thinking on every reasoning contract. The
+    # CLI ignores named budgets (including "off") on effort-native contracts
+    # (Qwen3.8 qwen_jinja: "use explicit max_think_tokens for cap"), so the
+    # budget alone left thinking open there; `reasoning.mode = "off"` is the
+    # contract-independent switch.
+    if cfg["thinking_budget"] == "off":
+        text += 'mode = "off"\n'
     effort = cfg.get("sampling", {}).get("reasoning_effort")
     if effort:
         text += f"effort = {json.dumps(effort)}\n"
