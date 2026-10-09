@@ -4025,18 +4025,26 @@ def _concurrent_terminal_failures(rows):
 def _concurrent_isolation_mismatches(cfg, rows):
     """Greedy isolation equality: every row equals the reference row for the
     same prompt (battery) or turn (chain). Reference = the lowest concurrency
-    level's client 0 (level 1 when requested)."""
+    level's client 0 (level 1 when requested).
+
+    Returns ``(mismatches, cache_divergent)``. A row whose server prompt-cache
+    reuse (`cached` tokens) differs from the reference ran a different prefill
+    (warm suffix vs cold), which is not a like-for-like greedy comparison; it
+    is reported separately, never counted as an isolation pass or failure."""
     ref_level = min(r["concurrency"] for r in rows)
     ref = {_concurrent_isolation_key(cfg, r): r for r in rows if r["concurrency"] == ref_level and r["client"] == 0}
-    out = []
+    out, divergent = [], []
     for r in rows:
         base = ref.get(_concurrent_isolation_key(cfg, r))
         if base is None or base is r:
             continue
         diff = [f for f in _CONCURRENT_ISOLATION_FIELDS if r.get(f) != base.get(f)]
-        if diff:
-            out.append(f"c{r['concurrency']}/client{r['client']}/turn{r['turn']} (prompt {r['prompt_index']}) differs in {diff}")
-    return out
+        tag = f"c{r['concurrency']}/client{r['client']}/turn{r['turn']} (prompt {r['prompt_index']})"
+        if r.get("cached") != base.get("cached"):
+            divergent.append(f"{tag} cached {base.get('cached')}->{r.get('cached')} outputs {'differ in ' + str(diff) if diff else 'equal'}")
+        elif diff:
+            out.append(f"{tag} differs in {diff}")
+    return out, divergent
 
 
 def _run_concurrent_clients(cfg, args, battery, feedback_shape):
@@ -4068,13 +4076,25 @@ def _run_concurrent_clients(cfg, args, battery, feedback_shape):
             flush=True,
         )
         rows.extend(level_rows)
+    def record():
+        if getattr(args, "out", None):
+            stamp_kv_backend_out_fields(rows, cfg)
+            json.dump(rows, open(args.out, "w"), indent=0)
     failures = _concurrent_terminal_failures(rows)
     if failures:
+        record()
         raise SystemExit("serve_harness: concurrent terminal accounting failed: " + "; ".join(failures[:16]))
     if greedy:
-        mismatches = _concurrent_isolation_mismatches(cfg, rows)
-        print(f"concurrent greedy isolation: {len(rows)} rows, mismatches={len(mismatches)}", flush=True)
+        mismatches, divergent = _concurrent_isolation_mismatches(cfg, rows)
+        print(
+            f"concurrent greedy isolation: {len(rows)} rows, mismatches={len(mismatches)} "
+            f"cache_divergent={len(divergent)} (not comparable)",
+            flush=True,
+        )
+        for line in divergent:
+            print(f"  cache-divergent: {line}", flush=True)
         if mismatches:
+            record()
             raise SystemExit("serve_harness: concurrent greedy isolation failed: " + "; ".join(mismatches[:16]))
     else:
         print("concurrent isolation equality: skipped (sampled; per-request outputs recorded)", flush=True)
@@ -4114,7 +4134,11 @@ def _self_test_concurrent_clients():
         assert _concurrent_terminal_failures(rows)
         rows[-1]["terminal_count"] = 1
         rows[-1]["content"] = "drift"
-        assert _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+        mism, div = _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+        assert mism and not div, (mism, div)
+        rows[-1]["cached"] = 7  # different prompt-cache reuse: not comparable
+        mism, div = _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+        assert not mism and div, (mism, div)
     finally:
         send = real_send
     print("self-test concurrent-clients: OK", flush=True)
