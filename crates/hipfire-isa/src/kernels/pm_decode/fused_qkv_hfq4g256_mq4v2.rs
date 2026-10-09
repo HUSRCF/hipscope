@@ -77,13 +77,12 @@ fn project_group(b: &mut Builder, stream: u8) -> Result<(), String> {
 /// Batch the quad's memory operations and interleave four independent dot
 /// chains. First-half x loads precede all second-half loads, so Builder can
 /// prove progressive waits instead of draining the counter for each group.
-/// Only one nibble per stream is live, keeping the production budget at 64 VGPRs.
+/// Retain all dequantized weights; reuse dead headers and packed words to fit 80 VGPRs.
 fn project_quad(b: &mut Builder) -> Result<(), String> {
     for stream in 0..4u8 {
         let offset = u32::from(stream) * 136;
         let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
         let header = 8 + stream * 2;
-        let packed = 4 + stream;
         if stream == 0 || stream == 3 {
             mem(b, format!("buffer_load_b64 v[{header}:{}], v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV", header + 1),
                 &[vr(header, 2)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
@@ -93,6 +92,11 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
             mem(b, format!("buffer_load_b32 v{}, v31, s[36:39], s40 offen offset:{} scope:SCOPE_DEV", header + 1, offset + 4),
                 &[v(header + 1)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
         }
+    }
+    for stream in 0..4u8 {
+        let offset = u32::from(stream) * 136;
+        let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+        let packed = 20 + stream;
         mem(b, format!("buffer_load_b32 v{packed}, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
             &[v(packed)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
     }
@@ -108,70 +112,80 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
     op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
     for stream in 0..4u8 {
         let header = 8 + stream * 2;
-        op(b, format!("v_cndmask_b32_e64 v{header}, v{}, v{header}, vcc_lo", header + 1),
-            &[v(header)], &[v(header), v(header + 1)])?;
+        op(b, format!("v_cndmask_b32_e64 v{}, v{}, v{header}, vcc_lo", 4 + stream, header + 1),
+            &[v(4 + stream)], &[v(header), v(header + 1)])?;
     }
-    // Even streams lead their odd partner by one term. This keeps both
-    // source banks distinct without changing either stream's dot DAG.
-    quad_weights(b, &[(0, 1), (2, 1)])?;
+    // Consume streams 2/3 before stream 1 reuses their packed registers.
+    // Stream 1's term 5 replaces its own packed word, so extract it last.
+    for stream in [2u8, 3, 0, 1] {
+        for term in [1u8, 0, 2, 3, 4, 6, 7, 5] {
+            let weight = quad_weight(stream, term);
+            let packed = 20 + stream;
+            let insn = match term {
+                0 => format!("v_and_b32_e32 v{weight}, 15, v{packed}"),
+                7 => format!("v_lshrrev_b32_e32 v{weight}, 28, v{packed}"),
+                _ => format!("v_bfe_u32 v{weight}, v{packed}, {}, 4", term * 4),
+            };
+            op(b, insn, &[v(weight)], &[v(packed)])?;
+        }
+    }
+    for term in 0..8u8 {
+        for stream in 0..4u8 {
+            let weight = quad_weight(stream, term);
+            op(b, format!("v_cvt_f32_ubyte0_e32 v{weight}, v{weight}"),
+                &[v(weight)], &[v(weight)])?;
+        }
+    }
+    for term in 0..8u8 {
+        for stream in 0..4u8 {
+            let weight = quad_weight(stream, term);
+            let header = 4 + stream;
+            op(b, format!("v_fma_mix_f32 v{weight}, v{header}, v{weight}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
+                &[v(weight)], &[v(header), v(weight)])?;
+        }
+    }
+    // All headers are now dead: their four registers become the lane dots.
     for stream in [0u8, 2] {
-        op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", 16 + stream, 20 + stream, 33 + stream * 8),
-            &[v(16 + stream)], &[v(20 + stream), v(33 + stream * 8)])?;
+        let weight = quad_weight(stream, 1);
+        op(b, format!("v_mul_f32_e32 v{}, v{weight}, v{}", 4 + stream, 33 + stream * 8),
+            &[v(4 + stream)], &[v(weight), v(33 + stream * 8)])?;
     }
+    // Even streams lead their odd partner by one term, preserving each
+    // dot's 1 -> 0 -> 2..7 chain while satisfying both VOPD source banks.
     for (lead, lag) in [(0u8, 1u8), (2, 0), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6)] {
-        quad_weights(b, &[(0, lead), (1, lag), (2, lead), (3, lag)])?;
         for stream in [0u8, 2] {
             use crate::vopd::{Operand, VopdF32, VopdOp};
-            // Nearest consumed mix packet is 3 VALU packets back for
-            // streams 0/1, then 2 back for 2/3 (including the first VOPD).
-            let distance = if stream == 0 { 3 } else { 2 };
-            op(b, format!("s_delay_alu instid0(VALU_DEP_{distance})"), &[], &[])?;
+            // The nearest consumed dot producer is two VALU packets back.
+            op(b, "s_delay_alu instid0(VALU_DEP_2)", &[], &[])?;
             b.vopd(
-                VopdOp { op: VopdF32::Fmac, dst: 16 + stream,
-                    src0: Operand::V(20 + stream), src1: 32 + stream * 8 + lead },
+                VopdOp { op: VopdF32::Fmac, dst: 4 + stream,
+                    src0: Operand::V(quad_weight(stream, lead)), src1: 32 + stream * 8 + lead },
                 VopdOp { op: if lag == 1 { VopdF32::Mul } else { VopdF32::Fmac },
-                    dst: 17 + stream, src0: Operand::V(21 + stream),
+                    dst: 5 + stream, src0: Operand::V(quad_weight(stream + 1, lag)),
                     src1: 40 + stream * 8 + lag },
             )?;
         }
     }
-    quad_weights(b, &[(1, 7), (3, 7)])?;
     for stream in [1u8, 3] {
-        op(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", 16 + stream, 20 + stream, 39 + stream * 8),
-            &[v(16 + stream)], &[v(16 + stream), v(20 + stream), v(39 + stream * 8)])?;
+        let weight = quad_weight(stream, 7);
+        op(b, format!("v_fmac_f32_e32 v{}, v{weight}, v{}", 4 + stream, 39 + stream * 8),
+            &[v(4 + stream)], &[v(4 + stream), v(weight), v(39 + stream * 8)])?;
     }
     for stream in [0u8, 2] {
         use crate::vopd::{Operand, VopdF32, VopdOp};
-        // The most recent consumed dot is two VALU packets back.
         op(b, "s_delay_alu instid0(VALU_DEP_2)", &[], &[])?;
         b.vopd(
             VopdOp { op: VopdF32::Add, dst: 26 + stream,
-                src0: Operand::V(26 + stream), src1: 16 + stream },
+                src0: Operand::V(26 + stream), src1: 4 + stream },
             VopdOp { op: VopdF32::Add, dst: 27 + stream,
-                src0: Operand::V(27 + stream), src1: 17 + stream },
+                src0: Operand::V(27 + stream), src1: 5 + stream },
         )?;
     }
     Ok(())
 }
 
-fn quad_weights(b: &mut Builder, terms: &[(u8, u8)]) -> Result<(), String> {
-    for &(stream, term) in terms {
-        let weight = 20 + stream;
-        op(b, format!("v_bfe_u32 v{weight}, v{}, {}, 4", 4 + stream, term * 4),
-            &[v(weight)], &[v(4 + stream)])?;
-    }
-    for &(stream, _) in terms {
-        let weight = 20 + stream;
-        op(b, format!("v_cvt_f32_ubyte0_e32 v{weight}, v{weight}"),
-            &[v(weight)], &[v(weight)])?;
-    }
-    for &(stream, _) in terms {
-        let weight = 20 + stream;
-        let header = 8 + stream * 2;
-        op(b, format!("v_fma_mix_f32 v{weight}, v{header}, v{weight}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
-            &[v(weight)], &[v(header), v(weight)])?;
-    }
-    Ok(())
+const fn quad_weight(stream: u8, term: u8) -> u8 {
+    [8, 16, 64, 72][stream as usize] + term
 }
 
 /// This is the incumbent shfl_down semantics, including out-of-range lanes
@@ -199,7 +213,7 @@ fn reduce_wave(b: &mut Builder) -> Result<(), String> {
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    let mut regs = RegPlan::new(64, 48)?;
+    let mut regs = RegPlan::new(80, 48)?;
     regs.add_range("workitem", Kind::V, 0, 1, Live::Whole)?;
     for base in 1..8 {
         regs.add_range(&format!("address_or_packed_{base}"), Kind::V, base, 1, Live::Whole)?;
@@ -207,7 +221,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     for base in [8, 16, 24] {
         regs.add_range(&format!("fragment_{base}"), Kind::V, base, 8, Live::Whole)?;
     }
-    for base in [32, 40, 48, 56] {
+    for base in [32, 40, 48, 56, 64, 72] {
         regs.add_range(&format!("quad_x_{base}"), Kind::V, base, 8, Live::Whole)?;
     }
     for (base, len) in [(0, 2), (4, 4), (8, 8), (16, 8), (24, 8), (32, 8), (40, 2)] {
@@ -388,7 +402,7 @@ mod tests {
         for stream in 0..4u8 {
             let mnemonic = if stream % 2 == 0 { "v_mul_f32_e32" } else { "v_dual_mul_f32" };
             assert!(quad.contains(&format!("{mnemonic} v{}, v{}, v{}",
-                16 + stream, 20 + stream, 33 + stream * 8)));
+                4 + stream, quad_weight(stream, 1), 33 + stream * 8)));
         }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../kernels/pm-decode/gfx1201");
