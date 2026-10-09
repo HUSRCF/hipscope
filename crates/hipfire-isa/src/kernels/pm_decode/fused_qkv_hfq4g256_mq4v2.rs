@@ -115,6 +115,11 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
         }
         Ok(())
     })?;
+    // Addresses are already issued. Keep this SCC live through the vector-only
+    // body so loop bookkeeping overlaps dequantization instead of its epilogue.
+    sop(b, "s_add_co_i32 s40, s40, 0x220", &[40], &[40])?;
+    sop(b, "s_sub_co_i32 s34, s34, 1", &[34], &[34])?;
+    sop(b, "s_cmp_lg_u32 s34, 0", &[], &[34])?;
     op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
     for stream in 0..4u8 {
         let header = 8 + stream * 2;
@@ -293,10 +298,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     op(&mut b, "s_cbranch_scc1 .Lqkv_tails", &[], &[])?;
     b.loop_(".Lqkv_quads", |b| {
         project_quad(b)?;
-        sop(b, "s_add_co_i32 s40, s40, 0x220", &[40], &[40])?;
         op(b, "v_add_nc_u32_e32 v2, 0x1000, v2", &[v(2)], &[v(2)])?;
-        sop(b, "s_sub_co_i32 s34, s34, 1", &[34], &[34])?;
-        sop(b, "s_cmp_lg_u32 s34, 0", &[], &[34])?;
         op(b, "s_cbranch_scc1 .Lqkv_quads", &[], &[])
     })?;
     b.label(".Lqkv_tails")?;
@@ -396,7 +398,7 @@ mod tests {
         assert_eq!(e.proof.loop_fixpoints.len(), 1);
         assert!(e.proof.lds_slots.is_empty());
         let quad = e.s_text.split(".Lqkv_quads:").nth(1).unwrap()
-            .split("s_add_co_i32 s40").next().unwrap();
+            .split("v_add_nc_u32_e32 v2, 0x1000, v2").next().unwrap();
         let issued_before_wait = quad.lines()
             .take_while(|line| !line.contains("s_wait_loadcnt"))
             .filter(|line| line.contains("buffer_load_") || line.contains("global_load_"))
@@ -406,6 +408,11 @@ mod tests {
         assert_eq!(quad.matches("s_delay_alu").count(), 16);
         assert_eq!(quad.lines().find(|line| line.contains("s_wait_loadcnt")).unwrap().trim(),
             "s_wait_loadcnt 0x11", "the oldest header needs only the first of 18 loads");
+        let live_scc = quad.split("s_cmp_lg_u32 s34, 0").nth(1).unwrap();
+        assert!(!live_scc.lines().any(|line| {
+            let op = line.trim();
+            op.starts_with("s_") && !op.starts_with("s_wait_") && !op.starts_with("s_delay_alu")
+        }), "early loop SCC must survive the quad body");
         for stream in 0..4u8 {
             let mnemonic = if stream % 2 == 0 { "v_mul_f32_e32" } else { "v_dual_mul_f32" };
             assert!(quad.contains(&format!("{mnemonic} v{}, v{}, v{}",
