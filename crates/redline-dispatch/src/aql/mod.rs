@@ -12,7 +12,7 @@ pub use generic::{AqlKernelCatalog, GenericAqlError, PreparedAqlPlan};
 pub use queue_policy::{QueuePolicy, QueuePolicyParseError};
 pub use redline_rocr::abi;
 pub use redline_rocr::{
-    AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CompletionSignal, Executable, FenceScope,
+    AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CodeObjectBytes, CompletionSignal, Executable, FenceScope,
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
     Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx11Pm4CommandBuffer, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuDevice, GpuSelector, HeaderPolicy,
