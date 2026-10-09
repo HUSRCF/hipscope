@@ -1035,6 +1035,36 @@ pub(crate) enum BatchEpilogue<'a> {
     Residual,
     Partial(&'a GpuTensor),
 }
+
+/// Arithmetic policy of the dense batched projection / FFN helpers.
+///
+/// `Product` is every pre-existing route: the prepared A8/IU4/FP8 producers,
+/// packed/fused quantized FFN, F1-lite and the in-place quantized FA gate and
+/// output arms stay admitted exactly as before. `SingletonWmma` runs only the
+/// F32 producers (AWQ + RMSNorm + FWHT, SwiGLU, sigmoid gate) and the explicit
+/// exact verify GEMMs (`Gpu::gemm_*_mq4g256v2_verify_exact`), whose per-output
+/// arithmetic is the singleton F16-input / f32-WMMA chain at any row count.
+/// It is MQ4G256V2-only: any other weight dtype, a `Partial` epilogue or a
+/// prepared/in-place producer request is a pre-mutation error, never a
+/// fallback to the quantized product arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DenseBatchMath {
+    Product,
+    SingletonWmma,
+}
+
+fn require_singleton_wmma_mq4v2(site: &str, dtypes: &[DType]) -> HipResult<()> {
+    if dtypes.iter().all(|d| *d == DType::MQ4G256V2) {
+        Ok(())
+    } else {
+        Err(HipError::new(
+            0,
+            &format!(
+                "{site}: SingletonWmma verify math requires dense MQ4G256V2 weights, got {dtypes:?}"
+            ),
+        ))
+    }
+}
 #[inline]
 fn zero_partial_for_residual(
     gpu: &mut Gpu,
@@ -1062,9 +1092,20 @@ fn dispatch_batched_gemm_epilogue(
     n: usize,
     q8_wmma_arch: bool,
     _arch_has_wmma: bool,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
     let m = w.m;
     let k = w.k;
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2("dispatch_batched_gemm_epilogue", &[w.gpu_dtype])?;
+        if !matches!(epilogue, BatchEpilogue::Residual) {
+            return Err(HipError::new(
+                0,
+                "dispatch_batched_gemm_epilogue: SingletonWmma verify math requires the Residual epilogue",
+            ));
+        }
+        return gpu.gemm_mq4g256v2_residual_verify_exact(&w.buf, input, &pbs.x_batch, m, k, n);
+    }
     let is_6bit = matches!(w.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let is_mq3_lloyd = matches!(w.gpu_dtype, DType::MQ3G256Lloyd);
     let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
@@ -5515,8 +5556,55 @@ fn batch_chunk_delta_net_input_projection(
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
     gdn: Option<&rdna_compute::F2GdnTargets<'_>>,
+    math: DenseBatchMath,
 ) -> HipResult<bool> {
     let _ = fusion;
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_delta_net_input_projection",
+            &[
+                layer.wqkv.gpu_dtype,
+                layer.wz.gpu_dtype,
+                layer.w_beta.gpu_dtype,
+                layer.w_alpha.gpu_dtype,
+            ],
+        )?;
+        if gdn.is_some() {
+            return Err(HipError::new(
+                0,
+                "batch_chunk_delta_net_input_projection: SingletonWmma verify math has no GDN chunk-scan targets",
+            ));
+        }
+        gpu.flush_residual_fold()?;
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wqkv,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        gpu.gemm_qkvza_mq4g256v2_verify_exact(
+            &layer.wqkv.buf,
+            &layer.wz.buf,
+            &layer.w_beta.buf,
+            &layer.w_alpha.buf,
+            &pbs.x_rot_batch,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_beta_batch,
+            &pbs.dn_alpha_batch,
+            layer.wqkv.m,
+            layer.wz.m,
+            layer.w_beta.m,
+            layer.w_alpha.m,
+            layer.wqkv.k,
+            n,
+        )?;
+        return Ok(false);
+    }
     // S3-f16-projection-inputs fast path: emit exact FP16 directly from the
     // RMSNorm+FWHT producer into `x_rot_f16_batch` and consume it with the
     // F16-direct qkvza GEMM. Saves the `convert_f32_to_f16` launch with
@@ -6484,7 +6572,49 @@ fn batch_chunk_delta_net_output_projection(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     x_fmt: GdnScanOut,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_delta_net_output_projection",
+            &[layer.wo.gpu_dtype],
+        )?;
+        if x_fmt != GdnScanOut::F32 || !matches!(&epilogue, BatchEpilogue::Residual) {
+            return Err(HipError::new(
+                0,
+                "batch_chunk_delta_net_output_projection: SingletonWmma verify math requires an F32 GDN scan plane and the Residual epilogue",
+            ));
+        }
+        gpu.gated_norm_f32_batched(
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            n,
+        )?;
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.dn_normed_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+        return dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            &pbs.dn_normed_rot_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+            math,
+        );
+    }
     if x_fmt != GdnScanOut::F32
         && gdn_out_reader(gpu, layer, config, n, n_v_heads, &epilogue, fusion)
             == GdnOutReader::F32Only
@@ -6713,6 +6843,7 @@ fn batch_chunk_delta_net_output_projection(
             n,
             q8_wmma_arch,
             arch_has_wmma,
+            math,
         )?;
     }
     Ok(())
@@ -6884,6 +7015,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         q8_wmma_arch,
         fusion,
         gdn_targets.as_ref(),
+        DenseBatchMath::Product,
     )?;
 
     if let Some((q, k, v, a, segment_rows, scan_out, kkt_batched)) = gdn_chunk_scan_views {
@@ -6970,6 +7102,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
             epilogue,
             fusion,
             scan_out,
+            DenseBatchMath::Product,
         )?;
         return Ok(());
     }
@@ -7202,6 +7335,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         epilogue,
         fusion,
         GdnScanOut::F32,
+        DenseBatchMath::Product,
     )?;
 
     Ok(())
@@ -7228,8 +7362,38 @@ fn batch_chunk_delta_net_ffn_gate_up(
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
     f1lite: bool,
+    math: DenseBatchMath,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_delta_net_ffn_gate_up",
+            &[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype],
+        )?;
+        gpu.flush_residual_fold()?;
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        gpu.gemm_gate_up_mq4g256v2_verify_exact(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
+        return Ok(FfnGateOutput::Separate);
+    }
     if try_packed_mq4_ffn_gate_up(
         gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
     )? {
@@ -7695,7 +7859,40 @@ fn batch_chunk_delta_net_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2("batch_chunk_delta_net_ffn_down", &[layer.w_down.gpu_dtype])?;
+        if h_source != FfnGateOutput::Separate
+            || !matches!(&epilogue, BatchEpilogue::Residual)
+            || layer.w_down.k != hidden_dim
+        {
+            return Err(HipError::new(
+                0,
+                "batch_chunk_delta_net_ffn_down: SingletonWmma verify math requires separate gate/up planes, the Residual epilogue and w_down.k == hidden_dim",
+            ));
+        }
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu,
+            &layer.w_down,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            &pbs.ffn_hidden_batch,
+            hidden_dim,
+            n,
+        )?;
+        return dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &pbs.ffn_hidden_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+            math,
+        );
+    }
     if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
         return Ok(());
     }
@@ -7879,6 +8076,7 @@ fn batch_chunk_delta_net_ffn_down(
             n,
             q8_wmma_arch,
             arch_has_wmma,
+            math,
         )?;
     }
     Ok(())
@@ -7896,6 +8094,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
     let f1lite = f1lite_ffn_eligible(
         gpu,
@@ -7917,6 +8116,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         q8_wmma_arch,
         fusion,
         f1lite,
+        math,
     )?;
 
     batch_chunk_delta_net_ffn_down(
@@ -7930,6 +8130,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         epilogue,
         fusion,
         h_source,
+        math,
     )?;
 
     Ok(())
@@ -7951,8 +8152,40 @@ fn batch_chunk_full_attn_input_projection(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
     let _ = fusion;
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_full_attn_input_projection",
+            &[layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype],
+        )?;
+        gpu.flush_residual_fold()?;
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wq,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        return gpu.gemm_qkv_mq4g256v2_verify_exact(
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        );
+    }
     // S3-f16-projection-inputs fast path: exact-FP16 FA qkv inputs. The
     // fused QKV kernel requires all three weights to share the MQ4G256V2
     // stride (same gate as `qkv_same_dtype` below, restricted to MQ4V2).
@@ -8673,7 +8906,40 @@ fn batch_chunk_full_attn_output_projection(
     // The out-projection's A4 slab, already written by the A4 attention
     // epilogue ([`batch_chunk_fa_attend_a4`]); `fa_attn_out_batch` was not.
     a4_epi: Option<rdna_compute::Int4MmqPrepared>,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_full_attn_output_projection",
+            &[layer.wo.gpu_dtype],
+        )?;
+        if fa_gate_in_place || a4_epi.is_some() || !matches!(&epilogue, BatchEpilogue::Residual) {
+            return Err(HipError::new(
+                0,
+                "batch_chunk_full_attn_output_projection: SingletonWmma verify math has no in-place gate/A4 epilogue and requires the Residual epilogue",
+            ));
+        }
+        gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_attn_out_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+        return dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            &pbs.fa_attn_out_rot_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+            math,
+        );
+    }
     if let Some(prep) = &a4_epi {
         return out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n);
     }
@@ -8859,6 +9125,7 @@ fn batch_chunk_full_attn_output_projection(
             n,
             q8_wmma_arch,
             arch_has_wmma,
+            math,
         )?;
     }
     Ok(())
@@ -9465,7 +9732,17 @@ pub(crate) fn batch_chunk_full_attn_attn(
     } else {
         None
     };
-    batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+    batch_chunk_full_attn_input_projection(
+        gpu,
+        layer,
+        config,
+        pbs,
+        n,
+        dim,
+        q8_wmma_arch,
+        fusion,
+        DenseBatchMath::Product,
+    )?;
 
     batch_chunk_full_attn_prepare(
         gpu,
@@ -9540,6 +9817,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         fusion,
         fa_gate_in_place,
         a4_epi,
+        DenseBatchMath::Product,
     )?;
 
     Ok(())
@@ -9566,8 +9844,38 @@ fn batch_chunk_full_attn_ffn_gate_up(
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
     f1lite: bool,
+    math: DenseBatchMath,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2(
+            "batch_chunk_full_attn_ffn_gate_up",
+            &[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype],
+        )?;
+        gpu.flush_residual_fold()?;
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        gpu.gemm_gate_up_mq4g256v2_verify_exact(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &pbs.x_rot_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
+        return Ok(FfnGateOutput::Separate);
+    }
     if try_packed_mq4_ffn_gate_up(
         gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
     )? {
@@ -10028,7 +10336,40 @@ fn batch_chunk_full_attn_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     h_source: FfnGateOutput,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma {
+        require_singleton_wmma_mq4v2("batch_chunk_full_attn_ffn_down", &[layer.w_down.gpu_dtype])?;
+        if h_source != FfnGateOutput::Separate
+            || !matches!(&epilogue, BatchEpilogue::Residual)
+            || layer.w_down.k != hidden_dim
+        {
+            return Err(HipError::new(
+                0,
+                "batch_chunk_full_attn_ffn_down: SingletonWmma verify math requires separate gate/up planes, the Residual epilogue and w_down.k == hidden_dim",
+            ));
+        }
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu,
+            &layer.w_down,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            &pbs.ffn_hidden_batch,
+            hidden_dim,
+            n,
+        )?;
+        return dispatch_batched_gemm_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &pbs.ffn_hidden_batch,
+            &epilogue,
+            n,
+            q8_wmma_arch,
+            arch_has_wmma,
+            math,
+        );
+    }
     if try_packed_mq4_down(gpu, &layer.w_down, pbs, hidden_dim, n, &epilogue, h_source)? {
         return Ok(());
     }
@@ -10202,6 +10543,7 @@ fn batch_chunk_full_attn_ffn_down(
             n,
             q8_wmma_arch,
             arch_has_wmma,
+            math,
         )?;
     }
     Ok(())
@@ -10219,6 +10561,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
     let f1lite = f1lite_ffn_eligible(
         gpu,
@@ -10240,6 +10583,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         q8_wmma_arch,
         fusion,
         f1lite,
+        math,
     )?;
     batch_chunk_full_attn_ffn_down(
         gpu,
@@ -10252,6 +10596,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         epilogue,
         fusion,
         h_source,
+        math,
     )?;
 
     Ok(())
@@ -12442,6 +12787,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                     dump_hidden_localize(
                         gpu,
@@ -12466,6 +12812,7 @@ fn forward_prefill_chunk_pair(
                         dim,
                         q8_wmma_arch,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_prepare(
                         gpu,
@@ -12497,6 +12844,7 @@ fn forward_prefill_chunk_pair(
                         dim,
                         q8_wmma_arch,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_prepare(
                         gpu,
@@ -12543,6 +12891,7 @@ fn forward_prefill_chunk_pair(
                         fusion,
                         false,
                         None,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -12556,6 +12905,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_output_projection(
                         gpu,
@@ -12568,6 +12918,7 @@ fn forward_prefill_chunk_pair(
                         fusion,
                         false,
                         None,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -12581,6 +12932,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                 } else {
                     batch_chunk_full_attn_attn(
@@ -12618,6 +12970,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                     batch_chunk_full_attn_attn(
                         gpu,
@@ -12654,6 +13007,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        DenseBatchMath::Product,
                     )?;
                 }
                 kv_layer_idx += 1;
@@ -13187,6 +13541,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
+                    DenseBatchMath::Product,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -13232,6 +13587,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
+                    DenseBatchMath::Product,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
