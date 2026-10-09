@@ -871,3 +871,7 @@ required-features = ["lab"]
 [[example]]
 name = "pm_xbatch_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "cb_rows_twins_gate"
+required-features = ["deltanet"]

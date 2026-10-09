@@ -1752,6 +1752,160 @@ pub fn is_vmm_batch_request_eligible(
     resolve_batch_sampling(msg, m).temp <= 0.0
 }
 
+/// Daemon: the VMM route serves this model (params parsed at load and
+/// `vmm_store` staged).
+pub fn vmm_route_active(vmm_batch: Option<VmmBatchParams>, m: &LoadedModel) -> bool {
+    vmm_batch.is_some() && m.qwen35().is_some_and(|b| b.vmm_store.is_some())
+}
+
+/// Daemon load: the loader's VMM staging request for the parsed
+/// `serve_vmm_batch` params. Route: `VmmRoute::Exact` (byte-identical to the
+/// singleton route) by default; the non-exact shared slots body only under
+/// the explicit `HIPFIRE_SERVE_BATCH_NONEXACT=1` opt-in (PLAN §4.3). An exact
+/// route the model does not support is not staged.
+pub fn vmm_staging_request(
+    vmm_batch: Option<VmmBatchParams>,
+) -> Option<hipfire_loader::batch_staging::VmmStagingRequest> {
+    use hipfire_arch_qwen35::forward_slots::vmm::VmmRoute;
+    vmm_batch.map(|p| hipfire_loader::batch_staging::VmmStagingRequest {
+        row_budget: p.max_batch_tokens,
+        route: if p.nonexact { VmmRoute::Nonexact } else { VmmRoute::Exact },
+    })
+}
+
+/// Daemon load ack: on the VMM batch route (`vmm_batch` Some) append the
+/// actual per-request owner receipt. Absent on every other route, so the
+/// flag-off ack is returned unchanged.
+pub fn vmm_loaded_ack(
+    ack: String,
+    m: &mut LoadedModel,
+    vmm_batch: Option<VmmBatchParams>,
+    slots: usize,
+    row_budget: usize,
+) -> String {
+    let Some(p) = vmm_batch else {
+        return ack;
+    };
+    let receipt = m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()).map(|s| s.receipt());
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
+        return ack;
+    };
+    v["continuous_batch_route"] = serde_json::json!("vmm");
+    v["continuous_batch_slots"] = serde_json::json!(slots);
+    v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
+    v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
+    v["continuous_batch_spec"] = serde_json::json!(false);
+    v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
+    let exact = m.qwen35().and_then(|b| b.vmm_store.as_ref()).is_some_and(|s| {
+        s.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+    });
+    v["continuous_batch_nonexact"] = serde_json::json!(!exact);
+    v["continuous_batch_exact"] = serde_json::json!(exact);
+    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    match receipt {
+        Some(Ok(r)) => {
+            v["vmm_batch_kv_backend"] = serde_json::json!(r.kv_backend);
+            v["vmm_batch_kv_mode"] = serde_json::json!(r.kv_mode);
+            v["vmm_batch_max_seq_bound"] = serde_json::json!(r.max_seq_bound);
+            v["vmm_batch_mapped_bytes"] = serde_json::json!(r.mapped_bytes);
+        }
+        Some(Err(e)) => {
+            v["vmm_batch_receipt_error"] = serde_json::json!(e);
+        }
+        None => {}
+    }
+    v.to_string()
+}
+
+/// Daemon: batch admission for a staged scheduler. On the VMM route
+/// (`vmm_route`) only when another batched generate is already waiting — a
+/// lonely request keeps the unchanged singleton route (exact singleton
+/// arithmetic/spec); otherwise the fixed-lane predicate.
+pub fn batch_request_eligible_for_route(
+    vmm_route: bool,
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    continuous_batch_size: usize,
+    serve_continuous_batch: bool,
+    pflash_active: bool,
+    inbox: &mut DaemonInbox,
+) -> bool {
+    if vmm_route {
+        is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
+            && inbox.has_pending_batch_generate()
+    } else {
+        is_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
+    }
+}
+
+/// Daemon: drive the staged batch scheduler — the VMM driver when
+/// `vmm_batch` is Some, else the fixed-lane Qwen driver.
+pub fn drive_staged_continuous_batch(
+    sched: &mut ContinuousBatchScheduler,
+    gpu: &mut rdna_compute::Gpu,
+    m: &mut LoadedModel,
+    vmm_batch: Option<VmmBatchParams>,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<(), BatchDriveError> {
+    match vmm_batch {
+        Some(params) => drive_qwen_vmm_continuous_batch(sched, gpu, m, params, stdout, inbox, None),
+        None => drive_qwen_continuous_batch(sched, gpu, m, stdout, inbox),
+    }
+}
+
+/// Daemon, right before a singleton `generate()`: grant promotion when the
+/// request could have joined the VMM batch (`armed` = VMM route active and a
+/// scheduler staged, and the request VMM-eligible), else clear it. The
+/// request may then promote itself into the batch driver at a token boundary
+/// if a batched peer arrives while it runs (closes the C1→C2 TTFT gap).
+#[allow(clippy::too_many_arguments)]
+pub fn arm_promotion(
+    armed: bool,
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    continuous_batch_size: usize,
+    serve_continuous_batch: bool,
+    pflash_active: bool,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    client_seed: Option<u64>,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+) {
+    let permit = (armed
+        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active))
+    .then(|| PromotionPermit {
+        original_msg: msg.clone(),
+        sampling: resolve_batch_sampling(msg, m),
+        max_tokens,
+        max_think_tokens,
+        client_seed,
+        assistant_prefix,
+    });
+    set_promotion_permit(permit);
+}
+
+/// Daemon, right after a singleton `generate()`: clear the permit and, if the
+/// request promoted itself, drive it in the VMM batch driver. None when it
+/// did not promote.
+pub fn drive_promoted(
+    sched: Option<&mut ContinuousBatchScheduler>,
+    gpu: &mut rdna_compute::Gpu,
+    m: &mut LoadedModel,
+    vmm_batch: Option<VmmBatchParams>,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Option<Result<(), BatchDriveError>> {
+    set_promotion_permit(None);
+    let promoted = take_promoted()?;
+    Some(match (sched, vmm_batch) {
+        (Some(sched), Some(params)) => {
+            drive_qwen_vmm_continuous_batch(sched, gpu, m, params, stdout, inbox, Some(promoted))
+        }
+        _ => Err(BatchDriveError::Gpu("promoted request without a staged VMM batch route".into())),
+    })
+}
+
 pub fn drive_qwen_vmm_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut rdna_compute::Gpu,

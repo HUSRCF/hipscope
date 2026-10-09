@@ -287,3 +287,17 @@ mod tests {
         needs_delta_net_ops::<()>();
     }
 }
+
+/// Batched sigmoid(beta) / alpha-gate prep over `batch_size` rows
+/// (`Gpu::fused_sigmoid_alpha_gate_f32_batched`), forwarded unchanged.
+pub fn sigmoid_alpha_gate_batched(
+    gpu: &mut Gpu,
+    beta: &GpuTensor,
+    alpha: &GpuTensor,
+    dt_bias: &GpuTensor,
+    a_log: &GpuTensor,
+    n: usize,
+    batch_size: usize,
+) -> hip_bridge::HipResult<()> {
+    gpu.fused_sigmoid_alpha_gate_f32_batched(beta, alpha, dt_bias, a_log, n, batch_size)
+}

@@ -16,3 +16,12 @@ description = "saddle — target-agnostic model composition: grammar, KV, capabi
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+# Archived research probes; gated so default builds do not compile them.
+# Run on demand:  cargo build -p saddle-core --examples --features lab
+[features]
+lab = []
+
+[[example]]
+name = "cb_vmm_addressing_g1"
+required-features = ["lab"]

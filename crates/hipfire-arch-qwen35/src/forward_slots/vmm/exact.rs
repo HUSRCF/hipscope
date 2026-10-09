@@ -31,6 +31,7 @@ use crate::qwen35::forward::{
 use crate::qwen35::{LayerWeights, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::ops::{delta_net, pm_xbatch};
 use hipfire_dispatch::families::gemv::RotateInputs;
 use hipfire_dispatch::pipeline::superop::{dispatch_super_op, SuperOpKind};
 use hipfire_runtime::llama::{fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, WeightTensor};
@@ -111,7 +112,8 @@ fn batched_proj(
     fused_rmsnorm_rotate_mq_batched_for(gpu, &p.x_batch, norm, ws[0].0, &p.x_rot_batch, config.dim, config.norm_eps, n)?;
     for (w, y) in ws {
         for (b0, nb) in xbatch_chunks(n) {
-            gpu.gemv_mq4g256v2_xbatch_pm(
+            pm_xbatch::plain(
+                gpu,
                 &w.buf,
                 &p.x_rot_batch.sub_offset(b0 * w.k, nb * w.k),
                 &y.sub_offset(b0 * w.m, nb * w.m),
@@ -265,7 +267,8 @@ fn batched_residual(gpu: &mut Gpu, st: &Qwen35VmmStore, layer: &LayerWeights, or
     let (w, stage) = residual_target(st, layer, ordinal)?;
     let x_batch = &st.pbs.x_batch;
     for (b0, nb) in xbatch_chunks(n) {
-        gpu.gemv_mq4g256v2_residual_xbatch(
+        pm_xbatch::residual(
+            gpu,
             &w.buf,
             &stage.sub_offset(b0 * w.k, nb * w.k),
             &x_batch.sub_offset(b0 * w.m, nb * w.m),
@@ -593,7 +596,8 @@ pub(super) fn decode(
                 _ => false,
             };
             if let (true, LayerWeights::DeltaNet(l)) = (split_dn_prep, layer) {
-                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                delta_net::sigmoid_alpha_gate_batched(
+                    gpu,
                     &st.pbs.dn_beta_batch,
                     &st.pbs.dn_alpha_batch,
                     &l.dt_bias,
@@ -736,7 +740,8 @@ pub(super) fn decode(
             while r1 < n && r1 - r0 < PM_XBATCH_MAX && rows[r1].0 == rows[r1 - 1].0 + 1 {
                 r1 += 1;
             }
-            gpu.gemv_mq4g256v2_multirow_r2_xbatch_pm(
+            pm_xbatch::multirow_r2(
+                gpu,
                 &out.buf,
                 &st.pbs.x_rot_batch.sub_offset(r0 * dim, (r1 - r0) * dim),
                 &st.logits.sub_offset(rows[r0].0 * vocab, (r1 - r0) * vocab),

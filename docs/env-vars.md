@@ -567,7 +567,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1452
+**Count:** 1456
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -681,8 +681,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CONV_QKNORM_SHAPE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_CONV_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_CPU_EXEC_TRACE` | crates/hipfire-dispatch/src/cpu_exec.rs, docs/perf-checkpoints/data-2026-09-27-cpu-exec-mq3-avx2/cpu_exec_ab.sh | developer |
-| `HIPFIRE_CQN_BLOCK` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_CQN_BLOCK` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
+| `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_SCALAR_PREP` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_CQ_SESSION_BUDGET_BYTES` | crates/hipfire-arch-qwen4/src/cache_quality.rs | developer |
 | `HIPFIRE_DAEMON` | scripts/test_pr228_spiral_check.sh | harness |
@@ -1841,6 +1841,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROUTER_EXACT_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROUTE_ORACLE_KV_B` | crates/hipfire-arch-qwen35/tests/route_oracle_single.rs | harness |
+| `HIPFIRE_ROWS_CQN` | crates/rdna-compute/src/rows_batched.rs | developer |
+| `HIPFIRE_ROWS_FA_PREP` | crates/rdna-compute/src/rows_batched.rs | developer |
+| `HIPFIRE_ROWS_GATED_NORM` | crates/rdna-compute/src/rows_batched.rs | developer |
+| `HIPFIRE_ROWS_GDN` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_OFF` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_ON` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SAMPLED_MTP_ARM` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
