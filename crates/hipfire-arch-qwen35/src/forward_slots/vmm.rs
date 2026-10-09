@@ -20,8 +20,9 @@
 // never enters this route (it runs the unchanged singleton route, G2); a
 // batch that drains to one live request may finish it here (tail steps).
 //
-// Stage-1 scope: AR and Prefill rows, greedy target picks (one argmax per
-// request's last row). Verify/Forced rows are slice-2 work and are refused
+// Stage-1 scope: AR and Prefill rows; one pick per request's last head row
+// through the singleton route's own `sampler::sample` with that request's
+// config/history/RNG. Verify/Forced rows are slice-2 work and are refused
 // at provision, never silently treated as AR. VL rows (pos3/ext_emb) are
 // refused. Native fp8 (gfx1201 default) and Q8 KV have `_vmm` kernels;
 // every other KV mode is refused rather than routed to a legacy arena.
@@ -40,8 +41,9 @@ use hipfire_runtime::llama::{EmbeddingFormat, KvCache, KvCacheExt, KvDims, KvLay
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestStepKind, StepOutput,
 };
-use rdna_compute::attention::{VmmKvFormat, VmmKvSide};
+use rdna_compute::attention::{VmmFlashDecodePlan, VmmKvFormat, VmmKvSide};
 use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
+use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// One FullAttention layer's per-request VMM addressing for a step.
@@ -51,6 +53,10 @@ pub struct VmmLayerKv<'a> {
     pub descs: &'a GpuTensor,
     /// Device `[rows]` i32 row → slot map.
     pub row_slot: &'a GpuTensor,
+    /// Row-batched flash decode plan (tile size of the singleton route for
+    /// this model bound) and its `[rows × partial_floats_per_row]` partials.
+    pub flash: &'a VmmFlashDecodePlan,
+    pub partials: &'a GpuTensor,
 }
 
 /// KV write (K and V) and causal attend over independent request owners.
@@ -59,9 +65,7 @@ pub(super) fn vmm_kv_write_attend(
     config: &Qwen35Config,
     layer: &VmmLayerKv,
     pbs: &PrefillBatchScratch,
-    _s: &Qwen35Scratch,
     n: usize,
-    max_ctx_len: usize,
 ) -> HipResult<()> {
     for (side, src) in [(VmmKvSide::K, &pbs.fa_k_batch), (VmmKvSide::V, &pbs.fa_v_batch)] {
         gpu.kv_cache_write_batched_vmm(
@@ -76,16 +80,18 @@ pub(super) fn vmm_kv_write_attend(
             layer.row_slot,
         )?;
     }
-    gpu.attention_kv_batched_vmm(
-        layer.format,
+    // Row-batched flash decode: bitwise the singleton flash decode per row,
+    // causal over each row's own absolute position, no LDS context cap.
+    gpu.attention_flash_decode_vmm(
+        layer.flash,
         &pbs.fa_q_batch,
         &pbs.fa_attn_out_batch,
         &pbs.positions,
         config.n_heads,
         config.n_kv_heads,
         config.head_dim,
-        max_ctx_len,
         n,
+        layer.partials,
         layer.descs,
         layer.row_slot,
     )
@@ -123,6 +129,23 @@ pub struct Qwen35RequestState {
     pub prompt_len: usize,
     /// Ids that finish the request with `finish = Some("stop")`.
     pub stop_ids: Vec<u32>,
+    /// The singleton route's sampler config for this request. The driver
+    /// may update policy fields (e.g. blocked tokens) between steps.
+    pub sampler: SamplerConfig,
+    /// RNG state, advanced only by a committed pick.
+    pub rng_state: u32,
+    /// Penalty history (the singleton route's sampling scope). The executor
+    /// appends every committed id.
+    pub history: Vec<u32>,
+}
+
+/// Admission inputs of one request, as the singleton route would hold them.
+pub struct VmmRequestInit {
+    pub prompt_len: usize,
+    pub stop_ids: Vec<u32>,
+    pub sampler: SamplerConfig,
+    pub rng_state: u32,
+    pub history: Vec<u32>,
 }
 
 /// Mapped-prefix bytes of one owner (mapped token capacity × K+V stride ×
@@ -149,8 +172,7 @@ impl Qwen35RequestState {
         template_dn: &DeltaNetState,
         epoch: RequestEpoch,
         slot: usize,
-        prompt_len: usize,
-        stop_ids: Vec<u32>,
+        init: VmmRequestInit,
     ) -> Result<Self, String> {
         let format = vmm_format_of(template_kv)?;
         let is_kv_layer: Vec<bool> = config
@@ -187,8 +209,11 @@ impl Qwen35RequestState {
             position: 0,
             pending_seed: None,
             poisoned: false,
-            prompt_len,
-            stop_ids,
+            prompt_len: init.prompt_len,
+            stop_ids: init.stop_ids,
+            sampler: init.sampler,
+            rng_state: init.rng_state,
+            history: init.history,
         })
     }
 
@@ -262,7 +287,9 @@ pub struct Qwen35VmmStore {
     descs_dev: Vec<GpuTensor>,
     descs_host: Vec<VmmKvSlotDesc>,
     row_slot_dev: GpuTensor,
-    picks_dev: GpuTensor,
+    flash_partials: GpuTensor,
+    /// Model-resolved max_seq: fixes the flash tile size to the singleton's.
+    model_max_seq: usize,
     logits: GpuTensor,
     pbs: PrefillBatchScratch,
     phase: Phase,
@@ -271,6 +298,8 @@ pub struct Qwen35VmmStore {
     row_gen: Vec<u64>,
     row_slot_host: Vec<i32>,
     skip: Vec<bool>,
+    /// RNG states produced by the forwarded step, published by commit.
+    pending_rng: Vec<(RequestEpoch, u32)>,
     /// Resolved logical context bound shared by every request owner.
     max_seq_bound: usize,
     mapped_high_water: usize,
@@ -312,17 +341,29 @@ impl Qwen35VmmStore {
             .filter(|(_, t)| **t == LayerType::FullAttention)
             .map(|(i, _)| i)
             .collect();
+        // Size flash partials for the worst step: every row at the bound.
+        let worst = gpu
+            .vmm_flash_decode_plan(
+                format,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                template_kv.max_seq,
+                template_kv.vmm_logical_bound(),
+            )
+            .map_err(|e| format!("VMM executor: {e}"))?;
         let result = (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor)> {
             let mut descs = Vec::with_capacity(kv_layer_ids.len());
             for _ in &kv_layer_ids {
                 descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
             }
             let row_slot = gpu.zeros(&[row_budget * 4], DType::Raw)?;
-            let picks = gpu.zeros(&[max_slots * 4], DType::Raw)?;
+            let partials =
+                gpu.zeros(&[row_budget * worst.partial_floats_per_row], DType::F32)?;
             let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
-            Ok((descs, row_slot, picks, logits))
+            Ok((descs, row_slot, partials, logits))
         })();
-        let (descs_dev, row_slot_dev, picks_dev, logits) =
+        let (descs_dev, row_slot_dev, flash_partials, logits) =
             result.map_err(|e| format!("VMM executor scratch: {e}"))?;
         // Plain trunk rows only: no GDN S-tape (that is a verify/tree cost).
         let pbs = match PrefillBatchScratch::new_opt(gpu, config, row_budget, false) {
@@ -332,7 +373,7 @@ impl Qwen35VmmStore {
                     let _ = gpu.free_tensor(t);
                 }
                 let _ = gpu.free_tensor(row_slot_dev);
-                let _ = gpu.free_tensor(picks_dev);
+                let _ = gpu.free_tensor(flash_partials);
                 let _ = gpu.free_tensor(logits);
                 return Err(format!("VMM executor pbs: {e}"));
             }
@@ -347,7 +388,8 @@ impl Qwen35VmmStore {
             descs_dev,
             descs_host: vec![VmmKvSlotDesc::MASKED; n_kv * max_slots],
             row_slot_dev,
-            picks_dev,
+            flash_partials,
+            model_max_seq: template_kv.max_seq,
             logits,
             pbs,
             phase: Phase::Idle,
@@ -355,6 +397,7 @@ impl Qwen35VmmStore {
             row_gen: Vec::with_capacity(row_budget),
             row_slot_host: Vec::with_capacity(row_budget),
             skip: vec![false; max_slots],
+            pending_rng: Vec::with_capacity(max_slots),
             max_seq_bound: template_kv.vmm_logical_bound(),
             mapped_high_water: 0,
             kv_budget_bytes,
@@ -512,7 +555,7 @@ impl Qwen35VmmStore {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.free_tensor(self.row_slot_dev);
-        let _ = gpu.free_tensor(self.picks_dev);
+        let _ = gpu.free_tensor(self.flash_partials);
         let _ = gpu.free_tensor(self.logits);
         if let Err(e) = self.pbs.free_gpu(gpu) {
             first.get_or_insert(e.to_string());
@@ -766,6 +809,18 @@ impl Qwen35VmmExecutor<'_> {
         let dn = DnTable(dn);
         let max_ctx_len = (b.positions.iter().copied().max().unwrap_or(0) as usize + 1).max(1);
         let format = st.format;
+        let flash = gpu.vmm_flash_decode_plan(
+            format,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            st.model_max_seq,
+            max_ctx_len,
+        )?;
+        if flash.partial_floats_per_row * n > st.flash_partials.numel() {
+            return Err(HipError::new(0, "VMM executor: flash partials undersized for this step"));
+        }
+        let partials = &st.flash_partials;
         let descs_dev = &st.descs_dev;
         let row_slot_dev = &st.row_slot_dev;
         let tier = SlotKvTier {
@@ -787,6 +842,8 @@ impl Qwen35VmmExecutor<'_> {
                     format,
                     descs: &descs_dev[kv_layer_idx],
                     row_slot: row_slot_dev,
+                    flash: &flash,
+                    partials,
                 })
             },
             &tier,
@@ -801,8 +858,9 @@ impl Qwen35VmmExecutor<'_> {
             None,
         )?;
 
-        // Head only for AR rows: a prefill chunk's last-row logits are
-        // discarded work that re-reads the whole lm_head.
+        // Head only for rows that pick: AR rows and the chunk completing a
+        // prompt. Other prefill chunks' last-row logits would be discarded
+        // work that re-reads the whole lm_head.
         st.skip.clear();
         st.skip.resize(n_slots, true);
         for r in &plan.requests {
@@ -817,18 +875,40 @@ impl Qwen35VmmExecutor<'_> {
             return Ok(picks);
         }
         final_logits_per_slot(gpu, weights, config, b, &st.pbs, s, &st.logits, &st.skip)?;
-        gpu.argmax_f32_batched(&st.logits, &st.picks_dev, config.vocab_size, n_slots)?;
-        let mut raw = vec![0u8; n_slots * 4];
-        gpu.hip.memcpy_dtoh(&mut raw, &st.picks_dev.buf)?;
+        // Pick with the singleton route's own sampler (`sampler::sample`:
+        // same kernel, same scratch window cap, same penalty/blocked-token
+        // order) on each request's logits row, its own history/config and a
+        // COPY of its RNG; the advanced RNG is published only by commit.
+        st.pending_rng.clear();
         for r in &plan.requests {
-            if st.wants_head(r) {
-                let slot = b.row_slot[r.rows.begin] as usize;
-                let id = i32::from_ne_bytes(raw[slot * 4..slot * 4 + 4].try_into().unwrap());
-                if id < 0 || id as usize >= config.vocab_size {
-                    return Err(HipError::new(0, &format!("VMM executor: argmax {id} out of vocab")));
-                }
-                picks[r.rows.begin + r.rows.len - 1] = id as u32;
+            if !st.wants_head(r) {
+                continue;
             }
+            let state = st
+                .slots
+                .iter()
+                .flatten()
+                .find(|x| x.epoch == r.epoch)
+                .expect("provisioned epoch");
+            let view = st
+                .logits
+                .sub_offset(state.slot * config.vocab_size, config.vocab_size);
+            let mut rng = state.rng_state;
+            let id = hipfire_runtime::sampler::sample(
+                gpu,
+                &view,
+                &s.sample_buf,
+                &s.repeat_buf,
+                config.vocab_size,
+                &state.history,
+                &state.sampler,
+                &mut rng,
+            );
+            if id as usize >= config.vocab_size {
+                return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
+            }
+            picks[r.rows.begin + r.rows.len - 1] = id;
+            st.pending_rng.push((r.epoch, rng));
         }
         Ok(picks)
     }
@@ -875,6 +955,10 @@ impl Qwen35VmmExecutor<'_> {
             if head {
                 let id = output.target_picks[r.rows.begin + r.rows.len - 1];
                 s.pending_seed = Some(id);
+                s.history.push(id);
+                if let Some(&(_, rng)) = st.pending_rng.iter().find(|(e, _)| *e == r.epoch) {
+                    s.rng_state = rng;
+                }
                 let finish = if s.stop_ids.contains(&id) {
                     Some("stop".to_string())
                 } else if s.position >= s.kv.vmm_logical_bound() {

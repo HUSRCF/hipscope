@@ -438,7 +438,7 @@ fn layer_kv_write_attend(
             )
         }
         LayerKvAddr::Vmm(layer) => {
-            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, s, n, max_ctx_len)
+            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n)
         }
     }
 }
