@@ -4,7 +4,7 @@
 //!
 //! cb_vmm_state_oracle <model> --ks 1,2,3,4,5,6,7,8 --contexts 512,8192,32768
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
-//!     [--phase all|singleton]
+//!     [--phase all|singleton] [--stop-repeats N]
 //!
 //! `--contexts` are test prefix lengths, never max_seq overrides: the model
 //! loads through the production `load_qwen35_bundle` with automatic VMM
@@ -64,6 +64,8 @@ struct Args {
     artifacts: PathBuf,
     /// Run the executor batch phase after the singleton phase.
     batch: bool,
+    /// In-process repetitions of the stop_id case (repeatability check).
+    stop_repeats: usize,
 }
 
 fn parse_list(s: &str) -> Result<Vec<usize>> {
@@ -81,8 +83,9 @@ fn parse_args() -> Result<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: cb_vmm_state_oracle <model> --ks 1,..,8 --contexts 512,8192,32768 \
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
-                 [--phase all|singleton]";
+                 [--phase all|singleton] [--stop-repeats N]";
     let mut batch = true;
+    let mut stop_repeats = 1usize;
     let model = raw.first().ok_or(usage)?.clone();
     let (mut ks, mut contexts, mut steps, mut out, mut short, mut artifacts) =
         (None, None, None, None, 256usize, None);
@@ -96,6 +99,7 @@ fn parse_args() -> Result<Args> {
             "--out" => out = Some(PathBuf::from(val)),
             "--short" => short = val.parse()?,
             "--artifacts" => artifacts = Some(PathBuf::from(val)),
+            "--stop-repeats" => stop_repeats = val.parse::<usize>()?.max(1),
             "--phase" => {
                 batch = match val.as_str() {
                     "all" => true,
@@ -123,7 +127,7 @@ fn parse_args() -> Result<Args> {
     if steps < 8 {
         return Err("--steps must be >= 8 (negative controls need 8 steps)".into());
     }
-    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch })
+    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats })
 }
 
 /// One isolated request fixture: request-unique prompt at an exact length.
@@ -741,16 +745,15 @@ fn new_store(ctx: &mut Ctx) -> Result<Qwen35VmmStore> {
     if let Some(pbs) = ctx.b.scratch.widened_prefill_batch.borrow_mut().take() {
         pbs.free_gpu(&mut ctx.gpu)?;
     }
-    // Row budget: every decode row plus one prefill chunk at the singleton's
-    // current admitted ceiling (the store's own allocation only lowers it).
-    let b = &ctx.b;
-    let ceiling = qwen35::ordinary_prefill_chunk_limit(&ctx.gpu, &b.weights, &b.config, &b.dn_state, &b.kv_cache, None)?;
-    // Shared physical KV budget: free VRAM minus a 6 GiB margin for the
-    // store's row scratch, per-request DeltaNet state and transients. This
-    // is an admission budget, not a max_seq override.
-    let budget = free_vram(&ctx.gpu)?.saturating_sub(6 << 30);
-    eprintln!("batch store: route=Exact width={WIDTH} row_budget={} (prefill ceiling {ceiling})", WIDTH + ceiling);
-    Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH + ceiling, budget, VmmRoute::Exact)?)
+    // Exact route: prefill rows run on the singleton prefill and do not count
+    // against the trunk row budget, so the budget is the decode width.
+    // Shared physical KV budget: free VRAM minus a 6 GiB margin for
+    // per-request DeltaNet state and transients. This is an admission
+    // budget, not a max_seq override.
+    let free = free_vram(&ctx.gpu)?;
+    let budget = free.saturating_sub(6 << 30);
+    eprintln!("batch store: route=Exact width={WIDTH} row_budget={WIDTH} free_vram={free} kv_budget={budget}");
+    Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH, budget, VmmRoute::Exact)?)
 }
 
 fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> Result<()> {
@@ -1158,14 +1161,21 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
         let picks: Vec<u32> = t.committed.iter().copied().chain([t.pending_seed]).collect();
         let stop = picks[5];
         let stop_at = picks.iter().position(|&p| p == stop).unwrap() + 1;
-        let mut a = Req::new(s0, 9001, 1, 2, steps + 1, compare_sink(s0));
-        a.stop = Some(stop);
-        let b = Req::new(s1, 9002, 1, 5, steps + 1, compare_sink(s1));
-        run_case(ctx, &mut store, "stop_id".into(), vec![a, b], false, &mut cases, &mut pass)?;
-        let got = cases.last().unwrap()["requests"][0].clone();
-        let ok = got["finish"] == json!("stop") && got["committed"] == json!(stop_at);
-        eprintln!("batch stop_id: finish={} committed={} expected {stop_at} -> {}", got["finish"], got["committed"], if ok { "OK" } else { "FAIL" });
-        pass &= ok;
+        // Repeated in this process (`--stop-repeats`): retire of a stopped
+        // request while its peer is mid-prefill must reproduce every time.
+        for rep in 0..args.stop_repeats {
+            let tag = 9001 + 10 * rep as u64;
+            let mut a = Req::new(s0, tag, 1, 2, steps + 1, compare_sink(s0));
+            a.stop = Some(stop);
+            let b = Req::new(s1, tag + 1, 1, 5, steps + 1, compare_sink(s1));
+            let name = if rep == 0 { "stop_id".to_string() } else { format!("stop_id_rep{rep}") };
+            eprintln!("batch {name}: free_vram before={}", free_vram(&ctx.gpu)?);
+            run_case(ctx, &mut store, name.clone(), vec![a, b], false, &mut cases, &mut pass)?;
+            let got = cases.last().unwrap()["requests"][0].clone();
+            let ok = got["finish"] == json!("stop") && got["committed"] == json!(stop_at);
+            eprintln!("batch {name}: finish={} committed={} expected {stop_at} -> {}", got["finish"], got["committed"], if ok { "OK" } else { "FAIL" });
+            pass &= ok;
+        }
         // Cancel mid-stream: the survivor must stay byte-exact.
         let mut a = Req::new(s0, 9101, 1, 0, steps + 1, compare_sink(s0));
         a.cancel_at = Some(9);
