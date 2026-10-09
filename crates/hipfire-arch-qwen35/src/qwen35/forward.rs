@@ -7115,7 +7115,7 @@ pub(crate) fn gated_norm_mq_rotate_enabled(
 /// path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
-fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE")
@@ -7145,7 +7145,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
-fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
+pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")

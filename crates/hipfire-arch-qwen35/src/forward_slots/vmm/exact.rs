@@ -24,7 +24,10 @@
 
 use super::{Qwen35RequestState, Qwen35VmmStore, RequestStepKind};
 use crate::forward_slots::final_logits_per_slot;
-use crate::qwen35::forward::{gated_norm_mq_rotate_enabled, lower_variant, variant_of, Qwen35Bindings};
+use crate::qwen35::forward::{
+    gated_norm_mq_rotate_enabled, lower_variant, qwen35_fa_epilogue_enabled, qwen35_fa_prep_enabled, variant_of,
+    Qwen35Bindings,
+};
 use crate::qwen35::{LayerWeights, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
@@ -176,6 +179,8 @@ impl RowScratch {
             std::ptr::write(&mut v.gate_ffn, row(&p.gate_ffn_batch, hidden));
             std::ptr::write(&mut v.up, row(&p.up_batch, hidden));
             std::ptr::write(&mut v.fa_attn_out, row(&p.fa_attn_out_batch, q_full / 2));
+            std::ptr::write(&mut v.fa_q, row(&p.fa_q_batch, q_full / 2));
+            std::ptr::write(&mut v.fa_gate, row(&p.fa_gate_batch, q_full / 2));
             std::ptr::write(&mut v.pos_buf, p.positions.sub_offset(r, 1).buf);
             Self(v)
         }
@@ -205,6 +210,8 @@ impl Drop for RowScratch {
             std::ptr::drop_in_place(&mut self.0.gate_ffn);
             std::ptr::drop_in_place(&mut self.0.up);
             std::ptr::drop_in_place(&mut self.0.fa_attn_out);
+            std::ptr::drop_in_place(&mut self.0.fa_q);
+            std::ptr::drop_in_place(&mut self.0.fa_gate);
             std::ptr::drop_in_place(&mut self.0.pos_buf);
         }
     }
@@ -304,6 +311,11 @@ pub(super) fn decode(
     gpu.hip.memcpy_htod(&st.pbs.positions.buf, &pos_bytes)?;
     gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
     let row_scratch: Vec<RowScratch> = (0..n).map(|r| RowScratch::new(s, st, config, r)).collect();
+    // Row→slot map and flash plan for the row-batched attention.
+    let slot_bytes: Vec<u8> = rows.iter().flat_map(|&(slot, _)| (slot as i32).to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &slot_bytes)?;
+    let max_ctx = rows.iter().map(|&(_, p)| p + 1).max().unwrap_or(1);
+    let flash = gpu.vmm_flash_decode_plan(st.format, config.n_heads, config.n_kv_heads, config.head_dim, st.model_max_seq, max_ctx)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -360,6 +372,63 @@ pub(super) fn decode(
             let stage_for = (end < program.len() && program[end].kind == SuperOpKind::ResidualGemv)
                 .then_some(last_proj)
                 .flatten();
+            if let LayerWeights::FullAttn(l) = layer {
+                // Row-batched attention, per row the singleton's: the fused
+                // FA prep per row, then the batched VMM KV write + flash
+                // decode (bitwise the singleton decode per row) and gate.
+                // Only where the singleton runs exactly that sequence.
+                let batched_attend = end == i + 1
+                    && program[i].kind == SuperOpKind::Attend
+                    && stage_for == Some(0)
+                    && qwen35_fa_prep_enabled(gpu, config)
+                    && !hipfire_runtime::triattn::tap_enabled()
+                    && !qwen35_fa_epilogue_enabled(gpu, config, &l.wo)
+                    && rows
+                        .iter()
+                        .all(|&(slot, _)| st.slots[slot].as_ref().is_some_and(|q| q.kv.compact_offset == 0));
+                if batched_attend {
+                    for rs in &row_scratch {
+                        gpu.qwen35_fa_prep_gfx1100(
+                            &rs.fa_q_full,
+                            &rs.fa_q,
+                            &rs.fa_gate,
+                            &rs.fa_k,
+                            &l.q_norm,
+                            &l.k_norm,
+                            &rs.pos_buf,
+                            config.norm_eps,
+                            config.rope_theta,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        )?;
+                    }
+                    let kv_l = st
+                        .kv_layer_ids
+                        .iter()
+                        .position(|&x| x == layer_idx)
+                        .ok_or_else(|| HipError::new(0, "exact VMM step: FA layer without a KV layer"))?;
+                    super::vmm_kv_write_attend(
+                        gpu,
+                        config,
+                        &super::VmmLayerKv {
+                            format: st.format,
+                            descs: &st.descs_dev[kv_l],
+                            row_slot: &st.row_slot_dev,
+                            flash: &flash,
+                            partials: &st.flash_partials,
+                        },
+                        &st.pbs,
+                        n,
+                    )?;
+                    let q = config.n_heads * config.head_dim;
+                    gpu.sigmoid_mul_f32(&st.pbs.fa_attn_out_batch.sub_offset(0, n * q), &st.pbs.fa_gate_batch.sub_offset(0, n * q))?;
+                    let (_, stage) = residual_target(st, layer, 0)?;
+                    hipfire_runtime::llama::rotate_x_mq_batched_for(gpu, &l.wo, &st.pbs.fa_attn_out_batch, stage, l.wo.k, n)?;
+                    staged = true;
+                    i = end;
+                    continue;
+                }
+            }
             for (r, &(slot, pos)) in rows.iter().enumerate() {
                 let rs = &row_scratch[r];
                 let req = st.slots[slot].as_mut().expect("provisioned slot");

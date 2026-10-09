@@ -536,12 +536,9 @@ impl Qwen35VmmStore {
             let row_slot = gpu.zeros(&[trunk_rows], DType::F32)?;
             // Fixed partials budget, never rows × context: the attention runs
             // in row groups that fit it. At least one row at the bound.
-            let floats = match route {
-                VmmRoute::Exact => 1,
-                VmmRoute::Nonexact => (VMM_FLASH_PARTIALS_BYTES / 4)
-                    .min(row_budget * worst.partial_floats_per_row)
-                    .max(worst.partial_floats_per_row),
-            };
+            let floats = (VMM_FLASH_PARTIALS_BYTES / 4)
+                .min(trunk_rows * worst.partial_floats_per_row)
+                .max(worst.partial_floats_per_row);
             let partials = gpu.zeros(&[floats], DType::F32)?;
             let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
             let hidden_out = gpu.zeros(&[trunk_rows * config.dim], DType::F32)?;
