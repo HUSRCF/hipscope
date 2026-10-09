@@ -581,7 +581,7 @@ fn stage_qwen_vmm_batch(
         }
     }
     if out.vmm && req.spec {
-        stage_qwen_vmm_spec(m, gpu, requested);
+        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
     }
     out
 }
@@ -591,10 +591,17 @@ fn stage_qwen_vmm_batch(
 /// decode as AR lanes.
 const VMM_SPEC_LANE_CAP: usize = 32768;
 
-/// Stage the VMM store's MTP engine when the resident model serves MTP: a
-/// dedicated head copy (KV sized [`VMM_SPEC_LANE_CAP`]) and the shared
-/// verify scratch. Any failure leaves AR lanes only.
-fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize) {
+/// Stage the VMM store's speculation engine from the **actually loaded**
+/// speculator (singleton load precedence DFlash > MTP > n-gram), never from
+/// weight presence alone: a loaded DFlash draft installs a `VmmDflashEngine`
+/// (shared draft weights, exact block-16 chain lanes) and never an MTP head;
+/// an MTP speculator (or none) keeps the MTP engine path. Any refusal logs a
+/// concrete reason and leaves AR lanes only.
+fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_budget: usize) {
+    if m.speculator.as_ref().is_some_and(|s| s.name() == "dflash") {
+        stage_qwen_vmm_dflash(m, gpu, row_budget);
+        return;
+    }
     if !m.mtp_weights_present || m.mtp_mode == "off" {
         return;
     }
@@ -626,5 +633,69 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize) {
             }
         }
         Err(e) => eprintln!("[daemon] VMM spec lanes unavailable: {e} — AR lanes"),
+    }
+}
+
+/// Stage the VMM store's DFlash engine over the loaded singleton's resident
+/// draft weights (shared by reference count, never reloaded). Eligibility is
+/// derived from the resolved loaded speculator (`vmm_assets`: fixed-block
+/// chain, no DDTree, no admitted retained PM4, adaptive block off) and the
+/// store (Exact route, `max_rows >= block`), not from a second env parse.
+fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) {
+    let assets = match m
+        .speculator
+        .as_mut()
+        .and_then(|s| s.drafter_any_mut())
+        .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+    {
+        Some(df) => df.vmm_assets(),
+        None => Err("loaded speculator is not a Qwen3.5 DFlashSpeculator".to_string()),
+    };
+    let assets = match assets {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[daemon] VMM DFlash lanes unavailable: {e} — AR lanes (singleton DFlash unchanged)");
+            return;
+        }
+    };
+    let Some(b) = m.qwen35_mut() else {
+        hipfire_arch_qwen35::dflash_spec::release_shared_dflash_weights(gpu, assets.weights);
+        return;
+    };
+    let route = b.vmm_store.as_ref().map(|s| s.route());
+    if route != Some(hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact) {
+        eprintln!(
+            "[daemon] VMM DFlash lanes unavailable: store route {route:?} is not Exact (exactness is proven only on the Exact route) — AR lanes"
+        );
+        hipfire_arch_qwen35::dflash_spec::release_shared_dflash_weights(gpu, assets.weights);
+        return;
+    }
+    let engine = match hipfire_arch_qwen35::forward_slots::vmm::dflash::VmmDflashEngine::new(
+        gpu,
+        &b.config,
+        assets,
+        row_budget.min(hipfire_arch_qwen35::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[daemon] VMM DFlash lanes unavailable: {e} — AR lanes");
+            return;
+        }
+    };
+    let receipt = engine.receipt();
+    let store = b.vmm_store.as_mut().expect("route checked above");
+    match store.install_dflash(engine) {
+        Ok(()) => eprintln!(
+            "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
+            receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
+        ),
+        Err(engine) => {
+            eprintln!(
+                "[daemon] VMM DFlash lanes unavailable: store row budget {} cannot run a {}-row block — AR lanes",
+                store.row_budget(),
+                receipt.block_size
+            );
+            engine.free_gpu(gpu);
+        }
     }
 }
