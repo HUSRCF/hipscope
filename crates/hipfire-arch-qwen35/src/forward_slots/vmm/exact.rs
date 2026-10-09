@@ -25,8 +25,8 @@
 use super::{Qwen35RequestState, Qwen35VmmStore, RequestStepKind};
 use crate::forward_slots::final_logits_per_slot;
 use crate::qwen35::forward::{
-    gated_norm_mq_rotate_enabled, lower_variant, qwen35_fa_epilogue_enabled, qwen35_fa_prep_enabled, variant_of,
-    Qwen35Bindings,
+    conv_qknorm_enabled, conv_scalar_prep_enabled, gated_norm_mq_rotate_enabled, gdn_compact_qk_div, lower_variant,
+    qkvza_scalar_prep_enabled, qwen35_fa_epilogue_enabled, qwen35_fa_prep_enabled, variant_of, Qwen35Bindings,
 };
 use crate::qwen35::{LayerWeights, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{HipError, HipResult};
@@ -429,6 +429,33 @@ pub(super) fn decode(
                     continue;
                 }
             }
+            // DeltaNet prep: where the singleton's ATTEND_DN_PREP is the
+            // plain sigmoid-alpha gate + fused conv/QK-norm (compact GDN),
+            // the stateless gate runs once over all rows and each row runs
+            // only its stateful conv before the rest of the run.
+            let split_dn_prep = match layer {
+                LayerWeights::DeltaNet(l) => {
+                    let quant = st.slots[rows[0].0].as_ref().expect("provisioned slot").dn.quant;
+                    program[i].kind == SuperOpKind::Attend
+                        && rows.iter().all(|&(slot, _)| st.slots[slot].as_ref().is_some_and(|q| q.dn.quant == quant))
+                        && !qkvza_scalar_prep_enabled(gpu, config, n_v_heads, quant, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha)
+                        && !conv_scalar_prep_enabled(gpu, config, n_v_heads, quant)
+                        && conv_qknorm_enabled(gpu, config, quant)
+                        && gdn_compact_qk_div(gpu, config, n_v_heads, quant).is_some()
+                }
+                _ => false,
+            };
+            if let (true, LayerWeights::DeltaNet(l)) = (split_dn_prep, layer) {
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    &st.pbs.dn_beta_batch,
+                    &st.pbs.dn_alpha_batch,
+                    &l.dt_bias,
+                    &l.a_log,
+                    n_v_heads,
+                    n,
+                )?;
+            }
+            let first_op = if split_dn_prep { i + 1 } else { i };
             for (r, &(slot, pos)) in rows.iter().enumerate() {
                 let rs = &row_scratch[r];
                 let req = st.slots[slot].as_mut().expect("provisioned slot");
@@ -456,7 +483,23 @@ pub(super) fn decode(
                         fa_output_prerotated: false,
                         defer_routed_combine: false,
                     };
-                    for op in &program[i..end] {
+                    if let (true, LayerWeights::DeltaNet(l)) = (split_dn_prep, layer) {
+                        gpu.conv1d_silu_split_qknorm(
+                            &rs.dn_q_raw,
+                            &rs.dn_k_raw,
+                            &rs.dn_v,
+                            &rs.dn_qkv,
+                            &l.conv_weight,
+                            &req.dn.conv_states[delta_layer_idx],
+                            k_dim,
+                            v_dim,
+                            config.linear_num_key_heads,
+                            hd,
+                            1.0 / (hd as f32).sqrt(),
+                            config.norm_eps,
+                        )?;
+                    }
+                    for op in &program[first_op..end] {
                         dispatch_super_op(gpu, &ctx, op, &mut bind)
                             .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }

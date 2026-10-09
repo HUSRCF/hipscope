@@ -7055,7 +7055,7 @@ fn gdn_compact3_enabled(
         && super::config::qwen36_27b_dense_shape(config, n_v_heads)
 }
 
-fn gdn_compact_qk_div(
+pub(crate) fn gdn_compact_qk_div(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7182,7 +7182,7 @@ fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
 /// the fixed-K QKVZA producer. Keep the gate deliberately narrow until exact
 /// replay and stationary product certification justify a default flip.
 #[allow(clippy::too_many_arguments)]
-fn qkvza_scalar_prep_enabled(
+pub(crate) fn qkvza_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7218,7 +7218,7 @@ fn qkvza_scalar_prep_enabled(
 /// Schedule the independent beta/alpha transforms as one extra workgroup of
 /// the following conv/QK-normalization dispatch. This keeps the hot QKVZA
 /// projection unchanged while deleting the same boundary.
-fn conv_scalar_prep_enabled(
+pub(crate) fn conv_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
@@ -7245,7 +7245,7 @@ fn conv_scalar_prep_enabled(
         && conv_qknorm_enabled(gpu, config, quant)
 }
 
-fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
+pub(crate) fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> bool {
     let mode = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM").ok();
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"
