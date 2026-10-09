@@ -5,8 +5,8 @@
 //! `gemv_mq4g256v2_residual` launch on `x[b]`, `y[b]`.
 //! ABI: A/x/y pointers at 0/8/16, M/K/B i32 at 24/28/32; block 32, no LDS or
 //! scratch; x is `[B][K]` and y is `[B][M]`, both row-major f32. Workgroup
-//! `w` owns rows `R*w .. R*w+R` with `R = ROWS_PER_WORKGROUP[B]`: the launcher
-//! grid is `ceil(M / R)` (larger grids are safe; surplus workgroups exit).
+//! `w` owns rows `4w .. 4w+4` (`ROWS_PER_WORKGROUP`): the launcher grid is
+//! `ceil(M / 4)` (larger grids are safe; surplus workgroups exit).
 //!
 //! Each 136-byte weight group of the workgroup's rows is loaded and
 //! dequantized once (`fma_mix(sc, nibble, zp)`), then applied to every column,
@@ -27,7 +27,15 @@
 //!
 //! Rows `2p`/`2p+1` of one column are VOPD pairs (multiplication commutes; the
 //! shared x operand is the gfx12 shared-src1 form; row weight bases differ by
-//! 2 mod 4). B is specialized: one code path per column count, selected once.
+//! 2 mod 4, x sits one bank past the even row's weights). Weights and x of
+//! the next group of a stream are issued as soon as the current group's
+//! registers are consumed. B is specialized: one code path per column count,
+//! selected once.
+//!
+//! Throughput (R9700, down 5120x17408): the dot FMAs are VALU-bound at about
+//! one FMA per lane per clock (a `v_dual_fmac` pair reads five VGPRs, so it
+//! does not dual-issue), so cost grows with B once the weight stream is
+//! covered; see the oracle example's timing mode.
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 use crate::insn::{Instruction, MemoryClass};
 use crate::reg::{Kind, Live};
@@ -35,8 +43,10 @@ use crate::vopd::{Operand, VopdF32, VopdOp};
 
 pub const SYMBOL: &str = "gemv_mq4g256v2_residual_xbatch";
 pub const MAX_COLUMNS: u8 = 8;
-/// Output rows per workgroup, indexed by the column count B (index 0 unused).
-pub const ROWS_PER_WORKGROUP: [u8; 9] = [0, 8, 8, 8, 8, 6, 6, 4, 4];
+/// Output rows per workgroup (two singleton row pairs). More rows share each
+/// x load but cost 3*R*B accumulators; on R9700 4 rows matched 6/8 rows at
+/// every B and is the only width that fits B = 7, 8.
+pub const ROWS_PER_WORKGROUP: u8 = 4;
 
 // Fixed VGPRs.
 const LANE: u8 = 0;
@@ -81,20 +91,25 @@ struct Layout {
     w: u8,
     acc: u8,
     x: u8,
-    end: u8,
+    end: u16,
 }
 
 impl Layout {
     fn new(nb: u8) -> Self {
-        let rows = ROWS_PER_WORKGROUP[usize::from(nb)];
+        let rows = ROWS_PER_WORKGROUP;
         let pk_addr = 4;
         let hdr_addr = pk_addr + rows;
         let hdr = hdr_addr + rows;
         let pk = hdr + 2 * rows;
         let w = (pk + rows).next_multiple_of(4);
         let acc = w + 10 * rows;
-        let x = acc + 3 * rows * nb;
-        Layout { rows, nb, pk_addr, hdr_addr, hdr, pk, w, acc, x, end: x + 8 * nb }
+        // x_n sits one bank past w_n (even rows at bank n, odd at n+2), so no
+        // dot FMA reads its two sources from one VGPR bank.
+        let x0 = u16::from(acc) + 3 * u16::from(rows) * u16::from(nb);
+        let x = x0 + (5 - x0 % 4) % 4;
+        let end = x + 8 * u16::from(nb);
+        // An oversize layout keeps `end` > 256 and is rejected by the build.
+        Layout { rows, nb, pk_addr, hdr_addr, hdr, pk, w, acc, x: x.min(255) as u8, end }
     }
     fn pairs(self) -> u8 { self.rows / 2 }
     /// Dequantized weights of row `r`: even rows at 0 mod 4, odd at 2 mod 4.
@@ -108,13 +123,28 @@ impl Layout {
     fn acc(self, b: u8, slot: u8, r: u8) -> u8 { self.acc + (b * 3 + slot) * self.rows + r }
     fn x(self, b: u8) -> u8 { self.x + 8 * b }
     fn hdr(self, r: u8) -> u8 { self.hdr + 2 * r }
-    // Epilogue temporaries: the x buffer and the weight block are dead.
-    fn red_tmp(self, b: u8, r: u8) -> u8 { self.x + b * self.rows + r }
-    fn y_tmp(self, b: u8, r: u8) -> u8 { self.w + b * self.rows + r }
-    fn y_addr(self, b: u8) -> u8 { self.w + self.nb * self.rows + b }
+    // Epilogue temporaries come from the then-dead weight block and x buffer:
+    // R*nb reduction temps, R*nb y values, nb y addresses.
+    fn spare(self, i: u8) -> u8 {
+        let weights = self.acc - self.w;
+        if i < weights { self.w + i } else { self.x + (i - weights) }
+    }
+    fn spare_fits(self) -> bool {
+        u16::from(self.rows) * u16::from(self.nb) * 2 + u16::from(self.nb)
+            <= u16::from(self.acc - self.w) + 8 * u16::from(self.nb)
+    }
+    fn red_tmp(self, b: u8, r: u8) -> u8 { self.spare(b * self.rows + r) }
+    fn y_tmp(self, b: u8, r: u8) -> u8 { self.spare(self.nb * self.rows + b * self.rows + r) }
+    fn y_addr(self, b: u8) -> u8 { self.spare(2 * self.nb * self.rows + b) }
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
+    for nb in 1..=MAX_COLUMNS {
+        let l = Layout::new(nb);
+        if l.rows == 0 || l.rows % 2 != 0 || !l.spare_fits() || u16::from(l.end) > 256 {
+            return Err(format!("B={nb}: {} rows / {} VGPRs is not a valid layout", l.rows, l.end));
+        }
+    }
     let vgprs = (1..=MAX_COLUMNS).map(|nb| Layout::new(nb).end).max().unwrap_or(0);
     let mut regs = RegPlan::new(u16::from(vgprs), 48)?;
     for (name, base) in [("kernarg", 0), ("matrix", 4), ("activation", 6), ("residual", 8)] {
@@ -129,10 +159,10 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
         regs.add_range(name, Kind::V, base, 1, Live::Whole)?;
     }
     // Each B path lays out v4.. itself (`Layout`): one shared register file.
-    let mut at = 4u8;
+    let mut at = 4u16;
     while at < vgprs {
-        let w = [8u8, 4, 2, 1].into_iter().find(|&w| at % w == 0 && u16::from(at) + u16::from(w) <= u16::from(vgprs)).unwrap_or(1);
-        regs.add_range(&format!("path_v{at}"), Kind::V, at, w, Live::Whole)?;
+        let w = [8u16, 4, 2, 1].into_iter().find(|&w| at % w == 0 && at + w <= vgprs).unwrap_or(1);
+        regs.add_range(&format!("path_v{at}"), Kind::V, at as u8, w as u8, Live::Whole)?;
         at += w;
     }
     let mut b = Builder::new(KernelSpec {
@@ -144,6 +174,8 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32,
         group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     }, regs);
+    // Dependent-VALU issue hints: ~5% at B=4 (R9700, down K=17408).
+    b.enable_delay_alu();
     smem(&mut b, "s_load_b128 s[4:7], s[0:1], 0x0", &[4, 5, 6, 7], &[0, 1])?;
     smem(&mut b, "s_load_b128 s[8:11], s[0:1], 0x10", &[8, 9, 10, 11], &[0, 1])?;
     smem(&mut b, "s_load_b32 s3, s[0:1], 0x20", &[S_B], &[0, 1])?;
@@ -220,7 +252,9 @@ fn section(b: &mut Builder, l: Layout) -> Result<(), String> {
         salu(b, "s_lshr_b32 s2, s2, 2", &[S_COUNT], &[S_COUNT])?;
         salu(b, "s_cmp_eq_u32 s2, 0", &[], &[S_COUNT])?;
         branch(b, &format!("s_cbranch_scc1 {done}"))?;
-        salu(b, &format!("s_mov_b32 s15, {:#x}", u32::from(stream) * 136), &[S_GOFF], &[])?;
+        // Inline 0 for stream 0, a literal (hex) offset otherwise.
+        let goff = if stream == 0 { "0".to_string() } else { format!("{:#x}", u32::from(stream) * 136) };
+        salu(b, &format!("s_mov_b32 s15, {goff}"), &[S_GOFF], &[])?;
         valu(b, "v_lshlrev_b32_e32 v2, 5, v0", &[X_OFF], &[LANE], &[])?;
         if stream > 0 {
             valu(b, &format!("v_add_nc_u32_e32 v2, {:#x}, v2", u32::from(stream) * 1024), &[X_OFF], &[X_OFF], &[])?;
@@ -300,17 +334,19 @@ fn group(b: &mut Builder, l: Layout, slot: u8) -> Result<(), String> {
     for r in 0..l.rows {
         let h = l.hdr(r);
         valu(b, &format!("v_cndmask_b32_e32 v{h}, v{}, v{h}, vcc_lo", h + 1), &[h], &[h, h + 1], &[])?;
-        for n in 0..8u8 {
-            let (w, p) = (l.w(r) + n, l.pk + r);
-            valu(b, &format!("v_bfe_u32 v{w}, v{p}, {}, 4", n * 4), &[w], &[p], &[])?;
+        // Even nibbles are the bytes of pk & 0x0f0f0f0f, odd nibbles those of
+        // (pk >> 4) & 0x0f0f0f0f: nibble n = byte n/2 of its half.
+        let (w, p) = (l.w(r), l.pk + r);
+        let (te, to) = (w + 6, w + 7);
+        valu(b, &format!("v_and_b32_e32 v{te}, 0xf0f0f0f, v{p}"), &[te], &[p], &[])?;
+        valu(b, &format!("v_lshrrev_b32_e32 v{to}, 4, v{p}"), &[to], &[p], &[])?;
+        valu(b, &format!("v_and_b32_e32 v{to}, 0xf0f0f0f, v{to}"), &[to], &[to], &[])?;
+        for n in [0u8, 2, 4, 1, 3, 5, 6, 7] {
+            let src = if n % 2 == 0 { te } else { to };
+            valu(b, &format!("v_cvt_f32_ubyte{}_e32 v{}, v{src}", n / 2, w + n), &[w + n], &[src], &[])?;
         }
         for n in 0..8u8 {
-            let w = l.w(r) + n;
-            valu(b, &format!("v_cvt_f32_ubyte0_e32 v{w}, v{w}"), &[w], &[w], &[])?;
-        }
-        for n in 0..8u8 {
-            let w = l.w(r) + n;
-            valu(b, &format!("v_fma_mix_f32 v{w}, v{h}, v{w}, v{h} op_sel:[0,0,1] op_sel_hi:[1,0,1]"), &[w], &[h, w], &[])?;
+            valu(b, &format!("v_fma_mix_f32 v{}, v{h}, v{}, v{h} op_sel:[0,0,1] op_sel_hi:[1,0,1]", w + n, w + n), &[w + n], &[h, w + n], &[])?;
         }
     }
     weight_loads(b, l, S_GNEXT)?;
@@ -423,14 +459,14 @@ fn epilogue(b: &mut Builder, l: Layout) -> Result<(), String> {
         for col in 0..nb {
             for r in [2 * p, 2 * p + 1] {
                 let (y, a) = (l.y_tmp(col, r), l.y_addr(col));
-                vmem(b, &format!("global_load_b32 v{y}, v{a}, s[8:9] offset:{}", 4 * u32::from(r)), &[y], &[a], &[8, 9], false)?;
+                vmem(b, &format!("global_load_b32 v{y}, v{a}, s[8:9]{}", row_off(r)), &[y], &[a], &[8, 9], false)?;
             }
         }
         for col in 0..nb {
             for r in [2 * p, 2 * p + 1] {
                 let (y, a, v) = (l.y_tmp(col, r), l.y_addr(col), l.acc(col, SLOT_A, r));
                 valu(b, &format!("v_add_f32_e32 v{y}, v{v}, v{y}"), &[y], &[v, y], &[])?;
-                vmem(b, &format!("global_store_b32 v{a}, v{y}, s[8:9] offset:{}", 4 * u32::from(r)), &[], &[a, y], &[8, 9], true)?;
+                vmem(b, &format!("global_store_b32 v{a}, v{y}, s[8:9]{}", row_off(r)), &[], &[a, y], &[8, 9], true)?;
             }
         }
         b.wait_all()?;
@@ -443,12 +479,12 @@ fn epilogue(b: &mut Builder, l: Layout) -> Result<(), String> {
         let r = 2 * p;
         for col in 0..nb {
             let (y, a) = (l.y_tmp(col, r), l.y_addr(col));
-            vmem(b, &format!("global_load_b32 v{y}, v{a}, s[8:9] offset:{}", 4 * u32::from(r)), &[y], &[a], &[8, 9], false)?;
+            vmem(b, &format!("global_load_b32 v{y}, v{a}, s[8:9]{}", row_off(r)), &[y], &[a], &[8, 9], false)?;
         }
         for col in 0..nb {
             let (y, a, v) = (l.y_tmp(col, r), l.y_addr(col), l.acc(col, SLOT_A, r));
             valu(b, &format!("v_add_f32_e32 v{y}, v{y}, v{v}"), &[y], &[y, v], &[])?;
-            vmem(b, &format!("global_store_b32 v{a}, v{y}, s[8:9] offset:{}", 4 * u32::from(r)), &[], &[a, y], &[8, 9], true)?;
+            vmem(b, &format!("global_store_b32 v{a}, v{y}, s[8:9]{}", row_off(r)), &[], &[a, y], &[8, 9], true)?;
         }
         b.wait_all()?;
         branch(b, &format!("s_branch {done}"))?;
@@ -460,6 +496,10 @@ fn epilogue(b: &mut Builder, l: Layout) -> Result<(), String> {
     branch(b, "s_branch .Lrx_end")
 }
 
+/// Byte offset of row `r` from the workgroup's first row in a y column.
+fn row_off(r: u8) -> String {
+    if r == 0 { String::new() } else { format!(" offset:{}", 4 * u32::from(r)) }
+}
 fn refs(kind: Kind, indices: &[u8]) -> Vec<crate::reg::RegRef> {
     indices.iter().map(|&base| crate::reg::RegRef { kind, base, len: 1 }).collect()
 }
@@ -489,7 +529,8 @@ mod tests {
     fn residual_xbatch_m7() {
         for nb in 1..=MAX_COLUMNS {
             let l = Layout::new(nb);
-            assert!(l.end <= 252 && l.rows % 2 == 0, "B={nb}: {} VGPRs, {} rows", l.end, l.rows);
+            // x_n one bank past even-row w_n, odd-row w_n two banks past.
+            assert_eq!((l.x(0) % 4, l.w(0) % 4, l.w(1) % 4), (1, 0, 2), "B={nb}");
         }
         let emitted = build_gfx1201().expect("residual xbatch").remove(0);
         // B=8 (4 rows): row1 seeds x1 then x0 on the shared x src1.

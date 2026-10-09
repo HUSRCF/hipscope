@@ -18,11 +18,17 @@
 //! real activation vector (residual, gate/up, qkv, qkvza, multirow inputs)
 //! and of the captured residual streams (pre and post). Edge shapes re-slice
 //! the same real matrices: group counts covering quads 0..2+ with tails 0..3
-//! and the real K-1..K, row counts 1/2/3/33/65/M-1 (odd final rows).
+//! and the real K-3..K, row counts 1..7/9/13/33/65/M-1 (every remainder of the
+//! 4-row workgroup, odd final rows), each at B = 1..8.
+//!
+//! Timing (`timing`): this launcher vs B singleton launches, the non-exact
+//! WMMA batched GEMM (`gemm_hfq4g256_residual_mq4v2`) and the hipcc x-batch
+//! GEMV, with the weights hot (one LLC-resident copy) and cold (copies rotated
+//! per call).
 //!
 //! ```text
-//! pm_residual_xbatch_oracle oracle --label run1
-//! pm_residual_xbatch_oracle timing --label t1
+//! pm_residual_xbatch_oracle oracle --label run1     # build with --features lab
+//! pm_residual_xbatch_oracle timing --label t1 [--batches 1,2,4,8]
 //! ```
 
 use hip_bridge::{HipResult, KernargBlob};
@@ -49,10 +55,10 @@ const GUARD_BYTE: u8 = 0xA5;
 
 /// Largest column count of one launch.
 pub const RESIDUAL_XBATCH_MAX: usize = 8;
-/// Output rows per workgroup by column count (index 0 unused); must equal
+/// Output rows per workgroup; must equal
 /// `hipfire_isa::kernels::pm_decode::gemv_hfq4g256_residual_xbatch_mq4v2::ROWS_PER_WORKGROUP`
 /// the object was built with. Grid = `ceil(m / rows)`.
-pub const RESIDUAL_XBATCH_ROWS: [usize; 9] = [0, 8, 8, 8, 8, 6, 6, 4, 4];
+pub const RESIDUAL_XBATCH_ROWS: usize = 4;
 /// The PM code object, linked by `hipfire-isa emit --kernel
 /// pm_decode_gemv_hfq4g256_residual_xbatch_mq4v2`.
 const RESIDUAL_XBATCH_CO: &[u8] =
@@ -97,7 +103,7 @@ impl ResidualXbatch for Gpu {
             blob.pad_to(16);
             // SAFETY: the blob follows the object's ABI (A/x/y at 0/8/16,
             // M/K/B at 24/28/32) and every pointer is a live device buffer.
-            let grid = m.div_ceil(RESIDUAL_XBATCH_ROWS[batch]) as u32;
+            let grid = m.div_ceil(RESIDUAL_XBATCH_ROWS) as u32;
             unsafe { self.hip.launch_kernel_blob(func, [grid, 1, 1], [32, 1, 1], 0, None, blob.as_mut_slice()) }
         })
     }
@@ -441,6 +447,11 @@ const XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
 
+/// Cold regime: enough weight copies, rotated per call, that their bytes
+/// exceed the 64 MiB last-level cache several times over (a decode step
+/// streams every layer's weights once from HBM).
+const COLD_BYTES: usize = 384 << 20;
+
 fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
     gpu.ensure_kernel_public("gemv_mq4g256v2_xbatch_residual", XBATCH_RESIDUAL_SRC, "gemv_mq4g256v2_xbatch_residual").map_err(err)?;
     let act = activation_pool()?;
@@ -450,58 +461,73 @@ fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
         let c = residual_capture(occ)?;
         let (m, k) = (c.m, c.k);
         let s = shape_inputs(String::new(), &c.w, m, k, Some((&c.x, &c.y)), &act, &res);
-        let w = gpu.upload_raw(&c.w, &[c.w.len()]).map_err(err)?;
+        let copies = COLD_BYTES.div_ceil(c.w.len()).max(2);
+        let mut ws = Vec::with_capacity(copies);
+        for _ in 0..copies {
+            ws.push(gpu.upload_raw(&c.w, &[c.w.len()]).map_err(err)?);
+        }
         let xcat: Vec<u8> = s.xs.concat();
         let ycat: Vec<u8> = s.ys.concat();
         let xf: Vec<f32> = xcat.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let yf: Vec<f32> = ycat.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let x = gpu.upload_f32(&xf, &[RESIDUAL_XBATCH_MAX, k]).map_err(err)?;
         let y = gpu.upload_f32(&yf, &[RESIDUAL_XBATCH_MAX, m]).map_err(err)?;
-        for &batch in batches {
-            let (cand, cand_s) = time(gpu, 15, 20, |g| g.gemv_mq4g256v2_residual_xbatch(&w, &x, &y, m, k, batch).map_err(err))?;
-            let (single, single_s) = time(gpu, 15, 20, |g| {
-                for b in 0..batch {
-                    let xb = x.sub_offset(b * k, k);
-                    let yb = y.sub_offset(b * m, m);
-                    singleton(g, &w, &xb, &yb, m, k)?;
-                }
-                Ok(())
-            })?;
-            let (wmma, wmma_s) = time(gpu, 15, 20, |g| g.gemm_hfq4g256_residual_mq4v2(&w, &x, &y, m, k, batch).map_err(err))?;
-            let (xb4, xb4_s) = time(gpu, 15, 20, |g| {
-                let (mi, ki) = (m as i32, k as i32);
-                for start in (0..batch).step_by(4) {
-                    let n = 4.min(batch - start) as i32;
-                    let mut blob = KernargBlob::new();
-                    blob.push_ptr(w.buf.as_ptr() as *const c_void);
-                    blob.push_ptr(x.sub_offset(start * k, n as usize * k).buf.as_ptr() as *const c_void);
-                    blob.push_ptr(y.sub_offset(start * m, n as usize * m).buf.as_ptr() as *const c_void);
-                    blob.push_i32(mi);
-                    blob.push_i32(ki);
-                    blob.push_i32(n);
-                    blob.pad_to(8);
-                    g.launch_kernel_blob("gemv_mq4g256v2_xbatch_residual", [m as u32, 1, 1], [32, 1, 1], 0, blob.as_mut_slice()).map_err(err)?;
-                }
-                Ok(())
-            })?;
-            let weight_gbs = c.w.len() as f64 / (cand * 1e-3) / 1e9;
-            println!("{occ} M={m} K={k} B={batch}: pm_xbatch {:.2} us | {batch}x singleton {:.2} us ({:.2}x) | wmma batched {:.2} us | hipcc xbatch {:.2} us | {weight_gbs:.0} GB/s",
-                cand * 1e3, single * 1e3, single / cand, wmma * 1e3, xb4 * 1e3);
-            rows.push(json!({
-                "capture": c.dir.display().to_string(), "M": m, "K": k, "B": batch, "weight_bytes": c.w.len(),
-                "pm_residual_xbatch_ms": cand, "pm_residual_xbatch_samples_ms": cand_s,
-                "singleton_x_B_ms": single, "singleton_x_B_samples_ms": single_s,
-                "speedup_vs_singleton_x_B": single / cand,
-                "nonexact_wmma_batched_gemm_ms": wmma, "nonexact_wmma_batched_gemm_samples_ms": wmma_s,
-                "nonexact_hipcc_xbatch_residual_ms": xb4, "nonexact_hipcc_xbatch_residual_samples_ms": xb4_s,
-                "pm_weight_GBs": weight_gbs,
-            }));
+        for (regime, n_w) in [("hot", 1usize), ("cold", copies)] {
+            let ws = &ws[..n_w];
+            for &batch in batches {
+                let mut i = 0usize;
+                let (cand, cand_s) = time(gpu, 15, 20, |g| {
+                    i += 1;
+                    g.gemv_mq4g256v2_residual_xbatch(&ws[i % n_w], &x, &y, m, k, batch).map_err(err)
+                })?;
+                let (single, single_s) = time(gpu, 15, 20, |g| {
+                    i += 1;
+                    for b in 0..batch {
+                        singleton(g, &ws[i % n_w], &x.sub_offset(b * k, k), &y.sub_offset(b * m, m), m, k)?;
+                    }
+                    Ok(())
+                })?;
+                let (wmma, wmma_s) = time(gpu, 15, 20, |g| {
+                    i += 1;
+                    g.gemm_hfq4g256_residual_mq4v2(&ws[i % n_w], &x, &y, m, k, batch).map_err(err)
+                })?;
+                let (xb4, xb4_s) = time(gpu, 15, 20, |g| {
+                    i += 1;
+                    let w = &ws[i % n_w];
+                    for start in (0..batch).step_by(4) {
+                        let n = 4.min(batch - start);
+                        let mut blob = KernargBlob::new();
+                        blob.push_ptr(w.buf.as_ptr() as *const c_void);
+                        blob.push_ptr(x.sub_offset(start * k, n * k).buf.as_ptr() as *const c_void);
+                        blob.push_ptr(y.sub_offset(start * m, n * m).buf.as_ptr() as *const c_void);
+                        blob.push_i32(m as i32);
+                        blob.push_i32(k as i32);
+                        blob.push_i32(n as i32);
+                        blob.pad_to(8);
+                        g.launch_kernel_blob("gemv_mq4g256v2_xbatch_residual", [m as u32, 1, 1], [32, 1, 1], 0, blob.as_mut_slice()).map_err(err)?;
+                    }
+                    Ok(())
+                })?;
+                let weight_gbs = c.w.len() as f64 / (cand * 1e-3) / 1e9;
+                println!("{regime} {occ} M={m} K={k} B={batch}: pm_xbatch {:.2} us | {batch}x singleton {:.2} us ({:.2}x) | wmma batched {:.2} us | hipcc xbatch {:.2} us | {weight_gbs:.0} GB/s",
+                    cand * 1e3, single * 1e3, single / cand, wmma * 1e3, xb4 * 1e3);
+                rows.push(json!({
+                    "regime": regime, "weight_copies": n_w,
+                    "capture": c.dir.display().to_string(), "M": m, "K": k, "B": batch, "weight_bytes": c.w.len(),
+                    "pm_residual_xbatch_ms": cand, "pm_residual_xbatch_samples_ms": cand_s,
+                    "singleton_x_B_ms": single, "singleton_x_B_samples_ms": single_s,
+                    "speedup_vs_singleton_x_B": single / cand,
+                    "nonexact_wmma_batched_gemm_ms": wmma, "nonexact_wmma_batched_gemm_samples_ms": wmma_s,
+                    "nonexact_hipcc_xbatch_residual_ms": xb4, "nonexact_hipcc_xbatch_residual_samples_ms": xb4_s,
+                    "pm_weight_GBs": weight_gbs,
+                }));
+            }
         }
-        for t in [w, x, y] {
+        for t in ws.into_iter().chain([x, y]) {
             gpu.free_tensor(t).map_err(err)?;
         }
     }
-    Ok(json!({"rows": rows, "method": "hip events, null stream, 5 warmup calls, 15 samples x 20 calls, median per call"}))
+    Ok(json!({"rows": rows, "method": "hip events, null stream, 5 warmup calls, 15 samples x 20 calls, median per call; hot = one weight copy (LLC-resident), cold = copies rotated per call totalling >= 384 MiB"}))
 }
 
 // ---------------------------------------------------------------------------
