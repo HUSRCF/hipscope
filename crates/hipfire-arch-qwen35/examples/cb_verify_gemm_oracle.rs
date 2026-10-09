@@ -17,16 +17,28 @@
 //   vt        — the existing exact VT kernels at 17..63 and VT4 explicitly at 64;
 //   bt        — the existing F16 BT4@64 / BT8@128 kernels;
 //   chunks    — the current DFlash C8 packing, VT 48+48+32 at row offsets;
-//   k32       — the standalone 128-row variant of this example (§3: K32 slab,
-//               fp16 row stride 40, double buffered, BT4/BT8 x W4/W8) for every
-//               N=1..128 (BT8) / 1..64 (BT4), prefixes and row permutations,
-//               negative controls and HIP-graph capture/replay.
-// `time` event-times VT 48+48+32 against one k32 128-row launch per shape.
+//   k32       — the Gate-0 standalone 128-row spike of this example (§3: K32
+//               slab, fp16 row stride 40, double buffered, BT4/BT8 x W4/W8) for
+//               every N=1..128 (BT8) / 1..64 (BT4);
+//   prod      — the production exact entry points (`Gpu::gemm_*_verify_exact`,
+//               the head through `gemm_mq4g256v2_lmhead_verify_exact` against a
+//               +0-initialized singleton reference) for every N=1..128, with the
+//               selected tier symbol and its loaded state recorded. The family
+//               is the process's `HIPFIRE_CB_VERIFY_PM` (1 PM bundle, 0 hipcc
+//               `_k32`); `prodcross` runs the other family in-process over
+//               N=64..128 and compares it byte for byte with both the singleton
+//               and the selected family. Per-N output digests go to digests.txt.
+// perm/neg/graph run on each `--cands` candidate (prod, k32): row permutations,
+// negative controls (input bit, header byte, row offset, canary, padded row;
+// out-of-domain N refusal for prod) and GraphState capture + 3 replays.
+// `time` event-times VT 48+48+32 against the 128-row launches (`prodtime`:
+// both production families, fp16 X cached, head via the residual entry).
 //
 // Build: cargo build -p hipfire-arch-qwen35 --features lab,deltanet --release \
 //          --example cb_verify_gemm_oracle -j12
 // Run:   cb_verify_gemm_oracle --model <path> --out <abs dir> [--ops a,b]
-//          [--seeds 1,2,3] [--n-max 128] [--tests t,..] [--reps 30] [--mode eager|graph|both]
+//          [--seeds 1,2,3] [--n-max 128] [--tests t,..] [--cands prod,k32]
+//          [--reps 30] [--mode eager|graph|both]
 
 use hip_bridge::KernargBlob;
 use hipfire_arch_qwen35::load_qwen35_bundle;
@@ -371,6 +383,20 @@ enum Kind {
     Bt(usize),
     /// This example's K32 variant `cbo_k32_*_bt{bt}w{w}`.
     K32(usize, usize),
+    /// The production exact entry point (`Gpu::gemm_*_verify_exact`; the head
+    /// case uses `gemm_mq4g256v2_lmhead_verify_exact`) on the F32 panel, with
+    /// the fp16 activation cache invalidated first.
+    Prod,
+    /// The production entry point for kernel timing: fp16 cache kept, the head
+    /// case through the residual entry (no memset).
+    ProdKernel,
+}
+
+/// The two activation panels: raw fp16 bytes (named kernels) and their exact
+/// F32 values (production entries, which convert back to the same fp16).
+struct Panels {
+    x16: GpuTensor,
+    x32: GpuTensor,
 }
 
 /// Product wave rule (gemm_vt.rs VT_WIDE_MIN_ROW_TILES).
@@ -428,20 +454,24 @@ fn ensure(gpu: &mut Gpu, case: &Case, kind: Kind) -> R<String> {
             gpu.ensure_kernel_public(K32_MODULE, K32_SRC, &sym)?;
             sym
         }
+        Kind::Prod | Kind::ProdKernel => return Err("production entries load their own kernels".into()),
     };
     Ok(sym)
 }
 
 /// Launch `kind` over batch rows [row0, row0 + n) of X/Y (row offsets applied
 /// to the pointers, as a chunk launch would).
-fn launch(gpu: &mut Gpu, case: &Case, kind: Kind, x: &GpuTensor, y: &[GpuTensor], row0: usize, n: usize) -> R<()> {
+fn launch(gpu: &mut Gpu, case: &Case, kind: Kind, px: &Panels, y: &[GpuTensor], row0: usize, n: usize) -> R<()> {
+    if matches!(kind, Kind::Prod | Kind::ProdKernel) {
+        return prod(gpu, case, kind == Kind::Prod, &px.x32, y, row0, n);
+    }
     let sym = ensure(gpu, case, kind)?;
     let tm = case.total_m();
     let mut b = KernargBlob::new();
     for w in &case.w {
         b.push_ptr(w.buf.as_ptr());
     }
-    b.push_ptr(ptr_at(x, row0 * case.k * 2));
+    b.push_ptr(ptr_at(&px.x16, row0 * case.k * 2));
     for (t, &m) in y.iter().zip(&case.ms) {
         b.push_ptr(ptr_at(t, row0 * m * 4));
     }
@@ -457,9 +487,79 @@ fn launch(gpu: &mut Gpu, case: &Case, kind: Kind, x: &GpuTensor, y: &[GpuTensor]
             [((tm + 16 * w - 1) / (16 * w)) as u32, ((n + 16 * bt - 1) / (16 * bt)) as u32, 1],
             [(32 * w) as u32, 1, 1],
         ),
+        Kind::Prod | Kind::ProdKernel => unreachable!(),
     };
-    gpu.launch_kernel_blob(&sym, grid, block, 0, b.as_mut_slice())?;
+    if gpu.graphs.capture_mode {
+        // A captured launch reads its kernarg blob at replay: keep it alive in
+        // the graph state's blob list (heap data of a pushed Vec is stable).
+        gpu.graphs.capture_blobs.push(b.as_bytes().to_vec());
+        let blob = gpu.graphs.capture_blobs.last_mut().unwrap().as_mut_slice() as *mut [u8];
+        gpu.launch_kernel_blob(&sym, grid, block, 0, unsafe { &mut *blob })?;
+    } else {
+        gpu.launch_kernel_blob(&sym, grid, block, 0, b.as_mut_slice())?;
+    }
     Ok(())
+}
+
+/// The production exact entry point over batch rows [row0, row0 + n) of the
+/// F32 panel and Y. `full`: invalidate the fp16 activation cache first and
+/// route the head case through the lm_head entry; otherwise (timing) keep the
+/// cache and use the residual entry.
+fn prod(gpu: &mut Gpu, case: &Case, full: bool, x32: &GpuTensor, y: &[GpuTensor], row0: usize, n: usize) -> R<()> {
+    let (w, m, k) = (&case.w, &case.ms, case.k);
+    // Views cover at most the NMAX-row panels: an out-of-domain `n` (refusal
+    // control) still reaches the entry, which must reject it before launching.
+    let nv = n.clamp(1, NMAX - row0);
+    let x = x32.sub_offset(row0 * k, nv * k);
+    let ys: Vec<GpuTensor> = y.iter().zip(m).map(|(t, &mm)| t.sub_offset(row0 * mm, nv * mm)).collect();
+    if full {
+        gpu.invalidate_fp16_cache();
+    }
+    match case.fam {
+        Fam::Qkvza => gpu.gemm_qkvza_mq4g256v2_verify_exact(w[0], w[1], w[2], w[3], &x, &ys[0], &ys[1], &ys[2], &ys[3], m[0], m[1], m[2], m[3], k, n)?,
+        Fam::Qkv => gpu.gemm_qkv_mq4g256v2_verify_exact(w[0], w[1], w[2], &x, &ys[0], &ys[1], &ys[2], m[0], m[1], m[2], k, n)?,
+        Fam::GateUp => gpu.gemm_gate_up_mq4g256v2_verify_exact(w[0], w[1], &x, &ys[0], &ys[1], m[0], m[1], k, n)?,
+        Fam::Residual if case.lmhead && full => gpu.gemm_mq4g256v2_lmhead_verify_exact(w[0], &x, &ys[0], m[0], k, n)?,
+        Fam::Residual => gpu.gemm_mq4g256v2_residual_verify_exact(w[0], &x, &ys[0], m[0], k, n)?,
+    }
+    Ok(())
+}
+
+/// The symbol the production entry selects (the gemm_vt.rs tier rule), for
+/// the receipt; its loaded state is checked separately.
+fn prod_symbol(case: &Case, n: usize, pm: bool) -> (String, u32) {
+    let (f, w) = (case.fam, waves_for(case.total_m()));
+    if n <= 16 {
+        return (f.prefix().to_string(), 32);
+    }
+    if n < 64 {
+        return (format!("{}_vt{}w{w}", f.prefix(), (n + 15) / 16), 32 * w as u32);
+    }
+    let bt = if n <= 64 { 4 } else { 8 };
+    let sym = if pm {
+        format!("mq4_verify_{}_pm_gfx1201_bt{bt}w{w}", f.short())
+    } else {
+        format!("{}_vt{bt}w{w}_k32", f.prefix())
+    };
+    (sym, 32 * w as u32)
+}
+
+/// Whether `sym` is loaded in this process (the occupancy query resolves the
+/// loaded function by name).
+fn loaded(gpu: &Gpu, sym: &str, block: u32) -> bool {
+    gpu.occupancy_max_active_blocks(sym, [block, 1, 1], 0).is_ok()
+}
+
+/// Run `f` with `HIPFIRE_CB_VERIFY_PM` forced to `pm` (oracle-only flag swap
+/// for the in-process HIP-vs-PM cross check), restoring the parsed flags.
+fn with_pm<T>(gpu: &mut Gpu, pm: bool, f: impl FnOnce(&mut Gpu) -> R<T>) -> R<T> {
+    let saved = gpu.flags.clone();
+    let mut swapped = (*saved).clone();
+    swapped.cb_verify_pm = pm;
+    gpu.flags = std::sync::Arc::new(swapped);
+    let r = f(gpu);
+    gpu.flags = saved;
+    r
 }
 
 /// The public generic dispatch over rows [0, n) (F32 activations).
@@ -690,18 +790,21 @@ struct Args {
     tests: Vec<String>,
     reps: usize,
     mode: String,
+    /// Candidates of the perm/neg/graph tests: `prod` (production entry) and/or `k32` (spike).
+    cands: Vec<String>,
 }
 
 fn parse_args() -> R<Args> {
     let mut a = Args {
         model: String::new(),
         out: String::new(),
-        ops: "qkvza,qkv,gate_up,wo,down,head".split(',').map(String::from).collect(),
+        ops: "qkvza,qkv,gate_up,wo,fa_wo,down,head".split(',').map(String::from).collect(),
         seeds: vec![1, 2, 3],
         n_max: NMAX,
-        tests: "refself,attrib,vt,bt,chunks,k32,perm,neg,graph,time".split(',').map(String::from).collect(),
+        tests: "refself,prod,prodcross,perm,neg,graph".split(',').map(String::from).collect(),
         reps: 30,
         mode: "both".into(),
+        cands: vec!["prod".into()],
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -716,6 +819,7 @@ fn parse_args() -> R<Args> {
             "--tests" => a.tests = list(&v),
             "--reps" => a.reps = v.parse()?,
             "--mode" => a.mode = v,
+            "--cands" => a.cands = list(&v),
             _ => return Err(format!("unknown argument {k}").into()),
         }
     }
@@ -816,21 +920,34 @@ fn run() -> R<usize> {
 
     // Activation panels: the widest K among selected cases.
     let kmax = cases.iter().map(|c| c.k).max().unwrap_or(kd);
-    let x16 = gpu.zeros(&[NMAX * kmax / 2 + 64], DType::F32)?;
-    let x32 = gpu.zeros(&[NMAX * kmax], DType::F32)?;
+    let px = Panels { x16: gpu.zeros(&[NMAX * kmax / 2 + 64], DType::F32)?, x32: gpu.zeros(&[NMAX * kmax], DType::F32)? };
     let load_x = |gpu: &mut Gpu, bits: &[u16]| -> R<()> {
         let bytes: Vec<u8> = bits.iter().flat_map(|h| h.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&x16.buf, &bytes)?;
+        gpu.hip.memcpy_htod(&px.x16.buf, &bytes)?;
         let f: Vec<u8> = bits.iter().flat_map(|&h| f16_to_f32(h).to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&x32.buf, &f)?;
+        gpu.hip.memcpy_htod(&px.x32.buf, &f)?;
         gpu.hip.device_synchronize()?;
         Ok(())
     };
+    let pm_sel = gpu.mq4_verify_pm_selected();
+    let family = |pm: bool| if pm { "PM" } else { "HIP" };
+    rep.line(format!(
+        "production family {} (HIPFIRE_CB_VERIFY_PM -> flags.cb_verify_pm={pm_sel}); wmma_batch_tiles={} mq4_verify_chunk_rows={}",
+        family(pm_sel),
+        gpu.flags.wmma_batch_tiles,
+        gpu.mq4_verify_chunk_rows()
+    ));
+    // Candidates the perm/neg/graph tests run against.
+    let cand_kinds: Vec<&str> = args.cands.iter().map(String::as_str).collect();
+    let mut digests = String::new();
+    // Other-family wide symbols the cross test has loaded (excluded from the
+    // "not loaded" assertion of later cases sharing a family).
+    let mut crossed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for case in &cases {
         let (ms, k, tm) = (&case.ms, case.k, case.total_m());
         let wr = waves_for(tm);
-        for &seed in &args.seeds {
+        for (si, &seed) in args.seeds.iter().enumerate() {
             let xb = gen_x(seed, k);
             load_x(&mut gpu, &xb)?;
             let tag = |t: &str| format!("{} seed{} {}", case.name, seed, t);
@@ -839,20 +956,45 @@ fn run() -> R<usize> {
             let yh: Vec<String> = outs.init.iter().map(|i| format!("{:016x}", fnv(i))).collect();
             // Reference: named singleton over all NMAX rows.
             reset(&mut gpu, &outs)?;
-            launch(&mut gpu, case, Kind::Single, &x16, &outs.y, 0, NMAX)?;
+            launch(&mut gpu, case, Kind::Single, &px, &outs.y, 0, NMAX)?;
             let refb = read(&mut gpu, &outs)?;
             // Determinism control.
             reset(&mut gpu, &outs)?;
-            launch(&mut gpu, case, Kind::Single, &x16, &outs.y, 0, NMAX)?;
+            launch(&mut gpu, case, Kind::Single, &px, &outs.y, 0, NMAX)?;
             rep.cmp(&tag("single rerun"), &read(&mut gpu, &outs)?, &refb, ms);
             let rh: Vec<String> = refb.iter().map(|r| format!("{:016x}", fnv(r))).collect();
             rep.line(format!("{} x_fnv={xh:016x} y_init_fnv={yh:?} ref_fnv={rh:?}", tag("inputs")));
+            // The lm_head entry is zero + acc: its reference is the singleton
+            // over +0-initialized rows (rows past N keep the nonzero init).
+            let refz = if case.lmhead {
+                let z = alloc_outs(&mut gpu, case, seed, true)?;
+                reset(&mut gpu, &z)?;
+                launch(&mut gpu, case, Kind::Single, &px, &z.y, 0, NMAX)?;
+                let r = read(&mut gpu, &z)?;
+                free_outs(&mut gpu, z)?;
+                rep.line(format!("{} lm_head zero-init ref_fnv={:016x}", tag("inputs"), fnv(&r[0])));
+                Some(r)
+            } else {
+                None
+            };
+            let ref_for = |kind: Kind| -> &Vec<Vec<u8>> {
+                match (&refz, kind) {
+                    (Some(z), Kind::Prod) => z,
+                    _ => &refb,
+                }
+            };
+            let cand_kind = |c: &str, n: usize| -> Kind {
+                match c {
+                    "k32" => Kind::K32(if n <= 64 { 4 } else { 8 }, wr),
+                    _ => Kind::Prod,
+                }
+            };
 
             if has("refself") {
                 // Each row alone (N=1 tile, X/Y at the row offset) == the NMAX launch.
                 reset(&mut gpu, &outs)?;
                 for r in 0..NMAX {
-                    launch(&mut gpu, case, Kind::Single, &x16, &outs.y, r, 1)?;
+                    launch(&mut gpu, case, Kind::Single, &px, &outs.y, r, 1)?;
                 }
                 let ok = rep.cmp(&tag("single N=1 per-row vs N=128"), &read(&mut gpu, &outs)?, &refb, ms);
                 rep.line(format!("{} {}", tag("refself"), if ok { "same" } else { "DIFF" }));
@@ -864,7 +1006,7 @@ fn run() -> R<usize> {
                 let (o, rb) = match &zo {
                     Some(z) => {
                         reset(&mut gpu, z)?;
-                        launch(&mut gpu, case, Kind::Single, &x16, &z.y, 0, NMAX)?;
+                        launch(&mut gpu, case, Kind::Single, &px, &z.y, 0, NMAX)?;
                         let r = read(&mut gpu, z)?;
                         (z, r)
                     }
@@ -876,7 +1018,7 @@ fn run() -> R<usize> {
                         continue;
                     }
                     reset(&mut gpu, o)?;
-                    generic(&mut gpu, case, &x32, &o.y, n)?;
+                    generic(&mut gpu, case, &px.x32, &o.y, n)?;
                     let got = read(&mut gpu, o)?;
                     let want = expect(&rb, &o.init, ms, n);
                     let d = first_diff(&got, &want, ms);
@@ -893,7 +1035,7 @@ fn run() -> R<usize> {
                 for n in [17usize, 31, 32, 33, 48, 63] {
                     let bt = (n + 15) / 16;
                     reset(&mut gpu, &outs)?;
-                    launch(&mut gpu, case, Kind::Vt(bt, wr), &x16, &outs.y, 0, n)?;
+                    launch(&mut gpu, case, Kind::Vt(bt, wr), &px, &outs.y, 0, n)?;
                     let ok = rep.cmp(&tag(&format!("vt{bt}w{wr} N={n}")), &read(&mut gpu, &outs)?, &expect(&refb, &outs.init, ms, n), ms);
                     v.push(format!("vt{bt}w{wr}@{n}:{}", if ok { "same" } else { "DIFF" }));
                 }
@@ -901,7 +1043,7 @@ fn run() -> R<usize> {
                 for w in [4usize, 8] {
                     for n in [64usize, 49] {
                         reset(&mut gpu, &outs)?;
-                        launch(&mut gpu, case, Kind::Vt(4, w), &x16, &outs.y, 0, n)?;
+                        launch(&mut gpu, case, Kind::Vt(4, w), &px, &outs.y, 0, n)?;
                         let ok = rep.cmp(&tag(&format!("vt4w{w} N={n}")), &read(&mut gpu, &outs)?, &expect(&refb, &outs.init, ms, n), ms);
                         v.push(format!("vt4w{w}@{n}:{}", if ok { "same" } else { "DIFF" }));
                     }
@@ -916,7 +1058,7 @@ fn run() -> R<usize> {
                         continue;
                     }
                     reset(&mut gpu, &outs)?;
-                    launch(&mut gpu, case, Kind::Bt(bv), &x16, &outs.y, 0, n)?;
+                    launch(&mut gpu, case, Kind::Bt(bv), &px, &outs.y, 0, n)?;
                     let ok = rep.cmp(&tag(&format!("bt{bv} N={n}")), &read(&mut gpu, &outs)?, &expect(&refb, &outs.init, ms, n), ms);
                     v.push(format!("bt{bv}@{n}:{}", if ok { "same" } else { "DIFF" }));
                 }
@@ -927,7 +1069,7 @@ fn run() -> R<usize> {
                 // Current C8 packing: VT3 48 + VT3 48 + VT2 32 at row offsets.
                 reset(&mut gpu, &outs)?;
                 for (r0, n) in [(0usize, 48usize), (48, 48), (96, 32)] {
-                    launch(&mut gpu, case, Kind::Vt((n + 15) / 16, wr), &x16, &outs.y, r0, n)?;
+                    launch(&mut gpu, case, Kind::Vt((n + 15) / 16, wr), &px, &outs.y, r0, n)?;
                 }
                 let ok = rep.cmp(&tag("vt 48+48+32"), &read(&mut gpu, &outs)?, &refb, ms);
                 rep.line(format!("{} 48+48+32 {}", tag("chunks"), if ok { "same" } else { "DIFF" }));
@@ -939,7 +1081,7 @@ fn run() -> R<usize> {
                     let mut bad = Vec::new();
                     for n in 1..=top {
                         reset(&mut gpu, &outs)?;
-                        launch(&mut gpu, case, Kind::K32(bt, w), &x16, &outs.y, 0, n)?;
+                        launch(&mut gpu, case, Kind::K32(bt, w), &px, &outs.y, 0, n)?;
                         if !rep.cmp(&tag(&format!("k32 bt{bt}w{w} N={n}")), &read(&mut gpu, &outs)?, &expect(&refb, &outs.init, ms, n), ms) {
                             bad.push(n);
                         }
@@ -948,142 +1090,256 @@ fn run() -> R<usize> {
                 }
             }
 
-            if has("perm") {
-                // Arbitrary-row permutation of the first n rows (X and residual init).
-                let mut v = Vec::new();
-                for n in [31usize, 32, 33, 48, 63, 64, 65, 96, 127, 128] {
-                    if n > n_max {
-                        continue;
-                    }
-                    let mut pi: Vec<usize> = (0..n).collect();
-                    for i in (1..n).rev() {
-                        let j = (hash3(seed, n as u64, i as u64) % (i as u64 + 1)) as usize;
-                        pi.swap(i, j);
-                    }
-                    let mut xp = xb.clone();
-                    for (i, &p) in pi.iter().enumerate() {
-                        xp[i * k..(i + 1) * k].copy_from_slice(&xb[p * k..(p + 1) * k]);
-                    }
-                    load_x(&mut gpu, &xp)?;
-                    let mut init_p = outs.init.clone();
-                    let mut want = outs.init.clone();
-                    for (o, &m) in ms.iter().enumerate() {
-                        for (i, &p) in pi.iter().enumerate() {
-                            let (d, s) = (i * m * 4..(i + 1) * m * 4, p * m * 4..(p + 1) * m * 4);
-                            init_p[o][d.clone()].copy_from_slice(&outs.init[o][s.clone()]);
-                            want[o][d].copy_from_slice(&refb[o][s]);
-                        }
-                        gpu.hip.memcpy_htod(&outs.y[o].buf, &init_p[o])?;
-                    }
-                    let bt = if n <= 64 { 4 } else { 8 };
-                    launch(&mut gpu, case, Kind::K32(bt, wr), &x16, &outs.y, 0, n)?;
-                    let ok = rep.cmp(&tag(&format!("perm k32 bt{bt}w{wr} N={n}")), &read(&mut gpu, &outs)?, &want, ms);
-                    v.push(format!("N={n}:{}", if ok { "same" } else { "DIFF" }));
-                }
-                load_x(&mut gpu, &xb)?;
-                rep.line(format!("{} k32 permuted rows {}", tag("perm"), v.join(" ")));
-            }
-
-            if has("neg") {
-                // Negative controls: each must be DETECTED by the comparator.
-                let bt_w = Kind::K32(8, wr);
-                let mut det = Vec::new();
-                let mut detect = |rep: &mut Report, what: &str, detected: bool| {
-                    rep.checks += 1;
-                    if !detected {
-                        rep.fails += 1;
-                        rep.line(format!("FAIL {}: negative control '{what}' NOT detected", tag("neg")));
-                    }
-                    det.push(format!("{what}:{}", if detected { "detected" } else { "MISSED" }));
-                };
-                // (a) one altered activation bit.
-                let mut xa = xb.clone();
-                xa[5 * k + 37] ^= 0x0400;
-                load_x(&mut gpu, &xa)?;
-                reset(&mut gpu, &outs)?;
-                launch(&mut gpu, case, bt_w, &x16, &outs.y, 0, NMAX)?;
-                let got = read(&mut gpu, &outs)?;
-                detect(&mut rep, "input bit", first_diff(&got, &refb, ms).is_some());
-                load_x(&mut gpu, &xb)?;
-                // (b) altered header (scale of the second half of group 0, weight row 3).
-                let wbytes = case.w[0].buf.size();
-                let wcopy = gpu.zeros(&[wbytes / 4 + 1], DType::F32)?;
-                gpu.hip.memcpy_dtod(&wcopy.buf, &case.w[0].buf, wbytes)?;
-                let row_bytes = (k / 256) * 136;
-                let mut hdr = [0u8; 4];
-                gpu.hip.memcpy_dtoh_at(&mut hdr, &wcopy.buf, 3 * row_bytes + 4)?;
-                hdr[1] ^= 0x04;
-                gpu.hip.memcpy_htod_offset(&wcopy.buf, 3 * row_bytes + 4, &hdr)?;
-                let mut alt = Case { name: case.name, fam: case.fam, w: case.w.clone(), ms: case.ms.clone(), k, lmhead: case.lmhead };
-                alt.w[0] = &wcopy;
-                reset(&mut gpu, &outs)?;
-                launch(&mut gpu, &alt, bt_w, &x16, &outs.y, 0, NMAX)?;
-                let got_h = read(&mut gpu, &outs)?;
-                detect(&mut rep, "header byte", first_diff(&got_h, &refb, ms).is_some());
-                gpu.free_tensor(wcopy)?;
-                // (c) row offset: output batch row r vs reference row r+1.
-                reset(&mut gpu, &outs)?;
-                launch(&mut gpu, case, bt_w, &x16, &outs.y, 0, NMAX)?;
-                let good = read(&mut gpu, &outs)?;
-                let shifted: Vec<Vec<u8>> = refb
-                    .iter()
-                    .zip(ms)
-                    .map(|(r, &m)| {
-                        let mut v = r.clone();
-                        v.copy_within(m * 4..NMAX * m * 4, 0);
-                        v
-                    })
-                    .collect();
-                detect(&mut rep, "row offset", first_diff(&good, &shifted, ms).is_some());
-                // (d) canary write and (e) padded-row write after an N=77 run.
-                reset(&mut gpu, &outs)?;
-                launch(&mut gpu, case, bt_w, &x16, &outs.y, 0, 77)?;
-                let mut g77 = read(&mut gpu, &outs)?;
-                let w77 = expect(&refb, &outs.init, ms, 77);
-                let clean = first_diff(&g77, &w77, ms).is_none();
-                let last = g77[0].len() - 4;
-                g77[0][last] ^= 1;
-                detect(&mut rep, "canary", clean && first_diff(&g77, &w77, ms).is_some());
-                g77[0][last] ^= 1;
-                g77[0][77 * ms[0] * 4] ^= 1;
-                detect(&mut rep, "padded row", clean && first_diff(&g77, &w77, ms).is_some());
-                rep.line(format!("{} {}", tag("neg"), det.join(" ")));
-            }
-
-            if has("graph") && args.mode != "eager" {
-                // Capture one K32 launch on a stream, replay 3x; bytes stable and == reference.
-                let mut v = Vec::new();
-                for n in [128usize, 77] {
-                    if n > n_max {
-                        continue;
-                    }
-                    let kind = Kind::K32(8, wr);
-                    ensure(&mut gpu, case, kind)?;
-                    let stream = gpu.hip.stream_create()?;
-                    gpu.active_stream = Some(stream);
+            // Production outputs of this seed, per N (for the cross check).
+            let mut prod_fnv: Vec<Option<Vec<u64>>> = vec![None; NMAX + 1];
+            if has("prod") {
+                // Every N through the production entry, 0-byte vs the singleton
+                // over the complete buffers (padded rows and canaries included).
+                let rz = ref_for(Kind::Prod);
+                let mut bad = Vec::new();
+                let mut syms: Vec<String> = Vec::new();
+                for n in 1..=n_max {
                     reset(&mut gpu, &outs)?;
-                    let s = gpu.active_stream.as_ref().unwrap();
-                    gpu.hip.stream_begin_capture(s, 0)?;
-                    let lr = launch(&mut gpu, case, kind, &x16, &outs.y, 0, n);
-                    let s = gpu.active_stream.as_ref().unwrap();
-                    let graph = gpu.hip.stream_end_capture(s)?;
-                    lr?;
-                    let exec = gpu.hip.graph_instantiate(&graph)?;
-                    let want = expect(&refb, &outs.init, ms, n);
-                    let mut okall = true;
-                    for i in 0..3 {
-                        reset(&mut gpu, &outs)?;
-                        gpu.hip.graph_launch(&exec, gpu.active_stream.as_ref().unwrap())?;
-                        okall &= rep.cmp(&tag(&format!("graph replay{i} k32 N={n}")), &read(&mut gpu, &outs)?, &want, ms);
+                    launch(&mut gpu, case, Kind::Prod, &px, &outs.y, 0, n)?;
+                    let got = read(&mut gpu, &outs)?;
+                    let (sym, _) = prod_symbol(case, n, pm_sel);
+                    if syms.last() != Some(&sym) {
+                        syms.push(sym.clone());
                     }
-                    let s = gpu.active_stream.take().unwrap();
-                    gpu.hip.device_synchronize()?;
-                    drop(exec);
-                    drop(graph);
-                    gpu.hip.stream_destroy(s)?;
-                    v.push(format!("N={n}:{}", if okall { "3x same" } else { "DIFF" }));
+                    if !rep.cmp(&tag(&format!("prod[{}] {sym} N={n}", family(pm_sel))), &got, &expect(rz, &outs.init, ms, n), ms) {
+                        bad.push(n);
+                    }
+                    let f: Vec<u64> = got.iter().map(|g| fnv(g)).collect();
+                    let _ = writeln!(digests, "{} {seed} {n} {}", case.name, f.iter().map(|x| format!("{x:016x}")).collect::<Vec<_>>().join(","));
+                    prod_fnv[n] = Some(f);
                 }
-                rep.line(format!("{} {}", tag("graph"), v.join(" ")));
+                rep.line(format!(
+                    "{} prod[{}] N=1..{n_max}: {} | tiers {}",
+                    tag("prod"),
+                    family(pm_sel),
+                    if bad.is_empty() { "all same".to_string() } else { format!("DIFF at {bad:?}") },
+                    syms.join(" -> ")
+                ));
+                if si == 0 {
+                    // Loaded identity: the selected family's wide symbols are
+                    // loaded, the other family's are not (before any cross run).
+                    let mut v = Vec::new();
+                    for n in [64usize, 128] {
+                        if n > n_max {
+                            continue;
+                        }
+                        let (s_sel, blk) = prod_symbol(case, n, pm_sel);
+                        let (s_oth, _) = prod_symbol(case, n, !pm_sel);
+                        let (l_sel, l_oth) = (loaded(&gpu, &s_sel, blk), loaded(&gpu, &s_oth, blk));
+                        rep.checks += 1;
+                        if !l_sel || (l_oth && !crossed.contains(&s_oth)) {
+                            rep.fails += 1;
+                            rep.line(format!("FAIL {}: selected {s_sel} loaded={l_sel}, other {s_oth} loaded={l_oth}", tag("identity")));
+                        }
+                        v.push(format!("N={n}: {s_sel} loaded={l_sel}; {s_oth} loaded={l_oth}{}", if crossed.contains(&s_oth) { " (by earlier cross)" } else { "" }));
+                    }
+                    rep.line(format!("{} {}", tag("identity"), v.join(" | ")));
+                }
+            }
+
+            if has("prodcross") {
+                // The other family in-process (flag swapped for these calls
+                // only) over the wide range: 0-byte vs the singleton and vs the
+                // selected family's bytes of the same N.
+                let rz = ref_for(Kind::Prod);
+                let mut bad = Vec::new();
+                let mut vs_sel = 0usize;
+                for n in 64..=n_max {
+                    let got = with_pm(&mut gpu, !pm_sel, |g| {
+                        reset(g, &outs)?;
+                        launch(g, case, Kind::Prod, &px, &outs.y, 0, n)?;
+                        read(g, &outs)
+                    })?;
+                    crossed.insert(prod_symbol(case, n, !pm_sel).0);
+                    if !rep.cmp(&tag(&format!("prodcross[{}] N={n}", family(!pm_sel))), &got, &expect(rz, &outs.init, ms, n), ms) {
+                        bad.push(n);
+                    }
+                    if let Some(f) = &prod_fnv[n] {
+                        rep.checks += 1;
+                        let g: Vec<u64> = got.iter().map(|x| fnv(x)).collect();
+                        if &g == f {
+                            vs_sel += 1;
+                        } else {
+                            rep.fails += 1;
+                            rep.line(format!("FAIL {}: {} vs {} bytes differ at N={n}", tag("prodcross"), family(!pm_sel), family(pm_sel)));
+                        }
+                    }
+                }
+                rep.line(format!(
+                    "{} prod[{}] N=64..{n_max} vs singleton: {}; == prod[{}] bytes at {vs_sel} N",
+                    tag("prodcross"),
+                    family(!pm_sel),
+                    if bad.is_empty() { "all same".to_string() } else { format!("DIFF at {bad:?}") },
+                    family(pm_sel)
+                ));
+            }
+
+            for &cand in &cand_kinds {
+                if has("perm") {
+                    // Arbitrary-row permutation of the first n rows (X and residual init).
+                    let mut v = Vec::new();
+                    for n in [31usize, 32, 33, 48, 63, 64, 65, 96, 127, 128] {
+                        if n > n_max {
+                            continue;
+                        }
+                        let kind = cand_kind(cand, n);
+                        let rk = ref_for(kind);
+                        let mut pi: Vec<usize> = (0..n).collect();
+                        for i in (1..n).rev() {
+                            let j = (hash3(seed, n as u64, i as u64) % (i as u64 + 1)) as usize;
+                            pi.swap(i, j);
+                        }
+                        let mut xp = xb.clone();
+                        for (i, &p) in pi.iter().enumerate() {
+                            xp[i * k..(i + 1) * k].copy_from_slice(&xb[p * k..(p + 1) * k]);
+                        }
+                        load_x(&mut gpu, &xp)?;
+                        let mut init_p = outs.init.clone();
+                        let mut want = outs.init.clone();
+                        for (o, &m) in ms.iter().enumerate() {
+                            for (i, &p) in pi.iter().enumerate() {
+                                let (d, s) = (i * m * 4..(i + 1) * m * 4, p * m * 4..(p + 1) * m * 4);
+                                init_p[o][d.clone()].copy_from_slice(&outs.init[o][s.clone()]);
+                                want[o][d].copy_from_slice(&rk[o][s]);
+                            }
+                            gpu.hip.memcpy_htod(&outs.y[o].buf, &init_p[o])?;
+                        }
+                        launch(&mut gpu, case, kind, &px, &outs.y, 0, n)?;
+                        let ok = rep.cmp(&tag(&format!("perm {cand} N={n}")), &read(&mut gpu, &outs)?, &want, ms);
+                        v.push(format!("N={n}:{}", if ok { "same" } else { "DIFF" }));
+                    }
+                    load_x(&mut gpu, &xb)?;
+                    rep.line(format!("{} {cand} permuted rows {}", tag("perm"), v.join(" ")));
+                }
+
+                if has("neg") {
+                    // Negative controls: each must be DETECTED by the comparator.
+                    let kn = cand_kind(cand, NMAX);
+                    let rk = ref_for(kn);
+                    let mut det = Vec::new();
+                    let mut detect = |rep: &mut Report, what: &str, detected: bool| {
+                        rep.checks += 1;
+                        if !detected {
+                            rep.fails += 1;
+                            rep.line(format!("FAIL {}: {cand} negative control '{what}' NOT detected", tag("neg")));
+                        }
+                        det.push(format!("{what}:{}", if detected { "detected" } else { "MISSED" }));
+                    };
+                    // (a) one altered activation bit.
+                    let mut xa = xb.clone();
+                    xa[5 * k + 37] ^= 0x0400;
+                    load_x(&mut gpu, &xa)?;
+                    reset(&mut gpu, &outs)?;
+                    launch(&mut gpu, case, kn, &px, &outs.y, 0, NMAX)?;
+                    let got = read(&mut gpu, &outs)?;
+                    detect(&mut rep, "input bit", first_diff(&got, rk, ms).is_some());
+                    load_x(&mut gpu, &xb)?;
+                    // (b) altered header (scale of the second half of group 0, weight row 3).
+                    let wbytes = case.w[0].buf.size();
+                    let wcopy = gpu.zeros(&[wbytes / 4 + 1], DType::F32)?;
+                    gpu.hip.memcpy_dtod(&wcopy.buf, &case.w[0].buf, wbytes)?;
+                    let row_bytes = (k / 256) * 136;
+                    let mut hdr = [0u8; 4];
+                    gpu.hip.memcpy_dtoh_at(&mut hdr, &wcopy.buf, 3 * row_bytes + 4)?;
+                    hdr[1] ^= 0x04;
+                    gpu.hip.memcpy_htod_offset(&wcopy.buf, 3 * row_bytes + 4, &hdr)?;
+                    let mut alt = Case { name: case.name, fam: case.fam, w: case.w.clone(), ms: case.ms.clone(), k, lmhead: case.lmhead };
+                    alt.w[0] = &wcopy;
+                    reset(&mut gpu, &outs)?;
+                    launch(&mut gpu, &alt, kn, &px, &outs.y, 0, NMAX)?;
+                    let got_h = read(&mut gpu, &outs)?;
+                    detect(&mut rep, "header byte", first_diff(&got_h, rk, ms).is_some());
+                    gpu.free_tensor(wcopy)?;
+                    // (c) row offset: output batch row r vs reference row r+1.
+                    reset(&mut gpu, &outs)?;
+                    launch(&mut gpu, case, kn, &px, &outs.y, 0, NMAX)?;
+                    let good = read(&mut gpu, &outs)?;
+                    let shifted: Vec<Vec<u8>> = rk
+                        .iter()
+                        .zip(ms)
+                        .map(|(r, &m)| {
+                            let mut v = r.clone();
+                            v.copy_within(m * 4..NMAX * m * 4, 0);
+                            v
+                        })
+                        .collect();
+                    detect(&mut rep, "row offset", first_diff(&good, &shifted, ms).is_some());
+                    // (d) canary write and (e) padded-row write after an N=77 run.
+                    let k77 = cand_kind(cand, 77);
+                    reset(&mut gpu, &outs)?;
+                    launch(&mut gpu, case, k77, &px, &outs.y, 0, 77)?;
+                    let mut g77 = read(&mut gpu, &outs)?;
+                    let w77 = expect(ref_for(k77), &outs.init, ms, 77);
+                    let clean = first_diff(&g77, &w77, ms).is_none();
+                    let last = g77[0].len() - 4;
+                    g77[0][last] ^= 1;
+                    detect(&mut rep, "canary", clean && first_diff(&g77, &w77, ms).is_some());
+                    g77[0][last] ^= 1;
+                    g77[0][77 * ms[0] * 4] ^= 1;
+                    detect(&mut rep, "padded row", clean && first_diff(&g77, &w77, ms).is_some());
+                    if kn == Kind::Prod {
+                        // (f) out-of-domain N fails closed before any write.
+                        for n in [0usize, NMAX + 1] {
+                            reset(&mut gpu, &outs)?;
+                            let refused = launch(&mut gpu, case, Kind::Prod, &px, &outs.y, 0, n).is_err();
+                            let untouched = first_diff(&read(&mut gpu, &outs)?, &outs.init, ms).is_none();
+                            detect(&mut rep, &format!("refuse N={n}"), refused && untouched);
+                        }
+                    }
+                    rep.line(format!("{} {cand} {}", tag("neg"), det.join(" ")));
+                }
+
+                if has("graph") && args.mode != "eager" {
+                    // Prewarm eagerly (load + scratch), capture one call through
+                    // the GraphState capture path (blob kernargs), replay 3x:
+                    // bytes stable and == reference.
+                    let mut v = Vec::new();
+                    let ns: &[usize] = if cand == "prod" { &[128, 77, 65, 64, 33, 1] } else { &[128, 77] };
+                    for &n in ns {
+                        if n > n_max {
+                            continue;
+                        }
+                        let kind = cand_kind(cand, n);
+                        let want = expect(ref_for(kind), &outs.init, ms, n);
+                        let stream = gpu.hip.stream_create()?;
+                        gpu.active_stream = Some(stream);
+                        reset(&mut gpu, &outs)?;
+                        launch(&mut gpu, case, kind, &px, &outs.y, 0, n)?;
+                        let eager_ok = rep.cmp(&tag(&format!("graph prewarm {cand} N={n}")), &read(&mut gpu, &outs)?, &want, ms);
+                        reset(&mut gpu, &outs)?;
+                        gpu.invalidate_fp16_cache();
+                        let dev = gpu.device_id;
+                        gpu.graphs.begin_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                        let lr = launch(&mut gpu, case, kind, &px, &outs.y, 0, n);
+                        let er = gpu.graphs.end_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap());
+                        lr?;
+                        er?;
+                        // Capture must not have executed anything.
+                        let not_run = first_diff(&read(&mut gpu, &outs)?, &outs.init, ms).is_none();
+                        rep.checks += 1;
+                        if !not_run {
+                            rep.fails += 1;
+                            rep.line(format!("FAIL {}: Y changed during capture N={n}", tag("graph")));
+                        }
+                        let mut okall = eager_ok && not_run;
+                        for i in 0..3 {
+                            reset(&mut gpu, &outs)?;
+                            gpu.graphs.graph_launch(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                            okall &= rep.cmp(&tag(&format!("graph replay{i} {cand} N={n}")), &read(&mut gpu, &outs)?, &want, ms);
+                        }
+                        gpu.hip.device_synchronize()?;
+                        gpu.graphs.drop_captured_graph(&gpu.hip, dev);
+                        let s = gpu.active_stream.take().unwrap();
+                        gpu.hip.stream_destroy(s)?;
+                        v.push(format!("N={n}:{}", if okall { "3x same" } else { "DIFF" }));
+                    }
+                    rep.line(format!("{} {cand} {}", tag("graph"), v.join(" ")));
+                }
             }
             free_outs(&mut gpu, outs)?;
         }
@@ -1092,25 +1348,16 @@ fn run() -> R<usize> {
             // Event timing on the null stream, one launch set per sample.
             let outs = alloc_outs(&mut gpu, case, 1, false)?;
             load_x(&mut gpu, &gen_x(1, k))?;
-            type Set = (&'static str, Vec<(Kind, usize, usize)>);
-            let sets: Vec<Set> = vec![
-                ("vt3+vt3+vt2 48+48+32", vec![(Kind::Vt(3, wr), 0, 48), (Kind::Vt(3, wr), 48, 48), (Kind::Vt(2, wr), 96, 32)]),
-                ("k32 bt8w4 128", vec![(Kind::K32(8, 4), 0, 128)]),
-                ("k32 bt8w8 128", vec![(Kind::K32(8, 8), 0, 128)]),
-                ("bt8 128", vec![(Kind::Bt(8), 0, 128)]),
-                ("single 128", vec![(Kind::Single, 0, 128)]),
-                ("vt4 64+64", vec![(Kind::Vt(4, wr), 0, 64), (Kind::Vt(4, wr), 64, 64)]),
-            ];
+            gpu.invalidate_fp16_cache();
             let e0 = gpu.hip.event_create()?;
             let e1 = gpu.hip.event_create()?;
-            let mut line = Vec::new();
-            for (name, set) in &sets {
+            let time_set = |gpu: &mut Gpu, set: &[(Kind, usize, usize)]| -> R<(f64, f64)> {
                 let mut ts = Vec::with_capacity(args.reps);
                 for rep_i in 0..args.reps + 3 {
                     gpu.hip.device_synchronize()?;
                     gpu.hip.event_record(&e0, None)?;
                     for &(kind, r0, n) in set {
-                        launch(&mut gpu, case, kind, &x16, &outs.y, r0, n)?;
+                        launch(gpu, case, kind, &px, &outs.y, r0, n)?;
                     }
                     gpu.hip.event_record(&e1, None)?;
                     gpu.hip.event_synchronize(&e1)?;
@@ -1119,49 +1366,62 @@ fn run() -> R<usize> {
                     }
                 }
                 let min = ts.iter().cloned().fold(f64::INFINITY, f64::min);
-                let med = median(&mut ts);
-                line.push(format!("{name}: med {med:.4} min {min:.4} ms"));
+                Ok((median(&mut ts), min))
+            };
+            let mut line = Vec::new();
+            let vt = [(Kind::Vt(3, wr), 0, 48), (Kind::Vt(3, wr), 48, 48), (Kind::Vt(2, wr), 96, 32)];
+            let (m, mn) = time_set(&mut gpu, &vt)?;
+            line.push(format!("vt3+vt3+vt2 48+48+32: med {m:.4} min {mn:.4} ms"));
+            if has("prodtime") {
+                // Production entry, fp16 X cached (kernel cost; the head case
+                // through the residual entry, no memset).
+                let (s_sel, _) = prod_symbol(case, 128, pm_sel);
+                let (m, mn) = time_set(&mut gpu, &[(Kind::ProdKernel, 0, 128)])?;
+                line.push(format!("prod[{}] {s_sel} 128: med {m:.4} min {mn:.4} ms", family(pm_sel)));
+                let (s_oth, _) = prod_symbol(case, 128, !pm_sel);
+                let (m, mn) = with_pm(&mut gpu, !pm_sel, |g| time_set(g, &[(Kind::ProdKernel, 0, 128)]))?;
+                line.push(format!("prod[{}] {s_oth} 128 (flag-swapped, same process): med {m:.4} min {mn:.4} ms", family(!pm_sel)));
             }
-            // Generic product dispatch at 128 (context only: not exact).
-            let mut ts = Vec::new();
-            for rep_i in 0..args.reps + 3 {
-                gpu.hip.device_synchronize()?;
-                gpu.hip.event_record(&e0, None)?;
-                generic(&mut gpu, case, &x32, &outs.y, 128)?;
-                gpu.hip.event_record(&e1, None)?;
-                gpu.hip.event_synchronize(&e1)?;
-                if rep_i >= 3 {
-                    ts.push(gpu.hip.event_elapsed_ms(&e0, &e1)? as f64);
+            if has("k32") || !has("prodtime") {
+                // The Gate-0 comparison sets.
+                let sets: [(&str, Vec<(Kind, usize, usize)>); 5] = [
+                    ("k32 spike bt8w4 128", vec![(Kind::K32(8, 4), 0, 128)]),
+                    ("k32 spike bt8w8 128", vec![(Kind::K32(8, 8), 0, 128)]),
+                    ("bt8 128", vec![(Kind::Bt(8), 0, 128)]),
+                    ("single 128", vec![(Kind::Single, 0, 128)]),
+                    ("vt4 64+64", vec![(Kind::Vt(4, wr), 0, 64), (Kind::Vt(4, wr), 64, 64)]),
+                ];
+                for (name, set) in &sets {
+                    let (m, mn) = time_set(&mut gpu, set)?;
+                    line.push(format!("{name}: med {m:.4} min {mn:.4} ms"));
                 }
             }
-            line.push(format!("generic 128 (product, not exact): med {:.4} ms", median(&mut ts)));
             rep.line(format!("time {} total_m={tm} k={k} W={wr} reps={} | {}", case.name, args.reps, line.join(" | ")));
             free_outs(&mut gpu, outs)?;
         }
     }
 
-    // Occupancy (code-object resource metadata lands in HIPFIRE_KERNEL_CACHE).
-    for (sym, block, lds) in [
-        ("cbo_k32_residual_bt8w4", 128u32, 2 * 128 * 40 * 2),
-        ("cbo_k32_residual_bt8w8", 256, 2 * 128 * 40 * 2),
-        ("cbo_k32_residual_bt4w4", 128, 2 * 64 * 40 * 2),
-        ("cbo_k32_residual_bt4w8", 256, 2 * 64 * 40 * 2),
-        ("gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", 128, 2 * 48 * 136 * 2),
-        ("gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", 128, 2 * 32 * 136 * 2),
-        ("gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", 256, 2 * 48 * 136 * 2),
-        ("gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", 256, 2 * 32 * 136 * 2),
-    ] {
-        match gpu.occupancy_max_active_blocks(sym, [block, 1, 1], 0) {
-            Ok(o) => rep.line(format!("occupancy {sym} block={block} static_lds={lds}B max_active_blocks_per_cu={o}")),
-            Err(e) => rep.line(format!("occupancy {sym}: n/a ({e})")),
+    // Occupancy / loaded state of every wide symbol of both families (the
+    // query resolves loaded functions by name; "not loaded" = never loaded here).
+    for case in &cases {
+        for n in [64usize, 128] {
+            for pm in [pm_sel, !pm_sel] {
+                let (sym, block) = prod_symbol(case, n, pm);
+                match gpu.occupancy_max_active_blocks(&sym, [block, 1, 1], 0) {
+                    Ok(o) => rep.line(format!("occupancy {} {sym} block={block} max_active_blocks_per_cu={o}", family(pm))),
+                    Err(_) => rep.line(format!("occupancy {} {sym}: not loaded", family(pm))),
+                }
+            }
         }
     }
 
+    std::fs::write(format!("{}/digests.txt", args.out), &digests)?;
     let mut summary = String::new();
     let _ = writeln!(summary, "checks {} fails {}", rep.checks, rep.fails);
     rep.line(summary.trim_end().to_string());
     rep.line(if rep.fails == 0 { "VERDICT PASS".into() } else { "VERDICT FAIL".into() });
     std::fs::write(format!("{}/report.txt", args.out), &rep.text)?;
+    let Panels { x16, x32 } = px;
     gpu.free_tensor(x16)?;
     gpu.free_tensor(x32)?;
     Ok(rep.fails)
