@@ -510,10 +510,18 @@ fn stage_qwen_vmm_batch(
         eprintln!("[daemon] VMM continuous batch requested but model state not Qwen35 — existing route");
         return out;
     };
-    // No `qwen_batch_weight_formats_supported` gate: that predicate covers
-    // the fixed-lane batched decode kernels. The VMM executor runs the slot
-    // forward's own projections, and an unsupported format fails its forward
-    // (fail-closed per step), not this load.
+    // The executor's own coverage predicate (embedding/lm_head dtypes,
+    // slots-body layer coverage, VMM KV route and flash plan) — not the
+    // fixed-lane `qwen_batch_weight_formats_supported` gate.
+    if let Err(e) = hipfire_arch_qwen35::forward_slots::vmm::vmm_executor_supports(
+        gpu,
+        &b.weights,
+        &b.config,
+        &b.kv_cache,
+    ) {
+        eprintln!("[daemon] VMM continuous batch unsupported for this model: {e} — existing route");
+        return out;
+    }
     let row_budget = req.row_budget.max(requested);
     // Shared physical KV budget for every request owner: free VRAM after the
     // resident model, minus fixed headroom for executor scratch and
