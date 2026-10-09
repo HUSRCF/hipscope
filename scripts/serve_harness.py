@@ -4042,10 +4042,12 @@ def _concurrent_isolation_mismatches(cfg, rows):
     same prompt (battery) or turn (chain). Reference = the lowest concurrency
     level's client 0 (level 1 when requested).
 
-    Returns ``(mismatches, cache_divergent)``. A row whose server prompt-cache
-    reuse (`cached` tokens) differs from the reference ran a different prefill
-    (warm suffix vs cold), which is not a like-for-like greedy comparison; it
-    is reported separately, never counted as an isolation pass or failure."""
+    Returns ``(mismatches, divergent)``. Not like-for-like, so reported
+    separately and never counted as an isolation pass or failure: a row whose
+    request bytes differ from the reference (`request_md5`: a chain whose
+    earlier turn already diverged carries different history), or whose
+    server prompt-cache reuse (`cached` tokens) differs (warm suffix vs cold
+    prefill)."""
     ref_level = min(r["concurrency"] for r in rows)
     ref = {_concurrent_isolation_key(cfg, r): r for r in rows if r["concurrency"] == ref_level and r["client"] == 0}
     out, divergent = [], []
@@ -4055,7 +4057,9 @@ def _concurrent_isolation_mismatches(cfg, rows):
             continue
         diff = [f for f in _CONCURRENT_ISOLATION_FIELDS if r.get(f) != base.get(f)]
         tag = f"c{r['concurrency']}/client{r['client']}/turn{r['turn']} (prompt {r['prompt_index']})"
-        if r.get("cached") != base.get("cached"):
+        if r.get("request_md5") != base.get("request_md5"):
+            divergent.append(f"{tag} request bytes differ (history diverged) outputs {'differ in ' + str(diff) if diff else 'equal'}")
+        elif r.get("cached") != base.get("cached"):
             divergent.append(f"{tag} cached {base.get('cached')}->{r.get('cached')} outputs {'differ in ' + str(diff) if diff else 'equal'}")
         elif diff:
             out.append(f"{tag} differs in {diff}")
@@ -4103,11 +4107,11 @@ def _run_concurrent_clients(cfg, args, battery, feedback_shape):
         mismatches, divergent = _concurrent_isolation_mismatches(cfg, rows)
         print(
             f"concurrent greedy isolation: {len(rows)} rows, mismatches={len(mismatches)} "
-            f"cache_divergent={len(divergent)} (not comparable)",
+            f"not_comparable={len(divergent)} (request bytes or prompt-cache reuse differ)",
             flush=True,
         )
         for line in divergent:
-            print(f"  cache-divergent: {line}", flush=True)
+            print(f"  not-comparable: {line}", flush=True)
         if mismatches:
             record()
             raise SystemExit("serve_harness: concurrent greedy isolation failed: " + "; ".join(mismatches[:16]))
