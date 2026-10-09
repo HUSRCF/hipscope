@@ -26,7 +26,7 @@
 //! Comparisons are actual byte comparisons; sha256 digests are receipts only.
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
-use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit};
+use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit, VmmRoute};
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
@@ -257,6 +257,8 @@ struct Trace {
     position: usize,
     pending_seed: u32,
     states: Vec<(String, PathBuf)>,
+    /// Prompt chunk lengths the route executed, in order.
+    prefill_chunks: Vec<usize>,
 }
 
 struct Ctx {
@@ -284,6 +286,23 @@ impl Ctx {
             &mut b.dn_state, &b.scratch, None, None, None, None,
         )?;
         Ok(())
+    }
+    /// Default singleton serve prefill: the same outer chunking as the serve
+    /// route (`ordinary_prefill_chunk_limit` + `ordinary_serve_prefill_chunk_len`),
+    /// re-evaluated before every chunk. Returns the executed chunk lengths.
+    fn prefill_serve(&mut self, tokens: &[u32]) -> Result<Vec<usize>> {
+        let mut chunks = Vec::new();
+        let mut done = 0;
+        while done < tokens.len() {
+            let rem = tokens.len() - done;
+            let b = &self.b;
+            let ceiling = qwen35::ordinary_prefill_chunk_limit(&self.gpu, &b.weights, &b.config, &b.dn_state, &b.kv_cache, None)?;
+            let len = qwen35::prefill::ordinary_serve_prefill_chunk_len(rem, ceiling).unwrap_or(rem.min(ceiling).max(1));
+            self.prefill(&tokens[done..done + len], done)?;
+            chunks.push(len);
+            done += len;
+        }
+        Ok(chunks)
     }
     fn decode(&mut self, token: u32, pos: usize) -> Result<()> {
         let b = &mut self.b;
@@ -349,7 +368,7 @@ fn record(ctx: &mut Ctx, f: &Fixture, steps: usize, dir: &Path) -> Result<Trace>
     fs::create_dir_all(dir.parent().ok_or("reference dir has no parent")?)?;
     fs::create_dir(dir)?; // never overwrite a previous reference
     ctx.reset()?;
-    ctx.prefill(&f.tokens, 0)?;
+    let prefill_chunks = ctx.prefill_serve(&f.tokens)?;
     let mut tr = Trace {
         logits: vec![],
         hidden: vec![],
@@ -357,6 +376,7 @@ fn record(ctx: &mut Ctx, f: &Fixture, steps: usize, dir: &Path) -> Result<Trace>
         position: f.prefix,
         pending_seed: 0,
         states: vec![],
+        prefill_chunks,
     };
     let save_states = |ctx: &Ctx, tr: &mut Trace, stage: &str, rows: usize| -> Result<()> {
         for (name, bytes) in state_bytes(&ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, &ctx.b.dn_state, rows)? {
@@ -447,7 +467,7 @@ fn replay(ctx: &mut Ctx, f: &Fixture, steps: usize, reference: &Trace, perturb: 
     let mut d = Diff::default();
     let rd = |p: &Path| fs::read(p);
     ctx.reset()?;
-    ctx.prefill(&f.tokens, 0)?;
+    ctx.prefill_serve(&f.tokens)?;
     let l = ctx.logits()?;
     d.check("logits_0000", &rd(&reference.logits[0])?, &l);
     let mut seed = argmax(&l)?;
@@ -564,9 +584,9 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
 
 // ── Batch phase: Qwen35VmmStore / executor (§4.2) ────────────────────
 
-/// Prefill chunk per request per step; identical in the isolated executor
-/// reference and every batch case so chunk boundaries never differ.
-const CHUNK: usize = 256;
+/// Requests in flight per store. Prefill chunk lengths come from the store's
+/// `exact_prefill_chunk_len` (the singleton serve chunking), one prefill
+/// request per step so the row budget is width + one chunk.
 const WIDTH: usize = 8;
 
 enum Sink {
@@ -589,6 +609,8 @@ struct Req {
     committed: Vec<u32>,
     finish: Option<String>,
     store_watermark_errors: Vec<String>,
+    /// Prompt chunk lengths the executor ran for this request.
+    chunks: Vec<usize>,
     sink: Sink,
 }
 
@@ -605,6 +627,7 @@ impl Req {
             committed: Vec::new(),
             finish: None,
             store_watermark_errors: Vec::new(),
+            chunks: Vec::new(),
             sink,
         }
     }
@@ -698,6 +721,16 @@ fn sink_finish(sink: &mut Sink, refs: &Refs, r_committed: &[u32], position: usiz
     Ok(())
 }
 
+/// Prompt chunk sequence the executor ran. Informational, not a parity
+/// item: the admitted ceiling follows free VRAM (other live requests), and
+/// the inner planner keeps 512-row state/KV commits, so chunking may differ
+/// while every state byte matches. Recorded in the reference and case JSON.
+fn sink_chunks(sink: &mut Sink, chunks: &[usize]) {
+    if let Sink::Record { trace, .. } = sink {
+        trace.prefill_chunks = chunks.to_vec();
+    }
+}
+
 fn free_vram(gpu: &Gpu) -> Result<usize> {
     Ok(gpu.hip.get_vram_info()?.0)
 }
@@ -708,11 +741,16 @@ fn new_store(ctx: &mut Ctx) -> Result<Qwen35VmmStore> {
     if let Some(pbs) = ctx.b.scratch.widened_prefill_batch.borrow_mut().take() {
         pbs.free_gpu(&mut ctx.gpu)?;
     }
+    // Row budget: every decode row plus one prefill chunk at the singleton's
+    // current admitted ceiling (the store's own allocation only lowers it).
+    let b = &ctx.b;
+    let ceiling = qwen35::ordinary_prefill_chunk_limit(&ctx.gpu, &b.weights, &b.config, &b.dn_state, &b.kv_cache, None)?;
     // Shared physical KV budget: free VRAM minus a 6 GiB margin for the
     // store's row scratch, per-request DeltaNet state and transients. This
     // is an admission budget, not a max_seq override.
     let budget = free_vram(&ctx.gpu)?.saturating_sub(6 << 30);
-    Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH * CHUNK, budget)?)
+    eprintln!("batch store: route=Exact width={WIDTH} row_budget={} (prefill ceiling {ceiling})", WIDTH + ceiling);
+    Ok(Qwen35VmmStore::new(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, WIDTH, WIDTH + ceiling, budget, VmmRoute::Exact)?)
 }
 
 fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> Result<()> {
@@ -740,22 +778,30 @@ fn retire(ctx: &mut Ctx, store: &mut Qwen35VmmStore, epoch: &RequestEpoch) -> Re
     Ok(())
 }
 
-/// Build the next step over every live request, in slot order.
-fn build_plan(store: &Qwen35VmmStore, fx: &[Fixture], reqs: &[Req]) -> Result<BatchStepPlan> {
+/// Build the next step: one AR row per decoding request plus one prefill
+/// chunk (first prefilling request in slot order) of the exact route's
+/// singleton chunk length. Other prefilling requests idle (masked) this step.
+fn build_plan(ctx: &Ctx, store: &Qwen35VmmStore, fx: &[Fixture], reqs: &[Req]) -> Result<BatchStepPlan> {
     let mut per: Vec<(usize, Vec<u32>, usize, Option<(RequestEpoch, RequestStepKind)>)> =
         (0..WIDTH).map(|s| (s, vec![], 0, None)).collect();
-    for r in reqs.iter().filter(|r| r.finish.is_none()) {
-        let st = store.request_state(&r.epoch).ok_or("live request missing from store")?;
+    let mut live: Vec<&Req> = reqs.iter().filter(|r| r.finish.is_none()).collect();
+    live.sort_by_key(|r| r.slot);
+    let mut prefill_taken = false;
+    for r in live {
+        store.request_state(&r.epoch).ok_or("live request missing from store")?;
         let f = &fx[r.fx];
         let (toks, start, kind) = if r.fed < f.prefix {
-            let end = (r.fed + CHUNK).min(f.prefix);
-            (f.tokens[r.fed..end].to_vec(), r.fed, RequestStepKind::Prefill)
+            if prefill_taken {
+                continue;
+            }
+            prefill_taken = true;
+            let len = store.exact_prefill_chunk_len(&ctx.gpu, &ctx.b.weights, &ctx.b.config, &r.epoch, f.prefix - r.fed)?;
+            (f.tokens[r.fed..r.fed + len].to_vec(), r.fed, RequestStepKind::Prefill)
         } else {
             let seed = *r.committed.last().ok_or("decode without a pick")?;
             (vec![seed], f.prefix + r.committed.len() - 1, RequestStepKind::Ar)
         };
         per[r.slot] = (r.slot, toks, start, Some((r.epoch, kind)));
-        let _ = st;
     }
     let triples: Vec<(SlotId, &[u32], usize)> =
         per.iter().map(|(s, t, p, _)| (SlotId(*s), t.as_slice(), *p)).collect();
@@ -786,12 +832,22 @@ fn run_step(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mu
     let (vocab, dim) = (b.config.vocab_size, b.config.dim);
     // Device heads are valid until the next forward: read before commit.
     let mut heads = Vec::new();
+    // Exact route: hidden() holds decode rows in plan order of the AR
+    // requests; prefill rows have no hidden (pick 0 records none).
+    let mut ar_ordinal = 0;
     for rr in &plan.requests {
         let last = rr.rows.end() - 1;
+        let ar_row = (rr.kind == RequestStepKind::Ar).then(|| {
+            ar_ordinal += 1;
+            ar_ordinal - 1
+        });
         if out.target_picks[last] != u32::MAX {
             let slot = plan.batch.row_slot[last] as usize;
             let l = read_dev(gpu, store.logits(), slot * vocab * 4, vocab * 4)?;
-            let h = read_dev(gpu, store.hidden(), last * dim * 4, dim * 4)?;
+            let h = match ar_row {
+                Some(row) => read_dev(gpu, store.hidden(), row * dim * 4, dim * 4)?,
+                None => Vec::new(),
+            };
             if argmax(&l)? != out.target_picks[last] {
                 return Err(format!("device pick {} != host argmax of slot logits", out.target_picks[last]).into());
             }
@@ -803,10 +859,12 @@ fn run_step(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mu
         let r = reqs.iter_mut().find(|r| r.epoch == rr.epoch).ok_or("plan epoch not in case")?;
         if rr.kind == RequestStepKind::Prefill {
             r.fed += rr.rows.len;
+            r.chunks.push(rr.rows.len);
             if r.fed == fx[r.fx].prefix {
                 let st = store.request_state(&r.epoch).ok_or("request vanished")?;
                 let now = state_bytes(gpu, &b.config, &st.kv, &st.dn, r.fed)?;
                 sink_state(&mut r.sink, refs, "prefill", now)?;
+                sink_chunks(&mut r.sink, &r.chunks);
             }
         }
     }
@@ -882,7 +940,7 @@ fn drive(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [
                     continue;
                 }
             }
-            let plan = build_plan(store, fx, reqs)?;
+            let plan = build_plan(ctx, store, fx, reqs)?;
             run_step(ctx, store, fx, reqs, refs, &plan).inspect_err(|_| store.abort_step(&plan))?;
         }
     })();
@@ -907,7 +965,7 @@ fn expect_err(map: &mut serde_json::Map<String, Value>, name: &str, r: std::resu
 /// its byte comparisons cover that.
 fn executor_controls(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], reqs: &mut [Req], live: &[usize], map: &mut serde_json::Map<String, Value>) -> Result<()> {
     let (i0, i1) = (live[0], live[1]);
-    let base = build_plan(store, fx, reqs)?;
+    let base = build_plan(ctx, store, fx, reqs)?;
     let try_plan = |ctx: &mut Ctx, store: &mut Qwen35VmmStore, plan: &BatchStepPlan| -> std::result::Result<(), String> {
         let Ctx { gpu, b } = ctx;
         let r = store.executor(&b.weights, &b.config, &b.scratch).provision_step(gpu, plan);
@@ -951,7 +1009,7 @@ fn executor_controls(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], 
     // must be refused. The step is then aborted after its forward, which
     // must poison request0 (device state written, never committed) while
     // request1 continues and must stay byte-exact over its poisoned tail.
-    let solo = build_plan(store, fx, std::slice::from_ref(&reqs[i0]))?;
+    let solo = build_plan(ctx, store, fx, std::slice::from_ref(&reqs[i0]))?;
     {
         let Ctx { gpu, b } = ctx;
         let mut ex = store.executor(&b.weights, &b.config, &b.scratch);
@@ -992,7 +1050,7 @@ fn case_json(name: &str, fx: &[Fixture], reqs: &[Req]) -> (bool, bool, Value) {
             route_exact &= a;
             json!({
                 "fixture": fx[r.fx].name(), "slot": r.slot, "epoch": [r.epoch.request_tag, r.epoch.owner_generation],
-                "max_tokens": r.max_tokens, "stop": r.stop, "cancel_at": r.cancel_at,
+                "max_tokens": r.max_tokens, "stop": r.stop, "cancel_at": r.cancel_at, "prefill_chunks": r.chunks,
                 "finish": r.finish, "committed": r.committed.len(),
                 "watermarks_ok": wm, "watermark_errors": r.store_watermark_errors,
                 "vs_isolated_executor": jb, "vs_singleton_route": ja,
@@ -1019,7 +1077,7 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
     for (i, f) in fx.iter().enumerate() {
         let dir = args.artifacts.join("executor_k1").join(f.name());
         fs::create_dir_all(&dir)?;
-        let trace = Trace { logits: vec![], hidden: vec![], committed: vec![], position: 0, pending_seed: 0, states: vec![] };
+        let trace = Trace { logits: vec![], hidden: vec![], committed: vec![], position: 0, pending_seed: 0, states: vec![], prefill_chunks: vec![] };
         let mut reqs = [Req::new(i, 1000 + i as u64, 1, i % WIDTH, steps + 1, Sink::Record { dir, trace })];
         let none: [Option<Trace>; 0] = [];
         let r = drive(ctx, &mut store, fx, &mut reqs, &Refs { b: &none, a: refs_a }, steps, None);
@@ -1043,7 +1101,10 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
                 d.ids("position", &[t.position as u32], &[trace.position as u32]);
                 d.ids("pending_seed", &[t.pending_seed], &[trace.pending_seed]);
                 eprintln!("executor k1 {}: vs singleton route exact={}", f.name(), d.exact());
-                isolated.push(json!({"fixture": f.name(), "supported": true, "vs_singleton_route": d.json()}));
+                isolated.push(json!({
+                    "fixture": f.name(), "supported": true, "vs_singleton_route": d.json(),
+                    "prefill_chunks_singleton": t.prefill_chunks, "prefill_chunks_executor": trace.prefill_chunks,
+                }));
                 refs_b.push(Some(trace));
             }
             (Err(e), _) => {
@@ -1131,7 +1192,7 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
         let probe = supported.first().copied().unwrap_or(0);
         let r = Req::new(probe, 9301, 1, 0, steps + 1, compare_sink(probe));
         admit(ctx, &mut store, fx, &r)?;
-        let mut p = build_plan(&store, fx, std::slice::from_ref(&r))?;
+        let mut p = build_plan(ctx, &store, fx, std::slice::from_ref(&r))?;
         p.requests[0].kind = RequestStepKind::Verify { draft_len: 0 };
         let Ctx { gpu, b } = ctx;
         let res = store.executor(&b.weights, &b.config, &b.scratch).provision_step(gpu, &p);
