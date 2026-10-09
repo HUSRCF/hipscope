@@ -1,0 +1,39 @@
+{
+  "module": "fused_qkv_hfq4g256_mq4v2",
+  "symbol": "fused_qkv_mq4g256v2",
+  "arch": "gfx1201",
+  "source_commit": "4fc68554cd55b85595001da28d757803766fad7c",
+  "artifact_commit": "dc15c14489",
+  "code_object_sha256": "579a3a837d45783b5fa59e50d9dc6a3a330455e3640023c8d1e344c991b6c6bb",
+  "bundle_sha256": "3eca4b78415b632e709b0fa31a13ecab0892a6d970e45ee94fdf391c25a5931a",
+  "assembly_sha256": "1106e0b139d009b772fd4ba7f04d4f63b374d6567c0f24a86c1159e679d5383a",
+  "proof_sha256": "1dc48cc0f3038e382043549fcae3e893f416843f9866e59866481fac2b448086",
+  "bundle_consistency": {
+    "target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "extracted_elf_sha256": "579a3a837d45783b5fa59e50d9dc6a3a330455e3640023c8d1e344c991b6c6bb",
+    "method": "/opt/rocm/llvm/bin/clang-offload-bundler --unbundle; sha256sum; cmp",
+    "byte_identical_to_co": true
+  },
+  "custom_build": "PASS",
+  "m7": {"lift": "byte-exact", "obligations": {}, "instructions": 389, "delays": 16, "ambiguous_delays": 0, "vgpr_high_water": 64, "sgpr_high_water": 41, "wait_facts": 26},
+  "full_oracle": [
+    {"capture": "occ0", "report": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkv_hfq4g256_mq4v2/full-occ0-579a3a837d45783b/report.json", "pass": true, "mismatch_bytes": 0, "incumbent_vs_captured_callsite_mismatch_bytes": 0, "edge_shapes": 88, "edge_mismatch_bytes": 0},
+    {"capture": "occ15", "report": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkv_hfq4g256_mq4v2/full-occ15-579a3a837d45783b/report.json", "pass": true, "mismatch_bytes": 0, "incumbent_vs_captured_callsite_mismatch_bytes": 0, "edge_shapes": 88, "edge_mismatch_bytes": 0}
+  ],
+  "timing": {
+    "harness": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/profile.py",
+    "gpu_uuid": "GPU-9eb7aeda51c88ffd",
+    "fresh_processes": 3,
+    "hipcc_sha256": "dbf87c6e7df677fc27b64b9a480f12ce275d1e165bace5da326e4441a9be457e",
+    "hipcc_medians_us": [46.160001307725906, 46.160999685525894, 46.59999907016754],
+    "native_medians_us": [50.23999884724617, 50.241000950336456, 50.1209981739521],
+    "reports": [
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-hints64-process-1.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-hints64-process-2.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-hints64-process-3.json"
+    ],
+    "post_mismatch_bytes": 0,
+    "parity_pass": false
+  },
+  "scope": "Standalone symbol exactness only; no graph, whole-model, toolchain-removal, or performance-promotion claim."
+}
