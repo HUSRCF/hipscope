@@ -3,8 +3,8 @@
     "ambiguous_delays": 0,
     "barrier_pairs": 0,
     "clauses": 0,
-    "delays": 0,
-    "instructions": 364,
+    "delays": 16,
+    "instructions": 389,
     "lds_accesses": 5,
     "lds_max_known_end": null,
     "lds_unknown_addresses": 5,
@@ -13,6 +13,6 @@
     "sgpr_high_water": 41,
     "table": "gfx1201",
     "vgpr_high_water": 64,
-    "wait_facts": 17
+    "wait_facts": 26
   }
 }

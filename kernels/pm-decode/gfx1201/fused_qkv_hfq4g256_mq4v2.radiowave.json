@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791511240,
+  "generated_unix_seconds": 1791511905,
   "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.s",
   "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
   "arch": "gfx1201",
@@ -18,9 +18,9 @@
     "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
-  "source_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
+  "source_sha256": "1106e0b139d009b772fd4ba7f04d4f63b374d6567c0f24a86c1159e679d5383a",
   "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "output_sha256": "43be91066e17eeb9d88bcd5a68c35d16ea57d06c40ee5060560a7a67dceffdad",
+  "output_sha256": "3eca4b78415b632e709b0fa31a13ecab0892a6d970e45ee94fdf391c25a5931a",
   "inspection": {
     "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
     "identity": {
@@ -122,7 +122,7 @@
           }
         ],
         "instructions": {
-          "static_instructions": 364,
+          "static_instructions": 389,
           "buffer_loads": 10,
           "buffer_stores": 0,
           "global_loads": 20,
@@ -133,8 +133,8 @@
           "kernarg_scalar_loads": 5,
           "scalar_buffer_loads": 0,
           "unknown_scalar_loads": 0,
-          "wait_instructions": 17,
-          "delay_alu_instructions": 0,
+          "wait_instructions": 42,
+          "delay_alu_instructions": 16,
           "memory_clause_instructions": 0,
           "max_consecutive_vmem_instructions": 18
         }
@@ -145,8 +145,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
-      "proof_sha256": "d18a875f0daf48f3b0e8af04bceaa42d7b1e89d3381581c5744f1281d2495a80"
+      "builder_git_sha": "4fc68554cd55b85595001da28d757803766fad7c",
+      "proof_sha256": "1dc48cc0f3038e382043549fcae3e893f416843f9866e59866481fac2b448086"
     },
     "tools": [
       {
@@ -162,11 +162,11 @@
           "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "4f10e94e462e65f76e2bb2be08b60f47d0dceb2eb0795d3ae913b4770e01b5a3"
+        "sha256": "62311aef24e81901f07859cd247d282463ae12c02762dc9ec65e9e4ef74e4260"
       }
     ],
-    "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
-    "text_section_sha256": "58ed89bb7b99fa36956fb276513af7765b092c72b3de6154fbb0668202e31e43",
+    "s_text_sha256": "1106e0b139d009b772fd4ba7f04d4f63b374d6567c0f24a86c1159e679d5383a",
+    "text_section_sha256": "9264a91afb726bee23314e74199389d3656a885e7e2cf2b0cdf60946d6e7741a",
     "shape_contract": {
       "counts": {},
       "end_label": null,
@@ -202,6 +202,7 @@
         "s_cmp_lt_i32": 2,
         "s_cmp_lt_u32": 3,
         "s_cselect_b32": 10,
+        "s_delay_alu": 16,
         "s_endpgm": 1,
         "s_load_b128": 4,
         "s_load_b64": 1,
@@ -214,7 +215,7 @@
         "s_sub_co_i32": 3,
         "s_wait_dscnt": 5,
         "s_wait_kmcnt": 1,
-        "s_wait_loadcnt": 10,
+        "s_wait_loadcnt": 19,
         "s_wait_storecnt": 1,
         "v_add_f32_e32": 11,
         "v_add_lshl_u32": 4,

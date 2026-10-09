@@ -2,15 +2,15 @@
   "module": "fused_qkv_hfq4g256_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
-  "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
+  "builder_git_sha": "4fc68554cd55b85595001da28d757803766fad7c",
+  "s_text_sha256": "1106e0b139d009b772fd4ba7f04d4f63b374d6567c0f24a86c1159e679d5383a",
   "kernels": [
     {
       "kernel_id": "fused_qkv_hfq4g256_mq4v2",
       "variant": "four-stream-quad-ilp",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
+      "builder_git_sha": "4fc68554cd55b85595001da28d757803766fad7c",
       "reg_plan": [
         {
           "name": "workitem",
@@ -179,9 +179,9 @@
         },
         {
           "pc_index": 69,
-          "insn": "s_wait_loadcnt 0x0",
+          "insn": "s_wait_loadcnt 0x11",
           "counter": "Load",
-          "count": 0,
+          "count": 17,
           "reason": {
             "Use": {
               "reg": "v[8:9]"
@@ -189,18 +189,117 @@
           }
         },
         {
-          "pc_index": 204,
-          "insn": "s_wait_loadcnt 0x2",
+          "pc_index": 71,
+          "insn": "s_wait_loadcnt 0xe",
           "counter": "Load",
-          "count": 2,
+          "count": 14,
           "reason": {
             "Use": {
-              "reg": "v6"
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 73,
+          "insn": "s_wait_loadcnt 0xb",
+          "counter": "Load",
+          "count": 11,
+          "reason": {
+            "Use": {
+              "reg": "v13"
+            }
+          }
+        },
+        {
+          "pc_index": 75,
+          "insn": "s_wait_loadcnt 0x9",
+          "counter": "Load",
+          "count": 9,
+          "reason": {
+            "Use": {
+              "reg": "v[14:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 83,
+          "insn": "s_wait_loadcnt 0x7",
+          "counter": "Load",
+          "count": 7,
+          "reason": {
+            "Use": {
+              "reg": "v[32:35]"
+            }
+          }
+        },
+        {
+          "pc_index": 85,
+          "insn": "s_wait_loadcnt 0x5",
+          "counter": "Load",
+          "count": 5,
+          "reason": {
+            "Use": {
+              "reg": "v[48:51]"
+            }
+          }
+        },
+        {
+          "pc_index": 102,
+          "insn": "s_wait_loadcnt 0x4",
+          "counter": "Load",
+          "count": 4,
+          "reason": {
+            "Use": {
+              "reg": "v[56:59]"
+            }
+          }
+        },
+        {
+          "pc_index": 149,
+          "insn": "s_wait_loadcnt 0x3",
+          "counter": "Load",
+          "count": 3,
+          "reason": {
+            "Use": {
+              "reg": "v[36:39]"
+            }
+          }
+        },
+        {
+          "pc_index": 152,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[52:55]"
+            }
+          }
+        },
+        {
+          "pc_index": 169,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[60:63]"
             }
           }
         },
         {
           "pc_index": 229,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v6"
+            }
+          }
+        },
+        {
+          "pc_index": 254,
           "insn": "s_wait_loadcnt 0x1",
           "counter": "Load",
           "count": 1,
@@ -211,51 +310,18 @@
           }
         },
         {
-          "pc_index": 234,
+          "pc_index": 259,
           "insn": "s_wait_loadcnt 0x0",
           "counter": "Load",
           "count": 0,
           "reason": {
             "Use": {
               "reg": "v[12:15]"
-            }
-          }
-        },
-        {
-          "pc_index": 248,
-          "insn": "s_wait_loadcnt 0x2",
-          "counter": "Load",
-          "count": 2,
-          "reason": {
-            "Use": {
-              "reg": "v6"
             }
           }
         },
         {
           "pc_index": 273,
-          "insn": "s_wait_loadcnt 0x1",
-          "counter": "Load",
-          "count": 1,
-          "reason": {
-            "Use": {
-              "reg": "v[8:11]"
-            }
-          }
-        },
-        {
-          "pc_index": 278,
-          "insn": "s_wait_loadcnt 0x0",
-          "counter": "Load",
-          "count": 0,
-          "reason": {
-            "Use": {
-              "reg": "v[12:15]"
-            }
-          }
-        },
-        {
-          "pc_index": 292,
           "insn": "s_wait_loadcnt 0x2",
           "counter": "Load",
           "count": 2,
@@ -266,7 +332,7 @@
           }
         },
         {
-          "pc_index": 317,
+          "pc_index": 298,
           "insn": "s_wait_loadcnt 0x1",
           "counter": "Load",
           "count": 1,
@@ -277,7 +343,7 @@
           }
         },
         {
-          "pc_index": 322,
+          "pc_index": 303,
           "insn": "s_wait_loadcnt 0x0",
           "counter": "Load",
           "count": 0,
@@ -288,42 +354,75 @@
           }
         },
         {
-          "pc_index": 333,
+          "pc_index": 317,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v6"
+            }
+          }
+        },
+        {
+          "pc_index": 342,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 347,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 358,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 339,
+          "pc_index": 364,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 345,
+          "pc_index": 370,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 351,
+          "pc_index": 376,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 357,
+          "pc_index": 382,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 365,
+          "pc_index": 390,
           "insn": "s_wait_storecnt 0x0",
           "counter": "Store",
           "count": 0,
@@ -345,7 +444,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600"
+      "s_text_sha256": "1106e0b139d009b772fd4ba7f04d4f63b374d6567c0f24a86c1159e679d5383a"
     }
   ]
 }

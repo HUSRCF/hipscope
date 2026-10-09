@@ -75,10 +75,13 @@ fused_qkv_mq4g256v2:
 	global_load_b128 v[52:55], v2, s[10:11] offset:2064
 	global_load_b128 v[60:63], v2, s[10:11] offset:3088
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
-	s_wait_loadcnt 0x0
+	s_wait_loadcnt 0x11
 	v_cndmask_b32_e64 v8, v9, v8, vcc_lo
+	s_wait_loadcnt 0xe
 	v_cndmask_b32_e64 v10, v11, v10, vcc_lo
+	s_wait_loadcnt 0xb
 	v_cndmask_b32_e64 v12, v13, v12, vcc_lo
+	s_wait_loadcnt 0x9
 	v_cndmask_b32_e64 v14, v15, v14, vcc_lo
 	v_bfe_u32 v20, v4, 4, 4
 	v_bfe_u32 v22, v6, 4, 4
@@ -86,7 +89,9 @@ fused_qkv_mq4g256v2:
 	v_cvt_f32_ubyte0_e32 v22, v22
 	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x7
 	v_mul_f32_e32 v16, v20, v33
+	s_wait_loadcnt 0x5
 	v_mul_f32_e32 v18, v22, v49
 	v_bfe_u32 v20, v4, 0, 4
 	v_bfe_u32 v21, v5, 4, 4
@@ -100,7 +105,10 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v32 :: v_dual_mul_f32 v17, v21, v41
+	s_delay_alu instid0(VALU_DEP_2)
+	s_wait_loadcnt 0x4
 	v_dual_fmac_f32 v18, v22, v48 :: v_dual_mul_f32 v19, v23, v57
 	v_bfe_u32 v20, v4, 8, 4
 	v_bfe_u32 v21, v5, 0, 4
@@ -114,7 +122,9 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v34 :: v_dual_fmac_f32 v17, v21, v40
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_fmac_f32 v18, v22, v50 :: v_dual_fmac_f32 v19, v23, v56
 	v_bfe_u32 v20, v4, 12, 4
 	v_bfe_u32 v21, v5, 8, 4
@@ -128,7 +138,9 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v35 :: v_dual_fmac_f32 v17, v21, v42
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_fmac_f32 v18, v22, v51 :: v_dual_fmac_f32 v19, v23, v58
 	v_bfe_u32 v20, v4, 16, 4
 	v_bfe_u32 v21, v5, 12, 4
@@ -142,7 +154,11 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
+	s_wait_loadcnt 0x3
 	v_dual_fmac_f32 v16, v20, v36 :: v_dual_fmac_f32 v17, v21, v43
+	s_delay_alu instid0(VALU_DEP_2)
+	s_wait_loadcnt 0x1
 	v_dual_fmac_f32 v18, v22, v52 :: v_dual_fmac_f32 v19, v23, v59
 	v_bfe_u32 v20, v4, 20, 4
 	v_bfe_u32 v21, v5, 16, 4
@@ -156,7 +172,10 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v37 :: v_dual_fmac_f32 v17, v21, v44
+	s_delay_alu instid0(VALU_DEP_2)
+	s_wait_loadcnt 0x0
 	v_dual_fmac_f32 v18, v22, v53 :: v_dual_fmac_f32 v19, v23, v60
 	v_bfe_u32 v20, v4, 24, 4
 	v_bfe_u32 v21, v5, 20, 4
@@ -170,7 +189,9 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v38 :: v_dual_fmac_f32 v17, v21, v45
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_fmac_f32 v18, v22, v54 :: v_dual_fmac_f32 v19, v23, v61
 	v_bfe_u32 v20, v4, 28, 4
 	v_bfe_u32 v21, v5, 24, 4
@@ -184,7 +205,9 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_delay_alu instid0(VALU_DEP_3)
 	v_dual_fmac_f32 v16, v20, v39 :: v_dual_fmac_f32 v17, v21, v46
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_fmac_f32 v18, v22, v55 :: v_dual_fmac_f32 v19, v23, v62
 	v_bfe_u32 v21, v5, 28, 4
 	v_bfe_u32 v23, v7, 28, 4
@@ -194,7 +217,9 @@ fused_qkv_mq4g256v2:
 	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
 	v_fmac_f32_e32 v17, v21, v47
 	v_fmac_f32_e32 v19, v23, v63
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_add_f32 v26, v26, v16 :: v_dual_add_f32 v27, v27, v17
+	s_delay_alu instid0(VALU_DEP_2)
 	v_dual_add_f32 v28, v28, v18 :: v_dual_add_f32 v29, v29, v19
 	s_add_co_i32 s40, s40, 0x220
 	v_add_nc_u32_e32 v2, 0x1000, v2
