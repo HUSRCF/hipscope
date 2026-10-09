@@ -11,6 +11,11 @@ use crate::GpuTensor;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 
+/// Rows-batched twins of singleton decode kernels (continuous batching);
+/// `rdna_compute::attention::rows_batched`.
+#[path = "rows_batched.rs"]
+pub mod rows_batched;
+
 /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
 /// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
 const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
