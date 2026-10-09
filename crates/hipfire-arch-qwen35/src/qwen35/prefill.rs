@@ -59,6 +59,10 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
 use rdna_compute::norm::GdnScanOut;
 
+/// Multi-request batched prefill chunk (cross-request speculative verify).
+#[path = "prefill_multi.rs"]
+pub mod multi;
+
 /// Producer-emitted A8 RMSNorm/FWHT, selected only for uniform MQ4v2 weights.
 #[allow(clippy::too_many_arguments)]
 fn try_a8_rmsnorm_prepared(
