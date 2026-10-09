@@ -38,7 +38,7 @@ use hipfire_runtime::slot_batch::{
 use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::slot_pool::SlotId;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -1175,6 +1175,51 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
             let ok = got["finish"] == json!("stop") && got["committed"] == json!(stop_at);
             eprintln!("batch {name}: finish={} committed={} expected {stop_at} -> {}", got["finish"], got["committed"], if ok { "OK" } else { "FAIL" });
             pass &= ok;
+        }
+        // Regression: stop_id under memory pressure (the ks56 failure at
+        // 34c1ee400b). Ballast lowers the singleton prefill ceiling to <=1024
+        // so r1's 8192 prompt runs in several chunks and r0's stop+retire
+        // lands between two of them (r0 picks 0..5 on steps 1..6, retired
+        // before step 7 = r1's sixth chunk). Exercised only if r1 actually
+        // ran more than five chunks of <=1024 rows.
+        for rep in 0..args.stop_repeats {
+            let name = if rep == 0 { "stop_id_pressure".to_string() } else { format!("stop_id_pressure_rep{rep}") };
+            let tag = 9051 + 10 * rep as u64;
+            let mut ballast: Vec<GpuTensor> = Vec::new();
+            let mut ceilings = Vec::new();
+            let limit = |ctx: &Ctx| -> Result<usize> {
+                let b = &ctx.b;
+                Ok(qwen35::ordinary_prefill_chunk_limit(&ctx.gpu, &b.weights, &b.config, &b.dn_state, &b.kv_cache, None)?)
+            };
+            let mut ceiling = limit(ctx)?;
+            ceilings.push(ceiling);
+            while ceiling > 1024 && ballast.len() < 128 && free_vram(&ctx.gpu)? > (1usize << 30) {
+                ballast.push(ctx.gpu.zeros(&[256 << 20], DType::Raw)?);
+                ceiling = limit(ctx)?;
+                ceilings.push(ceiling);
+            }
+            let ballast_bytes = ballast.len() * (256 << 20);
+            eprintln!("batch {name}: ballast={ballast_bytes} ceiling={ceiling} free_vram={}", free_vram(&ctx.gpu)?);
+            let mut a = Req::new(s0, tag, 1, 2, steps + 1, compare_sink(s0));
+            a.stop = Some(stop);
+            let b = Req::new(s1, tag + 1, 1, 5, steps + 1, compare_sink(s1));
+            let res = run_case(ctx, &mut store, name.clone(), vec![a, b], false, &mut cases, &mut pass);
+            for t in ballast {
+                ctx.gpu.free_tensor(t)?;
+            }
+            res?;
+            let j = cases.last_mut().unwrap();
+            let chunks: Vec<u64> = j["requests"][1]["prefill_chunks"]
+                .as_array()
+                .map(|v| v.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default();
+            let exercised = chunks.len() > 5 && chunks.iter().all(|&c| c <= 1024);
+            let ok = j["requests"][0]["finish"] == json!("stop") && j["requests"][0]["committed"] == json!(stop_at);
+            j["ballast_bytes"] = json!(ballast_bytes);
+            j["ceilings"] = json!(ceilings);
+            j["pressure_exercised"] = json!(exercised);
+            eprintln!("batch {name}: r1 chunks={chunks:?} exercised={exercised} stop_ok={ok}");
+            pass &= exercised && ok;
         }
         // Cancel mid-stream: the survivor must stay byte-exact.
         let mut a = Req::new(s0, 9101, 1, 0, steps + 1, compare_sink(s0));
