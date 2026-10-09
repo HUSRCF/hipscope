@@ -18,7 +18,7 @@ use crate::reg::{S, V};
 const G0_SYMBOL: &str = "pm_residual_dog_g0";
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    let mut regs=RegPlan::new(48,32)?;
+    let mut regs=RegPlan::new(108,32)?;
     for (name,base) in [("kernarg",0),("matrix",4),("activation",6),("residual",8)] {
         regs.s::<2>(name,base,Live::Whole)?;
     }
@@ -31,6 +31,12 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
         ("packed0",16,1),("packed1",17,1),("acc",24,4),("bcc",28,4),("dot",32,2),
         ("selected_header",34,1),("nibble",35,1),("weight",36,1),("shuffle_addr",38,1),
         ("shuffle_data",39,1),("output_offset",40,1),("old_y",41,2)] {
+        regs.add_range(name,crate::reg::Kind::V,base,width,Live::Whole)?;
+    }
+    for (name,base,width) in [("quad_weights_lo",18,2),("quad_weights_hi",20,4),
+        ("quad_weight_gap",37,1),("quad_weight_addresses",44,2),("quad_x_address",46,1),
+        ("quad_x1",49,8),("quad_x2",58,8),("quad_x3",67,8),
+        ("quad_headers_lo",76,8),("quad_headers_hi",84,8),("quad_packed",92,8),("quad_dots",100,8)] {
         regs.add_range(name,crate::reg::Kind::V,base,width,Live::Whole)?;
     }
     let mut b=Builder::new(KernelSpec {
@@ -69,7 +75,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     salu(&mut b,"s_cmp_eq_u32 s2, 0",&[],&[2])?;
     branch(&mut b,"s_cbranch_scc1 .Lres_tail")?;
     b.loop_(".Lres_quad",|b| {
-        for stream in 0..4 { group(b,stream)?; }
+        quad(b)?;
         salu(b,"s_add_co_i32 s2, s2, -1",&[2],&[2])?;
         salu(b,"s_cmp_lg_u32 s2, 0",&[],&[2])?;
         branch(b,"s_cbranch_scc1 .Lres_quad")
@@ -130,6 +136,132 @@ fn vmem(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8],scalar:&[u8],store:bool)-
     b.push(Instruction::new(text,refs(crate::reg::Kind::V,defs),uses).memory(if store {MemoryClass::VmemStore}else{MemoryClass::VmemLoad}))
 }
 fn branch(b:&mut Builder,text:&str)->Result<(),String> {b.control(Instruction::new(text,vec![],vec![]))}
+
+// Four independent groups, two rows each. Rotating the x banks allows VOPD
+// without exchanging even the multiplication operands in the incumbent DAG.
+fn quad(b:&mut Builder)->Result<(),String> {
+    use crate::ledger::Counter;
+    use crate::vopd::{Operand,VopdF32,VopdOp};
+    const X:[u8;4]=[8,49,58,67];
+    salu(b,"s_mul_i32 s24, s15, 0x88",&[24],&[15])?;
+    salu(b,"s_add_co_i32 s25, s16, s24",&[25],&[16,24])?;
+    salu(b,"s_add_co_i32 s26, s17, s24",&[26],&[17,24])?;
+    salu(b,"s_lshl_b32 s27, s15, 10",&[27],&[15])?;
+    valu(b,"v_mov_b32_e32 v3, s25",&[3],&[],&[25])?;
+    valu(b,"v_add_nc_u32_e32 v2, s25, v1",&[2],&[1],&[25])?;
+    valu(b,"v_mov_b32_e32 v45, s26",&[45],&[],&[26])?;
+    valu(b,"v_add_nc_u32_e32 v44, s26, v1",&[44],&[1],&[26])?;
+    valu(b,"v_lshlrev_b32_e32 v46, 5, v0",&[46],&[0],&[])?;
+    valu(b,"v_add_nc_u32_e32 v46, s27, v46",&[46],&[46],&[27])?;
+    // Incumbent first batch: sixteen weight loads and three lower x vectors.
+    // Keep addresses live separately from destinations throughout the clause.
+    b.clause(|b| {
+        for i in [0u8,2,3,4,5,7] {quad_packed(b,i)?;}
+        for i in [0u8,2,4,6,1,3,5,7] {
+            let h=76+2*i;let addr=if i%2==0 {3}else{45};
+            let off=u32::from(i/2)*136;
+            let suffix=if off==0 {String::new()}else{format!(" offset:{off}")};
+            vmem(b,&format!("buffer_load_b64 v[{h}:{}], v{addr}, s[20:23], null offen{suffix} scope:SCOPE_DEV",h+1),
+                &[h,h+1],&[addr],&[20,21,22,23],false)?;
+        }
+        quad_packed(b,1)?;
+        quad_packed(b,6)
+    })?;
+    for g in 0..3 {quad_x(b,X[g],g as u32*1024)?;}
+    valu(b,"v_cmp_gt_u32_e32 vcc_lo, 16, v0",&[],&[0],&[])?;
+    b.wait(Counter::Load,18)?;
+    quad_nibble(b,0,0,16)?;
+    b.wait(Counter::Load,17)?;
+    quad_nibble(b,2,0,18)?;
+    for (count,i) in [(12,0u8),(11,2),(10,4),(9,6),(7,3)] {
+        b.wait(Counter::Load,count)?;
+        quad_header(b,i)?;
+    }
+    b.wait(Counter::Load,1)?;
+    for i in [1,5,7] {quad_header(b,i)?;}
+    for i in [1u8,3,4,5,6,7] {quad_nibble(b,i,0,16+i)?;}
+    b.wait(Counter::Load,0)?;
+    // The remaining five x loads overlap all eight independent dequant chains.
+    quad_x(b,X[3],3072)?;
+    for (g,x) in X.into_iter().enumerate() {quad_x(b,x+4,g as u32*1024+16)?;}
+    for i in 0..8 {quad_mix(b,i,16+i)?;}
+    for i in 0..8 {quad_nibble(b,i,1,32+i)?;}
+    for i in 0..8 {quad_mix(b,i,32+i)?;}
+    for row in 0..2u8 {
+        for g in [0u8,2] {
+            if row==0 && g==2 {b.wait(Counter::Load,4)?;}
+            let op=|g:u8| {
+                let i=2*g+row;
+                VopdOp {op:VopdF32::Mul,dst:100+4*row+g,
+                    src0:Operand::V(X[g as usize]+row),src1:if row==0 {16+i}else{32+i}}
+            };
+            b.vopd(op(g),op(g+1))?;
+        }
+    }
+    for row in 0..2u8 {
+        for g in [0u8,2] {
+            let op=|g:u8| {
+                let i=2*g+row;
+                VopdOp {op:VopdF32::Fmac,dst:100+4*row+g,
+                    src0:Operand::V(X[g as usize]+1-row),src1:if row==0 {32+i}else{16+i}}
+            };
+            b.vopd(op(g),op(g+1))?;
+        }
+    }
+    for nibble in 2..8u8 {
+        // Upper vectors arrive progressively rather than four full drains.
+        for i in 0..8u8 {
+            if nibble==4 && i%2==0 {b.wait(Counter::Load,3-i/2)?;}
+            let p=92+i;let w=16+i;
+            valu(b,&format!("v_bfe_u32 v{w}, v{p}, {}, 4",nibble*4),&[w],&[p],&[])?;
+        }
+        for w in 16..24 {valu(b,&format!("v_cvt_f32_ubyte0_e32 v{w}, v{w}"),&[w],&[w],&[])?;}
+        for i in 0..8 {quad_mix(b,i,16+i)?;}
+        for row in 0..2u8 {
+            for g in [0u8,2] {
+                let op=|g:u8| VopdOp {op:VopdF32::Fmac,dst:100+4*row+g,
+                    src0:Operand::V(X[g as usize]+nibble),src1:16+2*g+row};
+                b.vopd(op(g),op(g+1))?;
+            }
+        }
+    }
+    for row in 0..2u8 {
+        for g in [0u8,2] {
+            let op=|g:u8| {
+                let acc=24+4*row+g;let dot=100+4*row+g;
+                VopdOp {op:VopdF32::Add,dst:acc,
+                    src0:Operand::V(if row==0 {dot}else{acc}),src1:if row==0 {acc}else{dot}}
+            };
+            b.vopd(op(g),op(g+1))?;
+        }
+    }
+    salu(b,"s_add_co_i32 s15, s15, 4",&[15],&[15])?;
+    b.wait_all()
+}
+
+fn quad_packed(b:&mut Builder,i:u8)->Result<(),String> {
+    let p=92+i;let addr=if i%2==0 {2}else{44};let off=u32::from(i/2)*136+8;
+    vmem(b,&format!("buffer_load_b32 v{p}, v{addr}, s[20:23], null offen offset:{off} scope:SCOPE_DEV"),
+        &[p],&[addr],&[20,21,22,23],false)
+}
+fn quad_x(b:&mut Builder,x:u8,off:u32)->Result<(),String> {
+    let suffix=if off==0 {String::new()}else{format!(" offset:{off}")};
+    vmem(b,&format!("global_load_b128 v[{x}:{}], v46, s[6:7]{suffix}",x+3),
+        &[x,x+1,x+2,x+3],&[46],&[6,7],false)
+}
+fn quad_header(b:&mut Builder,i:u8)->Result<(),String> {
+    let h=76+2*i;
+    valu(b,&format!("v_cndmask_b32_e32 v{h}, v{}, v{h}, vcc_lo",h+1),&[h],&[h,h+1],&[])
+}
+fn quad_nibble(b:&mut Builder,i:u8,nibble:u8,w:u8)->Result<(),String> {
+    let p=92+i;
+    valu(b,&format!("v_bfe_u32 v{w}, v{p}, {}, 4",nibble*4),&[w],&[p],&[])?;
+    valu(b,&format!("v_cvt_f32_ubyte0_e32 v{w}, v{w}"),&[w],&[w],&[])
+}
+fn quad_mix(b:&mut Builder,i:u8,w:u8)->Result<(),String> {
+    let h=76+2*i;
+    valu(b,&format!("v_fma_mix_f32 v{w}, v{h}, v{w}, v{h} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),&[w],&[h,w],&[])
+}
 
 fn group(b:&mut Builder,stream:u8)->Result<(),String> {
     salu(b,"s_mul_i32 s24, s15, 0x88",&[24],&[15])?;
@@ -271,9 +403,11 @@ mod tests {
     #[test]
     fn residual_second_row_tail_dag() {
         let emitted=build_gfx1201().expect("full residual twin").remove(0);
-        // Four quad groups plus three explicit scalar-tail groups.
-        assert_eq!(emitted.s_text.matches("v_mul_f32_e32 v33, v9, v36").count(),7);
-        assert_eq!(emitted.s_text.matches("v_fmac_f32_e32 v33, v8, v36").count(),7);
+        // Explicit tails retain the incumbent row1 x1 -> x0 seed order.
+        assert_eq!(emitted.s_text.matches("v_mul_f32_e32 v33, v9, v36").count(),3);
+        assert_eq!(emitted.s_text.matches("v_fmac_f32_e32 v33, v8, v36").count(),3);
+        assert!(emitted.s_text.contains("v_dual_mul_f32 v104, v9, v33 :: v_dual_mul_f32 v105, v50, v35"));
+        assert!(emitted.s_text.contains("v_dual_fmac_f32 v104, v8, v17 :: v_dual_fmac_f32 v105, v49, v19"));
         assert!(!emitted.s_text.contains("v_mul_f32_e32 v33, v8, v36"));
         assert!(emitted.s_text.contains("v_add_f32_e32 v41, v24, v41"));
         assert!(emitted.s_text.contains("v_add_f32_e32 v41, v41, v24"));
