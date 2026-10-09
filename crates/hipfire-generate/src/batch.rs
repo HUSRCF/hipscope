@@ -1807,7 +1807,14 @@ pub fn drive_qwen_vmm_continuous_batch(
             let Some(pending_req) = sched.pending.get(&key).cloned() else {
                 continue;
             };
-            if pending_req.started_in_think {
+            // A request with no live batch peer and nothing queued behind it
+            // is lonely: it takes the unchanged singleton route (exact
+            // singleton arithmetic and its MTP/DFlash speculation), exactly
+            // like a lonely request at daemon dispatch. Think-open prompts
+            // are sequential barriers as on the fixed-lane route.
+            let lonely =
+                !epochs.iter().any(|e| e.is_admitted()) && sched.inbox.is_empty();
+            if pending_req.started_in_think || lonely {
                 let handoff = match handoff_started_in_think(
                     sched,
                     lane_idx,
