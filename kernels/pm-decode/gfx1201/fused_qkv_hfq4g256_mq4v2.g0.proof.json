@@ -3,7 +3,7 @@
   "variant": "g0-single-group-lane-dot",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "unknown",
+  "builder_git_sha": "98b910e97c",
   "reg_plan": [
     {
       "name": "workitem",

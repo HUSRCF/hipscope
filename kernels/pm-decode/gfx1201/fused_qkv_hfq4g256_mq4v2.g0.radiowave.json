@@ -1,9 +1,9 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791507751,
-  "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.s",
-  "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
+  "generated_unix_seconds": 1791507852,
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.s",
+  "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.hxaco",
   "arch": "gfx1201",
   "wavefront": "wave32",
   "scheduler_profile": "default",
@@ -13,9 +13,9 @@
     "/home/kaden/qcal/release-0.4.2/target-pmdt-PmQkv/release/peacemaker",
     "native",
     "--arch=gfx1201",
-    "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.s",
+    "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.s",
     "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.co",
-    "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
+    "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
   "source_sha256": "b2ebeb171b1fe742c4f370bbfdd8f5c8eaf7b6968eab71cb53f38785c48546d2",
@@ -145,8 +145,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
-      "proof_sha256": "51ef6f69864c9ab2b522cdc4cdf7a2d597ed82a87834629b525f91c86c7a9642"
+      "builder_git_sha": "98b910e97c",
+      "proof_sha256": "2e3f98473620bdd25f8afd43bdeefe6aace99663fe361de3f8f95969e25d23a7"
     },
     "tools": [
       {
@@ -157,9 +157,9 @@
           "/home/kaden/qcal/release-0.4.2/target-pmdt-PmQkv/release/peacemaker",
           "native",
           "--arch=gfx1201",
-          "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.s",
+          "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.s",
           "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.co",
-          "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
+          "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.g0.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
         "sha256": "2c188080d5fe7048fc33a9872db079f76405b6318a1935569c80b76cd878077e"

@@ -50,6 +50,11 @@ fn group_dot(b: &mut Builder) -> Result<(), String> {
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
+    Err("QKV production admission requires the real-H2 G0 oracle and checked crosslane reduction".into())
+}
+
+/// Diagnostic only: never returned from the production entry point.
+pub fn build_g0() -> Result<Vec<Emitted>, String> {
     let mut regs = RegPlan::new(32, 16)?;
     regs.add_range("workitem", Kind::V, 0, 1, Live::Whole)?;
     for base in [1, 2, 3, 4, 5, 6, 7, 24, 25] {
@@ -100,12 +105,12 @@ mod tests {
 
     #[test]
     fn g0_emit_and_m7() {
-        let emitted = build_gfx1201().expect("checked G0 emission");
+        let emitted = build_g0().expect("checked G0 emission");
         let e = &emitted[0];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../kernels/pm-decode/gfx1201");
         std::fs::create_dir_all(&root).unwrap();
-        let path = |suffix: &str| root.join(format!("{MODULE}.{suffix}"));
+        let path = |suffix: &str| root.join(format!("{MODULE}.g0.{suffix}"));
         std::fs::write(path("s"), &e.s_text).unwrap();
         std::fs::write(path("proof.json"), serde_json::to_vec_pretty(&e.proof).unwrap()).unwrap();
         let contract = crate::toolchain::IsaShapeContract {
@@ -121,6 +126,6 @@ mod tests {
         let m7 = crate::pm_check::m7(&path("co"), "gfx1201", G0_SYMBOL)
             .expect("G0 requires M7 obligations {}");
         println!("{m7}");
-        std::fs::write(path("g0.m7.json"), serde_json::to_vec_pretty(&m7).unwrap()).unwrap();
+        std::fs::write(path("m7.json"), serde_json::to_vec_pretty(&m7).unwrap()).unwrap();
     }
 }
