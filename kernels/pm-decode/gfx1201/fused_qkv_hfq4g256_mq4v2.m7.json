@@ -4,7 +4,7 @@
     "barrier_pairs": 0,
     "clauses": 0,
     "delays": 0,
-    "instructions": 375,
+    "instructions": 364,
     "lds_accesses": 5,
     "lds_max_known_end": null,
     "lds_unknown_addresses": 5,
@@ -12,7 +12,7 @@
     "obligations": {},
     "sgpr_high_water": 41,
     "table": "gfx1201",
-    "vgpr_high_water": 32,
-    "wait_facts": 20
+    "vgpr_high_water": 64,
+    "wait_facts": 17
   }
 }

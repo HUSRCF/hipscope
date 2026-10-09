@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791509357,
+  "generated_unix_seconds": 1791511240,
   "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.s",
   "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
   "arch": "gfx1201",
@@ -18,9 +18,9 @@
     "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
-  "source_sha256": "5c199543efa8a688c752882526e595d6b5886e133c731e0e70d9b3b83709ef51",
+  "source_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
   "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "output_sha256": "b3304ddbda5254a5b8c70db054fb55e94e76a357028e8ea7d32343f72ef88a7c",
+  "output_sha256": "43be91066e17eeb9d88bcd5a68c35d16ea57d06c40ee5060560a7a67dceffdad",
   "inspection": {
     "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
     "identity": {
@@ -36,7 +36,7 @@
       {
         "name": "fused_qkv_mq4g256v2",
         "wavefront_size": 32,
-        "vgpr_count": 32,
+        "vgpr_count": 64,
         "sgpr_count": 44,
         "vgpr_spill_count": 0,
         "sgpr_spill_count": 0,
@@ -122,8 +122,8 @@
           }
         ],
         "instructions": {
-          "static_instructions": 375,
-          "buffer_loads": 8,
+          "static_instructions": 364,
+          "buffer_loads": 10,
           "buffer_stores": 0,
           "global_loads": 20,
           "global_stores": 1,
@@ -133,10 +133,10 @@
           "kernarg_scalar_loads": 5,
           "scalar_buffer_loads": 0,
           "unknown_scalar_loads": 0,
-          "wait_instructions": 20,
+          "wait_instructions": 17,
           "delay_alu_instructions": 0,
           "memory_clause_instructions": 0,
-          "max_consecutive_vmem_instructions": 4
+          "max_consecutive_vmem_instructions": 18
         }
       }
     ]
@@ -145,8 +145,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "b8e4b1d713790a8757160d7895afd42566f1912c",
-      "proof_sha256": "77af30ca45a3552aa650193ca4d7ccf801cfe87ddd9cfacd2a522d4083a85c5c"
+      "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
+      "proof_sha256": "d18a875f0daf48f3b0e8af04bceaa42d7b1e89d3381581c5744f1281d2495a80"
     },
     "tools": [
       {
@@ -162,11 +162,11 @@
           "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkv_hfq4g256_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "e05258f84d9e95ea10df18f405315938df84529abda2ad84d72eaa34c02e9728"
+        "sha256": "4f10e94e462e65f76e2bb2be08b60f47d0dceb2eb0795d3ae913b4770e01b5a3"
       }
     ],
-    "s_text_sha256": "5c199543efa8a688c752882526e595d6b5886e133c731e0e70d9b3b83709ef51",
-    "text_section_sha256": "2f95fea87f6da026fbba539b3043fe10cc4a3b5b2d63358307a80709e48ad402",
+    "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
+    "text_section_sha256": "58ed89bb7b99fa36956fb276513af7765b092c72b3de6154fbb0668202e31e43",
     "shape_contract": {
       "counts": {},
       "end_label": null,
@@ -184,6 +184,7 @@
     "shape_result": {
       "counts": {
         "buffer_load_b32": 8,
+        "buffer_load_b64": 2,
         "ds_bpermute_b32": 4,
         "ds_swizzle_b32": 1,
         "global_load_b128": 14,
@@ -213,27 +214,30 @@
         "s_sub_co_i32": 3,
         "s_wait_dscnt": 5,
         "s_wait_kmcnt": 1,
-        "s_wait_loadcnt": 13,
+        "s_wait_loadcnt": 10,
         "s_wait_storecnt": 1,
-        "v_add_f32_e32": 15,
+        "v_add_f32_e32": 11,
         "v_add_lshl_u32": 4,
         "v_add_nc_u32_e32": 8,
         "v_bfe_u32": 56,
-        "v_cmp_gt_u32_e32": 5,
+        "v_cmp_gt_u32_e32": 6,
         "v_cmpx_eq_u32_e32": 1,
-        "v_cndmask_b32_e64": 5,
+        "v_cndmask_b32_e64": 9,
         "v_cvt_f32_ubyte0_e32": 56,
+        "v_dual_add_f32": 2,
+        "v_dual_fmac_f32": 14,
         "v_fma_mix_f32": 56,
-        "v_fmac_f32_e32": 49,
+        "v_fmac_f32_e32": 23,
         "v_lshlrev_b32_e32": 2,
-        "v_mov_b32_e32": 5,
-        "v_mul_f32_e32": 7,
-        "valu_slots": 269
+        "v_mov_b32_e32": 6,
+        "v_mul_f32_e32": 5,
+        "valu_slots": 259,
+        "vopd_packets": 16
       },
       "private_segment_fixed_size": 0,
       "sgpr_count": 44,
       "sgpr_spill_count": 0,
-      "vgpr_count": 32,
+      "vgpr_count": 64,
       "vgpr_spill_count": 0,
       "wavefront_size": 32
     },

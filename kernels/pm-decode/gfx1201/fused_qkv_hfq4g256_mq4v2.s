@@ -48,6 +48,7 @@ fused_qkv_mq4g256v2:
 	v_lshlrev_b32_e32 v2, 5, v0
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
 	v_cndmask_b32_e64 v3, 4, 0, vcc_lo
+	v_mov_b32_e32 v31, 0
 	v_mov_b32_e32 v26, 0
 	v_mov_b32_e32 v27, 0
 	v_mov_b32_e32 v28, 0
@@ -55,158 +56,146 @@ fused_qkv_mq4g256v2:
 	s_cmp_eq_u32 s34, 0
 	s_cbranch_scc1 .Lqkv_tails
 	.Lqkv_quads:
-	buffer_load_b32 v5, v3, s[36:39], s40 offen scope:SCOPE_DEV
-	buffer_load_b32 v6, v1, s[36:39], s40 offen scope:SCOPE_DEV
-	global_load_b128 v[8:11], v2, s[10:11]
-	global_load_b128 v[12:15], v2, s[10:11] offset:16
-	s_wait_loadcnt 0x0
-	v_bfe_u32 v16, v6, 0, 4
-	v_cvt_f32_ubyte0_e32 v16, v16
-	v_fma_mix_f32 v16, v5, v16, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v17, v6, 4, 4
-	v_cvt_f32_ubyte0_e32 v17, v17
-	v_fma_mix_f32 v17, v5, v17, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v18, v6, 8, 4
-	v_cvt_f32_ubyte0_e32 v18, v18
-	v_fma_mix_f32 v18, v5, v18, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v19, v6, 12, 4
-	v_cvt_f32_ubyte0_e32 v19, v19
-	v_fma_mix_f32 v19, v5, v19, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v20, v6, 16, 4
-	v_cvt_f32_ubyte0_e32 v20, v20
-	v_fma_mix_f32 v20, v5, v20, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v21, v6, 20, 4
-	v_cvt_f32_ubyte0_e32 v21, v21
-	v_fma_mix_f32 v21, v5, v21, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v22, v6, 24, 4
-	v_cvt_f32_ubyte0_e32 v22, v22
-	v_fma_mix_f32 v22, v5, v22, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v23, v6, 28, 4
-	v_cvt_f32_ubyte0_e32 v23, v23
-	v_fma_mix_f32 v23, v5, v23, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v24, v17, v9
-	v_fmac_f32_e32 v24, v16, v8
-	v_fmac_f32_e32 v24, v18, v10
-	v_fmac_f32_e32 v24, v19, v11
-	v_fmac_f32_e32 v24, v20, v12
-	v_fmac_f32_e32 v24, v21, v13
-	v_fmac_f32_e32 v24, v22, v14
-	v_fmac_f32_e32 v24, v23, v15
-	v_add_f32_e32 v26, v26, v24
-	buffer_load_b32 v5, v3, s[36:39], s40 offen offset:136 scope:SCOPE_DEV
-	buffer_load_b32 v6, v1, s[36:39], s40 offen offset:136 scope:SCOPE_DEV
-	global_load_b128 v[8:11], v2, s[10:11] offset:1024
-	global_load_b128 v[12:15], v2, s[10:11] offset:1040
-	s_wait_loadcnt 0x0
-	v_bfe_u32 v16, v6, 0, 4
-	v_cvt_f32_ubyte0_e32 v16, v16
-	v_fma_mix_f32 v16, v5, v16, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v17, v6, 4, 4
-	v_cvt_f32_ubyte0_e32 v17, v17
-	v_fma_mix_f32 v17, v5, v17, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v18, v6, 8, 4
-	v_cvt_f32_ubyte0_e32 v18, v18
-	v_fma_mix_f32 v18, v5, v18, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v19, v6, 12, 4
-	v_cvt_f32_ubyte0_e32 v19, v19
-	v_fma_mix_f32 v19, v5, v19, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v20, v6, 16, 4
-	v_cvt_f32_ubyte0_e32 v20, v20
-	v_fma_mix_f32 v20, v5, v20, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v21, v6, 20, 4
-	v_cvt_f32_ubyte0_e32 v21, v21
-	v_fma_mix_f32 v21, v5, v21, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v22, v6, 24, 4
-	v_cvt_f32_ubyte0_e32 v22, v22
-	v_fma_mix_f32 v22, v5, v22, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v23, v6, 28, 4
-	v_cvt_f32_ubyte0_e32 v23, v23
-	v_fma_mix_f32 v23, v5, v23, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v24, v17, v9
-	v_fmac_f32_e32 v24, v16, v8
-	v_fmac_f32_e32 v24, v18, v10
-	v_fmac_f32_e32 v24, v19, v11
-	v_fmac_f32_e32 v24, v20, v12
-	v_fmac_f32_e32 v24, v21, v13
-	v_fmac_f32_e32 v24, v22, v14
-	v_fmac_f32_e32 v24, v23, v15
-	v_add_f32_e32 v27, v27, v24
-	buffer_load_b32 v5, v3, s[36:39], s40 offen offset:272 scope:SCOPE_DEV
+	buffer_load_b64 v[8:9], v31, s[36:39], s40 offen scope:SCOPE_DEV
+	buffer_load_b32 v4, v1, s[36:39], s40 offen scope:SCOPE_DEV
+	buffer_load_b32 v10, v31, s[36:39], s40 offen offset:136 scope:SCOPE_DEV
+	buffer_load_b32 v11, v31, s[36:39], s40 offen offset:140 scope:SCOPE_DEV
+	buffer_load_b32 v5, v1, s[36:39], s40 offen offset:136 scope:SCOPE_DEV
+	buffer_load_b32 v12, v31, s[36:39], s40 offen offset:272 scope:SCOPE_DEV
+	buffer_load_b32 v13, v31, s[36:39], s40 offen offset:276 scope:SCOPE_DEV
 	buffer_load_b32 v6, v1, s[36:39], s40 offen offset:272 scope:SCOPE_DEV
-	global_load_b128 v[8:11], v2, s[10:11] offset:2048
-	global_load_b128 v[12:15], v2, s[10:11] offset:2064
+	buffer_load_b64 v[14:15], v31, s[36:39], s40 offen offset:408 scope:SCOPE_DEV
+	buffer_load_b32 v7, v1, s[36:39], s40 offen offset:408 scope:SCOPE_DEV
+	global_load_b128 v[32:35], v2, s[10:11]
+	global_load_b128 v[40:43], v2, s[10:11] offset:1024
+	global_load_b128 v[48:51], v2, s[10:11] offset:2048
+	global_load_b128 v[56:59], v2, s[10:11] offset:3072
+	global_load_b128 v[36:39], v2, s[10:11] offset:16
+	global_load_b128 v[44:47], v2, s[10:11] offset:1040
+	global_load_b128 v[52:55], v2, s[10:11] offset:2064
+	global_load_b128 v[60:63], v2, s[10:11] offset:3088
+	v_cmp_gt_u32_e32 vcc_lo, 16, v0
 	s_wait_loadcnt 0x0
-	v_bfe_u32 v16, v6, 0, 4
-	v_cvt_f32_ubyte0_e32 v16, v16
-	v_fma_mix_f32 v16, v5, v16, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v17, v6, 4, 4
-	v_cvt_f32_ubyte0_e32 v17, v17
-	v_fma_mix_f32 v17, v5, v17, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v18, v6, 8, 4
-	v_cvt_f32_ubyte0_e32 v18, v18
-	v_fma_mix_f32 v18, v5, v18, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v19, v6, 12, 4
-	v_cvt_f32_ubyte0_e32 v19, v19
-	v_fma_mix_f32 v19, v5, v19, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v20, v6, 16, 4
+	v_cndmask_b32_e64 v8, v9, v8, vcc_lo
+	v_cndmask_b32_e64 v10, v11, v10, vcc_lo
+	v_cndmask_b32_e64 v12, v13, v12, vcc_lo
+	v_cndmask_b32_e64 v14, v15, v14, vcc_lo
+	v_bfe_u32 v20, v4, 4, 4
+	v_bfe_u32 v22, v6, 4, 4
 	v_cvt_f32_ubyte0_e32 v20, v20
-	v_fma_mix_f32 v20, v5, v20, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v21, v6, 20, 4
-	v_cvt_f32_ubyte0_e32 v21, v21
-	v_fma_mix_f32 v21, v5, v21, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v22, v6, 24, 4
 	v_cvt_f32_ubyte0_e32 v22, v22
-	v_fma_mix_f32 v22, v5, v22, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v23, v6, 28, 4
-	v_cvt_f32_ubyte0_e32 v23, v23
-	v_fma_mix_f32 v23, v5, v23, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v24, v17, v9
-	v_fmac_f32_e32 v24, v16, v8
-	v_fmac_f32_e32 v24, v18, v10
-	v_fmac_f32_e32 v24, v19, v11
-	v_fmac_f32_e32 v24, v20, v12
-	v_fmac_f32_e32 v24, v21, v13
-	v_fmac_f32_e32 v24, v22, v14
-	v_fmac_f32_e32 v24, v23, v15
-	v_add_f32_e32 v28, v28, v24
-	buffer_load_b32 v5, v3, s[36:39], s40 offen offset:408 scope:SCOPE_DEV
-	buffer_load_b32 v6, v1, s[36:39], s40 offen offset:408 scope:SCOPE_DEV
-	global_load_b128 v[8:11], v2, s[10:11] offset:3072
-	global_load_b128 v[12:15], v2, s[10:11] offset:3088
-	s_wait_loadcnt 0x0
-	v_bfe_u32 v16, v6, 0, 4
-	v_cvt_f32_ubyte0_e32 v16, v16
-	v_fma_mix_f32 v16, v5, v16, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v17, v6, 4, 4
-	v_cvt_f32_ubyte0_e32 v17, v17
-	v_fma_mix_f32 v17, v5, v17, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v18, v6, 8, 4
-	v_cvt_f32_ubyte0_e32 v18, v18
-	v_fma_mix_f32 v18, v5, v18, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v19, v6, 12, 4
-	v_cvt_f32_ubyte0_e32 v19, v19
-	v_fma_mix_f32 v19, v5, v19, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v20, v6, 16, 4
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_mul_f32_e32 v16, v20, v33
+	v_mul_f32_e32 v18, v22, v49
+	v_bfe_u32 v20, v4, 0, 4
+	v_bfe_u32 v21, v5, 4, 4
+	v_bfe_u32 v22, v6, 0, 4
+	v_bfe_u32 v23, v7, 4, 4
 	v_cvt_f32_ubyte0_e32 v20, v20
-	v_fma_mix_f32 v20, v5, v20, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v21, v6, 20, 4
 	v_cvt_f32_ubyte0_e32 v21, v21
-	v_fma_mix_f32 v21, v5, v21, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v22, v6, 24, 4
 	v_cvt_f32_ubyte0_e32 v22, v22
-	v_fma_mix_f32 v22, v5, v22, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_bfe_u32 v23, v6, 28, 4
 	v_cvt_f32_ubyte0_e32 v23, v23
-	v_fma_mix_f32 v23, v5, v23, v5 op_sel:[0,0,1] op_sel_hi:[1,0,1]
-	v_mul_f32_e32 v24, v17, v9
-	v_fmac_f32_e32 v24, v16, v8
-	v_fmac_f32_e32 v24, v18, v10
-	v_fmac_f32_e32 v24, v19, v11
-	v_fmac_f32_e32 v24, v20, v12
-	v_fmac_f32_e32 v24, v21, v13
-	v_fmac_f32_e32 v24, v22, v14
-	v_fmac_f32_e32 v24, v23, v15
-	v_add_f32_e32 v29, v29, v24
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v32 :: v_dual_mul_f32 v17, v21, v41
+	v_dual_fmac_f32 v18, v22, v48 :: v_dual_mul_f32 v19, v23, v57
+	v_bfe_u32 v20, v4, 8, 4
+	v_bfe_u32 v21, v5, 0, 4
+	v_bfe_u32 v22, v6, 8, 4
+	v_bfe_u32 v23, v7, 0, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v34 :: v_dual_fmac_f32 v17, v21, v40
+	v_dual_fmac_f32 v18, v22, v50 :: v_dual_fmac_f32 v19, v23, v56
+	v_bfe_u32 v20, v4, 12, 4
+	v_bfe_u32 v21, v5, 8, 4
+	v_bfe_u32 v22, v6, 12, 4
+	v_bfe_u32 v23, v7, 8, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v35 :: v_dual_fmac_f32 v17, v21, v42
+	v_dual_fmac_f32 v18, v22, v51 :: v_dual_fmac_f32 v19, v23, v58
+	v_bfe_u32 v20, v4, 16, 4
+	v_bfe_u32 v21, v5, 12, 4
+	v_bfe_u32 v22, v6, 16, 4
+	v_bfe_u32 v23, v7, 12, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v36 :: v_dual_fmac_f32 v17, v21, v43
+	v_dual_fmac_f32 v18, v22, v52 :: v_dual_fmac_f32 v19, v23, v59
+	v_bfe_u32 v20, v4, 20, 4
+	v_bfe_u32 v21, v5, 16, 4
+	v_bfe_u32 v22, v6, 20, 4
+	v_bfe_u32 v23, v7, 16, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v37 :: v_dual_fmac_f32 v17, v21, v44
+	v_dual_fmac_f32 v18, v22, v53 :: v_dual_fmac_f32 v19, v23, v60
+	v_bfe_u32 v20, v4, 24, 4
+	v_bfe_u32 v21, v5, 20, 4
+	v_bfe_u32 v22, v6, 24, 4
+	v_bfe_u32 v23, v7, 20, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v38 :: v_dual_fmac_f32 v17, v21, v45
+	v_dual_fmac_f32 v18, v22, v54 :: v_dual_fmac_f32 v19, v23, v61
+	v_bfe_u32 v20, v4, 28, 4
+	v_bfe_u32 v21, v5, 24, 4
+	v_bfe_u32 v22, v6, 28, 4
+	v_bfe_u32 v23, v7, 24, 4
+	v_cvt_f32_ubyte0_e32 v20, v20
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v22, v22
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v20, v8, v20, v8 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v22, v12, v22, v12 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_dual_fmac_f32 v16, v20, v39 :: v_dual_fmac_f32 v17, v21, v46
+	v_dual_fmac_f32 v18, v22, v55 :: v_dual_fmac_f32 v19, v23, v62
+	v_bfe_u32 v21, v5, 28, 4
+	v_bfe_u32 v23, v7, 28, 4
+	v_cvt_f32_ubyte0_e32 v21, v21
+	v_cvt_f32_ubyte0_e32 v23, v23
+	v_fma_mix_f32 v21, v10, v21, v10 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fma_mix_f32 v23, v14, v23, v14 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	v_fmac_f32_e32 v17, v21, v47
+	v_fmac_f32_e32 v19, v23, v63
+	v_dual_add_f32 v26, v26, v16 :: v_dual_add_f32 v27, v27, v17
+	v_dual_add_f32 v28, v28, v18 :: v_dual_add_f32 v29, v29, v19
 	s_add_co_i32 s40, s40, 0x220
 	v_add_nc_u32_e32 v2, 0x1000, v2
 	s_sub_co_i32 s34, s34, 1
@@ -407,7 +396,7 @@ fused_qkv_mq4g256v2:
 	.amdhsa_system_sgpr_workgroup_id_z 0
 	.amdhsa_system_sgpr_workgroup_info 0
 	.amdhsa_system_vgpr_workitem_id 0
-	.amdhsa_next_free_vgpr 32
+	.amdhsa_next_free_vgpr 64
 	.amdhsa_next_free_sgpr 42
 	.amdhsa_reserve_vcc 1
 	.amdhsa_float_round_mode_32 0
@@ -506,7 +495,7 @@ amdhsa.kernels:
     .symbol: fused_qkv_mq4g256v2.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
-    .vgpr_count: 32
+    .vgpr_count: 64
     .vgpr_spill_count: 0
     .wavefront_size: 32
     .workgroup_processor_mode: 1

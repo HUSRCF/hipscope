@@ -2,15 +2,15 @@
   "module": "fused_qkv_hfq4g256_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "b8e4b1d713790a8757160d7895afd42566f1912c",
-  "s_text_sha256": "5c199543efa8a688c752882526e595d6b5886e133c731e0e70d9b3b83709ef51",
+  "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
+  "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600",
   "kernels": [
     {
       "kernel_id": "fused_qkv_hfq4g256_mq4v2",
-      "variant": "four-stream-scalar",
+      "variant": "four-stream-quad-ilp",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "b8e4b1d713790a8757160d7895afd42566f1912c",
+      "builder_git_sha": "20a3139db4ff0ab233b7c9d87380a85e5b01643d",
       "reg_plan": [
         {
           "name": "workitem",
@@ -90,6 +90,34 @@
           "live": "Whole"
         },
         {
+          "name": "quad_x_32",
+          "kind": "v",
+          "base": 32,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_40",
+          "kind": "v",
+          "base": 40,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_48",
+          "kind": "v",
+          "base": 48,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_56",
+          "kind": "v",
+          "base": 56,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
           "name": "scalar_0",
           "kind": "s",
           "base": 0,
@@ -139,7 +167,7 @@
           "live": "Whole"
         }
       ],
-      "next_free_vgpr": 32,
+      "next_free_vgpr": 64,
       "next_free_sgpr": 42,
       "waits": [
         {
@@ -150,51 +178,18 @@
           "reason": "Barrier"
         },
         {
-          "pc_index": 53,
+          "pc_index": 69,
           "insn": "s_wait_loadcnt 0x0",
           "counter": "Load",
           "count": 0,
           "reason": {
             "Use": {
-              "reg": "v6"
+              "reg": "v[8:9]"
             }
           }
         },
         {
-          "pc_index": 91,
-          "insn": "s_wait_loadcnt 0x0",
-          "counter": "Load",
-          "count": 0,
-          "reason": {
-            "Use": {
-              "reg": "v6"
-            }
-          }
-        },
-        {
-          "pc_index": 129,
-          "insn": "s_wait_loadcnt 0x0",
-          "counter": "Load",
-          "count": 0,
-          "reason": {
-            "Use": {
-              "reg": "v6"
-            }
-          }
-        },
-        {
-          "pc_index": 167,
-          "insn": "s_wait_loadcnt 0x0",
-          "counter": "Load",
-          "count": 0,
-          "reason": {
-            "Use": {
-              "reg": "v6"
-            }
-          }
-        },
-        {
-          "pc_index": 215,
+          "pc_index": 204,
           "insn": "s_wait_loadcnt 0x2",
           "counter": "Load",
           "count": 2,
@@ -205,7 +200,7 @@
           }
         },
         {
-          "pc_index": 240,
+          "pc_index": 229,
           "insn": "s_wait_loadcnt 0x1",
           "counter": "Load",
           "count": 1,
@@ -216,7 +211,7 @@
           }
         },
         {
-          "pc_index": 245,
+          "pc_index": 234,
           "insn": "s_wait_loadcnt 0x0",
           "counter": "Load",
           "count": 0,
@@ -227,7 +222,7 @@
           }
         },
         {
-          "pc_index": 259,
+          "pc_index": 248,
           "insn": "s_wait_loadcnt 0x2",
           "counter": "Load",
           "count": 2,
@@ -238,7 +233,7 @@
           }
         },
         {
-          "pc_index": 284,
+          "pc_index": 273,
           "insn": "s_wait_loadcnt 0x1",
           "counter": "Load",
           "count": 1,
@@ -249,7 +244,7 @@
           }
         },
         {
-          "pc_index": 289,
+          "pc_index": 278,
           "insn": "s_wait_loadcnt 0x0",
           "counter": "Load",
           "count": 0,
@@ -260,7 +255,7 @@
           }
         },
         {
-          "pc_index": 303,
+          "pc_index": 292,
           "insn": "s_wait_loadcnt 0x2",
           "counter": "Load",
           "count": 2,
@@ -271,64 +266,64 @@
           }
         },
         {
-          "pc_index": 328,
+          "pc_index": 317,
           "insn": "s_wait_loadcnt 0x1",
           "counter": "Load",
           "count": 1,
           "reason": {
             "Use": {
               "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 322,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
             }
           }
         },
         {
           "pc_index": 333,
-          "insn": "s_wait_loadcnt 0x0",
-          "counter": "Load",
-          "count": 0,
-          "reason": {
-            "Use": {
-              "reg": "v[12:15]"
-            }
-          }
-        },
-        {
-          "pc_index": 344,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 350,
+          "pc_index": 339,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 356,
+          "pc_index": 345,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 362,
+          "pc_index": 351,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 368,
+          "pc_index": 357,
           "insn": "s_wait_dscnt 0x0",
           "counter": "Ds",
           "count": 0,
           "reason": "Barrier"
         },
         {
-          "pc_index": 376,
+          "pc_index": 365,
           "insn": "s_wait_storecnt 0x0",
           "counter": "Store",
           "count": 0,
@@ -337,7 +332,7 @@
       ],
       "hazards": [],
       "clauses": [],
-      "vopd_pairs": 0,
+      "vopd_pairs": 16,
       "lds_slots": [],
       "barriers": [],
       "loop_fixpoints": [
@@ -350,7 +345,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "5c199543efa8a688c752882526e595d6b5886e133c731e0e70d9b3b83709ef51"
+      "s_text_sha256": "dbe07537ec90eb61283f3dc3a390234da78c170dcedb950f09b32b7d7a3bc600"
     }
   ]
 }
