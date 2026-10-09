@@ -4,7 +4,7 @@
 //! `869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e`.
 //! ABI: A/x/y pointers at 0/8/16, M/K i32 at 24/28; grid M, block 32,
 //! no LDS or scratch. Four independent group streams per output row;
-//! second-row quad DOG begins x1 then x0, while its tails begin x0 then x1.
+//! second-row DOG begins x1 then x0 in both quads and scalar tails.
 //! The two-row and odd-row residual epilogues retain distinct add operands.
 //! The test-only G0 probe consumes 32 packed 48-byte header/nibble/x records
 //! and returns two reduced f32 values per lane.
@@ -69,7 +69,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     salu(&mut b,"s_cmp_eq_u32 s2, 0",&[],&[2])?;
     branch(&mut b,"s_cbranch_scc1 .Lres_tail")?;
     b.loop_(".Lres_quad",|b| {
-        for stream in 0..4 { group(b,stream,true)?; }
+        for stream in 0..4 { group(b,stream)?; }
         salu(b,"s_add_co_i32 s2, s2, -1",&[2],&[2])?;
         salu(b,"s_cmp_lg_u32 s2, 0",&[],&[2])?;
         branch(b,"s_cbranch_scc1 .Lres_quad")
@@ -78,7 +78,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     for stream in 0..3 {
         salu(&mut b,"s_cmp_lt_u32 s15, s14",&[],&[15,14])?;
         branch(&mut b,"s_cbranch_scc0 .Lres_fold")?;
-        group(&mut b,stream,false)?;
+        group(&mut b,stream)?;
     }
     b.label(".Lres_fold")?;
     for base in [24u8,28] {
@@ -131,7 +131,7 @@ fn vmem(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8],scalar:&[u8],store:bool)-
 }
 fn branch(b:&mut Builder,text:&str)->Result<(),String> {b.control(Instruction::new(text,vec![],vec![]))}
 
-fn group(b:&mut Builder,stream:u8,quad:bool)->Result<(),String> {
+fn group(b:&mut Builder,stream:u8)->Result<(),String> {
     salu(b,"s_mul_i32 s24, s15, 0x88",&[24],&[15])?;
     salu(b,"s_add_co_i32 s25, s16, s24",&[25],&[16,24])?;
     salu(b,"s_add_co_i32 s26, s17, s24",&[26],&[17,24])?;
@@ -151,7 +151,8 @@ fn group(b:&mut Builder,stream:u8,quad:bool)->Result<(),String> {
         valu(b,"v_cmp_gt_u32_e32 vcc_lo, 16, v0",&[],&[0],&[])?;
         valu(b,&format!("v_cndmask_b32_e32 v34, v{}, v{header}, vcc_lo",header+1),&[34],&[header,header+1],&[])?;
         let dot=32+row;
-        let order=if quad && row==1 {[1,0,2,3,4,5,6,7]}else{[0,1,2,3,4,5,6,7]};
+        // Tail row1 starts x1 at 0x216c/0x23dc/0x2660, then x0 FMAC.
+        let order=if row==1 {[1,0,2,3,4,5,6,7]}else{[0,1,2,3,4,5,6,7]};
         for (step,nibble) in order.into_iter().enumerate() {
             valu(b,&format!("v_bfe_u32 v35, v{packed}, {}, 4",nibble*4),&[35],&[packed],&[])?;
             valu(b,"v_cvt_f32_ubyte0_e32 v35, v35",&[35],&[35],&[])?;
@@ -267,6 +268,17 @@ fn build_dog_g0() -> Result<Emitted, String> {
 #[cfg(all(test, feature="toolchain"))]
 mod tests {
     use super::*;
+    #[test]
+    fn residual_second_row_tail_dag() {
+        let emitted=build_gfx1201().expect("full residual twin").remove(0);
+        // Four quad groups plus three explicit scalar-tail groups.
+        assert_eq!(emitted.s_text.matches("v_mul_f32_e32 v33, v9, v36").count(),7);
+        assert_eq!(emitted.s_text.matches("v_fmac_f32_e32 v33, v8, v36").count(),7);
+        assert!(!emitted.s_text.contains("v_mul_f32_e32 v33, v8, v36"));
+        assert!(emitted.s_text.contains("v_add_f32_e32 v41, v24, v41"));
+        assert!(emitted.s_text.contains("v_add_f32_e32 v41, v41, v24"));
+        crate::native::assemble(&emitted.s_text,Arch::Gfx1201).expect("native full twin");
+    }
     #[test]
     fn residual_dog_g0_m7() {
         let emitted=build_dog_g0().expect("checked DOG region");
