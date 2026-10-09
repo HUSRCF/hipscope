@@ -609,8 +609,9 @@ impl Qwen35VmmStore {
 
     /// Forward: every planned DFlash Verify lane through the shared ChainVerify
     /// trunk (whole lanes in chunks of at most the effective cap: `<= 63` rows,
-    /// or up to 128 with `HIPFIRE_CB_VERIFY_CHUNK128`) and ONE head + argmax +
-    /// D2H per chunk ([`dflash_cb_verify`]). Picks wait in each lane for commit.
+    /// or up to 128 when the wide verify route is admitted for the target) and
+    /// ONE head + argmax + D2H per chunk ([`dflash_cb_verify`]). Picks wait in
+    /// each lane for commit.
     pub(super) fn dflash_verify_planned(
         &mut self,
         gpu: &mut Gpu,
