@@ -115,6 +115,11 @@ pub struct VmmLayerKv<'a> {
     pub partials: &'a GpuTensor,
 }
 
+/// Device budget of the flash-decode partials buffer. Decode partials scale
+/// with context, so a `rows × bound` buffer is tens of GB at 256K; the
+/// attention instead runs in row groups that fit this fixed buffer.
+const VMM_FLASH_PARTIALS_BYTES: usize = 256 << 20;
+
 /// KV write (K and V) and causal attend over independent request owners.
 pub(super) fn vmm_kv_write_attend(
     gpu: &mut Gpu,
@@ -138,19 +143,30 @@ pub(super) fn vmm_kv_write_attend(
     }
     // Row-batched flash decode: bitwise the singleton flash decode per row,
     // causal over each row's own absolute position, no LDS context cap.
-    gpu.attention_flash_decode_vmm(
-        layer.flash,
-        &pbs.fa_q_batch,
-        &pbs.fa_attn_out_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n,
-        layer.partials,
-        layer.descs,
-        layer.row_slot,
-    )
+    // Rows are independent, so the step runs in row groups sized to the
+    // fixed partials buffer (exact: no cross-row reduction exists).
+    let per_row = layer.flash.partial_floats_per_row.max(1);
+    let group = (layer.partials.numel() / per_row).max(1);
+    let q_row = config.n_heads * config.head_dim;
+    let mut r0 = 0usize;
+    while r0 < n {
+        let len = group.min(n - r0);
+        gpu.attention_flash_decode_vmm(
+            layer.flash,
+            &pbs.fa_q_batch.sub_offset(r0 * q_row, len * q_row),
+            &pbs.fa_attn_out_batch.sub_offset(r0 * q_row, len * q_row),
+            &pbs.positions.sub_offset(r0, len),
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            len,
+            layer.partials,
+            layer.descs,
+            &layer.row_slot.sub_offset(r0, len),
+        )?;
+        r0 += len;
+    }
+    Ok(())
 }
 
 /// Map a resolved KV owner to its validated `_vmm` format, or refuse
@@ -413,9 +429,14 @@ impl Qwen35VmmStore {
             for _ in &kv_layer_ids {
                 descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
             }
-            let row_slot = gpu.zeros(&[row_budget * 4], DType::Raw)?;
-            let partials =
-                gpu.zeros(&[row_budget * worst.partial_floats_per_row], DType::F32)?;
+            // 4-byte elements so per-row-group sub-views address rows.
+            let row_slot = gpu.zeros(&[row_budget], DType::F32)?;
+            // Fixed partials budget, never rows × context: the attention runs
+            // in row groups that fit it. At least one row at the bound.
+            let floats = (VMM_FLASH_PARTIALS_BYTES / 4)
+                .min(row_budget * worst.partial_floats_per_row)
+                .max(worst.partial_floats_per_row);
+            let partials = gpu.zeros(&[floats], DType::F32)?;
             let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
             Ok((descs, row_slot, partials, logits))
         })();
@@ -873,7 +894,7 @@ impl Qwen35VmmExecutor<'_> {
             st.model_max_seq,
             max_ctx_len,
         )?;
-        if flash.partial_floats_per_row * n > st.flash_partials.numel() {
+        if flash.partial_floats_per_row > st.flash_partials.numel() {
             return Err(HipError::new(0, "VMM executor: flash partials undersized for this step"));
         }
         let partials = &st.flash_partials;
