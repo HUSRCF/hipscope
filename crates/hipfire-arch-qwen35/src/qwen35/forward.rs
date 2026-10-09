@@ -7077,7 +7077,7 @@ fn gdn_compact_qk_div(
 /// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
 /// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
 /// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
-fn gated_norm_mq_rotate_enabled(
+pub(crate) fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
