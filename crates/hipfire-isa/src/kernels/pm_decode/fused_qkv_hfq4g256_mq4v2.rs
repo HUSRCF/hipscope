@@ -122,10 +122,14 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
     sop(b, "s_cmp_lg_u32 s34, 0", &[], &[34])?;
     op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
     for stream in 0..4u8 {
+        if stream == 1 {
+            b.wait(crate::ledger::Counter::Load, 12)?;
+        }
         let header = 8 + stream * 2;
         op(b, format!("v_cndmask_b32_e64 v{}, v{}, v{header}, vcc_lo", 4 + stream, header + 1),
             &[v(4 + stream)], &[v(header), v(header + 1)])?;
     }
+    b.wait(crate::ledger::Counter::Load, 8)?;
     // Consume streams 2/3 before stream 1 reuses their packed registers.
     // Stream 1's term 5 replaces its own packed word, so extract it last.
     for stream in [2u8, 3, 0, 1] {
@@ -155,6 +159,8 @@ fn project_quad(b: &mut Builder) -> Result<(), String> {
                 &[v(weight)], &[v(header), v(weight)])?;
         }
     }
+    // Dequantization hides all eight activation loads; retire them together.
+    b.wait(crate::ledger::Counter::Load, 0)?;
     // All headers are now dead: their four registers become the lane dots.
     for stream in [0u8, 2] {
         let weight = quad_weight(stream, 1);
@@ -404,6 +410,7 @@ mod tests {
             .filter(|line| line.contains("buffer_load_") || line.contains("global_load_"))
             .count();
         assert_eq!(issued_before_wait, 18, "quad loads must overlap before the first wait");
+        assert_eq!(quad.matches("s_wait_loadcnt").count(), 4);
         assert_eq!(quad.matches(" :: ").count(), 16);
         assert_eq!(quad.matches("s_delay_alu").count(), 16);
         assert_eq!(quad.lines().find(|line| line.contains("s_wait_loadcnt")).unwrap().trim(),
