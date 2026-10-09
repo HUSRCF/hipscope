@@ -384,8 +384,21 @@ impl BatchPlanner {
             let n_adv = advances.iter().filter(|a| a.epoch == rr.epoch).count();
             match rr.kind {
                 RequestStepKind::Prefill => {
-                    if work[i].remaining_prompt.len() < rr.rows.len || n_adv != 0 {
+                    // A prompt-completing chunk carries exactly one advance
+                    // (the first sampled token); earlier chunks carry none.
+                    let left = work[i].remaining_prompt.len();
+                    let completes = left == rr.rows.len;
+                    if left < rr.rows.len || n_adv > usize::from(completes) {
                         return Err(format!("publish: invalid prefill commit for {:?}", rr.epoch));
+                    }
+                    if let Some(a) = advances.iter().find(|a| a.epoch == rr.epoch) {
+                        if a.committed_position != work[i].next_pos + rr.rows.len {
+                            return Err(format!(
+                                "publish: prefill advance position {} != {}",
+                                a.committed_position,
+                                work[i].next_pos + rr.rows.len
+                            ));
+                        }
                     }
                 }
                 _ => {
@@ -421,6 +434,14 @@ impl BatchPlanner {
                     }
                     w.remaining_prompt.drain(..rr.rows.len);
                     w.next_pos += rr.rows.len;
+                    if let Some(adv) = advances.iter().find(|a| a.epoch == rr.epoch) {
+                        w.decoding = true;
+                        if adv.finish.is_none() {
+                            if let Some(&seed) = adv.committed_ids.last() {
+                                w.remaining_prompt.push(seed);
+                            }
+                        }
+                    }
                 }
                 RequestStepKind::Ar | RequestStepKind::Verify { .. } | RequestStepKind::Forced => {
                     let adv = advances
@@ -614,5 +635,27 @@ mod tests {
         assert_eq!(work[0].next_pos, 51);
         assert!(work[1].remaining_prompt.is_empty());
         assert_eq!(work[1].next_pos, 10);
+    }
+
+    #[test]
+    fn completing_prefill_publishes_first_token_and_turns_decoding() {
+        let mut work = vec![pw(0, (0..10).collect(), 0, false, SpecKind::None)];
+        let epochs = [ep(1)];
+        let mut p = planner();
+        let plan = p.plan_step(&work, &epochs, &[true], 64, 1).unwrap();
+        let mut adv = RequestAdvance {
+            epoch: ep(1),
+            committed_ids: vec![77],
+            committed_position: 9,
+            accepted_drafts: 0,
+            verified_rows: 0,
+            finish: None,
+        };
+        assert!(p.publish(&mut work, &epochs, &plan, &[adv.clone()]).is_err());
+        assert_eq!(work[0].remaining_prompt.len(), 10);
+        adv.committed_position = 10;
+        p.publish(&mut work, &epochs, &plan, &[adv]).unwrap();
+        assert!(work[0].decoding);
+        assert_eq!(work[0].remaining_prompt, vec![77]);
     }
 }
