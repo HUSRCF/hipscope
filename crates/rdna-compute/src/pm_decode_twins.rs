@@ -91,8 +91,8 @@ pub static GFX1201_TWINS: &[NativeKernelBundle] = &[
         "fused_qkv_hfq4g256_mq4v2",
         &["fused_qkv_mq4g256v2"],
         source = "a0e7f85ec0a35eb777c07975cd888eb53aa21c855ae39d1c06ee02322836cd6b",
-        image = "3eca4b78415b632e709b0fa31a13ecab0892a6d970e45ee94fdf391c25a5931a",
-        elf = "579a3a837d45783b5fa59e50d9dc6a3a330455e3640023c8d1e344c991b6c6bb"
+        image = "9e4f53092542077b6b97d4b462cfb5be0f58f109b4deba65d3a1892c8402420b",
+        elf = "22c665a2548ad0a13d3b2a77212914d8ca42c3af4872dc9c394a3b0a70dbc4cb"
     ),
     twin!(
         "fused_gate_up_hfq4g256_mq4v2",
