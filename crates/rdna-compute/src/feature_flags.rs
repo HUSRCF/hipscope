@@ -53,8 +53,9 @@ pub struct FeatureFlags {
     pub g12_iu4_isa: bool,
     /// Oracle-accepted decode twins (`kernel.pm_decode`, `HIPFIRE_PM_DECODE`):
     /// exact gfx1201 loads the embedded builder images of
-    /// [`crate::pm_decode_twins`] in place of those HIP modules. Default off
-    /// during development; `=0` is the kill switch. Ignored on other arches.
+    /// [`crate::pm_decode_twins`] in place of those HIP modules. `auto`
+    /// (default) is on for exact gfx1201 only; `=0` restores the hipcc
+    /// modules. Other arches never load the twins.
     pub pm_decode: bool,
     /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
     pub a8_prefill: bool,
@@ -698,7 +699,7 @@ impl FeatureFlags {
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
-            pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(false),
+            pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(arch == "gfx1201"),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
             a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
@@ -1945,8 +1946,8 @@ mod tests {
     }
 
     #[test]
-    fn pm_decode_defaults_off_and_follows_typed_key() {
-        let flags_for = |raw: Option<&str>| {
+    fn pm_decode_auto_is_exact_gfx1201_and_follows_typed_key() {
+        let flags_for = |arch: &str, raw: Option<&str>| {
             let mut layers = Vec::new();
             if let Some(raw) = raw {
                 let mut layer = ConfigLayer::default();
@@ -1958,17 +1959,24 @@ mod tests {
             }
             let resolved = resolve(layers)?;
             let process = ProcessConfig::from_resolved(&resolved)?;
-            Ok::<_, hipfire_config::ConfigError>(FeatureFlags::from_process_config("gfx1201", &process))
+            Ok::<_, hipfire_config::ConfigError>(FeatureFlags::from_process_config(arch, &process))
         };
-        // Unset: off (development default; never on by default).
-        assert!(!flags_for(None).unwrap().pm_decode);
-        assert!(!flags_for(Some("0")).unwrap().pm_decode);
-        assert!(!flags_for(Some("false")).unwrap().pm_decode);
-        assert!(flags_for(Some("1")).unwrap().pm_decode);
-        assert!(flags_for(Some("true")).unwrap().pm_decode);
-        // Invalid values are refused by the typed schema, not read as off.
-        assert!(flags_for(Some("maybe")).is_err());
-        assert!(flags_for(Some("2")).is_err());
+        // Unset and `auto`: on for exact gfx1201 only.
+        for raw in [None, Some("auto")] {
+            assert!(flags_for("gfx1201", raw).unwrap().pm_decode, "{raw:?}");
+            for arch in ["gfx1200", "gfx12", "gfx1151", "gfx1100", "gfx942"] {
+                assert!(!flags_for(arch, raw).unwrap().pm_decode, "{arch} {raw:?}");
+            }
+        }
+        // `0`/`false` is the opt-out; `1`/`true` is explicit on.
+        assert!(!flags_for("gfx1201", Some("0")).unwrap().pm_decode);
+        assert!(!flags_for("gfx1201", Some("false")).unwrap().pm_decode);
+        assert!(flags_for("gfx1201", Some("1")).unwrap().pm_decode);
+        assert!(flags_for("gfx1201", Some("true")).unwrap().pm_decode);
+        // Invalid values are refused by the typed schema, not read as a default.
+        assert!(flags_for("gfx1201", Some("maybe")).is_err());
+        assert!(flags_for("gfx1201", Some("2")).is_err());
+        // The unit-test constructor stays off (deterministic baseline).
         assert!(!FeatureFlags::for_test("gfx1201").pm_decode);
     }
 

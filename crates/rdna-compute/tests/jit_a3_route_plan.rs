@@ -128,11 +128,15 @@ fn manifest(plan: &RouteKernelPlan) -> BTreeMap<String, (String, String, Value, 
     out
 }
 
+/// The frozen A3 manifests and observed identities are the hipcc closure:
+/// the `kernel.pm_decode=false` opt-out. The default (twins on) closure is
+/// derived from it exactly in [`pm_decode_twins_replace_their_hip_route_entries`].
 fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
     let trunk = header(G0, "header-27b.json");
     let head = header(A3, "header-27b-mtp.json");
     let tensors = metas(&[&trunk, &head]);
-    let flags = builtin_flags("gfx1201");
+    let mut flags = builtin_flags("gfx1201");
+    flags.pm_decode = false;
     let plan = plan(&Load {
         arch: "gfx1201",
         model_arch: trunk.arch_id,
@@ -304,7 +308,7 @@ fn conflicting_public_entry_plans_refuse() {
     validate_route_plan(&same).unwrap();
 }
 
-/// `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP
+/// Default `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP
 /// entry (same module and symbols, embedded image), the replaced HIP recipe
 /// is the exact source the oracle accepted against, nothing else changes,
 /// and the flag never reaches another architecture.
@@ -315,10 +319,10 @@ fn pm_decode_twins_replace_their_hip_route_entries() {
     let head = header(A3, "header-27b-mtp.json");
     let tensors = metas(&[&trunk, &head]);
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
-        let off_flags = builtin_flags("gfx1201");
-        assert!(!off_flags.pm_decode, "pm_decode must default off");
-        let mut on_flags = off_flags.clone();
-        on_flags.pm_decode = true;
+        let on_flags = builtin_flags("gfx1201");
+        assert!(on_flags.pm_decode, "pm_decode must default on for exact gfx1201");
+        let mut off_flags = on_flags.clone();
+        off_flags.pm_decode = false;
         let load = |flags| Load {
             arch: "gfx1201",
             model_arch: trunk.arch_id,

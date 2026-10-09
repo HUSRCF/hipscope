@@ -4,7 +4,7 @@
 
 //! Oracle-accepted builder (peacemaker) twins of gfx1201 decode HIP modules.
 //!
-//! With `kernel.pm_decode` (`HIPFIRE_PM_DECODE=1`) on exact `gfx1201`, the
+//! On exact `gfx1201` with `kernel.pm_decode` (default on; `HIPFIRE_PM_DECODE=0` opts out), the
 //! common first-load funnels (`scratch::load_kernel_module`, reached by
 //! `Gpu::ensure_kernel`, the scratch helpers and the planned-route preload)
 //! load the embedded image of a listed module instead of compiling its HIP
