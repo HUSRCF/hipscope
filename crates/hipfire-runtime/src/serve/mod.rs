@@ -2,13 +2,20 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Concurrent serve: several agents served at once by the multi-slot engine.
+// Legacy concurrent serve protocol: the experimental fixed-slot `SlotEngine`
+// (`serve.multi_slot`). It stays explicitly labeled legacy and is never the
+// default route.
 //
-// `hipfire serve` already exposes an OpenAI-compatible /v1/chat/completions
-// over HTTP, and HTTP is already concurrent. What serialises requests today is
-// behind it: one `Engine` (a single daemon process) guarded by a
-// `Mutex<ServeRuntime>`. `SlotEngine` is an alternative backend that lives
-// OUTSIDE that mutex — which is the entire point — so requests overlap.
+// What actually serializes default serve: the CLI's `Mutex<ServeRuntime>`
+// covers model/request setup only (the engine handle is cloned and the lock
+// dropped before generation), but the single daemon owns one mutable resident
+// model and runs one generation at a time unless a continuous-batch route is
+// admitted. Batch routes are daemon-owned (`hipfire-generate::batch`): the
+// existing fixed-lane Qwen/LFM/EP drivers, and the VMM continuous-batching
+// route (`serve.vmm_batch`, default off) that plans steps with
+// `slot_batch::BatchPlanner` over one resident weight set and per-request VMM
+// state. `SlotEngine` lives outside the CLI mutex and loads its own model; it
+// is not that VMM route.
 
 // The engine LOOP lives in `hipfire-arch-qwen35::serve_engine`, not here:
 // it needs `forward_batch_slots_graphed`, and that crate already depends on
