@@ -125,6 +125,9 @@ pub struct VmmLayerKv<'a> {
 /// with context, so a `rows × bound` buffer is tens of GB at 256K; the
 /// attention instead runs in row groups that fit this fixed buffer.
 const VMM_FLASH_PARTIALS_BYTES: usize = 256 << 20;
+/// Device memory provision_step never maps KV into: the exact route's
+/// prefill runs on the singleton scratch, which may widen after mapping.
+const VMM_MAP_DEVICE_RESERVE_BYTES: usize = 512 << 20;
 
 /// KV write (K and V) and causal attend over independent request owners.
 pub(super) fn vmm_kv_write_attend(
@@ -305,8 +308,14 @@ impl Qwen35RequestState {
     /// exact KV/DN, and this state holds what the bundle held. `position` and
     /// `pending_seed` are the caller's to exchange with its singleton frontier.
     pub fn swap_with_bundle(&mut self, bundle: &mut Qwen35Bundle) {
-        std::mem::swap(&mut self.kv, &mut bundle.kv_cache);
-        std::mem::swap(&mut self.dn, &mut bundle.dn_state);
+        self.swap_owners(&mut bundle.kv_cache, &mut bundle.dn_state);
+    }
+
+    /// [`Self::swap_with_bundle`] on borrowed bundle fields (a caller that
+    /// already holds `&mut bundle.kv_cache` / `&mut bundle.dn_state`).
+    pub fn swap_owners(&mut self, kv: &mut KvCache, dn: &mut DeltaNetState) {
+        std::mem::swap(&mut self.kv, kv);
+        std::mem::swap(&mut self.dn, dn);
     }
 
     /// Free this owner. Every forward that read it has completed (the
@@ -477,27 +486,38 @@ impl Qwen35VmmStore {
                 template_kv.vmm_logical_bound(),
             )
             .map_err(|e| format!("VMM executor: {e}"))?;
+        // The exact route's trunk rows are decode rows only (one per slot):
+        // its prefill is the singleton prefill on the singleton's own scratch
+        // and its attention is the singleton binding (no shared partials).
+        // Sizing these for prefill rows would duplicate the singleton's PBS.
+        let trunk_rows = match route {
+            VmmRoute::Exact => max_slots,
+            VmmRoute::Nonexact => row_budget,
+        };
         let result = (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor, GpuTensor)> {
             let mut descs = Vec::with_capacity(kv_layer_ids.len());
             for _ in &kv_layer_ids {
                 descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
             }
             // 4-byte elements so per-row-group sub-views address rows.
-            let row_slot = gpu.zeros(&[row_budget], DType::F32)?;
+            let row_slot = gpu.zeros(&[trunk_rows], DType::F32)?;
             // Fixed partials budget, never rows × context: the attention runs
             // in row groups that fit it. At least one row at the bound.
-            let floats = (VMM_FLASH_PARTIALS_BYTES / 4)
-                .min(row_budget * worst.partial_floats_per_row)
-                .max(worst.partial_floats_per_row);
+            let floats = match route {
+                VmmRoute::Exact => 1,
+                VmmRoute::Nonexact => (VMM_FLASH_PARTIALS_BYTES / 4)
+                    .min(row_budget * worst.partial_floats_per_row)
+                    .max(worst.partial_floats_per_row),
+            };
             let partials = gpu.zeros(&[floats], DType::F32)?;
             let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
-            let hidden_out = gpu.zeros(&[row_budget * config.dim], DType::F32)?;
+            let hidden_out = gpu.zeros(&[trunk_rows * config.dim], DType::F32)?;
             Ok((descs, row_slot, partials, logits, hidden_out))
         })();
         let (descs_dev, row_slot_dev, flash_partials, logits, hidden_out) =
             result.map_err(|e| format!("VMM executor scratch: {e}"))?;
         // Plain trunk rows only: no GDN S-tape (that is a verify/tree cost).
-        let pbs = match PrefillBatchScratch::new_opt(gpu, config, row_budget, false) {
+        let pbs = match PrefillBatchScratch::new_opt(gpu, config, trunk_rows, false) {
             Ok(p) => p,
             Err(e) => {
                 for t in descs_dev {
@@ -741,8 +761,19 @@ impl Qwen35VmmExecutor<'_> {
         if n == 0 || plan.requests.is_empty() {
             return Err("provision_step: empty plan".into());
         }
-        if n > st.row_budget {
-            return Err(format!("provision_step: {n} rows exceed row budget {}", st.row_budget));
+        // Exact-route prefill rows run on the singleton's scratch (chunk
+        // length checked below); only its decode rows use store scratch.
+        let trunk_rows = match st.route {
+            VmmRoute::Exact => plan
+                .requests
+                .iter()
+                .filter(|r| r.kind != RequestStepKind::Prefill)
+                .map(|r| r.rows.len)
+                .sum(),
+            VmmRoute::Nonexact => n,
+        };
+        if trunk_rows > st.row_budget {
+            return Err(format!("provision_step: {trunk_rows} rows exceed row budget {}", st.row_budget));
         }
         if b.m_per_slot.len() > st.max_slots
             || b.tokens.len() != n
@@ -843,11 +874,20 @@ impl Qwen35VmmExecutor<'_> {
             return Err("provision_step: rows outside every request range".into());
         }
         // Map granules (outside any forward/capture) against the shared
-        // physical budget; refusal maps nothing for that request.
+        // physical budget AND the device's actual free memory (less a
+        // reserve for the singleton prefill scratch the exact route widens),
+        // so an overstated budget is a typed refusal, never a raw HIP OOM.
+        // Refusal maps nothing for that request.
         let mut mapped_total = self.store.mapped_kv_bytes()?;
+        let mut device_room = gpu
+            .hip
+            .get_vram_info()
+            .map_err(|e| format!("provision_step: VRAM query: {e}"))?
+            .0
+            .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);
         let st = &mut *self.store;
         for r in &plan.requests {
-            let budget = st.kv_budget_bytes.saturating_sub(mapped_total);
+            let budget = st.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
             let s = st
                 .slots
                 .iter_mut()
@@ -860,6 +900,7 @@ impl Qwen35VmmExecutor<'_> {
                 .provision_vmm_positions(gpu, end, budget)
                 .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
             mapped_total += grown;
+            device_room = device_room.saturating_sub(grown);
         }
         st.mapped_high_water = st.mapped_high_water.max(mapped_total);
         // Build descriptors (re-read after provision: views borrow) and the
