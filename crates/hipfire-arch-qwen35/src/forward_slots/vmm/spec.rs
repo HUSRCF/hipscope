@@ -307,6 +307,9 @@ impl Qwen35VmmStore {
         config: &Qwen35Config,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
+        if !plan.requests.iter().any(|r| matches!(r.kind, RequestStepKind::Verify { .. })) {
+            return Ok(());
+        }
         let Self { slots, spec, .. } = self;
         let engine = spec.as_ref().expect("checked at provision");
         let planned: Vec<(RequestEpoch, usize)> = plan
