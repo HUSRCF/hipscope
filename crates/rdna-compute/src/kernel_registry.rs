@@ -6,7 +6,7 @@
 //! JIT modules of the admitted default Redline programs, and for railgun's
 //! own copy kernels. This is a packaging inventory, not a replacement for the
 //! runtime's dispatch policy. Every source below is the Rust source
-//! expression supplied to `ensure_kernel` or to `precompile_qwen35` (for
+//! expression supplied to `ensure_kernel` (for
 //! railgun, the source its lowering will JIT); never infer module names from
 //! HIP filenames.
 
@@ -102,7 +102,7 @@ pub enum RegistryError {
 }
 
 fn prepend_kv_slot_desc(body: &str) -> String {
-    // Same assembly as attention.rs and dispatch.rs precompile_qwen35.
+    // Same assembly as attention.rs `ensure_givens4_kernel`.
     format!(
         "{}\n{}",
         kernels::KV_SLOT_DESC_H,
@@ -187,7 +187,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         };
     }
 
-    // precompile_qwen35 common kernels (dispatch.rs:4852-4897,5176-5203).
+    // Common Qwen3.5 kernels (historical whole-model precompile set).
     add!("rmsnorm", kernels::RMSNORM_SRC, ["rmsnorm_f32"]);
     add!("add_inplace", kernels::ADD_INPLACE_SRC, ["add_inplace_f32"]);
     add!("mul", kernels::MUL_SRC, ["mul_f32"]);

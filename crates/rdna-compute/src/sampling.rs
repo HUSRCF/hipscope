@@ -27,7 +27,7 @@ fn sample_fast_stable_enabled() -> bool {
 }
 
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
-/// TOP_K 20). Shared by runtime ensure_kernel and `precompile_qwen35` so the
+/// TOP_K 20). Shared by runtime ensure_kernel and the kernel registry so the
 /// cache hash is identical.
 pub(crate) fn sample_top_p_parallel_src() -> String {
     kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
@@ -61,23 +61,6 @@ pub(crate) fn sample_top_p_parallel_fast_src(top_k_width: usize, suffix: &str) -
         .replace("sample_apply_repeat_penalty", &fn_penalty)
         .replace("sample_topk_partial", &fn_partial)
         .replace("sample_topk_finalize", &fn_finalize)
-}
-
-/// All exact parallel-sampler module identities used by `sample_top_p_pf`,
-/// for admission into `precompile_qwen35`'s compile_batch.
-pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String); 4] {
-    [
-        ("sample_top_p_parallel", sample_top_p_parallel_src()),
-        ("sample_top_p_parallel_w64", sample_top_p_parallel_w64_src()),
-        (
-            "sample_top_p_parallel_fast21",
-            sample_top_p_parallel_fast_src(21, "fast21"),
-        ),
-        (
-            "sample_top_p_parallel_fast65",
-            sample_top_p_parallel_fast_src(65, "fast65"),
-        ),
-    ]
 }
 
 impl Gpu {
