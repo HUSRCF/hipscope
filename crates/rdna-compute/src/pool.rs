@@ -118,7 +118,7 @@ impl GpuPool {
     }
 
     /// Bytes parked in the free lists (allocated from HIP, owned by no tensor).
-    fn pooled_bytes(&self) -> usize {
+    pub(crate) fn pooled_bytes(&self) -> usize {
         self.free_lists.values().flatten().map(DeviceBuffer::size).sum()
     }
 

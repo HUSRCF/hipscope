@@ -4638,7 +4638,12 @@ impl Gpu {
             .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
-                return Err(self.retain_failed_vmm_arena(arena, err));
+                if !self.vmm_pool_drain_for_retry(&err, initial_mapped_bytes) {
+                    return Err(self.retain_failed_vmm_arena(arena, err));
+                }
+                if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
+                    return Err(self.retain_failed_vmm_arena(arena, err));
+                }
             }
         }
         self.register_vmm_arena(arena, byte_size, shape, dtype)
@@ -4823,20 +4828,70 @@ impl Gpu {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
         let logical_bytes = tensor.byte_size();
-        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
-            HipError::new(
+        if !self.vmm_arenas.contains_key(&key) {
+            return Err(HipError::new(
                 0,
                 &format!("tensor at 0x{key:x} is not a registered VMM owner"),
-            )
-        })?;
+            ));
+        }
+        // A failed granule map aborts the arena, so it cannot be retried:
+        // return pooled memory before the map instead.
+        if granules {
+            self.vmm_pool_headroom(additional_bytes);
+        }
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
         if granules {
             arena.map_next_granules(&self.hip, additional_bytes, access_devices)?;
-        } else {
+        } else if let Err(err) = arena.map_next(&self.hip, additional_bytes, access_devices) {
+            if !self.vmm_pool_drain_for_retry(&err, additional_bytes) {
+                return Err(err);
+            }
+            let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
             arena.map_next(&self.hip, additional_bytes, access_devices)?;
         }
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
         let mapped_bytes = arena.mapped_bytes();
         tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
         Ok(mapped_bytes)
+    }
+
+    /// Before a VMM granule map of `bytes`: when HIP's free figure cannot
+    /// cover it (plus a 64 MiB margin) and the pool holds buffers, return
+    /// every pooled buffer to HIP first and log it. Pooled buffers are
+    /// invisible to `hipMemCreate`, exactly as to `hipMalloc`
+    /// ([`crate::pool::GpuPool::alloc`]); a failed granule map aborts its
+    /// arena, so these maps drain up front instead of retrying.
+    fn vmm_pool_headroom(&mut self, bytes: usize) {
+        const MARGIN: usize = 64 << 20;
+        let pooled = self.pool.pooled_bytes();
+        if pooled == 0 {
+            return;
+        }
+        let free = self.device_mem_info().map_or(0, |(free, _)| free);
+        if free >= bytes.saturating_add(MARGIN) {
+            return;
+        }
+        self.pool.drain(&self.hip);
+        eprintln!(
+            "GpuPool: VMM map of {bytes} B with {free} B free; returned {pooled} B of pooled \
+             buffers to HIP before mapping"
+        );
+    }
+
+    /// After a whole-segment VMM map (`VmmArena::map_next`, which leaves the
+    /// arena unchanged when `hipMemCreate` fails) ran out of memory: return
+    /// the pool's buffers to HIP and report whether a single retry is due.
+    fn vmm_pool_drain_for_retry(&mut self, err: &HipError, bytes: usize) -> bool {
+        let pooled = self.pool.pooled_bytes();
+        if err.code != hip_bridge::HIP_ERROR_OUT_OF_MEMORY || pooled == 0 {
+            return false;
+        }
+        self.pool.drain(&self.hip);
+        eprintln!(
+            "GpuPool: VMM map of {bytes} B out of memory; returned {pooled} B of pooled buffers \
+             to HIP and retrying once"
+        );
+        true
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
@@ -5153,6 +5208,7 @@ impl Gpu {
                 .valid_bytes
                 .next_multiple_of(arena.granule_bytes())
                 .min(arena.reserved_bytes());
+            self.vmm_pool_headroom(end - entry.alias_bytes);
             if let Err(err) =
                 arena.map_next_granules(&self.hip, end - entry.alias_bytes, access_devices)
             {
