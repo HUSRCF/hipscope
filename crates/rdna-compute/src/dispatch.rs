@@ -1056,6 +1056,13 @@ pub struct Gpu {
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
     pub(crate) pool: crate::pool::GpuPool,
+    /// Railgun E0: the multi-layer GDN replay scratch shared by every armed
+    /// `GdnTape` of one shape on this device, keyed by shape (see
+    /// `dflash_gdn_replay::GdnReplaySharedScratch`). Drained on unload.
+    pub(crate) dflash_gdn_replay_scratch: HashMap<
+        crate::dflash_gdn_replay::GdnReplayScratchShape,
+        crate::dflash_gdn_replay::GdnReplaySharedScratch,
+    >,
     /// VMM owners keyed by their base virtual address. VMM-backed tensors use
     /// non-owning DeviceBuffer views and must bypass GpuPool/hipFree teardown.
     vmm_arenas: HashMap<usize, VmmArena>,
@@ -1848,6 +1855,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            dflash_gdn_replay_scratch: HashMap::new(),
             vmm_arenas: HashMap::new(),
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
@@ -6134,6 +6142,9 @@ impl Gpu {
     ///     (`ScratchState::qsa_gather_vmm`): released, so the next model
     ///     reserves its own context and unload's VMM gate sees no Gpu-held
     ///     owner. The legacy slot (`qsa_gather_f16`) is kept, as before.
+    ///   * the shared GDN replay scratch (`dflash_gdn_replay_scratch`): every
+    ///     entry returns to the pool, so a model swap never inherits one; a
+    ///     tape that outlived the unload fails loudly at its next replay.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
@@ -6144,6 +6155,7 @@ impl Gpu {
         // A failed release is retained for `ensure_vmm_cleaned` to retry
         // and report.
         let _ = self.release_qsa_gather_workspace();
+        self.drain_dflash_gdn_replay_scratch();
     }
 
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called

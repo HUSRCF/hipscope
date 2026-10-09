@@ -2000,7 +2000,7 @@ impl GdnTape {
         Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>,
     ) {
         let n_la = self.qkv_bufs.len();
-        let row = ml.rows * self.v_dim * 4;
+        let row = ml.shape.rows * self.v_dim * 4;
         let mut pre = Vec::with_capacity(n_la);
         let mut gdn = Vec::with_capacity(n_la);
         let mut la_idx = 0usize;
@@ -2014,9 +2014,10 @@ impl GdnTape {
                 _ => unreachable!("LA layer type mismatch in replay_gdn"),
             };
             let off = (la_idx * row) as u64;
-            let q = ml.q.buf.as_ptr() as u64 + off;
-            let k = ml.k.buf.as_ptr() as u64 + off;
-            let v = ml.v.buf.as_ptr() as u64 + off;
+            let region = ml.shape.region_bytes() as u64;
+            let q = ml.base + off;
+            let k = ml.base + region + off;
+            let v = ml.base + 2 * region + off;
             pre.push(rdna_compute::dflash_gdn_replay::DflashReplayPreLayer {
                 qkv_tape: self.qkv_bufs[la_idx].buf.as_ptr() as u64,
                 conv_w: conv_weight.buf.as_ptr() as u64,
@@ -2033,7 +2034,7 @@ impl GdnTape {
                 beta: self.beta_bufs[la_idx].buf.as_ptr() as u64,
                 s_q8: dn_state.s_matrices[la_idx].buf.as_ptr() as u64,
                 s_scales: dn_state.s_scales[la_idx].buf.as_ptr() as u64,
-                output: ml.out.buf.as_ptr() as u64 + off,
+                output: ml.base + 3 * region + off,
                 ef: dn_state
                     .ef_residual(la_idx)
                     .map_or(0, |t| t.buf.as_ptr() as u64),
@@ -2084,6 +2085,7 @@ impl GdnTape {
             )?;
             ml.fingerprint = Some(fp);
         }
+        ml.order(gpu)?;
         let hd = self.key_head_dim;
         gpu.dflash_gdn_replay_pre_ml(
             ml.pre_table.as_ptr() as *const _,
@@ -2202,6 +2204,7 @@ impl GdnTape {
             )?;
             from.fingerprint = Some(fp);
         }
+        ml.order(gpu)?;
         let Some(from) = ml.from.as_ref() else {
             unreachable!("armed at construction")
         };
@@ -2262,6 +2265,9 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
+            if let Some(ml) = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                ml.order(gpu)?;
+            }
             return gpu.graphs.replay_graph_launch(
                 &gpu.hip,
                 gpu.device_id,
@@ -2497,18 +2503,17 @@ impl GdnTape {
     }
 }
 
-/// Railgun E0 / L6c: device state of the multi-layer replay. Each LA layer
-/// owns rows `[la * rows * v_dim, (la + 1) * rows * v_dim)` of the q/k/v
-/// preamble outputs and of the (dead) recurrence output, so all layers run
-/// concurrently without sharing scratch. `rows` is the tape's `max_n`
-/// capped at the route's step ceiling. `fingerprint` is `None` until the
-/// tables are first written.
+/// Railgun E0 / L6c: device state of the multi-layer replay. The q, k, v and
+/// (dead) recurrence-output scratch are the four regions of the `Gpu`'s
+/// shared replay scratch for `shape`
+/// (`rdna_compute::dflash_gdn_replay::GdnReplaySharedScratch`, which states
+/// why sharing is sound), based at `base`. Within a region each LA layer owns
+/// rows `[la * rows * v_dim, (la + 1) * rows * v_dim)`, so all layers run
+/// concurrently; `rows` is the tape's `max_n` capped at the route's step
+/// ceiling. `fingerprint` is `None` until the tables are first written.
 struct GdnReplayMl {
-    rows: usize,
-    q: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    out: GpuTensor,
+    shape: rdna_compute::dflash_gdn_replay::GdnReplayScratchShape,
+    base: u64,
     pre_table: DeviceBuffer,
     gdn_table: DeviceBuffer,
     fingerprint: Option<u64>,
@@ -2558,9 +2563,9 @@ impl GdnReplayMlFrom {
 }
 
 impl GdnReplayMl {
-    /// JIT both kernels and allocate scratch + tables, plus the D8
-    /// snapshot-source tables when `with_from`. Any failure frees what was
-    /// allocated and returns the error.
+    /// JIT both kernels, acquire the shared replay scratch and allocate the
+    /// tables, plus the D8 snapshot-source tables when `with_from`. Any
+    /// failure releases what was acquired and returns the error.
     fn arm(
         gpu: &mut Gpu,
         n_la: usize,
@@ -2569,20 +2574,12 @@ impl GdnReplayMl {
         with_from: bool,
     ) -> HipResult<Self> {
         gpu.ensure_dflash_gdn_replay_ml()?;
-        let rows = max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS);
-        let n = n_la * rows * v_dim;
-        let mut tensors = Vec::with_capacity(4);
-        for _ in 0..4 {
-            match gpu.alloc_tensor(&[n], DType::F32) {
-                Ok(t) => tensors.push(t),
-                Err(e) => {
-                    for t in tensors {
-                        let _ = gpu.free_tensor(t);
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        let shape = rdna_compute::dflash_gdn_replay::GdnReplayScratchShape {
+            n_layers: n_la,
+            rows: max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS),
+            v_dim,
+        };
+        let base = gpu.dflash_gdn_replay_scratch_acquire(shape)?;
         let pre_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>();
         let gdn_bytes =
@@ -2600,20 +2597,13 @@ impl GdnReplayMl {
         let (pre_table, gdn_table) = match tables {
             Ok(t) => t,
             Err(e) => {
-                for t in tensors {
-                    let _ = gpu.free_tensor(t);
-                }
+                gpu.dflash_gdn_replay_scratch_release(shape, base);
                 return Err(e);
             }
         };
-        let mut tensors = tensors.into_iter();
-        let mut next = || tensors.next().expect("allocated above");
         let mut ml = Self {
-            rows,
-            q: next(),
-            k: next(),
-            v: next(),
-            out: next(),
+            shape,
+            base: base as u64,
             pre_table,
             gdn_table,
             fingerprint: None,
@@ -2631,10 +2621,13 @@ impl GdnReplayMl {
         Ok(ml)
     }
 
+    /// Check and stream-order the shared scratch before a replay.
+    fn order(&self, gpu: &mut Gpu) -> HipResult<()> {
+        gpu.dflash_gdn_replay_scratch_order(self.shape, self.base as *mut _)
+    }
+
     fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [self.q, self.k, self.v, self.out] {
-            let _ = gpu.free_tensor(t);
-        }
+        gpu.dflash_gdn_replay_scratch_release(self.shape, self.base as *mut _);
         let _ = gpu.hip.free(self.pre_table);
         let _ = gpu.hip.free(self.gdn_table);
         if let Some(from) = self.from {
