@@ -1986,7 +1986,12 @@ fn spec_exec_cases(gpu: &mut Gpu, slot: &mut ModelSlot, args: &Args, fx: &[Fixtu
     if let Some(pbs) = slot.scratch.widened_prefill_batch.borrow_mut().take() {
         pbs.free_gpu(gpu)?;
     }
-    let budget_kv = free_vram(gpu)?.saturating_sub(6 << 30);
+    // The reference/mtp_cb phases freed their owners into the GpuPool free
+    // list; VMM mapping draws on device free memory, so return them first.
+    gpu.drain_pool();
+    let free = free_vram(gpu)?;
+    let budget_kv = free.saturating_sub(6 << 30);
+    eprintln!("spec exec store: width={EXEC_WIDTH} free_vram={free} kv_budget={budget_kv}");
     let mut store = Qwen35VmmStore::new(gpu, &slot.config, &slot.kv_cache, EXEC_WIDTH, EXEC_WIDTH * (k + 1), budget_kv, VmmRoute::Exact)?;
     let head = load_mtp_head(head_path, gpu, cap)?;
     let route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
@@ -2008,7 +2013,13 @@ fn spec_exec_cases(gpu: &mut Gpu, slot: &mut ModelSlot, args: &Args, fx: &[Fixtu
                 let init = VmmRequestInit { prompt_len: fx[fi].prefix, stop_ids: stop.into_iter().collect(), sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
                 let o = Qwen35RequestState::new_like(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, epoch, s, init)?;
                 store.admit(o).map_err(|(o, e)| { let _ = o.free_gpu(gpu); e })?;
-                let seed = store.spec_prefill(gpu, &slot.weights, &slot.config, &slot.scratch, &epoch, &fx[fi].tokens, SpecRequestConfig::default())?;
+                let seed = match store.spec_prefill(gpu, &slot.weights, &slot.config, &slot.scratch, &epoch, &fx[fi].tokens, SpecRequestConfig::default()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        store.retire(&epoch)?.free_gpu(gpu)?;
+                        return Err(e.into());
+                    }
+                };
                 let mut diff = Diff::default();
                 diff.ids("prefill_seed", &[reference.emitted[0]], &[seed]);
                 let st = store.request_state(&epoch).ok_or("lane")?;
