@@ -175,6 +175,7 @@ impl RowScratch {
             std::ptr::write(&mut v.fa_v, row(&p.fa_v_batch, kv_row));
             std::ptr::write(&mut v.gate_ffn, row(&p.gate_ffn_batch, hidden));
             std::ptr::write(&mut v.up, row(&p.up_batch, hidden));
+            std::ptr::write(&mut v.fa_attn_out, row(&p.fa_attn_out_batch, q_full / 2));
             std::ptr::write(&mut v.pos_buf, p.positions.sub_offset(r, 1).buf);
             Self(v)
         }
@@ -203,6 +204,7 @@ impl Drop for RowScratch {
             std::ptr::drop_in_place(&mut self.0.fa_v);
             std::ptr::drop_in_place(&mut self.0.gate_ffn);
             std::ptr::drop_in_place(&mut self.0.up);
+            std::ptr::drop_in_place(&mut self.0.fa_attn_out);
             std::ptr::drop_in_place(&mut self.0.pos_buf);
         }
     }
@@ -328,10 +330,21 @@ pub(super) fn decode(
                 let ordinal = last_proj.ok_or_else(|| HipError::new(0, "exact VMM step: residual before projection"))?;
                 if !staged {
                     // Directly after its projection (down after gate+up):
-                    // stage from that projection's batched outputs.
-                    for (r, rs) in row_scratch.iter().enumerate() {
-                        stage_residual_input(gpu, st, rs, config, layer, ordinal, r)?;
+                    // one batched fused SiLU·up rotate over every row.
+                    let (w, stage) = residual_target(st, layer, ordinal)?;
+                    if ordinal != 1 {
+                        return Err(HipError::new(0, "exact VMM step: unstaged attention residual"));
                     }
+                    gpu.ensure_mq_signs()?;
+                    hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for(
+                        gpu,
+                        w,
+                        &st.pbs.gate_ffn_batch,
+                        &st.pbs.up_batch,
+                        stage,
+                        w.k,
+                        n,
+                    )?;
                 }
                 batched_residual(gpu, st, layer, ordinal, n)?;
                 // Later runs of this layer start from the residual stream.
@@ -383,9 +396,15 @@ pub(super) fn decode(
                     req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
                     rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
                 }
-                if let Some(ordinal) = stage_for {
+                // Attention `wo` inputs stage batched after the row loop.
+                let batched_stage = matches!(layer, LayerWeights::FullAttn(_)) && stage_for == Some(0);
+                if let Some(ordinal) = stage_for.filter(|_| !batched_stage) {
                     stage_residual_input(gpu, st, rs, config, layer, ordinal, r)?;
                 }
+            }
+            if let (LayerWeights::FullAttn(l), Some(0)) = (layer, stage_for) {
+                let (_, stage) = residual_target(st, layer, 0)?;
+                hipfire_runtime::llama::rotate_x_mq_batched_for(gpu, &l.wo, &st.pbs.fa_attn_out_batch, stage, l.wo.k, n)?;
             }
             staged = stage_for.is_some();
             i = end;
