@@ -154,19 +154,18 @@ fn quad(b:&mut Builder)->Result<(),String> {
     valu(b,"v_lshlrev_b32_e32 v46, 5, v0",&[46],&[0],&[])?;
     valu(b,"v_add_nc_u32_e32 v46, s27, v46",&[46],&[46],&[27])?;
     // Incumbent first batch: sixteen weight loads and three lower x vectors.
-    // Keep addresses live separately from destinations throughout the clause.
-    b.clause(|b| {
-        for i in [0u8,2,3,4,5,7] {quad_packed(b,i)?;}
-        for i in [0u8,2,4,6,1,3,5,7] {
-            let h=76+2*i;let addr=if i%2==0 {3}else{45};
-            let off=u32::from(i/2)*136;
-            let suffix=if off==0 {String::new()}else{format!(" offset:{off}")};
-            vmem(b,&format!("buffer_load_b64 v[{h}:{}], v{addr}, s[20:23], null offen{suffix} scope:SCOPE_DEV",h+1),
-                &[h,h+1],&[addr],&[20,21,22,23],false)?;
-        }
-        quad_packed(b,1)?;
-        quad_packed(b,6)
-    })?;
+    // Issue separately: M7 correctly requires an indivisible clause to retire
+    // completely, whereas this schedule consumes individual loads progressively.
+    for i in [0u8,2,3,4,5,7] {quad_packed(b,i)?;}
+    for i in [0u8,2,4,6,1,3,5,7] {
+        let h=76+2*i;let addr=if i%2==0 {3}else{45};
+        let off=u32::from(i/2)*136;
+        let suffix=if off==0 {String::new()}else{format!(" offset:{off}")};
+        vmem(b,&format!("buffer_load_b64 v[{h}:{}], v{addr}, s[20:23], null offen{suffix} scope:SCOPE_DEV",h+1),
+            &[h,h+1],&[addr],&[20,21,22,23],false)?;
+    }
+    quad_packed(b,1)?;
+    quad_packed(b,6)?;
     for g in 0..3 {quad_x(b,X[g],g as u32*1024)?;}
     valu(b,"v_cmp_gt_u32_e32 vcc_lo, 16, v0",&[],&[0],&[])?;
     b.wait(Counter::Load,18)?;
