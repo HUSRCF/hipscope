@@ -215,6 +215,34 @@ static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
 pub const QWEN4_MQ6_X4_PM_MIN_M_GFX1151: usize = 2560;
 /// See [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`].
 pub const QWEN4_MQ6_X4_PM_MIN_N_GFX1151: usize = 2048;
+
+/// Header-planner counterpart of the launcher's selective native MQ6 arm.
+/// The process-frozen switch is supplied explicitly so shape policy is pure.
+pub(crate) fn mq6_x4_pm_gfx1151_selected(
+    arch: &str, enabled: bool, m: usize, n: usize,
+) -> bool {
+    enabled && arch == "gfx1151" && mq6_x4_pm_gfx1151_shape(m, n)
+}
+
+/// Shared HC-down tile admissions. Capture/recording retain their incumbent
+/// gfx1151 tile; gfx1201's split-K choice is independent of those modes.
+pub(crate) fn hc_down_tile_selected(
+    arch: &str, enabled: bool, m: usize, k: usize, rows: usize,
+    recording: bool, capturing: bool,
+) -> bool {
+    enabled && match arch {
+        "gfx1201" => m == 320 && k % 256 == 0,
+        "gfx1151" => m == 320 && k == 10240 && rows >= 2048
+            && !recording && !capturing,
+        _ => false,
+    }
+}
+
+/// gfx1201's symmetric MoE uses the native image even when the gfx1151
+/// native-image kill switch is off.
+pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
+    arch == "gfx1201" || (arch == "gfx1151" && enabled)
+}
 /// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
 /// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
 /// of the 64 x 128 / k64 split-K tile.
@@ -972,11 +1000,44 @@ fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usi
 
 /// Output form of a gfx1151 MQ6 X-LDS tile twin.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mq6X4Kind {
+pub(crate) enum Mq6X4Kind {
     Plain,
     Bf16,
     Regions,
     Hcw,
+}
+
+/// Pure U3 tile choice, shared by header planning and launch admission.
+/// `requested` is the already-resolved process flag/model-scope default.
+pub(crate) fn mq6_x4_tile_selected(
+    arch: &str, requested: Option<[u8; 3]>, kind: Mq6X4Kind,
+    m: usize, k: usize, n: usize,
+) -> Option<[u8; 3]> {
+    if arch != "gfx1151" {
+        return None;
+    }
+    let tile = match requested? {
+        [0, 0, 0] => match kind {
+            Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
+            Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, k, n)?,
+        },
+        explicit => explicit,
+    };
+    let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+    (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+}
+
+pub(crate) fn lds256_tile_source_selected(
+    is_gfx1151: bool, entry: &str,
+) -> (&'static str, &'static str) {
+    let qwen4_tile = matches!(
+        entry, "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
+    );
+    if qwen4_tile && !is_gfx1151 {
+        ("qwen4_gemm_wmma_lds256", kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC)
+    } else {
+        ("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(is_gfx1151))
+    }
 }
 
 /// Twin entry name, rows per workgroup (16 * RW) and block size (32 * RW).
@@ -27946,7 +28007,10 @@ impl Gpu {
         if self.arch_caps.is_gfx1201() {
             // HC-down keeps the incumbent 64 x 128 p_s4 tile's four K splits on the
             // 160 x 80 / k32 tile (HIPFIRE_QWEN4_HC_DOWN_TILE), so the bytes match.
-            let tile = if *QWEN4_HC_DOWN_TILE && m == 320 && k % 256 == 0 {
+            let tile = if hc_down_tile_selected(
+                self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, batch_size,
+                self.replay.is_recording(), self.graphs.capture_mode,
+            ) {
                 LdsTileSplitK::HC_DOWN_GFX1201
             } else {
                 Self::qwen4_lds_tile_gfx1201(m, k)
@@ -27955,13 +28019,10 @@ impl Gpu {
         }
         // Measured gfx1151 (flushed, N = 8192 / 2048 / 512): 3.66 / 1.75 / 0.60 ms on 64 x 64
         // vs 3.10 / 1.54 / 1.12 ms on 160 x 64, so only the large batches take it.
-        if *QWEN4_HC_DOWN_TILE
-            && m == 320
-            && k == 10240
-            && batch_size >= 2048
-            && self.arch_caps.is_gfx1151()
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
+        if hc_down_tile_selected(
+            self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, batch_size,
+            self.replay.is_recording(), self.graphs.capture_mode,
+        )
         {
             return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
                 &w_view,
@@ -29520,22 +29581,7 @@ impl Gpu {
     /// except on gfx1151, where the shipped module already compiles that copy
     /// (one ~30 s JIT of this translation unit instead of two).
     fn lds256_tile_module(&self, entry: &str) -> (&'static str, &'static str) {
-        let is_gfx1151 = self.arch_caps.is_gfx1151();
-        let qwen4_tile = matches!(
-            entry,
-            "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
-        );
-        if qwen4_tile && !is_gfx1151 {
-            (
-                "qwen4_gemm_wmma_lds256",
-                kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC,
-            )
-        } else {
-            (
-                Self::LDS256_MODULE,
-                kernels::gemm_f16_x_f16_wmma_lds256_src(is_gfx1151),
-            )
-        }
+        lds256_tile_source_selected(self.arch_caps.is_gfx1151(), entry)
     }
 
     /// A/B knob for the coalesced (LDS-staged) epilogue: `HIPFIRE_LDS_EPI_DIRECT=1`
@@ -40818,18 +40864,9 @@ impl Gpu {
     /// measured table, `None` keeps the incumbent entry.  BV12 needs
     /// `n % 192 == 0` and has no regions/HC-write twins.
     fn qwen4_mq6_x4_pick(&self, kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
-        if self.arch.as_str() != "gfx1151" {
-            return None;
-        }
-        let tile = match self.qwen4_mq6_x4_tile()? {
-            [0, 0, 0] => match kind {
-                Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
-                Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, k, n)?,
-            },
-            explicit => explicit,
-        };
-        let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
-        (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+        mq6_x4_tile_selected(
+            self.arch.as_str(), self.qwen4_mq6_x4_tile(), kind, m, k, n,
+        )
     }
 
     /// U3: the MQ6 a/b/z row-region fold.  Explicit
@@ -40846,7 +40883,7 @@ impl Gpu {
     /// builder module `qwen4_mq6_x4_pm_gfx1151` from [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] rows
     /// and [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`] tokens up (256-token tiles, `_w8` entries).
     fn mq6_x4_pm_gfx1151(&self, pm: bool, m: usize, n: usize) -> bool {
-        pm && self.arch.as_str() == "gfx1151" && mq6_x4_pm_gfx1151_shape(m, n)
+        mq6_x4_pm_gfx1151_selected(self.arch.as_str(), pm, m, n)
     }
 
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
@@ -45355,7 +45392,7 @@ impl Gpu {
     pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
         let arch = self.qwen4_moe_sym_arch_index()?;
         let h = host_mapped as usize;
-        Some(if arch == 1 || *QWEN4_MOE_SYM_PM {
+        Some(if qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM) {
             let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
                 2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
                 4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
@@ -45875,7 +45912,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
         let arch = self.qwen4_moe_sym_arch(what)?;
-        let pm = arch == 1 || *QWEN4_MOE_SYM_PM;
+        let pm = qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM);
         // Row blocks per workgroup: the down symbol and grid.x both come from
         // this one value, so a launch never covers fewer rows than `m`.
         let rr = if down { self.qwen4_moe_sym_down_rr()? } else { 1 };
@@ -47236,4 +47273,104 @@ mod lds_epi_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod route_selector_tests {
+    use super::*;
+
+    #[test]
+    fn native_mq6_admission_matches_incumbent_at_thresholds() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for enabled in [false, true] {
+                for m in [2559, 2560, 2561] {
+                    for n in [2047, 2048, 2049] {
+                        assert_eq!(
+                            mq6_x4_pm_gfx1151_selected(arch, enabled, m, n),
+                            enabled && arch == "gfx1151"
+                                && mq6_x4_pm_gfx1151_shape(m, n),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hc_tile_admission_matches_incumbent_in_all_capture_modes() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for enabled in [false, true] {
+                for m in [319, 320, 321] {
+                    for k in [10239, 10240, 10241, 10496] {
+                        for rows in [2047, 2048, 2049] {
+                            for recording in [false, true] {
+                                for capturing in [false, true] {
+                                    let previous = if arch == "gfx1201" {
+                                        enabled && m == 320 && k % 256 == 0
+                                    } else {
+                                        enabled && m == 320 && k == 10240
+                                            && rows >= 2048 && arch == "gfx1151"
+                                            && !recording && !capturing
+                                    };
+                                    assert_eq!(hc_down_tile_selected(
+                                        arch, enabled, m, k, rows, recording, capturing,
+                                    ), previous);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_moe_native_kill_switch_is_gfx1151_only() {
+        for enabled in [false, true] {
+            assert_eq!(qwen4_moe_sym_native_selected("gfx1151", enabled), enabled);
+            assert!(qwen4_moe_sym_native_selected("gfx1201", enabled));
+        }
+    }
+
+    #[test]
+    fn mq6_tile_choices_preserve_auto_explicit_and_regions_rules() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for requested in [None, Some([0, 0, 0]), Some([8, 4, 2]), Some([12, 8, 1])] {
+                for kind in [Mq6X4Kind::Plain, Mq6X4Kind::Bf16, Mq6X4Kind::Regions, Mq6X4Kind::Hcw] {
+                    for m in [48, 640, 2560, 6240] {
+                        for n in [511, 512, 513, 1131, 1535, 1536, 1537, 2048, 8192] {
+                            let previous = (|| {
+                                if arch != "gfx1151" { return None; }
+                                let tile = match requested? {
+                                    [0, 0, 0] => match kind {
+                                        Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, 2560, n)?,
+                                        Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, 2560, n)?,
+                                    },
+                                    explicit => explicit,
+                                };
+                                let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+                                (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+                            })();
+                            assert_eq!(mq6_x4_tile_selected(arch, requested, kind, m, 2560, n), previous);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lds_module_source_choice_preserves_special_tiles() {
+        for halo in [false, true] {
+            for entry in ["gemm_wmma_lds_64_64_32_64_k64", "gemm_wmma_lds_64_64_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64_p"] {
+                let special = entry.starts_with("gemm_wmma_lds_64_64");
+                let previous = if special && !halo {
+                    ("qwen4_gemm_wmma_lds256", kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC)
+                } else {
+                    ("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(halo))
+                };
+                assert_eq!(lds256_tile_source_selected(halo, entry), previous);
+            }
+        }
+    }
 }

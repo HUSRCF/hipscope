@@ -13,26 +13,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const BYTES_PER_JOB: u64 = 1536 * 1024 * 1024;
+use rdna_compute::compile_jobs::{available_memory, compile_job_budget, parse_job_override, BYTES_PER_JOB};
 
 fn worker_count(cores: usize, available_bytes: Option<u64>, override_jobs: Option<&str>) -> Result<usize, String> {
-    let cores = cores.max(1);
-    let requested = match override_jobs {
-        Some(value) => value.parse::<usize>().ok().filter(|&jobs| jobs > 0)
-            .ok_or("HIPFIRE_PACK_JOBS must be a positive integer")?,
-        None => cores.saturating_sub((cores / 8).max(1)).max(1),
-    };
-    // Unknown memory availability is conservative rather than launching dozens
-    // of clang processes on a host whose RAM budget we cannot determine.
-    let memory_jobs = available_bytes.map(|bytes| (bytes / BYTES_PER_JOB).max(1) as usize).unwrap_or(1);
-    Ok(requested.min(cores).min(memory_jobs))
-}
-
-fn available_memory(text: &str) -> Option<u64> {
-    text.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemAvailable:")?;
-        rest.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
-    })
+    let jobs = parse_job_override("HIPFIRE_PACK_JOBS", override_jobs)?;
+    // Packaging historically retains its last worker even with no free RAM.
+    // Unlike overlapping model loads it has no caller-owned weight reserve.
+    compile_job_budget(cores, available_bytes.map(|bytes| bytes.max(BYTES_PER_JOB)), 0, jobs)
 }
 
 fn host_jobs() -> Result<usize, String> {
