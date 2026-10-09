@@ -770,7 +770,7 @@
     {
      "module": "gemm_gate_up_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "536132123e6c2c4b5bab3bb21f592baf86c9945f37227c0694bc2c1ce05d2f72",
+     "sha256": "a016e4de75c2cf60a6e301d16f4a58c7c07e62e7eee47853a844708627e9876c",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -787,7 +787,11 @@
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -811,7 +815,7 @@
     {
      "module": "gemm_mq4g256v2_residual_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "08e4e53e1b58c322a959a9fc0d4f50951601b41f89a2ae351ae4c1a28b1e933a",
+     "sha256": "a0fb40a36c4a08912bafe1465ad63a4c7e65af302ef7774c384a690a1f68ca78",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -828,7 +832,11 @@
       "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4",
       "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8",
       "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4",
-      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -852,7 +860,7 @@
     {
      "module": "gemm_qkv_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "5eeee8eb2e16f32ed237d44af27307ea71d485d02e61fc9b0c6954ce59462c54",
+     "sha256": "551cad82e8d129e28e0fdf9ae18e3e584a5e4899ad62ed0a7741f9bc71ca139d",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -869,7 +877,11 @@
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -893,7 +905,7 @@
     {
      "module": "gemm_qkvza_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "87e32df60f7d9f131247128cdc393c8bd587cdb20540169a3bfa1dbdd79b2b6d",
+     "sha256": "63bc79436026b3aad83c8140a913fffa8ce8ae75a012c53626510e10bb1d7bbc",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -910,7 +922,11 @@
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -1293,7 +1309,7 @@
      ]
     }
    ],
-   "symbol_count": 99
+   "symbol_count": 115
   },
   "native_mtp": {
    "entries": [
@@ -2245,7 +2261,7 @@
     {
      "module": "gemm_gate_up_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "536132123e6c2c4b5bab3bb21f592baf86c9945f37227c0694bc2c1ce05d2f72",
+     "sha256": "a016e4de75c2cf60a6e301d16f4a58c7c07e62e7eee47853a844708627e9876c",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2262,7 +2278,11 @@
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -2304,7 +2324,7 @@
     {
      "module": "gemm_mq4g256v2_residual_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "08e4e53e1b58c322a959a9fc0d4f50951601b41f89a2ae351ae4c1a28b1e933a",
+     "sha256": "a0fb40a36c4a08912bafe1465ad63a4c7e65af302ef7774c384a690a1f68ca78",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2321,7 +2341,11 @@
       "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4",
       "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8",
       "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4",
-      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -2345,7 +2369,7 @@
     {
      "module": "gemm_qkv_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "5eeee8eb2e16f32ed237d44af27307ea71d485d02e61fc9b0c6954ce59462c54",
+     "sha256": "551cad82e8d129e28e0fdf9ae18e3e584a5e4899ad62ed0a7741f9bc71ca139d",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2362,7 +2386,11 @@
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -2386,7 +2414,7 @@
     {
      "module": "gemm_qkvza_mq4g256v2_wmma_gfx12_vt",
      "kind": "hip",
-     "sha256": "87e32df60f7d9f131247128cdc393c8bd587cdb20540169a3bfa1dbdd79b2b6d",
+     "sha256": "63bc79436026b3aad83c8140a913fffa8ce8ae75a012c53626510e10bb1d7bbc",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2403,7 +2431,11 @@
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4",
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8",
       "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4",
-      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -2984,7 +3016,7 @@
      ]
     }
    ],
-   "symbol_count": 122,
+   "symbol_count": 138,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
