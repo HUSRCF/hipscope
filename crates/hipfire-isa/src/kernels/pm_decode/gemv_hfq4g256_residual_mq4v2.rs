@@ -154,8 +154,8 @@ fn quad(b:&mut Builder)->Result<(),String> {
     valu(b,"v_lshlrev_b32_e32 v46, 5, v0",&[46],&[0],&[])?;
     valu(b,"v_add_nc_u32_e32 v46, s27, v46",&[46],&[46],&[27])?;
     // Incumbent first batch: sixteen weight loads and three lower x vectors.
-    // Issue separately: M7 correctly requires an indivisible clause to retire
-    // completely, whereas this schedule consumes individual loads progressively.
+    // Keep individual issues visible to the partial-retirement proof rather
+    // than grouping them with an optional clause hint.
     for i in [0u8,2,3,4,5,7] {quad_packed(b,i)?;}
     for i in [0u8,2,4,6,1,3,5,7] {
         let h=76+2*i;let addr=if i%2==0 {3}else{45};
@@ -410,6 +410,15 @@ mod tests {
         assert!(!emitted.s_text.contains("v_mul_f32_e32 v33, v8, v36"));
         assert!(emitted.s_text.contains("v_add_f32_e32 v41, v24, v41"));
         assert!(emitted.s_text.contains("v_add_f32_e32 v41, v41, v24"));
+        assert_eq!(emitted.proof.vopd_pairs,36);
+        assert_eq!(emitted.proof.next_free_vgpr,108);
+        let quad=emitted.s_text.split(".Lres_quad:\n").nth(1).expect("quad label")
+            .split(".Lres_tail:\n").next().expect("tail label");
+        assert_eq!(quad.matches("s_wait_loadcnt").count(),14);
+        let first=quad.split("s_wait_loadcnt").next().expect("first load batch");
+        assert_eq!(first.matches("buffer_load_").count(),16);
+        assert_eq!(first.matches("global_load_").count(),3);
+        assert_eq!(quad.matches("global_load_").count(),8);
         crate::native::assemble(&emitted.s_text,Arch::Gfx1201).expect("native full twin");
     }
     #[test]
