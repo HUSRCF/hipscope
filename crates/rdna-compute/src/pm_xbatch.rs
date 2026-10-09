@@ -102,6 +102,21 @@ static MULTIROW: PmObject = PmObject {
 
 static MULTIROW_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| MULTIROW.verify());
 
+/// The embedded objects as closed-route plan entries: `(module, image,
+/// symbol)`, preloaded at model load so the VMM exact route never loads a
+/// module after the route is sealed. Their digests are checked again at
+/// the first launch.
+pub(crate) fn route_objects() -> [(&'static str, &'static [u8], &'static [&'static str]); 3] {
+    const PLAIN_SYMBOLS: &[&str] = &["gemv_mq4g256v2_xbatch_pm"];
+    const RESIDUAL_SYMBOLS: &[&str] = &["gemv_mq4g256v2_residual_xbatch"];
+    const MULTIROW_SYMBOLS: &[&str] = &["gemv_mq4g256v2_multirow_r2_xbatch_pm"];
+    [
+        (PLAIN.module, PLAIN.image, PLAIN_SYMBOLS),
+        (RESIDUAL.module, RESIDUAL.image, RESIDUAL_SYMBOLS),
+        (MULTIROW.module, MULTIROW.image, MULTIROW_SYMBOLS),
+    ]
+}
+
 impl Gpu {
     /// The accepted PM objects replace the hipcc incumbents here.
     fn pm_xbatch_enabled(&self) -> bool {

@@ -1363,6 +1363,32 @@ const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
     ("softmax_temp_topp_batched", &["softmax_temp_topp_batched_f32"]),
 ];
 
+/// CbVmm's rows-batched twins of the singleton decode kernels
+/// (`attention::rows_batched`; module name = entry name).
+const QWEN36_27B_GFX1201_ROWS_TWINS_HIP: &[RouteHip] = &[
+    ("gated_delta_net_q8_compact3_b2_rows", &["gated_delta_net_q8_compact3_b2_rows"]),
+    ("conv1d_silu_split_qknorm_b256_rows", &["conv1d_silu_split_qknorm_b256_rows"]),
+    ("gated_norm_mq_rotate_awq_k6144_gfx1201_rows", &["gated_norm_mq_rotate_awq_k6144_gfx1201_rows"]),
+    ("qwen36_27b_fa_prep_gfx1201_rows", &["qwen36_27b_fa_prep_gfx1201_rows"]),
+];
+
+/// VMM continuous-batching exact route additions to
+/// [`QWEN36_27B_GFX1201_AR_HIP`] (`forward_slots/vmm/exact.rs`): batched
+/// VMM KV write, row-batched flash decode, and the rows twins.
+const QWEN36_27B_GFX1201_VMM_EXACT_HIP: &[RouteHip] = &[
+    ("kv_cache_write_fp8_e4m3_batched_vmm", &["kv_cache_write_fp8_e4m3_batched_vmm"]),
+    ("attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm", &["attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"]),
+    ("attention_flash_reduce_dsplit_gfx1201_vmm", &["attention_flash_reduce_dsplit_gfx1201_vmm"]),
+    ("gated_delta_net_q8_compact3_b2_rows", &["gated_delta_net_q8_compact3_b2_rows"]),
+    ("conv1d_silu_split_qknorm_b256_rows", &["conv1d_silu_split_qknorm_b256_rows"]),
+    ("gated_norm_mq_rotate_awq_k6144_gfx1201_rows", &["gated_norm_mq_rotate_awq_k6144_gfx1201_rows"]),
+    ("qwen36_27b_fa_prep_gfx1201_rows", &["qwen36_27b_fa_prep_gfx1201_rows"]),
+];
+
+/// The hipcc x-batch GEMV the PM multi-column launchers fall back to when
+/// `kernel.pm_decode` is off.
+const QWEN36_27B_GFX1201_XBATCH_HIP: &[RouteHip] = &[("gemv_mq4g256v2_xbatch", &["gemv_mq4g256v2_xbatch"])];
+
 /// The gfx1201 slab IU4 MMQ bundle every 27B prefill projection selects
 /// (`gemm.rs` `g12_iu4_b1s_image`, default A4 slab route).
 const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
@@ -1397,7 +1423,7 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
     }
     let (hip, embedded): (Vec<&[RouteHip]>, _) = match qwen36_27b_route(input)? {
         Some(mtp) => {
-            let mut hip = vec![QWEN36_27B_GFX1201_AR_HIP];
+            let mut hip = vec![QWEN36_27B_GFX1201_AR_HIP, QWEN36_27B_GFX1201_VMM_EXACT_HIP];
             if mtp {
                 hip.push(QWEN36_27B_GFX1201_MTP_HIP);
             }
@@ -1407,7 +1433,19 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
                 radiowave_json: None,
                 symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
             };
-            (hip, vec![b1s])
+            let mut embedded = vec![b1s];
+            // VMM exact route projections/lm_head: the accepted PM
+            // multi-column objects under pm_decode, else the hipcc x-batch
+            // GEMV their launchers fall back to (residual/multirow fall back
+            // to singleton modules already in the AR route).
+            if input.flags.pm_decode {
+                for (module, image, symbols) in crate::pm_xbatch::route_objects() {
+                    embedded.push(PlannedKernel::Embedded { module, image, radiowave_json: None, symbols });
+                }
+            } else {
+                hip.push(QWEN36_27B_GFX1201_XBATCH_HIP);
+            }
+            (hip, embedded)
         }
         None => {
             return refuse(format!(
@@ -1518,6 +1556,29 @@ fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regis
         // norm.rs `softmax_temp_topp_batched_into_f32` (MTP temperature verify).
         all.push(entry(arch, "softmax_temp_topp_batched", &["softmax_temp_topp_batched_f32"],
             kernels::SOFTMAX_TEMP_BATCHED_SRC.into(), extra_flags));
+        // VMM continuous batching exact route (forward_slots/vmm/exact.rs):
+        // the batched VMM KV write and row-batched flash decode, and the
+        // rows-batched singleton twins — the launchers' own module sources.
+        use crate::attention::{kv_slot_desc_vmm_source, vmm_rows_source, KV_CACHE_WRITE_FP8_E4M3_VMM_SRC};
+        let recipe_err = |e: hip_bridge::HipError| RegistryError::ConflictingPlan(format!("vmm exact route source: {e}"));
+        all.push(entry(arch, "kv_cache_write_fp8_e4m3_batched_vmm", &["kv_cache_write_fp8_e4m3_batched_vmm"],
+            kv_slot_desc_vmm_source(KV_CACHE_WRITE_FP8_E4M3_VMM_SRC, "kv_cache_write_fp8_e4m3_batched_vmm",
+                "kv_cache_write_fp8_e4m3_batched_vmm").into(), extra_flags));
+        all.push(entry(arch, "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm", &["attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"],
+            vmm_rows_source(kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201", "VMM_ROWS_FP8_GQA_TILE").map_err(recipe_err)?.into(),
+            extra_flags));
+        all.push(entry(arch, "attention_flash_reduce_dsplit_gfx1201_vmm", &["attention_flash_reduce_dsplit_gfx1201_vmm"],
+            vmm_rows_source(kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                "attention_flash_reduce_dsplit_gfx1201", "VMM_ROWS_DSPLIT_REDUCE").map_err(recipe_err)?.into(),
+            extra_flags));
+        for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP {
+            all.push(entry(arch, module, symbols,
+                crate::attention::rows_batched::rows_twin_module_source(module).map_err(recipe_err)?.into(),
+                extra_flags));
+        }
+        all.push(entry(arch, "gemv_mq4g256v2_xbatch", &["gemv_mq4g256v2_xbatch"],
+            kernels::GEMV_MQ4G256V2_XBATCH_SRC.into(), extra_flags));
     }
     Ok(all)
 }
