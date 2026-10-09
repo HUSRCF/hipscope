@@ -28,8 +28,12 @@
 // every other KV mode is refused rather than routed to a legacy arena.
 
 use super::{
-    final_logits_per_slot, q8_prefill_wmma_enabled, run_layers_slots, LayerKvAddr, SlotKvTier,
+    final_logits_per_slot, lm_head_slots_admissible, q8_prefill_wmma_enabled,
+    require_batchable_deltanet_layer, require_batchable_deltanet_moe_layer,
+    require_batchable_fullattn_layer, require_batchable_fullattn_moe_layer,
+    require_batchable_moe_ffn, run_layers_slots, LayerKvAddr, SlotKvTier,
 };
+use crate::qwen35::LayerWeights;
 use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{
     DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights,
@@ -45,6 +49,58 @@ use rdna_compute::attention::{VmmFlashDecodePlan, VmmKvFormat, VmmKvSide};
 use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
 use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Load-time admission for the VMM executor on this resident model: the
+/// exact predicates `forward_step` enforces (Q8_0 embedding table, an
+/// admitted lm_head dtype, every layer batchable by the shared slots body,
+/// a `_vmm` KV route and a VMM flash decode plan). Stage the store only when
+/// this is `Ok`; otherwise the request path stays on the singleton route.
+pub fn vmm_executor_supports(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    kv: &KvCache,
+) -> Result<(), String> {
+    if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
+        return Err("VMM executor: embedding table must be Q8_0".into());
+    }
+    if !lm_head_slots_admissible(weights.output.gpu_dtype) {
+        return Err(format!(
+            "VMM executor: lm_head dtype {:?} not admitted by the slots head",
+            weights.output.gpu_dtype
+        ));
+    }
+    let arch = gpu.arch.as_str();
+    for (i, (layer, lt)) in weights.layers.iter().zip(&config.layer_types).enumerate() {
+        let r = match (layer, lt) {
+            (LayerWeights::DeltaNet(l), LayerType::LinearAttention) => {
+                require_batchable_deltanet_layer(l, arch).map(drop)
+            }
+            (LayerWeights::FullAttn(l), LayerType::FullAttention) => {
+                require_batchable_fullattn_layer(l, arch).map(drop)
+            }
+            (LayerWeights::DeltaNetMoe(l), LayerType::LinearAttention) => {
+                require_batchable_deltanet_moe_layer(l).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+            }
+            (LayerWeights::FullAttnMoe(l), LayerType::FullAttention) => {
+                require_batchable_fullattn_moe_layer(l).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+            }
+            _ => return Err(format!("VMM executor: layer {i} weight/type mismatch")),
+        };
+        r.map_err(|e| format!("VMM executor: layer {i}: {e}"))?;
+    }
+    let format = vmm_format_of(kv)?;
+    gpu.vmm_flash_decode_plan(
+        format,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        kv.max_seq,
+        kv.vmm_logical_bound(),
+    )
+    .map(drop)
+    .map_err(|e| format!("VMM executor: {e}"))
+}
 
 /// One FullAttention layer's per-request VMM addressing for a step.
 pub struct VmmLayerKv<'a> {
