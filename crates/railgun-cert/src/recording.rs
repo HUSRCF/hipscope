@@ -737,12 +737,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx12-mq4v2-verify-tile-route",
         predicates: &[IsRecording, CaptureMode],
-        condition: "gfx12_verify_bt_active: `wmma_batch_tiles && gfx1201 && 16 < N < 64 && k % 256 == 0 && !is_recording() && !capture_mode` (gemm_vt.rs), consulted by gemm_{qkvza,qkv,gate_up}_hfq4g256_wmma_gfx12_mq4v2 and gemm_hfq4g256_residual_wmma_gfx12_mq4v2 (also the batched lm_head)",
+        condition: "generic route: gfx12_verify_bt_active: `wmma_batch_tiles && gfx1201 && 16 < N < 64 && k % 256 == 0 && !is_recording() && !capture_mode` (gemm_vt.rs), consulted by gemm_{qkvza,qkv,gate_up}_hfq4g256_wmma_gfx12_mq4v2 and gemm_hfq4g256_residual_wmma_gfx12_mq4v2 (also the batched lm_head). Explicit exact route (not a recording decision): Gpu::gemm_{qkvza,qkv,gate_up}_mq4g256v2_verify_exact, gemm_mq4g256v2_{residual,lmhead}_verify_exact (gemm_vt.rs) pick their kernel by N alone (1..=16 one-tile, 17..=63 `_vt`, 64..=128 K32 wide, hipcc `_vt{4,8}w{4,8}_k32` or the PM bundle `mq4_verify_*_pm_gfx1201_bt{4,8}w{4,8}`) and never consult is_recording()/capture_mode; they launch through launch_maybe_blob, which records or captures that same kernel. Inventory, not an admission: whole-CB capture/recording stays refused by its callers",
         effect: KernelSelection,
-        switches: "eager: the `*_mq4g256v2_wmma_gfx12_vt{2,3,4}w{4,8}` verify-tile GEMMs; recorded/captured: the one-tile `*_mq4g256v2_wmma_gfx12` launch contract",
+        switches: "generic route, eager: the `*_mq4g256v2_wmma_gfx12_vt{2,3,4}w{4,8}` verify-tile GEMMs; recorded/captured: the one-tile `*_mq4g256v2_wmma_gfx12` launch contract. Explicit exact route: the same kernel eager, recorded and captured",
         kernels: &["gemm_*_mq4g256v2_wmma_gfx12_vt*"],
         verdict: ByteExact,
-        evidence: "by construction: each (weight row, batch row) output is the one-tile kernel's single WMMA chain (same K order, dual-half headers, dequant expression, C mapping and epilogue); only the B-operand source (an LDS copy of the same fp16 bytes) and the blocks/waves per launch differ. Oracle: `hipfire-arch-qwen35/examples/cb_spec_verify_probe.rs` PROBE_GEMM / PROBE_GEMM_TIME memcmp every row at N = 17..63. Unreachable from defaults: the DFlash verify is N = 16 and decode members b = 1",
+        evidence: "by construction: each (weight row, batch row) output is the one-tile kernel's single WMMA chain (same K order, dual-half headers, dequant expression, C mapping and epilogue); only the B-operand source (an LDS copy of the same fp16 bytes) and the blocks/waves per launch differ. Oracle: `hipfire-arch-qwen35/examples/cb_spec_verify_probe.rs` PROBE_GEMM / PROBE_GEMM_TIME memcmp every row at N = 17..63; the K32 wide kernels (HIP and PM) are byte-compared against the singleton at every N = 1..128 by `hipfire-arch-qwen35/examples/cb_verify_gemm_oracle.rs` (eager and HIP-graph replay). Unreachable from defaults: the DFlash verify is N = 16 and decode members b = 1; the wide route is off unless HIPFIRE_CB_VERIFY_CHUNK128=1",
         reaches: &[],
     },
     Decision {

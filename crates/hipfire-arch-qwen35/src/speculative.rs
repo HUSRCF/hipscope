@@ -25,6 +25,7 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
+use crate::qwen35::prefill::DenseBatchMath;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -316,7 +317,17 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
     verify_scratch: &VerifyScratch,
     b: usize,
     vocab: usize,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
+    if math == DenseBatchMath::SingletonWmma && w_out.gpu_dtype != rdna_compute::DType::MQ4G256V2 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "DFlash verify lm_head: SingletonWmma verify math requires a dense MQ4G256V2 head, got {:?}",
+                w_out.gpu_dtype
+            ),
+        ));
+    }
     let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
     match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
@@ -369,16 +380,30 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gemm_mq_batched_lmhead(
-                gpu,
-                w_out.gpu_dtype,
-                &w_out.buf,
-                &rot,
-                &logits_batch,
-                w_out.m,
-                w_out.k,
-                b,
-            )?;
+            if math == DenseBatchMath::SingletonWmma {
+                run_spec_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq4G256V2LmheadVerifyExact,
+                    &w_out.buf,
+                    w_out.gpu_dtype,
+                    &rot,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            } else {
+                gemm_mq_batched_lmhead(
+                    gpu,
+                    w_out.gpu_dtype,
+                    &w_out.buf,
+                    &rot,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    b,
+                )?;
+            }
         }
         rdna_compute::DType::MQ3G256 => {
             assert!(
@@ -453,8 +478,9 @@ pub(crate) fn dflash_enqueue_verify_lm_head_argmax(
     verify_scratch: &VerifyScratch,
     b: usize,
     vocab: usize,
+    math: DenseBatchMath,
 ) -> HipResult<()> {
-    dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab)?;
+    dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
     let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
     let argmax_buf = verify_scratch.argmax.sub_offset(0, b);
     gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b)
@@ -4097,6 +4123,7 @@ fn verify_dflash_block_inner(
                         verify_scratch,
                         b,
                         vocab,
+                        DenseBatchMath::Product,
                     )
                 })
             } else {
@@ -4300,7 +4327,15 @@ pub(crate) fn dflash_verify_head(
         // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
-        dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab)?;
+        dflash_enqueue_verify_lm_head(
+            gpu,
+            w_out,
+            final_hidden,
+            verify_scratch,
+            b,
+            vocab,
+            DenseBatchMath::Product,
+        )?;
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
             // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
@@ -7559,6 +7594,7 @@ pub fn verify_dflash_block_dense_tp2(
             &states[0].dflash.verify_scratch,
             b,
             vocab,
+            DenseBatchMath::Product,
         )?;
         let argmax_buf = states[0].dflash.verify_scratch.argmax.sub_offset(0, b);
         gpus.devices[0].argmax_f32_batched(

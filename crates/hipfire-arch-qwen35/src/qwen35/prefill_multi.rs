@@ -19,6 +19,16 @@
 //! `2..64` (the gfx12 projection GEMMs are row-count independent there —
 //! CbSpec probe — and every n-dependent route switch is at >= 64 rows).
 //!
+//! Aggregate 64..=128 rows (`HIPFIRE_CB_VERIFY_CHUNK128`, exact gfx1201 with
+//! a dense MQ4G256V2 target only, see [`multi_chunk_wide_admitted`]): the
+//! default `>= 64`-row projection route (IU4/FP8 quantized activations) is not
+//! the singleton's arithmetic, so the shared stages run with
+//! `DenseBatchMath::SingletonWmma` — the F32 producers plus the explicit
+//! exact verify GEMMs, a F16-input / f32-WMMA chain byte-identical to the
+//! singleton at every row count. Every request stays below 64 rows on its
+//! own (its state-sensitive stages and its singleton equivalent are
+//! request-sized); only the combined row count may reach 128.
+//!
 //! DFlash chain-verify requests (`MultiChunkRequest::fusion == ChainVerify`,
 //! with their own hidden ring and tape) keep every route that depends on the
 //! request's own row count request-sized: GDN pre/tape fusion and FA prep use
@@ -55,18 +65,108 @@ pub struct MultiChunkRequest<'a> {
     pub hidden_rb: Option<&'a mut HiddenStateRingBuffer>,
 }
 
-/// The largest combined row count: below every n-dependent kernel/route
-/// switch of the shared stages (`>= 64` rows).
-pub const MULTI_CHUNK_MAX_ROWS: usize = 63;
+/// The largest aggregate row count the multi-request body supports (the
+/// exact wide verify GEMMs cover 64..=128 rows). The route's EFFECTIVE cap is
+/// [`multi_chunk_row_cap`]: 128 only with `HIPFIRE_CB_VERIFY_CHUNK128` on exact
+/// gfx1201, otherwise [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
+pub const MULTI_CHUNK_MAX_ROWS: usize = 128;
+
+/// The largest aggregate row count on the product arithmetic: below every
+/// n-dependent kernel/route switch of the shared stages (`>= 64` rows).
+pub const MULTI_CHUNK_PRODUCT_MAX_ROWS: usize = 63;
+
+/// The largest single request: its singleton (`forward_prefill_batch`) over
+/// 64+ rows would select the quantized `>= 64`-row projection route, whose
+/// bytes the wide exact route does not reproduce, so a lone 64/128-row request
+/// is never admitted as a window.
+pub const MULTI_CHUNK_MAX_LANE_ROWS: usize = 63;
+
+/// The effective aggregate row cap of this device/process:
+/// `Gpu::mq4_verify_chunk_rows` (128 on exact gfx1201 with
+/// `HIPFIRE_CB_VERIFY_CHUNK128` and WMMA batch tiles, else 63) bounded to the
+/// supported `MULTI_CHUNK_PRODUCT_MAX_ROWS..=MULTI_CHUNK_MAX_ROWS`.
+pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
+    gpu.mq4_verify_chunk_rows().clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
+}
+
+/// May an aggregate chunk of 64+ rows run on this target? The wide route is
+/// exact only when (a) the device's effective cap exceeds the product cap,
+/// (b) every singleton arm it must match runs the one-tile F16-WMMA chain the
+/// exact wide kernels reproduce ([`Gpu::mq4_verify_singleton_chain`]: refused
+/// under `HIPFIRE_FP16=0`, `HIPFIRE_LM_HEAD_WMMA=0`,
+/// `HIPFIRE_HFQ4G256_LDSSTAGE=1`), and (c) the trunk and head are dense
+/// MQ4G256V2: every projection of every layer and the lm_head (no MoE,
+/// Lloyd, MQ3/MQ6, Q8 or other dtypes), with `w_down.k == hidden_dim` (the
+/// `SingletonWmma` FFN-down shape). Decided before any request state is
+/// written; a refusal keeps the cap at [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
+pub fn multi_chunk_wide_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+    multi_chunk_wide_route(&gpu.arch, &gpu.flags) && multi_chunk_dense_mq4v2_target(weights, config)
+}
+
+/// The device/flag half of [`multi_chunk_wide_admitted`] (no device needed).
+fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> bool {
+    Gpu::mq4_verify_chunk_rows_for(arch, flags).clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
+        > MULTI_CHUNK_PRODUCT_MAX_ROWS
+        && Gpu::mq4_verify_singleton_chain_for(arch, flags)
+}
+
+/// The target half of [`multi_chunk_wide_admitted`].
+fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+    use rdna_compute::DType::MQ4G256V2;
+    config.num_experts == 0
+        && weights.output.gpu_dtype == MQ4G256V2
+        && weights.layers.iter().all(|l| match l {
+            LayerWeights::DeltaNet(d) => {
+                d.w_down.k == config.hidden_dim
+                    && [&d.wqkv, &d.wz, &d.w_alpha, &d.w_beta, &d.wo, &d.w_gate, &d.w_up, &d.w_down]
+                        .iter()
+                        .all(|w| w.gpu_dtype == MQ4G256V2)
+            }
+            LayerWeights::FullAttn(f) => {
+                f.w_down.k == config.hidden_dim
+                    && [&f.wq, &f.wk, &f.wv, &f.wo, &f.w_gate, &f.w_up, &f.w_down]
+                        .iter()
+                        .all(|w| w.gpu_dtype == MQ4G256V2)
+            }
+            _ => false,
+        })
+}
+
+/// The rows one trunk chunk of this target packs: the scratch capacity
+/// `cap` when the wide route is admitted for this target, else at most
+/// [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] (a scratch sized for the wide route may
+/// serve a target that cannot take it).
+pub fn multi_chunk_pack_cap(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, cap: usize) -> usize {
+    pack_cap_for(multi_chunk_wide_admitted(gpu, weights, config), cap)
+}
+
+fn pack_cap_for(wide_admitted: bool, cap: usize) -> usize {
+    cap.min(if wide_admitted { MULTI_CHUNK_MAX_ROWS } else { MULTI_CHUNK_PRODUCT_MAX_ROWS })
+}
+
+/// Rows a shared verify scratch planned for `requested` rows allocates on
+/// this target: its effective packing cap ([`multi_chunk_pack_cap`]), at
+/// least [`MIN_BATCH`]. A target the wide route does not admit allocates at
+/// most [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] rows, whatever the device cap.
+pub fn multi_chunk_scratch_rows(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, requested: usize) -> usize {
+    scratch_rows_for(multi_chunk_wide_admitted(gpu, weights, config), requested)
+}
+
+fn scratch_rows_for(wide_admitted: bool, requested: usize) -> usize {
+    pack_cap_for(wide_admitted, requested).max(MIN_BATCH)
+}
 
 /// Pack whole lanes, in order, into trunk chunks of at most
 /// `min(max_rows, MULTI_CHUNK_MAX_ROWS)` rows: `rows[i]` is lane `i`'s row
-/// count. `out` receives one lane-index range per chunk (cleared first; no
-/// allocation when `out` already has capacity). A lane is never split, padded
-/// or reordered, and a chunk never reaches 64 rows: e.g. eight 16-row lanes
-/// pack as `[0..3, 3..6, 6..8]` (48 + 48 + 32 rows). Errors (leaving `out`
-/// empty) when a lane has fewer than [`MIN_BATCH`] rows or more rows than one
-/// chunk can hold.
+/// count and `max_rows` the caller's effective cap (63 on the product route;
+/// 64..=128 only with the wide exact route admitted). `out` receives one
+/// lane-index range per chunk (cleared first; no allocation when `out`
+/// already has capacity). A lane is never split, padded or reordered, and no
+/// lane may exceed [`MULTI_CHUNK_MAX_LANE_ROWS`]: e.g. eight 16-row lanes pack
+/// as `[0..3, 3..6, 6..8]` (48 + 48 + 32 rows) at cap 63, `[0..4, 4..8]`
+/// (64 + 64) at cap 64 and `[0..8]` (one 128-row chunk) at cap 128. Errors
+/// (leaving `out` empty) when a lane has fewer than [`MIN_BATCH`] rows or more
+/// rows than one chunk or one request can hold.
 pub fn pack_whole_lanes(
     rows: &[usize],
     max_rows: usize,
@@ -74,13 +174,14 @@ pub fn pack_whole_lanes(
 ) -> Result<(), String> {
     out.clear();
     let cap = max_rows.min(MULTI_CHUNK_MAX_ROWS);
+    let lane_cap = cap.min(MULTI_CHUNK_MAX_LANE_ROWS);
     let mut start = 0usize;
     let mut acc = 0usize;
     for (i, &n) in rows.iter().enumerate() {
-        if n < MIN_BATCH || n > cap {
+        if n < MIN_BATCH || n > lane_cap {
             out.clear();
             return Err(format!(
-                "pack_whole_lanes: lane {i} has {n} rows, outside {MIN_BATCH}..={cap}"
+                "pack_whole_lanes: lane {i} has {n} rows, outside {MIN_BATCH}..={lane_cap}"
             ));
         }
         if acc + n > cap {
@@ -116,9 +217,11 @@ pub struct MultiChunkScratch {
 }
 
 impl MultiChunkScratch {
-    /// `max_rows` is clamped to `MIN_BATCH..=MULTI_CHUNK_MAX_ROWS`.
+    /// `max_rows` is clamped to `MIN_BATCH..=multi_chunk_row_cap(gpu)` (the
+    /// effective cap: 63 unless the wide verify route is on); the scratch
+    /// stores that capacity ([`Self::max_rows`]).
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let rows = max_rows.clamp(MIN_BATCH, MULTI_CHUNK_MAX_ROWS);
+        let rows = max_rows.clamp(MIN_BATCH, multi_chunk_row_cap(gpu));
         let pbs = PrefillBatchScratch::new(gpu, config, rows)?;
         let n_fa = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
         let bytes = n_fa.max(1) * MULTI_CHUNK_MAX_SEGS * std::mem::size_of::<AttnFp8Seg>();
@@ -272,10 +375,14 @@ fn capture_layer_rows(
 /// request's row view with its own `fusion` and `n` (MTP views with `Off`),
 /// never at the combined count.
 ///
-/// Every precondition (rows `2..=63` per request and in total, capacities,
+/// Every precondition (rows `2..=63` per request, in total at most the
+/// effective cap — `<= 63` on the product route, `64..=128` only when
+/// [`multi_chunk_wide_admitted`] holds for this target — capacities,
 /// ring/tape bounds, Q8+EF DeltaNet, uncompacted Q8/fp8 KV, no capture or
 /// recording) is checked before any request state is mutated; the request is
-/// refused before the first launch otherwise.
+/// refused before the first launch otherwise. A combined count of 64 or more
+/// runs the shared stages with [`DenseBatchMath::SingletonWmma`]; at most 63
+/// rows keeps [`DenseBatchMath::Product`] exactly as before.
 pub fn forward_prefill_batch_multi(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -288,9 +395,18 @@ pub fn forward_prefill_batch_multi(
     let refuse = |why: &str| Err(HipError::new(0, &format!("forward_prefill_batch_multi: {why}")));
     let pbs = &scratch.pbs;
     let total: usize = reqs.iter().map(|r| r.tokens.len()).sum();
-    if reqs.is_empty() || total > MULTI_CHUNK_MAX_ROWS || total > pbs.max_batch || pbs.lean {
-        return refuse("row count outside 1..=63 / scratch capacity, or lean scratch");
+    if reqs.is_empty() || total > multi_chunk_row_cap(gpu) || total > pbs.max_batch || pbs.lean {
+        return refuse("row count outside 1..=effective cap (63, or 128 on the wide verify route) / scratch capacity, or lean scratch");
     }
+    // Aggregate 64+ rows: the default projection route is quantized and not
+    // the singleton's arithmetic; only the exact verify GEMMs of a dense
+    // MQ4G256V2 target whose singleton runs the one-tile F16-WMMA chain
+    // reproduce it. Refused before any state write.
+    let wide = total > MULTI_CHUNK_PRODUCT_MAX_ROWS;
+    if wide && !multi_chunk_wide_admitted(gpu, weights, config) {
+        return refuse("64+ rows need the exact wide verify route: a dense MQ4G256V2 gfx1201 target whose singleton runs the one-tile F16-WMMA chain");
+    }
+    let math = if wide { DenseBatchMath::SingletonWmma } else { DenseBatchMath::Product };
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return refuse("graph capture / replay recording is not supported");
     }
@@ -301,6 +417,10 @@ pub fn forward_prefill_batch_multi(
         // The singleton runs n == 1 through forward_scratch, not this body.
         if n < MIN_BATCH {
             return refuse("every request needs >= 2 rows");
+        }
+        // A lone 64+-row request would be the singleton's quantized route.
+        if n > MULTI_CHUNK_MAX_LANE_ROWS {
+            return refuse("every request needs <= 63 rows");
         }
         if !prefill_batch_pbs_eligible(weights, config, r.dn_state, n, &arch, true) {
             return refuse("request not eligible for the batched prefill body");
@@ -436,11 +556,12 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_delta_net_input_projection(
                             gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion, None,
+                            DenseBatchMath::Product,
                         )?;
                     }
                 } else {
                     batch_chunk_delta_net_input_projection(
-                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None,
+                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None, math,
                     )?;
                 }
                 for (r, view) in reqs.iter_mut().zip(&views) {
@@ -486,10 +607,11 @@ pub fn forward_prefill_batch_multi(
                             BatchEpilogue::Residual,
                             r.fusion,
                             GdnScanOut::F32,
+                            DenseBatchMath::Product,
                         )?;
                         batch_chunk_delta_net_ffn(
                             gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                            BatchEpilogue::Residual, r.fusion,
+                            BatchEpilogue::Residual, r.fusion, DenseBatchMath::Product,
                         )?;
                     }
                 } else {
@@ -505,10 +627,11 @@ pub fn forward_prefill_batch_multi(
                         BatchEpilogue::Residual,
                         shared_fusion,
                         GdnScanOut::F32,
+                        math,
                     )?;
                     batch_chunk_delta_net_ffn(
                         gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                        BatchEpilogue::Residual, shared_fusion,
+                        BatchEpilogue::Residual, shared_fusion, math,
                     )?;
                 }
                 capture_layer_rows(gpu, reqs, &views, layer_idx)?;
@@ -521,10 +644,13 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_full_attn_input_projection(
                             gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion,
+                            DenseBatchMath::Product,
                         )?;
                     }
                 } else {
-                    batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion)?;
+                    batch_chunk_full_attn_input_projection(
+                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, math,
+                    )?;
                 }
                 for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                     let n = r.tokens.len();
@@ -598,10 +724,11 @@ pub fn forward_prefill_batch_multi(
                             r.fusion,
                             false,
                             None,
+                            DenseBatchMath::Product,
                         )?;
                         batch_chunk_full_attn_ffn(
                             gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                            BatchEpilogue::Residual, r.fusion,
+                            BatchEpilogue::Residual, r.fusion, DenseBatchMath::Product,
                         )?;
                     }
                 } else {
@@ -616,10 +743,11 @@ pub fn forward_prefill_batch_multi(
                         shared_fusion,
                         false,
                         None,
+                        math,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                        BatchEpilogue::Residual, shared_fusion,
+                        BatchEpilogue::Residual, shared_fusion, math,
                     )?;
                 }
                 capture_layer_rows(gpu, reqs, &views, layer_idx)?;
@@ -651,4 +779,111 @@ pub fn forward_prefill_batch_multi(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::{
+        multi_chunk_wide_route, pack_whole_lanes, scratch_rows_for, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
+    };
+    use rdna_compute::FeatureFlags;
+
+    /// gfx1201 defaults with `HIPFIRE_CB_VERIFY_CHUNK128=1` (the env default of
+    /// `HIPFIRE_WMMA_BATCH_TILES` on gfx1201 is on).
+    fn chunk128_flags() -> FeatureFlags {
+        let mut f = FeatureFlags::for_test("gfx1201");
+        f.cb_verify_chunk128 = true;
+        f.wmma_batch_tiles = true;
+        f
+    }
+
+    /// Every switch that moves a singleton (`<= 63`-row) dense MQ4G256V2 arm
+    /// off the one-tile F16-WMMA chain the wide kernels reproduce.
+    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 4] = [
+        ("HIPFIRE_FP16=0", |f| f.fp16_disabled = true),
+        ("HIPFIRE_LM_HEAD_WMMA=0", |f| f.lm_head_wmma_disabled = true),
+        ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| f.hfq4g256_ldsstage_wmma = true),
+        ("HIPFIRE_WMMA_BATCH_TILES=0", |f| f.wmma_batch_tiles = false),
+    ];
+
+    #[test]
+    fn wide_route_admitted_by_default_refused_under_each_singleton_switch() {
+        assert!(multi_chunk_wide_route("gfx1201", &chunk128_flags()));
+        // The chunk128 flag off, or another arch, never opens the wide route.
+        assert!(!multi_chunk_wide_route("gfx1201", &FeatureFlags::for_test("gfx1201")));
+        assert!(!multi_chunk_wide_route("gfx1100", &chunk128_flags()));
+        for (name, set) in SINGLETON_ARM_SWITCHES {
+            let mut f = chunk128_flags();
+            set(&mut f);
+            assert!(!multi_chunk_wide_route("gfx1201", &f), "{name} must refuse wide admission");
+        }
+    }
+
+    #[test]
+    fn scratch_rows_equal_the_effective_cap() {
+        // Admitted: the planned rows, up to 128.
+        assert_eq!(scratch_rows_for(true, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_MAX_ROWS);
+        assert_eq!(scratch_rows_for(true, 4096), MULTI_CHUNK_MAX_ROWS);
+        assert_eq!(scratch_rows_for(true, 96), 96);
+        // Not admitted (any refusing switch, a non-dense target, flag off):
+        // exactly the product cap, as before the wide route existed.
+        for (name, set) in SINGLETON_ARM_SWITCHES {
+            let mut f = chunk128_flags();
+            set(&mut f);
+            let rows = scratch_rows_for(multi_chunk_wide_route("gfx1201", &f), MULTI_CHUNK_MAX_ROWS);
+            assert_eq!(rows, MULTI_CHUNK_PRODUCT_MAX_ROWS, "{name}");
+        }
+        assert_eq!(scratch_rows_for(false, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_PRODUCT_MAX_ROWS);
+        assert_eq!(scratch_rows_for(false, 32), 32);
+        // Never below the batched-prefill minimum.
+        assert_eq!(scratch_rows_for(false, 0), 2);
+        assert_eq!(scratch_rows_for(true, 1), 2);
+    }
+
+    fn pack(rows: &[usize], cap: usize) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        pack_whole_lanes(rows, cap, &mut out).expect("packs");
+        out
+    }
+
+    #[test]
+    fn c8_block16_packs_by_effective_cap() {
+        let rows = [16usize; 8];
+        // Flag off (product cap 63): 48 + 48 + 32.
+        assert_eq!(pack(&rows, MULTI_CHUNK_PRODUCT_MAX_ROWS), vec![0..3, 3..6, 6..8]);
+        // Cap 64: 64 + 64.
+        assert_eq!(pack(&rows, 64), vec![0..4, 4..8]);
+        // Cap 128: one chunk.
+        assert_eq!(pack(&rows, MULTI_CHUNK_MAX_ROWS), vec![0..8]);
+        // A cap above the supported aggregate is clamped to it.
+        assert_eq!(pack(&rows, 4096), vec![0..8]);
+    }
+
+    #[test]
+    fn ragged_totals_pack_whole_lanes_in_order() {
+        // 4 x 16 rows then 6 x 15 rows (154 in all).
+        let rows = [16, 16, 16, 16, 15, 15, 15, 15, 15, 15];
+        assert_eq!(pack(&rows, 64), vec![0..4, 4..8, 8..10]);
+        assert_eq!(pack(&rows, 96), vec![0..6, 6..10]);
+        assert_eq!(pack(&rows, 128), vec![0..8, 8..10]);
+        // A 63-row lane leaves no room for a second lane at cap 64.
+        assert_eq!(pack(&[63, 2], 64), vec![0..1, 1..2]);
+        assert_eq!(pack(&[63, 63], 128), vec![0..2]);
+        // Nothing split, padded or reordered: every lane appears exactly once.
+        let r = pack(&[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31], 64);
+        assert_eq!(r.first().map(|x| x.start), Some(0));
+        assert_eq!(r.last().map(|x| x.end), Some(11));
+        assert!(r.windows(2).all(|w| w[0].end == w[1].start));
+    }
+
+    #[test]
+    fn a_lane_over_63_rows_or_under_2_is_refused() {
+        let mut out = vec![0..1];
+        assert!(pack_whole_lanes(&[16, 64], 128, &mut out).is_err());
+        assert!(out.is_empty());
+        assert!(pack_whole_lanes(&[1, 16], 128, &mut out).is_err());
+        assert!(out.is_empty());
+        // At the product cap a 64-row lane is also refused.
+        assert!(pack_whole_lanes(&[64], 63, &mut out).is_err());
+    }
 }

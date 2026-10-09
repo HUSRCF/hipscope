@@ -38,7 +38,9 @@ pub struct VmmSpecEngine {
 impl VmmSpecEngine {
     /// `head` loaded with the per-lane context cap; `k` = the singleton
     /// speculator's window (`mtp_k`, clamped like `Qwen35MtpDrafter`);
-    /// `max_lanes` sizes the shared verify scratch.
+    /// `max_lanes * (k + 1)` plans the shared verify scratch rows, clamped to
+    /// the effective chunk cap (63, or up to 128 on the wide verify route with
+    /// `HIPFIRE_CB_VERIFY_CHUNK128`; [`MtpCbScratch::new`]).
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen35Config,
@@ -271,7 +273,8 @@ impl Qwen35VmmStore {
     // A Verify request is tagged by its lane state: `mtp` (the MTP engine) or
     // `dflash` (the DFlash engine). Each tag's lanes run their own draft,
     // shared trunk + head and accept consumer; a step may carry both tags,
-    // each tag's whole lanes packing into its own `<= 63`-row trunk chunks.
+    // each tag's whole lanes packing into its own trunk chunks of at most the
+    // effective cap (`<= 63` rows, or up to 128 on the wide verify route).
 
     fn is_mtp_lane(&self, epoch: &RequestEpoch) -> bool {
         self.request_state(epoch).is_some_and(|s| s.mtp.is_some())

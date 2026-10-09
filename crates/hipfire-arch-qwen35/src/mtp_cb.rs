@@ -21,10 +21,19 @@
 //! or a batched-prefill-ineligible row count) runs the singleton verify.
 
 use super::*;
-use crate::qwen35::prefill::multi::{forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_ROWS};
+use crate::qwen35::prefill::multi::{
+    forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
+    MULTI_CHUNK_PRODUCT_MAX_ROWS,
+};
+
+/// Rows one MTP CB trunk chunk packs: the product cap. The wide 64..=128-row
+/// verify route is DFlash-only until a wide MTP state-oracle receipt exists,
+/// so MTP never takes `DenseBatchMath::SingletonWmma` or the exact wide head.
+const MTP_CB_MAX_ROWS: usize = MULTI_CHUNK_PRODUCT_MAX_ROWS;
 
 /// Shared verify buffers for one CB engine: trunk scratch, post-norm hidden
-/// rows, head rotation scratch and head logits, all `max_rows` rows.
+/// rows, head rotation scratch and head logits, all `max_rows` rows
+/// (`<= MTP_CB_MAX_ROWS`, 63).
 pub struct MtpCbScratch {
     pub max_rows: usize,
     trunk: MultiChunkScratch,
@@ -34,10 +43,11 @@ pub struct MtpCbScratch {
 }
 
 impl MtpCbScratch {
-    /// `max_rows` is clamped to [`MULTI_CHUNK_MAX_ROWS`]; a cycle with more
-    /// rows runs in several shared chunks.
+    /// `max_rows` is clamped to `2..=63` (the MTP effective cap, whatever the
+    /// wide verify route admits); a cycle with more rows runs in several
+    /// shared chunks.
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let max_rows = max_rows.clamp(2, MULTI_CHUNK_MAX_ROWS);
+        let max_rows = max_rows.clamp(2, MTP_CB_MAX_ROWS);
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
         let alloc = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32);
         let hidden = alloc(gpu, max_rows * config.dim)?;
@@ -262,19 +272,22 @@ pub enum MtpCbVerified {
 }
 
 /// Can the shared trunk verify this drafted window exactly (the singleton
-/// verifies it on the batched-prefill body with a rollback tape)?
-fn shared_verify_ok(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, cb: &MtpCbScratch, lane: &MtpCbVerifyLane<'_>) -> bool {
+/// verifies it on the batched-prefill body with a rollback tape)? `pack_cap`
+/// is the chunk's packing cap (`<= 63`); a window never exceeds one
+/// request's 63 rows.
+fn shared_verify_ok(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, pack_cap: usize, lane: &MtpCbVerifyLane<'_>) -> bool {
     let n = lane.draft.n_verify();
     n >= 2
-        && n <= cb.max_rows
+        && n <= pack_cap.min(MULTI_CHUNK_MAX_LANE_ROWS)
         && n <= lane.state.trunk_gdn_tape.max_n
         && qwen35::prefill_batch_pbs_eligible(weights, config, lane.dn_state, n, gpu.arch.as_str(), true)
 }
 
 /// Verify phase over drafted lanes: DeltaNet snapshot, ONE shared trunk
-/// forward (chunks of whole lanes within `cb.max_rows`) and ONE verify
-/// head per chunk; each lane's hidden/logit rows land in its own state.
-/// Writes trunk KV/DeltaNet (a failure here leaves the lanes untrusted).
+/// forward (chunks of whole lanes within `cb.max_rows`, never above 63: the
+/// product route) and ONE verify head per chunk; each lane's hidden/logit
+/// rows land in its own state. Writes trunk KV/DeltaNet (a failure here
+/// leaves the lanes untrusted).
 pub fn mtp_cb_verify(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -286,7 +299,8 @@ pub fn mtp_cb_verify(
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
-    let shared: Vec<bool> = lanes.iter().map(|l| shared_verify_ok(gpu, weights, config, cb, l)).collect();
+    let pack_cap = cb.max_rows.min(MTP_CB_MAX_ROWS);
+    let shared: Vec<bool> = lanes.iter().map(|l| shared_verify_ok(gpu, weights, config, pack_cap, l)).collect();
     let mut out: Vec<MtpCbVerified> = (0..lanes.len()).map(|_| MtpCbVerified::Pending).collect();
     let dim = config.dim;
     let vocab = config.vocab_size;
@@ -294,7 +308,7 @@ pub fn mtp_cb_verify(
     while !idx.is_empty() {
         let mut rows = 0usize;
         let mut take = 0usize;
-        while take < idx.len() && rows + lanes[idx[take]].draft.n_verify() <= cb.max_rows {
+        while take < idx.len() && rows + lanes[idx[take]].draft.n_verify() <= pack_cap {
             rows += lanes[idx[take]].draft.n_verify();
             take += 1;
         }

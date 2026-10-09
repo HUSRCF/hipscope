@@ -13,6 +13,7 @@ use super::config::MropeCtx;
 use super::config::Qwen35Config;
 use super::prefill::trace_finite_if_enabled;
 use super::prefill::BatchEpilogue;
+use super::prefill::DenseBatchMath;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::DeltaNetState;
 use super::weights::ExpertWeights;
@@ -5516,6 +5517,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5649,6 +5651,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
                             ) {
                                 process_res = Err(e);
                                 break;
