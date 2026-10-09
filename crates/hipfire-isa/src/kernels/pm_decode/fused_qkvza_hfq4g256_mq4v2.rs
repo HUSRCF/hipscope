@@ -179,29 +179,43 @@ fn projection_quad(b: &mut Builder) -> Result<(), String> {
     b.wait(Counter::Load, 9)?;
     quad_extract(b, 2)?;
     b.wait(Counter::Load, 6)?;
-    for stream in 0..2 { quad_dot_term(b, stream, 1)?; }
+    quad_dot_term(b, 0, 1)?;
     quad_extract(b, 3)?;
-    for element in [0,2,3] {
-        for stream in 0..2 { quad_dot_term(b, stream, element)?; }
-    }
+    // Stagger adjacent streams by one term to satisfy the checked VOPD banks.
+    quad_dual_term(b, 0, 0, 1)?;
+    quad_delay(b, 1)?;
+    quad_dual_term(b, 0, 2, 0)?;
+    quad_delay(b, 1)?;
+    quad_dual_term(b, 0, 3, 2)?;
     quad_dequant_pair(b, 2)?;
     b.wait(Counter::Load, 2)?;
-    for stream in 2..4 { quad_dot_term(b, stream, 1)?; }
-    for (element01, element23) in [(4,Some(0)),(5,Some(2)),(6,Some(3)),(7,None)] {
-        for stream in 0..2 { quad_dot_term(b, stream, element01)?; }
+    quad_dot_term(b, 2, 1)?;
+    quad_dual_term(b, 0, 4, 3)?;
+    quad_delay(b, 2)?;
+    quad_dual_term(b, 2, 0, 1)?;
+    for (element01, element23) in [(5,Some(2)),(6,Some(3)),(7,None)] {
+        quad_delay(b, 2)?;
+        quad_dual_term(b, 0, element01, element01-1)?;
         if let Some(element) = element23 {
-            for stream in 2..4 { quad_dot_term(b, stream, element)?; }
+            quad_delay(b, 2)?;
+            quad_dual_term(b, 2, element, if element == 2 { 0 } else { 2 })?;
         }
     }
+    quad_dot_term(b, 1, 7)?;
     b.wait(Counter::Load, 1)?;
-    for element in 4..8 { quad_dot_term(b, 2, element)?; }
+    quad_delay(b, 3)?;
+    quad_dual_term(b, 2, 4, 3)?;
+    b.wait(Counter::Load, 0)?;
+    for element in 5..8 {
+        quad_delay(b, 1)?;
+        quad_dual_term(b, 2, element, element-1)?;
+    }
     for stream in 0..2 {
         let acc = 4+stream;
         let dot = 40+stream;
         op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v{dot}"), &[v(acc)], &[v(acc),v(dot)])?;
     }
-    b.wait(Counter::Load, 0)?;
-    for element in 4..8 { quad_dot_term(b, 3, element)?; }
+    quad_dot_term(b, 3, 7)?;
     for stream in 2..4 {
         let acc = 4+stream;
         let dot = 40+stream;
@@ -251,6 +265,23 @@ fn quad_dot_term(b: &mut Builder, stream: u8, element: u8) -> Result<(), String>
     } else {
         op(b, format!("v_fmac_f32_e32 v{dot}, v{weight}, v{x}"), &[v(dot)], &[v(dot),v(weight),v(x)])
     }
+}
+
+fn quad_dual_term(b: &mut Builder, first: u8, x_element: u8, y_element: u8) -> Result<(), String> {
+    use crate::vopd::{VopdOp, VopdF32, Operand};
+    let term = |stream: u8, element: u8| VopdOp {
+        op: if element == 1 { VopdF32::Mul } else { VopdF32::Fmac },
+        dst: 40+stream,
+        src0: Operand::V(quad_level(stream, element)),
+        src1: 8+stream*8+element,
+    };
+    b.vopd(term(first, x_element), term(first+1, y_element))
+}
+
+fn quad_delay(b: &mut Builder, dependency: u8) -> Result<(), String> {
+    // Proven producer hints yield between dependent dual packets; they do not
+    // alter the per-stream RN/FMA sequence or add a new arithmetic operation.
+    op(b, format!("s_delay_alu instid0(VALU_DEP_{dependency})"), &[], &[])
 }
 
 fn projection_group(b: &mut Builder, stream: u8) -> Result<(), String> {
@@ -419,6 +450,8 @@ mod tests {
         }).collect();
         assert_eq!(waits, [14,12,11,10,9,6,2,1,0]);
         assert_eq!(quad.matches("s_clause 0x7").count(), 2);
+        assert_eq!(quad.matches(" :: ").count(), 14);
+        assert_eq!(quad.matches("s_delay_alu").count(), 12);
         assert!(text.contains(".vgpr_count: 76"));
         crate::native::assemble(text, crate::Arch::Gfx1201)?;
         Ok(())
