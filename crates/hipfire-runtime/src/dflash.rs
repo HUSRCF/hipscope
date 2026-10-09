@@ -1455,6 +1455,9 @@ mod target_hidden_log {
 }
 pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
 
+mod lanes;
+pub use lanes::{draft_forward_lanes, DraftLane};
+
 // ─── Scratch ───────────────────────────────────────────────────────────────
 
 /// Draft context mode (HIPFIRE_DFLASH_WINDOW).

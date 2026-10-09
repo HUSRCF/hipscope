@@ -33,9 +33,11 @@ use crate::qwen35::prefill::multi::{
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
-    dflash_download_verify_argmax, dflash_enqueue_verify_lm_head_argmax, draft_dflash_block_rank,
-    DeltaNetSnapshot, DflashCbDraft, VerifyScratch,
+    dflash_download_verify_argmax, dflash_draft_batch_eligible, dflash_enqueue_verify_lm_head_argmax,
+    draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
+    VerifyScratch, DFLASH_DRAFT_BATCH_MAX_ROWS,
 };
+use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
@@ -291,6 +293,18 @@ pub struct DflashCbScratch {
     /// argmax) into its own `df.verify_scratch` (the oracle's proof arrays).
     /// Greedy production leaves this off.
     pub keep_lane_rows: bool,
+    /// Row scratch of the batched draft forward, allocated once on the first
+    /// batched chunk (the shared draft activations; lane draft state stays in
+    /// each lane).
+    draft: Option<DflashScratch>,
+    /// Fewest lanes a draft chunk needs to take the batched forward (a lone
+    /// lane runs the singleton call; the oracle sets 1 to prove the batched
+    /// forward at one lane).
+    pub draft_min_lanes: usize,
+    /// `(lanes, chunks)` the last [`dflash_cb_draft`] call drafted through the
+    /// batched forward (the rest ran the singleton call); evidence for the
+    /// oracle that the batched path, not its fallback, produced the drafts.
+    pub draft_stats: (usize, usize),
 }
 
 impl DflashCbScratch {
@@ -312,7 +326,20 @@ impl DflashCbScratch {
             rows: Vec::with_capacity(max_rows),
             ranges: Vec::with_capacity(max_rows),
             keep_lane_rows: false,
+            draft: None,
+            draft_min_lanes: 2,
+            draft_stats: (0, 0),
         })
+    }
+
+    /// Allocate the batched-draft row scratch now (idempotent), so a serving
+    /// engine never allocates inside a step; `dflash_cb_draft` otherwise
+    /// allocates it on the first batched chunk.
+    pub fn reserve_draft(&mut self, gpu: &mut Gpu, draft_config: &hipfire_runtime::dflash::DflashConfig) -> HipResult<()> {
+        if self.draft.is_none() {
+            self.draft = Some(DflashScratch::new_with_mq(gpu, draft_config, DFLASH_DRAFT_BATCH_MAX_ROWS, 1, true)?);
+        }
+        Ok(())
     }
 
     /// Rows one trunk chunk can hold (`<= 63`).
@@ -321,11 +348,127 @@ impl DflashCbScratch {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
-        let DflashCbScratch { max_rows: _, trunk, head, rows: _, ranges: _, keep_lane_rows: _ } = self;
+        let DflashCbScratch {
+            max_rows: _,
+            trunk,
+            head,
+            rows: _,
+            ranges: _,
+            keep_lane_rows: _,
+            draft,
+            draft_min_lanes: _,
+            draft_stats: _,
+        } = self;
+        if let Some(d) = draft {
+            d.free_gpu(gpu);
+        }
         let r = trunk.free_gpu(gpu);
         head.free_gpu(gpu);
         r
     }
+}
+
+/// One lane of [`dflash_cb_draft`]: its private state and the window to draft
+/// (`b` rows at `position` with pending `seed`).
+pub struct DflashCbDraftLane<'a> {
+    pub state: &'a mut DflashVmmLaneState,
+    pub position: usize,
+    pub seed: u32,
+    pub b: usize,
+    pub compact_offset: i32,
+}
+
+/// Draft phase over lanes. With `batched` (and the exact-gfx1201 MQ4 v2
+/// eligibility of [`dflash_draft_batch_eligible`]), full-block lanes are
+/// packed in order into chunks of at most
+/// `min(DFLASH_DRAFT_BATCH_MAX_ROWS, cb.max_rows())` rows; each chunk of at
+/// least `cb.draft_min_lanes` lanes is ONE draft-model forward and ONE shared
+/// lm-head ([`draft_dflash_blocks_batched`]) with every lane keeping its own
+/// context rings, positions and hidden context. Every other lane (budget
+/// tails, lone lanes, ineligible machines/drafts, `batched == false`) runs
+/// the singleton call [`dflash_lane_draft`]. Returns each lane's
+/// `[seed, candidates..]`, byte-identical to `dflash_lane_draft` per lane.
+pub fn dflash_cb_draft(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    cb: &mut DflashCbScratch,
+    lanes: &mut [DflashCbDraftLane<'_>],
+    batched: bool,
+) -> HipResult<Vec<Vec<u32>>> {
+    let n = lanes.len();
+    let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+    // chunk id per lane (None = singleton draft).
+    let mut chunk_of: Vec<Option<usize>> = vec![None; n];
+    let mut n_chunks = 0usize;
+    if batched && n > 0 && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights) {
+        let cap = DFLASH_DRAFT_BATCH_MAX_ROWS.min(cb.max_rows);
+        let mut rows = 0usize;
+        let mut members: Vec<Vec<usize>> = Vec::new();
+        for (i, l) in lanes.iter().enumerate() {
+            if l.b < 3 || l.b != l.state.df.block_size || l.b > cap {
+                continue;
+            }
+            if members.last().is_none() || rows + l.b > cap {
+                members.push(Vec::new());
+                rows = 0;
+            }
+            members.last_mut().unwrap().push(i);
+            rows += l.b;
+        }
+        for m in members {
+            if m.len() >= cb.draft_min_lanes.max(1) {
+                for &i in &m {
+                    chunk_of[i] = Some(n_chunks);
+                }
+                n_chunks += 1;
+            }
+        }
+    }
+    cb.draft_stats = (chunk_of.iter().flatten().count(), n_chunks);
+    if n_chunks > 0 && cb.draft.is_none() {
+        let cfg = lanes.iter().zip(&chunk_of).find(|(_, c)| c.is_some()).map(|(l, _)| l.state.df.draft_config.clone());
+        if let Some(cfg) = cfg {
+            cb.draft = Some(DflashScratch::new_with_mq(gpu, &cfg, DFLASH_DRAFT_BATCH_MAX_ROWS, 1, true)?);
+        }
+    }
+    for c in 0..n_chunks {
+        let mut dl: Vec<DflashDraftLane<'_>> = Vec::new();
+        let mut idx: Vec<usize> = Vec::new();
+        for (i, l) in lanes.iter_mut().enumerate() {
+            if chunk_of[i] == Some(c) {
+                idx.push(i);
+                dl.push(DflashDraftLane {
+                    df: &mut l.state.df,
+                    position: l.position,
+                    seed: l.seed,
+                    b: l.b,
+                    compact_offset: l.compact_offset,
+                });
+            }
+        }
+        let DflashCbScratch { draft, head, .. } = &mut *cb;
+        let shared = draft.as_mut().ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
+        let toks = draft_dflash_blocks_batched(gpu, weights, config.vocab_size, shared, head, &mut dl)?;
+        for (i, t) in idx.into_iter().zip(toks) {
+            out[i] = Some(t);
+        }
+    }
+    for (i, l) in lanes.iter_mut().enumerate() {
+        if out[i].is_none() {
+            out[i] = Some(dflash_lane_draft(
+                gpu,
+                weights,
+                config,
+                l.compact_offset,
+                &mut l.state.df,
+                l.position,
+                l.seed,
+                l.b,
+            )?);
+        }
+    }
+    Ok(out.into_iter().map(|t| t.expect("every lane drafted")).collect())
 }
 
 /// One drafted lane between verify and accept: its trunk owners, its private

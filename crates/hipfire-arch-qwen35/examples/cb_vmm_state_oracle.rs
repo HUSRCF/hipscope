@@ -46,7 +46,7 @@ use hipfire_arch_qwen35::mtp_head::{load_mtp_head, MtpKvMode, Qwen35MtpHead};
 use hipfire_arch_qwen35::mtp_spec::cb::{mtp_cb_cycle, MtpCbLane, MtpCbScratch};
 use hipfire_arch_qwen35::mtp_spec::{prefill_trunk_and_mtp_cache, MtpPromptRoute, MtpSamplingConfig, MtpSpecState};
 use hipfire_arch_qwen35::mtp_speculator::Qwen35MtpDrafter;
-use hipfire_arch_qwen35::dflash_cb::{dflash_cb_head_argmax, dflash_lane_draft, DflashVmmLaneState};
+use hipfire_arch_qwen35::dflash_cb::{dflash_cb_draft, dflash_cb_head_argmax, dflash_lane_draft, DflashCbDraftLane, DflashCbScratch, DflashVmmLaneState};
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, load_dflash_state, DflashSpeculator, DflashState};
 use hipfire_arch_qwen35::qwen35::prefill::multi::{forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_ROWS};
 use hipfire_arch_qwen35::speculative::{
@@ -2738,6 +2738,7 @@ struct PostRef {
 struct G0Refs {
     pre: std::collections::HashMap<usize, PreRef>,
     post: std::collections::HashMap<(usize, usize), PostRef>,
+    draft: std::collections::HashMap<usize, DraftRef>,
 }
 
 fn ensure_pre(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, fi: usize) -> Result<()> {
@@ -3165,6 +3166,214 @@ fn g0_case(
     Ok((j, ok))
 }
 
+/// Frozen singleton draft of one fixture's pre-window state: the drafted
+/// `[seed, candidates..]` tokens and the lane's draft/ring state right after
+/// the isolated `dflash_lane_draft` (K/V rings, projection cache, thlog).
+struct DraftRef {
+    frozen: Frozen,
+    tokens: Vec<u32>,
+}
+
+fn ensure_draft_ref(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, fi: usize) -> Result<()> {
+    if refs.draft.contains_key(&fi) {
+        return Ok(());
+    }
+    eprintln!("draftbatch trace: ref_draft walk {}", fx[fi].name());
+    let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
+    let (mut lane, _rows) = take_lane(gpu, slot, d, w.position)?;
+    let compact = slot.kv_cache.compact_offset as i32;
+    let r = (|| -> Result<(Vec<u32>, Named)> {
+        let tokens = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut lane.df, w.position, w.seed, cfg.block)?;
+        gpu.hip.device_synchronize()?;
+        let ck: Vec<usize> = lane.checkpoints.iter().map(|(p, _)| *p).collect();
+        Ok((tokens, df_arrays(gpu, &lane.df, &ck)?))
+    })();
+    lane.free_gpu(gpu);
+    let (tokens, set) = r?;
+    let frozen = freeze(&cfg.dir.join(format!("ref_draft_{}", fx[fi].name())), &set)?;
+    refs.draft.insert(fi, DraftRef { frozen, tokens });
+    Ok(())
+}
+
+/// One batched-draft case: lanes `specs` (fixtures) are opened at their
+/// pre-window state (each compared with the frozen singleton pre-state), then
+/// drafted together by `dflash_cb_draft` (`min_lanes`: fewest lanes of a chunk
+/// that take the batched forward; `batched=false` is the per-lane singleton
+/// call). Every lane's tokens and post-draft draft state must equal the
+/// isolated singleton draft byte for byte. Returns `(receipt, ok, draft_ms)`.
+#[allow(clippy::too_many_arguments)]
+fn draft_case(
+    gpu: &mut Gpu,
+    slot: &mut ModelSlot,
+    d: &mut Box<dyn Speculator>,
+    cfg: &G0Cfg,
+    fx: &[Fixture],
+    refs: &mut G0Refs,
+    name: &str,
+    specs: &[usize],
+    min_lanes: usize,
+    batched: bool,
+    expect_batched_lanes: usize,
+) -> Result<(Value, bool, f64)> {
+    let t_case = std::time::Instant::now();
+    for &fi in specs {
+        ensure_pre(gpu, slot, d, cfg, fx, refs, fi)?;
+        ensure_draft_ref(gpu, slot, d, cfg, fx, refs, fi)?;
+    }
+    let mut lanes: Vec<LaneRun> = Vec::with_capacity(specs.len());
+    let mut open_err = None;
+    for (i, &fi) in specs.iter().enumerate() {
+        match g0_lane_open(gpu, slot, d, cfg, fx, refs, fi, 64, 80_000 + i as u64) {
+            Ok(l) => lanes.push(l),
+            Err(err) => {
+                open_err = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = open_err {
+        free_lanes(gpu, lanes)?;
+        return Err(err);
+    }
+    let mut cb = match DflashCbScratch::new(gpu, &slot.config, MULTI_CHUNK_MAX_ROWS) {
+        Ok(cb) => cb,
+        Err(e) => {
+            free_lanes(gpu, lanes)?;
+            return Err(e.into());
+        }
+    };
+    cb.draft_min_lanes = min_lanes;
+    let body = (|| -> Result<(Vec<Vec<u32>>, f64)> {
+        gpu.hip.device_synchronize()?;
+        let t0 = std::time::Instant::now();
+        let toks = {
+            let mut dl: Vec<DflashCbDraftLane<'_>> = lanes
+                .iter_mut()
+                .map(|l| DflashCbDraftLane { state: &mut l.lane, position: l.position, seed: l.seed, b: l.b, compact_offset: l.rs.kv.compact_offset as i32 })
+                .collect();
+            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut cb, &mut dl, batched)?
+        };
+        gpu.hip.device_synchronize()?;
+        Ok((toks, t0.elapsed().as_secs_f64() * 1e3))
+    })();
+    let mut lane_json = Vec::new();
+    let mut exact = true;
+    let mut err_text = None;
+    let mut ms = 0.0;
+    let stats = cb.draft_stats;
+    match body {
+        Ok((toks, t)) => {
+            ms = t;
+            for (i, l) in lanes.iter_mut().enumerate() {
+                let dr = &refs.draft[&l.fi];
+                l.post_diff.ids("draft.tokens", &dr.tokens, &toks[i]);
+                let post = (|| -> Result<Named> {
+                    let ck: Vec<usize> = l.lane.checkpoints.iter().map(|(p, _)| *p).collect();
+                    df_arrays(gpu, &l.lane.df, &ck)
+                })();
+                match post {
+                    Ok(post) => {
+                        if let Err(e) = cmp_frozen(&mut l.post_diff, "post_draft", &dr.frozen, &post) {
+                            err_text = Some(e.to_string());
+                        }
+                    }
+                    Err(e) => err_text = Some(e.to_string()),
+                }
+                lane_json.push(json!({
+                    "lane": i, "fixture": fx[l.fi].name(), "prefix": fx[l.fi].prefix, "b": l.b, "position": l.position,
+                    "tokens": toks[i], "pre": l.pre_diff.json(), "post_draft": l.post_diff.json(),
+                }));
+                println!(
+                    "draftbatch {name} lane{i} {} B={} pre_diffs={} draft_diffs={}",
+                    fx[l.fi].name(), l.b, l.pre_diff.differing_items.len(), l.post_diff.differing_items.len()
+                );
+                for it in l.pre_diff.differing_items.iter().chain(l.post_diff.differing_items.iter()).take(40) {
+                    println!("draftbatch {name} lane{i} DIFF {it}");
+                }
+                exact &= l.pre_diff.exact() && l.post_diff.exact();
+            }
+        }
+        Err(e) => {
+            err_text = Some(e.to_string());
+            exact = false;
+        }
+    }
+    let went_batched = stats.0 == expect_batched_lanes;
+    let ok = err_text.is_none() && exact && went_batched;
+    cb.free_gpu(gpu)?;
+    free_lanes(gpu, lanes)?;
+    eprintln!(
+        "draftbatch case {name}: lanes={} batched_lanes={} chunks={} (expected batched lanes {expect_batched_lanes}) draft_ms={ms:.2} exact={exact} -> {}",
+        specs.len(), stats.0, stats.1, if ok { "OK" } else { "FAIL" }
+    );
+    let j = json!({
+        "case": name, "lanes": specs.len(), "min_lanes": min_lanes, "batched": batched,
+        "batched_lanes": stats.0, "batched_chunks": stats.1, "expected_batched_lanes": expect_batched_lanes,
+        "exact": exact, "ok": ok, "error": err_text, "draft_ms": ms, "case_wall_s": t_case.elapsed().as_secs_f64(),
+        "per_lane": lane_json,
+    });
+    Ok((j, ok, ms))
+}
+
+/// Gate-0-style cases of the batched DFlash draft: 1..4 lanes (batched
+/// forward proven down to one lane with `min_lanes = 1`), the production
+/// chunking (`min_lanes = 2`: four lanes are a three-lane chunk plus a
+/// singleton lane), and the timing of eight lanes per step, serial vs
+/// batched (draft ms only; separate fresh lane sets, best of two).
+fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs) -> Result<(Vec<Value>, bool)> {
+    let n = fx.len();
+    let fxl = |k: usize| -> Vec<usize> { (0..k).map(|i| i % n).collect() };
+    // (name, lanes, min_lanes, expected batched lanes)
+    let cases: Vec<(&str, usize, usize, usize)> = vec![
+        ("draft_n1_batched16", 1, 1, 1),
+        ("draft_n2", 2, 1, 2),
+        ("draft_n3", 3, 1, 3),
+        ("draft_n4_min1", 4, 1, 4),
+        ("draft_n4_prod", 4, 2, 3),
+    ];
+    let mut rows = Vec::new();
+    let mut pass = true;
+    for (name, k, min_lanes, expect) in cases {
+        match draft_case(gpu, slot, d, cfg, fx, refs, name, &fxl(k), min_lanes, true, expect) {
+            Ok((j, ok, _)) => {
+                pass &= ok;
+                rows.push(j);
+            }
+            Err(e) => {
+                eprintln!("draftbatch case {name}: ERROR {e}");
+                rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                return Ok((rows, false));
+            }
+        }
+    }
+    let mut serial = Vec::new();
+    let mut batched = Vec::new();
+    for rep in 0..2 {
+        for (is_batched, sink) in [(false, &mut serial), (true, &mut batched)] {
+            let name = format!("draft_n8_{}_rep{rep}", if is_batched { "batched" } else { "serial" });
+            match draft_case(gpu, slot, d, cfg, fx, refs, &name, &fxl(8), 2, is_batched, if is_batched { 8 } else { 0 }) {
+                Ok((j, ok, ms)) => {
+                    pass &= ok;
+                    sink.push(ms);
+                    rows.push(j);
+                }
+                Err(e) => {
+                    eprintln!("draftbatch case {name}: ERROR {e}");
+                    rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                    return Ok((rows, false));
+                }
+            }
+        }
+    }
+    let best = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    println!(
+        "draftbatch timing 8 lanes/step: serial {:.2} ms (runs {:?}) batched {:.2} ms (runs {:?})",
+        best(&serial), serial, best(&batched), batched
+    );
+    rows.push(json!({"case": "draft_n8_timing", "serial_ms": serial, "batched_ms": batched, "serial_best_ms": best(&serial), "batched_best_ms": best(&batched)}));
+    Ok((rows, pass))
+}
+
 fn file_sha(p: &Path) -> Result<(u64, String)> {
     use std::io::Read;
     let mut f = fs::File::open(p)?;
@@ -3231,7 +3440,9 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
     let mut rows = Vec::new();
     let mut pass = true;
     let mut run_err = None;
-    for (name, specs, fusion, expect) in &cases {
+    // CB_ORACLE_DRAFT_ONLY=1 skips the shared-trunk Gate 0 cases and runs the batched-draft cases only.
+    let draft_only = std::env::var_os("CB_ORACLE_DRAFT_ONLY").is_some();
+    for (name, specs, fusion, expect) in cases.iter().filter(|_| !draft_only) {
         match g0_case(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs, &vs, &mc, name, specs, *fusion, *expect) {
             Ok((j, ok)) => {
                 pass &= ok;
@@ -3246,10 +3457,24 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
             }
         }
     }
+    let mut draft_rows = Vec::new();
+    if run_err.is_none() {
+        match draft_batch_cases(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs) {
+            Ok((r, ok)) => {
+                pass &= ok;
+                draft_rows = r;
+            }
+            Err(e) => {
+                eprintln!("draftbatch: ERROR {e}");
+                run_err = Some(e.to_string());
+                pass = false;
+            }
+        }
+    }
     let env_keys = [
         "HIPFIRE_VERIFY_GRAPH", "HIPFIRE_GRAPH", "HIPFIRE_CB_SEG_TWINS", "HIPFIRE_DFLASH_WINDOW", "HIPFIRE_DFLASH_CTX_CAP",
         "HIPFIRE_DFLASH_ADAPTIVE_B", "HIPFIRE_DFLASH_CKPT_RESUME", "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA", "HIPFIRE_SPEC_PHASES",
-        "HIPFIRE_DN_STATE_EF", "HIPFIRE_DN_SNAPSHOT_FLIP",
+        "HIPFIRE_DN_STATE_EF", "HIPFIRE_DN_SNAPSHOT_FLIP", "HIPFIRE_CB_DFLASH_DRAFT_BATCH", "HIPFIRE_WMMA_BATCH_TILES",
     ];
     let env: serde_json::Map<String, Value> = env_keys.iter().map(|k| (k.to_string(), json!(std::env::var(k).ok()))).collect();
     let mut pre_keys: Vec<usize> = refs.pre.keys().copied().collect();
@@ -3271,6 +3496,7 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         "arch": gpu.arch.clone(),
         "fixtures": pre_json,
         "cases": rows,
+        "draft_batch": draft_rows,
         "error": run_err,
         "unexercised": {
             "dflash_executor_k1_8": "needs the VMM DFlash engine (slices C/D); not part of Gate 0",

@@ -17,7 +17,7 @@
 //! speculative decode serializes draft-generate then target-verify).
 
 use crate::carrier::Qwen35Bundle;
-use crate::dflash_spec::DenseTpDflashRankState;
+use crate::dflash_spec::{DenseTpDflashRankState, DflashState};
 use crate::dflash_verify_pm4::{
     fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase, DflashVerifyRoute,
     DflashVerifyWindow,
@@ -5386,6 +5386,229 @@ pub(crate) fn draft_dflash_block_rank(
         }
     }
     Ok(drafted)
+}
+
+/// Rows one batched draft forward holds. The draft projections / FFN / head
+/// GEMMs are row-count independent on gfx1201 below the 64-row route
+/// boundary (the exact-trunk ceiling is 63); 48 keeps the draft on the rungs
+/// the exact trunk and the oracle already cover (three full 16-row lanes).
+pub const DFLASH_DRAFT_BATCH_MAX_ROWS: usize = 48;
+
+/// One lane of [`draft_dflash_blocks_batched`].
+pub struct DflashDraftLane<'a> {
+    pub df: &'a mut DflashState,
+    /// Committed target position (`position` of the singleton step).
+    pub position: usize,
+    /// Pending seed (`block[0]`).
+    pub seed: u32,
+    /// Block rows `b` (`3..`: one-row heads are GEMVs, a different kernel).
+    pub b: usize,
+    /// The lane's `kv_cache.compact_offset`.
+    pub compact_offset: i32,
+}
+
+/// Whether the batched draft is exact for this machine / draft / target head:
+/// the non-fused (non-gfx1100) draft route, MoE-free target, every draft
+/// matmul an MQ4 v2 (or, for the DFlash2 convolution kernel projections,
+/// F16/F32) weight and the target head MQ4 v2 — the families whose WMMA GEMMs
+/// are row-independent below 64 rows on gfx1201 (verified per lane against
+/// the singleton by the CB state oracle).
+pub fn dflash_draft_batch_eligible(
+    gpu: &Gpu,
+    target_weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    draft_weights: &DflashWeights,
+) -> bool {
+    use rdna_compute::DType::{MQ4G256V2, F16, F32};
+    if config.num_experts > 0 || gpu.draft_collapse_fused_enabled() || !gpu.arch.starts_with("gfx12") {
+        return false;
+    }
+    if target_weights.output.gpu_dtype != MQ4G256V2 {
+        return false;
+    }
+    let main_ok = |w: &llama::WeightTensor| w.gpu_dtype == MQ4G256V2;
+    let conv_ok = |w: &llama::WeightTensor| matches!(w.gpu_dtype, MQ4G256V2 | F16 | F32);
+    main_ok(&draft_weights.fc)
+        && draft_weights.layers.iter().all(|l| {
+            main_ok(&l.wq)
+                && main_ok(&l.wk)
+                && main_ok(&l.wv)
+                && main_ok(&l.wo)
+                && main_ok(&l.w_gate)
+                && main_ok(&l.w_up)
+                && main_ok(&l.w_down)
+                && l.attn_conv_proj.as_ref().is_none_or(conv_ok)
+                && l.mlp_conv_proj.as_ref().is_none_or(conv_ok)
+        })
+}
+
+/// Greedy chain drafts of several lanes through ONE draft-model forward
+/// (`dflash::draft_forward_lanes`) and ONE shared target lm-head GEMM, each
+/// lane keeping its own draft context rings, positions and hidden context:
+/// the batched counterpart of per-lane `draft_dflash_block_rank` calls (the
+/// singleton path is untouched). `shared` is the row scratch of the batched
+/// forward (`>= sum b` rows), `head` the head scratch (`max_n >= sum b`).
+/// Returns each lane's `[seed, candidates..]`. Preconditions:
+/// [`dflash_draft_batch_eligible`], `3 <= b` per lane, `sum b <=
+/// DFLASH_DRAFT_BATCH_MAX_ROWS`, one shared draft-weight asset.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_dflash_blocks_batched(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    vocab: usize,
+    shared: &mut DflashScratch,
+    head: &VerifyScratch,
+    lanes: &mut [DflashDraftLane<'_>],
+) -> HipResult<Vec<Vec<u32>>> {
+    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    if lanes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: usize = lanes.iter().map(|l| l.b).sum();
+    if rows > DFLASH_DRAFT_BATCH_MAX_ROWS || rows > shared.max_block_size || rows > head.max_n {
+        return err(format!(
+            "{rows} rows exceed the batch capacity (cap {DFLASH_DRAFT_BATCH_MAX_ROWS}, scratch {}, head {})",
+            shared.max_block_size, head.max_n
+        ));
+    }
+    let draft_weights = std::sync::Arc::clone(&lanes[0].df.draft_weights);
+    let draft_cfg = lanes[0].df.draft_config.clone();
+    let h = draft_cfg.hidden;
+    debug_assert_eq!(vocab, draft_cfg.vocab_size);
+    for (i, l) in lanes.iter().enumerate() {
+        if l.b < 3 {
+            return err(format!("lane {i}: block {} < 3 rows", l.b));
+        }
+        if !std::sync::Arc::ptr_eq(&l.df.draft_weights, &draft_weights) {
+            return err(format!("lane {i}: draft weights are not the shared asset"));
+        }
+        if l.b > l.df.draft_scratch.max_block_size {
+            return err(format!("lane {i}: block {} > its draft scratch", l.b));
+        }
+    }
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    // Noise embeddings of every lane's block into the shared rows (the
+    // singleton's non-fused per-token lookup loop, `draft_dflash_forward_rank`).
+    let mut off = 0usize;
+    for l in lanes.iter() {
+        for i in 0..l.b {
+            let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
+            let dst = shared.x.sub_offset((off + i) * h, h);
+            match target_weights.embd_format {
+                llama::EmbeddingFormat::HFQ4G256 => {
+                    gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
+                }
+                llama::EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
+                }
+                llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
+                llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
+                _ => return err("unsupported target embedding format for noise lookup".into()),
+            }
+        }
+        off += l.b;
+    }
+
+    // Per-lane positions (ctx_slice = None geometry of the singleton).
+    struct Geo {
+        ctx: usize,
+        pos_q: Vec<i32>,
+        pos_k: Vec<i32>,
+    }
+    let geos: Vec<Geo> = lanes
+        .iter()
+        .map(|l| {
+            let ctx = l.df.draft_scratch.thlog.abs_positions().len().min(l.position);
+            let co = l.compact_offset;
+            let pos_q: Vec<i32> = ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
+            let mut pos_k = Vec::with_capacity(ctx + l.b);
+            let th_abs = l.df.draft_scratch.thlog.abs_positions();
+            pos_k.extend_from_slice(&th_abs[th_abs.len().saturating_sub(ctx)..]);
+            for p in 0..l.b {
+                pos_k.push(l.position as i32 + p as i32 + co);
+            }
+            Geo { ctx, pos_q, pos_k }
+        })
+        .collect();
+    {
+        let mut dl: Vec<dflash::DraftLane<'_>> = lanes
+            .iter_mut()
+            .zip(&geos)
+            .map(|(l, g)| dflash::DraftLane {
+                b: l.b,
+                scratch: &mut l.df.draft_scratch,
+                ctx_len: g.ctx,
+                positions_q: &g.pos_q,
+                positions_k: &g.pos_k,
+            })
+            .collect();
+        dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
+    }
+
+    // One shared target lm-head over every lane's rows (seed rows included:
+    // they are discarded, the head is row-independent).
+    let w_out = &target_weights.output;
+    assert!(
+        rows * h <= head.max_n * head.hidden_k,
+        "head.rot undersized for the batched draft lm_head"
+    );
+    let hidden_all = shared.x.sub_offset(0, rows * h);
+    let logits_all = head.logits.sub_offset(0, rows * vocab);
+    let rotated = head.rot.sub_offset(0, rows * h);
+    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
+    gemm_mq_batched_lmhead(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)?;
+
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+    if draft_weights.has_candidate_selector() {
+        let mut off = 0usize;
+        for l in lanes.iter() {
+            let batch = l.b - 1;
+            let hidden_rows = shared.x.sub_offset((off + 1) * h, batch * h);
+            let logits_batch = head.logits.sub_offset((off + 1) * vocab, batch * vocab);
+            let proposal = dflash::propose_candidates_device(
+                gpu,
+                &draft_weights,
+                &l.df.draft_scratch,
+                &hidden_rows,
+                &logits_batch,
+                batch,
+                l.seed,
+                0.0,
+                None,
+            )?;
+            let mut drafted = vec![l.seed];
+            apply_dflash2_selector_proposal(
+                proposal,
+                vocab,
+                false,
+                &mut drafted,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            out.push(drafted);
+            off += l.b;
+        }
+    } else {
+        let argmax_buf = head.argmax.sub_offset(0, rows);
+        gpu.argmax_f32_batched(&logits_all, &argmax_buf, vocab, rows)?;
+        let mut host_idx = vec![0i32; rows];
+        {
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4) };
+            gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
+        }
+        let mut off = 0usize;
+        for l in lanes.iter() {
+            let mut drafted = vec![l.seed];
+            drafted.extend(host_idx[off + 1..off + l.b].iter().map(|&i| i as u32));
+            out.push(drafted);
+            off += l.b;
+        }
+    }
+    Ok(out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

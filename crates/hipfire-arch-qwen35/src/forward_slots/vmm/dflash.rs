@@ -26,8 +26,8 @@
 
 use super::{Phase, Qwen35RequestState, Qwen35VmmStore};
 use crate::dflash_cb::{
-    dflash_block_for_emit, dflash_cb_verify, dflash_lane_draft, DflashCbScratch, DflashCbVerifyLane,
-    DflashVmmLaneState,
+    dflash_block_for_emit, dflash_cb_draft, dflash_cb_verify, DflashCbDraftLane, DflashCbScratch,
+    DflashCbVerifyLane, DflashVmmLaneState,
 };
 use crate::dflash_spec::{
     dflash_prefill_lane_parts, dflash_repair_terminal_prefix_parts, new_dflash_lane_state,
@@ -112,10 +112,19 @@ impl VmmDflashEngine {
             let why = format!("context capacity {} < block {block}", assets.ctx_capacity);
             return refuse_engine(gpu, assets, why);
         }
-        match DflashCbScratch::new(gpu, config, rows) {
-            Ok(cb) => Ok(Self { assets, cb }),
-            Err(e) => refuse_engine(gpu, assets, format!("verify scratch: {e}")),
+        let mut cb = match DflashCbScratch::new(gpu, config, rows) {
+            Ok(cb) => cb,
+            Err(e) => return refuse_engine(gpu, assets, format!("verify scratch: {e}")),
+        };
+        // The batched draft's row scratch is part of the engine's footprint
+        // (a step never allocates); skipped under the kill switch.
+        if *DRAFT_BATCH_ON {
+            if let Err(e) = cb.reserve_draft(gpu, &assets.draft_config) {
+                let _ = cb.free_gpu(gpu);
+                return refuse_engine(gpu, assets, format!("draft batch scratch: {e}"));
+            }
         }
+        Ok(Self { assets, cb })
     }
 
     /// Fixed configured block (e.g. 16).
@@ -499,10 +508,14 @@ impl Qwen35VmmStore {
         Ok(())
     }
 
-    /// Provision: the singleton greedy draft of every planned DFlash Verify
-    /// lane on its own draft state (epoch-tagged: the draft and its thlog mark
-    /// are held until commit/abort). Touches only uncommitted drafter state
-    /// (projection watermarks, draft K/V of the window), never target state.
+    /// Provision: the greedy draft of every planned DFlash Verify lane on its
+    /// own draft state (epoch-tagged: the draft and its thlog mark are held
+    /// until commit/abort). Full-block lanes are drafted together through one
+    /// draft-model forward and one shared lm-head ([`dflash_cb_draft`]; kill
+    /// switch `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` drafts lane by lane with the
+    /// singleton call), byte-identical per lane. Touches only uncommitted
+    /// drafter state (projection watermarks, draft K/V of the window), never
+    /// target state.
     pub(super) fn dflash_draft_planned(
         &mut self,
         gpu: &mut Gpu,
@@ -523,31 +536,62 @@ impl Qwen35VmmStore {
         config: &Qwen35Config,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
-        let Self { slots, .. } = self;
-        for r in &plan.requests {
-            let RequestStepKind::Verify { draft_len } = r.kind else {
-                continue;
-            };
-            let s = slots
-                .iter_mut()
-                .flatten()
-                .find(|s| s.epoch == r.epoch)
-                .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
+        let planned: Vec<(RequestEpoch, usize)> = plan
+            .requests
+            .iter()
+            .filter_map(|r| match r.kind {
+                RequestStepKind::Verify { draft_len } => Some((r.epoch, draft_len + 1)),
+                _ => None,
+            })
+            .collect();
+        if planned.is_empty() {
+            return Ok(());
+        }
+        let Self { slots, dflash_engine, .. } = self;
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> = planned.iter().map(|_| None).collect();
+        for s in slots.iter_mut().flatten() {
+            if let Some(i) = planned.iter().position(|(e, _)| *e == s.epoch) {
+                owners[i] = Some(s);
+            }
+        }
+        struct Pending<'a> {
+            slot: &'a mut Option<DflashCbDraft>,
+            position: usize,
+            seed: u32,
+            max_accept: usize,
+            mark: hipfire_runtime::dflash::TargetHiddenLogMark,
+        }
+        let mut lanes: Vec<DflashCbDraftLane<'_>> = Vec::with_capacity(planned.len());
+        let mut pending: Vec<Pending<'_>> = Vec::with_capacity(planned.len());
+        for (owner, (epoch, b)) in owners.into_iter().zip(&planned) {
+            let s = owner.ok_or_else(|| format!("provision_step: epoch {epoch:?} vanished"))?;
             let Qwen35RequestState { kv, dflash, dflash_draft, position, pending_seed, .. } = s;
             let Some(lane) = dflash.as_mut() else {
                 continue;
             };
             let seed = pending_seed.ok_or("provision_step: DFlash lane without a pending seed")?;
-            let mark = lane.df.draft_scratch.thlog.mark();
-            let compact = kv.compact_offset as i32;
-            let tokens = dflash_lane_draft(gpu, weights, config, compact, &mut lane.df, *position, seed, draft_len + 1)
-                .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
-            *dflash_draft = Some(DflashCbDraft {
+            pending.push(Pending {
+                slot: dflash_draft,
                 position: *position,
                 seed,
-                verify_tokens: tokens,
                 max_accept: lane.max_emit.saturating_sub(1),
-                thlog_mark: mark,
+                mark: lane.df.draft_scratch.thlog.mark(),
+            });
+            lanes.push(DflashCbDraftLane { state: lane, position: *position, seed, b: *b, compact_offset: kv.compact_offset as i32 });
+        }
+        if lanes.is_empty() {
+            return Ok(());
+        }
+        let engine = dflash_engine.as_mut().ok_or("provision_step: DFlash lanes without a DFlash engine")?;
+        let tokens = dflash_cb_draft(gpu, weights, config, &mut engine.cb, &mut lanes, *DRAFT_BATCH_ON)
+            .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
+        for (p, t) in pending.into_iter().zip(tokens) {
+            *p.slot = Some(DflashCbDraft {
+                position: p.position,
+                seed: p.seed,
+                verify_tokens: t,
+                max_accept: p.max_accept,
+                thlog_mark: p.mark,
             });
         }
         Ok(())
@@ -690,6 +734,13 @@ impl Qwen35VmmStore {
         })
     }
 }
+
+/// `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` (developer kill switch): draft every DFlash
+/// lane with its own singleton call instead of batching full-block lanes
+/// through one draft-model forward. Default on (byte-identical per lane).
+static DRAFT_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH").map_or(true, |v| v.trim() != "0")
+});
 
 /// `HIPFIRE_CB_PHASES=1`: synchronized wall time of the DFlash lane phases
 /// (draft / shared verify / per-lane accept), summed and printed to stderr

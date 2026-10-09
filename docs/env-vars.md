@@ -567,7 +567,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1460
+**Count:** 1461
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -659,6 +659,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh | harness |
 | `HIPFIRE_CASK_OFF` | crates/hipfire-arch-qwen35/tests/pm_decode_twins_hw.rs, scripts/redline_daemon_harness.py | deprecated |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs | deprecated |
+| `HIPFIRE_CB_DFLASH_DRAFT_BATCH` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs | developer |
 | `HIPFIRE_CB_PHASES` | crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_CB_SEG_TWINS` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_CHATML` | crates/saddle-lab/examples/probe_argmax_agreement.rs | harness |
@@ -2019,7 +2020,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_WEIGHT_CACHE_FLAT_GEMV` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_WIDENED_PBS_GROW_ONLY` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
-| `HIPFIRE_WMMA_BATCH_TILES` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_WMMA_BATCH_TILES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_WMMA_FA` | benchmarks/results/wmma-fa-probe-gfx1100.sh, benchmarks/results/wmma-fa-probe.sh | developer |
 | `HIPFIRE_WMMA_FA_MIN_BATCH` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_WMMA_PREFILL` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
