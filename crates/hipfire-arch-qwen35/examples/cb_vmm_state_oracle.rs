@@ -4,7 +4,7 @@
 //!
 //! cb_vmm_state_oracle <model> --ks 1,2,3,4,5,6,7,8 --contexts 512,8192,32768
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
-//!     [--phase all|singleton] [--stop-repeats N]
+//!     [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]
 //!
 //! `--contexts` are test prefix lengths, never max_seq overrides: the model
 //! loads through the production `load_qwen35_bundle` with automatic VMM
@@ -66,6 +66,8 @@ struct Args {
     batch: bool,
     /// In-process repetitions of the stop_id case (repeatability check).
     stop_repeats: usize,
+    /// Sequential 2-request cycles for the memory-drift check (0 = off).
+    drift_cycles: usize,
 }
 
 fn parse_list(s: &str) -> Result<Vec<usize>> {
@@ -83,9 +85,10 @@ fn parse_args() -> Result<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: cb_vmm_state_oracle <model> --ks 1,..,8 --contexts 512,8192,32768 \
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
-                 [--phase all|singleton] [--stop-repeats N]";
+                 [--phase all|singleton] [--stop-repeats N] [--drift-cycles N]";
     let mut batch = true;
     let mut stop_repeats = 1usize;
+    let mut drift_cycles = 0usize;
     let model = raw.first().ok_or(usage)?.clone();
     let (mut ks, mut contexts, mut steps, mut out, mut short, mut artifacts) =
         (None, None, None, None, 256usize, None);
@@ -100,6 +103,7 @@ fn parse_args() -> Result<Args> {
             "--short" => short = val.parse()?,
             "--artifacts" => artifacts = Some(PathBuf::from(val)),
             "--stop-repeats" => stop_repeats = val.parse::<usize>()?.max(1),
+            "--drift-cycles" => drift_cycles = val.parse()?,
             "--phase" => {
                 batch = match val.as_str() {
                     "all" => true,
@@ -127,7 +131,7 @@ fn parse_args() -> Result<Args> {
     if steps < 8 {
         return Err("--steps must be >= 8 (negative controls need 8 steps)".into());
     }
-    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats })
+    Ok(Args { model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles })
 }
 
 /// One isolated request fixture: request-unique prompt at an exact length.
@@ -1068,6 +1072,91 @@ fn compare_sink(i: usize) -> Sink {
     Sink::Compare { b: i, a: i, vs_b: Diff::default(), vs_a: Diff::default() }
 }
 
+/// Free VRAM and pool counters `(free, pool_new, pool_reused, pool_bytes_new)`.
+fn mem_sample(gpu: &Gpu) -> Result<(usize, usize, usize, usize)> {
+    gpu.hip.device_synchronize()?;
+    let (n, r, b) = gpu.pool_stats();
+    Ok((free_vram(gpu)?, n, r, b))
+}
+
+/// Memory drift over `cycles` sequential 2-request admit/run/retire cycles
+/// (the two shortest fixtures, 8 picks each, byte-compared like every
+/// case), plus isolation probes that attribute any drift: DeltaNet state
+/// alone and a whole request owner (VMM KV + DN) allocated and freed with
+/// no forward. Bounded = the last 10 cycles together lose < 16 MiB.
+fn drift_check(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], refs: &Refs, supported: &[usize], cycles: usize) -> Result<(Value, bool)> {
+    let mut by_len = supported.to_vec();
+    by_len.sort_by_key(|&i| fx[i].prefix);
+    let (c0, c1) = (by_len[0], by_len[1]);
+    let mut rows = Vec::with_capacity(cycles);
+    let mut exact_all = true;
+    let start = mem_sample(&ctx.gpu)?;
+    for c in 0..cycles {
+        let before = mem_sample(&ctx.gpu)?;
+        let tag = 20_000 + 10 * c as u64;
+        let mut reqs = vec![
+            Req::new(c0, tag, 1, c % WIDTH, 8, compare_sink(c0)),
+            Req::new(c1, tag + 1, 1, (c + 4) % WIDTH, 8, compare_sink(c1)),
+        ];
+        // `steps` far above 8 picks: no "final" (256-step) state comparison.
+        drive(ctx, store, fx, &mut reqs, refs, usize::MAX - 1, None)?;
+        let after = mem_sample(&ctx.gpu)?;
+        let exact = reqs.iter().all(|r| matches!(&r.sink, Sink::Compare { vs_b, vs_a, .. } if vs_b.exact() && vs_a.exact()) && r.store_watermark_errors.is_empty());
+        exact_all &= exact;
+        let d_free = after.0 as i64 - before.0 as i64;
+        rows.push(json!({
+            "cycle": c, "free_before": before.0, "free_after": after.0, "free_delta": d_free,
+            "pool_new_delta": after.1 - before.1, "pool_reused_delta": after.2 - before.2,
+            "pool_bytes_new_delta": after.3 - before.3, "exact": exact,
+        }));
+        if c < 3 || c + 3 >= cycles || c % 10 == 0 {
+            eprintln!("drift cycle {c}: free_delta={d_free} pool_new+={} pool_bytes_new+={} exact={exact}", after.1 - before.1, after.3 - before.3);
+        }
+    }
+    let end = mem_sample(&ctx.gpu)?;
+    let deltas: Vec<i64> = rows.iter().map(|r| r["free_delta"].as_i64().unwrap()).collect();
+    let last10: i64 = deltas.iter().rev().take(10).sum();
+    let first10: i64 = deltas.iter().take(10).sum();
+    let bounded = last10 > -(16 << 20);
+    // Attribution probes (no forward, no admit).
+    let probe = |ctx: &mut Ctx, kind: &str, n: usize| -> Result<Value> {
+        let s0 = mem_sample(&ctx.gpu)?;
+        for i in 0..n {
+            match kind {
+                "dn_state" => {
+                    let dn = DeltaNetState::new_with_quant(&mut ctx.gpu, &ctx.b.config, ctx.b.dn_state.quant)?;
+                    dn.free_gpu(&mut ctx.gpu);
+                }
+                _ => {
+                    let init = VmmRequestInit { prompt_len: 1, stop_ids: vec![], sampler: SamplerConfig::greedy(), rng_state: 0, history: vec![] };
+                    let epoch = RequestEpoch { request_tag: 30_000 + i as u64, owner_generation: 1 };
+                    let st = Qwen35RequestState::new_like(&mut ctx.gpu, &ctx.b.config, &ctx.b.kv_cache, &ctx.b.dn_state, epoch, 0, init)?;
+                    st.free_gpu(&mut ctx.gpu)?;
+                }
+            }
+        }
+        let s1 = mem_sample(&ctx.gpu)?;
+        let v = json!({"iterations": n, "free_delta": s1.0 as i64 - s0.0 as i64, "pool_new_delta": s1.1 - s0.1, "pool_bytes_new_delta": s1.3 - s0.3});
+        eprintln!("drift probe {kind}: {v}");
+        Ok(v)
+    };
+    let p_dn = probe(ctx, "dn_state", 10)?;
+    let p_owner = probe(ctx, "request_owner", 10)?;
+    eprintln!(
+        "drift: cycles={cycles} total_free_delta={} first10={first10} last10={last10} bounded={bounded} exact={exact_all}",
+        end.0 as i64 - start.0 as i64
+    );
+    let v = json!({
+        "cycles": cycles, "fixtures": [fx[c0].name(), fx[c1].name()], "picks_per_request": 8,
+        "start": {"free": start.0, "pool_new": start.1, "pool_reused": start.2, "pool_bytes_new": start.3},
+        "end": {"free": end.0, "pool_new": end.1, "pool_reused": end.2, "pool_bytes_new": end.3},
+        "total_free_delta": end.0 as i64 - start.0 as i64, "first10_free_delta": first10, "last10_free_delta": last10,
+        "bounded": bounded, "all_exact": exact_all,
+        "probe_dn_state_x10": p_dn, "probe_request_owner_x10": p_owner, "per_cycle": rows,
+    });
+    Ok((v, bounded && exact_all))
+}
+
 /// Whole batch phase. Returns (report, pass).
 fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> Result<(Value, bool)> {
     let mut store = new_store(ctx)?;
@@ -1259,6 +1348,11 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
             "accepted_by_executor": res.is_ok(), "error": res.err(),
             "note": "full/partial accept, EOS-in-draft and spec max_tokens clipping need Verify rows (Slice2A); not certified until accepted",
         }));
+    }
+    if args.drift_cycles > 0 && supported.len() >= 2 {
+        let (drift, ok) = drift_check(ctx, &mut store, fx, &refs, &supported, args.drift_cycles)?;
+        out.insert("memory_drift".into(), drift);
+        pass &= ok;
     }
     out.insert("cases".into(), Value::Array(cases));
     let k1_route = out["executor_k1"]
