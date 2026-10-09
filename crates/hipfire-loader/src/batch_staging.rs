@@ -672,6 +672,7 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
     }
     let engine = match hipfire_arch_qwen35::forward_slots::vmm::dflash::VmmDflashEngine::new(
         gpu,
+        &b.weights,
         &b.config,
         assets,
         row_budget.min(hipfire_arch_qwen35::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS),

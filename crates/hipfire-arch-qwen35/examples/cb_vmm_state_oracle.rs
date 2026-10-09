@@ -4310,7 +4310,7 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
     let (dim, vocab) = (slot.config.dim, slot.config.vocab_size);
     let vs = VerifyScratch::new(&mut gpu, MULTI_CHUNK_MAX_ROWS, dim, vocab, dim.next_power_of_two())?;
     let mc = MultiChunkScratch::new(&mut gpu, &slot.config, MULTI_CHUNK_MAX_ROWS)?;
-    let mut cb = DflashCbScratch::new(&mut gpu, &slot.config, MULTI_CHUNK_MAX_ROWS)?;
+    let mut cb = DflashCbScratch::new(&mut gpu, &slot.weights, &slot.config, MULTI_CHUNK_MAX_ROWS)?;
     cb.keep_lane_rows = true;
     let wide = WideExpect::new(&gpu, &slot);
     eprintln!(

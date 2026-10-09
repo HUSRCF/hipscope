@@ -32,7 +32,7 @@ use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{
-    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_row_cap, pack_whole_lanes, MultiChunkRequest,
+    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::prefill::DenseBatchMath;
@@ -320,11 +320,12 @@ pub struct DflashCbScratch {
 }
 
 impl DflashCbScratch {
-    /// `max_rows` is clamped to `2..=multi_chunk_row_cap(gpu)`: one trunk
-    /// chunk's rows (63 unless `HIPFIRE_CB_VERIFY_CHUNK128` is on, then up to
-    /// 128). The scratch stores the effective cap ([`Self::max_rows`]).
-    pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let max_rows = max_rows.clamp(2, multi_chunk_row_cap(gpu));
+    /// `max_rows` is the planned rows; the scratch allocates this target's
+    /// effective cap ([`multi_chunk_scratch_rows`]: `2..=63`, or up to 128
+    /// only when the wide verify route is admitted for `weights`/`config`).
+    /// The scratch stores that cap ([`Self::max_rows`]).
+    pub fn new(gpu: &mut Gpu, weights: &Qwen35Weights, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
+        let max_rows = multi_chunk_scratch_rows(gpu, weights, config, max_rows);
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
         let head = match VerifyScratch::new(gpu, max_rows, config.dim, config.vocab_size, config.dim.next_power_of_two()) {
             Ok(h) => h,

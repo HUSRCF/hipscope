@@ -144,6 +144,18 @@ fn pack_cap_for(wide_admitted: bool, cap: usize) -> usize {
     cap.min(if wide_admitted { MULTI_CHUNK_MAX_ROWS } else { MULTI_CHUNK_PRODUCT_MAX_ROWS })
 }
 
+/// Rows a shared verify scratch planned for `requested` rows allocates on
+/// this target: its effective packing cap ([`multi_chunk_pack_cap`]), at
+/// least [`MIN_BATCH`]. A target the wide route does not admit allocates at
+/// most [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] rows, whatever the device cap.
+pub fn multi_chunk_scratch_rows(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, requested: usize) -> usize {
+    scratch_rows_for(multi_chunk_wide_admitted(gpu, weights, config), requested)
+}
+
+fn scratch_rows_for(wide_admitted: bool, requested: usize) -> usize {
+    pack_cap_for(wide_admitted, requested).max(MIN_BATCH)
+}
+
 /// Pack whole lanes, in order, into trunk chunks of at most
 /// `min(max_rows, MULTI_CHUNK_MAX_ROWS)` rows: `rows[i]` is lane `i`'s row
 /// count and `max_rows` the caller's effective cap (63 on the product route;
@@ -771,7 +783,9 @@ pub fn forward_prefill_batch_multi(
 
 #[cfg(test)]
 mod pack_tests {
-    use super::{multi_chunk_wide_route, pack_whole_lanes, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS};
+    use super::{
+        multi_chunk_wide_route, pack_whole_lanes, scratch_rows_for, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
+    };
     use rdna_compute::FeatureFlags;
 
     /// gfx1201 defaults with `HIPFIRE_CB_VERIFY_CHUNK128=1` (the env default of
@@ -803,6 +817,27 @@ mod pack_tests {
             set(&mut f);
             assert!(!multi_chunk_wide_route("gfx1201", &f), "{name} must refuse wide admission");
         }
+    }
+
+    #[test]
+    fn scratch_rows_equal_the_effective_cap() {
+        // Admitted: the planned rows, up to 128.
+        assert_eq!(scratch_rows_for(true, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_MAX_ROWS);
+        assert_eq!(scratch_rows_for(true, 4096), MULTI_CHUNK_MAX_ROWS);
+        assert_eq!(scratch_rows_for(true, 96), 96);
+        // Not admitted (any refusing switch, a non-dense target, flag off):
+        // exactly the product cap, as before the wide route existed.
+        for (name, set) in SINGLETON_ARM_SWITCHES {
+            let mut f = chunk128_flags();
+            set(&mut f);
+            let rows = scratch_rows_for(multi_chunk_wide_route("gfx1201", &f), MULTI_CHUNK_MAX_ROWS);
+            assert_eq!(rows, MULTI_CHUNK_PRODUCT_MAX_ROWS, "{name}");
+        }
+        assert_eq!(scratch_rows_for(false, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_PRODUCT_MAX_ROWS);
+        assert_eq!(scratch_rows_for(false, 32), 32);
+        // Never below the batched-prefill minimum.
+        assert_eq!(scratch_rows_for(false, 0), 2);
+        assert_eq!(scratch_rows_for(true, 1), 2);
     }
 
     fn pack(rows: &[usize], cap: usize) -> Vec<std::ops::Range<usize>> {
