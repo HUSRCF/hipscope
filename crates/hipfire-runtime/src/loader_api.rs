@@ -57,6 +57,49 @@ impl ModelSource {
     }
 }
 
+/// Owned header tensor metadata for kernel route planning
+/// (`rdna_compute::kernel_registry::KernelTensorMeta` borrows from it).
+/// Header-only: no tensor payload is read.
+pub struct HeaderTensorMeta {
+    pub name: String,
+    pub dtype: rdna_compute::DType,
+    pub shape: Vec<usize>,
+}
+
+/// Storage dtype for an HFQ `quant_type` tag. Tags without a planner-relevant
+/// mapping become `Raw`, which no closed route fingerprint accepts.
+fn kernel_dtype_for_quant_type(quant_type: u8) -> rdna_compute::DType {
+    use rdna_compute::DType;
+    match quant_type {
+        1 => DType::F16,
+        2 => DType::F32,
+        3 => DType::Q8_0,
+        6 => DType::HFQ4G256,
+        13 => DType::MQ4G256,
+        15 => DType::MQ6G256,
+        16 => DType::BF16,
+        44 => DType::MQ4G256V2,
+        47 => DType::MQ6G256V2,
+        48 => DType::MQ5G256V2,
+        49 => DType::MQ3G256V2,
+        50 => DType::MQ2G256V2,
+        53 => DType::MQ4G128V2,
+        _ => DType::Raw,
+    }
+}
+
+/// Header tensor names, storage dtypes and shapes of `hfq`.
+pub fn header_tensor_meta(hfq: &HfqFile) -> Vec<HeaderTensorMeta> {
+    hfq.tensor_infos()
+        .iter()
+        .map(|info| HeaderTensorMeta {
+            name: info.name.clone(),
+            dtype: kernel_dtype_for_quant_type(info.quant_type),
+            shape: info.shape.iter().map(|&d| d as usize).collect(),
+        })
+        .collect()
+}
+
 /// Qwen's load-time sequence decision: capacity is filled from actual free
 /// VRAM after weights upload and before its VMM cache is constructed.
 #[derive(Clone, Copy)]

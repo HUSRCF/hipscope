@@ -9,6 +9,7 @@ pub mod attention;
 pub mod cdna;
 pub mod code_object;
 mod compiler;
+pub mod compile_jobs;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;

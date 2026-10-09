@@ -1457,7 +1457,7 @@ fn prefill_chunk_rows_default(arch: &str) -> usize {
 /// wins, then `prefill.chunk_rows` (config file or
 /// `HIPFIRE_PREFILL_CHUNK_ROWS`), then the arch default above. Values below
 /// `WIDENED_COMMIT_ROWS` keep legacy behavior downstream.
-fn prefill_chunk_rows_requested(gpu: &Gpu) -> usize {
+pub fn prefill_chunk_rows_requested(gpu: &Gpu) -> usize {
     if let Some(explicit) = explicit_prefill_max_batch() {
         return explicit;
     }

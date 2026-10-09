@@ -175,6 +175,18 @@ rdna-compute Gpu methods  ↔  hipfire-dispatch family tables
 Serve long-running path: same daemon binary, HTTP surface documented in
 [`SERVE.md`](SERVE.md); chat attach in [`CHAT.md`](CHAT.md).
 
+**Kernel readiness at load.** `load_admitted_with_gemma4_drafter` (the common
+single-GPU/PP loader) asks `kernel_registry::route_entries` for the load's
+kernel closure. A closed route (today: Qwen3.6-27B MQ4G256V2 XTS on exact
+gfx1201, AR or native MTP) begins its bounded batch compile
+(`Gpu::begin_route_kernel_load`) while weights upload; the first kernel
+request or launch drains it and loads every planned HIP and embedded
+PeaceMaker image (`ensure_route_modules_preloaded`); after the model loads,
+`finish_route_kernel_load` seals the route, so `loaded` implies no further
+compile or module load. Refused routes keep lazy per-kernel JIT; unload and
+the next load reset the route. Details and the worker budget:
+[`env-vars.md`](env-vars.md) (`HIPFIRE_JIT_JOBS`).
+
 ## Model sources (not “two model paths”)
 
 Load is **source × carrier**, not a two-file hard split.

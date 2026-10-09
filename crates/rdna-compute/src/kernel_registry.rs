@@ -6,7 +6,7 @@
 //! JIT modules of the admitted default Redline programs, and for railgun's
 //! own copy kernels. This is a packaging inventory, not a replacement for the
 //! runtime's dispatch policy. Every source below is the Rust source
-//! expression supplied to `ensure_kernel` or to `precompile_qwen35` (for
+//! expression supplied to `ensure_kernel` (for
 //! railgun, the source its lowering will JIT); never infer module names from
 //! HIP filenames.
 
@@ -93,10 +93,16 @@ impl KernelEntry {
 pub enum RegistryError {
     UnsupportedArch(String),
     UnsupportedModule { arch: String, module: String },
+    /// The header/policy is outside every closed route: the caller keeps
+    /// lazy loading for it. Never a partial plan.
+    UnsupportedRoute(String),
+    /// Two selected images claim one public entry, or one module name
+    /// resolves to two different recipes.
+    ConflictingPlan(String),
 }
 
 fn prepend_kv_slot_desc(body: &str) -> String {
-    // Same assembly as attention.rs and dispatch.rs precompile_qwen35.
+    // Same assembly as attention.rs `ensure_givens4_kernel`.
     format!(
         "{}\n{}",
         kernels::KV_SLOT_DESC_H,
@@ -181,7 +187,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         };
     }
 
-    // precompile_qwen35 common kernels (dispatch.rs:4852-4897,5176-5203).
+    // Common Qwen3.5 kernels (historical whole-model precompile set).
     add!("rmsnorm", kernels::RMSNORM_SRC, ["rmsnorm_f32"]);
     add!("add_inplace", kernels::ADD_INPLACE_SRC, ["add_inplace_f32"]);
     add!("mul", kernels::MUL_SRC, ["mul_f32"]);
@@ -1160,6 +1166,411 @@ pub fn lookup(arch: &str, module: &str, extra_flags: &str) -> Result<KernelEntry
             arch: arch.to_owned(),
             module: module.to_owned(),
         })
+}
+
+// ── A3: header-selected route closure ──────────────────────────────────
+//
+// `route_entries` maps an already-resolved load (header tensor metadata,
+// arch, KV/state axes, spec route, process-frozen feature flags) to every
+// kernel module that route can request from load through prefill, decode,
+// sampling, retained replay and (for native MTP) draft/verify/rollback, so a
+// loader can compile and load the whole closure before the first dispatch.
+// It is CPU-only and pure: no weight payload, compiler, or HIP call.
+//
+// Only routes whose closure was walked from source and cross-checked against
+// a module-load audit of every request family are admitted; everything else
+// (other models/arches, explicit drafter routes, non-default feature flags or
+// policy axes) is `UnsupportedRoute`, and the caller keeps lazy loading.
+// Closures assume the default developer environment (no `HIPFIRE_*`
+// developer override of a launcher selector); such overrides are outside
+// this plan and are caught by the loader's post-ready barrier, not here.
+
+/// Borrowed header tensor metadata: name, storage dtype and shape.
+#[derive(Clone, Copy, Debug)]
+pub struct KernelTensorMeta<'a> {
+    pub name: &'a str,
+    pub dtype: crate::DType,
+    pub shape: &'a [usize],
+}
+
+/// The upper layer's already-resolved speculative route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelSpecRoute {
+    Ar,
+    NativeMtp,
+    DFlash,
+    DDTree,
+    DSpark,
+}
+
+/// Everything a route closure depends on. `tensors` lists the primary model
+/// header plus, for a sidecar native-MTP head, the head's tensors.
+pub struct RouteKernelInput<'a> {
+    pub arch: &'a str,
+    pub model_arch: u32,
+    pub tensors: &'a [KernelTensorMeta<'a>],
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seq: usize,
+    pub prefill_chunk_rows: usize,
+    pub kv_k: &'a str,
+    pub kv_v: &'a str,
+    pub state_quant: &'a str,
+    pub spec: KernelSpecRoute,
+    pub host_mapped_experts: bool,
+    pub retained_decode: bool,
+    pub hipcc_extra_flags: &'a str,
+    pub flags: &'a crate::feature_flags::FeatureFlags,
+}
+
+#[derive(Debug)]
+pub enum PlannedKernel {
+    Hip(KernelEntry),
+    Embedded {
+        module: &'static str,
+        image: &'static [u8],
+        symbols: &'static [&'static str],
+    },
+}
+
+impl PlannedKernel {
+    pub fn module(&self) -> &'static str {
+        match self {
+            Self::Hip(entry) => entry.module,
+            Self::Embedded { module, .. } => module,
+        }
+    }
+
+    pub fn symbols(&self) -> &'static [&'static str] {
+        match self {
+            Self::Hip(entry) => entry.symbols,
+            Self::Embedded { symbols, .. } => symbols,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RouteKernelPlan {
+    pub entries: Vec<PlannedKernel>,
+}
+
+/// One HIP module of a closed route: the module name the launcher passes to
+/// `ensure_kernel` and exactly the symbols the route requests from it. The
+/// source is the registry's launcher-identical expression for that module.
+type RouteHip = (&'static str, &'static [&'static str]);
+
+/// Qwen3.6-27B dense MQ4G256V2 XTS on exact gfx1201, AR route: native fp8
+/// K/V, Q8 DeltaNet state, widened 8192-row prefill and its 512-row legacy
+/// fallback, lowered single-token decode (direct and retained replay), and
+/// the AR sampler for every request option (`sample_top_p_pf`: the 20-wide
+/// parallel module including its penalty prepass, the >20 top-k 64-wide
+/// module, and the tie-safe fast21/fast65 reducers). Prefill attention spans
+/// every rows/context class of `AttnFp8E4m3KvBatchedMasked`: Q-resident FA2
+/// (64..=512 rows or 512-multiples, with and without the A4 epilogue),
+/// VerifyAttn (<= 32 rows past the 4096-context crossover), the flash tile
+/// with its batched asym reduce (33..63 rows past it), and the scalar kernel
+/// below it.
+const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
+    ("attention_flash_asym_reduce_batched", &["attention_flash_asym_reduce_batched"]),
+    ("attention_flash_fp8_e4m3_tile_batched", &["attention_flash_fp8_e4m3_tile_batched"]),
+    ("attention_flash_fp8_e4m3_tile_gqa_gfx1201", &["attention_flash_fp8_e4m3_tile_gqa_gfx1201"]),
+    ("attention_flash_reduce_dsplit_gfx1201", &["attention_flash_reduce_dsplit_gfx1201"]),
+    ("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201"]),
+    ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201"]),
+    ("attention_fp8_e4m3_kv_batched", &["attention_fp8_e4m3_kv_batched"]),
+    ("attention_verify_gqa_gfx1201", &["attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]),
+    ("conv1d_silu_split_qknorm_b256", &["conv1d_silu_split_qknorm_b256"]),
+    ("convert_f32_to_f16", &["convert_f32_to_f16"]),
+    ("dflash_state_bulk_copy_gfx1100", &["dflash_state_bulk_copy_gfx1100"]),
+    ("embedding_q8", &["embedding_q8"]),
+    ("embedding_q8_batched", &["embedding_q8_batched"]),
+    ("fused_gate_up_hfq4g256_mq4v2", &["fused_gate_up_mq4g256v2"]),
+    ("fused_qkv_hfq4g256_mq4v2", &["fused_qkv_mq4g256v2"]),
+    ("fused_qkvza_hfq4g256_mq4v2", &["fused_qkvza_mq4g256v2"]),
+    ("fused_rmsnorm_mq_rotate_awq", &["fused_rmsnorm_mq_rotate_awq"]),
+    ("fused_rmsnorm_mq_rotate_awq_g12dec", &["fused_rmsnorm_mq_rotate_awq_g12dec"]),
+    ("fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv", &["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv"]),
+    ("fused_sigmoid_alpha_gate", &["fused_sigmoid_alpha_gate_f32"]),
+    ("fused_silu_mul_mq_rotate_awq", &["fused_silu_mul_mq_rotate_awq"]),
+    ("fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast", &["fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast"]),
+    ("gated_delta_net_q8_compact3_b2", &["gated_delta_net_q8_compact3_b2"]),
+    ("gated_delta_net_q8_fast", &["gated_delta_net_q8_fast"]),
+    ("gated_norm", &["gated_norm_f32"]),
+    ("gated_norm_mq_rotate_awq_i4_gfx12_v2_slab", &["gated_norm_mq_rotate_awq_i4_gfx12_v2_slab"]),
+    ("gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab", &["gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab"]),
+    ("gated_norm_mq_rotate_awq_k6144_gfx1201", &["gated_norm_mq_rotate_awq_k6144_gfx1201"]),
+    ("gdn_chunk_kkt_solve", &["gdn_chunk_kkt_solve"]),
+    ("gdn_chunk_kkt_solve_batched", &["gdn_chunk_kkt_solve_batched"]),
+    ("gdn_chunk_prep", &["gdn_chunk_prep"]),
+    ("gdn_chunk_prep_fixup", &["gdn_chunk_prep_fixup"]),
+    ("gdn_chunk_scan_bf16", &["gdn_chunk_scan_bf16"]),
+    ("gdn_chunk_scan_bf16_mseg", &["gdn_chunk_scan_bf16_mseg"]),
+    ("gdn_pre_batched_gfx1201", &["gdn_pre_batched_gfx1201"]),
+    ("gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", &["gemm_gate_up_mq4g256v2_wmma_gfx12"]),
+    ("gemm_hfq4g256_residual_wmma_gfx12_mq4v2", &["gemm_mq4g256v2_residual_wmma_gfx12"]),
+    ("gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkv_mq4g256v2_wmma_gfx12"]),
+    ("gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkvza_mq4g256v2_wmma_gfx12"]),
+    ("gemv_hfq4g256_multirow_default_mq4v2", &["gemv_mq4g256v2_multirow_r2"]),
+    ("gemv_hfq4g256_residual_mq4v2", &["gemv_mq4g256v2_residual"]),
+    ("gemv_mq4g256v2_mq4v2", &["gemv_mq4g256v2"]),
+    ("kv_cache_write_fp8_e4m3", &["kv_cache_write_fp8_e4m3"]),
+    ("kv_cache_write_fp8_e4m3_batched", &["kv_cache_write_fp8_e4m3_batched"]),
+    ("mq_rotate_x", &["mq_rotate_x"]),
+    ("qwen35_fa_prep_batched_gfx1201", &["qwen35_fa_prep_batched_gfx1201"]),
+    ("qwen35_fa_prep_fp8q_nogate_batched_gfx1201", &["qwen35_fa_prep_fp8q_nogate_batched_gfx1201"]),
+    ("qwen36_27b_fa_prep_gfx1201", &["qwen36_27b_fa_prep_gfx1201"]),
+    ("rmsnorm_f32_rowsplit", &["rmsnorm_f32_rowsplit"]),
+    ("rotate_x_mq_awq", &["rotate_x_mq_awq"]),
+    ("sample_top_p_parallel", &["sample_apply_repeat_penalty", "sample_topk_partial", "sample_topk_finalize"]),
+    ("sample_top_p_parallel_fast21", &["sample_topk_partial_fast21", "sample_topk_finalize_fast21"]),
+    ("sample_top_p_parallel_fast65", &["sample_topk_partial_fast65", "sample_topk_finalize_fast65"]),
+    ("sample_top_p_parallel_w64", &["sample_apply_repeat_penalty_w64", "sample_topk_partial_w64", "sample_topk_finalize_w64"]),
+    ("sigmoid_mul", &["sigmoid_mul_f32"]),
+    ("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", &["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]),
+];
+
+/// Native-MTP additions to [`QWEN36_27B_GFX1201_AR_HIP`] for the sidecar
+/// MQ4G256 head (compressed-serial speculator): the head's prompt fill,
+/// Q8-KV head attention, greedy/temperature verify and accept, and the
+/// DeltaNet snapshot/replay rollback. The AR closure stays included because
+/// the MTP route falls back to AR for requests that do not fit the draft
+/// context (`hipfire-generate` `spec_ctx_request_fits`).
+const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
+    ("add_inplace", &["add_inplace_f32"]),
+    ("argmax_token_chain", &["argmax_token_chain_f32"]),
+    ("attention_flash_q8_0_reduce", &["attention_flash_q8_0_reduce"]),
+    ("attention_flash_q8_0_tile", &["attention_flash_q8_0_tile"]),
+    ("conv1d_silu_split", &["conv1d_silu_split_f32"]),
+    ("deinterleave", &["deinterleave_f32"]),
+    ("deinterleave_batched", &["deinterleave_f32_batched"]),
+    ("dflash_gdn_replay_pre_ml", &["dflash_gdn_replay_pre_ml"]),
+    ("fused_qk_l2_norm_scale_interleave_f32_batched", &["fused_qk_l2_norm_scale_interleave_f32_batched"]),
+    ("gated_delta_net_q8_fast_ml", &["gated_delta_net_q8_fast_ml"]),
+    ("gemm_hfq4g256", &["gemm_hfq4g256"]),
+    ("gemv_hfq4g256", &["gemv_hfq4g256"]),
+    ("gemv_hfq4g256_multirow_default", &["gemv_hfq4g256_multirow_r2"]),
+    ("greedy_accept", &["greedy_accept_from_argmax_i32"]),
+    ("kv_cache_write_q8_0", &["kv_cache_write_q8_0"]),
+    ("kv_cache_write_q8_0_batched", &["kv_cache_write_q8_0_batched"]),
+    ("rmsnorm", &["rmsnorm_f32"]),
+    ("rope_partial_halfsplit_batched", &["rope_partial_halfsplit_batched_f32"]),
+    ("rope_partial_halfsplit_f32_headgrid", &["rope_partial_halfsplit_f32_headgrid"]),
+    ("select_regrid", &["argmax_f32_batched_regrid"]),
+    ("silu_mul", &["silu_mul_f32"]),
+    ("softmax_temp_topp_batched", &["softmax_temp_topp_batched_f32"]),
+];
+
+/// The gfx1201 slab IU4 MMQ bundle every 27B prefill projection selects
+/// (`gemm.rs` `g12_iu4_b1s_image`, default A4 slab route).
+const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
+    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+];
+
+/// Header-selected kernel closure for one resolved load. Refuses (never
+/// returns a partial plan) when the model, arch, policy axes, spec route or
+/// feature flags are outside a closed route.
+pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, RegistryError> {
+    let refuse = |why: String| Err(RegistryError::UnsupportedRoute(why));
+    match input.spec {
+        KernelSpecRoute::Ar | KernelSpecRoute::NativeMtp => {}
+        other => {
+            return refuse(format!(
+                "{other:?} needs a separately admitted drafter header; no closed route"
+            ))
+        }
+    }
+    if input.host_mapped_experts {
+        return refuse("host-mapped experts have no closed route".into());
+    }
+    let default_flags = default_feature_flags(input.arch)?;
+    if format!("{:?}", input.flags) != format!("{default_flags:?}") {
+        return refuse(format!("non-default feature flags on {}", input.arch));
+    }
+    let (hip, embedded): (Vec<&[RouteHip]>, _) = match qwen36_27b_route(input)? {
+        Some(mtp) => {
+            let mut hip = vec![QWEN36_27B_GFX1201_AR_HIP];
+            if mtp {
+                hip.push(QWEN36_27B_GFX1201_MTP_HIP);
+            }
+            let b1s = PlannedKernel::Embedded {
+                module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
+                image: crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+                symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
+            };
+            (hip, vec![b1s])
+        }
+        None => {
+            return refuse(format!(
+                "model arch {} on {} has no closed route",
+                input.model_arch, input.arch
+            ))
+        }
+    };
+    let corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
+    let mut entries = embedded;
+    for &(module, symbols) in hip.into_iter().flatten() {
+        let mut matches = corpus.iter().filter(|entry| entry.module == module);
+        let found = matches.next().ok_or_else(|| RegistryError::UnsupportedModule {
+            arch: input.arch.to_owned(),
+            module: module.to_owned(),
+        })?;
+        if matches.any(|other| other.source != found.source || other.flags != found.flags) {
+            return Err(RegistryError::ConflictingPlan(format!(
+                "module {module} has two registry recipes"
+            )));
+        }
+        entries.push(PlannedKernel::Hip(KernelEntry {
+            arch: found.arch,
+            module,
+            symbols,
+            source: found.source.clone(),
+            flags: found.flags.clone(),
+            scheduler_profile: found.scheduler_profile.clone(),
+        }));
+    }
+    let plan = RouteKernelPlan { entries };
+    validate_route_plan(&plan)?;
+    Ok(plan)
+}
+
+/// One selected image per public entry and one recipe per module name. Any
+/// other plan is refused before loading: the function cache is keyed by
+/// entry name, so mutually exclusive images exporting one name cannot both
+/// be preloaded.
+pub fn validate_route_plan(plan: &RouteKernelPlan) -> Result<(), RegistryError> {
+    let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, entry) in plan.entries.iter().enumerate() {
+        let module = entry.module();
+        if let Some(previous) = plan.entries[..index].iter().find(|e| e.module() == module) {
+            let same_recipe = match (previous, entry) {
+                (PlannedKernel::Hip(a), PlannedKernel::Hip(b)) => {
+                    a.source == b.source && a.flags == b.flags && a.scheduler_profile == b.scheduler_profile
+                }
+                _ => false,
+            };
+            if !same_recipe {
+                return Err(RegistryError::ConflictingPlan(format!(
+                    "module {module} selected with two different images"
+                )));
+            }
+        }
+        for &symbol in entry.symbols() {
+            if let Some(&first) = owner.get(symbol) {
+                if plan.entries[first].module() != module {
+                    return Err(RegistryError::ConflictingPlan(format!(
+                        "entry {symbol} exported by {} and {module}",
+                        plan.entries[first].module()
+                    )));
+                }
+            } else {
+                owner.insert(symbol, index);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builtin-default feature flags for `arch`, independent of the process
+/// environment, as the reference a closed route was walked against.
+fn default_feature_flags(arch: &str) -> Result<crate::feature_flags::FeatureFlags, RegistryError> {
+    let resolved = hipfire_config::resolve(std::iter::empty())
+        .map_err(|e| RegistryError::UnsupportedRoute(format!("builtin config: {e}")))?;
+    let config = hipfire_config::ProcessConfig::from_resolved(&resolved)
+        .map_err(|e| RegistryError::UnsupportedRoute(format!("builtin config: {e}")))?;
+    Ok(crate::feature_flags::FeatureFlags::from_process_config(arch, &config))
+}
+
+/// Registry sources a route may name: the installer inventory, the admitted
+/// default-route corpus, and route-only launcher sources neither carries.
+fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
+    let mut all = entries(arch, extra_flags)?;
+    all.extend(default_route_entries(arch, extra_flags)?);
+    let arch = all.first().map(|e| e.arch).unwrap_or("");
+    if arch == "gfx1201" {
+        // norm.rs `softmax_temp_topp_batched_into_f32` (MTP temperature verify).
+        all.push(entry(arch, "softmax_temp_topp_batched", &["softmax_temp_topp_batched_f32"],
+            kernels::SOFTMAX_TEMP_BATCHED_SRC.into(), extra_flags));
+    }
+    Ok(all)
+}
+
+/// Qwen3.6-27B dense XTS fingerprint on exact gfx1201. `Ok(Some(mtp))` when
+/// the closed route applies (`mtp` = native-MTP route), `Ok(None)` when the
+/// header is not this model, `Err` when it is but a policy axis is outside
+/// the closure.
+fn qwen36_27b_route(input: &RouteKernelInput<'_>) -> Result<Option<bool>, RegistryError> {
+    use crate::DType;
+    let refuse = |why: &str| Err(RegistryError::UnsupportedRoute(format!("qwen3.6-27b: {why}")));
+    if input.arch != "gfx1201" || input.model_arch != 5 {
+        return Ok(None);
+    }
+    if (input.n_heads, input.n_kv_heads, input.head_dim) != (24, 4, 256) {
+        return Ok(None);
+    }
+    let trunk: Vec<_> = input.tensors.iter().filter(|t| t.name.starts_with("model.language_model.")
+        || t.name == "lm_head.weight").collect();
+    let layer_of = |name: &str| -> Option<usize> {
+        name.strip_prefix("model.language_model.layers.")?.split('.').next()?.parse().ok()
+    };
+    let layers = trunk.iter().filter_map(|t| layer_of(t.name)).max().map_or(0, |l| l + 1);
+    let shape_of = |name: &str| trunk.iter().find(|t| t.name == name).map(|t| (t.dtype, t.shape));
+    let projections_mq4v2 = trunk.iter().filter(|t| t.name.ends_with("_proj.weight")
+        || t.name.ends_with("in_proj_qkv.weight") || t.name.ends_with("in_proj_z.weight")
+        || t.name.ends_with("in_proj_a.weight") || t.name.ends_with("in_proj_b.weight"));
+    let mut n_projections = 0;
+    for tensor in projections_mq4v2 {
+        if tensor.dtype != DType::MQ4G256V2 {
+            return Ok(None);
+        }
+        n_projections += 1;
+    }
+    let fingerprint = layers == 64
+        && n_projections == 48 * 5 + 16 * 4 + 64 * 3
+        && shape_of("lm_head.weight") == Some((DType::MQ4G256V2, &[248_320, 5_120][..]))
+        && shape_of("model.language_model.embed_tokens.weight")
+            == Some((DType::Q8_0, &[248_320, 5_120][..]))
+        && shape_of("model.language_model.layers.0.mlp.gate_proj.weight")
+            == Some((DType::MQ4G256V2, &[17_408, 5_120][..]))
+        && shape_of("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
+            == Some((DType::MQ4G256V2, &[10_240, 5_120][..]))
+        && shape_of("model.language_model.layers.3.self_attn.q_proj.weight")
+            == Some((DType::MQ4G256V2, &[12_288, 5_120][..]));
+    if !fingerprint {
+        return Ok(None);
+    }
+    if (input.kv_k, input.kv_v) != ("fp8", "fp8") {
+        return refuse("KV must resolve to native fp8 K/V");
+    }
+    if input.state_quant != "q8" {
+        return refuse("DeltaNet state must be Q8");
+    }
+    if !(2..=262_144).contains(&input.max_seq) {
+        return refuse("max_seq outside the model's 262144 positions");
+    }
+    if !(512..=8_192).contains(&input.prefill_chunk_rows) {
+        return refuse("prefill chunk ceiling outside the walked 512..=8192 rungs");
+    }
+    // The sidecar head (`<trunk>.mtp`): one MQ4G256 layer at the trunk width.
+    let head = |name: &str, dtype: DType, shape: &[usize]| {
+        input.tensors.iter().any(|t| t.name == name && t.dtype == dtype && t.shape == shape)
+    };
+    let mtp_head = head("eh_proj", DType::MQ4G256, &[5_120, 10_240])
+        && head("wq", DType::MQ4G256, &[12_288, 5_120])
+        && head("wk", DType::MQ4G256, &[1_024, 5_120])
+        && head("wv", DType::MQ4G256, &[1_024, 5_120])
+        && head("wo", DType::MQ4G256, &[5_120, 6_144])
+        && head("ffn_gate", DType::MQ4G256, &[17_408, 5_120])
+        && head("ffn_up", DType::MQ4G256, &[17_408, 5_120])
+        && head("ffn_down", DType::MQ4G256, &[5_120, 17_408]);
+    match input.spec {
+        KernelSpecRoute::NativeMtp if !mtp_head => refuse("native MTP needs the MQ4G256 sidecar head tensors"),
+        KernelSpecRoute::NativeMtp => Ok(Some(true)),
+        _ => Ok(Some(false)),
+    }
 }
 
 #[cfg(test)]

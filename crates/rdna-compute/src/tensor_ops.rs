@@ -3625,17 +3625,38 @@ const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 /// BF16 pooled keys, and every buffer addressed through 32-bit raw-buffer
 /// offsets below the out-of-range offset (pooled extents use its element size).
 fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
+    qsa_select_pm_shape_fits(
+        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, p.rows, p.index_heads,
+        p.index_dim, p.block_count, p.query_row_stride, p.capacity,
+    )
+}
+
+/// No tensor payload or GPU initialization is needed to choose the native
+/// score/select image. Keep raw-offset admissions shared with live dispatch.
+pub(crate) fn qsa_select_pm_shape_fits(
+    halo: bool, dtype: DType, rows: usize, index_heads: usize,
+    index_dim: usize, block_count: usize, query_row_stride: usize, capacity: usize,
+) -> bool {
     const PM_OOB_OFFSET: usize = 0x7fff_ff00;
     let below = |n: Option<usize>| n.is_some_and(|bytes| bytes < PM_OOB_OFFSET);
-    gpu.arch_caps.is_gfx1151()
-        && matches!(p.pooled.dtype, DType::F32 | DType::BF16)
-        && p.rows >= QSA_SELECT_PM_MIN_ROWS
-        && p.index_heads == 4
-        && p.index_dim == 128
-        && p.block_count <= QSA_SELECT_PM_MAX_BLOCKS
-        && below(p.rows.checked_mul(p.query_row_stride).and_then(|n| n.checked_mul(4)))
-        && below(p.block_count.checked_mul(128 * p.pooled.dtype.size()))
-        && below(p.rows.checked_mul(p.capacity).and_then(|n| n.checked_mul(4)))
+    halo && matches!(dtype, DType::F32 | DType::BF16)
+        && rows >= QSA_SELECT_PM_MIN_ROWS && index_heads == 4 && index_dim == 128
+        && block_count <= QSA_SELECT_PM_MAX_BLOCKS
+        && below(rows.checked_mul(query_row_stride).and_then(|n| n.checked_mul(4)))
+        && below(block_count.checked_mul(128 * dtype.size()))
+        && below(rows.checked_mul(capacity).and_then(|n| n.checked_mul(4)))
+}
+
+pub(crate) fn qsa_select_pm_selected(
+    fits: bool, score: bool, select: bool,
+) -> QsaSelectPmArm {
+    if !fits { return QsaSelectPmArm::Hipcc; }
+    match (score, select) {
+        (false, false) => QsaSelectPmArm::Hipcc,
+        (true, false) => QsaSelectPmArm::ScoreOnly,
+        (false, true) => QsaSelectPmArm::SelectOnly,
+        (true, true) => QsaSelectPmArm::Both,
+    }
 }
 
 /// The route's arm: `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM`
@@ -3644,12 +3665,9 @@ fn qsa_select_pm_arm(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> QsaSelec
     if !qsa_select_pm_fits(gpu, p) {
         return QsaSelectPmArm::Hipcc;
     }
-    match (*QWEN4_QSA_SCORE_PM, *QWEN4_QSA_SELECT_PM) {
-        (false, false) => QsaSelectPmArm::Hipcc,
-        (true, false) => QsaSelectPmArm::ScoreOnly,
-        (false, true) => QsaSelectPmArm::SelectOnly,
-        (true, true) => QsaSelectPmArm::Both,
-    }
+    qsa_select_pm_selected(
+        true, *QWEN4_QSA_SCORE_PM, *QWEN4_QSA_SELECT_PM,
+    )
 }
 
 /// Lab entry with an explicit arm (grouping, scratch and mirror persistence;
@@ -4796,13 +4814,19 @@ fn qsa_gathered_wmma(
 /// so the F16 K/V scratch over the whole cache capacity and the query row
 /// stay below its out-of-range offset.
 fn qsa_gathered_pm_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    qsa_gathered_pm_shape_fits(p.full_capacity, p.n_kv_heads, p.n_heads)
+}
+
+pub(crate) fn qsa_gathered_pm_shape_fits(
+    full_capacity: usize, n_kv_heads: usize, n_heads: usize,
+) -> bool {
     const PM_OOB_OFFSET: usize = 0x7fff_ff00;
-    let scratch = p.full_capacity.div_ceil(4).checked_mul(4).and_then(|t| t.checked_mul(p.n_kv_heads * 512));
+    let scratch = full_capacity.div_ceil(4).checked_mul(4)
+        .and_then(|t| t.checked_mul(n_kv_heads * 512));
     scratch.is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
-        && p.n_heads.checked_mul(2048).is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
-        // `v_mad_u32_u24` token and stride operands.
-        && p.full_capacity < 1 << 24
-        && p.n_kv_heads * 2048 < 1 << 24
+        && n_heads.checked_mul(2048).is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        && full_capacity < 1 << 24
+        && n_kv_heads * 2048 < 1 << 24
 }
 
 /// The gathered route's producer and attention launches: the hipcc kernels,
@@ -10508,5 +10532,70 @@ mod tests {
         assert!(!plain.persisted);
         assert!(plain.selected == reference.selected, "default BF16 selection without a mirror differs");
         case.free(&mut gpu);
+    }
+}
+
+#[cfg(test)]
+mod route_selector_tests {
+    use super::*;
+
+    #[test]
+    fn qsa_select_switches_preserve_all_four_arms() {
+        for fits in [false, true] {
+            for score in [false, true] {
+                for select in [false, true] {
+                    let old = if !fits { QsaSelectPmArm::Hipcc } else {
+                        match (score, select) {
+                            (false, false) => QsaSelectPmArm::Hipcc,
+                            (true, false) => QsaSelectPmArm::ScoreOnly,
+                            (false, true) => QsaSelectPmArm::SelectOnly,
+                            (true, true) => QsaSelectPmArm::Both,
+                        }
+                    };
+                    assert_eq!(qsa_select_pm_selected(fits, score, select), old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_select_shape_thresholds_and_raw_offsets() {
+        for halo in [false, true] {
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                for rows in [511usize, 512, 513] {
+                    for blocks in [0, QSA_SELECT_PM_MAX_BLOCKS - 1, QSA_SELECT_PM_MAX_BLOCKS, QSA_SELECT_PM_MAX_BLOCKS + 1] {
+                        for stride in [512, usize::MAX] {
+                            let below = |n: Option<usize>| n.is_some_and(|v| v < 0x7fff_ff00);
+                            let old = halo && matches!(dtype, DType::F32 | DType::BF16)
+                                && rows >= 512 && blocks <= QSA_SELECT_PM_MAX_BLOCKS
+                                && below(rows.checked_mul(stride).and_then(|v| v.checked_mul(4)))
+                                && below(blocks.checked_mul(128 * dtype.size()))
+                                && below(rows.checked_mul(1027).and_then(|v| v.checked_mul(4)));
+                            assert_eq!(qsa_select_pm_shape_fits(
+                                halo, dtype, rows, 4, 128, blocks, stride, 1027,
+                            ), old);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!qsa_select_pm_shape_fits(true, DType::F32, 512, 3, 128, 128, 512, 1027));
+        assert!(!qsa_select_pm_shape_fits(true, DType::F32, 512, 4, 127, 128, 512, 1027));
+    }
+
+    #[test]
+    fn qsa_gathered_raw_offset_admission_is_unchanged() {
+        for capacity in [32767usize, 32768, 32769, (1 << 24) - 1, 1 << 24] {
+            for kv in [1usize, 4, 8] {
+                for heads in [4usize, 24, 32] {
+                    let scratch = capacity.div_ceil(4).checked_mul(4)
+                        .and_then(|t| t.checked_mul(kv * 512));
+                    let old = scratch.is_some_and(|v| v + 4096 <= 0x7fff_ff00)
+                        && heads.checked_mul(2048).is_some_and(|v| v + 4096 <= 0x7fff_ff00)
+                        && capacity < 1 << 24 && kv * 2048 < 1 << 24;
+                    assert_eq!(qsa_gathered_pm_shape_fits(capacity, kv, heads), old);
+                }
+            }
+        }
     }
 }
