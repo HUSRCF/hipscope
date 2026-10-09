@@ -13,6 +13,10 @@
 //! - [`Gpu::gemv_mq4g256v2_residual_xbatch`]: `y[b] += W · x[b]`, per column
 //!   equal to the hipcc `gemv_mq4g256v2_residual` (PmResidualX oracle,
 //!   `gemv_hfq4g256_residual_xbatch_mq4v2.oracle.json`).
+//! - [`Gpu::gemv_mq4g256v2_multirow_r2_xbatch_pm`]: `y[b] = W · x[b]`, per
+//!   column equal to the singleton `gemv_mq4g256v2_multirow_r2` (the lm_head
+//!   route; PmMultirow oracle,
+//!   `gemv_hfq4g256_multirow_xbatch_mq4v2.acceptance.json`).
 //!
 //! The embedded objects are the oracle-accepted ones, pinned by SHA-256 and
 //! verified once before first load (fails closed). They load only on exact
@@ -85,6 +89,18 @@ static RESIDUAL: PmObject = PmObject {
 
 static PLAIN_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| PLAIN.verify());
 static RESIDUAL_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| RESIDUAL.verify());
+
+/// PmMultirow (`gemv_hfq4g256_multirow_xbatch_mq4v2.acceptance.json`: the
+/// `.co` ELF is the oracled object; 2 rows per workgroup).
+static MULTIROW: PmObject = PmObject {
+    module: "gemv_hfq4g256_multirow_xbatch_mq4v2_pm",
+    symbol: "gemv_mq4g256v2_multirow_r2_xbatch_pm",
+    image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_xbatch_mq4v2.co"),
+    sha256: "07ea1deb45e546345567bf1e891923b0fcf05f7959be51448787059a6867c2e4",
+    rows_per_workgroup: Some(2),
+};
+
+static MULTIROW_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| MULTIROW.verify());
 
 impl Gpu {
     /// The accepted PM objects replace the hipcc incumbents here.
@@ -166,6 +182,35 @@ impl Gpu {
         self.gemv_mq4g256v2_xbatch(a_raw, x, y, m, k, batch)
     }
 
+    /// `y[b] = W · x[b]` for `b < batch` (<= [`PM_XBATCH_MAX`]), each column
+    /// byte-identical to the singleton `gemv_mq4g256v2_multirow_r2` (the
+    /// lm_head GEMV). Byte offsets of W, x and y must fit 32 bits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256v2_multirow_r2_xbatch_pm(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        Self::check_xbatch_shape("gemv_mq4g256v2_multirow_r2_xbatch_pm", m, k, batch)?;
+        let fits = |n: Option<usize>| n.is_some_and(|n| n <= u32::MAX as usize);
+        if !fits(m.checked_mul(batch * 4)) || !fits(k.checked_mul(batch * 4)) || !fits((k / 256).checked_mul(m * 136)) {
+            return Err(HipError::new(0, "gemv_mq4g256v2_multirow_r2_xbatch_pm: 32-bit byte offsets required"));
+        }
+        if self.pm_xbatch_enabled() {
+            return self.launch_pm_xbatch(&MULTIROW, &MULTIROW_VERIFIED, a_raw, x, y, m, k, batch);
+        }
+        for b in 0..batch {
+            let xb = x.sub_offset(b * k, k);
+            let yb = y.sub_offset(b * m, m);
+            self.gemv_mq4g256v2_multirow(a_raw, &xb, &yb, m, k)?;
+        }
+        Ok(())
+    }
+
     /// `y[b] += W · x[b]` for `b < batch` (<= [`PM_XBATCH_MAX`]), each column
     /// byte-identical to the singleton `gemv_mq4g256v2_residual` on
     /// (`x[b]`, `y[b]`).
@@ -200,5 +245,6 @@ mod tests {
     fn embedded_objects_match_their_accepted_digests() {
         PLAIN.verify().unwrap();
         RESIDUAL.verify().unwrap();
+        MULTIROW.verify().unwrap();
     }
 }
