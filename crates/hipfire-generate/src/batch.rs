@@ -3284,6 +3284,14 @@ pub fn drive_qwen_vmm_continuous_batch(
                 (Some(_), Some(kind)) => kind,
                 _ => VmmLaneDecode::Ar,
             };
+            if hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1") {
+                eprintln!(
+                    "[cb-phases] admit id={} lane={lane_idx} mode={} (pick={:?})",
+                    key.id,
+                    lane_decode[lane_idx].wire(),
+                    spec_pick_kind.map(VmmLaneDecode::wire)
+                );
+            }
             spec_stats[lane_idx] = VmmSpecStats::default();
             dflash_win[lane_idx] = None;
             work[lane_idx] = match spec_seed {

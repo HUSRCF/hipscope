@@ -510,6 +510,19 @@ impl Qwen35VmmStore {
         config: &Qwen35Config,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
+        let t0 = phase_start(gpu);
+        let r = self.dflash_draft_planned_inner(gpu, weights, config, plan);
+        phase_end(gpu, 0, t0);
+        r
+    }
+
+    fn dflash_draft_planned_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        plan: &BatchStepPlan,
+    ) -> Result<(), String> {
         let Self { slots, .. } = self;
         for r in &plan.requests {
             let RequestStepKind::Verify { draft_len } = r.kind else {
@@ -585,7 +598,10 @@ impl Qwen35VmmStore {
                 draft,
             });
         }
-        dflash_cb_verify(gpu, weights, config, scratch, &mut engine.cb, &mut lanes)
+        let t0 = phase_start(gpu);
+        let r = dflash_cb_verify(gpu, weights, config, scratch, &mut engine.cb, &mut lanes);
+        phase_end(gpu, 1, t0);
+        r
     }
 
     /// Commit one verified DFlash window: the singleton greedy accept
@@ -631,8 +647,10 @@ impl Qwen35VmmStore {
                 dn_state: &mut *dn,
                 scratch,
             };
-            dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified)
-                .map_err(|e| format!("commit_step: DFlash accept: {e}"))?
+            let t0 = phase_start(gpu);
+            let r = dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified);
+            phase_end(gpu, 2, t0);
+            r.map_err(|e| format!("commit_step: DFlash accept: {e}"))?
         };
         let mut picks = verified.argmax_per_pos;
         picks.clear();
@@ -670,6 +688,47 @@ impl Qwen35VmmStore {
             verified_rows: draft.verify_tokens.len(),
             finish,
         })
+    }
+}
+
+/// `HIPFIRE_CB_PHASES=1`: synchronized wall time of the DFlash lane phases
+/// (draft / shared verify / per-lane accept), summed and printed to stderr
+/// every 64 verify steps. Instrumentation only (adds device syncs).
+static PHASES_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
+});
+static PHASE_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static PHASE_N: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn phase_start(gpu: &mut Gpu) -> Option<std::time::Instant> {
+    if !*PHASES_ON {
+        return None;
+    }
+    let _ = gpu.hip.device_synchronize();
+    Some(std::time::Instant::now())
+}
+
+fn phase_end(gpu: &mut Gpu, i: usize, t0: Option<std::time::Instant>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(t0) = t0 else { return };
+    let _ = gpu.hip.device_synchronize();
+    PHASE_NS[i].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let n = PHASE_N[i].fetch_add(1, Relaxed) + 1;
+    if i == 1 && n % 16 == 0 {
+        static BASE: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+        static LAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = BASE.elapsed().as_nanos() as u64;
+        let wall = now.saturating_sub(LAST_NS.swap(now, Relaxed)) as f64 / 1e6;
+        let ms = |j: usize| PHASE_NS[j].swap(0, Relaxed) as f64 / 1e6;
+        let c = |j: usize| PHASE_N[j].swap(0, Relaxed);
+        let (d, v, a) = (ms(0), ms(1), ms(2));
+        let (dn, vn, an) = (c(0), c(1), c(2));
+        eprintln!(
+            "[cb-phases] dflash over {vn} verify steps: wall {wall:.1}ms draft {d:.1}ms ({dn} calls) verify {v:.1}ms accept {a:.1}ms ({an} lanes) | per step draft {:.2} verify {:.2} accept {:.2} ms",
+            d / vn.max(1) as f64,
+            v / vn.max(1) as f64,
+            a / vn.max(1) as f64
+        );
     }
 }
 
