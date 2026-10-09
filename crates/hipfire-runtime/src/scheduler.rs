@@ -214,23 +214,92 @@ impl Scheduler {
         eligible: &[bool],
     ) -> SlotBatch {
         let n = work.len();
+        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible);
+        if let Some(c) = plan.next_prefill_cursor {
+            self.prefill_cursor = c;
+        }
+        let alloc = plan.alloc;
         // A step carrying VL rows runs the batched M-RoPE kernel for EVERY
         // row (text rows take [p, p, p], bit-identical to 1D RoPE), so the
         // per-row pos3/ext side arrays exist whenever some slot is VL — or
         // carries a continuation rope delta, whose rows need the shifted
         // phases for the same kernel.
-        let any_pos3 = work
-            .iter()
-            .any(|w| (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0);
+        let any_pos3 = self.any_pos3(work);
         let mut b = SlotBatch::default();
         b.m_per_slot = vec![0; n];
 
+        // ---- Build the batch in slot order from the allocation ----
+        // Flat arrays are packed in slot order (the forward reads them via
+        // `m_per_slot` offsets), so the row-building pass runs in slot order
+        // even though the allocation was phased decode-then-prefill.
+        for i in 0..n {
+            let take = alloc[i];
+            if take == 0 {
+                continue;
+            }
+            let w = &mut work[i];
+            let toks: Vec<u32> = w.remaining_prompt.drain(..take).collect();
+            let start_pos = w.next_pos;
+            b.m_per_slot[i] = toks.len();
+            for (j, t) in toks.iter().enumerate() {
+                let pos = start_pos + j;
+                b.tokens.push(*t);
+                b.positions.push(pos as i32);
+                b.row_slot.push(w.slot.0 as i32);
+                if !any_pos3 {
+                    continue;
+                }
+                match w.vl_prefill.as_mut() {
+                    Some(vl) => {
+                        b.pos3.push(vl.pos3(pos));
+                        // Image pads splice visual embeddings in prompt
+                        // order; everything else uses the token table.
+                        if *t == vl.image_pad_id && vl.visual_idx < vl.n_visual_tokens {
+                            b.ext_emb.push(vl.visual_idx as i32);
+                            vl.visual_idx += 1;
+                        } else {
+                            b.ext_emb.push(-1);
+                        }
+                    }
+                    None => {
+                        // Text row: [p, p, p] is bit-identical to 1D RoPE;
+                        // a continuation of an image conversation shifts the
+                        // phase by its session's rope delta instead.
+                        b.pos3.push([pos as i32 + w.pos3_delta; 3]);
+                        b.ext_emb.push(-1);
+                    }
+                }
+            }
+            w.next_pos += toks.len();
+        }
+        b
+    }
+
+    /// True when a step over `work` must carry per-row `pos3`/`ext_emb`.
+    pub fn any_pos3(&self, work: &[PendingWork]) -> bool {
+        work.iter()
+            .any(|w| (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0)
+    }
+
+    /// The row-allocation half of [`next_batch_eligible`](Self::next_batch_eligible)
+    /// with no side effects: reads `work` and the rotation cursor, returns
+    /// per-slot row counts and the cursor value the caller publishes only
+    /// once the step built from this allocation has committed.
+    pub fn allocate_rows(
+        &self,
+        work: &[PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+        eligible: &[bool],
+    ) -> RowAllocation {
+        let n = work.len();
         // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
         // Admit decode lanes in slot order until the budget is exhausted; a
         // step that cannot afford every decode lane serves a prefix of them
         // rather than overflowing (spec §5.2 S2). A slot not in the FairQueue
         // grant mask (`eligible[s] == false`) is skipped entirely.
         let mut alloc = vec![0usize; n];
+        let mut next_prefill_cursor = None;
         let mut used = 0usize;
         for i in 0..n {
             if !is_runnable_decode(&work[i], self.vl_sequential)
@@ -311,56 +380,23 @@ impl Scheduler {
                         keep_going = true;
                     }
                 }
-                self.prefill_cursor = (self.prefill_cursor + 1) % n_pr;
+                next_prefill_cursor = Some((self.prefill_cursor + 1) % n_pr);
             }
         }
-
-        // ---- Build the batch in slot order from the allocation ----
-        // Flat arrays are packed in slot order (the forward reads them via
-        // `m_per_slot` offsets), so the row-building pass runs in slot order
-        // even though the allocation was phased decode-then-prefill.
-        for i in 0..n {
-            let take = alloc[i];
-            if take == 0 {
-                continue;
-            }
-            let w = &mut work[i];
-            let toks: Vec<u32> = w.remaining_prompt.drain(..take).collect();
-            let start_pos = w.next_pos;
-            b.m_per_slot[i] = toks.len();
-            for (j, t) in toks.iter().enumerate() {
-                let pos = start_pos + j;
-                b.tokens.push(*t);
-                b.positions.push(pos as i32);
-                b.row_slot.push(w.slot.0 as i32);
-                if !any_pos3 {
-                    continue;
-                }
-                match w.vl_prefill.as_mut() {
-                    Some(vl) => {
-                        b.pos3.push(vl.pos3(pos));
-                        // Image pads splice visual embeddings in prompt
-                        // order; everything else uses the token table.
-                        if *t == vl.image_pad_id && vl.visual_idx < vl.n_visual_tokens {
-                            b.ext_emb.push(vl.visual_idx as i32);
-                            vl.visual_idx += 1;
-                        } else {
-                            b.ext_emb.push(-1);
-                        }
-                    }
-                    None => {
-                        // Text row: [p, p, p] is bit-identical to 1D RoPE;
-                        // a continuation of an image conversation shifts the
-                        // phase by its session's rope delta instead.
-                        b.pos3.push([pos as i32 + w.pos3_delta; 3]);
-                        b.ext_emb.push(-1);
-                    }
-                }
-            }
-            w.next_pos += toks.len();
+        RowAllocation {
+            alloc,
+            next_prefill_cursor,
         }
-        b
     }
+}
+
+/// Side-effect-free result of [`Scheduler::allocate_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowAllocation {
+    /// Rows granted per `work` index (decode 1, prefill chunk, else 0).
+    pub alloc: Vec<usize>,
+    /// Rotation cursor to publish after the step commits; `None` = unchanged.
+    pub next_prefill_cursor: Option<usize>,
 }
 
 // ---- Runnable predicates (spec §5.2 S2) ----
