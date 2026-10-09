@@ -510,10 +510,10 @@ fn stage_qwen_vmm_batch(
         eprintln!("[daemon] VMM continuous batch requested but model state not Qwen35 — existing route");
         return out;
     };
-    if !qwen_batch_weight_formats_supported(&b.weights) {
-        eprintln!("[daemon] VMM continuous batch: weight formats unsupported — existing route");
-        return out;
-    }
+    // No `qwen_batch_weight_formats_supported` gate: that predicate covers
+    // the fixed-lane batched decode kernels. The VMM executor runs the slot
+    // forward's own projections, and an unsupported format fails its forward
+    // (fail-closed per step), not this load.
     let row_budget = req.row_budget.max(requested);
     // Shared physical KV budget for every request owner: free VRAM after the
     // resident model, minus fixed headroom for executor scratch and
