@@ -1091,6 +1091,7 @@ fn drift_check(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], refs: 
     let mut rows = Vec::with_capacity(cycles);
     let mut exact_all = true;
     let start = mem_sample(&ctx.gpu)?;
+    let mut refused: Option<(usize, String)> = None;
     for c in 0..cycles {
         let before = mem_sample(&ctx.gpu)?;
         let tag = 20_000 + 10 * c as u64;
@@ -1099,25 +1100,35 @@ fn drift_check(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], refs: 
             Req::new(c1, tag + 1, 1, (c + 4) % WIDTH, 8, compare_sink(c1)),
         ];
         // `steps` far above 8 picks: no "final" (256-step) state comparison.
-        drive(ctx, store, fx, &mut reqs, refs, usize::MAX - 1, None)?;
+        if let Err(e) = drive(ctx, store, fx, &mut reqs, refs, usize::MAX - 1, None) {
+            eprintln!("drift cycle {c}: REFUSED/FAILED: {e}");
+            refused = Some((c, e.to_string()));
+            break;
+        }
         let after = mem_sample(&ctx.gpu)?;
         let exact = reqs.iter().all(|r| matches!(&r.sink, Sink::Compare { vs_b, vs_a, .. } if vs_b.exact() && vs_a.exact()) && r.store_watermark_errors.is_empty());
         exact_all &= exact;
         let d_free = after.0 as i64 - before.0 as i64;
+        // Singleton's cached widened prefill scratch (exact prefill runs on it).
+        let widened = ctx.b.scratch.widened_prefill_batch.borrow().as_ref().map(|p| p.max_batch);
+        let store_mapped = store.mapped_kv_bytes()?;
         rows.push(json!({
             "cycle": c, "free_before": before.0, "free_after": after.0, "free_delta": d_free,
             "pool_new_delta": after.1 - before.1, "pool_reused_delta": after.2 - before.2,
-            "pool_bytes_new_delta": after.3 - before.3, "exact": exact,
+            "pool_bytes_new_delta": after.3 - before.3, "widened_pbs_rows": widened,
+            "store_mapped_after_retire": store_mapped, "exact": exact,
         }));
-        if c < 3 || c + 3 >= cycles || c % 10 == 0 {
-            eprintln!("drift cycle {c}: free_delta={d_free} pool_new+={} pool_bytes_new+={} exact={exact}", after.1 - before.1, after.3 - before.3);
-        }
+        eprintln!(
+            "drift cycle {c}: free_before={} free_delta={d_free} pool_new+={} pool_reused+={} pool_bytes_new+={} widened_pbs={widened:?} store_mapped={store_mapped} exact={exact}",
+            before.0, after.1 - before.1, after.2 - before.2, after.3 - before.3
+        );
     }
     let end = mem_sample(&ctx.gpu)?;
     let deltas: Vec<i64> = rows.iter().map(|r| r["free_delta"].as_i64().unwrap()).collect();
     let last10: i64 = deltas.iter().rev().take(10).sum();
     let first10: i64 = deltas.iter().take(10).sum();
-    let bounded = last10 > -(16 << 20);
+    // Bounded only if every cycle ran and the last 10 together lose < 16 MiB.
+    let bounded = refused.is_none() && rows.len() >= 10 && last10 > -(16 << 20);
     // Attribution probes (no forward, no admit).
     let probe = |ctx: &mut Ctx, kind: &str, n: usize| -> Result<Value> {
         let s0 = mem_sample(&ctx.gpu)?;
@@ -1140,14 +1151,17 @@ fn drift_check(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], refs: 
         eprintln!("drift probe {kind}: {v}");
         Ok(v)
     };
-    let p_dn = probe(ctx, "dn_state", 10)?;
-    let p_owner = probe(ctx, "request_owner", 10)?;
+    let p_dn = probe(ctx, "dn_state", 10).unwrap_or_else(|e| json!({"error": e.to_string()}));
+    let p_owner = probe(ctx, "request_owner", 10).unwrap_or_else(|e| json!({"error": e.to_string()}));
     eprintln!(
-        "drift: cycles={cycles} total_free_delta={} first10={first10} last10={last10} bounded={bounded} exact={exact_all}",
+        "drift: cycles_run={}/{cycles} total_free_delta={} first10={first10} last10={last10} bounded={bounded} exact={exact_all} refused={refused:?}",
+        rows.len(),
         end.0 as i64 - start.0 as i64
     );
     let v = json!({
-        "cycles": cycles, "fixtures": [fx[c0].name(), fx[c1].name()], "picks_per_request": 8,
+        "cycles_requested": cycles, "cycles_run": rows.len(),
+        "refused": refused.as_ref().map(|(c, e)| json!({"cycle": c, "error": e})),
+        "fixtures": [fx[c0].name(), fx[c1].name()], "picks_per_request": 8,
         "start": {"free": start.0, "pool_new": start.1, "pool_reused": start.2, "pool_bytes_new": start.3},
         "end": {"free": end.0, "pool_new": end.1, "pool_reused": end.2, "pool_bytes_new": end.3},
         "total_free_delta": end.0 as i64 - start.0 as i64, "first10_free_delta": first10, "last10_free_delta": last10,
