@@ -9,6 +9,7 @@ use crate::reg::{Kind, Live};
 use crate::kernels::common::{mem, op, s, smem, sop, sr, v, vr};
 
 const MODULE: &str = "fused_qkv_hfq4g256_mq4v2";
+#[cfg(all(test, feature = "toolchain"))]
 const G0_SYMBOL: &str = "fused_qkv_mq4g256v2_g0_group";
 
 fn kernargs() -> KernargLayout {
@@ -17,7 +18,12 @@ fn kernargs() -> KernargLayout {
         ("A_q", 0), ("A_k", 8), ("A_v", 16), ("x", 24),
         ("y_q", 32), ("y_k", 40), ("y_v", 48),
     ] {
-        args = args.pointer(name, offset);
+        let access = if offset < 32 {
+            crate::plan::Access::ReadOnly
+        } else {
+            crate::plan::Access::WriteOnly
+        };
+        args = args.pointer_access(name, offset, access);
     }
     for (i, name) in ["q_m", "k_m", "v_m", "K"].iter().enumerate() {
         args = args.hidden(name, 56 + i as u32 * 4, 4, "by_value");
@@ -200,8 +206,9 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     Ok(vec![b.finish()?])
 }
 
-/// Diagnostic only: never returned from the production entry point.
-pub fn build_g0() -> Result<Vec<Emitted>, String> {
+/// Preserved arithmetic oracle fixture; unavailable to production callers.
+#[cfg(all(test, feature = "toolchain"))]
+fn build_g0() -> Result<Vec<Emitted>, String> {
     let mut regs = RegPlan::new(32, 16)?;
     regs.add_range("workitem", Kind::V, 0, 1, Live::Whole)?;
     for base in [1, 2, 3, 4, 5, 6, 7, 24, 25] {
@@ -252,6 +259,37 @@ pub fn build_g0() -> Result<Vec<Emitted>, String> {
 #[cfg(all(test, feature = "toolchain"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_emit_and_m7() {
+        let emitted = build_gfx1201().expect("checked full-symbol emission");
+        assert_eq!(emitted.len(), 1);
+        let e = &emitted[0];
+        for directive in [
+            ".kernarg_segment_size: 72", ".kernarg_segment_align: 8",
+            ".max_flat_workgroup_size: 32", ".wavefront_size: 32",
+            ".group_segment_fixed_size: 0", ".private_segment_fixed_size: 0",
+            ".amdhsa_float_round_mode_32 0", ".amdhsa_float_round_mode_16_64 0",
+            ".amdhsa_float_denorm_mode_32 3", ".amdhsa_float_denorm_mode_16_64 3",
+        ] {
+            assert!(e.s_text.contains(directive), "missing frozen ABI/FP directive {directive}");
+        }
+        assert_eq!(e.s_text.matches(".actual_access: read_only").count(), 4);
+        assert_eq!(e.s_text.matches(".actual_access: write_only").count(), 3);
+        assert_eq!(e.shape.ds, 5);
+        assert_eq!(e.proof.loop_fixpoints.len(), 1);
+        assert!(e.proof.lds_slots.is_empty());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/pm-decode/gfx1201");
+        std::fs::create_dir_all(&root).unwrap();
+        let object = root.join(format!("{MODULE}.co"));
+        let elf = crate::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
+        std::fs::write(&object, elf).unwrap();
+        let m7 = crate::pm_check::m7(&object, "gfx1201", "fused_qkv_mq4g256v2").unwrap();
+        assert_eq!(m7["obligations"], serde_json::json!({}));
+        assert_eq!(m7["ambiguous_delays"], 0);
+        println!("{m7}");
+    }
 
     #[test]
     fn g0_emit_and_m7() {
