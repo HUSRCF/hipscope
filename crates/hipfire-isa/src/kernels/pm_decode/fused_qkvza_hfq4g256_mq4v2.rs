@@ -78,7 +78,7 @@ fn build_g0() -> Result<Emitted, String> {
     op(&mut b, "v_add_f32_e32 v4, v4, v22", &[v(4)], &[v(4), v(22)])?;
     // clang24's shfl-down16 sets lane bit 4; out-of-range lanes read themselves.
     b.ds_crosslane(Instruction::new(
-        "ds_swizzle_b32 v21, v4 offset:0x20f",
+        "ds_swizzle_b32 v21, v4 offset:swizzle(BITMASK_PERM,\"1pppp\")",
         vec![v(21)], vec![v(4)],
     ).memory(MemoryClass::DsLoad))?;
     b.wait(crate::ledger::Counter::Ds, 0)?;

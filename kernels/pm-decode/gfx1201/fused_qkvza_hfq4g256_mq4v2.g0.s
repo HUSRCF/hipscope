@@ -182,7 +182,7 @@ pm_decode_qkvza_g0:
 	v_add_f32_e32 v4, v4, v5
 	v_add_f32_e32 v22, v6, v7
 	v_add_f32_e32 v4, v4, v22
-	ds_swizzle_b32 v21, v4 offset:0x20f
+	ds_swizzle_b32 v21, v4 offset:swizzle(BITMASK_PERM,"1pppp")
 	s_wait_dscnt 0x0
 	v_add_f32_e32 v4, v4, v21
 	v_cmp_gt_u32_e32 vcc_lo, 24, v0
