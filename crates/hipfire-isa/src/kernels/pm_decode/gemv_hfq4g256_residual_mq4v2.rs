@@ -66,7 +66,7 @@ fn build_dog_g0() -> Result<Emitted, String> {
     // steps an out-of-range source lane reads itself, not a wrapped lane.
     for result in [24u8,25] {
         b.ds_crosslane(Instruction::new(
-            format!("ds_swizzle_b32 v27, v{result} offset:0x20f"),
+            format!("ds_swizzle_b32 v27, v{result} offset:swizzle(BITMASK_PERM,\"1pppp\")"),
             vec![V::<1>(27).reg()],vec![V::<1>(result).reg()],
         ).memory(MemoryClass::DsLoad))?;
         b.wait(crate::ledger::Counter::Ds,0)?;
