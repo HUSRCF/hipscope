@@ -1,20 +1,191 @@
-//! Exact residual DOG arithmetic admission probe; not a selectable decode twin.
+//! Exact gfx1201 twin of `gemv_mq4g256v2_residual`.
 //!
-//! Each of 32 input records is 48 bytes: packed half scale/zero for row 0,
-//! packed nibbles for row 0, packed half scale/zero for row 1, packed nibbles
-//! for row 1, then eight f32 activations. Output is two f32 values per lane.
-//! Headers must already select the lane's half-group. This isolates the
-//! clang24 second-stream order before admitting the complete generic kernel.
+//! Frozen recipe SHA256:
+//! `869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e`.
+//! ABI: A/x/y pointers at 0/8/16, M/K i32 at 24/28; grid M, block 32,
+//! no LDS or scratch. Four independent group streams per output row;
+//! second-row quad DOG begins x1 then x0, while its tails begin x0 then x1.
+//! The two-row and odd-row residual epilogues retain distinct add operands.
+//! The test-only G0 probe consumes 32 packed 48-byte header/nibble/x records
+//! and returns two reduced f32 values per lane.
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 use crate::insn::{Instruction, MemoryClass};
-use crate::reg::{Live, S, V};
+use crate::reg::Live;
+#[cfg(test)]
+use crate::reg::{S, V};
 
+#[cfg(test)]
 const G0_SYMBOL: &str = "pm_residual_dog_g0";
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    Err("residual twin not admitted: run the separately named DOG G0 region and real-H2 oracle before full emission".into())
+    let mut regs=RegPlan::new(48,32)?;
+    for (name,base) in [("kernarg",0),("matrix",4),("activation",6),("residual",8)] {
+        regs.s::<2>(name,base,Live::Whole)?;
+    }
+    regs.s::<4>("weight_resource",20,Live::Whole)?;
+    for base in [2,3,10,11,12,13,14,15,16,17,18,19,24,25,26,27] {
+        regs.add_range(&format!("scalar{base}"),crate::reg::Kind::S,base,1,Live::Whole)?;
+    }
+    for (name,base,width) in [("lane",0,1),("weight_lane_offset",1,1),("packed_offset",2,1),
+        ("load_offset",3,1),("header0",4,2),("header1",6,2),("x_lo",8,4),("x_hi",12,4),
+        ("packed0",16,1),("packed1",17,1),("acc",24,4),("bcc",28,4),("dot",32,2),
+        ("selected_header",34,1),("nibble",35,1),("weight",36,1),("shuffle_addr",38,1),
+        ("shuffle_data",39,1),("output_offset",40,1),("old_y",41,2)] {
+        regs.add_range(name,crate::reg::Kind::V,base,width,Live::Whole)?;
+    }
+    let mut b=Builder::new(KernelSpec {
+        kernel_id:"gemv_hfq4g256_residual_mq4v2".into(),variant:"exact_four_stream".into(),
+        arch:Arch::Gfx1201,symbol:"gemv_mq4g256v2_residual".into(),
+        kernargs:KernargLayout::new(32).pointer_access("A",0,crate::plan::Access::ReadOnly)
+            .pointer_access("x",8,crate::plan::Access::ReadOnly).pointer("y",16)
+            .hidden("M",24,4,"by_value").hidden("K",28,4,"by_value"),
+        user_sgpr_count:2,system_sgpr_workgroup_id_y:false,workgroup_size:32,
+        group_segment_fixed_size:0,wave32:true,cu_mode:false,
+    },regs);
+    smem(&mut b,"s_load_b64 s[10:11], s[0:1], 0x18", &[10,11],&[0,1])?;
+    salu(&mut b,"s_lshl_b32 s12, ttmp9, 1",&[12],&[])?;
+    b.wait_all()?;
+    salu(&mut b,"s_cmp_ge_i32 s12, s10",&[],&[12,10])?;
+    branch(&mut b,"s_cbranch_scc1 .Lres_end")?;
+    smem(&mut b,"s_load_b128 s[4:7], s[0:1], 0x0",&[4,5,6,7],&[0,1])?;
+    smem(&mut b,"s_load_b64 s[8:9], s[0:1], 0x10",&[8,9],&[0,1])?;
+    b.wait_all()?;
+    salu(&mut b,"s_add_co_i32 s13, s12, 1",&[13],&[12])?;
+    salu(&mut b,"s_cmp_lt_i32 s13, s10",&[],&[13,10])?;
+    salu(&mut b,"s_cselect_b32 s18, 1, 0",&[18],&[])?;
+    salu(&mut b,"s_cselect_b32 s13, s13, s12",&[13],&[13,12])?;
+    salu(&mut b,"s_lshr_b32 s14, s11, 8",&[14],&[11])?;
+    salu(&mut b,"s_mul_i32 s19, s14, 0x88",&[19],&[14])?;
+    salu(&mut b,"s_mul_i32 s16, s19, s12",&[16],&[19,12])?;
+    salu(&mut b,"s_mul_i32 s17, s19, s13",&[17],&[19,13])?;
+    salu(&mut b,"s_lshr_b32 s2, s14, 2",&[2],&[14])?;
+    salu(&mut b,"s_mov_b32 s15, 0",&[15],&[])?;
+    salu(&mut b,"s_mov_b32 s20, s4",&[20],&[4])?;
+    salu(&mut b,"s_and_b32 s21, s5, 0xffff",&[21],&[5])?;
+    salu(&mut b,"s_mov_b32 s22, -1",&[22],&[])?;
+    salu(&mut b,"s_mov_b32 s23, 0x31004000",&[23],&[])?;
+    valu(&mut b,"v_lshlrev_b32_e32 v1, 2, v0",&[1],&[0],&[])?;
+    for r in 24..32 { valu(&mut b,&format!("v_mov_b32_e32 v{r}, 0"),&[r],&[],&[])?; }
+    salu(&mut b,"s_cmp_eq_u32 s2, 0",&[],&[2])?;
+    branch(&mut b,"s_cbranch_scc1 .Lres_tail")?;
+    b.loop_(".Lres_quad",|b| {
+        for stream in 0..4 { group(b,stream,true)?; }
+        salu(b,"s_add_co_i32 s2, s2, -1",&[2],&[2])?;
+        salu(b,"s_cmp_lg_u32 s2, 0",&[],&[2])?;
+        branch(b,"s_cbranch_scc1 .Lres_quad")
+    })?;
+    b.label(".Lres_tail")?;
+    for stream in 0..3 {
+        salu(&mut b,"s_cmp_lt_u32 s15, s14",&[],&[15,14])?;
+        branch(&mut b,"s_cbranch_scc0 .Lres_fold")?;
+        group(&mut b,stream,false)?;
+    }
+    b.label(".Lres_fold")?;
+    for base in [24u8,28] {
+        valu(&mut b,&format!("v_add_f32_e32 v32, v{base}, v{}",base+1),&[32],&[base,base+1],&[])?;
+        valu(&mut b,&format!("v_add_f32_e32 v33, v{}, v{}",base+2,base+3),&[33],&[base+2,base+3],&[])?;
+        valu(&mut b,&format!("v_add_f32_e32 v{base}, v32, v33"),&[base],&[32,33],&[])?;
+        reduce_full(&mut b,base)?;
+    }
+    valu(&mut b,"v_cmpx_eq_u32_e32 0, v0",&[],&[0],&[])?;
+    branch(&mut b,"s_cbranch_execz .Lres_end")?;
+    salu(&mut b,"s_lshl_b32 s27, s12, 2",&[27],&[12])?;
+    valu(&mut b,"v_mov_b32_e32 v40, s27",&[40],&[],&[27])?;
+    salu(&mut b,"s_cmp_eq_u32 s18, 0",&[],&[18])?;
+    branch(&mut b,"s_cbranch_scc1 .Lres_single")?;
+    vmem(&mut b,"global_load_b64 v[41:42], v40, s[8:9]",&[41,42],&[40],&[8,9],false)?;
+    b.wait_all()?;
+    // Incumbent two-row epilogue adds acc+y, bcc+y (not y+acc).
+    valu(&mut b,"v_add_f32_e32 v41, v24, v41",&[41],&[24,41],&[])?;
+    valu(&mut b,"v_add_f32_e32 v42, v28, v42",&[42],&[28,42],&[])?;
+    vmem(&mut b,"global_store_b64 v40, v[41:42], s[8:9]",&[],&[40,41,42],&[8,9],true)?;
+    b.wait_all()?;
+    branch(&mut b,"s_branch .Lres_end")?;
+    b.label(".Lres_single")?;
+    vmem(&mut b,"global_load_b32 v41, v40, s[8:9]",&[41],&[40],&[8,9],false)?;
+    b.wait_all()?;
+    valu(&mut b,"v_add_f32_e32 v41, v41, v24",&[41],&[41,24],&[])?;
+    vmem(&mut b,"global_store_b32 v40, v41, s[8:9]",&[],&[40,41],&[8,9],true)?;
+    b.wait_all()?;
+    b.label(".Lres_end")?;
+    branch(&mut b,"s_endpgm")?;
+    Ok(vec![b.finish()?])
 }
 
+fn refs(kind:crate::reg::Kind, indices:&[u8])->Vec<crate::reg::RegRef> {
+    indices.iter().map(|&base|crate::reg::RegRef{kind,base,len:1}).collect()
+}
+fn salu(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8])->Result<(),String> {
+    b.push(Instruction::new(text,refs(crate::reg::Kind::S,defs),refs(crate::reg::Kind::S,uses)))
+}
+fn valu(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8],scalar:&[u8])->Result<(),String> {
+    let mut uses=refs(crate::reg::Kind::V,uses);uses.extend(refs(crate::reg::Kind::S,scalar));
+    b.push(Instruction::new(text,refs(crate::reg::Kind::V,defs),uses))
+}
+fn smem(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8])->Result<(),String> {
+    b.push(Instruction::new(text,refs(crate::reg::Kind::S,defs),refs(crate::reg::Kind::S,uses)).memory(MemoryClass::SmemLoad))
+}
+fn vmem(b:&mut Builder,text:&str,defs:&[u8],uses:&[u8],scalar:&[u8],store:bool)->Result<(),String> {
+    let mut uses=refs(crate::reg::Kind::V,uses);uses.extend(refs(crate::reg::Kind::S,scalar));
+    b.push(Instruction::new(text,refs(crate::reg::Kind::V,defs),uses).memory(if store {MemoryClass::VmemStore}else{MemoryClass::VmemLoad}))
+}
+fn branch(b:&mut Builder,text:&str)->Result<(),String> {b.control(Instruction::new(text,vec![],vec![]))}
+
+fn group(b:&mut Builder,stream:u8,quad:bool)->Result<(),String> {
+    salu(b,"s_mul_i32 s24, s15, 0x88",&[24],&[15])?;
+    salu(b,"s_add_co_i32 s25, s16, s24",&[25],&[16,24])?;
+    salu(b,"s_add_co_i32 s26, s17, s24",&[26],&[17,24])?;
+    salu(b,"s_lshl_b32 s27, s15, 10",&[27],&[15])?;
+    valu(b,"v_lshlrev_b32_e32 v3, 5, v0",&[3],&[0],&[])?;
+    valu(b,"v_add_nc_u32_e32 v3, s27, v3",&[3],&[3],&[27])?;
+    vmem(b,"global_load_b128 v[8:11], v3, s[6:7]",&[8,9,10,11],&[3],&[6,7],false)?;
+    vmem(b,"global_load_b128 v[12:15], v3, s[6:7] offset:16",&[12,13,14,15],&[3],&[6,7],false)?;
+    b.wait_all()?;
+    for row in 0..2u8 {
+        let header=4+row*2;let packed=16+row;let scalar=25+row;
+        valu(b,&format!("v_mov_b32_e32 v3, s{scalar}"),&[3],&[],&[scalar])?;
+        vmem(b,&format!("buffer_load_b64 v[{header}:{}], v3, s[20:23], null offen scope:SCOPE_DEV",header+1),&[header,header+1],&[3],&[20,21,22,23],false)?;
+        valu(b,&format!("v_add_nc_u32_e32 v2, s{scalar}, v1"),&[2],&[1],&[scalar])?;
+        vmem(b,&format!("buffer_load_b32 v{packed}, v2, s[20:23], null offen offset:8 scope:SCOPE_DEV"),&[packed],&[2],&[20,21,22,23],false)?;
+        b.wait_all()?;
+        valu(b,"v_cmp_gt_u32_e32 vcc_lo, 16, v0",&[],&[0],&[])?;
+        valu(b,&format!("v_cndmask_b32_e32 v34, v{}, v{header}, vcc_lo",header+1),&[34],&[header,header+1],&[])?;
+        let dot=32+row;
+        let order=if quad && row==1 {[1,0,2,3,4,5,6,7]}else{[0,1,2,3,4,5,6,7]};
+        for (step,nibble) in order.into_iter().enumerate() {
+            valu(b,&format!("v_bfe_u32 v35, v{packed}, {}, 4",nibble*4),&[35],&[packed],&[])?;
+            valu(b,"v_cvt_f32_ubyte0_e32 v35, v35",&[35],&[35],&[])?;
+            valu(b,"v_fma_mix_f32 v36, v34, v35, v34 op_sel:[0,0,1] op_sel_hi:[1,0,1]",&[36],&[34,35],&[])?;
+            let x=8+nibble;
+            if step==0 {valu(b,&format!("v_mul_f32_e32 v{dot}, v{x}, v36"),&[dot],&[x,36],&[])?;}
+            else {valu(b,&format!("v_fmac_f32_e32 v{dot}, v{x}, v36"),&[dot],&[dot,x,36],&[])?;}
+        }
+        let acc=24+row*4+stream;
+        let (a,c)=if row==0 {(dot,acc)}else{(acc,dot)};
+        valu(b,&format!("v_add_f32_e32 v{acc}, v{a}, v{c}"),&[acc],&[a,c],&[])?;
+    }
+    salu(b,"s_add_co_i32 s15, s15, 1",&[15],&[15])?;
+    b.wait_all()
+}
+
+fn reduce_full(b:&mut Builder,result:u8)->Result<(),String> {
+    b.ds_crosslane(Instruction::new(format!("ds_swizzle_b32 v39, v{result} offset:swizzle(BITMASK_PERM,\"1pppp\")"),
+        refs(crate::reg::Kind::V,&[39]),refs(crate::reg::Kind::V,&[result])).memory(MemoryClass::DsLoad))?;
+    b.wait(crate::ledger::Counter::Ds,0)?;
+    valu(b,&format!("v_add_f32_e32 v{result}, v{result}, v39"),&[result],&[result,39],&[])?;
+    for offset in [8,4,2,1] {
+        valu(b,&format!("v_cmp_gt_u32_e32 vcc_lo, {}, v0",32-offset),&[],&[0],&[])?;
+        valu(b,&format!("v_cndmask_b32_e64 v38, 0, {offset}, vcc_lo"),&[38],&[],&[])?;
+        valu(b,"v_add_lshl_u32 v38, v38, v0, 2",&[38],&[38,0],&[])?;
+        b.ds_crosslane(Instruction::new(format!("ds_bpermute_b32 v39, v38, v{result}"),
+            refs(crate::reg::Kind::V,&[39]),refs(crate::reg::Kind::V,&[38,result])).memory(MemoryClass::DsLoad))?;
+        b.wait(crate::ledger::Counter::Ds,0)?;
+        valu(b,&format!("v_add_f32_e32 v{result}, v{result}, v39"),&[result],&[result,39],&[])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn build_dog_g0() -> Result<Emitted, String> {
     let mut regs = RegPlan::new(32, 8)?;
     regs.s::<2>("kernarg", 0, Live::Whole)?;
