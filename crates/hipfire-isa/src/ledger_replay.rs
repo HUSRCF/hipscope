@@ -176,8 +176,8 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
             Some((Kind::Vmem, true))
         } else if name.starts_with("buffer_store") || name.starts_with("global_store") {
             Some((Kind::Store, false))
-        } else if name.starts_with("ds_load") || name == "ds_swizzle_b32" {
-            // ds_swizzle_b32 returns its lane exchange through the DS queue like a load.
+        } else if name.starts_with("ds_load") || name == "ds_swizzle_b32" || name == "ds_bpermute_b32" {
+            // ds_swizzle_b32 / ds_bpermute_b32 return their lane exchange through the DS queue like a load.
             Some((Kind::Ds, true))
         } else if name.starts_with("ds_store") {
             Some((Kind::Ds, false))
@@ -325,5 +325,16 @@ mod tests {
         assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v3, v3\n")).is_ok());
         // lgkmcnt(1) leaves the youngest load, behind the swizzle, pending.
         assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v5, v5\n")).is_err());
+    }
+    /// A ds_bpermute_b32 lane exchange returns through the gfx12 DS queue in
+    /// order with the DS loads around it, exactly like a swizzle.
+    #[test]
+    fn gfx12_bpermute_results_wait_like_ds_loads() {
+        let gfx12 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1201);
+        let stream = "ds_load_b32 v2, v9\nds_bpermute_b32 v3, v4, v7\nds_load_b32 v5, v9 offset:4\n";
+        assert!(gfx12(&format!("{stream}v_add_f32_e32 v6, v3, v3\n")).is_err());
+        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x2\nv_add_f32_e32 v6, v3, v3\n")).is_err());
+        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v3, v3\n")).is_ok());
+        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v5, v5\n")).is_err());
     }
 }
