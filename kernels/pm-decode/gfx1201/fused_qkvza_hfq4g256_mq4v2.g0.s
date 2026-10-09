@@ -21,11 +21,13 @@ pm_decode_qkvza_g0:
 	global_load_b128 v[8:11], v3, s[8:9] offset:0
 	global_load_b128 v[12:15], v3, s[8:9] offset:16
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
-	s_wait_loadcnt 0x0
+	s_wait_loadcnt 0x3
 	v_cndmask_b32_e64 v16, v17, v16, vcc_lo
+	s_wait_loadcnt 0x2
 	v_bfe_u32 v19, v18, 4, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x1
 	v_mul_f32_e32 v21, v20, v9
 	v_bfe_u32 v19, v18, 0, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -42,6 +44,7 @@ pm_decode_qkvza_g0:
 	v_bfe_u32 v19, v18, 16, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x0
 	v_fmac_f32_e32 v21, v20, v12
 	v_bfe_u32 v19, v18, 20, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -62,11 +65,13 @@ pm_decode_qkvza_g0:
 	global_load_b128 v[8:11], v3, s[8:9] offset:1024
 	global_load_b128 v[12:15], v3, s[8:9] offset:1040
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
-	s_wait_loadcnt 0x0
+	s_wait_loadcnt 0x3
 	v_cndmask_b32_e64 v16, v17, v16, vcc_lo
+	s_wait_loadcnt 0x2
 	v_bfe_u32 v19, v18, 4, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x1
 	v_mul_f32_e32 v21, v20, v9
 	v_bfe_u32 v19, v18, 0, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -83,6 +88,7 @@ pm_decode_qkvza_g0:
 	v_bfe_u32 v19, v18, 16, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x0
 	v_fmac_f32_e32 v21, v20, v12
 	v_bfe_u32 v19, v18, 20, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -103,11 +109,13 @@ pm_decode_qkvza_g0:
 	global_load_b128 v[8:11], v3, s[8:9] offset:2048
 	global_load_b128 v[12:15], v3, s[8:9] offset:2064
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
-	s_wait_loadcnt 0x0
+	s_wait_loadcnt 0x3
 	v_cndmask_b32_e64 v16, v17, v16, vcc_lo
+	s_wait_loadcnt 0x2
 	v_bfe_u32 v19, v18, 4, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x1
 	v_mul_f32_e32 v21, v20, v9
 	v_bfe_u32 v19, v18, 0, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -124,6 +132,7 @@ pm_decode_qkvza_g0:
 	v_bfe_u32 v19, v18, 16, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x0
 	v_fmac_f32_e32 v21, v20, v12
 	v_bfe_u32 v19, v18, 20, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -144,11 +153,13 @@ pm_decode_qkvza_g0:
 	global_load_b128 v[8:11], v3, s[8:9] offset:3072
 	global_load_b128 v[12:15], v3, s[8:9] offset:3088
 	v_cmp_gt_u32_e32 vcc_lo, 16, v0
-	s_wait_loadcnt 0x0
+	s_wait_loadcnt 0x3
 	v_cndmask_b32_e64 v16, v17, v16, vcc_lo
+	s_wait_loadcnt 0x2
 	v_bfe_u32 v19, v18, 4, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x1
 	v_mul_f32_e32 v21, v20, v9
 	v_bfe_u32 v19, v18, 0, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
@@ -165,6 +176,7 @@ pm_decode_qkvza_g0:
 	v_bfe_u32 v19, v18, 16, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
 	v_fma_mix_f32 v20, v16, v19, v16 op_sel:[0,0,1] op_sel_hi:[1,0,1]
+	s_wait_loadcnt 0x0
 	v_fmac_f32_e32 v21, v20, v12
 	v_bfe_u32 v19, v18, 20, 4
 	v_cvt_f32_ubyte0_e32 v19, v19
