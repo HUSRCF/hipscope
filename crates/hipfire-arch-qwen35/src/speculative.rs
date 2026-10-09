@@ -3409,6 +3409,74 @@ pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
+/// GPU: the temperature softmax of every verify row (`probs`, row-major
+/// `[rows * vocab]`) and, when top_p / top_k truncation is active, the per-row
+/// cutoff `tau` and kept mass `z` from `softmax_temp_topp_batched_into_f32`.
+#[doc(hidden)]
+pub struct FastTargetRows {
+    pub probs: Vec<f32>,
+    pub trunc: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// Target distribution of verify row `row` in a sampled DFlash window, written
+/// into `out`: temperature softmax, then top_k, then top_p — from the GPU rows
+/// (`fast`, truncated by their `tau`/`z`) or, without FAST_SAMPLE, from the
+/// host `logits` (`[rows * vocab]`). Every sampled target read of the host
+/// accept loop goes through here — the accept test, the rejection residual
+/// and the full-accept / budget bonus — so they share one law.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn sampled_target_row_into(
+    out: &mut Vec<f32>,
+    row: usize,
+    vocab: usize,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+) {
+    match fast {
+        Some(fast) => {
+            out.clear();
+            out.extend_from_slice(&fast.probs[row * vocab..(row + 1) * vocab]);
+            if let Some((tau, z)) = &fast.trunc {
+                apply_topp_trunc(out, tau[row], z[row]);
+            }
+        }
+        None => {
+            softmax_temp_into(&logits[row * vocab..(row + 1) * vocab], temp, out);
+            if top_k > 0 && top_k < vocab {
+                apply_host_topk(out, top_k);
+            }
+            if top_p < 0.999 {
+                apply_host_nucleus(out, top_p);
+            }
+        }
+    }
+}
+
+/// Full-accept / budget-bound bonus of a sampled DFlash window: one draw with
+/// uniform `u` from [`sampled_target_row_into`]'s row `row`. `scratch` is
+/// reused as the row buffer.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn sampled_target_bonus(
+    scratch: &mut Vec<f32>,
+    row: usize,
+    vocab: usize,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    u: f32,
+) -> u32 {
+    sampled_target_row_into(scratch, row, vocab, fast, logits, temp, top_k, top_p);
+    sample_categorical(scratch, u)
+}
+
 /// Draw from (p_target − p_draft)₊, renormalized. Used on rejection to
 /// sample the "corrective" bonus token in speculative rejection sampling
 /// (Chen & Leviathan 2023, algorithm 1).
@@ -6737,11 +6805,10 @@ pub fn spec_step_dflash(
             // distribution-parity probs. The verify logits are still resident in
             // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
             // and only ran GPU-argmax afterwards, which does not overwrite it).
-            let mut fast_tgt_tau: Option<Vec<f32>> = None;
-            let mut fast_tgt_z: Option<Vec<f32>> = None;
-            let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+            let fast_tgt: Option<FastTargetRows> = if fast_sample_active {
                 let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
                 let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+                let mut trunc = None;
                 if topp_active {
                     let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
                     let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
@@ -6757,17 +6824,16 @@ pub fn spec_step_dflash(
                         top_k,
                         0.0,
                     )?;
-                    fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
-                    fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
+                    trunc = Some((gpu.download_f32(&tau_gpu)?, gpu.download_f32(&z_gpu)?));
                     let _ = gpu.free_tensor(tau_gpu);
                     let _ = gpu.free_tensor(z_gpu);
                 } else {
                     gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
                 }
-                let host = gpu.download_f32(&probs_gpu)?;
+                let probs = gpu.download_f32(&probs_gpu)?;
                 let _ = gpu.free_tensor(probs_gpu);
-                debug_assert_eq!(host.len(), b * vocab);
-                Some(host)
+                debug_assert_eq!(probs.len(), b * vocab);
+                Some(FastTargetRows { probs, trunc })
             } else {
                 debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
                 None
@@ -6786,25 +6852,16 @@ pub fn spec_step_dflash(
                         break;
                     }
                 }
-                if let Some(fast) = &fast_tgt_probs {
-                    target_probs.clear();
-                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                    }
-                } else {
-                    softmax_temp_into(
-                        &tgt_logits[i * vocab..(i + 1) * vocab],
-                        temp,
-                        &mut target_probs,
-                    );
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut target_probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut target_probs, top_p);
-                    }
-                }
+                sampled_target_row_into(
+                    &mut target_probs,
+                    i,
+                    vocab,
+                    fast_tgt.as_ref(),
+                    tgt_logits,
+                    temp,
+                    top_k,
+                    top_p,
+                );
                 let t = block[i + 1] as usize;
                 let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
                 let p_t = target_probs[t];
@@ -6842,26 +6899,21 @@ pub fn spec_step_dflash(
                 b
             } else {
                 // Full-accept OR budget-bound: draw bonus from the target row
-                // at the boundary (accept_len). Never substitute argmax.
+                // at the boundary (accept_len), under the same truncated law
+                // as the acceptance rows. Never substitute argmax.
                 let i = accept_len.min(b - 1);
-                if let Some(fast) = &fast_tgt_probs {
-                    target_probs.clear();
-                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                } else {
-                    softmax_temp_into(
-                        &tgt_logits[i * vocab..(i + 1) * vocab],
-                        temp,
-                        &mut target_probs,
-                    );
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut target_probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut target_probs, top_p);
-                    }
-                }
                 let u = xorshift_next_unit(rng_state);
-                sample_categorical(&target_probs, u)
+                sampled_target_bonus(
+                    &mut target_probs,
+                    i,
+                    vocab,
+                    fast_tgt.as_ref(),
+                    tgt_logits,
+                    temp,
+                    top_k,
+                    top_p,
+                    u,
+                )
             };
         }
     } else {
@@ -10438,6 +10490,123 @@ mod tests {
         apply_topp_trunc(&mut row, tau, z);
         assert!((row[0] - 1.0).abs() < 1e-5, "single-token nucleus → 1.0");
         assert_eq!(&row[1..], &[0.0, 0.0, 0.0]);
+    }
+
+    /// Bucket frequencies of `sampled_target_bonus` over a uniform `u` grid
+    /// (each bucket exact to one grid step per kept token).
+    #[allow(clippy::too_many_arguments)]
+    fn bonus_grid_freq(
+        row: usize,
+        vocab: usize,
+        fast: Option<&FastTargetRows>,
+        logits: &[f32],
+        temp: f32,
+        top_k: usize,
+        top_p: f32,
+        grid: usize,
+    ) -> Vec<f64> {
+        let mut scratch = Vec::new();
+        let mut freq = vec![0.0f64; vocab];
+        for g in 0..grid {
+            let u = (g as f32 + 0.5) / grid as f32;
+            let t = sampled_target_bonus(
+                &mut scratch,
+                row,
+                vocab,
+                fast,
+                logits,
+                temp,
+                top_k,
+                top_p,
+                u,
+            );
+            freq[t as usize] += 1.0 / grid as f64;
+        }
+        freq
+    }
+
+    #[test]
+    fn sampled_bonus_draws_from_the_acceptance_row_law() {
+        // Two verify rows; the bonus sits at row 1. Logits are distinct, so
+        // nucleus boundaries carry no ties.
+        let vocab = 64usize;
+        let rows = 2usize;
+        let logits: Vec<f32> = (0..rows * vocab)
+            .map(|j| {
+                let (r, i) = (j / vocab, j % vocab);
+                let rank = (i * 37 + r * 11) % vocab;
+                6.0 - 1.1 * ((rank + 1) as f32).ln()
+            })
+            .collect();
+        let grid = 200_000usize;
+        for &(temp, top_p, top_k) in &[(0.7f32, 0.95f32, 20usize), (1.0, 0.8, 0), (0.6, 0.9, 5)] {
+            // FAST_SAMPLE rows: the per-row softmax plus an exact nucleus
+            // tau/Z (top_k folded in by keeping at least the k-th prob).
+            let mut probs = Vec::with_capacity(rows * vocab);
+            let (mut tau, mut z) = (Vec::new(), Vec::new());
+            for r in 0..rows {
+                let mut row = Vec::new();
+                softmax_temp_into(&logits[r * vocab..(r + 1) * vocab], temp, &mut row);
+                let mut sorted = row.clone();
+                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let tau_k = if top_k > 0 { sorted[top_k - 1] } else { 0.0 };
+                let (tau_p, _) = cpu_tau_cut_z(&row, top_p);
+                let t = tau_k.max(tau_p);
+                tau.push(t);
+                z.push(row.iter().filter(|&&p| p >= t).sum());
+                probs.extend_from_slice(&row);
+            }
+            let fast = FastTargetRows {
+                probs,
+                trunc: Some((tau, z)),
+            };
+            for (fast, label) in [(Some(&fast), "fast"), (None, "host")] {
+                let mut law = Vec::new();
+                sampled_target_row_into(&mut law, 1, vocab, fast, &logits, temp, top_k, top_p);
+                let freq = bonus_grid_freq(1, vocab, fast, &logits, temp, top_k, top_p, grid);
+                for i in 0..vocab {
+                    if law[i] == 0.0 {
+                        assert_eq!(
+                            freq[i], 0.0,
+                            "{label} T{temp}: bonus {i} outside the row law"
+                        );
+                    } else {
+                        assert!(
+                            (freq[i] - law[i] as f64).abs() < 2e-4,
+                            "{label} T{temp}: token {i} freq {} vs law {}",
+                            freq[i],
+                            law[i]
+                        );
+                    }
+                }
+                if top_k > 0 {
+                    let kept = law.iter().filter(|&&p| p > 0.0).count();
+                    assert!(kept <= top_k, "{label}: {kept} kept > top_k {top_k}");
+                }
+            }
+            // Negative control: the pre-fix bonus read the raw FAST_SAMPLE
+            // row and lands outside the truncated support.
+            let raw = &fast.probs[vocab..2 * vocab];
+            let mut truncated = Vec::new();
+            sampled_target_row_into(
+                &mut truncated,
+                1,
+                vocab,
+                Some(&fast),
+                &logits,
+                temp,
+                top_k,
+                top_p,
+            );
+            let outside = (0..grid)
+                .map(|g| sample_categorical(raw, (g as f32 + 0.5) / grid as f32) as usize)
+                .filter(|&t| truncated[t] == 0.0)
+                .count();
+            assert!(
+                outside > 0,
+                "T{temp}: legacy raw-row bonus stayed inside the nucleus"
+            );
+        }
     }
 
     #[test]
