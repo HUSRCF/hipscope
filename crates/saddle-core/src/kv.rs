@@ -2280,11 +2280,25 @@ impl KvCache {
         Ok(need)
     }
 
+    /// Request-wide owner generation: the registration generation of this
+    /// owner's first real K tensor. Generations are monotonic per GPU and
+    /// never reused, so it identifies this owner instance across abort and
+    /// slot reuse; every layer descriptor carries the same value.
+    pub fn vmm_owner_generation(&self, gpu: &Gpu) -> HipResult<u64> {
+        let k = self
+            .k_gpu
+            .iter()
+            .find(|t| t.buf.is_vmm_owner())
+            .ok_or_else(|| hip_bridge::HipError::new(0, "KV cache has no VMM K owner"))?;
+        gpu.vmm_owner_generation(k)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU"))
+    }
+
     /// Per-layer VMM descriptors for this request (index = model layer;
     /// non-KV layers are [`VmmKvSlotDesc::MASKED`]). Addresses are the
     /// owners' stable VAs; `mapped_positions` is the actual mapped prefix
-    /// over K and V, `owner_generation` the K owner's registration
-    /// generation. A view borrows: it never transfers or clones ownership,
+    /// over K and V, `owner_generation` the request-wide
+    /// [`Self::vmm_owner_generation`]. A view borrows: it never transfers or clones ownership,
     /// and is invalid after [`Self::release_vmm_after`].
     pub fn vmm_slot_descs(
         &self,
@@ -2300,6 +2314,7 @@ impl KvCache {
         };
         let mapped_positions = to_u32(mapped.min(self.vmm_logical_bound()), "mapped prefix")?;
         let logical_bound = to_u32(self.vmm_logical_bound(), "logical bound")?;
+        let owner_generation = self.vmm_owner_generation(gpu)?;
         self.k_gpu
             .iter()
             .zip(&self.v_gpu)
@@ -2310,7 +2325,7 @@ impl KvCache {
                 if !v.buf.is_vmm_owner() {
                     return Err(hip_bridge::HipError::new(0, "VMM K owner paired with non-VMM V"));
                 }
-                let owner_generation = gpu.vmm_owner_generation(k).ok_or_else(|| {
+                gpu.vmm_owner_generation(k).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
                 })?;
                 Ok(VmmKvSlotDesc {
