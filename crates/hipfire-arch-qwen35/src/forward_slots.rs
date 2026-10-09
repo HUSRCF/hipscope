@@ -87,6 +87,8 @@
 // KV write and the attend call, both single launches via the `_slots`
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
 
+pub mod vmm;
+
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
     moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
@@ -337,6 +339,106 @@ impl SlotDescStaging {
         let _ = gpu.free_tensor(self.tile_qbase_dev);
         for t in self.block_table_devs {
             let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// Where one FullAttention layer's KV lives for a slots step.
+///
+/// `Arena` is the explicitly-legacy shared-arena route (`SlotPool` slab or
+/// paged), addressed through `KvSlotDesc` offsets into one arena tensor per
+/// layer. `Vmm` is the per-request route: every request owns its own
+/// `KvCache` VMM reservation and this layer's `VmmKvSlotDesc` table carries
+/// each request's absolute per-layer K/V base VA. The two descriptor ABIs are
+/// never reinterpreted as one another.
+pub(crate) enum LayerKvAddr<'a> {
+    Arena {
+        k_cache: &'a GpuTensor,
+        v_cache: &'a GpuTensor,
+        desc_staging: &'a SlotDescStaging,
+        single_slot: Option<(u64, usize)>,
+        n_tiles: Option<usize>,
+    },
+    Vmm(vmm::VmmLayerKv<'a>),
+}
+
+/// KV write + attend for one FullAttention layer step on either storage.
+#[allow(clippy::too_many_arguments)]
+fn layer_kv_write_attend(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    kv: &SlotKvTier,
+    addr: &LayerKvAddr,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    n: usize,
+    physical_cap: usize,
+    max_ctx_len: usize,
+) -> HipResult<()> {
+    match addr {
+        LayerKvAddr::Arena {
+            k_cache,
+            v_cache,
+            desc_staging,
+            single_slot,
+            n_tiles,
+        } => {
+            // Batched KV write — slot-aware, ONE launch per arena across every
+            // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
+            // resolve through the descriptor table (block tables under paged);
+            // on the rotated-K tiers the V write resolves the descriptor's
+            // `legacy_v_base`, which differs from `legacy_k_base`.
+            kv_write_slots(
+                gpu,
+                kv,
+                k_cache,
+                v_cache,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+                &desc_staging.descs_dev,
+                &desc_staging.row_slot_dev,
+            )?;
+            // Batched attend — slot-aware, one launch across every slot.
+            // `positions[]` (not any `desc.seq_len`) is authoritative for the
+            // causal bound inside the ported kernels — SP1's only Critical
+            // defect came from conflating the two on a tile kernel bounded by
+            // `desc.seq_len` while the shared reduce kernel stayed bounded by
+            // `positions[]`. `tree_bias` is never combined with descriptors
+            // here (asserted out of SP1 scope).
+            tier_attend_slots(
+                gpu,
+                kv,
+                &pbs.fa_q_batch,
+                k_cache,
+                v_cache,
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                physical_cap,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+                &desc_staging.descs_dev,
+                &desc_staging.row_slot_dev,
+                *single_slot,
+                n_tiles.map(|nt| {
+                    (
+                        &desc_staging.tile_slot_dev,
+                        &desc_staging.tile_row0_dev,
+                        &desc_staging.tile_qbase_dev,
+                        nt,
+                    )
+                }),
+            )
+        }
+        LayerKvAddr::Vmm(layer) => {
+            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, s, n, max_ctx_len)
         }
     }
 }
@@ -1000,18 +1102,21 @@ fn spec_tape_layer_rows(
 /// once over all `n` rows. The stateful pieces (conv1d, the GDN recurrence)
 /// loop per slot with that slot's own state — see the module doc.
 #[allow(clippy::too_many_arguments)]
-fn run_deltanet_layer_slots(
+fn run_deltanet_layer_slots<D>(
     gpu: &mut Gpu,
     config: &Qwen35Config,
     layer: &DeltaNetLayerWeights,
     batch: &SlotBatch,
-    dn_states: &mut [DeltaNetState],
+    dn_states: &D,
     pbs: &PrefillBatchScratch,
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
     mut spec_capture: Option<&mut SpecVerifyCapture>,
-) -> HipResult<()> {
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
     let attn_dtype = require_batchable_deltanet_layer(layer, gpu.arch.as_str())?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -1319,12 +1424,12 @@ fn run_deltanet_layer_slots(
 /// function already threads through the attention body is exactly the input
 /// shape `prefill_moe_ffn_body_batched` expects.
 #[allow(clippy::too_many_arguments)]
-fn run_deltanet_moe_layer_slots(
+fn run_deltanet_moe_layer_slots<D>(
     gpu: &mut Gpu,
     config: &Qwen35Config,
     layer: &DeltaNetMoeLayerWeights,
     batch: &SlotBatch,
-    dn_states: &mut [DeltaNetState],
+    dn_states: &D,
     pbs: &PrefillBatchScratch,
     q8_wmma_arch: bool,
     n: usize,
@@ -1339,7 +1444,10 @@ fn run_deltanet_moe_layer_slots(
     // instead of the model-wide flag would silently diverge from the
     // reference whenever the SAME model mixes an MQ6 layer elsewhere.
     weights_moe_has_mq6: bool,
-) -> HipResult<()> {
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
     let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
@@ -2324,16 +2432,12 @@ fn run_fullattn_layer_slots(
     layer: &FullAttnLayerWeights,
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
-    k_cache: &GpuTensor,
-    v_cache: &GpuTensor,
-    desc_staging: &SlotDescStaging,
+    addr: &LayerKvAddr,
     kv: &SlotKvTier,
     q8_wmma_arch: bool,
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
-    single_slot: Option<(u64, usize)>,
-    n_tiles: Option<usize>,
     // When true, `pbs.pos3` carries per-row M-RoPE phases: dispatch the
     // batched M-RoPE kernel instead of the 1D one. Text rows carry [p, p, p]
     // (bit-identical angles); only VL image/post-image rows genuinely differ.
@@ -2502,60 +2606,9 @@ fn run_fullattn_layer_slots(
         )?;
     }
 
-    // 6. Batched KV write — slot-aware, ONE launch per arena across every
-    // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
-    // resolve through the descriptor table (block tables under paged); on
-    // the rotated-K tiers the V write resolves the descriptor's
-    // `legacy_v_base`, which differs from `legacy_k_base`.
-    kv_write_slots(
-        gpu,
-        kv,
-        k_cache,
-        v_cache,
-        &pbs.fa_k_batch,
-        &pbs.fa_v_batch,
-        &pbs.positions,
-        config.n_kv_heads,
-        config.head_dim,
-        n,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-    )?;
-
-    // 7. Batched attend — slot-aware, one launch across every slot.
-    // `positions[]` (not any `desc.seq_len`) is authoritative for the
-    // causal bound inside the ported kernels — SP1's only Critical defect
-    // came from conflating the two on a tile kernel bounded by
-    // `desc.seq_len` while the shared reduce kernel stayed bounded by
-    // `positions[]`. `tree_bias` is never combined with descriptors here
-    // (asserted out of SP1 scope).
-    tier_attend_slots(
-        gpu,
-        kv,
-        &pbs.fa_q_batch,
-        k_cache,
-        v_cache,
-        &pbs.fa_attn_out_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        physical_cap,
-        max_ctx_len,
-        n,
-        &s.flash_partials,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-        single_slot,
-        n_tiles.map(|nt| {
-            (
-                &desc_staging.tile_slot_dev,
-                &desc_staging.tile_row0_dev,
-                &desc_staging.tile_qbase_dev,
-                nt,
-            )
-        }),
-    )?;
+    // 6-7. Batched KV write + attend — slot-aware, one launch each across
+    // every slot, on the resolved KV tier and storage (`LayerKvAddr`).
+    layer_kv_write_attend(gpu, config, kv, addr, pbs, s, n, physical_cap, max_ctx_len)?;
 
     // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
     //
@@ -2632,16 +2685,12 @@ fn run_fullattn_moe_layer_slots(
     layer: &FullAttnMoeLayerWeights,
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
-    k_cache: &GpuTensor,
-    v_cache: &GpuTensor,
-    desc_staging: &SlotDescStaging,
+    addr: &LayerKvAddr,
     kv: &SlotKvTier,
     q8_wmma_arch: bool,
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
-    single_slot: Option<(u64, usize)>,
-    n_tiles: Option<usize>,
     weights_moe_has_mq6: bool,
     use_mrope: bool,
 ) -> HipResult<()> {
@@ -2807,51 +2856,10 @@ fn run_fullattn_moe_layer_slots(
         )?;
     }
 
-    // 6. Batched KV write — slot-aware, on the engine's resolved KV tier
-    // regardless of this layer's projection weight dtype (see module doc).
-    kv_write_slots(
-        gpu,
-        kv,
-        k_cache,
-        v_cache,
-        &pbs.fa_k_batch,
-        &pbs.fa_v_batch,
-        &pbs.positions,
-        config.n_kv_heads,
-        config.head_dim,
-        n,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-    )?;
-
-    // 7. Batched attend — slot-aware, one launch across every slot.
-    tier_attend_slots(
-        gpu,
-        kv,
-        &pbs.fa_q_batch,
-        k_cache,
-        v_cache,
-        &pbs.fa_attn_out_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        physical_cap,
-        max_ctx_len,
-        n,
-        &s.flash_partials,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-        single_slot,
-        n_tiles.map(|nt| {
-            (
-                &desc_staging.tile_slot_dev,
-                &desc_staging.tile_row0_dev,
-                &desc_staging.tile_qbase_dev,
-                nt,
-            )
-        }),
-    )?;
+    // 6-7. Batched KV write + attend — slot-aware, on the engine's resolved
+    // KV tier and storage regardless of this layer's projection weight dtype
+    // (see module doc).
+    layer_kv_write_attend(gpu, config, kv, addr, pbs, s, n, physical_cap, max_ctx_len)?;
 
     // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
     //
@@ -4032,103 +4040,30 @@ pub fn forward_batch_slots_opts(
 
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
     let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
-    let mut delta_layer_idx = 0usize;
-    let mut kv_layer_idx = 0usize;
-    for layer_idx in 0..layer_end {
-        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
-            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                run_deltanet_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    batch,
-                    dn_states,
-                    pbs,
-                    q8_wmma_arch,
-                    n,
-                    delta_layer_idx,
-                    spec_capture.as_deref_mut(),
-                )?;
-                delta_layer_idx += 1;
-            }
-            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                run_fullattn_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    pbs,
-                    s,
-                    &k_arenas[kv_layer_idx],
-                    &v_arenas[kv_layer_idx],
-                    desc_staging,
-                    kv,
-                    q8_wmma_arch,
-                    n,
-                    physical_cap,
-                    max_ctx_len,
-                    single_slot,
-                    n_tiles,
-                    use_mrope,
-                )?;
-                kv_layer_idx += 1;
-            }
-            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                run_deltanet_moe_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    batch,
-                    dn_states,
-                    pbs,
-                    q8_wmma_arch,
-                    n,
-                    delta_layer_idx,
-                    spec_capture.as_deref_mut(),
-                    weights.moe_has_mq6,
-                )?;
-                delta_layer_idx += 1;
-            }
-            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                run_fullattn_moe_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    pbs,
-                    s,
-                    &k_arenas[kv_layer_idx],
-                    &v_arenas[kv_layer_idx],
-                    desc_staging,
-                    kv,
-                    q8_wmma_arch,
-                    n,
-                    physical_cap,
-                    max_ctx_len,
-                    single_slot,
-                    n_tiles,
-                    weights.moe_has_mq6,
-                    use_mrope,
-                )?;
-                kv_layer_idx += 1;
-            }
-            (_, lt) => {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "forward_batch_slots: layer {layer_idx} weight/type mismatch \
-                         (layer_type={lt:?})"
-                    ),
-                ));
-            }
-        }
-        // DFlash2 extract-layer hidden capture: copy this step's
-        // post-layer hidden rows into the shared staging buffer. Runs
-        // for every layer kind (extract layers can be DeltaNet or
-        // FullAttention); `capture_hidden_rows` is a no-op when the
-        // capture is unset or this layer is not an extract layer.
-        if let Some(cap) = spec_capture.as_deref() {
-            cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
-        }
-    }
+    run_layers_slots(
+        gpu,
+        weights,
+        config,
+        batch,
+        &*dn_states,
+        |kv_layer_idx| LayerKvAddr::Arena {
+            k_cache: &k_arenas[kv_layer_idx],
+            v_cache: &v_arenas[kv_layer_idx],
+            desc_staging,
+            single_slot,
+            n_tiles,
+        },
+        kv,
+        pbs,
+        s,
+        q8_wmma_arch,
+        n,
+        physical_cap,
+        max_ctx_len,
+        use_mrope,
+        layer_end,
+        spec_capture.as_deref_mut(),
+    )?;
 
     if max_layer.is_some() {
         // Early-exit for bisection: mirror the reference's `do_lm_head =
@@ -4165,6 +4100,123 @@ pub fn forward_batch_slots_opts(
     // correct-by-construction: this function is the only thing that advances a
     // slot's KV, so it is the only thing that can get the length right.
     advance_slot_seq_lens(batch, pool)?;
+    Ok(())
+}
+
+/// The per-layer body shared by the arena and VMM slots forwards. `kv_addr`
+/// yields the KV storage for FullAttention layer `kv_layer_idx`.
+#[allow(clippy::too_many_arguments)]
+fn run_layers_slots<'a, D, F>(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    dn_states: &D,
+    kv_addr: F,
+    kv: &SlotKvTier,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    q8_wmma_arch: bool,
+    n: usize,
+    physical_cap: usize,
+    max_ctx_len: usize,
+    use_mrope: bool,
+    layer_end: usize,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+    F: Fn(usize) -> LayerKvAddr<'a>,
+{
+    let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
+    for layer_idx in 0..layer_end {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                run_deltanet_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    batch,
+                    dn_states,
+                    pbs,
+                    q8_wmma_arch,
+                    n,
+                    delta_layer_idx,
+                    spec_capture.as_deref_mut(),
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                run_fullattn_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    pbs,
+                    s,
+                    &kv_addr(kv_layer_idx),
+                    kv,
+                    q8_wmma_arch,
+                    n,
+                    physical_cap,
+                    max_ctx_len,
+                    use_mrope,
+                )?;
+                kv_layer_idx += 1;
+            }
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                run_deltanet_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    batch,
+                    dn_states,
+                    pbs,
+                    q8_wmma_arch,
+                    n,
+                    delta_layer_idx,
+                    spec_capture.as_deref_mut(),
+                    weights.moe_has_mq6,
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                run_fullattn_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    pbs,
+                    s,
+                    &kv_addr(kv_layer_idx),
+                    kv,
+                    q8_wmma_arch,
+                    n,
+                    physical_cap,
+                    max_ctx_len,
+                    weights.moe_has_mq6,
+                    use_mrope,
+                )?;
+                kv_layer_idx += 1;
+            }
+            (_, lt) => {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "forward_batch_slots: layer {layer_idx} weight/type mismatch \
+                         (layer_type={lt:?})"
+                    ),
+                ));
+            }
+        }
+        // DFlash2 extract-layer hidden capture: copy this step's
+        // post-layer hidden rows into the shared staging buffer. Runs
+        // for every layer kind (extract layers can be DeltaNet or
+        // FullAttention); `capture_hidden_rows` is a no-op when the
+        // capture is unset or this layer is not an extract layer.
+        if let Some(cap) = spec_capture.as_deref() {
+            cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
+        }
+    }
     Ok(())
 }
 

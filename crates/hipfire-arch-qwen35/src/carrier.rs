@@ -38,6 +38,10 @@ pub struct Qwen35Bundle {
     /// or eagerly via `LoadedModel::qwen35_mut()` in `unload_model` before
     /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
     pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
+    /// Per-request VMM continuous-batching executor (request owners plus
+    /// row-budget scratch). `None` unless the VMM batch route is staged;
+    /// freed before KV/weights in every bundle free path.
+    pub vmm_store: Option<crate::forward_slots::vmm::Qwen35VmmStore>,
 }
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
@@ -146,6 +150,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         vision_config: None,
         vision_weights: None,
         qwen35_decode_batch: None,
+        vmm_store: None,
     })
 }
 
@@ -534,12 +539,18 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vision_config: _,
         vision_weights,
         qwen35_decode_batch,
+        vmm_store,
     } = bundle;
     debug_assert!(
         pp_scratch_set.is_none(),
         "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
     );
     let _ = pp_scratch_set;
+    if let Some(store) = vmm_store {
+        if let Err(e) = store.free_gpu(gpu) {
+            eprintln!("free_qwen35_bundle: VMM batch store free: {e}");
+        }
+    }
     if let Some(batch) = qwen35_decode_batch {
         let _ = batch.free_gpu(gpu);
     }
