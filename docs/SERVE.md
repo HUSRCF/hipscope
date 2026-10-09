@@ -98,12 +98,16 @@ Config and env owners for bind, idle, queue, and body limits:
    per-request VMM KV/DeltaNet owners (no fixed lanes, no second model). The
    loaded ack then reports `continuous_batch_route: "vmm"` and the actual
    owner receipt (`vmm_batch_kv_backend`, `vmm_batch_kv_mode`,
-   `vmm_batch_max_seq_bound`). Stage-1 limits: greedy requests only
+   `vmm_batch_max_seq_bound`). The route is **not singleton-exact** (its
+   prefill and decode projections take different kernels than the singleton
+   route), so it is staged and dispatched only when
+   `serve.batch_nonexact` / `HIPFIRE_SERVE_BATCH_NONEXACT=1` is also set; the
+   ack then reports `continuous_batch_nonexact: true` and
+   `continuous_batch_exact: false`. Stage-1 limits: greedy requests only
    (penalties apply as on the singleton route) and AR rows only;
-   `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) and
-   `serve.batch_nonexact` (`HIPFIRE_SERVE_BATCH_NONEXACT`) are reserved
-   switches — no cross-request speculation or non-exact arithmetic is enabled
-   yet. A request that is alone at dispatch keeps the unchanged singleton
+   `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) is a reserved switch — no
+   cross-request speculation is enabled yet. A request that is alone at
+   dispatch keeps the unchanged singleton route
    route (including native MTP/DFlash); requests arriving while a singleton
    generation runs wait for it to finish, so their TTFT includes that
    generation (known gap). The fixed-slot `serve.multi_slot` engine below is

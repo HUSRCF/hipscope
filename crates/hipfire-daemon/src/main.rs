@@ -1201,8 +1201,13 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                // The VMM executor is not singleton-exact
+                // (`Qwen35VmmStore::ROUTE_EXACT == false`): PLAN §4.3 admits
+                // it only with the explicit nonexact opt-in. Without it the
+                // route is neither staged nor dispatched.
                 let parsed_vmm_batch =
-                    hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
+                    hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"))
+                        .filter(|p| p.nonexact);
                 let experimental_multi_slot = msg
                     .get("params")
                     .and_then(|p| p.get("experimental_multi_slot"))
@@ -2588,7 +2593,10 @@ fn main() {
                                         serde_json::json!(p.max_batch_tokens);
                                     v["continuous_batch_spec"] = serde_json::json!(false);
                                     v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
-                                    v["continuous_batch_nonexact"] = serde_json::json!(false);
+                                    v["continuous_batch_nonexact"] = serde_json::json!(true);
+                                    v["continuous_batch_exact"] = serde_json::json!(
+                                        hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore::ROUTE_EXACT
+                                    );
                                     v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
                                     match receipt {
                                         Some(Ok(r)) => {
