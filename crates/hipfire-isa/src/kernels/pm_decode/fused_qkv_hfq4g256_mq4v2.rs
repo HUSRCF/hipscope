@@ -52,22 +52,15 @@ fn group_dot(b: &mut Builder) -> Result<(), String> {
     Ok(())
 }
 
-fn project_group(b: &mut Builder, stream: u8, tail: bool) -> Result<(), String> {
+fn project_group(b: &mut Builder, stream: u8) -> Result<(), String> {
     let offset = u32::from(stream) * 136;
     let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
-    if tail {
-        op(b, "v_add_nc_u32_e32 v4, s40, v3", &[v(4)], &[s(40), v(3)])?;
-        op(b, "v_add_nc_u32_e32 v7, s40, v1", &[v(7)], &[s(40), v(1)])?;
-        mem(b, format!("global_load_b32 v5, v4, s[32:33]{suffix}"),
-            &[v(5)], &[v(4), sr(32, 2)], MemoryClass::VmemLoad)?;
-        mem(b, format!("global_load_b32 v6, v7, s[32:33]{suffix}"),
-            &[v(6)], &[v(7), sr(32, 2)], MemoryClass::VmemLoad)?;
-    } else {
-        mem(b, format!("buffer_load_b32 v5, v3, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
-            &[v(5)], &[v(3), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-        mem(b, format!("buffer_load_b32 v6, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
-            &[v(6)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
-    }
+    op(b, "v_add_nc_u32_e32 v4, s40, v3", &[v(4)], &[s(40), v(3)])?;
+    op(b, "v_add_nc_u32_e32 v7, s40, v1", &[v(7)], &[s(40), v(1)])?;
+    mem(b, format!("global_load_b32 v5, v4, s[32:33]{suffix}"),
+        &[v(5)], &[v(4), sr(32, 2)], MemoryClass::VmemLoad)?;
+    mem(b, format!("global_load_b32 v6, v7, s[32:33]{suffix}"),
+        &[v(6)], &[v(7), sr(32, 2)], MemoryClass::VmemLoad)?;
     let xoff = u32::from(stream) * 1024;
     let xsuffix = if xoff == 0 { String::new() } else { format!(" offset:{xoff}") };
     mem(b, format!("global_load_b128 v[8:11], v2, s[10:11]{xsuffix}"),
@@ -79,6 +72,83 @@ fn project_group(b: &mut Builder, stream: u8, tail: bool) -> Result<(), String> 
     op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v24"),
         &[v(acc)], &[v(acc), v(24)])?;
     b.wait_all()
+}
+
+/// Batch the quad's memory operations and interleave four independent dot
+/// chains. First-half x loads precede all second-half loads, so Builder can
+/// prove progressive waits instead of draining the counter for each group.
+/// Only one nibble per stream is live, keeping the production budget at 64 VGPRs.
+fn project_quad(b: &mut Builder) -> Result<(), String> {
+    for stream in 0..4u8 {
+        let offset = u32::from(stream) * 136;
+        let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+        let header = 8 + stream * 2;
+        let packed = 4 + stream;
+        if stream == 0 || stream == 3 {
+            mem(b, format!("buffer_load_b64 v[{header}:{}], v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV", header + 1),
+                &[vr(header, 2)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+        } else {
+            mem(b, format!("buffer_load_b32 v{header}, v31, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+                &[v(header)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+            mem(b, format!("buffer_load_b32 v{}, v31, s[36:39], s40 offen offset:{} scope:SCOPE_DEV", header + 1, offset + 4),
+                &[v(header + 1)], &[v(31), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+        }
+        mem(b, format!("buffer_load_b32 v{packed}, v1, s[36:39], s40 offen{suffix} scope:SCOPE_DEV"),
+            &[v(packed)], &[v(1), sr(36, 4), s(40)], MemoryClass::VmemLoad)?;
+    }
+    for half in [0u8, 4] {
+        for stream in 0..4u8 {
+            let base = 32 + stream * 8 + half;
+            let offset = u32::from(stream) * 1024 + u32::from(half) * 4;
+            let suffix = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+            mem(b, format!("global_load_b128 v[{base}:{}], v2, s[10:11]{suffix}", base + 3),
+                &[vr(base, 4)], &[v(2), sr(10, 2)], MemoryClass::VmemLoad)?;
+        }
+    }
+    op(b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
+    for stream in 0..4u8 {
+        let header = 8 + stream * 2;
+        op(b, format!("v_cndmask_b32_e64 v{header}, v{}, v{header}, vcc_lo", header + 1),
+            &[v(header)], &[v(header), v(header + 1)])?;
+    }
+    for term in [1u8, 0, 2, 3, 4, 5, 6, 7] {
+        for stream in 0..4u8 {
+            let weight = 20 + stream;
+            let packed = 4 + stream;
+            op(b, format!("v_bfe_u32 v{weight}, v{packed}, {}, 4", term * 4),
+                &[v(weight)], &[v(packed)])?;
+        }
+        for stream in 0..4u8 {
+            let weight = 20 + stream;
+            op(b, format!("v_cvt_f32_ubyte0_e32 v{weight}, v{weight}"),
+                &[v(weight)], &[v(weight)])?;
+        }
+        for stream in 0..4u8 {
+            let weight = 20 + stream;
+            let header = 8 + stream * 2;
+            op(b, format!("v_fma_mix_f32 v{weight}, v{header}, v{weight}, v{header} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
+                &[v(weight)], &[v(header), v(weight)])?;
+        }
+        for stream in 0..4u8 {
+            let dot = 16 + stream;
+            let weight = 20 + stream;
+            let x = 32 + stream * 8 + term;
+            if term == 1 {
+                op(b, format!("v_mul_f32_e32 v{dot}, v{weight}, v{x}"),
+                    &[v(dot)], &[v(weight), v(x)])?;
+            } else {
+                op(b, format!("v_fmac_f32_e32 v{dot}, v{weight}, v{x}"),
+                    &[v(dot)], &[v(dot), v(weight), v(x)])?;
+            }
+        }
+    }
+    for stream in 0..4u8 {
+        let acc = 26 + stream;
+        let dot = 16 + stream;
+        op(b, format!("v_add_f32_e32 v{acc}, v{acc}, v{dot}"),
+            &[v(acc)], &[v(acc), v(dot)])?;
+    }
+    Ok(())
 }
 
 /// This is the incumbent shfl_down semantics, including out-of-range lanes
@@ -106,7 +176,7 @@ fn reduce_wave(b: &mut Builder) -> Result<(), String> {
 }
 
 pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
-    let mut regs = RegPlan::new(32, 48)?;
+    let mut regs = RegPlan::new(64, 48)?;
     regs.add_range("workitem", Kind::V, 0, 1, Live::Whole)?;
     for base in 1..8 {
         regs.add_range(&format!("address_or_packed_{base}"), Kind::V, base, 1, Live::Whole)?;
@@ -114,11 +184,14 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     for base in [8, 16, 24] {
         regs.add_range(&format!("fragment_{base}"), Kind::V, base, 8, Live::Whole)?;
     }
+    for base in [32, 40, 48, 56] {
+        regs.add_range(&format!("quad_x_{base}"), Kind::V, base, 8, Live::Whole)?;
+    }
     for (base, len) in [(0, 2), (4, 4), (8, 8), (16, 8), (24, 8), (32, 8), (40, 2)] {
         regs.add_range(&format!("scalar_{base}"), Kind::S, base, len, Live::Whole)?;
     }
     let mut b = Builder::new(KernelSpec {
-        kernel_id: MODULE.into(), variant: "four-stream-scalar".into(),
+        kernel_id: MODULE.into(), variant: "four-stream-quad-ilp".into(),
         arch: Arch::Gfx1201, symbol: "fused_qkv_mq4g256v2".into(),
         kernargs: kernargs(), user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: false, workgroup_size: 32,
@@ -168,15 +241,14 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     op(&mut b, "v_lshlrev_b32_e32 v2, 5, v0", &[v(2)], &[v(0)])?;
     op(&mut b, "v_cmp_gt_u32_e32 vcc_lo, 16, v0", &[], &[v(0)])?;
     op(&mut b, "v_cndmask_b32_e64 v3, 4, 0, vcc_lo", &[v(3)], &[])?;
+    op(&mut b, "v_mov_b32_e32 v31, 0", &[v(31)], &[])?;
     for acc in 26..30 {
         op(&mut b, format!("v_mov_b32_e32 v{acc}, 0"), &[v(acc)], &[])?;
     }
     sop(&mut b, "s_cmp_eq_u32 s34, 0", &[], &[34])?;
     op(&mut b, "s_cbranch_scc1 .Lqkv_tails", &[], &[])?;
     b.loop_(".Lqkv_quads", |b| {
-        for stream in 0..4 {
-            project_group(b, stream, false)?;
-        }
+        project_quad(b)?;
         sop(b, "s_add_co_i32 s40, s40, 0x220", &[40], &[40])?;
         op(b, "v_add_nc_u32_e32 v2, 0x1000, v2", &[v(2)], &[v(2)])?;
         sop(b, "s_sub_co_i32 s34, s34, 1", &[34], &[34])?;
@@ -187,7 +259,7 @@ pub fn build_gfx1201() -> Result<Vec<Emitted>, String> {
     for stream in 0..3 {
         sop(&mut b, format!("s_cmp_lt_u32 s35, {}", stream + 1), &[], &[35])?;
         op(&mut b, "s_cbranch_scc1 .Lqkv_reduce", &[], &[])?;
-        project_group(&mut b, stream, true)?;
+        project_group(&mut b, stream)?;
     }
     b.label(".Lqkv_reduce")?;
     reduce_wave(&mut b)?;
@@ -279,6 +351,17 @@ mod tests {
         assert_eq!(e.shape.ds, 5);
         assert_eq!(e.proof.loop_fixpoints.len(), 1);
         assert!(e.proof.lds_slots.is_empty());
+        let quad = e.s_text.split(".Lqkv_quads:").nth(1).unwrap()
+            .split("s_add_co_i32 s40").next().unwrap();
+        let issued_before_wait = quad.lines()
+            .take_while(|line| !line.contains("s_wait_loadcnt"))
+            .filter(|line| line.contains("buffer_load_") || line.contains("global_load_"))
+            .count();
+        assert_eq!(issued_before_wait, 18, "quad loads must overlap before the first wait");
+        for stream in 0..4u8 {
+            assert!(quad.contains(&format!("v_mul_f32_e32 v{}, v{}, v{}",
+                16 + stream, 20 + stream, 33 + stream * 8)));
+        }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../kernels/pm-decode/gfx1201");
         std::fs::create_dir_all(&root).unwrap();
