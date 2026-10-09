@@ -3372,6 +3372,7 @@ impl Gpu {
         plan: crate::kernel_registry::RouteKernelPlan,
         jobs: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.abort_route_kernel_load()?;
         crate::kernel_registry::validate_route_plan(&plan)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
@@ -3405,6 +3406,8 @@ impl Gpu {
     /// symbol. Idempotent; every kernel request and mutable launch funnel
     /// calls it, so no dispatch precedes the full plan.
     pub fn ensure_route_modules_preloaded(&mut self) -> HipResult<()> {
+        // bind_thread: skip — hot launch-funnel check; binds below only when a
+        // plan is pending and modules are about to load.
         if !self.scratch.route_load.pending() {
             return Ok(());
         }
@@ -3422,6 +3425,7 @@ impl Gpu {
     /// then refuse any unplanned kernel compile/module load. No-op when no
     /// route was begun (lazy loading stays).
     pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         match self.scratch.route_load {
             crate::scratch::RouteLoad::Idle | crate::scratch::RouteLoad::Sealed => Ok(()),
             _ => {
@@ -3435,6 +3439,7 @@ impl Gpu {
     /// Drop any route state and return to lazy loading, joining every
     /// outstanding compile worker. Modules already loaded stay cached.
     pub fn abort_route_kernel_load(&mut self) -> HipResult<()> {
+        // bind_thread: skip — CPU-only: joins compile workers, no HIP call.
         match std::mem::take(&mut self.scratch.route_load) {
             crate::scratch::RouteLoad::Pending {
                 batch: Some(batch), ..
@@ -3445,6 +3450,7 @@ impl Gpu {
 
     /// True while a begun route's modules are not yet on the GPU.
     pub fn route_kernels_pending(&self) -> bool {
+        // bind_thread: skip — pure state query.
         self.scratch.route_load.pending()
     }
 
@@ -6564,6 +6570,7 @@ impl Gpu {
     /// the function cache, so a loaded model's route is untouched. Recipes
     /// come from the one registry resolver the packager and route planner use.
     pub fn precompile_registry(&mut self) -> HipResult<()> {
+        // bind_thread: skip — CPU-only compile into the kernel cache, no HIP call.
         let entries = crate::kernel_registry::entries(&self.arch, &self.compiler.extra_flags)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("kernel registry: {e:?}")))?;
         let jobs = crate::compile_jobs::host_compile_job_budget()
