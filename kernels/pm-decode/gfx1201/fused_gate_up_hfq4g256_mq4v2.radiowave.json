@@ -1,7 +1,7 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791509376,
+  "generated_unix_seconds": 1791509566,
   "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
   "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
   "arch": "gfx1201",
@@ -124,8 +124,8 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
-      "proof_sha256": "e3202e1ed44a2668152e9b4cfc70f2ceb99f8f00359d2d12e1a16062737d563c"
+      "builder_git_sha": "55f693fd3efadd0aad85d3a4dac420d9200edf7d",
+      "proof_sha256": "66dc0f80e5e96dc5d5ff19edc496145e9e4e3290f0a907598ea28a55d62a8cbf"
     },
     "tools": [
       {
@@ -141,7 +141,7 @@
           "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "c758865153dc8fb5667fc64eaf768caddc98c8554efe9a295b05bf4b7eebe826"
+        "sha256": "c10d919496c9d6bafdddce4629947ff7a4984d5573dd22b7fdd980b26b16073f"
       }
     ],
     "s_text_sha256": "c524f2dbaf7a6949396286eebf229df144d5397f6803f8ecf54976eecb9b0e6c",
