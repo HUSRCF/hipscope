@@ -1286,6 +1286,13 @@ fn batch_phase(ctx: &mut Ctx, args: &Args, fx: &[Fixture], refs_a: &[Trace]) -> 
         // before step 7 = r1's sixth chunk). Exercised only if r1 actually
         // ran more than five chunks of <=1024 rows.
         for rep in 0..args.stop_repeats {
+            if fx[s1].prefix <= 5 * 1024 {
+                // Needs a peer prompt of >5 chunks at <=1024 rows (the default
+                // contexts give 8192); recorded, not silently passed.
+                cases.push(json!({"case": "stop_id_pressure", "skipped": format!("peer prompt {} rows <= 5120", fx[s1].prefix)}));
+                eprintln!("batch stop_id_pressure: SKIPPED (peer prompt {} rows)", fx[s1].prefix);
+                break;
+            }
             let name = if rep == 0 { "stop_id_pressure".to_string() } else { format!("stop_id_pressure_rep{rep}") };
             let tag = 9051 + 10 * rep as u64;
             let mut ballast: Vec<GpuTensor> = Vec::new();
