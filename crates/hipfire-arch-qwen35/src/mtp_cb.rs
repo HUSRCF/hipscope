@@ -22,13 +22,18 @@
 
 use super::*;
 use crate::qwen35::prefill::multi::{
-    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_row_cap, MultiChunkRequest, MultiChunkScratch,
-    MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
+    forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
+    MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 
+/// Rows one MTP CB trunk chunk packs: the product cap. The wide 64..=128-row
+/// verify route is DFlash-only until a wide MTP state-oracle receipt exists,
+/// so MTP never takes `DenseBatchMath::SingletonWmma` or the exact wide head.
+const MTP_CB_MAX_ROWS: usize = MULTI_CHUNK_PRODUCT_MAX_ROWS;
+
 /// Shared verify buffers for one CB engine: trunk scratch, post-norm hidden
-/// rows, head rotation scratch and head logits, all `max_rows` rows (the
-/// effective cap: 63, or up to 128 on the wide verify route).
+/// rows, head rotation scratch and head logits, all `max_rows` rows
+/// (`<= MTP_CB_MAX_ROWS`, 63).
 pub struct MtpCbScratch {
     pub max_rows: usize,
     trunk: MultiChunkScratch,
@@ -38,11 +43,11 @@ pub struct MtpCbScratch {
 }
 
 impl MtpCbScratch {
-    /// `max_rows` is clamped to `2..=multi_chunk_row_cap(gpu)` (63 unless
-    /// `HIPFIRE_CB_VERIFY_CHUNK128` is on, then up to 128); a cycle with more
-    /// rows runs in several shared chunks.
+    /// `max_rows` is clamped to `2..=63` (the MTP effective cap, whatever the
+    /// wide verify route admits); a cycle with more rows runs in several
+    /// shared chunks.
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
-        let max_rows = max_rows.clamp(2, multi_chunk_row_cap(gpu));
+        let max_rows = max_rows.clamp(2, MTP_CB_MAX_ROWS);
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
         let alloc = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32);
         let hidden = alloc(gpu, max_rows * config.dim)?;
@@ -268,8 +273,8 @@ pub enum MtpCbVerified {
 
 /// Can the shared trunk verify this drafted window exactly (the singleton
 /// verifies it on the batched-prefill body with a rollback tape)? `pack_cap`
-/// is the chunk's packing cap ([`multi_chunk_pack_cap`]); a window never
-/// exceeds one request's 63 rows.
+/// is the chunk's packing cap (`<= 63`); a window never exceeds one
+/// request's 63 rows.
 fn shared_verify_ok(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, pack_cap: usize, lane: &MtpCbVerifyLane<'_>) -> bool {
     let n = lane.draft.n_verify();
     n >= 2
@@ -278,33 +283,11 @@ fn shared_verify_ok(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, p
         && qwen35::prefill_batch_pbs_eligible(weights, config, lane.dn_state, n, gpu.arch.as_str(), true)
 }
 
-/// The verify head of a chunk over 64+ rows (a wide chunk): rotate, then the
-/// exact singleton-WMMA MQ4G256V2 lm-head (zero + exact residual), whose rows
-/// equal the singleton head's. Chunks below 64 rows keep
-/// [`mtp_trunk_verify_lm_head`]. Wide admission guarantees an MQ4G256V2 head;
-/// any other dtype is an error, never a product fallback.
-#[allow(clippy::too_many_arguments)]
-fn mtp_wide_verify_lm_head(
-    gpu: &mut Gpu,
-    w_out: &llama::WeightTensor,
-    hidden: &GpuTensor,
-    rot: &GpuTensor,
-    logits: &GpuTensor,
-    rows: usize,
-) -> HipResult<()> {
-    if w_out.gpu_dtype != DType::MQ4G256V2 {
-        return Err(hip_bridge::HipError::new(0, "mtp_cb_verify: wide verify head needs an MQ4G256V2 lm_head"));
-    }
-    let rot = rot.sub_offset(0, rows * w_out.k);
-    llama::rotate_x_mq_batched_for(gpu, w_out, hidden, &rot, w_out.k, rows)?;
-    gpu.gemm_mq4g256v2_lmhead_verify_exact(&w_out.buf, &rot, logits, w_out.m, w_out.k, rows)
-}
-
 /// Verify phase over drafted lanes: DeltaNet snapshot, ONE shared trunk
-/// forward (chunks of whole lanes within the packing cap: `cb.max_rows`, held
-/// to 63 unless the wide route is admitted for the target) and ONE verify
-/// head per chunk; each lane's hidden/logit rows land in its own state.
-/// Writes trunk KV/DeltaNet (a failure here leaves the lanes untrusted).
+/// forward (chunks of whole lanes within `cb.max_rows`, never above 63: the
+/// product route) and ONE verify head per chunk; each lane's hidden/logit
+/// rows land in its own state. Writes trunk KV/DeltaNet (a failure here
+/// leaves the lanes untrusted).
 pub fn mtp_cb_verify(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -316,7 +299,7 @@ pub fn mtp_cb_verify(
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
-    let pack_cap = multi_chunk_pack_cap(gpu, weights, config, cb.max_rows);
+    let pack_cap = cb.max_rows.min(MTP_CB_MAX_ROWS);
     let shared: Vec<bool> = lanes.iter().map(|l| shared_verify_ok(gpu, weights, config, pack_cap, l)).collect();
     let mut out: Vec<MtpCbVerified> = (0..lanes.len()).map(|_| MtpCbVerified::Pending).collect();
     let dim = config.dim;
@@ -357,11 +340,7 @@ pub fn mtp_cb_verify(
             forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))?;
         }
         let logits = cb.logits.sub_offset(0, rows * vocab);
-        if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS {
-            mtp_wide_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows)?;
-        } else {
-            mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)?;
-        }
+        mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)?;
         let mut row = 0usize;
         for &i in &chunk {
             let n = lanes[i].draft.n_verify();
