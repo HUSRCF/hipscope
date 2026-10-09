@@ -1964,8 +1964,7 @@ fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config)
             }
         }
     }
-    gpu.hip
-        .get_vram_info()
+    gpu.device_mem_info()
         .is_ok_and(|(free, _)| free >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
 }
 
@@ -2007,11 +2006,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
                 .and_then(|minimum| growth.checked_add(minimum))
         })
         .and_then(|needed| needed.checked_add(128 << 20))
-        .is_some_and(|needed| {
-            gpu.hip
-                .get_vram_info()
-                .is_ok_and(|(free, _)| free >= needed)
-        });
+        .is_some_and(|needed| gpu.device_mem_info().is_ok_and(|(free, _)| free >= needed));
     if !keep {
         if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
             old.free_gpu(gpu)?;
@@ -2051,7 +2046,7 @@ fn memory_admitted_rung(
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
-    let (free_bytes, _) = gpu.hip.get_vram_info()?;
+    let (free_bytes, _) = gpu.device_mem_info()?;
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
     // Only a selectable gfx11 whole-chunk FA2 route needs more than the
     // incumbent 512-row Q16 scratch. Charge each candidate rung separately.

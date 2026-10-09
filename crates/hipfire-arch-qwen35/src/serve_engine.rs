@@ -852,8 +852,7 @@ impl Rig {
         // against a hardcoded R9700 budget.
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
         let (vram_free, vram_total) = gpu
-            .hip
-            .get_vram_info()
+            .device_mem_info()
             .map_err(|e| format!("vram info: {e}"))?;
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;

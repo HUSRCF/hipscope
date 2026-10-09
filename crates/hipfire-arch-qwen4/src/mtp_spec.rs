@@ -3483,18 +3483,43 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<crate::GdnStateFormat>,
     batched_fill: bool,
 ) -> Option<u64> {
+    let request = native_mtp_request_bytes(
+        config,
+        context.max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )?;
+    let (resident, scratch) =
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
+    u64::try_from(resident).ok()?.checked_add(u64::try_from(scratch).ok()?.max(request))
+}
+
+/// Device bytes the first speculative request of a native MTP load of
+/// `max_seq` tokens allocates once and keeps (after the head attached): the
+/// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
+/// whichever is larger), the pending and row hidden carries, with
+/// `row_capture` the `max_k + 1`-row GDN capture in that format, and with
+/// `batched_fill` the batched prompt-fill scratch.
+pub fn native_mtp_request_bytes(
+    config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<crate::GdnStateFormat>,
+    batched_fill: bool,
+) -> Option<u64> {
     let rows = max_k.clamp(1, 10) + 1;
     let hidden_row = config
         .hc_count
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
-    let verify_rows = rows.max(context.max_seq.min(chunk_rows));
+    let verify_rows = rows.max(max_seq.min(chunk_rows));
     let capture = match row_capture {
         Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
         None => 0,
     };
-    let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
     let fill = if batched_fill {
         MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS.min(chunk_rows).max(1))?
     } else {
@@ -3505,7 +3530,7 @@ pub fn native_mtp_device_bytes(
         .checked_mul(hidden_row)?
         .checked_add(capture)?
         .checked_add(fill)?;
-    u64::try_from(resident.checked_add(scratch.max(request))?).ok()
+    u64::try_from(request).ok()
 }
 
 #[cfg(any(test, feature = "reference-parity"))]

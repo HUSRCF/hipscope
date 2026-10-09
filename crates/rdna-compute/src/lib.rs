@@ -64,6 +64,7 @@ pub use gemm::F2GdnTargets;
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
+pub mod uma_memory;
 pub mod vae;
 pub mod trunk_mask;
 pub use trunk_mask::{

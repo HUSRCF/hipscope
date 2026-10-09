@@ -416,12 +416,13 @@ impl SessionState for Qwen4Bundle {
         .map_err(|e| e.to_string())
     }
 
-    fn growth_reserve_bytes(&self) -> u64 {
-        self.state.context_growth_bytes()
-            + self
-                .mtp
-                .as_ref()
-                .map_or(0, Qwen4MtpGpu::context_growth_bytes)
+    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64 {
+        let through = self
+            .turn
+            .as_ref()
+            .map_or(self.state.position, |(prompt, _)| prompt.len());
+        let (context, gather) = self.context_growth_bytes(gpu, through);
+        context.saturating_add(gather)
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -663,7 +664,7 @@ impl Qwen4Bundle {
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
-        let (free, _) = gpu.hip.get_vram_info().map_err(BundleError::Hip)?;
+        let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
         let max_chunk = qwen4_prefill_chunk_rungs(requested)
             .find(|&rows| {
                 qwen4_forward_device_bytes(&self.config, rows)
@@ -1759,6 +1760,50 @@ impl Qwen4Bundle {
             None => 0,
         };
         Ok((target, mtp))
+    }
+
+    /// Device bytes the live state may still commit before it holds
+    /// `through` tokens (at most the admitted context), `(QSA context arenas
+    /// of target and MTP head, gathered prefill attention workspace)`: the
+    /// unmapped part of VMM arenas (0 for legacy ones, allocated whole) and
+    /// the workspace's extent past what this GPU committed (0 when the route
+    /// is off).
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> (u64, u64) {
+        let through = through.min(self.state.max_seq_len);
+        let context = self.state.context_growth_bytes(through).saturating_add(
+            self.mtp
+                .as_ref()
+                .map_or(0, |mtp| mtp.context_growth_bytes(through)),
+        );
+        let gather = self
+            .state
+            .qsa
+            .first()
+            .filter(|qsa| rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa.format))
+            .and_then(|_| {
+                rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                    self.config.num_key_value_heads,
+                    through,
+                )
+            })
+            .map_or(0, |bytes| {
+                (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64)
+            });
+        (context, gather)
+    }
+
+    /// Before a forward maps context past what is mapped (a VMM growth
+    /// boundary, never on the steady path), have the session cache free
+    /// snapshots until the growth through `end_position` fits: the cache
+    /// never causes a context allocation to fail.
+    pub(crate) fn release_session_for_growth(&mut self, gpu: &mut Gpu, end_position: usize) {
+        if self.session.is_none() || end_position <= self.state.mapped_context_tokens() {
+            return;
+        }
+        let (context, gather) = self.context_growth_bytes(gpu, end_position);
+        if let Some(cache) = self.session.as_mut() {
+            cache.release_for(gpu, context.saturating_add(gather));
+        }
     }
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill

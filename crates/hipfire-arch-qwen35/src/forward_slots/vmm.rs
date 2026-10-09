@@ -1026,8 +1026,7 @@ impl Qwen35VmmExecutor<'_> {
         // Refusal maps nothing for that request.
         let mut mapped_total = self.store.mapped_kv_bytes()?;
         let mut device_room = gpu
-            .hip
-            .get_vram_info()
+            .device_mem_info()
             .map_err(|e| format!("provision_step: VRAM query: {e}"))?
             .0
             .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);

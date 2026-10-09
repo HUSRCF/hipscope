@@ -1493,9 +1493,9 @@ impl Qwen4State {
         Ok(())
     }
 
-    /// Context-arena bytes still unmapped below `max_seq_len` (0 for legacy
-    /// full-capacity arenas).
-    pub(crate) fn context_growth_bytes(&self) -> u64 {
+    /// Context-arena bytes still unmapped below `through` tokens (at most
+    /// `max_seq_len`; 0 for legacy full-capacity arenas).
+    pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
         if self.qsa_backend == Qwen4KvBackend::Legacy || self.max_seq_len == 0 {
             return 0;
         }
@@ -1505,7 +1505,10 @@ impl Qwen4State {
             .flat_map(|layer| layer.context_arenas())
             .map(|tensor| tensor.byte_size() as u64)
             .sum();
-        capacity * self.max_seq_len.saturating_sub(self.qsa_mapped_tokens) as u64
+        capacity
+            * through
+                .min(self.max_seq_len)
+                .saturating_sub(self.qsa_mapped_tokens) as u64
             / self.max_seq_len as u64
     }
 

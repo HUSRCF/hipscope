@@ -1420,6 +1420,42 @@ impl Gpu {
         }
     }
 
+    /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
+    /// with the free figure of a GTT-backed unified-memory APU clamped to
+    /// the host RAM a GTT allocation can take (`MemAvailable` plus TTM's
+    /// page pool estimate); see [`crate::uma_memory::device_free_from`].
+    /// Discrete GPUs and carve-out APUs get `hipMemGetInfo` unchanged. Every
+    /// free-memory sizing site uses this, not `hip.get_vram_info` directly.
+    pub fn device_mem_info(&self) -> HipResult<(usize, usize)> {
+        self.bind_thread()?;
+        let (free, total) = self.hip.get_vram_info()?;
+        if !self.is_uma() {
+            return Ok((free, total));
+        }
+        use crate::uma_memory;
+        let carveout_total = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| uma_memory::carveout_total_bytes(&bdf));
+        let memory = uma_memory::DeviceMemory {
+            device_free: free as u64,
+            device_total: total as u64,
+            uma: true,
+            carveout_total,
+            host_available: uma_memory::gtt_backed(total as u64, carveout_total)
+                .then(uma_memory::host_available_bytes)
+                .flatten(),
+        };
+        let free = uma_memory::device_free_from(memory).ok_or_else(|| {
+            HipError::new(
+                0,
+                "unified-memory free bytes: /proc/meminfo has no readable MemAvailable",
+            )
+        })?;
+        Ok((free.min(usize::MAX as u64) as usize, total))
+    }
+
     /// Install a real stream if launches are still going to the null stream.
     ///
     /// HIP refuses to capture the legacy default stream, so anything that

@@ -236,6 +236,117 @@ pub fn qwen4_request_admission(
     }
     Ok(())
 }
+
+/// Device memory a Qwen4 load keeps free beyond the growth it can name
+/// (context pages, gather workspace, native MTP request buffers): the
+/// first long request's other lazy allocations (measured ~1.9 GiB on Strix
+/// Halo with 8192-row chunks), kernel-cache warmup and VMM page rounding.
+pub const QWEN4_MEMORY_HEADROOM_BYTES: u64 = 2 << 30;
+
+/// Smallest context an automatic Qwen4 load accepts.
+const QWEN4_MIN_AUTO_CONTEXT: usize = 4096;
+
+/// What a Qwen4 load admits of the device memory left free after its own
+/// allocations ([`qwen4_memory_admission`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4MemoryAdmission {
+    /// Free device memory once the load's own allocations are made.
+    pub free: u64,
+    /// Target and MTP-head QSA context arenas still unmapped through
+    /// `max_seq` (VMM storage maps them as forwards reach them).
+    pub context_growth: u64,
+    /// Gathered QSA prefill workspace still uncommitted through `max_seq`.
+    pub gather_growth: u64,
+    /// Buffers the first native MTP request allocates and keeps.
+    pub mtp_request: u64,
+    pub headroom: u64,
+    /// Largest context whose growth fits (at most the assembled capacity).
+    pub card_cap: usize,
+    /// The admitted context.
+    pub max_seq: usize,
+}
+
+impl Qwen4MemoryAdmission {
+    /// Everything a request through `max_seq` still commits after load.
+    pub fn growth(&self) -> u64 {
+        self.context_growth
+            .saturating_add(self.gather_growth)
+            .saturating_add(self.mtp_request)
+    }
+}
+
+/// Admit what a Qwen4 load commits after load against the `free` device
+/// memory its own allocations left, keeping `headroom` free: VMM context
+/// pages and the gathered workspace through a context of `t` tokens
+/// (`growth(t)` = `(context, gather)`, monotone, assembled for `capacity`
+/// tokens) and the native MTP request buffers. `card_cap` is the largest
+/// context that fits. An automatic load (`requested` = `None`) admits
+/// `min(capacity, card_cap)`; an explicit `max_seq` must fit whole. The
+/// session cache is not charged: its snapshots yield to context growth.
+pub fn qwen4_memory_admission(
+    capacity: usize,
+    requested: Option<usize>,
+    free: u64,
+    mtp_request: u64,
+    headroom: u64,
+    growth: impl Fn(usize) -> (u64, u64),
+) -> Result<Qwen4MemoryAdmission, String> {
+    const MIB: u64 = 1 << 20;
+    let fixed = mtp_request.saturating_add(headroom);
+    let fits = |tokens: usize| {
+        let (context, gather) = growth(tokens);
+        context.saturating_add(gather).saturating_add(fixed) <= free
+    };
+    let card_cap = if !fits(0) {
+        0
+    } else {
+        // Largest fitting context in [0, capacity].
+        let (mut lo, mut hi) = (0usize, capacity);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    };
+    let max_seq = requested.unwrap_or(capacity.min(card_cap));
+    let (context_growth, gather_growth) = growth(max_seq);
+    let admission = Qwen4MemoryAdmission {
+        free,
+        context_growth,
+        gather_growth,
+        mtp_request,
+        headroom,
+        card_cap,
+        max_seq,
+    };
+    let detail = || {
+        format!(
+            "a {max_seq}-token context commits {} MiB after load ({} MiB QSA context + {} MiB QSA gather workspace + {} MiB native MTP request buffers) plus {} MiB headroom, and {} MiB is free after load",
+            admission.growth() / MIB,
+            context_growth / MIB,
+            gather_growth / MIB,
+            mtp_request / MIB,
+            headroom / MIB,
+            free / MIB
+        )
+    };
+    match requested {
+        None if max_seq < QWEN4_MIN_AUTO_CONTEXT.min(capacity) => Err(format!(
+            "qwen4: device memory cannot hold an automatic context: {}; free device memory",
+            detail()
+        )),
+        Some(requested) if requested > card_cap => Err(format!(
+            "qwen4: max_seq {requested} does not fit device memory: {}; lower memory.max_seq to at most {card_cap} or omit it",
+            detail()
+        )),
+        _ => Ok(admission),
+    }
+}
+
 /// Validate a reserved arch-16 HFQM source without allocating weights.
 ///
 /// The architecture crate owns the complete source/index contract.  Loader
@@ -905,15 +1016,18 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    // An omitted (automatic) Qwen4 request gets the default context; explicit
-    // values are checked against QWEN4_MAX_CONTEXT below.
-    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 {
+    // Qwen4 sequence on a unified-memory APU: an omitted max_seq is automatic
+    // (the model's context, capped by the measured card capacity at load);
+    // explicit values are honored within the limits below. A discrete GPU
+    // keeps the default context for an omitted max_seq and no sequence.
+    let unified_memory = hipfire_config::is_unified_memory_arch(gpu_arch);
+    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 && !unified_memory {
         hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
     } else {
         max_seq
     };
-
     let mut qwen35_ep_experts = None;
+    let mut qwen4_sequence = None;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
@@ -924,7 +1038,7 @@ pub fn admit_source_with_options(
                 hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
-        hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
+        let qwen4_kv = hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
@@ -940,6 +1054,16 @@ pub fn admit_source_with_options(
             return Err(format!(
                 "qwen4: max_seq {max_seq} exceeds max_position_embeddings {positions}"
             ));
+        }
+        let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
+        if unified_memory {
+            qwen4_sequence = Some(SequenceResolution {
+                max_seq: if max_seq == 0 { model_ctx } else { max_seq },
+                bound: if max_seq == 0 { "pending" } else { "user" },
+                model_ctx,
+                card_cap: 0,
+                kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
+            });
         }
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
@@ -1126,6 +1250,16 @@ pub fn admit_source_with_options(
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
     {
         Some(resolve_sequence(&source, max_seq, gpu_arch, hints)?)
+    } else if let Some(sequence) = qwen4_sequence {
+        // Automatic Qwen4 context grows VMM pages on demand; legacy storage
+        // would allocate all of it at load.
+        if sequence.bound == "pending" && kv_backend != KvBackend::Vmm {
+            return Err(format!(
+                "qwen4: automatic max_seq needs the VMM KV backend ({}); set memory.max_seq for legacy storage",
+                kv_backend_reason.as_deref().unwrap_or("legacy requested")
+            ));
+        }
+        Some(sequence)
     } else {
         None
     };
@@ -2297,6 +2431,119 @@ mod tests {
             .expect_err("full model as head must refuse");
             assert!(err.contains("expected only"), "refusal: {err}");
             cleanup(&[trunk, head]);
+        }
+    }
+
+    mod qwen4_memory {
+        use super::super::{qwen4_memory_admission, QWEN4_MEMORY_HEADROOM_BYTES};
+
+        const MIB: u64 = 1 << 20;
+        const CAPACITY: usize = 262_144;
+        /// Strix Halo receipt: 98,304 MiB carve-out, 78,547 MiB used after a
+        /// default Flash-Next load (native MTP, max_seq 262144, VMM).
+        const HALO_FREE: u64 = (98_304 - 78_547) * MIB;
+        const MTP_REQUEST: u64 = 740 * MIB;
+
+        /// Linear growth: 15,392 MiB of target + MTP QSA arenas and 512 MiB
+        /// of gather workspace over the 262,144-token capacity.
+        fn growth(tokens: usize) -> (u64, u64) {
+            let tokens = tokens.min(CAPACITY) as u64;
+            (
+                15_392 * MIB * tokens / CAPACITY as u64,
+                512 * MIB * tokens / CAPACITY as u64,
+            )
+        }
+
+        fn fixed() -> u64 {
+            MTP_REQUEST + QWEN4_MEMORY_HEADROOM_BYTES
+        }
+
+        #[test]
+        fn halo_default_admits_the_whole_model_context() {
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.context_growth, 15_392 * MIB);
+            assert_eq!(admission.gather_growth, 512 * MIB);
+            assert!(admission.growth() + admission.headroom <= HALO_FREE);
+        }
+
+        #[test]
+        fn automatic_context_caps_at_the_largest_fit() {
+            let free = 12 << 30;
+            let admission =
+                qwen4_memory_admission(CAPACITY, None, free, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
+                    .unwrap();
+            let cap = admission.card_cap;
+            assert!(cap > 0 && cap < CAPACITY);
+            assert_eq!(admission.max_seq, cap);
+            let total = |tokens| {
+                let (context, gather) = growth(tokens);
+                context + gather + fixed()
+            };
+            assert!(total(cap) <= free);
+            assert!(total(cap + 1) > free);
+        }
+
+        #[test]
+        fn explicit_context_is_honored_when_it_fits() {
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            let short =
+                qwen4_memory_admission(8192, Some(8192), HALO_FREE, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
+                    .unwrap();
+            assert_eq!(short.max_seq, 8192);
+            assert_eq!(short.card_cap, 8192);
+        }
+
+        #[test]
+        fn explicit_context_that_cannot_grow_refuses_at_load() {
+            let free = 12 << 30;
+            let cap = qwen4_memory_admission(CAPACITY, None, free, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
+                .unwrap()
+                .card_cap;
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap_err();
+            assert!(error.contains("max_seq 262144 does not fit device memory"), "{error}");
+            assert!(error.contains(&format!("at most {cap}")), "{error}");
+            assert!(error.contains("15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"), "{error}");
+        }
+
+        #[test]
+        fn automatic_context_refuses_when_nothing_fits() {
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                fixed() - 1,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap_err();
+            assert!(error.contains("cannot hold an automatic context"), "{error}");
         }
     }
 }
