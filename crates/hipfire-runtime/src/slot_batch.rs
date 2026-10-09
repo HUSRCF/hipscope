@@ -188,6 +188,11 @@ pub struct BatchPlanner {
     /// Verify draft length for a decoding `SpecKind::Dflash` request
     /// (block − 1).
     pub dflash_draft_len: usize,
+    /// Per-`work`-index forced prefill chunk length (empty = scheduler
+    /// allocation). `Some(n)`: that request's prefill takes exactly `n` rows
+    /// or none this step (an executor whose arithmetic depends on chunk
+    /// boundaries, e.g. the exact VMM route, sets this every step).
+    pub forced_prefill_len: Vec<Option<usize>>,
     pending_cursor: Option<usize>,
 }
 
@@ -197,6 +202,7 @@ impl BatchPlanner {
             scheduler,
             mtp_draft_len,
             dflash_draft_len,
+            forced_prefill_len: Vec::new(),
             pending_cursor: None,
         }
     }
@@ -276,12 +282,42 @@ impl BatchPlanner {
             verify_used += rows;
         }
 
-        let alloc = self.scheduler.allocate_rows(
+        let mut alloc = self.scheduler.allocate_rows(
             work,
             row_budget - verify_used,
             prefill_min_tokens,
             &admitted,
         );
+        if !self.forced_prefill_len.is_empty() {
+            // Re-allocate prefill rows: decode rows stay, each forced
+            // request gets exactly its length if it fits, rotating from the
+            // cursor so two prefills alternate.
+            let mut avail = row_budget - verify_used;
+            for i in 0..n {
+                if alloc.alloc[i] > 0 && work[i].decoding {
+                    avail -= alloc.alloc[i];
+                } else {
+                    alloc.alloc[i] = 0;
+                }
+            }
+            let pf: Vec<usize> = (0..n)
+                .filter(|&i| admitted[i] && is_runnable_prefill(&work[i], vl_seq))
+                .collect();
+            let start = if pf.is_empty() { 0 } else { self.scheduler.prefill_cursor % pf.len() };
+            for k in 0..pf.len() {
+                let i = pf[(start + k) % pf.len()];
+                let want = match self.forced_prefill_len.get(i).copied().flatten() {
+                    Some(w) => w.min(work[i].remaining_prompt.len()),
+                    None => continue,
+                };
+                if want > 0 && want <= avail {
+                    alloc.alloc[i] = want;
+                    avail -= want;
+                }
+            }
+            alloc.next_prefill_cursor = (!pf.is_empty())
+                .then(|| (self.scheduler.prefill_cursor + 1) % pf.len());
+        }
         let any_pos3 = self.scheduler.any_pos3(work);
         let mut plan = BatchStepPlan::default();
         plan.batch.m_per_slot = vec![0; n];

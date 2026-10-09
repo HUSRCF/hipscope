@@ -1985,6 +1985,39 @@ pub fn drive_qwen_vmm_continuous_batch(
         }
         // ── One planned step: provision → forward → commit → publish ──
         let eligible: Vec<bool> = (0..batch_size).map(|i| running.contains(&i)).collect();
+        // Exact route: every prefill chunk must be the singleton route's own
+        // chunk for that request (DeltaNet requant cadence), so the planner
+        // takes exactly that length or nothing.
+        let forced = (|| -> Result<Vec<Option<usize>>, String> {
+            let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+            let store = b.vmm_store.as_ref().ok_or("store not staged")?;
+            if store.route() != hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact {
+                return Ok(Vec::new());
+            }
+            (0..batch_size)
+                .map(|i| {
+                    let w = &work[i];
+                    if !eligible[i] || w.decoding || w.remaining_prompt.is_empty() {
+                        return Ok(None);
+                    }
+                    store
+                        .exact_prefill_chunk_len(
+                            gpu,
+                            &b.weights,
+                            &b.config,
+                            &epochs[i],
+                            w.remaining_prompt.len(),
+                        )
+                        .map(Some)
+                })
+                .collect()
+        })();
+        planner.forced_prefill_len = match forced {
+            Ok(f) => f,
+            Err(e) => {
+                return fail_all(sched, gpu, model, &mut epochs, stdout, format!("exact chunk: {e}"))
+            }
+        };
         let plan = match planner.plan_step(
             &work,
             &epochs,

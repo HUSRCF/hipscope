@@ -48,10 +48,13 @@ pub struct BatchStaging {
 }
 
 /// Load-time request for the VMM continuous-batching route.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct VmmStagingRequest {
     /// Global trunk-row budget per step (`serve.max_batch_tokens`).
     pub row_budget: usize,
+    /// `Exact` (default; byte-identical to the singleton route) or
+    /// `Nonexact` (only under `HIPFIRE_SERVE_BATCH_NONEXACT=1`).
+    pub route: hipfire_arch_qwen35::forward_slots::vmm::VmmRoute,
 }
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
@@ -520,6 +523,7 @@ fn stage_qwen_vmm_batch(
         &b.weights,
         &b.config,
         &b.kv_cache,
+        req.route,
     ) {
         eprintln!("[daemon] VMM continuous batch unsupported for this model: {e} — existing route");
         return out;
@@ -542,6 +546,7 @@ fn stage_qwen_vmm_batch(
             requested,
             row_budget,
             kv_budget_bytes,
+            req.route,
         ) {
             Ok(store) => {
                 b.vmm_store = Some(store);
