@@ -381,8 +381,11 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
             if math == DenseBatchMath::SingletonWmma {
-                gpu.gemm_mq4g256v2_lmhead_verify_exact(
+                run_spec_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq4G256V2LmheadVerifyExact,
                     &w_out.buf,
+                    w_out.gpu_dtype,
                     &rot,
                     &logits_batch,
                     w_out.m,

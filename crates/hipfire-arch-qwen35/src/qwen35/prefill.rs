@@ -1104,7 +1104,17 @@ fn dispatch_batched_gemm_epilogue(
                 "dispatch_batched_gemm_epilogue: SingletonWmma verify math requires the Residual epilogue",
             ));
         }
-        return gpu.gemm_mq4g256v2_residual_verify_exact(&w.buf, input, &pbs.x_batch, m, k, n);
+        return run_residual_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4G256V2ResidualVerifyExact,
+            &w.buf,
+            w.gpu_dtype,
+            input,
+            &pbs.x_batch,
+            m,
+            k,
+            n,
+        );
     }
     let is_6bit = matches!(w.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let is_mq3_lloyd = matches!(w.gpu_dtype, DType::MQ3G256Lloyd);
@@ -5586,7 +5596,9 @@ fn batch_chunk_delta_net_input_projection(
             config.norm_eps,
             n,
         )?;
-        gpu.gemm_qkvza_mq4g256v2_verify_exact(
+        run_fused_qkvza_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedQkvzaMq4G256V2VerifyExact,
             &layer.wqkv.buf,
             &layer.wz.buf,
             &layer.w_beta.buf,
@@ -7381,7 +7393,9 @@ fn batch_chunk_delta_net_ffn_gate_up(
             config.norm_eps,
             n,
         )?;
-        gpu.gemm_gate_up_mq4g256v2_verify_exact(
+        run_fused_gate_up_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedGateUpMq4G256V2VerifyExact,
             &layer.w_gate.buf,
             &layer.w_up.buf,
             &pbs.x_rot_batch,
@@ -8171,7 +8185,9 @@ fn batch_chunk_full_attn_input_projection(
             config.norm_eps,
             n,
         )?;
-        return gpu.gemm_qkv_mq4g256v2_verify_exact(
+        return run_fused_qkv_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedQkvMq4G256V2VerifyExact,
             &layer.wq.buf,
             &layer.wk.buf,
             &layer.wv.buf,
@@ -9863,7 +9879,9 @@ fn batch_chunk_full_attn_ffn_gate_up(
             config.norm_eps,
             n,
         )?;
-        gpu.gemm_gate_up_mq4g256v2_verify_exact(
+        run_fused_gate_up_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedGateUpMq4G256V2VerifyExact,
             &layer.w_gate.buf,
             &layer.w_up.buf,
             &pbs.x_rot_batch,
