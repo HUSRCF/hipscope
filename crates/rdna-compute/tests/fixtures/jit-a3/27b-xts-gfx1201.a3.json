@@ -2987,7 +2987,7 @@
     {
      "module": "softmax_temp_topp_batched",
      "kind": "hip",
-     "sha256": "e5caeb67c552bdd34cd03a448c4200824143f282d407a53b210e1fed065998d2",
+     "sha256": "b8f2c67796574a5d1e4e4bfd147244a6e931869557ecd2e9f4d34a352dfd2e21",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -5276,7 +5276,7 @@
     "module": "softmax_temp_topp_batched",
     "symbol": "softmax_temp_topp_batched_f32",
     "kind": "hip",
-    "sha256": "e5caeb67c552bdd34cd03a448c4200824143f282d407a53b210e1fed065998d2",
+    "sha256": "b8f2c67796574a5d1e4e4bfd147244a6e931869557ecd2e9f4d34a352dfd2e21",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
