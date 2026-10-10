@@ -13,7 +13,7 @@
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
+    apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
     seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
@@ -767,7 +767,7 @@ impl DflashSpeculator {
             // Greedy by default until a request calls `set_sampling`.
             sample_temp: 0.0,
             sample_top_p: 1.0,
-            sample_top_k: 0,
+            sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
             resume_enabled,
@@ -903,15 +903,10 @@ impl Speculator for DflashSpeculator {
             let mut probs = Vec::with_capacity(first_logits.len());
             softmax_temp_into(&first_logits, self.sample_temp, &mut probs);
             // DDTree SWOR honors temperature only (matches step's tree arm).
-            // Chain mode applies the same host top_k + nucleus cuts as
-            // `spec_step_dflash` so the seed is AR-at-(top_k,top_p).
+            // Chain mode applies the same AR truncation as `spec_step_dflash`
+            // so the seed is an AR draw.
             if self.df.ddtree.is_none() {
-                if self.sample_top_k > 0 && self.sample_top_k < probs.len() {
-                    apply_host_topk(&mut probs, self.sample_top_k);
-                }
-                if self.sample_top_p < 0.999 {
-                    apply_host_nucleus(&mut probs, self.sample_top_p);
-                }
+                apply_host_ar_trunc(&mut probs, self.sample_top_k, self.sample_top_p);
             }
             let u = xorshift_next_unit(&mut self.rng_state);
             sample_categorical(&probs, u)
@@ -1303,7 +1298,7 @@ impl Speculator for DflashSpeculator {
         // its draw sequence exactly).
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
-        self.sample_top_k = cfg.top_k_cut();
+        self.sample_top_k = cfg.ar_candidate_cap();
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
         self.last_window = None;

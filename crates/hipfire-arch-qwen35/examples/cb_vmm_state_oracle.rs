@@ -2371,7 +2371,7 @@ fn lane_open(gpu: &mut Gpu, slot: &mut ModelSlot, head: &Qwen35MtpHead, k: usize
         let cfg = SpecRequestConfig::default();
         st.set_sampling(
             MtpSamplingConfig {
-                temp: cfg.temp, top_k: cfg.top_k_cut(), top_p: cfg.top_p.min(1.0), min_p: cfg.min_p,
+                temp: cfg.temp, top_k: cfg.ar_candidate_cap(), top_p: cfg.top_p.min(1.0), min_p: cfg.min_p,
                 repeat_penalty: cfg.repeat_penalty, repeat_window: 0,
                 presence_penalty: cfg.presence_penalty, frequency_penalty: cfg.frequency_penalty,
             },

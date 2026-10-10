@@ -178,7 +178,7 @@ impl DflashVmmLaneState {
             request_rng_state(request.rng_seed),
             request.temp,
             request.top_p,
-            request.top_k_cut(),
+            request.ar_candidate_cap(),
             request.cactus_delta,
             checkpoints,
             policy,

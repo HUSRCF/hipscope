@@ -3409,20 +3409,35 @@ pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// The AR sampler's truncation (`llama::sample_top_k_p`, min_p off) of a
+/// normalized softmax row, IN PLACE: keep the `cap` most probable tokens
+/// (`cap` from `llama::ar_candidate_cap`; like the kernel, 0 or > 64 → 64),
+/// then the nucleus over their own mass, renormalized. The host twin of
+/// `softmax_temp_topp_batched_f32`'s `tau`/`Z`.
+pub(crate) fn apply_host_ar_trunc(row: &mut [f32], cap: usize, top_p: f32) {
+    const MAX_CAP: usize = 64;
+    let cap = if cap == 0 { MAX_CAP } else { cap.min(MAX_CAP) };
+    apply_host_topk(row, cap);
+    apply_host_nucleus(row, top_p);
+}
+
 /// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
 /// GPU: the temperature softmax of every verify row (`probs`, row-major
-/// `[rows * vocab]`) and, when top_p / top_k truncation is active, the per-row
-/// cutoff `tau` and kept mass `z` from `softmax_temp_topp_batched_into_f32`.
+/// `[rows * vocab]`) and the per-row AR cutoff `tau` and kept mass `z` from
+/// `softmax_temp_topp_batched_into_f32`.
 #[doc(hidden)]
 pub struct FastTargetRows {
     pub probs: Vec<f32>,
-    pub trunc: Option<(Vec<f32>, Vec<f32>)>,
+    pub tau: Vec<f32>,
+    pub z: Vec<f32>,
 }
 
 /// Target distribution of verify row `row` in a sampled DFlash window, written
-/// into `out`: temperature softmax, then top_k, then top_p — from the GPU rows
-/// (`fast`, truncated by their `tau`/`z`) or, without FAST_SAMPLE, from the
-/// host `logits` (`[rows * vocab]`). Every sampled target read of the host
+/// into `out`: AR's law (`llama::sample_top_k_p`) — temperature softmax, the
+/// `top_k` most probable tokens (`top_k` is the AR candidate cap,
+/// `llama::ar_candidate_cap`), then the nucleus over their mass — from the GPU
+/// rows (`fast`, truncated by their `tau`/`z`) or, without FAST_SAMPLE, from
+/// the host `logits` (`[rows * vocab]`). Every sampled target read of the host
 /// accept loop goes through here — the accept test, the rejection residual
 /// and the full-accept / budget bonus — so they share one law.
 #[doc(hidden)]
@@ -3441,18 +3456,11 @@ pub fn sampled_target_row_into(
         Some(fast) => {
             out.clear();
             out.extend_from_slice(&fast.probs[row * vocab..(row + 1) * vocab]);
-            if let Some((tau, z)) = &fast.trunc {
-                apply_topp_trunc(out, tau[row], z[row]);
-            }
+            apply_topp_trunc(out, fast.tau[row], fast.z[row]);
         }
         None => {
             softmax_temp_into(&logits[row * vocab..(row + 1) * vocab], temp, out);
-            if top_k > 0 && top_k < vocab {
-                apply_host_topk(out, top_k);
-            }
-            if top_p < 0.999 {
-                apply_host_nucleus(out, top_p);
-            }
+            apply_host_ar_trunc(out, top_k, top_p);
         }
     }
 }
@@ -5880,17 +5888,16 @@ pub fn spec_step_dflash(
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
     temp: f32,
-    // Nucleus (top_p) cutoff applied IDENTICALLY to both the draft and target
-    // softmax rows on the temp sampling path. 1.0 (or >= 0.999) disables it →
-    // the path is byte-equivalent to plain temp-T full-vocab sampling. Lossless
-    // == AR-at-this-top_p holds via the TARGET truncation (Leviathan marginal
-    // preservation); the draft is truncated too for parity + acceptance
-    // efficiency. See apply_topp_trunc / apply_host_nucleus.
+    // Nucleus (top_p) mass on the temp sampling path, applied with `top_k`
+    // to both the draft and target softmax rows as AR does
+    // (`llama::sample_top_k_p`): the nucleus is taken over the top_k pool's
+    // own mass. Lossless == AR via the TARGET truncation (Leviathan marginal
+    // preservation); the draft is truncated too for acceptance efficiency.
+    // See apply_topp_trunc / apply_host_ar_trunc.
     top_p: f32,
-    // Top-k cutoff, applied identically to draft + target softmax rows on the
-    // sampled path (folded into tau by the GPU kernel: tau = max(tau_p, tau_k)).
-    // 0 = disabled (top_p-only). Lossless == AR-at-(top_k,top_p), same cut both
-    // sides.
+    // AR candidate cap (`llama::ar_candidate_cap`: absent top_k → 20, 0 → 64,
+    // k → min(k, 64)). The sampled path keeps the `top_k` most probable
+    // tokens before the nucleus, like AR's pool.
     top_k: usize,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
@@ -6015,10 +6022,6 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
-    // Truncation active when either top_p non-default OR top_k enabled (vocab-gated).
-    // Host applies top-k before nucleus; GPU uses combined softmax_temp_topp whenever active.
-    let trunc_active = use_temp_sampling && (top_p < 0.999 || (top_k > 0 && top_k < vocab));
-    let topp_active = trunc_active;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -6332,38 +6335,20 @@ pub fn spec_step_dflash(
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
                 // chain_accept_spec_f32 consumes it after verify.
                 let probs_dev = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-                let (tau_dev, z_dev) = if topp_active {
-                    let tau_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    gpu.softmax_temp_topp_batched_into_f32(
-                        &logits_batch,
-                        &probs_dev,
-                        &tau_d,
-                        &z_d,
-                        vocab,
-                        batch,
-                        temp,
-                        top_p,
-                        top_k,
-                        0.0, // min_p: DFlash min_p parity is the follow-up; off here
-                    )?;
-                    (tau_d, z_d)
-                } else {
-                    gpu.softmax_temp_batched_into_f32(
-                        &logits_batch,
-                        &probs_dev,
-                        vocab,
-                        batch,
-                        temp,
-                    )?;
-                    // topp inactive: kernel expects tau=0 (no truncation) and z=1
-                    // (inv_z=1 → eff_prob returns p unchanged). Use zeros() for tau
-                    // (0.0 bit-pattern = 0x00000000) and fill_f32 for z.
-                    let tau_d = gpu.zeros(&[batch], rdna_compute::DType::F32)?;
-                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    gpu.fill_f32(&z_d, 1.0f32)?;
-                    (tau_d, z_d)
-                };
+                let tau_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                let z_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
+                    &logits_batch,
+                    &probs_dev,
+                    &tau_dev,
+                    &z_dev,
+                    vocab,
+                    batch,
+                    temp,
+                    top_p,
+                    top_k,
+                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                )?;
                 // GPU categorical sample per row: writes draft_tokens + draft_p_at_token.
                 let tok_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?; // i32 via f32 slot
                 let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
@@ -6407,13 +6392,8 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
-                    // Host truncation: top-k before nucleus, matching GPU combined cut.
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut probs, top_p);
-                    }
+                    // Host truncation: the same AR law as the GPU tau/Z cut.
+                    apply_host_ar_trunc(&mut probs, top_k, top_p);
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -6500,12 +6480,7 @@ pub fn spec_step_dflash(
                 if use_temp_sampling {
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(&logits, temp, &mut probs);
-                    if top_k > 0 && top_k < vocab {
-                        apply_host_topk(&mut probs, top_k);
-                    }
-                    if top_p < 0.999 {
-                        apply_host_nucleus(&mut probs, top_p);
-                    }
+                    apply_host_ar_trunc(&mut probs, top_k, top_p);
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -6728,29 +6703,20 @@ pub fn spec_step_dflash(
             // Softmax them into tgt_probs_dev (kept device-resident).
             let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
             let tgt_probs_dev = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-            let (tau_t_dev, z_t_dev) = if topp_active {
-                let tau_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                gpu.softmax_temp_topp_batched_into_f32(
-                    &logits_batch,
-                    &tgt_probs_dev,
-                    &tau_t,
-                    &z_t,
-                    vocab,
-                    b,
-                    temp,
-                    top_p,
-                    top_k,
-                    0.0,
-                )?;
-                (tau_t, z_t)
-            } else {
-                gpu.softmax_temp_batched_into_f32(&logits_batch, &tgt_probs_dev, vocab, b, temp)?;
-                let tau_t = gpu.zeros(&[b], rdna_compute::DType::F32)?;
-                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                gpu.fill_f32(&z_t, 1.0f32)?;
-                (tau_t, z_t)
-            };
+            let tau_t_dev = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            let z_t_dev = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            gpu.softmax_temp_topp_batched_into_f32(
+                &logits_batch,
+                &tgt_probs_dev,
+                &tau_t_dev,
+                &z_t_dev,
+                vocab,
+                b,
+                temp,
+                top_p,
+                top_k,
+                0.0,
+            )?;
 
             let dft_probs_dev = c8_draft_probs_dev.as_ref().unwrap();
             let dft_tok_dev = c8_draft_tokens_dev.as_ref().unwrap();
@@ -6808,32 +6774,28 @@ pub fn spec_step_dflash(
             let fast_tgt: Option<FastTargetRows> = if fast_sample_active {
                 let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
                 let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-                let mut trunc = None;
-                if topp_active {
-                    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                    gpu.softmax_temp_topp_batched_into_f32(
-                        &logits_batch,
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
-                        vocab,
-                        b,
-                        temp,
-                        top_p,
-                        top_k,
-                        0.0,
-                    )?;
-                    trunc = Some((gpu.download_f32(&tau_gpu)?, gpu.download_f32(&z_gpu)?));
-                    let _ = gpu.free_tensor(tau_gpu);
-                    let _ = gpu.free_tensor(z_gpu);
-                } else {
-                    gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
-                }
+                let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
+                    &logits_batch,
+                    &probs_gpu,
+                    &tau_gpu,
+                    &z_gpu,
+                    vocab,
+                    b,
+                    temp,
+                    top_p,
+                    top_k,
+                    0.0,
+                )?;
+                let tau = gpu.download_f32(&tau_gpu)?;
+                let z = gpu.download_f32(&z_gpu)?;
                 let probs = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(tau_gpu);
+                let _ = gpu.free_tensor(z_gpu);
                 let _ = gpu.free_tensor(probs_gpu);
                 debug_assert_eq!(probs.len(), b * vocab);
-                Some(FastTargetRows { probs, trunc })
+                Some(FastTargetRows { probs, tau, z })
             } else {
                 debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
                 None
@@ -10539,27 +10501,25 @@ mod tests {
             })
             .collect();
         let grid = 200_000usize;
-        for &(temp, top_p, top_k) in &[(0.7f32, 0.95f32, 20usize), (1.0, 0.8, 0), (0.6, 0.9, 5)] {
-            // FAST_SAMPLE rows: the per-row softmax plus an exact nucleus
-            // tau/Z (top_k folded in by keeping at least the k-th prob).
+        for &(temp, top_p, top_k) in &[(0.7f32, 0.95f32, 20usize), (1.0, 0.8, 64), (0.6, 0.9, 5)] {
+            // FAST_SAMPLE rows: the per-row softmax plus the kernel's AR
+            // tau/Z (prob of the last kept token, kept mass).
             let mut probs = Vec::with_capacity(rows * vocab);
             let (mut tau, mut z) = (Vec::new(), Vec::new());
             for r in 0..rows {
                 let mut row = Vec::new();
                 softmax_temp_into(&logits[r * vocab..(r + 1) * vocab], temp, &mut row);
-                let mut sorted = row.clone();
-                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                let tau_k = if top_k > 0 { sorted[top_k - 1] } else { 0.0 };
-                let (tau_p, _) = cpu_tau_cut_z(&row, top_p);
-                let t = tau_k.max(tau_p);
+                let mut ar = row.clone();
+                apply_host_ar_trunc(&mut ar, top_k, top_p);
+                let t = (0..vocab)
+                    .filter(|&i| ar[i] > 0.0)
+                    .map(|i| row[i])
+                    .fold(f32::INFINITY, f32::min);
                 tau.push(t);
                 z.push(row.iter().filter(|&&p| p >= t).sum());
                 probs.extend_from_slice(&row);
             }
-            let fast = FastTargetRows {
-                probs,
-                trunc: Some((tau, z)),
-            };
+            let fast = FastTargetRows { probs, tau, z };
             for (fast, label) in [(Some(&fast), "fast"), (None, "host")] {
                 let mut law = Vec::new();
                 sampled_target_row_into(&mut law, 1, vocab, fast, &logits, temp, top_k, top_p);
