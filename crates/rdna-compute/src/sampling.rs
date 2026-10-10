@@ -1382,9 +1382,10 @@ impl Gpu {
     /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.
     ///
     /// For each of `batch` rows in `probs[batch * vocab]`, applies the
-    /// top-p truncation `(p >= tau_cut[r]) ? p / z[r] : 0`, draws one
-    /// categorical sample (LCG seeded per-row from `seed ^ row | 1`), and
-    /// writes the sampled token id and its effective probability.
+    /// truncation `(p >= tau_cut[r]) ? p / z[r] : 0`, draws one categorical
+    /// sample with an LCG started from `seeds[r]` (u32 bits, from
+    /// [`spec_draft_row_seed`]), and writes the sampled token id and its
+    /// effective probability.
     ///
     /// D2H after this call: `batch * 8 bytes` (token + prob per row),
     /// replacing the `batch * vocab * 4` download that the FAST_SAMPLE path
@@ -1394,18 +1395,18 @@ impl Gpu {
     /// `chain_accept_spec_f32` as the draft prob buffer.
     ///
     /// `tau_cut` and `z` come from `softmax_temp_topp_batched_into_f32`.
-    /// Pass zero-filled buffers (tau=0, z=1) when top-p is disabled.
+    /// Pass zero-filled buffers (tau=0, z=1) for no truncation.
     #[allow(clippy::too_many_arguments)]
     pub fn batched_categorical_sample_f32(
         &mut self,
         probs: &GpuTensor,      // [batch * vocab] f32 — softmax output
-        tau_cut: &GpuTensor,    // [batch] f32 — top-p threshold per row
+        tau_cut: &GpuTensor,    // [batch] f32 — truncation threshold per row
         z: &GpuTensor,          // [batch] f32 — kept mass per row
+        seeds: &GpuTensor,      // [batch] u32 — per-row LCG seed
         out_tokens: &GpuTensor, // [batch] i32 — sampled token ids
         out_probs: &GpuTensor,  // [batch] f32 — prob at sampled token
         vocab: usize,
         batch: usize,
-        seed: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1418,7 +1419,7 @@ impl Gpu {
         let tp = tau_cut.buf.as_ptr();
         let zp = z.buf.as_ptr();
         let vs = vocab as i32;
-        let mut sd = seed;
+        let sp = seeds.buf.as_ptr();
         let ot = out_tokens.buf.as_ptr();
         let op = out_probs.buf.as_ptr();
 
@@ -1427,7 +1428,7 @@ impl Gpu {
             &tp as *const _ as *mut c_void,
             &zp as *const _ as *mut c_void,
             &vs as *const _ as *mut c_void,
-            &mut sd as *mut _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
             &ot as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
         ];
@@ -1445,7 +1446,7 @@ impl Gpu {
                 b.push_ptr(tp);
                 b.push_ptr(zp);
                 b.push_i32(vs);
-                b.push_u32(sd);
+                b.push_ptr(sp);
                 b.push_ptr(ot);
                 b.push_ptr(op);
                 b
@@ -1983,6 +1984,51 @@ pub fn all_greedy(params: &[SlotSampleParams]) -> bool {
 /// the bare-argmax path and the batch needs no repeat-window uploads.
 pub fn any_penalized(params: &[SlotSampleParams]) -> bool {
     params.iter().any(|p| p.penalized())
+}
+
+fn fmix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Seed of draft row `row` for [`Gpu::batched_categorical_sample_f32`]: a
+/// hash of the request's sampler `stream` state at the start of the window
+/// (before the window's draws), the window's absolute start `position`, and
+/// the row within the lane's block. Rows of one block, the same row across
+/// windows, and co-scheduled lanes therefore draw independent uniforms. A
+/// lane's draws depend only on its own (stream, position, row), so a batched
+/// launch reproduces the singleton's.
+pub fn spec_draft_row_seed(stream: u64, position: u64, row: u32) -> u32 {
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    fmix64(stream ^ fmix64(position.wrapping_add(fmix64((row as u64).wrapping_add(GOLDEN))))) as u32
+}
+
+#[cfg(test)]
+mod spec_draft_seed_tests {
+    use super::spec_draft_row_seed;
+    use std::collections::HashSet;
+
+    #[test]
+    fn row_seeds_are_deterministic_and_distinct() {
+        let stream = 0x1357_9BDF_2468_ACE0u64;
+        assert_eq!(
+            spec_draft_row_seed(stream, 100, 3),
+            spec_draft_row_seed(stream, 100, 3)
+        );
+        // Rows 2k / 2k+1 (the pre-fix collision), every row of 64 windows, and
+        // two request streams: no repeats.
+        let mut seen = HashSet::new();
+        for s in [stream, stream ^ 1] {
+            for position in 0..64u64 {
+                for row in 0..16u32 {
+                    assert!(seen.insert(spec_draft_row_seed(s, position, row)));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

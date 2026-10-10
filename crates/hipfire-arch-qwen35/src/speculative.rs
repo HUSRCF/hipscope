@@ -6352,9 +6352,21 @@ pub fn spec_step_dflash(
                 // GPU categorical sample per row: writes draft_tokens + draft_p_at_token.
                 let tok_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?; // i32 via f32 slot
                 let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+                // Per-row seeds: hash of (stream state at window start,
+                // absolute position, row) — `spec_draft_row_seed`.
+                let seeds: Vec<u8> = (0..batch)
+                    .flat_map(|r| {
+                        rdna_compute::sampling::spec_draft_row_seed(
+                            *rng_state,
+                            position as u64,
+                            r as u32,
+                        )
+                        .to_ne_bytes()
+                    })
+                    .collect();
+                let seeds_dev = gpu.upload_raw(&seeds, &[seeds.len()])?;
                 gpu.batched_categorical_sample_f32(
-                    &probs_dev, &tau_dev, &z_dev, &tok_dev, &pat_dev, vocab, batch, seed_u32,
+                    &probs_dev, &tau_dev, &z_dev, &seeds_dev, &tok_dev, &pat_dev, vocab, batch,
                 )?;
                 // Download only tokens + probs: batch×8 bytes total.
                 let mut raw_tok = vec![0i32; batch];
@@ -6365,6 +6377,7 @@ pub fn spec_step_dflash(
                     gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
                 let raw_pat = gpu.download_f32(&pat_dev)?;
+                let _ = gpu.free_tensor(seeds_dev);
                 // Keep pat_dev alive on device for chain_accept_spec_f32.
                 for i in 0..batch {
                     drafted.push(raw_tok[i] as u32);
