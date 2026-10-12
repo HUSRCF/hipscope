@@ -1943,6 +1943,7 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
 /// from one FP32 stream. Same source and quant recipe as
 /// [`FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC`] from the AWQ divide on.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC: &str = concat!(
+    "#if defined(__gfx1100__) && defined(IU4_A4_CANDIDATES) && IU4_A4_CANDIDATES == 2\n#define HIPFIRE_IU4_C2_ONEPASS 1\n#endif\n",
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
@@ -4692,9 +4693,9 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 /// Certified gfx1100 builder code object, SHA-256
-/// 175a5b506c54118931b5028afba049a326327e58a5724867e2baed0b9dca7efe
-/// (cad59b86 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
-/// nothing else changed)
+/// 56b49afb87007ebf81bc23f87092cd3baa92d5a5e1e7d7c9743371b62f506289
+/// (local 4x4 tile-coordinate transpose for N>=4096 and complete groups;
+/// short/incomplete grids retain linear ordering)
 /// (`hipfire-isa emit --kernel iu4_v2c --epi all`, one contract-checked
 /// `peacemaker custom build --arch gfx1100` per symbol): the V2C algorithm's
 /// SET, ADD and F1-lite gate/up SiLU entries with every fold op VOPD-paired

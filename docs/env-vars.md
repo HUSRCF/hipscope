@@ -591,6 +591,11 @@ deprecations are listed in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Generated inventory
 
+`HIPFIRE_IU4_C2_ONEPASS` below is a compile-time kernel macro, not an
+environment-variable control. The HIN source defines it only for gfx1100 with
+an explicitly selected two-candidate quantizer; setting it in the process
+environment does not enable or disable this path.
+
 **Do not hand-edit rows below**; regenerate with `python3 scripts/check-lifecycle.py --write`.
 Presence in the inventory means the token appears in source; it does **not** mean the knob is supported, stable, or admitted.
 
@@ -598,7 +603,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1513
+**Count:** 1514
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1390,6 +1395,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ISA_SYMBOL_SUFFIX` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_ISA_TILE_ROWS` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_IU4_BAFOLD` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_IU4_C2_ONEPASS` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4_ONEPASS` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_IU4_RTN_RCP` | crates/rdna-compute/src/kernels.rs | developer |

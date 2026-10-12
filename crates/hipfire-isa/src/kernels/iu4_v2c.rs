@@ -512,6 +512,89 @@ fn prologue(
         &[s(Regs::WC)],
         &[s(Regs::WAVE)],
     )?;
+    // Transpose the low two tile-coordinate bits only for complete 4x4
+    // groups. Each tile keeps its arithmetic; incomplete/short grids stay linear.
+    let row_mask = if epi.silu() { 255 } else { 511 };
+    op(
+        b,
+        format!("s_and_b32 s{t0}, s{}, {}", ar.m, lit(row_mask)),
+        &[s(t0)],
+        &[s(ar.m)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{t1}, s{}, 0x1ff", ar.n),
+        &[s(t1)],
+        &[s(ar.n)],
+    )?;
+    op(
+        b,
+        format!("s_or_b32 s{t0}, s{t0}, s{t1}"),
+        &[s(t0)],
+        &[s(t0), s(t1)],
+    )?;
+    op(
+        b,
+        format!("s_cmp_lt_u32 s{}, 0x1000", ar.n),
+        &[],
+        &[s(ar.n)],
+    )?;
+    op(b, format!("s_cselect_b32 s{t1}, 1, 0"), &[s(t1)], &[])?;
+    op(
+        b,
+        format!("s_or_b32 s{t0}, s{t0}, s{t1}"),
+        &[s(t0)],
+        &[s(t0), s(t1)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{t64}, s{}, 3", Regs::WGX),
+        &[s(t64)],
+        &[s(Regs::WGX)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{}, s{}, 3", t64 + 1, Regs::WGY),
+        &[s(t64 + 1)],
+        &[s(Regs::WGY)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{t1}, s{}, -4", Regs::WGX),
+        &[s(t1)],
+        &[s(Regs::WGX)],
+    )?;
+    op(
+        b,
+        format!("s_or_b32 s{t1}, s{t1}, s{}", t64 + 1),
+        &[s(t1)],
+        &[s(t1), s(t64 + 1)],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 s{}, s{}, -4", t64 + 1, Regs::WGY),
+        &[s(t64 + 1)],
+        &[s(Regs::WGY)],
+    )?;
+    op(
+        b,
+        format!("s_or_b32 s{t64}, s{t64}, s{}", t64 + 1),
+        &[s(t64)],
+        &[s(t64), s(t64 + 1)],
+    )?;
+    op(b, format!("s_cmp_eq_u32 s{t0}, 0"), &[], &[s(t0)])?;
+    op(
+        b,
+        format!("s_cselect_b32 s{}, s{t1}, s{}", Regs::WGX, Regs::WGX),
+        &[s(Regs::WGX)],
+        &[s(t1), s(Regs::WGX)],
+    )?;
+    op(
+        b,
+        format!("s_cselect_b32 s{}, s{t64}, s{}", Regs::WGY, Regs::WGY),
+        &[s(Regs::WGY)],
+        &[s(t64), s(Regs::WGY)],
+    )?;
     // row_bytes = (K/256)*136; trips = K/256 - 1 (whole two-epoch trips before the tail pair).
     op(
         b,
