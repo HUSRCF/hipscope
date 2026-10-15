@@ -2900,10 +2900,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx1100_fa2_split_verify",
         "gfx1100_fa2_split_verify",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX1100_FA2_SPLIT_VERIFY",
-        "Opt in to the exact-gfx1100 Q8 FA2 split-KV VerifyAttn route (default off; applies only on exact gfx1100 inside the dense H24/KV4/HD256 long-context envelope with VMM KV, and a load that resolves legacy KV is refused). Off keeps the established VerifyAttn/R4-R8/batched route. The parent kernel.verify_attn switch takes precedence."
+        "Use the Q8 FA2 split-KV VerifyAttn route by default on exact gfx1100 inside the existing dense H24/KV4/HD256 long-context VMM-KV envelope (false or HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0 restores the established VerifyAttn/R4-R8/batched route). The independent parent kernel.verify_attn=false / HIPFIRE_VERIFY_ATTN=0 also opts out. Other architectures remain off."
     ),
     process_bool_field!(
         "kernel.gfx12_fa_prep_fused",

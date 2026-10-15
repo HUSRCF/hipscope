@@ -453,9 +453,9 @@ pub struct FeatureFlags {
     pub verify_attn: bool,
     /// Exact-gfx1100 FA2 split-KV implementation of VerifyAttn
     /// (`HIPFIRE_GFX1100_FA2_SPLIT_VERIFY`,
-    /// `kernel.gfx1100_fa2_split_verify`). Default OFF on every arch; an
-    /// explicit opt-in takes effect only on exact gfx1100 with VMM KV, and
-    /// the stable [`Self::verify_attn`] switch remains the parent opt-out.
+    /// `kernel.gfx1100_fa2_split_verify`). Default ON only on exact gfx1100
+    /// inside its existing VMM-KV admission envelope. This switch and the
+    /// stable [`Self::verify_attn`] parent are independent opt-outs.
     pub gfx1100_fa2_split_verify: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
@@ -996,7 +996,7 @@ impl FeatureFlags {
             verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
             gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
-                .unwrap_or(false),
+                .unwrap_or(arch == "gfx1100"),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -2091,12 +2091,12 @@ mod tests {
     }
 
     #[test]
-    fn gfx1100_split_verify_is_default_off_and_opt_in() {
+    fn gfx1100_split_verify_defaults_only_on_exact_arch_and_keeps_two_opt_outs() {
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
         let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
         assert!(gfx1100.verify_attn);
-        assert!(!gfx1100.gfx1100_fa2_split_verify);
+        assert!(gfx1100.gfx1100_fa2_split_verify);
         for arch in ["gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
             assert!(
                 !FeatureFlags::from_process_config(arch, &process).gfx1100_fa2_split_verify,
@@ -2104,31 +2104,9 @@ mod tests {
             );
         }
 
-        let mut split_on = ConfigLayer::default();
-        split_on
-            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
-            .unwrap();
-        let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: "config.toml".into(),
-            },
-            layer: split_on,
-        }])
-        .unwrap();
-        let flags = FeatureFlags::from_process_config(
-            "gfx1100",
-            &ProcessConfig::from_resolved(&resolved).unwrap(),
-        );
-        assert!(flags.verify_attn);
-        assert!(flags.gfx1100_fa2_split_verify);
-
-        // The parent switch stays independent: the dispatch predicate
-        // requires both, so `kernel.verify_attn=false` still opts out.
+        // The parent switch stays independent: dispatch requires both.
         let mut parent_off = ConfigLayer::default();
         parent_off.set_cli("kernel.verify_attn", "false").unwrap();
-        parent_off
-            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
-            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -2142,6 +2120,24 @@ mod tests {
         );
         assert!(!flags.verify_attn);
         assert!(flags.gfx1100_fa2_split_verify);
+
+        let mut split_off = ConfigLayer::default();
+        split_off
+            .set_cli("kernel.gfx1100_fa2_split_verify", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: split_off,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(flags.verify_attn);
+        assert!(!flags.gfx1100_fa2_split_verify);
     }
 
     #[test]
