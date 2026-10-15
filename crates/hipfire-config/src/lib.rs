@@ -2900,10 +2900,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx1100_fa2_split_verify",
         "gfx1100_fa2_split_verify",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX1100_FA2_SPLIT_VERIFY",
-        "Opt in to the exact-gfx1100 Q8 FA2 split-KV VerifyAttn route (default off; applies only on exact gfx1100 inside the dense H24/KV4/HD256 long-context envelope with VMM KV, and a load that resolves legacy KV is refused). Off keeps the established VerifyAttn/R4-R8/batched route. The parent kernel.verify_attn switch takes precedence."
+        "Enable the exact-gfx1100 Q8 FA2 split-KV VerifyAttn route (default on exact gfx1100 inside the dense H24/KV4/HD256 long-context envelope with VMM KV, and a load that resolves legacy KV is refused). False restores the established VerifyAttn/R4-R8/batched route. The parent kernel.verify_attn switch takes precedence."
     ),
     process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
@@ -6077,7 +6077,9 @@ mod tests {
 
     #[test]
     fn windows_home_never_falls_back_to_relative() {
-        let missing = hipfire_home_from(true, home_env(&[])).unwrap_err().to_string();
+        let missing = hipfire_home_from(true, home_env(&[]))
+            .unwrap_err()
+            .to_string();
         assert!(missing.contains("HIPFIRE_HOME") && missing.contains("USERPROFILE"));
         for bad in [
             ("HIPFIRE_HOME", ".hipfire"),
@@ -6112,7 +6114,9 @@ mod tests {
         ] {
             assert!(is_windows_absolute(Path::new(ok)), "{ok}");
         }
-        for bad in ["", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x"] {
+        for bad in [
+            "", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x",
+        ] {
             assert!(!is_windows_absolute(Path::new(bad)), "{bad}");
         }
     }
@@ -6232,8 +6236,14 @@ mod tests {
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
-        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
-        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason,
+            ""
+        );
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason,
+            ""
+        );
         let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
@@ -7425,9 +7435,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(layer
             .set("serve.api_key_file", ConfigValue::Integer(1))
             .is_err());
-        assert!(layer
-            .set("serve.api_key_file", ConfigValue::Null)
-            .is_err());
+        assert!(layer.set("serve.api_key_file", ConfigValue::Null).is_err());
     }
 
     #[test]
@@ -8232,18 +8240,12 @@ pub mod memory {
             assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
             assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
             // Both ends of the legal range are pinned shares; 0 disables.
-            assert_eq!(
-                parse_passback_share(Some("0")),
-                PassbackShare::Share(0.0)
-            );
+            assert_eq!(parse_passback_share(Some("0")), PassbackShare::Share(0.0));
             assert_eq!(
                 parse_passback_share(Some("0.375")),
                 PassbackShare::Share(0.375)
             );
-            assert_eq!(
-                parse_passback_share(Some("0.5")),
-                PassbackShare::Share(0.5)
-            );
+            assert_eq!(parse_passback_share(Some("0.5")), PassbackShare::Share(0.5));
             // Out of range and garbage fail closed to scheduling (the schema
             // rejects them earlier; this is the second guard).
             assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
@@ -8561,13 +8563,20 @@ pub mod memory {
         #[test]
         fn budget_keys_default_to_full_and_preserve_explicit_placement() {
             use OffloadBudget::{Auto, Full, Layers};
-            let defaults = crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
             for (key, env) in [
                 ("memory.gpu_layer_budget", "HIPFIRE_GPU_LAYER_BUDGET"),
                 ("memory.moe_expert_budget", "HIPFIRE_MOE_EXPERT_BUDGET"),
             ] {
-                assert_eq!(crate::field(key).unwrap().default.to_value(), crate::ConfigValue::Null);
-                assert_eq!(parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()), Full);
+                assert_eq!(
+                    crate::field(key).unwrap().default.to_value(),
+                    crate::ConfigValue::Null
+                );
+                assert_eq!(
+                    parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()),
+                    Full
+                );
                 for (spelling, expected) in [
                     ("null", Full),
                     ("auto", Auto),
@@ -8582,7 +8591,8 @@ pub mod memory {
                             argument: format!("{key}={spelling}"),
                         },
                         layer,
-                    }]).unwrap();
+                    }])
+                    .unwrap();
                     let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
                     for budget_env in ["HIPFIRE_GPU_LAYER_BUDGET", "HIPFIRE_MOE_EXPERT_BUDGET"] {
                         assert_eq!(
