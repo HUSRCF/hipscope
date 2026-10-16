@@ -687,9 +687,9 @@ waits on the peer's producer event and, before the next layer overwrites a
 partial, on the peer's consumer-complete event.
 
 Two developer controls, both tri-state (`1` forces on, `0` forces off, unset
-takes the default), change only the synchronization. On an exact gfx1201
-pair the whole-token graph (and with it the alternating protocol) is on by
-default; on every other topology both default off:
+takes the default), change only the synchronization. On an exact homogeneous
+gfx1100 or gfx1201 pair the whole-token graph (and with it the alternating
+protocol) is on by default; on every other topology both default off:
 
 - `HIPFIRE_TP_PEER_ALTERNATING`: the attention partial and the FFN partial
   live in different buffers. Once a peer has produced the next partial, it
@@ -707,10 +707,26 @@ default; on every other topology both default off:
   this control implies the alternating protocol unless
   `HIPFIRE_TP_PEER_ALTERNATING=0`.
 
-On gfx1201 the whole-token graph is the default; `HIPFIRE_TP_FULL_GRAPH=0`
-restores the segmented-graph route with event-synchronized reductions. On
-gfx1100 it stays opt-in; its evidence is the author's 2x W7900 measurement in
-#830. Measured 2026-10-15 on 2x R9700 (gfx1201, PCIe 5.0 x16), Qwen3.8-27B
+On exact homogeneous gfx1100 and gfx1201 pairs the whole-token graph is the
+default; `HIPFIRE_TP_FULL_GRAPH=0` restores the segmented-graph route with
+event-synchronized reductions.
+
+The gfx1100 promotion receipt was measured 2026-10-16 on 2x W7900, current
+Qwen3.8-27B mq4-xts (SHA-256 `3e38ccba…`), Q8 VMM KV, pure AR, greedy, 512
+generated tokens, three fresh processes per arm in `A,B,B,A,A,B` order:
+
+| gfx1100 route | decode samples (tok/s) | median | delta |
+|---|---|---:|---:|
+| segmented (`HIPFIRE_TP_FULL_GRAPH=0`) | 48.0, 47.8, 47.8 | 47.8 | — |
+| whole-token graph | 53.4, 53.2, 53.1 | 53.2 | +11.30% |
+
+The path oracle passed 100/100 exact replays. Six product-path prompts produced
+3,072 tokens per arm with byte-identical transcripts (MD5
+`84410b3e45e9ddbb506c33f5d12526de`). See the dated
+[performance checkpoint](perf-checkpoints/2026-10-16-gfx1100-tp2-whole-token-graph.md)
+for fixture and binary identities.
+
+The gfx1201 receipt was measured 2026-10-15 on 2x R9700 (PCIe 5.0 x16), Qwen3.8-27B
 mq4-xts (sha256 `3e38ccba…`), greedy decode of 64 tokens after a 127- or
 8191-token prefill, 3 fresh processes per arm, median ms/token after the
 first token (fixture-bound, not a floor):

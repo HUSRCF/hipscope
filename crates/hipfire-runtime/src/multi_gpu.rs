@@ -200,12 +200,17 @@ fn tp_peer_direct_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_TP_PEER_DIRECT", true)
 }
 
-/// Default for the homogeneous gfx1201 TP2 whole-token decode graph when
-/// `HIPFIRE_TP_FULL_GRAPH` is unset: on. Measured on 2x R9700, Qwen3.8-27B
-/// mq4-xts, 3 fresh processes per arm: 19.99 -> 18.55 ms/token at ctx 128 and
-/// 20.59 -> 18.97 ms/token at ctx 8192, rank-0 logits byte-identical on every
-/// token. `HIPFIRE_TP_FULL_GRAPH=0` is the kill switch. gfx1100 TP2 stays
-/// opt-in (default off) as before.
+/// Architecture defaults for the homogeneous TP2 whole-token decode graph
+/// when `HIPFIRE_TP_FULL_GRAPH` is unset. Both admitted exact architectures
+/// have an independent hardware receipt and retain `=0` as the kill switch.
+///
+/// gfx1100: 2x W7900, Qwen3.8-27B mq4-xts, 3 fresh processes per arm,
+/// 47.8 -> 53.2 tok/s median (+11.30%); 100 exact graph replays and six
+/// byte-identical product transcripts (3,072 generated tokens per arm).
+const GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
+/// gfx1201: 2x R9700, Qwen3.8-27B mq4-xts, 3 fresh processes per arm,
+/// 19.99 -> 18.55 ms/token at ctx 128 and 20.59 -> 18.97 ms/token at ctx 8192;
+/// rank-0 logits byte-identical on every token.
 const GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
 
 /// The exact homogeneous TP2 meshes the whole-token graph route admits.
@@ -232,15 +237,16 @@ fn tp2_graph_topology<'a>(
 
 /// Tri-state whole-token graph request (`HIPFIRE_TP_FULL_GRAPH`): `"1"` opts
 /// in, `"0"` opts out, anything else (unset, empty, other spellings) takes
-/// the arch default — [`GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT`] on a
-/// homogeneous gfx1201 TP2 mesh, off otherwise.
+/// the architecture default on an admitted homogeneous TP2 mesh, off
+/// otherwise.
 fn tp_full_graph_requested(raw: Option<&str>, topology: Option<Tp2GraphTopology>) -> bool {
     match raw {
         Some("1") => true,
         Some("0") => false,
         _ => match topology {
+            Some(Tp2GraphTopology::Gfx1100) => GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
             Some(Tp2GraphTopology::Gfx1201) => GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
-            Some(Tp2GraphTopology::Gfx1100) | None => false,
+            None => false,
         },
     }
 }
@@ -1403,7 +1409,7 @@ impl Gpus {
     }
 
     /// Effective `HIPFIRE_TP_FULL_GRAPH` for this mesh: tri-state, with the
-    /// arch default ([`GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT`]) when unset.
+    /// architecture default when unset.
     fn tp_full_graph_effective(&self) -> bool {
         tp_full_graph_requested(
             tp_full_graph_env().as_deref(),
@@ -1432,7 +1438,8 @@ impl Gpus {
 
     /// Load-time half of the homogeneous gfx1100/gfx1201 TP2 whole-token
     /// decode graph (`HIPFIRE_TP_FULL_GRAPH`: `1` opts in, `0` opts out,
-    /// unset takes the arch default — on for gfx1201, off for gfx1100).
+    /// unset takes the architecture default — on for exact gfx1100 and
+    /// gfx1201 TP2 pairs).
     /// Call before [`Self::enable_peer_all`], as
     /// for the gfx1201 signal tape. Returns `Ok(false)` and touches nothing
     /// unless the graph is requested, both the direct-peer and alternating
@@ -3750,9 +3757,13 @@ mod tests {
     fn tp_full_graph_is_tri_state_with_arch_default() {
         let gfx1100 = Some(Tp2GraphTopology::Gfx1100);
         let gfx1201 = Some(Tp2GraphTopology::Gfx1201);
-        // gfx1100 TP2 default is off; gfx1201 TP2 follows the named constant.
+        // Each admitted exact topology follows its independently promoted
+        // default; unsupported topologies stay off.
         for raw in [None, Some(""), Some("true"), Some("false"), Some(" 1")] {
-            assert!(!tp_full_graph_requested(raw, gfx1100));
+            assert_eq!(
+                tp_full_graph_requested(raw, gfx1100),
+                GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+            );
             assert_eq!(
                 tp_full_graph_requested(raw, gfx1201),
                 GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
@@ -3766,23 +3777,33 @@ mod tests {
     }
 
     #[test]
-    fn tp2_whole_token_graph_admits_requested_gfx1201_and_honors_zero() {
-        let gfx1201 = || ["gfx1201", "gfx1201"].into_iter();
-        let full_graph = |raw| tp_full_graph_requested(raw, tp2_graph_topology(gfx1201()));
-        // Default (unset) follows the named constant; `1` opts in; `0` opts out.
-        assert_eq!(full_graph(None), GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT);
-        assert!(tp2_whole_token_graph_admitted(
-            full_graph(Some("1")),
-            || true,
-            || tp_peer_alternating_for_mesh(None, Some("1"), gfx1201()),
-            gfx1201(),
-        ));
-        assert!(!tp2_whole_token_graph_admitted(
-            full_graph(Some("0")),
-            || panic!("direct flag must not be read when full graph is off"),
-            || panic!("alternating flag must not be read when full graph is off"),
-            gfx1201(),
-        ));
+    fn tp2_whole_token_graph_defaults_on_for_admitted_pairs_and_honors_zero() {
+        for (arches, arch_default) in [
+            (
+                ["gfx1100", "gfx1100"],
+                GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+            ),
+            (
+                ["gfx1201", "gfx1201"],
+                GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+            ),
+        ] {
+            let full_graph =
+                |raw| tp_full_graph_requested(raw, tp2_graph_topology(arches.into_iter()));
+            assert_eq!(full_graph(None), arch_default);
+            assert!(tp2_whole_token_graph_admitted(
+                full_graph(Some("1")),
+                || true,
+                || tp_peer_alternating_for_mesh(None, Some("1"), arches.into_iter()),
+                arches.into_iter(),
+            ));
+            assert!(!tp2_whole_token_graph_admitted(
+                full_graph(Some("0")),
+                || panic!("direct flag must not be read when full graph is off"),
+                || panic!("alternating flag must not be read when full graph is off"),
+                arches.into_iter(),
+            ));
+        }
         // Mixed and 3-rank meshes refuse even an explicit `1`.
         for arches in [
             &["gfx1100", "gfx1201"][..],
