@@ -1153,6 +1153,9 @@ pub struct Qwen35Scratch {
     // on. RefCell because the prefill entries take `&Qwen35Scratch`; all
     // mutation happens on the single owning daemon thread.
     pub widened_prefill_batch: std::cell::RefCell<Option<PrefillBatchScratch>>,
+    // Dense TP owns its PBS and reduction partial together. Lazy, opt-in and
+    // bounded by prefill_max_batch_tp; never shared with verify/tape scratch.
+    dense_tp_prefill: std::cell::RefCell<Option<Box<DenseTpPrefillScratch>>>,
     // Explicit-equivalent owner of an eligible DEFAULT resident-MoE request
     // under `HIPFIRE_PREFILL_REUSE_PBS=1` (`plan_wrapper_pbs`): allocated
     // lazily, with the rows/tape flag the explicit
@@ -1417,6 +1420,7 @@ impl Qwen35Scratch {
             moe_down_expanded: None,
             prefill_batch: None,
             widened_prefill_batch: std::cell::RefCell::new(None),
+            dense_tp_prefill: std::cell::RefCell::new(None),
             reuse_virtual_pbs: std::cell::RefCell::new(None),
         })
         .and_then(|mut s| {
@@ -1568,6 +1572,10 @@ impl Qwen35Scratch {
         }
         if let Some(pbs) = self.widened_prefill_batch.into_inner() {
             note(pbs.free_gpu(gpu));
+        }
+        if let Some(cache) = self.dense_tp_prefill.into_inner() {
+            note(cache.pbs.free_gpu(gpu));
+            note(gpu.free_tensor(cache.partial));
         }
         if let Some(pbs) = self.reuse_virtual_pbs.into_inner() {
             note(pbs.free_gpu(gpu));
@@ -6048,6 +6056,36 @@ pub fn forward_prefill_dense_tp(
     )
 }
 
+struct DenseTpPrefillScratch {
+    pbs: PrefillBatchScratch,
+    partial: GpuTensor,
+}
+
+fn dense_tp_release_prefill(
+    gpus: &mut Gpus,
+    scratches: &[Qwen35Scratch],
+    pbs_vec: Vec<PrefillBatchScratch>,
+    partials: Vec<GpuTensor>,
+    retain: bool,
+) {
+    // Vectors may have different lengths after a transactional allocation
+    // failure. Do not zip them and silently strand the last PBS.
+    let mut partials = partials.into_iter();
+    for (rank, pbs) in pbs_vec.into_iter().enumerate() {
+        if let Some(partial) = partials.next() {
+            if retain {
+                *scratches[rank].dense_tp_prefill.borrow_mut() =
+                    Some(Box::new(DenseTpPrefillScratch { pbs, partial }));
+            } else {
+                let _ = pbs.free_gpu(&mut gpus.devices[rank]);
+                let _ = gpus.devices[rank].free_tensor(partial);
+            }
+        } else {
+            let _ = pbs.free_gpu(&mut gpus.devices[rank]);
+        }
+    }
+}
+
 /// `per_token_hidden_out` takes the post-output-norm row of every prefilled
 /// token, which the MTP head needs to warm its private KV over the prompt.
 #[allow(clippy::too_many_arguments)]
@@ -6091,18 +6129,35 @@ pub fn forward_prefill_dense_tp_with_hidden(
     // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
     let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
+    let reuse = hipfire_config::developer_bool("HIPFIRE_TP_PREFILL_REUSE", false);
     for rank in 0..tp {
+        let cached = scratches[rank].dense_tp_prefill.borrow_mut().take();
+        if let Some(cache) = cached {
+            if reuse && cache.pbs.max_batch >= cap {
+                pbs_vec.push(cache.pbs);
+                partials.push(cache.partial);
+                continue;
+            }
+            // Do not release an old request's asynchronously used storage
+            // until its owning stream has completed. Growth frees the old
+            // cache first, so it never doubles the per-rank PBS peak.
+            if let Err(e) = gpus.devices[rank]
+                .bind_thread()
+                .and_then(|_| gpus.devices[rank].hip.device_synchronize())
+            {
+                *scratches[rank].dense_tp_prefill.borrow_mut() = Some(cache);
+                dense_tp_release_prefill(gpus, scratches, pbs_vec, partials, reuse);
+                return Err(e);
+            }
+            let _ = cache.pbs.free_gpu(&mut gpus.devices[rank]);
+            let _ = gpus.devices[rank].free_tensor(cache.partial);
+        }
         let pbs =
             match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
             {
                 Ok(p) => p,
                 Err(e) => {
-                    for (i, prev) in pbs_vec.drain(..).enumerate() {
-                        let _ = prev.free_gpu(&mut gpus.devices[i]);
-                    }
-                    for (i, prev) in partials.drain(..).enumerate() {
-                        let _ = gpus.devices[i].free_tensor(prev);
-                    }
+                    dense_tp_release_prefill(gpus, scratches, pbs_vec, partials, reuse);
                     return Err(e);
                 }
             };
@@ -6110,12 +6165,7 @@ pub fn forward_prefill_dense_tp_with_hidden(
         let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
             Ok(t) => t,
             Err(e) => {
-                for (i, prev) in pbs_vec.drain(..).enumerate() {
-                    let _ = prev.free_gpu(&mut gpus.devices[i]);
-                }
-                for (i, prev) in partials.drain(..).enumerate() {
-                    let _ = gpus.devices[i].free_tensor(prev);
-                }
+                dense_tp_release_prefill(gpus, scratches, pbs_vec, partials, reuse);
                 return Err(e);
             }
         };
@@ -6182,12 +6232,7 @@ pub fn forward_prefill_dense_tp_with_hidden(
         }
     }
     // ── Transactional free on success and every error path ──
-    for (rank, pbs) in pbs_vec.into_iter().enumerate() {
-        let _ = pbs.free_gpu(&mut gpus.devices[rank]);
-    }
-    for (rank, partial) in partials.into_iter().enumerate() {
-        let _ = gpus.devices[rank].free_tensor(partial);
-    }
+    dense_tp_release_prefill(gpus, scratches, pbs_vec, partials, reuse);
     process_res
 }
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
