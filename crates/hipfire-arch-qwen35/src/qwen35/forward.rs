@@ -5018,6 +5018,14 @@ fn dense_tp_output(
     configs: &[Qwen35Config],
     scratches: &[Qwen35Scratch],
 ) -> HipResult<()> {
+    if gpus.peer_access_enabled && super::tp_output::enabled(gpus, weights, configs) {
+        let inputs: Vec<_> = scratches
+            .iter()
+            .map(|s| s.x.sub_offset(0, configs[0].dim))
+            .collect();
+        super::tp_output::local(gpus, weights, configs, scratches, &inputs)?;
+        return super::tp_output::gather(gpus, scratches, configs[0].vocab_size);
+    }
     gpus.devices[0].rmsnorm_f32(
         &scratches[0].x,
         &weights[0].output_norm,
@@ -5071,7 +5079,16 @@ fn forward_scratch_dense_tp_layers(
             delta_layer_idx += 1;
         }
     }
-    dense_tp_output(gpus, weights, configs, scratches)
+    // Cross-device head gather must not be recorded into per-rank graphs:
+    // gfx1100 replay can retain stale peer VRAM reads/copies. Keep the trunk
+    // captured and enqueue the sharded head after both trunk graph launches.
+    if super::tp_output::enabled(gpus, weights, configs)
+        && gpus.devices.iter().all(|gpu| gpu.graphs.capture_mode)
+    {
+        Ok(())
+    } else {
+        dense_tp_output(gpus, weights, configs, scratches)
+    }
 }
 
 fn dense_tp_graph_enabled(gpus: &Gpus, kv_caches: &[llama::KvCache]) -> bool {
@@ -5289,6 +5306,17 @@ fn forward_scratch_dense_tp_segmented(
             delta_layer_idx += 1;
         }
     }
+    if gpus.peer_access_enabled && super::tp_output::enabled(gpus, weights, configs) {
+        if capture {
+            dense_tp_capture_and_launch_segment(gpus, |gpus| {
+                let inputs: Vec<_> = scratches.iter().map(|s| s.x.sub_offset(0, dim)).collect();
+                super::tp_output::local(gpus, weights, configs, scratches, &inputs)
+            })?;
+        } else {
+            dense_tp_launch_segment(gpus, segment)?;
+        }
+        return super::tp_output::gather(gpus, scratches, configs[0].vocab_size);
+    }
     if capture {
         dense_tp_capture_and_launch_root_segment(gpus, |gpus| {
             dense_tp_output(gpus, weights, configs, scratches)
@@ -5373,6 +5401,8 @@ pub fn forward_scratch_dense_tp(
     // TP2 whole-token graph on an exact gfx1201 pair (default) or gfx1100 pair
     // (`HIPFIRE_TP_FULL_GRAPH=1`; `=0` off); the runtime owns capture/replay
     // and the cross-rank signal protocol.
+    let sharded_output =
+        gpus.peer_access_enabled && super::tp_output::enabled(gpus, weights, configs);
     let barriers = n_layers * 2;
     if gpus.tp2_whole_token_graph_ready(barriers) {
         let step = gpus.tp2_whole_token_graph_forward(barriers, |gpus| {
@@ -5380,6 +5410,9 @@ pub fn forward_scratch_dense_tp(
                 gpus, weights, configs, pos, kv_caches, dn_states, scratches,
             )
         })?;
+        if sharded_output && step != TpGraphStep::Direct {
+            dense_tp_output(gpus, weights, configs, scratches)?;
+        }
         if step == TpGraphStep::Captured && ar_graph_trace_enabled() {
             eprintln!(
                 "[qwen-dense-tp-graph] captured whole-token tp=2 barriers={barriers} pos={pos}"
@@ -5390,7 +5423,7 @@ pub fn forward_scratch_dense_tp(
 
     let expected_segments = n_layers * 2;
     let replay_ready = gpus.devices.iter().enumerate().all(|(rank, gpu)| {
-        let expected = expected_segments + usize::from(rank == 0);
+        let expected = expected_segments + usize::from(rank == 0 || sharded_output);
         gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_segment_count() == expected
     });
     if replay_ready {
@@ -5402,8 +5435,9 @@ pub fn forward_scratch_dense_tp(
         }
         if ar_graph_trace_enabled() {
             eprintln!(
-                "[qwen-dense-tp-graph] replay tp={tp} root_segments={} peer_segments={expected_segments} pos={pos}",
-                expected_segments + 1
+                "[qwen-dense-tp-graph] replay tp={tp} root_segments={} peer_segments={} pos={pos}",
+                gpus.devices[0].graphs.graph_segment_count(),
+                gpus.devices[1].graphs.graph_segment_count()
             );
         }
         return result;
@@ -5432,7 +5466,7 @@ pub fn forward_scratch_dense_tp(
         return Err(error);
     }
     if gpus.devices.iter().enumerate().any(|(rank, gpu)| {
-        let expected = expected_segments + usize::from(rank == 0);
+        let expected = expected_segments + usize::from(rank == 0 || sharded_output);
         gpu.graphs.graph_segment_count() != expected
     }) {
         gpus.drop_rank_graphs(true);
@@ -5446,8 +5480,9 @@ pub fn forward_scratch_dense_tp(
     }
     if ar_graph_trace_enabled() {
         eprintln!(
-            "[qwen-dense-tp-graph] capture tp={tp} root_segments={} peer_segments={expected_segments} pos={pos}",
-            expected_segments + 1
+            "[qwen-dense-tp-graph] capture tp={tp} root_segments={} peer_segments={} pos={pos}",
+            gpus.devices[0].graphs.graph_segment_count(),
+            gpus.devices[1].graphs.graph_segment_count()
         );
     }
     Ok(())
@@ -6139,8 +6174,9 @@ pub fn forward_prefill_dense_tp_with_hidden(
                 continue;
             }
             // Do not release an old request's asynchronously used storage
-            // until its owning stream has completed. Growth frees the old
-            // cache first, so it never doubles the per-rank PBS peak.
+            // until its owning stream has completed. Drop old cache ownership
+            // before growing; free_tensor may park storage in the allocator
+            // pool, so physical VRAM still needs measurement.
             if let Err(e) = gpus.devices[rank]
                 .bind_thread()
                 .and_then(|_| gpus.devices[rank].hip.device_synchronize())
@@ -6206,6 +6242,14 @@ pub fn forward_prefill_dense_tp_with_hidden(
         let last_row_offset = (last_chunk_n - 1) * dim;
         let x_last = pbs_vec[0].x_batch.sub_offset(last_row_offset, dim);
         let res = (|| -> HipResult<()> {
+            if gpus.peer_access_enabled && super::tp_output::enabled(gpus, weights, configs) {
+                let inputs: Vec<_> = pbs_vec
+                    .iter()
+                    .map(|pbs| pbs.x_batch.sub_offset(last_row_offset, dim))
+                    .collect();
+                super::tp_output::local(gpus, weights, configs, scratches, &inputs)?;
+                return super::tp_output::gather(gpus, scratches, configs[0].vocab_size);
+            }
             gpus.devices[0].bind_thread()?;
             gpus.devices[0].rmsnorm_f32(
                 &x_last,

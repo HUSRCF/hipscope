@@ -177,3 +177,8 @@ required-features = ["lab"]
 name = "gpu_moe_cpu_parity"
 path = "tests/gpu_moe_cpu_parity.rs"
 required-features = ["lab"]
+
+[[example]]
+name = "tp2_lm_head_oracle"
+path = "examples/tp2_lm_head_oracle.rs"
+required-features = ["deltanet"]
