@@ -169,3 +169,21 @@ contract and covered by a CPU regression. No raw receipt was rewritten.
 
 Raw artifacts and source identities are preserved in
 [`benchmarks/results/2026-10-22-tiered-kv-streaming/README.md`](../../benchmarks/results/2026-10-22-tiered-kv-streaming/README.md).
+
+### Complete CPU-suite follow-up
+
+The current source's complete workspace-library rerun finished all 58 targets:
+8,292 passed, 2 failed, 86 ignored. Both failures are the unchanged tensor-ops
+export/index closure cases, reproduced on clean pinned beta. The original
+no-GPU script fails on those same cases; every later phase was also executed
+separately. The full-source ABI check passes 62/62, CLI 770/770, and the entire
+Python list passes 818/818 in an isolated system-Python environment. Initial
+Anaconda import failures are preserved and explained, not erased.
+
+The old loader failure is configuration-sensitive, not a current tiered-KV
+regression: the same test binary passes with isolated `HIPFIRE_HOME`, fails
+with the inherited `asym3` user configuration, and all 186 loader tests pass
+in the isolated full run. These findings correct the earlier attribution
+without changing the historical logs. Full-suite **pass** claims remain
+blocked by the two registry failures. See the
+[complete CPU checkpoint](../../benchmarks/results/2026-10-22-tiered-kv-full-ci/README.md).
