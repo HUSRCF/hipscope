@@ -948,6 +948,16 @@ impl NpuForward {
         self.guard_tripped = false;
         Ok(())
     }
+    /// Schedule the request begun last GPU-only (the `off` schedule), for a
+    /// request the pair executor cannot serve; `why` is logged once. Like the
+    /// diagnostic route it never touches the fault latch.
+    pub(super) fn force_gpu_request(&mut self, why: &str) {
+        if !self.request_gpu && !self.pair_logged {
+            eprintln!("npu-trunk: route=gpu ({why})");
+            self.pair_logged = true;
+        }
+        self.request_gpu = true;
+    }
     /// With a matched calibration every mode (`auto`, `on`, `emulate`) executes the planner's pairs, including the
     /// rebalanced last pair; `auto` logs the plan. Without one the forced modes keep the natural 8192 + B pairing.
     pub(super) fn plan_request(

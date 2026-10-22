@@ -47,7 +47,10 @@
 //! retire = `barrier(&[Retire])`.
 
 use crate::backend::{Auth, Backend, EventId, SlotTransition};
+use crate::lds::{Lendable, Ring, RingParts, Slots};
+use crate::scope::{End, Scc, WgUniform, Workgroup};
 use crate::target::{SplitBarrier, Target, WaitModel};
+use std::any::TypeId;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -189,6 +192,8 @@ enum Hold {
     Barrier,
     /// Joined, split, made a ring buffer, or re-laid out.
     Gone,
+    /// Taken by a typed body (`Lend::take`) until it is given back or consumed.
+    Lent,
 }
 
 /// A place's store bookkeeping. `pending` mirrors the typed core's token
@@ -243,6 +248,9 @@ struct Region {
 struct RingBuf {
     name: String,
     bufs: [Vec<usize>; 2],
+    /// `Some` for a ring a typed body gave (`Lend::give`): the `TypeId` of its
+    /// tag. Only such a ring can be taken back.
+    tag: Option<TypeId>,
     cur: usize,
     /// `cur` holds data a barrier published (false only before the first
     /// rotation of a steady ring).
@@ -275,6 +283,7 @@ fn desc(phase: Phase, undrained: bool, hold: Hold) -> String {
     match hold {
         Hold::Gone => "consumed".into(),
         Hold::Barrier => "held by a split barrier".into(),
+        Hold::Lent => "lent to a typed body".into(),
         Hold::Live => format!(
             "{phase:?}{}",
             if undrained {
@@ -522,7 +531,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 "{} is held by a split barrier in flight until wait_arrived",
                 r.name
             )),
-            Hold::Gone => Err(format!(
+            Hold::Gone | Hold::Lent => Err(format!(
                 "{} was consumed (joined, split, made a ring buffer or re-laid out)",
                 r.name
             )),
@@ -537,6 +546,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             Hold::Live => Ok(id.idx),
             Hold::Barrier => Err(format!(
                 "ring {} is held by a split barrier in flight until wait_arrived",
+                r.name
+            )),
+            Hold::Lent => Err(format!(
+                "ring {} is lent to a typed body until it is given back",
                 r.name
             )),
             Hold::Gone => Err(format!("ring {} was re-laid out", r.name)),
@@ -804,6 +817,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.st.rings.push(RingBuf {
             name: name.into(),
             bufs,
+            tag: None,
             cur: 1,
             cur_live: false,
             cur_phase: Phase::RtFree,
@@ -1536,5 +1550,244 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let out = self.scoped(|d| read(d, region, &end))?;
         self.end(end)?;
         Ok(out)
+    }
+
+    // ---- typed-core bridge ----------------------------------------------
+
+    /// Run a typed-core body on this driver's backend and session: `body`
+    /// gets a `Workgroup` over the same backend, authorized by this driver's
+    /// own `Auth` (no new seal, no `Auth` leaves the crate), and a [`Lend`]
+    /// that moves typed rings across the boundary under the driver's checks.
+    /// Everything the body emits reaches the backend through `Auth`-gated
+    /// calls, so the backend's wait ledger, slot machine and loop fixpoint
+    /// see all of it.
+    ///
+    /// A `Workgroup` is workgroup scope, so `typed` is refused under
+    /// wave-uniform control (`skip_if`, `exec_if`, `if_else`, `forward`,
+    /// `loop_until`), after a wave-uniform kernel exit and while a split
+    /// barrier is in flight. Every ring the body took must be given back
+    /// ([`Lend::give_back`]) or declared consumed ([`Lend::consumed`])
+    /// before it returns, else `typed` returns `Err`. As with any `Err` that
+    /// reaches the backend, the lowering is dead after an `Err` from `body`
+    /// or from that check: rings still lent stay lent.
+    pub fn typed<R>(
+        &mut self,
+        body: impl FnOnce(&mut Workgroup<'_, T, B>, &mut Lend<'_>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.wg("typed")?;
+        if self.st.wave_exit {
+            return Err(
+                "typed body after a wave-uniform kernel exit: it is workgroup scope".into(),
+            );
+        }
+        if self.st.in_flight.is_some() {
+            return Err("typed body while a split barrier is in flight".into());
+        }
+        let mut wg = Workgroup::over(&mut *self.b, self.auth.reenter());
+        let mut lend = Lend {
+            st: &mut self.st,
+            owner: self.owner,
+        };
+        let out = body(&mut wg, &mut lend);
+        if wg.wave_exited() {
+            lend.st.wave_exit = true;
+        }
+        let out = out?;
+        if let Some(r) = lend.st.rings.iter().find(|r| r.hold == Hold::Lent) {
+            return Err(format!(
+                "typed body ended with ring {} still taken: give it back (or declare it consumed)",
+                r.name
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// The view a typed body (`Driver::typed`) has of its driver: the rings,
+/// kernel exits and conditions of the script side. It cannot mint a ring, a
+/// region or an `Auth`; it only moves what the typed core built.
+///
+/// A ring crosses only in a state with no `Pending` token (`Free` or
+/// `Published` buffers, [`Lendable`]) and only under its own tag, which is
+/// what makes a ring of the wrong payload kind a refusal instead of a
+/// misread LDS plane.
+pub struct Lend<'a> {
+    st: &'a mut St,
+    owner: u64,
+}
+
+impl Lend<'_> {
+    fn ring_slot(&self, id: RingId) -> Result<usize, String> {
+        if id.owner != self.owner {
+            return Err("ring id from another Driver".into());
+        }
+        if id.idx >= self.st.rings.len() {
+            return Err("unknown LDS ring".into());
+        }
+        Ok(id.idx)
+    }
+    fn tag_check<Tag: 'static>(r: &RingBuf) -> Result<(), String> {
+        match r.tag {
+            Some(t) if t == TypeId::of::<Tag>() => Ok(()),
+            Some(_) => Err(format!(
+                "ring {} carries a different tag than the typed body's `{}`",
+                r.name,
+                std::any::type_name::<Tag>()
+            )),
+            None => Err(format!(
+                "ring {} was not given by a typed body: a script-made ring cannot be lent as `{}`",
+                r.name,
+                std::any::type_name::<Tag>()
+            )),
+        }
+    }
+    /// Register a typed ring with the driver: a new live ring of its phases
+    /// (`C` current, `N` next), tagged `Tag`. Only `Free` and `Published`
+    /// states can be given.
+    pub fn give<Tag: 'static, C: Lendable, N: Lendable>(
+        &mut self,
+        ring: Ring<Tag, C, N>,
+        name: &str,
+    ) -> RingId {
+        let p = ring.into_parts();
+        self.st.rings.push(RingBuf {
+            name: name.into(),
+            bufs: [p.bufs[0].ids().to_vec(), p.bufs[1].ids().to_vec()],
+            tag: Some(TypeId::of::<Tag>()),
+            cur: p.cur,
+            cur_live: p.cur_live,
+            cur_phase: C::PHASE,
+            next: N::PHASE,
+            stores: Stores {
+                events: p.last.into_iter().collect(),
+                pending: false,
+            },
+            hold: Hold::Live,
+        });
+        RingId {
+            owner: self.owner,
+            idx: self.st.rings.len() - 1,
+        }
+    }
+    /// Move a ring out of the driver as the typed `Ring<Tag, C, N>`. It must
+    /// be live (not in a split barrier, not already lent, not consumed), carry
+    /// no `Pending` token or outstanding store, be tagged `Tag` and be in
+    /// phases `C`/`N`. Its internals (`cur`, `cur_live`, buffers) travel
+    /// unchanged. The driver marks it lent until [`give_back`](Self::give_back)
+    /// or [`consumed`](Self::consumed).
+    pub fn take<Tag: 'static, C: Lendable, N: Lendable>(
+        &mut self,
+        id: RingId,
+    ) -> Result<Ring<Tag, C, N>, String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        match r.hold {
+            Hold::Live => {}
+            Hold::Lent => return Err(format!("ring {} is already lent", r.name)),
+            Hold::Barrier => {
+                return Err(format!(
+                    "ring {} is held by a split barrier in flight until wait_arrived",
+                    r.name
+                ))
+            }
+            Hold::Gone => return Err(format!("ring {} was re-laid out or consumed", r.name)),
+        }
+        Self::tag_check::<Tag>(r)?;
+        if r.stores.undrained() || !r.stores.events.is_empty() {
+            return Err(format!(
+                "ring {} has a Pending store: only a drained ring can be lent",
+                r.name
+            ));
+        }
+        if r.cur_phase != C::PHASE || r.next != N::PHASE {
+            return Err(format!(
+                "ring {} is [cur {:?}, next {:?}]; the typed body takes it as [cur {:?}, next {:?}]",
+                r.name,
+                r.cur_phase,
+                r.next,
+                C::PHASE,
+                N::PHASE
+            ));
+        }
+        let parts = RingParts {
+            bufs: [Slots::from_ids(&r.bufs[0])?, Slots::from_ids(&r.bufs[1])?],
+            cur: r.cur,
+            cur_live: r.cur_live,
+            last: None,
+        };
+        self.st.rings[i].hold = Hold::Lent;
+        Ok(Ring::from_parts(parts))
+    }
+    /// Return a taken ring to its driver slot, in the phases `C`/`N` the body
+    /// left it in (a body may retire or publish it). It must be the ring
+    /// taken under `id`: same tag, same buffers. From here on it is an
+    /// ordinary driver ring, so a script loop around the body checks it
+    /// like any other.
+    pub fn give_back<Tag: 'static, C: Lendable, N: Lendable>(
+        &mut self,
+        id: RingId,
+        ring: Ring<Tag, C, N>,
+    ) -> Result<(), String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        if r.hold != Hold::Lent {
+            return Err(format!("ring {} is not lent: nothing to give back", r.name));
+        }
+        Self::tag_check::<Tag>(r)?;
+        let p = ring.into_parts();
+        if r.bufs[0] != p.bufs[0].ids() || r.bufs[1] != p.bufs[1].ids() {
+            return Err(format!(
+                "ring {}: the ring given back is not the one that was taken",
+                r.name
+            ));
+        }
+        let r = &mut self.st.rings[i];
+        r.cur = p.cur;
+        r.cur_live = p.cur_live;
+        r.cur_phase = C::PHASE;
+        r.next = N::PHASE;
+        r.stores = Stores {
+            events: p.last.into_iter().collect(),
+            pending: false,
+        };
+        r.hold = Hold::Live;
+        Ok(())
+    }
+    /// The body consumed a taken ring (the typed code dropped it, as
+    /// `Workgroup::relayout` does): its slots are gone like a re-laid out
+    /// ring's.
+    pub fn consumed(&mut self, id: RingId) -> Result<(), String> {
+        let i = self.ring_slot(id)?;
+        let r = &mut self.st.rings[i];
+        if r.hold != Hold::Lent {
+            return Err(format!(
+                "ring {} is not lent: it cannot be consumed",
+                r.name
+            ));
+        }
+        r.hold = Hold::Gone;
+        Ok(())
+    }
+    /// The kernel exit `exit` as the typed `End`: the same label, sharing the
+    /// "a branch reaches the exit" flag (`Workgroup::exit_if` through the view
+    /// marks the driver's `Exit`). Only this driver's exits.
+    pub fn end(&self, exit: &Exit) -> Result<End, String> {
+        if exit.owner != self.owner {
+            return Err(format!(
+                "kernel exit {} belongs to another Driver",
+                exit.label
+            ));
+        }
+        Ok(End::shared(&exit.label, exit.branched.clone()))
+    }
+    /// A typed workgroup-uniform condition as the driver's `WgCond`, so a
+    /// script's `wg_skip_if` / `loop_carried` can consume it. The compare's
+    /// position travels with it: the branch refuses it if SCC was redefined
+    /// since, exactly as for a `WgCond` from `scmp_wg_uniform`.
+    pub fn wg_cond(&self, cond: WgUniform<Scc>) -> WgCond {
+        WgCond {
+            owner: self.owner,
+            at: cond.at(),
+        }
     }
 }

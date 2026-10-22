@@ -25,10 +25,11 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
-use crate::qwen35::prefill::{fp8_verify_target, verify_dense_math, DenseBatchMath};
+use crate::qwen35::prefill::fp8_verify_target;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -3247,6 +3248,12 @@ pub struct VerifyScratch {
     /// (`HIPFIRE_DFLASH_DEVICE_ACCEPT`), grown on first sampled window. A
     /// `Mutex` because the singleton step borrows `VerifyScratch` shared.
     pub device_accept: std::sync::Mutex<Option<DflashAcceptScratch>>,
+    /// Reusable verbatim-lookup tail buffer of the singleton DFlash step
+    /// (`spec_step_dflash`'s `lookup` seam), reserved at its 15-candidate
+    /// maximum so a spliced window allocates nothing. A `Mutex` because the
+    /// singleton step borrows `VerifyScratch` shared; only locked when a
+    /// lookup is supplied.
+    pub lookup_tail: std::sync::Mutex<Vec<u32>>,
 }
 
 impl VerifyScratch {
@@ -3268,6 +3275,7 @@ impl VerifyScratch {
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
             prefill_batch: None,
             device_accept: std::sync::Mutex::new(None),
+            lookup_tail: std::sync::Mutex::new(Vec::with_capacity(DFLASH_LOOKUP_MAX_CANDIDATES)),
         })
     }
 
@@ -3945,6 +3953,16 @@ impl SparseQRows {
         self.off.push(0);
         self.idx.clear();
         self.val.clear();
+    }
+
+    /// Keep the first `rows` rows (no-op when fewer exist).
+    pub fn truncate_rows(&mut self, rows: usize) {
+        if rows < self.rows() {
+            let end = self.off[rows] as usize;
+            self.off.truncate(rows + 1);
+            self.idx.truncate(end);
+            self.val.truncate(end);
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -4690,6 +4708,38 @@ fn dflash_sampled_accept_q_rows(
     rng: &mut u64,
     scratch: &mut Vec<f32>,
 ) -> SampledWindowDecision {
+    dflash_sampled_accept_q_rows_with(
+        block,
+        selected_q,
+        q,
+        fast,
+        logits,
+        vocab,
+        cfg,
+        max_accept,
+        &mut || xorshift_next_unit(rng),
+        scratch,
+    )
+}
+
+/// [`dflash_sampled_accept_q_rows`] over an explicit uniform source: the body
+/// is the single accept/residual/bonus implementation, `next_u` replaces the
+/// xorshift draw (one call per accept test, per residual draw and per bonus
+/// draw, in the same order). The law tests drive it with exact uniform grids.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn dflash_sampled_accept_q_rows_with(
+    block: &[u32],
+    selected_q: &[f32],
+    q: QRows<'_>,
+    fast: Option<&FastTargetRows>,
+    logits: &[f32],
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    max_accept: usize,
+    next_u: &mut impl FnMut() -> f32,
+    scratch: &mut Vec<f32>,
+) -> SampledWindowDecision {
     let b = block.len();
     let mut accept_len = 0;
     let mut rejected_bonus = None;
@@ -4711,11 +4761,11 @@ fn dflash_sampled_accept_q_rows(
             ) = (fast.map(|f| f.row(i, vocab)), q)
             {
                 let p_t = sparse_row_prob(tidx, tval, inv_z, block[i + 1]);
-                let u = xorshift_next_unit(rng);
+                let u = next_u();
                 if u * p_d <= p_t {
                     accept_len += 1;
                 } else {
-                    let u2 = xorshift_next_unit(rng);
+                    let u2 = next_u();
                     let (qidx, qval) = qs.row(i);
                     rejected_bonus = Some(sample_residual_sparse(
                         tidx, tval, inv_z, qidx, qval, vocab, u2,
@@ -4735,7 +4785,7 @@ fn dflash_sampled_accept_q_rows(
         } else {
             p_t
         };
-        let u = xorshift_next_unit(rng);
+        let u = next_u();
         if u * p_d <= accept_prob {
             accept_len += 1;
         } else {
@@ -4754,7 +4804,7 @@ fn dflash_sampled_accept_q_rows(
                     }
                 }
             }
-            let u2 = xorshift_next_unit(rng);
+            let u2 = next_u();
             rejected_bonus = Some(match q {
                 QRows::Dense(d) => sample_residual(scratch, &d[i], u2),
                 QRows::Sparse(s) => {
@@ -4769,7 +4819,7 @@ fn dflash_sampled_accept_q_rows(
         b
     } else {
         let i = accept_len.min(b - 1);
-        let u = xorshift_next_unit(rng);
+        let u = next_u();
         sampled_target_bonus(
             scratch, i, vocab, fast, logits, cfg.temp, cfg.top_k, cfg.top_p, u,
         )
@@ -8389,6 +8439,214 @@ pub fn draft_dflash_blocks_batched(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// DFlash verbatim-lookup splice seam
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Largest lookup candidate count the singleton DFlash2 window can verify:
+/// 16 verify rows incl. the seed. Mirrors `spec_lookup::LOOKUP_MAX_CANDIDATES`
+/// (this crate does not depend on the policy module).
+pub const DFLASH_LOOKUP_MAX_CANDIDATES: usize = 15;
+
+/// Verbatim-lookup candidates composed into one DFlash2 verify window
+/// (selector mode only). The window's effective verify rows are
+/// `b_eff = 1 + K + L <= b`; every downstream verify / accept / commit /
+/// rollback step runs at `b_eff`. The learned draft always runs at the
+/// original `b` (no draft-work saving), so RNG draws of the learned draft are
+/// identical with and without a lookup.
+pub enum DflashLookup<'a> {
+    /// Copy window: `tokens` (1..=b-1) replace every learned candidate
+    /// (K = 0). The learned draft forward still runs; its candidates are
+    /// discarded.
+    Copy(&'a [u32]),
+    /// Hybrid: after the learned draft, the source may keep the first K
+    /// learned candidates and append a lookup tail.
+    Tail(&'a mut dyn DflashTailSource),
+}
+
+pub trait DflashTailSource {
+    /// `drafted` = learned candidates d1..d(b-1) (seed excluded). Sequential
+    /// stopping rule REQUIRED: the decision to splice at K may read only
+    /// `drafted[..K]` (sampled-law validity).
+    /// `Some(k)` with `1 <= k` and the tail (`1..=b-1-k` tokens) written into
+    /// `tail` (cleared first); `None` keeps the incumbent window unchanged.
+    fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize>;
+}
+
+fn lookup_err(msg: &str) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(0, msg)
+}
+
+/// Copy-window shape: `1 <= tokens.len() <= b - 1`, every id `< vocab`.
+fn dflash_lookup_check_copy(tokens: &[u32], b: usize, vocab: usize) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Err(lookup_err(
+            "dflash lookup: Copy window needs at least one token",
+        ));
+    }
+    if tokens.len() + 1 > b {
+        return Err(lookup_err(&format!(
+            "dflash lookup: Copy window of {} tokens exceeds the window's {} verify rows",
+            tokens.len(),
+            b
+        )));
+    }
+    dflash_lookup_check_ids(tokens, vocab)
+}
+
+fn dflash_lookup_check_ids(tokens: &[u32], vocab: usize) -> HipResult<()> {
+    if let Some(&t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+        return Err(lookup_err(&format!(
+            "dflash lookup: token id {t} out of vocab {vocab}"
+        )));
+    }
+    Ok(())
+}
+
+/// Pre-draft refusal: nothing has run yet, so an `Err` leaves every piece of
+/// state (RNG included) untouched.
+fn dflash_lookup_preflight(
+    lookup: &Option<DflashLookup<'_>>,
+    selector_mode: bool,
+    pld_spine: bool,
+    b: usize,
+    vocab: usize,
+) -> HipResult<()> {
+    let Some(lookup) = lookup else {
+        return Ok(());
+    };
+    if !selector_mode {
+        return Err(lookup_err(
+            "dflash lookup: requires the DFlash2 candidate selector (learned q receipts)",
+        ));
+    }
+    if pld_spine {
+        return Err(lookup_err("dflash lookup: not supported with a PLD spine"));
+    }
+    if b < 2 {
+        return Err(lookup_err("dflash lookup: window has no candidate rows"));
+    }
+    if let DflashLookup::Copy(tokens) = lookup {
+        dflash_lookup_check_copy(tokens, b, vocab)?;
+    }
+    Ok(())
+}
+
+/// Resolve the splice against the learned block `drafted` (`[seed, d1..d(b-1)]`).
+/// On `Ok(Some(keep))` the lookup tokens (Copy: the caller's tokens; Tail: the
+/// source's tail) are in `tail` and `1 + keep + tail.len() <= b`. `Ok(None)`:
+/// the source declined, keep the incumbent window. Validation precedes every
+/// verify/commit write; `drafted` is never mutated here.
+fn dflash_lookup_resolve(
+    lookup: DflashLookup<'_>,
+    drafted: &[u32],
+    b: usize,
+    vocab: usize,
+    tail: &mut Vec<u32>,
+) -> HipResult<Option<usize>> {
+    match lookup {
+        DflashLookup::Copy(tokens) => {
+            dflash_lookup_check_copy(tokens, b, vocab)?;
+            tail.clear();
+            tail.extend_from_slice(tokens);
+            Ok(Some(0))
+        }
+        DflashLookup::Tail(source) => {
+            if drafted.len() != b {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: learned block has {} rows, window has {}",
+                    drafted.len(),
+                    b
+                )));
+            }
+            tail.clear();
+            let Some(k) = source.splice(&drafted[1..], tail) else {
+                tail.clear();
+                return Ok(None);
+            };
+            if k < 1 || k > b - 1 {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: Tail keep {k} outside 1..={}",
+                    b - 1
+                )));
+            }
+            if tail.is_empty() {
+                return Err(lookup_err("dflash lookup: Tail spliced with an empty tail"));
+            }
+            if k + tail.len() > b - 1 {
+                return Err(lookup_err(&format!(
+                    "dflash lookup: Tail keep {k} + tail {} exceeds {} candidate rows",
+                    tail.len(),
+                    b - 1
+                )));
+            }
+            dflash_lookup_check_ids(tail, vocab)?;
+            Ok(Some(k))
+        }
+    }
+}
+
+/// A sampled window needs the learned q receipt of at least `keep` rows to
+/// splice onto; checked before any receipt mutation.
+fn dflash_lookup_check_receipt(receipt: Option<&DflashSampledDraft>, keep: usize) -> HipResult<()> {
+    let Some(r) = receipt else {
+        return Err(lookup_err(
+            "dflash lookup: sampled window without a q receipt",
+        ));
+    };
+    let rows = if r.sparse {
+        r.sparse_q.rows()
+    } else {
+        r.dense_q.len()
+    };
+    if r.selected_q.len() < keep || rows < keep {
+        return Err(lookup_err(&format!(
+            "dflash lookup: q receipt holds {} rows, Tail keeps {keep}",
+            r.selected_q.len().min(rows)
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild the q receipt of a spliced sampled window: learned rows `..keep`
+/// keep their real q (selected probability and support), every lookup row is a
+/// POINT-MASS q (`selected_q = 1.0`, support `{c: 1.0}` — a one-entry sparse
+/// row, or a one-hot dense row). The learned selector `proposal` is dropped:
+/// it describes the discarded learned rows and must not feed lookup rows.
+/// Dense mode reuses the discarded learned rows' buffers.
+fn dflash_lookup_splice_receipt(
+    receipt: &mut DflashSampledDraft,
+    keep: usize,
+    tokens: &[u32],
+    vocab: usize,
+) -> HipResult<()> {
+    receipt.selected_q.truncate(keep);
+    receipt.uniforms.truncate(keep);
+    receipt.proposal = None;
+    if receipt.sparse {
+        receipt.sparse_q.truncate_rows(keep);
+        for &c in tokens {
+            receipt.sparse_q.push_row(&[c], &[1.0], vocab)?;
+            receipt.selected_q.push(1.0);
+        }
+    } else {
+        for (j, &c) in tokens.iter().enumerate() {
+            let row = keep + j;
+            if row < receipt.dense_q.len() {
+                let r = &mut receipt.dense_q[row];
+                r.clear();
+                r.resize(vocab, 0.0);
+            } else {
+                receipt.dense_q.push(vec![0.0; vocab]);
+            }
+            receipt.dense_q[row][c as usize] = 1.0;
+            receipt.selected_q.push(1.0);
+        }
+        receipt.dense_q.truncate(keep + tokens.len());
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DFlash spec step — one speculative decode iteration
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -8425,6 +8683,16 @@ pub fn draft_dflash_blocks_batched(
 /// Use this for accept-rate bisect experiments — if training-time context
 /// was shorter than inference-time, truncation may help. `None` uses the
 /// full cumulative context (the default, distribution-preserving path).
+///
+/// `lookup`: `None` is the incumbent window. `Some(Copy(tokens))` verifies
+/// `[seed, tokens..]` in place of the learned candidates; `Some(Tail(src))`
+/// calls `src.splice` after the learned draft and, on `Some(k)`, verifies
+/// `[seed, d1..dk, tail..]`. A declining `Tail` source is byte-identical to
+/// `None`. DFlash2 selector mode only. The learned draft still runs at the
+/// original `b`; all later stages run at `b_eff = 1 + K + L <= b`.
+/// Sampled windows give lookup rows point-mass q receipts (see
+/// `dflash_lookup_splice_receipt`). Invalid splices return `Err` before any
+/// verify/commit write, with the sampling RNG restored to its entry state.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
@@ -8467,6 +8735,7 @@ pub fn spec_step_dflash(
     // Retained-PM4 verify route owned by the speculator. `None` keeps the
     // shipping HIP/HipGraph path byte-for-byte.
     verify_pm4: Option<&mut DflashVerifyPm4>,
+    lookup: Option<DflashLookup<'_>>,
 ) -> HipResult<SpecStepResult> {
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
@@ -8520,6 +8789,10 @@ pub fn spec_step_dflash(
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
     let mask_token = draft_cfg.mask_token_id;
+    dflash_lookup_preflight(&lookup, selector_mode, pld_spine.is_some(), b, vocab)?;
+    // Sampled windows consume RNG in the learned draft before the splice can
+    // be refused; an abandoned window restores it.
+    let rng_at_entry = *rng_state;
 
     // Ensure active_stream is set before any draft/verify work so memset_async
     // and stream-ordered launches have a non-null stream to ride on. Without
@@ -9125,6 +9398,48 @@ pub fn spec_step_dflash(
         }
     } // close else (DFlash draft path)
 
+    // ── 5a. Verbatim-lookup splice ───────────────────────────────────────
+    // From here every stage runs at the effective verify rows `b_eff`; the
+    // learned draft above ran at the original `b`. `block` is truncated to
+    // `b_eff` before it is filled, so verify/graph B/logit slices/accept/
+    // hidden ring/GDN tape+rollback/thlog all see the spliced window.
+    let b = match lookup {
+        None => b,
+        Some(lk) => {
+            let mut tail = verify_scratch
+                .lookup_tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let plan = dflash_lookup_resolve(lk, &drafted, b, vocab, &mut tail).and_then(|keep| {
+                if let Some(keep) = keep {
+                    if use_temp_sampling {
+                        dflash_lookup_check_receipt(q_receipt.as_ref(), keep)?;
+                    }
+                }
+                Ok(keep)
+            });
+            match plan {
+                Err(e) => {
+                    *rng_state = rng_at_entry;
+                    return Err(e);
+                }
+                Ok(None) => b,
+                Ok(Some(keep)) => {
+                    if use_temp_sampling {
+                        let receipt = q_receipt.as_mut().expect("receipt checked above");
+                        if let Err(e) = dflash_lookup_splice_receipt(receipt, keep, &tail, vocab) {
+                            *rng_state = rng_at_entry;
+                            return Err(e);
+                        }
+                    }
+                    drafted.truncate(1 + keep);
+                    drafted.extend_from_slice(&tail);
+                    drafted.len()
+                }
+            }
+        }
+    };
+    block.truncate(b);
     for i in 1..b {
         block[i] = drafted[i];
     }
@@ -14581,5 +14896,948 @@ mod device_accept_tests {
             bonus_mismatch * 100 <= checked,
             "{bonus_mismatch}/{checked} bonus draws differ"
         );
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    //! Verbatim-lookup splice seam, host only.
+    //!
+    //! The law tests drive the REAL host accept loop
+    //! (`dflash_sampled_accept_q_rows_with`, the single implementation behind
+    //! `dflash_sampled_accept_rows`) with an EXACT uniform source: every
+    //! uniform the window consumes is enumerated over a midpoint grid of
+    //! `grid` cells per draw (depth-first, only as many draws as the window
+    //! takes). Every threshold of these toy windows (accept ratio `p/q`,
+    //! residual / bonus CDF fractions) is a multiple of `1/grid`, so each cell
+    //! lies wholly on one side of every threshold and the integral is exact
+    //! up to f64 rounding (asserted to 1e-6). Candidates of model rows are
+    //! enumerated with weight `q(c)`; point-mass rows are fixed. The q
+    //! receipts are built by the production `dflash_lookup_splice_receipt`.
+    //!
+    //! Law checked at every window position `i` that the chain can reach:
+    //! `P(emitted_i = x | positions < i all accepted) == p_i(x)` — covering
+    //! the accept-or-residual token for candidate rows (q = 0 / p = 0 at the
+    //! candidate included) and the bonus after a full or budget-bound accept —
+    //! plus `P(reach i) == prod_{j<i} sum_c min(q_j, p_j)`.
+    //!
+    //! Pre-existing: `xorshift_next_unit` may return exactly `0.0` (2^-24), at
+    //! which a point-mass candidate with `p = 0` is accepted (`0 <= 0`). That
+    //! measure-2^-24 event predates the seam (PLD uses the same arithmetic)
+    //! and is not representable on the midpoint grid.
+    use super::*;
+
+    fn integrate<T>(
+        grid: usize,
+        run: &mut impl FnMut(&mut dyn FnMut() -> f32) -> T,
+        visit: &mut impl FnMut(T, f64),
+    ) {
+        fn go<T>(
+            grid: usize,
+            script: &mut Vec<usize>,
+            run: &mut impl FnMut(&mut dyn FnMut() -> f32) -> T,
+            visit: &mut impl FnMut(T, f64),
+        ) {
+            let mut pos = 0usize;
+            let mut need_more = false;
+            let out = {
+                let s: &[usize] = &script[..];
+                let mut src = || -> f32 {
+                    if pos < s.len() {
+                        let u = (s[pos] as f32 + 0.5) / (grid as f32);
+                        pos += 1;
+                        u
+                    } else {
+                        need_more = true;
+                        0.5
+                    }
+                };
+                run(&mut src)
+            };
+            if need_more {
+                for cell in 0..grid {
+                    script.push(cell);
+                    go(grid, script, run, visit);
+                    script.pop();
+                }
+            } else {
+                debug_assert_eq!(pos, script.len());
+                visit(out, (grid as f64).powi(-(script.len() as i32)));
+            }
+        }
+        go(grid, &mut Vec::new(), run, visit)
+    }
+
+    const V: usize = 6;
+    const T0: [f32; V] = [0.5, 0.25, 0.125, 0.125, 0.0, 0.0];
+    const T1: [f32; V] = [0.25, 0.25, 0.25, 0.125, 0.125, 0.0];
+    const T2: [f32; V] = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0];
+    const T3: [f32; V] = [0.125, 0.125, 0.125, 0.125, 0.25, 0.25];
+    const T4: [f32; V] = [0.25, 0.25, 0.5, 0.0, 0.0, 0.0];
+    const T5: [f32; V] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.5];
+    const T6: [f32; V] = [0.0, 0.5, 0.5, 0.0, 0.0, 0.0];
+    const TONE: [f32; V] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+
+    #[derive(Clone)]
+    enum RowQ {
+        Model(Vec<f32>),
+        Point(u32),
+    }
+
+    /// Raw target row plus the nucleus/top-k cut that `tau`/`z` describe
+    /// (`tau <= 0`: no cut). Logits mode derives the same cut from top_k/top_p.
+    #[derive(Clone)]
+    struct Target {
+        raw: Vec<f32>,
+        tau: f32,
+        z: f32,
+    }
+
+    impl Target {
+        fn plain(raw: &[f32]) -> Self {
+            Self {
+                raw: raw.to_vec(),
+                tau: 0.0,
+                z: 1.0,
+            }
+        }
+        fn cut(raw: &[f32], tau: f32, z: f32) -> Self {
+            Self {
+                raw: raw.to_vec(),
+                tau,
+                z,
+            }
+        }
+        /// The truncated distribution, computed independently of the code under test.
+        fn expected(&self) -> Vec<f64> {
+            self.raw
+                .iter()
+                .map(|&p| {
+                    if self.tau <= 0.0 {
+                        p as f64
+                    } else if p >= self.tau {
+                        p as f64 / self.z as f64
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        FastDense,
+        FastSparse,
+        Logits { top_k: usize, top_p: f32 },
+    }
+
+    struct Win {
+        rows: Vec<RowQ>,
+        targets: Vec<Target>,
+        max_accept: usize,
+        grid: usize,
+    }
+
+    fn build_target(win: &Win, mode: Mode) -> (DflashSampleCfg, Option<FastTargetRows>, Vec<f32>) {
+        let rows = win.targets.len();
+        let base = DflashSampleCfg {
+            temp: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            cactus_delta: 0.0,
+        };
+        match mode {
+            Mode::FastDense => {
+                let probs: Vec<f32> = win
+                    .targets
+                    .iter()
+                    .flat_map(|t| t.raw.iter().copied())
+                    .collect();
+                let tau = win.targets.iter().map(|t| t.tau).collect();
+                let z = win.targets.iter().map(|t| t.z).collect();
+                (base, Some(FastTargetRows::dense(probs, tau, z)), Vec::new())
+            }
+            Mode::FastSparse => {
+                let cap = V;
+                let mut tau = Vec::new();
+                let mut z = Vec::new();
+                let mut counts = Vec::new();
+                let mut idx = vec![0u32; rows * cap];
+                let mut val = vec![0f32; rows * cap];
+                for (r, t) in win.targets.iter().enumerate() {
+                    // An uncut row keeps its non-zero entries (z = 1): same law as the dense row.
+                    let tau_r = if t.tau <= 0.0 { 1e-9 } else { t.tau };
+                    let mut c = 0;
+                    for (j, &p) in t.raw.iter().enumerate() {
+                        if p >= tau_r {
+                            idx[r * cap + c] = j as u32;
+                            val[r * cap + c] = p;
+                            c += 1;
+                        }
+                    }
+                    counts.push(c as u32);
+                    tau.push(tau_r);
+                    z.push(t.z);
+                }
+                let mut f = FastTargetRows {
+                    tau,
+                    z,
+                    capacity: cap,
+                    counts,
+                    idx,
+                    val,
+                    ..FastTargetRows::default()
+                };
+                assert_eq!(f.plan_dense_rows(V).unwrap(), 0);
+                (base, Some(f), Vec::new())
+            }
+            Mode::Logits { top_k, top_p } => {
+                let logits: Vec<f32> = win
+                    .targets
+                    .iter()
+                    .flat_map(|t| {
+                        t.raw.iter().map(|&p| {
+                            if p > 0.0 {
+                                (p as f64).ln() as f32
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                    })
+                    .collect();
+                (
+                    DflashSampleCfg {
+                        top_p,
+                        top_k,
+                        ..base
+                    },
+                    None,
+                    logits,
+                )
+            }
+        }
+    }
+
+    /// The learned receipt of the window (`rows.len()` rows: real q for the
+    /// leading model rows, garbage learned q for the rows a lookup replaces),
+    /// spliced by the production receipt builder.
+    fn build_receipt(win: &Win, cands: &[u32], sparse_q: bool) -> DflashSampledDraft {
+        let l = win.rows.len();
+        let keep = win
+            .rows
+            .iter()
+            .take_while(|r| matches!(r, RowQ::Model(_)))
+            .count();
+        let mut r = DflashSampledDraft::default();
+        r.sparse = sparse_q;
+        for i in 0..l {
+            let (qrow, tok) = match &win.rows[i] {
+                RowQ::Model(q) => (q.clone(), cands[i]),
+                RowQ::Point(_) => (vec![1.0 / V as f32; V], 0),
+            };
+            r.selected_q.push(qrow[tok as usize]);
+            if sparse_q {
+                let ids: Vec<u32> = (0..V as u32).filter(|&j| qrow[j as usize] > 0.0).collect();
+                let vals: Vec<f32> = ids.iter().map(|&j| qrow[j as usize]).collect();
+                r.sparse_q.push_row(&ids, &vals, V).unwrap();
+            } else {
+                r.dense_q.push(qrow);
+            }
+        }
+        let toks: Vec<u32> = win.rows[keep..]
+            .iter()
+            .map(|row| match row {
+                RowQ::Point(c) => *c,
+                RowQ::Model(_) => panic!("model rows must precede point rows"),
+            })
+            .collect();
+        dflash_lookup_check_receipt(Some(&r), keep).unwrap();
+        dflash_lookup_splice_receipt(&mut r, keep, &toks, V).unwrap();
+        r
+    }
+
+    fn check_law(name: &str, win: &Win, mode: Mode, sparse_q: bool) {
+        const TOL: f64 = 1e-6;
+        let l = win.rows.len();
+        assert_eq!(win.targets.len(), l + 1);
+        let expect: Vec<Vec<f64>> = win.targets.iter().map(Target::expected).collect();
+        for e in &expect {
+            let s: f64 = e.iter().sum();
+            assert!(
+                (s - 1.0).abs() < 1e-6,
+                "{name}: target row does not sum to 1: {e:?}"
+            );
+        }
+        let (cfg, fast, logits) = build_target(win, mode);
+        let choices: Vec<Vec<(u32, f64)>> = win
+            .rows
+            .iter()
+            .map(|r| match r {
+                RowQ::Model(q) => (0..V as u32)
+                    .filter(|&c| q[c as usize] > 0.0)
+                    .map(|c| (c, q[c as usize] as f64))
+                    .collect(),
+                RowQ::Point(c) => vec![(*c, 1.0)],
+            })
+            .collect();
+
+        let mut reach = vec![0f64; l + 1];
+        let mut emit = vec![vec![0f64; V]; l + 1];
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut odo = vec![0usize; l];
+        'combos: loop {
+            let cands: Vec<u32> = (0..l).map(|i| choices[i][odo[i]].0).collect();
+            let wc: f64 = (0..l).map(|i| choices[i][odo[i]].1).product();
+            let receipt = build_receipt(win, &cands, sparse_q);
+            let block: Vec<u32> = std::iter::once(0u32).chain(cands.iter().copied()).collect();
+            let q_rows = if receipt.sparse {
+                QRows::Sparse(&receipt.sparse_q)
+            } else {
+                QRows::Dense(&receipt.dense_q)
+            };
+            let mut run = |src: &mut dyn FnMut() -> f32| {
+                let mut next = || src();
+                dflash_sampled_accept_q_rows_with(
+                    &block,
+                    &receipt.selected_q,
+                    q_rows,
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    win.max_accept,
+                    &mut next,
+                    &mut scratch,
+                )
+            };
+            let mut visit = |d: SampledWindowDecision, wu: f64| {
+                let w = wc * wu;
+                let a = d.accepted_drafts;
+                for i in 0..a {
+                    reach[i] += w;
+                    emit[i][block[i + 1] as usize] += w;
+                }
+                reach[a] += w;
+                emit[a][d.bonus_token as usize] += w;
+            };
+            integrate(win.grid, &mut run, &mut visit);
+            let mut i = l;
+            loop {
+                if i == 0 {
+                    break 'combos;
+                }
+                i -= 1;
+                odo[i] += 1;
+                if odo[i] < choices[i].len() {
+                    break;
+                }
+                odo[i] = 0;
+            }
+        }
+
+        let mut analytic = 1.0f64;
+        for i in 0..=l {
+            let reachable = i <= win.max_accept;
+            let want_reach = if reachable { analytic } else { 0.0 };
+            assert!(
+                (reach[i] - want_reach).abs() < TOL,
+                "{name}: reach[{i}] = {} want {want_reach}",
+                reach[i]
+            );
+            if reachable && want_reach > 1e-9 {
+                for x in 0..V {
+                    let got = emit[i][x] / reach[i];
+                    assert!(
+                        (got - expect[i][x]).abs() < TOL,
+                        "{name}: position {i} token {x}: P = {got}, target p = {}",
+                        expect[i][x]
+                    );
+                }
+            }
+            if i < l {
+                let alpha: f64 = match &win.rows[i] {
+                    RowQ::Model(q) => (0..V).map(|c| (q[c] as f64).min(expect[i][c])).sum(),
+                    RowQ::Point(c) => expect[i][*c as usize].min(1.0),
+                };
+                analytic *= alpha;
+            }
+        }
+    }
+
+    fn model_uniform4() -> RowQ {
+        RowQ::Model(vec![0.25, 0.25, 0.25, 0.25, 0.0, 0.0])
+    }
+
+    /// Model rows (real q, incl. q = 0 entries) then a point-mass row, then the
+    /// bonus row: all four target-row shapes and both q representations.
+    #[test]
+    fn lookup_law_mixed_model_then_point_rows() {
+        let win = Win {
+            rows: vec![
+                model_uniform4(),
+                RowQ::Model(vec![0.5, 0.5, 0.0, 0.0, 0.0, 0.0]),
+                RowQ::Point(2),
+            ],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T1),
+                Target::plain(&T2),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        check_law("mixed/fast-dense/sparse-q", &win, Mode::FastDense, true);
+        check_law("mixed/fast-dense/dense-q", &win, Mode::FastDense, false);
+        check_law("mixed/fast-sparse/sparse-q", &win, Mode::FastSparse, true);
+        check_law("mixed/fast-sparse/dense-q", &win, Mode::FastSparse, false);
+        check_law(
+            "mixed/logits/sparse-q",
+            &win,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 1.0,
+            },
+            true,
+        );
+    }
+
+    /// Pure point-mass windows: p(c) in {1/2, 1/2, 1/2}, certain accept
+    /// (p(c) = 1), zero target mass at the candidate (always rejected, residual
+    /// is p itself), and the bonus after a full accept.
+    #[test]
+    fn lookup_law_point_rows_zero_and_full_target_mass() {
+        let all_half = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(1), RowQ::Point(5)],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T6),
+                Target::plain(&T5),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        let zero_mass = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(4)],
+            targets: vec![Target::plain(&T0), Target::plain(&T4), Target::plain(&T3)],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        let certain = Win {
+            rows: vec![RowQ::Point(1), RowQ::Point(0)],
+            targets: vec![Target::plain(&TONE), Target::plain(&T0), Target::plain(&T3)],
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        for (name, w) in [
+            ("all-half", &all_half),
+            ("zero-mass", &zero_mass),
+            ("certain", &certain),
+        ] {
+            check_law(
+                &format!("{name}/fast-dense/sparse-q"),
+                w,
+                Mode::FastDense,
+                true,
+            );
+            check_law(
+                &format!("{name}/fast-sparse/sparse-q"),
+                w,
+                Mode::FastSparse,
+                true,
+            );
+            check_law(
+                &format!("{name}/fast-dense/dense-q"),
+                w,
+                Mode::FastDense,
+                false,
+            );
+            check_law(
+                &format!("{name}/logits/sparse-q"),
+                w,
+                Mode::Logits {
+                    top_k: 0,
+                    top_p: 1.0,
+                },
+                true,
+            );
+        }
+    }
+
+    /// Tail window (one learned row then two lookup rows) under every
+    /// `max_accept` budget: the boundary bonus is drawn from the boundary row.
+    #[test]
+    fn lookup_law_tail_window_budget_clamp() {
+        for max_accept in [0usize, 1, 2, 3, usize::MAX] {
+            let win = Win {
+                rows: vec![model_uniform4(), RowQ::Point(2), RowQ::Point(3)],
+                targets: vec![
+                    Target::plain(&T0),
+                    Target::plain(&T2),
+                    Target::plain(&T2),
+                    Target::plain(&T3),
+                ],
+                max_accept,
+                grid: 16,
+            };
+            check_law(
+                &format!("tail/ma{max_accept}/fast-sparse"),
+                &win,
+                Mode::FastSparse,
+                true,
+            );
+            check_law(
+                &format!("tail/ma{max_accept}/fast-dense/dense-q"),
+                &win,
+                Mode::FastDense,
+                false,
+            );
+        }
+    }
+
+    /// top_k / top_p truncation of p (the target of every row, including the
+    /// point-mass rows' residual and the bonus) in all three target
+    /// representations; point mass on a zero-mass (truncated-away) token.
+    #[test]
+    fn lookup_law_truncated_targets() {
+        let q = RowQ::Model(vec![0.125, 0.125, 0.125, 0.125, 0.25, 0.25]);
+        let mk = |raw: &[f32], tau: f32, z: f32| Win {
+            rows: vec![q.clone(), RowQ::Point(1), RowQ::Point(3)],
+            targets: (0..4).map(|_| Target::cut(raw, tau, z)).collect(),
+            max_accept: usize::MAX,
+            grid: 16,
+        };
+        // top_k = 2 of [.25, .25, .125 x4] -> [.5, .5, 0 ...].
+        let topk = mk(&[0.25, 0.25, 0.125, 0.125, 0.125, 0.125], 0.2, 0.5);
+        check_law("topk/fast-dense", &topk, Mode::FastDense, true);
+        check_law("topk/fast-sparse", &topk, Mode::FastSparse, true);
+        check_law("topk/fast-sparse/dense-q", &topk, Mode::FastSparse, false);
+        check_law(
+            "topk/logits",
+            &topk,
+            Mode::Logits {
+                top_k: 2,
+                top_p: 1.0,
+            },
+            false,
+        );
+        // top_p = 0.7 of [.375, .375, .125, .125, 0, 0] -> [.5, .5, 0 ...].
+        let topp = mk(&[0.375, 0.375, 0.125, 0.125, 0.0, 0.0], 0.3, 0.75);
+        check_law("topp/fast-dense", &topp, Mode::FastDense, true);
+        check_law("topp/fast-sparse", &topp, Mode::FastSparse, true);
+        check_law(
+            "topp/logits",
+            &topp,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 0.7,
+            },
+            true,
+        );
+    }
+
+    /// One lookup (or learned) row, thresholds at arbitrary multiples of 1/8
+    /// (thirds, fifths, sixths, sevenths of the renormalized mass): grid 840.
+    #[test]
+    fn lookup_law_single_row_fine_grid() {
+        let point = |c: u32, t: Target| Win {
+            rows: vec![RowQ::Point(c)],
+            targets: vec![t.clone(), t],
+            max_accept: usize::MAX,
+            grid: 840,
+        };
+        // p(c) = 1/4: residual over thirds-of-six masses.
+        let a = point(0, Target::plain(&[0.25, 0.375, 0.125, 0.125, 0.125, 0.0]));
+        check_law("fine/point/plain", &a, Mode::FastDense, true);
+        // top_p = 0.7 of [.5, .25, .125, .125, 0, 0] -> [2/3, 1/3, 0 ...].
+        let b = point(
+            1,
+            Target::cut(&[0.5, 0.25, 0.125, 0.125, 0.0, 0.0], 0.2, 0.75),
+        );
+        check_law(
+            "fine/point/topp-logits",
+            &b,
+            Mode::Logits {
+                top_k: 0,
+                top_p: 0.7,
+            },
+            true,
+        );
+        check_law("fine/point/topp-sparse", &b, Mode::FastSparse, true);
+        // kept mass 5/8 -> fifths.
+        let c = point(
+            0,
+            Target::cut(&[0.375, 0.25, 0.125, 0.125, 0.125, 0.0], 0.2, 0.625),
+        );
+        check_law("fine/point/fifths", &c, Mode::FastDense, false);
+        // Learned row, q != p everywhere (ratios 1/3 and sub-1 residual).
+        let d = Win {
+            rows: vec![RowQ::Model(vec![0.375, 0.375, 0.25, 0.0, 0.0, 0.0])],
+            targets: vec![
+                Target::plain(&[0.125, 0.5, 0.25, 0.125, 0.0, 0.0]),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 840,
+        };
+        check_law("fine/model", &d, Mode::FastDense, true);
+    }
+
+    /// The accept loop draws exactly: one uniform per accept test, one more
+    /// per rejection (residual) or one bonus draw — point-mass rows follow the
+    /// same rule as learned rows.
+    #[test]
+    fn lookup_rng_draw_counts_follow_accept_rule() {
+        let run = |rows: &[RowQ], targets: &[&[f32; V]], max_accept: usize| -> (usize, usize) {
+            let win = Win {
+                rows: rows.to_vec(),
+                targets: targets.iter().map(|t| Target::plain(*t)).collect(),
+                max_accept,
+                grid: 1,
+            };
+            let (cfg, fast, logits) = build_target(&win, Mode::FastDense);
+            let cands: Vec<u32> = rows
+                .iter()
+                .map(|r| match r {
+                    RowQ::Point(c) => *c,
+                    RowQ::Model(_) => unreachable!(),
+                })
+                .collect();
+            let receipt = build_receipt(&win, &cands, true);
+            let block: Vec<u32> = std::iter::once(0u32).chain(cands.iter().copied()).collect();
+            let mut draws = 0usize;
+            let mut next = || {
+                draws += 1;
+                0.5f32
+            };
+            let mut scratch = Vec::new();
+            let d = dflash_sampled_accept_q_rows_with(
+                &block,
+                &receipt.selected_q,
+                QRows::Sparse(&receipt.sparse_q),
+                fast.as_ref(),
+                &logits,
+                V,
+                cfg,
+                max_accept,
+                &mut next,
+                &mut scratch,
+            );
+            (d.accepted_drafts, draws)
+        };
+        let two_ok = [RowQ::Point(0), RowQ::Point(1)];
+        // u = 0.5 accepts p = 0.5 (0.5 <= 0.5): 2 accept tests + 1 bonus.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], usize::MAX), (2, 3));
+        // Budget 1: 1 accept test, loop stops, 1 bonus draw from the boundary row.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], 1), (1, 2));
+        // Budget 0: no accept test, only the bonus draw.
+        assert_eq!(run(&two_ok, &[&T0, &T6, &T3], 0), (0, 1));
+        // Row 1 rejects (p = 0): accept test + residual draw, no bonus.
+        let rej = [RowQ::Point(0), RowQ::Point(4)];
+        assert_eq!(run(&rej, &[&T0, &T4, &T3], usize::MAX), (1, 3));
+    }
+
+    /// The public RNG-driven wrapper is the generic body fed the xorshift
+    /// stream: same decision, same RNG state afterwards.
+    #[test]
+    fn lookup_accept_wrapper_matches_uniform_source() {
+        let win = Win {
+            rows: vec![RowQ::Point(0), RowQ::Point(2), RowQ::Point(3)],
+            targets: vec![
+                Target::plain(&T0),
+                Target::plain(&T1),
+                Target::plain(&T2),
+                Target::plain(&T3),
+            ],
+            max_accept: usize::MAX,
+            grid: 1,
+        };
+        let (cfg, fast, logits) = build_target(&win, Mode::FastDense);
+        let receipt = build_receipt(&win, &[0, 2, 3], true);
+        let block = [0u32, 0, 2, 3];
+        for seed in 1u64..200 {
+            for max_accept in [0usize, 1, 2, usize::MAX] {
+                let mut rng_a = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut rng_b = rng_a;
+                let mut scratch_a = Vec::new();
+                let mut scratch_b = Vec::new();
+                let a = dflash_sampled_accept_rows(
+                    &block,
+                    &receipt,
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    max_accept,
+                    &mut rng_a,
+                    &mut scratch_a,
+                );
+                let b = dflash_sampled_accept_q_rows_with(
+                    &block,
+                    &receipt.selected_q,
+                    QRows::Sparse(&receipt.sparse_q),
+                    fast.as_ref(),
+                    &logits,
+                    V,
+                    cfg,
+                    max_accept,
+                    &mut || xorshift_next_unit(&mut rng_b),
+                    &mut scratch_b,
+                );
+                assert_eq!(a.accepted_drafts, b.accepted_drafts);
+                assert_eq!(a.bonus_token, b.bonus_token);
+                assert_eq!(rng_a, rng_b);
+            }
+        }
+    }
+
+    struct FakeSource {
+        ret: Option<usize>,
+        tail: Vec<u32>,
+        seen: Vec<u32>,
+        buffer_was_clear: bool,
+    }
+
+    impl FakeSource {
+        fn new(ret: Option<usize>, tail: &[u32]) -> Self {
+            Self {
+                ret,
+                tail: tail.to_vec(),
+                seen: Vec::new(),
+                buffer_was_clear: false,
+            }
+        }
+    }
+
+    impl DflashTailSource for FakeSource {
+        fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize> {
+            self.seen = drafted.to_vec();
+            self.buffer_was_clear = tail.is_empty();
+            tail.extend_from_slice(&self.tail);
+            self.ret
+        }
+    }
+
+    const B: usize = 8;
+    const VOCAB: usize = 100;
+
+    fn learned_block() -> Vec<u32> {
+        vec![7, 11, 12, 13, 14, 15, 16, 17]
+    }
+
+    /// Every refusal happens in the pure helpers: the learned block and the
+    /// (caller-visible) tail scratch of a rejected Copy are never touched.
+    #[test]
+    fn lookup_copy_validation_errors_precede_mutation() {
+        let drafted = learned_block();
+        let mut tail = vec![9u32, 9, 9];
+        let too_long: Vec<u32> = (20..28).collect(); // 8 tokens -> 9 rows > b = 8
+        let oob = [20u32, VOCAB as u32];
+        for (name, tokens) in [
+            ("empty", &[] as &[u32]),
+            ("too long", &too_long[..]),
+            ("id out of vocab", &oob[..]),
+        ] {
+            let r =
+                dflash_lookup_resolve(DflashLookup::Copy(tokens), &drafted, B, VOCAB, &mut tail);
+            assert!(r.is_err(), "{name} must be refused");
+            assert_eq!(tail, vec![9, 9, 9], "{name}: tail scratch mutated");
+            assert_eq!(drafted, learned_block(), "{name}: learned block mutated");
+            assert!(
+                dflash_lookup_preflight(&Some(DflashLookup::Copy(tokens)), true, false, B, VOCAB)
+                    .is_err(),
+                "{name}: preflight must refuse before the draft runs"
+            );
+        }
+        // b - 1 tokens fit exactly (b_eff == b) and replace every learned row.
+        let full: Vec<u32> = (20..27).collect();
+        let r = dflash_lookup_resolve(DflashLookup::Copy(&full), &drafted, B, VOCAB, &mut tail);
+        assert_eq!(r.unwrap(), Some(0));
+        assert_eq!(tail, full);
+        assert_eq!(drafted, learned_block());
+    }
+
+    #[test]
+    fn lookup_tail_validation_errors_precede_mutation() {
+        let drafted = learned_block();
+        let cases: Vec<(&str, Option<usize>, Vec<u32>, bool)> = vec![
+            ("k = 0", Some(0), vec![50], false),
+            ("k > b - 1", Some(8), vec![50], false),
+            ("empty tail", Some(2), vec![], false),
+            (
+                "k + tail > b - 1",
+                Some(2),
+                vec![50, 51, 52, 53, 54, 55],
+                false,
+            ),
+            ("k = b - 1 leaves no room", Some(7), vec![50], false),
+            (
+                "tail id out of vocab",
+                Some(2),
+                vec![50, VOCAB as u32],
+                false,
+            ),
+            ("exact fit", Some(2), vec![50, 51, 52, 53, 54], true),
+            ("k = 1", Some(1), vec![50], true),
+        ];
+        for (name, ret, tail_tokens, ok) in cases {
+            let mut src = FakeSource::new(ret, &tail_tokens);
+            let mut tail = vec![9u32, 9, 9];
+            let r =
+                dflash_lookup_resolve(DflashLookup::Tail(&mut src), &drafted, B, VOCAB, &mut tail);
+            assert_eq!(r.is_ok(), ok, "{name}");
+            assert_eq!(drafted, learned_block(), "{name}: learned block mutated");
+            assert_eq!(src.seen, drafted[1..], "{name}: source must see d1..d(b-1)");
+            assert!(
+                src.buffer_was_clear,
+                "{name}: tail buffer not cleared first"
+            );
+            if ok {
+                assert_eq!(r.unwrap(), ret);
+                assert_eq!(tail, tail_tokens);
+                assert!(1 + ret.unwrap() + tail.len() <= B);
+            }
+        }
+        // A declining source: incumbent window, tail left empty.
+        let mut src = FakeSource::new(None, &[50, 51]);
+        let mut tail = vec![9u32];
+        let r = dflash_lookup_resolve(DflashLookup::Tail(&mut src), &drafted, B, VOCAB, &mut tail);
+        assert_eq!(r.unwrap(), None);
+        assert!(tail.is_empty());
+        // The learned block must be the window's full block.
+        let mut src = FakeSource::new(Some(1), &[50]);
+        assert!(dflash_lookup_resolve(
+            DflashLookup::Tail(&mut src),
+            &drafted[..5],
+            B,
+            VOCAB,
+            &mut tail
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lookup_preflight_refuses_unsupported_modes_before_the_draft() {
+        let copy = [1u32, 2, 3];
+        assert!(dflash_lookup_preflight(&None, false, true, B, VOCAB).is_ok());
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), true, false, B, VOCAB)
+                .is_ok()
+        );
+        // Not selector mode: no learned q receipts to compose with.
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), false, false, B, VOCAB)
+                .is_err()
+        );
+        // PLD spine owns the block.
+        assert!(
+            dflash_lookup_preflight(&Some(DflashLookup::Copy(&copy)), true, true, B, VOCAB)
+                .is_err()
+        );
+        let mut src = FakeSource::new(Some(1), &[1]);
+        assert!(dflash_lookup_preflight(
+            &Some(DflashLookup::Tail(&mut src)),
+            false,
+            false,
+            B,
+            VOCAB
+        )
+        .is_err());
+        assert!(src.seen.is_empty(), "preflight must not call the source");
+    }
+
+    fn learned_receipt(sparse: bool, rows: usize) -> DflashSampledDraft {
+        let mut r = DflashSampledDraft::default();
+        r.sparse = sparse;
+        for i in 0..rows {
+            let ids = [i as u32 + 1, i as u32 + 40];
+            let vals = [0.5f32 - 0.01 * i as f32, 0.25];
+            r.selected_q.push(vals[0]);
+            r.uniforms.push(0.1 * i as f32);
+            if sparse {
+                r.sparse_q.push_row(&ids, &vals, VOCAB).unwrap();
+            } else {
+                let mut d = vec![0f32; VOCAB];
+                d[ids[0] as usize] = vals[0];
+                d[ids[1] as usize] = vals[1];
+                r.dense_q.push(d);
+            }
+        }
+        r
+    }
+
+    /// Learned rows `..keep` keep their real receipts; lookup rows are point
+    /// masses; the learned selector proposal never reaches a lookup row.
+    #[test]
+    fn lookup_receipt_keeps_learned_rows_and_point_masses_the_tail() {
+        for sparse in [true, false] {
+            for (keep, tokens) in [
+                (0usize, vec![10u32, 11, 12]),
+                (2, vec![10, 11, 12]),
+                (3, vec![5]),
+            ] {
+                let orig = learned_receipt(sparse, 7);
+                let mut r = learned_receipt(sparse, 7);
+                dflash_lookup_check_receipt(Some(&r), keep).unwrap();
+                dflash_lookup_splice_receipt(&mut r, keep, &tokens, VOCAB).unwrap();
+                let rows = keep + tokens.len();
+                assert_eq!(r.selected_q.len(), rows);
+                assert!(r.proposal.is_none());
+                assert_eq!(r.uniforms.len(), keep);
+                assert_eq!(&r.selected_q[..keep], &orig.selected_q[..keep]);
+                assert!(r.selected_q[keep..].iter().all(|&q| q == 1.0));
+                if sparse {
+                    assert_eq!(r.sparse_q.rows(), rows);
+                    for i in 0..keep {
+                        assert_eq!(r.sparse_q.row(i), orig.sparse_q.row(i), "learned row {i}");
+                    }
+                    for (j, &c) in tokens.iter().enumerate() {
+                        assert_eq!(r.sparse_q.row(keep + j), (&[c][..], &[1.0f32][..]));
+                    }
+                } else {
+                    assert_eq!(r.dense_q.len(), rows);
+                    for i in 0..keep {
+                        assert_eq!(r.dense_q[i], orig.dense_q[i], "learned row {i}");
+                    }
+                    for (j, &c) in tokens.iter().enumerate() {
+                        let row = &r.dense_q[keep + j];
+                        assert_eq!(row.len(), VOCAB);
+                        assert_eq!(row[c as usize], 1.0);
+                        assert_eq!(row.iter().filter(|&&x| x != 0.0).count(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_receipt_check_refuses_short_or_missing_receipts() {
+        assert!(dflash_lookup_check_receipt(None, 1).is_err());
+        let r = learned_receipt(true, 3);
+        assert!(dflash_lookup_check_receipt(Some(&r), 3).is_ok());
+        assert!(dflash_lookup_check_receipt(Some(&r), 4).is_err());
+        let d = learned_receipt(false, 2);
+        assert!(dflash_lookup_check_receipt(Some(&d), 2).is_ok());
+        assert!(dflash_lookup_check_receipt(Some(&d), 3).is_err());
+    }
+
+    #[test]
+    fn lookup_sparse_q_truncate_rows() {
+        let mut q = SparseQRows::with_capacity(4, 4);
+        q.push_row(&[3, 1], &[0.1, 0.2], 16).unwrap();
+        q.push_row(&[5], &[1.0], 16).unwrap();
+        q.push_row(&[2, 9], &[0.3, 0.4], 16).unwrap();
+        q.truncate_rows(5); // no-op beyond the end
+        assert_eq!(q.rows(), 3);
+        q.truncate_rows(1);
+        assert_eq!(q.rows(), 1);
+        assert_eq!(q.row(0), (&[1u32, 3][..], &[0.2f32, 0.1][..]));
+        q.push_row(&[7], &[1.0], 16).unwrap();
+        assert_eq!(q.row(1), (&[7u32][..], &[1.0f32][..]));
+        q.truncate_rows(0);
+        assert_eq!(q.rows(), 0);
+        assert_eq!(q.offsets(), &[0]);
     }
 }

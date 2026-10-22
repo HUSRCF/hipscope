@@ -31,6 +31,69 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
         _ => KernelKey::FusedGateUpHfq4G256,
     }
 }
+
+// ── Kernel-key selection by weight CONTAINER, never hardcoded ──────────────
+//
+// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one container: 136 B groups holding
+// `[0..4) f32 scale, [4..8) f32 zero` over all 256 weights, then 128 B of nibbles.
+// MQ4 is that container plus an offline FWHT, so it has always borrowed HFQ4's
+// kernel keys and that is correct — only the activations differ.
+//
+// qt=44 (MQ4G256V2) is a DIFFERENT container. Same 136 B stride, same nibble
+// payload at the same offset, but the 8 header bytes become
+// `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1`, with s0/z0
+// governing weights 0..127 and s1/z1 governing 128..255.
+//
+// Hand a v1 key a qt=44 weight and the kernel bit_casts an fp16 pair to f32,
+// yielding ~1e-14: every weight in the tensor collapses to numerically zero. It
+// cannot fail — every bit pattern is a valid finite f32, the nibbles are read
+// correctly, and stride/alignment/K%256 are identical — so it runs at full speed
+// and returns noise. That cost two full KLD measurement cycles (WT2 12.137559
+// against a 0.043776 baseline, bit-identical across both runs) before it was
+// found. Select on the container; never hardcode.
+
+pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::Q8_0 => KernelKey::FusedQkvzaQ8_0,
+        DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
+        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
+        // read them at the 136 B HFQ4 stride and return noise at full speed.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvzaHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvzaMq3G256Lloyd,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedQkvzaHfq4G256,
+    }
+}
+
+pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::Q8_0 => KernelKey::FusedQkvQ8_0,
+        DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvMq3G256Lloyd,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedQkvHfq4G256,
+    }
+}
+
 fn is_fused_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,

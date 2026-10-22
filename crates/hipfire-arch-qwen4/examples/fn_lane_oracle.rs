@@ -747,7 +747,7 @@ fn read_step_logits(
 ) -> R<Vec<(RequestEpoch, Vec<u8>)>> {
     gpu.hip.device_synchronize().map_err(e)?;
     let store = bundle.lanes().ok_or("lane store vanished")?;
-    let t = store.logits();
+    let t = store.logits().ok_or("lane store has no step logits")?;
     let mut out = Vec::new();
     let (mut ar, mut pre) = (0usize, 0usize);
     for rr in &plan.requests {
@@ -2798,6 +2798,7 @@ fn spec_main(
     lane_capacity: usize,
     file_size: u64,
     primary: LaneStagePolicy,
+    loaded_evidence: String,
 ) -> R<bool> {
     let k = args.k;
     let prompts: Vec<Vec<u32>> = (0..max_k)
@@ -3015,7 +3016,8 @@ fn spec_main(
             "controls": args.controls, "bench": args.bench,
             "spec": "mtp", "k": args.k, "routes": args.routes.name(), "promote": args.promote,
         },
-        "policy_evidence": primary.evidence(),
+        "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
+        "loaded_policy_evidence": loaded_evidence,
         "requests": app.prompts.iter().map(|p| json!({"context": p.len()})).collect::<Vec<_>>(),
         "runs": runs,
         "controls": controls_json,
@@ -3306,7 +3308,9 @@ fn real_main() -> R<bool> {
         "model: {} ({file_size} bytes)",
         args.model.display()
     ));
-    {
+    // The proofs the store resolved at load (`store.evidence()`): diagnostic
+    // only. Every run below installs an explicit policy, which clears them.
+    let loaded_evidence = {
         let store = w.bundle.lanes().ok_or("lane store is not staged")?;
         let r = store.receipt(&w.gpu);
         log.say(format!(
@@ -3317,7 +3321,8 @@ fn real_main() -> R<bool> {
         if args.spec_mtp {
             log.say(format!("lanes spec: spec={} spec_k={}", r.spec, r.spec_k));
         }
-    }
+        store.evidence().to_string()
+    };
     log.say(format!(
         "args: ks={:?} contexts={:?} steps={} max_seq={} lane_capacity={} policy={} ({}) g0={} controls={} bench={}",
         args.ks, args.contexts, args.steps, args.max_seq, lane_capacity, args.policy, primary.describe(), args.g0,
@@ -3330,8 +3335,8 @@ fn real_main() -> R<bool> {
             args.routes.name()
         ));
     }
-    if !primary.evidence().is_empty() {
-        log.say(format!("policy evidence: {}", primary.evidence()));
+    if !loaded_evidence.is_empty() {
+        log.say(format!("loaded policy proofs: {loaded_evidence}"));
     }
 
     let text = fs::read_to_string(&args.text).map_err(e)?;
@@ -3355,6 +3360,7 @@ fn real_main() -> R<bool> {
             lane_capacity,
             file_size,
             primary,
+            loaded_evidence,
         );
     }
 
@@ -3674,7 +3680,8 @@ fn real_main() -> R<bool> {
             "controls": args.controls, "bench": args.bench, "spec": "ar",
             "promote": args.promote, "k": args.promote.map(|_| args.k),
         },
-        "policy_evidence": primary.evidence(),
+        "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
+        "loaded_policy_evidence": loaded_evidence,
         "requests": app.refs.iter().map(|r| json!({"context": r.prompt.len(), "dir": r.dir.display().to_string()})).collect::<Vec<_>>(),
         "s1_prefill_parity_k2": s1_pass,
         "runs": runs,
@@ -3751,7 +3758,7 @@ mod ple_rows_tests {
         let err = out.unwrap_err();
         assert!(err.starts_with("qwen4 PLE rows:"), "{err}");
         assert!(
-            err.contains("missing and derivation was not requested"),
+            err.contains("sidecar is missing") && err.contains("derivation was not requested"),
             "{err}"
         );
         assert!(!attached);

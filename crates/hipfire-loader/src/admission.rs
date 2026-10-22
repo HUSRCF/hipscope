@@ -21,6 +21,7 @@ use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
+pub use hipfire_runtime::loader_api::BatchLoadRequest;
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use hipfire_runtime::mesh_placement::{
     pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
@@ -401,6 +402,12 @@ pub(crate) fn partial_offload_refusal(
         let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
             .map_err(|e| format!("qwen35 config: {e}"))?;
         (config.paged_experts, config.reap_keep.is_some())
+    } else if arch_id == 11 {
+        // LFM2.5 parses its own REAP keep-map inside `Lfm2MoeConfig::from_hfq`
+        // (`apply_reap_plan`). It has no paged-expert route.
+        let config = hipfire_arch_lfm2moe::Lfm2MoeConfig::from_hfq(hfq)
+            .map_err(|e| format!("lfm2moe config: {e}"))?;
+        (false, config.reap_keep.is_some())
     } else {
         (false, false)
     };
@@ -416,13 +423,13 @@ pub(crate) fn partial_offload_refusal(
 fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
     use hipfire_config::memory::SpillRefusal::*;
     match refusal {
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
-        // RAM. Qwen4 has its own expert-residency route and the other arches have
-        // none, so either knob is a request this loader cannot honour.
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
-            "load refused: partial GPU offload ({keys}) only works for Qwen3.5 dense and MoE \
-             models; this model is a different architecture (arch id {arch_id}). Unset both keys \
-             for this model"
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             and LFM2.5 only; this source is arch id {arch_id}. Unset both keys for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
@@ -1051,6 +1058,11 @@ pub struct SourceAdmission {
     /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
     /// this value and never reread the environment.
     pub pp_layer_counts: Option<Vec<usize>>,
+    /// The continuous-batch request of this load (default off). Admission
+    /// never sets it; the caller that will stage lanes after the load sets it
+    /// on the admitted handle before the load, and the carrier forwards it
+    /// through `LoadCtx::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -1062,6 +1074,32 @@ pub struct SequenceResolution {
     pub bound: &'static str,
     pub model_ctx: usize,
     pub card_cap: usize,
+    pub kv_mode: &'static str,
+    /// The pre-teardown capacity projection this resolution was admitted
+    /// against ([`qwen35_card_projection`]); `None` where no projection runs
+    /// (Qwen4 on unified memory measures after load).
+    pub projection: Option<Qwen35CardProjection>,
+}
+
+/// The pre-teardown context-capacity projection of a single-card Qwen3.5
+/// VMM load ([`qwen35_card_projection`]), itemised so `hipfire fit` reports
+/// the same numbers admission refuses on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35CardProjection {
+    /// Free device bytes before the load (`KvBackendHints::free_vram_bytes`).
+    pub free: usize,
+    /// Projected resident weights: the HFQ file plus 12.5% and 512 MiB.
+    pub weights: usize,
+    /// The minimum viable prefill scratch reservation.
+    pub scratch: usize,
+    /// VMM page rounding across the K/V owners.
+    pub page_rounding: usize,
+    /// Selected K+V bytes per token over the full-attention layers.
+    pub bytes_per_token: usize,
+    /// Largest context the remaining free memory holds.
+    pub card_cap: usize,
+    /// The checkpoint's trained window (`max_position_embeddings`).
+    pub model_ctx: usize,
     pub kv_mode: &'static str,
 }
 
@@ -1093,6 +1131,7 @@ fn qwen4_context_sequence(
         model_ctx,
         card_cap: 0,
         kv_mode,
+        projection: None,
     })
 }
 
@@ -1417,6 +1456,20 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     })
 }
 
+/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
+/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
+/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
+/// allocation, instead of reaching a generic EP or carrier refusal or being
+/// ignored (`topology.ep`).
+fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
+    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
+        format!(
+            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
+             (no pipeline, tensor or expert parallel placement exists for arch 14)"
+        )
+    })
+}
+
 /// Pipeline/tensor-parallel geometry admission (#666 G2). `Gpus::init_uniform`
 /// refuses `n_layers < n_devices` deep inside GPU init (`multi_gpu.rs`) —
 /// after the daemon has already torn down the resident model for the pp path
@@ -1485,18 +1538,29 @@ fn trained_context(source: &ModelSource) -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+/// Smallest projected context an automatic single-card Qwen VMM load accepts
+/// ([`resolve_sequence`]); below it the load is refused before teardown.
+pub const QWEN35_MIN_AUTO_CONTEXT: usize = 512;
+
+/// VMM page rounding reserved across the K/V owners in the projection.
+const QWEN35_VMM_PAGE_ROUNDING_BYTES: usize = 128 << 20;
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
 /// expanded raw tensors/runtime state and 512 MiB for allocator/transients.
 /// Reserve only the minimum 512-row PBS plus the widened guard's existing
 /// 1 GiB headroom and 128 MiB for VMM page rounding across K/V owners.
 /// Per-request prefill selects wider scratch from then-current mapped-KV free VRAM.
-fn resolve_sequence(
+///
+/// The one projection admission refuses on ([`resolve_sequence`]); `hipfire
+/// fit` reads the same value. It is a pre-teardown fit check, never the
+/// effective bound: the Qwen carrier remeasures free VRAM after the weights
+/// upload, immediately before KV reservation.
+pub fn qwen35_card_projection(
     source: &ModelSource,
-    requested: usize,
     gpu_arch: &str,
     hints: KvBackendHints<'_>,
-) -> Result<SequenceResolution, String> {
+) -> Result<Qwen35CardProjection, String> {
     use hipfire_runtime::kv_mode;
     let ModelSource::Hfq(hfq) = source else {
         return Err("automatic Qwen VMM context sizing requires an HFQ weight manifest".into());
@@ -1546,29 +1610,48 @@ fn resolve_sequence(
     let scratch =
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
             .ok_or("Qwen minimum prefill scratch sizing overflow")?;
-    let projected_card_cap = free
+    let card_cap = free
         .saturating_sub(weights)
         .saturating_sub(scratch)
-        .saturating_sub(128 << 20)
+        .saturating_sub(QWEN35_VMM_PAGE_ROUNDING_BYTES)
         / bytes_per_token;
+    Ok(Qwen35CardProjection {
+        free,
+        weights,
+        scratch,
+        page_rounding: QWEN35_VMM_PAGE_ROUNDING_BYTES,
+        bytes_per_token,
+        card_cap,
+        model_ctx,
+        kv_mode: kv_mode::qwen_k_display_name(pair.k()),
+    })
+}
+
+fn resolve_sequence(
+    source: &ModelSource,
+    requested: usize,
+    gpu_arch: &str,
+    hints: KvBackendHints<'_>,
+) -> Result<SequenceResolution, String> {
+    let projection = qwen35_card_projection(source, gpu_arch, hints)?;
     // Projection is a pre-teardown fit refusal, never the effective bound.
     // Weight upload changes free VRAM; the Qwen carrier remeasures that
     // *after* weights and immediately before KV reservation.
-    if projected_card_cap < 512 && requested == 0 {
+    if projection.card_cap < QWEN35_MIN_AUTO_CONTEXT && requested == 0 {
         return Err("Qwen VMM load refused: the model weights, the minimum prefill scratch and the KV cache do not fit in free VRAM. Free GPU memory, set a smaller memory.max_seq, or use a smaller quantization of this model".into());
     }
     let (max_seq, bound) = if requested != 0 {
         (requested, "user")
     } else {
-        (model_ctx, "pending")
+        (projection.model_ctx, "pending")
     };
-    let kv_mode = kv_mode::qwen_k_display_name(pair.k());
     Ok(SequenceResolution {
         max_seq,
         bound,
-        model_ctx,
+        model_ctx: projection.model_ctx,
         card_cap: 0,
-        kv_mode,
+        kv_mode: projection.kv_mode,
+        projection: Some(projection),
     })
 }
 
@@ -2277,6 +2360,12 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    if arch_id == 14 {
+        let ep = hipfire_config::topology::ep()?;
+        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
+            return Err(refusal);
+        }
+    }
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
@@ -2890,6 +2979,7 @@ pub fn admit_source_with_options(
         mesh,
         pp_bands,
         pp_layer_counts,
+        batch_request: BatchLoadRequest::default(),
     })
 }
 
@@ -4096,6 +4186,18 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    #[test]
+    fn muse_glimmer_refuses_every_parallel_axis() {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
+            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
+                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
+            assert!(err.contains("single-device only"), "{err}");
+        }
+        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
+        // Other architectures keep their own topology gates.
+        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
     }
 
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`

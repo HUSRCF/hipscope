@@ -41,6 +41,7 @@ use crate::wait::{Drained, Event, LdsWrite, Pending, Pendings};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 /// The scalar condition code.
 pub enum Scc {}
@@ -74,11 +75,27 @@ pub struct LoopExit<B: Backend> {
 pub struct End {
     label: String,
     /// A branch reaches the exit (its state is not joined at the label).
-    branched: Cell<bool>,
+    branched: Rc<Cell<bool>>,
 }
 impl End {
     pub fn label(&self) -> &str {
         &self.label
+    }
+}
+impl End {
+    /// An exit view that shares `branched` with the runtime `Exit` it views
+    /// (`runtime::Lend::end`).
+    pub(crate) fn shared(label: &str, branched: Rc<Cell<bool>>) -> Self {
+        Self {
+            label: label.into(),
+            branched,
+        }
+    }
+}
+impl<C> WgUniform<C> {
+    /// The program position its compare ended at.
+    pub(crate) fn at(&self) -> usize {
+        self.at
     }
 }
 fn fresh<B: Backend>(b: &B, at: usize) -> Result<(), String> {
@@ -528,6 +545,23 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
             },
         })
     }
+    /// A workgroup scope over a backend this crate's runtime `Driver` already
+    /// sealed: the driver's own session (`auth` is its re-entered `Auth`), so
+    /// no new seal and no `Auth` leaves the crate (`runtime::Driver::typed`).
+    pub(crate) fn over(b: &'b mut B, auth: Auth) -> Self {
+        Self {
+            wave: Wave {
+                b,
+                auth,
+                wave_exit: Cell::new(false),
+                _t: PhantomData,
+            },
+        }
+    }
+    /// A wave-uniform kernel exit was taken in this scope.
+    pub(crate) fn wave_exited(&self) -> bool {
+        self.wave.wave_exit.get()
+    }
     /// Declare one LDS region (one backend slot; ids follow declaration order).
     pub fn lds<R: 'static>(
         &mut self,
@@ -618,7 +652,7 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         self.wave.b.reserve_exit(&self.wave.auth, label)?;
         Ok(End {
             label: label.into(),
-            branched: Cell::new(false),
+            branched: Rc::new(Cell::new(false)),
         })
     }
     /// Leave the kernel when `cond` holds: skipping every later barrier is

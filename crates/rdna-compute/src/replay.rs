@@ -7232,18 +7232,31 @@ impl ReplayController {
     }
 
     /// Refuse to prepare an automatic forward body whose window issued a device
-    /// copy, readback or memset: the tape replays dispatches only, so that
-    /// state would be missing on every replay. Every adapter treats a prepare
-    /// error as sticky fallback, so the route runs on HIP. Manual captures
-    /// (benchmarks, speculative verify bodies) delimit windows spanning several
-    /// forwards and keep their own contracts.
+    /// copy, readback or memset, or launched a kernel past the recorder (a raw
+    /// `hip.launch_kernel` instead of the `launch_maybe_blob` funnel): the tape
+    /// replays recorded dispatches only, so that work would be missing on every
+    /// replay. Every adapter treats a prepare error as sticky fallback, so the
+    /// route runs on HIP. Manual captures (benchmarks, speculative verify
+    /// bodies) delimit windows spanning several forwards and keep their own
+    /// contracts.
     fn refuse_effect_incomplete_window(&self) -> Result<(), String> {
+        if !self.auto_lifecycle {
+            return Ok(());
+        }
         let effects = self.capture_window_effects();
-        if self.auto_lifecycle && !effects.replayable() {
+        if !effects.replayable() {
             return Err(format!(
                 "effect-incomplete capture: {} device copy(ies), {} readback(s) and {} \
                  memset(s) inside the window are state the tape cannot replay",
                 effects.dtod, effects.dtoh, effects.memset
+            ));
+        }
+        let recorded = self.recorded.len() as u64;
+        if effects.launches > recorded {
+            return Err(format!(
+                "unrecorded launch: {} kernel launch(es) inside the window, {recorded} on the \
+                 tape; a launcher bypassed the replay recorder",
+                effects.launches
             ));
         }
         Ok(())

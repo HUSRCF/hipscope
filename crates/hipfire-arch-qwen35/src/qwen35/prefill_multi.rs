@@ -739,7 +739,13 @@ fn lane_fa_chunk_admitted(
             || !kv.quant_fp8
             || kv.compact_offset != 0
             || !(MIN_BATCH..64).contains(&n)
-            || gfx12_fa_prep_admitted(gpu, config, r.fusion, n)
+            || gfx12_fa_prep_admitted(
+                gpu,
+                &hybrid_dims(config),
+                r.fusion,
+                n,
+                hipfire_runtime::triattn::tap_enabled(),
+            )
             || multirow
             || !lane_fa_plan_ok(gpu, s, kv, r.start_pos, n)
             || s.flash_partials.numel()
@@ -1296,7 +1302,6 @@ pub fn forward_prefill_batch_multi(
     }
 
     let dim = config.dim;
-    let hidden_dim = config.hidden_dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
@@ -1475,6 +1480,11 @@ pub fn forward_prefill_batch_multi(
             .lane_fa_partials_acquire(gpu, Gpu::lane_fa_partials_len(config.n_heads, &shape));
     }
     let lane_fa_partials: Option<&GpuTensor> = lane_fa_guard.as_ref().and_then(|g| (**g).as_ref());
+    let dims = hybrid_dims(config);
+    let batch = pbs.view();
+    let flash = flash_scratch(s);
+    let tap_fn = batched_attention_tap(config);
+    let tap = tap_fn.get();
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -1483,9 +1493,9 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_delta_net_input_projection(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
                             r.tokens.len(),
                             dim,
                             q8_wmma_arch,
@@ -1497,9 +1507,9 @@ pub fn forward_prefill_batch_multi(
                 } else {
                     batch_chunk_delta_net_input_projection(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
                         total,
                         dim,
                         q8_wmma_arch,
@@ -1533,7 +1543,7 @@ pub fn forward_prefill_batch_multi(
                     //  * requests own disjoint rows of the shared scratch and
                     //    disjoint DeltaNet/tape state, so interleaving their
                     //    work across launches changes no byte.
-                    gdn_sigmoid_alpha_gate(gpu, layer, pbs, n_v_heads, total)?;
+                    gdn_sigmoid_alpha_gate(gpu, &layer.mixer_view(), &batch, n_v_heads, total)?;
                     // DFlash tape capture (the pre-GDN sink branch's three
                     // descriptors per request): nothing below writes the
                     // source rows, and the next layer's producers have not
@@ -1542,8 +1552,8 @@ pub fn forward_prefill_batch_multi(
                         if let Some(tape) = r.gdn_tape {
                             push_gdn_tape_copies(
                                 &mut tape_copies,
-                                tape,
-                                view,
+                                &gdn_tape_view(tape),
+                                &view.view(),
                                 n_v_heads,
                                 0,
                                 r.tokens.len(),
@@ -1606,7 +1616,7 @@ pub fn forward_prefill_batch_multi(
                         k_dim,
                         v_dim,
                     )?;
-                    gdn_qk_norm_interleave(gpu, config, pbs, n_v_heads, hd, total)?;
+                    gdn_qk_norm_interleave(gpu, &dims, &batch, n_v_heads, hd, total)?;
                     match lane_from {
                         Some(from) => {
                             // `_from` changes only the S / scales / EF LOAD
@@ -1646,10 +1656,10 @@ pub fn forward_prefill_batch_multi(
                         let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
                         let parents = batch_chunk_delta_net_pre_gdn(
                             gpu,
-                            layer,
-                            config,
-                            view,
-                            r.dn_state,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            &deltanet_state_view(r.dn_state),
                             n,
                             k_dim,
                             v_dim,
@@ -1657,7 +1667,7 @@ pub fn forward_prefill_batch_multi(
                             hd,
                             sem,
                             None,
-                            r.gdn_tape,
+                            r.gdn_tape.map(gdn_tape_view).as_ref(),
                             0,
                             delta_layer_idx,
                             r.fusion,
@@ -1698,9 +1708,9 @@ pub fn forward_prefill_batch_multi(
                         let n = r.tokens.len();
                         batch_chunk_delta_net_output_projection(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
                             n,
                             n_v_heads,
                             q8_wmma_arch,
@@ -1710,17 +1720,15 @@ pub fn forward_prefill_batch_multi(
                             GdnScanOut::F32,
                             DenseBatchMath::Product,
                         )?;
-                        batch_chunk_delta_net_ffn(
+                        layer.ffn_rows(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            config.norm_eps,
+                            &view.view(),
                             n,
                             dim,
-                            hidden_dim,
                             q8_wmma_arch,
                             arch_has_wmma,
-                            BatchEpilogue::Residual,
+                            MlpOutput::Residual,
                             r.fusion,
                             DenseBatchMath::Product,
                         )?;
@@ -1728,9 +1736,9 @@ pub fn forward_prefill_batch_multi(
                 } else {
                     batch_chunk_delta_net_output_projection(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
                         total,
                         n_v_heads,
                         q8_wmma_arch,
@@ -1740,17 +1748,15 @@ pub fn forward_prefill_batch_multi(
                         GdnScanOut::F32,
                         math,
                     )?;
-                    batch_chunk_delta_net_ffn(
+                    layer.ffn_rows(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        config.norm_eps,
+                        &batch,
                         total,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         shared_fusion,
                         math,
                     )?;
@@ -1765,9 +1771,9 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_full_attn_input_projection(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
                             r.tokens.len(),
                             dim,
                             q8_wmma_arch,
@@ -1778,9 +1784,9 @@ pub fn forward_prefill_batch_multi(
                 } else {
                     batch_chunk_full_attn_input_projection(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
                         total,
                         dim,
                         q8_wmma_arch,
@@ -1798,8 +1804,8 @@ pub fn forward_prefill_batch_multi(
                     // lanes. Per request this is exactly the unfused prep +
                     // `batch_chunk_fa_attend` (fp8 write, then the
                     // `verify_tile_attend` tile + reduce).
-                    fa_prep_unfused_qk_norm(gpu, layer, config, pbs, total)?;
-                    fa_prep_unfused_rope(gpu, config, pbs, &pbs.positions, total, 0)?;
+                    fa_prep_unfused_qk_norm(gpu, &layer.mixer_view(), &dims, &batch, total)?;
+                    fa_prep_unfused_rope(gpu, &dims, &batch, &pbs.positions, total, 0)?;
                     let k_writes: Vec<rdna_compute::lane_fa::LaneFaWrite<'_>> = reqs
                         .iter()
                         .zip(&views)
@@ -1861,7 +1867,8 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             &ctx
                         };
-                        let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
+                        let gfx12_fa_prep =
+                            gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, tap.is_some());
                         let multirow = q8_multirow_attn_admitted(
                             gpu.arch_caps.arch(),
                             r.kv_cache.quant_q8,
@@ -1878,11 +1885,11 @@ pub fn forward_prefill_batch_multi(
                         batch_chunk_full_attn_prepare(
                             gpu,
                             multirow,
-                            layer,
-                            config,
-                            view,
-                            s,
-                            r.kv_cache,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            &flash,
+                            &kv_view(r.kv_cache),
                             n,
                             r.start_pos,
                             max_ctx_len,
@@ -1895,6 +1902,7 @@ pub fn forward_prefill_batch_multi(
                             gfx12_fa_prep,
                             false,
                             false,
+                            tap,
                         )?;
                         if twin {
                             // The singleton attend's paired write; the attention
@@ -1915,14 +1923,19 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             // Same S6 paired Q8 K/V-write admission as the singleton
                             // attend (byte-identical to the two batched writes).
-                            let pair_q8_writes =
-                                dflash_fa_batch_fusion_admitted(gpu, config, r.fusion, n);
+                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(
+                                gpu,
+                                &dims,
+                                r.fusion,
+                                n,
+                                tap.is_some(),
+                            );
                             batch_chunk_fa_attend(
                                 gpu,
-                                config,
-                                view,
-                                s,
-                                r.kv_cache,
+                                &dims,
+                                &view.view(),
+                                &flash,
+                                &kv_view(r.kv_cache),
                                 n,
                                 r.start_pos,
                                 max_ctx_len,
@@ -1959,8 +1972,8 @@ pub fn forward_prefill_batch_multi(
                         let n = r.tokens.len();
                         batch_chunk_full_attn_output_projection(
                             gpu,
-                            layer,
-                            view,
+                            &layer.mixer_view(),
+                            &view.view(),
                             n,
                             q8_wmma_arch,
                             arch_has_wmma,
@@ -1970,17 +1983,15 @@ pub fn forward_prefill_batch_multi(
                             None,
                             DenseBatchMath::Product,
                         )?;
-                        batch_chunk_full_attn_ffn(
+                        layer.ffn_rows(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            config.norm_eps,
+                            &view.view(),
                             n,
                             dim,
-                            hidden_dim,
                             q8_wmma_arch,
                             arch_has_wmma,
-                            BatchEpilogue::Residual,
+                            MlpOutput::Residual,
                             r.fusion,
                             DenseBatchMath::Product,
                         )?;
@@ -1988,8 +1999,8 @@ pub fn forward_prefill_batch_multi(
                 } else {
                     batch_chunk_full_attn_output_projection(
                         gpu,
-                        layer,
-                        pbs,
+                        &layer.mixer_view(),
+                        &batch,
                         total,
                         q8_wmma_arch,
                         arch_has_wmma,
@@ -1999,17 +2010,15 @@ pub fn forward_prefill_batch_multi(
                         None,
                         math,
                     )?;
-                    batch_chunk_full_attn_ffn(
+                    layer.ffn_rows(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        config.norm_eps,
+                        &batch,
                         total,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         shared_fusion,
                         math,
                     )?;

@@ -1527,7 +1527,7 @@ fn mtp_verify_graph_eligible(
     // The eager-only multirow route is suppressed during capture. Respect its
     // developer-configurable threshold rather than changing verifier math.
     if n_verify == 4
-        && qwen35::prefill::fa_pertoken_min_ctx(gpu.arch.as_str())
+        && hipfire_dispatch::pipeline::batched_attention::fa_pertoken_min_ctx(gpu.arch.as_str())
             .is_some_and(|threshold| cur_pos + n_verify > threshold)
     {
         return false;

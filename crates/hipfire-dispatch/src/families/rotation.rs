@@ -23,6 +23,8 @@ pub struct RotationParams<'a> {
     pub givens_theta: Option<&'a GpuTensor>,
     pub givens_scales: Option<&'a GpuTensor>,
     pub givens_krot: Option<usize>,
+    /// Givens block width = `DType::paro_group_size` of the consuming weight.
+    pub givens_group_size: Option<usize>,
 }
 
 /// Rotation kernel family — selects and runs FWHT rotation kernels.
@@ -67,6 +69,9 @@ impl RotationFamily {
                 let krot = params
                     .givens_krot
                     .ok_or_else(|| HipError::new(0, "givens_krot required for Givens rotation"))?;
+                let group = params.givens_group_size.ok_or_else(|| {
+                    HipError::new(0, "givens_group_size required for Givens rotation")
+                })?;
                 // givens_rotate_to does copy_d2d + rotate in one kernel
                 gpu.givens_rotate_to(
                     params.x,
@@ -77,6 +82,7 @@ impl RotationFamily {
                     1, /* seq_len */
                     params.k,
                     krot,
+                    group,
                 )
             }
             RotationVariant::PlainG128 => {
@@ -171,27 +177,53 @@ impl RotationFamily {
                     }
                 }
             }
+            // The batched launchers run the same kernel over `batch_size` rows.
             RotationVariant::WithSwiGLU => {
                 let x_up = params
                     .x_up
                     .ok_or_else(|| HipError::new(0, "x_up required for WithSwiGLU rotation"))?;
-                match has_awq {
-                    false => {
+                match (params.awq_scale, batched) {
+                    (None, false) => {
                         self.registry
                             .resolve(KernelKey::SiluMulRotateMq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq(params.x, x_up, params.x_rot, params.k)
                     }
-                    true => {
+                    (Some(awq), false) => {
                         self.registry
                             .resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq_awq(
                             params.x,
                             x_up,
-                            params.awq_scale.unwrap(),
+                            awq,
                             params.x_rot,
                             params.k,
+                        )
+                    }
+                    (None, true) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_batched(
+                            params.x,
+                            x_up,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
+                        )
+                    }
+                    (Some(awq), true) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_awq_batched(
+                            params.x,
+                            x_up,
+                            awq,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
                         )
                     }
                 }

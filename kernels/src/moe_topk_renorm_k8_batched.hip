@@ -29,18 +29,10 @@
 // valid set to 32/64/128/256 and rejects everything else. The block size is
 // launch geometry only (not a kernel argument).
 //
-// rows_per_block (runtime scalar, appended last): every existing launch passes
-// 1 with dynamic shared bytes 0 and blockDim.y == 1, which is the original
-// one-row-per-block kernel. The opt-in multirow fused route passes 2 with
-// blockDim = (128, 2) and 3136 dynamic shared bytes (n_exp = 256). Row slot
-// threadIdx.y == 0 uses the original static arrays; slot 1 uses the same
-// arrays laid out in dynamic shared memory, so the reduction bodies below are
-// the single original text for every slot. Only `bid` (block row base +
-// threadIdx.y) differs per slot; `tid` stays threadIdx.x, so each row sees
-// the identical lane assignment, virtual trees, and operation order. Slots
-// share only the block barriers. Mode 0 always runs rows_per_block == 1
-// (smem_i has no dynamic twin); the multirow route needs an even batch so
-// no slot is ever past the last row.
+// moe_router_softmax_topk_k8_wave (below, same module) is the A3B prefill
+// route: one wave32 per row, 8 rows per 256-thread block, n_exp == 256. It
+// reproduces the result of the fused path above bit for bit (see its header);
+// this symbol keeps the one-row-per-block modes 0 and 1.
 
 #define BLOCK_SIZE 256
 #define MAX_NEXP   1024
@@ -53,36 +45,16 @@ __global__ void moe_topk_renorm_k8_batched(
     float*       __restrict__ topk_w,      // [N × 8]
     int n_exp,
     int norm_topk,
-    int fuse_softmax,
-    int rows_per_block
+    int fuse_softmax
 ) {
-    // Row slot 0: the original static arrays.
-    __shared__ float smem_v_slot0[MAX_NEXP];
-    __shared__ int   smem_i[MAX_NEXP];     // mode 0 only (rows_per_block == 1)
-    __shared__ float reduce_v_slot0[BLOCK_SIZE];
-    __shared__ int   reduce_i_slot0[BLOCK_SIZE];
-    __shared__ int   picked_idx_slot0[K_TOP];
-    __shared__ float picked_w_slot0[K_TOP];
-    // Row slot 1 (rows_per_block == 2 only): dynamic shared memory, laid out
-    // smem_v[n_exp], reduce_v[256], reduce_i[256], picked_idx[8], picked_w[8]
-    // = 4 * (n_exp + 528) bytes.
-    extern __shared__ float dyn_slot_smem[];
+    __shared__ float smem_v[MAX_NEXP];
+    __shared__ int   smem_i[MAX_NEXP];     // mode 0 only
+    __shared__ float reduce_v[BLOCK_SIZE];
+    __shared__ int   reduce_i[BLOCK_SIZE];
+    __shared__ int   picked_idx[K_TOP];
+    __shared__ float picked_w[K_TOP];
 
-    // The names the (unchanged) row algorithm below uses.
-    float* smem_v     = smem_v_slot0;
-    float* reduce_v   = reduce_v_slot0;
-    int*   reduce_i   = reduce_i_slot0;
-    int*   picked_idx = picked_idx_slot0;
-    float* picked_w   = picked_w_slot0;
-    if (threadIdx.y != 0) {
-        smem_v     = dyn_slot_smem;
-        reduce_v   = dyn_slot_smem + n_exp;
-        reduce_i   = reinterpret_cast<int*>(dyn_slot_smem + n_exp + BLOCK_SIZE);
-        picked_idx = reduce_i + BLOCK_SIZE;
-        picked_w   = reinterpret_cast<float*>(picked_idx + K_TOP);
-    }
-
-    const int bid = blockIdx.x * rows_per_block + threadIdx.y;
+    const int bid = blockIdx.x;
     const int tid = threadIdx.x;
     const float* __restrict__ row_probs = probs_in + (long long)bid * n_exp;
     int*   __restrict__ row_idx = topk_idx + bid * K_TOP;
@@ -272,5 +244,150 @@ __global__ void moe_topk_renorm_k8_batched(
         }
         row_idx[tid] = safe_idx;
         row_w[tid]   = safe_w;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// moe_router_softmax_topk_k8_wave: fused softmax + top-8 + renorm, one wave32
+// per row, n_exp == 256 (A3B), k == 8. Byte-identical to moe_topk_renorm_k8_batched
+// mode 1 (and so to softmax_f32 + mode 0): every float operation of a row keeps
+// the incumbent value and operand order, only the thread that computes it moves.
+//
+// Lane l of the wave holds experts 4l..4l+3 (x[0..3]) and 128+4l..128+4l+3
+// (x[4..7]) from two float4 loads. The incumbent's 256 virtual threads own one
+// expert each (virtual thread t = expert t), so in this layout:
+//   * max: order independent (fmaxf over a set, seeded with -1e30f like the
+//     incumbent's per-thread seed) -> in-lane fold + xor butterfly.
+//   * sum: the incumbent tree reduce[t] += reduce[t+s], s = 128..1, is
+//     s=128 in-lane (x[c] + x[4+c]), s=64/32/16/8/4 as shfl_down by 16/8/4/2/1
+//     lanes (t+s lives in lane l + s/4, same c), s=2/1 in-lane in lane 0.
+//     Each add is the same two operands in the same order (v[t] + v[t+s]).
+//   * exp(x - max) and the direct divide by the tree sum are per element.
+//   * top-8: the incumbent scan + tree s = 128..1 replaces only on strictly
+//     greater, so the winner among equal values is the one with the smallest
+//     bit-reversed (8-bit) expert index (bit 0 is the last tree level and has
+//     top priority: all-equal rows pick 0,128,64,192,...). Each lane keeps
+//     its 8 candidates with that priority; a xor butterfly over (value,
+//     priority) pairs, a strict total order, yields the same winner on every
+//     lane. NaN probabilities never win (v > -inf is false), exactly as in
+//     the incumbent scan; a round with no valid candidate records (-1, -inf)
+//     and the common clamp maps it to (0, 0.0f).
+//   * renorm: sequential sum of the eight picks from 0.0f, direct divide, same
+//     clamp as the other modes.
+// No barriers: a wave only talks to itself, so waves past the last row just exit.
+// Wave32 only (the launcher rejects other devices).
+// ---------------------------------------------------------------------------
+
+#define WAVE_ROWS 8  // rows (waves) per 256-thread block
+#define WAVE_NEXP 256
+
+__device__ __forceinline__ bool topk_wave_better(float va, int pa, float vb, int pb) {
+    return va > vb || (va == vb && pa < pb);
+}
+
+extern "C" __launch_bounds__(WAVE_ROWS * 32)
+__global__ void moe_router_softmax_topk_k8_wave(
+    const float* __restrict__ logits,      // [n_rows x 256] raw router logits (left untouched)
+    int*         __restrict__ topk_idx,    // [n_rows x 8]
+    float*       __restrict__ topk_w,      // [n_rows x 8]
+    int n_rows,
+    int norm_topk
+) {
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * WAVE_ROWS + (threadIdx.x >> 5);
+    if (row >= n_rows) return;
+
+    const float4* __restrict__ rp =
+        reinterpret_cast<const float4*>(logits + (long long)row * WAVE_NEXP);
+    const float4 qa = rp[lane];
+    const float4 qb = rp[32 + lane];
+    float x[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+
+    // Row max.
+    float m = -1e30f;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) m = fmaxf(m, x[j]);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor(m, off));
+    const float max_val = m;
+
+    // exp(x - max), tree sum.
+    float e[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) e[j] = expf(x[j] - max_val);
+    float u[4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = e[c] + e[4 + c];                  // s = 128
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = u[c] + __shfl_down(u[c], 16);     // s = 64
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = u[c] + __shfl_down(u[c], 8);      // s = 32
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = u[c] + __shfl_down(u[c], 4);      // s = 16
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = u[c] + __shfl_down(u[c], 2);      // s = 8
+    #pragma unroll
+    for (int c = 0; c < 4; c++) u[c] = u[c] + __shfl_down(u[c], 1);      // s = 4
+    const float q0 = u[0] + u[2];                                        // s = 2
+    const float q1 = u[1] + u[3];
+    const float sum_all = __shfl(q0 + q1, 0);                            // s = 1
+
+    // Probabilities, candidate priorities.
+    float v[8];
+    int   pr[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const float p = e[j] / sum_all;
+        v[j] = (p > -INFINITY) ? p : -INFINITY;
+        const unsigned pos = (j < 4 ? 0u : 128u) + 4u * (unsigned)lane + (unsigned)(j & 3);
+        pr[j] = (int)(__brev(pos) >> 24);
+    }
+
+    int   pick_i[K_TOP];
+    float pick_w[K_TOP];
+    #pragma unroll
+    for (int k = 0; k < K_TOP; k++) {
+        float bv = v[0];
+        int   bp = pr[0];
+        #pragma unroll
+        for (int j = 1; j < 8; j++) {
+            if (topk_wave_better(v[j], pr[j], bv, bp)) { bv = v[j]; bp = pr[j]; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off);
+            const int   op = __shfl_xor(bp, off);
+            if (topk_wave_better(ov, op, bv, bp)) { bv = ov; bp = op; }
+        }
+        pick_i[k] = (bv > -INFINITY) ? (int)(__brev((unsigned)bp) >> 24) : -1;
+        pick_w[k] = bv;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (pr[j] == bp) v[j] = -INFINITY;
+        }
+    }
+
+    // Renorm: sequential sum from 0.0f, direct divide.
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < K_TOP; k++) s += pick_w[k];
+    if (norm_topk && s > 0.0f) {
+        #pragma unroll
+        for (int k = 0; k < K_TOP; k++) pick_w[k] /= s;
+    }
+
+    int   oi = 0;
+    float ow = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < K_TOP; k++) {
+        if (lane == k) {
+            const bool ok = pick_i[k] >= 0 && pick_i[k] < WAVE_NEXP;
+            oi = ok ? pick_i[k] : 0;
+            ow = ok ? pick_w[k] : 0.0f;
+        }
+    }
+    if (lane < K_TOP) {
+        topk_idx[row * K_TOP + lane] = oi;
+        topk_w[row * K_TOP + lane]   = ow;
     }
 }

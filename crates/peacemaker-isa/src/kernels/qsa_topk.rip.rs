@@ -248,7 +248,8 @@ const V_END: u8 = 112;
 
 /// Plane counts of the per-lane bit-sliced counters (`<= 2^planes - 1` packets per wave),
 /// with the exclusive lower and inclusive upper bound of the per-wave packet count each serves.
-const VARIANTS: [(u8, Option<u32>, Option<u32>); 3] = [
+/// Named `HIST_VARIANTS`, not `VARIANTS`: `const VARIANTS` is reserved for `.rip` variant discovery.
+const HIST_VARIANTS: [(u8, Option<u32>, Option<u32>); 3] = [
     (5, None, Some(31)),
     (7, Some(31), Some(127)),
     (9, Some(127), None),
@@ -961,7 +962,7 @@ fn pass(
 ) -> Result<(LdsRegion<Tile, Free>, WgUniform<Scc>), String> {
     op(wg.isa(), format!("v_mov_b32_e32 v{CW}, 0"), &[v(CW)], &[])?;
     // The plane count is picked by the wave's packet count: fewer planes, shorter ripples.
-    for (planes, lower, upper) in VARIANTS {
+    for (planes, lower, upper) in HIST_VARIANTS {
         gated(wg, g, lower, upper, |wg| hist_variant(wg, g, planes))?;
     }
     // Publish the eight wave counts, then read bin `31 - lane` of every wave.

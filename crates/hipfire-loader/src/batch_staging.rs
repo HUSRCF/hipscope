@@ -23,6 +23,7 @@
 //! fields.
 
 use crate::LoadedModel;
+use hipfire_arch_qwen35::qwen35::StateQuant;
 use rdna_compute::Gpu;
 
 /// What the load handler needs to know after staging.
@@ -103,11 +104,15 @@ pub fn stage_continuous_batch(
 ) -> Result<BatchStaging, String> {
     let mut out = BatchStaging::default();
     if let Some(req) = vmm {
-        if requested > 1 && m.pp == 1 && m.ep.is_none() {
+        if requested > 1 {
             match crate::continuous_batch_route(m.arch_id) {
-                Some(crate::ContinuousBatchRoute::Qwen35) => {
+                // Qwen35's VMM route stays single-device only.
+                Some(crate::ContinuousBatchRoute::Qwen35) if m.pp == 1 && m.ep.is_none() => {
                     return Ok(stage_qwen_vmm_batch(m, gpu, requested, req));
                 }
+                // Qwen4 lanes run under single, topology.ep (replicated
+                // ranks, `Qwen4Bundle::stage_lanes`) and topology.pp
+                // (band-scoped stores, `pp_stage_lanes`).
                 Some(crate::ContinuousBatchRoute::Qwen4) => {
                     return Ok(stage_qwen4_lanes(m, gpu, requested, req));
                 }
@@ -513,6 +518,23 @@ pub fn stage_continuous_batch(
     Ok(out)
 }
 
+/// Return `gpu` from a finished planned kernel route to lazy loading: the
+/// fn-lanes route is outside Flash-Next's walked kernel plan.
+/// `abort_route_kernel_load` is CPU-only (joins compile workers), so no
+/// device bind is needed.
+fn leave_planned_route(gpu: &mut Gpu, label: &str) -> Result<(), String> {
+    if !gpu.route_kernels_finished() {
+        return Ok(());
+    }
+    gpu.abort_route_kernel_load()
+        .map_err(|e| format!("kernel route reset failed ({label}): {e}"))?;
+    eprintln!(
+        "  kernels: {} [left the planned route: qwen4 fn-lanes ({label})]",
+        crate::LAZY_KERNELS_NOTE
+    );
+    Ok(())
+}
+
 /// Stage the exact Flash-Next (qwen4) lane store beside the resident
 /// bundle: native MTP lanes when `req.spec` (`serve.batch_spec`) is on and
 /// the loaded model carries the MTP head, AR lanes otherwise. Qwen4 has only
@@ -520,14 +542,26 @@ pub fn stage_continuous_batch(
 /// non-VMM QSA backend are refused, as is a lane store that does not fit the
 /// free device memory. Every refusal logs the reason and keeps the singleton
 /// route (`capable == false`); nothing is staged.
+///
+/// Topology (`Qwen4Bundle::lane_topology`):
+/// - `single`: one-device budget check here, then `stage_lanes`.
+/// - `ep`: replicated rank stores through `stage_lanes` (the arch fans it
+///   out and budgets every rank against its own free memory). Native MTP is
+///   unsupported: AR lanes. Route-kernel ownership: only the load's `gpu`
+///   (rank 0) ever runs `begin_route_kernels`; peer rank devices are never
+///   planned and stay lazy, so resetting rank 0 is sufficient.
+/// - `pp`: band-scoped stores through `pp_stage_lanes` (the arch budgets
+///   every band on its own device and resets each band device's finished
+///   route). Native MTP is unsupported: AR lanes. The daemon `gpu` is a
+///   handle separate from `Gpus::devices`, so both are reset here.
 fn stage_qwen4_lanes(
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     requested: usize,
     req: VmmStagingRequest,
 ) -> BatchStaging {
-    use hipfire_arch_qwen4::lane::Qwen4LaneStore;
-    use hipfire_arch_qwen4::{Qwen4ContextCommit, Qwen4KvBackend};
+    use hipfire_arch_qwen4::ep::{ep_lane_row_budget, ep_lane_store_device_bytes};
+    use hipfire_arch_qwen4::Qwen4KvBackend;
     let refuse = |reason: &str| {
         eprintln!("[daemon] qwen4 lanes refused: {reason} — fallback to sequential");
         BatchStaging::default()
@@ -535,14 +569,8 @@ fn stage_qwen4_lanes(
     if req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact {
         return refuse("qwen4 has only the exact lane route");
     }
-    let ep = crate::admission::effective_ep(m.arch_id);
-    if ep > 1 {
-        return refuse(&format!(
-            "expert parallelism (topology.ep = {ep}) serves one request at a time; lanes/continuous batching need topology.ep = 1"
-        ));
-    }
     let max_seq = m.max_seq;
-    let spec_off_reason = if !req.spec {
+    let natural_spec_off = if !req.spec {
         Some("serve.batch_spec off")
     } else if !m.mtp_weights_present {
         Some("no MTP head loaded")
@@ -561,8 +589,31 @@ fn stage_qwen4_lanes(
         .tokenizer
         .as_ref()
         .and_then(|t| t.special_token_id("<|im_end|>"));
-    let Some(bundle) = m.qwen4_mut() else {
+    let Some(bundle) = m.qwen4() else {
         return refuse("model state not Qwen4");
+    };
+    let topology = bundle.lane_topology();
+    let topology_log = match topology {
+        "pp" => format!("pp {}", m.pp),
+        "ep" => format!(
+            "ep {}",
+            bundle
+                .ep_mesh()
+                .expect("topology ep has an attached EP mesh")
+                .device_ids()
+                .len()
+        ),
+        other => other.to_string(),
+    };
+    // EP and PP stage AR lanes only: a spec config is never forwarded there.
+    let spec_off_reason: Option<String> = match (natural_spec_off, topology) {
+        (None, "pp" | "ep") => {
+            eprintln!(
+                "[daemon] qwen4 fn-lanes: native-MTP lanes are not supported under topology.ep/pp yet; staging AR lanes"
+            );
+            Some(format!("native-MTP unsupported under topology.{topology}"))
+        }
+        (reason, _) => reason.map(str::to_string),
     };
     let spec = spec_off_reason
         .is_none()
@@ -574,50 +625,61 @@ fn stage_qwen4_lanes(
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
         return refuse("QSA context backend is not VMM");
     }
-    let row_budget = req.row_budget.max(requested);
-    let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
-    let context = Qwen4ContextCommit::new(
-        Qwen4KvBackend::Vmm,
-        max_seq,
-        chunk,
-        gpu.vmm_recommended_granularity().unwrap_or(1),
-    );
-    let Some(need) = Qwen4LaneStore::device_bytes(
-        &bundle.config,
-        bundle.state_format(),
-        &context,
-        requested,
-        row_budget,
-        spec_on_k,
-    ) else {
-        return refuse("lane store device bytes overflow");
-    };
-    let free = match gpu.device_mem_info() {
-        Ok((free, _)) => free as u64,
-        Err(e) => return refuse(&format!("device memory query failed: {e}")),
-    };
-    if need > free {
-        return refuse(&format!(
-            "lane store needs {} MiB, {} MiB free (lanes={requested} row_budget={row_budget})",
-            need >> 20,
-            free >> 20
-        ));
+    // The row budget and lane bytes are the EP load reservation's own rule and
+    // helper (`Qwen4Carrier` reserves them before splitting the experts).
+    let row_budget = ep_lane_row_budget(req.row_budget, requested);
+    if topology == "single" {
+        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
+        let Some(need) = ep_lane_store_device_bytes(
+            &bundle.config,
+            bundle.state_format(),
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            gpu.vmm_recommended_granularity().unwrap_or(1),
+            requested,
+            row_budget,
+            spec_on_k,
+        ) else {
+            return refuse("lane store device bytes overflow");
+        };
+        let free = match gpu.device_mem_info() {
+            Ok((free, _)) => free as u64,
+            Err(e) => return refuse(&format!("device memory query failed: {e}")),
+        };
+        if need > free {
+            return refuse(&format!(
+                "lane store needs {} MiB, {} MiB free (lanes={requested} row_budget={row_budget})",
+                need >> 20,
+                free >> 20
+            ));
+        }
     }
     // The fn-lanes route is outside Flash-Next's walked kernel plan: return the
     // load to lazy kernel loading before staging dispatches anything.
-    if gpu.route_kernels_finished() {
-        if let Err(e) = gpu.abort_route_kernel_load() {
-            return refuse(&format!("kernel route reset failed: {e}"));
+    if let Err(e) = leave_planned_route(gpu, "daemon device") {
+        return refuse(&e);
+    }
+    let staged = if topology == "pp" {
+        let Some((bundle, gpus)) = m.qwen4_mesh_mut() else {
+            return refuse("topology.pp bundle has no caller-owned mesh devices");
+        };
+        for (index, device) in gpus.devices.iter_mut().enumerate() {
+            if let Err(e) = leave_planned_route(device, &format!("pp device {index}")) {
+                return refuse(&e);
+            }
         }
-        eprintln!(
-            "  kernels: {} [left the planned route: qwen4 fn-lanes]",
-            crate::LAZY_KERNELS_NOTE
-        );
+        bundle.pp_stage_lanes(gpus, requested, row_budget, spec)
+    } else {
+        match m.qwen4_mut() {
+            Some(bundle) => bundle.stage_lanes(gpu, requested, row_budget, spec),
+            None => return refuse("model state not Qwen4"),
+        }
+    };
+    if let Err(e) = staged {
+        return refuse(&format!("{topology} staging failed: {e}"));
     }
-    if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
-        return refuse(&format!("staging failed: {e}"));
-    }
-    let Some(store) = bundle.lanes() else {
+    let Some(store) = m.qwen4().and_then(|bundle| bundle.lanes()) else {
         return refuse("lane store missing after staging");
     };
     let spec_log = match (spec_on_k, spec_off_reason) {
@@ -626,7 +688,7 @@ fn stage_qwen4_lanes(
         (None, None) => "off".to_string(),
     };
     eprintln!(
-        "[daemon] qwen4 fn-lanes staged: lanes={requested} row_budget={} spec={spec_log} policy={}",
+        "[daemon] qwen4 fn-lanes staged: topology={topology_log} lanes={requested} row_budget={} spec={spec_log} policy={}",
         store.row_budget(),
         store.stage_policy().describe()
     );
@@ -638,6 +700,10 @@ fn stage_qwen4_lanes(
         lane_capacity: max_seq,
         ..Default::default()
     }
+}
+
+fn stochastic_q8_state_without_ef(quant: StateQuant, has_state: bool, has_ef: bool) -> bool {
+    quant == StateQuant::Q8 && has_state && !has_ef
 }
 
 /// Stage the VMM continuous-batching store beside the resident Qwen35
@@ -658,6 +724,19 @@ fn stage_qwen_vmm_batch(
         );
         return out;
     };
+    if gpu.arch_caps.is_gfx1100()
+        && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        && stochastic_q8_state_without_ef(
+            b.dn_state.quant,
+            !b.dn_state.s_scales.is_empty(),
+            !b.dn_state.s_ef_residual.is_empty(),
+        )
+    {
+        // Legacy stochastic Q8 state is not singleton-exact under hipGraph:
+        // replay freezes the captured requant frame, unlike eager AR lanes.
+        eprintln!("[daemon] gfx1100 Exact VMM requires Q8 error feedback (HIPFIRE_DN_STATE_EF=1); stochastic EF-off singleton graph parity is unproven — existing route");
+        return out;
+    }
     // The executor's own coverage predicate (embedding/lm_head dtypes,
     // slots-body layer coverage, VMM KV route and flash plan) — not the
     // fixed-lane `qwen_batch_weight_formats_supported` gate.
@@ -722,7 +801,15 @@ fn stage_qwen_vmm_batch(
         }
     }
     if out.vmm && req.spec {
-        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        if gpu.arch_caps.is_gfx1100()
+            && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        {
+            // gfx1100 exact AR uses singleton layers per request. Shared
+            // speculative verify has a separate numerical/state contract.
+            eprintln!("[daemon] gfx1100 Exact VMM: AR lanes only; batched speculative verification is not admitted");
+        } else {
+            stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        }
     }
     out
 }
@@ -849,13 +936,14 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
     let receipt = engine.receipt();
     let (lane_bytes, snapshot_bytes) = (engine.lane_bytes(), engine.snapshot_bytes());
     let store = b.vmm_store.as_mut().expect("route checked above");
-    match store.install_dflash(engine) {
+    let installed = match store.install_dflash(engine) {
         Ok(()) => {
             eprintln!(
                 "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
                 receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
             );
             eprintln!("[daemon] VMM DFlash lane footprint: lane_state={lane_bytes} B dn_snapshot={snapshot_bytes} B");
+            true
         }
         Err(engine) => {
             eprintln!(
@@ -864,6 +952,43 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
                 receipt.block_size
             );
             engine.free_gpu(gpu);
+            false
+        }
+    };
+    // Lanes never run the verbatim-copy lookup: with lanes staged the
+    // singleton must not either, or a request's text would depend on whether
+    // it was promoted to a lane.
+    if installed {
+        if let Some(df) = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+        {
+            df.disarm_lookup("VMM DFlash lanes staged; lanes never run lookup");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stochastic_q8_state_without_ef, StateQuant};
+
+    #[test]
+    fn exact_ef_guard_only_rejects_live_stochastic_q8_state() {
+        assert!(stochastic_q8_state_without_ef(StateQuant::Q8, true, false));
+        assert!(!stochastic_q8_state_without_ef(StateQuant::Q8, true, true));
+        assert!(!stochastic_q8_state_without_ef(
+            StateQuant::Q8,
+            false,
+            false
+        ));
+        for quant in [StateQuant::FP32, StateQuant::Q4] {
+            for has_state in [false, true] {
+                for has_ef in [false, true] {
+                    assert!(!stochastic_q8_state_without_ef(quant, has_state, has_ef));
+                }
+            }
         }
     }
 }

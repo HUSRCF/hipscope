@@ -24,11 +24,13 @@ use crate::weights::{Qwen4EpPlacement, Qwen4FfnWeights, Qwen4Weights, WeightErro
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::MoeRowGather;
+use hipfire_dispatch::pipeline::gated_mlp::{
+    Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
+};
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DenseFfnOp, DenseFfnRecipe,
-    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
-    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
-    MixerPhase, ProjectOp, Step,
+    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
+    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -2170,7 +2172,7 @@ pub(crate) enum MtpStep {
 /// The FFN call of one non-Append MTP step, in the profile's FFN kind.
 enum MtpFfnCall<'a> {
     Moe(hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>),
-    Dense(DenseFfnOp<'a>),
+    Dense(GatedMlpOp<'a>),
 }
 
 /// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
@@ -2945,21 +2947,27 @@ impl Qwen4MtpGpu {
                     }
                     (Qwen4FfnWeights::Dense(dense), None) => {
                         let gate = dense_ref(weights, &dense.gate)?;
-                        MtpFfnCall::Dense(DenseFfnOp {
-                            recipe: DenseFfnRecipe::SiluBf16Source,
+                        MtpFfnCall::Dense(GatedMlpOp {
+                            rows: 1,
+                            hidden,
                             intermediate: gate.m,
+                            x: &scratch.hc_mixed,
+                            pre_norm: None,
                             gate,
                             up: dense_ref(weights, &dense.up)?,
                             down: dense_ref(weights, &dense.down)?,
-                            input: &scratch.hc_mixed,
+                            activation: Activation::Silu,
+                            storage: MlpStorage::Bf16Source,
+                            output: MlpOutput::Write(&scratch.ffn_output),
+                            ladder: MlpLadder::Trunk,
                             // The MoE batch scratch, sized to the dense
                             // intermediate for a dense profile.
-                            gate_scratch: &scratch.moe_gate_batch,
-                            up_scratch: &scratch.moe_up_batch,
-                            output: &scratch.ffn_output,
-                            rotation: &scratch.rotation,
-                            rows: 1,
-                            hidden,
+                            scratch: GatedMlpScratch {
+                                gate: &scratch.moe_gate_batch,
+                                up: &scratch.moe_up_batch,
+                                act: &scratch.moe_gate_batch,
+                                x_rot: &scratch.rotation,
+                            },
                         })
                     }
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
@@ -3030,7 +3038,7 @@ impl Qwen4MtpGpu {
                         }));
                         steps.push(Step::Moe(moe));
                     }
-                    MtpFfnCall::Dense(dense) => steps.push(Step::DenseFfn(dense)),
+                    MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
                 }
                 steps.push(Step::HyperWrite(hc_write(
                     &mlp.write,

@@ -31,6 +31,10 @@ const ARCH: Arch = Arch::Gfx1201;
 const MODULE: &str = "iu4_c8_producer_pm_gfx1201";
 const ROTATE: &str = "iu4_c8_rotate_pm_gfx1201";
 const NORM: &str = "iu4_c8_rmsnorm_rotate_pm_gfx1201";
+const SIGMOID: &str = "iu4_c8_sigmoid_rotate_pm_gfx1201";
+const NORM_OUT: &str = "iu4_c8_rmsnorm_out_rotate_pm_gfx1201";
+/// The original two exports: frozen 72-byte ABI and the per-export census assertions written for them.
+const LEGACY: [Export; 2] = [Export::Rotate, Export::Norm];
 const KERNARG: u32 = 72;
 /// `(offset, size, name, value_kind)` in kernarg order.
 const ARGS: [(u32, u32, &str, &str); 10] = [
@@ -160,7 +164,7 @@ fn emission_is_deterministic_and_the_module_is_the_two_exports() {
         serde_json::to_string(&mb).unwrap()
     );
     assert_eq!((ma.module.as_str(), ma.arch), (MODULE, ARCH));
-    assert_eq!((ma.kernels.len(), ea.len()), (2, 2));
+    assert_eq!((ma.kernels.len(), ea.len()), (4, 4));
     for (export, e) in c8::module_exports().into_iter().zip(&ea) {
         let standalone = c8::emit(ARCH, export).unwrap();
         assert_eq!(
@@ -174,11 +178,11 @@ fn emission_is_deterministic_and_the_module_is_the_two_exports() {
         );
         assert!(ta.contains(&format!(".name: {}\n", export.symbol())));
     }
-    assert_eq!(ta.matches(".amdhsa_kernel ").count(), 2);
+    assert_eq!(ta.matches(".amdhsa_kernel ").count(), 4);
     assert_eq!(
         ta.matches(".symbol: ").count(),
-        2,
-        "exactly the two exports"
+        4,
+        "exactly the four exports"
     );
     assert!(ta.contains("amdgcn-amd-amdhsa--gfx1201"));
     let (bundle_a, bundle_b) = (
@@ -222,7 +226,7 @@ fn kernarg_layout_and_resources_match_contract() {
         ),
         (KERNARG, 32, 256, 256, 8192)
     );
-    for (export, e) in c8::module_exports().into_iter().zip(&entries) {
+    for (export, e) in LEGACY.into_iter().zip(&entries) {
         let text = &e.s_text;
         let has = |directive: &str| text.contains(&format!("\t.amdhsa_{directive}\n"));
         let lds = if export == Export::Norm { 32 } else { 0 };
@@ -329,6 +333,72 @@ fn kernarg_layout_and_resources_match_contract() {
             usize::from(export == Export::Norm),
             "vector rsq, norm only"
         );
+    }
+}
+
+/// The two folded exports: 80-byte kernarg block (the frozen ten arguments plus one pointer @72), their LDS and
+/// the instruction families that make them what they are.
+#[test]
+fn folded_exports_carry_the_extra_pointer_and_resources() {
+    let (entries, _) = emitted();
+    assert_eq!(c8::KERNARG_BYTES_EXT, 80);
+    for (export, extra, e) in [
+        (Export::SigmoidRotate, "gate", &entries[2]),
+        (Export::NormOut, "norm_out", &entries[3]),
+    ] {
+        let text = &e.s_text;
+        assert_eq!(field(text, ".kernarg_segment_size:"), [80], "{export:?}");
+        let found = metadata_args(text);
+        assert_eq!(found.len(), ARGS.len() + 1, "{export:?}");
+        for ((name, offset, size, kind), (eo, es, en, ek)) in found.iter().zip(ARGS) {
+            assert_eq!(
+                (name.as_str(), *offset, *size, kind.as_str()),
+                (en, eo, es, ek),
+                "{export:?} argument {en}"
+            );
+        }
+        let (name, offset, size, kind) = &found[ARGS.len()];
+        assert_eq!(
+            (name.as_str(), *offset, *size, kind.as_str()),
+            (extra, 72, 8, "global_buffer"),
+            "{export:?}"
+        );
+        assert_eq!(field(text, ".max_flat_workgroup_size:"), [export.block()]);
+        let lds = export.lds_bytes();
+        assert_eq!(
+            field(text, ".group_segment_fixed_size:"),
+            [lds],
+            "{export:?}"
+        );
+        assert_eq!(field(text, ".amdhsa_next_free_vgpr"), [64], "{export:?}");
+        assert_eq!(count(text, "s_load_b64"), 1);
+        assert_eq!(count(text, "s_endpgm"), 1);
+        assert_eq!(count(text, "v_s_rsq_f32"), 0);
+        match export {
+            Export::SigmoidRotate => {
+                assert_eq!(count(text, "v_exp_f32_e32"), 8, "one expf per element");
+                assert_eq!(count(text, "v_ldexp_f32"), 8);
+                assert_eq!(
+                    count(text, "global_load_b128"),
+                    10,
+                    "x, signs1, signs2, awq, gate"
+                );
+                assert_eq!(count(text, "global_store_b128"), 0);
+                assert_eq!(count(text, "s_barrier_signal"), 0);
+            }
+            _ => {
+                assert_eq!(
+                    count(text, "global_store_b128"),
+                    2,
+                    "the normalized f32 row"
+                );
+                assert_eq!(count(text, "ds_store_b32"), 1);
+                assert_eq!(count(text, "ds_load_b128"), 2);
+                assert_eq!(count(text, "s_barrier_signal"), 1);
+                assert_eq!(count(text, "v_rsq_f32_e32"), 1);
+                assert_eq!(lds, 1024, "one 1 KiB partials slot");
+            }
+        }
     }
 }
 
@@ -755,6 +825,9 @@ fn run(rig: &Rig, export: Export, i: &Inputs) -> (Vec<u32>, Vec<u8>) {
     let (grid, block) = match export {
         Export::Rotate => (i.rows * i.k / 256, 32),
         Export::Norm => (i.rows, 256),
+        Export::SigmoidRotate | Export::NormOut => {
+            unreachable!("the folded exports are proven by the GPU byte oracle (iu4_c8_pm_oracle)")
+        }
     };
     for wg in 0..grid {
         emu.run_workgroup(
@@ -921,6 +994,7 @@ fn identity_cases(export: Export, ks: &[usize], rows: &[usize], seeds: u64) {
                         let want = match export {
                             Export::Rotate => reference_rotate(&i),
                             Export::Norm => reference_norm(&i),
+                            Export::SigmoidRotate | Export::NormOut => unreachable!(),
                         };
                         let got = run(&rig, export, &i);
                         check(
@@ -1123,7 +1197,7 @@ fn check_against_census(contract: &Value, text: &str) {
 #[test]
 fn contracts_are_derived_from_the_emission() {
     let (entries, _) = emitted();
-    for (export, e) in c8::module_exports().into_iter().zip(&entries) {
+    for (export, e) in LEGACY.into_iter().zip(&entries) {
         let c = c8::contract(ARCH, e, export);
         assert_eq!(c["symbol"], export.symbol());
         check_against_census(&c, &e.s_text);
@@ -1241,8 +1315,8 @@ fn committed_bundle_equals_fresh_emission() {
         .collect();
     assert_eq!(
         symbols,
-        [ROTATE, NORM],
-        "the committed bundle must hold exactly the two exports"
+        [ROTATE, NORM, SIGMOID, NORM_OUT],
+        "the committed bundle must hold exactly the four exports"
     );
 }
 #[test]
@@ -1270,13 +1344,19 @@ fn committed_contracts_and_m7_receipt_equal_fresh_ones() {
             .unwrap();
     let mut keys: Vec<&str> = m7.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, [NORM, ROTATE], "{file}: receipt keys");
-    for symbol in [ROTATE, NORM] {
+    let mut want = [NORM, NORM_OUT, ROTATE, SIGMOID];
+    want.sort_unstable();
+    assert_eq!(keys, want, "{file}: receipt keys");
+    for symbol in [ROTATE, NORM, SIGMOID, NORM_OUT] {
         let r = &m7[symbol];
         assert_eq!(r["lift"], "byte-exact", "{symbol}");
         assert_eq!(r["obligations"], serde_json::json!({}), "{symbol}");
         assert_eq!(r["ambiguous_delays"], 0, "{symbol}");
-        assert_eq!(r["barrier_pairs"], u64::from(symbol == NORM), "{symbol}");
+        assert_eq!(
+            r["barrier_pairs"],
+            u64::from(symbol == NORM || symbol == NORM_OUT),
+            "{symbol}"
+        );
         assert!(r["instructions"].as_u64().unwrap() > 0);
     }
 }
@@ -1391,7 +1471,7 @@ mod toolchain {
             let kd = read_kd(&co, symbol).unwrap();
             assert_eq!(
                 (kd.group_segment_size, kd.private_segment_size, kd.wave32),
-                (if export == Export::Norm { 32 } else { 0 }, 0, true)
+                (export.lds_bytes(), 0, true)
             );
             assert_eq!(
                 kd.compute_pgm_rsrc1 & 0x000f_f000,
@@ -1468,7 +1548,7 @@ mod toolchain {
         );
         assert_eq!(
             (scan.kernels, scan.barrier_kernels, scan.barriers),
-            (2, 1, 1),
+            (4, 2, 2),
             "{scan:?}"
         );
         assert!(

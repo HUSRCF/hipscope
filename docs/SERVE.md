@@ -922,6 +922,29 @@ request run alone on the singleton route. **Default off, experimental.**
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
   GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
   every stage per lane until their own G0 run.
+- **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
+  **AR** fn-lanes route is staged across the cards, with these differences from
+  the single-card route above. The lane store is budgeted per device: every
+  band (PP) or rank (EP) must satisfy `need <= free` on its own card, else
+  nothing is staged and the singleton route is kept. There are **no native-MTP
+  lanes** (`continuous_batch_spec: false`, spec mode `"off"`) and a running
+  singleton is **never promoted** into a lane
+  (`continuous_batch_promotion: false`). EP replicates the lane store on every
+  rank; PP keeps a band-scoped store per band, the HC streams crossing each
+  band edge through pinned host memory; a decode step is split into `G`
+  contiguous whole-lane micro-batches that wavefront through the bands
+  (`G` = the maximal overlap `min(lanes, 2 * stages)` under the default
+  per-lane policy; adaptive over `1..=min(lanes, 2 * stages)` under a shared
+  policy; the developer variables `HIPFIRE_PP_LANE_GROUPS=<G>` and
+  `HIPFIRE_FN_LANE_POLICY=<spec>` override group count and stage policy, see
+  [env-vars.md](env-vars.md)). Row-local stages run once over all lanes'
+  rows only where per-stage proof rows cover the bound routes (gfx1201: PP2
+  mq2 and EP2 mq4, byte-exact against the topology singleton); every other
+  stage runs per lane. Measured on 2x R9700 (16 prompts x 256 tokens, 3 fresh
+  processes per arm), aggregate output at C8 is 1.97x (PP2) and 1.83x (EP2)
+  the batching-off C1, and batching on costs C1 0.3% (PP2) and 2.2% (EP2).
+  Like the single-card route it stays default-off. Details:
+  [multi-gpu.md](multi-gpu.md#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,
 `continuous_batch_history_capable: true` (the typed capability the serve
@@ -938,7 +961,11 @@ and the lane-store receipt:
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
 policy). Each lane's `done` event carries the singleton's MTP counters
 (`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
-`mtp_accepted`.
+`mtp_accepted`. Under PP/EP the ack also reports `fn_lanes_topology`
+(`"single"`, `"ep"` or `"pp"`) and `fn_lanes_device_receipts`, one entry per
+card (EP rank order; PP input band to output band); the scalar `fn_lanes_*`
+receipt is the root's (rank 0, or the output band), and
+`continuous_batch_promotion` is `true` only on a single card.
 
 ## Multi-process notes
 

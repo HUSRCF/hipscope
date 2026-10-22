@@ -696,6 +696,662 @@ fn for_gemv_swiglu_residual_maps_hfq_and_mq() {
     );
 }
 
+// ── Admission → dispatch-arm completeness ─────────────────────────────────────
+//
+// A `KernelKey::for_*` constructor (or a key table / key selector) that ADMITS
+// a dtype or key while the dispatch fn that finally launches it has no arm for
+// it resolves fine and then fails the call at RUNTIME (`unsupported
+// gemv.<variant>` / `no implementation for <key>`). Two instances so far:
+// MQ6G256 in the residual/swiglu dispatch (fixed in d6c79bb17) and MQ3G256 in
+// `dispatch_swiglu_residual` (the qwen3.5/3.6 27B MQ3 rungs' FFN down failed
+// request 1 on gfx1201). The test below checks the whole class instead of one
+// instance: every (admission, dispatch) pair in this crate is enumerated and
+// every admitted dtype/key must have an explicit arm on the dispatch side.
+//
+// Admission side: the real `KernelKey::for_*` / `*_key_for` fns and the real
+// registries are EVALUATED over every `DType` variant (`ALL_DTYPES`, checked
+// against the enum's source by `all_dtypes_list_matches_the_dtype_enum`).
+// Dispatch side: only the arm list is parsed out of the dispatch fn's source
+// (rustfmt layout: arms one indent below the `match`), up to the fn's own
+// closing brace. Shared-key cases (qt=52 MQ4G256V2Lloyd reusing the qt=44 key,
+// MQ2G256LloydU mapping to GemvMq2G256Lloyd) are checked on the KEY where the
+// dispatch is key-based and on the DTYPE where it is dtype-based.
+
+/// Every `rdna_compute::DType` variant. `all_dtypes_list_matches_the_dtype_enum`
+/// fails when the enum gains or loses a variant without this list following.
+const ALL_DTYPES: &[DType] = &[
+    DType::F32,
+    DType::F16,
+    DType::BF16,
+    DType::Q4K,
+    DType::Q6K,
+    DType::Q8_0,
+    DType::Q4F16G64,
+    DType::Q4F16G32,
+    DType::Q8HFQ,
+    DType::HFQ4G256,
+    DType::HFQ4G128,
+    DType::HFQ3G256,
+    DType::HFQ3G128,
+    DType::MQ4G256,
+    DType::MQ4G256V2,
+    DType::MQ4G256V2Lloyd,
+    DType::MQ4CG256,
+    DType::MQ6G256V2,
+    DType::MQ5G256V2,
+    DType::MQ4G128V2,
+    DType::MQ4G128,
+    DType::MQ3G256V2,
+    DType::MQ2G256V2,
+    DType::MQ8G256,
+    DType::MQ6G256,
+    DType::MQ5G256,
+    DType::MQ3G256,
+    DType::MQ2G256,
+    DType::MQ2G256Lloyd,
+    DType::MQ2G256LloydU,
+    DType::MQ3G256Lloyd,
+    DType::MQ4G256Lloyd,
+    DType::MQ2G256GL,
+    DType::MQ3G256GL,
+    DType::HFP4G32,
+    DType::MFP4G32,
+    DType::MFP4G32Lloyd,
+    DType::MFP4G32P,
+    DType::MFP4G32E8,
+    DType::MFP4G32E8SOA,
+    DType::MFP3G32E8,
+    DType::MFP2G32E8,
+    DType::MFP4G32E8G128,
+    DType::HFQ2G256,
+    DType::HFQ2G128,
+    DType::TQ2G128,
+    DType::BQ1G128,
+    DType::HFQ6G256,
+    DType::ParoQ4G128,
+    DType::ParoQ4G64,
+    DType::FP8E4M3B128,
+    DType::FP8E4M3PT,
+    DType::Raw,
+    DType::MQ3I4G128R256,
+    DType::MQ3I4G128R128,
+    DType::MQ2I4G128R256,
+    DType::MQ2I4G128R128,
+    DType::E8PI4G128R256,
+    DType::E8PI4G128R128,
+];
+
+/// Registered keys that are KNOWN to have no dispatch arm today. Each entry is
+/// re-checked: once the arm lands the entry is stale and the test fails until
+/// it is removed, so this list can only shrink.
+const KNOWN_UNDISPATCHED_KEYS: &[(&str, &str)] = &[(
+    "GemmQ8_0Wmma4W",
+    "registered in tables/gemm_table.rs (HasWmma) but GemmFamily::run_key has no arm \
+     (run_key(GemmQ8_0Wmma4W) -> MissingImpl); its only consumer, pipeline/sandwich.rs, \
+     calls gpu.gemm_q8_0_wmma_4w directly, so nothing resolves it through run_key today",
+)];
+
+/// Variant names of `pub enum DType` parsed from rdna-compute's source.
+fn dtype_enum_source_variants() -> Vec<String> {
+    let src = include_str!("../../rdna-compute/src/dispatch.rs");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in src.lines() {
+        if line == "pub enum DType {" {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        let Some(rest) = line.strip_prefix("    ") else {
+            continue;
+        };
+        let Some((ident, _)) = rest.split_once(',') else {
+            continue;
+        };
+        if ident.starts_with(|c: char| c.is_ascii_uppercase())
+            && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            out.push(ident.to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn all_dtypes_list_matches_the_dtype_enum() {
+    let listed: Vec<String> = ALL_DTYPES.iter().map(|d| format!("{d:?}")).collect();
+    let source = dtype_enum_source_variants();
+    assert!(
+        source.len() >= 58,
+        "parsed only {} DType variants from rdna-compute/src/dispatch.rs",
+        source.len()
+    );
+    for v in &source {
+        assert!(
+            listed.contains(v),
+            "DType::{v} exists in the enum but not in tests.rs ALL_DTYPES: add it, then check \
+             every admission->dispatch pair in every_admitted_dtype_or_key_has_a_dispatch_arm"
+        );
+    }
+    for v in &listed {
+        assert!(
+            source.contains(v),
+            "ALL_DTYPES lists {v}, which is not a DType variant in the enum source"
+        );
+    }
+    assert_eq!(listed.len(), source.len(), "duplicate entry in ALL_DTYPES");
+}
+
+/// Lines of the item whose first line contains `sig`: from that line up to (not
+/// including) the first later line that is exactly `close` at the item's own
+/// indentation. `sig` must match exactly one non-comment line.
+fn item_lines(src: &'static str, sig: &str, close: &str) -> Vec<&'static str> {
+    let lines: Vec<&'static str> = src.lines().collect();
+    let hits: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains(sig) && !lines[i].trim_start().starts_with("//"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "`{sig}` must match exactly one non-comment source line, matched {}",
+        hits.len()
+    );
+    let start = hits[0];
+    let indent = " ".repeat(lines[start].len() - lines[start].trim_start().len());
+    let close_line = format!("{indent}{close}");
+    let end = (start + 1..lines.len())
+        .find(|&i| lines[i] == close_line)
+        .unwrap_or_else(|| panic!("no closing `{close}` at the indent of `{sig}`"));
+    lines[start..end].to_vec()
+}
+
+/// Every `KernelKey::<Ident>` named in the non-comment code of `lines`.
+fn kernel_keys_in(lines: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let mut rest = line.split("//").next().unwrap_or("");
+        while let Some(at) = rest.find("KernelKey::") {
+            rest = &rest[at + "KernelKey::".len()..];
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
+/// Names in one match-arm pattern: `|` alternations split, path prefixes
+/// (`K::`, `KernelKey::`, `DType::`) stripped, guards dropped.
+fn arm_pattern_names(pat: &str) -> Vec<String> {
+    let pat = pat.split(" if ").next().unwrap_or(pat);
+    pat.split('|')
+        .filter_map(|alt| {
+            let token = alt.split_whitespace().last()?;
+            Some(token.rsplit("::").next()?.to_string())
+        })
+        .collect()
+}
+
+/// The arms of one dispatch fn's top-level `match`: (pattern names, arm body).
+struct ArmSet {
+    /// Human-readable dispatch site for failure messages.
+    label: &'static str,
+    arms: Vec<(Vec<String>, String)>,
+}
+
+impl ArmSet {
+    /// Parse the arms of `match <scrutinee> {` directly inside the fn matched by
+    /// `sig`, bounded by the fn's own closing brace. Relies on rustfmt layout
+    /// (match at fn-body indent, arms one indent deeper). `min_arms` guards
+    /// against a layout change silently emptying the set.
+    fn parse(
+        label: &'static str,
+        src: &'static str,
+        sig: &str,
+        scrutinee: &str,
+        min_arms: usize,
+    ) -> Self {
+        let body = item_lines(src, sig, "}");
+        let fn_indent = body[0].len() - body[0].trim_start().len();
+        let head = format!("match {scrutinee} {{");
+        let m = body
+            .iter()
+            .position(|l| {
+                let trimmed = l.trim();
+                (trimmed == head || trimmed.strip_prefix("Ok(") == Some(head.as_str()))
+                    && l.len() - l.trim_start().len() == fn_indent + 4
+            })
+            .unwrap_or_else(|| panic!("{label}: no `{head}` at the fn-body indent"));
+        let arm_indent = fn_indent + 8;
+        let match_close = format!(
+            "{}{}",
+            " ".repeat(fn_indent + 4),
+            if body[m].trim_start().starts_with("Ok(") {
+                "})"
+            } else {
+                "}"
+            }
+        );
+        let end = (m + 1..body.len())
+            .find(|&i| body[i] == match_close)
+            .unwrap_or(body.len());
+
+        let mut arms: Vec<(Vec<String>, String)> = Vec::new();
+        let mut pending = String::new();
+        for &line in &body[m + 1..end] {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let continues_body = indent > arm_indent || trimmed.starts_with(['}', ')', ']']);
+            if continues_body {
+                if let Some((_, text)) = arms.last_mut() {
+                    text.push_str(trimmed);
+                    text.push('\n');
+                }
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            pending.push(' ');
+            pending.push_str(trimmed);
+            if let Some((pat, rest)) = pending.split_once("=>") {
+                arms.push((arm_pattern_names(pat), rest.to_string()));
+                pending.clear();
+            }
+        }
+        assert!(
+            arms.len() >= min_arms,
+            "{label}: parsed only {} arms (expected >= {min_arms}); did the fn layout change?",
+            arms.len()
+        );
+        ArmSet { label, arms }
+    }
+
+    /// Body of the first arm that explicitly names `name` (a wildcard / `other`
+    /// arm never matches a concrete name).
+    fn arm(&self, name: &str) -> Option<&str> {
+        self.arms
+            .iter()
+            .find(|(names, _)| names.iter().any(|n| n == name))
+            .map(|(_, body)| body.as_str())
+    }
+}
+
+fn arm_failure(admitted_by: &str, name: &str, dispatch: &ArmSet) -> String {
+    format!(
+        "  {name}: admitted by {admitted_by}, but {} has no explicit arm for it \
+         (runtime: `unsupported ...` / MissingImpl after resolution said Ok)",
+        dispatch.label
+    )
+}
+
+/// Every dtype/key an admission side returns Ok for / registers has an explicit
+/// arm in the dispatch fn that launches it (see the section comment above;
+/// d6c79bb17 fixed MQ6G256, and MQ3G256 in `dispatch_swiglu_residual` broke
+/// qwen3.5/3.6 27B MQ3 decode on gfx1201). Pairs covered:
+///
+/// 1. `for_gemv(dtype, Plain)`            -> `launch` key arms (families/gemv.rs)
+/// 2. `for_gemv_prerotated(dtype)`        -> `launch` key arms
+/// 3. `for_gemv_residual(dtype)`          -> shared `residual_kernel` dtype arms
+/// 4. `for_gemv_swiglu_residual(dtype)`   -> shared `residual_kernel` dtype arms
+/// 5. GemvFamily registry (tables/gemv_table.rs `register_*`) -> `launch` key arms
+///    (residual/swiglu keys are covered by 3/4; `GemvMfp4G32Fused` by `run`)
+/// 6. FusedQkvFamily registry (tables/fused_qkv_table.rs) -> `dispatch_fused_qkv`
+///    arms, or `launch_fused` (pipeline/steps.rs) arms that launch directly
+/// 7. `FUSED_TABLE` pattern keys (pipeline/steps.rs) -> `launch_fused` arm that
+///    exists and, when it forwards to `FusedQkvFamily::run`, `dispatch_fused_qkv`
+/// 8. `fused_gate_up_key_for(dtype)`      -> `dispatch_fused_qkv` key arms
+/// 9. `qkv_bias_fold_supported` key list (pipeline/steps.rs) ->
+///    `dispatch_fused_qkv_with_qwen2_bias` key arms
+/// 10. `residual_gemm_key_for(dtype)`     -> `GemmFamily::run_key` key arms
+/// 11. GemmFamily registry (tables/gemm_table.rs) -> `run_key` arms (packed keys
+///     via `packed_gemm_contract`, which `run_key` consumes before its match)
+/// 12. `prefill_shared_gemm_key(dtype)` (pipeline/mod.rs) -> `run_key` key arms
+///
+/// Plain keys of dtypes whose `dtype_post_rotation_variant` is `Prerotated` (MQ*,
+/// MFP4G32) are admitted by `for_gemv` but never launched as `Plain`
+/// (`run_input` switches them to `Prerotated`), so they are exempt from pair 1
+/// and from the registry check of pair 5.
+#[test]
+fn every_admitted_dtype_or_key_has_a_dispatch_arm() {
+    use crate::families::fused_qkv::fused_gate_up_key_for;
+    use crate::families::gemm::{residual_gemm_key_for, GemmFamily};
+    use std::collections::BTreeSet;
+
+    let gemv_src = include_str!("families/gemv.rs");
+    let fused_src = include_str!("families/fused_qkv.rs");
+    let gemm_src = include_str!("families/gemm.rs");
+    let steps_src = include_str!("pipeline/steps.rs");
+    let pipeline_src = include_str!("pipeline/mod.rs");
+
+    let launch = ArmSet::parse(
+        "families/gemv.rs::launch",
+        gemv_src,
+        "fn launch(",
+        "key",
+        35,
+    );
+    // Beta uses one dtype table for both residual variants. Pin the forwarding
+    // edges as well as the table, so a wrapper cannot bypass the checked arms.
+    for sig in ["fn dispatch_residual(", "fn dispatch_swiglu_residual("] {
+        assert!(
+            item_lines(gemv_src, sig, "}")
+                .iter()
+                .any(|line| line.trim_start().starts_with("launch_residual(")),
+            "{sig} no longer forwards to the shared residual launcher"
+        );
+    }
+    assert!(
+        item_lines(gemv_src, "fn launch_residual(", "}")
+            .iter()
+            .any(|line| line.trim() == "match residual_kernel(w.dtype, variant)? {"),
+        "the shared residual launcher no longer consumes the checked dtype table"
+    );
+    let residual = ArmSet::parse(
+        "families/gemv.rs::residual_kernel (residual)",
+        gemv_src,
+        "fn residual_kernel(",
+        "dtype",
+        15,
+    );
+    let swiglu = ArmSet::parse(
+        "families/gemv.rs::residual_kernel (swiglu_residual)",
+        gemv_src,
+        "fn residual_kernel(",
+        "dtype",
+        15,
+    );
+    let fused = ArmSet::parse(
+        "families/fused_qkv.rs::dispatch_fused_qkv",
+        fused_src,
+        "fn dispatch_fused_qkv(",
+        "params.kind",
+        40,
+    );
+    let bias = ArmSet::parse(
+        "families/fused_qkv.rs::dispatch_fused_qkv_with_qwen2_bias",
+        fused_src,
+        "fn dispatch_fused_qkv_with_qwen2_bias(",
+        "params.kind",
+        8,
+    );
+    let launch_fused = ArmSet::parse(
+        "pipeline/steps.rs::launch_fused",
+        steps_src,
+        "fn launch_fused<'a>(",
+        "key",
+        8,
+    );
+    let run_key = ArmSet::parse(
+        "families/gemm.rs::GemmFamily::run_key",
+        gemm_src,
+        "pub fn run_key(",
+        "key",
+        40,
+    );
+    let packed = ArmSet::parse(
+        "families/gemm.rs::packed_gemm_contract (consumed by run_key before its match)",
+        gemm_src,
+        "fn packed_gemm_contract(",
+        "key",
+        4,
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let (mut n_plain, mut n_pre, mut n_res, mut n_swi) = (0usize, 0usize, 0usize, 0usize);
+    let mut plain_unlaunched: BTreeSet<String> = BTreeSet::new();
+    let mut residual_keys: BTreeSet<String> = BTreeSet::new();
+    let mut swiglu_keys: BTreeSet<String> = BTreeSet::new();
+
+    for &dtype in ALL_DTYPES {
+        // 1. Plain
+        if let Ok(key) = KernelKey::for_gemv(dtype, GemvVariant::Plain, false) {
+            let name = format!("{key:?}");
+            if matches!(dtype_post_rotation_variant(dtype), GemvVariant::Plain) {
+                n_plain += 1;
+                if launch.arm(&name).is_none() {
+                    failures.push(arm_failure(
+                        &format!("KernelKey::for_gemv({dtype:?}, Plain)"),
+                        &name,
+                        &launch,
+                    ));
+                }
+            } else {
+                plain_unlaunched.insert(name);
+            }
+        }
+        // 2. Prerotated
+        if let Ok(key) = KernelKey::for_gemv_prerotated(dtype) {
+            n_pre += 1;
+            let name = format!("{key:?}");
+            if launch.arm(&name).is_none() {
+                failures.push(arm_failure(
+                    &format!("KernelKey::for_gemv_prerotated({dtype:?})"),
+                    &name,
+                    &launch,
+                ));
+            }
+        }
+        // 3. Residual (dtype-dispatched; the key is shared for qt=52, so the DTYPE is checked)
+        if let Ok(key) = KernelKey::for_gemv_residual(dtype) {
+            n_res += 1;
+            residual_keys.insert(format!("{key:?}"));
+            let name = format!("{dtype:?}");
+            if residual.arm(&name).is_none() {
+                failures.push(arm_failure(
+                    &format!("KernelKey::for_gemv_residual({dtype:?}) = {key:?}"),
+                    &name,
+                    &residual,
+                ));
+            }
+        }
+        // 4. SwiGLU residual (dtype-dispatched)
+        if let Ok(key) = KernelKey::for_gemv_swiglu_residual(dtype) {
+            n_swi += 1;
+            swiglu_keys.insert(format!("{key:?}"));
+            let name = format!("{dtype:?}");
+            if swiglu.arm(&name).is_none() {
+                failures.push(arm_failure(
+                    &format!("KernelKey::for_gemv_swiglu_residual({dtype:?}) = {key:?}"),
+                    &name,
+                    &swiglu,
+                ));
+            }
+        }
+    }
+    assert!(n_plain >= 15, "plain: only {n_plain} admitted dtypes");
+    assert!(n_pre >= 20, "prerotated: only {n_pre} admitted dtypes");
+    assert!(n_res >= 15, "residual: only {n_res} admitted dtypes");
+    assert!(n_swi >= 15, "swiglu_residual: only {n_swi} admitted dtypes");
+
+    // 5. GemvFamily registry: every registered key is launchable.
+    let run_body = item_lines(gemv_src, "pub fn run(", "}").join("\n");
+    for key in GemvFamily::new().registry().all_keys() {
+        let name = format!("{key:?}");
+        if residual_keys.contains(&name) || swiglu_keys.contains(&name) {
+            continue; // dtype-dispatched, covered by pairs 3/4
+        }
+        if name == "GemvMfp4G32Fused" {
+            assert!(
+                run_body.contains("KernelKey::GemvMfp4G32Fused")
+                    && run_body.contains("dispatch_fused("),
+                "GemvMfp4G32Fused is registered in tables/gemv_table.rs but GemvFamily::run \
+                 no longer dispatches it through dispatch_fused"
+            );
+            continue;
+        }
+        if launch.arm(&name).is_none() && !plain_unlaunched.contains(&name) {
+            failures.push(arm_failure(
+                "the GemvFamily registry (tables/gemv_table.rs)",
+                &name,
+                &launch,
+            ));
+        }
+    }
+
+    // 6. FusedQkvFamily registry. A key is dispatchable when dispatch_fused_qkv
+    //    has its arm, or launch_fused launches it directly (qt=52 Lloyd keys).
+    let fused_dispatchable = |name: &str| {
+        fused.arm(name).is_some()
+            || launch_fused
+                .arm(name)
+                .is_some_and(|body| !body.contains("fused_qkv.run("))
+    };
+    for key in FusedQkvFamily::new().registry().all_keys() {
+        let name = format!("{key:?}");
+        if !fused_dispatchable(&name) {
+            failures.push(arm_failure(
+                "the FusedQkvFamily registry (tables/fused_qkv_table.rs)",
+                &name,
+                &fused,
+            ));
+        }
+    }
+
+    // 7. FUSED_TABLE pattern keys (what the decode pipeline actually selects).
+    let table = kernel_keys_in(&item_lines(
+        steps_src,
+        "const FUSED_TABLE: &[FusedPattern]",
+        "];",
+    ));
+    assert!(table.len() >= 20, "FUSED_TABLE: only {} keys", table.len());
+    for name in &table {
+        match launch_fused.arm(name) {
+            None => failures.push(arm_failure(
+                "a FUSED_TABLE pattern (pipeline/steps.rs)",
+                name,
+                &launch_fused,
+            )),
+            Some(_) if !fused_dispatchable(name) => failures.push(arm_failure(
+                "a FUSED_TABLE pattern (pipeline/steps.rs; launch_fused forwards it to \
+                 FusedQkvFamily::run)",
+                name,
+                &fused,
+            )),
+            Some(_) => {}
+        }
+    }
+
+    // 8. fused_gate_up_key_for (panics for qt=52 by design: a refusal, not an admission).
+    let mut n_gate_up = 0usize;
+    for &dtype in ALL_DTYPES {
+        let Ok(key) = std::panic::catch_unwind(|| fused_gate_up_key_for(dtype)) else {
+            continue;
+        };
+        n_gate_up += 1;
+        let name = format!("{key:?}");
+        if fused.arm(&name).is_none() {
+            failures.push(arm_failure(
+                &format!("fused_gate_up_key_for({dtype:?})"),
+                &name,
+                &fused,
+            ));
+        }
+    }
+    assert!(n_gate_up >= 50, "fused_gate_up_key_for: {n_gate_up} dtypes");
+
+    // 9. qkv_bias_fold_supported -> the Qwen2 bias dispatch.
+    let bias_keys = kernel_keys_in(&item_lines(steps_src, "fn qkv_bias_fold_supported(", "}"));
+    assert!(
+        bias_keys.len() >= 5,
+        "qkv_bias_fold_supported: {bias_keys:?}"
+    );
+    for name in &bias_keys {
+        if bias.arm(name).is_none() {
+            failures.push(arm_failure(
+                "qkv_bias_fold_supported (pipeline/steps.rs)",
+                name,
+                &bias,
+            ));
+        }
+    }
+
+    // 10. residual_gemm_key_for (panics for qt=52 by design).
+    let gemm_dispatchable = |name: &str| run_key.arm(name).is_some() || packed.arm(name).is_some();
+    let mut n_gemm_res = 0usize;
+    for &dtype in ALL_DTYPES {
+        let Ok(key) = std::panic::catch_unwind(|| residual_gemm_key_for(dtype)) else {
+            continue;
+        };
+        n_gemm_res += 1;
+        let name = format!("{key:?}");
+        if !gemm_dispatchable(&name) {
+            failures.push(arm_failure(
+                &format!("residual_gemm_key_for({dtype:?})"),
+                &name,
+                &run_key,
+            ));
+        }
+    }
+    assert!(
+        n_gemm_res >= 50,
+        "residual_gemm_key_for: {n_gemm_res} dtypes"
+    );
+
+    // 11. GemmFamily registry, with the explicit known-gap list.
+    let mut seen_gaps: BTreeSet<&str> = BTreeSet::new();
+    for key in GemmFamily::new().registry().all_keys() {
+        let name = format!("{key:?}");
+        if gemm_dispatchable(&name) {
+            continue;
+        }
+        match KNOWN_UNDISPATCHED_KEYS.iter().find(|entry| entry.0 == name) {
+            Some(entry) => {
+                seen_gaps.insert(entry.0);
+            }
+            None => failures.push(arm_failure(
+                "the GemmFamily registry (tables/gemm_table.rs)",
+                &name,
+                &run_key,
+            )),
+        }
+    }
+    for (k, reason) in KNOWN_UNDISPATCHED_KEYS {
+        if !seen_gaps.contains(k) {
+            failures.push(format!(
+                "  {k}: listed in KNOWN_UNDISPATCHED_KEYS ({reason}) but it now has an arm or is \
+                 no longer registered; remove the stale entry"
+            ));
+        }
+    }
+
+    // 12. prefill_shared_gemm_key (private to pipeline/): its returned keys.
+    let shared = kernel_keys_in(&item_lines(
+        pipeline_src,
+        "fn prefill_shared_gemm_key(",
+        "}",
+    ));
+    assert!(shared.len() >= 5, "prefill_shared_gemm_key: {shared:?}");
+    for name in &shared {
+        if !gemm_dispatchable(name) {
+            failures.push(arm_failure(
+                "prefill_shared_gemm_key (pipeline/mod.rs)",
+                name,
+                &run_key,
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{} admitted dtype/key cases with no dispatch arm:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn for_gemv_rejects_unsupported_variant_combo() {
     // Residual for F32 has no kernel.
@@ -1810,6 +2466,7 @@ fn make_qkv3_steps<'a>(
             k: 4096,
             eps: 1e-6,
             rotation,
+            rows: 1,
         },
         Step::Gemv {
             w: wr,
@@ -1844,6 +2501,7 @@ fn make_gate_up2_steps<'a>(
             k: 4096,
             eps: 1e-6,
             rotation,
+            rows: 1,
         },
         Step::Gemv {
             w: wr,
@@ -2046,6 +2704,7 @@ fn guard_qkv_rejects_mixed_gemv_input() {
             k: 4096,
             eps: 1e-6,
             rotation: RotationPlan::FwhtG256,
+            rows: 1,
         },
         Step::Gemv {
             w: &wr,
@@ -2198,6 +2857,7 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
             k: 4096,
             eps: 1e-6,
             rotation: RotationPlan::FwhtG256,
+            rows: 1,
         },
         Step::Gemv {
             w: &wr_v2,

@@ -12,7 +12,7 @@
 //! variant rounds each h to bf16 RNE before storing.
 use super::{
     region::{self, Binding, Region},
-    Epi, Gen, Wg, EPI,
+    Epi, Gen, Wg, END, EPI,
 };
 use crate::kernels::{
     bf16::Bf16,
@@ -20,6 +20,7 @@ use crate::kernels::{
 };
 use crate::{
     insn::{Instruction, MemoryClass},
+    reg::Live,
     Builder,
 };
 use peacemaker_author::End;
@@ -38,6 +39,28 @@ struct Epilogue {
 }
 /// Concurrently live SiLU region instances (register slots).
 const SILU_SLOTS: u8 = 4;
+/// `Epi::AddSigmoid`: per-nb gate logit / sigmoid value (one register each,
+/// the region reads its input only in its first op and writes its output in
+/// its last), the gate byte offset, and the four sigmoid slots' temporaries:
+/// slot q owns `SIG_TEMPS + 6q .. +6` (v139..v162; v136..v138 are tok/row/off).
+const SIG_VALUE: u8 = 128;
+const SIG_OFF: u8 = 132;
+const SIG_TEMPS: u8 = 139;
+/// First SGPR of the gate buffer descriptor (past `epi_s`, s64..s87).
+const SIG_SRD: u8 = 88;
+
+/// Registers the sigmoid residual ADD epilogue needs beyond the common plan:
+/// v128..v135 (dead `magic8`), v160..v162 (dead `d_x`/prefetch) and s88..s91.
+pub(crate) fn plan_sigmoid(p: &mut crate::RegPlan) -> Result<(), String> {
+    let epi = || Live::Between(EPI.into(), END.into());
+    p.v::<4>("sig_value", SIG_VALUE, epi())?;
+    p.v::<1>("sig_gate_off", SIG_OFF, epi())?;
+    for r in 160..=162u8 {
+        p.v::<1>("sig_tmp", r, epi())?;
+    }
+    p.s::<4>("srd_gate", SIG_SRD, epi())?;
+    Ok(())
+}
 
 fn layout(g: &Gen) -> Epilogue {
     let e = g.epi_s;
@@ -426,6 +449,126 @@ fn store(
                         ),
                         &[v(t), v(t + 1)],
                         &[v(t), v(t + 1), v(x), v(x + 1)],
+                    )?;
+                }
+            }
+            for (i, &(nb, rg, c)) in order.iter().enumerate() {
+                quad(b, "buffer_store_b128", tmp(i), nb, rg, c, false)?;
+            }
+        }
+        Epi::AddSigmoid => {
+            // Y = fma(sigmoid(gate[token]), 0.0f + acc, Y), hipcc `full_add_v3`
+            // `add == 2` (`iu4_sigmoid_residual`): the `0.0f +` turns an acc of -0
+            // into +0 and the product is one fused rounding, like the incumbent
+            // `sigmoid_scaled_residual_add_batched_f32`'s v_fmac_f32.
+            let gate = g
+                .args
+                .gate
+                .ok_or("the sigmoid residual ADD needs a shared_gate argument")?;
+            let sigmoid = Region::sigmoid()?;
+            if sigmoid.temps > region::SIGMOID_TEMPS {
+                return Err("sigmoid region needs more temporaries than planned".into());
+            }
+            // Gate descriptor: base = shared_gate, N * 4 bytes (tokens >= N read 0
+            // and are never stored: their `tm` lane mask is clear).
+            let d = SIG_SRD;
+            sop(b, format!("s_mov_b32 s{d}, s{gate}"), &[d], &[gate])?;
+            sop(
+                b,
+                format!("s_and_b32 s{}, s{}, 0xffff", d + 1, gate + 1),
+                &[d + 1],
+                &[gate + 1],
+            )?;
+            sop(
+                b,
+                format!("s_lshl_b32 s{}, s{}, 2", d + 2, a.n),
+                &[d + 2],
+                &[a.n],
+            )?;
+            sop(
+                b,
+                format!("s_mov_b32 s{}, 0x31004000", d + 3),
+                &[d + 3],
+                &[],
+            )?;
+            // Byte offset of this lane's first token (bs + tok); column block nb adds 64 B.
+            op(
+                b,
+                format!("v_add_nc_u32_e32 v{SIG_OFF}, s{}, v{}", g.bs, e.tok),
+                &[v(SIG_OFF)],
+                &[s(g.bs), v(e.tok)],
+            )?;
+            op(
+                b,
+                format!("v_lshlrev_b32_e32 v{0}, 2, v{0}", SIG_OFF),
+                &[v(SIG_OFF)],
+                &[v(SIG_OFF)],
+            )?;
+            for nb in 0..4u8 {
+                let val = SIG_VALUE + nb;
+                mem(
+                    b,
+                    format!(
+                        "buffer_load_b32 v{val}, v{SIG_OFF}, s[{d}:{}], null offen{}",
+                        d + 3,
+                        if nb == 0 {
+                            String::new()
+                        } else {
+                            format!(" offset:{}", 64 * u32::from(nb))
+                        }
+                    ),
+                    &[v(val)],
+                    &[v(SIG_OFF), sr(d, 4)],
+                    MemoryClass::VmemLoad,
+                )?;
+            }
+            // Old Y into the dead int32 accumulators, one quad per (nb, rg, c).
+            let tmp = |i: usize| g.cacc + 4 * i as u8;
+            let order: Vec<_> = (0..4)
+                .flat_map(|nb| (0..2).flat_map(move |rg| (0..2).map(move |c| (nb, rg, c))))
+                .collect();
+            for (i, &(nb, rg, c)) in order.iter().enumerate() {
+                quad(b, "buffer_load_b128", tmp(i), nb, rg, c, true)?;
+            }
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+            // Four live sigmoid instances: the logit of column block nb in
+            // v{128+nb}, replaced in place by its sigmoid.
+            let binds: Vec<_> = (0..4u8)
+                .map(|nb| Binding {
+                    g: SIG_VALUE + nb,
+                    u: SIG_VALUE + nb,
+                    out: SIG_VALUE + nb,
+                    temps: (0..region::SIGMOID_TEMPS as u8)
+                        .map(|t| SIG_TEMPS + 6 * nb + t)
+                        .collect(),
+                    masks: vec![],
+                })
+                .collect();
+            region::emit_interleaved(b, &sigmoid, &binds)?;
+            for (i, &(nb, rg, c)) in order.iter().enumerate() {
+                let sig = SIG_VALUE + nb as u8;
+                for p in [0u8, 2] {
+                    let (t, x) = (tmp(i) + p, acc(nb, rg, c) + p);
+                    // x = 0.0f + x (a -0 acc becomes +0), then t = fma(sig, x, t).
+                    op(
+                        b,
+                        format!(
+                            "v_dual_add_f32 v{x}, 0, v{x} :: v_dual_add_f32 v{}, 0, v{}",
+                            x + 1,
+                            x + 1
+                        ),
+                        &[v(x), v(x + 1)],
+                        &[v(x), v(x + 1)],
+                    )?;
+                    op(
+                        b,
+                        format!(
+                            "v_dual_fmac_f32 v{t}, v{x}, v{sig} :: v_dual_fmac_f32 v{}, v{}, v{sig}",
+                            t + 1,
+                            x + 1
+                        ),
+                        &[v(t), v(t + 1)],
+                        &[v(t), v(t + 1), v(x), v(x + 1), v(sig)],
                     )?;
                 }
             }

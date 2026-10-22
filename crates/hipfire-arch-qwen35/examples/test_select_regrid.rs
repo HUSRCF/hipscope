@@ -99,15 +99,15 @@ fn make_rows(rng: &mut Lcg, case: &str, rows: usize, vocab: usize) -> Vec<f32> {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
-    if !gpu.arch_caps.is_gfx1201() {
-        eprintln!("SKIP: test_select_regrid requires exact gfx1201");
+    if !(gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1151()) {
+        eprintln!("SKIP: test_select_regrid requires exact gfx1201 or gfx1151");
         return;
     }
     assert!(
         gpu.select_regrid_enabled(),
-        "re-grid must be enabled on gfx1201 by default"
+        "re-grid must be enabled on gfx1201 / gfx1151 by default"
     );
-    eprintln!("=== selector re-grid parity (gfx1201) ===");
+    eprintln!("=== selector re-grid parity ({}) ===", gpu.arch);
     let mut rng = Lcg(0xD1F7_5E1E);
     let max_rows = 16usize;
     let max_vocab = 248_320usize;

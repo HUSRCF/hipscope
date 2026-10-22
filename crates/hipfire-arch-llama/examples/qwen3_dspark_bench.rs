@@ -181,6 +181,7 @@ fn main() -> Result<(), String> {
         mtp_path: None,
         vision_mode: "auto".to_string(),
         xdna: None,
+        batch_request: Default::default(),
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;
 

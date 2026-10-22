@@ -2982,13 +2982,30 @@ pub fn render_client_events(
     t_ms: u64,
     hold_tool_calls: bool,
 ) {
+    render_client_events_with_logprob(stdout, id, events, t_ms, hold_tool_calls, None);
+}
+
+/// [`render_client_events`] whose token events carry one committed token's
+/// `logprob` / `top_logprobs` fields (`common::token_logprob_fields`).
+fn render_client_events_with_logprob(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    events: &[ClientEvent],
+    t_ms: u64,
+    hold_tool_calls: bool,
+    logprob: Option<&(f64, serde_json::Value)>,
+) {
     for ev in events {
         match ev {
             ClientEvent::Committed { id: tok_id, idx } => {
                 emit_committed_event(stdout, id, *tok_id, *idx, t_ms);
             }
             ClientEvent::Token(text) => {
-                let envelope = qwen_dflash_token_event_value(id, text, active_attempt_id());
+                let mut envelope = qwen_dflash_token_event_value(id, text, active_attempt_id());
+                if let Some((lp, top)) = logprob {
+                    envelope["logprob"] = serde_json::json!(lp);
+                    envelope["top_logprobs"] = top.clone();
+                }
                 let _ = writeln!(stdout, "{}", envelope);
                 let _ = stdout.flush();
             }
@@ -3606,6 +3623,8 @@ pub fn generate_dflash(
             // the drafter keeps its pre-window target/head snapshots reopenable
             // for `repair_terminal_prefix` only when the request may need that.
             stop_sequences: !stop.is_empty(),
+            // The Qwen spec routes emit no logprobs.
+            logprobs: false,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -3641,6 +3660,7 @@ pub fn generate_dflash(
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
+            logprobs_top_k: None,
         },
         temp,
     ) {
@@ -3820,6 +3840,7 @@ pub fn generate_dflash(
                     finish_reason,
                     active_attempt_id(),
                 );
+                spec_retire_done_fields(&mut pending_done, &run);
                 if spec_name == "mtp" {
                     qwen_mtp_done_fields(
                         &mut pending_done,
@@ -3971,6 +3992,7 @@ pub fn generate_dflash(
             "finish_reason": finish_reason,
             "attempt_id": active_attempt_id(),
         });
+        spec_retire_done_fields(&mut pending_done, &run);
         if spec_name == "mtp" {
             qwen_mtp_done_fields(
                 &mut pending_done,
@@ -4035,11 +4057,36 @@ pub fn generate_dflash(
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
     let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
+    let retired = run
+        .spec_retired_at
+        .map(|at| format!(", retired to AR at {at} for {} tok", run.ar_steps))
+        .unwrap_or_default();
     eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows{retired})",
         run.generated, run.spec_cycles
     );
     true
+}
+
+/// Spec → AR retirement on the `done` envelope; absent when the request never
+/// retired. `cycles`/`tau` cover the spec windows only.
+fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
+    if let Some(at) = run.spec_retired_at {
+        done["spec_retired"] = serde_json::Value::Bool(true);
+        done["spec_retired_at"] = serde_json::json!(at);
+        done["ar_tokens"] = serde_json::json!(run.ar_steps);
+    }
+}
+
+/// Break-even line of the spec → AR retirement policy from `HIPFIRE_SPEC_RETIRE`
+/// (see [`hipfire_runtime::spec_retire::parse_break_even`]). A malformed value
+/// turns retirement off and says so, rather than guessing a line.
+fn spec_retire_break_even() -> Option<hipfire_runtime::spec_retire::BreakEven> {
+    let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
+    hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()).unwrap_or_else(|e| {
+        eprintln!("[spec-retire] {e}; retirement off");
+        None
+    })
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -4067,8 +4114,9 @@ pub fn generate_spec(
     emit_req: SpecEmitRequest,
     // Request sampling temperature. >0 only reaches here for speculators that
     // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR, sampled
-    // MTP); greedy drafters ignore it. The daemon's routing gate enforces that
-    // invariant.
+    // MTP) or that sample inside their own verify (Gemma4 EAGLE, configured
+    // through `configure_request`); greedy drafters ignore it. The daemon's
+    // routing gate enforces that invariant.
     temp: f32,
 ) -> Option<SpecRun> {
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
@@ -4468,6 +4516,15 @@ pub fn generate_spec(
     // can reproduce: no tools/grammar, no stop strings, no think budget.
     let promo_shape_ok =
         emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    let logprobs_top_k = emit_req.logprobs_top_k;
+    // Logprob fields of emission token `index` (`tok`), from the target row
+    // the speculator kept for it.
+    let token_logprob = |spec: &dyn Speculator, index: usize, tok: u32| {
+        logprobs_top_k.and_then(|k| {
+            let row = spec.token_logits(index)?;
+            crate::common::token_logprob_fields(row, tok, Some(k), tokenizer)
+        })
+    };
     let promo_started_in_think = matches!(
         emit_req.assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
@@ -4662,12 +4719,13 @@ pub fn generate_spec(
     // first token is itself a terminator (→ skip the spec loop entirely, so
     // spec_step_dflash never drafts a whole block seeded on a terminal token).
     let first_begin = emit.begin(first_token);
-    render_client_events(
+    render_client_events_with_logprob(
         stdout,
         id,
         &first_begin.events,
         t0.elapsed().as_millis() as u64,
         false,
+        token_logprob(spec.as_ref(), 0, first_token).as_ref(),
     );
 
     // Count/bake the first token only when the emitter emitted it (same guard
@@ -4747,6 +4805,15 @@ pub fn generate_spec(
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
+    // Spec → AR retirement (`hipfire_runtime::spec_retire`) for greedy requests
+    // on a speculator with an AR step. It reads token counts only, so a greedy
+    // request retires at the same cycle on every run.
+    let mut retire = hipfire_runtime::spec_retire::SpecRetire::new(
+        (temp <= 1e-6 && spec.supports_ar_step())
+            .then(spec_retire_break_even)
+            .flatten(),
+    );
+    let mut ar_steps = 0usize;
     while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
@@ -4818,6 +4885,7 @@ pub fn generate_spec(
                                     emitted: &emitted,
                                     position,
                                     seed_token,
+                                    seed_emitted: true,
                                     max_tokens,
                                     created_at: t0,
                                     prefill_done_at: t_prefill,
@@ -5028,18 +5096,25 @@ pub fn generate_spec(
         );
         let window_seed = seed_token;
         let mtp_outer_t0 = std::time::Instant::now();
-        let step = match spec_step(
-            pp.as_deref_mut(),
-            gpu,
-            spec.as_mut(),
-            slot,
-            position,
-            seed_token,
-            &emitted,
-            emit.grammar(),
-            temp,
-            max_emit,
-        ) {
+        let ar_step = retire.is_retired();
+        let step_result = if ar_step {
+            spec.ar_step(gpu, slot, position, seed_token)
+                .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
+        } else {
+            spec_step(
+                pp.as_deref_mut(),
+                gpu,
+                spec.as_mut(),
+                slot,
+                position,
+                seed_token,
+                &emitted,
+                emit.grammar(),
+                temp,
+                max_emit,
+            )
+        };
+        let step = match step_result {
             Ok(s) => s,
             Err(e) => {
                 // Authoritative failure: reset+sync first, then one correlated
@@ -5060,8 +5135,12 @@ pub fn generate_spec(
                 return None;
             }
         };
-        spec_cycles += 1;
-        spec_accepted += step.accepted;
+        if ar_step {
+            ar_steps += 1;
+        } else {
+            spec_cycles += 1;
+            spec_accepted += step.accepted;
+        }
         // `emit` is already the committed tail with the seed re-echo stripped.
         let committed_tail = step.emit;
         // Absolute host cursor before this window's commit. Spec.step left
@@ -5127,12 +5206,13 @@ pub fn generate_spec(
             pending_seed_committable = spec_outcome_seed_committable(&outcome);
             if pending_seed_committable {
                 emitted.push(tok);
-                render_client_events(
+                render_client_events_with_logprob(
                     stdout,
                     id,
                     &outcome.events,
                     t0.elapsed().as_millis() as u64,
                     false,
+                    token_logprob(spec.as_ref(), consumed, tok).as_ref(),
                 );
                 generated += 1;
             }
@@ -5190,6 +5270,13 @@ pub fn generate_spec(
         } else {
             host.seed_token
         };
+        if !ar_step && retire.observe(committed_tail.len(), position) {
+            eprintln!(
+                "[spec-retire] id={id} drafter={} retired to AR at position {position} (generated {generated}, {spec_cycles} cycles, tau {:.2})",
+                spec.name(),
+                spec_accepted as f64 / spec_cycles as f64,
+            );
+        }
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
         // target + drafter. Native Qwen4 MTP first tries a window-local repair
@@ -5762,6 +5849,8 @@ pub fn generate_spec(
         generated,
         spec_cycles,
         spec_accepted,
+        spec_retired_at: retire.retired_at(),
+        ar_steps,
         streamed_tokens,
         prefill_tokens_len: prefill_tokens.len(),
         finish,

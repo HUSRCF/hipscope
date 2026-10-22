@@ -5,25 +5,28 @@
 //! Declarative Gemma 4 decoder-layer program.
 //!
 //! Each layer is
-//! `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`:
+//! `[SandwichAttention, GatedMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`:
 //! MoE checkpoints run the parallel dense+expert block, E-series checkpoints
 //! add the per-layer-input branch, and the scale step exists when the learned
 //! layer scalar is not 1. This module only binds resident weights, KV storage
-//! and scratch to the shared `hipfire_dispatch::pipeline::sandwich`
-//! operations; route selection and executor bodies live in dispatch. The same
-//! program serves single-token decode (`rows == 1`) and batched prefill /
-//! verify (`rows > 1`) of every Gemma 4 variant.
+//! and scratch to the shared `hipfire_dispatch::pipeline::sandwich` and
+//! `gated_mlp` operations; route selection and executor bodies live in
+//! dispatch. The same program serves single-token decode (`rows == 1`) and
+//! batched prefill / verify (`rows > 1`) of every Gemma 4 variant.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{self, MoeLayerExtras, MoeScratch, PerLayerBranchWeights};
 use hip_bridge::DeviceBuffer;
 use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::pipeline::gated_mlp::{
+    Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage, RmsNorm,
+};
 use hipfire_dispatch::pipeline::sandwich::{
-    Activation, KvProjection, ParallelMoeMlpOp, PerLayerInputOp, Rope, RopeKind, RoutedExperts,
-    RoutedScratch, SandwichAttentionOp, SandwichKv, SandwichMlpOp, SandwichStream, ScaleOp,
+    KvProjection, KvRoute, ParallelMoeMlpOp, PerLayerInputOp, Rope, RopeKind, RoutedExperts,
+    RoutedScratch, SandwichAttentionOp, SandwichKv, SandwichRoute, SandwichStream, ScaleOp,
     SoftcapOp,
 };
-use hipfire_dispatch::pipeline::{GemvInput, Step};
+use hipfire_dispatch::pipeline::{GemvInput, RowsRoute, Step};
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -531,9 +534,20 @@ impl<'a> ProgramBinding<'a> {
             rows: self.rows,
             hidden: self.geo.dim,
             eps: self.geo.eps,
+            post_eps: self.geo.eps,
             x: self.scratch.x,
             residual: self.scratch.residual,
             normed: self.scratch.normed,
+            out: None,
+            // One row decodes. A batch (prefill or verify share one body)
+            // takes the Wide ladder, which does not tell the two apart.
+            route: if self.rows == 1 {
+                RowsRoute::Decode
+            } else {
+                RowsRoute::Prefill
+            },
+            kernels: SandwichRoute::Wide,
+            bf16: None,
         }
     }
 
@@ -572,50 +586,69 @@ impl<'a> ProgramBinding<'a> {
             q_scale: (attn.head_dim as f32).sqrt(),
             rope: attn.rope,
             kv: SandwichKv {
-                tier: kv.tier_inputs(),
                 k_cache: &kv.k_gpu[kv_slot.slot],
                 v_cache: &kv.v_gpu[kv_slot.slot],
                 physical_cap: kv.physical_cap,
-                givens_cos: kv.givens_cos.as_ref(),
-                givens_sin: kv.givens_sin.as_ref(),
                 window: attn.window,
+                route: KvRoute::Tier {
+                    tier: kv.tier_inputs(),
+                    givens_cos: kv.givens_cos.as_ref(),
+                    givens_sin: kv.givens_sin.as_ref(),
+                    flash_partials: r.flash_partials,
+                },
             },
             pos_buf: r.pos_buf,
             positions: self.positions,
+            gate: None,
             wo: w.o.dispatch_ref(),
-            post_norm: w.post_attn_norm,
+            post_norm: Some(w.post_attn_norm),
             x_rot: sc.attn_rot,
             q: sc.q,
             k: sc.k,
             v: sc.v,
             attn_out: sc.attn_out,
-            flash_partials: r.flash_partials,
         }));
-        let mlp = SandwichMlpOp {
-            stream: self.stream(),
-            pre_norm: w.pre_ffn_norm,
-            w_gate: w.gate.dispatch_ref(),
-            w_up: w.up.dispatch_ref(),
-            w_down: w.down.dispatch_ref(),
+        let mlp = |output| GatedMlpOp {
+            rows: self.rows,
+            hidden: geo.dim,
+            intermediate: w.ffn_hidden_dim,
+            x: sc.x,
+            pre_norm: Some(RmsNorm {
+                weight: w.pre_ffn_norm,
+                eps: geo.eps,
+                normed: sc.normed,
+            }),
+            gate: w.gate.dispatch_ref(),
+            up: w.up.dispatch_ref(),
+            down: w.down.dispatch_ref(),
             activation: Activation::GeluTanh,
-            hidden_dim: w.ffn_hidden_dim,
-            post_norm: w.post_ffn_norm,
-            x_rot: sc.mlp_rot,
-            gate: sc.gate,
-            up: sc.up,
-            act: sc.act,
-            out: sc.mlp_out,
+            storage: MlpStorage::F32,
+            output,
+            ladder: MlpLadder::SandwichWide,
+            scratch: GatedMlpScratch {
+                gate: sc.gate,
+                up: sc.up,
+                act: sc.act,
+                x_rot: sc.mlp_rot,
+            },
         };
         match w.moe {
-            None => steps.push(Step::SandwichMlp(mlp)),
+            None => steps.push(Step::GatedMlp(mlp(MlpOutput::PostNorm {
+                norm: w.post_ffn_norm,
+                eps: geo.eps,
+                out: sc.mlp_out,
+                residual: sc.residual,
+            }))),
             Some(moe) => {
                 let scratch = sc
                     .moe
                     .as_ref()
                     .ok_or_else(|| format!("gemma4 layer {layer_idx}: missing MoE scratch"))?;
                 steps.push(Step::ParallelMoeMlp(ParallelMoeMlpOp {
-                    mlp,
+                    stream: self.stream(),
+                    mlp: mlp(MlpOutput::Write(sc.mlp_out)),
                     dense_post_norm: &moe.post_feedforward_layernorm_1,
+                    post_norm: w.post_ffn_norm,
                     experts: RoutedExperts {
                         pre_norm: &moe.pre_feedforward_layernorm_2,
                         router_norm: &moe.router_scale,
@@ -705,6 +738,7 @@ pub(crate) fn head<'a>(
         k: geo.dim,
         eps: geo.eps,
         rotation: RotationPlan::None,
+        rows: 1,
     });
     steps.push(Step::Gemv {
         w: lm_head,

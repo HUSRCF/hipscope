@@ -972,4 +972,43 @@ mod tests {
         st.v[1][0] = 16;
         assert!(add(&mut st, &mut lds).is_err());
     }
+    // ds_load_b64 rides the generic ds_ load path (width b64 -> 8 bytes): per-lane ADDR plus the
+    // DsOffset immediate, two dwords into the VDST pair, inactive lanes skipped.
+    #[test]
+    fn ds_load_b64_loads_two_dwords_and_skips_inactive_lanes() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1201] {
+            let mut lds = [0u8; 64];
+            for (i, b) in lds.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            let mut st = state();
+            st.exec = 0b01; // lane 1 inactive
+            st.v[2][0] = 4;
+            st.v[2][1] = 16;
+            st.v[0] = [0xdead_beef; 32];
+            st.v[1] = [0xdead_beef; 32];
+            execute(
+                "ds_load_b64",
+                &insn_on(
+                    arch,
+                    "ds_load_b64",
+                    vec![
+                        reg(Kind::V, 0, 2),
+                        reg(Kind::V, 2, 1),
+                        Operand::Imm(ImmField::DsOffset(4)),
+                    ],
+                ),
+                &mut st,
+                &mut Memory::default(),
+                &mut lds,
+            )
+            .unwrap();
+            // Lane 0: effective address 4 + 4 = 8; bytes 08..0f fill both halves.
+            assert_eq!(st.v[0][0], 0x0b0a_0908, "{arch:?}");
+            assert_eq!(st.v[1][0], 0x0f0e_0d0c, "{arch:?}");
+            // Lane 1 inactive: destination pair untouched.
+            assert_eq!(st.v[0][1], 0xdead_beef, "{arch:?}");
+            assert_eq!(st.v[1][1], 0xdead_beef, "{arch:?}");
+        }
+    }
 }

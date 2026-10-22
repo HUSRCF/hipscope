@@ -5,10 +5,11 @@
 //! gfx1100/gfx1151: the A3B 16Q/2K decode fusion; gfx1100/gfx1201:
 //! the Qwen3.6/3.8-27B 24Q/4K decode fusion must produce the same bytes
 //! as the chain it replaces: `deinterleave_f32`, Q/K `rmsnorm_batched`, then
-//! `rope_partial_interleaved_f32` (the half-split partial RoPE). The Qwen3.5
-//! lowered decode uses the fusion and the hand decode
-//! (`HIPFIRE_FORWARD_LOWERED=0`) uses the chain, so any difference makes the
-//! two decode paths diverge. On gfx1100 it did: left to the compiler, the
+//! `rope_partial_interleaved_f32` (the half-split partial RoPE). Qwen3.5
+//! decode runs the fusion where its gate admits the shape and the chain
+//! where it does not (the TriAttention tap, VL mrope,
+//! `HIPFIRE_QWEN35_FA_PREP_FUSE=0`), so any difference makes the same model's
+//! decode depend on that gate. On gfx1100 it did: left to the compiler, the
 //! fused RoPE second output was `fma(x1, cos, x0 * sin)` where the chain
 //! computes `fma(x0, sin, x1 * cos)`.
 //!

@@ -47,13 +47,13 @@
 use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
+use crate::qwen35::prefill::fp8_verify_open;
 use crate::qwen35::prefill::multi::{
     cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi,
     lane_gdn_batch_ready, lane_gdn_varrows_enabled, multi_chunk_pack_cap, multi_chunk_scratch_rows,
     pack_whole_lanes, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
     MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
-use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
@@ -66,6 +66,7 @@ use crate::speculative::{
     SampledWindowDecision, TargetRowsScratch, VerifyScratch,
 };
 use hip_bridge::{HipError, HipResult};
+use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
 use hipfire_runtime::dflash::DflashScratch;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};

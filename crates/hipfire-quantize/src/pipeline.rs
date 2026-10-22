@@ -234,7 +234,6 @@ fn check_moe_expert_down(
     }
     Ok(())
 }
-
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
     m: usize,
@@ -5123,6 +5122,12 @@ fn try_handle_lfm2moe(
                 data: bytes,
                 spilled_len: 0,
             });
+            // The bias rides F32 (precision-sensitive router input), but it is
+            // still a handled tensor: count it or the load-bearing
+            // "param accounting does not close" check refuses the artifact
+            // (caught live quantizing LFM2.5-24B-A2B: 38 MoE layers × 64
+            // experts = 2432 dropped params).
+            *quantized_params += n_elements as u64;
             st_files[file_idx].drop_tensor_pages(name);
             return true;
         }

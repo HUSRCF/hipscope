@@ -41,7 +41,7 @@
 //!
 //! A draft step is one declarative step list: the target-embedding lookup and
 //! its √backbone scale into the first concat half, `Gemv(pre_projection)`, one
-//! query-only `[SandwichAttention, SandwichMlp, Scale?]` block per layer over
+//! query-only `[SandwichAttention, GatedMlp, Scale?]` block per layer over
 //! the target's last cache slot of the matching type (`crate::program`, the
 //! same ops the target runs), the final norm, and `post_projection` straight
 //! into the second concat half (the next step's hidden input). The shared
@@ -980,6 +980,7 @@ fn run_step(
         k: dcfg.hidden,
         eps: dcfg.norm_eps,
         rotation: hipfire_dispatch::types::RotationPlan::None,
+        rows: 1,
     });
     // The next step's hidden half; pre_projection already consumed this one.
     steps.push(Step::Gemv {

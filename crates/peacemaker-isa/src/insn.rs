@@ -275,14 +275,12 @@ impl Vbuffer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wmma {
     Iu4,
-    SwmmacIu4,
     Fp8,
 }
 impl Wmma {
     pub fn mnemonic(self, arch: Arch) -> Result<&'static str, String> {
         match self {
             Self::Iu4 => Ok(arch.wmma_iu4()),
-            Self::SwmmacIu4 if arch.gfx12() => Ok("v_swmmac_i32_16x16x64_iu4"),
             Self::Fp8 if arch == Arch::Gfx1201 => Ok("v_wmma_f32_16x16x16_fp8_fp8"),
             _ => Err("WMMA opcode requires gfx1201".into()),
         }
@@ -330,28 +328,166 @@ impl Wmma {
             uses,
         ))
     }
+    /// Sparse (2:4 structured) WMMA, gfx12 only.
+    ///
+    /// The pinned table rows are `crates/peacemaker-ir/isa/gfx12.tbl` 502-511
+    /// (the ten `v_swmmac_*x32_*` kinds) and 135 (`i32_16x16x64_iu4`); their
+    /// operand column is `SRC0,SRC1,SRC2,VDST`, i.e. SWMMAC has no separate C
+    /// operand: `dst` is read in place as the accumulator, so `dst` is in
+    /// both `defs` and `uses`. `a` is the compressed A operand, `b` the dense
+    /// B operand, `index` the sparsity index VGPR.
+    ///
+    /// Modifier acceptance matrix (probed with ROCm `llvm-mc -mcpu=gfx1201`;
+    /// OP_SEL bit 0 carries `index_key`, bit 2 of `neg_lo`/`neg_hi` is never
+    /// accepted):
+    ///
+    /// | kinds | index_key | neg_lo | neg_hi | clamp |
+    /// |---|---|---|---|---|
+    /// | `F32F16` `F32Bf16` `F16F16` `Bf16Bf16` | 0\|1 | bits 0-1 | bits 0-1 | no |
+    /// | `I32Iu8` `I32Iu4` | 0\|1 | bits 0-1 | no | yes |
+    /// | `I32Iu4X64` | no | bits 0-1 | no | yes |
+    /// | `F32Fp8Fp8` `F32Fp8Bf8` `F32Bf8Fp8` `F32Bf8Bf8` | 0\|1 | no | no | no |
     pub fn swmmac(
         arch: Arch,
-        dst: V<8>,
-        a: V<2>,
-        b: V<4>,
+        kind: Swmmac,
+        dst: RegRef,
+        a: RegRef,
+        b: RegRef,
         index: V<1>,
+        mods: SwmmacMods,
     ) -> Result<Instruction, String> {
         if !arch.gfx12() {
             return Err("SWMMAC requires gfx12".into());
         }
+        let name = kind.mnemonic();
+        let (nd, na, nb) = kind.regs();
+        for (role, reg, n) in [("D", dst, nd), ("A", a, na), ("B", b, nb)] {
+            if reg.kind != Kind::V || reg.len != n {
+                return Err(format!("{name}: {role} requires {n} VGPRs, found {reg}"));
+            }
+        }
+        let class = kind.class();
+        if class == SwmmacClass::Int64 {
+            if mods.index_key != 0 {
+                return Err(format!("{name} has no index_key"));
+            }
+        } else if mods.index_key > 1 {
+            return Err(format!("{name}: index_key must be 0 or 1"));
+        }
+        if mods.neg_lo > 3 || mods.neg_hi > 3 {
+            return Err(format!("{name}: neg_lo/neg_hi bit 2 (C) is not encodable"));
+        }
+        if class == SwmmacClass::Fp8 && mods.neg_lo != 0 {
+            return Err(format!("{name} does not accept neg_lo"));
+        }
+        if class != SwmmacClass::Float16 && mods.neg_hi != 0 {
+            return Err(format!("{name} does not accept neg_hi"));
+        }
+        if class != SwmmacClass::Int32 && class != SwmmacClass::Int64 && mods.clamp {
+            return Err(format!("{name} does not accept clamp"));
+        }
+        let mut text = format!("{name} {dst}, {a}, {b}, {}", index.reg());
+        if mods.index_key == 1 {
+            text.push_str(" index_key:1");
+        }
+        for (label, bits) in [("neg_lo", mods.neg_lo), ("neg_hi", mods.neg_hi)] {
+            if bits != 0 {
+                text.push_str(&format!(" {label}:[{},{},0]", bits & 1, (bits >> 1) & 1));
+            }
+        }
+        if mods.clamp {
+            text.push_str(" clamp");
+        }
         Ok(Instruction::new(
-            format!(
-                "v_swmmac_i32_16x16x64_iu4 {}, {}, {}, {}",
-                dst.reg(),
-                a.reg(),
-                b.reg(),
-                index.reg()
-            ),
-            vec![dst.reg()],
-            vec![a.reg(), b.reg(), index.reg()],
+            text,
+            vec![dst],
+            vec![a, b, index.reg(), dst],
         ))
     }
+}
+/// The SWMMAC opcodes of gfx12 (`v_swmmac_*`), named `{D}{A}{B}` after the
+/// accumulator/A/B element types (`Iu4X64` is the K=64 iu4 row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Swmmac {
+    F32F16,
+    F32Bf16,
+    F16F16,
+    Bf16Bf16,
+    I32Iu8,
+    I32Iu4,
+    I32Iu4X64,
+    F32Fp8Fp8,
+    F32Fp8Bf8,
+    F32Bf8Fp8,
+    F32Bf8Bf8,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwmmacClass {
+    Float16,
+    Int32,
+    Int64,
+    Fp8,
+}
+impl Swmmac {
+    pub const ALL: [Swmmac; 11] = [
+        Self::F32F16,
+        Self::F32Bf16,
+        Self::F16F16,
+        Self::Bf16Bf16,
+        Self::I32Iu8,
+        Self::I32Iu4,
+        Self::I32Iu4X64,
+        Self::F32Fp8Fp8,
+        Self::F32Fp8Bf8,
+        Self::F32Bf8Fp8,
+        Self::F32Bf8Bf8,
+    ];
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Self::F32F16 => "v_swmmac_f32_16x16x32_f16",
+            Self::F32Bf16 => "v_swmmac_f32_16x16x32_bf16",
+            Self::F16F16 => "v_swmmac_f16_16x16x32_f16",
+            Self::Bf16Bf16 => "v_swmmac_bf16_16x16x32_bf16",
+            Self::I32Iu8 => "v_swmmac_i32_16x16x32_iu8",
+            Self::I32Iu4 => "v_swmmac_i32_16x16x32_iu4",
+            Self::I32Iu4X64 => "v_swmmac_i32_16x16x64_iu4",
+            Self::F32Fp8Fp8 => "v_swmmac_f32_16x16x32_fp8_fp8",
+            Self::F32Fp8Bf8 => "v_swmmac_f32_16x16x32_fp8_bf8",
+            Self::F32Bf8Fp8 => "v_swmmac_f32_16x16x32_bf8_fp8",
+            Self::F32Bf8Bf8 => "v_swmmac_f32_16x16x32_bf8_bf8",
+        }
+    }
+    /// VGPR counts `(dst, a, b)`; the sparse index is always one VGPR.
+    pub fn regs(self) -> (u8, u8, u8) {
+        match self {
+            Self::F32F16 | Self::F32Bf16 => (8, 4, 8),
+            Self::F16F16 | Self::Bf16Bf16 => (4, 4, 8),
+            Self::I32Iu8 => (8, 2, 4),
+            Self::I32Iu4 => (8, 1, 2),
+            Self::I32Iu4X64 => (8, 2, 4),
+            Self::F32Fp8Fp8 | Self::F32Fp8Bf8 | Self::F32Bf8Fp8 | Self::F32Bf8Bf8 => (8, 2, 4),
+        }
+    }
+    fn class(self) -> SwmmacClass {
+        match self {
+            Self::F32F16 | Self::F32Bf16 | Self::F16F16 | Self::Bf16Bf16 => SwmmacClass::Float16,
+            Self::I32Iu8 | Self::I32Iu4 => SwmmacClass::Int32,
+            Self::I32Iu4X64 => SwmmacClass::Int64,
+            Self::F32Fp8Fp8 | Self::F32Fp8Bf8 | Self::F32Bf8Fp8 | Self::F32Bf8Bf8 => {
+                SwmmacClass::Fp8
+            }
+        }
+    }
+}
+/// SWMMAC modifiers: `index_key` (0|1, OP_SEL bit 0), `neg_lo`/`neg_hi`
+/// (bit 0 = A, bit 1 = B; bit 2 is never encodable) and `clamp`. Which are
+/// legal depends on the kind; see [`Wmma::swmmac`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwmmacMods {
+    pub index_key: u8,
+    pub neg_lo: u8,
+    pub neg_hi: u8,
+    pub clamp: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ds {

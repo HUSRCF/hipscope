@@ -1154,6 +1154,11 @@ impl Qwen4Bundle {
         if self.state.row_capture_armed {
             return Err("speculative row capture armed");
         }
+        // S1 lowers its own layer-major steps, which the DFlash2 layer
+        // capture never hooks: the draft would read stale feature rows.
+        if self.dflash.is_some() {
+            return Err("DFlash2 target-layer capture armed");
+        }
         if self.state.snapshot_active() {
             return Err("an outstanding state snapshot ticket");
         }

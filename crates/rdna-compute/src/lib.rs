@@ -41,6 +41,8 @@ pub mod gdn_chunk_prep_pm;
 mod gdn_q8ef_reference;
 pub mod gemm;
 mod gemm_fp8_verify;
+mod gemm_mq6_fp8;
+mod gemm_mq6_i8;
 mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
@@ -101,6 +103,7 @@ pub use gemm_fp8_verify::{
     fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget,
     Fp8VerifyTile, Fp8VerifyX,
 };
+pub use gemm_mq6_fp8::Mq6Fp8Arm;
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation,
     Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,

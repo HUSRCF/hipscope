@@ -36,6 +36,14 @@
 //!    history, `state.position`) themselves, exactly as the singleton route
 //!    does; commit never touches device state.
 //!
+//! Under an attached expert-parallel mesh every mutating entry below runs the
+//! identical call on every rank (rank 0 on the caller's thread, peers on
+//! their workers; `Qwen4Bundle::ep_lane_*`), and the host results (drafts,
+//! step output, advances, errors) must agree across ranks. `forward_step`
+//! shares the MoE row-gather barrier, so any failure there poisons the mesh;
+//! the host-only entries report an error every rank agreed on without
+//! poisoning it.
+//!
 //! Invariants of the lane plan (PLAN §3.2), and how each is enforced:
 //!
 //! - I1 (`state.position == mtp.position`): AR lanes carry no MTP state; the
@@ -104,7 +112,7 @@ pub enum LaneRoute {
 }
 
 /// One lane's routed window, as `draft_step` returns it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneDraft {
     pub epoch: RequestEpoch,
     pub route: LaneRoute,
@@ -121,7 +129,7 @@ pub(crate) struct StepKey {
 }
 
 impl StepKey {
-    fn of(plan: &BatchStepPlan) -> Self {
+    pub(crate) fn of(plan: &BatchStepPlan) -> Self {
         Self {
             rows: plan
                 .requests
@@ -143,28 +151,28 @@ pub(crate) enum LanePhase {
 }
 
 impl LanePhase {
-    fn check_idle(&self) -> Result<(), String> {
+    pub(crate) fn check_idle(&self) -> Result<(), String> {
         match self {
             Self::Idle => Ok(()),
             _ => Err("provision_step: previous step not committed or aborted".to_string()),
         }
     }
 
-    fn check_draft(&self) -> Result<(), String> {
+    pub(crate) fn check_draft(&self) -> Result<(), String> {
         match self {
             Self::Idle => Ok(()),
             _ => Err("draft_step: previous step not committed or aborted".to_string()),
         }
     }
 
-    fn check_forward(&self, key: &StepKey) -> Result<(), String> {
+    pub(crate) fn check_forward(&self, key: &StepKey) -> Result<(), String> {
         match self {
             Self::Provisioned(provisioned) if provisioned == key => Ok(()),
             _ => Err("forward_step: plan was not provisioned".to_string()),
         }
     }
 
-    fn check_commit(&self, key: &StepKey, step_id: u64) -> Result<(), String> {
+    pub(crate) fn check_commit(&self, key: &StepKey, step_id: u64) -> Result<(), String> {
         match self {
             Self::Forwarded(forwarded, id) if forwarded == key && *id == step_id => Ok(()),
             _ => Err("commit_step: output does not belong to the forwarded plan".to_string()),
@@ -187,7 +195,7 @@ struct SpecView<'a> {
 }
 
 /// What plan validation reads of one lane.
-struct LaneView<'a> {
+pub(crate) struct LaneView<'a> {
     slot: usize,
     host: &'a LaneHost,
     /// `state.position`: the next row's absolute position.
@@ -198,7 +206,7 @@ struct LaneView<'a> {
     spec: Option<SpecView<'a>>,
 }
 
-fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
+pub(crate) fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
     LaneView {
         slot: lane.host.slot,
         host: &lane.host,
@@ -216,16 +224,16 @@ fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
 }
 
 #[derive(Clone, Copy)]
-struct PlanLimits {
-    max_lanes: usize,
-    row_budget: usize,
+pub(crate) struct PlanLimits {
+    pub(crate) max_lanes: usize,
+    pub(crate) row_budget: usize,
 }
 
 /// Every host-only check of `provision_step`. `view` finds a live lane by
 /// epoch; `prefill_len` is the singleton tile length at the lane's
 /// `prefilled`. Returns each request's end position (`state.position +
 /// rows`), in plan order.
-fn validate_plan<'a>(
+pub(crate) fn validate_plan<'a>(
     plan: &BatchStepPlan,
     limits: PlanLimits,
     view: impl Fn(&RequestEpoch) -> Option<LaneView<'a>>,
@@ -465,7 +473,7 @@ fn validate_plan<'a>(
 
 /// Whether `r` ends in a greedy pick: a decode row (AR or Verify), or the
 /// tile that completes the prompt.
-fn wants_pick(host: &LaneHost, r: &RequestRows) -> bool {
+pub(crate) fn wants_pick(host: &LaneHost, r: &RequestRows) -> bool {
     match r.kind {
         RequestStepKind::Ar | RequestStepKind::Verify { .. } => true,
         RequestStepKind::Prefill => host.prefilled + r.rows.len == host.prompt.len(),
@@ -475,7 +483,7 @@ fn wants_pick(host: &LaneHost, r: &RequestRows) -> bool {
 
 /// Lane bookkeeping of one committed AR or Prefill request; returns the
 /// committed id.
-fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Option<u32> {
+pub(crate) fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Option<u32> {
     let picks = wants_pick(host, r);
     if r.kind == RequestStepKind::Prefill {
         host.prefilled += r.rows.len;
@@ -505,18 +513,6 @@ fn commit_verify(host: &mut LaneHost, committed: &[u32]) -> Option<u32> {
 /// staged [`Qwen4LaneStore`].
 pub struct Qwen4LaneExecutor<'a> {
     pub(crate) bundle: &'a mut Qwen4Bundle,
-}
-
-/// Lane (continuous-batch) steps do not run under expert parallelism; every
-/// executor entry refuses before it touches any lane state.
-fn refuse_expert_parallel(bundle: &Qwen4Bundle) -> Result<(), String> {
-    if bundle.weights.ep_placement().is_some() {
-        return Err(
-            "Qwen4 lane steps do not run under expert parallelism (EP is one-row decode and chunk forwards only)"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 impl Qwen4LaneExecutor<'_> {
@@ -557,7 +553,17 @@ impl Qwen4LaneExecutor<'_> {
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
     ) -> Result<Vec<LaneDraft>, String> {
-        refuse_expert_parallel(self.bundle)?;
+        if self.bundle.ep.is_some() {
+            return self.bundle.ep_lane_draft_step(gpu, requests);
+        }
+        self.draft_step_local(gpu, requests)
+    }
+
+    fn draft_step_local(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+    ) -> Result<Vec<LaneDraft>, String> {
         let mut store = self
             .bundle
             .lanes
@@ -585,7 +591,13 @@ impl Qwen4LaneExecutor<'_> {
     /// arenas (an MTP lane's head arenas too) through the step's end
     /// position. Mapping happens here, never inside a forward (I4).
     pub fn provision_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
-        refuse_expert_parallel(self.bundle)?;
+        if self.bundle.ep.is_some() {
+            return self.bundle.ep_lane_provision_step(gpu, plan);
+        }
+        self.provision_step_local(gpu, plan)
+    }
+
+    fn provision_step_local(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
         let ends = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
@@ -646,18 +658,29 @@ impl Qwen4LaneExecutor<'_> {
     /// ([`LANE_MAX_ROWS`] rows), or the configured `k` if larger, not `k`
     /// alone. Mapping only grows capacity (no position or length commits) and
     /// `provision_step` still maps the actual step end on demand. Best effort:
-    /// a failure (or an expert-parallel bundle, an unknown / non-Decoding
-    /// lane, a zero budget) is logged / skipped and `provision_step` grows on
-    /// demand as before.
+    /// a failure (or an unknown / non-Decoding lane, a zero budget) is logged /
+    /// skipped and `provision_step` grows on demand as before. Under EP every
+    /// rank maps its own lane copy.
     pub fn map_ahead_decode(
         &mut self,
         gpu: &mut Gpu,
         epoch: &RequestEpoch,
         remaining_new_tokens: usize,
     ) {
-        if refuse_expert_parallel(self.bundle).is_err() {
+        if self.bundle.ep.is_some() {
+            self.bundle
+                .ep_lane_map_ahead_decode(gpu, epoch, remaining_new_tokens);
             return;
         }
+        self.map_ahead_decode_local(gpu, epoch, remaining_new_tokens);
+    }
+
+    fn map_ahead_decode_local(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+        remaining_new_tokens: usize,
+    ) {
         let Some(store) = self.bundle.lanes.as_mut() else {
             return;
         };
@@ -713,7 +736,17 @@ impl Qwen4LaneExecutor<'_> {
         gpu: &mut Gpu,
         plan: &BatchStepPlan,
     ) -> Result<StepOutput, String> {
-        refuse_expert_parallel(self.bundle)?;
+        if self.bundle.ep.is_some() {
+            return self.bundle.ep_lane_forward_step(gpu, plan);
+        }
+        self.forward_step_local(gpu, plan)
+    }
+
+    fn forward_step_local(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<StepOutput, String> {
         let key = StepKey::of(plan);
         let store = self
             .bundle
@@ -751,6 +784,18 @@ impl Qwen4LaneExecutor<'_> {
     /// anything. A Verify request advances by its window's committed tokens
     /// (`committed_ids`, `accepted_drafts`, `verified_rows = drafts + 1`).
     pub fn commit_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+        output: StepOutput,
+    ) -> Result<Vec<RequestAdvance>, String> {
+        if self.bundle.ep.is_some() {
+            return self.bundle.ep_lane_commit_step(gpu, plan, output);
+        }
+        self.commit_step_local(gpu, plan, output)
+    }
+
+    fn commit_step_local(
         &mut self,
         _gpu: &mut Gpu,
         plan: &BatchStepPlan,
@@ -839,6 +884,14 @@ impl Qwen4LaneExecutor<'_> {
     /// half-advanced), its pending window dropped, and the executor returns
     /// to idle.
     pub fn abort_step(&mut self, plan: &BatchStepPlan) {
+        if self.bundle.ep.is_some() {
+            self.bundle.ep_lane_abort_step(plan);
+            return;
+        }
+        self.abort_step_local(plan);
+    }
+
+    fn abort_step_local(&mut self, plan: &BatchStepPlan) {
         if let Some(store) = self.bundle.lanes.as_mut() {
             for r in &plan.requests {
                 store.poison(&r.epoch);
@@ -857,7 +910,7 @@ struct Entry<'a> {
     dec: Option<usize>,
 }
 
-fn pick_at(host: &[u8], row: usize) -> u32 {
+pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     let b = &host[row * 4..row * 4 + 4];
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
 }

@@ -3334,14 +3334,8 @@ pub(crate) fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
 
 // ─── State ──────────────────────────────────────────────────────────────
 
-/// Persistent state for DeltaNet layers across tokens.
 /// State quantization mode for DeltaNet S matrix.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum StateQuant {
-    FP32,
-    Q8,
-    Q4,
-}
+pub use hipfire_dispatch::ops::delta_net::StateQuant;
 
 /// Whether a `quant` DeltaNet state carries the per-element f16 error-feedback
 /// residual (Q8 only; `HIPFIRE_DN_STATE_EF=0` opts out).
@@ -3429,6 +3423,7 @@ impl DeltaNetStateGeometry for DeltaNetStatePlan {
     }
 }
 
+/// Persistent state for DeltaNet layers across tokens.
 pub struct DeltaNetState {
     /// S matrix storage — FP32 or Q8 depending on quant mode
     pub s_matrices: Vec<GpuTensor>,

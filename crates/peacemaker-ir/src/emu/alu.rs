@@ -862,6 +862,11 @@ fn vector(
         "v_max_i32" => (Class::Int, (raw(0)? as i32).max(raw(1)? as i32) as u32),
         "v_min_u32" => (Class::Int, raw(0)?.min(raw(1)?)),
         "v_max_u32" => (Class::Int, raw(0)?.max(raw(1)?)),
+        // D.u = (S0.u & S1.u) | (~S0.u & S2.u): S0 is the mask (1 selects S1,
+        // 0 selects S2). AMD RDNA ISA pseudocode (`V_BFI_B32`); the rdna4 row in
+        // this repo's decode (`isa/gfx12.tbl`, `v_bfi_b32 v5, v3, 0, 32`) matches
+        // with S0=v3, S1=0, S2=32, giving D = ~v3 & 32.
+        "v_bfi_b32" => (Class::Int, (raw(0)? & raw(1)?) | (!raw(0)? & raw(2)?)),
         "v_bfe_u32" => {
             let width = raw(2)? & 31;
             (
@@ -874,7 +879,6 @@ fn vector(
             )
         }
         "v_perm_b32" => {
-            // BYTE_PERMUTE({S0,S1}, sel): 0..7 bytes, 8..11 sign of bytes 1/3/5/7, 12 zero, >=13 0xff.
             let (a, b, c) = (raw(0)?, raw(1)?, raw(2)?);
             let bytes = (u64::from(b) | (u64::from(a) << 32)).to_le_bytes();
             let sign = |byte: u8| if byte & 0x80 != 0 { 0xff } else { 0 };
@@ -1868,10 +1872,29 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             "le" => Pred::Le,
             _ => return Err(format!("unsupported scalar compare {name}")),
         };
-        let (a, b) = (rd(s, 0)?, rd(s, 1)?);
         s.scc = match ty {
-            "u32" => ord_test(p, a, b),
-            "i32" => ord_test(p, a as i32, b as i32),
+            "u32" => {
+                let (a, b) = (rd(s, 0)?, rd(s, 1)?);
+                ord_test(p, a, b)
+            }
+            "i32" => {
+                let (a, b) = (rd(s, 0)?, rd(s, 1)?);
+                ord_test(p, a as i32, b as i32)
+            }
+            // SOPC 64-bit rows (`s_cmp_eq_u64`, `s_cmp_lg_u64`): SSRC0/SSRC1 are
+            // register pairs, SCC = the 64-bit predicate (a low-word-only compare
+            // would miss differences above bit 32).
+            "u64" => {
+                let (a, b) = (
+                    s.read_wide(
+                        o.first().ok_or("missing scalar operand")?,
+                        0,
+                        Wide::Unsigned,
+                    )?,
+                    s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?,
+                );
+                ord_test(p, a, b)
+            }
             _ => return Err(format!("unsupported scalar compare {name}")),
         }
         .ok_or_else(|| format!("unsupported scalar compare {name}"))?;
@@ -2472,6 +2495,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scalar_u64_compares_use_both_words() {
+        // `s_cmp_lg_u64`: SCC = (S0.u64 != S1.u64) over the full pair. The low
+        // words alone would call the first row equal (both 1); the high words
+        // differ, so SCC must be true.
+        let i = insn_on(
+            Arch::Gfx1201,
+            "s_cmp_lg_u64",
+            vec![pair(Kind::S, 0), pair(Kind::S, 2)],
+        );
+        let mut st = state();
+        st.s[0] = 1;
+        st.s[1] = 2;
+        st.s[2] = 1;
+        st.s[3] = 3;
+        st.scc = false;
+        execute(Arch::Gfx1201, "s_cmp_lg_u64", &i, &mut st).unwrap();
+        assert!(st.scc);
+        let mut st = state();
+        st.s[0] = 0xffff_ffff;
+        st.s[1] = 1;
+        st.s[2] = 0xffff_ffff;
+        st.s[3] = 1;
+        st.scc = true;
+        execute(Arch::Gfx1201, "s_cmp_lg_u64", &i, &mut st).unwrap();
+        assert!(!st.scc);
+        // `s_cmp_eq_u64` rides the same `s_cmp_` prefix arm: equal 64-bit pairs
+        // set SCC, and a difference above bit 32 clears it.
+        let i = insn_on(
+            Arch::Gfx1201,
+            "s_cmp_eq_u64",
+            vec![pair(Kind::S, 0), pair(Kind::S, 2)],
+        );
+        let mut st = state();
+        st.s[0] = 7;
+        st.s[1] = 0x8000_0000;
+        st.s[2] = 7;
+        st.s[3] = 0x8000_0000;
+        execute(Arch::Gfx1201, "s_cmp_eq_u64", &i, &mut st).unwrap();
+        assert!(st.scc);
+        st.s[3] = 0x8000_0001;
+        execute(Arch::Gfx1201, "s_cmp_eq_u64", &i, &mut st).unwrap();
+        assert!(!st.scc);
+    }
+
+    #[test]
+    fn vector_bfi_selects_bits_by_mask_with_inactive_lanes_kept() {
+        // `v_bfi_b32`: D = (S0 & S1) | (~S0 & S2). Nibble insert checked by hand:
+        // S0 = 0x0000ff00, S1 = 0x0000ab00, S2 = 0x12345678 -> 0x1234ab78.
+        // Lane 1 is inactive: it keeps its register and contributes no write.
+        let i = insn_on(Arch::Gfx1201, "v_bfi_b32", vec![v(0), v(1), v(2), v(3)]);
+        let mut st = state();
+        st.exec = 0b01;
+        st.v[0][1] = 0xdead_beef;
+        for lane in 0..2 {
+            st.v[1][lane] = 0x0000_ff00;
+            st.v[2][lane] = 0x0000_ab00;
+            st.v[3][lane] = 0x1234_5678;
+        }
+        execute(Arch::Gfx1201, "v_bfi_b32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x1234_ab78);
+        assert_eq!(st.v[0][1], 0xdead_beef);
+        // Full-mask and empty-mask corners: bit-picked corners of the same rule.
+        st.v[1][0] = u32::MAX;
+        st.v[2][0] = 0xaaaa_5555;
+        st.v[3][0] = 0x1234_5678;
+        execute(Arch::Gfx1201, "v_bfi_b32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xaaaa_5555);
+        st.v[1][0] = 0;
+        execute(Arch::Gfx1201, "v_bfi_b32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x1234_5678);
     }
 
     #[test]
@@ -4102,6 +4198,51 @@ mod tests {
     }
 
     #[test]
+    fn scalar_subtract_borrows_wrap_and_chain_through_scc() {
+        // gfx1100/gfx1151 spell the pair `s_sub_u32`/`s_subb_u32`; gfx12 renames
+        // the same opcodes `s_sub_co_u32`/`s_sub_co_ci_u32`. Hand-computed rows:
+        // D = (S0 - S1 - borrow_in) mod 2^32, SCC = (S1 + borrow_in > S0).
+        for (arch, no_in, with_in) in [
+            (Arch::Gfx1100, "s_sub_u32", "s_subb_u32"),
+            (Arch::Gfx1151, "s_sub_u32", "s_subb_u32"),
+            (Arch::Gfx1201, "s_sub_co_u32", "s_sub_co_ci_u32"),
+        ] {
+            // No borrow: 5 - 3 = 2, SCC clear.
+            assert_eq!(
+                scalar_on(arch, no_in, &[5, 3], 0xdead_beef, true),
+                Ok((2, false))
+            );
+            // Wrap: 3 - 5 = 0xfffffffe, SCC set (borrow-out).
+            assert_eq!(
+                scalar_on(arch, no_in, &[3, 5], 0, false),
+                Ok((0xffff_fffe, true))
+            );
+            // Equal operands: 0 with SCC clear.
+            assert_eq!(scalar_on(arch, no_in, &[7, 7], 9, true), Ok((0, false)));
+            // Incoming SCC is ignored by the no-borrow form: 0 - 0 - 0 = 0.
+            assert_eq!(scalar_on(arch, no_in, &[0, 0], 9, true), Ok((0, false)));
+            // Borrow-in chain: 5 - 3 - 1 = 1, SCC clear.
+            assert_eq!(scalar_on(arch, with_in, &[5, 3], 0, true), Ok((1, false)));
+            // Borrow-in underflow: 3 - 3 - 1 = 0xffffffff, SCC set.
+            assert_eq!(
+                scalar_on(arch, with_in, &[3, 3], 0, true),
+                Ok((0xffff_ffff, true))
+            );
+            // Widened borrow compare: S1 = u32::MAX with borrow-in still
+            // borrows (0 - 0xffffffff - 1 = 0, SCC set).
+            assert_eq!(
+                scalar_on(arch, with_in, &[0, 0xffff_ffff], 0, true),
+                Ok((0, true))
+            );
+            // Borrow-in clear behaves like the plain form.
+            assert_eq!(
+                scalar_on(arch, with_in, &[3, 5], 0, false),
+                Ok((0xffff_fffe, true))
+            );
+        }
+    }
+
+    #[test]
     fn scalar_sext_nor_bitset_and_pack_follow_the_isa_pseudocode() {
         for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
             // D = signext(S0[7:0]); SCC is untouched.
@@ -4780,6 +4921,93 @@ mod tests {
         assert_eq!(st.vcc, 0b10);
     }
 
+    #[test]
+    fn subrev_nc_subtracts_reversed_with_inactive_lanes_kept() {
+        // `v_subrev_nc_u32_e32`: D = S1 - S0 (reversed). Hand-computed: lane 0
+        // is 10 - 4 = 6; lane 2 wraps, 3 - 5 = 0xfffffffe. Lane 1 is inactive:
+        // it keeps its register and contributes no write.
+        let i = insn_on(Arch::Gfx1201, "v_subrev_nc_u32_e32", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 0b101;
+        st.v[0][1] = 0xdead_beef;
+        (st.v[1][0], st.v[2][0]) = (4, 10);
+        (st.v[1][1], st.v[2][1]) = (1, 2);
+        (st.v[1][2], st.v[2][2]) = (5, 3);
+        execute(Arch::Gfx1201, "v_subrev_nc_u32_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 6);
+        assert_eq!(st.v[0][1], 0xdead_beef);
+        assert_eq!(st.v[0][2], 0xffff_fffe);
+    }
+
+    #[test]
+    fn signed_gt_i64_uses_all_64_bits_with_vcc_sgpr_and_exec() {
+        // `v_cmp_gt_i64` is signed: lane rows cross bit 32 and the sign bit so
+        // a low-word-only or unsigned compare would misorder them.
+        let lanes = [
+            (0x1_0000_0000u64, 0xffff_ffffu64), // +2^32 > -1 signed
+            (0xffff_ffffu64, 0x1_0000_0000u64), // -1 < +2^32 signed
+            (i64::MIN as u64, 0),               // most negative loses
+            (0, i64::MIN as u64),               // zero beats most negative
+            (i64::MAX as u64, -1i64 as u64),    // most positive beats -1
+            (-1i64 as u64, i64::MAX as u64),    // -1 loses to most positive
+            (7u64, 7u64),                       // equal is not greater
+        ];
+        let m = |f: &dyn Fn(u64, u64) -> bool| {
+            lanes
+                .iter()
+                .enumerate()
+                .map(|(l, (a, b))| u32::from(f(*a, *b)) << l)
+                .sum::<u32>()
+        };
+        let want = m(&|a, b| (a as i64) > (b as i64));
+        // VOPC (implicit VCC) and VOP3 (explicit SGPR dst) agree bit-for-bit.
+        let e32 = vec![
+            Operand::Special(Special::VccLo),
+            pair(Kind::V, 4),
+            pair(Kind::V, 6),
+        ];
+        assert_eq!(
+            cmp64("v_cmp_gt_i64_e32", Arch::Gfx1201, &lanes, e32).map(|r| r.1),
+            Ok(want)
+        );
+        let e64 = vec![pair(Kind::S, 10), pair(Kind::V, 4), pair(Kind::V, 6)];
+        assert_eq!(
+            cmp64("v_cmp_gt_i64_e64", Arch::Gfx1201, &lanes, e64).map(|r| r.0),
+            Ok(want)
+        );
+        // EXEC-masked: lane 1 disabled by EXEC writes a zero bit, so the VOP3
+        // SGPR result and the VOPC VCC result both read 0b01.
+        let i = insn_on(
+            Arch::Gfx1201,
+            "v_cmp_gt_i64_e64",
+            vec![pair(Kind::S, 10), pair(Kind::V, 4), pair(Kind::V, 6)],
+        );
+        let mut st = state();
+        st.exec = 0b01;
+        set64(&mut st, 4, 0, 5);
+        set64(&mut st, 6, 0, 3);
+        set64(&mut st, 4, 1, 9);
+        set64(&mut st, 6, 1, 1);
+        execute(Arch::Gfx1201, "v_cmp_gt_i64_e64", &i, &mut st).unwrap();
+        assert_eq!(st.s[10], 0b01);
+        let i = insn_on(
+            Arch::Gfx1201,
+            "v_cmp_gt_i64_e32",
+            vec![
+                Operand::Special(Special::VccLo),
+                pair(Kind::V, 4),
+                pair(Kind::V, 6),
+            ],
+        );
+        let mut st = state();
+        st.exec = 0b01;
+        set64(&mut st, 4, 0, 5);
+        set64(&mut st, 6, 0, 3);
+        set64(&mut st, 4, 1, 9);
+        set64(&mut st, 6, 1, 1);
+        execute(Arch::Gfx1201, "v_cmp_gt_i64_e32", &i, &mut st).unwrap();
+        assert_eq!(st.vcc, 0b01);
+    }
     #[test]
     fn sixteen_bit_and_float_predicate_compares_cover_nan_and_signedness() {
         let half_cmp = |arch: Arch,

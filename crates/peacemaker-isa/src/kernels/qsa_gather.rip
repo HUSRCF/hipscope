@@ -2,6 +2,10 @@
 // Both targets and both kernel kinds share these compile-time tiles and helpers.
 // Instructions carry explicit defs/uses; LDS handoffs and waits go through
 // peacemaker-author's sealed runtime driver, then object-level certification.
+
+/// The `check` channel: variant names and target arches (front-door discovery).
+pub const VARIANTS: &[&str] = &["Convert", "Attend"];
+pub const ARCHES: &[&str] = &["gfx1151", "gfx1201"];
 pub const P_BASE: u32 = 0;
 pub const Q_BASE: u32 = 0x2000;
 pub const RED_BASE: u32 = 0x4000;

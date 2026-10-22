@@ -1752,7 +1752,7 @@ fn down_stage(
     if sym_iu4(gpu, p, use_path2) {
         // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
         // grouped IU4 down, BF16 per grouped row for the BF16-input combine.
-        let xq = hip(gpu.qwen4_moe_rotate128_i4(
+        let xq = hip(gpu.qwen4_moe_rotate128_i4_gp(
             p.y_gate_up_grouped,
             p.sorted_slot_index,
             p.down_k,

@@ -233,6 +233,7 @@ fn run() -> R<()> {
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         xdna: None,
+        batch_request: Default::default(),
     };
     let mut b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     if !gpu.mq4v2_symmetric || b.weights.output.gpu_dtype != DType::MQ4G256V2 {

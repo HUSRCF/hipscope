@@ -239,7 +239,16 @@ pub struct Modifiers {
     pub clause: Option<u8>,
 }
 impl Modifiers {
-    pub fn append_text_suffix(&self, out: &mut String) {
+    /// Append the modifier suffix text for the row named `name`.
+    /// SWMMAC rows carry the sparse-index half select in OP_SEL bit 0 and
+    /// spell it `index_key:1` (before `neg_lo`); they never print `op_sel:`,
+    /// and the all-ones `op_sel_hi` that every SWMMAC word carries by default
+    /// is implied, as in `llvm-mc`.
+    pub fn append_text_suffix(&self, out: &mut String, name: &str) {
+        let swmmac = name.starts_with("v_swmmac_");
+        if swmmac && self.op_sel & 1 != 0 {
+            out.push_str(" index_key:1");
+        }
         if self.neg_lo != 0 {
             write!(
                 out,
@@ -260,7 +269,7 @@ impl Modifiers {
             )
             .expect("String write");
         }
-        if self.op_sel != 0 {
+        if self.op_sel != 0 && !swmmac {
             write!(
                 out,
                 " op_sel:[{},{},{}]",
@@ -270,7 +279,7 @@ impl Modifiers {
             )
             .expect("String write");
         }
-        if self.op_sel_hi != 0 {
+        if self.op_sel_hi != 0 && !(swmmac && self.op_sel_hi == 7) {
             write!(
                 out,
                 " op_sel_hi:[{},{},{}]",

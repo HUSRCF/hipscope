@@ -68,6 +68,7 @@ impl<'a> LayerRefs<'a> {
                 k: wq.k,
                 eps,
                 rotation: dtype_rotation_plan(wq.dtype),
+                rows: 1,
             },
             Step::Gemv {
                 w: wq,
@@ -101,6 +102,7 @@ impl<'a> LayerRefs<'a> {
                     k,
                     eps,
                     rotation: RotationPlan::None,
+                    rows: 1,
                 });
             }
         }
@@ -268,6 +270,7 @@ pub(crate) fn head_steps<'a>(
             eps: cfg.rms_norm_eps,
             // Plain norm: the Raw LM-head GEMV rotates its own input.
             rotation: RotationPlan::None,
+            rows: 1,
         },
         Step::Gemv {
             w: lm_head,

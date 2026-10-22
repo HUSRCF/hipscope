@@ -136,6 +136,33 @@ Manual VGPR granule padding is **not required by RegPlan or the emitter**: the e
 
 `Chain::new(dst:u8,width:u8,kind:str) -> Chain` describes a WMMA accumulator; width must be 8 and kind `"f16"` or `"bf16"`. Example `let c = Chain::new(0,8,"f16");`. `c.step(b,a:u8,aw:u8,b:u8,bw:u8) -> Result<(),String>` emits the kind's `v_wmma_f32_16x16x16_*` using and redefining its accumulator; example `c.step(wg.isa(),8,8,16,8)?;` on gfx11. Operand widths must match the architecture (eight on gfx11, four on gfx12); initialize the accumulator before its first step. The item keyword `chain` merely defines a function and is unrelated to this native Chain value.
 
+`Wmma::swmmac(arch, kind: Swmmac, dst, a, b, index: RegRef, mods: SwmmacMods) -> Result<Instruction,String>` builds a gfx12 sparse (2:4) WMMA; push it with `wg.isa().push(..)?`. `kind` is `Swmmac::<Kind>`; `dst`, `a` and `b` are `vr(..)` ranges of exactly the kind's width (table below); `index` is one VGPR (`v(n)`); `mods` is the struct literal `SwmmacMods { index_key, neg_lo, neg_hi, clamp }` with all four fields written (`u8, u8, u8, bool`). SWMMAC has no C operand: `dst` is read in place as the accumulator, so the instruction declares defs `[dst]` and uses `[a, b, index, dst]`, and the accumulator must be initialized first. Example: `wg.isa().push(Wmma::swmmac(arch, Swmmac::F32F16, vr(24,8), vr(8,4), vr(12,8), v(20), SwmmacMods { index_key: 0, neg_lo: 0, neg_hi: 0, clamp: false })?)?;` emits `v_swmmac_f32_16x16x32_f16 v[24:31], v[8:11], v[12:19], v20`. Refusals carry the Rust error text: `SWMMAC requires gfx12` (gfx1100/gfx1151), `<mnemonic>: A requires 4 VGPRs, found v[8:10]` (width), and the modifier errors below. A hand-written `op` with the same text must declare `dst` in its uses as well. Worked example: `docs/cookbook/10-swmmac.md`.
+
+| `Swmmac::` kind | mnemonic | D | A | B | modifiers |
+|---|---|---|---|---|---|
+| `F32F16` | v_swmmac_f32_16x16x32_f16 | 8 | 4 | 8 | float |
+| `F32Bf16` | v_swmmac_f32_16x16x32_bf16 | 8 | 4 | 8 | float |
+| `F16F16` | v_swmmac_f16_16x16x32_f16 | 4 | 4 | 8 | float |
+| `Bf16Bf16` | v_swmmac_bf16_16x16x32_bf16 | 4 | 4 | 8 | float |
+| `I32Iu8` | v_swmmac_i32_16x16x32_iu8 | 8 | 2 | 4 | int |
+| `I32Iu4` | v_swmmac_i32_16x16x32_iu4 | 8 | 1 | 2 | int |
+| `I32Iu4X64` | v_swmmac_i32_16x16x64_iu4 | 8 | 2 | 4 | int, no `index_key` |
+| `F32Fp8Fp8` | v_swmmac_f32_16x16x32_fp8_fp8 | 8 | 2 | 4 | fp8 |
+| `F32Fp8Bf8` | v_swmmac_f32_16x16x32_fp8_bf8 | 8 | 2 | 4 | fp8 |
+| `F32Bf8Fp8` | v_swmmac_f32_16x16x32_bf8_fp8 | 8 | 2 | 4 | fp8 |
+| `F32Bf8Bf8` | v_swmmac_f32_16x16x32_bf8_bf8 | 8 | 2 | 4 | fp8 |
+
+Counts are VGPRs (dwords); the index is always one VGPR. Legal modifier sets (as accepted by `llvm-mc -mcpu=gfx1201`; anything else is refused as `<mnemonic> does not accept <modifier>`, `<mnemonic> has no index_key` or `<mnemonic>: neg_lo/neg_hi bit 2 (C) is not encodable`):
+
+| class | `index_key` | `neg_lo` | `neg_hi` | `clamp` |
+|---|---|---|---|---|
+| float (`F32F16` `F32Bf16` `F16F16` `Bf16Bf16`) | 0 or 1 | bits 0-1 (A, B) | bits 0-1 | no |
+| int (`I32Iu8` `I32Iu4`) | 0 or 1 | bits 0-1 | no | yes |
+| `I32Iu4X64` | no (must be 0) | bits 0-1 | no | yes |
+| fp8 (`F32Fp8Fp8` `F32Fp8Bf8` `F32Bf8Fp8` `F32Bf8Bf8`) | 0 or 1 | no | no | no |
+
+`neg_lo`/`neg_hi` bit 0 negates A and bit 1 negates B; bit 2 (C) never encodes. Text order is `index_key:1 neg_lo:[a,b,0] neg_hi:[a,b,0] clamp`; `index_key:1` is OP_SEL bit 0 (`index_key:0` is the default and is not printed). In instruction text `index_key:N` is accepted only on `v_swmmac_*` rows other than `v_swmmac_i32_16x16x64_iu4`.
+
 ## 8. Workgroup driver
 
 ### Scope and complete skeleton
@@ -305,7 +332,7 @@ The tables are the supported PeaceMaker vocabulary, not a complete silicon ISA c
 
 Inline integer constants are -16..64. A larger integer is a literal, spelled canonically with `lit`, not a decimal inline constant. There is one literal word per instruction (reusing the same literal is different from requesting two distinct literal words). VOP2 `_e32` has VGPR-only src1: use `_e64` when that source must be scalar or constant, or commute operands if valid. Not every opcode has both encodings in the tables. DPP controls are instruction modifiers, not standalone cross-lane instructions. `row_shr` is not a supported substitute for `row_shl`.
 
-The following checks prove representative spellings and intentional rejections. F16 WMMA widths are in dwords, not element counts.
+The following checks prove representative spellings and intentional rejections. F16 WMMA and SWMMAC widths are in dwords, not element counts.
 
 ```mnemonics
 gfx1151: s_add_u32 s12, s12, s13
@@ -357,6 +384,12 @@ gfx1201: v_add_nc_u32_e64 v1, v2, 0x80
 !gfx1201: v_add_nc_u32 v1, v2, v3
 gfx1151: v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]
 gfx1201: v_wmma_f32_16x16x16_f16 v[0:7], v[8:11], v[16:19], v[0:7]
+gfx1201: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
+gfx1201: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]
+gfx1201: v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14 index_key:1 neg_lo:[1,1,0] clamp
+gfx1201: v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14 index_key:1
+!gfx1201: v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14 index_key:1
+!gfx1151: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
 gfx1151: s_waitcnt vmcnt(0)
 gfx1151: s_waitcnt lgkmcnt(0)
 gfx1151: s_waitcnt_vscnt null, 0
@@ -406,4 +439,71 @@ The [diagnostic reference](ERRORS.md) explains each stable code. R01xx is parsin
 
 ### Source map
 
-Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs`. Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+
+## 13. Production generators: `iu4_gemm` and `qwen4_moe_sym`
+
+The fast kernels are Rust generators. A script reaches them in two layers, neither of which adds typestate surface: whole-kernel natives that take the generator's `Spec`, and (for `iu4_gemm`) its phase blocks, which a script composes under the same checks as its own code. Production output does not change: a composition that mirrors `iu4_gemm::emit` re-emits its bytes.
+
+### Coarse natives
+
+The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, AddSigmoid, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
+
+| native | Rust | result |
+|---|---|---|
+| `Iu4Spec { fold, tile, cacc, epi, act, arch }` | `iu4_gemm::Spec` | a spec value |
+| `Iu4Gemm::emit(spec)` | `iu4_gemm::emit` | `Result<Emitted, String>` |
+| `Iu4Gemm::emit_module(fold, tile, cacc, act, arch)` | `iu4_gemm::emit_module` | `Result<(Vec<Emitted>, String, String), String>`: the symbols, the module text and its proof as JSON |
+| `MoeSymSpec { arch, kind, nt, rr, codec }` | `qwen4_moe_sym::Spec` | a spec value |
+| `MoeSym::emit(spec)` | `qwen4_moe_sym::emit` | `Result<Emitted, String>` |
+| `MoeSym::emit_module(arch)` | `qwen4_moe_sym::emit_module` | as `Iu4Gemm::emit_module` |
+| `MoeSym::emit_module_codec(arch, codec)` | `qwen4_moe_sym::emit_module_codec` | as `Iu4Gemm::emit_module` |
+
+`Spec::validate` stays the gate: a combination without a generator returns the Rust refusal (`iu4_gemm targets gfx1201 only`, ...).
+
+```rip arch=gfx1201
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    Iu4Gemm::emit(Iu4Spec {
+        fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
+        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch,
+    })
+}
+```
+
+### `iu4_gemm` phase blocks
+
+`Iu4Gen::new(Iu4Spec { .. })?` builds the generator of one valid spec (`Spec::validate`, gfx1201 only): the register assignment and geometry every block reads. It is an opaque value with read-only accessors.
+
+| call | meaning |
+|---|---|
+| `gen.plan()?` | the kernel's `RegPlan` (a script may add ranges) |
+| `gen.kernel_spec()` | the kernel's `KernelSpec` (symbol, kernargs, workgroup size) |
+| `gen.spec()` | the `Iu4Spec` |
+| `gen.reg("name")` | `Option<u8>`, the base of a physical register by name: `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i> st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips rs bs wave gpr136 mm1 hs tmp epi_s a_slab1`, kernel arguments `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`; `None` for an unknown name or an absent optional register |
+
+The blocks run inside a `Workgroup::new` scope. `lds` is the array of the four LDS rings (A, W, DS, SZ); `end` is a kernel exit from `wg.exit(..)`.
+
+| call | Rust (`iu4_gemm::blocks`) | rings |
+|---|---|---|
+| `iu4::declare_lds(wg, gen)?` | `declare_lds` | declares them, every buffer `Free`; returns `lds` |
+| `iu4::prologue(wg, gen, end, lds)?` | `prologue` | `Free`/`Free` in, `Published`/`Free` out (the block boundary); returns `lds` |
+| `iu4::kloop(wg, gen, lds)?` | `kloop` | the whole rolled K-loop with its peeled group; returns `lds` |
+| `iu4::block(wg, gen, tag, h, fetch_next, end_label, entry_label, lds)?` | `block` | one K128 block on plane `h` (0 or 1); `tag` names its labels, `end_label` closes its register lifetimes, `entry_label = false` leaves the block's own label to a `wg_skip_if` target; returns `lds` |
+| `iu4::block_stepping(.., entry_label, step, lds)?` | `block_stepping` | `block` that also advances descriptor `step` (0 or 1) right after its slab-1 fetch: the production odd block does this for descriptor 0, inside one block, so it cannot sit between two `block` calls |
+| `iu4::step_descriptor(wg, gen, which)?` | `step_descriptor` | `s_add_nc_u64` of the group stride onto descriptor 0 or 1 |
+| `iu4::trip_end(wg, gen)?` | `trip_end` | odd descriptor, group offset and trip counter advance |
+| `iu4::trips_cmp(wg, gen, "s_cmp_lg_u32")?` | `trips_cmp` | a `WgCond` for `wg_skip_if` / `loop_carried` (`s_cmp_{eq,lg,lt,le,gt,ge}_{u32,i32}` only) |
+| `iu4::epilogue(wg, gen, end)?` | `epilogue` | the store path; places `iu4::EPI` |
+| `iu4::gdn_epilogue(wg, gen, lds)?` | `gdn_epilogue` | the fused projection's GDN preparation; consumes `lds` (`Epi::QkvzaGdn` only) |
+| `iu4::label(tag)`, `iu4::tail_label(h)` | `label`, `tail_label` | `.Liu4_<tag>`, `.Liu4_t<h>` |
+| `iu4::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END GDN` | the label constants | strings |
+
+Each block is one checked `Driver::typed` call. The native takes the four rings from the driver, runs the Rust block on the typed `Workgroup`, and gives the rings back to the same driver slots, so a block cannot read a `Free` buffer, and a script loop (`loop_carried`) or branch (`wg_skip_if`) around blocks is checked by the driver's ordinary rule that a body leaves every ring in the state it found it. What the bridge refuses:
+
+- a ring of the wrong kind (the W ring where the A ring is expected: the tag differs), a ring in another phase, a ring with an undrained store, a ring the script made with `Ring::new` (only rings a typed block gave can be lent);
+- any typed call under wave-uniform control (`skip_if`, `exec_if`, `if_else`, `forward`, `loop_until`), after a wave-uniform kernel exit, or on a target other than gfx1201 (the blocks are gfx1201-typed);
+- a typed body that leaves a taken ring out. After any `Err` from a typed call the lowering is dead, like any backend `Err`: stop at the first one.
+
+The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
+
+The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.

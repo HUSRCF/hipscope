@@ -912,6 +912,10 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
+    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
+    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
+    // reverse); `paro_group_size` is the one place either width is read from.
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -1001,6 +1005,7 @@ impl DType {
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
             | DType::ParoQ4G128
+            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1040,6 +1045,7 @@ impl DType {
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
             DType::ParoQ4G128 => grouped(128, 72),
+            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1058,6 +1064,17 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128 => None,
+            _ => None,
+        }
+    }
+
+    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
+    /// block of its activation rotation (the two are the same in ParoQuant).
+    /// `None` for every non-Paro dtype.
+    pub fn paro_group_size(self) -> Option<usize> {
+        match self {
+            DType::ParoQ4G128 => Some(128),
+            DType::ParoQ4G64 => Some(64),
             _ => None,
         }
     }
@@ -1468,7 +1485,8 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
-    /// True while the Flash-Next lane step runs (set by the lane-step driver):
+    /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
+    /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
     /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
     /// ([`Gpu::lane_rows_pm_enabled`]).
@@ -2223,6 +2241,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -3850,9 +3869,11 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        self.scratch
-            .route_load
-            .admit_unplanned(module_name, func_name)?;
+        self.scratch.route_load.admit_unplanned(
+            module_name,
+            func_name,
+            crate::scratch::LazyKind::EmbeddedImage,
+        )?;
         if !self.modules.contains_key(module_name) {
             if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
                 // Developer-only route-closure audit, as `scratch::load_embedded_module`.
@@ -3919,33 +3940,47 @@ impl Gpu {
         jobs: usize,
         open: Option<String>,
     ) -> HipResult<()> {
+        self.begin_route_kernel_load_predicted(plan, None, jobs, open)
+    }
+
+    /// [`Self::begin_route_kernel_load`] plus a predicted family set: its
+    /// exact registry recipes compile in the same bounded batch as `plan`
+    /// (an empty `plan` is a pure fallback route), and at the first dispatch
+    /// barrier only their proven conflict-free symbols bind. Predicted
+    /// modules are speculative coverage, so a route carrying any must have
+    /// an `open` label (it can never seal); their compile or bind failure
+    /// fails the load like a planned module's, since a known predicted
+    /// module is predictable work, not a lazy miss.
+    pub fn begin_route_kernel_load_predicted(
+        &mut self,
+        plan: crate::kernel_registry::RouteKernelPlan,
+        predicted: Option<crate::kernel_registry::PredictedKernels>,
+        jobs: usize,
+        open: Option<String>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.abort_route_kernel_load()?;
         crate::kernel_registry::validate_route_plan(&plan)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
-        let hip_entries: Vec<crate::kernel_registry::KernelEntry> = plan
+        let predicted = predicted.map(|p| p.modules).unwrap_or_default();
+        if !predicted.is_empty() && open.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "predicted kernels need an open route (a predicted fallback can never be sealed)",
+            ));
+        }
+        let mut batch_entries: Vec<crate::kernel_registry::KernelEntry> = plan
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                crate::kernel_registry::PlannedKernel::Hip(entry) => {
-                    Some(crate::kernel_registry::KernelEntry {
-                        arch: entry.arch,
-                        module: entry.module,
-                        symbols: entry.symbols,
-                        source: entry.source.clone(),
-                        flags: entry.flags.clone(),
-                        scheduler_profile: entry.scheduler_profile.clone(),
-                    })
-                }
+                crate::kernel_registry::PlannedKernel::Hip(entry) => Some(entry.clone()),
                 crate::kernel_registry::PlannedKernel::Embedded { .. } => None,
             })
             .collect();
-        let batch = self.compiler.begin_batch(hip_entries, jobs)?;
-        self.scratch.route_load = crate::scratch::RouteLoad::Pending {
-            plan,
-            batch: Some(batch),
-            open,
-        };
+        batch_entries.extend(predicted.iter().map(|m| m.entry.clone()));
+        let batch = self.compiler.begin_batch(batch_entries, jobs)?;
+        self.scratch.route_load =
+            crate::scratch::RouteLoad::pending_route(plan, Some(batch), predicted, open)?;
         Ok(())
     }
 
@@ -3984,13 +4019,26 @@ impl Gpu {
             return Ok(());
         }
         self.ensure_route_modules_preloaded()?;
-        self.scratch.route_load = match std::mem::take(&mut self.scratch.route_load) {
-            RouteLoad::Prepared { open: Some(route) } => RouteLoad::Open {
-                route,
-                unplanned: 0,
-            },
-            _ => RouteLoad::Sealed,
-        };
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished();
+        Ok(())
+    }
+
+    /// [`Self::finish_route_kernel_load`] for a model that left its closed
+    /// plan: the pending compile still completes (every planned and
+    /// predicted module compiled and bound, counters kept) and the route
+    /// finishes `Open` under `route`, never sealed. No-op when no route was
+    /// begun or it already finished.
+    pub fn finish_route_kernel_load_open(&mut self, route: String) -> HipResult<()> {
+        self.bind_thread()?;
+        use crate::scratch::RouteLoad;
+        if matches!(
+            self.scratch.route_load,
+            RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }
+        ) {
+            return Ok(());
+        }
+        self.ensure_route_modules_preloaded()?;
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished_open(route);
         Ok(())
     }
 
@@ -4004,6 +4052,14 @@ impl Gpu {
             } => self.compiler.finish_batch(batch),
             _ => Ok(()),
         }
+    }
+
+    /// Preload counters of the begun route: predicted modules compiled,
+    /// bound and failed, and unplanned kernels loaded lazily during load.
+    /// Zero when no route was begun.
+    pub fn route_kernel_stats(&self) -> crate::scratch::RouteKernelStats {
+        // bind_thread: skip — pure state query.
+        self.scratch.route_load.stats()
     }
 
     /// True while a begun route's modules are not yet on the GPU.
@@ -9110,6 +9166,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
         assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
+        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
+        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
@@ -9440,6 +9499,62 @@ mod tests {
 
         gpu.free_tensor(t).ok();
         gpu.free_tensor(dev).ok();
+    }
+
+    /// A kernel launched past the replay recorder (a raw `hip.launch_kernel`)
+    /// inside an automatic capture window runs once but is missing from the
+    /// tape, so every replay would skip it. Prepare must refuse that tape
+    /// (sticky HIP fallback) and accept the same window without the stray
+    /// launch (HIPF-121: legacy MQ5G256 decoded garbage under Redline).
+    #[test]
+    fn retained_prepare_refuses_a_window_with_an_unrecorded_launch() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let a = gpu.upload_f32(&[1.0; 256], &[256]).expect("upload");
+        let b = gpu.zeros(&[256], super::DType::F32).expect("zeros");
+        for stray in [false, true] {
+            if !gpu.replay.configure_model_default(true) {
+                eprintln!("skip: an explicit replay backend disables the automatic lifecycle");
+                return;
+            }
+            gpu.replay.set_forward_eligible(true);
+            gpu.replay
+                .begin_auto_capture_if_armed()
+                .expect("begin capture");
+            assert!(gpu.replay.is_recording());
+            gpu.copy_f32_buffer(&b, &a, 256).expect("recorded copy");
+            gpu.copy_f32_buffer(&a, &b, 256).expect("recorded copy");
+            if stray {
+                let (dp, sp, n) = (b.buf.as_ptr(), a.buf.as_ptr(), 256i32);
+                let mut params: [*mut std::ffi::c_void; 3] = [
+                    &dp as *const _ as *mut _,
+                    &sp as *const _ as *mut _,
+                    &n as *const _ as *mut _,
+                ];
+                // SAFETY: the params match copy_f32_buffer(dst, src, n), loaded above.
+                unsafe {
+                    gpu.hip.launch_kernel(
+                        &gpu.functions["copy_f32_buffer"],
+                        [1, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        gpu.active_stream.as_ref(),
+                        &mut params,
+                    )
+                }
+                .expect("stray launch");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            gpu.replay.finish_capture().expect("finish capture");
+            let prepared = gpu.replay.prepare_pm4_prefix(gpu.device_id as usize, 2);
+            let refused = prepared
+                .as_ref()
+                .is_err_and(|reason| reason.contains("unrecorded launch"));
+            assert_eq!(refused, stray, "{prepared:?}");
+        }
+        gpu.replay.configure_model_default(false);
     }
 
     /// The row-chunked requant (and its reordered ranges) packs every row

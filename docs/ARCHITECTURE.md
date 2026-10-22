@@ -482,6 +482,11 @@ The runtime verifies the installed index and object SHA-256 before loading,
 even with hipcc present. A missing or stale index falls back to JIT only when
 hipcc is available; compiler-free loads fail closed. Packaged module names
 come from the exact Rust registry, never HIP source basenames.
+The installed pack is read-only to the runtime: a missing, stale or rejected
+packaged object is recompiled into the hot JIT cache only and is never rewritten
+under `kernels/compiled/<arch>`. Only the packaging tools (`hipfire-kernel-pack`
+and `daemon --precompile`, which publish to an explicit output directory) write
+a pack.
 
 JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`, then the
@@ -532,8 +537,12 @@ After `load_model`, request handling builds sampling defaults
 Continuous batching is a separate exact-id staging route
 (`hipfire_loader::continuous_batch_route`): Qwen3.5 (5/6) and Flash-Next
 (16). Qwen4 batches only as exact AR lanes through the VMM branch
-(`serve.vmm_batch`; there is no fixed-lane Qwen4 body), and its lane steps are
-refused under expert parallelism. LFM2 (11) has no servable batch path.
+(`serve.vmm_batch`; there is no fixed-lane Qwen4 body). Lane steps run on one
+card, replicated across EP ranks, or band-split across PP bands (sequential
+bands, host-staged HC edges; each device's lane store must fit its own free
+memory). Multi-card lanes are AR only: no native-MTP lanes and no promotion of a
+running singleton; their GPU gates and performance are pending. LFM2 (11) has
+no servable batch path.
 
 Capability examples that are **implemented** but not automatically
 “product-certified”:

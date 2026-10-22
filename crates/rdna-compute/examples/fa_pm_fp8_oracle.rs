@@ -1005,7 +1005,7 @@ fn ieee_cases() -> Result<Vec<IeeeCase>> {
 /// prefixes. Every finite cell, including general data, gates byte-exactly
 /// against the independent quantized HIP reference. Winner closed forms are
 /// additional checks only. Counts are PLANNED, not observed GPU results.
-const NATIVE_CELLS: [(usize, usize, NativeKind); 28] = [
+const NATIVE_CELLS: [(usize, usize, NativeKind); 30] = [
     // Winner gates, short horizons: tails, one block, ragged rows.
     (1, 0, NativeKind::Winner),
     (7, 0, NativeKind::Winner),
@@ -1047,6 +1047,12 @@ const NATIVE_CELLS: [(usize, usize, NativeKind); 28] = [
     // segment starts at a nonzero offset (FULL-plane offsets exercised).
     (512, 15872, NativeKind::Random),
     (64, 16320, NativeKind::Random),
+    // pp16000 prefill chunks (A3B Qwen3.6, two chunks over a 16000 prompt):
+    // 8192 rows from position 0 (16 full 512-query runs) and 7808 rows from
+    // position 8192 (15 full runs + one 128-row tail); 11 blocks per run, up to
+    // ~333 KT48 tiles per block. Pins the whole causal work distribution.
+    (8192, 0, NativeKind::Random),
+    (7808, 8192, NativeKind::Random),
     // NaN classification cells (separate classifier, not the finite gate).
     (8, 0, NativeKind::Nan),
     (65, 63, NativeKind::Nan),
@@ -1074,13 +1080,14 @@ fn native_cells() -> Vec<NativeCell> {
 /// of old packet numerical PASS. Primitive reuse is explicitly source-bound.
 fn native_coverage_map() -> Value {
     json!({
-        "native_cells":30,"finite":26,"nonfinite":4,
+        "native_cells":32,"finite":28,"nonfinite":4,
         "reference":"all finite direct/range outputs: independent H16 FP8-WMMA KT48 byte gate",
         "shape_groups":{
             "tails_winners":"n1/7/8/16, n48_s1, n64_s1, n49_s1, n48_s14, n600_s2",
             "KT48_live_keys":"47/48/49/63/64/65, including odd 516-byte rows",
             "general_positions":"n47/48/49_s63; n511/512/513_s1; n512_s63; n64_s64; n65_s63",
             "long_active_prefix":"n512_s15872 and n64_s16320 reach key16383",
+            "pp16000_chunks":"n8192_s0 (ctx 8192) and n7808_s8192 (ctx 16000): full 512-query runs, causal work distribution",
             "range":"every cell: FULL-total scale plane, offset0 replay and nonzero offset where possible",
             "nonfinite":"KV NaN n8_s0/n65_s63 plus F32-Q NaN/Inf n8_s0; independent affected-head masks"
         },
@@ -2770,8 +2777,14 @@ fn native_out_compare(
         && zero_mismatches == 0
         && secondary_mismatches == 0
         && (!kind.nonfinite() || affected_nan + q_taint > 0);
+    // FNV-1a over the candidate bytes: receipts of two kernel builds on the
+    // same fixture are byte-comparable without re-running the reference.
+    let cand_fnv64 = cand_bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    });
     json!({"classification":if is_q {"q_taint_strict_positive_zero"} else if kind.nonfinite() {"nonfinite_positions_separate"} else {"finite_byte_gate"},
         "reference":"independent_quantized_HIP", "gate":true, "words":words,
+        "candidate_fnv64":format!("{cand_fnv64:016x}"),
         "candidate_reference_word_mismatches":mismatches,
         "unexpected_nonfinite_words":nonfinite, "expected_nan_words":affected_nan,
         "nan_mask_mismatches":nan_mismatches,
@@ -3882,8 +3895,8 @@ fn self_check() -> usize {
         );
     }
     ok(
-        native_cells().len() == 30 && NATIVE_CELLS.len() == 28,
-        "native family: 30 planned cells (26 finite byte gates, 4 nonfinite masks)",
+        native_cells().len() == 32 && NATIVE_CELLS.len() == 30,
+        "native family: 32 planned cells (28 finite byte gates, 4 nonfinite masks)",
     );
     ok(
         native_cells()
@@ -3904,7 +3917,7 @@ fn self_check() -> usize {
         native_cells()
             .iter()
             .all(|c| native_prepare(c, 0).is_ok() && native_prepare(c, 1).is_ok()),
-        "native family: all 30 cells build on CPU for both poison rounds",
+        "native family: all 32 cells build on CPU for both poison rounds",
     );
     ok(
         NATIVE_REF_BODY.contains("q_scales[") && NATIVE_REF_BODY.contains("q_codes + "),
@@ -3943,7 +3956,7 @@ fn self_check() -> usize {
     );
     let mapping = native_coverage_map();
     ok(
-        mapping["native_cells"] == 30,
+        mapping["native_cells"] == 32,
         "bounded native coverage is explicit, not old31 numerical equivalence",
     );
     let inf = native_prepare(

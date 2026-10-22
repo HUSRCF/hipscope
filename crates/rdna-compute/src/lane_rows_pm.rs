@@ -254,8 +254,8 @@ fn refuse(name: &str, detail: &str) -> HipError {
 impl Gpu {
     /// Whether the incumbent rows launchers route to the lane-rows PM kernels:
     /// the `fn_lane_pm_rows` flag (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151 default on) on
-    /// exact gfx1151, inside the lane step ([`Gpu::lane_rows_scope`]), with no
-    /// recorder or graph capture active.
+    /// exact gfx1151, inside the lane step or a Qwen4 speculative verify
+    /// ([`Gpu::lane_rows_scope`]), with no recorder or graph capture active.
     pub fn lane_rows_pm_enabled(&self) -> bool {
         self.flags.fn_lane_pm_rows_enabled()
             && self.arch_caps.is_gfx1151()

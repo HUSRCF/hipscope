@@ -47,8 +47,9 @@ pub enum BackendSel {
     /// No batching: the daemon serves one request at a time and the other
     /// lanes queue, as `hipfire serve` does with batching off.
     Sequential,
-    /// The VMM continuous-batching route `hipfire serve` runs with
-    /// `serve.vmm_batch` on.
+    /// The continuous-batching route `hipfire serve` runs with
+    /// `serve.vmm_batch` on: `vmm` (Qwen3.5) or `fn-lanes` (Qwen4, single
+    /// card or under `topology.pp` / `topology.ep`).
     Batch,
     Both,
 }
@@ -378,6 +379,11 @@ fn last_user_text(messages: &Value) -> Option<&str> {
         .as_str()
 }
 
+/// The continuous-batching routes the batch sweep may measure.
+pub fn is_batch_route(route: Option<&str>) -> bool {
+    matches!(route, Some("vmm" | "fn-lanes"))
+}
+
 // ── Drivers ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -434,9 +440,10 @@ impl Driver {
         )
     }
 
-    /// The VMM continuous-batching route. `loaded` is the load reply; the
-    /// driver refuses unless the daemon staged that route, so the numbers
-    /// can never describe another one.
+    /// The continuous-batching route `hipfire serve` runs with
+    /// `serve.vmm_batch` on (`vmm` or `fn-lanes`). `loaded` is the load
+    /// reply; the driver refuses unless the daemon staged one of them, so the
+    /// numbers can never describe another route.
     pub fn batch(
         engine: hipfire_client::Engine,
         max_concurrency: usize,
@@ -451,10 +458,10 @@ impl Driver {
             bail!("daemon does not advertise continuous_batch_capable");
         }
         let route = loaded.get("continuous_batch_route").and_then(Value::as_str);
-        if route != Some("vmm") {
+        if !is_batch_route(route) {
             bail!(
-                "daemon staged continuous-batch route {route:?}, not the VMM route `hipfire serve` \
-                 runs with serve.vmm_batch"
+                "daemon staged continuous-batch route {route:?}, not the `vmm` or `fn-lanes` \
+                 route `hipfire serve` runs with serve.vmm_batch"
             );
         }
         Ok(Self::new(
@@ -1573,5 +1580,13 @@ mod tests {
         assert!(sample_is_valid(WorkloadSel::Multiturn, "slots", &hits).is_ok());
         assert!(sample_is_valid(WorkloadSel::Multiturn, "batch", &none).is_ok());
         assert!(sample_is_valid(WorkloadSel::Stateless, "slots", &none).is_ok());
+    }
+
+    #[test]
+    fn batch_route_admits_vmm_and_fn_lanes_only() {
+        assert!(is_batch_route(Some("vmm")));
+        assert!(is_batch_route(Some("fn-lanes")));
+        assert!(!is_batch_route(Some("legacy")));
+        assert!(!is_batch_route(None));
     }
 }

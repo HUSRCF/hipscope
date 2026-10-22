@@ -713,14 +713,17 @@ Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
 [redline] qwen4 capture census: effect-incomplete — 13 device copy(ies) and 48 memset(s) inside the window are state the tape cannot replay (kernelise them, or move them into the external boundary)
 ```
 
-`launched` is an independent count from `hip_bridge::launch_counters` (every
-launch, funnel or raw), so the comparison is not the recorder grading itself.
+`launched` (printed as `computed=` today) is an independent count from
+`hip_bridge::memory_effects` (every launch on the capturing thread, funnel or
+raw), so the comparison is not the recorder grading itself.
 
-The finalization hook treats an unequal census as a typed capture refusal:
-it poisons the retained route before closing or preparing the tape, logs the
-launched and recorded counts plus the HIP fallback, and leaves the completed
-warmup output intact. Later forwards use ordinary HIP. A matching census is
-necessary, not sufficient: effect and binding validation still gate preparation.
+An unequal census is a capture refusal. The check now lives in the shared
+prepare (`ReplayController::refuse_effect_incomplete_window`, HIPF-121), so it
+covers every automatic Redline route, not only Qwen4: prepare fails with
+`unrecorded launch`, the route is poisoned, the HIP fallback is logged, and the
+completed warmup output stays intact. Later forwards use ordinary HIP. A
+matching census is necessary, not sufficient: effect and binding validation
+still gate preparation.
 Shared launchers, including `Gpu::silu_f32`, use `launch_maybe_blob` so graph
 capture and retained recording own their kernarg bytes rather than stack pointers.
 

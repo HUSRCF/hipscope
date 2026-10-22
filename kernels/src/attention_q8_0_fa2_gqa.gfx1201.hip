@@ -3195,6 +3195,13 @@ static __device__ __forceinline__ void fa2_a4_epilogue(
 }
 #endif
 
+// Wave arbitration hint (A3B only; no arithmetic): the WMMA bursts of one
+// wave run ahead of the others' VALU/fill work. The dense body is unchanged.
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+#define FA2_QR2_PRIO(x) __builtin_amdgcn_s_setprio(x)
+#else
+#define FA2_QR2_PRIO(x) ((void)0)
+#endif
 #if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
 // Geometry-only specialization: the KT48 Q-resident arithmetic below is shared.
 #if !defined(HIPFIRE_FA2_QRESIDENT_V2_Q8) || defined(HIPFIRE_FA2_A4_EPILOGUE)
@@ -3374,14 +3381,150 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const int gmin = bounds[1];
     const int seq_len = gmax + 1;
     const bool qok_all = row_base + 383 < QR_GQA * run_rows;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    const bool wave_live = row_base + 16 * wave < QR_GQA * run_rows;
+#endif
 
-    // Fill roles: waves 0..11 load K (4 b64 wave-loads each), waves 12..23
-    // load pre-transposed V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads
-    // the tile's 48 K/V scale pairs. Keys at/after seq_len are zero in every
-    // plane, as in v1.
+    // Fill roles (dense H24; the A3B fill below has its own roles): waves
+    // 0..11 load K (4 b64 wave-loads each), waves 12..23 load pre-transposed
+    // V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
     constexpr int TK = 48;
     constexpr unsigned KPL = 12288u;
     constexpr unsigned BUFB = 2u * KPL + 384u;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    // A3B fill (native 516-byte rows: four-byte alignment only). Every wave
+    // loads one 16-byte K chunk (one key, 16 dims); waves 12..23 also load
+    // one 4-byte word per key of an 8-key x 4-dim V block and transpose it
+    // into four fragment words in commit(); wave 0 loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
+    const bool sfill = wave == 0;
+    const bool vfill = wave >= 12;
+    const int ksub = wave >> 3;
+    const int kdcf = ((wave & 7) << 1) | (lane & 1);
+    const int kml = lane >> 1;
+    const int vw_i = wave - 12;
+    const int vsub = vw_i >> 2;
+    const int vkg = (vw_i >> 1) & 1;
+    const int vdc = ((vw_i & 1) << 3) | (lane >> 2);
+    uint32_t kwords[4];
+    uint32_t vwords[8];
+    uint32_t spre[2];
+
+    auto issue = [&](int kt) {
+        {
+            const int gk = kt + ksub * 16 + kml;
+            uint32_t k0 = 0u, k1 = 0u, k2 = 0u, k3 = 0u;
+            if (gk < seq_len) {
+                const uint32_t* p = (const uint32_t*)(k_cache
+                    + (unsigned long long)gk * QR_KV_STRIDE
+                    + (unsigned)(kv_h * 256 + kdcf * 16));
+                k0 = p[0];
+                k1 = p[1];
+                k2 = p[2];
+                k3 = p[3];
+            }
+            kwords[0] = k0;
+            kwords[1] = k1;
+            kwords[2] = k2;
+            kwords[3] = k3;
+        }
+        if (vfill) {
+            const int kb = kt + vsub * 16 + vkg * 8;
+            const unsigned char* vp = v_cache
+                + (unsigned)(kv_h * 256 + vdc * 16 + (lane & 3) * 4);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int key = min(kb + r, seq_len - 1);
+                vwords[r] = *(const uint32_t*)(
+                    vp + (unsigned long long)key * QR_KV_STRIDE);
+            }
+        }
+        if (sfill) {
+            uint32_t s0 = 0u, s1 = 0u;
+            const int gk0 = kt + lane;
+            const int gk1 = kt + 32 + lane;
+            if (gk0 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s0 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            if (lane < 16 && gk1 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s1 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            spre[0] = s0;
+            spre[1] = s1;
+        }
+    };
+    auto commit = [&](int kt, unsigned b) {
+        unsigned char* K8w = (unsigned char*)LDS + b * BUFB;
+        unsigned char* V8w = K8w + KPL;
+        float* SKw = (float*)(K8w + 2u * KPL);
+        float* SVw = SKw + 48;
+        {
+            // Key kml, dims 16*kdcf..+15: the kg=0 / kg=1 fragment halves.
+            unsigned char* kd = K8w
+                + (unsigned)((((kdcf >> 1) * 3 + ksub) * 32 + kml) * 16
+                             + (kdcf & 1) * 8);
+            *(unsigned long long*)kd = (unsigned long long)kwords[0]
+                | ((unsigned long long)kwords[1] << 32);
+            *(unsigned long long*)(kd + 256) = (unsigned long long)kwords[2]
+                | ((unsigned long long)kwords[3] << 32);
+        }
+        if (vfill) {
+            // 8 keys x 4 dims -> four fragment words (byte j = key k0 + j).
+            const int k0 = kt + vsub * 16 + vkg * 8;
+            unsigned long long keep = ~0ULL;
+            if (k0 + 8 > seq_len) {
+                const int nvalid = max(0, seq_len - k0);
+                keep = (1ULL << (8 * nvalid)) - 1ULL;
+            }
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t w0 = vwords[4 * h], w1 = vwords[4 * h + 1];
+                const uint32_t w2 = vwords[4 * h + 2], w3 = vwords[4 * h + 3];
+                const uint32_t t0 = __builtin_amdgcn_perm(w1, w0, 0x05010400u);
+                const uint32_t t1 = __builtin_amdgcn_perm(w1, w0, 0x07030602u);
+                const uint32_t u0 = __builtin_amdgcn_perm(w3, w2, 0x05010400u);
+                const uint32_t u1 = __builtin_amdgcn_perm(w3, w2, 0x07030602u);
+                uint32_t* o = h ? hi : lo;
+                o[0] = __builtin_amdgcn_perm(u0, t0, 0x05040100u);
+                o[1] = __builtin_amdgcn_perm(u0, t0, 0x07060302u);
+                o[2] = __builtin_amdgcn_perm(u1, t1, 0x05040100u);
+                o[3] = __builtin_amdgcn_perm(u1, t1, 0x07060302u);
+            }
+            unsigned char* vdst = V8w
+                + (unsigned)(((vsub * 8 + (vdc >> 1)) * 32 + vkg * 16
+                              + 4 * (lane & 3)) * 16 + (vdc & 1) * 8);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const unsigned long long v =
+                    ((unsigned long long)lo[c] | ((unsigned long long)hi[c] << 32))
+                    & keep;
+                *(unsigned long long*)(vdst + c * 16) = v;
+            }
+        }
+        if (sfill) {
+            const fa2_dw_t d0 = {.u = spre[0]};
+            const fa2_dw_t d1 = {.u = spre[1]};
+            SKw[lane] = (float)d0.h[0];
+            SVw[lane] = (float)d0.h[1];
+            if (lane < 16) {
+                SKw[32 + lane] = (float)d1.h[0];
+                SVw[32 + lane] = (float)d1.h[1];
+            }
+        }
+    };
+#else
     const bool kfill = wave < 12;
     const bool sfill = wave == 0;
     unsigned long long pre[4];
@@ -3400,15 +3543,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                     const unsigned char* p = k_cache
                         + (unsigned long long)gk * QR_KV_STRIDE
                         + (unsigned)(kv_h * 256 + dcf * 16 + kg * 8);
-#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
-                    // Native 516-byte rows guarantee four-byte, not eight-byte,
-                    // alignment. Load the same eight K bytes without a u64 cast.
-                    const uint32_t* p32 = (const uint32_t*)p;
-                    v = (unsigned long long)p32[0]
-                        | ((unsigned long long)p32[1] << 32);
-#else
                     v = *(const unsigned long long*)p;
-#endif
                 }
                 pre[i] = v;
             }
@@ -3420,26 +3555,6 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 const int idx = (wave - 12) * 4 + i;
                 const int sub = idx >> 4;
                 const int dc = idx & 15;
-#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
-                // Construct exactly the transposed fragment consumed by commit:
-                // byte j = V[kt + 16*sub + 8*kg + j][16*dc + ml].
-                // This is the native WMMA V operand row=ml, k=8*kg+j.
-                // Four-byte loads stay within that head's code plane even at
-                // dim=255; no TR instruction/alignment assumption on odd rows,
-                // no scale-header read, and no additional LDS or cache layout.
-                unsigned long long gathered = 0ULL;
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int key = min(kt + sub * 16 + kg * 8 + j, seq_len - 1);
-                    const unsigned char* p = v_cache
-                        + (unsigned long long)key * QR_KV_STRIDE
-                        + (unsigned)(kv_h * 256 + dc * 16 + (ml & ~3));
-                    const uint32_t word = *(const uint32_t*)p;
-                    gathered |= (unsigned long long)((word >> (8 * (ml & 3))) & 255u)
-                        << (8 * j);
-                }
-                pre[i] = gathered;
-#else
                 const int gk = min(kt + sub * 16 + skey, seq_len - 1);
                 const unsigned char* p = v_cache
                     + (unsigned long long)gk * QR_KV_STRIDE
@@ -3449,7 +3564,6 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                     (__attribute__((address_space(1))) v2i_t*)(p));
                 pre[i] = (unsigned long long)(uint32_t)r.x
                     | ((unsigned long long)(uint32_t)r.y << 32);
-#endif
             }
         }
         if (sfill) {
@@ -3520,6 +3634,8 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         }
     };
 
+#endif
+
     float8_t Ofr[16];
 #pragma unroll
     for (int dc = 0; dc < 16; ++dc)
@@ -3539,6 +3655,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     __syncthreads();
     unsigned buf = 0u;
     for (int ktile = 0; ktile < seq_len; ktile += TK) {
+        FA2_QR2_PRIO(0);
         if (ktile + TK < seq_len) {
             commit(ktile + TK, buf ^ 1u);
             if (ktile + 2 * TK < seq_len)
@@ -3552,10 +3669,18 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
 #pragma unroll 1
         for (int sub = 0; sub < 3; ++sub) {
             const int kt_sub = ktile + sub * 16;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+            // A wave whose 16 rows all lie past the run's last query computes
+            // nothing that is stored; it still fills and joins the barriers.
+            if (kt_sub > gmax || !wave_live)
+                break;
+#else
             if (kt_sub > gmax)
                 break;
+#endif
             float8_t sacc =
                 (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            FA2_QR2_PRIO(3);
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
                 const uint4 kv = *(const uint4*)(K8
@@ -3570,6 +3695,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                         kf1, Qfr[2 * p + 1], sacc);
                 asm volatile("" ::: "memory");
             }
+            FA2_QR2_PRIO(0);
             const float4 sk0 = *(const float4*)(SKf + sub * 16 + 8 * kg);
             const float4 sk1 = *(const float4*)(SKf + sub * 16 + 8 * kg + 4);
             const float4 sv0 = *(const float4*)(SVf + sub * 16 + 8 * kg);
@@ -3679,6 +3805,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                     sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
             }
             const v2i_t pb = {(int)p0, (int)p1};
+            FA2_QR2_PRIO(3);
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
                 const uint4 vv = *(const uint4*)(V8
@@ -3758,6 +3885,7 @@ FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201)
 FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201)
 #undef FA2_QR2_A3B_ENTRY
 #endif
+#undef FA2_QR2_PRIO
 #undef FA2_QR2_YLO
 #undef FA2_QR2_YHI
 #endif

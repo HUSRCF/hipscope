@@ -1661,6 +1661,9 @@ pub struct SpecEmitRequest {
     /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
     /// wrapper builds/caches the Arc so this struct carries no `LoadedModel` ref.
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    /// `Some(k)`: each emitted token event carries `logprob` and `k`
+    /// `top_logprobs` from the row `Speculator::token_logits` kept for it.
+    pub logprobs_top_k: Option<usize>,
 }
 
 /// Summary returned by `generate_spec` to its arch wrapper, which writes the
@@ -1671,6 +1674,11 @@ pub struct SpecRun {
     pub generated: usize,
     pub spec_cycles: usize,
     pub spec_accepted: usize,
+    /// Context position where the spec-retire policy switched this request to
+    /// AR (`hipfire_runtime::spec_retire`); `None` while it speculated throughout.
+    pub spec_retired_at: Option<usize>,
+    /// Tokens decoded as plain AR after retirement (not counted in `spec_cycles`).
+    pub ar_steps: usize,
     /// Full committed stream (from the emitter) for the wrapper's cache store.
     /// Empty for emitters that don't track it. Deepseek4 and qwen35 both expose
     /// streamed tokens for asst-turn cache replay on safe terminals.

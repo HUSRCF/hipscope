@@ -83,7 +83,36 @@ const _: () = assert!(QWEN35_NORM_BIAS == 1.0);
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
+/// Sidecar `.mtp` files name the MoE tensors of the MTP layer in their own
+/// scheme; under the [`crate::mtp_head::MTP_MOE_PREFIX`] layer prefix the
+/// trunk MoE loader resolves them through this map.
+fn mtp_sidecar_tensor_name(name: &str) -> Option<String> {
+    let rest = name
+        .strip_prefix(crate::mtp_head::MTP_MOE_PREFIX)?
+        .strip_prefix(".mlp.")?;
+    let fixed = match rest {
+        "gate.weight" => "moe_router",
+        "shared_expert_gate.weight" => "moe_shared_expert_gate",
+        "shared_expert.gate_proj.weight" => "moe_shared_gate",
+        "shared_expert.up_proj.weight" => "moe_shared_up",
+        "shared_expert.down_proj.weight" => "moe_shared_down",
+        _ => {
+            let (expert, proj) = rest.strip_prefix("experts.")?.split_once('.')?;
+            let proj = match proj {
+                "gate_up_proj.weight" => "gate_up",
+                "down_proj.weight" => "down",
+                _ => return None,
+            };
+            return Some(format!("moe_experts.{expert}.{proj}"));
+        }
+    };
+    Some(fixed.to_owned())
+}
+
 pub fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+    if let Some(sidecar) = mtp_sidecar_tensor_name(name) {
+        return vec![sidecar];
+    }
     let mut out = Vec::with_capacity(4);
     let mut push = |s: String| {
         if !out.iter().any(|x| x == &s) {
@@ -3239,9 +3268,20 @@ pub struct ParoSource<'a> {
 }
 impl<'a> ParoSource<'a> {
     pub fn new(source: &'a dyn ModelSource, c: &'a Qwen35Config) -> HipResult<Self> {
-        source
+        let qc = source
             .quant_config()
             .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
+        // qwen3.5 Paro decode/prefill bind only the G128 kernels; the shared
+        // loader would hand a G64 checkpoint ParoQ4G64 weights they never admit.
+        if qc.group_size != 128 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen3.5 ParoQuant supports group_size 128 only, got {}",
+                    qc.group_size
+                ),
+            ));
+        }
         let mp = paro_text_prefix(source)?;
         Ok(Self { source, mp, c })
     }

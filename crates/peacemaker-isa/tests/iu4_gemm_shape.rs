@@ -95,6 +95,40 @@ fn assemble(text: &str) -> Result<(), String> {
     }
 }
 
+/// The sigmoid residual ADD shares the ADD K-loop instruction for instruction
+/// (only the epilogue differs) and exists for the token-layout production tile.
+#[test]
+fn sigmoid_add_shares_the_add_hot_loop() {
+    let emit = |epi, act| {
+        iu4_gemm::emit(Spec {
+            fold: Fold::K128,
+            tile: Tile::T128x128x8,
+            cacc: Cacc::One,
+            epi,
+            act,
+            arch: Arch::Gfx1201,
+        })
+    };
+    let add = emit(Epi::Add, ALayout::Token).unwrap();
+    let sig = emit(Epi::AddSigmoid, ALayout::Token).unwrap();
+    assert_eq!(
+        iu4_gemm::hot_loop_census(&sig.s_text),
+        iu4_gemm::hot_loop_census(&add.s_text)
+    );
+    assert!(emit(Epi::AddSigmoid, ALayout::Slab).is_err());
+    assert!(iu4_gemm::emit(Spec {
+        tile: Tile::T256x128x16,
+        ..Spec::control(Epi::AddSigmoid)
+    })
+    .is_err());
+    // The epilogue region: one exp + one IEEE division per column block.
+    let count = |m: &str| sig.s_text.matches(m).count();
+    assert_eq!(count("v_exp_f32"), 4);
+    assert_eq!(count("v_div_scale_f32"), 8);
+    assert_eq!(count("v_div_fmas_f32"), 4);
+    assert_eq!(count("v_div_fixup_f32"), 4);
+}
+
 #[test]
 fn hot_loop_meets_shape_contract_for_every_product_symbol() {
     for (tile, act, name) in POINTS {
@@ -191,6 +225,43 @@ fn module_waits_pass_independent_replay() {
             iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
         peacemaker_isa::ledger_replay::replay_waits(&text, Arch::Gfx1201)
             .unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
+    }
+}
+
+#[test]
+fn knob_strings_parse_to_the_spec_the_cli_emits() {
+    let got = Spec::from_knobs("k128", "256x128x16", "1", "silu", "token", Arch::Gfx1201).unwrap();
+    assert_eq!(
+        got,
+        Spec {
+            tile: Tile::T256x128x16,
+            epi: Epi::GateUpSilu,
+            ..Spec::control(Epi::Set)
+        }
+    );
+    let slab = Spec::from_knobs("k128", "128x128x8", "1", "silu-bf16", "slab", Arch::Gfx1201);
+    assert_eq!(slab.unwrap().act, ALayout::Slab);
+    // Long fold names are aliases; the closed axes parse but `emit` refuses them.
+    for (name, fold) in [
+        ("k256shared", Fold::K256Shared),
+        ("k256pow2", Fold::K256Pow2),
+    ] {
+        let spec = Spec::from_knobs(name, "128x128x8", "1", "set", "token", Arch::Gfx1201);
+        assert_eq!(spec.unwrap().fold, fold);
+        assert_eq!(name.parse::<Fold>(), Ok(fold));
+    }
+    for bad in [
+        ("k999", "128x128x8", "1", "set", "token"),
+        ("k128", "64x64", "1", "set", "token"),
+        ("k128", "128x128x8", "3", "set", "token"),
+        ("k128", "128x128x8", "1", "all", "token"),
+        ("k128", "128x128x8", "1", "set", "tile"),
+    ] {
+        let (f, t, c, e, a) = bad;
+        assert!(
+            Spec::from_knobs(f, t, c, e, a, Arch::Gfx1201).is_err(),
+            "{bad:?}"
+        );
     }
 }
 

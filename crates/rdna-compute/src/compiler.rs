@@ -22,7 +22,6 @@ use std::thread;
 struct PreparedModule {
     name: String,
     hash: String,
-    symbols: Vec<String>,
 }
 
 struct PreparedJob {
@@ -411,14 +410,15 @@ fn core_hipcc_flags(arch: &str) -> Vec<String> {
 ///   (`$HOME/.hipfire_kernels/{arch}` by default). Hot filenames are
 ///   content-keyed (`{name}.{hash}.hsaco`), so a nonempty hit is by
 ///   construction the right blob. Preferred for lookup after seeding.
-/// - **cold** (`cold_dir`): persistent install location
-///   (`kernels/compiled/{arch}` under the installed binary). Writeback target
-///   so install-time / post-update recompiles refresh the blobs that seed the
-///   next process. Distinct from hot; must not be collapsed into the lookup dir.
+/// - **cold** (`cold_dir`): the installed kernel pack
+///   (`kernels/compiled/{arch}` under the installed binary). Read-only to the
+///   runtime: it is only read for indexed-package verification and to seed
+///   hot. Distinct from hot; must not be collapsed into the lookup dir.
 ///
 /// `precompiled_dir` is the lookup view: hot when it has blobs, otherwise cold.
-/// Tries that first (with hash validation), falls back to hipcc into hot, then
-/// writeback to cold.
+/// Tries that first (with hash validation), then falls back to hipcc into hot.
+/// JIT misses and rejected packaged objects are rebuilt into hot only; the
+/// runtime never writes under an installed pack.
 pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
@@ -427,8 +427,9 @@ pub struct KernelCompiler {
     code_objects: CodeObjectRegistry,
     /// Lookup directory for pre-compiled blobs (hot when seeded, else cold).
     precompiled_dir: Option<PathBuf>,
-    /// Persistent install dir (`kernels/compiled/{arch}`). Writeback target;
-    /// kept even when lookup prefers the hot path.
+    /// Installed kernel pack (`kernels/compiled/{arch}`). Read-only: consulted
+    /// for indexed-package verification and hot seeding, never written. Kept
+    /// even when lookup prefers the hot path.
     cold_dir: Option<PathBuf>,
     has_hipcc: bool,
     pub extra_flags: String,
@@ -581,12 +582,13 @@ impl KernelCompiler {
                     .filter(|p| p.is_dir())
             });
 
-        // Seed the hot path from the persistent install location. Cold survives
-        // reboots / process restarts; hot may not (or may be worktree-local).
-        // Copy is incremental — only copies files not already present as a
-        // JIT-validated hot pair (see seed_hot_from_cold skip rule).
-        // Stale pairs are not wiped by update: hash mismatch in compile()
-        // triggers hipcc and writeback refreshes cold in place.
+        // Seed the hot path from the installed pack (read-only to the runtime).
+        // Cold survives reboots / process restarts; hot may not (or may be
+        // worktree-local). Copy is incremental — only copies files not already
+        // present as a JIT-validated hot pair (see seed_hot_from_cold skip rule).
+        // Stale pairs are not wiped by update: a rejected or stale packaged
+        // object is recompiled by hipcc into hot only; the install dir is never
+        // rewritten.
         // cache_dir is already arch-keyed; the hot dir IS the cache dir.
         let cold_dir = precompiled_dir;
         let hot_dir = cache_dir.clone();
@@ -600,7 +602,7 @@ impl KernelCompiler {
         }
         // Prefer the hot-path dir when it exists and has contents.
         // This is what the `compile()` lookup uses from here on. Cold stays
-        // on `cold_dir` for writeback even when lookup points at hot.
+        // on `cold_dir` for indexed verification only, never for writes.
         let effective_precompiled = if hot_dir.is_dir()
             && std::fs::read_dir(&hot_dir)
                 .map(|mut it| {
@@ -1112,75 +1114,6 @@ impl KernelCompiler {
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn writeback_package(
-        &self,
-        module: &str,
-        source: &str,
-        symbol: &str,
-        object: &Path,
-        force: bool,
-    ) {
-        let Some(dir) = self.writeback_dir() else {
-            return;
-        };
-        let key = self.packaging_hash(module, source);
-        let index_path = dir.join(format!("{module}.index.json"));
-        let cold_object = dir.join(format!("{module}.hsaco"));
-        let cold_hash = dir.join(format!("{module}.hash"));
-        let mut index = match self.pack_index(module, source, vec![symbol.to_owned()], object) {
-            Ok(index) => index,
-            Err(error) => {
-                eprintln!("  WARNING: {module}: cold index unavailable ({error})");
-                return;
-            }
-        };
-        let existing = std::fs::read(&index_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).ok());
-        let same_bytes = existing.as_ref().is_some_and(|prior| {
-            prior.version == index.version
-                && prior.module == index.module
-                && prior.arch == index.arch
-                && prior.source_sha256 == index.source_sha256
-                && prior.flags == index.flags
-                && prior.scheduler_profile == index.scheduler_profile
-                && prior.cache_abi == index.cache_abi
-                && prior.packaging_key == index.packaging_key
-                && prior.object_sha256 == index.object_sha256
-                && prior.toolchain_id == index.toolchain_id
-                && prior.toolchain_sha256 == index.toolchain_sha256
-        });
-        if same_bytes && pair_valid(&cold_object, &cold_hash, &key) {
-            index.symbols.extend(
-                existing
-                    .unwrap()
-                    .symbols
-                    .into_iter()
-                    .filter(|s| s != symbol),
-            );
-            // Even if the old index says its digest matches, check the actual
-            // cold bytes; a corrupted blob must be repaired from the hot object.
-            if std::fs::read(&cold_object)
-                .ok()
-                .is_some_and(|bytes| sha256_hex(&bytes) == index.object_sha256)
-                && !force
-            {
-                if let Err(error) = publish_index(dir, &index) {
-                    eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
-                }
-                return;
-            }
-        }
-        let _ = std::fs::remove_file(&index_path);
-        if let Err(error) = publish_pair(dir, module, object, &key, true) {
-            eprintln!("  WARNING: {module}: cold writeback failed ({error})");
-            return;
-        }
-        if let Err(error) = publish_index(dir, &index) {
-            eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
-        }
-    }
-
     /// Build or retrieve one object, publishing a verified install package.
     pub fn pack_to(
         &mut self,
@@ -1294,14 +1227,6 @@ impl KernelCompiler {
             &self.extra_flags,
             &self.module_flags(module),
         )
-    }
-
-    /// Persistent install dir for writeback. None when no cold location was
-    /// probed, or when it coincides with the hot cache (nothing extra to sync).
-    fn writeback_dir(&self) -> Option<&Path> {
-        self.cold_dir
-            .as_deref()
-            .filter(|d| !same_path(d, self.cache_dir.as_path()))
     }
 
     fn compiler_unavailable_error(&self, name: &str, action: &str) -> hip_bridge::HipError {
@@ -1463,7 +1388,6 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(hot_object_name(name, &src_hash));
 
         if nonempty_blob(&obj_path) {
-            self.writeback_package(name, source, symbol, &obj_path, false);
             self.ensure_radiowave_certification(name, &obj_path);
             self.compiled.insert(name.to_string(), obj_path);
             return Ok(&self.compiled[name]);
@@ -1482,7 +1406,6 @@ impl KernelCompiler {
                 } else {
                     legacy_obj
                 };
-            self.writeback_package(name, source, symbol, &hit_path, false);
             self.ensure_radiowave_certification(name, &hit_path);
             self.compiled.insert(name.to_string(), hit_path);
             return Ok(&self.compiled[name]);
@@ -1517,26 +1440,17 @@ impl KernelCompiler {
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
 
-        // Hot keys keep the toolchain ID; cold pairs use the packaging key
-        // with toolchain identity bound in the checked index.
-        self.writeback_package(name, source, symbol, &obj_path, false);
-
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
     }
 
     /// Force a fresh hipcc recompile after the driver rejects a loaded image.
     ///
-    /// Does **not** pre-delete hot/cold artifacts (safe when hot==cold or the
+    /// Does **not** pre-delete hot artifacts (safe when hot==cold or the
     /// dirs are aliased). Bypasses all lookup and invokes transactional hipcc
-    /// publication directly. Cold is force-synced only after success. A failed
-    /// hipcc leaves prior durable pairs intact.
-    pub(crate) fn recompile(
-        &mut self,
-        name: &str,
-        source: &str,
-        symbol: &str,
-    ) -> HipResult<PathBuf> {
+    /// publication directly into the hot cache; the installed pack is never
+    /// touched. A failed hipcc leaves prior durable pairs intact.
+    pub(crate) fn recompile(&mut self, name: &str, source: &str) -> HipResult<PathBuf> {
         if !self.has_hipcc {
             return Err(self.compiler_unavailable_error(
                 name,
@@ -1563,9 +1477,6 @@ impl KernelCompiler {
             false,
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
-
-        // Force-sync only after the new object is complete.
-        self.writeback_package(name, source, symbol, &obj_path, true);
 
         self.compiled.insert(name.to_string(), obj_path.clone());
         Ok(obj_path)
@@ -1867,6 +1778,12 @@ impl KernelCompiler {
             return Err(e);
         }
 
+        // The one place hipcc really ran (a cache miss): cache hits, packaged
+        // objects and embedded native images never reach here. Bracketed by
+        // the loader's route begin/ready lines, a line after ready is a
+        // request-time compile.
+        eprintln!("  {name}: hipcc compiled ({arch}, key {src_hash})");
+
         if !nonempty_blob(&tmp_obj) {
             cleanup_tmp();
             return Err(hip_bridge::HipError::new(
@@ -2033,7 +1950,6 @@ impl KernelCompiler {
             let obj_path = self.cache_dir.join(hot_object_name(name, &src_hash));
 
             if nonempty_blob(&obj_path) {
-                self.writeback_package(name, source, symbol, &obj_path, false);
                 self.ensure_radiowave_certification(name, &obj_path);
                 self.compiled.insert(name.to_string(), obj_path);
                 continue;
@@ -2048,7 +1964,6 @@ impl KernelCompiler {
                     } else {
                         legacy_obj
                     };
-                self.writeback_package(name, source, symbol, &hit_path, false);
                 self.ensure_radiowave_certification(name, &hit_path);
                 self.compiled.insert(name.to_string(), hit_path);
                 continue;
@@ -2069,15 +1984,10 @@ impl KernelCompiler {
                 .iter_mut()
                 .find(|job| job.modules[0].hash == src_hash)
             {
-                if let Some(module) = job.modules.iter_mut().find(|module| module.name == name) {
-                    if !module.symbols.iter().any(|s| s == symbol) {
-                        module.symbols.push(symbol.to_owned());
-                    }
-                } else {
+                if !job.modules.iter().any(|module| module.name == name) {
                     job.modules.push(PreparedModule {
                         name: name.to_owned(),
                         hash: src_hash,
-                        symbols: vec![symbol.to_owned()],
                     });
                 }
             } else {
@@ -2087,7 +1997,6 @@ impl KernelCompiler {
                     modules: vec![PreparedModule {
                         name: name.to_owned(),
                         hash: src_hash,
-                        symbols: vec![symbol.to_owned()],
                     }],
                 });
             }
@@ -2201,15 +2110,6 @@ impl KernelCompiler {
                                 }
                             }
                             self.ensure_radiowave_certification(&module.name, &object);
-                            for symbol in module.symbols {
-                                self.writeback_package(
-                                    &module.name,
-                                    &job.source,
-                                    &symbol,
-                                    &object,
-                                    false,
-                                );
-                            }
                             self.compiled.insert(module.name, object);
                         }
                     }
@@ -2283,30 +2183,6 @@ mod tests {
     }
 
     #[test]
-    fn two_dir_writeback_stays_distinct() {
-        // Lookup may prefer hot while cold remains the install writeback target.
-        // Defends the directory-selection invariant without invoking hipcc.
-        let mut c = test_compiler("", "hipcc 7.2");
-        c.cache_dir = PathBuf::from("/tmp/hipfire_hot/gfx1201");
-        c.precompiled_dir = Some(PathBuf::from("/tmp/hipfire_hot/gfx1201"));
-        c.cold_dir = Some(PathBuf::from(
-            "/home/user/.hipfire/bin/kernels/compiled/gfx1201",
-        ));
-
-        assert_eq!(
-            c.writeback_dir(),
-            Some(Path::new(
-                "/home/user/.hipfire/bin/kernels/compiled/gfx1201"
-            )),
-            "writeback must target cold, not the hot lookup view"
-        );
-
-        // When cold coincides with hot there is nothing extra to sync.
-        c.cold_dir = Some(c.cache_dir.clone());
-        assert_eq!(c.writeback_dir(), None);
-    }
-
-    #[test]
     fn same_path_equates_lexical_identity() {
         let p = Path::new("/tmp/hipfire_hot/gfx1201");
         assert!(same_path(p, p));
@@ -2325,6 +2201,33 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ))
+    }
+
+    /// File name → SHA-256 of every entry directly under `dir`.
+    fn snapshot_dir(dir: &Path) -> std::collections::BTreeMap<String, String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let digest = if path.is_file() {
+                    sha256_hex(&std::fs::read(&path).unwrap())
+                } else {
+                    "<not a file>".to_owned()
+                };
+                (entry.file_name().to_string_lossy().into_owned(), digest)
+            })
+            .collect()
+    }
+
+    /// Build an installed pack in `root/cold` the way the packaging tool does:
+    /// an explicit output dir, compiled from a scratch hot cache so the
+    /// consumer under test starts with an empty `root/hot`.
+    fn install_pack(root: &Path, name: &str, source: &str, symbols: &[&str]) {
+        let symbols = symbols.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        prebuilt_gate_compiler(&root.join("producer"), true)
+            .pack_to(name, source, &symbols, &root.join("cold"))
+            .unwrap();
     }
 
     #[test]
@@ -2356,9 +2259,9 @@ mod tests {
     }
 
     #[test]
-    fn validated_hot_lookup_writeback_refreshes_stale_cold() {
-        // With a compiler available, a hot-keyed build repairs a stale,
-        // unindexed cold install pair without invoking hipcc again.
+    fn validated_hot_lookup_never_rewrites_stale_cold() {
+        // A validated hot hit must leave a stale, unindexed installed pair
+        // byte-identical: the runtime never writes under the install dir.
         let root = temp_root("hot_lookup_wb");
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -2380,22 +2283,27 @@ mod tests {
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
         std::fs::write(cold.join(format!("{name}.hsaco")), b"OLD_COLD_BLOB").unwrap();
         std::fs::write(cold.join(format!("{name}.hash")), "stale").unwrap();
+        let before = snapshot_dir(&cold);
 
         let path = c
             .compile(name, source)
-            .expect("validated hot lookup must refresh stale installed object");
-        assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
+            .expect("validated hot lookup must succeed")
+            .to_path_buf();
+        assert_eq!(path, hot.join(hot_object_name(name, &src_hash)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"HOT_BLOB_V1");
 
-        let cold_hash = std::fs::read_to_string(cold.join(format!("{name}.hash"))).unwrap();
         assert_eq!(
-            cold_hash.trim(),
-            c.packaging_hash(name, source),
-            "stale cold hash must be refreshed from validated hot lookup"
+            snapshot_dir(&cold),
+            before,
+            "a hot hit must not rewrite the installed pack"
         );
         assert_eq!(
             std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"HOT_BLOB_V1",
-            "cold blob must be copied from the validated hot pair"
+            b"OLD_COLD_BLOB"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cold.join(format!("{name}.hash"))).unwrap(),
+            "stale"
         );
         // Hot pair must remain the source of truth (no self-clobber).
         assert_eq!(
@@ -2413,9 +2321,9 @@ mod tests {
     }
 
     #[test]
-    fn validated_hot_lookup_restores_missing_cold_blob() {
-        // End-to-end RED: hot hit + cold hash present + cold hsaco missing
-        // must restore the cold blob (install daemon --precompile path).
+    fn validated_hot_lookup_does_not_restore_missing_cold_blob() {
+        // Hot hit + cold hash present + cold hsaco missing: the runtime must
+        // not recreate the cold blob (install-time repair is the installer's job).
         let root = temp_root("hot_lookup_missing_cold");
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -2435,27 +2343,19 @@ mod tests {
 
         std::fs::write(hot.join(format!("{name}.hsaco")), b"HOT_BLOB_V1").unwrap();
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
-        // Cold hash matches, but blob is gone (the verified RED fixture).
+        // Cold hash matches, but blob is gone.
         std::fs::write(cold.join(format!("{name}.hash")), &src_hash).unwrap();
+        let before = snapshot_dir(&cold);
 
         let path = c
             .compile(name, source)
             .expect("validated hot lookup must succeed without hipcc");
         assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
 
+        assert_eq!(snapshot_dir(&cold), before);
         assert!(
-            cold.join(format!("{name}.hsaco")).exists(),
-            "missing cold hsaco must be restored from validated hot"
-        );
-        assert_eq!(
-            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
-            b"HOT_BLOB_V1"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cold.join(format!("{name}.hash")))
-                .unwrap()
-                .trim(),
-            c.packaging_hash(name, source)
+            !cold.join(format!("{name}.hsaco")).exists(),
+            "the runtime must not restore a missing cold hsaco"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2980,7 +2880,7 @@ mod tests {
         std::fs::write(shared.join(format!("{name}.hsaco")), b"PRIOR_PAIR").unwrap();
         std::fs::write(shared.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.recompile(name, source, name).unwrap_err();
+        let err = c.recompile(name, source).unwrap_err();
         assert!(err.to_string().contains("hipcc"), "{err}");
 
         assert_eq!(
@@ -3028,7 +2928,7 @@ mod tests {
         std::fs::write(real.join(format!("{name}.hsaco")), b"ALIAS_PRIOR").unwrap();
         std::fs::write(real.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let _ = c.recompile(name, source, name).unwrap_err();
+        let _ = c.recompile(name, source).unwrap_err();
 
         assert_eq!(
             std::fs::read(real.join(format!("{name}.hsaco"))).unwrap(),
@@ -3040,8 +2940,6 @@ mod tests {
                 .trim(),
             src_hash
         );
-        // writeback_dir must treat alias as same path → no distinct cold.
-        assert_eq!(c.writeback_dir(), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3295,8 +3193,7 @@ mod tests {
             let name = "gate";
             let source = "__global__ void gate() {}";
             let cold = root.join("cold");
-            let mut producer = prebuilt_gate_compiler(&root, true);
-            producer.compile_for_symbol(name, source, name).unwrap();
+            install_pack(&root, name, source, &[name]);
             let single = prebuilt_gate_compiler(&root, false);
             let hash_path = cold.join("gate.hash");
             match hash {
@@ -3307,6 +3204,7 @@ mod tests {
                     std::fs::write(&hash_path, bad).unwrap();
                 }
             }
+            let before = snapshot_dir(&cold);
             for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
                 .into_iter()
                 .enumerate()
@@ -3319,6 +3217,11 @@ mod tests {
                 assert!(err.to_string().contains("pair missing or stale"), "{err}");
                 assert!(!compiler.compiled.contains_key(name));
             }
+            assert_eq!(
+                snapshot_dir(&cold),
+                before,
+                "a rejected packaged object must not be touched"
+            );
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -3369,6 +3272,7 @@ mod tests {
             let old = root.join("cold/gate.hsaco");
             std::fs::write(&old, b"STALE").unwrap();
             std::fs::write(root.join("cold/gate.hash"), "wrong-key").unwrap();
+            let before = snapshot_dir(&root.join("cold"));
             let key = compiler.cache_hash(name, source);
             if batch {
                 compiler.compile_batch(&[(name, source)]).unwrap();
@@ -3378,10 +3282,11 @@ mod tests {
             let hot = root.join("hot").join(hot_object_name(name, &key));
             assert_eq!(compiler.compiled[name], hot);
             assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
-            assert_eq!(std::fs::read(&old).unwrap(), b"FRESH");
+            assert_eq!(std::fs::read(&old).unwrap(), b"STALE");
             assert_eq!(
-                std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(),
-                compiler.packaging_hash(name, source)
+                snapshot_dir(&root.join("cold")),
+                before,
+                "a rejected packaged object must be rebuilt into hot, not rewritten in the pack"
             );
             let _ = std::fs::remove_dir_all(root);
         }
@@ -3393,10 +3298,10 @@ mod tests {
             let root = temp_root("gate_hot_hit");
             let name = "gate";
             let source = "__global__ void gate() {}";
-            let mut producer = prebuilt_gate_compiler(&root, true);
-            producer.compile_for_symbol(name, source, name).unwrap();
+            install_pack(&root, name, source, &[name]);
             let mut compiler = prebuilt_gate_compiler(&root, false);
             std::fs::write(root.join("cold/gate.hsaco"), b"CORRUPTED").unwrap();
+            let before = snapshot_dir(&root.join("cold"));
             let key = compiler.cache_hash(name, source);
             let hot = root.join("hot").join(hot_object_name(name, &key));
             std::fs::write(&hot, b"HOT_VALID").unwrap();
@@ -3407,6 +3312,7 @@ mod tests {
             }
             assert!(!compiler.compiled.contains_key(name));
             assert_eq!(std::fs::read(&hot).unwrap(), b"HOT_VALID");
+            assert_eq!(snapshot_dir(&root.join("cold")), before);
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -3421,10 +3327,10 @@ mod tests {
         let hot_key = producer.cache_hash(name, source);
         let portable_key = producer.packaging_hash(name, source);
         assert_ne!(hot_key, portable_key);
-        producer
-            .compile_batch_for_symbols(&[(name, source, symbol)])
-            .unwrap();
         let cold = root.join("cold");
+        producer
+            .pack_to(name, source, &[symbol.to_owned()], &cold)
+            .unwrap();
         let object = cold.join("rmsnorm.hsaco");
         assert!(pair_valid(
             &object,
@@ -3456,12 +3362,10 @@ mod tests {
     }
 
     #[test]
-    fn indexed_writeback_preserves_all_symbols_in_shared_module() {
+    fn indexed_pack_preserves_all_symbols_in_shared_module() {
         let root = temp_root("shared_module_symbols");
         let source = "__global__ void a() {} __global__ void b() {}";
-        let mut producer = prebuilt_gate_compiler(&root, true);
-        producer.compile_for_symbol("shared", source, "a").unwrap();
-        producer.compile_for_symbol("shared", source, "b").unwrap();
+        install_pack(&root, "shared", source, &["a", "b"]);
         let mut consumer = prebuilt_gate_compiler(&root, false);
         assert!(consumer.compile_for_symbol("shared", source, "a").is_ok());
         assert!(consumer.compile_for_symbol("shared", source, "b").is_ok());
@@ -3542,12 +3446,17 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // The pre-repair registry is exactly the sealed index.
+                // Keep the sealed inventory unchanged; beta later added the
+                // HC-write widening to the shared source on every arch.
                 assert_eq!(
                     old.iter()
                         .copied()
                         .collect::<std::collections::BTreeSet<_>>(),
                     sealed
+                        .iter()
+                        .copied()
+                        .chain(["hyper_write_bf16x8_gfx1201"])
+                        .collect::<std::collections::BTreeSet<_>>()
                 );
             }
             let mut compiler = test_compiler("", "hipcc 7.16");
@@ -3606,8 +3515,7 @@ mod tests {
         let source = "__global__ void rmsnorm_f32() {}";
         let name = "rmsnorm";
         let symbol = "rmsnorm_f32";
-        let mut producer = prebuilt_gate_compiler(&root, true);
-        producer.compile_for_symbol(name, source, symbol).unwrap();
+        install_pack(&root, name, source, &[symbol]);
         let cold = root.join("cold");
         let object = cold.join("rmsnorm.hsaco");
         let index_path = cold.join("rmsnorm.index.json");
@@ -3667,10 +3575,10 @@ mod tests {
     fn indexed_package_from_another_compiler_build_is_rebuilt_not_loaded() {
         let root = temp_root("indexed_foreign_toolchain");
         let (name, source, symbol) = ("rmsnorm", "__global__ void rmsnorm_f32() {}", "rmsnorm_f32");
-        let mut producer = prebuilt_gate_compiler(&root, true);
-        producer.compile_for_symbol(name, source, symbol).unwrap();
+        install_pack(&root, name, source, &[symbol]);
         let cold = root.join("cold");
         assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"FRESH");
+        let before = snapshot_dir(&cold);
 
         // The installed index is intact, but this machine's compiler is a
         // different build: the object must not load, it must be rebuilt.
@@ -3683,11 +3591,17 @@ mod tests {
             .to_path_buf();
         assert_eq!(std::fs::read(&loaded).unwrap(), b"LOCAL");
         assert_ne!(loaded, cold.join("rmsnorm.hsaco"));
+        assert!(
+            loaded.starts_with(root.join("hot")),
+            "the rebuilt object must land in the hot cache: {}",
+            loaded.display()
+        );
         let index: PackIndex =
             serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap())
                 .unwrap();
-        assert_eq!(index.toolchain_id, "hipcc 9.9");
-        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"LOCAL");
+        assert_eq!(index.toolchain_id, "hipcc 7.2");
+        assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"FRESH");
+        assert_eq!(snapshot_dir(&cold), before);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3844,25 +3758,28 @@ mod tests {
                 }
                 assert_eq!(active, 0);
                 let mut identities = Vec::new();
-                for module in ["alpha", "alias", "beta", "gamma"] {
-                    for extension in ["hsaco", "hash", "index.json"] {
-                        identities.push(
-                            std::fs::read(arm.join("cold").join(format!("{module}.{extension}")))
-                                .unwrap(),
-                        );
-                    }
+                for (module, source) in [
+                    ("alpha", sources[0]),
+                    ("alias", sources[0]),
+                    ("beta", sources[1]),
+                    ("gamma", sources[2]),
+                ] {
+                    let key = compiler.cache_hash(module, source);
+                    let hot = arm.join("hot");
+                    identities
+                        .push(std::fs::read(hot.join(hot_object_name(module, &key))).unwrap());
+                    identities
+                        .push(std::fs::read(hot.join(format!("{module}.{key}.hash"))).unwrap());
                 }
                 if let Some(expected) = &expected {
                     assert_eq!(&identities, expected);
                 } else {
                     expected = Some(identities);
                 }
-                let index: PackIndex = serde_json::from_slice(
-                    &std::fs::read(arm.join("cold/alpha.index.json")).unwrap(),
-                )
-                .unwrap();
-                assert!(index.symbols.contains(&"first".to_owned()));
-                assert!(index.symbols.contains(&"second".to_owned()));
+                assert!(
+                    snapshot_dir(&arm.join("cold")).is_empty(),
+                    "the batch must not write under the installed pack dir"
+                );
                 if std::env::var_os("HIPFIRE_TEST_REAL_HIPCC").is_some() {
                     for &(module, _, symbol) in &requests {
                         let object = &compiler.compiled[module];
@@ -3883,12 +3800,7 @@ mod tests {
                 assert!(batch.handles.is_empty());
                 compiler.finish_batch(batch).unwrap();
                 assert_eq!(std::fs::read(&log).unwrap(), before);
-                compiler.cold_dir = None;
-                let batch = compiler.prepare_batch(&requests, jobs).unwrap();
-                assert!(batch.handles.is_empty());
-                compiler.finish_batch(batch).unwrap();
-                assert_eq!(std::fs::read(&log).unwrap(), before);
-                eprintln!("{arch}: jobs={jobs}, compiler starts=3, aliases=4, objects/hash/index identical, installed/hot starts=0");
+                eprintln!("{arch}: jobs={jobs}, compiler starts=3, aliases=4, hot objects/hash identical, installed pack untouched, hot-hit starts=0");
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -3935,5 +3847,95 @@ mod tests {
             .prepare_batch(&[("one", "first", "one"), ("one", "second", "two")], 2)
             .is_err());
         assert!(compiler.compiled.is_empty());
+    }
+
+    #[test]
+    fn jit_miss_and_recompile_write_hot_only() {
+        for batch in [false, true] {
+            let root = temp_root("jit_miss_hot_only");
+            let (name, source) = ("gate", "__global__ void gate() {}");
+            // The installed pack holds only an unrelated module: `gate` misses.
+            install_pack(&root, "other", "__global__ void other() {}", &["other"]);
+            let cold = root.join("cold");
+            let before = snapshot_dir(&cold);
+            assert!(!before.is_empty());
+
+            let mut compiler = prebuilt_gate_compiler(&root, true);
+            let key = compiler.cache_hash(name, source);
+            let hot = root.join("hot").join(hot_object_name(name, &key));
+            if batch {
+                compiler.compile_batch(&[(name, source)]).unwrap();
+            } else {
+                compiler.compile(name, source).unwrap();
+            }
+            assert_eq!(compiler.compiled[name], hot);
+            assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
+            assert_eq!(
+                snapshot_dir(&cold),
+                before,
+                "a JIT miss must not write under the installed pack (batch={batch})"
+            );
+
+            // A driver-rejected image recompiles into hot as well.
+            assert_eq!(compiler.recompile(name, source).unwrap(), hot);
+            assert_eq!(snapshot_dir(&cold), before);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn rejected_packaged_object_is_rebuilt_into_hot_and_pack_is_untouched() {
+        let (name, symbol) = ("rmsnorm", "rmsnorm_f32");
+        let source = "__global__ void rmsnorm_f32() {}";
+        // (label, source offered, symbol requested, corrupt the packaged blob)
+        let cases = [
+            (
+                "stale index",
+                "__global__ void rmsnorm_f32() { /* changed */ }",
+                symbol,
+                false,
+            ),
+            ("missing symbol", source, "other_symbol", false),
+            ("corrupt object", source, symbol, true),
+        ];
+        for (label, offered, wanted, corrupt) in cases {
+            for batch in [false, true] {
+                let root = temp_root("rejected_pack_hot_only");
+                install_pack(&root, name, source, &[symbol]);
+                let cold = root.join("cold");
+                if corrupt {
+                    std::fs::write(cold.join("rmsnorm.hsaco"), b"CORRUPTED").unwrap();
+                }
+                let before = snapshot_dir(&cold);
+
+                let mut compiler = prebuilt_gate_compiler(&root, true);
+                let key = compiler.cache_hash(name, offered);
+                let hot = root.join("hot").join(hot_object_name(name, &key));
+                if batch {
+                    compiler
+                        .compile_batch_for_symbols(&[(name, offered, wanted)])
+                        .unwrap();
+                } else {
+                    compiler.compile_for_symbol(name, offered, wanted).unwrap();
+                }
+                assert_eq!(compiler.compiled[name], hot, "{label} batch={batch}");
+                assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH", "{label}");
+                assert_eq!(
+                    snapshot_dir(&cold),
+                    before,
+                    "{label} batch={batch}: the installed pack must stay byte-identical"
+                );
+
+                // A fresh process keeps rejecting the pack and reuses the hot object.
+                let mut next = prebuilt_gate_compiler(&root, true);
+                assert_eq!(
+                    next.compile_for_symbol(name, offered, wanted).unwrap(),
+                    hot,
+                    "{label}"
+                );
+                assert_eq!(snapshot_dir(&cold), before, "{label}");
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
     }
 }

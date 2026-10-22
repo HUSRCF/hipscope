@@ -25,6 +25,8 @@ pub mod chunk_dump;
 pub mod config;
 /// Per-load default of the D2 CPU tier split (measured engine-rate selector).
 pub mod d2_default;
+/// Target side of the shared DFlash2 drafter (layer capture, embed, head).
+pub(crate) mod dflash_target;
 pub mod ep;
 pub mod ep_seal;
 pub mod expert_keep;
@@ -53,7 +55,9 @@ pub mod kv_backend;
 pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
+pub(crate) mod lane_token_ring;
 pub mod mesh_bindings;
+pub mod mesh_tp;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
 pub mod mtp_spec;

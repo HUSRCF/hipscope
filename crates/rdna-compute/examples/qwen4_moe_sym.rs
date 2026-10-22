@@ -652,7 +652,12 @@ fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
             c.t,
             c.host,
         )?,
-        3 => h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?),
+        // The route's producer: the grouped-position plane where the PM twins apply (the dispatch call),
+        // else the flat-slot sidecar. The anchors below always rebuild the flat sidecar.
+        3 => {
+            h.down =
+                Some(gpu.qwen4_moe_rotate128_i4_gp(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?)
+        }
         _ => gpu.gemm_qwen4_moe_down_iu4_sym(
             &c.dn_ptrs,
             &c.tiles,
@@ -860,11 +865,14 @@ fn cand_and_anchors(gpu: &Gpu, host: bool, total_slots: usize) -> Res<(Entry, Ve
         )
         .into());
     }
+    // Where the route runs the grouped-position `..._gp` twins, the flat entry of the same name is
+    // not the candidate and stays an anchor (the byte-identity claim is twin vs original).
+    let gp = gpu.qwen4_moe_rotate128_i4_gp_selected(geo().mi, total_slots, total_slots);
     Ok((
         cand,
         all.iter()
             .copied()
-            .filter(|e| e.name != cand.name)
+            .filter(|e| gp || e.name != cand.name)
             .collect(),
     ))
 }
@@ -886,6 +894,16 @@ fn report_candidate(
         format!("[{},{}]", q(cand.gate_up), q(cand.down)),
     );
     out.insert("candidate_entry".into(), q(cand.name));
+    out.insert(
+        "down_plane".into(),
+        q(
+            if gpu.qwen4_moe_rotate128_i4_gp_selected(geo().mi, total_slots, total_slots) {
+                "grouped_position_gp_twins"
+            } else {
+                "flat_slot"
+            },
+        ),
+    );
     out.insert("down_rr".into(), cand.down_rr.to_string());
     out.insert("residency".into(), q(residency));
     out.insert("candidate_total_slots".into(), total_slots.to_string());
@@ -1321,33 +1339,42 @@ fn down_sidecar_mismatch(gpu: &mut Gpu, c: &Case, xqd: &[u8]) -> Res<usize> {
     gpu.ensure_mq_signs_128()?;
     let s1 = gpu.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
     let s2 = gpu.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
-    let mut a = KernargBlob::new();
-    a.push_ptr(p(&rot));
-    a.push_ptr(p(&rot));
-    a.push_ptr(s1);
-    a.push_ptr(s2);
-    a.push_i32(geo().mi as i32);
-    launch(
-        gpu,
-        "mq_rotate_x_128_v2",
-        [(geo().mi / 128) as u32, c.pmax as u32, 1],
-        32,
-        &mut a,
-    )?;
-    let mut a = KernargBlob::new();
-    a.push_ptr(p(&rot));
-    a.push_ptr(p(&c.sorted));
-    a.push_ptr(p(&refq));
-    a.push_i32(geo().mi as i32);
-    a.push_i32(c.pmax as i32);
-    a.push_i32(c.l as i32);
-    launch(
-        gpu,
-        "qwen4_moe_sym_ref_quant",
-        [(geo().mi / 128) as u32, c.pmax as u32, 1],
-        32,
-        &mut a,
-    )?;
+    // Both reference kernels are row-local with grid.y = rows; chunk the rows under HIP's grid.y limit
+    // (a3b at 8192 tokens has 69376 grouped rows). `qwen4_moe_sym_ref_quant` keeps the full
+    // `l` slot extent, so a chunk only offsets the row base of `rot` and `sorted`.
+    const ROWS_PER_LAUNCH: usize = 32768;
+    for first in (0..c.pmax).step_by(ROWS_PER_LAUNCH) {
+        let rows = (c.pmax - first).min(ROWS_PER_LAUNCH);
+        let rot_at = (p(&rot) as *const u8).wrapping_add(first * geo().mi * 4) as *const _;
+        let sorted_at = (p(&c.sorted) as *const u8).wrapping_add(first * 4) as *const _;
+        let mut a = KernargBlob::new();
+        a.push_ptr(rot_at);
+        a.push_ptr(rot_at);
+        a.push_ptr(s1);
+        a.push_ptr(s2);
+        a.push_i32(geo().mi as i32);
+        launch(
+            gpu,
+            "mq_rotate_x_128_v2",
+            [(geo().mi / 128) as u32, rows as u32, 1],
+            32,
+            &mut a,
+        )?;
+        let mut a = KernargBlob::new();
+        a.push_ptr(rot_at);
+        a.push_ptr(sorted_at);
+        a.push_ptr(p(&refq));
+        a.push_i32(geo().mi as i32);
+        a.push_i32(rows as i32);
+        a.push_i32(c.l as i32);
+        launch(
+            gpu,
+            "qwen4_moe_sym_ref_quant",
+            [(geo().mi / 128) as u32, rows as u32, 1],
+            32,
+            &mut a,
+        )?;
+    }
     gpu.hip.device_synchronize()?;
     let r = download(gpu, &refq.buf, (geo().mi / 128) * c.l * BLK)?;
     gpu.free_tensor(rot)?;
@@ -1355,6 +1382,14 @@ fn down_sidecar_mismatch(gpu: &mut Gpu, c: &Case, xqd: &[u8]) -> Res<usize> {
     Ok(r.iter().zip(xqd).filter(|(a, b)| a != b).count())
 }
 
+/// Whether the route's down producer writes the grouped-position plane for this case.
+fn gp_plane(gpu: &Gpu, c: &Case) -> bool {
+    gpu.qwen4_moe_rotate128_i4_gp_selected(geo().mi, c.pmax, c.l)
+}
+
+/// The gate and down sidecars. The grouped-position down plane (record `g * pmax + p`) is returned
+/// remapped to the flat-slot layout (record `g * l + sorted[p]`, every slot a valid row names exactly
+/// once), so every flat-sidecar comparison below applies to either producer.
 fn sidecars(gpu: &Gpu, c: &Case) -> Res<(Vec<u8>, Vec<u8>)> {
     let g = gpu
         .scratch
@@ -1366,10 +1401,28 @@ fn sidecars(gpu: &Gpu, c: &Case) -> Res<(Vec<u8>, Vec<u8>)> {
         .qwen4_moe_down_i4_scratch
         .as_ref()
         .ok_or("no down sidecar")?;
-    Ok((
-        download(gpu, g, (geo().hid / 128) * c.t * BLK)?,
-        download(gpu, d, (geo().mi / 128) * c.l * BLK)?,
-    ))
+    let groups = geo().mi / 128;
+    let down = if gp_plane(gpu, c) {
+        let plane = download(gpu, d, groups * c.pmax * BLK)?;
+        let sorted = download(gpu, &c.sorted.buf, c.pmax * 4)?;
+        let mut flat = vec![0x7Bu8; groups * c.l * BLK];
+        for grp in 0..groups {
+            for (pos, w) in sorted.chunks_exact(4).enumerate() {
+                let slot = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                if slot >= 0 {
+                    let (src, dst) = (
+                        (grp * c.pmax + pos) * BLK,
+                        (grp * c.l + slot as usize) * BLK,
+                    );
+                    flat[dst..dst + BLK].copy_from_slice(&plane[src..src + BLK]);
+                }
+            }
+        }
+        flat
+    } else {
+        download(gpu, d, groups * c.l * BLK)?
+    };
+    Ok((download(gpu, g, (geo().hid / 128) * c.t * BLK)?, down))
 }
 
 fn sample_tiles(used: usize) -> Vec<usize> {
@@ -2601,7 +2654,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .qwen4_moe_down_i4_scratch
                         .as_ref()
                         .ok_or("no down sidecar")?;
-                    gpu.hip.memset(ds, v, (geo().mi / 128) * c.l * BLK)?;
+                    gpu.hip
+                        .memset(ds, v, (geo().mi / 128) * c.pmax.max(c.l) * BLK)?;
                     gpu.hip.device_synchronize()?;
                     Ok(())
                 };

@@ -11,6 +11,15 @@
 //! `Gpu::fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched` (`cand_mode = 8`,
 //! `quantize_block_i4_128_wave<false>`, the 8-candidate "C8" search).
 //!
+//! L4 folds (same module, 80-byte kernarg block): `iu4_c8_sigmoid_rotate_pm_gfx1201`
+//! (`Gpu::mq_sigmoid_rotate_x_i4_c8_pm`) against the unfused chain
+//! `Gpu::sigmoid_mul_f32` (in place on a copy of the attention input) followed by
+//! `Gpu::rotate_x_mq_i4_gfx12_exact_batched`, and `iu4_c8_rmsnorm_out_rotate_pm_gfx1201`
+//! (`Gpu::fused_rmsnorm_out_mq_rotate_i4_c8_pm`) against `Gpu::rmsnorm_batched` (the standalone
+//! `rmsnorm_f32`) followed by `Gpu::rotate_x_mq_i4_gfx12_exact_batched` on its output. Besides the
+//! sidecar and the rotated f32, the norm fold's normalized f32 row (`norm_out`) is compared
+//! bytewise, and the sigmoid fold must leave its attention input unmodified.
+//!
 //! ## What is compared
 //!
 //! For every case TWO things are compared bytewise, never one alone:
@@ -35,10 +44,10 @@
 //!
 //! The PM exports are launched explicitly through the low-level PM launchers,
 //! independent of the production route: the oracle never reads the
-//! `PrefillIu4C8Pm` capability / `HIPFIRE_PREFILL_IU4_C8_PM` /
-//! `developer.prefill_iu4_c8_pm`, and refuses to run with
-//! `HIPFIRE_PREFILL_IU4_C8_PM=1` so the HIP incumbent arm can never be
-//! silently re-routed to PM.
+//! `PrefillIu4C8Pm` capability / `developer.prefill_iu4_c8_pm`. The route is
+//! qualified on exact gfx1201, so an unset flag would let the HIP incumbent
+//! arm (`*_exact_batched`) take the PM twin; the oracle therefore requires the
+//! explicit kill `HIPFIRE_PREFILL_IU4_C8_PM=0` and refuses to run otherwise.
 //!
 //! CPU diagnostic (never contributes to `all_byte_identical`): the first 64
 //! rows of the incumbent's rotated f32 are quantized by the CPU C8 model in
@@ -52,8 +61,12 @@
 //! |---|---|---|---|---|
 //! | rotate (`iu4_c8_rotate_pm_gfx1201`, block 32, grid rows*K/256) | 2048, 4096 | 512, 4096, 8192 | zero, random, large | none, some |
 //! | norm (`iu4_c8_rmsnorm_rotate_pm_gfx1201`, block 256, grid rows) | 2048 | 512, 4096, 8192 | zero, random, large | none, some |
+//! | sigmoid_rotate (`iu4_c8_sigmoid_rotate_pm_gfx1201`, block 32, grid rows*K/256) | 2048, 4096 | 512, 4096, 7808, 8192 | zero, random, large | none, some |
+//! | norm_out (`iu4_c8_rmsnorm_out_rotate_pm_gfx1201`, block 256, grid rows) | 2048 | 512, 4096, 7808, 8192 | zero, random, large | none, some |
 //!
-//! = 36 + 18 = 54 cases. `zero` makes every amax 0 (d = 1 branch); `random`
+//! Rows are 512, 4096, 7808 and 8192 for every export (7808 and 8192 are the A3B prefill chunks);
+//! the default matrix is 48 + 24 + 48 + 24 = 144 cases (`--exports` filters, so one export is
+//! 24 or 48 cases). `zero` makes every amax 0 (d = 1 branch); `random`
 //! is uniform in `[-1, 1)` times a per-row scale `0.25 * (1 + row % 5)`;
 //! `large` spans ~2^-40..2^40 per element/row, with all-zero rows
 //! (`row % 7 == 3`), single-spike rows (`row % 13 == 0`) and rows with
@@ -109,7 +122,7 @@ const QS_RANGE: (usize, usize) = (8, 72);
 /// Nonzero fill for sidecar and rotated outputs before each verified launch.
 const SENTINEL: u8 = 0xA5;
 const EPS: f32 = 1.0e-6;
-const ROWS: [usize; 3] = [512, 4096, 8192];
+const ROWS: [usize; 4] = [512, 4096, 7808, 8192];
 const KS: [usize; 2] = [2048, 4096];
 /// Raw env key of the production flag; the oracle must not run with it on.
 const FLAG_ENV: &str = "HIPFIRE_PREFILL_IU4_C8_PM";
@@ -138,15 +151,24 @@ const PM_KERNARG_BYTES: usize = 72;
 enum Export {
     Rotate,
     Norm,
+    SigmoidRotate,
+    NormOut,
 }
 
 impl Export {
-    const ALL: [Export; 2] = [Export::Rotate, Export::Norm];
+    const ALL: [Export; 4] = [
+        Export::Rotate,
+        Export::Norm,
+        Export::SigmoidRotate,
+        Export::NormOut,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Export::Rotate => "rotate",
             Export::Norm => "norm",
+            Export::SigmoidRotate => "sigmoid_rotate",
+            Export::NormOut => "norm_out",
         }
     }
 
@@ -158,20 +180,33 @@ impl Export {
         match self {
             Export::Rotate => "iu4_c8_rotate_pm_gfx1201",
             Export::Norm => "iu4_c8_rmsnorm_rotate_pm_gfx1201",
+            Export::SigmoidRotate => "iu4_c8_sigmoid_rotate_pm_gfx1201",
+            Export::NormOut => "iu4_c8_rmsnorm_out_rotate_pm_gfx1201",
         }
     }
 
     fn supports_k(self, k: usize) -> bool {
         match self {
-            Export::Rotate => k == 2048 || k == 4096,
-            Export::Norm => k == 2048,
+            Export::Rotate | Export::SigmoidRotate => k == 2048 || k == 4096,
+            Export::Norm | Export::NormOut => k == 2048,
         }
+    }
+
+    /// The RMSNorm-fronted exports (take a norm weight).
+    fn is_norm(self) -> bool {
+        matches!(self, Export::Norm | Export::NormOut)
     }
 
     fn hip_incumbent(self) -> &'static str {
         match self {
             Export::Rotate => "rotate_x_mq_i4_gfx12_exact_batched",
             Export::Norm => "fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched",
+            Export::SigmoidRotate => {
+                "sigmoid_mul_f32 + rotate_x_mq_i4_gfx12_exact_batched (unfused chain)"
+            }
+            Export::NormOut => {
+                "rmsnorm_batched + rotate_x_mq_i4_gfx12_exact_batched (unfused chain)"
+            }
         }
     }
 
@@ -179,15 +214,33 @@ impl Export {
         match self {
             Export::Rotate => "mq_rotate_x_i4_c8_pm",
             Export::Norm => "fused_rmsnorm_mq_rotate_i4_c8_pm",
+            Export::SigmoidRotate => "mq_sigmoid_rotate_x_i4_c8_pm",
+            Export::NormOut => "fused_rmsnorm_out_mq_rotate_i4_c8_pm",
         }
     }
 
     /// (grid, block) of the PM export.
     fn geometry(self, k: usize, rows: usize) -> (usize, usize) {
         match self {
-            Export::Rotate => (rows * (k / 256), 32),
-            Export::Norm => (rows, 256),
+            Export::Rotate | Export::SigmoidRotate => (rows * (k / 256), 32),
+            Export::Norm | Export::NormOut => (rows, 256),
         }
+    }
+
+    /// The byte streams compared for this export.
+    fn compared(self) -> Vec<&'static str> {
+        let mut v = vec![
+            "sidecar d@0..4",
+            "sidecar s@4..8",
+            "sidecar payload@8..72",
+            "rotated f32",
+        ];
+        match self {
+            Export::NormOut => v.push("normalized f32 row (norm_out)"),
+            Export::SigmoidRotate => v.push("attention input untouched"),
+            Export::Rotate | Export::Norm => {}
+        }
+        v
     }
 }
 
@@ -299,7 +352,9 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--self-check" => a.mode = Mode::SelfCheck,
             "--exports" => {
                 a.exports = parse_list("--exports", &value("--exports")?, |s| {
-                    Export::from_name(s).ok_or_else(|| format!("export {s:?} not rotate|norm"))
+                    Export::from_name(s).ok_or_else(|| {
+                        format!("export {s:?} not rotate|norm|sigmoid_rotate|norm_out")
+                    })
                 })?;
             }
             "--k" => {
@@ -484,6 +539,34 @@ fn synth_pos(len: usize, seed: u64, lo: f32, span: f32, data: Data, spread: i32)
         .collect()
 }
 
+/// Gate rows of the sigmoid fold. `zero`: all zero (`sigmoid = 0.5`). `random`: uniform in `[-30, 30)` with
+/// one element in 32 forced to `+-[80, 110)`, which straddles the `expf(-g)` range selects (`-g` below
+/// -103.27 / above 88.72). `large`: the wide-exponent activation synthesis (magnitudes up to ~2^40 of both signs).
+fn synth_gate(rows: usize, k: usize, seed: u64, data: Data) -> Vec<f32> {
+    match data {
+        Data::Zero => vec![0.0; rows * k],
+        Data::Random => {
+            let mut rng = Rng(seed);
+            (0..rows * k)
+                .map(|_| {
+                    let u = rng.unit();
+                    if rng.next() % 32 == 0 {
+                        let m = 80.0 + 30.0 * rng.unit().abs();
+                        if u < 0.0 {
+                            -m
+                        } else {
+                            m
+                        }
+                    } else {
+                        u * 30.0
+                    }
+                })
+                .collect()
+        }
+        Data::Large => synth_x(rows, k, seed, Data::Large),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CPU model of the C8 quantizer / remap / packing (covered by --self-check)
 // ---------------------------------------------------------------------------
@@ -620,10 +703,10 @@ fn cpu_model_vs_sidecar(
 }
 
 /// Flag expectation for `HIPFIRE_PREFILL_IU4_C8_PM`: explicit 1 opts in,
-/// 0 kills, unset is off.
+/// 0 kills, unset follows the exact-gfx1201 qualification (on there).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FlagState {
-    Off,
+    Default,
     On,
     Killed,
 }
@@ -632,13 +715,14 @@ fn flag_state(env: Option<&str>) -> FlagState {
     match env {
         Some("1") => FlagState::On,
         Some("0") => FlagState::Killed,
-        _ => FlagState::Off,
+        _ => FlagState::Default,
     }
 }
 
-/// The oracle's HIP incumbent must not be re-routed to PM.
+/// The oracle's HIP incumbent must not be re-routed to PM: only the explicit
+/// kill keeps the `*_exact_batched` methods on the HIP export.
 fn env_isolated(env: Option<&str>) -> bool {
-    flag_state(env) != FlagState::On
+    flag_state(env) == FlagState::Killed
 }
 
 // ---------------------------------------------------------------------------
@@ -782,24 +866,44 @@ struct Group {
     x: GpuTensor,
     rot_hip: GpuTensor,
     rot_pm: GpuTensor,
+    /// Sigmoid fold: the gate rows, and the copy of `x` the unfused chain gates in place.
+    gate: GpuTensor,
+    attn_work: GpuTensor,
+    /// Norm fold: the normalized f32 row of each arm.
+    norm_hip: GpuTensor,
+    norm_pm: GpuTensor,
 }
 
 fn make_group(gpu: &mut Gpu, case: &Case) -> Group {
     let (k, rows) = (case.k, case.rows);
     let host = synth_x(rows, k, group_seed(k, rows, case.data), case.data);
     let x = gpu.upload_f32(&host, &[rows, k]).expect("upload x");
+    let gate_host = synth_gate(rows, k, group_seed(k, rows, case.data) + 0x400, case.data);
+    let gate = gpu.upload_f32(&gate_host, &[rows, k]).expect("upload gate");
     Group {
         key: (case.rows, case.data, case.k),
         x,
         rot_hip: gpu.zeros(&[rows, k], DType::F32).expect("alloc rot_hip"),
         rot_pm: gpu.zeros(&[rows, k], DType::F32).expect("alloc rot_pm"),
+        gate,
+        attn_work: gpu.zeros(&[rows, k], DType::F32).expect("alloc attn_work"),
+        norm_hip: gpu.zeros(&[rows, k], DType::F32).expect("alloc norm_hip"),
+        norm_pm: gpu.zeros(&[rows, k], DType::F32).expect("alloc norm_pm"),
     }
 }
 
 fn free_group(gpu: &mut Gpu, g: Group) {
-    let _ = gpu.free_tensor(g.x);
-    let _ = gpu.free_tensor(g.rot_hip);
-    let _ = gpu.free_tensor(g.rot_pm);
+    for t in [
+        g.x,
+        g.rot_hip,
+        g.rot_pm,
+        g.gate,
+        g.attn_work,
+        g.norm_hip,
+        g.norm_pm,
+    ] {
+        let _ = gpu.free_tensor(t);
+    }
 }
 
 struct Ctx<'a> {
@@ -807,6 +911,7 @@ struct Ctx<'a> {
     x: &'a GpuTensor,
     weight: Option<&'a GpuTensor>,
     awq: Option<&'a GpuTensor>,
+    g: &'a Group,
 }
 
 fn fill_device(gpu: &Gpu, ptr: *mut std::ffi::c_void, bytes: usize, val: u8) {
@@ -858,6 +963,57 @@ fn launch(
             EPS,
             n,
         ),
+        // The unfused chain of the sigmoid fold: `sigmoid_mul_f32` in place on the attention copy, then the
+        // HIP exact rotate of it (the flag is off, so the exact wrapper is the HIP producer).
+        (Export::SigmoidRotate, Arm::Hip) => {
+            gpu.sigmoid_mul_f32(&c.g.attn_work, &c.g.gate)?;
+            gpu.rotate_x_mq_i4_gfx12_exact_batched(&c.g.attn_work, c.awq, Some(x_rot), res, k, n)
+        }
+        (Export::SigmoidRotate, Arm::Pm) => {
+            gpu.mq_sigmoid_rotate_x_i4_c8_pm(c.x, &c.g.gate, c.awq, Some(x_rot), res, k, n)
+        }
+        // The unfused chain of the norm fold: the standalone `rmsnorm_f32` (as `rmsnorm_batched`) into
+        // `norm_hip`, then the HIP exact rotate of it.
+        (Export::NormOut, Arm::Hip) => {
+            gpu.rmsnorm_batched(
+                c.x,
+                c.weight.expect("norm weight"),
+                &c.g.norm_hip,
+                n,
+                k,
+                EPS,
+            )?;
+            gpu.rotate_x_mq_i4_gfx12_exact_batched(&c.g.norm_hip, c.awq, Some(x_rot), res, k, n)
+        }
+        (Export::NormOut, Arm::Pm) => gpu.fused_rmsnorm_out_mq_rotate_i4_c8_pm(
+            c.x,
+            c.weight.expect("norm weight"),
+            c.awq,
+            &c.g.norm_pm,
+            Some(x_rot),
+            res,
+            k,
+            EPS,
+            n,
+        ),
+    }
+}
+
+/// The normalized-row tensor of an arm (norm fold only).
+fn norm_tensor<'a>(c: &Ctx<'a>, arm: Arm) -> &'a GpuTensor {
+    if arm == Arm::Hip {
+        &c.g.norm_hip
+    } else {
+        &c.g.norm_pm
+    }
+}
+
+/// Untimed per-launch setup: the unfused sigmoid chain gates a fresh copy of the attention input in place.
+fn prepare_arm(gpu: &mut Gpu, c: &Ctx, arm: Arm) {
+    if c.case.export == Export::SigmoidRotate && arm == Arm::Hip {
+        gpu.hip
+            .memcpy_dtod_at(&c.g.attn_work.buf, 0, &c.x.buf, 0, c.x.byte_size())
+            .expect("copy attention input");
     }
 }
 
@@ -883,11 +1039,20 @@ fn snapshot_sidecar(gpu: &Gpu, k: usize, n: usize) -> Vec<u8> {
 struct ArmOut {
     sidecar: Vec<u8>,
     rot: Vec<u8>,
+    /// The arm's normalized f32 row (norm fold only, else empty).
+    norm: Vec<u8>,
+    /// The attention input after the PM sigmoid arm (sigmoid fold only, else empty).
+    attn_after: Vec<u8>,
 }
 
 fn run_arm_verified(gpu: &mut Gpu, c: &Ctx, arm: Arm, x_rot: &GpuTensor) -> ArmOut {
     let (k, n) = (c.case.k, c.case.rows);
     fill_device(gpu, x_rot.buf.as_ptr(), x_rot.byte_size(), SENTINEL);
+    if c.case.export == Export::NormOut {
+        let t = norm_tensor(c, arm);
+        fill_device(gpu, t.buf.as_ptr(), t.byte_size(), SENTINEL);
+    }
+    prepare_arm(gpu, c, arm);
     sync(gpu);
     let gen_before = gpu.scratch.int4_mmq_live().0;
     let prep = launch(gpu, c, arm, x_rot, true)
@@ -903,6 +1068,18 @@ fn run_arm_verified(gpu: &mut Gpu, c: &Ctx, arm: Arm, x_rot: &GpuTensor) -> ArmO
     ArmOut {
         sidecar: snapshot_sidecar(gpu, k, n),
         rot: gpu.download_raw_bytes(x_rot).expect("download x_rot"),
+        norm: if c.case.export == Export::NormOut {
+            gpu.download_raw_bytes(norm_tensor(c, arm))
+                .expect("download norm_out")
+        } else {
+            Vec::new()
+        },
+        attn_after: if c.case.export == Export::SigmoidRotate && arm == Arm::Pm {
+            gpu.download_raw_bytes(c.x)
+                .expect("download attention input")
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -915,22 +1092,39 @@ struct Pass {
 /// One verification pass: HIP incumbent then PM, both sentinel-initialized.
 fn verify_pass(gpu: &mut Gpu, c: &Ctx, g: &Group) -> Pass {
     let (k, n) = (c.case.k, c.case.rows);
+    let attn_before = (c.case.export == Export::SigmoidRotate).then(|| {
+        gpu.download_raw_bytes(c.x)
+            .expect("download attention input")
+    });
     let inc = run_arm_verified(gpu, c, Arm::Hip, &g.rot_hip);
     let pm = run_arm_verified(gpu, c, Arm::Pm, &g.rot_pm);
 
     let side = compare_sidecar(&inc.sidecar, &pm.sidecar, n);
     let rot_first = first_mismatch(&inc.rot, &pm.rot);
     let rot_equal = rot_first.is_none();
+    // Norm fold: the normalized f32 row. Sigmoid fold: the PM arm leaves its attention input unmodified.
+    let norm_first = (c.case.export == Export::NormOut)
+        .then(|| first_mismatch(&inc.norm, &pm.norm))
+        .flatten();
+    let norm_equal = norm_first.is_none();
+    let attn_first = attn_before
+        .as_ref()
+        .and_then(|before| first_mismatch(before, &pm.attn_after));
+    let attn_equal = attn_first.is_none();
 
     // Diagnostic: CPU C8 model on the incumbent's rotated f32 vs the
     // incumbent's own sidecar (first CPU_MODEL_ROWS rows).
     let model_bad = cpu_model_vs_sidecar(&inc.rot, &inc.sidecar, k, n, CPU_MODEL_ROWS);
 
-    let identical = side.equal && rot_equal;
+    let identical = side.equal && rot_equal && norm_equal && attn_equal;
     let first_mismatch = if !side.equal {
         Some(json!({ "stage": "sidecar", "at": side.json["first_mismatch"].clone() }))
+    } else if let Some(b) = rot_first {
+        Some(json!({ "stage": "rotated_f32", "at": rot_locate(b, k) }))
+    } else if let Some(b) = norm_first {
+        Some(json!({ "stage": "norm_out_f32", "at": rot_locate(b, k) }))
     } else {
-        rot_first.map(|b| json!({ "stage": "rotated_f32", "at": rot_locate(b, k) }))
+        attn_first.map(|b| json!({ "stage": "attention_input_modified", "at": rot_locate(b, k) }))
     };
     Pass {
         json: json!({
@@ -940,6 +1134,12 @@ fn verify_pass(gpu: &mut Gpu, c: &Ctx, g: &Group) -> Pass {
                 "bytes": inc.rot.len(),
                 "first_mismatch": rot_first.map(|b| rot_locate(b, k)),
             },
+            "norm_out_f32": (c.case.export == Export::NormOut).then(|| json!({
+                "equal": norm_equal,
+                "bytes": inc.norm.len(),
+                "first_mismatch": norm_first.map(|b| rot_locate(b, k)),
+            })),
+            "attention_input_untouched": (c.case.export == Export::SigmoidRotate).then_some(attn_equal),
             "cpu_model_matches_incumbent": model_bad.is_none(),
             "cpu_model_first_mismatch": model_bad.map(|(kb, t)| json!({"kblock": kb, "token": t})),
             "cpu_model_rows": CPU_MODEL_ROWS.min(n),
@@ -988,6 +1188,7 @@ fn time_arms(
                 &g.rot_pm
             };
             fill_device(gpu, x_rot.buf.as_ptr(), x_rot.byte_size(), SENTINEL);
+            prepare_arm(gpu, c, arm);
             sync(gpu);
             let t0 = Instant::now();
             let r: R = launch(gpu, c, arm, x_rot, false).map(drop);
@@ -1016,7 +1217,7 @@ struct CaseOut {
 fn run_case(gpu: &mut Gpu, case: &Case, g: &Group, a: &Args, deadline: Instant) -> CaseOut {
     let k = case.k;
     let seed = group_seed(k, case.rows, case.data);
-    let weight = (case.export == Export::Norm).then(|| {
+    let weight = case.export.is_norm().then(|| {
         let h = synth_pos(k, seed + 0x200, 0.5, 1.0, case.data, 8);
         gpu.upload_f32(&h, &[k]).expect("upload norm weight")
     });
@@ -1029,6 +1230,7 @@ fn run_case(gpu: &mut Gpu, case: &Case, g: &Group, a: &Args, deadline: Instant) 
         x: &g.x,
         weight: weight.as_ref(),
         awq: awq.as_ref(),
+        g,
     };
 
     let first = verify_pass(gpu, &ctx, g);
@@ -1089,7 +1291,7 @@ fn run_case(gpu: &mut Gpu, case: &Case, g: &Group, a: &Args, deadline: Instant) 
 fn prerequisites() -> Vec<String> {
     vec![
         "exact gfx1201 (the oracle refuses any other arch with exit 2)".to_string(),
-        format!("{FLAG_ENV} must not be 1: the oracle launches the PM launchers explicitly and the HIP incumbent through the *_exact_batched methods; exit 2 otherwise"),
+        format!("{FLAG_ENV}=0 is required: the route is qualified on exact gfx1201, the oracle launches the PM launchers explicitly and the HIP incumbent through the *_exact_batched methods; exit 2 otherwise"),
         format!("module {PM_MODULE} is embedded in the build (kernels/{PM_MODULE}.hxaco, include_bytes! in rdna-compute src/iu4_c8_pm.rs)"),
         "one GPU, single process, watchdog <= 120 s".to_string(),
     ]
@@ -1098,9 +1300,9 @@ fn prerequisites() -> Vec<String> {
 fn limitations() -> Vec<&'static str> {
     vec![
         "launcher-level bytes only: does not read the PrefillIu4C8Pm capability, the production flag or the prefill.rs wiring",
-        "normalized scratch is not emitted by the PM twins; only the f32 rotated side-output and the sidecar exist and are compared",
+        "the norm fold's normalized f32 row is compared bytewise; the plain norm twin emits none, so only the f32 rotated side-output and the sidecar exist for it",
         "inputs are finite f32 (no inf/NaN); weights, signs and AWQ scales are finite, AWQ positive without reciprocal planes",
-        "sigmoid-gated rotate and shared-down SwiGLU are not part of this twin (incumbent HIP stays)",
+        "the shared-down SwiGLU producer is not part of this twin (incumbent HIP stays); the sigmoid and RMSNorm folds are compared against the unfused chain on the HIP exact rotate",
         "timing includes host launch overhead with device_synchronize bracketing, not isolated kernel time",
         "the CPU model (--self-check) covers quantizer/index/pack only; it is cross-checked against the incumbent on 64 rows per case as a diagnostic",
     ]
@@ -1146,7 +1348,7 @@ fn plan(a: &Args) {
                 "pm_grid": grid, "pm_block": block,
                 "sidecar_bytes": c.sidecar_bytes(),
                 "rotated_f32_bytes": c.rot_bytes(),
-                "compared": ["sidecar d@0..4", "sidecar s@4..8", "sidecar payload@8..72", "rotated f32"],
+                "compared": c.export.compared(),
             })
         );
     }
@@ -1172,7 +1374,7 @@ fn self_check() {
     let all = parse_args(&[]).expect("default args");
     let cases = case_matrix(&all);
     check!(
-        cases.len() == 54,
+        cases.len() == 144,
         "default matrix has {} cases",
         cases.len()
     );
@@ -1181,17 +1383,31 @@ fn self_check() {
     names.dedup();
     check!(names.len() == cases.len(), "case names are not unique");
     let count = |f: &dyn Fn(&Case) -> bool| cases.iter().filter(|c| f(c)).count();
-    check!(count(&|c| c.export == Export::Rotate) == 36, "rotate cases");
-    check!(count(&|c| c.export == Export::Norm) == 18, "norm cases");
+    check!(count(&|c| c.export == Export::Rotate) == 48, "rotate cases");
+    check!(count(&|c| c.export == Export::Norm) == 24, "norm cases");
     check!(
-        count(&|c| c.export == Export::Rotate && c.k == 4096) == 18,
+        count(&|c| c.export == Export::SigmoidRotate) == 48,
+        "sigmoid_rotate cases"
+    );
+    check!(
+        count(&|c| c.export == Export::NormOut) == 24,
+        "norm_out cases"
+    );
+    check!(
+        count(&|c| c.export == Export::Rotate && c.k == 4096) == 24,
         "rotate K4096 cases"
     );
     check!(
-        cases
-            .iter()
-            .all(|c| c.export != Export::Norm || c.k == 2048),
-        "norm only K2048"
+        count(&|c| c.export == Export::SigmoidRotate && c.k == 4096) == 24,
+        "sigmoid_rotate K4096 cases"
+    );
+    check!(
+        count(&|c| c.rows == 7808) == 36 && count(&|c| c.rows == 8192) == 36,
+        "the two A3B prefill chunk row counts"
+    );
+    check!(
+        cases.iter().all(|c| !c.export.is_norm() || c.k == 2048),
+        "norm exports only K2048"
     );
     check!(
         cases
@@ -1203,8 +1419,8 @@ fn self_check() {
         for d in Data::ALL {
             for aw in [false, true] {
                 check!(
-                    count(&|c| c.rows == r && c.data == d && c.awq == aw) == 3,
-                    "rows {r} {} awq {aw}: rotate K2048/K4096 + norm K2048",
+                    count(&|c| c.rows == r && c.data == d && c.awq == aw) == 6,
+                    "rows {r} {} awq {aw}: rotate and sigmoid_rotate K2048/K4096 + norm and norm_out K2048",
                     d.name()
                 );
             }
@@ -1238,12 +1454,16 @@ fn self_check() {
     check!(
         Export::Rotate.geometry(2048, 512) == (512 * 8, 32)
             && Export::Rotate.geometry(4096, 8192) == (8192 * 16, 32)
-            && Export::Norm.geometry(2048, 4096) == (4096, 256),
+            && Export::Norm.geometry(2048, 4096) == (4096, 256)
+            && Export::SigmoidRotate.geometry(4096, 7808) == (7808 * 16, 32)
+            && Export::NormOut.geometry(2048, 7808) == (7808, 256),
         "launch geometry"
     );
     check!(
         Export::Rotate.symbol() == "iu4_c8_rotate_pm_gfx1201"
-            && Export::Norm.symbol() == "iu4_c8_rmsnorm_rotate_pm_gfx1201",
+            && Export::Norm.symbol() == "iu4_c8_rmsnorm_rotate_pm_gfx1201"
+            && Export::SigmoidRotate.symbol() == "iu4_c8_sigmoid_rotate_pm_gfx1201"
+            && Export::NormOut.symbol() == "iu4_c8_rmsnorm_out_rotate_pm_gfx1201",
         "export symbols"
     );
     {
@@ -1282,13 +1502,19 @@ fn self_check() {
     }
 
     // ---- Flag expectations -------------------------------------------
-    check!(flag_state(None) == FlagState::Off, "unset is off");
+    check!(
+        flag_state(None) == FlagState::Default,
+        "unset follows qualification"
+    );
     check!(flag_state(Some("1")) == FlagState::On, "1 opts in");
     check!(flag_state(Some("0")) == FlagState::Killed, "0 kills");
-    check!(flag_state(Some("")) == FlagState::Off, "empty is off");
     check!(
-        env_isolated(None) && env_isolated(Some("0")) && !env_isolated(Some("1")),
-        "oracle refuses only the opted-in flag"
+        flag_state(Some("")) == FlagState::Default,
+        "empty is the default"
+    );
+    check!(
+        !env_isolated(None) && env_isolated(Some("0")) && !env_isolated(Some("1")),
+        "oracle runs only with the explicit kill"
     );
     check!(
         FLAG_ENV == "HIPFIRE_PREFILL_IU4_C8_PM" && FLAG_TYPED_KEY == "developer.prefill_iu4_c8_pm",
@@ -1727,8 +1953,8 @@ fn self_check() {
         parse_args(&s(&["--data", "large", "--exports", "norm"]))
             .map(|a| case_matrix(&a).len())
             .ok()
-            == Some(3 * 2),
-        "norm large = 3 rows x 2 awq"
+            == Some(ROWS.len() * 2),
+        "norm large = every row count x 2 awq"
     );
 
     let failed = failures.len();
@@ -1764,8 +1990,8 @@ fn run(a: &Args) {
     let env = std::env::var(FLAG_ENV).ok();
     if !env_isolated(env.as_deref()) {
         eprintln!(
-            "iu4_c8_pm_oracle: {FLAG_ENV}=1 would let the HIP incumbent route to PM; \
-             unset it (the oracle launches PM explicitly)"
+            "iu4_c8_pm_oracle: {FLAG_ENV} must be 0 (the route is qualified on exact gfx1201, \
+             so unset or 1 lets the HIP incumbent route to PM; the oracle launches PM explicitly)"
         );
         std::process::exit(2);
     }

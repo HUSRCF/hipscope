@@ -29,17 +29,21 @@ pub(crate) fn fit_max_tokens(
 /// `speculation.dflash_block`): one width per serving configuration, resolved
 /// from the staged route (`vmm_batch`, `lanes` = `continuous_batch_size`) and
 /// never from the live batch, so batched lanes stay byte-identical to the
-/// singleton. An invalid value is answered as a validation error (`None`).
+/// singleton. Also whether the width was `auto` (a producer may keep its own
+/// default then). An invalid value is answered as a validation error (`None`).
 pub(crate) fn dflash_block(
     stdout: &mut impl Write,
     msg: &serde_json::Value,
     vmm_batch: bool,
     lanes: usize,
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
         msg.get("params").and_then(|p| p.get("dflash_block")),
     ) {
-        Ok(policy) => Some(policy.resolve(vmm_batch, lanes)),
+        Ok(policy) => Some((
+            policy.resolve(vmm_batch, lanes),
+            policy == hipfire_runtime::dflash::DflashBlockPolicy::Auto,
+        )),
         Err(e) => {
             hipfire_generate::batch::emit_uncorrelated_error(
                 stdout,

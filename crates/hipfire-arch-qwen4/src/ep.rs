@@ -19,8 +19,7 @@
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
-    qwen4_ep_buffer_index, Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
-    QWEN4_EP_GATHER_MAX_ROWS,
+    Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
@@ -145,6 +144,20 @@ impl Shared {
 
     fn poison(&self) -> Option<String> {
         lock(&self.poison).clone()
+    }
+
+    /// Record a failure that belongs to no single rank (the ranks diverged)
+    /// and abort the barrier. The first failure wins.
+    fn fail_mesh(&self, message: &str) {
+        {
+            let mut poison = lock(&self.poison);
+            if poison.is_none() {
+                *poison = Some(message.to_string());
+            }
+        }
+        if let Some(abort) = self.abort.get() {
+            abort();
+        }
     }
 }
 
@@ -328,6 +341,11 @@ impl<P: 'static> PeerPool<P> {
     /// The first recorded failure, if the pool is poisoned.
     pub(crate) fn poisoned(&self) -> Option<String> {
         self.shared.poison()
+    }
+
+    /// Poison the pool with a failure no single rank owns.
+    pub(crate) fn poison_mesh(&self, message: &str) {
+        self.shared.fail_mesh(message);
     }
 
     /// Run `f` on the workers `targets` (indices) while `local` runs on the
@@ -818,14 +836,20 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String> {
-        let buffer = qwen4_ep_buffer_index(usize::from(layer_idx), self.trunk_layers);
+        // Singleton forwards select by layer parity; lane steps select by
+        // invocation ordinal because a layer can invoke MoE more than once.
+        // The expanded-row allocation identifies the actual transport buffer.
         let ptr = down_expanded.buf.as_ptr() as usize;
-        if self.buffer_ptrs.get(buffer) != Some(&ptr) {
-            return Err(format!(
-                "qwen4 EP row gather: layer {layer_idx} expanded rows at {ptr:#x} are not gather buffer {buffer} of rank {}",
-                self.rank
-            ));
-        }
+        let buffer = self
+            .buffer_ptrs
+            .iter()
+            .position(|&buffer_ptr| buffer_ptr == ptr)
+            .ok_or_else(|| {
+                format!(
+                    "qwen4 EP row gather: layer {layer_idx} expanded rows at {ptr:#x} are not a gather buffer of rank {}",
+                    self.rank
+                )
+            })?;
         note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
         // A balanced layer gathers from the owners its own assignment wrote
         // this call; every other layer keeps the static `e % ranks` placement.
@@ -1088,6 +1112,24 @@ impl Qwen4EpMesh {
         self.pool.poisoned()
     }
 
+    /// Poison the mesh after the ranks diverged on a result that must agree.
+    pub(crate) fn poison(&self, message: &str) {
+        self.pool.poison_mesh(message);
+    }
+
+    /// [`Self::run`] that also runs on a poisoned mesh (rollback and teardown
+    /// drains).
+    pub(crate) fn run_forced<R: Send>(
+        &self,
+        local: impl FnOnce() -> Result<R, String>,
+        job: PeerJob<'_, R>,
+    ) -> Result<Vec<R>, String> {
+        self.pool
+            .run_all_forced(local, &|_, peer: &mut Qwen4EpPeer| {
+                job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
+            })
+    }
+
     /// Run `job` on every peer while `local` runs rank 0 on the caller's
     /// thread. Results in rank order. Any rank's error or panic aborts the
     /// row-gather barrier, poisons the mesh, and is returned (the first one).
@@ -1136,7 +1178,7 @@ impl Qwen4EpMesh {
     }
 }
 
-fn ep_err(message: impl Into<String>) -> BundleError {
+pub(crate) fn ep_err(message: impl Into<String>) -> BundleError {
     BundleError::Forward(format!("qwen4 EP: {}", message.into()))
 }
 
@@ -1677,18 +1719,26 @@ impl Qwen4Bundle {
         agreed
     }
 
-    /// Refuse an entry point that has no EP replication (lanes, MTP/spec, state
-    /// snapshots) instead of running it on rank 0 alone and stalling the gather
-    /// barrier.
+    /// Refuse an entry point that has no EP replication (MTP/spec, state
+    /// snapshots, wave prefill) instead of running it on rank 0 alone and
+    /// stalling the gather barrier.
     pub(crate) fn ep_refuse(&self, what: &str) -> Result<(), BundleError> {
-        if self.pp.is_some() {
-            return Err(BundleError::Forward(format!(
-                "{what} is not supported under qwen4 topology.pp yet"
-            )));
-        }
+        self.pp_refuse(what)?;
         if self.ep.is_some() {
             return Err(BundleError::Forward(format!(
                 "{what} is unsupported under qwen4 EP"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse an entry point that has no pipeline-parallel form. Entry points
+    /// replicated across an EP mesh (fn-lanes) use this instead of
+    /// [`Self::ep_refuse`].
+    pub(crate) fn pp_refuse(&self, what: &str) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(BundleError::Forward(format!(
+                "{what} is not supported under qwen4 topology.pp yet"
             )));
         }
         Ok(())
@@ -1889,6 +1939,517 @@ impl Qwen4Bundle {
                 return lowest;
             }
             cap = lowest;
+        }
+    }
+}
+
+// ───────────────────────────────── fn-lanes ─────────────────────────────────
+
+use crate::lane::{LaneSpecConfig, LaneStoreReceipt, Qwen4LaneStore};
+use crate::lane_exec::{LaneDraft, Qwen4LaneExecutor};
+use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, StepOutput};
+
+/// Free device bytes a rank keeps beyond its lane store when EP stages lanes.
+/// The single-device loader (`batch_staging::stage_qwen4_lanes`) compares the
+/// store with the free device memory directly, with no reserve, and EP stages
+/// by the same rule; a loader that reserves headroom passes its own value to
+/// [`ep_lane_budget`] / [`ep_lane_fit`].
+pub const QWEN4_EP_LANE_RESERVE_BYTES: u64 = 0;
+
+/// Device bytes a rank may commit to its lane store: its own `free` memory
+/// minus `reserve` (saturating).
+pub fn ep_lane_budget(free: u64, reserve: u64) -> u64 {
+    free.saturating_sub(reserve)
+}
+
+/// Whether a lane store of `need` bytes fits rank `rank`'s `free` memory
+/// after `reserve`; the refusal names the rank, the need and the free bytes.
+pub fn ep_lane_fit(rank: usize, need: u64, free: u64, reserve: u64) -> Result<(), String> {
+    if need <= ep_lane_budget(free, reserve) {
+        return Ok(());
+    }
+    Err(format!(
+        "rank {rank}: lane store needs {need} bytes, {free} bytes free ({reserve} bytes reserved)"
+    ))
+}
+
+/// Row budget an AR lane store is staged with: the requested step row budget
+/// (`serve.max_batch_tokens`), never below one row per lane. The one rule the
+/// load-time reservation and the batch staging share.
+pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
+    requested_row_budget.max(lanes)
+}
+
+/// Device bytes one rank's lane store commits, for `lanes` lanes at
+/// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
+/// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// source of the byte count: the loader's EP load reservation and
+/// `stage_rank_lanes` (and the single-device staging check) all call it, so
+/// planned and staged bytes cannot differ. `None` on overflow.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_lane_store_device_bytes(
+    config: &crate::Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    backend: crate::Qwen4KvBackend,
+    max_seq: usize,
+    chunk_rows: usize,
+    granularity: usize,
+    lanes: usize,
+    row_budget: usize,
+    spec_k: Option<usize>,
+) -> Option<u64> {
+    let context =
+        crate::kv_backend::Qwen4ContextCommit::new(backend, max_seq, chunk_rows, granularity);
+    Qwen4LaneStore::device_bytes(config, format, &context, lanes, row_budget, spec_k)
+}
+
+/// A lane-entry error as the plain text every rank compares.
+fn bundle_text(error: BundleError) -> String {
+    match error {
+        BundleError::Forward(message) => message,
+        other => other.to_string(),
+    }
+}
+
+/// Run `f` on `bundle`'s lane executor (`Qwen4Bundle::lane_executor`).
+fn run_lane_exec<T>(
+    bundle: &mut Qwen4Bundle,
+    f: impl FnOnce(&mut Qwen4LaneExecutor<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut executor = bundle.lane_executor().map_err(bundle_text)?;
+    f(&mut executor)
+}
+
+/// One rank's lane staging: the loader's budget check against this rank's own
+/// free memory, then the singleton `stage_lanes`. `Ok` means this call
+/// created the rank's store; `Err` means it created nothing.
+fn stage_rank_lanes(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    max_lanes: usize,
+    row_budget: usize,
+    reserve: u64,
+) -> Result<(), String> {
+    let rank = bundle
+        .weights
+        .ep_placement()
+        .map_or(0, |placement| placement.rank);
+    let max_seq = bundle.state.max_seq_len;
+    let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
+    let need = ep_lane_store_device_bytes(
+        &bundle.config,
+        bundle.state_format(),
+        bundle.state.qsa_backend(),
+        max_seq,
+        chunk,
+        gpu.vmm_recommended_granularity().unwrap_or(1),
+        max_lanes,
+        row_budget,
+        None,
+    )
+    .ok_or_else(|| format!("rank {rank}: lane store device bytes overflow"))?;
+    let free = gpu
+        .device_mem_info()
+        .map(|(free, _)| free as u64)
+        .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
+    ep_lane_fit(rank, need, free, reserve)?;
+    bundle
+        .stage_lanes(gpu, max_lanes, row_budget, None)
+        .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))
+}
+
+/// Free the lane store a failed stage left on this rank (a no-op when none).
+fn rollback_rank_lanes(bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> Result<(), String> {
+    match bundle.lanes.take() {
+        Some(store) => store.free_gpu(gpu),
+        None => Ok(()),
+    }
+}
+
+fn rank_lane_receipt(bundle: &Qwen4Bundle, gpu: &Gpu) -> Result<LaneStoreReceipt, String> {
+    bundle
+        .lanes()
+        .map(|store| store.receipt(gpu))
+        .ok_or_else(|| "Qwen4 lanes are not staged".to_string())
+}
+
+/// The replicated forms of the fn-lanes entries. Every rank owns its own
+/// lane store, built from the same calls in the same order, so the host lane
+/// tables stay identical; the device states differ per rank only in what the
+/// row gather and the expert split make rank-local.
+///
+/// Two failure disciplines, both requiring agreed host results:
+///
+/// - [`Self::ep_lane_soft`] (everything but `forward_step`): no rank blocks on
+///   the row-gather barrier, so a refusal or error every rank reports
+///   identically is returned as an ordinary error and the mesh stays usable.
+///   Ranks that disagree (one failed, or different outcomes) have diverged
+///   tables or states: the mesh is poisoned.
+/// - [`Self::ep_lane_strict`] (`forward_step`): ranks share the gather
+///   barrier, so any rank's failure aborts it and poisons the mesh, as every
+///   singleton forward does.
+impl Qwen4Bundle {
+    /// Run `local` (rank 0, mesh detached) and `job` (every peer) and return
+    /// every rank's value in rank order without comparing them: only for
+    /// calls whose per-rank values legitimately differ (staging, receipts,
+    /// rollback). Without a mesh this is `local` alone. `forced` also runs on
+    /// a poisoned mesh (rollback drains).
+    fn ep_run_ranks<R: Send>(
+        &mut self,
+        forced: bool,
+        local: impl FnOnce(&mut Self) -> Result<R, String>,
+        job: PeerJob<'_, R>,
+    ) -> Result<Vec<R>, String> {
+        let Some(mesh) = self.ep.take() else {
+            return local(self).map(|value| vec![value]);
+        };
+        let result = if forced {
+            mesh.run_forced(|| local(&mut *self), job)
+        } else {
+            mesh.run(|| local(&mut *self), job)
+        };
+        self.ep = Some(mesh);
+        result
+    }
+
+    /// Host-only / non-barrier lane call over [`Self::ep_fanout`]: every
+    /// rank's whole outcome (value or error) is the fanned-out result, so an
+    /// error all ranks agree on comes back as an ordinary `Err` and leaves
+    /// the mesh usable. A mesh failure or a disagreement between ranks
+    /// (already poisoned or not) leaves the mesh poisoned.
+    fn ep_lane_soft<T: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        local: impl FnOnce(&mut Self) -> Result<T, String>,
+        job: PeerJob<'_, T>,
+    ) -> Result<T, String> {
+        let fanned = self.ep_fanout(
+            what,
+            |bundle| Ok(local(bundle)),
+            &|bundle, peer_gpu, mirrors| Ok(job(bundle, peer_gpu, mirrors)),
+        );
+        match fanned {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = bundle_text(error);
+                if let Some(mesh) = self.ep.as_ref() {
+                    mesh.poison(&message);
+                }
+                Err(message)
+            }
+        }
+    }
+
+    /// Barrier-sharing lane call: [`Self::ep_fanout`] as is (any failure
+    /// poisons the mesh).
+    fn ep_lane_strict<T: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        local: impl FnOnce(&mut Self) -> Result<T, String>,
+        job: PeerJob<'_, T>,
+    ) -> Result<T, String> {
+        self.ep_fanout(
+            what,
+            |bundle| local(bundle).map_err(BundleError::Forward),
+            job,
+        )
+        .map_err(bundle_text)
+    }
+
+    /// Stage the AR lane store on every rank, all or nothing. Refused before
+    /// any work for a native-MTP spec, or when any rank already holds a store
+    /// (rollback frees only stores this call made). Each rank checks the
+    /// store against its own free memory ([`ep_lane_fit`], reserve
+    /// [`QWEN4_EP_LANE_RESERVE_BYTES`]); if any rank fails, every rank's new
+    /// store is freed and the first failure is returned. A failed stage does
+    /// not poison the mesh (the singleton route keeps running).
+    pub(crate) fn ep_stage_lanes(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<LaneSpecConfig>,
+    ) -> Result<(), BundleError> {
+        if spec.is_some() {
+            return Err(ep_err(
+                "native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)",
+            ));
+        }
+        let reserve = QWEN4_EP_LANE_RESERVE_BYTES;
+        let staged = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(bundle.lanes.is_some()),
+                &|bundle, _, _| Ok(bundle.lanes.is_some()),
+            )
+            .map_err(BundleError::Forward)?;
+        if let Some(rank) = staged.iter().position(|&has_store| has_store) {
+            return Err(ep_err(format!(
+                "Qwen4 lanes are already staged (rank {rank})"
+            )));
+        }
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| {
+                Ok(stage_rank_lanes(
+                    bundle, gpu, max_lanes, row_budget, reserve,
+                ))
+            },
+            &|bundle, peer_gpu, _| {
+                Ok(stage_rank_lanes(
+                    bundle, peer_gpu, max_lanes, row_budget, reserve,
+                ))
+            },
+        );
+        let reason = match outcomes {
+            Ok(outcomes) => match outcomes.into_iter().find_map(Result::err) {
+                Some(reason) => reason,
+                None => return Ok(()),
+            },
+            Err(pool) => pool,
+        };
+        let rollback = self.ep_run_ranks(
+            true,
+            |bundle| rollback_rank_lanes(bundle, gpu),
+            &|bundle, peer_gpu, _| rollback_rank_lanes(bundle, peer_gpu),
+        );
+        let note = match rollback {
+            Ok(_) => String::new(),
+            Err(error) => format!("; rollback also failed: {error}"),
+        };
+        Err(ep_err(format!("{reason}{note}")))
+    }
+
+    /// Every rank's lane-store receipt in rank order (rank 0 alone without a
+    /// mesh), not compared: device receipts (`mapped_bytes`) legitimately
+    /// differ per rank. A rank without a store is an error naming it.
+    pub fn ep_lane_receipts(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<Vec<LaneStoreReceipt>, BundleError> {
+        let receipts = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(rank_lane_receipt(bundle, gpu)),
+                &|bundle, peer_gpu, _| Ok(rank_lane_receipt(bundle, peer_gpu)),
+            )
+            .map_err(BundleError::Forward)?;
+        receipts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, receipt)| receipt.map_err(|error| ep_err(format!("rank {rank}: {error}"))))
+            .collect()
+    }
+
+    pub(crate) fn ep_admit_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+    ) -> Result<usize, BundleError> {
+        self.ep_lane_soft(
+            "admit_lane",
+            |bundle| {
+                bundle
+                    .admit_lane(gpu, epoch, prompt.clone())
+                    .map_err(bundle_text)
+            },
+            &|bundle, peer_gpu, _| {
+                bundle
+                    .admit_lane(peer_gpu, epoch, prompt.clone())
+                    .map_err(bundle_text)
+            },
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    /// [`Self::set_lane_stage_policy`] on every rank: the policy is
+    /// host-only, so ranks must agree (a store that cannot take it on every
+    /// rank refuses with the common message and leaves the mesh usable).
+    pub(crate) fn ep_set_lane_stage_policy(
+        &mut self,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "set_lane_stage_policy",
+            |bundle| bundle.set_lane_stage_policy_local(policy),
+            &|bundle, _, _| bundle.set_lane_stage_policy_local(policy),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_release_lane(&mut self, epoch: &RequestEpoch) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "release_lane",
+            |bundle| bundle.release_lane(epoch).map_err(bundle_text),
+            &|bundle, _, _| bundle.release_lane(epoch).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    /// `poison_lane` returns nothing: a mesh failure or disagreement is
+    /// logged (the mesh is poisoned and the next replicated call reports it).
+    pub(crate) fn ep_poison_lane(&mut self, epoch: &RequestEpoch) {
+        let poisoned = self.ep_lane_soft(
+            "poison_lane",
+            |bundle| {
+                bundle.poison_lane(epoch);
+                Ok(())
+            },
+            &|bundle, _, _| {
+                bundle.poison_lane(epoch);
+                Ok(())
+            },
+        );
+        if let Err(error) = poisoned {
+            eprintln!("  qwen4 EP: poison_lane: {error}");
+        }
+    }
+
+    pub(crate) fn ep_force_lane_seed(
+        &mut self,
+        epoch: &RequestEpoch,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "force_lane_seed",
+            |bundle| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
+            &|bundle, _, _| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_abort_promotion(&mut self, epoch: &RequestEpoch) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "abort_promotion",
+            |bundle| bundle.abort_promotion(epoch).map_err(bundle_text),
+            &|bundle, _, _| bundle.abort_promotion(epoch).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_commit_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "commit_promotion",
+            |bundle| bundle.commit_promotion(gpu, epoch).map_err(bundle_text),
+            &|bundle, peer_gpu, _| {
+                bundle
+                    .commit_promotion(peer_gpu, epoch)
+                    .map_err(bundle_text)
+            },
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_lane_draft_step(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+    ) -> Result<Vec<LaneDraft>, String> {
+        self.ep_lane_soft(
+            "lane draft_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.draft_step(gpu, requests)),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| exec.draft_step(peer_gpu, requests))
+            },
+        )
+    }
+
+    pub(crate) fn ep_lane_provision_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<(), String> {
+        self.ep_lane_soft(
+            "lane provision_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.provision_step(gpu, plan)),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| exec.provision_step(peer_gpu, plan))
+            },
+        )
+    }
+
+    /// Best effort and void, like the singleton entry: a mesh failure or
+    /// disagreement is logged and `provision_step` grows on demand.
+    pub(crate) fn ep_lane_map_ahead_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+        remaining_new_tokens: usize,
+    ) {
+        let mapped = self.ep_lane_soft(
+            "lane map_ahead_decode",
+            |bundle| {
+                run_lane_exec(bundle, |exec| {
+                    exec.map_ahead_decode(gpu, epoch, remaining_new_tokens);
+                    Ok(())
+                })
+            },
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.map_ahead_decode(peer_gpu, epoch, remaining_new_tokens);
+                    Ok(())
+                })
+            },
+        );
+        if let Err(error) = mapped {
+            eprintln!("  qwen4 EP: lane map_ahead_decode: {error}");
+        }
+    }
+
+    pub(crate) fn ep_lane_forward_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<StepOutput, String> {
+        self.ep_lane_strict(
+            "lane forward_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.forward_step(gpu, plan)),
+            &|bundle, peer_gpu, _| run_lane_exec(bundle, |exec| exec.forward_step(peer_gpu, plan)),
+        )
+    }
+
+    pub(crate) fn ep_lane_commit_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+        output: StepOutput,
+    ) -> Result<Vec<RequestAdvance>, String> {
+        self.ep_lane_soft(
+            "lane commit_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.commit_step(gpu, plan, output.clone())),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.commit_step(peer_gpu, plan, output.clone())
+                })
+            },
+        )
+    }
+
+    /// `abort_step` returns nothing: a mesh failure or disagreement is logged.
+    pub(crate) fn ep_lane_abort_step(&mut self, plan: &BatchStepPlan) {
+        let aborted = self.ep_lane_soft(
+            "lane abort_step",
+            |bundle| {
+                run_lane_exec(bundle, |exec| {
+                    exec.abort_step(plan);
+                    Ok(())
+                })
+            },
+            &|bundle, _, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.abort_step(plan);
+                    Ok(())
+                })
+            },
+        );
+        if let Err(error) = aborted {
+            eprintln!("  qwen4 EP: lane abort_step: {error}");
         }
     }
 }
@@ -2342,6 +2903,144 @@ mod tests {
                 shape: vec![2, 124_160],
                 dtype: DType::F32,
             }
+        );
+    }
+
+    fn lane_draft(tag: u64, route: crate::lane_exec::LaneRoute) -> crate::lane_exec::LaneDraft {
+        crate::lane_exec::LaneDraft {
+            epoch: RequestEpoch {
+                request_tag: tag,
+                owner_generation: 1,
+            },
+            route,
+            drafts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lane_results_must_agree_across_ranks() {
+        use crate::lane_exec::LaneRoute;
+        let ar = || Ok(vec![lane_draft(1, LaneRoute::Ar)]);
+        let outcomes: Vec<Result<Vec<_>, String>> = vec![ar(), ar(), ar()];
+        assert_eq!(agree("lane draft_step", outcomes).unwrap(), ar());
+        // A different route on one rank.
+        let error = agree(
+            "lane draft_step",
+            vec![ar(), Ok(vec![lane_draft(1, LaneRoute::ArRetired)])],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("lane draft_step") && error.contains("rank 1"),
+            "{error}"
+        );
+        // One rank refusing where the others succeed is a disagreement; every
+        // rank refusing identically is an agreed refusal.
+        let refusal: Result<Vec<_>, String> = Err("no free lane".to_string());
+        assert!(agree("lane draft_step", vec![ar(), refusal.clone()]).is_err());
+        assert_eq!(
+            agree("lane draft_step", vec![refusal.clone(), refusal.clone()]).unwrap(),
+            refusal
+        );
+        // Step output and advances compare field by field.
+        let output = |pick: u32| -> Result<StepOutput, String> {
+            Ok(StepOutput {
+                step_id: 3,
+                target_picks: vec![pick],
+            })
+        };
+        assert!(agree("lane forward_step", vec![output(5), output(5)]).is_ok());
+        assert!(agree("lane forward_step", vec![output(5), output(6)]).is_err());
+        let advance = |position: usize| -> Result<Vec<RequestAdvance>, String> {
+            Ok(vec![RequestAdvance {
+                epoch: RequestEpoch {
+                    request_tag: 1,
+                    owner_generation: 1,
+                },
+                committed_ids: vec![9],
+                committed_position: position,
+                accepted_drafts: 0,
+                verified_rows: 0,
+                finish: None,
+            }])
+        };
+        assert!(agree("lane commit_step", vec![advance(4), advance(4)]).is_ok());
+        assert!(agree("lane commit_step", vec![advance(4), advance(5)]).is_err());
+    }
+
+    #[test]
+    fn lane_budget_is_own_free_minus_reserve() {
+        assert_eq!(QWEN4_EP_LANE_RESERVE_BYTES, 0);
+        assert_eq!(ep_lane_budget(100, 0), 100);
+        assert_eq!(ep_lane_budget(100, 30), 70);
+        // The reserve never underflows.
+        assert_eq!(ep_lane_budget(10, 30), 0);
+        // The loader's rule at zero reserve: need <= free fits, one byte over does not.
+        assert!(ep_lane_fit(0, 100, 100, 0).is_ok());
+        assert!(ep_lane_fit(0, 70, 100, 30).is_ok());
+        let error = ep_lane_fit(3, 71, 100, 30).unwrap_err();
+        for part in [
+            "rank 3",
+            "needs 71 bytes",
+            "100 bytes free",
+            "30 bytes reserved",
+        ] {
+            assert!(error.contains(part), "{part}: {error}");
+        }
+        assert!(ep_lane_fit(2, 1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn ep_lane_reservation_bytes_are_the_stage_bytes() {
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let format = Qwen4StateFormat::F32;
+        let (max_seq, chunk, granularity) = (32768usize, 1536usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let mut previous = 0u64;
+        for lanes in [2usize, 4, 8] {
+            let budget = ep_lane_row_budget(4096, lanes);
+            let planned = ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                lanes,
+                budget,
+                None,
+            );
+            assert_eq!(
+                planned,
+                Qwen4LaneStore::device_bytes(&config, format, &context, lanes, budget, None)
+            );
+            let planned = planned.unwrap();
+            assert!(planned > previous, "lanes={lanes}");
+            previous = planned;
+        }
+        // A request below one row per lane is raised to the lane count.
+        assert_eq!(ep_lane_row_budget(2, 8), 8);
+        assert_eq!(ep_lane_row_budget(0, 8), 8);
+        assert_eq!(ep_lane_row_budget(4096, 8), 4096);
+        // Overflow is reported, never wrapped.
+        assert_eq!(
+            ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                usize::MAX,
+                usize::MAX,
+                None,
+            ),
+            None
         );
     }
 }

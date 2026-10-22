@@ -105,11 +105,13 @@ pub mod launch_counters {
     counter!(graph_launch);
 }
 
-/// Per-thread tally of the HIP memory operations issued on this thread.
+/// Per-thread tally of the HIP memory operations and kernel launches issued
+/// on this thread.
 ///
 /// A retained Redline tape replays recorded kernel dispatches only, so a
 /// device copy, readback or memset issued inside its capture window is state
-/// the tape cannot reproduce. The replay controller differences two snapshots
+/// the tape cannot reproduce, and so is a kernel launched past the recorder.
+/// The replay controller differences two snapshots
 /// around the window. Unlike [`launch_counters`] this tally is never reset, so
 /// a profiler resetting its counters mid-window cannot hide an effect, and
 /// every synchronous and asynchronous variant counts.
@@ -126,6 +128,9 @@ pub mod memory_effects {
         pub dtoh: u64,
         /// Memsets.
         pub memset: u64,
+        /// Kernel launches (`hipModuleLaunchKernel`, both argument paths). A
+        /// launch the replay recorder did not see is missing from the tape.
+        pub launches: u64,
     }
 
     impl MemoryEffects {
@@ -136,6 +141,7 @@ pub mod memory_effects {
                 dtod: self.dtod - earlier.dtod,
                 dtoh: self.dtoh - earlier.dtoh,
                 memset: self.memset - earlier.memset,
+                launches: self.launches - earlier.launches,
             }
         }
 
@@ -149,7 +155,7 @@ pub mod memory_effects {
 
     thread_local! {
         static TALLY: Cell<MemoryEffects> = const {
-            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0 })
+            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0, launches: 0 })
         };
     }
 
@@ -177,6 +183,9 @@ pub mod memory_effects {
     }
     pub(crate) fn memset() {
         bump(|value| value.memset += 1);
+    }
+    pub(crate) fn launch() {
+        bump(|value| value.launches += 1);
     }
 }
 
@@ -2827,6 +2836,7 @@ impl HipRuntime {
             ptr::null_mut(),
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        memory_effects::launch();
         self.check(code, "hipModuleLaunchKernel")
     }
 
@@ -2899,6 +2909,7 @@ impl HipRuntime {
             extra.as_mut_ptr(),
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        memory_effects::launch();
         self.check(code, "hipModuleLaunchKernel(extra blob)")
     }
     /// Max active blocks per multiprocessor for a loaded module function
@@ -4914,6 +4925,15 @@ impl Stream {
     /// a raw stream pointer to hand to `ncclAllReduce`).
     pub fn raw_ptr(&self) -> *mut c_void {
         self.0
+    }
+    /// Non-owning copy of this handle, for borrowing a stream where an owned
+    /// `Stream` is expected (e.g. `Gpu::active_stream`).
+    ///
+    /// # Safety
+    /// The alias must not outlive the stream and must never reach
+    /// `stream_destroy`; the owner destroys the stream exactly once.
+    pub unsafe fn alias(&self) -> Stream {
+        Stream(self.0)
     }
 }
 // SAFETY: Stream is an opaque HIP handle (*mut c_void). Sending the handle

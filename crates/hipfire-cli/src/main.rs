@@ -57,6 +57,7 @@ mod config_view;
 #[cfg(target_os = "linux")]
 mod doctor;
 mod emu;
+mod fit;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
@@ -149,9 +150,11 @@ pub(crate) enum Commands {
     Ple(ple::PleArgs),
     /// Write a keyed NPU trunk calibration from offline measurement inputs.
     CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
-    /// Check this machine for the Strix Halo NPU trunk route and measure it (--npu).
+    /// Runtime preflight: GPU driver, firmware, ROCm and install mismatches, with fixes (--npu: the Strix Halo NPU trunk route).
     #[cfg(target_os = "linux")]
     Doctor(doctor::DoctorArgs),
+    /// What fits on this machine: context, placement, route and expected speed for a model.
+    Fit(fit::FitArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1091,6 +1094,7 @@ fn run() -> Result<()> {
         Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
         #[cfg(target_os = "linux")]
         Some(Commands::Doctor(args)) => doctor::doctor_command(&paths, args),
+        Some(Commands::Fit(args)) => fit::fit_command(&paths, args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
@@ -6816,7 +6820,8 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
             Ok(mut d) => {
                 let field = |key: &str| loaded.get(key).cloned().unwrap_or_default();
                 eprintln!(
-                    "  batch backend up (VMM route, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    "  batch backend up (route={}, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    field("continuous_batch_route"),
                     field("continuous_batch_exact"),
                     field("continuous_batch_spec_mode"),
                     field("continuous_batch_row_budget"),
@@ -9946,7 +9951,7 @@ fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
     message
 }
 
-fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+pub(crate) fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
     anyhow!(
         "unknown model '{input}'{}",
         model_suggestions(registry, input)

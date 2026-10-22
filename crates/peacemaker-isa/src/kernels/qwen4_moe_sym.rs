@@ -235,6 +235,36 @@ pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
 }
 
 impl Spec {
+    /// One MQ4 entry from its CLI `--epi` spelling: `gate_up`/`down` (the
+    /// 16-slot NT1 entry), `gate_up_ntN`/`down_ntN` (expert-run tile width
+    /// `N`) or `down_nt4rR` (`R` contiguous 64-row blocks per CTA). The result
+    /// is not validated (`emit` validates).
+    pub fn from_epi(epi: &str, arch: Arch) -> Result<Self, String> {
+        let (kind, tile) = match epi.rsplit_once("_nt") {
+            Some((k, n)) => (k, Some(n)),
+            None => (epi, None),
+        };
+        let (nt, rr) = match tile {
+            Some(t) => {
+                let (n, r) = t.split_once('r').map_or((t, None), |(n, r)| (n, Some(r)));
+                (
+                    n.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
+                    match r {
+                        Some(r) => r.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
+                        None => 1,
+                    },
+                )
+            }
+            None => (1, 1),
+        };
+        Ok(Self {
+            arch,
+            kind: kind.parse()?,
+            nt,
+            rr,
+            codec: WeightCodec::Mq4Sym,
+        })
+    }
     pub fn symbol(self) -> String {
         let infix = match self.codec {
             WeightCodec::Mq4Sym => "",
@@ -1427,6 +1457,24 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     bstore_b128(b, OUT, YOFF, SRD_Y, 0)
 }
 
+/// The position-indexed-activation twin of a gfx1201 MQ4 down NT4 / NT8 entry (`qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt{4,8}`):
+/// the same grid, tile walk, fold order, rounding and stores, reading the down A4 plane written in grouped-position order
+/// (record `g * m_total + 16 * tile + lane`, see `moe_rotate_i4_pm::emit_gp`) instead of gathering `sorted[p]`-indexed records.
+/// Outputs are byte-identical to the flat-slot entry's over the same activations; a padding lane or dead tile still reads
+/// zeros through an out-of-range offset. `x_src_rows` is ignored (the plane stride is `m_total * 72`).
+pub fn emit_down_gp(spec: Spec) -> Result<Emitted, String> {
+    spec.validate()?;
+    if spec.arch != Arch::Gfx1201
+        || spec.kind != Kind::Down
+        || spec.codec != WeightCodec::Mq4Sym
+        || spec.rr != 1
+        || !matches!(spec.nt, 4 | 8)
+    {
+        return Err("qwen4_moe_sym gp: the gfx1201 MQ4 down NT4/NT8 entries only".into());
+    }
+    nt::emit_gp(spec)
+}
+
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     if spec.codec == WeightCodec::Mq3I4 {
@@ -1610,6 +1658,10 @@ mod nt {
         chains: u8,
         prefetch: bool,
         grouped: bool,
+        /// Position-indexed activation plane (`..._gp` entries): record
+        /// `(16 * tile + lane) * 72` of the epoch's `m_total`-record plane instead
+        /// of the flat-slot gather. The fold, rounding and stores are unchanged.
+        gpos: bool,
     }
     impl G {
         fn arch(&self) -> Arch {
@@ -1633,7 +1685,9 @@ mod nt {
         }
         /// Block-local label; `rr = 1` keeps the frozen entry's names.
         fn label(&self, name: &str) -> String {
-            if self.rr() == 1 {
+            if self.gpos {
+                format!(".Lq4s_{}_nt{}_gp_{name}", self.spec.kind.tag(), self.nt())
+            } else if self.rr() == 1 {
                 format!(".Lq4s_{}_nt{}_{name}", self.spec.kind.tag(), self.nt())
             } else {
                 format!(
@@ -1953,8 +2007,15 @@ mod nt {
 
     /// Words 0..3 of both activation descriptors (epoch 0, then epoch 1)
     /// from the kernel arguments; leaves `s4 = x_src_rows * 72`.
-    fn x_descriptors(b: &mut Builder) -> Result<(), String> {
-        sop(b, "s_mul_i32 s4, s22, 0x48", &[4], &[22])?;
+    fn x_descriptors(b: &mut Builder, gpos: bool) -> Result<(), String> {
+        // Epoch plane records: x_src_rows (flat slots), or m_total (positions).
+        let records = if gpos { 21 } else { 22 };
+        sop(
+            b,
+            format!("s_mul_i32 s4, s{records}, 0x48"),
+            &[4],
+            &[records],
+        )?;
         sop(
             b,
             format!("s_mov_b32 s{}, s14", SRD_X[0]),
@@ -1999,6 +2060,51 @@ mod nt {
             format!("s_lshr_b32 s{TRIPS}, s{TRIPS}, 1"),
             &[TRIPS],
             &[TRIPS],
+        )
+    }
+
+    /// Position-indexed activation row offset of tile `j`: `dst = live ? (16 * (tile + j) + lr) * 72 : GATHER_OOB`
+    /// with `live = slot >= 0` (the sorted entry still marks padding and dead tiles). `v3` is the lane's row
+    /// `lr`, `TILE16` the leader's first position; a padding lane reads zeros exactly like the flat-slot gather.
+    fn position_offset(b: &mut Builder, dst: u8, slot: u8, j: u8, live: u8) -> Result<(), String> {
+        let q = 14u8;
+        op(
+            b,
+            format!("v_cmp_le_i32_e64 s{live}, 0, v{slot}"),
+            &[s(live)],
+            &[v(slot)],
+        )?;
+        op(
+            b,
+            format!("v_add_nc_u32_e32 v{q}, s{TILE16}, v3"),
+            &[v(q)],
+            &[s(TILE16), v(3)],
+        )?;
+        if j > 0 {
+            op(
+                b,
+                format!("v_add_nc_u32_e32 v{q}, {}, v{q}", lit(16 * u32::from(j))),
+                &[v(q)],
+                &[v(q)],
+            )?;
+        }
+        op(
+            b,
+            format!(
+                "v_mul_u32_u24_e32 v{q}, {}, v{q}",
+                lit(iu4_fold::XBLK_BYTES)
+            ),
+            &[v(q)],
+            &[v(q)],
+        )?;
+        op(
+            b,
+            format!(
+                "v_cndmask_b32_e64 v{dst}, {}, v{q}, s{live}",
+                lit(common::GATHER_OOB)
+            ),
+            &[v(dst)],
+            &[v(q), s(live)],
         )
     }
 
@@ -2324,7 +2430,7 @@ mod nt {
         }
         let b = wg.isa();
         // Activation descriptors: epoch 0 (X0) and 1 (X1), x_src_rows*72 records.
-        x_descriptors(b)?;
+        x_descriptors(b, g.gpos)?;
         sop(b, format!("s_lshl_b32 s{XS2}, s4, 1"), &[XS2], &[4])?;
         // Weight descriptor: rows rbase.. of the expert.
         w_descriptor(b)?;
@@ -2373,18 +2479,22 @@ mod nt {
                     &[v(slot), s(m)],
                 )?;
             }
-            common::gather_offset(
-                b,
-                XOFF + j,
-                slot,
-                Some(20),
-                iu4_fold::XBLK_BYTES,
-                g.live(j),
-                GatherTemps {
-                    v: [14, 15, 1, 2],
-                    mask: MASKT[0],
-                },
-            )?;
+            if g.gpos {
+                position_offset(b, XOFF + j, slot, j, g.live(j))?;
+            } else {
+                common::gather_offset(
+                    b,
+                    XOFF + j,
+                    slot,
+                    Some(20),
+                    iu4_fold::XBLK_BYTES,
+                    g.live(j),
+                    GatherTemps {
+                        v: [14, 15, 1, 2],
+                        mask: MASKT[0],
+                    },
+                )?;
+            }
             if a.gfx12() {
                 op(
                     b,
@@ -3026,7 +3136,7 @@ mod nt {
         let nx = g.at(g.blk + 1);
         wg.label(&g.label("epilogue"))?;
         let b = wg.isa();
-        x_descriptors(b)?;
+        x_descriptors(b, g.gpos)?;
         sop(
             b,
             format!("{} s{RBASE}, s{RBASE}, 64", s_add_i32(g.arch())),
@@ -3193,6 +3303,23 @@ mod nt {
     }
 
     pub(super) fn emit_with(r4: R4Spec) -> Result<Emitted, String> {
+        emit_full(r4, false)
+    }
+
+    /// The position-indexed twin of `spec` (down only): symbol `..._sym_gp_pm_...`, variant `<tag>_gp`.
+    pub(super) fn emit_gp(spec: Spec) -> Result<Emitted, String> {
+        emit_full(
+            R4Spec {
+                base: spec,
+                chains: 1,
+                prefetch: true,
+                grouped: false,
+            },
+            true,
+        )
+    }
+
+    fn emit_full(r4: R4Spec, gpos: bool) -> Result<Emitted, String> {
         let spec = r4.base;
         let g = G {
             spec,
@@ -3200,6 +3327,7 @@ mod nt {
             chains: r4.chains,
             prefetch: r4.prefetch,
             grouped: r4.grouped,
+            gpos,
         };
         let experimental = g.experimental();
         let suffix = if experimental {
@@ -3219,9 +3347,17 @@ mod nt {
         }
         let kspec = KernelSpec {
             kernel_id: "qwen4_moe_sym".into(),
-            variant: format!("{}{suffix}", spec.variant()),
+            variant: format!(
+                "{}{suffix}{}",
+                spec.variant(),
+                if gpos { "_gp" } else { "" }
+            ),
             arch: spec.arch,
-            symbol: format!("{}{suffix}", spec.symbol()),
+            symbol: if gpos {
+                spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)
+            } else {
+                format!("{}{suffix}", spec.symbol())
+            },
             kernargs,
             user_sgpr_count: 2,
             system_sgpr_workgroup_id_y: true,

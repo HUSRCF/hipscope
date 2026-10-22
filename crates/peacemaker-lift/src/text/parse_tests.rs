@@ -892,3 +892,47 @@ fn profile_hwreg_names_and_global_th_match_llvm_mc_per_target() {
         &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201],
     );
 }
+
+/// `index_key:N` is SWMMAC's OP_SEL bit 0 (llvm-mc gfx1201 words); it is
+/// refused on every other row, on the K=64 iu4 row, and outside 0|1.
+#[test]
+fn swmmac_index_key_matches_llvm_mc_and_is_refused_elsewhere() {
+    for (text, words) in [
+        (
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]",
+            [0xcc504b00, 0x7c521908],
+        ),
+        (
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:0",
+            [0xcc504000, 0x1c521908],
+        ),
+        (
+            "v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14 index_key:1",
+            [0xcc574800, 0x1c3a1508],
+        ),
+        (
+            "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14 index_key:1 neg_lo:[1,1,0] clamp",
+            [0xcc54c800, 0x7c3a1508],
+        ),
+    ] {
+        assert_eq!(parse_encode(text, Arch::Gfx1201).unwrap(), words, "{text}");
+    }
+    for text in [
+        "v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14 index_key:1",
+        "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:2",
+        "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:",
+        "v_wmma_f32_16x16x16_f16 v[0:7], v[8:11], v[12:15], v[0:7] index_key:1",
+        "v_add_f32_e32 v0, v1, v2 index_key:1",
+    ] {
+        let err = parse_encode(text, Arch::Gfx1201).unwrap_err();
+        assert!(
+            err.contains("index_key"),
+            "{text}: expected an index_key refusal, got {err}"
+        );
+    }
+    assert!(parse_encode(
+        "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1",
+        Arch::Gfx1100
+    )
+    .is_err());
+}

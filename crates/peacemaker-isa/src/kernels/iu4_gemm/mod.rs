@@ -16,6 +16,7 @@
 //! dynamic LDS `Layout::launch` bytes. Preconditions shared with the hipcc
 //! wide epilogue: `K % 256 == 0`, `M % 4 == 0`, and `Y`/`H` 4-byte aligned;
 //! packed bf16 h uses contiguous rows with `M * 2` byte stride.
+pub mod blocks;
 pub mod epilogue;
 pub mod fold;
 pub mod gdn_epilogue;
@@ -34,14 +35,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
 
-pub(crate) const ENTRY: &str = "entry";
-pub(crate) const K_BEGIN: &str = ".Liu4_k_begin";
-pub(crate) const K_LOOP: &str = ".Liu4_k_loop";
-pub(crate) const K_LOOP_END: &str = ".Liu4_k_loop_end";
-pub(crate) const EPI: &str = ".Liu4_epilogue";
-pub(crate) const END: &str = ".Liu4_end";
+/// The program's first label (the kernel entry); `Live` ranges start here.
+pub const ENTRY: &str = "entry";
+pub const K_BEGIN: &str = ".Liu4_k_begin";
+pub const K_LOOP: &str = ".Liu4_k_loop";
+pub const K_LOOP_END: &str = ".Liu4_k_loop_end";
+pub const EPI: &str = ".Liu4_epilogue";
+pub const END: &str = ".Liu4_end";
 /// Fused projection only: the QKV tiles' GDN preparation (after the stores).
-pub(crate) const GDN: &str = ".Liu4_gdn";
+pub const GDN: &str = ".Liu4_gdn";
 
 /// DS offset fields spelled as objdump prints them (zero fields omitted).
 pub(crate) fn ds_offsets(o0: u32, o1: u32) -> String {
@@ -93,6 +95,8 @@ pub(crate) struct Args {
     pub m: u8,
     pub k: u8,
     pub n: u8,
+    /// `Epi::AddSigmoid` only: the `shared_gate` pointer (SGPR pair).
+    pub gate: Option<u8>,
     pub bcx: u8,
     pub bcy: u8,
 }
@@ -103,51 +107,51 @@ pub(crate) struct Args {
 /// products alias them once their WMMAs have issued), `d v[160:163]`, the
 /// prefetch payload, then hoisted addresses: 187 VGPRs (T256: 186).
 #[derive(Clone, Debug)]
-pub(crate) struct Gen {
-    pub spec: Spec,
-    pub tile: Tile,
-    pub layout: spec::Layout,
-    pub args: Args,
-    pub cacc: u8,
-    pub acc: u8,
-    pub magic: u8,
-    pub f: [u8; 2],
-    pub d: u8,
-    pub a_pf: Vec<u8>,
-    pub w_pf: Vec<u8>,
-    pub ds_nx: u8,
-    pub sz_nx: u8,
-    pub fr_a: [u8; 2],
-    pub fr_w: [u8; 2],
-    pub st_lds: u8,
-    pub st_a: u8,
-    pub st_w: Vec<u8>,
-    pub meta_ds: u8,
-    pub meta_sz: u8,
-    pub ds_voff: u8,
-    pub sz_voff: u8,
-    pub sc_addr: u8,
-    pub d_addr: u8,
+pub struct Gen {
+    pub(crate) spec: Spec,
+    pub(crate) tile: Tile,
+    pub(crate) layout: spec::Layout,
+    pub(crate) args: Args,
+    pub(crate) cacc: u8,
+    pub(crate) acc: u8,
+    pub(crate) magic: u8,
+    pub(crate) f: [u8; 2],
+    pub(crate) d: u8,
+    pub(crate) a_pf: Vec<u8>,
+    pub(crate) w_pf: Vec<u8>,
+    pub(crate) ds_nx: u8,
+    pub(crate) sz_nx: u8,
+    pub(crate) fr_a: [u8; 2],
+    pub(crate) fr_w: [u8; 2],
+    pub(crate) st_lds: u8,
+    pub(crate) st_a: u8,
+    pub(crate) st_w: Vec<u8>,
+    pub(crate) meta_ds: u8,
+    pub(crate) meta_sz: u8,
+    pub(crate) ds_voff: u8,
+    pub(crate) sz_voff: u8,
+    pub(crate) sc_addr: u8,
+    pub(crate) d_addr: u8,
     // SGPRs
-    pub karg: u8,
-    pub srd_w: u8,
-    pub srd_z: u8,
-    pub srd_a: [u8; 2],
-    pub srd_y: u8,
-    pub step2: u8,
-    pub goff: u8,
-    pub trips: u8,
-    pub rs: u8,
-    pub bs: u8,
-    pub wave: u8,
-    pub gpr136: u8,
-    pub mm1: u8,
-    pub hs: u8,
-    pub tmp: u8,
-    pub epi_s: u8,
+    pub(crate) karg: u8,
+    pub(crate) srd_w: u8,
+    pub(crate) srd_z: u8,
+    pub(crate) srd_a: [u8; 2],
+    pub(crate) srd_y: u8,
+    pub(crate) step2: u8,
+    pub(crate) goff: u8,
+    pub(crate) trips: u8,
+    pub(crate) rs: u8,
+    pub(crate) bs: u8,
+    pub(crate) wave: u8,
+    pub(crate) gpr136: u8,
+    pub(crate) mm1: u8,
+    pub(crate) hs: u8,
+    pub(crate) tmp: u8,
+    pub(crate) epi_s: u8,
     /// `ALayout::Slab` only: the SGPR holding `32 * N`, the byte distance
     /// from a token's slab-0 plane entry to its slab-1 entry.
-    pub a_slab1: Option<u8>,
+    pub(crate) a_slab1: Option<u8>,
 }
 
 pub(crate) const PRO_TEMPS: u8 = 24;
@@ -155,7 +159,106 @@ pub(crate) const S_TEMPS: u8 = 8;
 pub(crate) const EPI_S: u8 = 24;
 
 impl Gen {
-    fn new(spec: Spec) -> Self {
+    /// The generator for `spec`: the register assignment and geometry every
+    /// block of `blocks` reads. `Err` when `spec` has no generator
+    /// (`Spec::validate`).
+    pub fn new(spec: Spec) -> Result<Self, String> {
+        spec.validate()?;
+        Ok(Self::build(spec))
+    }
+    /// The spec this generator was built for.
+    pub fn spec(&self) -> Spec {
+        self.spec
+    }
+    /// The kernel header (symbol, kernargs, workgroup size) of this spec.
+    pub fn kernel_spec(&self) -> KernelSpec {
+        let spec = self.spec;
+        KernelSpec {
+            kernel_id: "iu4_gemm".into(),
+            variant: spec.variant_name(),
+            arch: spec.arch,
+            symbol: spec.symbol(),
+            kernargs: spec.kernargs(),
+            user_sgpr_count: 2,
+            system_sgpr_workgroup_id_y: true,
+            workgroup_size: spec.tile.threads() as u16,
+            group_segment_fixed_size: 0,
+            wave32: true,
+            cu_mode: false,
+        }
+    }
+    /// A physical register base of this assignment by name (read-only):
+    /// `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a
+    /// meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i>
+    /// st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips
+    /// rs bs wave gpr136 mm1 hs tmp epi_s a_slab1` and kernel arguments
+    /// `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None`
+    /// for an unknown name and for an absent optional register (`arg_u`
+    /// outside gate/up, `arg_gate` outside the sigmoid ADD, `a_slab1` outside
+    /// the slab layout).
+    pub fn reg(&self, name: &str) -> Option<u8> {
+        let a = &self.args;
+        let indexed = |base: &str, v: &[u8]| -> Option<u8> {
+            v.get(name.strip_prefix(base)?.parse::<usize>().ok()?)
+                .copied()
+        };
+        Some(match name {
+            "cacc" => self.cacc,
+            "acc" => self.acc,
+            "magic" => self.magic,
+            "d" => self.d,
+            "f0" => self.f[0],
+            "f1" => self.f[1],
+            "ds_nx" => self.ds_nx,
+            "sz_nx" => self.sz_nx,
+            "fr_a0" => self.fr_a[0],
+            "fr_a1" => self.fr_a[1],
+            "fr_w0" => self.fr_w[0],
+            "fr_w1" => self.fr_w[1],
+            "st_lds" => self.st_lds,
+            "st_a" => self.st_a,
+            "meta_ds" => self.meta_ds,
+            "meta_sz" => self.meta_sz,
+            "ds_voff" => self.ds_voff,
+            "sz_voff" => self.sz_voff,
+            "sc_addr" => self.sc_addr,
+            "d_addr" => self.d_addr,
+            "karg" => self.karg,
+            "srd_w" => self.srd_w,
+            "srd_z" => self.srd_z,
+            "srd_a0" => self.srd_a[0],
+            "srd_a1" => self.srd_a[1],
+            "srd_y" => self.srd_y,
+            "step2" => self.step2,
+            "goff" => self.goff,
+            "trips" => self.trips,
+            "rs" => self.rs,
+            "bs" => self.bs,
+            "wave" => self.wave,
+            "gpr136" => self.gpr136,
+            "mm1" => self.mm1,
+            "hs" => self.hs,
+            "tmp" => self.tmp,
+            "epi_s" => self.epi_s,
+            "a_slab1" => return self.a_slab1,
+            "arg_a" => a.a,
+            "arg_u" => return a.u,
+            "arg_gate" => return a.gate,
+            "arg_xq" => a.xq,
+            "arg_y" => a.y,
+            "arg_m" => a.m,
+            "arg_k" => a.k,
+            "arg_n" => a.n,
+            "arg_bcx" => a.bcx,
+            "arg_bcy" => a.bcy,
+            _ => {
+                return indexed("a_pf", &self.a_pf)
+                    .or_else(|| indexed("w_pf", &self.w_pf))
+                    .or_else(|| indexed("st_w", &self.st_w))
+            }
+        })
+    }
+    fn build(spec: Spec) -> Self {
         let tile = spec.tile;
         let args = if spec.epi.is_silu() {
             Args {
@@ -166,6 +269,7 @@ impl Gen {
                 m: 16,
                 k: 17,
                 n: 18,
+                gate: None,
                 bcx: 20,
                 bcy: 21,
             }
@@ -180,8 +284,24 @@ impl Gen {
                 m: 30,
                 k: 22,
                 n: 23,
+                gate: None,
                 bcx: 28,
                 bcy: 29,
+            }
+        } else if spec.epi == Epi::AddSigmoid {
+            // The ADD arguments, then `shared_gate` at offset 40 (s[18:19]);
+            // the hidden block counts follow at offset 48.
+            Args {
+                a: 8,
+                u: None,
+                xq: 10,
+                y: 12,
+                m: 14,
+                k: 15,
+                n: 16,
+                gate: Some(18),
+                bcx: 20,
+                bcy: 21,
             }
         } else {
             Args {
@@ -192,6 +312,7 @@ impl Gen {
                 m: 14,
                 k: 15,
                 n: 16,
+                gate: None,
                 bcx: 18,
                 bcy: 19,
             }
@@ -271,7 +392,7 @@ impl Gen {
     /// are declared by the K-loop generator with label-delimited lifetimes.
     /// The fused projection ends the K-loop/store registers at its GDN label,
     /// where `gdn_epilogue` reuses them.
-    fn plan(&self) -> Result<RegPlan, String> {
+    pub fn plan(&self) -> Result<RegPlan, String> {
         let gdn = self.spec.epi == Epi::QkvzaGdn;
         let mut p = RegPlan::new(spec::VGPR_CEILING, 104)?;
         let pro = || Live::Between(ENTRY.into(), K_BEGIN.into());
@@ -386,6 +507,9 @@ impl Gen {
         for i in 0..EPI_S {
             p.s::<1>("epi_s", self.epi_s + i, shared())?;
         }
+        if self.spec.epi == Epi::AddSigmoid {
+            epilogue::plan_sigmoid(&mut p)?;
+        }
         if gdn {
             gdn_epilogue::plan(&mut p)?;
         }
@@ -394,18 +518,7 @@ impl Gen {
 
     /// Slots A0, W0, A1, W1, DS0, DS1, SZ0, SZ1 (builder ids 0..7) as four
     /// two-buffer rings; buffer 0 of each is written first.
-    fn declare_lds(
-        &self,
-        wg: &mut Wg,
-    ) -> Result<
-        (
-            Ring<PayA, Free, Free>,
-            Ring<PayW, Free, Free>,
-            Ring<MetaD, Free, Free>,
-            Ring<MetaS, Free, Free>,
-        ),
-        String,
-    > {
+    pub(crate) fn declare_lds(&self, wg: &mut Wg) -> Result<FreeRings, String> {
         let l = self.layout;
         let (a0, w0) = (
             wg.lds("A0", l.a[0], l.a_bytes)?,
@@ -441,11 +554,19 @@ pub enum PayA {}
 pub enum PayW {}
 pub enum MetaD {}
 pub enum MetaS {}
-pub(crate) type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
+/// The kernel's workgroup scope on gfx1201.
+pub type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
 pub(crate) type Wv<'b> = Wave<'b, Gfx1201, Builder>;
+/// The four LDS rings as declared: every buffer free.
+pub type FreeRings = (
+    Ring<PayA, Free, Free>,
+    Ring<PayW, Free, Free>,
+    Ring<MetaD, Free, Free>,
+    Ring<MetaS, Free, Free>,
+);
 /// Steady state at a block boundary: each ring's current buffer published,
 /// the next one free.
-pub(crate) type Lds = (
+pub type Lds = (
     Ring<PayA, Published, Free>,
     Ring<PayW, Published, Free>,
     Ring<MetaD, Published, Free>,
@@ -456,24 +577,10 @@ pub(crate) type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrit
 
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
-    spec.validate()?;
-    let g = Gen::new(spec);
-    let kspec = KernelSpec {
-        kernel_id: "iu4_gemm".into(),
-        variant: spec.variant_name(),
-        arch: spec.arch,
-        symbol: spec.symbol(),
-        kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: spec.tile.threads() as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, g.plan()?);
+    let g = Gen::new(spec)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     let mut wg = Wg::new(&mut b)?;
-    let lds = g.declare_lds(&mut wg)?;
+    let lds = blocks::declare_lds(&mut wg, &g)?;
     let end = wg.exit(END)?;
     // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its
     // epilogue (`epilogue::emit`; the fused projection keeps its stores at 1
@@ -481,13 +588,13 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     // co-resident K-loops win issue arbitration over a finishing tile.
     // Scheduling only; every result bit is unchanged.
     op(wg.isa(), "s_setprio 1", &[], &[])?;
-    let lds = prologue::emit(&mut wg, &g, &end, lds)?;
-    let lds = kloop::emit(&mut wg, &g, lds)?;
-    epilogue::emit(&mut wg, &g, &end)?;
+    let lds = blocks::prologue(&mut wg, &g, &end, lds)?;
+    let lds = blocks::kloop(&mut wg, &g, lds)?;
+    blocks::epilogue(&mut wg, &g, &end)?;
     // Only the fused projection reuses the LDS after the K loop: its QKV
     // tiles continue at the GDN label the epilogue's exit branch skips to.
     if spec.epi == Epi::QkvzaGdn {
-        gdn_epilogue::emit(&mut wg, &g, lds)?;
+        blocks::gdn_epilogue(&mut wg, &g, lds)?;
     }
     wg.end(end)?;
     b.finish()
@@ -579,6 +686,10 @@ pub fn emit_module(
     if tile == Tile::T128x128x8 {
         epis.push(Epi::GateUpSiluBf16);
         epis.push(Epi::QkvzaGdn);
+        // The sigmoid residual ADD reads token-layout activations only.
+        if act == ALayout::Token {
+            epis.push(Epi::AddSigmoid);
+        }
     }
     let emitted = epis
         .into_iter()

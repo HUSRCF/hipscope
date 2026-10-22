@@ -444,6 +444,10 @@ fn modifier_suffix(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
             out.push_str(&vop3_op_sel_suffix(inst, row)?);
         }
         Form::Vop3p => {
+            // SWMMAC carries its sparse-index half select in OP_SEL bit 0.
+            if row.name.starts_with("v_swmmac_") && mods.op_sel & 1 != 0 {
+                out.push_str(" index_key:1");
+            }
             if mods.neg_lo != 0 {
                 out.push_str(&format!(
                     " neg_lo:[{},{},{}]",

@@ -3,10 +3,13 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle and timing for the A3B shared-expert down fold (H3, gfx1201,
-//! lab): `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi`, the existing V3
-//! IU4 `full_add_v3` kernel launched with runtime mode `add == 2` (sigmoid of
-//! the per-token shared gate fused into the final residual store), against the
-//! incumbent two-launch sequence.
+//! lab): `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi` (sigmoid of the
+//! per-token shared gate fused into the final residual store), against the
+//! incumbent two-launch sequence. The fold has two launch targets with the same
+//! kernarg layout and bytes: the builder `_b1` bundle entry
+//! `gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1` (selected when
+//! `HIPFIRE_G12_IU4_ISA` holds and the shape/pointer are eligible) and the hipcc
+//! V3 `full_add_v3` kernel launched with runtime mode `add == 2` (the anchor).
 //!
 //! ## Arms (A3B geometry: hidden M = 2048, shared intermediate K = 512)
 //!
@@ -17,8 +20,13 @@
 //!   2048)`.
 //! * candidate: `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi(w_down, x_rot,
 //!   None, residual, gate, 2048, 512, rows)`: one standalone quantize from the
-//!   already-rotated `x_rot`, V3 ADD mode 2 straight into the residual, no
-//!   `tmp` memset or write.
+//!   already-rotated `x_rot`, the `_b1` sigmoid ADD straight into the residual,
+//!   no `tmp` memset or write. The oracle asserts the `_b1` symbol was the
+//!   arm's last launch.
+//! * V3 anchor: the same call with `Gpu::flags.g12_iu4_isa` cleared for the
+//!   call, which selects the hipcc V3 ADD mode 2 (the pre-`_b1` selected entry);
+//!   the oracle asserts the V3 symbol was its last launch. Its bytes must equal both the
+//!   incumbent and the candidate, and it is timed as a third arm.
 //!
 //! `x_rot` (SwiGLU + FWHT, AWQ variant when AWQ is `some`) is produced once per
 //! case by the same F32 producer for every arm and sits outside every timer.
@@ -42,7 +50,8 @@
 //!
 //! ## Matrix
 //!
-//! rows {512, 4096, 8192} x data {zero, random} x AWQ {none, some} = 12 cases.
+//! rows {512, 4096, 7808, 8192} x data {zero, random} x AWQ {none, some} = 16
+//! cases (7808 and 8192 are the A3B pp16000 prefill chunks).
 //! `zero` activations (gate = up = 0 -> `x_rot` = 0, amax 0 / `d = 1` path);
 //! the residual and gate logits stay the nonzero pattern above so the epilogue
 //! is still exercised. `random` activations are finite, per-row scaled
@@ -93,7 +102,7 @@
 //!     --example shared_down_sigmoid_epi_oracle -- --self-check
 //! cargo run --release -p rdna-compute --features lab \
 //!     --example shared_down_sigmoid_epi_oracle
-//! # optional: --rows 512,4096,8192 --data zero,random --awq none,some
+//! # optional: --rows 512,4096,7808,8192 --data zero,random --awq none,some
 //! #           --reps N>=20 --warmups N --deadline-secs 1..=120
 //! ```
 //!
@@ -115,7 +124,7 @@ const MAX_DEADLINE_SECS: u64 = 120;
 const M: usize = 2048;
 /// A3B shared-expert intermediate size: reduction K of the shared down.
 const K: usize = 512;
-const DEFAULT_ROWS: [usize; 3] = [512, 4096, 8192];
+const DEFAULT_ROWS: [usize; 4] = [512, 4096, 7808, 8192];
 /// The incumbent IU4 route (`mq4g256v2_shared_iu4_supported`) needs rows >= 64.
 const MIN_ROWS: usize = 64;
 const MAX_ROWS: usize = 16384;
@@ -138,6 +147,7 @@ const V3_ABI: [(&str, usize); 8] = [
     ("shared_gate", 8),
 ];
 const V3_SYMBOL: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3";
+const B1_SIGMOID_SYMBOL: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Data {
@@ -558,6 +568,7 @@ struct Bufs {
     res0: GpuTensor,
     inc: GpuTensor,
     cand: GpuTensor,
+    v3: GpuTensor,
 }
 
 fn reset(gpu: &Gpu, dst: &GpuTensor, src: &GpuTensor) -> Result<(), Fail> {
@@ -613,6 +624,26 @@ fn run_candidate(gpu: &mut Gpu, f: &Fx, residual: &GpuTensor) -> Result<(), Fail
     }
 }
 
+/// The candidate launch with the builder bundle switched off, which selects the
+/// hipcc V3 ADD mode 2; the flag is restored on every path.
+fn run_v3_anchor(gpu: &mut Gpu, f: &Fx, residual: &GpuTensor) -> Result<(), Fail> {
+    let isa = gpu.flags.g12_iu4_isa;
+    std::sync::Arc::make_mut(&mut gpu.flags).g12_iu4_isa = false;
+    let r = run_candidate(gpu, f, residual);
+    std::sync::Arc::make_mut(&mut gpu.flags).g12_iu4_isa = isa;
+    r
+}
+
+/// Fail unless the arm's final launch was `symbol` (the arm really ran the entry it claims).
+fn require_last_launch(gpu: &Gpu, symbol: &str, arm: &str) -> Result<(), Fail> {
+    match gpu.last_launched_kernel() {
+        Some(last) if last == symbol => Ok(()),
+        last => Err(Fail::Unsupported(format!(
+            "{arm}: last launch was {last:?}, expected {symbol}; the arm did not take its intended route"
+        ))),
+    }
+}
+
 struct Pass {
     json: Value,
     identical: bool,
@@ -637,6 +668,12 @@ fn verify_pass(gpu: &mut Gpu, f: &Fx, b: &Bufs) -> Result<Pass, Fail> {
     }
     run_candidate(gpu, f, &b.cand)?;
     sync(gpu)?;
+    require_last_launch(gpu, B1_SIGMOID_SYMBOL, "candidate")?;
+    reset(gpu, &b.v3, &b.res0)?;
+    sync(gpu)?;
+    run_v3_anchor(gpu, f, &b.v3)?;
+    sync(gpu)?;
+    require_last_launch(gpu, V3_SYMBOL, "v3 anchor")?;
     let inc = hip(
         gpu.download_raw_bytes(&b.inc),
         "download incumbent residual",
@@ -645,15 +682,34 @@ fn verify_pass(gpu: &mut Gpu, f: &Fx, b: &Bufs) -> Result<Pass, Fail> {
         gpu.download_raw_bytes(&b.cand),
         "download candidate residual",
     )?;
+    let v3 = hip(gpu.download_raw_bytes(&b.v3), "download v3 anchor residual")?;
     let quant = compare_bytes(&inc, &cand, M);
+    let v3_vs_inc = compare_bytes(&inc, &v3, M);
+    let v3_vs_cand = compare_bytes(&cand, &v3, M);
 
-    let identical = quant.identical;
+    let identical = quant.identical && v3_vs_inc.identical && v3_vs_cand.identical;
     let first = quant
         .first
         .clone()
-        .map(|m| json!({ "arm": "standalone_quantize", "mismatch": m }));
+        .map(|m| json!({ "arm": "standalone_quantize", "mismatch": m }))
+        .or_else(|| {
+            v3_vs_inc
+                .first
+                .clone()
+                .map(|m| json!({ "arm": "v3_anchor_vs_incumbent", "mismatch": m }))
+        })
+        .or_else(|| {
+            v3_vs_cand
+                .first
+                .clone()
+                .map(|m| json!({ "arm": "v3_anchor_vs_candidate", "mismatch": m }))
+        });
     Ok(Pass {
-        json: json!({ "standalone_quantize": quant.json }),
+        json: json!({
+            "standalone_quantize": quant.json,
+            "v3_anchor_vs_incumbent": v3_vs_inc.json,
+            "v3_anchor_vs_candidate": v3_vs_cand.json,
+        }),
         identical,
         first,
     })
@@ -662,6 +718,7 @@ fn verify_pass(gpu: &mut Gpu, f: &Fx, b: &Bufs) -> Result<Pass, Fail> {
 struct Timing {
     inc: Vec<f64>,
     cand: Vec<f64>,
+    v3: Vec<f64>,
     deadline_hit: bool,
 }
 
@@ -676,6 +733,7 @@ fn time_arms(
     let mut t = Timing {
         inc: Vec::with_capacity(reps),
         cand: Vec::with_capacity(reps),
+        v3: Vec::with_capacity(reps),
         deadline_hit: false,
     };
     for rep in 0..warmups + reps {
@@ -697,9 +755,17 @@ fn time_arms(
         sync(gpu)?;
         let cand_us = t0.elapsed().as_secs_f64() * 1e6;
 
+        reset(gpu, &b.v3, &b.res0)?;
+        sync(gpu)?;
+        let t0 = Instant::now();
+        run_v3_anchor(gpu, f, &b.v3)?;
+        sync(gpu)?;
+        let v3_us = t0.elapsed().as_secs_f64() * 1e6;
+
         if rep >= warmups {
             t.inc.push(inc_us);
             t.cand.push(cand_us);
+            t.v3.push(v3_us);
         }
     }
     if t.inc.len() < reps {
@@ -746,6 +812,7 @@ fn run_case(
         res0,
         inc: hip(gpu.alloc_tensor(&[rows, M], DType::F32), "alloc residual")?,
         cand: hip(gpu.alloc_tensor(&[rows, M], DType::F32), "alloc residual")?,
+        v3: hip(gpu.alloc_tensor(&[rows, M], DType::F32), "alloc residual")?,
     };
     let fx = Fx {
         rows,
@@ -766,13 +833,20 @@ fn run_case(
 
     let identical = first.identical && post.identical && !timing.deadline_hit;
     let first_mismatch = first.first.clone().or_else(|| post.first.clone());
-    let timing_json = if timing.inc.len() >= MIN_REPS && timing.cand.len() >= MIN_REPS {
+    let timing_json = if timing.inc.len() >= MIN_REPS
+        && timing.cand.len() >= MIN_REPS
+        && timing.v3.len() >= MIN_REPS
+    {
         let inc = stats(&timing.inc);
         let cand = stats(&timing.cand);
+        let v3 = stats(&timing.v3);
         let speedup = inc["median"].as_f64().unwrap() / cand["median"].as_f64().unwrap();
+        let v3_speedup = v3["median"].as_f64().unwrap() / cand["median"].as_f64().unwrap();
         json!({
             "incumbent_us": inc,
             "candidate_us": cand,
+            "v3_anchor_us": v3,
+            "candidate_speedup_vs_v3_median": v3_speedup,
             "speedup_median": speedup,
             "saving_vs_incumbent_pct": (1.0 - 1.0 / speedup) * 100.0,
         })
@@ -793,7 +867,9 @@ fn run_case(
         "case_byte_identical": identical,
     });
 
-    for t in [gate, up, x_rot, logits, tmp, bufs.res0, bufs.inc, bufs.cand] {
+    for t in [
+        gate, up, x_rot, logits, tmp, bufs.res0, bufs.inc, bufs.cand, bufs.v3,
+    ] {
         let _ = gpu.free_tensor(t);
     }
     Ok(CaseOut {
@@ -819,7 +895,8 @@ fn incumbent_sequence() -> Vec<&'static str> {
 fn candidate_sequence() -> Vec<&'static str> {
     vec![
         "same F32 x_rot (common producer, untimed)",
-        "try_gemm_mq4g256v2_shared_down_sigmoid_epi(prepared = None): one standalone quantize from x_rot, V3 full_add_v3 ADD mode 2 straight into the residual; no tmp memset, no intermediate write",
+        "try_gemm_mq4g256v2_shared_down_sigmoid_epi(prepared = None): one standalone quantize from x_rot, the _b1 full_add_sigmoid_b1 ADD straight into the residual; no tmp memset, no intermediate write",
+        "V3 anchor (same call, Gpu::flags.g12_iu4_isa cleared): one standalone quantize from x_rot, V3 full_add_v3 ADD mode 2 straight into the residual",
     ]
 }
 
@@ -827,7 +904,7 @@ fn prerequisites() -> Vec<&'static str> {
     vec![
         "exact gfx1201 with WMMA (any other arch: exit 2, nothing compared)",
         "Gpu::mq4g256v2_shared_down_sigmoid_epi_supported(2048, 512, rows) true for every selected rows (IU4 prefill, symmetric MQ4V2, V3 route, no slab sidecars); false is an error, never a pass",
-        "the V3 module must be the launch target of the candidate (support inherits IU4 prefill + symmetric MQ4V2 + HIPFIRE_G12_IU4_ISA or HIPFIRE_G12_IU4_V3); the oracle only sets Gpu::mq4v2_symmetric = true for its symmetric synthetic weights",
+        "the _b1 sigmoid entry must be the launch target of the candidate and the V3 module that of the anchor (support inherits IU4 prefill + symmetric MQ4V2 + HIPFIRE_G12_IU4_ISA or HIPFIRE_G12_IU4_V3); the oracle only sets Gpu::mq4v2_symmetric = true for its symmetric synthetic weights",
         "the incumbent gemm_mq4g256v2 must bump the IU4 scratch generation (standalone-quantizer route); checked per case",
         "one GPU, single process, <= 120 s; weights are synthetic valid symmetric MQ4G256V2, not model weights",
     ]
@@ -909,12 +986,12 @@ fn self_check() {
     let all = parse_args(&[]).expect("default args");
     let cases = case_matrix(&all);
     check!(
-        cases.len() == 3 * 2 * 2,
+        cases.len() == 4 * 2 * 2,
         "default matrix has {} cases",
         cases.len()
     );
     check!(
-        all.rows == vec![512, 4096, 8192],
+        all.rows == vec![512, 4096, 7808, 8192],
         "default rows {:?}",
         all.rows
     );
@@ -1347,7 +1424,7 @@ fn main() {
         Err(e) => {
             eprintln!("shared_down_sigmoid_epi_oracle: {e}");
             eprintln!(
-                "usage: [--plan|--self-check] [--rows 512,4096,8192] [--data zero,random] \
+                "usage: [--plan|--self-check] [--rows 512,4096,7808,8192] [--data zero,random] \
                  [--awq none,some] [--reps N>=20] [--warmups N] [--deadline-secs 1..=120]"
             );
             std::process::exit(2);

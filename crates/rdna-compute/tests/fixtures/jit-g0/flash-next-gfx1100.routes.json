@@ -2247,12 +2247,7 @@
         "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/tensor_ops/rep-1/kernel.hsaco",
         "sha256": "c21c1cc18b25dbb77653a66a0e765b92bd1afee101937d484ae66fbb2312edfc"
       },
-      "registry_missing_symbols": [
-        "indexed_attention_attention_q8_batched",
-        "indexed_attention_attention_q8_batched_hg4",
-        "indexed_attention_cache_append_q8_batched",
-        "indexed_attention_decode_prologue_q8"
-      ]
+      "registry_missing_symbols": []
     }
   ],
   "alternate_arms": [

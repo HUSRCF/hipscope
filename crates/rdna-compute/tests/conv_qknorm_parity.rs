@@ -5,10 +5,10 @@
 //! gfx1201, gfx1100 and gfx1151: the decode-only fusion
 //! `conv1d_silu_split_qknorm` must produce the same bytes as the unfused pair
 //! it replaces (`conv1d_silu_split_f32` then `fused_qk_l2_norm_scale_f32`).
-//! The Qwen3.5 lowered decode uses the fusion and the hand decode
-//! (`HIPFIRE_FORWARD_LOWERED=0`, DFlash's per-token hidden-extracting
-//! forward) uses the pair, so any difference makes the two decode paths
-//! diverge. It did: the compiler contracted the conv tap sum and the first Q/K
+//! Qwen3.5 decode runs the fusion where its gate admits the shape and the pair
+//! where it does not (FP32/Q4 DeltaNet state, `HIPFIRE_CONV_QKNORM=0`), so any
+//! difference makes the same model's decode depend on that gate. It did: the
+//! compiler contracted the conv tap sum and the first Q/K
 //! square-sum add into FMAs in a different order in each kernel.
 //!
 //! Q, K, V and the conv state are compared bit for bit over four chained

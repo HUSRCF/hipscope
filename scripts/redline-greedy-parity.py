@@ -4,6 +4,11 @@
 Runs identical requests through ordinary HIP and the automatic retained route.
 Unlike the synthetic state shadow, this covers the real prefill -> first direct
 decode -> retained takeover lifecycle and compares committed token streams.
+
+`--backend redline` forces the retained route for formats the model default
+leaves on HIP; run it once per weight format a retained route admits. Each row
+reports whether the route was actually retained (replays > 0) or fell back to
+HIP (with the fallback reason); `--require-retained` fails a row that fell back.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +26,7 @@ def run_arm(
     daemon: Path,
     model: Path,
     backend: str,
+    transport: str,
     state_quant: str,
     prompt: str,
     max_tokens: int,
@@ -29,7 +36,8 @@ def run_arm(
     env = dict(os.environ)
     env.update(
         HIPFIRE_REPLAY_BACKEND=backend,
-        HIPFIRE_REPLAY_TRANSPORT="pm4",
+        HIPFIRE_REPLAY_TRANSPORT=transport,
+        HIPFIRE_REPLAY_ROUTE_PROOF_LOG="1",
         HIPFIRE_EMIT_TOKEN_IDS="1",
         HIPFIRE_AR_GRAPH="0",
         HIPFIRE_GRAPH="0",
@@ -91,12 +99,16 @@ def run_arm(
             f"errors={errors[:1]} done={done is not None} stream={len(stream)}\n"
             f"stderr tail:\n{proc.stderr[-4000:]}"
         )
+    proofs = re.findall(r"HIPFIRE_REPLAY_ROUTE_PROOF .*?replays=(\d+)", proc.stderr)
+    fallbacks = sorted(set(re.findall(r"\[redline\] falling back to HIP: (.*)", proc.stderr)))
     return {
         "backend": backend,
         "state_quant": state_quant,
         "stream": stream,
         "visible": visible,
         "done": done,
+        "replays": int(proofs[-1]) if proofs else 0,
+        "fallbacks": fallbacks,
         "stderr_tail": proc.stderr[-4000:],
     }
 
@@ -117,6 +129,13 @@ def main() -> int:
         "--state-quant", choices=("q8", "fp32"), action="append", dest="states"
     )
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--backend", choices=("auto", "redline"), default="auto")
+    parser.add_argument("--transport", choices=("pm4", "aql", "auto"), default="pm4")
+    parser.add_argument(
+        "--require-retained",
+        action="store_true",
+        help="fail a row whose retained arm fell back to HIP (no replays)",
+    )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -129,27 +148,36 @@ def main() -> int:
     passed = True
     for state in states:
         hip = run_arm(
-            daemon, model, "hip", state, args.prompt, args.max_tokens, args.max_seq, args.timeout
+            daemon, model, "hip", args.transport, state, args.prompt, args.max_tokens,
+            args.max_seq, args.timeout,
         )
         auto = run_arm(
-            daemon, model, "auto", state, args.prompt, args.max_tokens, args.max_seq, args.timeout
+            daemon, model, args.backend, args.transport, state, args.prompt, args.max_tokens,
+            args.max_seq, args.timeout,
         )
         exact = hip["stream"] == auto["stream"]
         coherent = len(auto["visible"].strip()) >= 8
+        retained = auto["replays"] > 0
         row = {
             "state_quant": state,
             "exact": exact,
             "coherent": coherent,
+            "retained": retained,
+            "replays": auto["replays"],
+            "fallbacks": auto["fallbacks"],
             "tokens": len(auto["stream"]),
             "hip_visible": hip["visible"],
             "auto_visible": auto["visible"],
         }
         report["rows"].append(row)
-        passed &= exact and coherent
+        passed &= exact and coherent and (retained or not args.require_retained)
         print(
-            f"state={state} exact={exact} coherent={coherent} tokens={len(auto['stream'])}",
+            f"state={state} exact={exact} coherent={coherent} retained={retained} "
+            f"replays={auto['replays']} tokens={len(auto['stream'])}",
             flush=True,
         )
+        for reason in auto["fallbacks"]:
+            print(f"fallback: {reason}", flush=True)
         if not exact:
             first = next(
                 (

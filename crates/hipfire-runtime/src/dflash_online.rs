@@ -414,7 +414,7 @@ impl OnlineDraftTuner {
         let (di, dv) = self.dev.as_ref().unwrap();
         let di = di.sub_offset(0, rows * K);
         let dv = dv.sub_offset(0, rows * K);
-        gpu.topk_values_batched_f32_verified_regrid(logits, &di, &dv, vocab, K, rows)?;
+        gpu.topk_values_batched_f32(logits, &di, &dv, vocab, K, rows)?;
         let mut ids = vec![0u32; rows * K];
         // SAFETY: `ids` holds exactly rows*K u32; any byte pattern is valid.
         let bytes =

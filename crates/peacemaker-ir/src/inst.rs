@@ -188,7 +188,7 @@ impl Inst {
             write!(&mut text, "{operand}").expect("String write");
             previous_operand = true;
         }
-        self.mods.append_text_suffix(&mut text);
+        self.mods.append_text_suffix(&mut text, row.name);
         Ok(text)
     }
     pub fn from_parts(

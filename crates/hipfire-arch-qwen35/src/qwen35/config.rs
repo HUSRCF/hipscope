@@ -10,7 +10,6 @@ use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::tp_shard::ShardConfig;
-use rdna_compute::GpuTensor;
 use serde::Deserialize;
 use std::ops::Range;
 
@@ -91,46 +90,7 @@ pub struct MaskEmbedOverride<'a> {
     pub embed: &'a [f32],
 }
 
-/// Frozen AR/verify discriminator for the DFlash launch-fusion project.
-///
-/// `Off` is the behavior-preserving default: every hook takes the pre-change
-/// path. `ChainVerify` arms the exact-shape fast routes (linear chain verify
-/// only — tree verify stays `Off`). Computed once in
-/// `verify_dflash_block_inner` (`ChainVerify` iff `tree_verify` is `None`)
-/// and threaded through the verify forwards; every other caller passes `Off`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DflashFusionCtx {
-    Off,
-    ChainVerify,
-    /// Linear-chain verify whose exact model/KV/context envelope admits the
-    /// gfx1100 FA2 split-KV route. This only widens capture-safe auxiliary
-    /// kernels; ordinary eager ChainVerify behavior is otherwise unchanged.
-    ChainVerifySplit,
-}
-
-impl DflashFusionCtx {
-    #[inline]
-    pub const fn is_chain_verify(self) -> bool {
-        matches!(self, Self::ChainVerify | Self::ChainVerifySplit)
-    }
-
-    #[inline]
-    pub const fn split_verify_active(self) -> bool {
-        matches!(self, Self::ChainVerifySplit)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct TreeVerifyCtx<'a> {
-    pub positions: &'a [i32],
-    pub attn_bias: &'a GpuTensor,
-    /// `[N]` i32 — for each linearized slot, the slot index of its parent
-    /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
-    /// use tree-aware kernels that read parent state from the per-layer
-    /// s_tape scratch in `PrefillBatchScratch`.
-    pub parent_indices: Option<&'a GpuTensor>,
-}
+pub use hipfire_dispatch::pipeline::batched::{DflashFusionCtx, TreeVerifyCtx};
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
@@ -1024,19 +984,6 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config,
     config_from_metadata_json(source.metadata_json())
 }
 
-/// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.
-pub(crate) fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
-    config.dim == 5_120
-        && config.n_layers == 64
-        && config.n_heads == 24
-        && config.n_kv_heads == 4
-        && config.head_dim == 256
-        && config.linear_num_key_heads == 16
-        && config.linear_key_head_dim == 128
-        && n_v_heads == 48
-        && config.linear_value_head_dim == 128
-        && config.num_experts == 0
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,30 +1270,6 @@ mod tests {
             parse_f16_lm_head_mode(Some("surprise")),
             F16LmHeadMode::Native
         );
-    }
-
-    #[test]
-    fn qwen36_27b_dense_shape_is_exact() {
-        let inner = serde_json::json!({
-            "hidden_size": 5120,
-            "num_hidden_layers": 64,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 48,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128
-        });
-        let mut cfg = from_config_value(&inner).expect("Qwen3.6-27B shape parse");
-        assert!(qwen36_27b_dense_shape(&cfg, 48));
-        assert!(!qwen36_27b_dense_shape(&cfg, 47));
-        cfg.num_experts = 8;
-        assert!(!qwen36_27b_dense_shape(&cfg, 48));
-        cfg.num_experts = 0;
-        cfg.dim = 2_048;
-        assert!(!qwen36_27b_dense_shape(&cfg, 48));
     }
 
     #[test]

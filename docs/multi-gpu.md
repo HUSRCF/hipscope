@@ -332,8 +332,10 @@ when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
 are visible, or when a directed card pair is not peer-accessible. EP has no
 host-staged fallback for a missing peer pair; the load refuses. EP also refuses
 DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK, PFlash,
-lane batching and the retained Redline default, and
-`HIPFIRE_MTP_SAMPLED_MODE=naive`. Flash-Next EP stays **opt-in and
+the retained Redline default and `HIPFIRE_MTP_SAMPLED_MODE=naive`. Exact AR
+lane batching (`serve.vmm_batch`) is **not** refused under EP; see
+[fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
+Flash-Next EP stays **opt-in and
 experimental** (`topology.ep` defaults to `1`). EP decode is eager (no graph
 capture).
 
@@ -447,6 +449,50 @@ N = 2 and N = 4 sit within 1 MiB of the next layer (the quotient is 19.998 and
 39.997), so a slightly different free-VRAM or reserve figure moves them by one
 layer. At N = 2, 3 and 4 the layers that do not fit are host-mapped (the MTP
 layer always is when not every layer is resident).
+
+### Flash-Next EP: AR lane reservation
+
+A Flash-Next EP load that requests lane batching (`serve.vmm_batch` on and
+`serve.continuous_batch_size` above `1`, the same request the daemon reads
+for staging, on the VMM KV backend) charges the AR lane store to each rank
+**before** the routed experts are split into resident and host-mapped layers.
+The lane store is staged after the weights from the memory that is left, so
+without the charge the plan can fill the card with expert layers and staging is
+then refused for lack of room. The charge is the same figure staging checks
+later: one shared helper computes the lane-store bytes from the lane count, the
+load's `max_seq`, the requested prefill chunk, the VMM granularity and a row
+budget of at least the lane count, and the load placement and
+`stage_rank_lanes` read that one function (the loader's batch staging for EP
+does too), so the reserved and the staged bytes cannot drift. The reservation
+is planner capacity only: it changes which layers are resident, never a
+forward. Singleton forward bytes and numerics are unchanged.
+
+- **Off is identical.** With no batch request (no `serve.vmm_batch`, or
+  `continuous_batch_size` of `1`), or on any load that is not a Flash-Next EP
+  load, nothing is charged and the placement is the same plan as before. The
+  request is a per-load field on the loader's admission, not an environment
+  variable, and the plain `load_model` entry points leave it off.
+- **Trade line.** A charged load logs exactly one line:
+  `[daemon] qwen4 EP lane reservation: lanes=N max_seq=S -> X GiB/rank; resident expert layers A -> B`.
+  `A` is the resident expert layer count the plan would have chosen without
+  the charge, `B` the count with it. A smaller `B` is the trade: lane memory is
+  bought with host-mapped expert layers.
+- **Impossible reservation.** If the charge cannot be met even with every
+  expert layer on the host, the load keeps the baseline (uncharged) plan and
+  logs why. Staging then meets its existing per-rank `lane store bytes <= free`
+  refusal, the load keeps the singleton route
+  (`continuous_batch_capable = false`), and nothing else changes.
+- **Oracle.** `fn_mesh_lane_oracle --reserve-lanes N` loads through the admitted
+  route with that request set to `N` lanes and a row budget equal to the
+  oracle's staged `--row-budget` (default `max(--ks)`; the loader takes the
+  larger of that and `N`). `N = 1` is the same plan as off; without the flag the
+  oracle loads as before. Pick `N = max(--ks)` to reserve what the oracle
+  stages. The flag is planner capacity only: the oracle's
+  singleton-versus-lanes comparison and its `--ks`, `--row-budget` and
+  `--policies` are unchanged. The report records `reserve_lanes`.
+
+This section records behavior only; it carries no measurement and no exactness
+evidence. The changed placement is not covered by the EP2/EP4 evidence above.
 
 ### Flash-Next EP: card topology
 
@@ -702,12 +748,12 @@ string or a blanket “always refuse at load.”
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree/lanes stay refused |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
 arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
-access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
+access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/Redline,
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
@@ -923,9 +969,161 @@ Mesh, rank, band and budget refusals use the prefix
   trunk-overlay sidecar and a set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`
   (`qwen4: topology.pp does not admit … (host-mapped expert layers)`).
 
-Also refused under PP: lane batching and the daemon-level `tp > 1 && pp > 1`
-(`mutually exclusive`). The synthetic `hipfire bench --matrix` probes
+Also refused under PP: the daemon-level `tp > 1 && pp > 1`
+(`mutually exclusive`). Exact AR lane batching is admitted under PP; see
+[fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
+The synthetic `hipfire bench --matrix` probes
 (`bench_prefill` / `bench_decode`) are **not** refused under PP, TP or EP.
+
+#### Flash-Next fn-lanes continuous batching under PP and EP
+
+With `serve.vmm_batch` on, a Qwen4 load under `topology.pp` or `topology.ep`
+(`2..=8`) stages the same exact **AR fn-lanes** route as a single card
+(`continuous_batch_route = "fn-lanes"`, greedy-only lanes), default-off like
+the single-card route. Exactness rests on two byte-identity receipts (PP2 mq2,
+and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
+**Measured** bullet at the end of this section.
+
+- **Staging and admission.** Lanes are staged after the weights, from each
+  device's remaining free memory. The check is per device: every band (PP) or
+  rank (EP) needs `lane store bytes <= free` on its own card. If any device does
+  not fit, nothing is staged, the reason is logged and the load keeps the
+  singleton route (`continuous_batch_capable = false`). Without the EP lane
+  reservation below, staging does not change the singleton's own admission and
+  residency plan. Under EP a lane request can reserve its bytes in that plan
+  first: [Flash-Next EP: AR lane reservation](#flash-next-ep-ar-lane-reservation).
+- **EP.** The trunk is replicated, so every rank holds a full lane-store replica
+  and runs each lane entry through the same per-rank worker fan-out as the
+  singleton EP forward.
+- **PP.** Each band holds a band-scoped lane store. HC streams cross each band
+  edge through pinned host memory (no peer access), exactly as the singleton
+  PP forward. A decode step is cut into `G` contiguous, balanced, whole-lane
+  micro-batches (a lane's rows are never split) that wavefront through the
+  bands with sender completion events gating each receiver upload
+  (`HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  tiles run as singleton PP tiles. Per-step token staging uses pinned host
+  memory with event-fenced asynchronous uploads; it must stay byte-identical
+  to a synchronous upload, and no speedup from it is measured or claimed here.
+- **PP micro-batch count `G`.** `G` ranges over `1..=min(lanes, 2 * stages)`.
+  Stage-policy admission is per-stage proof-row based (see the stage-policy
+  bullet below); nothing is assumed per-lane or shared by arch alone. Under a
+  no-sharing policy (per-lane, no row-local sharing to trade against) `G` is
+  the maximal overlap `min(lanes, 2 * stages)`. Under a shared policy `G` is
+  adaptive: bounded exploration of each `G`, then the `G` with the cheapest
+  observed complete-step wall (the step's final output sync included, not
+  caller-side picks), ties broken deterministically; statistics are kept
+  separately per exact row shape, stage count and policy, so a policy change
+  never mixes timings. The adaptive path is production opt-in only. Two
+  developer-only variables steer it (both in
+  [env-vars.md](env-vars.md#qwen4--qwen38-flash-next-arch-16)):
+  `HIPFIRE_PP_LANE_GROUPS=<G>` forces `G` (a positive value is clamped to
+  `min(active lanes, 2 * stages)`; `0` or a non-integer refuses), overriding
+  the per-lane maximal overlap too; `HIPFIRE_FN_LANE_POLICY=<spec>` (a
+  `LaneStagePolicy::parse` spec, read at lane-store construction, applied to
+  every band/rank store and logged; a bad spec refuses the load) selects the
+  stage policy. Every `G` and every policy must keep lane outputs
+  byte-identical; the choice is a scheduling decision, not a numerical one,
+  and no measured gain is claimed on this page.
+- **AR lanes only.** Native-MTP lanes are not staged under PP/EP
+  (`continuous_batch_spec = false`, `continuous_batch_spec_mode = "off"`),
+  whatever `speculation.mtp` requests.
+- **No promotion.** A running singleton request is never promoted into a lane
+  under PP/EP (`continuous_batch_promotion = false`); on one card it is `true`.
+- **Stage-policy admission is per-stage proof rows.** Sharing is decided per
+  row-local stage, from the weights each lane store actually bound, never from
+  the production shape or from a whole-policy certificate or flag. A stage
+  becomes `OnceAllRows` only if **every** owned weight-instance route of that
+  stage matches a `RowTwinProof` row `{arch, stage, route: StageRoute,
+  domain: &[LaneTopology], receipt}` of `LANE_ROW_TWIN_PROOFS`; one unmatched
+  instance (an unproved projection, router, shared-expert or MoE route, or a
+  topology outside the row's `domain`) leaves only **that** stage per lane,
+  with the reason recorded, while the other stages keep their own proofs. The
+  stateful stages (`ple_conv`, `gdn_core`, `qsa_core`) are always per lane.
+  The routes are derived per bound instance (`LaneStageRoutes`) and resolved
+  into a policy plus evidence and per-lane reasons (`LanePolicyResolution`).
+  gfx1151 keeps all its historical topologies and expert classes: its rows are
+  wildcard-route rows over every `LaneTopology`, preserving the old behavior
+  under the exact receipt `GFX1151_LANE_RECEIPT`. The gfx1201 rows are
+  route-bound and carry one receipt per proved topology.
+
+  *PP rows.* The PP2 mq2 rows (PP domain) carry `GFX1201_PP2_MQ2_RECEIPT`
+  (hold j1574, `fn_mesh_lane_oracle` on 2x R9700): with every row-local stage
+  shared and with every stage per lane, each lane's ids and every logits row
+  were byte-identical to the serialized PP singleton at K=1..8 (8 prompts x 64
+  tokens) under adaptive, 1 and 4 decode micro-batches and with overlap off.
+  Their routes are the actual all-MQ6 projection route of the PP2 artifact
+  (GDN input, QSA and head projections MQ6, Q8 embedding), the BF16
+  HC/router/shared routes, and the resident MQ4/E8P MoE route with per-expert
+  `DecodeGemv` capability admission.
+
+  *EP rows.* The EP rows (`[Ep]` domain) are twelve: eleven non-MoE rows
+  (embedding, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out
+  projections, final HC read, head and argmax) and one MoE row. All carry
+  `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`,
+  2026-10-18, gfx1201 EP2 mq4-xts): production lane ids and logits were
+  byte-identical to the serialized EP singleton at K=1, 2, 4 and 8 over 64
+  tokens. The bound routes a non-MoE row requires are those the proved
+  artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out
+  projection and for the head, Q8 embedding, BF16 HC, BF16 PLE rows and F32
+  argmax.
+
+  *EP MoE class.* The MoE row requires the route class
+  `LaneExpertRoute::EpPackedStaticOrBalanced`, with BF16 router/shared routes
+  and per-expert `DecodeGemv` capability admission. The class is decided per
+  owned MoE layer, and **every** owned MoE layer must be one of exactly two
+  things: (a) the actual static gathered runtime over fully resident packed
+  QT44/QT53 experts, or (b) the actual balanced-live gathered runtime over
+  fully host-mapped packed QT44/QT53 experts. In both, the gather must be
+  installed; there must be no CPU (D1/D2), tier, slab, pruned or FP8 expert
+  route; and the layer's dtype buffers and the runtime it selected must
+  agree. Any mix of (a) and (b) layers is admitted, with no restriction on how
+  many layers are resident (27 resident + 21 host-mapped, 28 + 20, and so
+  on). A single MoE layer outside that class matches no row, so the MoE stage
+  alone runs per lane.
+
+  *Fallback and limits.* A different bound route, arch or topology (a mixed
+  or otherwise different artifact route, or any expert route outside the EP
+  MoE class above) matches no row, and the fallback is stage-specific: only
+  the affected stage runs per lane with the singleton's typed ops. The `Ep`
+  domain does not encode the rank count, and the measured EP cells are EP2
+  mq4-xts at K=1, 2, 4 and 8 only: the receipt is exactness evidence, not
+  performance, and it evidences no other EP width, topology count or latency
+  (the admitted class covers both ownership runtimes above, but no
+  throughput or per-stream figure is attached to either). Both receipts are
+  exactness evidence, not performance. A future arch or route qualifies
+  solely by adding a proof row; no resolver code changes. The evidence is the
+  deduplicated set of receipts of the proofs actually used, logged once per
+  store as `qwen4 lanes: stage policy <describe()> (proofs <receipts>;
+  per-lane: <stage>=<reason>,...)` and reported through
+  `fn_lanes_stage_policy` / `fn_lanes_stage_evidence` in the load ack. The
+  developer `HIPFIRE_FN_LANE_POLICY` override is unchanged. On a stage that
+  stays per lane, a step of C lanes runs that stage C times serially under
+  both topologies; this is the policy, not a tuning gap.
+- **Load ack.** `fn_lanes_topology` is `single`, `ep` or `pp`;
+  `fn_lanes_device_receipts` has one entry per card (EP: rank order; PP: input
+  band to output band). The scalar `fn_lanes_*` receipt fields are the root's:
+  rank 0 under EP, the output band under PP.
+- **Bench.** `hipfire bench --concurrency … --backend batch` accepts the `vmm`
+  and `fn-lanes` routes. It loads through the same path as the other bench
+  arms, which forwards the configured `topology.pp` (load `params.pp`) and the
+  configured `topology.ep` (daemon process config), so the sweep measures the
+  PP/EP topology configured for the model.
+- **Measured (S1, 2x R9700 gfx1201, 2026-10-19).** Serve, greedy, thinking
+  off, 16 prompts x 256 tokens, `continuous_batch_size` 8, K closed-loop
+  clients, 3 fresh processes per arm (PP batching-off C1: 4), the
+  packet binaries against its parent with batching off. Output tok/s (mean);
+  ratios against the batching-off C1. Every cell's text equals the
+  batching-off text, and the stacked oracle cells on the same binaries passed
+  (PP2 K=1, 8; EP2 K=3, 5, 6, 7; ids and logits).
+
+  | topology | off C1 (parent) | off C1 | on C1 | on C4 | on C8 |
+  |---|---|---|---|---|---|
+  | PP2 mq2-xts | 50.01 | 49.90 (median 49.99 vs 49.95) | 49.88 (−0.3%) | 79.19 (1.58x) | 98.61 (1.97x) |
+  | EP2 mq4-xts | 45.80 | 45.46 (median 45.89 vs 45.82) | 44.78 (−2.2%) | 75.38 (1.65x) | 83.72 (1.83x) |
+
+  A global default flip of `serve.vmm_batch` still needs single-card
+  Flash-Next C1/C4/C8 with batching on (C1 no regression, C4/C8 above C1, 3
+  fresh processes per arm).
 
 #### Qualify a box: `fn-ep-gate` mode `pp`
 
@@ -1042,6 +1240,164 @@ token. The first decode token after load runs direct and the second captures
 `tp2_cross_device_graph_reduce` (`--features lab`,
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
+
+### Generic mesh executor: TP collectives (developer)
+
+`Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
+meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
+is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
+and `AllReduce` collectives over the group of every rank in rank order, with
+the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
+`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+provisioning, and each transport has exactly one route (no per-call choice;
+`peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
+not apply to it):
+
+- **Peer**: every rank pair is one device under `HIPFIRE_EMULATE_GPUS` or
+  passes `qualify_peer`. Each rank pulls every partial with the same kernel
+  copy that `qualify_peer` byte-checks (never `hipMemcpyPeer`, which writes
+  nothing into allocations made after peer enable) and folds the sum locally.
+  Producer and read events order the cross-rank reads; nothing waits on the
+  host.
+- **Host**: some pair is not peer-qualified. The hand route's host-staged
+  rank-order reduction (`Gpus::all_reduce_sum_f32_host`), then `x + sum` on
+  each rank. It synchronizes the rank streams. RCCL is never used, as in the
+  hand dense-TP route (`qwen35` `dense_tp_all_reduce_sum_f32`).
+
+Scratch, events, host staging and kernels are prepared at provisioning. The
+whole epoch is validated before the first enqueue (group = every rank
+ascending, one occurrence per rank, F32 descriptors equal on every rank,
+16-byte aligned, no overlapping operands or targets, the replaced
+`Accumulate` not scheduled), and a failed drain quarantines the mesh exactly
+as for PP edges. Family bindings return the operand as `BoundaryIo::view`, the
+`AllReduceAdd` target as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as
+the descriptor epoch. An `AllReduceAdd` operand's contents are unspecified
+afterwards.
+
+Oracle: byte identity against the single-device rank-order sum over three
+undrained epochs with distinct partials, for the provisioned transport and the
+forced host transport, plus a TP×EP refusal. Every oracle buffer is allocated
+after provisioning has enabled peer access. On one device:
+
+```sh
+cargo test -p hipfire-runtime --lib --no-run   # prints the unittests binary
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n <binary> \
+  multi_gpu::executor::tests::tp_collectives_match_single_device_rank_order_sum \
+  --ignored --nocapture --test-threads=1; done
+```
+
+Physical runbook (gfx1201, not run on a single-device box). Run the same
+binary without `HIPFIRE_EMULATE_GPUS`: every visible device is one rank.
+
+1. **Peer reads into post-enable allocations (the arm that guards the Peer
+   transport).** `HIP_VISIBLE_DEVICES` = two, then four peer-capable cards.
+   Pass: the `provisioned transport Peer` line (not `Host`) and the `host`
+   line both report byte identity on every rank. Provisioning enables peer
+   access before the oracle allocates its activations, so a copy mechanism
+   that does not reach post-enable allocations fails the `x`/`n` comparison
+   (the partials differ per epoch, so a stale read fails too). A `Host`
+   provisioned line on cards expected to be peer-capable means `qualify_peer`
+   refused the pair; record it.
+2. **Optional reference.** The same arm with the binary from the first PR head
+   (`99853a2db`, rooted `hipMemcpyPeerAsync` route) shows whether the
+   `hipMemcpyPeer` trap reproduces on that ROCm; arm 1 must pass either way.
+3. **Host transport.** Arm 1's `host` line already runs it on the same cards.
+   If the box has a pair without peer access, run that pair too: its
+   provisioned line must read `Host`.
+
+Record per arm the `TP<n> oracle` lines (FNV-64 digests of `x` and `n`), the
+binary MD5, `HIP_VISIBLE_DEVICES` and the ROCm version.
+
+### Dense FFN tensor parallelism: `GatedMlp` split (developer)
+
+`SplitRule::GatedMlp` splits a dense gated MLP along its intermediate: gate
+and up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }`. Every rank
+runs the op's kernel ladder unchanged on its `intermediate / parts` slice
+with the input whole (the pre-norm needs complete rows), and the output is a
+partial sum that its consumer reduces: an `Accumulate` fuses one
+`AllReduceAdd`, any other whole reader takes an `AllReduce`. All-`Replicate`
+weights, or a single TP part (a PP stage), keep the op whole and local.
+Admission refuses, without allocating, a mixed policy, gate/up/down that do
+not share one intermediate, `intermediate % (parts * group)` on the down
+weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
+epilogue cannot take a partial sum).
+
+The first end-to-end use is the Qwen4 dense developer profile: each rank
+holds the whole model with only its BF16 FFN slice
+(`Qwen4Weights::shard_dense_ffn`, which records `(rank, parts)`),
+`qwen4_tp_plan` reduces each layer's FFN output before its `HyperWrite`
+(and refuses a packed FFN), and `Qwen4TpBindings` runs a rank's program in
+one segment per collective after checking the plan is that of exactly its
+shards. A rank's FFN hands its F32 partial to the reduction
+(`MlpStorage::Bf16SourcePartial`); the HC write rounds the sum once, as the
+unsharded FFN output is rounded once. Everything except the FFN is
+replicated. Sessions, checkpoints and prefix repair are not admitted on TP
+yet, and the loader has no Qwen4 TP route. Oracle (tokens and logits
+byte-identical to a single-device run of the same rank shards that sums the
+FFN partials in rank order, and reported against the plain single card):
+
+```sh
+cargo test --release -p hipfire-arch-qwen4 --features qwen4-dev-profiles --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN4_DEV_ARTIFACT=<tiny-dense-dev .hfq> \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
+The second use is Qwen3.5/3.6/3.8 dense prefill and decode (`qwen35::mesh_tp`,
+#927 item 4), with the hand dense-TP route's work split. Each rank holds an
+even contiguous block of the query, KV, DeltaNet key and value heads and of
+the FFN intermediate (`tp_rank_layouts`, loaded through
+`load_weights_dense_tp_rank`; uneven TP3/TP5 layouts are refused). Each
+layer's mixer (`SplitRule::HeadMixer`: whole input, head-split input
+projections and state, `RowShard { axis: 1 }` output projection) and its
+`GatedMlp` each write the rank's partial, and the residual `Accumulate` after
+each becomes one rank-ordered `AllReduceAdd` into `x`: two reductions per
+layer, as in the hand route. A decode epoch is one token; a prefill epoch is
+up to the rank's batch-scratch rows (the provisioned `max_bytes` must hold
+`rows * dim * 4`). `Qwen35TpBindings` is checked against the plan of exactly
+its shards (ranks come only from `Qwen35TpRank::load`, which loads each
+rank's slice with the layout it records); a prefill past the batch scratch,
+sessions, checkpoints and prefix repair are refused before any launch.
+Prefix repair is refused through the host-only
+`MeshStepBindings::admits_prefix_repair` capability, checked before the
+first callback, so the mesh stays healthy. The loader has no generic
+Qwen3.5 TP route; product dense TP stays on the hand route (see
+`docs/design/qwen35-declarative-program.md`, "What stays on the hand route").
+Oracle (`HIPFIRE_QWEN35_TP_ROWS` prompt rows, default 16, as prefill epochs
+of at most `HIPFIRE_QWEN35_TP_CHUNK` rows, default 16; then 16 tokens
+teacher-forced to the plain card's greedy tokens, the first and the ninth as
+1-row Prefill epochs; byte identity against the hand dense-TP route over the
+same shards and epochs, reported against the plain card). The 1-row rows are
+`ROWS=1025 CHUNK=64` and `ROWS=577 CHUNK=96`, which end the prompt in a
+1-row epoch:
+
+```sh
+cargo test --release -p hipfire-arch-qwen35 --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN35_TP_MODEL=<dense .mq4> \
+  <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
+Physical TP2 runbook (gfx1201, e.g. hiptrx; not runnable on a one-card box).
+Fixtures: `qwen3.5-9b.mq4` (sha256 `ba83acf5…28ad`, 5313750016 B) and
+`qwen3.8-27b.mq4-xt` (`9f91556f…eeb7`, 14980361216 B). Without
+`HIPFIRE_EMULATE_GPUS`, the rank count comes from `HIPFIRE_QWEN35_TP_PARTS`
+and rank `i` runs on visible device `i` for both the hand route and the
+generic route; the plain card runs on device 0.
+
+```sh
+for model in qwen3.5-9b.mq4 qwen3.8-27b.mq4-xt; do
+  HIP_VISIBLE_DEVICES=0,1 HIPFIRE_QWEN35_TP_PARTS=2 HIPFIRE_QWEN35_TP_MODEL=<models>/$model \
+    <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+done
+```
+
+Pass: each `TP2 <model>` line shows the hand and TP FNV-64 equal (the test
+asserts it) on the transport `provision_mesh_edges` chose (Peer on
+peer-qualified cards, else Host). The hand route reduces through its own
+peer-rooted or host-staged route; a mismatch here that the emulated arm does
+not show localizes to the two transports. Record per model the two `TP2` lines, the
+binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
+emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
+same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
 
 ### Architectural limits (current)
 

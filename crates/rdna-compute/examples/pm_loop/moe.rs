@@ -1,0 +1,1938 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+
+//! `--kernel qwen4_moe_sym`: the grouped symmetric IU4 MoE GEMMs of the Qwen4
+//! prefill route on gfx1201 (`peacemaker-isa emit --kernel qwen4_moe_sym`,
+//! `crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs`, weight codec
+//! `WeightCodec::Mq4Sym`: pointer-addressed QT44 gate/up and QT53 down).
+//!
+//! Included by the driver with `#[path = "pm_loop/moe.rs"] mod moe;`.
+//!
+//! # Knobs
+//!
+//! * `--epi gate_up|down|gate_up_ntN|down_ntN|down_nt4rR` (default `gate_up`):
+//!   the candidate entry, parsed by `Spec::from_epi(epi, Gfx1201)` and emitted
+//!   with `qwen4_moe_sym::emit`; `validate` errors (e.g. a row repeat, which is
+//!   gfx1151-only) are returned verbatim by `candidate()`.
+//! * `--base-epi <epi>`: emit the baseline from that entry instead of using the
+//!   shipped one (must be the same kind as the candidate: gate/up and down
+//!   outputs are not comparable).
+//! * `--ref-rows full|sample:<n>` (default `sample:128`): how many live grouped
+//!   rows the CPU reference computes (all output columns of each). `sample` rows
+//!   are spaced evenly through the grouped order (first and last included), so
+//!   they span experts, tiles, tile positions and the ragged last tile.
+//!
+//! # Shape grammar (`--shape`)
+//!
+//! `[<preset>,] key=value, ...` (items in any order; empty = the default):
+//!
+//! * preset `fn` (default): Flash-Next `E=512,TOP=10,H=2560,I=640`
+//!   (`crates/peacemaker-isa/tests/qwen4_moe_sym.rs` geometry test;
+//!   `examples/qwen4_moe_sym.rs:96 GEO_FN`); preset `a3b`: `E=256,TOP=8,H=2048,I=512`
+//!   (`examples/qwen4_moe_sym.rs:97 GEO_A3B`).
+//! * `E` routed experts (pointer-table length = kernarg `n_experts`), `TOP`
+//!   experts per token, `T` prefill tokens (default 4096), `H` hidden, `I` per-expert
+//!   intermediate width, `D` distinct synthetic experts (default `E`; expert `e`
+//!   aliases synthetic expert `e % D`, a memory cap), `seed` (default 1),
+//!   `route` = `uniform` (default: `TOP` distinct uniform experts per token) |
+//!   `skew` (experts 0..min(5,TOP) on every token, rest uniform distinct) |
+//!   `all` (flat slot `f` -> expert `f % E`) | `one` (every slot to expert 0).
+//!
+//! The kind (`gate_up` or `down`) comes from `--epi`; the GEMM dims follow
+//! `ExpertGeometry::plan` (so its admission rules apply):
+//!
+//! | kind    | M (kernarg) | K (kernarg) | `x_row_div` | `x_src_rows` | Y row (BF16) |
+//! |---------|-------------|-------------|-------------|--------------|--------------|
+//! | gate_up | `2I`        | `H`         | `TOP`       | `T`          | `M/2 = I`    |
+//! | down    | `H`         | `I`         | `1`         | `T * TOP`    | `M = H`      |
+//!
+//! # Launch ABI (reproduced from production)
+//!
+//! `qwen4_moe_sym_gemm` (`crates/rdna-compute/src/gemm.rs:51568`; callers
+//! `gemm_qwen4_moe_{gate_up_silu,down}_iu4_sym` at `:51041`, `:51088`):
+//! kernarg 64 B (`Spec::kernargs`, `KERNARG_BYTES`):
+//! `expert_weight_ptrs@0, expert_tile_ids@8, sorted_slot_index@16, Xq@24,
+//! Y_grouped@32` (device pointers) then `M@40, K@44, x_row_div@48, m_total@52,
+//! x_src_rows@56, n_experts@60` (i32). `n_experts` is the pointer-table length
+//! (`moe_expert_table_len`, `gemm.rs:1428`), `m_total` the grouped rows. Grid
+//! `(M / (64 * rr), m_total / 16, 1)`, block `Spec::threads()` (64 for the NT1
+//! gate/up, else 128), **no dynamic LDS** (the NT gate/up LDS is static in the
+//! descriptor; `gemm.rs:51646` passes 0).
+//!
+//! Grouping (`examples/qwen4_moe_sym.rs:395-428 cpu_group`, `make_case:557-560`):
+//! the flat slot `f = token * TOP + j` is stable-sorted by (expert, `f`); each
+//! expert's run is padded to a multiple of 16 with `-1`; `sorted_slot_index[p]`
+//! is the flat slot of grouped row `p` (or `-1`), `expert_tile_ids[t]` the expert
+//! of tile `t = p / 16` (`-1` for unused tiles). `m_total = pmax =
+//! ceil16(T*TOP + E*15)` so, as in production, trailing sentinel tiles exist and
+//! exit before any load or store.
+//!
+//! Weights: expert `e`'s tensor is `M` rows of `row_bytes = (K/128)*68` B; gate/up
+//! = QT44 groups of 136 B per K256 (`[f16 sc0, zp0, sc1, zp1][64 B nibbles epoch 2g]
+//! [64 B epoch 2g+1]`), down = QT53 groups of 68 B per K128 (`[f16 sc, zp][64 B]`),
+//! every header `zp == -8*sc` (`w = sc * (u - 8)`); `expert_weight_ptrs[e]` points at
+//! it. Activations `Xq`: `block_i4_128` (`[f32 d, i32 s, 64 B]`, 72 B, nibble `j` of
+//! byte `j/2` low first, signed), epoch-major `[K/128][x_src_rows]`, row
+//! `slot / x_row_div` (`iu4_fold.rs:30`, HIP twin `qwen4_moe_iu4_sym.gfx1151.hip:12-20`).
+//!
+//! # Shipped baseline (gfx1201, VRAM-resident experts)
+//!
+//! Production loads `rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201`
+//! (`kernels.rs:4303`, `kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco`, six exports: NT1,
+//! NT4, NT8 x gate/up, down; `MoeSymIu4Kernel` row `gemm.rs:49542-49566`) and picks the
+//! symbol per call: **down is always NT4**; **gate/up is NT4 unless the real slots
+//! `x_src_rows * x_row_div` reach 128 per table expert (`total_slots >= 128 * E`),
+//! then NT8** (`qwen4_moe_sym_nt8_selected`, `gemm.rs:48775`; `qwen4_moe_sym_wide_shape`,
+//! `gemm.rs:48754`; flag `HIPFIRE_MOE_IU4_WIDE_TILES` unset = on at gfx1201,
+//! `prefill_route_capabilities.rs:303,327`; the tables `gemm.rs:48718-48737`). Host-mapped
+//! experts (NT8 for both GEMMs) are not modelled: weights here are VRAM-resident; use
+//! `--base-epi gate_up_nt8` / `down_nt8` for that arm. All NT entries share the 64-byte
+//! ABI, grid and output bytes (each output byte equals the NT1 entry's;
+//! `qwen4_moe_sym.rs:1544-1554`), so a candidate of any `nt` is directly comparable
+//! with the shipped symbol of a different `nt`; `baseline().source` records the nt.
+//!
+//! # Correctness reference
+//!
+//! The CPU reference reproduces the exact fold DAG of
+//! `examples/qwen4_moe_sym.rs:262-328 fold_reference` (the oracle of the PM route; HIP twin
+//! `kernels/src/qwen4_moe_iu4_sym.gfx1151.hip:19`): per output and ascending K128 epoch `h`,
+//! `C_h` = exact int32 dot of the signed weight nibbles and signed activations, `sum =
+//! fma(RN(sc_h * d_h), float(C_h), sum)` from `+0`. Down stores `bf16_rne(sum)` (a pure
+//! rounding: **bit-exact, tolerance 0**). Gate/up stores `bf16_rne(silu(rt(g)) * rt(u))`
+//! with `rt` the BF16 round trip; the SwiGLU is the portable-math twin of
+//! `mq_i4_reference.rs:926-1068` (`f32::exp2`, exact `ldexp`, IEEE division), documented there as a
+//! portable reference, **not a device byte oracle** (the kernel uses `v_exp_f32` / `v_rcp_f32`
+//! sequences), so gate/up is compared to **1 BF16 ulp** (fold inputs are bit-exact). Padding
+//! rows and sentinel-tile rows must be exactly `+0` / untouched (zero) and are always scanned
+//! in full; only the sampled live rows are compared numerically.
+//!
+//! `Workload::emu` runs the candidate on the peacemaker emulator
+//! (`peacemaker_ir::emu`) at a tiny shape (`E=2,TOP=2,T=20,H=512,I=128`) against the same
+//! reference; if the emulator cannot lift/decode/execute some instruction it refuses with its
+//! own message verbatim.
+
+use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
+use half::f16;
+use hip_bridge::DeviceBuffer;
+use peacemaker_isa::kernels::qwen4_moe_sym::{
+    self, ExpertGeometry, Kind, Spec, WeightCodec, KERNARG_BYTES, MAX_SLOTS,
+};
+use peacemaker_isa::Arch;
+use rayon::prelude::*;
+use rdna_compute::Gpu;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+
+const ARCH: Arch = Arch::Gfx1201;
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Cap on device memory the synthetic problem may take.
+const DEVICE_CAP: u64 = 3 << 30;
+/// `block_i4_128` record bytes.
+const XBLK: usize = 72;
+const DEFAULT_TOKENS: usize = 4096;
+const DEFAULT_SAMPLE: usize = 128;
+
+fn err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic PRNG: splitmix64 (as `examples/qwen4_moe_sym.rs:158`).
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(GOLDEN);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shape
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Uniform,
+    Skew,
+    All,
+    One,
+}
+
+impl Route {
+    fn name(self) -> &'static str {
+        match self {
+            Route::Uniform => "uniform",
+            Route::Skew => "skew",
+            Route::All => "all",
+            Route::One => "one",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Geo {
+    preset: &'static str,
+    experts: usize,
+    top: usize,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    distinct: usize,
+    route: Route,
+    seed: u64,
+}
+
+fn num<T: std::str::FromStr>(key: &str, v: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    v.trim()
+        .parse::<T>()
+        .map_err(|e| format!("--shape {key}={v}: {e}"))
+}
+
+impl Geo {
+    fn parse(shape: &str) -> Result<Geo> {
+        let items: Vec<&str> = shape
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Presets first so explicit keys override whatever the order.
+        let mut preset = ("fn", 512usize, 10usize, 2560usize, 640usize);
+        for item in items.iter().filter(|i| !i.contains('=')) {
+            preset = match *item {
+                "fn" => ("fn", 512, 10, 2560, 640),
+                "a3b" => ("a3b", 256, 8, 2048, 512),
+                other => {
+                    return Err(format!(
+                        "--shape item `{other}`: expected a preset (fn|a3b) or key=value \
+                         (E,TOP,T,H,I,D,seed,route)"
+                    ))
+                }
+            };
+        }
+        let mut g = Geo {
+            preset: preset.0,
+            experts: preset.1,
+            top: preset.2,
+            tokens: DEFAULT_TOKENS,
+            hidden: preset.3,
+            inter: preset.4,
+            distinct: 0,
+            route: Route::Uniform,
+            seed: 1,
+        };
+        let mut distinct = None;
+        for item in items.iter().filter(|i| i.contains('=')) {
+            let Some((k, v)) = item.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "E" => g.experts = num(k, v)?,
+                "TOP" => g.top = num(k, v)?,
+                "T" => g.tokens = num(k, v)?,
+                "H" => g.hidden = num(k, v)?,
+                "I" => g.inter = num(k, v)?,
+                "D" => distinct = Some(num::<usize>(k, v)?),
+                "seed" => g.seed = num(k, v)?,
+                "route" => {
+                    g.route = match v.trim() {
+                        "uniform" => Route::Uniform,
+                        "skew" => Route::Skew,
+                        "all" => Route::All,
+                        "one" => Route::One,
+                        other => {
+                            return Err(format!(
+                                "--shape route={other}: expected uniform|skew|all|one"
+                            ))
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "--shape key `{other}`: expected E,TOP,T,H,I,D,seed,route"
+                    ))
+                }
+            }
+        }
+        g.distinct = distinct.unwrap_or(g.experts);
+        g.validate()?;
+        Ok(g)
+    }
+
+    fn slots(&self) -> usize {
+        self.tokens * self.top
+    }
+
+    fn expert_geometry(&self) -> Result<ExpertGeometry> {
+        let u = |name: &str, v: usize| {
+            u32::try_from(v).map_err(|_| format!("--shape {name}={v} exceeds u32"))
+        };
+        Ok(ExpertGeometry {
+            experts: u("E", self.experts)?,
+            top_k: u("TOP", self.top)?,
+            hidden: u("H", self.hidden)?,
+            intermediate: u("I", self.inter)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.tokens == 0 {
+            return Err("--shape T must be >= 1".into());
+        }
+        if self.distinct == 0 || self.distinct > self.experts {
+            return Err(format!(
+                "--shape D={} must be in 1..=E ({})",
+                self.distinct, self.experts
+            ));
+        }
+        let slots = self
+            .tokens
+            .checked_mul(self.top)
+            .ok_or("--shape T*TOP overflows")?;
+        if slots > MAX_SLOTS as usize {
+            return Err(format!(
+                "--shape T*TOP = {slots} exceeds the gather's exact slot range {MAX_SLOTS}"
+            ));
+        }
+        let hot = self.hot();
+        if matches!(self.route, Route::Uniform | Route::Skew) && self.top > self.experts {
+            return Err(format!(
+                "--shape route={} needs TOP ({}) <= E ({})",
+                self.route.name(),
+                self.top,
+                self.experts
+            ));
+        }
+        if hot > self.experts {
+            return Err("--shape route=skew needs E >= min(5, TOP)".into());
+        }
+        self.expert_geometry()?.plan(ARCH, WeightCodec::Mq4Sym)?;
+        Ok(())
+    }
+
+    /// Experts every token picks under `route=skew`.
+    fn hot(&self) -> usize {
+        if self.route == Route::Skew {
+            self.top.min(5)
+        } else {
+            0
+        }
+    }
+
+    /// Flat slot (`token * TOP + j`) -> expert id.
+    fn route_table(&self) -> Vec<u32> {
+        let l = self.slots();
+        let mut rng = Rng(self.seed ^ 0xabcdef);
+        match self.route {
+            Route::One => vec![0; l],
+            Route::All => (0..l).map(|f| (f % self.experts) as u32).collect(),
+            Route::Uniform | Route::Skew => {
+                let hot = self.hot();
+                let mut v = Vec::with_capacity(l);
+                for _ in 0..self.tokens {
+                    let mut row: Vec<u32> = (0..hot as u32).collect();
+                    while row.len() < self.top {
+                        let e = (hot as u64 + rng.below((self.experts - hot) as u64)) as u32;
+                        if !row.contains(&e) {
+                            row.push(e);
+                        }
+                    }
+                    v.extend(row);
+                }
+                v
+            }
+        }
+    }
+}
+
+/// How many live grouped rows the reference computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sample {
+    Full,
+    Rows(usize),
+}
+
+impl Sample {
+    fn parse(s: &str) -> Result<Sample> {
+        if s == "full" {
+            return Ok(Sample::Full);
+        }
+        match s.strip_prefix("sample:") {
+            Some(n) => match n.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Sample::Rows(n)),
+                _ => Err(format!("--ref-rows {s}: sample:<n> needs n >= 1")),
+            },
+            None => Err(format!("--ref-rows {s}: expected full or sample:<n>")),
+        }
+    }
+    fn label(self) -> String {
+        match self {
+            Sample::Full => "full".into(),
+            Sample::Rows(n) => format!("sample:{n}"),
+        }
+    }
+}
+
+/// `n` live rows spaced evenly through `live` (first and last included).
+fn pick_evenly(live: &[usize], n: usize) -> Vec<usize> {
+    if n >= live.len() {
+        return live.to_vec();
+    }
+    if n == 1 {
+        return vec![live[0]];
+    }
+    (0..n)
+        .map(|i| live[i * (live.len() - 1) / (n - 1)])
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic problem (host side, deterministic)
+
+/// `(sc, zp)` header with `zp == -8*sc` exactly: independently varied normal
+/// scales of both signs (2^-12 .. 2^-4), plus zero groups of both zero signs.
+/// `examples/qwen4_moe_sym.rs:198-211`.
+fn sym_header(r: &mut Rng) -> (u16, u16) {
+    match r.below(64) {
+        0 => (0x0000, 0x8000),
+        1 => (0x8000, 0x0000),
+        _ => {
+            let sign = (r.below(2) as u16) << 15;
+            let exp = 3 + r.below(9) as u16;
+            let man = r.below(1024) as u16;
+            let sc = sign | (exp << 10) | man;
+            let zp = (sign ^ 0x8000) | ((exp + 3) << 10) | man;
+            (sc, zp)
+        }
+    }
+}
+
+/// One expert's rows: QT44 (136 B groups, `K % 256`) or QT53 (68 B groups,
+/// `K % 128`), every header symmetric, every nibble code uniform.
+/// `examples/qwen4_moe_sym.rs:223-244`.
+fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64) {
+    let mut r = Rng(seed ^ 0x5eed_0000_0000_0001);
+    let hdrs = group_bytes / 68;
+    for g in w.chunks_exact_mut(group_bytes) {
+        for h in 0..hdrs {
+            let (sc, zp) = sym_header(&mut r);
+            g[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
+            g[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
+        }
+        for c in g[4 * hdrs..].chunks_mut(8) {
+            let v = r.next().to_le_bytes();
+            c.copy_from_slice(&v[..c.len()]);
+        }
+    }
+}
+
+/// Byte offsets of the header word and the 64 nibble bytes of K128 epoch `h`
+/// of weight row `row` (`examples/qwen4_moe_sym.rs:247-256`, kernel
+/// `qwen4_moe_sym.rs` `header_off` / `nibble_off`).
+fn locate(kind: Kind, row_bytes: usize, row: usize, h: usize) -> (usize, usize) {
+    match kind {
+        Kind::GateUp => {
+            let g = row * row_bytes + (h / 2) * 136;
+            (g + 4 * (h % 2), g + 8 + 64 * (h % 2))
+        }
+        Kind::Down => {
+            let g = row * row_bytes + h * 68;
+            (g, g + 4)
+        }
+    }
+}
+
+/// One activation row decoded: per-epoch scale and `epochs * 128` signed values.
+struct XRow {
+    d: Vec<f32>,
+    v: Vec<i8>,
+}
+
+/// Exact fold of `m` weight rows against each activation row: `[xs.len()][m]`
+/// f32 sums, `sum = fma(RN(sc_h * d_h), float(C_h), sum)` from `+0`, ascending
+/// epochs (`examples/qwen4_moe_sym.rs:262-328`). `C_h` is an exact integer sum,
+/// so its evaluation order is irrelevant.
+fn fold_slots(
+    kind: Kind,
+    m: usize,
+    epochs: usize,
+    row_bytes: usize,
+    w: &[u8],
+    xs: &[XRow],
+) -> Vec<f32> {
+    let mut sums = vec![0f32; xs.len() * m];
+    let mut w8 = [0i8; 128];
+    for row in 0..m {
+        for h in 0..epochs {
+            let (hdr, nib) = locate(kind, row_bytes, row, h);
+            let sc = f16::from_bits(u16::from_le_bytes([w[hdr], w[hdr + 1]])).to_f32();
+            for j in 0..64 {
+                let b = w[nib + j];
+                w8[2 * j] = (b & 15) as i8 - 8;
+                w8[2 * j + 1] = (b >> 4) as i8 - 8;
+            }
+            for (s, x) in xs.iter().enumerate() {
+                let xv = &x.v[h * 128..(h + 1) * 128];
+                let c: i32 = w8
+                    .iter()
+                    .zip(xv)
+                    .map(|(&a, &b)| i32::from(a) * i32::from(b))
+                    .sum();
+                let acc = &mut sums[s * m + row];
+                *acc = (sc * x.d[h]).mul_add(c as f32, *acc);
+            }
+        }
+    }
+    sums
+}
+
+/// BF16 RNE of raw f32 bits, non-finite passed through as the high half
+/// (`mq_i4_reference.rs:926-936`, kernel `sym_bf16_bits`).
+fn bf16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    if !v.is_finite() {
+        return (u >> 16) as u16;
+    }
+    (u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1) >> 16) as u16
+}
+
+/// BF16 round trip (`mq_i4_reference.rs:941-948`, kernel `sym_bf16_rt`).
+fn rt_f32(v: f32) -> f32 {
+    if !v.is_finite() {
+        return v;
+    }
+    let u = v.to_bits();
+    f32::from_bits(u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1) & 0xffff_0000)
+}
+
+/// Portable-math SwiGLU `RN(IEEE(g / (1 + e^-g)) * u)` of `silu_dense`
+/// (`mq_i4_reference.rs:1046-1068` with `PortableEpilogue`): a portable reference,
+/// not a device byte oracle.
+fn portable_silu_mul(g: f32, u: f32) -> f32 {
+    let neg_log2e = f32::from_bits(0xbfb8_aa3b);
+    let neg_log2e_lo = f32::from_bits(0xb2a5_705f);
+    let ph = neg_log2e * g;
+    let mut pl = neg_log2e.mul_add(g, -ph);
+    pl = neg_log2e_lo.mul_add(g, pl);
+    let e = ph.round_ties_even();
+    let a = (ph - e) + pl;
+    // Exact power-of-two scaling in f64, one rounding to f32 (gradual underflow).
+    let pow2 = f64::from_bits((((e as i32).clamp(-400, 400) + 1023) as u64) << 52);
+    let mut r = (f64::from(a.exp2()) * pow2) as f32;
+    if f32::from_bits(0x42ce_8ed0) < g {
+        r = 0.0;
+    }
+    if g < f32::from_bits(0xc2b1_7218) {
+        r = f32::INFINITY;
+    }
+    (g / (1.0 + r)) * u
+}
+
+fn bf16_to_f64(b: u16) -> f64 {
+    f64::from(f32::from_bits(u32::from(b) << 16))
+}
+
+fn bf16_nonfinite(b: u16) -> bool {
+    b & 0x7f80 == 0x7f80
+}
+
+fn bf16_nan(b: u16) -> bool {
+    bf16_nonfinite(b) && b & 0x7f != 0
+}
+
+/// Monotonic ordinal of a finite BF16 (`+0` and `-0` both 0): adjacent BF16 values differ by 1.
+fn bf16_ord(b: u16) -> i32 {
+    if b & 0x8000 != 0 {
+        -i32::from(b & 0x7fff)
+    } else {
+        i32::from(b)
+    }
+}
+
+/// One BF16 ulp at the magnitude of `b` (`2^(e-134)`, subnormals at `e = 1`).
+fn bf16_ulp(b: u16) -> f64 {
+    let e = i32::from((b >> 7) & 0xff).max(1);
+    2f64.powi(e - 134)
+}
+
+/// Per-row comparison accumulator of [`Problem::compare`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Acc {
+    err: f64,
+    tol: f64,
+    bad: usize,
+    compared_rows: usize,
+    pad_rows: usize,
+    pad_bad: usize,
+    sentinel_rows: usize,
+    sentinel_bad: usize,
+}
+
+impl Acc {
+    fn merge(a: Acc, b: Acc) -> Acc {
+        Acc {
+            err: a.err.max(b.err),
+            tol: a.tol.max(b.tol),
+            bad: a.bad + b.bad,
+            compared_rows: a.compared_rows + b.compared_rows,
+            pad_rows: a.pad_rows + b.pad_rows,
+            pad_bad: a.pad_bad + b.pad_bad,
+            sentinel_rows: a.sentinel_rows + b.sentinel_rows,
+            sentinel_bad: a.sentinel_bad + b.sentinel_bad,
+        }
+    }
+}
+
+/// One GEMM call of the route: shape, routing tables and every host-side
+/// generator the device arms and the reference share.
+struct Problem {
+    geo: Geo,
+    kind: Kind,
+    m: usize,
+    k: usize,
+    epochs: usize,
+    x_row_div: usize,
+    x_src_rows: usize,
+    /// BF16 elements per grouped output row (gate/up `M/2`, down `M`).
+    row_len: usize,
+    group_bytes: usize,
+    row_bytes: usize,
+    /// Bytes of one expert tensor.
+    stride: usize,
+    /// Grouped rows `m_total` (padded runs plus sentinel tail), a multiple of 16.
+    pmax: usize,
+    sorted: Vec<i32>,
+    tiles: Vec<i32>,
+    xq: OnceLock<Vec<u8>>,
+}
+
+impl Problem {
+    fn new(geo: &Geo, kind: Kind) -> Result<Problem> {
+        geo.validate()?;
+        let plan = geo.expert_geometry()?.plan(ARCH, WeightCodec::Mq4Sym)?;
+        let pg = match kind {
+            Kind::GateUp => plan.gate_up,
+            Kind::Down => plan.down,
+        };
+        let (m, k) = (pg.m as usize, pg.k as usize);
+        let row_bytes = pg.row_bytes as usize;
+        let x_row_div = pg.x_row_div as usize;
+        let x_src_rows = match kind {
+            Kind::GateUp => geo.tokens,
+            Kind::Down => geo.slots(),
+        };
+        let route = geo.route_table();
+        let l = route.len();
+        let e = geo.experts;
+        let pmax = (l + e * 15).div_ceil(16) * 16;
+        // CPU stable grouping, pad16 (`examples/qwen4_moe_sym.rs:395-428`).
+        let mut counts = vec![0usize; e];
+        for &x in &route {
+            counts[x as usize] += 1;
+        }
+        let mut offsets = vec![0usize; e + 1];
+        for i in 0..e {
+            offsets[i + 1] = offsets[i] + counts[i].div_ceil(16) * 16;
+        }
+        let mut sorted = vec![-1i32; pmax];
+        let mut tiles = vec![-1i32; pmax / 16];
+        let mut fill = offsets.clone();
+        for (f, &x) in route.iter().enumerate() {
+            sorted[fill[x as usize]] = f as i32;
+            fill[x as usize] += 1;
+        }
+        for i in 0..e {
+            for t in offsets[i] / 16..offsets[i + 1] / 16 {
+                tiles[t] = i as i32;
+            }
+        }
+        let row_len = match kind {
+            Kind::GateUp => m / 2,
+            Kind::Down => m,
+        };
+        // The kernel indexes Y with a 32-bit byte offset (`gemm.rs:1403 pm_check_moe_down_extent`).
+        if (pmax as u64) * (row_len as u64) * 2 > u64::from(u32::MAX) {
+            return Err(format!(
+                "{} grouped rows x {row_len} x 2 B exceed the kernel's 32-bit Y byte offset",
+                pmax
+            ));
+        }
+        let stride = m * row_bytes;
+        let p = Problem {
+            geo: geo.clone(),
+            kind,
+            m,
+            k,
+            epochs: pg.epochs as usize,
+            x_row_div,
+            x_src_rows,
+            row_len,
+            group_bytes: kind.group_bytes() as usize,
+            row_bytes,
+            stride,
+            pmax,
+            sorted,
+            tiles,
+            xq: OnceLock::new(),
+        };
+        let need = p.device_bytes();
+        if need > DEVICE_CAP {
+            return Err(format!(
+                "shape needs {need} B of device memory (> {DEVICE_CAP} B cap): lower T, E or D"
+            ));
+        }
+        Ok(p)
+    }
+
+    fn ntiles(&self) -> usize {
+        self.pmax / 16
+    }
+
+    fn y_bytes(&self) -> usize {
+        self.pmax * self.row_len * 2
+    }
+
+    fn xq_bytes(&self) -> usize {
+        self.epochs * self.x_src_rows * XBLK
+    }
+
+    fn device_bytes(&self) -> u64 {
+        (self.geo.distinct * self.stride
+            + 2 * self.y_bytes()
+            + self.xq_bytes()
+            + self.geo.experts * 8
+            + self.pmax * 4
+            + self.ntiles() * 4) as u64
+    }
+
+    /// Grouped rows holding a real slot, ascending.
+    fn live_rows(&self) -> Vec<usize> {
+        (0..self.pmax)
+            .filter(|&p| self.tiles[p / 16] >= 0 && self.sorted[p] >= 0)
+            .collect()
+    }
+
+    fn total_slots(&self) -> usize {
+        self.x_src_rows * self.x_row_div
+    }
+
+    fn fill_weights(&self, idx: usize, out: &mut [u8]) {
+        let seed = self.geo.seed
+            ^ (idx as u64).wrapping_mul(GOLDEN)
+            ^ (self.group_bytes as u64).wrapping_mul(0x1_0000_0001);
+        symmetric_weights_into(out, self.group_bytes, seed);
+    }
+
+    /// Epoch-major `[epochs][x_src_rows]` `block_i4_128` records: `d` a normal
+    /// f32 in `[2^-3, 2)`, 128 uniform signed nibbles, `s` their sum.
+    fn make_xq(&self) -> Vec<u8> {
+        let mut rng = Rng(self.geo.seed ^ 0xA4A4_0000_0000_0000 ^ self.x_src_rows as u64);
+        let mut out = vec![0u8; self.xq_bytes()];
+        for rec in out.chunks_exact_mut(XBLK) {
+            let d = f32::from_bits(
+                ((124 + rng.below(4) as u32) << 23) | (rng.next() as u32 & 0x7f_ffff),
+            );
+            let mut s = 0i32;
+            for c in rec[8..].chunks_exact_mut(8) {
+                c.copy_from_slice(&rng.next().to_le_bytes());
+            }
+            for &b in &rec[8..] {
+                s += i32::from(((b << 4) as i8) >> 4) + i32::from((b as i8) >> 4);
+            }
+            rec[0..4].copy_from_slice(&d.to_le_bytes());
+            rec[4..8].copy_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    fn xq(&self) -> &[u8] {
+        self.xq.get_or_init(|| self.make_xq())
+    }
+
+    fn x_row(&self, r: usize) -> XRow {
+        let xq = self.xq();
+        let mut d = Vec::with_capacity(self.epochs);
+        let mut v = Vec::with_capacity(self.epochs * 128);
+        for h in 0..self.epochs {
+            let o = (h * self.x_src_rows + r) * XBLK;
+            d.push(f32::from_le_bytes(
+                xq[o..o + 4].try_into().expect("4 bytes"),
+            ));
+            for j in 0..128 {
+                let b = xq[o + 8 + j / 2];
+                let nib = if j % 2 == 0 { b } else { b >> 4 };
+                v.push(((nib << 4) as i8) >> 4);
+            }
+        }
+        XRow { d, v }
+    }
+
+    /// BF16 bits of one output row from its `[m]` sums.
+    fn epilogue(&self, sums: &[f32]) -> Vec<u16> {
+        match self.kind {
+            Kind::GateUp => {
+                let half = self.m / 2;
+                (0..half)
+                    .map(|c| bf16_bits(portable_silu_mul(rt_f32(sums[c]), rt_f32(sums[half + c]))))
+                    .collect()
+            }
+            Kind::Down => sums.iter().map(|&s| bf16_bits(s)).collect(),
+        }
+    }
+
+    /// Reference output rows `(grouped row, BF16 bits)`, ascending.
+    fn reference(&self, sample: Sample) -> Vec<(usize, Vec<u16>)> {
+        let live = self.live_rows();
+        let picks = match sample {
+            Sample::Full => live,
+            Sample::Rows(n) => pick_evenly(&live, n),
+        };
+        let mut by_expert: std::collections::BTreeMap<i32, Vec<usize>> = Default::default();
+        for p in picks {
+            by_expert.entry(self.tiles[p / 16]).or_default().push(p);
+        }
+        let groups: Vec<(i32, Vec<usize>)> = by_expert.into_iter().collect();
+        let mut rows: Vec<(usize, Vec<u16>)> = groups
+            .into_par_iter()
+            .flat_map_iter(|(e, ps)| {
+                let mut w = vec![0u8; self.stride];
+                self.fill_weights(e as usize % self.geo.distinct, &mut w);
+                let xs: Vec<XRow> = ps
+                    .iter()
+                    .map(|&p| self.x_row(self.sorted[p] as usize / self.x_row_div))
+                    .collect();
+                let sums = fold_slots(self.kind, self.m, self.epochs, self.row_bytes, &w, &xs);
+                ps.iter()
+                    .enumerate()
+                    .map(|(s, &p)| (p, self.epilogue(&sums[s * self.m..(s + 1) * self.m])))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    /// Compare a downloaded `[pmax][row_len]` BF16 output with the reference rows.
+    fn compare(
+        &self,
+        out: &[u8],
+        reference: &[(usize, Vec<u16>)],
+        sample: Sample,
+    ) -> Result<RefReport> {
+        if out.len() != self.y_bytes() {
+            return Err(format!(
+                "output is {} B, expected {} ({} grouped rows x {} BF16)",
+                out.len(),
+                self.y_bytes(),
+                self.pmax,
+                self.row_len
+            ));
+        }
+        let down = self.kind == Kind::Down;
+        let allow: i32 = if down { 0 } else { 1 };
+        let rl = self.row_len;
+        let acc = (0..self.pmax)
+            .into_par_iter()
+            .map(|p| {
+                let row = &out[p * rl * 2..(p + 1) * rl * 2];
+                let bits = |c: usize| u16::from_le_bytes([row[2 * c], row[2 * c + 1]]);
+                let mut a = Acc::default();
+                let expect_zero = |a: &mut Acc| -> usize {
+                    let mut bad = 0;
+                    for c in 0..rl {
+                        let b = bits(c);
+                        if b != 0 {
+                            bad += 1;
+                            let e = if bf16_nonfinite(b) {
+                                f64::MAX
+                            } else {
+                                bf16_to_f64(b).abs()
+                            };
+                            a.err = a.err.max(e);
+                        }
+                    }
+                    bad
+                };
+                if self.tiles[p / 16] < 0 {
+                    a.sentinel_rows = 1;
+                    a.sentinel_bad = usize::from(expect_zero(&mut a) > 0);
+                    a.bad += a.sentinel_bad;
+                } else if self.sorted[p] < 0 {
+                    a.pad_rows = 1;
+                    a.pad_bad = usize::from(expect_zero(&mut a) > 0);
+                    a.bad += a.pad_bad;
+                } else if let Ok(i) = reference.binary_search_by_key(&p, |r| r.0) {
+                    a.compared_rows = 1;
+                    for (c, &want) in reference[i].1.iter().enumerate() {
+                        let got = bits(c);
+                        if bf16_nonfinite(got) || bf16_nonfinite(want) {
+                            if !(got == want || (bf16_nan(got) && bf16_nan(want))) {
+                                a.bad += 1;
+                                a.err = f64::MAX;
+                            }
+                            continue;
+                        }
+                        let dist = (bf16_ord(got) - bf16_ord(want)).abs();
+                        let diff = (bf16_to_f64(got) - bf16_to_f64(want)).abs();
+                        a.err = a.err.max(diff);
+                        if !down {
+                            a.tol = a.tol.max(bf16_ulp(want));
+                        }
+                        if dist > allow {
+                            a.bad += 1;
+                        }
+                    }
+                }
+                a
+            })
+            .reduce(Acc::default, Acc::merge);
+        let live = self.live_rows().len();
+        let name = match self.kind {
+            Kind::GateUp => {
+                "cpu_qt44_a4_fold_f32 + portable_silu_bf16_rne (fold bit-exact; SwiGLU is a \
+                 portable-math reference, not a device byte oracle; tolerance 1 BF16 ulp of the \
+                 reference per element, `tolerance` = largest such ulp)"
+            }
+            Kind::Down => "cpu_qt53_a4_fold_f32 + bf16_rne (bit-exact, tolerance 0)",
+        };
+        Ok(RefReport {
+            reference: format!(
+                "{name}; ref-rows {}: {} of {live} live slot rows compared x {rl} cols \
+                 ({} reference rows); padding rows zero-checked {} (bad {}), sentinel-tile rows \
+                 zero-checked {} (bad {}), mismatching elements/rows {}",
+                sample.label(),
+                acc.compared_rows,
+                reference.len(),
+                acc.pad_rows,
+                acc.pad_bad,
+                acc.sentinel_rows,
+                acc.sentinel_bad,
+                acc.bad
+            ),
+            max_abs_err: acc.err,
+            tolerance: acc.tol,
+            pass: acc.bad == 0 && acc.compared_rows == reference.len(),
+        })
+    }
+
+    /// The 64-byte kernarg blob (`Spec::kernargs`): five device pointers, then
+    /// `M, K, x_row_div, m_total, x_src_rows, n_experts` as i32.
+    fn kernarg(&self, [wptrs, tiles, sorted, xq, y]: [u64; 5]) -> Vec<u8> {
+        let mut a = Vec::with_capacity(KERNARG_BYTES as usize);
+        for p in [wptrs, tiles, sorted, xq, y] {
+            a.extend_from_slice(&p.to_le_bytes());
+        }
+        for v in [
+            self.m,
+            self.k,
+            self.x_row_div,
+            self.pmax,
+            self.x_src_rows,
+            self.geo.experts,
+        ] {
+            a.extend_from_slice(&(v as i32).to_le_bytes());
+        }
+        assert_eq!(a.len(), KERNARG_BYTES as usize);
+        a
+    }
+
+    fn launch_for(&self, spec: Spec, ptrs: [u64; 5]) -> Launch {
+        Launch {
+            kernarg: self.kernarg(ptrs),
+            grid: [
+                (self.m / (64 * usize::from(spec.rr.max(1)))) as u32,
+                self.ntiles() as u32,
+                1,
+            ],
+            block: [spec.threads(), 1, 1],
+            lds: 0,
+        }
+    }
+
+    fn i32_bytes(v: &[i32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn shape_json(&self) -> Value {
+        let g = &self.geo;
+        json!({
+            "preset": g.preset, "experts": g.experts, "top_k": g.top, "tokens": g.tokens,
+            "hidden": g.hidden, "intermediate": g.inter, "distinct_experts": g.distinct,
+            "route": g.route.name(), "seed": g.seed,
+            "kind": self.kind.tag(), "M": self.m, "K": self.k, "epochs": self.epochs,
+            "x_row_div": self.x_row_div, "x_src_rows": self.x_src_rows,
+            "grouped_rows": self.pmax, "tiles": self.ntiles(),
+            "live_slots": g.slots(), "total_slots": self.total_slots(),
+            "expert_tensor_bytes": self.stride, "y_bytes_per_arm": self.y_bytes(),
+            "device_bytes": self.device_bytes(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workload
+
+/// Production's gfx1201 resident symbol width for one call: down is always NT4;
+/// gate/up is NT8 when `total_slots >= 128 * n_experts`, else NT4
+/// (`gemm.rs:48775 qwen4_moe_sym_nt8_selected`, `:48754 qwen4_moe_sym_wide_shape`).
+fn shipped_nt(kind: Kind, total_slots: usize, experts: usize) -> u8 {
+    let wide = kind == Kind::GateUp
+        && experts != 0
+        && experts
+            .checked_mul(128)
+            .is_some_and(|floor| total_slots >= floor);
+    if wide {
+        8
+    } else {
+        4
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Baseline {
+    /// The embedded `qwen4_moe_iu4_sym_pm_gfx1201` bundle, this entry.
+    Shipped(Spec),
+    /// Emitted from `--base-epi`.
+    Emitted(Spec),
+}
+
+impl Baseline {
+    fn spec(self) -> Spec {
+        match self {
+            Baseline::Shipped(s) | Baseline::Emitted(s) => s,
+        }
+    }
+}
+
+struct Dev {
+    _weights: DeviceBuffer,
+    ptrs: DeviceBuffer,
+    tiles: DeviceBuffer,
+    sorted: DeviceBuffer,
+    xq: DeviceBuffer,
+    /// Per-arm output: `[Baseline, Candidate]`.
+    y: [DeviceBuffer; 2],
+}
+
+struct Moe {
+    problem: Problem,
+    sample: Sample,
+    cand: Spec,
+    base: Baseline,
+    dev: Option<Dev>,
+    reference: OnceLock<Vec<(usize, Vec<u16>)>>,
+}
+
+fn arm_index(arm: Arm) -> usize {
+    match arm {
+        Arm::Baseline => 0,
+        Arm::Candidate => 1,
+    }
+}
+
+fn spec_json(spec: Spec) -> Value {
+    json!({
+        "epi": spec.variant(), "kind": spec.kind.tag(), "nt": spec.nt, "rr": spec.rr,
+        "codec": format!("{:?}", spec.codec), "arch": spec.arch.name(),
+        "symbol": spec.symbol(), "threads": spec.threads(), "lds_bytes": spec.lds_bytes(),
+    })
+}
+
+/// Emit and link exactly like `peacemaker-isa emit --kernel qwen4_moe_sym --co`
+/// (`peacemaker-isa.rs:202-216` and the `native::assemble` block at `:1547`).
+fn emit_object(spec: Spec, source: Value) -> Result<Object> {
+    let e = qwen4_moe_sym::emit(spec)?;
+    let bytes = peacemaker_isa::native::assemble(&e.s_text, spec.arch)?;
+    let symbol = spec.symbol();
+    Ok(Object {
+        bytes,
+        launch_symbol: symbol.clone(),
+        exports: vec![symbol],
+        desc: json!({"knobs": spec_json(spec)}),
+        source,
+    })
+}
+
+/// Constructor for `--kernel qwen4_moe_sym`.
+pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
+    let epi = knobs.take_or("epi", "gate_up");
+    let base_epi = knobs.take("base-epi");
+    let sample = Sample::parse(&knobs.take_or("ref-rows", &format!("sample:{DEFAULT_SAMPLE}")))?;
+    let geo = Geo::parse(shape)?;
+    let cand = Spec::from_epi(&epi, ARCH)?;
+    let problem = Problem::new(&geo, cand.kind)?;
+    let base = match base_epi {
+        Some(b) => {
+            let spec = Spec::from_epi(&b, ARCH).map_err(|e| format!("--base-epi: {e}"))?;
+            if spec.kind != cand.kind {
+                return Err(format!(
+                    "--base-epi {b}: kind {} differs from the candidate's {} (outputs are not comparable)",
+                    spec.kind.tag(),
+                    cand.kind.tag()
+                ));
+            }
+            Baseline::Emitted(spec)
+        }
+        None => Baseline::Shipped(Spec {
+            arch: ARCH,
+            kind: cand.kind,
+            nt: shipped_nt(cand.kind, problem.total_slots(), geo.experts),
+            rr: 1,
+            codec: WeightCodec::Mq4Sym,
+        }),
+    };
+    Ok(Box::new(Moe {
+        problem,
+        sample,
+        cand,
+        base,
+        dev: None,
+        reference: OnceLock::new(),
+    }))
+}
+
+impl Moe {
+    fn dev(&self) -> Result<&Dev> {
+        self.dev
+            .as_ref()
+            .ok_or_else(|| "qwen4_moe_sym workload used before setup".to_owned())
+    }
+
+    fn baseline_object(&self) -> Result<Object> {
+        let spec = self.base.spec();
+        match self.base {
+            Baseline::Emitted(_) => emit_object(
+                spec,
+                json!({
+                    "source": "emitted from --base-epi: peacemaker_isa::kernels::qwen4_moe_sym::emit \
+                               + native::assemble (peacemaker-isa.rs:202-216, :1547)",
+                }),
+            ),
+            Baseline::Shipped(_) => {
+                let bytes = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201.to_vec();
+                let symbol = spec.symbol();
+                let mut needle = symbol.clone().into_bytes();
+                needle.push(0);
+                if !bytes.windows(needle.len()).any(|w| w == needle.as_slice()) {
+                    return Err(format!(
+                        "shipped bundle QWEN4_MOE_IU4_SYM_PM_GFX1201 does not export {symbol}"
+                    ));
+                }
+                let exports: Vec<String> = qwen4_moe_sym::module_specs(ARCH)
+                    .into_iter()
+                    .map(Spec::symbol)
+                    .collect();
+                let p = &self.problem;
+                Ok(Object {
+                    launch_symbol: symbol.clone(),
+                    exports,
+                    desc: json!({
+                        "artifact": "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
+                        "knobs": spec_json(spec),
+                    }),
+                    source: json!({
+                        "source": "crates/rdna-compute/src/gemm.rs:48775 qwen4_moe_sym_nt8_selected \
+                                   (resident width; wide shape :48754; tables :48718-48737), \
+                                   :49542-49566 gfx1201 MoeSymIu4Kernel row, \
+                                   :51568-51666 qwen4_moe_sym_gemm launcher",
+                        "const": "rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 \
+                                  (crates/rdna-compute/src/kernels.rs:4303)",
+                        "artifact": "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
+                        "sha256": sha256_hex(&bytes),
+                        "symbol": symbol,
+                        "nt": spec.nt,
+                        "selection": {
+                            "residency": "vram (host-mapped experts would take NT8 for both GEMMs)",
+                            "rule": "down: NT4 always; gate_up: NT8 iff total_slots >= 128 * n_experts \
+                                     (HIPFIRE_MOE_IU4_WIDE_TILES unset = on at gfx1201, \
+                                     prefill_route_capabilities.rs:303,327), else NT4",
+                            "total_slots": p.total_slots(),
+                            "n_experts": p.geo.experts,
+                        },
+                        "launch": "grid (M/64, m_total/16, 1), block = Spec::threads, dynamic LDS 0 \
+                                   (gemm.rs:51621,51646)",
+                        "outputs_comparable": "yes: every NT entry shares the 64-byte ABI, grid and \
+                                   output bytes (qwen4_moe_sym.rs:1544-1554), so the shipped nt may \
+                                   differ from the candidate's",
+                    }),
+                    bytes,
+                })
+            }
+        }
+    }
+
+    fn reference(&self) -> &[(usize, Vec<u16>)] {
+        self.reference
+            .get_or_init(|| self.problem.reference(self.sample))
+    }
+
+    /// Tiny-shape emulator run of the candidate; `Err` is a refusal reason.
+    fn emu_run(&self) -> Result<Value> {
+        use peacemaker_ir::emu::{Emulator, Launch as EmuLaunch, Memory};
+        const KERNARG: u64 = 0x1_0000;
+        const TABLE: u64 = 0x10_0000;
+        const TILES: u64 = 0x20_0000;
+        const SORTED: u64 = 0x30_0000;
+        const EXPERTS: u64 = 0x1000_0000;
+        const EXPERT_STRIDE: u64 = 0x100_0000;
+        const XQ: u64 = 0x4000_0000;
+        const Y: u64 = 0x5000_0000;
+        // The kernels prefetch one epoch ahead; slack keeps a harmless over-read mapped.
+        const SLACK: usize = 4096;
+
+        let geo = Geo {
+            preset: "emu",
+            experts: 2,
+            top: 2,
+            tokens: 20,
+            hidden: 512,
+            inter: 128,
+            distinct: 2,
+            route: Route::Uniform,
+            seed: 7,
+        };
+        let p = Problem::new(&geo, self.cand.kind)?;
+        let object = self.candidate()?;
+        let program = peacemaker_lift::lift_object(
+            &object.bytes,
+            peacemaker_lift::Options {
+                frontend: peacemaker_ir::inst::Frontend::Builder,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?
+        .program;
+        let emu = Emulator::new(&program, &object.launch_symbol)?;
+
+        let mut mem = Memory::default();
+        let mut table = Vec::with_capacity(geo.experts * 8);
+        for e in 0..geo.experts {
+            let mut w = vec![0u8; p.stride + SLACK];
+            p.fill_weights(e % geo.distinct, &mut w[..p.stride]);
+            let base = EXPERTS + e as u64 * EXPERT_STRIDE;
+            assert!((w.len() as u64) < EXPERT_STRIDE);
+            table.extend_from_slice(&base.to_le_bytes());
+            mem.map(format!("expert{e}"), base, w)?;
+        }
+        mem.map("table".into(), TABLE, table)?;
+        mem.map("tiles".into(), TILES, Problem::i32_bytes(&p.tiles))?;
+        mem.map("sorted".into(), SORTED, Problem::i32_bytes(&p.sorted))?;
+        let mut xq = p.xq().to_vec();
+        xq.resize(xq.len() + SLACK, 0);
+        mem.map("xq".into(), XQ, xq)?;
+        mem.map("y".into(), Y, vec![0u8; p.y_bytes()])?;
+        mem.map(
+            "kernarg".into(),
+            KERNARG,
+            p.kernarg([TABLE, TILES, SORTED, XQ, Y]),
+        )?;
+        let launch = p.launch_for(self.cand, [TABLE, TILES, SORTED, XQ, Y]);
+        for gy in 0..launch.grid[1] {
+            for gx in 0..launch.grid[0] {
+                emu.run_workgroup(
+                    &EmuLaunch {
+                        kernarg_ptr: KERNARG,
+                        workgroup: [gx, gy, 0],
+                        block: launch.block,
+                        dynamic_lds: launch.lds,
+                    },
+                    &mut mem,
+                )
+                .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
+            }
+        }
+        let y = mem
+            .regions
+            .iter()
+            .find(|r| r.name == "y")
+            .map(|r| r.bytes.clone())
+            .ok_or("emulator memory lost the y region")?;
+        let reference = p.reference(Sample::Full);
+        let report = p.compare(&y, &reference, Sample::Full)?;
+        Ok(json!({
+            "status": if report.pass { "pass" } else { "fail" },
+            "symbol": object.launch_symbol,
+            "shape": p.shape_json(),
+            "workgroups": u64::from(launch.grid[0]) * u64::from(launch.grid[1]),
+            "reference": report.reference,
+            "max_abs_err": report.max_abs_err,
+            "tolerance": report.tolerance,
+        }))
+    }
+}
+
+impl Workload for Moe {
+    fn kernel(&self) -> &'static str {
+        "qwen4_moe_sym"
+    }
+
+    fn arch(&self) -> &'static str {
+        "gfx1201"
+    }
+
+    fn shape_json(&self) -> Value {
+        let mut v = self.problem.shape_json();
+        v["ref_rows"] = json!(self.sample.label());
+        v
+    }
+
+    fn candidate_knobs(&self) -> Value {
+        spec_json(self.cand)
+    }
+
+    fn candidate(&self) -> Result<Object> {
+        emit_object(
+            self.cand,
+            json!({
+                "source": "peacemaker_isa::kernels::qwen4_moe_sym::emit via Spec::from_epi + \
+                           native::assemble (the `peacemaker-isa emit --kernel qwen4_moe_sym --co` \
+                           path: crates/peacemaker-isa/src/bin/peacemaker-isa.rs:202-216, :1547)",
+            }),
+        )
+    }
+
+    fn baseline(&self) -> Result<Object> {
+        self.baseline_object()
+    }
+
+    fn setup(&mut self, gpu: &Gpu) -> Result<()> {
+        let p = &self.problem;
+        let distinct = p.geo.distinct;
+        let mut host = vec![0u8; distinct * p.stride];
+        host.par_chunks_mut(p.stride)
+            .enumerate()
+            .for_each(|(i, chunk)| p.fill_weights(i, chunk));
+        let upload = |bytes: &[u8]| -> Result<DeviceBuffer> {
+            let d = gpu.hip.malloc(bytes.len().max(16)).map_err(err)?;
+            gpu.hip.memcpy_htod(&d, bytes).map_err(err)?;
+            Ok(d)
+        };
+        let weights = upload(&host)?;
+        drop(host);
+        let wbase = weights.as_ptr() as u64;
+        let table: Vec<u8> = (0..p.geo.experts)
+            .flat_map(|e| (wbase + ((e % distinct) * p.stride) as u64).to_le_bytes())
+            .collect();
+        let y = || -> Result<DeviceBuffer> {
+            let d = gpu.hip.malloc(p.y_bytes().max(16)).map_err(err)?;
+            gpu.hip.memset(&d, 0, d.size()).map_err(err)?;
+            Ok(d)
+        };
+        let dev = Dev {
+            ptrs: upload(&table)?,
+            tiles: upload(&Problem::i32_bytes(&p.tiles))?,
+            sorted: upload(&Problem::i32_bytes(&p.sorted))?,
+            xq: upload(p.xq())?,
+            y: [y()?, y()?],
+            _weights: weights,
+        };
+        self.dev = Some(dev);
+        Ok(())
+    }
+
+    fn launch(&self, arm: Arm) -> Launch {
+        let dev = self
+            .dev()
+            .expect("Workload::setup must run before Workload::launch");
+        let spec = match arm {
+            Arm::Baseline => self.base.spec(),
+            Arm::Candidate => self.cand,
+        };
+        let ptr = |b: &DeviceBuffer| b.as_ptr() as u64;
+        self.problem.launch_for(
+            spec,
+            [
+                ptr(&dev.ptrs),
+                ptr(&dev.tiles),
+                ptr(&dev.sorted),
+                ptr(&dev.xq),
+                ptr(&dev.y[arm_index(arm)]),
+            ],
+        )
+    }
+
+    fn reset(&self, gpu: &Gpu, arm: Arm) -> Result<()> {
+        let y = &self.dev()?.y[arm_index(arm)];
+        gpu.hip.memset(y, 0, y.size()).map_err(err)
+    }
+
+    fn output(&self, gpu: &Gpu, arm: Arm) -> Result<Vec<u8>> {
+        let y = &self.dev()?.y[arm_index(arm)];
+        let mut v = vec![0u8; self.problem.y_bytes()];
+        gpu.hip.memcpy_dtoh(&mut v, y).map_err(err)?;
+        Ok(v)
+    }
+
+    fn check(&self, out: &[u8]) -> Result<RefReport> {
+        self.problem.compare(out, self.reference(), self.sample)
+    }
+
+    fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64> {
+        if a.len() != b.len() || a.len() % 2 != 0 {
+            return Err(format!(
+                "outputs differ in length ({} vs {}) or are not BF16",
+                a.len(),
+                b.len()
+            ));
+        }
+        Ok(a.par_chunks(1 << 20)
+            .zip(b.par_chunks(1 << 20))
+            .map(|(x, y)| {
+                let mut worst = 0f64;
+                for (u, v) in x.chunks_exact(2).zip(y.chunks_exact(2)) {
+                    let (u, v) = (
+                        u16::from_le_bytes([u[0], u[1]]),
+                        u16::from_le_bytes([v[0], v[1]]),
+                    );
+                    if u == v {
+                        continue;
+                    }
+                    let d = if bf16_nan(u) != bf16_nan(v) {
+                        f64::INFINITY
+                    } else if bf16_nan(u) {
+                        0.0
+                    } else {
+                        (bf16_to_f64(u) - bf16_to_f64(v)).abs()
+                    };
+                    worst = worst.max(d);
+                }
+                worst
+            })
+            .reduce(|| 0.0, f64::max))
+    }
+
+    fn emu(&self) -> Value {
+        match self.emu_run() {
+            Ok(v) => v,
+            Err(reason) => Value::String(format!("refused ({reason})")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn knobs(pairs: &[(&str, &str)]) -> Knobs {
+        let mut k = Knobs::default();
+        for (a, b) in pairs {
+            k.0.insert((*a).to_owned(), (*b).to_owned());
+        }
+        k
+    }
+
+    fn tiny(kind: Kind) -> Problem {
+        let geo = Geo::parse("E=3,TOP=2,T=12,H=256,I=128,D=2,seed=5").unwrap();
+        Problem::new(&geo, kind).unwrap()
+    }
+
+    #[test]
+    fn shape_grammar() {
+        let d = Geo::parse("").unwrap();
+        assert_eq!(
+            (d.preset, d.experts, d.top, d.tokens, d.hidden, d.inter, d.distinct),
+            ("fn", 512, 10, 4096, 2560, 640, 512)
+        );
+        assert_eq!((d.route, d.seed), (Route::Uniform, 1));
+        let a = Geo::parse("a3b, T=8, route=skew,seed=9").unwrap();
+        assert_eq!(
+            (a.preset, a.experts, a.top, a.tokens, a.hidden, a.inter, a.route, a.seed),
+            ("a3b", 256, 8, 8, 2048, 512, Route::Skew, 9)
+        );
+        // Explicit keys win whatever the order.
+        let b = Geo::parse("E=64,a3b").unwrap();
+        assert_eq!((b.preset, b.experts, b.top), ("a3b", 64, 8));
+        for bad in [
+            "bogus",
+            "T=0",
+            "E=4,TOP=8",
+            "route=zigzag",
+            "Q=1",
+            "T=abc",
+            "D=0",
+            "D=999999",
+            "I=100",
+            "H=300",
+            "T=900000",
+        ] {
+            assert!(Geo::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dims_follow_the_plan() {
+        let g = Geo::parse("T=100").unwrap();
+        let gu = Problem::new(&g, Kind::GateUp).unwrap();
+        assert_eq!(
+            (
+                gu.m,
+                gu.k,
+                gu.epochs,
+                gu.x_row_div,
+                gu.x_src_rows,
+                gu.row_len
+            ),
+            (1280, 2560, 20, 10, 100, 640)
+        );
+        assert_eq!((gu.row_bytes, gu.group_bytes), (20 * 68, 136));
+        let dn = Problem::new(&g, Kind::Down).unwrap();
+        assert_eq!(
+            (
+                dn.m,
+                dn.k,
+                dn.epochs,
+                dn.x_row_div,
+                dn.x_src_rows,
+                dn.row_len
+            ),
+            (2560, 640, 5, 1, 1000, 2560)
+        );
+        assert_eq!((dn.row_bytes, dn.group_bytes), (5 * 68, 68));
+        // pmax = ceil16(L + E*15)
+        assert_eq!(gu.pmax, (1000 + 512 * 15usize).div_ceil(16) * 16);
+    }
+
+    #[test]
+    fn grouping_is_stable_pad16_with_sentinel_tail() {
+        let p = tiny(Kind::GateUp);
+        let l = p.geo.slots();
+        assert_eq!(p.pmax % 16, 0);
+        assert_eq!(p.pmax, (l + 3 * 15usize).div_ceil(16) * 16);
+        // Every flat slot appears exactly once, in its expert's tiles, ascending within a run.
+        let mut seen = vec![false; l];
+        let route = p.geo.route_table();
+        let mut last: Vec<i32> = vec![-1; 3];
+        for (row, &s) in p.sorted.iter().enumerate() {
+            if s < 0 {
+                continue;
+            }
+            let e = p.tiles[row / 16];
+            assert_eq!(route[s as usize] as i32, e);
+            assert!(s > last[e as usize]);
+            last[e as usize] = s;
+            assert!(!std::mem::replace(&mut seen[s as usize], true));
+        }
+        assert!(seen.iter().all(|&s| s));
+        // Tiles of one expert are contiguous; a tile's padding is only at its run's tail.
+        let mut runs = Vec::new();
+        for &t in &p.tiles {
+            if runs.last() != Some(&t) {
+                runs.push(t);
+            }
+        }
+        let live: Vec<i32> = runs.iter().copied().filter(|&t| t >= 0).collect();
+        assert!(live.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(*p.tiles.last().unwrap(), -1);
+        assert_eq!(p.live_rows().len(), l);
+    }
+
+    #[test]
+    fn kernarg_packing_layout() {
+        let p = tiny(Kind::Down);
+        let a = p.kernarg([0x1111, 0x2222, 0x3333, 0x4444, 0x5555]);
+        assert_eq!(KERNARG_BYTES, 64);
+        assert_eq!(a.len(), 64);
+        let u64_at = |o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
+        let i32_at = |o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
+        assert_eq!(
+            [u64_at(0), u64_at(8), u64_at(16), u64_at(24), u64_at(32)],
+            [0x1111, 0x2222, 0x3333, 0x4444, 0x5555]
+        );
+        assert_eq!(
+            [
+                i32_at(40),
+                i32_at(44),
+                i32_at(48),
+                i32_at(52),
+                i32_at(56),
+                i32_at(60)
+            ],
+            [
+                p.m as i32,
+                p.k as i32,
+                1,
+                p.pmax as i32,
+                p.geo.slots() as i32,
+                3
+            ]
+        );
+        let g = tiny(Kind::GateUp);
+        let a = g.kernarg([0; 5]);
+        assert_eq!(i32::from_le_bytes(a[48..52].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(a[56..60].try_into().unwrap()), 12);
+        // Launch: grid (M/64, tiles), block per spec, no dynamic LDS.
+        for (epi, grid_x, block) in [
+            ("gate_up", 4, 64),
+            ("gate_up_nt4", 4, 128),
+            ("gate_up_nt8", 4, 128),
+        ] {
+            let spec = Spec::from_epi(epi, ARCH).unwrap();
+            let l = g.launch_for(spec, [0; 5]);
+            assert_eq!(
+                (l.grid, l.block, l.lds),
+                ([grid_x, g.ntiles() as u32, 1], [block, 1, 1], 0),
+                "{epi}"
+            );
+        }
+        let spec = Spec::from_epi("down_nt4", ARCH).unwrap();
+        assert_eq!(p.launch_for(spec, [0; 5]).grid[0], (p.m / 64) as u32);
+    }
+
+    #[test]
+    fn synthetic_blobs_are_valid_symmetric_mq4() {
+        for kind in [Kind::GateUp, Kind::Down] {
+            let p = tiny(kind);
+            let mut w = vec![0u8; p.stride];
+            p.fill_weights(1, &mut w);
+            let mut again = vec![0u8; p.stride];
+            p.fill_weights(1, &mut again);
+            assert_eq!(w, again, "deterministic");
+            let mut other = vec![0u8; p.stride];
+            p.fill_weights(0, &mut other);
+            assert_ne!(w, other);
+            for g in w.chunks_exact(p.group_bytes) {
+                for h in 0..p.group_bytes / 68 {
+                    let sc = f16::from_bits(u16::from_le_bytes([g[4 * h], g[4 * h + 1]]));
+                    let zp = f16::from_bits(u16::from_le_bytes([g[4 * h + 2], g[4 * h + 3]]));
+                    assert!(sc.is_finite() && zp.is_finite());
+                    assert_eq!(zp.to_f32(), -8.0 * sc.to_f32(), "zp == -8*sc");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xq_is_epoch_major_a4_blocks() {
+        let p = tiny(Kind::Down);
+        let xq = p.xq();
+        assert_eq!(xq.len(), p.epochs * p.x_src_rows * 72);
+        let row = p.x_row(5);
+        for h in 0..p.epochs {
+            let o = (h * p.x_src_rows + 5) * 72;
+            let d = f32::from_le_bytes(xq[o..o + 4].try_into().unwrap());
+            let s = i32::from_le_bytes(xq[o + 4..o + 8].try_into().unwrap());
+            assert!(d.is_normal() && (0.125..2.0).contains(&d));
+            assert_eq!(row.d[h], d);
+            let vals = &row.v[h * 128..(h + 1) * 128];
+            assert_eq!(vals.iter().map(|&v| i32::from(v)).sum::<i32>(), s);
+            assert!(vals.iter().all(|&v| (-8..=7).contains(&v)));
+            // element j = byte j/2, low nibble first
+            assert_eq!(i32::from(((xq[o + 8] << 4) as i8) >> 4), i32::from(vals[0]));
+            assert_eq!(i32::from((xq[o + 8] as i8) >> 4), i32::from(vals[1]));
+        }
+    }
+
+    /// Hand-checkable fold: weights `+1` (nibble 9) against activations `3`.
+    #[test]
+    fn fold_hand_checked_down() {
+        let (m, epochs, rb) = (2usize, 1usize, 68usize);
+        let mut w = vec![0u8; m * rb];
+        w[0..2].copy_from_slice(&0x3800u16.to_le_bytes()); // sc = 0.5
+        w[4..68].fill(0x99); // u = 9 -> w = +1
+        w[68..70].copy_from_slice(&0x3c00u16.to_le_bytes()); // sc = 1.0
+        w[72..136].fill(0x77); // u = 7 -> w = -1
+        let flat = |d: f32, v: Vec<i8>| XRow { d: vec![d], v };
+        let xs = [
+            flat(2.0, vec![3; 128]),
+            flat(
+                1.0,
+                (0..128).map(|j| if j % 2 == 0 { 7 } else { -8 }).collect(),
+            ),
+        ];
+        let s = fold_slots(Kind::Down, m, epochs, rb, &w, &xs);
+        // x0: row0 0.5*2 * (128*1*3) = 384; row1 1*2 * (128*-1*3) = -768.
+        assert_eq!((s[0], s[1]), (384.0, -768.0));
+        // x1: row0 0.5 * (64*7 - 64*8) = -32; row1 1 * (-64*7 + 64*8) = 64.
+        assert_eq!((s[2], s[3]), (-32.0, 64.0));
+        assert_eq!(bf16_bits(384.0), 0x43c0);
+    }
+
+    #[test]
+    fn fold_hand_checked_gate_up_layout() {
+        // One K256 group of 136 B: [sc0 zp0 sc1 zp1][64 B epoch 0][64 B epoch 1].
+        let (m, epochs, rb) = (2usize, 2usize, 136usize);
+        let mut w = vec![0u8; m * rb];
+        w[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // sc0 = 1.0
+        w[4..6].copy_from_slice(&0x3800u16.to_le_bytes()); // sc1 = 0.5
+        w[8..72].fill(0x99); // epoch 0: +1
+        w[72..136].fill(0xaa); // epoch 1: +2
+        let xs = [XRow {
+            d: vec![1.0, 1.0],
+            v: vec![3; 256],
+        }];
+        let s = fold_slots(Kind::GateUp, m, epochs, rb, &w, &xs);
+        // epoch 0: 1.0 * 384 = 384; epoch 1: fma(0.5, 768, 384) = 768; row 1: scale 0 -> 0.
+        assert_eq!((s[0], s[1]), (768.0, 0.0));
+    }
+
+    #[test]
+    fn bf16_epilogue_pieces() {
+        // RNE ties-to-even on exact halfway f32 bit patterns.
+        assert_eq!(bf16_bits(f32::from_bits(0x3f80_8000)), 0x3f80);
+        assert_eq!(bf16_bits(f32::from_bits(0x3f81_8000)), 0x3f82);
+        assert_eq!(bf16_bits(f32::INFINITY), 0x7f80);
+        assert_eq!(rt_f32(f32::from_bits(0x3f81_8000)).to_bits(), 0x3f82_0000);
+        assert!(rt_f32(f32::NAN).is_nan());
+        // silu(0) = 0; silu(16) * 1 rounds to 16.0 in BF16; silu(-200) = 0 (e^200 overflows to inf).
+        assert_eq!(bf16_bits(portable_silu_mul(0.0, 1.0)), 0);
+        assert_eq!(bf16_bits(portable_silu_mul(16.0, 1.0)), 0x4180);
+        assert_eq!(portable_silu_mul(-200.0, 1.0), 0.0);
+        let x = portable_silu_mul(1.0, 2.0); // 2 / (1 + e^-1) = 1.46211...
+        assert!((x - 1.462_117_1).abs() < 1e-6, "{x}");
+        assert_eq!(
+            (bf16_ord(0x8000), bf16_ord(0), bf16_ord(0x8001)),
+            (0, 0, -1)
+        );
+        assert_eq!(bf16_ulp(0x3f80), 2f64.powi(-7));
+        assert_eq!(bf16_ulp(0), 2f64.powi(-133));
+    }
+
+    /// The comparison machinery against a hand-built output: exact for down, 1 ulp for gate/up,
+    /// padding / sentinel rows must be zero.
+    #[test]
+    fn compare_tolerances_and_zero_checks() {
+        for kind in [Kind::Down, Kind::GateUp] {
+            let p = tiny(kind);
+            let reference = p.reference(Sample::Full);
+            assert_eq!(reference.len(), p.geo.slots());
+            let mut out = vec![0u8; p.y_bytes()];
+            for (row, bits) in &reference {
+                for (c, b) in bits.iter().enumerate() {
+                    let o = (row * p.row_len + c) * 2;
+                    out[o..o + 2].copy_from_slice(&b.to_le_bytes());
+                }
+            }
+            let ok = p.compare(&out, &reference, Sample::Full).unwrap();
+            assert!(ok.pass, "{}", ok.reference);
+            assert_eq!(ok.max_abs_err, 0.0);
+            // A finite element nudged one BF16 step.
+            let (row, bits) = &reference[reference.len() / 2];
+            let c = bits
+                .iter()
+                .position(|&b| b & 0x7f80 != 0 && b & 0x7f80 != 0x7f80)
+                .unwrap();
+            let o = (row * p.row_len + c) * 2;
+            let mut bumped = out.clone();
+            let b = bits[c];
+            bumped[o..o + 2].copy_from_slice(&(b ^ 1).to_le_bytes());
+            let r1 = p.compare(&bumped, &reference, Sample::Full).unwrap();
+            assert_eq!(r1.pass, kind == Kind::GateUp, "{kind:?}: 1 ulp");
+            assert!(r1.max_abs_err > 0.0);
+            if kind == Kind::GateUp {
+                assert!(r1.max_abs_err <= r1.tolerance);
+            }
+            // Two steps fail for both kinds.
+            let mut far = out.clone();
+            let two = b ^ 2;
+            far[o..o + 2].copy_from_slice(&two.to_le_bytes());
+            assert!(!p.compare(&far, &reference, Sample::Full).unwrap().pass);
+            // A padding row or a sentinel tile row that is not +0 fails.
+            let pad = (0..p.pmax)
+                .find(|&r| p.sorted[r] < 0 && p.tiles[r / 16] >= 0)
+                .unwrap();
+            let mut bad = out.clone();
+            bad[pad * p.row_len * 2] = 1;
+            assert!(!p.compare(&bad, &reference, Sample::Full).unwrap().pass);
+            let mut bad = out.clone();
+            let last = (p.pmax - 1) * p.row_len * 2;
+            bad[last + 1] = 0x3f;
+            let r = p.compare(&bad, &reference, Sample::Full).unwrap();
+            assert!(
+                !r.pass && r.reference.contains("(bad 1), mismatching"),
+                "{}",
+                r.reference
+            );
+            assert!(p.compare(&out[2..], &reference, Sample::Full).is_err());
+        }
+    }
+
+    #[test]
+    fn sampling_is_even_and_includes_the_ends() {
+        let live: Vec<usize> = (0..100).map(|i| i * 3).collect();
+        let s = pick_evenly(&live, 5);
+        assert_eq!(s, vec![live[0], live[24], live[49], live[74], live[99]]);
+        assert_eq!(pick_evenly(&live, 1), vec![0]);
+        assert_eq!(pick_evenly(&live, 100), live);
+        assert_eq!(pick_evenly(&live, 1000), live);
+        assert_eq!(Sample::parse("full").unwrap(), Sample::Full);
+        assert_eq!(Sample::parse("sample:7").unwrap(), Sample::Rows(7));
+        assert!(Sample::parse("sample:0").is_err());
+        assert!(Sample::parse("rows").is_err());
+        let p = tiny(Kind::Down);
+        let part = p.reference(Sample::Rows(10));
+        assert_eq!(part.len(), 10);
+        let full = p.reference(Sample::Full);
+        for (row, bits) in &part {
+            let f = full.iter().find(|r| r.0 == *row).unwrap();
+            assert_eq!(&f.1, bits, "sampled row equals the full reference row");
+        }
+    }
+
+    #[test]
+    fn knob_to_spec_and_symbol_mapping() {
+        let w = new("", &mut knobs(&[])).unwrap();
+        let k = w.candidate_knobs();
+        assert_eq!(k["epi"], "gate_up");
+        assert_eq!(k["symbol"], "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201");
+        assert_eq!(
+            (k["threads"].as_u64(), k["lds_bytes"].as_u64()),
+            (Some(64), Some(0))
+        );
+        for (epi, symbol, threads, lds) in [
+            ("down", "qwen4_moe_down_iu4_sym_pm_gfx1201", 128, 0),
+            ("down_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", 128, 0),
+            ("down_nt8", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8", 128, 0),
+            (
+                "gate_up_nt4",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+                128,
+                8192,
+            ),
+            (
+                "gate_up_nt8",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+                128,
+                16384,
+            ),
+        ] {
+            let w = new("T=64", &mut knobs(&[("epi", epi)])).unwrap();
+            let k = w.candidate_knobs();
+            assert_eq!(k["symbol"], symbol);
+            assert_eq!(
+                (k["threads"].as_u64(), k["lds_bytes"].as_u64()),
+                (Some(threads), Some(lds)),
+                "{epi}"
+            );
+            assert_eq!(
+                w.shape_json()["kind"],
+                if epi.starts_with("down") {
+                    "down"
+                } else {
+                    "gate_up"
+                }
+            );
+        }
+        // Unparsable knobs fail at construction; unsupported combos fail in candidate().
+        assert!(new("", &mut knobs(&[("epi", "up")])).is_err());
+        assert!(new("", &mut knobs(&[("epi", "down_ntx")])).is_err());
+        assert!(new("", &mut knobs(&[("ref-rows", "some")])).is_err());
+        for epi in ["down_nt4r2", "gate_up_nt16", "gate_up_nt3"] {
+            let w = new("T=64", &mut knobs(&[("epi", epi)])).unwrap();
+            assert!(w.candidate().is_err(), "{epi}");
+        }
+        // A base-epi of the other kind is refused; unknown extras stay for the driver's finish().
+        assert!(new("", &mut knobs(&[("epi", "down"), ("base-epi", "gate_up")])).is_err());
+        let mut rest = knobs(&[("epi", "down"), ("base-tile", "x")]);
+        new("", &mut rest).unwrap();
+        assert_eq!(rest.0.len(), 1);
+        assert!(rest.0.contains_key("base-tile"));
+    }
+
+    #[test]
+    fn shipped_baseline_selection_follows_production() {
+        // Resident: down NT4 always; gate/up NT8 iff total_slots >= 128 * n_experts.
+        assert_eq!(shipped_nt(Kind::Down, 10_000_000, 512), 4);
+        assert_eq!(shipped_nt(Kind::GateUp, 128 * 512 - 1, 512), 4);
+        assert_eq!(shipped_nt(Kind::GateUp, 128 * 512, 512), 8);
+        assert_eq!(shipped_nt(Kind::GateUp, 5, 0), 4);
+        for (shape, epi, want) in [
+            (
+                "T=4096",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+            ),
+            (
+                "T=6553",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+            ),
+            (
+                "T=6554",
+                "gate_up",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+            ),
+            (
+                "T=8192",
+                "down_nt8",
+                "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
+            ),
+        ] {
+            let w = new(shape, &mut knobs(&[("epi", epi)])).unwrap();
+            let b = w.baseline().unwrap();
+            assert_eq!(b.launch_symbol, want, "{shape} {epi}");
+            assert_eq!(b.source["symbol"], want);
+            assert!(b.source["source"]
+                .as_str()
+                .unwrap()
+                .contains("gemm.rs:48775"));
+            assert_eq!(
+                b.source["sha256"],
+                sha256_hex(rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201)
+            );
+            assert_eq!(b.bytes, rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201);
+            assert_eq!(b.exports.len(), 6);
+            assert!(b.exports.contains(&b.launch_symbol));
+            assert_eq!(
+                b.desc["artifact"],
+                "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco"
+            );
+        }
+        // --base-epi emits that entry (a native-writer ELF) and inherits nothing else.
+        let w = new(
+            "T=64",
+            &mut knobs(&[("epi", "down_nt8"), ("base-epi", "down_nt4")]),
+        )
+        .unwrap();
+        let b = w.baseline().unwrap();
+        assert_eq!(b.launch_symbol, "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4");
+        assert_eq!(b.exports, [b.launch_symbol.clone()]);
+        assert_eq!(&b.bytes[..4], b"\x7fELF");
+        assert!(b.desc["knobs"]["epi"] == "down_nt4");
+    }
+
+    #[test]
+    fn candidate_is_the_native_writer_link_of_the_emitted_text() {
+        let w = new("T=64", &mut knobs(&[("epi", "down_nt4")])).unwrap();
+        let c = w.candidate().unwrap();
+        let spec = Spec::from_epi("down_nt4", ARCH).unwrap();
+        let e = qwen4_moe_sym::emit(spec).unwrap();
+        assert_eq!(
+            c.bytes,
+            peacemaker_isa::native::assemble(&e.s_text, ARCH).unwrap()
+        );
+        assert_eq!(c.launch_symbol, spec.symbol());
+        assert_eq!(c.exports, [spec.symbol()]);
+        assert_eq!(&c.bytes[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn emu_never_fabricates() {
+        for epi in ["down", "gate_up_nt4"] {
+            let w = new("T=64", &mut knobs(&[("epi", epi)])).unwrap();
+            match w.emu() {
+                Value::String(s) => assert!(s.starts_with("refused ("), "{s}"),
+                Value::Object(o) => {
+                    assert!(matches!(o["status"].as_str(), Some("pass" | "fail")));
+                    assert!(o["workgroups"].as_u64().unwrap() > 0);
+                }
+                other => panic!("{other}"),
+            }
+        }
+    }
+}

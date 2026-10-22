@@ -239,7 +239,7 @@ fn gfx1201_plans(layout: &Layout) -> (RouteKernelPlan, RouteKernelPlan) {
 
 /// Each header layout resolves to exactly one walked plan: the canonical header
 /// and the split header (canonical minus the 128 ngram shards) have distinct
-/// layouts, and no other plan exists for the arch.
+/// layouts, plus the independently walked split mq2 header.
 #[test]
 fn walked_layouts_are_the_canonical_and_split_flash_next_headers() {
     let layouts = layouts();
@@ -250,9 +250,12 @@ fn walked_layouts_are_the_canonical_and_split_flash_next_headers() {
     let plans = walked_plans("gfx1201");
     assert_eq!(
         plans.len(),
-        layouts.len(),
-        "one walked plan per header layout"
+        layouts.len() + 1,
+        "canonical layouts plus split mq2"
     );
+    assert!(plans.iter().any(|plan| {
+        plan.layout == "92d2c376d98535639df92432b6255c8de577ac43f57a5e9f32fbc71c970d471a"
+    }));
     for layout in &layouts {
         assert_eq!(
             walked("gfx1201", &layout.sha).layout,

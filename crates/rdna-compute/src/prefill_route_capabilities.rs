@@ -33,13 +33,9 @@
 //! use [`qualified`]; the exact-gfx1201 strings live only in the raw-inventory anchors and the
 //! [`QUALIFIED`] rows below.
 //!
-//! Eleven routes have one exact-gfx1201 [`QUALIFIED`] row, so with their flags unset they are
-//! on at exact gfx1201 and off elsewhere; an explicit `0` kills a route on any architecture
-//! and an explicit `1` opts in elsewhere only where the callers' raw-inventory conjunct holds.
-//! The four inventory-only routes [`PrefillRoute::MoeRotateI4Pm`],
-//! [`PrefillRoute::PrefillIu4C8Pm`], [`PrefillRoute::GdnChunkPrepPm`] and
-//! [`PrefillRoute::MoeSharedDownSigmoidEpi`] have no qualified rows, so unset is off everywhere
-//! and only an explicit `1` opts in where raw inventory exists.
+//! Every route has one exact-gfx1201 [`QUALIFIED`] row, so with its flag unset it is on at
+//! exact gfx1201 and off elsewhere; an explicit `0` kills a route on any architecture and an
+//! explicit `1` opts in elsewhere only where the callers' raw-inventory conjunct holds.
 //! Nested routes retain the parent's resolved flag and admission: `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`
 //! runs only inside the admitted `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` branch,
 //! `HIPFIRE_FA_PREFILL_PM_QPREP` needs the *resolved* `HIPFIRE_FA_PREFILL_PM` flag (an explicit
@@ -47,19 +43,11 @@
 //! `HIPFIRE_GDN_MOE_CHUNK_SCAN` layer (an explicit chunk-scan `0` refuses it). For
 //! `HIPFIRE_MOE_IU4_WIDE_TILES` the flag only governs VRAM-resident gate/up (the resident
 //! down stays NT4); host-mapped experts keep their existing NT8 selection for both GEMMs
-//! whatever the flag says. `HIPFIRE_MOE_ROTATE_I4_PM` is an **inventory-only** route: it has
-//! raw inventory but no [`QUALIFIED`] row, so unset is off on every architecture and only an
-//! explicit `1` opts in (`0` stays off); the selection also stays nested beneath the requested
-//! symmetric IU4 route and its frozen C2 producer candidate set (`Gpu::qwen4_moe_rotate128_i4`).
-//!
-//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`]) is the second inventory-only
-//! route: raw inventory only, no [`QUALIFIED`] row, so unset is off everywhere, `0` kills and
-//! `1` opts in; it nests beneath the *resolved* `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` flag.
-//!
-//! [`PrefillRoute::MoeSharedDownSigmoidEpi`] is deliberately NOT qualified (no
-//! [`QUALIFIED`] row, on no architecture): unset is off everywhere, `0` is off, and only an
-//! explicit `1` opts in, and then only where the raw inventory below and the GPU-side shape
-//! admission hold.
+//! whatever the flag says. `HIPFIRE_MOE_ROTATE_I4_PM` stays nested beneath the requested
+//! symmetric IU4 route and its frozen C2 producer candidate set (`Gpu::qwen4_moe_rotate128_i4`),
+//! and `HIPFIRE_PREFILL_IU4_C8_PM` nests beneath the *resolved*
+//! `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` flag. `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` still applies
+//! only where the raw inventory and the GPU-side shape admission hold.
 
 /// A prefill route whose unset default is decided by qualification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -82,8 +70,8 @@ pub enum PrefillRoute {
     /// `HIPFIRE_FA_PREFILL_PM`: A3B H16/KV2/D256 Q8_0 prefill with the
     /// packet-minimal gfx1201 body. Unset follows its exact-gfx1201 qualification.
     FaPrefillPm,
-    /// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`: the fused router runs two rows per workgroup
-    /// (`moe_topk_renorm_k8_batched`, fused-softmax mode, `rows_per_block = 2`). Nested
+    /// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`: the fused router runs one wave32 per row, eight rows
+    /// per workgroup (`moe_router_softmax_topk_k8_wave`, same registry module). Nested
     /// beneath [`PrefillRoute::MoeRouterFusedPrefill`]. Unset follows its exact-gfx1201
     /// qualification.
     MoeRouterTopkMultirow,
@@ -107,24 +95,24 @@ pub enum PrefillRoute {
     FaPrefillPmQprep,
     /// `HIPFIRE_MOE_ROTATE_I4_PM`: the down A4 producer `qwen4_moe_rotate128_i4` runs the exact
     /// PeaceMaker twin `moe_rotate_i4_pm_gfx1201` (grid `[P, K/128, 1]`, wave32) instead of the
-    /// HIP incumbent. Inventory only: no [`QUALIFIED`] row, so unset is off everywhere and
-    /// only an explicit `1` opts in.
+    /// HIP incumbent. Unset follows its exact-gfx1201 qualification.
     MoeRotateI4Pm,
     /// `HIPFIRE_PREFILL_IU4_C8_PM`: the PeaceMaker C8 rotate / RMSNorm-rotate producer twins
     /// (`iu4_c8_rotate_pm_gfx1201`, `iu4_c8_rmsnorm_rotate_pm_gfx1201`) run in place of the HIP
-    /// exact (`cand_mode = 8`) F3 producers. Raw inventory only, NO qualified row: unset is off,
-    /// `1` opts in, `0` kills. Nested beneath the resolved
-    /// [`PrefillRoute::PrefillIu4ProducerFused`] flag.
+    /// exact (`cand_mode = 8`) F3 producers. Nested beneath the resolved
+    /// [`PrefillRoute::PrefillIu4ProducerFused`] flag. Unset follows its exact-gfx1201
+    /// qualification.
     PrefillIu4C8Pm,
     /// `HIPFIRE_GDN_CHUNK_PREP_PM`: the MoE GDN chunk-scan layer runs the PM twin of
     /// `gdn_chunk_prep` (`gdn_chunk_prep_pm_gfx1201`, 16 key / 32 value heads, rows 1..=8192)
     /// in place of the incumbent preamble. Nested beneath [`PrefillRoute::GdnMoeChunkScan`].
-    /// Raw inventory only: no qualified row, so unset is off and an explicit `1` opts in.
+    /// Unset follows its exact-gfx1201 qualification.
     GdnChunkPrepPm,
     /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`: the A3B shared-expert MQ4G256V2 down GEMM folds
-    /// `residual += sigmoid(gate) * down` into the gfx12 V3 IU4 ADD epilogue (`add == 2` of
-    /// `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3`), with no intermediate temp, no output
-    /// memset and no separate gated residual add. NOT qualified: opt-in only.
+    /// `residual += sigmoid(gate) * down` into a gfx12 IU4 ADD epilogue (the builder `_b1` entry
+    /// `gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1` when eligible, else `add == 2` of the
+    /// hipcc `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3`), with no intermediate temp, no output
+    /// memset and no separate gated residual add. Unset follows its exact-gfx1201 qualification.
     MoeSharedDownSigmoidEpi,
 }
 
@@ -160,7 +148,7 @@ pub struct QualifiedCell {
 
 /// The explicit qualification rows. A route is on by default exactly where a row names its
 /// architecture AND the raw inventory is present.
-pub const QUALIFIED: [QualifiedCell; 11] = [
+pub const QUALIFIED: [QualifiedCell; 15] = [
     QualifiedCell {
         arch: "gfx1201",
         route: PrefillRoute::GdnQkIndexed,
@@ -216,6 +204,26 @@ pub const QUALIFIED: [QualifiedCell; 11] = [
         route: PrefillRoute::FaPrefillPmQprep,
         evidence: "a3b-pp-hold/p31-run1 (j1647): stacked prefill-prompt kldseq byte-equal to BASE a152cd40; fa_pm_qprep_oracle GPU byte oracle all_byte_identical (p3thin-run1/2 + p31 stack-tip oracles); stacked pp4096 Ornith 13649->15095 / Qwen 13651->15076 tok/s, pp8192 Ornith 12935->13957",
     },
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::MoeRotateI4Pm,
+        evidence: "a3b-20k/oracles/L0-001 moe_rotate_i4_pm_oracle all_byte_identical (beta 272e16c5b4); a3b-20k/quality/L0-compare-001 kldseq wt2/agentic x prefill-prompt/per-token byte-equal stock vs four late-H; A3B MQ4RS pp16000 stock 16625.7 -> four late-H 17035.8 tok/s (a3b-20k/runs/beta272-default-001, beta272-fourfold-001)",
+    },
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::PrefillIu4C8Pm,
+        evidence: "a3b-20k/oracles/L0-001 iu4_c8_pm_oracle all_byte_identical (beta 272e16c5b4); a3b-20k/quality/L0-compare-001 kldseq wt2/agentic x prefill-prompt/per-token byte-equal stock vs four late-H; A3B MQ4RS pp16000 stock 16625.7 -> four late-H 17035.8 tok/s (a3b-20k/runs/beta272-default-001, beta272-fourfold-001)",
+    },
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::GdnChunkPrepPm,
+        evidence: "a3b-20k/oracles/L0-001 gdn_chunk_prep_pm_oracle all_byte_identical (beta 272e16c5b4); a3b-20k/quality/L0-compare-001 kldseq wt2/agentic x prefill-prompt/per-token byte-equal stock vs four late-H; A3B MQ4RS pp16000 stock 16625.7 -> four late-H 17035.8 tok/s (a3b-20k/runs/beta272-default-001, beta272-fourfold-001)",
+    },
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::MoeSharedDownSigmoidEpi,
+        evidence: "a3b-20k/oracles/L0-001 shared_down_sigmoid_epi_oracle all_byte_identical (beta 272e16c5b4); a3b-20k/quality/L0-compare-001 kldseq wt2/agentic x prefill-prompt/per-token byte-equal stock vs four late-H; A3B MQ4RS pp16000 stock 16625.7 -> four late-H 17035.8 tok/s (a3b-20k/runs/beta272-default-001, beta272-fourfold-001)",
+    },
 ];
 
 /// The raw kernel inventory of `route` on `arch`: whether its kernels exist, before any
@@ -240,8 +248,8 @@ pub const QUALIFIED: [QualifiedCell; 11] = [
 /// * [`PrefillRoute::FaPrefillPm`]: the exact-gfx1201 embedded PM images selected
 ///   by `Gpu::attention_q8_0_fa_prefill_pm_gfx1201` (outside the HIP source registry).
 /// * [`PrefillRoute::MoeRouterTopkMultirow`]: the same `moe_topk_renorm_k8_batched` registry
-///   module and wave32 architectures as [`PrefillRoute::MoeRouterFusedPrefill`] (the two-row
-///   launch reuses the symbol); `Gpu::moe_router_topk_multirow_admitted` adds the shape.
+///   module and wave32 architectures as [`PrefillRoute::MoeRouterFusedPrefill`] (the wave-per-row
+///   symbol `moe_router_softmax_topk_k8_wave` lives in that module); `Gpu::moe_router_topk_multirow_admitted` adds the shape.
 /// * [`PrefillRoute::MoeCombineV2`]: the exact-gfx1201 embedded v2 combine bundle
 ///   `kernels::MOE_SLOT_OPS_V2_PM_GFX1201` (symbol `moe_down_combine_grouped_bf16in_v2_pm_gfx1201`)
 ///   selected by `moe_slot_ops::moe_slot_ops_v2_kernel` (outside the HIP source registry); a test
@@ -272,15 +280,17 @@ pub const QUALIFIED: [QualifiedCell; 11] = [
 ///   image (`kernels/iu4_c8_producer_pm_gfx1201.hxaco`, exports
 ///   `iu4_c8_rotate_pm_gfx1201` and `iu4_c8_rmsnorm_rotate_pm_gfx1201`) run by
 ///   `Gpu::mq_rotate_x_i4_c8_pm` / `Gpu::fused_rmsnorm_mq_rotate_i4_c8_pm` (outside the HIP
-///   source registry); a test searches the image bytes for both symbols. No qualified row.
+///   source registry); a test searches the image bytes for both symbols.
 /// * [`PrefillRoute::GdnChunkPrepPm`]: the exact-gfx1201 embedded `gdn_chunk_prep_pm_gfx1201`
 ///   image run by `Gpu::gdn_chunk_prep_pm` (outside the HIP source registry; a test searches
-///   the image for its symbol). It has no [`QUALIFIED`] row.
+///   the image for its symbol).
 /// * [`PrefillRoute::MoeSharedDownSigmoidEpi`]: the exact-gfx1201 gfx12 V3 IU4 module outside
 ///   the standard HIP source registry (JIT on demand, no registry module):
 ///   `kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC`, entry
 ///   `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3` (runtime `add == 2` with the trailing
-///   `shared_gate` pointer), launched by `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi`,
+///   `shared_gate` pointer; the same fold's `_b1` bundle twin `..._full_add_sigmoid_b1` is the
+///   default launch target when the builder bundle is eligible), launched by
+///   `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi`,
 ///   whose consumer `Gpu::mq4g256v2_shared_iu4_supported` requires exact gfx1201. A test pins
 ///   the source digest and the symbol.
 pub fn raw_inventory(arch: &str, route: PrefillRoute) -> bool {
@@ -442,18 +452,6 @@ mod tests {
         ),
     ];
 
-    /// How many [`QUALIFIED`] rows the route must have: every route has exactly one, on
-    /// exact gfx1201, except the four inventory-only routes (none).
-    fn expected_rows(route: PrefillRoute) -> usize {
-        match route {
-            PrefillRoute::MoeRotateI4Pm
-            | PrefillRoute::PrefillIu4C8Pm
-            | PrefillRoute::GdnChunkPrepPm
-            | PrefillRoute::MoeSharedDownSigmoidEpi => 0,
-            _ => 1,
-        }
-    }
-
     fn registry_has(arch: &str, module: &str) -> bool {
         match crate::kernel_registry::entries(arch, "") {
             Ok(entries) => entries.iter().any(|entry| entry.module == module),
@@ -525,7 +523,7 @@ mod tests {
             for arch in ARCHES {
                 assert_eq!(
                     qualified(arch, route),
-                    arch == "gfx1201" && expected_rows(route) == 1,
+                    arch == "gfx1201",
                     "qualification of {route:?} on {arch}"
                 );
             }
@@ -559,7 +557,7 @@ mod tests {
                     rows += 1;
                 }
             }
-            assert_eq!(rows, expected_rows(route), "{route:?} qualified row count");
+            assert_eq!(rows, 1, "{route:?} qualified row count");
         }
     }
 
@@ -595,21 +593,21 @@ mod tests {
     }
 
     #[test]
-    fn chunk_prep_pm_is_raw_inventory_only_and_nests_beneath_the_chunk_scan_route() {
+    fn chunk_prep_pm_is_qualified_on_exact_gfx1201_and_nests_beneath_the_chunk_scan_route() {
         let route = PrefillRoute::GdnChunkPrepPm;
         assert_eq!(
             PrefillRoute::ALL[13],
             route,
             "appended at the end, earlier order unchanged"
         );
-        assert!(
-            QUALIFIED.iter().all(|cell| cell.route != route),
-            "no QUALIFIED row"
+        assert_eq!(
+            QUALIFIED.iter().filter(|cell| cell.route == route).count(),
+            1
         );
         for arch in ARCHES {
             assert_eq!(raw_inventory(arch, route), arch == "gfx1201", "{arch}");
-            assert!(!qualified(arch, route), "{arch}: no row, never qualified");
-            assert!(!enabled(None, arch, route), "{arch}: unset is off");
+            assert_eq!(qualified(arch, route), arch == "gfx1201", "{arch}");
+            assert_eq!(enabled(None, arch, route), arch == "gfx1201", "{arch}");
             assert!(!enabled(Some(false), arch, route), "{arch}: 0 kills");
             assert!(enabled(Some(true), arch, route), "{arch}: 1 opts in");
             // The raw inventory is the embedded image and is exactly the chunk-scan cell it
@@ -638,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_i4_pm_is_inventory_only_and_off_unless_explicitly_one() {
+    fn rotate_i4_pm_is_qualified_exactly_where_its_bundle_exists() {
         fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             !needle.is_empty()
                 && haystack
@@ -649,7 +647,7 @@ mod tests {
         assert_eq!(PrefillRoute::ALL[11], route);
         assert_eq!(
             QUALIFIED.iter().filter(|cell| cell.route == route).count(),
-            0
+            1
         );
         for arch in ARCHES {
             // The raw inventory is established by the embedded object itself: the arch's bundle
@@ -661,8 +659,8 @@ mod tests {
             });
             assert_eq!(raw_inventory(arch, route), carried, "{arch}");
             assert_eq!(raw_inventory(arch, route), arch == "gfx1201", "{arch}");
-            assert!(!qualified(arch, route), "{arch}: no qualified row");
-            assert!(!enabled(None, arch, route), "{arch}: unset is off");
+            assert_eq!(qualified(arch, route), carried, "{arch}");
+            assert_eq!(enabled(None, arch, route), carried, "{arch}");
             assert!(enabled(Some(true), arch, route), "{arch}: 1 opts in");
             assert!(!enabled(Some(false), arch, route), "{arch}: 0 kills");
             if let Some((image, symbol)) = bundle {
@@ -677,29 +675,29 @@ mod tests {
     }
 
     #[test]
-    fn iu4_c8_pm_is_raw_inventory_only_opt_in_on_exact_gfx1201() {
+    fn iu4_c8_pm_is_qualified_on_exact_gfx1201() {
         let route = PrefillRoute::PrefillIu4C8Pm;
         assert_eq!(PrefillRoute::ALL[12], route, "appended at the end of ALL");
         assert_eq!(
             QUALIFIED.iter().filter(|cell| cell.route == route).count(),
-            0
+            1
         );
         for arch in ARCHES {
             assert_eq!(raw_inventory(arch, route), arch == "gfx1201", "{arch}");
-            assert!(!qualified(arch, route), "{arch}: no qualified row");
-            assert!(!enabled(None, arch, route), "{arch}: unset is off");
+            assert_eq!(qualified(arch, route), arch == "gfx1201", "{arch}");
+            assert_eq!(enabled(None, arch, route), arch == "gfx1201", "{arch}");
             assert!(enabled(Some(true), arch, route), "{arch}: 1 opts in");
             assert!(!enabled(Some(false), arch, route), "{arch}: 0 kills");
         }
     }
 
     #[test]
-    fn shared_down_sigmoid_epi_is_opt_in_only_and_never_qualified() {
+    fn shared_down_sigmoid_epi_is_qualified_on_exact_gfx1201() {
         let route = PrefillRoute::MoeSharedDownSigmoidEpi;
         assert_eq!(PrefillRoute::ALL[14], route, "appended at the end of ALL");
-        assert!(
-            QUALIFIED.iter().all(|cell| cell.route != route),
-            "no qualified row"
+        assert_eq!(
+            QUALIFIED.iter().filter(|cell| cell.route == route).count(),
+            1
         );
         for arch in ARCHES {
             assert_eq!(
@@ -707,9 +705,8 @@ mod tests {
                 arch == "gfx1201",
                 "raw inventory on {arch}"
             );
-            assert!(!qualified(arch, route), "qualified on {arch}");
-            // Unset is off everywhere, 0 kills, only an explicit 1 opts in.
-            assert!(!enabled(None, arch, route), "unset on {arch}");
+            assert_eq!(qualified(arch, route), arch == "gfx1201", "{arch}");
+            assert_eq!(enabled(None, arch, route), arch == "gfx1201", "{arch}");
             assert!(!enabled(Some(false), arch, route), "0 on {arch}");
             assert!(enabled(Some(true), arch, route), "1 on {arch}");
         }
@@ -760,8 +757,8 @@ mod tests {
         assert_eq!(PrefillRoute::ALL.len(), 15);
         assert_eq!(
             QUALIFIED.len(),
-            11,
-            "six prior rows plus the five phase-3 rows; H1-H4 have none"
+            15,
+            "six prior rows, the five phase-3 rows and the four late-H rows"
         );
         for (index, route, oracle) in PHASE3 {
             assert_eq!(PrefillRoute::ALL[index], route, "ALL order is unchanged");

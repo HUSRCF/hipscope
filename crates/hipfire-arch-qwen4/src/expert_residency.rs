@@ -2926,6 +2926,190 @@ pub fn ep_vram_layers(
         .unwrap_or(0)
 }
 
+/// The expert-parallel split with each rank's AR lane store reserved
+/// ([`ep_vram_layers_with_lanes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpLaneReservedSplit {
+    /// Device bytes of one rank's lane store held back from the experts.
+    pub lane_bytes: u64,
+    /// The split without the reservation ([`ep_vram_layers`]).
+    pub baseline_layers: usize,
+    /// The split with `lane_bytes` added to every rank's reserve; never above
+    /// `baseline_layers`.
+    pub reserved_layers: usize,
+}
+
+/// [`ep_vram_layers`] with `lane_bytes` (one rank's lane store,
+/// [`crate::ep::ep_lane_store_device_bytes`]) added to the `reserve_bytes`
+/// every rank keeps free, so the stage after the load finds the store's bytes
+/// still free on every rank. `lane_bytes == 0` returns the baseline twice.
+/// `Err` (the caller keeps the baseline split and says why) when the sum
+/// overflows, or when some rank cannot hold the non-expert weights plus the
+/// reserve plus the lane store even with every routed expert in host RAM.
+pub fn ep_vram_layers_with_lanes(
+    config: &Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    lane_bytes: u64,
+) -> Result<EpLaneReservedSplit, String> {
+    const MIB: u64 = 1 << 20;
+    let baseline_layers = ep_vram_layers(
+        config,
+        free_per_rank,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+    );
+    let reserved = reserve_bytes
+        .checked_add(lane_bytes)
+        .ok_or_else(|| "the EP lane reservation overflows the expert reserve".to_string())?;
+    let floor = non_expert_bytes.checked_add(reserved).ok_or_else(|| {
+        "the EP lane reservation overflows the non-expert weights plus reserve".to_string()
+    })?;
+    if let Some((rank, &free)) = free_per_rank
+        .iter()
+        .enumerate()
+        .find(|(_, free)| **free < floor)
+    {
+        return Err(format!(
+            "rank {rank}: {} MiB free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve and the {} MiB lane store even with every routed expert in host RAM",
+            free / MIB,
+            non_expert_bytes / MIB,
+            reserve_bytes / MIB,
+            lane_bytes / MIB
+        ));
+    }
+    let reserved_layers = ep_vram_layers(
+        config,
+        free_per_rank,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserved,
+    );
+    Ok(EpLaneReservedSplit {
+        lane_bytes,
+        baseline_layers,
+        reserved_layers,
+    })
+}
+
+/// An AR-lane reservation request of an expert-parallel load, already
+/// resolved to one rank's lane-store bytes. `bytes` is `Err` when the bytes
+/// cannot be planned (overflow, a backend whose lane staging refuses): the
+/// plan then keeps the baseline split and reports the reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpLaneRequest {
+    pub lanes: usize,
+    /// Staged row budget (`ep_lane_row_budget`).
+    pub row_budget: usize,
+    pub bytes: Result<u64, String>,
+}
+
+/// A lane reservation the plan applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpLaneReservation {
+    pub lanes: usize,
+    pub row_budget: usize,
+    /// Device bytes of one rank's lane store held back from the experts.
+    pub lane_bytes: u64,
+    /// Resident expert layers without the reservation.
+    pub baseline_layers: usize,
+}
+
+/// The expert VRAM split an EP load applies, and the lane reservation (if
+/// any) behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpVramPlan {
+    /// Resident MoE layers every rank applies.
+    pub layers: usize,
+    /// The reservation `layers` already accounts for (`None`: none was
+    /// requested, or it was impossible and `unreserved` says why).
+    pub reservation: Option<EpLaneReservation>,
+    /// Why a requested reservation was not applied; the baseline split is
+    /// kept and the later lane staging keeps its own refusal.
+    pub unreserved: Option<String>,
+}
+
+/// [`ep_vram_layers`] and, when `lane` asks for it, the same split with the
+/// lane store reserved on every rank ([`ep_vram_layers_with_lanes`]). Without
+/// a request the plan is exactly the baseline split.
+pub fn ep_vram_plan(
+    config: &Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    lane: Option<EpLaneRequest>,
+) -> EpVramPlan {
+    let baseline = || {
+        ep_vram_layers(
+            config,
+            free_per_rank,
+            non_expert_bytes,
+            layer_expert_bytes_per_rank,
+            reserve_bytes,
+        )
+    };
+    let Some(lane) = lane else {
+        return EpVramPlan {
+            layers: baseline(),
+            reservation: None,
+            unreserved: None,
+        };
+    };
+    let planned = lane.bytes.and_then(|bytes| {
+        ep_vram_layers_with_lanes(
+            config,
+            free_per_rank,
+            non_expert_bytes,
+            layer_expert_bytes_per_rank,
+            reserve_bytes,
+            bytes,
+        )
+    });
+    match planned {
+        Ok(split) => EpVramPlan {
+            layers: split.reserved_layers,
+            reservation: Some(EpLaneReservation {
+                lanes: lane.lanes,
+                row_budget: lane.row_budget,
+                lane_bytes: split.lane_bytes,
+                baseline_layers: split.baseline_layers,
+            }),
+            unreserved: None,
+        },
+        Err(reason) => EpVramPlan {
+            layers: baseline(),
+            reservation: None,
+            unreserved: Some(reason),
+        },
+    }
+}
+
+/// The one load log line of an EP lane reservation: the trade
+/// (`lanes`, `max_seq`, bytes per rank, resident expert layers before and
+/// after), or why the reservation was not applied. `None` when no
+/// reservation was requested.
+pub fn ep_lane_reservation_line(max_seq: usize, plan: &EpVramPlan) -> Option<String> {
+    if let Some(reservation) = &plan.reservation {
+        return Some(format!(
+            "[daemon] qwen4 EP lane reservation: lanes={} max_seq={max_seq} -> {:.3} GiB/rank; resident expert layers {} -> {}",
+            reservation.lanes,
+            reservation.lane_bytes as f64 / GIB,
+            reservation.baseline_layers,
+            plan.layers
+        ));
+    }
+    plan.unreserved.as_ref().map(|reason| {
+        format!(
+            "[daemon] qwen4 EP lane reservation skipped: {reason}; keeping the baseline plan (resident expert layers {})",
+            plan.layers
+        )
+    })
+}
+
 /// One rank's line of the expert-parallel fit table: free VRAM, the
 /// replicated trunk, the rank's routed-expert bytes (`MoE layers` of
 /// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
@@ -5940,6 +6124,165 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn ep_lane_reservation_subtracts_exactly_the_lane_bytes_from_every_rank() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let free = [30u64 << 30, 29 << 30, 30 << 30, 30 << 30];
+        let baseline = ep_vram_layers(&config, &free, non_expert, layer, reserve);
+        assert!(baseline > 0 && baseline < 49, "{baseline}");
+        // No lane bytes: the baseline twice, identical plan.
+        let off = ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, 0).unwrap();
+        assert_eq!(
+            off,
+            EpLaneReservedSplit {
+                lane_bytes: 0,
+                baseline_layers: baseline,
+                reserved_layers: baseline,
+            }
+        );
+        // Lane bytes equal to whole layers cost exactly that many layers on
+        // the tightest rank, no more and no fewer.
+        let one =
+            ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, layer).unwrap();
+        assert_eq!(one.baseline_layers, baseline);
+        assert_eq!(one.reserved_layers, baseline - 1);
+        let four = ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, 4 * layer)
+            .unwrap();
+        assert_eq!(four.reserved_layers, baseline - 4);
+        // The reservation is the sum added to the reserve, byte for byte.
+        let lane = 3_221_225_472u64;
+        let split =
+            ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, lane).unwrap();
+        assert_eq!(
+            split.reserved_layers,
+            ep_vram_layers(&config, &free, non_expert, layer, reserve + lane)
+        );
+        assert!(split.reserved_layers < split.baseline_layers);
+        // Never above the baseline, and monotone in the reserved bytes.
+        let mut last = baseline;
+        for lane in [1u64 << 20, 1 << 28, 1 << 30, 2 << 30, 4 << 30] {
+            let split = ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, lane)
+                .unwrap();
+            assert!(split.reserved_layers <= last, "{lane}");
+            last = split.reserved_layers;
+        }
+    }
+
+    #[test]
+    fn ep_lane_reservation_refuses_overflow_and_impossible_reserve() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let free = [30u64 << 30; 4];
+        let overflow =
+            ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, u64::MAX)
+                .unwrap_err();
+        assert!(overflow.contains("overflows"), "{overflow}");
+        let overflow =
+            ep_vram_layers_with_lanes(&config, &free, u64::MAX, layer, 0, 1).unwrap_err();
+        assert!(overflow.contains("overflows"), "{overflow}");
+        // Even with every expert in host RAM the lane store does not fit
+        // the tightest rank: the error names that rank.
+        let free = [30u64 << 30, 30 << 30, 10 << 30, 30 << 30];
+        let error = ep_vram_layers_with_lanes(&config, &free, non_expert, layer, reserve, 4 << 30)
+            .unwrap_err();
+        assert!(
+            error.contains("rank 2") && error.contains("lane store"),
+            "{error}"
+        );
+        // The boundary: exactly the floor fits (zero resident layers), one
+        // byte less is refused.
+        let lane = 2u64 << 30;
+        let floor = non_expert + reserve + lane;
+        let at =
+            ep_vram_layers_with_lanes(&config, &[floor], non_expert, layer, reserve, lane).unwrap();
+        assert_eq!(at.reserved_layers, 0);
+        assert!(
+            ep_vram_layers_with_lanes(&config, &[floor - 1], non_expert, layer, reserve, lane)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ep_lane_reservation_plan_is_the_baseline_without_a_request() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let free = [30u64 << 30, 29 << 30, 30 << 30, 30 << 30];
+        let plan = ep_vram_plan(&config, &free, non_expert, layer, reserve, None);
+        assert_eq!(
+            plan,
+            EpVramPlan {
+                layers: ep_vram_layers(&config, &free, non_expert, layer, reserve),
+                reservation: None,
+                unreserved: None,
+            }
+        );
+        assert_eq!(ep_lane_reservation_line(32768, &plan), None);
+    }
+
+    #[test]
+    fn ep_lane_reservation_plan_trades_layers_for_lane_bytes_and_logs_once() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let free = [30u64 << 30, 29 << 30, 30 << 30, 30 << 30];
+        let baseline = ep_vram_layers(&config, &free, non_expert, layer, reserve);
+        let lane = EpLaneRequest {
+            lanes: 4,
+            row_budget: 4096,
+            bytes: Ok(2 * layer),
+        };
+        let plan = ep_vram_plan(&config, &free, non_expert, layer, reserve, Some(lane));
+        assert_eq!(plan.layers, baseline - 2);
+        assert_eq!(plan.unreserved, None);
+        let reservation = plan.reservation.clone().unwrap();
+        assert_eq!(
+            (
+                reservation.lanes,
+                reservation.row_budget,
+                reservation.lane_bytes,
+                reservation.baseline_layers
+            ),
+            (4, 4096, 2 * layer, baseline)
+        );
+        let line = ep_lane_reservation_line(32768, &plan).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "[daemon] qwen4 EP lane reservation: lanes=4 max_seq=32768 -> {:.3} GiB/rank; resident expert layers {baseline} -> {}",
+                (2 * layer) as f64 / (1u64 << 30) as f64,
+                baseline - 2
+            )
+        );
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn ep_lane_reservation_plan_keeps_the_baseline_when_impossible() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let free = [30u64 << 30, 30 << 30, 10 << 30, 30 << 30];
+        let baseline = ep_vram_layers(&config, &free, non_expert, layer, reserve);
+        for bytes in [
+            Ok(4u64 << 30),
+            Err("lane store device bytes overflow".to_string()),
+        ] {
+            let lane = EpLaneRequest {
+                lanes: 8,
+                row_budget: 8,
+                bytes,
+            };
+            let plan = ep_vram_plan(&config, &free, non_expert, layer, reserve, Some(lane));
+            assert_eq!(plan.layers, baseline);
+            assert_eq!(plan.reservation, None);
+            let line = ep_lane_reservation_line(32768, &plan).unwrap();
+            assert!(
+                line.starts_with("[daemon] qwen4 EP lane reservation skipped:")
+                    && line.contains(&format!("resident expert layers {baseline}")),
+                "{line}"
+            );
+        }
     }
 
     fn band_scopes(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {

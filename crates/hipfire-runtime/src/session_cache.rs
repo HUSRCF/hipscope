@@ -5020,7 +5020,7 @@ mod tests {
 
         // A live continuation that captures: state at the end of m, extended
         // by a message with a marker. Only boundaries above `reused` are
-        // armed, and commit publishes them.
+        // armed, and commit publishes them under the session-exact domain.
         assert_eq!(turn(&mut cache, gpu, &mut toy, &m, true), 2 * STRIDE);
         let mut tail = prompt(6, 30);
         tail[9] = MARKER;
@@ -5031,6 +5031,8 @@ mod tests {
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);
         cache.begin_live(gpu, &mut toy, &live, SessionRoute::Ar, m.len(), true);
         let marker_end = m.len() + 10;
+        let exact = session_exact_domain(&scoped);
+        let marker_fp = prefix_fingerprint(&live[..marker_end]);
         assert_eq!(cache.next_boundary(), Some(marker_end));
         toy.advance(gpu, &live[..marker_end]);
         cache
@@ -5039,8 +5041,14 @@ mod tests {
         assert_eq!(cache.next_boundary(), None);
         toy.advance(gpu, &live);
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);
+        assert!(!cache.pool.contains(&exact, marker_end as u64, marker_fp));
         cache.commit();
-        assert!(held(&cache, &live, marker_end));
+        assert!(!held(&cache, &live, marker_end));
+        assert!(cache.pool.contains(&exact, marker_end as u64, marker_fp));
+        assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), marker_end);
+        // Drop the live-row resident so restoration must use the published
+        // session-exact pool snapshot, not just its fixed-only resident.
+        cache.live_state_reset();
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), marker_end);
         assert_restores(&mut cache, gpu, &mut toy, &probe, marker_end);
         cache.clear(gpu);

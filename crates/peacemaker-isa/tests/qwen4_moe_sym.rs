@@ -16,6 +16,41 @@ fn specs(arch: Arch) -> impl Iterator<Item = Spec> {
 }
 
 #[test]
+fn epi_spellings_parse_to_module_entries() {
+    let spec = |kind, nt, rr| Spec {
+        arch: Arch::Gfx1201,
+        kind,
+        nt,
+        rr,
+        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
+    };
+    for (epi, want) in [
+        ("gate_up", spec(Kind::GateUp, 1, 1)),
+        ("down", spec(Kind::Down, 1, 1)),
+        ("gate_up_nt4", spec(Kind::GateUp, 4, 1)),
+        ("down_nt8", spec(Kind::Down, 8, 1)),
+        ("down_nt4r2", spec(Kind::Down, 4, 2)),
+    ] {
+        assert_eq!(Spec::from_epi(epi, Arch::Gfx1201), Ok(want), "{epi}");
+    }
+    // The shipped gfx1201 entries are exactly the module's specs.
+    for want in specs(Arch::Gfx1201) {
+        let epi = want.variant();
+        assert_eq!(Spec::from_epi(&epi, Arch::Gfx1201), Ok(want), "{epi}");
+    }
+    for bad in [
+        "",
+        "up",
+        "down_nt",
+        "down_ntx",
+        "down_nt4rx",
+        "gate_up_nt99999",
+    ] {
+        assert!(Spec::from_epi(bad, Arch::Gfx1201).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn entries_are_deterministic_and_target_only_their_arches() {
     for arch in ARCHES {
         for spec in specs(arch) {

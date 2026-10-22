@@ -57,6 +57,7 @@ pub mod kernels {
     pub mod mq4_fp8_verify;
     pub mod mq4_rows_x4;
     pub mod mq4_verify;
+    pub mod mq6_i8_gemm;
     pub mod mq_i4_a4;
     pub mod mq_i4_moe_gemv;
     pub mod mq_i4_moe_gemv_c1;
@@ -80,6 +81,7 @@ pub mod kernels {
     pub mod qwen4_lane_rows;
     pub mod qwen4_lane_rows_mq6;
     pub mod qwen4_lane_rows_q8;
+    pub mod qwen4_moe_down_gp;
     pub mod qwen4_moe_sym;
     /// gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs; the E8P-I4 module is the gfx1151 Halo port (`--kernel qwen4_moe_sym_gfx11_e8p`).
     #[allow(dead_code, unused_imports)]
@@ -101,6 +103,8 @@ pub mod kernels {
 }
 #[cfg(feature = "toolchain")]
 pub mod audit;
+#[cfg(feature = "toolchain")]
+mod cert_cache;
 #[cfg(feature = "toolchain")]
 pub mod cost_lint;
 #[cfg(feature = "toolchain")]

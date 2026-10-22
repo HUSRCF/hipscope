@@ -1592,6 +1592,18 @@ pub static FIELDS: &[ConfigField] = &[
         "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). Default `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; `16` restores the previous fixed width. Legacy DFlash drafts keep their declared width."
     ),
     field!(
+        "speculation.dflash_lookup",
+        "dflash_lookup",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_LOOKUP"),
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+    ),
+    field!(
         "speculation.dflash",
         "dflash_mode",
         Speculation,
@@ -5026,6 +5038,30 @@ fn mtp_ngram_copy_enabled_for_arch_value(
         _ => false,
     }
 }
+/// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
+/// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
+/// `auto` (the schema default; an unset key also resolves to `auto`) and
+/// `on`/`1` arm it; only `off`/`0` disables it (CHANGELOG 0.4.3: +39.8%
+/// copy-heavy decode on R9700; non-copy requests run the incumbent window).
+/// This only resolves the user policy; the consumer (`DflashSpeculator`)
+/// additionally requires a singleton DFlash2 selector chain and reports the
+/// reason it declined.
+pub fn dflash_lookup_enabled() -> bool {
+    dflash_lookup_enabled_value(process_value("HIPFIRE_DFLASH_LOOKUP").as_deref())
+}
+fn dflash_lookup_enabled_value(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "off"))
+}
+/// Developer kill switch for the Tail windows of the DFlash lookup
+/// (`HIPFIRE_SPEC_LOOKUP_TAIL=0`, read through the `[developer]` namespace):
+/// an exact `0` disables only the Tail windows (Copy windows stay); anything
+/// else, including unset, leaves them on.
+pub fn dflash_lookup_tail_enabled() -> bool {
+    dflash_lookup_tail_enabled_value(process_value("HIPFIRE_SPEC_LOOKUP_TAIL").as_deref())
+}
+fn dflash_lookup_tail_enabled_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
 fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
     ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
 }
@@ -7989,6 +8025,49 @@ mod tests {
     }
 
     #[test]
+    fn dflash_lookup_key_and_resolver() {
+        let field = field("speculation.dflash_lookup").expect("dflash_lookup schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_DFLASH_LOOKUP"));
+        assert_eq!(field.legacy_key, "dflash_lookup");
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        for raw in ["auto", "on", "off", "1", "0"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+        }
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+        assert!(field.validate(&ConfigValue::String("true".into())).is_err());
+        // Default on: only an explicit off/0 disables; anything else is the default.
+        for (raw, expect) in [
+            (Some("on"), true),
+            (Some("1"), true),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("auto"), true),
+            (Some(""), true),
+            (Some("yes"), true),
+            (None, true),
+        ] {
+            assert_eq!(dflash_lookup_enabled_value(raw), expect, "{raw:?}");
+        }
+        // The live (unset) snapshot resolves to the auto default: on.
+        assert!(dflash_lookup_enabled());
+    }
+
+    #[test]
+    fn dflash_lookup_tail_kill_switch_is_strict_zero() {
+        // Default on (lookup itself is gated by `speculation.dflash_lookup`);
+        // only an exact `0` disables the Tail windows.
+        assert!(dflash_lookup_tail_enabled_value(None));
+        assert!(dflash_lookup_tail_enabled_value(Some("1")));
+        assert!(dflash_lookup_tail_enabled_value(Some("")));
+        assert!(dflash_lookup_tail_enabled_value(Some("off")));
+        assert!(!dflash_lookup_tail_enabled_value(Some("0")));
+        assert!(dflash_lookup_tail_enabled());
+    }
+
+    #[test]
     fn mtp_k_default_per_arch_and_auto_rule() {
         assert_eq!(mtp_k_default(16, 8), 7);
         assert_eq!(mtp_k_default(16, 16), 15);
@@ -10130,7 +10209,8 @@ pub mod memory {
     /// same reason in their fail-closed refusal).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SpillRefusal {
-        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        /// Neither Qwen3.5 dense (5) / MoE (6) nor LFM2.5 (11); carries the
+        /// arch id.
         Arch(u32),
         /// Tensor-parallel ranks each load every layer; carries tp.
         Tp(usize),
@@ -10159,10 +10239,11 @@ pub mod memory {
         is_vl: bool,
     ) -> SpillSupport {
         use SpillRefusal::*;
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in
-        // host RAM. Qwen4 has its own expert-residency route and the other
-        // arches have none, so either knob is a request this loader cannot honour.
-        if !matches!(arch_id, 5 | 6) {
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6 | 11) {
             return SpillSupport::Refused(Arch(arch_id));
         }
         if tp > 1 {
@@ -11032,7 +11113,7 @@ pub mod memory {
             use SpillSupport::{Refused, Supported};
             // Clean single-GPU non-VL non-paged non-REAP MoE: the only
             // supported shape (dense included — the policy is MoE-blind).
-            for arch_id in [5u32, 6] {
+            for arch_id in [5u32, 6, 11] {
                 assert_eq!(
                     spill_support(arch_id, 1, 1, None, false, false, false),
                     Supported,

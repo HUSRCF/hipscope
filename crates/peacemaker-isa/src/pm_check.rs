@@ -32,12 +32,67 @@ fn ir_arch(arch: &str) -> Result<peacemaker_ir::Arch> {
 }
 
 /// Lift, re-emit and analyze `symbol` in the linked ELF `elf`.
+///
+/// Successful receipts are cached by exact object bytes, architecture, symbol
+/// and the running checker's identity. See `cert_cache` for configuration and
+/// integrity rules. Cache failures never change certification's outcome.
 pub fn m7(elf: &Path, arch: &str, symbol: &str) -> Result<Value> {
-    use peacemaker_ir::passes::{barriers, windows};
+    m7_status(elf, arch, symbol).map(|(receipt, _)| receipt)
+}
+
+/// How [`m7_status`] obtained its receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum M7Cache {
+    /// A stored success receipt for exactly these inputs was returned; M7 did not run.
+    Hit,
+    /// The cache was consulted, M7 ran and its success receipt was stored.
+    Miss,
+    /// No cache applies (disabled or no executable identity): M7 ran uncached.
+    Disabled,
+}
+
+impl M7Cache {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// [`m7`] reporting whether the receipt came from the certification cache.
+pub fn m7_status(elf: &Path, arch: &str, symbol: &str) -> Result<(Value, M7Cache)> {
     let target = ir_arch(arch)?;
     let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let cache = crate::cert_cache::Cache::for_request(&bytes, arch, symbol);
+    if let Some(receipt) = cache.as_ref().and_then(crate::cert_cache::Cache::load) {
+        return Ok((receipt, M7Cache::Hit));
+    }
+    let receipt = m7_uncached(elf, &bytes, arch, symbol, target)?;
+    let status = if cache.is_some() {
+        M7Cache::Miss
+    } else {
+        M7Cache::Disabled
+    };
+    if let Some(cache) = cache {
+        cache.store(&receipt);
+    }
+    Ok((receipt, status))
+}
+
+fn m7_uncached(
+    elf: &Path,
+    bytes: &[u8],
+    arch: &str,
+    symbol: &str,
+    target: peacemaker_ir::Arch,
+) -> Result<Value> {
+    use peacemaker_ir::passes::{barriers, windows};
+    #[cfg(test)]
+    M7_RUNS.with(|runs| runs.set(runs.get() + 1));
     let lifted = peacemaker_lift::lift_object(
-        &bytes,
+        bytes,
         peacemaker_lift::Options {
             frontend: peacemaker_ir::inst::Frontend::Builder,
         },
@@ -110,6 +165,11 @@ pub fn m7(elf: &Path, arch: &str, symbol: &str) -> Result<Value> {
         ));
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+thread_local! {
+    static M7_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Lane values of one wave: `None` is a value the prologue cannot know.
@@ -630,5 +690,178 @@ mod tests {
         ] {
             assert!(lds_bounds(&bad, "k", 2, 1 << 20).is_err(), "{bad}")
         }
+    }
+}
+
+// Environment configuration is exercised in fresh test subprocesses rather
+// than mutating process-global variables while other tests are running.
+#[cfg(all(test, target_os = "linux"))]
+mod cache_tests {
+    use super::{m7, M7_RUNS};
+    use std::path::{Path, PathBuf};
+
+    fn fixture() -> (Vec<u8>, &'static str) {
+        use crate::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
+        use peacemaker_author::{Gfx1151, Workgroup};
+        let mut regs = RegPlan::new(16, 8).unwrap();
+        regs.s::<4>("abi", 0, crate::reg::Live::Whole).unwrap();
+        regs.v::<1>("tid", 0, crate::reg::Live::Whole).unwrap();
+        let mut builder = Builder::new(
+            KernelSpec {
+                kernel_id: "probe".into(),
+                variant: "default".into(),
+                arch: Arch::Gfx1151,
+                symbol: "probe".into(),
+                kernargs: KernargLayout::new(8),
+                user_sgpr_count: 2,
+                system_sgpr_workgroup_id_y: false,
+                workgroup_size: 64,
+                group_segment_fixed_size: 0,
+                wave32: true,
+                cu_mode: false,
+            },
+            regs,
+        );
+        let mut workgroup = Workgroup::<Gfx1151, Builder>::new(&mut builder).unwrap();
+        let exit = workgroup.exit(".Lend").unwrap();
+        workgroup.end(exit).unwrap();
+        let emitted = builder.finish().unwrap();
+        (
+            crate::native::assemble(&emitted.s_text, Arch::Gfx1151).unwrap(),
+            "probe",
+        )
+    }
+
+    fn isolated(case: &str) {
+        let root = std::env::temp_dir().join(format!(
+            "pm-m7-{}-{}-{case}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = root.join("cache");
+        if case == "unwritable" {
+            std::fs::write(&cache, b"not a directory").unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pm_check::cache_tests::cache_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HIPFIRE_M7_TEST_CASE", case)
+            .env("HIPFIRE_M7_TEST_ROOT", &root)
+            .env(
+                "HIPFIRE_CERT_CACHE",
+                if case == "disabled" {
+                    Path::new("0")
+                } else {
+                    &cache
+                },
+            )
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if case == "unwritable" {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .matches("warning: M7 certification cache")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_receipt_is_byte_identical_and_hits() {
+        isolated("repeat");
+    }
+
+    #[test]
+    fn changed_elf_bytes_miss() {
+        isolated("bytes");
+    }
+
+    #[test]
+    fn changed_architecture_misses() {
+        isolated("arch");
+    }
+
+    #[test]
+    fn changed_symbol_misses() {
+        isolated("symbol");
+    }
+
+    #[test]
+    fn corrupt_entry_recomputes() {
+        isolated("corrupt");
+    }
+
+    #[test]
+    fn disabled_cache_bypasses() {
+        isolated("disabled");
+    }
+
+    #[test]
+    fn unwritable_cache_warns_once_and_certifies() {
+        isolated("unwritable");
+    }
+
+    #[test]
+    #[ignore = "invoked in an isolated environment by the parent tests"]
+    fn cache_child() {
+        let case = std::env::var("HIPFIRE_M7_TEST_CASE").unwrap();
+        let root = PathBuf::from(std::env::var_os("HIPFIRE_M7_TEST_ROOT").unwrap());
+        let elf = root.join("fixture.co");
+        let (bytes, symbol) = fixture();
+        std::fs::write(&elf, &bytes).unwrap();
+        let first = m7(&elf, "gfx1151", symbol).unwrap();
+        assert_eq!(M7_RUNS.with(|runs| runs.get()), 1);
+        match case.as_str() {
+            "repeat" | "disabled" | "unwritable" => {
+                let second = m7(&elf, "gfx1151", symbol).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&first).unwrap(),
+                    serde_json::to_vec(&second).unwrap()
+                );
+                if case == "disabled" {
+                    assert!(!root.join("cache").exists());
+                }
+            }
+            "bytes" => {
+                let mut changed = bytes.clone();
+                changed[0] ^= 0xff;
+                std::fs::write(&elf, changed).unwrap();
+                assert!(m7(&elf, "gfx1151", symbol).is_err());
+            }
+            "arch" => assert!(m7(&elf, "gfx1100", symbol).is_err()),
+            "symbol" => assert!(m7(&elf, "gfx1151", "missing_kernel").is_err()),
+            "corrupt" => {
+                let cache =
+                    crate::cert_cache::Cache::for_request(&bytes, "gfx1151", symbol).unwrap();
+                std::fs::write(cache.path(), b"{truncated").unwrap();
+                let second = m7(&elf, "gfx1151", symbol).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&first).unwrap(),
+                    serde_json::to_vec(&second).unwrap()
+                );
+                assert_eq!(cache.load(), Some(first));
+            }
+            _ => panic!("unknown isolated test case {case}"),
+        }
+        assert_eq!(
+            M7_RUNS.with(|runs| runs.get()),
+            if case == "repeat" { 1 } else { 2 }
+        );
     }
 }

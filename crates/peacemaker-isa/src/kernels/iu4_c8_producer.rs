@@ -19,6 +19,20 @@
 //! contracts the sign multiply into an FMA, which is bit-identical to the separate product only because the
 //! product with `+-1` is exact).
 //!
+//! Two further exports fold the standalone passes that feed these producers on the A3B MoE prefill route; both take
+//! an 80-byte kernarg block (the frozen 72 bytes plus one pointer @72) and leave every byte the unfused chain
+//! produces unchanged:
+//!
+//!  * `iu4_c8_sigmoid_rotate_pm_gfx1201` - the rotate export whose input is first gated: `x = attn * sigmoid(gate)`
+//!    with the exact `sigmoid_mul_f32` expression (`1 / (1 + expf(-g))`, hipcc's range-reduced `expf` and IEEE
+//!    division op for op), then the identical AWQ / rotate / C8 path. `gate`@72 f32 `[rows, K]` (K 2048 or 4096).
+//!  * `iu4_c8_rmsnorm_out_rotate_pm_gfx1201` - the RMSNorm export in the reduction order of the standalone
+//!    `rmsnorm_f32` kernel (block 256, thread partial `fma` chain, then the `sdata[t] += sdata[t + s]` tree
+//!    `s = 128 .. 1`: cross-wave first, then the wave) that also stores the normalized f32 row (`norm_out`@72,
+//!    `y = (x * w) * rms`, before the AWQ divide and the sign product) next to the rotated row and the sidecar.
+//!    The incumbent `rmsnorm_f32` order differs from the fused RMSNorm export above (wave tree first), so the
+//!    two norm exports are not interchangeable.
+//!
 //! # Arithmetic (every rounding point equals the incumbent objects)
 //!
 //! Lane `p` of a wave owns the eight consecutive elements `8p..8p+7` of a 256-element FWHT group.
@@ -70,6 +84,12 @@ pub const MODULE: &str = "iu4_c8_producer_pm_gfx1201";
 pub const ROTATE_SYMBOL: &str = "iu4_c8_rotate_pm_gfx1201";
 /// RMSNorm + rotate export.
 pub const NORM_SYMBOL: &str = "iu4_c8_rmsnorm_rotate_pm_gfx1201";
+/// Sigmoid-gated rotate export (`sigmoid_mul_f32` folded into the rotate producer).
+pub const SIGMOID_ROTATE_SYMBOL: &str = "iu4_c8_sigmoid_rotate_pm_gfx1201";
+/// `rmsnorm_f32`-order RMSNorm + rotate export that also stores the normalized f32 row.
+pub const NORM_OUT_SYMBOL: &str = "iu4_c8_rmsnorm_out_rotate_pm_gfx1201";
+/// Kernarg segment bytes of the two extended exports (the frozen block plus one pointer @72).
+pub const KERNARG_BYTES_EXT: u32 = 80;
 /// Kernarg segment bytes.
 pub const KERNARG_BYTES: u32 = 72;
 /// Rotate block (one wave32 per 256-element group).
@@ -89,17 +109,21 @@ pub fn candidate_multiplier(j: u32) -> f32 {
     1.0f32 + (j as f32) / 7.0f32
 }
 
-/// One of the two exports.
+/// One of the four exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Export {
     Rotate,
     Norm,
+    SigmoidRotate,
+    NormOut,
 }
 impl Export {
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Rotate => ROTATE_SYMBOL,
             Self::Norm => NORM_SYMBOL,
+            Self::SigmoidRotate => SIGMOID_ROTATE_SYMBOL,
+            Self::NormOut => NORM_OUT_SYMBOL,
         }
     }
     /// Contract file tag.
@@ -107,31 +131,66 @@ impl Export {
         match self {
             Self::Rotate => "rotate",
             Self::Norm => "norm",
+            Self::SigmoidRotate => "sigmoid_rotate",
+            Self::NormOut => "norm_out",
+        }
+    }
+    /// The RMSNorm-fronted exports (block 256, eight waves).
+    pub fn is_norm(self) -> bool {
+        matches!(self, Self::Norm | Self::NormOut)
+    }
+    /// The exports with the extra pointer @72 (80-byte kernarg block).
+    pub fn extended(self) -> bool {
+        matches!(self, Self::SigmoidRotate | Self::NormOut)
+    }
+    pub fn kernarg_bytes(self) -> u32 {
+        if self.extended() {
+            KERNARG_BYTES_EXT
+        } else {
+            KERNARG_BYTES
         }
     }
     pub fn block(self) -> u32 {
+        if self.is_norm() {
+            NORM_BLOCK
+        } else {
+            ROTATE_BLOCK
+        }
+    }
+    /// Bytes of the one LDS slot (`0` = none).
+    pub fn lds_bytes(self) -> u32 {
         match self {
-            Self::Rotate => ROTATE_BLOCK,
-            Self::Norm => NORM_BLOCK,
+            Self::Norm => 32,
+            Self::NormOut => 1024,
+            _ => 0,
         }
     }
     fn exit(self) -> &'static str {
         match self {
             Self::Rotate => ".Liu4c8r_exit",
             Self::Norm => ".Liu4c8n_exit",
+            Self::SigmoidRotate => ".Liu4c8s_exit",
+            Self::NormOut => ".Liu4c8o_exit",
         }
     }
     fn skip_awq(self) -> &'static str {
         match self {
             Self::Rotate => ".Liu4c8r_noawq",
             Self::Norm => ".Liu4c8n_noawq",
+            Self::SigmoidRotate => ".Liu4c8s_noawq",
+            Self::NormOut => ".Liu4c8o_noawq",
         }
     }
 }
 
 /// The module's exports in order.
-pub fn module_exports() -> [Export; 2] {
-    [Export::Rotate, Export::Norm]
+pub fn module_exports() -> [Export; 4] {
+    [
+        Export::Rotate,
+        Export::Norm,
+        Export::SigmoidRotate,
+        Export::NormOut,
+    ]
 }
 
 /// Pure launch validation (host side): rotate K 2048 / 4096, norm K 2048, rows `1..=8192`.
@@ -140,8 +199,8 @@ pub fn validate(export: Export, k: usize, rows: usize) -> Result<(), String> {
         return Err(format!("rows {rows} outside 1..={MAX_ROWS}"));
     }
     let ok = match export {
-        Export::Rotate => k == 2048 || k == 4096,
-        Export::Norm => k == NORM_K as usize,
+        Export::Rotate | Export::SigmoidRotate => k == 2048 || k == 4096,
+        Export::Norm | Export::NormOut => k == NORM_K as usize,
     };
     if ok {
         Ok(())
@@ -197,6 +256,11 @@ const TAKE: u8 = 56;
 const EL: u8 = 57;
 /// The norm's phase-1a row base (x row, no group offset).
 const XP0_ROW: u8 = 58;
+/// The extended exports' extra kernarg pointer (`gate` / `norm_out`), then that pointer plus the run's byte offset.
+const ARG_XTRA: u8 = 60;
+const XTP: u8 = 62;
+/// `expf` range-select mask.
+const GM: u8 = 64;
 
 // ------------------------------------------------------------------ VGPR map
 const TID: u8 = 0;
@@ -276,6 +340,9 @@ fn plan() -> Result<RegPlan, String> {
         ("take_mask", Kind::S, TAKE, 1),
         ("element_offset", Kind::S, EL, 1),
         ("row_pointer", Kind::S, XP0_ROW, 2),
+        ("extra_arg", Kind::S, ARG_XTRA, 2),
+        ("extra_pointer", Kind::S, XTP, 2),
+        ("exp_mask", Kind::S, GM, 1),
         ("lane_block", Kind::V, TID, 8),
         ("x", Kind::V, X, 8),
         ("signs1_partners", Kind::V, S1, 8),
@@ -344,6 +411,25 @@ fn gstore_b32(b: &mut Builder, voff: u8, data: u8, sbase: u8, imm: u32) -> R {
         ),
         &[],
         &[v(voff), v(data), sr(sbase, 2)],
+        MemoryClass::VmemStore,
+    )
+}
+
+fn gstore_b128(b: &mut Builder, voff: u8, data: u8, sbase: u8, imm: u32) -> R {
+    let off = if imm == 0 {
+        String::new()
+    } else {
+        format!(" offset:{imm}")
+    };
+    let d = vr(data, 4);
+    mem(
+        b,
+        format!(
+            "global_store_b128 v{voff}, {d}, s[{sbase}:{}]{off}",
+            sbase + 1
+        ),
+        &[],
+        &[v(voff), d, sr(sbase, 2)],
         MemoryClass::VmemStore,
     )
 }
@@ -461,6 +547,77 @@ fn fdiv(b: &mut Builder, dst: u8, num: u8, den: Opd) -> R {
     )
 }
 
+/// hipcc's `expf(x)` (OCML f32: range-reduced `v_exp_f32` with under/overflow selects), op for op. `t` needs three
+/// temporaries and `m` one mask SGPR; `dst` may alias `x`. The sigmoid passes `x = -gate`: the product
+/// `log2(e) * (-g)` and the correction FMA are the negations of the incumbent's `(-log2(e)) * g` forms, so every
+/// intermediate is bit-identical, and the two range tests are the incumbent's `g > 103.27` / `g < -88.72` selects.
+fn expf(b: &mut Builder, dst: u8, x: u8, t: [u8; 3], m: u8) -> R {
+    let [a, e, n] = t;
+    op(
+        b,
+        format!("v_mul_f32_e32 v{a}, 0x3fb8aa3b, v{x}"),
+        &[v(a)],
+        &[v(x)],
+    )?;
+    op(
+        b,
+        format!("v_fma_f32 v{e}, 0x3fb8aa3b, v{x}, -v{a}"),
+        &[v(e)],
+        &[v(x), v(a)],
+    )?;
+    op(b, format!("v_rndne_f32_e32 v{n}, v{a}"), &[v(n)], &[v(a)])?;
+    op(
+        b,
+        format!("v_fmac_f32_e32 v{e}, 0x32a5705f, v{x}"),
+        &[v(e)],
+        &[v(e), v(x)],
+    )?;
+    op(
+        b,
+        format!("v_sub_f32_e32 v{a}, v{a}, v{n}"),
+        &[v(a)],
+        &[v(a), v(n)],
+    )?;
+    op(
+        b,
+        format!("v_add_f32_e32 v{a}, v{a}, v{e}"),
+        &[v(a)],
+        &[v(a), v(e)],
+    )?;
+    op(b, format!("v_cvt_i32_f32_e32 v{n}, v{n}"), &[v(n)], &[v(n)])?;
+    op(b, format!("v_exp_f32_e32 v{a}, v{a}"), &[v(a)], &[v(a)])?;
+    op(
+        b,
+        format!("v_ldexp_f32 v{a}, v{a}, v{n}"),
+        &[v(a)],
+        &[v(a), v(n)],
+    )?;
+    op(
+        b,
+        format!("v_cmp_ngt_f32_e64 s{m}, 0xc2ce8ed0, v{x}"),
+        &[s(m)],
+        &[v(x)],
+    )?;
+    op(
+        b,
+        format!("v_cndmask_b32_e64 v{a}, 0, v{a}, s{m}"),
+        &[v(a)],
+        &[v(a), s(m)],
+    )?;
+    op(
+        b,
+        format!("v_cmp_nlt_f32_e64 s{m}, 0x42b17218, v{x}"),
+        &[s(m)],
+        &[v(x)],
+    )?;
+    op(
+        b,
+        format!("v_cndmask_b32_e64 v{dst}, 0x7f800000, v{a}, s{m}"),
+        &[v(dst)],
+        &[v(a), s(m)],
+    )
+}
+
 // ------------------------------------------------------------------ prologues
 /// Kernarg loads, launch validation, the (row, group) of the workgroup, pointers and per-lane constants.
 /// Leaves `ROW`, `GRP` (norm: `GRP` = wave, set after `v_readfirstlane`) valid and every pointer built.
@@ -469,8 +626,11 @@ fn prologue(b: &mut Builder, export: Export) -> R {
     let exit = export.exit();
     smem(b, ARG_X, 8, KARG, 0)?;
     smem(b, ARG_S2, 8, KARG, 32)?;
-    if export == Export::Norm {
+    if export.is_norm() {
         smem(b, ARG_EPS, 1, KARG, 64)?;
+    }
+    if export.extended() {
+        smem(b, ARG_XTRA, 2, KARG, 72)?;
     }
     sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
     // rows in 1..=8192 (unsigned: rows - 1 < 8192).
@@ -488,7 +648,7 @@ fn prologue(b: &mut Builder, export: Export) -> R {
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     match export {
-        Export::Rotate => {
+        Export::Rotate | Export::SigmoidRotate => {
             // K 2048 -> shift 3, K 4096 -> shift 4, otherwise exit.
             sop(
                 b,
@@ -533,7 +693,7 @@ fn prologue(b: &mut Builder, export: Export) -> R {
                 &[WGX, T0],
             )?;
         }
-        Export::Norm => {
+        Export::Norm | Export::NormOut => {
             sop(
                 b,
                 format!("s_cmp_lg_u32 s{ARG_K}, {}", lit(NORM_K)),
@@ -582,6 +742,9 @@ fn prologue(b: &mut Builder, export: Export) -> R {
     )?;
     sop(b, format!("s_lshl_b32 s{EL}, s{T0}, 2"), &[EL], &[T0])?;
     add64(b, XP, ARG_X, EL)?;
+    if export.extended() {
+        add64(b, XTP, ARG_XTRA, EL)?;
+    }
     add64(b, RSRD, ARG_ROT, EL)?;
     sop(
         b,
@@ -640,7 +803,7 @@ fn prologue(b: &mut Builder, export: Export) -> R {
         &[sr(AP, 2)],
         &[sr(XP, 2), sr(AP, 2)],
     )?;
-    if export == Export::Norm {
+    if export.is_norm() {
         add64(b, WP, ARG_W, T1)?;
     }
     // Constants.
@@ -664,7 +827,7 @@ fn prologue(b: &mut Builder, export: Export) -> R {
     )?;
     sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
     sop(b, format!("s_mov_b32 s{MHI}, 0xffff0000"), &[MHI], &[])?;
-    if export == Export::Norm {
+    if export.is_norm() {
         sop(
             b,
             format!("s_mov_b32 s{KDIV}, {}", lit((NORM_K as f32).to_bits())),
@@ -749,6 +912,53 @@ fn rotate_front(b: &mut Builder) -> R {
     awq_and_signs(b, Export::Rotate)
 }
 
+/// Sigmoid-gated rotate: the rotate loads plus the gate row, `x = x * (1 / (1 + expf(-g)))` per element (the
+/// incumbent `sigmoid_mul_f32` expression, divide through the shared IEEE expansion with a register `1.0`
+/// numerator), then the AWQ divide and `x * signs1` of the plain rotate.
+fn sigmoid_rotate_front(b: &mut Builder) -> R {
+    for h in 0..2u32 {
+        gload(b, X + 4 * h as u8, 4, VOFF, XP, 16 * h)?;
+    }
+    for h in 0..2u32 {
+        gload(b, S1 + 4 * h as u8, 4, VOFF, ARG_S1, 16 * h)?;
+    }
+    for h in 0..2u32 {
+        gload(b, S2 + 4 * h as u8, 4, VOFF, ARG_S2, 16 * h)?;
+    }
+    for h in 0..2u32 {
+        gload(b, AW + 4 * h as u8, 4, VOFF, AP, 16 * h)?;
+    }
+    for h in 0..2u32 {
+        gload(b, WT + 4 * h as u8, 4, VOFF, XTP, 16 * h)?;
+    }
+    b.wait_all()?;
+    for k in 0..8u8 {
+        let g = WT + k;
+        op(
+            b,
+            format!("v_xor_b32_e32 v{g}, {}, v{g}", lit(0x8000_0000)),
+            &[v(g)],
+            &[v(g)],
+        )?;
+        expf(b, g, g, [61, 62, 63], GM)?;
+        op(
+            b,
+            format!("v_add_f32_e32 v{g}, 1.0, v{g}"),
+            &[v(g)],
+            &[v(g)],
+        )?;
+        op(b, "v_mov_b32_e32 v63, 1.0".to_string(), &[v(63)], &[])?;
+        fdiv(b, g, 63, Opd::V(g))?;
+        op(
+            b,
+            format!("v_mul_f32_e32 v{0}, v{0}, v{g}", X + k),
+            &[v(X + k)],
+            &[v(X + k), v(g)],
+        )?;
+    }
+    awq_and_signs(b, Export::SigmoidRotate)
+}
+
 /// `x[k] / awq[k]` when a table is present (a scalar skip, with every load drained first so the builder's wait
 /// ledger agrees on both paths), then `x[k] * signs1[k]`.
 fn awq_and_signs(b: &mut Builder, export: Export) -> R {
@@ -795,7 +1005,7 @@ fn ds_load_b128(dst: u8, addr: u8, off: u32) -> Instruction {
 
 /// Norm: phase 1a sum of squares, wave tree, LDS, the eight-root tree, `rsqrt`, then `y = (x * w) * rms`
 /// (AWQ `/ awq`), `y * signs1`.
-fn norm_front(b: &mut Builder) -> R {
+fn norm_front(b: &mut Builder, export: Export) -> R {
     // Phase 1a: 8 dword loads of the row at tid + 256 j (into the spare block), then the phase-2 prefetch.
     op(
         b,
@@ -836,40 +1046,71 @@ fn norm_front(b: &mut Builder) -> R {
             &[v(NV_SUM), v(PART + j)],
         )?;
     }
-    // Wave tree 16, 8, 4, 2, 1.
-    for m in [16u32, 8, 4, 2, 1] {
-        xch(b, NV_TMP, NV_SUM, m)?;
+    if export == Export::Norm {
+        wave_tree(b)?;
+        // Every lane of the wave stores the same wave sum at wave * 4; one barrier publishes all eight.
+        // (The masks are the form `pm_check::lds_bounds` proves: wave * 4 <= 28 for the store, address 0 for the loads.)
         op(
             b,
-            format!("v_add_f32_e32 v{NV_SUM}, v{NV_SUM}, v{NV_TMP}"),
-            &[v(NV_SUM)],
-            &[v(NV_SUM), v(NV_TMP)],
+            format!("v_lshlrev_b32_e32 v{NV_LDSA}, 2, v{NV_WAVEV}"),
+            &[v(NV_LDSA)],
+            &[v(NV_WAVEV)],
         )?;
+        op(
+            b,
+            format!("v_and_b32_e32 v{NV_LDSA}, {}, v{NV_LDSA}", lit(0x1c)),
+            &[v(NV_LDSA)],
+            &[v(NV_LDSA)],
+        )?;
+        b.ds_store(0, ds_store_b32(NV_LDSA, NV_SUM))?;
+        b.barrier(&[Transition::Ready(0)])?;
+        op(
+            b,
+            format!("v_and_b32_e32 v{NV_T4}, 0, v{LANE}"),
+            &[v(NV_T4)],
+            &[v(LANE)],
+        )?;
+        b.ds_load(0, ds_load_b128(PART, NV_T4, 0))?;
+        b.ds_load(0, ds_load_b128(PART + 4, NV_T4, 16))?;
+    } else {
+        // `rmsnorm_f32` order: every thread publishes its partial at `lane * 32 + wave * 4` (1 KiB, masks bound the
+        // address at 1020), one barrier, then lane `l` of every wave reads the eight waves' partials of lane `l`
+        // (the incumbent's `sdata[l + 32 k]`, `k` = wave) with two `ds_load_b128` from `lane * 32`.
+        op(
+            b,
+            format!("v_lshlrev_b32_e32 v{NV_LDSA}, 5, v{LANE}"),
+            &[v(NV_LDSA)],
+            &[v(LANE)],
+        )?;
+        op(
+            b,
+            format!("v_lshl_add_u32 v{NV_LDSA}, v{NV_WAVEV}, 2, v{NV_LDSA}"),
+            &[v(NV_LDSA)],
+            &[v(NV_WAVEV), v(NV_LDSA)],
+        )?;
+        op(
+            b,
+            format!("v_and_b32_e32 v{NV_LDSA}, {}, v{NV_LDSA}", lit(0x3fc)),
+            &[v(NV_LDSA)],
+            &[v(NV_LDSA)],
+        )?;
+        b.ds_store(0, ds_store_b32(NV_LDSA, NV_SUM))?;
+        b.barrier(&[Transition::Ready(0)])?;
+        op(
+            b,
+            format!("v_lshlrev_b32_e32 v{NV_T4}, 5, v{LANE}"),
+            &[v(NV_T4)],
+            &[v(LANE)],
+        )?;
+        op(
+            b,
+            format!("v_and_b32_e32 v{NV_T4}, {}, v{NV_T4}", lit(0x3e0)),
+            &[v(NV_T4)],
+            &[v(NV_T4)],
+        )?;
+        b.ds_load(0, ds_load_b128(PART, NV_T4, 0))?;
+        b.ds_load(0, ds_load_b128(PART + 4, NV_T4, 16))?;
     }
-    // Every lane of the wave stores the same wave sum at wave * 4; one barrier publishes all eight.
-    // (The masks are the form `pm_check::lds_bounds` proves: wave * 4 <= 28 for the store, address 0 for the loads.)
-    op(
-        b,
-        format!("v_lshlrev_b32_e32 v{NV_LDSA}, 2, v{NV_WAVEV}"),
-        &[v(NV_LDSA)],
-        &[v(NV_WAVEV)],
-    )?;
-    op(
-        b,
-        format!("v_and_b32_e32 v{NV_LDSA}, {}, v{NV_LDSA}", lit(0x1c)),
-        &[v(NV_LDSA)],
-        &[v(NV_LDSA)],
-    )?;
-    b.ds_store(0, ds_store_b32(NV_LDSA, NV_SUM))?;
-    b.barrier(&[Transition::Ready(0)])?;
-    op(
-        b,
-        format!("v_and_b32_e32 v{NV_T4}, 0, v{LANE}"),
-        &[v(NV_T4)],
-        &[v(LANE)],
-    )?;
-    b.ds_load(0, ds_load_b128(PART, NV_T4, 0))?;
-    b.ds_load(0, ds_load_b128(PART + 4, NV_T4, 16))?;
     let r = |i: u8| PART + i;
     // ((r0 + r4) + (r2 + r6)) + ((r1 + r5) + (r3 + r7)).
     for (d, x, y) in [(TA, r(0), r(4)), (TB, r(2), r(6))] {
@@ -906,6 +1147,10 @@ fn norm_front(b: &mut Builder) -> R {
         &[v(NV_SUM)],
         &[v(TA), v(TB)],
     )?;
+    if export == Export::NormOut {
+        // The remaining in-wave steps of the incumbent tree (`s = 16 .. 1`), after the cross-wave levels above.
+        wave_tree(b)?;
+    }
     // mean = sum / 2048.0f; eps + mean; the incumbent's vector rsqrt with its denormal guard.
     fdiv(b, NV_TMP, NV_SUM, Opd::S(KDIV))?;
     op(
@@ -967,7 +1212,28 @@ fn norm_front(b: &mut Builder) -> R {
             &[v(X + k), v(NV_SUM)],
         )?;
     }
-    awq_and_signs(b, Export::Norm)
+    if export == Export::NormOut {
+        // The normalized f32 row (`y` before the AWQ divide and the sign product), then release the store
+        // sources: the divide and the sign product overwrite them in place.
+        gstore_b128(b, VOFF, X, XTP, 0)?;
+        gstore_b128(b, VOFF, X + 4, XTP, 16)?;
+        b.release_store_sources()?;
+    }
+    awq_and_signs(b, export)
+}
+
+/// Wave XOR tree 16, 8, 4, 2, 1 over `NV_SUM`: every lane ends with the incumbent's `shfl_down` lane 0 value.
+fn wave_tree(b: &mut Builder) -> R {
+    for m in [16u32, 8, 4, 2, 1] {
+        xch(b, NV_TMP, NV_SUM, m)?;
+        op(
+            b,
+            format!("v_add_f32_e32 v{NV_SUM}, v{NV_SUM}, v{NV_TMP}"),
+            &[v(NV_SUM)],
+            &[v(NV_SUM), v(NV_TMP)],
+        )?;
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ FWHT, scale, store, quantizer
@@ -1303,7 +1569,7 @@ fn store_record(b: &mut Builder, export: Export) -> R {
 // ------------------------------------------------------------------ emission
 pub fn emit(arch: Arch, export: Export) -> Result<Emitted, String> {
     admit(arch)?;
-    let kernargs = KernargLayout::new(KERNARG_BYTES)
+    let mut kernargs = KernargLayout::new(export.kernarg_bytes())
         .pointer_access("x", 0, Access::ReadOnly)
         .pointer_access("rotated", 8, Access::WriteOnly)
         .pointer_access("sidecar", 16, Access::WriteOnly)
@@ -1314,6 +1580,11 @@ pub fn emit(arch: Arch, export: Export) -> Result<Emitted, String> {
         .hidden("rows", 56, 4, "by_value")
         .hidden("k", 60, 4, "by_value")
         .hidden("eps", 64, 4, "by_value");
+    kernargs = match export {
+        Export::SigmoidRotate => kernargs.pointer_access("gate", 72, Access::ReadOnly),
+        Export::NormOut => kernargs.pointer_access("norm_out", 72, Access::WriteOnly),
+        _ => kernargs,
+    };
     let kspec = KernelSpec {
         kernel_id: KERNEL_ID.into(),
         variant: export.tag().into(),
@@ -1323,19 +1594,20 @@ pub fn emit(arch: Arch, export: Export) -> Result<Emitted, String> {
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: false,
         workgroup_size: export.block() as u16,
-        group_segment_fixed_size: if export == Export::Norm { 32 } else { 0 },
+        group_segment_fixed_size: export.lds_bytes(),
         wave32: true,
         cu_mode: false,
     };
     let mut b = Builder::new(kspec, plan()?);
     b.enable_delay_alu();
-    if export == Export::Norm && b.lds_slot("rms_partials", 0, 32)? != 0 {
+    if export.lds_bytes() != 0 && b.lds_slot("rms_partials", 0, export.lds_bytes())? != 0 {
         return Err("LDS slot order".into());
     }
     prologue(&mut b, export)?;
     match export {
         Export::Rotate => rotate_front(&mut b)?,
-        Export::Norm => norm_front(&mut b)?,
+        Export::SigmoidRotate => sigmoid_rotate_front(&mut b)?,
+        Export::Norm | Export::NormOut => norm_front(&mut b, export)?,
     }
     fwht_scale_store(&mut b)?;
     quantize(&mut b)?;
@@ -1357,12 +1629,14 @@ pub fn emit_module(
 }
 
 // ------------------------------------------------------------------ contract
-const COUNTED: [&str; 31] = [
+const COUNTED: [&str; 37] = [
     "s_load_b256",
     "s_load_b32",
+    "s_load_b64",
     "global_load_b32",
     "global_load_b128",
     "global_store_b32",
+    "global_store_b128",
     "buffer_store_b128",
     "ds_store_b32",
     "ds_load_b128",
@@ -1381,6 +1655,10 @@ const COUNTED: [&str; 31] = [
     "v_mov_b32_dpp",
     "v_permlanex16_b32",
     "v_cvt_i32_f32_e32",
+    "v_exp_f32_e32",
+    "v_ldexp_f32",
+    "v_cmp_ngt_f32_e64",
+    "v_cmp_nlt_f32_e64",
     "v_cndmask_b32_e64",
     "v_cmp_lt_f32_e64",
     "v_cmp_eq_f32_e64",
@@ -1432,7 +1710,7 @@ pub fn contract(arch: Arch, e: &Emitted, export: Export) -> serde_json::Value {
         "s_add_f32",
         "s_mul_f32",
     ];
-    if export == Export::Rotate {
+    if matches!(export, Export::Rotate | Export::SigmoidRotate) {
         forbidden.extend(["ds_*", "s_barrier*"]);
     } else {
         forbidden.extend([
@@ -1448,6 +1726,6 @@ pub fn contract(arch: Arch, e: &Emitted, export: Export) -> serde_json::Value {
         "vgpr_max": VGPRS, "sgpr_max": 104,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
         "launch_dynamic_lds_bytes": 0,
-        "group_segment_fixed_bytes": if export == Export::Norm { 32 } else { 0 },
+        "group_segment_fixed_bytes": export.lds_bytes(),
     })
 }

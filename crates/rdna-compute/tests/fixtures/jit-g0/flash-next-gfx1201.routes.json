@@ -2687,12 +2687,7 @@
         "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/tensor_ops/rep-1/kernel.hsaco",
         "sha256": "8986bb3e28863f4e2f56a87c3928a5c1bfcdc784979f70607bad4d4eaeb08952"
       },
-      "registry_missing_symbols": [
-        "indexed_attention_attention_q8_batched",
-        "indexed_attention_attention_q8_batched_hg4",
-        "indexed_attention_cache_append_q8_batched",
-        "indexed_attention_decode_prologue_q8"
-      ]
+      "registry_missing_symbols": []
     },
     {
       "arch": "gfx1201",
@@ -4805,12 +4800,7 @@
             "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/tensor_ops/rep-1/kernel.hsaco",
             "sha256": "8986bb3e28863f4e2f56a87c3928a5c1bfcdc784979f70607bad4d4eaeb08952"
           },
-          "registry_missing_symbols": [
-            "indexed_attention_attention_q8_batched",
-            "indexed_attention_attention_q8_batched_hg4",
-            "indexed_attention_cache_append_q8_batched",
-            "indexed_attention_decode_prologue_q8"
-          ]
+          "registry_missing_symbols": []
         }
       ]
     }

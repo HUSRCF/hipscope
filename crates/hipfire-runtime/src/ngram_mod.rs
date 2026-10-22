@@ -575,6 +575,85 @@ impl MtpCopyContext {
         None
     }
 
+    /// Like [`propose`](Self::propose), but looks up as if `speculative_prefix`
+    /// had already been appended to the request's history, and copies what
+    /// followed the matched earlier occurrence. This is the lookup tail of a
+    /// speculative verify window: the prefix is the window's learned
+    /// (unverified) draft candidates, and the returned candidates are meant to
+    /// follow them.
+    ///
+    /// Semantics:
+    /// - [`sync_emitted`](Self::sync_emitted)`(emitted)` only; the committed
+    ///   history is `prompt ++ emitted`.
+    /// - For each key length `n` (longest first, the same tables and slot hash
+    ///   as `propose`), the key is the last `n` tokens of
+    ///   `history ++ speculative_prefix`, hashed straight off the two slices
+    ///   (no scratch, no allocation; any `n_match` works).
+    /// - A stored position `pos` is accepted only if `pos < history.len()`,
+    ///   `pos >= n`, and `history[pos - n..pos]` equals the key token for token
+    ///   (a hash collision or another request's stale slot never proposes).
+    /// - `take = min(n_max, caller_max, history.len() - pos)` must be
+    ///   `>= n_min`, else the next shorter key is tried.
+    /// - The copied source is committed history only: candidates are
+    ///   `history[pos..pos + take]`; speculative ids are never copied.
+    ///
+    /// `speculative_prefix` ids are NEVER inserted into the tables or the
+    /// history, so a rejected/aborted prefix leaves no trace; an empty prefix is
+    /// exactly `propose(emitted, caller_max)`. The slice borrows the internal
+    /// buffer. `None` before `begin_request`.
+    pub fn propose_after(
+        &mut self,
+        emitted: &[u32],
+        speculative_prefix: &[u32],
+        caller_max: usize,
+    ) -> Option<&[u32]> {
+        if !self.begun {
+            return None;
+        }
+        self.sync_emitted(emitted);
+        self.candidate.clear();
+        let limit = self.config.n_max.min(caller_max);
+        if limit == 0 || self.config.n_min > limit {
+            return None;
+        }
+        let end = self.history.len();
+        let plen = speculative_prefix.len();
+        for (k, &n) in self.keys.iter().enumerate() {
+            if end + plen < n {
+                continue;
+            }
+            // key = (last `from_hist` tokens of history) ++ (last `from_pref` tokens of the prefix)
+            let from_pref = n.min(plen);
+            let from_hist = n - from_pref;
+            let hist_part = &self.history[end - from_hist..];
+            let pref_part = &speculative_prefix[plen - from_pref..];
+            let mut h = 0u64;
+            for &t in hist_part.iter().chain(pref_part.iter()) {
+                h = h.wrapping_mul(HASH_MUL).wrapping_add(u64::from(t));
+            }
+            let pos = self.table[k * self.slots + self.slot(h)];
+            if pos == EMPTY {
+                continue;
+            }
+            let pos = pos as usize;
+            if pos >= end || pos < n {
+                continue;
+            }
+            let cand_key = &self.history[pos - n..pos];
+            if cand_key[..from_hist] != *hist_part || cand_key[from_hist..] != *pref_part {
+                continue;
+            }
+            let take = limit.min(end - pos);
+            if take == 0 || take < self.config.n_min {
+                continue;
+            }
+            self.candidate
+                .extend_from_slice(&self.history[pos..pos + take]);
+            return Some(&self.candidate);
+        }
+        None
+    }
+
     /// Drop the request's history and set `begun = false` (allocations kept).
     pub fn reset_request(&mut self) {
         self.history.clear();
@@ -1311,5 +1390,356 @@ mod tests {
                 assert!(pos != EMPTY && pos as usize >= j, "key {n} at {j}: {pos}");
             }
         }
+    }
+
+    // ---- MtpCopyContext::propose_after -----------------------------------
+
+    /// Deterministic repetitive stream: random tokens interleaved with
+    /// verbatim copies of earlier segments.
+    fn copy_after_stream(len: usize, vocab: u32) -> Vec<u32> {
+        let mut s: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (s >> 33) as usize
+        };
+        let mut out: Vec<u32> = Vec::with_capacity(len + 64);
+        while out.len() < len {
+            if out.len() > 64 && next() % 3 != 0 {
+                let seg = 5 + next() % 36;
+                let from = next() % (out.len() - seg);
+                for i in 0..seg {
+                    let t = out[from + i];
+                    out.push(t);
+                }
+            } else {
+                for _ in 0..(1 + next() % 12) {
+                    out.push((next() as u32) % vocab);
+                }
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn copy_after_ctx(
+        n_match: usize,
+        n_min: usize,
+        n_max: usize,
+        prompt: &[u32],
+    ) -> MtpCopyContext {
+        let mut ctx = MtpCopyContext::new(copy_cfg(n_match, n_min, n_max)).unwrap();
+        ctx.begin_request(prompt);
+        ctx
+    }
+
+    #[test]
+    fn copy_after_zero_prefix_equals_propose() {
+        let stream = copy_after_stream(2200, 50);
+        let (prompt, tail) = stream.split_at(400);
+        let mut some = 0usize;
+        for (n_match, n_min, n_max) in [(3, 1, 8), (4, 2, 15), (24, 4, 15), (40, 3, 15)] {
+            let mut a = copy_after_ctx(n_match, n_min, n_max, prompt);
+            let mut b = copy_after_ctx(n_match, n_min, n_max, prompt);
+            for i in 0..=1700 {
+                let emitted = &tail[..i];
+                let cm = 1 + (i % 15);
+                let want = a.propose(emitted, cm).map(<[u32]>::to_vec);
+                let got = b.propose_after(emitted, &[], cm).map(<[u32]>::to_vec);
+                assert_eq!(want, got, "cfg {n_match}/{n_min}/{n_max} i={i} cm={cm}");
+                some += usize::from(want.is_some());
+            }
+            assert_eq!(a.history(), b.history());
+        }
+        assert!(some > 500, "stream too sparse to be a real check: {some}");
+    }
+
+    #[test]
+    fn copy_after_before_begin_is_none() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 8)).unwrap();
+        assert!(ctx.propose_after(&[1, 2], &[3], 8).is_none());
+    }
+
+    #[test]
+    fn copy_after_prefix_crosses_committed_boundary() {
+        let prompt: Vec<u32> = (100..140).collect();
+        let mut ctx = copy_after_ctx(3, 1, 8, &prompt);
+        let emitted = [100u32, 101];
+        // Key [100 101 102] = 2 committed tokens + 1 prefix token (idx 0..3).
+        assert_eq!(
+            ctx.propose_after(&emitted, &[102], 8).unwrap(),
+            &[103, 104, 105, 106, 107, 108, 109, 110]
+        );
+        // Key [101 102 103] = 1 committed + 2 prefix tokens.
+        assert_eq!(
+            ctx.propose_after(&emitted, &[102, 103], 8).unwrap(),
+            &[104, 105, 106, 107, 108, 109, 110, 111]
+        );
+        // Key entirely inside the prefix: [102 103 104].
+        assert_eq!(
+            ctx.propose_after(&emitted, &[102, 103, 104], 3).unwrap(),
+            &[105, 106, 107]
+        );
+        // A prefix that diverges from the source proposes nothing.
+        assert!(ctx.propose_after(&emitted, &[102, 999], 8).is_none());
+    }
+
+    #[test]
+    fn copy_after_prefix_lengths_zero_one_and_beyond_longest_key() {
+        let prompt: Vec<u32> = (100..140).collect();
+        let mut ctx = copy_after_ctx(3, 1, 8, &prompt);
+        assert_eq!(ctx.keys(), &[32, 16, 8, 3]);
+        // len 0: plain propose.
+        let emitted = [137u32, 138, 139];
+        assert_eq!(
+            ctx.propose_after(&emitted, &[], 8).map(<[u32]>::to_vec),
+            ctx.propose(&emitted, 8).map(<[u32]>::to_vec)
+        );
+        // len 1.
+        let emitted = [137u32, 138, 139, 100, 101];
+        assert_eq!(ctx.propose_after(&emitted, &[102], 2).unwrap(), &[103, 104]);
+        // len K = 32 (the longest key): the 32-key is the prefix itself,
+        // 102..=133 (idx 2..34), so the copy starts at idx 34 and runs
+        // 134..140 then over the committed tail [137 138 139 100 101].
+        let prefix: Vec<u32> = (102..134).collect();
+        assert_eq!(prefix.len(), 32);
+        let got = ctx.propose_after(&emitted, &prefix, 8).unwrap().to_vec();
+        assert_eq!(
+            got,
+            (134..140)
+                .collect::<Vec<u32>>()
+                .into_iter()
+                .chain([137, 138])
+                .collect::<Vec<u32>>()
+        );
+        // len > K: the key is the last 32 prefix tokens, 105..=136.
+        let prefix: Vec<u32> = (102..137).collect();
+        let got = ctx.propose_after(&emitted, &prefix, 8).unwrap().to_vec();
+        assert_eq!(got, vec![137, 138, 139, 137, 138, 139, 100, 101]);
+    }
+
+    #[test]
+    fn copy_after_key_longer_than_32_needs_no_scratch() {
+        let prompt: Vec<u32> = (1000..1100).collect();
+        let mut ctx = copy_after_ctx(40, 1, 8, &prompt);
+        assert_eq!(ctx.keys(), &[40]);
+        let prefix: Vec<u32> = (1010..1060).collect();
+        assert_eq!(
+            ctx.propose_after(&[], &prefix, 8).unwrap(),
+            &[1060, 1061, 1062, 1063, 1064, 1065, 1066, 1067]
+        );
+        // Key straddles committed (30 emitted) + prefix (10).
+        let emitted: Vec<u32> = (1020..1050).collect();
+        let prefix: Vec<u32> = (1050..1060).collect();
+        assert_eq!(
+            ctx.propose_after(&emitted, &prefix, 4).unwrap(),
+            &[1060, 1061, 1062, 1063]
+        );
+    }
+
+    #[test]
+    fn copy_after_longest_key_wins_and_most_recent_occurrence() {
+        let mut prompt: Vec<u32> = (1..=16).collect();
+        prompt.extend_from_slice(&[50, 51, 52, 53, 54, 7, 8, 9, 90, 91, 92]);
+        let emitted: Vec<u32> = (1..=7).collect();
+        // 8-key [2..=9] (6 committed + 2 prefix) beats the 3-key [7 8 9].
+        let mut ctx = copy_after_ctx(3, 1, 8, &prompt);
+        assert_eq!(
+            ctx.propose_after(&emitted, &[8, 9], 8).unwrap(),
+            &[10, 11, 12, 13, 14, 15, 16, 50]
+        );
+        // Only the 3-key matches: the most recent occurrence of [7 8 9]
+        // (idx 21..24), not the older one at idx 6..9.
+        let mut ctx = copy_after_ctx(3, 1, 8, &prompt);
+        assert_eq!(
+            ctx.propose_after(&[99, 7], &[8, 9], 8).unwrap(),
+            &[90, 91, 92, 99, 7]
+        );
+    }
+
+    #[test]
+    fn copy_after_refuses_hash_collision_with_wrong_stored_position() {
+        // capacity 8, 4 keys -> 2 slots per key: nearly every key collides
+        // with a stored position that holds different tokens.
+        let prompt: Vec<u32> = (100..112).collect();
+        let mut ctx = MtpCopyContext::new(small_cfg(8, 2, 1, 4)).unwrap();
+        assert_eq!(ctx.slots, 2);
+        ctx.begin_request(&prompt);
+        let emitted = [105u32];
+        let mut wrong_stored = 0usize;
+        for x in 1000u32..1064 {
+            // 2-key table (the last key): [105, x] with x in no history.
+            let n = 2usize;
+            let k = ctx.keys().len() - 1;
+            let key = [105u32, x];
+            let pos = ctx.table[k * ctx.slots + ctx.slot(hash_window(&key))];
+            if pos != EMPTY {
+                let pos = pos as usize;
+                assert!(pos < ctx.history.len() && pos >= n && ctx.history[pos - n..pos] != key);
+                wrong_stored += 1;
+            }
+            assert!(
+                ctx.propose_after(&emitted, &[x], 4).is_none(),
+                "collision on x={x} proposed"
+            );
+        }
+        assert!(
+            wrong_stored > 0,
+            "test never exercised a stored wrong position"
+        );
+        // A real key in the same table still proposes when its slot survived.
+        if let Some(c) = ctx.propose_after(&emitted, &[106], 4) {
+            assert_eq!(c, &[107, 108, 109, 110]);
+        }
+    }
+
+    #[test]
+    fn copy_after_take_clamps_to_history_end_and_n_min_refuses() {
+        let prompt: Vec<u32> = (100..110).collect();
+        // history = 100..109 ++ [107 108]; key [108 109] -> pos 10, 2 left.
+        let mut ctx = copy_after_ctx(2, 1, 6, &prompt);
+        assert_eq!(
+            ctx.propose_after(&[107, 108], &[109], 6).unwrap(),
+            &[107, 108]
+        );
+        // caller_max clamps further.
+        assert_eq!(ctx.propose_after(&[107, 108], &[109], 1).unwrap(), &[107]);
+        // n_min 3 > the 2 tokens that remain: falls through to nothing.
+        let mut ctx = copy_after_ctx(2, 3, 6, &prompt);
+        assert!(ctx.propose_after(&[107, 108], &[109], 6).is_none());
+        // caller_max < n_min refuses outright.
+        let mut ctx = copy_after_ctx(2, 2, 6, &prompt);
+        assert!(ctx.propose_after(&[100], &[101], 1).is_none());
+        assert_eq!(ctx.propose_after(&[100], &[101], 2).unwrap(), &[102, 103]);
+    }
+
+    #[test]
+    fn copy_after_source_crosses_prompt_emitted_boundary() {
+        let prompt: Vec<u32> = (100..110).collect();
+        // history = prompt ++ [104 105]; key [105 106] -> pos 7; the copy
+        // runs over the prompt/emitted seam (idx 10).
+        let mut ctx = copy_after_ctx(2, 1, 6, &prompt);
+        assert_eq!(
+            ctx.propose_after(&[104, 105], &[106], 6).unwrap(),
+            &[107, 108, 109, 104, 105]
+        );
+        // Source wholly inside the emitted region.
+        let mut ctx = copy_after_ctx(2, 1, 6, &prompt);
+        let emitted = [200u32, 201, 202, 203, 200, 201];
+        assert_eq!(
+            ctx.propose_after(&emitted, &[202], 6).unwrap(),
+            &[203, 200, 201]
+        );
+    }
+
+    #[test]
+    fn copy_after_rejected_prefix_leaves_no_trace() {
+        let stream = copy_after_stream(900, 40);
+        let (prompt, tail) = stream.split_at(300);
+        let mut ctx = copy_after_ctx(3, 1, 8, prompt);
+        let mut fresh = copy_after_ctx(3, 1, 8, prompt);
+        let emitted = &tail[..100];
+        let _ = ctx.propose(emitted, 8);
+        let hist = ctx.history().to_vec();
+        let table = ctx.table.clone();
+        let (idx, em) = (ctx.indexed_until, ctx.emitted_len);
+        for p in 0..200usize {
+            let prefix: Vec<u32> = (0..(p % 40))
+                .map(|i| (p * 31 + i * 7) as u32 % 40)
+                .collect();
+            let _ = ctx.propose_after(emitted, &prefix, 1 + p % 15);
+            assert_eq!(ctx.history(), hist.as_slice());
+            assert_eq!(ctx.table, table, "table changed after prefix {prefix:?}");
+            assert_eq!((ctx.indexed_until, ctx.emitted_len), (idx, em));
+        }
+        // A later propose (after a rejected prefix at every step) equals a
+        // fresh context that never saw any prefix.
+        for i in 100..400 {
+            let e = &tail[..i];
+            let _ = ctx.propose_after(e, &[7, 7, 7], 4);
+            assert_eq!(
+                ctx.propose(e, 8).map(<[u32]>::to_vec),
+                fresh.propose(e, 8).map(<[u32]>::to_vec)
+            );
+        }
+        assert_eq!(ctx.history(), fresh.history());
+        assert_eq!(ctx.table, fresh.table);
+    }
+
+    #[test]
+    fn copy_after_requests_are_isolated_a_b_a() {
+        let prompt_a: Vec<u32> = (1..=20).collect();
+        let prompt_b: Vec<u32> = (200..220).collect();
+        let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 6)).unwrap();
+        let mut fresh = MtpCopyContext::new(copy_cfg(3, 1, 6)).unwrap();
+        fresh.begin_request(&prompt_a);
+        let want_a = fresh
+            .propose_after(&[1, 2], &[3, 4], 6)
+            .map(<[u32]>::to_vec);
+        assert_eq!(want_a.as_deref(), Some(&[5u32, 6, 7, 8, 9, 10][..]));
+
+        ctx.begin_request(&prompt_a);
+        assert_eq!(
+            ctx.propose_after(&[1, 2], &[3, 4], 6).map(<[u32]>::to_vec),
+            want_a
+        );
+        ctx.begin_request(&prompt_b);
+        assert!(
+            ctx.propose_after(&[1, 2], &[3, 4], 6).is_none(),
+            "A's positions never propose in B"
+        );
+        assert_eq!(
+            ctx.propose_after(&[1, 2, 200, 201], &[202], 6).unwrap(),
+            &[203, 204, 205, 206, 207, 208]
+        );
+        ctx.begin_request(&prompt_a);
+        assert_eq!(
+            ctx.propose_after(&[1, 2], &[3, 4], 6).map(<[u32]>::to_vec),
+            want_a
+        );
+        assert!(ctx.propose_after(&[1, 2, 200, 201], &[202], 6).is_none());
+    }
+
+    #[test]
+    fn copy_after_does_not_allocate_after_warm_capacity() {
+        let stream = copy_after_stream(700, 30);
+        let (prompt, tail) = stream.split_at(500);
+        let mut ctx = copy_after_ctx(3, 1, 15, prompt);
+        let emitted = &tail[..100];
+        let _ = ctx.propose_after(emitted, &[], 15); // warm history growth
+        let caps = (
+            ctx.history.capacity(),
+            ctx.candidate.capacity(),
+            ctx.table.capacity(),
+        );
+        let ptrs = (
+            ctx.history.as_ptr(),
+            ctx.candidate.as_ptr(),
+            ctx.table.as_ptr(),
+        );
+        let mut some = 0usize;
+        for i in 0..1000usize {
+            let plen = i % 20;
+            let prefix: Vec<u32> = (0..plen).map(|j| ((i + j * 3) % 30) as u32).collect();
+            some += usize::from(ctx.propose_after(emitted, &prefix, 1 + i % 15).is_some());
+            assert_eq!(
+                (
+                    ctx.history.capacity(),
+                    ctx.candidate.capacity(),
+                    ctx.table.capacity()
+                ),
+                caps
+            );
+            assert_eq!(
+                (
+                    ctx.history.as_ptr(),
+                    ctx.candidate.as_ptr(),
+                    ctx.table.as_ptr()
+                ),
+                ptrs
+            );
+        }
+        assert!(some > 0);
     }
 }

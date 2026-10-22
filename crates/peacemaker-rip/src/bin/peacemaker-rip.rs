@@ -1,7 +1,9 @@
-//! `peacemaker-rip`: check, format, explain and compile `.rip` kernel scripts without cargo.
+//! `peacemaker-rip`: check, run, format, explain and compile `.rip` kernel scripts without cargo.
 //!
 //! ```text
 //! peacemaker-rip check FILE [--arch LIST|all] [--variant LIST] [--json]
+//! peacemaker-rip features FILE [--arch LIST|all] [--variant LIST] [--routes FILE] [--json]
+//! peacemaker-rip run FILE [--case FILE.json] [--arch LIST|all] [--variant LIST] [--json] [--dump OUT]
 //! peacemaker-rip build [--certify] [--json] SOURCE.rip ARCH VARIANT OUTPUT.s
 //! peacemaker-rip build [--certify] [--json] --module SOURCE.rip ARCH VARIANT[,VARIANT..] MODULE_NAME OUTPUT.s
 //! peacemaker-rip fmt [--check] FILE...
@@ -16,6 +18,18 @@
 //!   variants declared by the script's `enum Kind`). `--json` prints one JSON
 //!   document on stdout instead of the human text. Exit 0 when there are no
 //!   errors (warnings allowed), 1 on errors, 2 on a usage error.
+//! - `features` reports shared check resources, linked-object schedule features,
+//!   emulator coverage, and SHA256 provenance without a GPU. `--routes` passes
+//!   a cost-lint routes JSON document unchanged; failures are per-target errors.
+//! - `run` compiles every (arch, variant) of FILE, executes the declared grid
+//!   on the CPU emulator and checks every buffer against `--case` (default:
+//!   FILE with its extension replaced by `.json`). No GPU or ROCm tools are
+//!   involved. Target selection (`--arch`/`--variant`) works exactly like
+//!   `check`. `--json` prints the flat schema-1 report for one target, or
+//!   `{schema:1,ok,results:[reports]}` for several. `--dump OUT` needs exactly
+//!   one target and writes the behavior-capture case (behavior, not
+//!   correctness) even when expectations fail. Exit 0 iff every target passes,
+//!   1 on failures, 2 on a usage error.
 //! - `build` writes the assembly. `ARCH` is `gfx1151`, `gfx1201`, `gfx1100` or
 //!   `both` (gfx1151 and gfx1201; `OUTPUT` then gets the arch before its
 //!   extension: `out.gfx1151.s`). `--certify` assembles and links the emitted
@@ -38,6 +52,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   peacemaker-rip check FILE [--arch LIST|all] [--variant LIST] [--json]
+  peacemaker-rip features FILE [--arch LIST|all] [--variant LIST] [--routes FILE] [--json]
+  peacemaker-rip run FILE [--case FILE.json] [--arch LIST|all] [--variant LIST] [--json] [--dump OUT]
   peacemaker-rip build [--certify] [--json] SOURCE.rip ARCH VARIANT OUTPUT.s
   peacemaker-rip build [--certify] [--json] --module SOURCE.rip ARCH VARIANT[,VARIANT..] MODULE_NAME OUTPUT.s
   peacemaker-rip fmt [--check] FILE...
@@ -45,9 +61,17 @@ const USAGE: &str = "usage:
   peacemaker-rip help
 
 check:   compile every (arch, variant) and report diagnostics; exit 0 ok (warnings allowed), 1 errors, 2 usage.
-         --arch LIST|all   comma list of gfx1100,gfx1151,gfx1201 (default gfx1151,gfx1201; all = all three)
-         --variant LIST    comma list (default: the variants of the script's `enum Kind`)
+         --arch LIST|all   comma list of gfx1100,gfx1151,gfx1201 (default: the script's `const ARCHES`, else gfx1151,gfx1201; all = declared ARCHES, else all three)
+         --variant LIST    comma list (default: the script's `const VARIANTS`, else its `enum Kind`)
          --json            one JSON document on stdout
+features: report offline resource, schedule and emulator facts; target selection is the same as check.
+         --routes FILE     cost-lint routes JSON keyed by exact kernel symbol
+run:    execute every (arch, variant) on the CPU emulator and check buffers; exit 0 iff all pass, 1 failures, 2 usage.
+         --case FILE       case JSON (default: FILE with its extension replaced by `.json`)
+         --arch LIST|all   same target selection as check
+         --variant LIST    comma list (default: the script's `const VARIANTS`, else its `enum Kind`)
+         --json            one target prints the flat schema-1 report; several print {schema:1,ok,results:[reports]}
+         --dump OUT        write the behavior-capture case; exactly one target required, written even when expectations fail
 build:   write assembly; ARCH is gfx1151, gfx1201, gfx1100 or both. --certify assembles, links and certifies.
          The legacy form `peacemaker-rip [--certify] [--module] SOURCE ARCH ...` is `build`.
 fmt:     format in place with rustfmt; --check lists files that would change and exits 1.
@@ -58,16 +82,25 @@ fn usage_error(msg: &str) -> u8 {
     2
 }
 
-/// Comma list of arches, `both` (gfx1151, gfx1201) or `all` (gfx1100, gfx1151, gfx1201).
-fn arches(a: &str) -> Result<Vec<Arch>, String> {
+/// Parse `--arch`: a comma list of arches, `both` (gfx1151, gfx1201) or
+/// `all`. Bare `all` expands to `declared` when the script declares `const
+/// ARCHES`, else to every arch; an explicit list never consults the const.
+fn arches(a: &str, declared: Option<&[Arch]>) -> Result<Vec<Arch>, String> {
     match a {
         "both" => return Ok(vec![Arch::Gfx1151, Arch::Gfx1201]),
-        "all" => return Ok(vec![Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]),
+        "all" => {
+            return Ok(match declared {
+                Some(ds) => ds.to_vec(),
+                None => peacemaker_rip::ALL_ARCHES.to_vec(),
+            })
+        }
         _ => {}
     }
     let mut out = Vec::new();
     for part in a.split(',') {
-        let arch = part.parse::<Arch>()?;
+        let arch = part
+            .parse::<Arch>()
+            .map_err(|_| format!("unsupported architecture {part}"))?;
         if !out.contains(&arch) {
             out.push(arch);
         }
@@ -141,9 +174,103 @@ fn print_json(v: &serde_json::Value) {
     );
 }
 
+fn feature_failure(
+    file: &str,
+    source: Option<&str>,
+    routes_supplied: bool,
+    json: bool,
+    stage: &str,
+    message: &str,
+) -> u8 {
+    if json {
+        print_json(&serde_json::json!({
+            "schema": 1, "file": file,
+            "source_sha256": source.map(peacemaker_rip::features::source_sha256), "ok": false,
+            "routes_supplied": routes_supplied, "targets": {},
+            "error": {"stage": stage, "message": message},
+        }));
+    } else {
+        eprintln!("error {stage}: {message}");
+    }
+    1
+}
+
+fn print_features(report: &serde_json::Value) {
+    let Some(targets) = report["targets"].as_object() else {
+        return;
+    };
+    for (key, target) in targets {
+        println!("{key}:");
+        if let Some(r) = target["resources"].as_object() {
+            println!(
+                "  {} instructions, {} VGPRs, {} SGPRs, LDS {} B, wave {}",
+                r["instructions"], r["vgprs"], r["sgprs"], r["lds_bytes"], r["wave_size"],
+            );
+        }
+        println!(
+            "  sha256 source={} assembly={}",
+            report["source_sha256"].as_str().unwrap_or("unavailable"),
+            target["assembly_sha256"].as_str().unwrap_or("unavailable"),
+        );
+        if let Some(error) = target["error"].as_object() {
+            println!(
+                "  error {}: {}",
+                error["stage"].as_str().unwrap_or("unknown"),
+                error["message"].as_str().unwrap_or("unknown"),
+            );
+            continue;
+        }
+        let routes = report["routes_supplied"].as_bool() == Some(true);
+        println!("  cost: routes_supplied={routes}, drain_pressure=null (requires a pair)");
+        if let Some(kernels) = target["cost"]["kernels"].as_array() {
+            for kernel in kernels {
+                if let Some(loops) = kernel["loops"].as_array() {
+                    for (index, cost) in loops.iter().enumerate() {
+                        println!(
+                            "    loop {index}: wmma_per_trip={}, valu_per_wmma={}, wait_depth_before_wmma={}, independent_chains={}, padding_fraction={}, wmma_per_k128={}, prefetch_distance_epochs={}",
+                            cost["wmma_per_trip"], cost["valu_per_wmma"],
+                            cost["wait_depth_before_wmma"], cost["independent_chains"],
+                            cost["padding_fraction"], cost["wmma_per_k128"],
+                            cost["prefetch_distance_epochs"],
+                        );
+                    }
+                }
+            }
+        }
+        let coverage = &target["emulator"];
+        let unmodeled = coverage["unmodeled"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                format!(
+                    "{}={}",
+                    entry["mnemonic"].as_str().unwrap_or("?"),
+                    entry["count"]
+                )
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "  emulator: modeled={}/{}, unmodeled={}{}",
+            coverage["modeled"],
+            coverage["instructions"],
+            if unmodeled.is_empty() {
+                "none".into()
+            } else {
+                unmodeled.join(", ")
+            },
+            if unmodeled.is_empty() {
+                ""
+            } else {
+                " (CPU execution refused)"
+            },
+        );
+    }
+}
+
 // ---------------------------------------------------------------- check
 
-fn check(mut args: Vec<String>) -> u8 {
+fn inspect(mut args: Vec<String>, feature_mode: bool) -> u8 {
     let json = take_flag(&mut args, "--json");
     let arch_arg = match take_value(&mut args, "--arch") {
         Ok(v) => v,
@@ -153,21 +280,39 @@ fn check(mut args: Vec<String>) -> u8 {
         Ok(v) => v,
         Err(e) => return usage_error(&e),
     };
+    let routes_arg = if feature_mode {
+        match take_value(&mut args, "--routes") {
+            Ok(v) => v,
+            Err(e) => return usage_error(&e),
+        }
+    } else {
+        None
+    };
     if let Err(e) = reject_unknown_options(&args) {
         return usage_error(&e);
     }
     if args.len() != 1 {
-        return usage_error("`check` takes exactly one FILE");
+        return usage_error(if feature_mode {
+            "`features` takes exactly one FILE"
+        } else {
+            "`check` takes exactly one FILE"
+        });
     }
     let file = args.remove(0);
-    let arches = match arches(arch_arg.as_deref().unwrap_or("gfx1151,gfx1201")) {
-        Ok(a) => a,
-        Err(e) => return usage_error(&e),
-    };
     let source = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
             let d = tool_error(&file, format!("{file}: {e}"));
+            if feature_mode {
+                return feature_failure(
+                    &file,
+                    None,
+                    routes_arg.is_some(),
+                    json,
+                    "source",
+                    &d.message,
+                );
+            }
             if json {
                 print_json(
                     &serde_json::json!({"file": file, "ok": false, "results": [], "diagnostics": [d.to_json()]}),
@@ -178,7 +323,30 @@ fn check(mut args: Vec<String>) -> u8 {
             return 1;
         }
     };
-    let variants: Vec<String> = match variant_arg {
+    // Discovery runs over the source twice (variants, arches) so a failure
+    // of either is reported with its own location before any compile.
+    let failed = |raw: String| {
+        if feature_mode {
+            return feature_failure(
+                &file,
+                Some(&source),
+                routes_arg.is_some(),
+                json,
+                "discovery",
+                &raw,
+            );
+        }
+        let d = Diagnostic::from_raw(&raw, &file, &source, Severity::Error);
+        if json {
+            print_json(
+                &serde_json::json!({"file": file, "ok": false, "results": [], "diagnostics": [d.to_json()]}),
+            );
+        } else {
+            print_diagnostic(&d, &source);
+        }
+        1
+    };
+    let variants: Vec<String> = match &variant_arg {
         Some(list) => list
             .split(',')
             .filter(|v| !v.is_empty())
@@ -186,23 +354,77 @@ fn check(mut args: Vec<String>) -> u8 {
             .collect(),
         None => match peacemaker_rip::variants(&source, &file) {
             Ok(v) => v,
-            Err(raw) => {
-                let d = Diagnostic::from_raw(&raw, &file, &source, Severity::Error);
-                if json {
-                    print_json(
-                        &serde_json::json!({"file": file, "ok": false, "results": [], "diagnostics": [d.to_json()]}),
-                    );
-                } else {
-                    print_diagnostic(&d, &source);
-                }
-                return 1;
-            }
+            Err(raw) => return failed(raw),
         },
     };
     if variants.is_empty() {
         return usage_error(&format!(
-            "{file} declares no `enum Kind` variants; pass `--variant NAME[,NAME..]`"
+            "{file} declares no `VARIANTS` (nor `enum Kind` variants); pass `--variant NAME[,NAME..]`"
         ));
+    }
+    // An explicit `--arch` list wins over the script; without one the
+    // declared `ARCHES` (when present and well-formed) is the target list.
+    let declared: Option<Vec<Arch>> = match peacemaker_rip::arches(&source, &file) {
+        Ok(None) => None,
+        Ok(Some(names)) => {
+            let mut ds = Vec::new();
+            for n in &names {
+                match peacemaker_rip::parse_arch(n) {
+                    Ok(a) => {
+                        if !ds.contains(&a) {
+                            ds.push(a);
+                        }
+                    }
+                    Err(e) => return usage_error(&format!("{file}: const ARCHES: {e}")),
+                }
+            }
+            Some(ds)
+        }
+        Err(raw) => return failed(raw),
+    };
+    let arches = match &arch_arg {
+        Some(list) => match arches(list, declared.as_deref()) {
+            Ok(a) => a,
+            Err(e) => return usage_error(&format!("{file}: {e}")),
+        },
+        None => declared.unwrap_or_else(|| peacemaker_rip::DEFAULT_ARCHES.to_vec()),
+    };
+    if arches.is_empty() {
+        return usage_error(&format!(
+            "{file} declares an empty `ARCHES`; pass `--arch NAME[,NAME..]`"
+        ));
+    }
+    if feature_mode {
+        let routes = match routes_arg {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    return feature_failure(
+                        &file,
+                        Some(&source),
+                        true,
+                        json,
+                        "routes",
+                        &format!("{path}: {e}"),
+                    )
+                }
+            },
+            None => None,
+        };
+        let report = peacemaker_rip::features::collect(
+            &source,
+            &file,
+            &arches,
+            &variants,
+            routes.as_deref(),
+        );
+        let ok = report["ok"].as_bool() == Some(true);
+        if json {
+            print_json(&report);
+        } else {
+            print_features(&report);
+        }
+        return u8::from(!ok);
     }
 
     let mut all_ok = true;
@@ -418,7 +640,7 @@ fn build(mut args: Vec<String>) -> u8 {
             )
         }
     };
-    let arch_list = match arches(&b.args[1]) {
+    let arch_list = match arches(&b.args[1], None) {
         Ok(a) => a,
         Err(e) => return report_build_failure(&b, &file, &source, vec![tool_error(&file, e)]),
     };
@@ -455,6 +677,250 @@ fn report_build_failure(
         }
     }
     1
+}
+// ---------------------------------------------------------------- run
+
+fn run_json_failure(file: &str, stage: &str, message: String) {
+    print_json(&peacemaker_rip::run::failure(
+        file, None, None, None, stage, &message,
+    ));
+}
+
+fn default_case_path(file: &str) -> String {
+    let mut path = PathBuf::from(file);
+    path.set_extension("json");
+    path.to_string_lossy().into_owned()
+}
+
+fn print_report(report: &serde_json::Value) {
+    let file = report["file"].as_str().unwrap_or("?");
+    let arch = report["arch"].as_str().unwrap_or("?");
+    let variant = report["variant"].as_str().unwrap_or("?");
+    let case = report["case"].as_str().unwrap_or("?");
+    let prefix = format!("{file} {arch}/{variant} case {case}");
+    if let Some(buffers) = report["buffers"].as_object() {
+        for (name, entry) in buffers {
+            match entry["kind"].as_str() {
+                Some("input") => {
+                    let changed = entry["changed"].as_bool().unwrap_or(false);
+                    if changed {
+                        match entry.get("first_mismatch") {
+                            Some(offset) => {
+                                println!("{prefix} input {name}: changed at byte {offset}")
+                            }
+                            None => println!("{prefix} input {name}: changed"),
+                        }
+                    } else {
+                        println!("{prefix} input {name}: unchanged");
+                    }
+                }
+                Some("output") => {
+                    let mismatch = entry.get("first_mismatch");
+                    let guard_ok = entry["guard_ok"].as_bool().unwrap_or(true);
+                    let mut detail = match mismatch {
+                        Some(index) => format!("first mismatch at element {index}"),
+                        None => "matches".to_string(),
+                    };
+                    if !entry["max_abs_diff"].is_null() {
+                        detail.push_str(&format!(" max_abs_diff={}", entry["max_abs_diff"]));
+                    }
+                    let guard = if guard_ok {
+                        "guard ok"
+                    } else {
+                        "guard damaged"
+                    };
+                    println!("{prefix} output {name}: {detail}, {guard}");
+                }
+                _ => println!("{prefix} buffer {name}: {entry}"),
+            }
+        }
+    }
+    if let Some(error) = report.get("error").and_then(|e| e.as_object()) {
+        println!(
+            "{prefix}: failed at {}: {}",
+            error["stage"].as_str().unwrap_or("unknown"),
+            error["message"].as_str().unwrap_or("unknown")
+        );
+    } else if report["ok"].as_bool() == Some(true) {
+        println!("{prefix}: pass");
+    } else {
+        println!("{prefix}: failed");
+    }
+}
+
+fn dump_error(stage: &str, message: String, json: bool, file: &str) -> u8 {
+    if json {
+        print_json(&peacemaker_rip::run::failure(
+            file, None, None, None, "dump", &message,
+        ));
+    } else {
+        eprintln!("error {stage}: {message}");
+    }
+    1
+}
+
+fn run(mut args: Vec<String>) -> u8 {
+    let json = take_flag(&mut args, "--json");
+    let arch_arg = match take_value(&mut args, "--arch") {
+        Ok(v) => v,
+        Err(e) => return usage_error(&e),
+    };
+    let variant_arg = match take_value(&mut args, "--variant") {
+        Ok(v) => v,
+        Err(e) => return usage_error(&e),
+    };
+    let case_arg = match take_value(&mut args, "--case") {
+        Ok(v) => v,
+        Err(e) => return usage_error(&e),
+    };
+    let dump_arg = match take_value(&mut args, "--dump") {
+        Ok(v) => v,
+        Err(e) => return usage_error(&e),
+    };
+    if let Err(e) = reject_unknown_options(&args) {
+        return usage_error(&e);
+    }
+    if args.len() != 1 {
+        return usage_error("`run` takes exactly one FILE");
+    }
+    let file = args.remove(0);
+    let source = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            let message = format!("{file}: {e}");
+            if json {
+                run_json_failure(&file, "source", message);
+            } else {
+                eprintln!("error source: {message}");
+            }
+            return 1;
+        }
+    };
+    let failed = |stage: &str, raw: String| {
+        if json {
+            run_json_failure(&file, stage, raw);
+        } else {
+            let d = Diagnostic::from_raw(&raw, &file, &source, Severity::Error);
+            print_diagnostic(&d, &source);
+        }
+        1
+    };
+    let variants: Vec<String> = match &variant_arg {
+        Some(list) => list
+            .split(',')
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => match peacemaker_rip::variants(&source, &file) {
+            Ok(v) => v,
+            Err(raw) => return failed("discovery", raw),
+        },
+    };
+    if variants.is_empty() {
+        return usage_error(&format!(
+            "{file} declares no `VARIANTS` (nor `enum Kind` variants); pass `--variant NAME[,NAME..]`"
+        ));
+    }
+    let declared: Option<Vec<Arch>> = match peacemaker_rip::arches(&source, &file) {
+        Ok(None) => None,
+        Ok(Some(names)) => {
+            let mut ds = Vec::new();
+            for n in &names {
+                match peacemaker_rip::parse_arch(n) {
+                    Ok(a) => {
+                        if !ds.contains(&a) {
+                            ds.push(a);
+                        }
+                    }
+                    Err(e) => return usage_error(&format!("{file}: const ARCHES: {e}")),
+                }
+            }
+            Some(ds)
+        }
+        Err(raw) => return failed("discovery", raw),
+    };
+    let arch_list = match &arch_arg {
+        Some(list) => match arches(list, declared.as_deref()) {
+            Ok(a) => a,
+            Err(e) => return usage_error(&format!("{file}: {e}")),
+        },
+        None => declared.unwrap_or_else(|| peacemaker_rip::DEFAULT_ARCHES.to_vec()),
+    };
+    if arch_list.is_empty() {
+        return usage_error(&format!(
+            "{file} declares an empty `ARCHES`; pass `--arch NAME[,NAME..]`"
+        ));
+    }
+    let targets: Vec<(Arch, &str)> = arch_list
+        .iter()
+        .flat_map(|a| variants.iter().map(|v| (*a, v.as_str())))
+        .collect();
+    let case_path = match case_arg {
+        Some(path) => path,
+        None => default_case_path(&file),
+    };
+    let case_json = match std::fs::read_to_string(&case_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let message = format!("{case_path}: {e}");
+            if json {
+                run_json_failure(&file, "case", message);
+            } else {
+                eprintln!("error case: {message}");
+            }
+            return 1;
+        }
+    };
+    if dump_arg.is_some() && targets.len() != 1 {
+        return usage_error("--dump needs exactly one target");
+    }
+    let mut outcomes: Vec<peacemaker_rip::run::Outcome> = Vec::with_capacity(targets.len());
+    for (arch, variant) in &targets {
+        outcomes.push(peacemaker_rip::run::execute(
+            &source,
+            &file,
+            *arch,
+            variant,
+            &case_json,
+            dump_arg.is_some(),
+        ));
+    }
+    let all_ok = outcomes
+        .iter()
+        .all(|o| o.report["ok"].as_bool() == Some(true));
+    let dump_outcome = dump_arg.as_ref().zip(outcomes.first());
+    if let Some((dump_path, outcome)) = dump_outcome {
+        match &outcome.dump {
+            Some(dump) => {
+                let text = serde_json::to_string_pretty(dump).expect("a JSON value serializes");
+                if let Err(e) = std::fs::write(dump_path, format!("{text}\n")) {
+                    return dump_error("dump", format!("{dump_path}: {e}"), json, &file);
+                }
+            }
+            None => {
+                if json {
+                    print_json(&outcome.report);
+                } else {
+                    print_report(&outcome.report);
+                }
+                return 1;
+            }
+        }
+    }
+    if json {
+        if outcomes.len() == 1 {
+            print_json(&outcomes[0].report);
+        } else {
+            print_json(
+                &serde_json::json!({"schema": 1, "ok": all_ok, "results": outcomes.iter().map(|o| &o.report).collect::<Vec<_>>()}),
+            );
+        }
+    } else {
+        for outcome in &outcomes {
+            print_report(&outcome.report);
+        }
+    }
+    u8::from(!all_ok)
 }
 
 // ---------------------------------------------------------------- fmt
@@ -538,7 +1004,9 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             0
         }
-        "check" => check(args.split_off(1)),
+        "check" => inspect(args.split_off(1), false),
+        "features" => inspect(args.split_off(1), true),
+        "run" => run(args.split_off(1)),
         "build" => build(args.split_off(1)),
         "fmt" => fmt(args.split_off(1)),
         "explain" => explain(args.split_off(1)),

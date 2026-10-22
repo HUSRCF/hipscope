@@ -561,6 +561,7 @@ pub fn generate_deepseek4_spec(
             frequency_penalty: 0.0,
             // The DSpark speculator keeps no one-row windows to retain.
             stop_sequences: false,
+            logprobs: false,
         });
     }
 
@@ -606,6 +607,7 @@ pub fn generate_deepseek4_spec(
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
             decoded_vocab,
+            logprobs_top_k: None,
         },
         temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
@@ -2239,8 +2241,9 @@ fn trace_gemma4_logits(
 /// arch 13 `cache_capable` when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
-/// `HIPFIRE_GEMMA4_EAGLE=1`) runs greedy tool-free requests through the
-/// generic `generate_spec` core instead ([`generate_gemma4_spec`]).
+/// `HIPFIRE_GEMMA4_EAGLE=1`; not faster than AR on gfx1151) runs tool-free
+/// greedy, sampled, penalized and logprobs requests through the generic
+/// `generate_spec` core instead ([`generate_gemma4_spec`]).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
@@ -2437,21 +2440,18 @@ pub fn generate_gemma4(
         return;
     }
 
-    // Greedy, penalty-free requests that fit one verify block past their
-    // budget go to the EAGLE speculator. It commits the target's batched
-    // verify argmax, which can differ from AR decode on near-tied logits.
-    let spec = temp <= 1e-6
-        && sampler_cfg.repeat_penalty == 1.0
-        && sampler_cfg.presence_penalty == 0.0
-        && sampler_cfg.frequency_penalty == 0.0
-        && logprobs_top_k.is_none()
-        && !tools_nonempty
+    // Tool-free requests that fit one verify block past their budget go to
+    // the EAGLE speculator. Greedy ones commit the target's batched verify
+    // argmax, which can differ from AR decode on near-tied logits; sampled
+    // and penalized ones draw each verify row with the AR sampler.
+    let spec = !tools_nonempty
         && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
             .ok()
             .as_deref()
             == Some("1")
         && m.speculator.as_ref().is_some_and(|s| {
-            spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
+            (temp <= 1e-6 || !s.requires_greedy())
+                && spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
         });
     let route = if spec {
         hipfire_runtime::session_cache::SessionRoute::Mtp
@@ -2470,10 +2470,13 @@ pub fn generate_gemma4(
             id,
             prompt_ids,
             reused,
+            &sampler_cfg,
+            request_seed,
             max_tokens,
             max_think_tokens,
             enable_thinking,
             cfg_eos_tok,
+            logprobs_top_k,
         );
         return;
     }
@@ -2867,8 +2870,10 @@ pub fn gemma4_commit_terminal<W: Write>(
 /// Gemma 4 EAGLE spec decode on the generic `generate_spec` core: the
 /// `MtpSpeculator<Gemma4Drafter>` in `m.speculator`, the bundle as
 /// `SpecTarget` and `GemmaSpecEmit`. `reused` prompt tokens come from the
-/// session plan; greedy and tool-free only. Ends on the same two-phase
-/// terminal as AR and publishes the session's snapshots only on commit.
+/// session plan; tool-free only. The request's sampler (temperature,
+/// top-p/k, min-p, penalties, seed) and logprobs reach the drafter through
+/// `configure_request`. Ends on the same two-phase terminal as AR and
+/// publishes the session's snapshots only on commit.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4_spec(
     m: &mut LoadedModel,
@@ -2877,11 +2882,29 @@ fn generate_gemma4_spec(
     id: &str,
     prompt_ids: Vec<u32>,
     reused: usize,
+    sampler_cfg: &hipfire_runtime::sampler::SamplerConfig,
+    request_seed: u32,
     max_tokens: usize,
     max_think_tokens: usize,
     enable_thinking: bool,
     cfg_eos_tok: u32,
+    logprobs_top_k: Option<usize>,
 ) {
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.configure_request(SpecRequestConfig {
+            temp: sampler_cfg.temperature,
+            top_p: sampler_cfg.top_p,
+            top_k: sampler_cfg.top_k,
+            min_p: sampler_cfg.min_p.unwrap_or(0.0),
+            rng_seed: request_seed as u64,
+            repeat_penalty: sampler_cfg.repeat_penalty,
+            repeat_window: sampler_cfg.repeat_window,
+            presence_penalty: sampler_cfg.presence_penalty,
+            frequency_penalty: sampler_cfg.frequency_penalty,
+            logprobs: logprobs_top_k.is_some(),
+            ..SpecRequestConfig::default()
+        });
+    }
     // Host mirrors match the reused prefix; the bundle owns device state.
     let prompt_tokens = prompt_ids.len();
     m.seq_pos = reused;
@@ -2914,8 +2937,9 @@ fn generate_gemma4_spec(
                 ThinkMode::NonThink
             },
             decoded_vocab: None,
+            logprobs_top_k,
         },
-        0.0,
+        sampler_cfg.temperature,
     ) else {
         // generate_spec already wrote the terminal event.
         return;
@@ -5097,8 +5121,15 @@ pub fn generate_muse_glimmer(
                     ctx_len + block_size,
                     "positions.len() must equal ctx_len + block_size"
                 );
+                // A verify window writes `block_size` KV rows from `cur_pos`; one
+                // that would cross the cache finishes the request on AR decode.
+                let past_cap = cur_pos as usize + block_size > cache_cap;
                 // Device: forward from resident log. Host: suffix Vec + host call.
-                let drafter_ok = if device_capture {
+                let drafter_ok = if past_cap {
+                    Err(format!(
+                        "verify window {cur_pos}+{block_size} would pass max_seq {cache_cap}"
+                    ))
+                } else if device_capture {
                     let log = match bundle.state.target_hidden_log() {
                         Some(l) => l,
                         None => {
@@ -5153,10 +5184,11 @@ pub fn generate_muse_glimmer(
                 };
                 if let Err(e) = drafter_ok {
                     // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                    let fatal = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
-                        .ok()
-                        .as_deref()
-                        != Some("1");
+                    let fatal = !past_cap
+                        && hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
+                            .ok()
+                            .as_deref()
+                            != Some("1");
                     if fatal {
                         emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
                         let es = format!("{e}");
@@ -5175,7 +5207,9 @@ pub fn generate_muse_glimmer(
                         }
                         return;
                     }
-                    eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    if !past_cap {
+                        eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    }
                     // One-token-ahead AR fallback: `last_pick` is already emitted and pending at
                     // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
                     // sample a NEW prediction from the returned logits and make it the next pending seed.
@@ -6132,6 +6166,11 @@ pub fn generate_lfm2moe(
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // `primed_think` records whether the rendered prompt ended with the
+    // template's `<think>` generation-primer, so we only re-emit the opener
+    // (below) when the model truly begins inside the reasoning block. A jinja
+    // render failure that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
@@ -6196,7 +6235,10 @@ pub fn generate_lfm2moe(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = hipfire_engine::emit::render_tail_opens_think(&rendered);
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
                     hipfire_runtime::prompt_frame::ChatFrame {
@@ -6359,6 +6401,20 @@ pub fn generate_lfm2moe(
         return;
     }
 
+    // LFM2.5's chat template primes the assistant turn with `<think>`
+    // (generation-prompt block), so generated tokens begin *inside* the
+    // reasoning block and the model only ever emits the closing `</think>`.
+    // Downstream `<think>` consumers — the serve reasoning_content/content
+    // split, the run/chat-path stripper, history `stripThinkingInline` — key
+    // on a LEADING `<think>` and so never engage without the opener. The
+    // primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only) so the turn is a well-formed
+    // `<think>...</think>...` block for every consumer. Mirrors the MiniMax
+    // `primed_think` convention above.
+    if primed_think {
+        emit_dense_token_text(stdout, id, "<think>");
+    }
+
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
     // client cancel stops the loop immediately and emits `aborted`+`done`.
@@ -6371,6 +6427,30 @@ pub fn generate_lfm2moe(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // LFM2.5 tool calls arrive inside dedicated special tokens
+    // (\x3C\x7Ctool_call_start\x7C\x3E / \x3C\x7Ctool_call_end\x7C\x3E as
+    // TEXT). The span — markers included — is suppressed from the client
+    // stream and parsed into `tool_calls` at the terminal (vLLM/llama.cpp
+    // semantics: the marker block is protocol, not content). Everything
+    // still lands in `conversation_tokens` so multi-turn history stays
+    // byte-faithful. An unclosed span is re-emitted as raw text (the
+    // treat-as-text fallback) and never fabricates calls.
+    let tool_open_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E"));
+    let tool_close_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E"));
+    // `in_tool_span`: between the markers; `tool_span_tokens`: every token
+    // since the opener (for the unclosed fallback); `tool_body_tokens`: only
+    // the inner tokens (what gets parsed); `tool_calls`: extracted so far.
+    let mut in_tool_span = false;
+    let mut tool_span_tokens: Vec<u32> = Vec::new();
+    let mut tool_body_tokens: Vec<u32> = Vec::new();
+    let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut hit_eos = false;
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     // Multi-byte characters span tokens: decode incrementally, never per token.
@@ -6386,6 +6466,7 @@ pub fn generate_lfm2moe(
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_toks.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
 
@@ -6396,10 +6477,95 @@ pub fn generate_lfm2moe(
         // text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
         if matches!(
             tokenizer.decode(&[next_tok]).trim(),
-            "<|endoftext|>" | "</s>" | "<|im_end|>"
+            "\x3C\x7Cendoftext\x7C\x3E" | "</s>" | "\x3C\x7Cim_end\x7C\x3E"
         ) {
+            hit_eos = true;
             break;
         }
+
+        // Tool-call span handling. Marker ids come from `special_token_id`
+        // at the top of the loop; on span close the body parses into
+        // structured `tool_calls` (emitted as an event at the terminal).
+        // While inside, text_stream is NOT fed — the span never reaches the
+        // client. Tokens always enter `conversation_tokens` and the decode
+        // step, so KV and history see the real stream.
+        if tool_open_tok.is_some_and(|t| next_tok == t) && !in_tool_span {
+            in_tool_span = true;
+            tool_span_tokens.clear();
+            tool_span_tokens.push(next_tok);
+            tool_body_tokens.clear();
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+        if in_tool_span {
+            tool_span_tokens.push(next_tok);
+            if tool_close_tok.is_some_and(|t| next_tok == t) {
+                in_tool_span = false;
+                let body_text = tokenizer.decode(&tool_body_tokens);
+                tool_calls.extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
+                    &body_text,
+                ));
+            } else {
+                tool_body_tokens.push(next_tok);
+            }
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+
         emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -6442,6 +6608,18 @@ pub fn generate_lfm2moe(
     }
     emit_dense_token_text(stdout, id, &text_stream.flush());
 
+    // Unclosed tool span (EOS or max_tokens landed mid-call): never
+    // fabricate a call from a truncated body — re-emit the buffered span
+    // text so the client sees exactly what the model wrote (the
+    // treat-as-text fallback vLLM uses).
+    if in_tool_span {
+        emit_dense_token_text(
+            stdout,
+            id,
+            &m.tokenizer.as_ref().unwrap().decode(&tool_span_tokens),
+        );
+    }
+
     // Abort latched between loop exit and commit must not proceed to the
     // two-phase commit handshake — emit the attested `aborted` terminal
     // instead so the client's drain loop terminates.
@@ -6460,15 +6638,32 @@ pub fn generate_lfm2moe(
     } else {
         0.0
     };
-    let pending_done = serde_json::json!({
+    // "length" when the token budget ended the turn mid-stream; a truncated
+    // reply must not masquerade as a complete "stop". `tool_calls` when the
+    // turn ended by producing executable calls (same convention as every
+    // other arch).
+    let finish_reason = if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract surfaces calls ONLY from a `{"type":"tool_calls"}`
+    // event read BEFORE the commit_ready terminal — precede the handshake.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)

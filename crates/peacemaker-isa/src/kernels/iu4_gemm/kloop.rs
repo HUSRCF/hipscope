@@ -17,7 +17,7 @@
 //!   slab 1 during the fold's `mul`/`fmac` stage (row group 1's `subrev`
 //!   rides in row group 0's `fmac` packets); B2 wait.
 use super::{
-    fold,
+    blocks, fold,
     publish::{self, ds_load},
     Gen, Lds, PayA, PayW, Wg, Wv, EPI, K_LOOP, K_LOOP_END,
 };
@@ -34,7 +34,7 @@ fn between(a: &str, b: &str) -> Live {
 }
 
 /// The trip counter `K/256 - 1` derives from the `K` kernel argument only.
-fn trips_cmp(wg: &mut Wg, g: &Gen, cmp: &str) -> Result<WgUniform<Scc>, String> {
+pub(crate) fn trips_cmp(wg: &mut Wg, g: &Gen, cmp: &str) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(
         format!("{cmp} s{}, 0", g.trips),
         vec![],
@@ -42,89 +42,80 @@ fn trips_cmp(wg: &mut Wg, g: &Gen, cmp: &str) -> Result<WgUniform<Scc>, String> 
     ))
 }
 
+/// Advance buffer descriptor `which` (0: the even block's `srd_a[0]`, 1: the
+/// odd block's `srd_a[1]`) by the two-block group stride.
+pub(crate) fn step_descriptor(b: &mut Builder, g: &Gen, which: usize) -> Result<(), String> {
+    let srd = *g
+        .srd_a
+        .get(which)
+        .ok_or_else(|| format!("step_descriptor: descriptor {which} is not 0 or 1"))?;
+    op(
+        b,
+        format!(
+            "s_add_nc_u64 s[{0}:{1}], s[{0}:{1}], s[{2}:{3}]",
+            srd,
+            srd + 1,
+            g.step2,
+            g.step2 + 1
+        ),
+        &[sr(srd, 2)],
+        &[sr(srd, 2), sr(g.step2, 2)],
+    )
+}
+
+/// Trip end: the odd-block descriptor and the group offset move on after
+/// every read of them in this trip, and the trip counter drops by one.
+pub(crate) fn trip_end(wg: &mut Wg, g: &Gen) -> Result<(), String> {
+    let b = wg.isa();
+    step_descriptor(b, g, 1)?;
+    op(
+        b,
+        format!("s_add_co_i32 s{0}, s{0}, 0x88", g.goff),
+        &[s(g.goff)],
+        &[s(g.goff)],
+    )?;
+    op(
+        b,
+        format!("s_add_co_i32 s{0}, s{0}, -1", g.trips),
+        &[s(g.trips)],
+        &[s(g.trips)],
+    )
+}
+
 pub(crate) fn emit(wg: &mut Wg, g: &Gen, lds: Lds) -> Result<Lds, String> {
     wg.label(super::K_BEGIN)?;
     // K == 256: no full trip; go straight to the peeled group.
-    let no_trip = trips_cmp(wg, g, "s_cmp_eq_u32")?;
-    let step = |b: &mut Builder, srd: u8| {
-        op(
-            b,
-            format!(
-                "s_add_nc_u64 s[{0}:{1}], s[{0}:{1}], s[{2}:{3}]",
-                srd,
-                srd + 1,
-                g.step2,
-                g.step2 + 1
-            ),
-            &[sr(srd, 2)],
-            &[sr(srd, 2), sr(g.step2, 2)],
-        )
-    };
-    let lds = wg.wg_skip_if(no_trip, &tail_label(0), lds, |wg, lds| {
+    let no_trip = blocks::trips_cmp(wg, g, "s_cmp_eq_u32")?;
+    let lds = wg.wg_skip_if(no_trip, &blocks::tail_label(0), lds, |wg, lds| {
         let lds = wg.loop_carried(K_LOOP, lds, |wg, lds| {
-            let lds = block(wg, g, "m0", 0, true, &label("m1"), lds)?;
+            let lds = blocks::block(wg, g, "m0", 0, true, &blocks::label("m1"), true, lds)?;
             // The even-block descriptor was last read by block 0's slab-1 fetch;
             // move it to block 2g+2 before block 1's next-block fetch reads it.
-            let lds = block_with(
-                wg,
-                g,
-                "m1",
-                1,
-                true,
-                K_LOOP_END,
-                true,
-                |b| step(b, g.srd_a[0]),
-                lds,
-            )?;
+            let lds = blocks::block_stepping(wg, g, "m1", 1, true, K_LOOP_END, true, 0, lds)?;
             // Trip end: the odd-block descriptor and the group offset move on
             // after every read of them in this trip.
-            let b = wg.isa();
-            step(b, g.srd_a[1])?;
-            op(
-                b,
-                format!("s_add_co_i32 s{0}, s{0}, 0x88", g.goff),
-                &[s(g.goff)],
-                &[s(g.goff)],
-            )?;
-            op(
-                b,
-                format!("s_add_co_i32 s{0}, s{0}, -1", g.trips),
-                &[s(g.trips)],
-                &[s(g.trips)],
-            )?;
-            Ok((lds, trips_cmp(wg, g, "s_cmp_lg_u32")?))
+            blocks::trip_end(wg, g)?;
+            Ok((lds, blocks::trips_cmp(wg, g, "s_cmp_lg_u32")?))
         })?;
         wg.label(K_LOOP_END)?;
         Ok(lds)
     })?;
     // The skip target is the peeled group's first block label.
-    let lds = block_with(wg, g, "t0", 0, true, &label("t1"), false, |_| Ok(()), lds)?;
-    block(wg, g, "t1", 1, false, EPI, lds)
+    let lds = blocks::block(wg, g, "t0", 0, true, &blocks::label("t1"), false, lds)?;
+    blocks::block(wg, g, "t1", 1, false, EPI, true, lds)
 }
 
-fn label(tag: &str) -> String {
+pub(crate) fn label(tag: &str) -> String {
     format!(".Liu4_{tag}")
 }
-fn tail_label(h: usize) -> String {
+pub(crate) fn tail_label(h: usize) -> String {
     label(&format!("t{h}"))
-}
-
-fn block(
-    wg: &mut Wg,
-    g: &Gen,
-    tag: &str,
-    h: usize,
-    fetch_next: bool,
-    end: &str,
-    lds: Lds,
-) -> Result<Lds, String> {
-    block_with(wg, g, tag, h, fetch_next, end, true, |_| Ok(()), lds)
 }
 /// One K128 block on token/row plane `h`; `after_slab1_fetch` runs when its
 /// preceding fetch has issued. `entry_label`: emit the block's label (the
 /// peeled group's first block is the K-loop skip target, which emits it).
 #[allow(clippy::too_many_arguments)]
-fn block_with(
+pub(crate) fn block_with(
     wg: &mut Wg,
     g: &Gen,
     tag: &str,

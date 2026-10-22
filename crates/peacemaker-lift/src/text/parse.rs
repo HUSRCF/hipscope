@@ -156,6 +156,7 @@ fn split_operands(rest: &str) -> Vec<String> {
 
 fn is_suffix_token(token: &str) -> bool {
     token.starts_with("op_sel:")
+        || token.starts_with("index_key:")
         || token.starts_with("op_sel_hi:")
         || token.starts_with("neg_lo:")
         || token.starts_with("neg_hi:")
@@ -1324,6 +1325,21 @@ fn parse_suffixes(
             mods.omod = Omod::Mul4;
         } else if suffix == "div:2" {
             mods.omod = Omod::Div2;
+        } else if let Some(value) = suffix.strip_prefix("index_key:") {
+            // SWMMAC sparse-index half select, encoded as OP_SEL bit 0. The
+            // 16x16x64 iu4 row has no index_key (all 32 index bits are used).
+            if !row.name.starts_with("v_swmmac_") || row.name == "v_swmmac_i32_16x16x64_iu4" {
+                return Err(bad_operand(
+                    row.name,
+                    suffix,
+                    "index_key is only valid on SWMMAC rows that take it",
+                ));
+            }
+            match value {
+                "0" => {}
+                "1" => mods.op_sel |= 1,
+                _ => return Err(bad_operand(row.name, suffix, "index_key must be 0 or 1")),
+            }
         } else if let Some(list) = suffix.strip_prefix("op_sel:[") {
             parse_op_sel(row, suffix, list, false, mods)?;
         } else if let Some(list) = suffix.strip_prefix("op_sel_hi:[") {

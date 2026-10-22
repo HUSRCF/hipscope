@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Imported hipcc region: the SiLU epilogue value `h = g / (1 + expf(-g)) * u`.
+//! Imported hipcc regions: the SiLU epilogue value `h = g / (1 + expf(-g)) * u`
+//! and the shared-expert sigmoid `1.0f / (1.0f + __expf(-s))`.
 //!
 //! `expf` and the IEEE division are lowered by hipcc into a fixed VALU DAG
 //! (range-reduced `v_exp_f32`, overflow/underflow selects, the
@@ -26,6 +27,11 @@ pub const SILU_GOLDEN: &str = include_str!("../../../kernels/iu4_gemm.silu.regio
 /// (`slice_silu_gfx11`); gfx11 needs no ALU dependency waits inside it.
 pub const SILU_GOLDEN_GFX1100: &str =
     include_str!("../../../kernels/iu4_v2c.gfx1100.silu.region.s");
+/// hipcc's lowering of `iu4_shared_sigmoid` (`1.0f / (1.0f + __expf(-s))`), the
+/// per-token gate of the V3 `full_add_v3` `add == 2` epilogue.
+pub const SIGMOID_GOLDEN: &str = include_str!("../../../kernels/iu4_gemm.sigmoid.region.s");
+/// VGPR temporaries one sigmoid element needs (no lane masks).
+pub const SIGMOID_TEMPS: usize = 6;
 /// Temporaries and lane-mask SGPRs one element needs.
 pub const SILU_TEMPS: usize = 7;
 pub const SILU_MASKS: usize = 2;
@@ -170,8 +176,8 @@ impl Region {
                 dual,
             });
         }
-        if inputs.len() != 2 {
-            return Err("region must read exactly two live-ins".into());
+        if inputs.is_empty() {
+            return Err("region must read a live-in".into());
         }
         match ops.last() {
             Some(op) if matches!(op.operands.first(), Some((false, Operand::Temp(_)))) => {}
@@ -186,6 +192,10 @@ impl Region {
 
     pub fn silu() -> Result<Self, String> {
         Self::parse(SILU_GOLDEN)
+    }
+    /// The shared-gate sigmoid: one live-in (`G`), VGPR temporaries only.
+    pub fn sigmoid() -> Result<Self, String> {
+        Self::parse(SIGMOID_GOLDEN)
     }
     /// The gfx1100 golden (hipcc's gfx1100 lowering of the same source).
     pub fn silu_gfx1100() -> Result<Self, String> {
@@ -831,6 +841,28 @@ pub fn body_of(golden: &str) -> String {
 mod tests {
     use super::*;
     use crate::{reg::Live, Arch, KernargLayout, KernelSpec, RegPlan};
+
+    /// The imported hipcc sigmoid: `1.0f / (1.0f + __expf(-s))` is one
+    /// `v_exp_f32` of `-log2(e) * s` and the IEEE division expansion; one
+    /// live-in, VGPR temporaries only.
+    #[test]
+    fn sigmoid_region_census() {
+        let r = Region::sigmoid().unwrap();
+        let m = r.mnemonics();
+        for (op, n) in [
+            ("v_exp_f32_e32", 1),
+            ("v_div_scale_f32", 2),
+            ("v_div_fmas_f32", 1),
+            ("v_div_fixup_f32", 1),
+            ("v_rcp_f32_e32", 1),
+            ("s_wait_alu", 1),
+        ] {
+            assert_eq!(m.iter().filter(|x| **x == op).count(), n, "{op}");
+        }
+        assert_eq!(m.first(), Some(&"v_mul_f32_e32"));
+        assert_eq!(m.last(), Some(&"v_div_fixup_f32"));
+        assert_eq!((r.temps, r.masks), (SIGMOID_TEMPS, 0));
+    }
 
     /// `elements` instances over `slots` register slots, laid out the way the
     /// gate/up epilogue binds them (partners an odd distance apart).

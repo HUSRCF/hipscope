@@ -38,14 +38,14 @@ since; see "Engine seams"):
 
 ## Vocabulary
 
-New model-neutral ops live in `hipfire-dispatch/src/pipeline/sandwich.rs`
-(not `deltanet`-gated). Each executor takes `rows`.
+New model-neutral ops live in `hipfire-dispatch/src/pipeline/sandwich.rs` and,
+for the MLP, `gated_mlp.rs` (not `deltanet`-gated). Each executor takes `rows`.
 
 | Step | Semantics | Route choice owned by dispatch |
 |---|---|---|
 | `SandwichAttention` | `x = residual + post_norm(o_proj(attend(rope(norm_h(q)), rope(norm_h(k)), norm(v))))` on `input_norm(x)`. Optional V projection (`None` = K=V from pre-norm K); optional weightless V norm; Q prescale; **explicit `Rope { kind: RotateHalf \| PartialHalved { rot_pairs }, theta }`**; `kv_proj: Option<KvProjection>` (`None` = query-only attend over a shared slot, no cache write: E-series KV sharing and the drafter); `window` | fused norm+FWHT-rotate + prerotated GEMVs (MQ4), fused Q8 q+k, fused qk-norm+RoPE, fused post-norm+residual, KV tier via `KvTierPlan` |
-| `SandwichMlp` | `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(x)`, `act ∈ {GeluTanh}` | fused norm+rotate + fused gate/up (MQ4), fused post-norm+residual |
-| `ParallelMoeMlp` | Gemma 4 MoE block: dense GeGLU MLP ∥ routed experts (router input `rms(x)·router_scale/√dim`, softmax top-k renorm, per-expert scale, GeGLU), `post_ffn_norm(norm1(mlp) + norm2(moe))`, residual add | expert dtype routes (MQ4 / HFQ4 / Q8 indexed) |
+| `GatedMlp` (ladder `SandwichWide`, output `PostNorm`; formerly `SandwichMlp`) | `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(x)`, `act ∈ {GeluTanh}` | fused norm+rotate + fused gate/up (MQ4), fused post-norm+residual |
+| `ParallelMoeMlp` | Gemma 4 MoE block: dense GeGLU MLP (a `GatedMlp` with output `Write`) ∥ routed experts (router input `rms(x)·router_scale/√dim`, softmax top-k renorm, per-expert scale, GeGLU), `post_ffn_norm(norm1(mlp) + norm2(moe))`, residual add | expert dtype routes (MQ4 / HFQ4 / Q8 indexed) |
 | `PerLayerInput` | E-series PLE branch: `x += post_norm(proj(gelu(gate(x)) * ple[layer]))` | batched strided PLE kernel |
 | `Scale` | `x *= s` (layer scalar), replay-safe recorded scale | — |
 | `Softcap` | `logits = tanh(logits / c) · c` | — |
@@ -56,14 +56,14 @@ Projections, the final norm and the LM head reuse `Gemv` and
 ## Slices
 
 1. **Eager stack** (dense, E-series, EAGLE target). `SandwichAttention`,
-   `SandwichMlp`, `PerLayerInput`, `Scale`, `Softcap` with `rows == 1` and
+   `GatedMlp`, `PerLayerInput`, `Scale`, `Softcap` with `rows == 1` and
    `rows > 1` executors; `decode_step_body` and `forward_batch_spec` run the
    same program. The token-level PLE staging and embedding stay in the arch
    crate, outside the captured body.
 2. **MoE.** `ParallelMoeMlp` (`rows == 1` and `rows > 1`); 26B-A4B runs the
    shared program on its sliding ring and full-tier KV.
 3. **EAGLE/MTP drafter.** The drafter block is `[SandwichAttention(query-only,
-   kv_proj: None, target KV), SandwichMlp, Scale]`; pre/post projection and
+   kv_proj: None, target KV), GatedMlp, Scale]`; pre/post projection and
    head are `Gemv` steps.
 4. **Deletion.** `lowered.rs` super-op facade and hand arms; calibration
    tools move to the shared batched program.

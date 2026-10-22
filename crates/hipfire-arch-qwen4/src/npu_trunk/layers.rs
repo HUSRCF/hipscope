@@ -330,19 +330,25 @@ pub(super) fn build_program<'a>(
                 steps.push(Step::Moe(sealed));
             }
             Qwen4FfnBinding::Dense(dense) => {
-                steps.push(Step::DenseFfn(DenseFfnOp {
-                    recipe: DenseFfnRecipe::SiluBf16Source,
-                    gate: dense.gate,
-                    up: dense.up,
-                    down: dense.down,
-                    input: &scratch.hc_mixed,
-                    gate_scratch: &scratch.moe_gate_batch,
-                    up_scratch: &scratch.moe_up_batch,
-                    output: &scratch.ffn_output,
-                    rotation: &scratch.rotation,
+                steps.push(Step::GatedMlp(GatedMlpOp {
                     rows: n,
                     hidden: config.hidden_size,
                     intermediate: dense.intermediate,
+                    x: &scratch.hc_mixed,
+                    pre_norm: None,
+                    gate: dense.gate,
+                    up: dense.up,
+                    down: dense.down,
+                    activation: Activation::Silu,
+                    storage: MlpStorage::Bf16Source,
+                    output: MlpOutput::Write(&scratch.ffn_output),
+                    ladder: MlpLadder::Trunk,
+                    scratch: GatedMlpScratch {
+                        gate: &scratch.moe_gate_batch,
+                        up: &scratch.moe_up_batch,
+                        act: &scratch.moe_gate_batch,
+                        x_rot: &scratch.rotation,
+                    },
                 }));
             }
         }

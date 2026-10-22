@@ -2,41 +2,41 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle, CPU structural proof and timing harness for the two-rows-per-block
+//! Byte oracle, CPU structural proof and timing harness for the wave-per-row
 //! fused prefill MoE router (`Gpu::moe_router_softmax_topk_k8_multirow_prefill`,
-//! block 128 x 2, A3B shape: 256 experts, top-8).
+//! symbol `moe_router_softmax_topk_k8_wave`: one wave32 per row, 8 rows per
+//! 256-thread block, A3B shape: 256 experts, top-8).
 //!
 //! Three routes are compared on identical inputs (n_exp 256, k 8):
 //! * incumbent pair: `gpu.softmax_f32(&logits)` + `gpu.moe_topk_renorm_k8_batched(..)`.
 //! * current fused: `gpu.moe_router_softmax_topk_k8_prefill(.., lanes = 128)`.
-//! * new: `gpu.moe_router_softmax_topk_k8_multirow_prefill(..)` (two rows per
-//!   block, 128 lanes each, grid `batch / 2`).
+//! * new: `gpu.moe_router_softmax_topk_k8_multirow_prefill(..)` (wave-per-row).
 //!
 //! Modes (one per invocation):
-//! * `--plan` (CPU, no GPU): prints the launch geometry, LDS arithmetic, the
-//!   admission table, and the exact GPU case grid with an FNV-1a/64 hash of every
-//!   deterministic input, so the owner run can be matched to the plan.
-//! * `--self-check` (CPU, no GPU): proves the virtualization structure without
-//!   libm/GPU exp assumptions. An independent serial reference of the original
-//!   256-thread softmax + mode-0 top-8 (strict `>` scan, tree s = 128..1,
+//! * `--plan` (CPU, no GPU): prints the launch geometry, the admission table, and
+//!   the exact GPU case grid with an FNV-1a/64 hash of every deterministic input,
+//!   so the owner run can be matched to the plan.
+//! * `--self-check` (CPU, no GPU): proves the wave structure without libm/GPU exp
+//!   assumptions. An independent serial reference of the original 256-thread
+//!   softmax + mode-0 top-8 (strict `>` scan, tree s = 128..1,
 //!   replace-on-strictly-greater, sequential renorm, clamp) is compared bit for
-//!   bit with a lane-level emulation of the new kernel (128 lanes x 2 row slots,
-//!   `for t = tid; t < width; t += 128` virtual-thread loops, per-row separate
-//!   storage, `bid = block * 2 + ty`). Both sides use the same CPU `exp`/division,
-//!   so only the structure (trees, ties, lane assignment, row layout) is under
-//!   test. Also checks: every virtual thread is visited exactly once by lane
-//!   `t % 128` in every stage, tree reads/writes are disjoint, the row/block/grid
-//!   layout, the LDS byte budget, hand-derived tie orders (all-zero picks
-//!   0,128,64,192; {5,133} -> 5,133; {1,2} -> 2,1: tree position, not lowest
-//!   index) and the pure admission rule.
-//! * default / `--gpu` (wave32 GPU, one process): rows {512, 4096, 8192} x n_exp 256
+//!   bit with a lane-level emulation of the new kernel (32 lanes, two float4
+//!   per lane, xor/down shuffles, bit-reversed tie priority). Both sides use the
+//!   same CPU `exp`/division, so only the structure (trees, ties, lane layout,
+//!   row mapping) is under test. Also checks: the row/block/wave layout, the
+//!   tie rule (winner among equal maxima = smallest bit-reversed index, proved on
+//!   the serial reference), hand-derived tie orders (all-zero picks 0,128,64,192;
+//!   {5,133} -> 5,133; {1,2} -> 2,1: tree position, not lowest index), non-finite
+//!   rows and the pure admission rule.
+//! * default / `--gpu` (wave32 GPU, one process): rows {8, 513, 4096, 7808, 8192}
+//!   (7808 = the A3B second chunk, 513 = odd tail block) x n_exp 256
 //!   x norm {false, true} x inputs {allzero, random, tie_heavy, tie_tree_cross,
-//!   mixed_rows}. Ids (raw i32 in F32-typed tensors) and weights are compared by
-//!   raw bit pattern: new vs current fused AND new vs incumbent (and, for the
-//!   record, current fused vs incumbent). Then per rows x norm the event-timed
-//!   median over 50 reps (10 warmups, >= 20 required) of each route on the random
-//!   input. Every rep first restores the raw logits (softmax is in place) from a
-//!   GPU-resident pristine copy outside the event interval.
+//!   mixed_rows, nonfinite, flat_tail}. Ids (raw i32 in F32-typed tensors) and
+//!   weights are compared by raw bit pattern: new vs current fused AND new vs
+//!   incumbent (and, for the record, current fused vs incumbent). Then per rows x
+//!   norm the event-timed median over 50 reps (10 warmups, >= 20 required) of each
+//!   route on the random input. Every rep first restores the raw logits (softmax is
+//!   in place) from a GPU-resident pristine copy outside the event interval.
 //!
 //! Output (stdout, one JSON object per line): per-comparison verdict lines, timing
 //! lines `{"timing":true,"rows","norm","median_us":{"incumbent_pair","current_fused","new"},..}`
@@ -58,25 +58,21 @@ use std::time::Instant;
 
 const TOP_K: usize = 8;
 const N_EXP: usize = 256;
-/// Virtual block of the incumbent softmax (`min(256, n_exp)`) and top-8 kernels.
-const VBLOCK: usize = 256;
-/// Physical lanes per row slot and rows per block of the new route.
+/// Physical lanes per row of the current fused (one-row, 128-lane) route.
 const LANES: usize = 128;
-const ROWS_PER_BLOCK: usize = 2;
-/// Static LDS of the shared symbol (row slot 0): smem_v + smem_i (1024 each),
-/// reduce_v + reduce_i (256 each), picked_idx + picked_w (8 each), 4 bytes each.
-const STATIC_LDS_BYTES: usize = 4 * (1024 + 1024 + 256 + 256 + 8 + 8);
-/// Dynamic LDS of row slot 1 at n_exp 256: smem_v[n_exp], reduce_v[256],
-/// reduce_i[256], picked_idx[8], picked_w[8]; smem_i is mode 0 only.
-const DYN_LDS_BYTES: usize = 4 * (N_EXP + 256 + 256 + 8 + 8);
+/// Lanes (one wave32) per row and rows per block of the new wave-per-row route.
+const WAVE: usize = 32;
+const ROWS_PER_BLOCK: usize = 8;
 
-const GPU_ROWS: [usize; 3] = [512, 4096, 8192];
-const VARIANTS: [&str; 5] = [
+const GPU_ROWS: [usize; 5] = [8, 513, 4096, 7808, 8192];
+const VARIANTS: [&str; 7] = [
     "allzero",
     "random",
     "tie_heavy",
     "tie_tree_cross",
     "mixed_rows",
+    "nonfinite",
+    "flat_tail",
 ];
 const MIXED_KINDS: [&str; 4] = ["allzero", "random", "tie_heavy", "tie_tree_cross"];
 /// Equal-maximum position sets that cross virtual tree positions (n_exp 256: one
@@ -128,7 +124,7 @@ fn expected_admission(
     batch: usize,
     has_wave32: bool,
 ) -> bool {
-    enabled && k == 8 && n_exp == 256 && has_wave32 && batch >= 2 && batch.is_multiple_of(2)
+    enabled && k == 8 && n_exp == 256 && has_wave32 && batch >= 1
 }
 
 fn check_admission() -> Result<usize, String> {
@@ -136,7 +132,7 @@ fn check_admission() -> Result<usize, String> {
     for enabled in [false, true] {
         for k in [1usize, 4, 8, 10] {
             for n_exp in [64usize, 128, 255, 256, 257, 512, 1024] {
-                for batch in [0usize, 1, 2, 3, 4, 7, 512, 4095, 4096, 8192, 8193] {
+                for batch in [0usize, 1, 2, 3, 4, 7, 8, 9, 512, 4095, 4096, 8192, 8193] {
                     for wave32 in [false, true] {
                         let got = Gpu::moe_router_topk_multirow_admitted(
                             enabled, k, n_exp, batch, wave32,
@@ -163,18 +159,16 @@ fn check_admission() -> Result<usize, String> {
 
 fn plan() {
     println!(
-        "{{\"plan\":true,\"geometry\":{{\"lanes\":{LANES},\"rows_per_block\":{ROWS_PER_BLOCK},\
-         \"block\":[{LANES},{ROWS_PER_BLOCK},1],\"threads\":{},\"n_exp\":{N_EXP},\"k\":{TOP_K},\
-         \"static_lds_bytes\":{STATIC_LDS_BYTES},\"dynamic_lds_bytes\":{DYN_LDS_BYTES},\
-         \"total_lds_bytes\":{},\"virtual_block\":{VBLOCK},\"virtual_threads_per_lane\":{}}}}}",
-        LANES * ROWS_PER_BLOCK,
-        STATIC_LDS_BYTES + DYN_LDS_BYTES,
-        VBLOCK / LANES,
+        "{{\"plan\":true,\"geometry\":{{\"lanes_per_row\":{WAVE},\"rows_per_block\":{ROWS_PER_BLOCK},\
+         \"block\":[{},1,1],\"n_exp\":{N_EXP},\"k\":{TOP_K},\"dynamic_lds_bytes\":0,\
+         \"floats_per_lane\":{}}}}}",
+        WAVE * ROWS_PER_BLOCK,
+        N_EXP / WAVE,
     );
     for &rows in &GPU_ROWS {
         println!(
             "{{\"plan_grid\":true,\"rows\":{rows},\"grid\":[{}, 1, 1],\"admitted_wave32\":{}}}",
-            rows / ROWS_PER_BLOCK,
+            rows.div_ceil(ROWS_PER_BLOCK),
             expected_admission(true, TOP_K, N_EXP, rows, true)
         );
     }
@@ -224,11 +218,7 @@ fn self_check() {
         }
     }
 
-    record("lds_budget", check_lds(), &mut failures);
-    checks += 1;
-    record("virtual_thread_coverage", check_coverage(), &mut failures);
-    checks += 1;
-    record("row_block_layout", check_layout(), &mut failures);
+    record("row_block_wave_layout", check_layout(), &mut failures);
     checks += 1;
     record(
         "admission_rule",
@@ -236,28 +226,19 @@ fn self_check() {
         &mut failures,
     );
     checks += 1;
+    record("tie_rule_bit_reversed", check_tie_rule(), &mut failures);
+    checks += 1;
     record("hand_derived_ties", check_hand_ties(), &mut failures);
     checks += 1;
 
     for variant in VARIANTS {
         for norm in [false, true] {
-            let logits = make_logits(variant, 130);
+            // 133 rows: 16 full blocks + a 5-row tail block.
+            let logits = make_logits(variant, 133);
             let name = format!("emulation_vs_reference/{variant}/norm={norm}");
-            record(&name, check_emulation(&logits, 130, norm), &mut failures);
+            record(&name, check_emulation(&logits, 133, norm), &mut failures);
             checks += 1;
         }
-    }
-    // Identical rows in both slots of every block: slot storage is independent.
-    for norm in [false, true] {
-        let mut logits = make_logits("tie_tree_cross", 64);
-        for pair in 0..32 {
-            let (a, b) = (2 * pair * N_EXP, (2 * pair + 1) * N_EXP);
-            let (head, tail) = logits.split_at_mut(b);
-            tail[..N_EXP].copy_from_slice(&head[a..a + N_EXP]);
-        }
-        let name = format!("emulation_vs_reference/duplicate_pairs/norm={norm}");
-        record(&name, check_emulation(&logits, 64, norm), &mut failures);
-        checks += 1;
     }
 
     println!(
@@ -270,83 +251,24 @@ fn self_check() {
     }
 }
 
-fn check_lds() -> Result<(), String> {
-    if STATIC_LDS_BYTES != 10304 {
-        return Err(format!("static LDS {STATIC_LDS_BYTES} != 10304"));
-    }
-    if DYN_LDS_BYTES != 3136 {
-        return Err(format!("dynamic LDS {DYN_LDS_BYTES} != 3136"));
-    }
-    if LANES * ROWS_PER_BLOCK != 256 || !VBLOCK.is_multiple_of(LANES) {
-        return Err("block geometry is not 128 x 2 over 256 virtual threads".into());
-    }
-    Ok(())
-}
-
-/// Every stage of the fused kernel loops `for t = tid; t < width; t += 128`.
-/// Each virtual thread must be visited exactly once, by lane `t % 128`; tree
-/// stages additionally read `[s, 2s)` and write `[0, s)` (disjoint).
-fn check_coverage() -> Result<(), String> {
-    let mut widths: Vec<(String, usize)> = Vec::new();
-    for name in [
-        "max_scan",
-        "exp_sum_scan",
-        "elementwise_divide",
-        "top8_scan",
-    ] {
-        widths.push((name.to_string(), VBLOCK));
-    }
-    let mut s = VBLOCK >> 1;
-    while s > 0 {
-        widths.push((format!("tree_s{s}"), s));
-        s >>= 1;
-    }
-    for (name, width) in widths {
-        let mut visits = vec![0usize; width];
-        for tid in 0..LANES {
-            let mut t = tid;
-            while t < width {
-                if t % LANES != tid {
-                    return Err(format!("{name}: virtual thread {t} on lane {tid}"));
-                }
-                visits[t] += 1;
-                t += LANES;
-            }
-        }
-        if let Some(t) = visits.iter().position(|&c| c != 1) {
-            return Err(format!(
-                "{name}: virtual thread {t} visited {} times",
-                visits[t]
-            ));
-        }
-    }
-    let mut s = VBLOCK >> 1;
-    while s > 0 {
-        // write set [0, s), read set [s, 2s): disjoint by construction.
-        if s > VBLOCK - s {
-            return Err(format!("tree stage {s}: read/write sets overlap"));
-        }
-        s >>= 1;
-    }
-    Ok(())
-}
-
-/// `bid = blockIdx.x * 2 + threadIdx.y` over grid `batch / 2` covers every row
-/// exactly once and every output slot `row * 8 + [0, 8)` exactly once.
+/// `row = blockIdx.x * 8 + wave` over grid `ceil(batch / 8)` with the
+/// `row >= batch` early exit covers every row exactly once and every output slot
+/// `row * 8 + [0, 8)` exactly once (lane < 8 of the owning wave), for every
+/// batch size including partial tail blocks.
 fn check_layout() -> Result<(), String> {
-    for batch in [2usize, 4, 6, 512, 4096, 8192] {
-        let grid = batch / ROWS_PER_BLOCK;
+    for batch in [1usize, 2, 7, 8, 9, 15, 16, 17, 133, 513, 4095, 7808, 8192] {
+        let grid = batch.div_ceil(ROWS_PER_BLOCK);
         let mut seen = vec![0u8; batch];
         let mut out = vec![0u8; batch * TOP_K];
         for block in 0..grid {
-            for ty in 0..ROWS_PER_BLOCK {
-                let bid = block * ROWS_PER_BLOCK + ty;
-                if bid >= batch {
-                    return Err(format!("batch {batch}: bid {bid} out of range"));
+            for wave in 0..ROWS_PER_BLOCK {
+                let row = block * ROWS_PER_BLOCK + wave;
+                if row >= batch {
+                    continue;
                 }
-                seen[bid] += 1;
-                for tid in 0..TOP_K {
-                    out[bid * TOP_K + tid] += 1;
+                seen[row] += 1;
+                for lane in 0..TOP_K {
+                    out[row * TOP_K + lane] += 1;
                 }
             }
         }
@@ -354,6 +276,49 @@ fn check_layout() -> Result<(), String> {
             return Err(format!(
                 "batch {batch}: rows/outputs not covered exactly once"
             ));
+        }
+        if (grid - 1) * ROWS_PER_BLOCK >= batch {
+            return Err(format!("batch {batch}: empty trailing block"));
+        }
+    }
+    // Two float4 loads per lane cover the 256-expert row exactly once.
+    let mut covered = [0u8; N_EXP];
+    for lane in 0..WAVE {
+        for c in 0..4 {
+            covered[4 * lane + c] += 1;
+            covered[128 + 4 * lane + c] += 1;
+        }
+    }
+    if covered.iter().any(|&c| c != 1) {
+        return Err("lane layout does not cover every expert exactly once".into());
+    }
+    Ok(())
+}
+
+/// The serial reference resolves equal maxima by the smallest bit-reversed
+/// (8-bit) expert index; the wave kernel's priority key relies on exactly this.
+fn check_tie_rule() -> Result<(), String> {
+    let mut rng = Rng::new(7, 9001);
+    for round in 0..4000usize {
+        let count = 1 + rng.below(24);
+        let set = rng.positions(count);
+        let probs = {
+            let mut p = vec![0.01f32; N_EXP];
+            for &i in &set {
+                p[i] = 0.5;
+            }
+            p
+        };
+        let (ids, _) = reference_row(&probs, false);
+        let mut want: Vec<usize> = set.clone();
+        want.sort_by_key(|&i| (i as u8).reverse_bits());
+        for k in 0..TOP_K.min(count) {
+            if ids[k] as usize != want[k] {
+                return Err(format!(
+                    "round {round}: pick {k} is {}, bit-reversed order says {} (set {set:?})",
+                    ids[k], want[k]
+                ));
+            }
         }
     }
     Ok(())
@@ -367,42 +332,36 @@ fn check_hand_ties() -> Result<(), String> {
     ];
     for (name, row, want) in cases {
         for norm in [false, true] {
-            let mut logits = row.clone();
-            logits.extend_from_slice(&row);
-            let (ids, _) = reference_row(&reference_softmax(&logits[..N_EXP]), norm);
+            let (ids, _) = reference_row(&reference_softmax(&row), norm);
             if ids[..want.len()] != *want {
                 return Err(format!(
                     "{name} norm={norm}: reference picks {:?}, expected prefix {want:?}",
                     &ids[..want.len()]
                 ));
             }
-            check_emulation(&logits, 2, norm).map_err(|e| format!("{name} norm={norm}: {e}"))?;
+            check_emulation(&row, 1, norm).map_err(|e| format!("{name} norm={norm}: {e}"))?;
         }
     }
     Ok(())
 }
 
 /// Compares the lane-level emulation of the new kernel to the serial reference,
-/// bit for bit, for every row of `logits` (`rows` even).
+/// bit for bit, for every row of `logits`.
 fn check_emulation(logits: &[f32], rows: usize, norm: bool) -> Result<(), String> {
-    if !rows.is_multiple_of(ROWS_PER_BLOCK) || logits.len() != rows * N_EXP {
-        return Err("rows must be even and logits sized rows * n_exp".into());
-    }
-    let mut idx = vec![i32::from_ne_bytes(SENTINEL_BITS.to_ne_bytes()); rows * TOP_K];
-    let mut w = vec![f32::from_bits(SENTINEL_BITS); rows * TOP_K];
-    for block in 0..rows / ROWS_PER_BLOCK {
-        emulate_block(logits, block, norm, &mut idx, &mut w);
+    if logits.len() != rows * N_EXP {
+        return Err("logits must be sized rows * n_exp".into());
     }
     for row in 0..rows {
-        let probs = reference_softmax(&logits[row * N_EXP..(row + 1) * N_EXP]);
-        let (ref_ids, ref_w) = reference_row(&probs, norm);
+        let row_logits = &logits[row * N_EXP..(row + 1) * N_EXP];
+        let (got_ids, got_w) = emulate_wave_row(row_logits, norm);
+        let (ref_ids, ref_w) = reference_row(&reference_softmax(row_logits), norm);
         for pick in 0..TOP_K {
-            let (gi, gw) = (idx[row * TOP_K + pick], w[row * TOP_K + pick]);
-            if gi != ref_ids[pick] || gw.to_bits() != ref_w[pick].to_bits() {
+            if got_ids[pick] != ref_ids[pick] || got_w[pick].to_bits() != ref_w[pick].to_bits() {
                 return Err(format!(
-                    "row {row} pick {pick}: emulated id {gi} weight {:#010x}, reference id {} \
+                    "row {row} pick {pick}: emulated id {} weight {:#010x}, reference id {} \
                      weight {:#010x}",
-                    gw.to_bits(),
+                    got_ids[pick],
+                    got_w[pick].to_bits(),
                     ref_ids[pick],
                     ref_w[pick].to_bits()
                 ));
@@ -534,175 +493,158 @@ fn reference_row(probs: &[f32], norm: bool) -> ([i32; TOP_K], [f32; TOP_K]) {
     (picked_idx, picked_w)
 }
 
-/// Per-row-slot LDS: the original names (smem_v / reduce_v / reduce_i /
-/// picked_idx / picked_w) aliased to one row's storage. Slot 0 is the static
-/// array set, slot 1 the dynamic block; they never alias each other.
-struct RowLds {
-    smem_v: Vec<f32>,
-    reduce_v: Vec<f32>,
-    reduce_i: Vec<i32>,
-    picked_idx: [i32; TOP_K],
-    picked_w: [f32; TOP_K],
+/// `__shfl_xor(v, off)` across the wave.
+fn shfl_xor<T: Copy>(v: &[T; WAVE], lane: usize, off: usize) -> T {
+    v[lane ^ off]
 }
 
-impl RowLds {
-    fn new() -> Self {
-        RowLds {
-            smem_v: vec![0.0; N_EXP],
-            reduce_v: vec![0.0; VBLOCK],
-            reduce_i: vec![0; VBLOCK],
-            picked_idx: [0; TOP_K],
-            picked_w: [0.0; TOP_K],
-        }
+/// `__shfl_down(v, off)`: lane + off, or the lane's own value past the wave end.
+fn shfl_down<T: Copy>(v: &[T; WAVE], lane: usize, off: usize) -> T {
+    if lane + off < WAVE {
+        v[lane + off]
+    } else {
+        v[lane]
     }
 }
 
-/// Executes one block (128 lanes x 2 row slots) of the fused path stage by
-/// stage. Every `for ty { for tid {..} }` nest is one barrier-delimited stage;
-/// lanes run serially, which is exact because within a stage no lane reads
-/// anything another lane writes (checked in `check_coverage`). Virtual thread
-/// loops are `for t = tid; t < width; t += 128`, as in the kernel.
-fn emulate_block(logits: &[f32], block: usize, norm: bool, out_idx: &mut [i32], out_w: &mut [f32]) {
-    let mut st = [RowLds::new(), RowLds::new()];
-    let probs_of = |ty: usize| {
-        let bid = block * ROWS_PER_BLOCK + ty;
-        &logits[bid * N_EXP..(bid + 1) * N_EXP]
-    };
+/// `a` beats `b`: larger value, equal value with the smaller priority.
+fn better(va: f32, pa: i32, vb: f32, pb: i32) -> bool {
+    va > vb || (va == vb && pa < pb)
+}
 
-    // Row max scan.
-    for (ty, row) in st.iter_mut().enumerate() {
-        let probs = probs_of(ty);
-        for tid in 0..LANES {
-            for t in (tid..VBLOCK).step_by(LANES) {
-                let mut m = -1e30f32;
-                let mut i = t;
-                while i < N_EXP {
-                    m = fmax(m, probs[i]);
-                    i += VBLOCK;
-                }
-                row.reduce_v[t] = m;
-            }
-        }
-    }
-    tree(&mut st, fmax);
-    let max_val = [st[0].reduce_v[0], st[1].reduce_v[0]];
-
-    // exp(x - max) per element, per-virtual-thread sum.
-    for ty in 0..ROWS_PER_BLOCK {
-        let probs = probs_of(ty);
-        for tid in 0..LANES {
-            for t in (tid..VBLOCK).step_by(LANES) {
-                let mut sum = 0.0f32;
-                let mut i = t;
-                while i < N_EXP {
-                    let e = (probs[i] - max_val[ty]).exp();
-                    st[ty].smem_v[i] = e;
-                    sum += e;
-                    i += VBLOCK;
-                }
-                st[ty].reduce_v[t] = sum;
-            }
-        }
-    }
-    tree(&mut st, fadd);
-    let sum_all = [st[0].reduce_v[0], st[1].reduce_v[0]];
-
-    // Direct divide.
-    for ty in 0..ROWS_PER_BLOCK {
-        for tid in 0..LANES {
-            for i in (tid..N_EXP).step_by(LANES) {
-                st[ty].smem_v[i] /= sum_all[ty];
-            }
+/// Lane-level emulation of one wave of `moe_router_softmax_topk_k8_wave`
+/// (32 lanes run in lockstep; every shuffle is a whole-wave step, so the lane loops
+/// below are exact). Lane `l` holds experts `4l + c` (`x[l][c]`) and
+/// `128 + 4l + c` (`x[l][4 + c]`).
+fn emulate_wave_row(row: &[f32], norm: bool) -> ([i32; TOP_K], [f32; TOP_K]) {
+    let mut x = [[0.0f32; 8]; WAVE];
+    for l in 0..WAVE {
+        for c in 0..4 {
+            x[l][c] = row[4 * l + c];
+            x[l][4 + c] = row[128 + 4 * l + c];
         }
     }
 
-    // Top-8.
+    // Row max: in-lane fold from -1e30, xor butterfly.
+    let mut m = [-1e30f32; WAVE];
+    for l in 0..WAVE {
+        for j in 0..8 {
+            m[l] = fmax(m[l], x[l][j]);
+        }
+    }
+    for off in [16usize, 8, 4, 2, 1] {
+        let prev = m;
+        for l in 0..WAVE {
+            m[l] = fmax(prev[l], shfl_xor(&prev, l, off));
+        }
+    }
+    let max_val = m[0];
+
+    // exp(x - max), tree sum.
+    let mut e = [[0.0f32; 8]; WAVE];
+    for l in 0..WAVE {
+        for j in 0..8 {
+            e[l][j] = (x[l][j] - max_val).exp();
+        }
+    }
+    let mut u = [[0.0f32; 4]; WAVE];
+    for l in 0..WAVE {
+        for c in 0..4 {
+            u[l][c] = e[l][c] + e[l][4 + c]; // s = 128
+        }
+    }
+    for off in [16usize, 8, 4, 2, 1] {
+        // s = 64, 32, 16, 8, 4
+        for c in 0..4 {
+            let mut col = [0.0f32; WAVE];
+            for l in 0..WAVE {
+                col[l] = u[l][c];
+            }
+            for l in 0..WAVE {
+                u[l][c] = col[l] + shfl_down(&col, l, off);
+            }
+        }
+    }
+    let q0 = u[0][0] + u[0][2]; // s = 2
+    let q1 = u[0][1] + u[0][3];
+    let sum_all = q0 + q1; // s = 1
+
+    // Probabilities and bit-reversed priorities.
+    let mut v = [[0.0f32; 8]; WAVE];
+    let mut pr = [[0i32; 8]; WAVE];
+    for l in 0..WAVE {
+        for j in 0..8 {
+            let p = e[l][j] / sum_all;
+            v[l][j] = if p > f32::NEG_INFINITY {
+                p
+            } else {
+                f32::NEG_INFINITY
+            };
+            let pos = (if j < 4 { 0 } else { 128 }) + 4 * l + (j & 3);
+            pr[l][j] = i32::from((pos as u8).reverse_bits());
+        }
+    }
+
+    let mut pick_i = [0i32; TOP_K];
+    let mut pick_w = [0.0f32; TOP_K];
     for k in 0..TOP_K {
-        for row in st.iter_mut() {
-            for tid in 0..LANES {
-                for t in (tid..VBLOCK).step_by(LANES) {
-                    let mut best_v = f32::NEG_INFINITY;
-                    let mut best_i = -1i32;
-                    let mut i = t;
-                    while i < N_EXP {
-                        let v = row.smem_v[i];
-                        if v > best_v {
-                            best_v = v;
-                            best_i = i as i32;
-                        }
-                        i += VBLOCK;
-                    }
-                    row.reduce_v[t] = best_v;
-                    row.reduce_i[t] = best_i;
+        let mut bv = [0.0f32; WAVE];
+        let mut bp = [0i32; WAVE];
+        for l in 0..WAVE {
+            bv[l] = v[l][0];
+            bp[l] = pr[l][0];
+            for j in 1..8 {
+                if better(v[l][j], pr[l][j], bv[l], bp[l]) {
+                    bv[l] = v[l][j];
+                    bp[l] = pr[l][j];
                 }
             }
         }
-        let mut s = VBLOCK >> 1;
-        while s > 0 {
-            for row in st.iter_mut() {
-                for tid in 0..LANES {
-                    for t in (tid..s).step_by(LANES) {
-                        let (va, vb) = (row.reduce_v[t], row.reduce_v[t + s]);
-                        if vb > va {
-                            row.reduce_v[t] = vb;
-                            row.reduce_i[t] = row.reduce_i[t + s];
-                        }
-                    }
+        for off in [16usize, 8, 4, 2, 1] {
+            let (pv, pp) = (bv, bp);
+            for l in 0..WAVE {
+                let (ov, op) = (shfl_xor(&pv, l, off), shfl_xor(&pp, l, off));
+                if better(ov, op, pv[l], pp[l]) {
+                    bv[l] = ov;
+                    bp[l] = op;
                 }
             }
-            s >>= 1;
         }
-        for row in st.iter_mut() {
-            let winner = row.reduce_i[0];
-            let winner_w = row.reduce_v[0];
-            // tid == 0 lane.
-            row.picked_idx[k] = winner;
-            row.picked_w[k] = winner_w;
-            if winner >= 0 && (winner as usize) < N_EXP {
-                row.smem_v[winner as usize] = f32::NEG_INFINITY;
+        // Every lane holds the same winner.
+        if (1..WAVE).any(|l| bv[l].to_bits() != bv[0].to_bits() || bp[l] != bp[0]) {
+            panic!("xor butterfly lanes disagree");
+        }
+        pick_i[k] = if bv[0] > f32::NEG_INFINITY {
+            i32::from((bp[0] as u8).reverse_bits())
+        } else {
+            -1
+        };
+        pick_w[k] = bv[0];
+        for l in 0..WAVE {
+            for j in 0..8 {
+                if pr[l][j] == bp[0] {
+                    v[l][j] = f32::NEG_INFINITY;
+                }
             }
         }
     }
 
-    // Renorm (tid == 0 lane), then clamp + store (tid < 8 lanes).
-    for (ty, row) in st.iter_mut().enumerate() {
-        let mut s = 0.0f32;
-        for k in 0..TOP_K {
-            s += row.picked_w[k];
-        }
-        if norm && s > 0.0 {
-            for k in 0..TOP_K {
-                row.picked_w[k] /= s;
-            }
-        }
-        let bid = block * ROWS_PER_BLOCK + ty;
-        for tid in 0..TOP_K {
-            let mut safe_idx = row.picked_idx[tid];
-            let mut safe_w = row.picked_w[tid];
-            if safe_idx < 0 || safe_idx as usize >= N_EXP {
-                safe_idx = 0;
-                safe_w = 0.0;
-            }
-            out_idx[bid * TOP_K + tid] = safe_idx;
-            out_w[bid * TOP_K + tid] = safe_w;
+    let mut s = 0.0f32;
+    for w in pick_w.iter() {
+        s += *w;
+    }
+    if norm && s > 0.0 {
+        for w in pick_w.iter_mut() {
+            *w /= s;
         }
     }
-}
-
-/// `for s = 128; s > 0; s >>= 1 { for t = tid; t < s; t += 128 { r[t] = op(r[t], r[t+s]) } }`
-/// on both row slots.
-fn tree(st: &mut [RowLds; 2], op: fn(f32, f32) -> f32) {
-    let mut s = VBLOCK >> 1;
-    while s > 0 {
-        for row in st.iter_mut() {
-            for tid in 0..LANES {
-                for t in (tid..s).step_by(LANES) {
-                    row.reduce_v[t] = op(row.reduce_v[t], row.reduce_v[t + s]);
-                }
-            }
+    for k in 0..TOP_K {
+        if pick_i[k] < 0 || pick_i[k] as usize >= N_EXP {
+            pick_i[k] = 0;
+            pick_w[k] = 0.0;
         }
-        s >>= 1;
     }
+    (pick_i, pick_w)
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1114,96 @@ fn make_row(kind: &str, row: usize, rng: &mut Rng) -> Vec<f32> {
             }
             v
         }
+        "nonfinite" => nonfinite_row(row, rng),
+        "flat_tail" => match row % 6 {
+            // One spike over a flat floor: 255 equal probabilities, the k = 8
+            // cut falls deep inside the tie (bit-reversed order).
+            0 => {
+                let mut v = vec![-3.0f32; N_EXP];
+                v[rng.below(N_EXP)] = 5.0;
+                v
+            }
+            // Exp underflow: every non-spike probability is exactly 0.0.
+            1 => {
+                let mut v = vec![-200.0f32; N_EXP];
+                v[rng.below(N_EXP)] = 0.0;
+                v
+            }
+            // Logits one or two ulps apart: distinct exps whose divided
+            // probabilities may round equal.
+            2 => (0..N_EXP)
+                .map(|_| 1.0f32 + (rng.below(3) as f32) * f32::EPSILON)
+                .collect(),
+            // Every logit below the incumbent's -1e30 max seed, with duplicates.
+            3 => (0..N_EXP)
+                .map(|_| -1.0e30f32 * (2.0 + rng.below(3) as f32))
+                .collect(),
+            // All equal at a large magnitude.
+            4 => vec![-65504.0f32; N_EXP],
+            // Tiny magnitudes around zero (exp ~ 1, rounding-sensitive sums).
+            _ => (0..N_EXP).map(|_| rng.range(-1.0e-6, 1.0e-6)).collect(),
+        },
         other => panic!("unknown variant {other}"),
     }
+}
+
+/// Non-finite and extreme-range rows (the incumbent ignores NaN in the max,
+/// never picks NaN, and clamps a round without a valid candidate to (0, 0.0f)).
+fn nonfinite_row(row: usize, rng: &mut Rng) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..N_EXP).map(|_| rng.range(-12.0, 12.0)).collect();
+    match row % 11 {
+        // One NaN logit: the row sum is NaN, every probability is NaN.
+        0 => v[rng.below(N_EXP)] = f32::NAN,
+        1 => v = vec![f32::NAN; N_EXP],
+        // One +inf: x - max is inf - inf = NaN for it, -inf for the rest.
+        2 => v[rng.below(N_EXP)] = f32::INFINITY,
+        3 => {
+            for p in rng.positions(128) {
+                v[p] = f32::NEG_INFINITY;
+            }
+        }
+        4 => v = vec![f32::NEG_INFINITY; N_EXP],
+        // Below the -1e30 seed, with some -inf.
+        5 => {
+            v = (0..N_EXP)
+                .map(|_| rng.range(-3.0e38, -1.5e30))
+                .collect::<Vec<_>>();
+            for p in rng.positions(8) {
+                v[p] = f32::NEG_INFINITY;
+            }
+        }
+        6 => {
+            for p in rng.positions(3) {
+                v[p] = f32::NAN;
+            }
+            for p in rng.positions(3) {
+                v[p] = f32::INFINITY;
+            }
+            for p in rng.positions(3) {
+                v[p] = f32::NEG_INFINITY;
+            }
+        }
+        // Wide range: most exps underflow to exactly 0, picks tie at 0.0.
+        7 => v = (0..N_EXP).map(|_| rng.range(-1.0e4, 1.0e4)).collect(),
+        // Two +inf.
+        8 => {
+            for p in rng.positions(2) {
+                v[p] = f32::INFINITY;
+            }
+        }
+        // Subnormal / signed-zero logits.
+        9 => {
+            v = (0..N_EXP)
+                .map(|i| match i % 4 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => 1.0e-40,
+                    _ => -1.0e-40,
+                })
+                .collect()
+        }
+        // Huge positive logits (max subtraction keeps exp finite).
+        _ => v = (0..N_EXP).map(|_| rng.range(3.0e38, 3.4e38)).collect(),
+    }
+    v
 }

@@ -370,6 +370,10 @@ detected arch when one is available. Otherwise they build kernels locally
 with hipcc. See
 [Prebuilt kernel packs](docs/GETTING_STARTED.md#prebuilt-kernel-packs).
 
+Before the first pull, `hipfire doctor` checks the driver and ROCm install, and
+`hipfire fit <model> --ctx N` says whether that model loads at that context on
+this machine, what the load would choose, and what to change if it does not.
+
 `hipfire version` compares the installed binary, the managed source checkout
 and the daemon. To switch revisions, use `hipfire update @beta`,
 `hipfire update --tag <tag>` or `hipfire update --commit <sha>`. To

@@ -49,6 +49,10 @@ use hipfire_runtime::weight_manifest::{plan_manifest, StateEntry, WeightEntry};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "pp_lanes.rs"]
+mod lanes;
+pub use lanes::Qwen4PpLaneExecutor;
+
 /// Band identity of one PP bundle, stamped on every band (root included) at
 /// attach. It carries what a session scope and boundary schedule need while the
 /// band's forward is taken or the mesh holder is detached: band index/count,
@@ -417,6 +421,67 @@ pub(crate) struct Qwen4PpMesh {
     committable: Option<u64>,
     /// The one live aggregate MTP window (per-band local tickets and the head's).
     windows: WindowStore<Qwen4StateSnapshot, MtpGpuStateSnapshot>,
+    /// Portable pinned decode edge staging, allocated on device zero: one
+    /// `max_lanes`-row f32 region (the lane store's `rows_cap` without spec).
+    /// Edge copies through it may be enqueued asynchronously; the host
+    /// touches it only after the sender's [`Self::lane_events`] fence has
+    /// completed, and a region is reused only after its consumer's copy has
+    /// finished.
+    lane_bounce: Option<LaneBounce>,
+    /// Persistent decode-overlap fences, `[sender band][microbatch]`: each
+    /// non-output band owns `min(max_lanes, 2 * stages)` events created on
+    /// its own device (the output band sends nothing and has no row).
+    /// Staged with the bounce, rolled back with it, and destroyed on their
+    /// owning devices in [`Qwen4Bundle::pp_free_gpu`] after the edge drain.
+    lane_events: Vec<Vec<hip_bridge::Event>>,
+}
+
+struct LaneBounce(hip_bridge::PinnedHostBuffer);
+
+// SAFETY: portable pinned storage has no thread affinity. Access is exclusive
+// through &mut mesh. Producer events gate other devices' reads; stream order
+// protects a band's upload from its later download to the same region.
+// Successful calls finish all copies. Failed calls drain all bands and
+// quarantine the mesh, retaining storage if a drain fails; teardown leaks it
+// rather than freeing memory that may still be in use.
+unsafe impl Send for LaneBounce {}
+
+impl LaneBounce {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.0.as_bytes_mut()
+    }
+}
+
+/// What [`destroy_lane_events`] could not release.
+struct LaneEventTeardown {
+    /// First device bind failure; that device's events were leaked.
+    bind: Option<String>,
+    /// First `hipEventDestroy` failure on a bound device.
+    destroy: Option<String>,
+}
+
+/// Destroy every sender band's events on its owning device. A device that
+/// cannot be bound leaks its events (an event must not be destroyed under
+/// another device's context); the remaining devices are still released.
+fn destroy_lane_events(gpus: &mut Gpus, events: Vec<Vec<hip_bridge::Event>>) -> LaneEventTeardown {
+    let mut teardown = LaneEventTeardown {
+        bind: None,
+        destroy: None,
+    };
+    for (index, row) in events.into_iter().enumerate() {
+        let gpu = &gpus.devices[index];
+        if let Err(error) = gpu.bind_thread() {
+            teardown.bind.get_or_insert(error.to_string());
+            std::mem::forget(row);
+            continue;
+        }
+        for event in row {
+            if let Err(error) = gpu.hip.event_destroy(event) {
+                teardown.destroy.get_or_insert(error.to_string());
+            }
+        }
+    }
+    teardown
 }
 
 impl Qwen4PpMesh {
@@ -1159,11 +1224,307 @@ fn run_tiles(
     }
 }
 
+fn refuse_lane_spec(spec: Option<crate::lane::LaneSpecConfig>) -> Result<(), BundleError> {
+    if spec.is_some() {
+        return Err(BundleError::Forward(
+            "qwen4 topology.pp: native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn lane_edge_bytes(rows: usize, hc: usize, hidden: usize, bf16: bool) -> Option<usize> {
+    rows.checked_mul(hc)?
+        .checked_mul(hidden)?
+        .checked_mul(if bf16 { 2 } else { 4 })
+}
+
 impl Qwen4Bundle {
+    /// Stage exact AR stores on every band's device without changing the
+    /// resident singleton state, sessions or admission plan.
+    pub fn pp_stage_lanes(
+        &mut self,
+        gpus: &mut Gpus,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<crate::lane::LaneSpecConfig>,
+    ) -> Result<(), BundleError> {
+        refuse_lane_spec(spec)?;
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = (|| {
+            mesh.require_ready(gpus)?;
+            if mesh.lane_bounce.is_some()
+                || mesh
+                    .bands
+                    .iter()
+                    .chain(std::iter::once(&*self))
+                    .any(|band| band.lanes.is_some())
+            {
+                return Err(pp_error("lanes are already staged on a pipeline band"));
+            }
+            // Match stage_qwen4_lanes: need <= current free, with no added
+            // reserve from another architecture's KV policy.
+            for (index, band) in mesh.bands.iter().chain(std::iter::once(&*self)).enumerate() {
+                let gpu = &mut gpus.devices[index];
+                gpu.bind_thread().map_err(|e| pp_error(e.to_string()))?;
+                let context = crate::Qwen4ContextCommit::new(
+                    band.state.qsa_backend(),
+                    band.state.max_seq_len,
+                    mesh.chunk,
+                    gpu.vmm_recommended_granularity().unwrap_or(1),
+                );
+                let need = crate::lane::Qwen4LaneStore::device_bytes_scoped(
+                    &band.config,
+                    band.state_format,
+                    &context,
+                    max_lanes,
+                    row_budget,
+                    None,
+                    band.weights.band_scope(),
+                )
+                .ok_or_else(|| pp_error("lane store device bytes overflow"))?;
+                let (free, _) = gpu.device_mem_info().map_err(|e| pp_error(e.to_string()))?;
+                if need > free as u64 {
+                    return Err(pp_error(format!(
+                        "band {index} lane store needs {} MiB, {} MiB free",
+                        need >> 20,
+                        free >> 20,
+                    )));
+                }
+                if band.execution.is_none() {
+                    return Err(pp_error("a band's forward resources are not attached"));
+                }
+            }
+            let bytes = lane_edge_bytes(
+                max_lanes,
+                self.config.hc_count,
+                self.config.hidden_size,
+                false,
+            )
+            .ok_or_else(|| pp_error("lane edge byte count overflows"))?;
+            gpus.devices[0]
+                .bind_thread()
+                .map_err(|e| pp_error(e.to_string()))?;
+            let bounce = LaneBounce(
+                gpus.devices[0]
+                    .hip
+                    .host_buffer(bytes)
+                    .map_err(|e| pp_error(e.to_string()))?,
+            );
+            let stages = mesh.stages();
+            let mut staged = 0;
+            let mut events: Vec<Vec<hip_bridge::Event>> = Vec::new();
+            let outcome: Result<(), BundleError> = (|| {
+                // One fence row per sender band (the output band sends
+                // nothing), created on that band's device.
+                let per_band = max_lanes.min(2 * stages);
+                for index in 0..stages - 1 {
+                    let gpu = &gpus.devices[index];
+                    gpu.bind_thread().map_err(|e| pp_error(e.to_string()))?;
+                    events.push(Vec::with_capacity(per_band));
+                    for _ in 0..per_band {
+                        let event = gpu
+                            .hip
+                            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+                            .map_err(|e| pp_error(e.to_string()))?;
+                        events[index].push(event);
+                    }
+                }
+                for index in 0..stages {
+                    let band = band_mut(&mut mesh.bands, self, index);
+                    let gpu = &mut gpus.devices[index];
+                    gpu.bind_thread().map_err(|e| pp_error(e.to_string()))?;
+                    if gpu.route_kernels_finished() {
+                        gpu.abort_route_kernel_load()
+                            .map_err(|e| pp_error(e.to_string()))?;
+                    }
+                    band.stage_lanes(gpu, max_lanes, row_budget, None)?;
+                    staged += 1;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                let mut cleanup = None;
+                for index in 0..staged {
+                    let band = band_mut(&mut mesh.bands, self, index);
+                    let gpu = &mut gpus.devices[index];
+                    if let Err(e) = gpu.bind_thread() {
+                        cleanup.get_or_insert(e.to_string());
+                        continue;
+                    }
+                    if let Some(store) = band.lanes.take() {
+                        if let Err(e) = store.free_gpu(gpu) {
+                            cleanup.get_or_insert(e);
+                        }
+                    }
+                }
+                let teardown = destroy_lane_events(gpus, events);
+                cleanup = cleanup.or(teardown.bind).or(teardown.destroy);
+                match gpus.devices[0].bind_thread() {
+                    Ok(()) => drop(bounce),
+                    Err(e) => {
+                        cleanup.get_or_insert(e.to_string());
+                        std::mem::forget(bounce);
+                    }
+                }
+                if let Some(cleanup) = cleanup {
+                    let reason = format!("lane staging failed: {error}; cleanup failed: {cleanup}");
+                    mesh.quarantine(reason.clone());
+                    return Err(pp_error(reason));
+                }
+                return Err(error);
+            }
+            mesh.lane_bounce = Some(bounce);
+            mesh.lane_events = events;
+            Ok(())
+        })();
+        self.pp = Some(mesh);
+        result
+    }
+
+    /// The cold PP singleton's next tile, including its tail-lineage split,
+    /// without arming or publishing any session.
+    fn pp_lane_tile_len(&self, mesh: &Qwen4PpMesh, prompt: &[u32], prefilled: usize) -> usize {
+        if prefilled >= prompt.len() {
+            return 0;
+        }
+        if !mesh.sessions_enabled {
+            return (prompt.len() - prefilled).min(mesh.chunk);
+        }
+        let mut boundaries = SessionState::snapshot_boundaries(self, prompt, 0, prompt.len());
+        let lineage = SessionState::lineage_boundary(self, prompt, 0, prompt.len())
+            .filter(|&at| at > 0 && at < prompt.len());
+        if let Some(at) = lineage {
+            boundaries.push(at);
+            boundaries.sort_unstable();
+            boundaries.dedup();
+        }
+        let stop = lineage.filter(|&at| at > prefilled).unwrap_or(prompt.len());
+        let mut upcoming = boundaries.into_iter().filter(|&at| at > prefilled);
+        qwen4_prefill_segment_rows(
+            prefilled,
+            stop,
+            mesh.chunk,
+            SessionBoundaries {
+                next: upcoming.next(),
+                after: upcoming.next(),
+            },
+            false,
+        )
+    }
+
+    /// Run one PP singleton prefill tile with every band's lane state swapped
+    /// in. Mesh forwards retain ordinary admission (lane_scope stays false);
+    /// their chunk path does not replay retained bodies. Sessions are removed
+    /// for the call, so no singleton request bookkeeping is published.
+    fn pp_lane_prefill_tile_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+        tokens: &[u32],
+        logits: Option<&GpuTensor>,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        mesh.require_ready(gpus)?;
+        for band in mesh.bands.iter().chain(std::iter::once(&*self)) {
+            let lane = band
+                .lanes
+                .as_ref()
+                .and_then(|store| store.lane(epoch))
+                .ok_or_else(|| pp_error(format!("prefill: unknown or stale epoch {epoch:?}")))?;
+            if band.execution.is_none() || lane.spec.is_some() {
+                return Err(pp_error(
+                    "prefill needs an attached forward and an AR lane on every band",
+                ));
+            }
+        }
+        let mut sessions = Vec::with_capacity(mesh.stages());
+        for band in mesh.bands.iter_mut().chain(std::iter::once(&mut *self)) {
+            sessions.push(band.session.take());
+            let lane = band.lanes.as_mut().unwrap().lane_mut(epoch).unwrap();
+            band.state.clamp_f16_valid();
+            lane.state.clamp_f16_valid();
+            std::mem::swap(&mut band.state, &mut lane.state);
+            band.execution.as_mut().unwrap().set_ple_lookahead(&[]);
+        }
+        // Advances only next_op (transport identity), not singleton request
+        // identity, windows, committable state or session records.
+        let result = self.pp_forward_detached(
+            mesh,
+            gpus,
+            &Request {
+                tokens,
+                logits,
+                top1,
+                rows: Qwen4OutputRows::Final,
+                route: MeshRoute::Prefill,
+                session: None,
+                wide: None,
+            },
+        );
+        for (band, session) in mesh
+            .bands
+            .iter_mut()
+            .chain(std::iter::once(&mut *self))
+            .zip(sessions)
+        {
+            let lane = band.lanes.as_mut().unwrap().lane_mut(epoch).unwrap();
+            band.state.clamp_f16_valid();
+            lane.state.clamp_f16_valid();
+            std::mem::swap(&mut band.state, &mut lane.state);
+            band.session = session;
+        }
+        result
+    }
+
     /// Whether this bundle is the output-band root of an attached PP mesh
     /// (including one whose attach failed and is awaiting `free_gpu`).
     pub fn pp_mesh_active(&self) -> bool {
         self.pp.is_some()
+    }
+
+    /// Lane topology of this bundle: `"pp"` (band-scoped stores), `"ep"`
+    /// (replicated rank stores) or `"single"`.
+    pub fn lane_topology(&self) -> &'static str {
+        if self.pp.is_some() {
+            "pp"
+        } else if self.ep.is_some() {
+            "ep"
+        } else {
+            "single"
+        }
+    }
+
+    /// Every band's lane-store receipt in pipeline order (input band first,
+    /// the output-band root LAST). A band without a store is an error.
+    pub fn pp_lane_receipts(
+        &self,
+        gpus: &Gpus,
+    ) -> Result<Vec<crate::lane::LaneStoreReceipt>, BundleError> {
+        let mesh = self
+            .pp
+            .as_ref()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        mesh.bands
+            .iter()
+            .chain(std::iter::once(self))
+            .enumerate()
+            .map(|(index, band)| {
+                let gpu = gpus
+                    .devices
+                    .get(index)
+                    .ok_or_else(|| pp_error(format!("band {index} has no device")))?;
+                band.lanes
+                    .as_ref()
+                    .map(|store| store.receipt(gpu))
+                    .ok_or_else(|| pp_error(format!("band {index} lanes are not staged")))
+            })
+            .collect()
     }
 
     /// Read-only local states in pipeline band order, including the output band.
@@ -1210,6 +1571,8 @@ impl Qwen4Bundle {
             sessions_enabled: false,
             committable: None,
             windows: WindowStore::new(),
+            lane_bounce: None,
+            lane_events: Vec::new(),
         });
         let verdict = self.validate_pp_attach(&mut holder, gpus);
         let result = match verdict {
@@ -2784,13 +3147,42 @@ impl Qwen4Bundle {
         let Qwen4PpMesh {
             mut bands,
             mut sessions,
+            lane_bounce,
+            lane_events,
             ..
         } = *mesh;
+        // Edges are drained, so no transfer or recorded fence is pending. Each
+        // event dies on the device that created it. A bind failure leaves
+        // the owning context unknown: that event leaks and so does the whole
+        // mesh (below); a destroy failure on a bound device does not stop
+        // the remaining release and is reported last.
+        let events = destroy_lane_events(gpus, lane_events);
+        if let Some(error) = events.bind {
+            std::mem::forget(self);
+            std::mem::forget(bands);
+            std::mem::forget(sessions);
+            std::mem::forget(lane_bounce);
+            return Err(pp_error(format!(
+                "unload could not bind a lane event owner: {error}"
+            )));
+        }
+        // The host allocation belongs to device zero. Edges are already
+        // drained, so no transfer can retain a reference to this storage.
+        if let Err(error) = gpus.devices[0].bind_thread() {
+            std::mem::forget(self);
+            std::mem::forget(bands);
+            std::mem::forget(sessions);
+            std::mem::forget(lane_bounce);
+            return Err(pp_error(format!(
+                "unload could not bind the lane bounce owner: {error}"
+            )));
+        }
+        drop(lane_bounce);
         // Aggregate pins go before any band's cache is freed.
         if let Some(mut drivers) = session_drivers(&mut bands, &mut self) {
             sessions.clear(&mut drivers);
         }
-        let mut first = None;
+        let mut first = events.destroy.map(pp_error);
         for (index, band) in bands.into_iter().enumerate() {
             if let Err(error) = Qwen4Bundle::free_gpu(band, &mut gpus.devices[index]) {
                 first.get_or_insert(error);
@@ -2807,6 +3199,27 @@ impl Qwen4Bundle {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn pp_lane_edge_bytes_preserve_bf16_and_f32_streams() {
+        assert_eq!(lane_edge_bytes(8, 4, 64, true), Some(4096));
+        assert_eq!(lane_edge_bytes(8, 4, 64, false), Some(8192));
+        assert_eq!(lane_edge_bytes(usize::MAX, 4, 64, false), None);
+    }
+
+    #[test]
+    fn pp_lane_spec_refusal_is_explicit_and_ar_is_admitted() {
+        assert!(refuse_lane_spec(None).is_ok());
+        let error = refuse_lane_spec(Some(crate::lane::LaneSpecConfig {
+            k: 3,
+            end_of_turn: None,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(
+            "qwen4 topology.pp: native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)"
+        ));
+    }
 
     #[test]
     fn tiles_are_canonical_in_order_and_unpadded() {

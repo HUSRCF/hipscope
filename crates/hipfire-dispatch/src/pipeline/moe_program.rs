@@ -293,6 +293,11 @@ pub(super) struct MoeStepState<'a> {
     /// The call's one expert IU4 verdict ([`MoeStepState::expert_iu4_decision`]),
     /// decided at the first routed stage and never re-decided.
     expert_iu4: OnceCell<ExpertIu4Decision>,
+    /// L4: the grouped prefill normalize stage already ran the RMSNorm, the F32 normalized row, the
+    /// rotated F32 basis and the shared IU4 token as one exact C8 PM producer
+    /// ([`SealedMoeOp::fold_prefill_norm_into_input_basis`]); the input-basis stage has nothing
+    /// left to produce.
+    norm_basis_folded: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -370,6 +375,7 @@ impl<'a> MoeStepState<'a> {
             split_phase: Cell::new(SplitPhase::Idle),
             split_reference: Cell::new(false),
             expert_iu4: OnceCell::new(),
+            norm_basis_folded: Cell::new(false),
         }
     }
 
@@ -699,26 +705,106 @@ impl<'a> SealedMoeOp<'a> {
                 }
             }
             MoeProtocol::GroupedPrefill => {
-                let (params, _) = self.state.prefill_parts()?;
+                let (params, selection) = self.state.prefill_parts()?;
                 if let MoeNormalization::RmsNorm {
                     weight,
                     plain_out,
                     eps,
                 } = &params.prelude.normalization
                 {
-                    gpu.rmsnorm_batched(
-                        params.x_batch,
-                        weight,
-                        plain_out,
-                        params.batch_size,
-                        params.gate_up_k,
-                        *eps,
-                    )
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    if !self.fold_prefill_norm_into_input_basis(
+                        gpu, params, selection, weight, plain_out, *eps,
+                    )? {
+                        gpu.rmsnorm_batched(
+                            params.x_batch,
+                            weight,
+                            plain_out,
+                            params.batch_size,
+                            params.gate_up_k,
+                            *eps,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// L4: the grouped prefill's standalone `rmsnorm_f32` folded into the exact C8 PM input-basis
+    /// producer that consumes its output (`HIPFIRE_PREFILL_IU4_C8_PM` nested under the F3 producer
+    /// fusion). Taken only where [`Self::input_basis`] would run the producer-fused arm for this call
+    /// (same selection, carry and shared-gate admission) and the PM rotate itself is admitted for the
+    /// operands: one launch writes the normalized F32 row into `x_norm_batch` (the router, shared
+    /// selector and routed-expert producers read it), the rotated F32 basis into `x_rot_batch`, and
+    /// the sidecar token the shared gate/up consumes, with the bytes of `rmsnorm_batched` followed by
+    /// the exact rotate. Returns whether the fold ran; `false` launched nothing and leaves the
+    /// unfused chain (the standalone norm, then [`Self::input_basis`]) to run unchanged.
+    fn fold_prefill_norm_into_input_basis(
+        &self,
+        gpu: &mut Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+        norm_weight: &GpuTensor,
+        plain_out: &GpuTensor,
+        eps: f32,
+    ) -> Result<bool, DispatchError> {
+        if selection.cpu_split
+            || selection
+                .route
+                .is_some_and(MoeRouteCapability::is_sealed_grouped)
+            || selection.resolution.paro_mode
+        {
+            return Ok(false);
+        }
+        let Some(shared) = params.prelude.shared.as_ref() else {
+            return Ok(false);
+        };
+        let weight = &shared.weights.gate;
+        if !input_basis_producer_fused_admitted(
+            super::prefill_iu4_producer_fused_enabled(gpu),
+            self.prefill_router_carries_shared_iu4(gpu, params),
+            weight.dtype,
+            weight.k,
+            params.prelude.router.k,
+        ) || self.state.shared_iu4.borrow().is_some()
+        {
+            return Ok(false);
+        }
+        let (k, n) = (weight.k, params.batch_size);
+        if k != params.gate_up_k || plain_out.buf.as_ptr() != params.x_norm_batch.buf.as_ptr() {
+            return Ok(false);
+        }
+        if !gpu.iu4_c8_pm_norm_out_admitted(
+            params.x_batch,
+            norm_weight,
+            weight.awq_scale,
+            params.x_norm_batch,
+            params.x_rot_batch,
+            k,
+            n,
+        ) {
+            return Ok(false);
+        }
+        let reservation = gpu
+            .reserve_int4_mmq(k, n)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        let token = gpu
+            .fused_rmsnorm_out_mq_rotate_i4_c8_pm(
+                params.x_batch,
+                norm_weight,
+                weight.awq_scale,
+                params.x_norm_batch,
+                Some(params.x_rot_batch),
+                reservation,
+                k,
+                eps,
+                n,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        *self.state.shared_iu4.borrow_mut() = Some(token);
+        self.state.norm_basis_folded.set(true);
+        Ok(true)
     }
 
     pub(super) fn input_basis(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -726,6 +812,10 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
+        if self.state.norm_basis_folded.get() {
+            // The normalize stage produced the F32 basis and the token (L4 fold).
+            return Ok(());
+        }
         if selection.cpu_split {
             // The CPU computes from the F32 rotated basis. The grouped stage may
             // skip it when the GPU gate/up rotates to F16 itself, so the split

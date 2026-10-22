@@ -19,8 +19,8 @@ use crate::speculative::{
     seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
     seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
     spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit, DdtreeScratch,
-    DeltaNetSnapshot, DenseTpTargetView, DflashTargetParts, GdnTape, HiddenStateRingBuffer,
-    ModelSlot, SpecStepResult, VerifyScratch,
+    DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -858,13 +858,1312 @@ pub(crate) fn dflash_first_token(
 
 // ─── DflashSpeculator ───────────────────────────────────────────────────
 
+/// Developer-only per-cycle DFlash trace (`HIPFIRE_DFLASH_CYCLE_TRACE=<path>`):
+/// one JSON object per line appended to `<path>`. Off by default; when unset the
+/// only cost on the hot path is one `LazyLock` read. Diagnostic only — it never
+/// changes decode behaviour and an open/write failure is swallowed (one
+/// `eprintln` at open, tracing disabled).
+mod cycle_trace {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{LazyLock, Mutex};
+
+    type Sink = Mutex<std::io::BufWriter<std::fs::File>>;
+
+    static SINK: LazyLock<Option<Sink>> = LazyLock::new(|| {
+        let path = hipfire_config::developer_var("HIPFIRE_DFLASH_CYCLE_TRACE")
+            .ok()
+            .filter(|p| !p.is_empty())?;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => Some(Mutex::new(std::io::BufWriter::new(f))),
+            Err(e) => {
+                eprintln!(
+                    "[dflash] HIPFIRE_DFLASH_CYCLE_TRACE: cannot open {path}: {e}; tracing disabled"
+                );
+                None
+            }
+        }
+    });
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn sink() -> Option<&'static Sink> {
+        SINK.as_ref()
+    }
+
+    pub(super) fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    /// Next 1-based per-process request ordinal (called from `prefill`).
+    pub(super) fn next_seq() -> u64 {
+        SEQ.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Append one line and flush. Write errors are ignored (diagnostic only).
+    pub(super) fn emit(line: &str) {
+        if let Some(sink) = sink() {
+            if let Ok(mut w) = sink.lock() {
+                let _ = w.write_all(line.as_bytes());
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
+        }
+    }
+
+    fn push_u32s(out: &mut String, v: &[u32]) {
+        out.push('[');
+        for (i, t) in v.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{t}");
+        }
+        out.push(']');
+    }
+
+    pub(super) fn prefill_line(
+        pid: u32,
+        seq: u64,
+        prompt_ids: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+    ) -> String {
+        let mut s = String::with_capacity(96 + prompt_ids.len() * 7);
+        let _ = write!(
+            s,
+            r#"{{"ev":"prefill","pid":{pid},"seq":{seq},"prompt_len":{},"prefill_start":{prefill_start},"cache_hit":{cache_hit},"prompt_ids":"#,
+            prompt_ids.len()
+        );
+        push_u32s(&mut s, prompt_ids);
+        s.push('}');
+        s
+    }
+
+    pub(super) fn forced_line(pid: u32, seq: u64, pos: usize, tokens: &[u32]) -> String {
+        let mut s = String::with_capacity(64 + tokens.len() * 7);
+        let _ = write!(
+            s,
+            r#"{{"ev":"forced","pid":{pid},"seq":{seq},"pos":{pos},"tokens":"#
+        );
+        push_u32s(&mut s, tokens);
+        s.push('}');
+        s
+    }
+
+    pub(super) fn reset_line(pid: u32, seq: u64) -> String {
+        format!(r#"{{"ev":"reset","pid":{pid},"seq":{seq}}}"#)
+    }
+
+    /// Trailing lookup fields of a `cycle` line (written only when the
+    /// lookup is armed; unarmed lines are unchanged).
+    pub(super) struct LookupTag {
+        pub kind: &'static str,
+        pub k: usize,
+        pub lookup: usize,
+    }
+
+    /// Fields of one `cycle` line. `accepted` is the raw `SpecStepResult`
+    /// value; `committed` is the post-`cap_emit` emit (drafted[..accepted] ++
+    /// [bonus] unless capped).
+    pub(super) struct Cycle<'a> {
+        pub pid: u32,
+        pub seq: u64,
+        pub cyc: u64,
+        pub pos: usize,
+        pub seed: u32,
+        pub b: usize,
+        pub max_emit: usize,
+        pub temp: f32,
+        pub drafted: &'a [u32],
+        pub accepted: usize,
+        pub committed: &'a [u32],
+        pub step_us: u64,
+        /// Tree-mode result: appended as a trailing `"ddtree":true`.
+        pub ddtree: bool,
+        /// Armed-lookup window kind: appended as trailing
+        /// `"kind":..,"k":..,"lookup":..`.
+        pub lookup: Option<LookupTag>,
+    }
+
+    impl Cycle<'_> {
+        pub(super) fn line(&self) -> String {
+            let mut s =
+                String::with_capacity(192 + (self.drafted.len() + self.committed.len()) * 7);
+            let _ = write!(
+                s,
+                r#"{{"ev":"cycle","pid":{},"seq":{},"cyc":{},"pos":{},"seed":{},"b":{},"max_emit":{},"temp":"#,
+                self.pid, self.seq, self.cyc, self.pos, self.seed, self.b, self.max_emit
+            );
+            if self.temp.is_finite() {
+                let _ = write!(s, "{}", self.temp);
+            } else {
+                s.push_str("null");
+            }
+            s.push_str(r#","drafted":"#);
+            push_u32s(&mut s, self.drafted);
+            let _ = write!(s, r#","accepted":{},"committed":"#, self.accepted);
+            push_u32s(&mut s, self.committed);
+            let _ = write!(s, r#","step_us":{}"#, self.step_us);
+            if self.ddtree {
+                s.push_str(r#","ddtree":true"#);
+            }
+            if let Some(l) = &self.lookup {
+                let _ = write!(
+                    s,
+                    r#","kind":"{}","k":{},"lookup":{}"#,
+                    l.kind, l.k, l.lookup
+                );
+            }
+            s.push('}');
+            s
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cycle_trace_cycle_line_exact_bytes() {
+            let c = Cycle {
+                pid: 7,
+                seq: 2,
+                cyc: 3,
+                pos: 100,
+                seed: 5,
+                b: 4,
+                max_emit: 16,
+                temp: 0.5,
+                drafted: &[9, 8, 7],
+                accepted: 2,
+                committed: &[9, 8, 6],
+                step_us: 1234,
+                ddtree: false,
+                lookup: None,
+            };
+            assert_eq!(
+                c.line(),
+                r#"{"ev":"cycle","pid":7,"seq":2,"cyc":3,"pos":100,"seed":5,"b":4,"max_emit":16,"temp":0.5,"drafted":[9,8,7],"accepted":2,"committed":[9,8,6],"step_us":1234}"#
+            );
+        }
+
+        #[test]
+        fn cycle_trace_cycle_line_empty_drafted_and_ddtree() {
+            let c = Cycle {
+                pid: 1,
+                seq: 1,
+                cyc: 0,
+                pos: 0,
+                seed: 3,
+                b: 1,
+                max_emit: 1,
+                temp: 0.0,
+                drafted: &[],
+                accepted: 0,
+                committed: &[4],
+                step_us: 0,
+                ddtree: true,
+                lookup: None,
+            };
+            assert_eq!(
+                c.line(),
+                r#"{"ev":"cycle","pid":1,"seq":1,"cyc":0,"pos":0,"seed":3,"b":1,"max_emit":1,"temp":0,"drafted":[],"accepted":0,"committed":[4],"step_us":0,"ddtree":true}"#
+            );
+        }
+
+        #[test]
+        fn cycle_trace_other_lines_exact_bytes() {
+            assert_eq!(
+                prefill_line(9, 1, &[10, 11], 0, false),
+                r#"{"ev":"prefill","pid":9,"seq":1,"prompt_len":2,"prefill_start":0,"cache_hit":false,"prompt_ids":[10,11]}"#
+            );
+            assert_eq!(
+                forced_line(9, 1, 42, &[1, 2]),
+                r#"{"ev":"forced","pid":9,"seq":1,"pos":42,"tokens":[1,2]}"#
+            );
+            assert_eq!(reset_line(9, 1), r#"{"ev":"reset","pid":9,"seq":1}"#);
+        }
+
+        #[test]
+        fn lookup_cycle_trace_suffix_only_when_armed() {
+            let mk = |lookup| Cycle {
+                pid: 7,
+                seq: 2,
+                cyc: 3,
+                pos: 100,
+                seed: 5,
+                b: 16,
+                max_emit: 64,
+                temp: 0.0,
+                drafted: &[9, 8],
+                accepted: 1,
+                committed: &[9, 6],
+                step_us: 10,
+                ddtree: false,
+                lookup,
+            };
+            let plain = mk(None).line();
+            assert!(!plain.contains("kind"), "{plain}");
+            assert!(plain.ends_with(r#""step_us":10}"#), "{plain}");
+            let tagged = mk(Some(LookupTag {
+                kind: "copy",
+                k: 0,
+                lookup: 15,
+            }))
+            .line();
+            assert_eq!(
+                tagged,
+                format!(
+                    "{}{}",
+                    &plain[..plain.len() - 1],
+                    r#","kind":"copy","k":0,"lookup":15}"#
+                )
+            );
+        }
+    }
+}
+
+// ─── Verbatim-copy lookup composed into the DFlash2 verify window ───────
+//
+// Wide-lookup S3b (`release-0.4.3/wide-lookup/PLAN.md` §3). Host-side glue
+// between the request-local `MtpCopyContext` / `LookupController`
+// (`hipfire_runtime`) and the `DflashLookup` seam of `spec_step_dflash`. All
+// GPU-free logic is factored here so it is unit-tested on the CPU; `step`
+// only wires it.
+//
+// `emitted` contract (verified in `hipfire-generate/src/qwen.rs`
+// `generate_spec`): the loop pushes the prefill first token and every token
+// the emitter retained, so at `step(position, seed, emitted)` the pending
+// seed is `emitted.last()`. Hence `prompt ++ emitted` ends with the seed and
+// the suffix key of a proposal is "…, seed". A window whose `emitted` does not
+// end with `seed` (a grammar-rejected or non-committable token) runs the
+// incumbent window with no lookup bookkeeping at all.
+mod lookup {
+    use crate::speculative::DflashTailSource;
+    use hipfire_runtime::ngram_mod::{MtpCopyContext, NgramModConfig};
+    use hipfire_runtime::spec_lookup::{
+        LookupAction, LookupBudget, LookupController, LookupKind, LookupPolicy, WindowOutcome,
+        LOOKUP_MAX_CANDIDATES, LOOKUP_MAX_ROWS,
+    };
+
+    /// Copy-lane pool of this lane: the Qwen4 copy lane's triple
+    /// (`hipfire_config::ngram_mod_copy_triple()` = `NGRAM_MOD_COPY_TRIPLE`
+    /// 5/1/63 plus its `HIPFIRE_NGRAM_MOD_*` overrides) and capacity
+    /// (`NgramModConfig::default().capacity`), validated and row-capped exactly
+    /// like `qwen4_ngram_mod_config` (`hipfire-arch-qwen4/src/mtp_spec.rs`):
+    /// `n_max` is the proposal length, here at most one window's candidates.
+    /// A triple the pool cannot run is an error, never a silently different
+    /// policy.
+    pub(super) fn copy_config(
+        (n_match, n_min, n_max): (usize, usize, usize),
+    ) -> Result<NgramModConfig, String> {
+        if n_match == 0 || n_max == 0 || n_max > 64 || n_min > n_max {
+            return Err(format!(
+                "invalid n-gram triple n_match={n_match} n_min={n_min} n_max={n_max} (need 1 <= n_match, n_min <= n_max <= 64)"
+            ));
+        }
+        let n_max = n_max.min(LOOKUP_MAX_CANDIDATES);
+        Ok(NgramModConfig {
+            n_match,
+            n_min: n_min.min(n_max),
+            n_max,
+            ..NgramModConfig::default()
+        })
+    }
+
+    /// Load-time arming inputs.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ArmInputs {
+        /// Resolved `speculation.dflash_lookup` (`auto` = on).
+        pub on: bool,
+        /// `HIPFIRE_SPEC_LOOKUP_TAIL` is not `0`.
+        pub tail_env: bool,
+        pub ddtree: bool,
+        pub selector: bool,
+        /// Retained-PM4 verify replay admitted (shape-frozen at B=16).
+        pub pm4: bool,
+        /// The load's runtime verify block.
+        pub block_size: usize,
+    }
+
+    /// `Ok(tail_enabled)` when lookup may arm, else the reason it stays off.
+    /// Only the singleton `DflashSpeculator` calls this: the VMM/CB lanes and
+    /// the dense-TP mesh speculator are different types that never arm, and
+    /// CACTUS (a per-request setting) is excluded per window in `step`.
+    pub(super) fn arming(i: &ArmInputs) -> Result<bool, &'static str> {
+        if !i.on {
+            return Err("speculation.dflash_lookup is off");
+        }
+        if i.ddtree {
+            return Err("DDTree chain");
+        }
+        if !i.selector {
+            return Err("no DFlash2 candidate selector");
+        }
+        if i.pm4 {
+            return Err("retained PM4 verify is shape-frozen at B=16");
+        }
+        if i.block_size < 3 {
+            return Err("verify block < 3 rows");
+        }
+        Ok(i.tail_env)
+    }
+
+    pub(super) fn load_line(arm: &Result<bool, String>, max_rows: usize) -> String {
+        match arm {
+            Ok(true) => format!("[dflash] lookup: armed (copy+tail, rows<={max_rows})"),
+            Ok(false) => format!("[dflash] lookup: armed (copy, rows<={max_rows})"),
+            Err(why) => format!("[dflash] lookup: off ({why})"),
+        }
+    }
+
+    /// Armed state, or the load line of a lookup that stays off. `None` for
+    /// the state is the whole unarmed path: nothing is allocated.
+    pub(super) fn build_state(
+        i: &ArmInputs,
+        triple: (usize, usize, usize),
+    ) -> (Option<LookupState>, String) {
+        let max_rows = i.block_size.min(LOOKUP_MAX_ROWS);
+        let arm = arming(i).map_err(str::to_string).and_then(|tail| {
+            let ctx = copy_config(triple)
+                .and_then(|c| MtpCopyContext::new(c).map_err(str::to_string))
+                .map_err(|e| format!("copy context: {e}"))?;
+            Ok((tail, ctx))
+        });
+        match arm {
+            Ok((tail, ctx)) => {
+                let line = load_line(&Ok(tail), max_rows);
+                (Some(LookupState::new(ctx, tail, max_rows)), line)
+            }
+            Err(why) => (None, load_line(&Err(why), max_rows)),
+        }
+    }
+
+    /// Budget at the pre-draft Copy decision (`model_drafts = 0`,
+    /// `lookup_available` unset). `native_b` is the incumbent window's rows
+    /// (seed included) after the adaptive / `max_emit` logic; `block_size` the
+    /// load's runtime block; `max_emit` the remaining client budget;
+    /// `context_rows_left` mirrors the generate loop's overflow guard
+    /// (`position + width < ctx_capacity`).
+    pub(super) fn lookup_budget(
+        native_b: usize,
+        block_size: usize,
+        max_emit: usize,
+        position: usize,
+        ctx_capacity: usize,
+    ) -> LookupBudget {
+        LookupBudget {
+            native_candidates: native_b.saturating_sub(1),
+            model_drafts: 0,
+            lookup_available: 0,
+            max_rows: block_size.min(LOOKUP_MAX_ROWS),
+            remaining_emit: max_emit,
+            context_rows_left: ctx_capacity.saturating_sub(position).saturating_sub(1),
+        }
+    }
+
+    /// Verify rows (seed included) any lookup window of `b` may use.
+    pub(super) fn rows_cap(b: &LookupBudget) -> usize {
+        b.max_rows
+            .min(LOOKUP_MAX_ROWS)
+            .min(b.remaining_emit)
+            .min(b.context_rows_left)
+    }
+
+    /// Clamp a chooser's Copy `take` before any write: `None` when no legal
+    /// candidate remains.
+    pub(super) fn clamp_copy_take(take: usize, offered: usize, b: &LookupBudget) -> Option<usize> {
+        let t = take
+            .min(offered)
+            .min(LOOKUP_MAX_CANDIDATES)
+            .min(rows_cap(b).saturating_sub(1));
+        (t >= 1).then_some(t)
+    }
+
+    /// Clamp a chooser's Tail `take` after `k` kept learned candidates of a
+    /// `drafted_len`-candidate window.
+    pub(super) fn clamp_tail_take(
+        take: usize,
+        offered: usize,
+        k: usize,
+        drafted_len: usize,
+        b: &LookupBudget,
+    ) -> Option<usize> {
+        let t = take
+            .min(offered)
+            .min(drafted_len.saturating_sub(k))
+            .min(rows_cap(b).saturating_sub(1 + k));
+        (k >= 1 && t >= 1).then_some(t)
+    }
+
+    /// A price-probe native window: only wider than the incumbent window and
+    /// within the same clamps a Copy of that many rows would face.
+    pub(super) fn valid_probe_rows(
+        rows: usize,
+        native_b: usize,
+        b: &LookupBudget,
+    ) -> Option<usize> {
+        (rows >= 2 && rows > native_b && rows <= rows_cap(b)).then_some(rows)
+    }
+
+    /// Sequential Tail stopping rule. For `K = 1..drafted.len()` (at least
+    /// one tail slot remains) the decision to splice at `K` reads only
+    /// `drafted[..K]`: `propose(prefix, cap, out)` fills `out` with the
+    /// lookup candidates after the committed history plus that prefix
+    /// (`cap = drafted.len() - K`) and `decide(K, offered)` returns the
+    /// chosen take. The first `K` that takes wins. On `Some((K, L))` the tail
+    /// is `tail[..L]`; `None` leaves `tail` empty.
+    pub(super) fn tail_splice<P, D>(
+        drafted: &[u32],
+        tail: &mut Vec<u32>,
+        cand: &mut Vec<u32>,
+        mut propose: P,
+        mut decide: D,
+    ) -> Option<(usize, usize)>
+    where
+        P: FnMut(&[u32], usize, &mut Vec<u32>),
+        D: FnMut(usize, usize) -> Option<usize>,
+    {
+        tail.clear();
+        let n = drafted.len();
+        for k in 1..n {
+            let cap = n - k;
+            cand.clear();
+            propose(&drafted[..k], cap, cand);
+            let offered = cand.len().min(cap);
+            if offered == 0 {
+                continue;
+            }
+            if let Some(take) = decide(k, offered) {
+                let take = take.min(offered);
+                if take == 0 {
+                    continue;
+                }
+                tail.extend_from_slice(&cand[..take]);
+                return Some((k, take));
+            }
+        }
+        None
+    }
+
+    /// `DflashTailSource` over the request's copy context and controller.
+    pub(super) struct TailSource<'a> {
+        pub ctx: &'a mut MtpCopyContext,
+        pub ctl: &'a LookupController,
+        pub emitted: &'a [u32],
+        /// Pre-draft budget template; `native_candidates` is set per window.
+        pub base: LookupBudget,
+        pub position: usize,
+        pub cand: &'a mut Vec<u32>,
+        /// `(K, L)` of the splice taken, `None` when the window stayed native.
+        pub spliced: Option<(usize, usize)>,
+    }
+
+    impl DflashTailSource for TailSource<'_> {
+        fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize> {
+            let mut base = self.base;
+            base.native_candidates = drafted.len();
+            let (ctx, ctl, emitted, position) =
+                (&mut *self.ctx, self.ctl, self.emitted, self.position);
+            let r = tail_splice(
+                drafted,
+                tail,
+                &mut *self.cand,
+                |prefix, cap, out| {
+                    if let Some(c) = ctx.propose_after(emitted, prefix, cap) {
+                        out.extend_from_slice(c);
+                    }
+                },
+                |k, offered| {
+                    let mut b = base;
+                    b.model_drafts = k;
+                    b.lookup_available = offered;
+                    match ctl.plan(b, position) {
+                        LookupAction::Tail { take } => {
+                            clamp_tail_take(take, offered, k, drafted.len(), &b)
+                        }
+                        _ => None,
+                    }
+                },
+            );
+            self.spliced = r;
+            r.map(|(k, _)| k)
+        }
+    }
+
+    /// What `step` decided for this window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum WindowPlan {
+        /// Lookup state unusable this window (seed not at the end of
+        /// `emitted`): run the incumbent call and observe nothing.
+        Off,
+        /// Incumbent block; `tail` = offer the Tail source.
+        Native {
+            tail: bool,
+        },
+        Copy {
+            take: usize,
+        },
+        /// Run THIS native window at `rows` (> the incumbent width) to price
+        /// the row count a Copy needs.
+        Probe {
+            rows: usize,
+        },
+    }
+
+    /// Which window ran.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Ran {
+        Native,
+        Copy { take: usize },
+        Tail { k: usize, l: usize },
+    }
+
+    /// `(matched, available)` of the pre-window copy `proposal` against the
+    /// window's committed tokens after the seed (`accepted` drafts + bonus).
+    /// `None` when nothing was proposed.
+    pub(super) fn shadow_match(
+        proposal: &[u32],
+        committed_after_seed: &[u32],
+    ) -> Option<(usize, usize)> {
+        if proposal.is_empty() {
+            return None;
+        }
+        let matched = proposal
+            .iter()
+            .zip(committed_after_seed)
+            .take_while(|(p, c)| p == c)
+            .count();
+        Some((matched, proposal.len()))
+    }
+
+    /// Controller observation of one finished window (the shared observation
+    /// rules live in `LookupController::observe`). `rows` = verified rows
+    /// (`SpecStepResult.drafted.len()`), `accepted` the raw accepted
+    /// candidates (clamped to `rows - 1`), `proposal` the pre-window copy
+    /// proposal and `committed_after_seed` the window's committed tokens
+    /// after the seed. Only a window that ran no lookup rows (Native, incl. a
+    /// declined Tail and a price probe) carries a shadow.
+    pub(super) fn window_outcome(
+        ran: Ran,
+        rows: usize,
+        accepted: usize,
+        proposal: &[u32],
+        committed_after_seed: &[u32],
+        ctx: usize,
+        wall_us: f64,
+    ) -> WindowOutcome {
+        let accepted = accepted.min(rows.saturating_sub(1));
+        let (kind, model_drafts, lookup_len, shadow) = match ran {
+            Ran::Native => (
+                LookupKind::Native,
+                rows.saturating_sub(1),
+                0,
+                shadow_match(proposal, committed_after_seed),
+            ),
+            Ran::Copy { take } => (LookupKind::Copy, 0, take, None),
+            Ran::Tail { k, l } => (LookupKind::Tail, k, l, None),
+        };
+        WindowOutcome {
+            kind,
+            rows,
+            model_drafts,
+            lookup_len,
+            accepted,
+            shadow,
+            ctx,
+            wall_us,
+        }
+    }
+
+    /// Trailing `"kind","k","lookup"` of the dev cycle-trace line.
+    /// `offered` = the pre-window copy proposal length (a Native window's
+    /// `lookup` is what it declined to verify).
+    pub(super) fn trace_tag(o: &WindowOutcome, offered: usize) -> (&'static str, usize, usize) {
+        match o.kind {
+            LookupKind::Native => ("native", o.model_drafts, offered),
+            LookupKind::Copy => ("copy", o.model_drafts, o.lookup_len),
+            LookupKind::Tail => ("tail", o.model_drafts, o.lookup_len),
+        }
+    }
+
+    /// Request-local lookup state of an armed `DflashSpeculator`.
+    pub(super) struct LookupState {
+        pub ctx: MtpCopyContext,
+        pub ctl: LookupController,
+        pub tail: bool,
+        pub max_rows: usize,
+        prompt_len: usize,
+        dirty: bool,
+        /// Pre-window copy proposal (reusable; capacity reserved once).
+        pub proposal: Vec<u32>,
+        /// Tail candidate scratch.
+        pub cand: Vec<u32>,
+    }
+
+    impl LookupState {
+        fn new(ctx: MtpCopyContext, tail: bool, max_rows: usize) -> Self {
+            Self {
+                ctx,
+                ctl: LookupController::new(LookupPolicy::default(), true),
+                tail,
+                max_rows,
+                prompt_len: 0,
+                dirty: false,
+                proposal: Vec::with_capacity(LOOKUP_MAX_CANDIDATES),
+                cand: Vec::with_capacity(LOOKUP_MAX_CANDIDATES),
+            }
+        }
+
+        /// New request: history = the canonical full prompt, acceptance
+        /// tables reset (prices are load-scoped and kept).
+        pub fn begin_request(&mut self, prompt: &[u32]) {
+            self.ctx.begin_request(prompt);
+            self.ctl.begin_request();
+            self.prompt_len = prompt.len();
+            self.dirty = false;
+            self.proposal.clear();
+        }
+
+        /// No live request (prefill start / `reset`): nothing proposes.
+        pub fn end_request(&mut self) {
+            self.ctx.reset_request();
+            self.prompt_len = 0;
+            self.dirty = false;
+            self.proposal.clear();
+        }
+
+        /// A rewind / terminal repair may have shrunk or rewritten `emitted`:
+        /// rebuild the history from the prompt at the next window.
+        pub fn mark_dirty(&mut self) {
+            self.dirty = true;
+        }
+
+        /// Make the history `prompt ++ emitted`. A shrunk or diverged
+        /// `emitted` (rewind, terminal repair, divergent re-render) rebuilds
+        /// it from the stored prompt prefix (`begin_request(prompt)` then
+        /// `sync_emitted`); otherwise only the new suffix is appended.
+        /// `false` before `begin_request`.
+        pub fn sync_history(&mut self, emitted: &[u32]) -> bool {
+            if !self.ctx.is_begun() {
+                return false;
+            }
+            let hist = self.ctx.history();
+            let have = hist.len().saturating_sub(self.prompt_len);
+            let stale = self.dirty
+                || emitted.len() < have
+                || (have > 0 && emitted[have - 1] != hist[hist.len() - 1]);
+            if stale {
+                let prompt = self.ctx.history()[..self.prompt_len].to_vec();
+                self.ctx.begin_request(&prompt);
+                self.dirty = false;
+            }
+            self.ctx.sync_emitted(emitted);
+            true
+        }
+
+        /// Plan one window: sync the history, take the pre-window copy
+        /// proposal (stored in `self.proposal`), then Copy / price-probe /
+        /// native(+tail offer). No proposal and no tail offer = the incumbent
+        /// call exactly.
+        #[allow(clippy::too_many_arguments)]
+        pub fn plan_window(
+            &mut self,
+            emitted: &[u32],
+            seed: u32,
+            position: usize,
+            native_b: usize,
+            max_emit: usize,
+            block_size: usize,
+            ctx_capacity: usize,
+        ) -> WindowPlan {
+            self.proposal.clear();
+            if emitted.last() != Some(&seed) || !self.sync_history(emitted) {
+                return WindowPlan::Off;
+            }
+            let mut budget = lookup_budget(native_b, block_size, max_emit, position, ctx_capacity);
+            budget.max_rows = budget.max_rows.min(self.max_rows);
+            let rows = rows_cap(&budget);
+            let cap = rows.saturating_sub(1).min(LOOKUP_MAX_CANDIDATES);
+            if cap >= 1 {
+                if let Some(c) = self.ctx.propose(emitted, cap) {
+                    self.proposal.extend_from_slice(c);
+                }
+            }
+            if !self.proposal.is_empty() {
+                let mut b = budget;
+                b.lookup_available = self.proposal.len();
+                if let LookupAction::Copy { take } = self.ctl.plan(b, position) {
+                    if let Some(t) = clamp_copy_take(take, self.proposal.len(), &b) {
+                        return WindowPlan::Copy { take: t };
+                    }
+                }
+                if let Some(r) = self
+                    .ctl
+                    .price_probe_rows(b, position)
+                    .and_then(|r| valid_probe_rows(r, native_b, &b))
+                {
+                    return WindowPlan::Probe { rows: r };
+                }
+            }
+            WindowPlan::Native {
+                tail: self.tail && rows >= 3,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn st(tail: bool) -> LookupState {
+            let ctx = MtpCopyContext::new(copy_config((5, 1, 63)).unwrap()).unwrap();
+            LookupState::new(ctx, tail, 16)
+        }
+
+        fn inputs() -> ArmInputs {
+            ArmInputs {
+                on: true,
+                tail_env: true,
+                ddtree: false,
+                selector: true,
+                pm4: false,
+                block_size: 16,
+            }
+        }
+
+        #[test]
+        fn lookup_budget_construction_and_clamps() {
+            let b = lookup_budget(16, 16, 1000, 500, 100_000);
+            assert_eq!(
+                b,
+                LookupBudget {
+                    native_candidates: 15,
+                    model_drafts: 0,
+                    lookup_available: 0,
+                    max_rows: 16,
+                    remaining_emit: 1000,
+                    context_rows_left: 100_000 - 500 - 1,
+                }
+            );
+            // Adaptive shrink reduces the native candidates, not the lookup width.
+            let b = lookup_budget(5, 16, 1000, 500, 100_000);
+            assert_eq!((b.native_candidates, b.max_rows), (4, 16));
+            // Configured block above 16 never exceeds 16 rows; below keeps it.
+            assert_eq!(lookup_budget(8, 24, 9, 0, 100).max_rows, 16);
+            assert_eq!(lookup_budget(8, 8, 9, 0, 100).max_rows, 8);
+            // Context mirrors the loop's `position + width < ctx_capacity` guard.
+            assert_eq!(lookup_budget(8, 16, 99, 95, 100).context_rows_left, 4);
+            assert_eq!(lookup_budget(8, 16, 99, 99, 100).context_rows_left, 0);
+            assert_eq!(lookup_budget(8, 16, 99, 400, 100).context_rows_left, 0);
+            // Uncapped benches pass usize::MAX through.
+            assert_eq!(
+                lookup_budget(8, 16, usize::MAX, 0, 100).remaining_emit,
+                usize::MAX
+            );
+            // Degenerate native width never underflows.
+            assert_eq!(lookup_budget(0, 16, 4, 0, 100).native_candidates, 0);
+        }
+
+        #[test]
+        fn lookup_copy_and_tail_takes_clamp_before_any_write() {
+            let b = lookup_budget(16, 16, 1000, 0, 100_000);
+            assert_eq!(clamp_copy_take(15, 15, &b), Some(15));
+            assert_eq!(clamp_copy_take(40, 15, &b), Some(15));
+            assert_eq!(clamp_copy_take(15, 9, &b), Some(9));
+            assert_eq!(clamp_copy_take(0, 9, &b), None);
+            assert_eq!(clamp_copy_take(4, 0, &b), None);
+            // remaining_emit: rows <= max_emit, so take <= max_emit - 1.
+            let b4 = lookup_budget(16, 16, 4, 0, 100_000);
+            assert_eq!(clamp_copy_take(15, 15, &b4), Some(3));
+            let b1 = lookup_budget(16, 16, 1, 0, 100_000);
+            assert_eq!(clamp_copy_take(15, 15, &b1), None);
+            // context rows left.
+            let bc = lookup_budget(16, 16, 1000, 97, 100);
+            assert_eq!(clamp_copy_take(15, 15, &bc), Some(1));
+            let bc0 = lookup_budget(16, 16, 1000, 99, 100);
+            assert_eq!(clamp_copy_take(15, 15, &bc0), None);
+            // block width 8.
+            let b8 = lookup_budget(8, 8, 1000, 0, 100_000);
+            assert_eq!(clamp_copy_take(15, 15, &b8), Some(7));
+            // Tail: K=3 of 15 drafted leaves 12 slots; rows 1+3+L <= 16.
+            assert_eq!(clamp_tail_take(12, 12, 3, 15, &b), Some(12));
+            assert_eq!(clamp_tail_take(15, 15, 3, 15, &b), Some(12));
+            assert_eq!(clamp_tail_take(5, 2, 3, 15, &b), Some(2));
+            assert_eq!(clamp_tail_take(5, 5, 15, 15, &b), None);
+            assert_eq!(clamp_tail_take(5, 5, 0, 15, &b), None);
+            // K=14: one tail slot.
+            assert_eq!(clamp_tail_take(9, 9, 14, 15, &b), Some(1));
+            // emit budget: K + L + 1 <= max_emit.
+            assert_eq!(clamp_tail_take(9, 9, 2, 15, &b4), Some(1));
+            assert_eq!(clamp_tail_take(9, 9, 3, 15, &b4), None);
+            // Probe rows: strictly wider than the incumbent, inside the clamps.
+            assert_eq!(valid_probe_rows(16, 8, &b), Some(16));
+            assert_eq!(valid_probe_rows(8, 8, &b), None);
+            assert_eq!(valid_probe_rows(6, 8, &b), None);
+            assert_eq!(valid_probe_rows(16, 8, &b4), None);
+            assert_eq!(valid_probe_rows(1, 0, &b), None);
+        }
+
+        #[test]
+        fn lookup_shadow_matched_computation() {
+            assert_eq!(shadow_match(&[], &[1, 2]), None);
+            assert_eq!(shadow_match(&[1, 2, 3], &[]), Some((0, 3)));
+            assert_eq!(shadow_match(&[1, 2, 3], &[9, 2, 3]), Some((0, 3)));
+            assert_eq!(shadow_match(&[1, 2, 3], &[1, 2, 9]), Some((2, 3)));
+            assert_eq!(shadow_match(&[1, 2, 3], &[1, 2, 3, 7]), Some((3, 3)));
+            // Committed shorter than the proposal: matched <= committed.
+            assert_eq!(shadow_match(&[1, 2, 3, 4], &[1, 2]), Some((2, 4)));
+        }
+
+        #[test]
+        fn lookup_outcome_per_kind_accepted_zero_partial_full_and_eos_cap() {
+            let prop = [10, 11, 12, 13];
+            // Native, accepted 0: the bonus alone, shadow compares it to the proposal.
+            let o = window_outcome(Ran::Native, 8, 0, &prop, &[10], 700, 1500.0);
+            assert_eq!(
+                o,
+                WindowOutcome {
+                    kind: LookupKind::Native,
+                    rows: 8,
+                    model_drafts: 7,
+                    lookup_len: 0,
+                    accepted: 0,
+                    shadow: Some((1, 4)),
+                    ctx: 700,
+                    wall_us: 1500.0,
+                }
+            );
+            // Native partial; the learned run and the proposal diverge after 2.
+            let o = window_outcome(Ran::Native, 16, 3, &prop, &[10, 11, 99, 5], 1, 2.0);
+            assert_eq!(
+                (o.accepted, o.shadow, o.model_drafts),
+                (3, Some((2, 4)), 15)
+            );
+            // Native full accept (accepted = rows-1), no proposal -> no shadow.
+            let o = window_outcome(Ran::Native, 4, 3, &[], &[1, 2, 3, 4], 1, 2.0);
+            assert_eq!((o.accepted, o.shadow), (3, None));
+            // Copy: never a shadow, model unobserved, lookup_len = take.
+            for acc in [0, 6, 15] {
+                let o = window_outcome(Ran::Copy { take: 15 }, 16, acc, &prop, &prop, 9, 3.0);
+                assert_eq!(
+                    (o.kind, o.model_drafts, o.lookup_len, o.accepted, o.shadow),
+                    (LookupKind::Copy, 0, 15, acc, None)
+                );
+                assert_eq!(o.rows, 16);
+            }
+            // Tail(K=3, L=8): accepted inside the learned prefix, at the splice, full.
+            for acc in [0usize, 2, 3, 7, 11] {
+                let o = window_outcome(Ran::Tail { k: 3, l: 8 }, 12, acc, &prop, &prop, 9, 3.0);
+                assert_eq!(
+                    (o.kind, o.model_drafts, o.lookup_len, o.accepted, o.shadow),
+                    (LookupKind::Tail, 3, 8, acc, None)
+                );
+            }
+            // EOS / max_emit cap: a raw accepted above rows-1 can never be observed.
+            let o = window_outcome(Ran::Copy { take: 3 }, 4, 9, &prop, &prop, 0, 1.0);
+            assert_eq!(o.accepted, 3);
+            let o = window_outcome(Ran::Native, 1, 5, &[], &[1], 0, 1.0);
+            assert_eq!((o.accepted, o.model_drafts), (0, 0));
+            // Trace tags.
+            assert_eq!(
+                trace_tag(&window_outcome(Ran::Native, 8, 2, &prop, &[10], 0, 1.0), 4),
+                ("native", 7, 4)
+            );
+            assert_eq!(
+                trace_tag(
+                    &window_outcome(Ran::Copy { take: 5 }, 6, 2, &prop, &prop, 0, 1.0),
+                    9
+                ),
+                ("copy", 0, 5)
+            );
+            assert_eq!(
+                trace_tag(
+                    &window_outcome(Ran::Tail { k: 2, l: 4 }, 7, 2, &prop, &prop, 0, 1.0),
+                    9
+                ),
+                ("tail", 2, 4)
+            );
+        }
+
+        /// The splice decision at K may read only `drafted[..K]`: the propose
+        /// callback sees prefixes of exactly K = 1, 2, ... in order, the
+        /// decision is asked once per K that offers candidates, and nothing
+        /// is read after the first K that takes.
+        #[test]
+        fn lookup_tail_source_decides_from_prefix_only() {
+            let mut seen: Vec<Vec<u32>> = Vec::new();
+            let mut asked: Vec<(usize, usize)> = Vec::new();
+            let drafted = [10, 11, 12, 13, 14, 15];
+            let mut tail = vec![99];
+            let mut cand = Vec::new();
+            let r = tail_splice(
+                &drafted,
+                &mut tail,
+                &mut cand,
+                |prefix, cap, out| {
+                    seen.push(prefix.to_vec());
+                    assert_eq!(cap, drafted.len() - prefix.len());
+                    // Candidates exist only after the prefix [10, 11, 12].
+                    if prefix == [10, 11, 12] {
+                        out.extend_from_slice(&[7, 8, 9, 6]);
+                    }
+                },
+                |k, offered| {
+                    asked.push((k, offered));
+                    Some(2)
+                },
+            );
+            assert_eq!(r, Some((3, 2)));
+            assert_eq!(tail, vec![7, 8]);
+            assert_eq!(
+                seen,
+                vec![vec![10], vec![10, 11], vec![10, 11, 12]],
+                "never read past the deciding prefix"
+            );
+            assert_eq!(asked, vec![(3, 3)], "offered clamps to the slots left");
+            // Same decision for any drafted[K..]: change everything after K.
+            let drafted_b = [10, 11, 12, 1, 2, 3];
+            let mut tail_b = Vec::new();
+            let r_b = tail_splice(
+                &drafted_b,
+                &mut tail_b,
+                &mut cand,
+                |prefix, _cap, out| {
+                    if prefix == [10, 11, 12] {
+                        out.extend_from_slice(&[7, 8, 9, 6]);
+                    }
+                },
+                |_k, _offered| Some(2),
+            );
+            assert_eq!(r_b, Some((3, 2)));
+            assert_eq!(tail_b, vec![7, 8]);
+        }
+
+        #[test]
+        fn lookup_tail_source_first_k_wins_declines_and_bounds() {
+            let drafted = [1, 2, 3, 4];
+            let mut tail = Vec::new();
+            let mut cand = Vec::new();
+            // Decline everything: None, tail left empty.
+            let r = tail_splice(
+                &drafted,
+                &mut tail,
+                &mut cand,
+                |_p, _c, out| out.extend_from_slice(&[5, 6]),
+                |_k, _o| None,
+            );
+            assert_eq!((r, tail.len()), (None, 0));
+            // A chooser that takes at K=1 stops there (first K wins).
+            let mut calls = 0;
+            let r = tail_splice(
+                &drafted,
+                &mut tail,
+                &mut cand,
+                |_p, _c, out| out.extend_from_slice(&[5, 6, 7, 8]),
+                |k, _o| {
+                    calls += 1;
+                    (k == 1).then_some(9)
+                },
+            );
+            // take clamps to what was offered (cap = 3 slots after K=1).
+            assert_eq!((r, calls, tail.clone()), (Some((1, 3)), 1, vec![5, 6, 7]));
+            // No lookup candidates at any K: the chooser is never asked.
+            let r = tail_splice(
+                &drafted,
+                &mut tail,
+                &mut cand,
+                |_p, _c, _out| {},
+                |_k, _o| panic!("decide without candidates"),
+            );
+            assert_eq!(r, None);
+            // K = drafted.len() leaves no tail slot, so a window of 1 or 0
+            // learned candidates never splices.
+            let none: [u32; 0] = [];
+            let one = [1u32];
+            for d in [&none[..], &one[..]] {
+                let r = tail_splice(
+                    d,
+                    &mut tail,
+                    &mut cand,
+                    |_p, _c, _o| panic!("propose with no tail slot"),
+                    |_k, _o| panic!("decide with no tail slot"),
+                );
+                assert_eq!(r, None);
+            }
+            // A zero take is a decline, the search continues.
+            let r = tail_splice(
+                &drafted,
+                &mut tail,
+                &mut cand,
+                |_p, _c, out| out.push(5),
+                |k, _o| Some(if k == 2 { 1 } else { 0 }),
+            );
+            assert_eq!(r, Some((2, 1)));
+        }
+
+        fn mk_history() -> (Vec<u32>, Vec<u32>) {
+            // 40 unique ids; the prompt ends in a copy of an earlier run.
+            let a: Vec<u32> = (100..140).collect();
+            let mut prompt = a.clone();
+            prompt.extend_from_slice(&[900, 901]);
+            (prompt, a)
+        }
+
+        #[test]
+        fn lookup_rewind_rebuilds_history_from_prompt() {
+            let (prompt, a) = mk_history();
+            let mut s = st(true);
+            s.begin_request(&prompt);
+            let emitted: Vec<u32> = a[..8].to_vec();
+            assert!(s.sync_history(&emitted));
+            assert_eq!(s.ctx.history().len(), prompt.len() + 8);
+            assert_eq!(&s.ctx.history()[..prompt.len()], &prompt[..]);
+            assert_eq!(&s.ctx.history()[prompt.len()..], &emitted[..]);
+            // Incremental growth appends only the new suffix.
+            let grown: Vec<u32> = a[..12].to_vec();
+            assert!(s.sync_history(&grown));
+            assert_eq!(&s.ctx.history()[prompt.len()..], &grown[..]);
+            // emitted shrinks (terminal repair / re-render): rebuilt, not stale.
+            let shrunk: Vec<u32> = a[..5].to_vec();
+            assert!(s.sync_history(&shrunk));
+            assert_eq!(s.ctx.history().len(), prompt.len() + 5);
+            assert_eq!(&s.ctx.history()[prompt.len()..], &shrunk[..]);
+            // Same length, different content (divergent re-render): rebuilt.
+            let diverged: Vec<u32> = vec![a[0], a[1], a[2], a[3], 777];
+            assert!(s.sync_history(&diverged));
+            assert_eq!(&s.ctx.history()[prompt.len()..], &diverged[..]);
+            // A rewind marks the state dirty: rebuilt even though emitted only grew.
+            s.mark_dirty();
+            let regrown: Vec<u32> = vec![a[0], a[1], a[2], a[3], 777, 778];
+            assert!(s.sync_history(&regrown));
+            assert_eq!(&s.ctx.history()[prompt.len()..], &regrown[..]);
+            assert!(!s.dirty);
+            // The rebuilt tables match a fresh context's proposals.
+            let mut fresh = MtpCopyContext::new(copy_config((5, 1, 63)).unwrap()).unwrap();
+            fresh.begin_request(&prompt);
+            let key: Vec<u32> = a[..8].to_vec();
+            let want = fresh.propose(&key, 15).map(<[u32]>::to_vec);
+            assert!(s.sync_history(&key));
+            assert_eq!(s.ctx.propose(&key, 15).map(<[u32]>::to_vec), want);
+            assert!(want.is_some());
+            // No request: nothing proposes, no history.
+            s.end_request();
+            assert!(!s.sync_history(&key));
+            assert!(s.ctx.history().is_empty());
+        }
+
+        #[test]
+        fn lookup_plan_window_incumbent_paths() {
+            let (prompt, a) = mk_history();
+            let mut s = st(true);
+            // Before begin_request: lookup off for the window (incumbent call).
+            let emitted: Vec<u32> = a[..8].to_vec();
+            assert_eq!(
+                s.plan_window(&emitted, a[7], 1000, 16, 4096, 16, 100_000),
+                WindowPlan::Off
+            );
+            s.begin_request(&prompt);
+            // The seed must be the last emitted token.
+            assert_eq!(
+                s.plan_window(&emitted, a[3], 1000, 16, 4096, 16, 100_000),
+                WindowPlan::Off
+            );
+            assert!(s.proposal.is_empty());
+            // A proposal exists but the controller has no prices/evidence:
+            // the incumbent block, Tail offered (it can only splice on measured wins).
+            assert_eq!(
+                s.plan_window(&emitted, a[7], 1000, 16, 4096, 16, 100_000),
+                WindowPlan::Native { tail: true }
+            );
+            assert_eq!(s.proposal, a[8..23].to_vec());
+            // Tail kill switch: still native, no tail offer.
+            let mut s2 = st(false);
+            s2.begin_request(&prompt);
+            assert_eq!(
+                s2.plan_window(&emitted, a[7], 1000, 16, 4096, 16, 100_000),
+                WindowPlan::Native { tail: false }
+            );
+            // No proposal: `emitted` of tokens never seen before.
+            let mut s3 = st(true);
+            s3.begin_request(&prompt);
+            let novel: Vec<u32> = vec![5000, 5001, 5002, 5003, 5004, 5005];
+            assert_eq!(
+                s3.plan_window(&novel, 5005, 1000, 16, 4096, 16, 100_000),
+                WindowPlan::Native { tail: true }
+            );
+            assert!(s3.proposal.is_empty());
+            // max_emit 2: no room for a tail (rows < 3), no proposal.
+            assert_eq!(
+                s3.plan_window(&novel, 5005, 1000, 2, 2, 16, 100_000),
+                WindowPlan::Native { tail: false }
+            );
+        }
+
+        #[test]
+        fn lookup_plan_window_takes_copy_after_priced_evidence() {
+            let (prompt, a) = mk_history();
+            let mut s = st(true);
+            s.begin_request(&prompt);
+            let emitted: Vec<u32> = a[..8].to_vec();
+            // Priced native 16-row windows whose lookup shadow always matches
+            // the full proposal while the learned chain accepts little.
+            for _ in 0..12 {
+                let o = window_outcome(Ran::Native, 16, 1, &a[8..23], &a[8..23], 1000, 40_000.0);
+                s.ctl.observe(&o);
+            }
+            let plan = s.plan_window(&emitted, a[7], 1000, 16, 4096, 16, 100_000);
+            match plan {
+                WindowPlan::Copy { take } => {
+                    assert!((1..=15).contains(&take), "{take}");
+                    assert!(take <= s.proposal.len());
+                }
+                other => panic!("expected a Copy window, got {other:?}"),
+            }
+            // The same state clamps to max_emit: rows <= max_emit.
+            let plan = s.plan_window(&emitted, a[7], 1000, 16, 4, 16, 100_000);
+            if let WindowPlan::Copy { take } = plan {
+                assert!(take <= 3, "{take}");
+            }
+        }
+
+        #[test]
+        fn lookup_arming_reasons_and_load_lines() {
+            assert_eq!(arming(&inputs()), Ok(true));
+            assert_eq!(
+                arming(&ArmInputs {
+                    tail_env: false,
+                    ..inputs()
+                }),
+                Ok(false)
+            );
+            assert_eq!(
+                arming(&ArmInputs {
+                    on: false,
+                    ..inputs()
+                }),
+                Err("speculation.dflash_lookup is off")
+            );
+            assert_eq!(
+                arming(&ArmInputs {
+                    ddtree: true,
+                    ..inputs()
+                }),
+                Err("DDTree chain")
+            );
+            assert_eq!(
+                arming(&ArmInputs {
+                    selector: false,
+                    ..inputs()
+                }),
+                Err("no DFlash2 candidate selector")
+            );
+            assert_eq!(
+                arming(&ArmInputs {
+                    pm4: true,
+                    ..inputs()
+                }),
+                Err("retained PM4 verify is shape-frozen at B=16")
+            );
+            assert_eq!(
+                arming(&ArmInputs {
+                    block_size: 2,
+                    ..inputs()
+                }),
+                Err("verify block < 3 rows")
+            );
+            assert_eq!(
+                load_line(&Ok(true), 16),
+                "[dflash] lookup: armed (copy+tail, rows<=16)"
+            );
+            assert_eq!(
+                load_line(&Ok(false), 8),
+                "[dflash] lookup: armed (copy, rows<=8)"
+            );
+            assert_eq!(
+                load_line(&Err("DDTree chain".into()), 16),
+                "[dflash] lookup: off (DDTree chain)"
+            );
+        }
+
+        #[test]
+        fn lookup_unarmed_builds_no_state() {
+            for i in [
+                ArmInputs {
+                    on: false,
+                    ..inputs()
+                },
+                ArmInputs {
+                    ddtree: true,
+                    ..inputs()
+                },
+                ArmInputs {
+                    selector: false,
+                    ..inputs()
+                },
+                ArmInputs {
+                    pm4: true,
+                    ..inputs()
+                },
+            ] {
+                let (state, line) = build_state(&i, (5, 1, 63));
+                assert!(state.is_none());
+                assert!(line.starts_with("[dflash] lookup: off ("), "{line}");
+            }
+            let (state, line) = build_state(&inputs(), (5, 1, 63));
+            let state = state.expect("armed");
+            assert!(state.tail);
+            assert_eq!(state.max_rows, 16);
+            assert_eq!(line, "[dflash] lookup: armed (copy+tail, rows<=16)");
+            assert!(!state.ctx.is_begun());
+            assert!(state.proposal.capacity() >= LOOKUP_MAX_CANDIDATES);
+            let (state, line) = build_state(
+                &ArmInputs {
+                    tail_env: false,
+                    block_size: 8,
+                    ..inputs()
+                },
+                (5, 1, 63),
+            );
+            let state = state.expect("armed copy-only");
+            assert!(!state.tail);
+            assert_eq!(state.max_rows, 8);
+            assert_eq!(line, "[dflash] lookup: armed (copy, rows<=8)");
+            // An unrunnable triple never arms and says why.
+            let (state, line) = build_state(&inputs(), (5, 9, 3));
+            assert!(state.is_none());
+            assert!(
+                line.starts_with("[dflash] lookup: off (copy context: invalid n-gram triple"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn lookup_copy_config_matches_the_qwen4_copy_lane() {
+            let c = copy_config(hipfire_config::NGRAM_MOD_COPY_TRIPLE).unwrap();
+            assert_eq!((c.n_match, c.n_min, c.n_max), (5, 1, 15));
+            assert_eq!(c.capacity, NgramModConfig::default().capacity);
+            let c = copy_config((8, 20, 30)).unwrap();
+            assert_eq!((c.n_match, c.n_min, c.n_max), (8, 15, 15));
+            assert!(copy_config((0, 1, 3)).is_err());
+            assert!(copy_config((5, 1, 65)).is_err());
+            assert!(copy_config((5, 4, 3)).is_err());
+        }
+    }
+}
+
 /// Lower a qwen35 `SpecStepResult` onto the arch-generic `SpecStep`.
 ///
 /// The daemon-called `spec_step_*` build `committed = [seed, drafts.., bonus]`,
 /// so `committed[1..]` is exactly the daemon's `committed_tail` (the tokens
 /// emitted this window) and its length is `accepted + 1` — which is why the
 /// unified loop advances `position` by `emit.len()`.
-fn lower_qwen35(r: SpecStepResult) -> SpecStep {
+fn lower_qwen35(r: &SpecStepResult) -> SpecStep {
     SpecStep::new(
         r.committed[1..].iter().copied(),
         r.bonus_token,
@@ -926,6 +2225,14 @@ pub struct DflashSpeculator {
     /// Resolved adaptive knob passed to `new` (the controller's `enabled` is
     /// private); VMM lanes require it to be false (fixed block).
     adaptive_enabled: bool,
+    /// `HIPFIRE_DFLASH_CYCLE_TRACE` request ordinal (process-wide counter value
+    /// taken at the last `prefill`) and per-request cycle index. Diagnostic only.
+    trace_seq: u64,
+    trace_cyc: u64,
+    /// Request-local verbatim-copy lookup composed into the verify window
+    /// (`speculation.dflash_lookup`). `None` = not armed: the unarmed `step`
+    /// is the incumbent window with no lookup state at all.
+    lookup: Option<lookup::LookupState>,
 }
 
 /// Pre-window mark of the last completed window (terminal-prefix repair).
@@ -972,6 +2279,9 @@ impl DflashSpeculator {
             last_window: None,
             adaptive,
             adaptive_enabled: adaptive_b,
+            trace_seq: 0,
+            trace_cyc: 0,
+            lookup: None,
         }
     }
 
@@ -992,6 +2302,42 @@ impl DflashSpeculator {
     pub fn is_vacant(&self) -> bool {
         self.df.is_none()
     }
+
+    /// Arm (or leave off) the verbatim-copy lookup and print the one load
+    /// line. `on` = resolved `speculation.dflash_lookup`, `tail_env` = the
+    /// `HIPFIRE_SPEC_LOOKUP_TAIL` kill switch is not `0`. Armed only on this
+    /// singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify);
+    /// the VMM/CB lanes and the dense-TP mesh speculator are other types and
+    /// never arm; CACTUS is excluded per window in `step`.
+    pub fn configure_lookup(&mut self, on: bool, tail_env: bool) {
+        let Some(df) = self.df.as_ref() else {
+            self.lookup = None;
+            return;
+        };
+        let inputs = lookup::ArmInputs {
+            on,
+            tail_env,
+            ddtree: df.ddtree.is_some(),
+            selector: df.draft_weights.has_candidate_selector(),
+            pm4: df.verify_pm4.admitted(),
+            block_size: df.block_size,
+        };
+        let (state, line) = lookup::build_state(&inputs, hipfire_config::ngram_mod_copy_triple());
+        eprintln!("{line}");
+        self.lookup = state;
+    }
+
+    /// Drop an armed lookup once VMM DFlash lanes are staged for this load,
+    /// printing `[dflash] lookup: off (<why>)`. Lanes never run lookup and a
+    /// request can move between the singleton and a lane mid-decode, so an
+    /// armed singleton would make a request's text depend on server load
+    /// (the same reason the lanes refuse the adaptive block). No-op when the
+    /// lookup was never armed.
+    pub fn disarm_lookup(&mut self, why: &str) {
+        if self.lookup.take().is_some() {
+            eprintln!("{}", lookup::load_line(&Err(why.to_string()), 0));
+        }
+    }
 }
 
 impl Speculator for DflashSpeculator {
@@ -1011,6 +2357,9 @@ impl Speculator for DflashSpeculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
         self.adaptive.reset();
+        if let Some(lk) = self.lookup.as_mut() {
+            lk.end_request();
+        }
         self.last_window = None;
         let slot = target
             .as_any_mut()
@@ -1117,6 +2466,22 @@ impl Speculator for DflashSpeculator {
             &mut self.rng_state,
             &mut Vec::new(),
         );
+        if cycle_trace::enabled() {
+            self.trace_seq = cycle_trace::next_seq();
+            self.trace_cyc = 0;
+            cycle_trace::emit(&cycle_trace::prefill_line(
+                std::process::id(),
+                self.trace_seq,
+                prompt_tokens,
+                prefill_start,
+                cache_hit,
+            ));
+        }
+        if let Some(lk) = self.lookup.as_mut() {
+            // Canonical full prompt (cache hits included); the first token
+            // reaches the history through `emitted`.
+            lk.begin_request(prompt_tokens);
+        }
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -1179,7 +2544,72 @@ impl Speculator for DflashSpeculator {
         df.draft_scratch
             .thlog
             .append_committed(start_pos, tokens.len(), co);
+        if cycle_trace::enabled() {
+            cycle_trace::emit(&cycle_trace::forced_line(
+                std::process::id(),
+                self.trace_seq,
+                start_pos,
+                tokens,
+            ));
+        }
         Ok(true)
+    }
+
+    fn supports_ar_step(&self) -> bool {
+        self.df.is_some()
+    }
+
+    /// AR's single-token decode forward plus this position's hidden rows, then
+    /// the same scatter + log append a forced advance does, so the draft
+    /// context stays whole for a later request on this prompt cache.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        // No retained window: a terminal stop after this token flushes plainly.
+        self.last_window = None;
+        qwen35::forward_scratch_with_hidden(
+            gpu,
+            &slot.weights,
+            &slot.config,
+            seed,
+            position,
+            &mut slot.kv_cache,
+            &mut slot.dn_state,
+            &slot.scratch,
+            &mut df.hidden_rb,
+        )
+        .map_err(|e| e.to_string())?;
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &df.hidden_rb,
+            &df.draft_scratch.target_hidden,
+            position,
+            1,
+            1,
+            df.draft_scratch.ctx_modulus(),
+        )
+        .map_err(|e| e.to_string())?;
+        let co = slot.kv_cache.compact_offset as i32;
+        df.draft_scratch.thlog.append_committed(position, 1, co);
+        // The verify's argmax kernel and buffer: same tie-break, no per-token alloc.
+        let argmax = df.verify_scratch.argmax.sub_offset(0, 1);
+        gpu.argmax_f32_batched(&slot.scratch.logits, &argmax, slot.config.vocab_size, 1)
+            .map_err(|e| e.to_string())?;
+        crate::speculative::dflash_download_verify_argmax(gpu, &df.verify_scratch, 1)
+            .map(|t| t[0])
+            .map_err(|e| e.to_string())
     }
 
     /// Temp>0 verify is distribution-correct on the ddtree-batched arm (SWOR)
@@ -1216,6 +2646,7 @@ impl Speculator for DflashSpeculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
+        let t0 = cycle_trace::enabled().then(std::time::Instant::now);
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -1272,6 +2703,12 @@ impl Speculator for DflashSpeculator {
         // The production chain/tree calls below use ctx_slice=None, so no
         // persistent host shadow exists or is read after prompt backfill.
         let mut host_hidden = Vec::new();
+        // Armed-lookup bookkeeping of this window. `lk_ran` is `None` when
+        // lookup is inactive for it (unarmed, DDTree, CACTUS, or the pending
+        // seed is not `emitted.last()`): the incumbent call, nothing observed.
+        let mut lk_ran: Option<lookup::Ran> = None;
+        let mut lk_probe = false;
+        let mut lk_wall_us = 0.0f64;
         let result = if let Some(dd) = df.ddtree.as_mut() {
             // Tree node budget is structural; max_accept is the commit bound.
             // Keep at least 1 node so the tree builder stays well-formed; the
@@ -1313,7 +2750,71 @@ impl Speculator for DflashSpeculator {
                     "selector mode: CACTUS is not supported with DFlash2 candidate selector".into(),
                 );
             }
-            spec_step_dflash(
+            // Lookup planning (armed only). The unarmed path and any window
+            // with no lookup proposal and no Tail offer reach the call below
+            // with `block_override` and `lookup = None`: the incumbent call.
+            let native_b = block_override.unwrap_or(df.draft_config.block_size);
+            let mut lk: Option<&mut lookup::LookupState> = if self.sample_cactus == 0.0 {
+                self.lookup.as_mut()
+            } else {
+                None
+            };
+            let plan = match lk.as_deref_mut() {
+                Some(l) => l.plan_window(
+                    emitted,
+                    seed,
+                    position,
+                    native_b,
+                    max_emit,
+                    df.block_size,
+                    df.ctx_capacity,
+                ),
+                None => lookup::WindowPlan::Off,
+            };
+            // Copy runs at `1 + take` rows (the learned draft forward runs at
+            // that width and its candidates are discarded); a price probe is
+            // ONE native window at the wider row count that prices the Copy
+            // it would need (its acceptance feeds the lookup shadow only).
+            let (call_block, mut ran) = match plan {
+                lookup::WindowPlan::Copy { take } => {
+                    (Some(1 + take), Some(lookup::Ran::Copy { take }))
+                }
+                lookup::WindowPlan::Probe { rows } => {
+                    lk_probe = true;
+                    (Some(rows), Some(lookup::Ran::Native))
+                }
+                lookup::WindowPlan::Native { .. } => (block_override, Some(lookup::Ran::Native)),
+                lookup::WindowPlan::Off => (block_override, None),
+            };
+            let mut tail_src: Option<lookup::TailSource<'_>> = None;
+            let lookup_arg: Option<DflashLookup<'_>> = match (plan, lk.as_deref_mut()) {
+                (lookup::WindowPlan::Copy { take }, Some(l)) => {
+                    Some(DflashLookup::Copy(&l.proposal[..take]))
+                }
+                (lookup::WindowPlan::Native { tail: true }, Some(l)) => {
+                    let mut base = lookup::lookup_budget(
+                        native_b,
+                        df.block_size,
+                        max_emit,
+                        position,
+                        df.ctx_capacity,
+                    );
+                    base.max_rows = base.max_rows.min(l.max_rows);
+                    tail_src = Some(lookup::TailSource {
+                        ctx: &mut l.ctx,
+                        ctl: &l.ctl,
+                        emitted,
+                        base,
+                        position,
+                        cand: &mut l.cand,
+                        spliced: None,
+                    });
+                    tail_src.as_mut().map(|s| DflashLookup::Tail(s))
+                }
+                _ => None,
+            };
+            let call_t0 = ran.is_some().then(std::time::Instant::now);
+            let res = spec_step_dflash(
                 gpu,
                 slot,
                 &df.draft_weights,
@@ -1338,8 +2839,8 @@ impl Speculator for DflashSpeculator {
                 self.sample_top_p, // top_p (1.0 = no truncation)
                 self.sample_top_k, // top_k (0 = top_p-only)
                 &mut self.rng_state,
-                block_override, // remaining-output budget
-                None,           // ngram_cache
+                call_block, // remaining-output budget (Copy / probe: the lookup width)
+                None,       // ngram_cache
                 emitted,
                 self.sample_cactus, // selector already checked — safe to pass through
                 None,               // pld_spine
@@ -1347,15 +2848,59 @@ impl Speculator for DflashSpeculator {
                 0,                  // repeat_window
                 max_accept,
                 Some(&mut df.verify_pm4),
-            )
+                lookup_arg,
+            );
+            if let Some(t) = call_t0 {
+                lk_wall_us = t.elapsed().as_secs_f64() * 1e6;
+            }
+            // A Tail offer that spliced ran a Tail window; one that declined
+            // ran the incumbent window unchanged (Native, with a shadow).
+            if let Some((k, l)) = tail_src.as_ref().and_then(|s| s.spliced) {
+                ran = Some(lookup::Ran::Tail { k, l });
+            }
+            lk_ran = ran;
+            res
         };
+        // `online` (`HIPFIRE_DFLASH_ONLINE_TUNE`) labels its pending proposal
+        // rows with the tokens the TARGET committed after the seed. Those are
+        // the true labels for any window kind (a Copy / Tail window verifies
+        // lookup rows, but what it commits is still the target's own stream),
+        // and skipping a window would leave its pending cycle unlabelled
+        // forever (the tuner finalizes strictly in order), so it is fed
+        // every chain window exactly as before.
         if df.ddtree.is_none() {
             if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
                 t.observe(position, &r.committed[1..], r.accepted);
             }
         }
+        // Armed lookup: the controller learns from the window it actually ran
+        // (`LookupController::observe` owns the censoring / source-separated
+        // rules), and only Native windows feed the adaptive-B controller: a
+        // Copy / Tail window's accepted count measures the lookup rows, not
+        // the learned chain the controller sizes the block for, and a price
+        // probe runs at a width the controller did not choose.
+        let mut lk_trace: Option<(&'static str, usize, usize)> = None;
+        let mut feed_adaptive = true;
+        if let (Some(ran), Ok(r), Some(lk)) = (lk_ran, &result, self.lookup.as_mut()) {
+            let o = lookup::window_outcome(
+                ran,
+                r.drafted.len(),
+                r.accepted,
+                &lk.proposal,
+                r.committed.get(1..).unwrap_or(&[]),
+                position,
+                lk_wall_us,
+            );
+            lk.ctl.observe(&o);
+            // A price probe is a Native window run wider than the incumbent
+            // would have: tag it so receipts never count it as incumbent.
+            lk_trace = Some(lookup::trace_tag(&o, lk.proposal.len()))
+                .map(|(kind, k, l)| (if lk_probe { "probe" } else { kind }, k, l));
+            feed_adaptive = matches!(ran, lookup::Ran::Native) && !lk_probe;
+        }
 
         let lowered = result
+            .as_ref()
             .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
@@ -1365,7 +2910,7 @@ impl Speculator for DflashSpeculator {
         // `accepted` with the truncated emit, so this is what really
         // committed). DDTree has its own structural budget — only the chain
         // proposal width shrinks; the tree budget is never fed here.
-        if let Ok(s) = &lowered {
+        if let (Ok(s), true) = (&lowered, feed_adaptive) {
             let prev = self.adaptive.effective();
             let next = self.adaptive.observe(s.accepted);
             if next != prev {
@@ -1388,6 +2933,43 @@ impl Speculator for DflashSpeculator {
                     } else {
                         ""
                     },
+                );
+            }
+        }
+        if let Some(t0) = t0 {
+            let step_us = t0.elapsed().as_micros() as u64;
+            if let (Ok(r), Ok(s)) = (&result, &lowered) {
+                let cyc = self.trace_cyc;
+                self.trace_cyc += 1;
+                cycle_trace::emit(
+                    &cycle_trace::Cycle {
+                        pid: std::process::id(),
+                        seq: self.trace_seq,
+                        cyc,
+                        pos: position,
+                        seed,
+                        // `SpecStepResult.drafted` is `[seed, d1..d(b-1)]`:
+                        // its length is the verify rows, the candidates
+                        // follow the seed.
+                        b: r.drafted.len(),
+                        max_emit,
+                        temp: if df.ddtree.is_some() {
+                            temp
+                        } else {
+                            self.sample_temp
+                        },
+                        drafted: r.drafted.get(1..).unwrap_or(&[]),
+                        accepted: r.accepted,
+                        committed: &s.emit,
+                        step_us,
+                        ddtree: df.ddtree.is_some(),
+                        lookup: lk_trace.map(|(kind, k, lookup)| cycle_trace::LookupTag {
+                            kind,
+                            k,
+                            lookup,
+                        }),
+                    }
+                    .line(),
                 );
             }
         }
@@ -1417,6 +2999,9 @@ impl Speculator for DflashSpeculator {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if cycle_trace::enabled() {
+            cycle_trace::emit(&cycle_trace::reset_line(std::process::id(), self.trace_seq));
+        }
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle). The adaptive window reseeds to
@@ -1427,6 +3012,9 @@ impl Speculator for DflashSpeculator {
         }
         self.last_window = None;
         self.adaptive.reset();
+        if let Some(lk) = self.lookup.as_mut() {
+            lk.end_request();
+        }
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
@@ -1441,6 +3029,10 @@ impl Speculator for DflashSpeculator {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        if let Some(lk) = self.lookup.as_mut() {
+            // `emitted` shrinks to the consumed prefix: rebuild the history.
+            lk.mark_dirty();
+        }
         if self.df.is_none() {
             return Err(SINGLETON_VACANT.into());
         }
@@ -1521,6 +3113,11 @@ impl Speculator for DflashSpeculator {
         target: &mut dyn SpecTarget,
         position: usize,
     ) -> Result<usize, String> {
+        if let Some(lk) = self.lookup.as_mut() {
+            // Divergent re-render: the request restarts from `prefill`; any
+            // surviving history is rebuilt from the prompt.
+            lk.mark_dirty();
+        }
         // Restore the target's DeltaNet recurrent state to the checkpoint at
         // `position` and drop the now-stale tail of the ring (mirrors the old
         // divergent-render resume at generate_dflash 4021-4036). Caller rewinds
@@ -1665,13 +3262,12 @@ pub fn build_dflash_speculator(
         );
     }
     let adaptive_b = adaptive_b && !pm4_replay;
-    Box::new(DflashSpeculator::new(
-        df,
-        resume_enabled,
-        ck_interval,
-        ck_cap,
-        adaptive_b,
-    ))
+    let mut speculator = DflashSpeculator::new(df, resume_enabled, ck_interval, ck_cap, adaptive_b);
+    speculator.configure_lookup(
+        hipfire_config::dflash_lookup_enabled(),
+        hipfire_config::dflash_lookup_tail_enabled(),
+    );
+    Box::new(speculator)
 }
 
 // ─── Shared-asset VMM lanes (continuous batching) ───────────────────────

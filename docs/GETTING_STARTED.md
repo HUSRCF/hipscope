@@ -385,6 +385,7 @@ other shared system dependencies.
 hipfire --version
 hipfire version
 hipfire diag
+hipfire doctor
 ```
 
 `--version` prints the release, source commit, and source ref in one line.
@@ -392,6 +393,17 @@ hipfire diag
 matches the binary and hashes the installed daemon; add `--json` for support
 reports. `diag` reports GPU arch, VRAM, HIP/ROCm, kernel locations, model dir,
 and config overrides.
+
+On Linux, run `hipfire doctor` before the first model load: it checks the amdgpu
+driver, `/dev/kfd` access, the ROCm install and your GPU's device libraries, any
+`HSA_OVERRIDE_GFX_VERSION`, the kernel pack, and that the CLI and the daemon are
+one build, then prints one `fix:` line per problem
+([details](CLI.md#hipfire-doctor-runtime-preflight)).
+
+- Before pulling a large model, run `hipfire fit <tag> --ctx N`: it reports
+  whether the model loads at that context on this machine (no GPU work, no
+  daemon), what the load would choose, and what to change when it does not
+  ([details](CLI.md#hipfire-fit)).
 
 ### Update or switch channels on Linux
 

@@ -18,6 +18,10 @@ use crate::{
 pub enum Variant {
     FullSet,
     FullAdd,
+    /// `full_add_v3` with runtime `add == 2`: the shared-expert sigmoid residual
+    /// epilogue. Explicit arguments 0..48: the ADD ABI plus the `shared_gate`
+    /// pointer at offset 40; the hidden block follows at 48.
+    FullAddSigmoid,
     GateUpSilu,
 }
 
@@ -25,30 +29,39 @@ impl Variant {
     pub fn symbol(self) -> &'static str {
         match self {
             Self::FullSet => "gemm_mq4g256v2_residual_mmq_iu4_full_set_v3",
-            Self::FullAdd => "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3",
+            Self::FullAdd | Self::FullAddSigmoid => "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3",
             Self::GateUpSilu => "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
         }
     }
 
-    /// HIP's explicit arguments occupy bytes 0..40 (0..44 for gate/up).
+    /// HIP's explicit arguments occupy bytes 0..40 (0..44 for gate/up, 0..48 for
+    /// the sigmoid residual ADD).
     /// ROCm fills the hidden fields when launching through hipModuleLaunchKernel.
     pub fn kernargs(self) -> KernargLayout {
         let gate = self == Self::GateUpSilu;
-        let mut args = KernargLayout::new(if gate { 304 } else { 296 })
-            .pointer(if gate { "G" } else { "A" }, 0)
-            .pointer(if gate { "U" } else { "Xq" }, 8)
-            .pointer(if gate { "Xq" } else { "Y" }, 16);
+        let mut args = KernargLayout::new(if gate || self == Self::FullAddSigmoid {
+            304
+        } else {
+            296
+        })
+        .pointer(if gate { "G" } else { "A" }, 0)
+        .pointer(if gate { "U" } else { "Xq" }, 8)
+        .pointer(if gate { "Xq" } else { "Y" }, 16);
         if gate {
             args = args.pointer("H", 24);
         }
+        let sigmoid = self == Self::FullAddSigmoid;
         let base = if gate { 32 } else { 24 };
         for (i, name) in ["M", "K", "N"].iter().enumerate() {
             args = args.hidden(name, base + 4 * i as u32, 4, "by_value");
         }
         if !gate {
-            args = args.hidden("unused", 36, 4, "by_value");
+            args = args.hidden(if sigmoid { "add" } else { "unused" }, 36, 4, "by_value");
         }
-        let hidden = if gate { 48 } else { 40 };
+        if sigmoid {
+            args = args.pointer("shared_gate", 40);
+        }
+        let hidden = if gate || sigmoid { 48 } else { 40 };
         for (i, name) in ["x", "y", "z"].iter().enumerate() {
             args = args.hidden(
                 &format!("hidden_block_count_{name}"),

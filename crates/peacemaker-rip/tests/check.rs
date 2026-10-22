@@ -308,11 +308,23 @@ fn variants_are_the_declared_kinds() {
         peacemaker_rip::variants(GATHER, "qsa_gather.rip").unwrap(),
         ["Convert", "Attend"]
     );
-    // No `enum Kind`: no variants (the caller names one).
-    assert!(peacemaker_rip::variants(SCORE, "qsa_score.rip")
-        .unwrap()
-        .is_empty());
-    assert!(peacemaker_rip::variants(TOPK, "qsa_topk.rip")
+    // `const VARIANTS` beats the missing `enum Kind` on the single-kernel sources.
+    assert_eq!(
+        peacemaker_rip::variants(SCORE, "qsa_score.rip").unwrap(),
+        ["score", "score32"]
+    );
+    assert_eq!(
+        peacemaker_rip::variants(SCORE_BF16, "qsa_score_bf16.rip").unwrap(),
+        ["score-bf16", "score-bf16-rows32"]
+    );
+    assert_eq!(
+        peacemaker_rip::variants(TOPK, "qsa_topk.rip").unwrap(),
+        ["select"]
+    );
+    // Neither const nor `enum Kind`: no variants (the caller names one).
+    let bare =
+        "fn emit(arch: Arch, variant: &str) -> Result<Emitted, String> { Err(\"x\".into()) }";
+    assert!(peacemaker_rip::variants(bare, "bare.rip")
         .unwrap()
         .is_empty());
     // A syntax error is a located error.
@@ -320,6 +332,37 @@ fn variants_are_the_declared_kinds() {
         .err()
         .expect("syntax error");
     assert!(e.starts_with("bad.rip:1:"), "{e}");
+}
+
+#[test]
+fn arches_are_the_declared_arches() {
+    assert_eq!(
+        peacemaker_rip::arches(GATHER, "qsa_gather.rip").unwrap(),
+        Some(vec!["gfx1151".to_string(), "gfx1201".to_string()])
+    );
+    assert_eq!(
+        peacemaker_rip::arches(SCORE, "qsa_score.rip").unwrap(),
+        Some(vec!["gfx1151".to_string()])
+    );
+    assert_eq!(
+        peacemaker_rip::arches(SCORE_BF16, "qsa_score_bf16.rip").unwrap(),
+        Some(vec!["gfx1151".to_string()])
+    );
+    assert_eq!(
+        peacemaker_rip::arches(TOPK, "qsa_topk.rip").unwrap(),
+        Some(vec!["gfx1151".to_string()])
+    );
+    // No `const ARCHES`: no declared arches (the caller picks the default).
+    let bare =
+        "fn emit(arch: Arch, variant: &str) -> Result<Emitted, String> { Err(\"x\".into()) }";
+    assert_eq!(peacemaker_rip::arches(bare, "bare.rip").unwrap(), None);
+    // A declared-but-malformed const is an error naming the const.
+    let bad = "pub const ARCHES: &[&str] = &[1u32];\nfn emit(arch: Arch, variant: &str) -> Result<Emitted, String> { Err(\"x\".into()) }";
+    let e = peacemaker_rip::arches(bad, "bad.rip")
+        .err()
+        .expect("malformed");
+    assert!(e.contains("`ARCHES`"), "{e}");
+    assert!(e.starts_with("bad.rip:"), "{e}");
 }
 
 /// The module text and every kernel of the gather module hash to the recorded baseline.

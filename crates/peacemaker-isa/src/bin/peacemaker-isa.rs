@@ -105,12 +105,12 @@ fn probe(arch: Arch) -> Result<Emitted, String> {
     b.control(Instruction::new("s_endpgm", vec![], vec![]))?;
     b.finish()
 }
-const USAGE:&str="usage: peacemaker-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
+const USAGE:&str="usage: peacemaker-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel mq6_i8_gemm [--epi set|set_bf16|all] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
 const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       peacemaker-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)\n       peacemaker-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (tiles bt1w1, bt{2,4,8}w{4,8}; with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_fp8_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (the four-export lane-rows module qwen4_lane_rows_pm; --co is required and M7 runs on every export of the linked object)\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module mq4_rows_x4_pm_<arch> holds the exports gemv_mq4g256v2_rows_x4_pm_<arch> and gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_<arch>)\n       peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi r16|r32|k4_r16|k4_r32|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module bf16_rows_wide_pm_gfx1151 holds the four exports gemv_bf16_xf32_x4_rows_wide_r{16,32}_pm_gfx1151 and gemv_bf16_xf32_k4_rows_wide_r{16,32}_pm_gfx1151; no --shape/--m7: its contracts are committed in kernels/)\n       peacemaker-isa emit --kernel mq_i4_rows [--epi w3_r256|w3_r128|w2_r256|w2_r128|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (the four-export planar MQ-I4 row module mq_i4_rows_pm_gfx1201; with --co, M7 runs on every selected export of the linked object; --shape writes DIR/mq_i4_rows.gfx1201.<codec>_<rotation>.contract.json)\n       peacemaker-isa emit --kernel mtp_dense_det_gfx11 [--epi w8|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (experimental standalone DET dense F16 WMMA GEMM, module mtp_dense_det_pm_gfx1151; --co is required and M7 runs on the single export of the linked object; no --shape: its contract is committed in kernels/)";
 const FA_PREFILL_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 Q8_0 FA2-GQA twin: one module, exports attention_fa2_q_preconvert_pm_gfx1201 then attention_q8_0_fa2_gqa_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_pm.gfx1201.{preconvert,direct}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_PREFILL_FP8_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_fp8_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 native-fp8 E4M3 FA2-GQA twin: one module, ONE export attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201 (the Q preconvert/qprep stay in the Q8 and F5 modules); --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_fp8_pm.gfx1201.direct.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_QPREP_USAGE:&str="       peacemaker-isa emit --kernel fa_qprep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 rotary-64 Q prep: one module, one export attention_fa2_qprep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qprep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
-const IU4_C8_USAGE:&str="       peacemaker-isa emit --kernel iu4_c8_producer_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (exact C8 IU4 producers of the A3B F3 route: one module, two exports iu4_c8_rotate_pm_gfx1201 and iu4_c8_rmsnorm_rotate_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/iu4_c8_producer_pm.gfx1201.{rotate,norm}.contract.json, --m7 a symbol-keyed receipt map)";
+const IU4_C8_USAGE:&str="       peacemaker-isa emit --kernel iu4_c8_producer_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (exact C8 IU4 producers of the A3B F3 route: one module, four exports iu4_c8_rotate_pm_gfx1201, iu4_c8_rmsnorm_rotate_pm_gfx1201, iu4_c8_sigmoid_rotate_pm_gfx1201 and iu4_c8_rmsnorm_out_rotate_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/iu4_c8_producer_pm.gfx1201.{rotate,norm,sigmoid_rotate,norm_out}.contract.json, --m7 a symbol-keyed receipt map)";
 const GDN_CHUNK_PREP_USAGE:&str="       peacemaker-isa emit --kernel gdn_chunk_prep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (HK16/HV32/HD128 GDN chunk prep: one module, one export gdn_chunk_prep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/gdn_chunk_prep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
@@ -123,22 +123,15 @@ fn iu4_gemm(
     arch: Arch,
 ) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::iu4_gemm::{self, Spec};
-    let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
     if epi == "all" {
+        let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
         let (_, text, proof) = iu4_gemm::emit_module(fold, tile, cacc, act, arch)?;
         return Ok((
             text,
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let emitted = iu4_gemm::emit(Spec {
-        fold,
-        tile,
-        cacc,
-        epi: epi.parse()?,
-        act,
-        arch,
-    })?;
+    let emitted = iu4_gemm::emit(Spec::from_knobs(fold, tile, cacc, epi, act, arch)?)?;
     Ok((
         emitted.s_text,
         serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
@@ -215,30 +208,7 @@ fn qwen4_moe_sym(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let (kind, tile) = match epi.rsplit_once("_nt") {
-        Some((k, n)) => (k, Some(n)),
-        None => (epi, None),
-    };
-    let (nt, rr) = match tile {
-        Some(t) => {
-            let (n, r) = t.split_once('r').map_or((t, None), |(n, r)| (n, Some(r)));
-            (
-                n.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                match r {
-                    Some(r) => r.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                    None => 1,
-                },
-            )
-        }
-        None => (1, 1),
-    };
-    let e = qwen4_moe_sym::emit(Spec {
-        arch,
-        kind: kind.parse()?,
-        nt,
-        rr,
-        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
-    })?;
+    let e = qwen4_moe_sym::emit(Spec::from_epi(epi, arch)?)?;
     Ok((
         e.s_text,
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
@@ -468,6 +438,14 @@ fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
+fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// The eight-columns-per-lane ordered BF16 grouped expert combine (gfx1201 only), a separate module from v1.
 fn moe_slot_ops_v2(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::moe_slot_ops::emit_module_v2(arch)?;
@@ -633,6 +611,30 @@ fn mq4_rows_x4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
         return Err(format!("mq4_rows_x4 --epi {epi} (entry|all)"));
     }
     let e = mq4_rows_x4::emit(Spec { arch })?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// gfx1201 exact-INT8 MQ6G256V2 prefill GEMM twin of the hipcc `gemm_mq6g256v2_mmq_i8` route:
+/// `--epi set|set_bf16` one entry, `all` (default) the two-entry module.
+fn mq6_i8_gemm(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec};
+    if epi == "all" {
+        let (_, text, proof) = mq6_i8_gemm::emit_module(arch)?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let epi: Epi = epi
+        .parse()
+        .map_err(|_| format!("mq6_i8_gemm --epi {epi} (set|set_bf16|all)"))?;
+    let e = mq6_i8_gemm::emit(Spec {
+        epi,
+        raster: Raster::Banded,
+        arch,
+    })?;
     Ok((
         e.s_text,
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
@@ -1382,6 +1384,7 @@ fn run() -> Result<(), String> {
         "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
         "ep_tile_mask_pm" => ep_tile_mask(arch)?,
         "moe_slot_ops_pm" => moe_slot_ops(arch)?,
+        "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
         "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
         "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
             peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
@@ -1416,6 +1419,7 @@ fn run() -> Result<(), String> {
         "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
         "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
         "mq4_rows_x4" => mq4_rows_x4(epi.as_deref().unwrap_or("all"), arch)?,
+        "mq6_i8_gemm" => mq6_i8_gemm(epi.as_deref().unwrap_or("all"), arch)?,
         "qwen4_bf16_rows_wide" => qwen4_bf16_rows_wide(epi.as_deref().unwrap_or("all"), arch)?,
         "mq_i4_rows" => mq_i4_rows(epi.as_deref().unwrap_or("all"), arch)?,
         "mq_i4_a4" => mq_i4_a4(epi.as_deref().unwrap_or("all"), arch)?,

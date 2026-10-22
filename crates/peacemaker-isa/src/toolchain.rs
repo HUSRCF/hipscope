@@ -850,11 +850,14 @@ pub fn certify(
                     | "attention_fa2_qprep_pm_gfx1201"
                     | "gdn_chunk_prep_pm_gfx1201"
             );
-        // The A3B F3 exact C8 IU4 producers: the rotate and RMSNorm + rotate exports of `iu4_c8_producer_pm_gfx1201`.
+        // The A3B F3 exact C8 IU4 producers: the rotate, RMSNorm + rotate and the two folded (sigmoid rotate, `rmsnorm_f32`-order RMSNorm + rotate) exports of `iu4_c8_producer_pm_gfx1201`.
         let iu4_c8_pm = arch == "gfx1201"
             && matches!(
                 contract.symbol.as_str(),
-                "iu4_c8_rotate_pm_gfx1201" | "iu4_c8_rmsnorm_rotate_pm_gfx1201"
+                "iu4_c8_rotate_pm_gfx1201"
+                    | "iu4_c8_rmsnorm_rotate_pm_gfx1201"
+                    | "iu4_c8_sigmoid_rotate_pm_gfx1201"
+                    | "iu4_c8_rmsnorm_out_rotate_pm_gfx1201"
             );
         let m7_cert = matches!(arch, "gfx1100" | "gfx1151")
             || arch == "gfx1201"

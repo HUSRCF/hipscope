@@ -53,6 +53,10 @@ pub enum Step<'a> {
         k: usize,
         eps: f32,
         rotation: RotationPlan, // FwhtG256 for MQ dtypes, None for HFQ4/others
+        /// Row-major rows of width `k`. `1` is the single-row route (the
+        /// fusion table's producer); more rows take the batched kernels and
+        /// are a fusion barrier. A row norm is row-complete, never head-split.
+        rows: usize,
     },
     /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
     /// (derived once per attention step) and AttnParams (tensor borrows).
@@ -116,14 +120,15 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
-    /// Dense gated feed-forward block (gate/up projections, SiLU product,
-    /// down projection) with the source's BF16 storage boundaries.  Opaque to
-    /// fusion: no HC read/write pairing or epilogue fold crosses it.
-    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
+    /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
+    /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
+    /// read/write pairing or epilogue fold crosses it.
+    GatedMlp(crate::pipeline::gated_mlp::GatedMlpOp<'a>),
+    /// Glimmer's MLP sublayer on the sandwich stream (pre-norm or sandwich
+    /// norms, SwiGLU, steps/rows ladders).
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
     /// Sandwich-norm attention sublayer.
     SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
-    /// Sandwich-norm gated MLP sublayer.
-    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
     /// Parallel dense + routed-expert MLP sublayer.
     ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
     /// Sandwich-norm per-layer-input branch.
@@ -132,6 +137,12 @@ pub enum Step<'a> {
     Scale(crate::pipeline::sandwich::ScaleOp<'a>),
     /// In-place final-logit soft cap.
     Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
+    /// Hybrid decoder gated-DeltaNet linear-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    DeltaNetMixer(crate::pipeline::hybrid::DeltaNetMixerOp<'a>),
+    /// Hybrid decoder gated full-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    GatedAttention(crate::pipeline::hybrid::GatedAttentionOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -139,6 +150,53 @@ pub enum Step<'a> {
         crate::pipeline::moe_program::SealedMoeOp<'a>,
         crate::pipeline::moe_program::MoeStage,
     ),
+    /// Manifold hyper-connection pre step: control vector and layer input.
+    HcPre(crate::pipeline::mla::hc::HcPreOp<'a>),
+    /// Manifold hyper-connection mix of a sublayer output into the streams.
+    HcPost(crate::pipeline::mla::hc::HcPostOp<'a>),
+    /// Hyper-connection head prologue: stream combine and final norm.
+    HcHead(crate::pipeline::mla::hc::HcHeadOp<'a>),
+    /// Attention-side RMSNorm of the HC layer input (plain and FWHT-rotated).
+    QLoraPrepare(crate::pipeline::mla::query_kv::QLoraPrepareOp<'a>),
+    /// Several projections of one shared activation in one mixed-row launch.
+    PackedProjections(crate::pipeline::mla::query_kv::PackedProjectionsOp<'a>),
+    /// Low-rank query: A projection, q_norm, B projection, per-head norm.
+    QLoraProject(crate::pipeline::mla::query_kv::QLoraProjectOp<'a>),
+    /// Joint latent KV projection and kv_norm.
+    KvJoint(crate::pipeline::mla::query_kv::KvJointOp<'a>),
+    /// Tail-only YaRN RoPE of Q and the latent KV.
+    ApplyTailRope(crate::pipeline::mla::query_kv::ApplyTailRopeOp<'a>),
+    /// Shared-plus-routed expert FFN of one row or rows window.
+    ExpertFfn(crate::pipeline::mla::expert_ffn::ExpertFfnOp<'a>),
+    /// Ratio-4 sparse indexer: query, head weights, scores, top-k.
+    SparseIndex(crate::pipeline::mla::attention::SparseIndexOp<'a>),
+    /// Strided KV compressor (main or indexer flavor): one decode row or a rows window.
+    KvCompress(crate::pipeline::mla::compressor::KvCompressOp<'a>),
+    /// Projection of architecture-prepared (plain + rotated) input: one row, or a
+    /// `rows`-row window.
+    PreparedProjection(crate::pipeline::mla::project::PreparedProjectionOp<'a>),
+    /// Write the step's KV rows into the SWA rings.
+    SwaRingWrite(crate::pipeline::mla::attention::SwaRingWriteOp<'a>),
+    /// In-order gather of the active compressed rows (compress ratio 128).
+    IdentityGather(crate::pipeline::mla::attention::IdentityGatherOp<'a>),
+    /// Sliding-window attention (compress ratio 0).
+    SwaAttention(crate::pipeline::mla::attention::SwaAttentionOp<'a>),
+    /// Joint attention over the SWA window and the compressed top-k rows.
+    SparseAttention(crate::pipeline::mla::attention::SparseAttentionOp<'a>),
+    /// Grouped O-LoRA output projection of the attention.
+    OLora(crate::pipeline::mla::attention::OLoraOp<'a>),
+    /// Compressor `wkv` / `wgate` projections of the prepared input.
+    CompressorProject(crate::pipeline::mla::compressor::CompressorProjectOp<'a>),
+    /// Row-batched Q8 embedding lookup and HC stream broadcast (prefill / verify).
+    EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp<'a>),
+    /// Row-batched DSpark capture: HC stream mean of each row into a capture slot.
+    StreamMeanCapture(crate::pipeline::mla::rows::StreamMeanCaptureOp<'a>),
+    /// Row-batched latent KV of the context rows, written into the SWA rings.
+    RingKv(crate::pipeline::mla::rows::RingKvOp<'a>),
+    /// Row-batched bidirectional block staging over the ring's committed window.
+    BlockStage(crate::pipeline::mla::rows::BlockStageOp<'a>),
+    /// Row-batched sliding-window KV staging of each row's visible window.
+    SwaStage(crate::pipeline::mla::rows::SwaStageOp<'a>),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -147,7 +205,8 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
         Step::Gemv { .. } => Some(PipelineOp::Gemv),
         Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
-        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { rows: 1, .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { .. } => None,
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
@@ -165,14 +224,39 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::DenseFfn(_)
+        | Step::GatedMlp(_)
+        | Step::SandwichMlp(_)
         | Step::MoeStage(..)
         | Step::SandwichAttention(_)
-        | Step::SandwichMlp(_)
         | Step::ParallelMoeMlp(_)
         | Step::PerLayerInput(_)
         | Step::Scale(_)
-        | Step::Softcap(_) => None,
+        | Step::Softcap(_)
+        | Step::HcPre(_)
+        | Step::HcPost(_)
+        | Step::HcHead(_)
+        | Step::QLoraPrepare(_)
+        | Step::PackedProjections(_)
+        | Step::QLoraProject(_)
+        | Step::KvJoint(_)
+        | Step::ApplyTailRope(_)
+        | Step::ExpertFfn(_)
+        | Step::SparseIndex(_)
+        | Step::KvCompress(_)
+        | Step::PreparedProjection(_)
+        | Step::SwaRingWrite(_)
+        | Step::IdentityGather(_)
+        | Step::SwaAttention(_)
+        | Step::SparseAttention(_)
+        | Step::OLora(_)
+        | Step::EmbedStreams(_)
+        | Step::StreamMeanCapture(_)
+        | Step::RingKv(_)
+        | Step::BlockStage(_)
+        | Step::SwaStage(_)
+        | Step::CompressorProject(_) => None,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(_) | Step::GatedAttention(_) => None,
     }
 }
 
@@ -536,8 +620,11 @@ pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> boo
     };
     dt == DType::ParoQ4G128
         && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        // The pack4 kernel reads the native PARO4-G128 tensor, whose rotation is
+        // embedded in the weight bytes. A safetensors-Dir weight (HFQ4-G128 repack
+        // + sidecar `rotation`) has the same dtype but not that layout.
         && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0 && w.rotation.is_none(),
             _ => false,
         })
         // Gate and up must have equal m — the fused kernel takes a single m.
@@ -794,7 +881,55 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
-            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
+            // One row keeps the single-row route's contract (`x` may be a wider
+            // buffer whose shape the kernel reads); a batch must hold its rows.
+            Step::RmsnormAutomatic {
+                x, out, k, rows, ..
+            } if *rows != 1 => {
+                let need = rows * k;
+                if *rows == 0 || x.numel() < need || out.numel() < need {
+                    return Err(DispatchError::Hip(format!(
+                        "rmsnorm: {rows} rows of {k} need {need} elements, x has {}, out {}",
+                        x.numel(),
+                        out.numel()
+                    )));
+                }
+            }
+            Step::HcPre(op) => op.validate_for_gpu(gpu)?,
+            Step::HcPost(op) => op.validate_for_gpu(gpu)?,
+            Step::HcHead(op) => op.validate_for_gpu(gpu)?,
+            Step::QLoraPrepare(op) => op.validate_for_gpu(gpu)?,
+            Step::PackedProjections(op) => op.validate_for_gpu(gpu)?,
+            Step::QLoraProject(op) => op.validate_for_gpu(gpu)?,
+            Step::KvJoint(op) => op.validate_for_gpu(gpu)?,
+            Step::ApplyTailRope(op) => op.validate_for_gpu(gpu)?,
+            Step::ExpertFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::SparseIndex(op) => op.validate_for_gpu(gpu)?,
+            Step::KvCompress(op) => op.validate_for_gpu(gpu)?,
+            Step::PreparedProjection(op) => op.validate_for_gpu(gpu)?,
+            Step::SwaRingWrite(op) => op.validate_for_gpu(gpu)?,
+            Step::IdentityGather(op) => op.validate_for_gpu(gpu)?,
+            Step::SwaAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SparseAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::OLora(op) => op.validate_for_gpu(gpu)?,
+            Step::CompressorProject(op) => op.validate_for_gpu(gpu)?,
+            // Rows-only DS4 operations have one route; a window holds rows.
+            Step::EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp { rows: 0, .. })
+            | Step::SwaStage(crate::pipeline::mla::rows::SwaStageOp { rows: 0, .. })
+            | Step::StreamMeanCapture(crate::pipeline::mla::rows::StreamMeanCaptureOp {
+                rows: 0,
+                ..
+            })
+            | Step::BlockStage(crate::pipeline::mla::rows::BlockStageOp { block: 0, .. }) => {
+                return Err(DispatchError::Hip("DS4 rows step with no rows".into()));
+            }
+            Step::RingKv(op) if op.positions.is_empty() => {
+                return Err(DispatchError::Hip("DS4 ring KV step with no rows".into()));
+            }
             _ => {}
         }
     }
@@ -819,6 +954,17 @@ pub trait MoeStepHooks {
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
     /// Right after the call's last launch.
     fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+    /// At the top of the interpreter's loop, before `step` is dispatched by
+    /// whatever route takes it (fused, CPU or plain): every earlier step has
+    /// run, `step` has not. A step consumed inside an earlier step's fused
+    /// launch is never announced, except the members of a multi-lane GDN Core
+    /// group (fn-lanes): each is announced exactly once, in program order,
+    /// right before the group's launches (its members write only per-lane
+    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// Default: nothing (no fusion changes).
+    fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
+        Ok(())
+    }
 }
 
 struct NoMoeHooks;
@@ -923,6 +1069,42 @@ fn execute_window<'a>(
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
+        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
+        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // group's steps are announced here, once each in program order, after
+        // every refusal check and before the grouped launch; a refused group
+        // announced nothing and each step is announced by the plain path below.
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+            && !cpu_exec::cpu_exec_enabled()
+        {
+            let ops: Vec<_> = steps[i..end]
+                .iter()
+                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .map_while(|s| match s {
+                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                        Some(op)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let group = ops.len();
+            if group >= 2
+                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(
+                    gpu,
+                    &ops,
+                    |gpu| {
+                        for step in &steps[i..i + group] {
+                            hooks.before_step(gpu, step)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            {
+                i += group;
+                continue;
+            }
+        }
+        hooks.before_step(gpu, &steps[i])?;
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,
@@ -1621,8 +1803,16 @@ pub(crate) fn launch_op_rows(
             k,
             eps,
             rotation,
+            rows,
         } => {
-            if *rotation == RotationPlan::None {
+            if *rows > 1 && *rotation == RotationPlan::None {
+                gpu.rmsnorm_batched(x, norm_weight, out, *rows, *k, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else if *rows > 1 && *rotation == RotationPlan::Mq8Internal {
+                Err(DispatchError::Hip(
+                    "rmsnorm: MQ8 internal rotation is single-row only".into(),
+                ))
+            } else if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
                 gpu.rmsnorm_f32(x, norm_weight, out, *eps)
@@ -1652,12 +1842,13 @@ pub(crate) fn launch_op_rows(
                             awq_scale: *awq_scale,
                             k: *k,
                             eps: *eps,
-                            batch_size: 1,
+                            batch_size: *rows,
                             variant: RotationVariant::WithRmsnorm,
                             givens_pairs: None,
                             givens_theta: None,
                             givens_scales: None,
                             givens_krot: None,
+                            givens_group_size: None,
                         },
                     )
                     .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -1708,19 +1899,58 @@ pub(crate) fn launch_op_rows(
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
-        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
+        Step::GatedMlp(op) => crate::pipeline::gated_mlp::execute_gated_mlp(gpu, ctx, op),
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
         Step::SandwichAttention(op) => {
             crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
         }
-        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
         Step::ParallelMoeMlp(op) => {
             crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
         }
         Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
         Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
         Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(op) => crate::pipeline::hybrid::execute_deltanet_mixer(gpu, ctx, op),
+        #[cfg(feature = "deltanet")]
+        Step::GatedAttention(op) => crate::pipeline::hybrid::execute_gated_attention(gpu, ctx, op),
+        Step::HcPre(op) => crate::pipeline::mla::hc::execute_hc_pre(gpu, op),
+        Step::HcPost(op) => crate::pipeline::mla::hc::execute_hc_post(gpu, op),
+        Step::HcHead(op) => crate::pipeline::mla::hc::execute_hc_head(gpu, op),
+        Step::QLoraPrepare(op) => crate::pipeline::mla::query_kv::execute_q_lora_prepare(gpu, op),
+        Step::PackedProjections(op) => {
+            crate::pipeline::mla::query_kv::execute_packed_projections(gpu, op)
+        }
+        Step::QLoraProject(op) => crate::pipeline::mla::query_kv::execute_q_lora_project(gpu, op),
+        Step::KvJoint(op) => crate::pipeline::mla::query_kv::execute_kv_joint(gpu, op),
+        Step::ApplyTailRope(op) => crate::pipeline::mla::query_kv::execute_apply_tail_rope(gpu, op),
+        Step::ExpertFfn(op) => crate::pipeline::mla::expert_ffn::execute_expert_ffn(gpu, op),
+        Step::SparseIndex(op) => crate::pipeline::mla::attention::execute_sparse_index(gpu, op),
+        Step::KvCompress(op) => crate::pipeline::mla::compressor::execute_kv_compress(gpu, op),
+        Step::PreparedProjection(op) => {
+            crate::pipeline::mla::project::execute_prepared_projection(gpu, op)
+        }
+        Step::SwaRingWrite(op) => crate::pipeline::mla::attention::execute_swa_ring_write(gpu, op),
+        Step::IdentityGather(op) => {
+            crate::pipeline::mla::attention::execute_identity_gather(gpu, op)
+        }
+        Step::SwaAttention(op) => crate::pipeline::mla::attention::execute_swa_attention(gpu, op),
+        Step::SparseAttention(op) => {
+            crate::pipeline::mla::attention::execute_sparse_attention(gpu, op)
+        }
+        Step::OLora(op) => crate::pipeline::mla::attention::execute_o_lora(gpu, op),
+        Step::CompressorProject(op) => {
+            crate::pipeline::mla::compressor::execute_compressor_project(gpu, op)
+        }
+        Step::EmbedStreams(op) => crate::pipeline::mla::rows::execute_embed_streams(gpu, op),
+        Step::StreamMeanCapture(op) => {
+            crate::pipeline::mla::rows::execute_stream_mean_capture(gpu, op)
+        }
+        Step::RingKv(op) => crate::pipeline::mla::rows::execute_ring_kv(gpu, op),
+        Step::BlockStage(op) => crate::pipeline::mla::rows::execute_block_stage(gpu, op),
+        Step::SwaStage(op) => crate::pipeline::mla::rows::execute_swa_stage(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
@@ -2202,6 +2432,79 @@ mod tests {
         assert!(!guard_qkv_paro4g128t(empty, &ctx));
     }
 
+    /// The pack4 kernel behind `FusedGateUpParo4G128T` reads the rotation from
+    /// native PARO4-G128 weight bytes. A safetensors-Dir weight of the same
+    /// dtype carries a sidecar rotation instead, and a G64 weight has neither
+    /// layout: both must stay on the per-projection Givens + GEMV path.
+    #[test]
+    fn paro_gate_up_fusion_admits_only_native_g128() {
+        use crate::families::gemv::GivensRef;
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let t = || GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) },
+            shape: vec![1024],
+            dtype: DType::F32,
+        };
+        let (x, norm, act, pairs, theta, scales) = (t(), t(), t(), t(), t(), t());
+        let sidecar = GivensRef {
+            pairs: &pairs,
+            theta: &theta,
+            scales: &scales,
+            krot: 8,
+        };
+        let admits = |dtype: DType, rotation: Option<GivensRef>| {
+            let w = WeightRef {
+                buf: &x,
+                dtype,
+                m: 16,
+                k: 128,
+                row_stride: 0,
+                rotation,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            };
+            let steps = [
+                Step::RmsnormAutomatic {
+                    x: &x,
+                    norm_weight: &norm,
+                    x_plain: &act,
+                    out: &act,
+                    awq_scale: None,
+                    k: 128,
+                    eps: 1e-6,
+                    rotation: RotationPlan::None,
+                    rows: 1,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+            ];
+            guard_gate_up_paro4g128t(&steps, &ctx)
+        };
+        assert!(
+            admits(DType::ParoQ4G128, None),
+            "native PARO4-G128 window must fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G128, Some(sidecar)),
+            "sidecar G128 must not fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G64, Some(sidecar)),
+            "G64 must not fuse"
+        );
+        assert!(!admits(DType::ParoQ4G64, None), "G64 must not fuse");
+    }
+
     #[test]
     fn paro_fused_table_entries_exist() {
         let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
@@ -2334,6 +2637,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2364,6 +2668,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2389,6 +2694,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,

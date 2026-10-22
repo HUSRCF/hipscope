@@ -2961,10 +2961,21 @@ struct RouteRequest<'a> {
     kv_backend: KvBackend,
 }
 
-/// A begun route: the speculative route its plan was resolved for, checked
-/// against the loaded model before the route is sealed.
+/// A begun route, checked against the loaded model before it finishes.
+/// `spec` is the speculative route its closed plan was resolved for; `None`
+/// for a predicted-family fallback (no closed plan): that route is always
+/// open and nothing of the model can leave it.
 struct PlannedRoute {
-    spec: rdna_compute::kernel_registry::KernelSpecRoute,
+    spec: Option<rdna_compute::kernel_registry::KernelSpecRoute>,
+    predicted: Option<PredictedRoute>,
+}
+
+/// The predicted-family set a route compiles beyond (or instead of) a closed
+/// plan, summarised for the load log.
+struct PredictedRoute {
+    family: &'static str,
+    basis: &'static str,
+    modules: usize,
 }
 
 /// Resolve this load's kernel route plan from header metadata and the
@@ -2977,6 +2988,7 @@ fn resolve_route_plan(
     (
         rdna_compute::kernel_registry::RouteKernelPlan,
         rdna_compute::kernel_registry::KernelSpecRoute,
+        rdna_compute::kernel_registry::RouteSeal,
     ),
     String,
 > {
@@ -2987,12 +2999,15 @@ fn resolve_route_plan(
     };
     // Developer kill switch, and how route walks (scripts/route_plan_walk.py)
     // observe a route's whole lazy closure without the plan they regenerate.
-    if !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true) {
-        return Err("HIPFIRE_ROUTE_PLAN=0".into());
-    }
+    // Qwen3.5 resolves its axes (and logs them for the walk) before refusing.
+    let route_plan_off = !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true);
+    const ROUTE_PLAN_OFF: &str = "HIPFIRE_ROUTE_PLAN=0";
     match hfq.arch_id {
-        // Qwen3.5 dense: the hand-walked 27B closure shares this policy.
-        5 => {}
+        // Qwen3.5 dense (5) and MoE (6: A3B, Qwen3.6, Ornith) share the qwen35
+        // carrier: the hand-walked 27B closure and the walked plans share this
+        // policy.
+        5 | 6 => {}
+        _ if route_plan_off => return Err(ROUTE_PLAN_OFF.into()),
         hipfire_arch_qwen4::ARCH_ID => return resolve_qwen4_route_plan(req, gpu, hfq),
         other => return Err(format!("model arch {other}")),
     }
@@ -3127,7 +3142,58 @@ fn resolve_route_plan(
             shape: &t.shape,
         })
         .collect();
-    let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
+    // Routed-expert placement: a closed plan is the fully resident one. The
+    // pager, a REAP keep-map and any configured spill (host-placed experts or
+    // layers, which run other kernels) have no closed route.
+    if config.paged_experts {
+        return Err("paged experts".into());
+    }
+    if config.reap_keep.is_some() {
+        return Err("REAP keep-map".into());
+    }
+    {
+        use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+        if effective_offload_budgets() != (OffloadBudget::Full, OffloadBudget::Full) {
+            return Err("memory.gpu_layer_budget / memory.moe_expert_budget spill".into());
+        }
+    }
+    // The walked-plan axes: every resolved policy a walk must have covered
+    // exactly (`#! axis` lines). Names match `scripts/route_plan_build.py`.
+    let prefill_chunk_rows = qwen35::prefill::prefill_chunk_rows_requested(gpu);
+    let axes = [
+        ("kv_k", kv_k.to_owned()),
+        ("kv_v", kv_v.to_owned()),
+        ("state_quant", state_quant.to_owned()),
+        ("kv_backend", req.kv_backend.as_str().to_owned()),
+        ("prefill_chunk_rows", prefill_chunk_rows.to_string()),
+        // MoE shape the tensor layout does not pin (top-k), and the resident
+        // placement the refusals above guarantee; dense models walk 0 / 0.
+        ("num_experts", config.num_experts.to_string()),
+        ("experts_per_tok", config.num_experts_per_tok.to_string()),
+        ("expert_placement", "resident".to_owned()),
+    ];
+    // Developer-only: the resolved route facts `route_plan_build.py` reads
+    // from a walk's stderr (the Qwen3.5 counterpart of `qwen4 state:`).
+    if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+        let resolved: Vec<String> = axes
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        eprintln!(
+            "  route plan axes: arch={} model_arch={} spec={spec:?} heads={},{},{} max_seq={} {}",
+            gpu.arch,
+            hfq.arch_id,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            req.max_seq,
+            resolved.join(" ")
+        );
+    }
+    if route_plan_off {
+        return Err(ROUTE_PLAN_OFF.into());
+    }
+    let (plan, seal) = rdna_compute::kernel_registry::route_entries_sealed(&RouteKernelInput {
         arch: gpu.arch.as_str(),
         model_arch: hfq.arch_id,
         tensors: &tensors,
@@ -3135,7 +3201,7 @@ fn resolve_route_plan(
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         max_seq: req.max_seq,
-        prefill_chunk_rows: qwen35::prefill::prefill_chunk_rows_requested(gpu),
+        prefill_chunk_rows,
         kv_k,
         kv_v,
         state_quant,
@@ -3145,10 +3211,10 @@ fn resolve_route_plan(
         retained_decode: true,
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
-        route_axes: &[],
+        route_axes: &axes,
     })
     .map_err(|e| format!("{e:?}"))?;
-    Ok((plan, spec))
+    Ok((plan, spec, seal))
 }
 
 /// Flash-Next (Qwen4) route plan: the walked plan (`kernel_registry`
@@ -3163,6 +3229,7 @@ fn resolve_qwen4_route_plan(
     (
         rdna_compute::kernel_registry::RouteKernelPlan,
         rdna_compute::kernel_registry::KernelSpecRoute,
+        rdna_compute::kernel_registry::RouteSeal,
     ),
     String,
 > {
@@ -3258,7 +3325,7 @@ fn resolve_qwen4_route_plan(
             shape: &t.shape,
         })
         .collect();
-    let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
+    let (plan, seal) = rdna_compute::kernel_registry::route_entries_sealed(&RouteKernelInput {
         arch: gpu.arch.as_str(),
         model_arch: hfq.arch_id,
         tensors: &tensors,
@@ -3278,18 +3345,30 @@ fn resolve_qwen4_route_plan(
         route_axes: &axes,
     })
     .map_err(|e| format!("{e:?}"))?;
-    Ok((plan, spec))
+    Ok((plan, spec, seal))
 }
 
 /// User-facing note for the lazy kernel path: a cold kernel cache compiles
 /// each kernel at its first launch, which is the slow first run users see.
 const LAZY_KERNELS_NOTE: &str = "compiling kernels on first use (one-time, cached afterwards)…";
 
-/// Start a planner-closed route's kernel load: the bounded batch compile
-/// overlaps the weight load when the host budget admits a worker alongside
-/// it; otherwise the whole plan is compiled and loaded before any weight
-/// allocation. A load no budget admits fails here, before destructive work.
-/// Refused routes reset to lazy loading and return `None`.
+/// Start a route's kernel load: the bounded batch compile overlaps the
+/// weight load when the host budget admits a worker alongside it; otherwise
+/// the whole plan is compiled and loaded before any weight allocation. A
+/// load no budget admits, or any planned or predicted module that fails to
+/// compile, fails here, before destructive work and never at the first
+/// request.
+///
+/// Everything predictable is compiled before the model is loaded: a refused
+/// route (no closed plan) and an open walked plan both add the model
+/// family's predicted module set (the arch's whole installer inventory
+/// minus the plan; the family trace only chooses which symbols bind; see
+/// `kernel_registry::predicted_kernels`). That coverage is never a closure:
+/// the route finishes open, never sealed. `HIPFIRE_ROUTE_PLAN=0` (a route
+/// walk) returns `None` and loads lazily with no preload, so the walk
+/// records the real dispatch. `HIPFIRE_ROUTE_PLAN_SEAL=1` (a sealed replay)
+/// loads only the exact plan, with no predicted extras, and seals it; a
+/// refused route then stays lazy so the replay fails loudly.
 fn begin_route_kernels(
     req: &RouteRequest<'_>,
     gpu: &mut Gpu,
@@ -3297,20 +3376,105 @@ fn begin_route_kernels(
     use rdna_compute::compile_jobs::{
         compile_job_budget, host_available_memory, parse_job_override,
     };
+    use rdna_compute::kernel_registry::{PredictKernelInput, RouteKernelPlan, RouteSeal};
     gpu.abort_route_kernel_load()
         .map_err(|e| format!("kernel route reset: {e}"))?;
-    let (plan, spec) = match resolve_route_plan(req, gpu) {
-        Ok(resolved) => resolved,
-        Err(reason) => {
-            eprintln!("  kernels: {LAZY_KERNELS_NOTE} [no closed route plan: {reason}]");
+    // Resolve first: a walk (`HIPFIRE_ROUTE_PLAN=0`) still needs the axes
+    // line the resolver logs, then loads lazily with nothing preloaded.
+    let resolved = resolve_route_plan(req, gpu);
+    if !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true) {
+        eprintln!(
+            "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN=0: route walk, nothing preloaded]"
+        );
+        return Ok(None);
+    }
+    let sealed_replay = hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN_SEAL", false);
+    let (plan, spec, mut open, refusal) = match resolved {
+        Ok((plan, spec, _)) if sealed_replay => (plan, Some(spec), None, None),
+        Ok((plan, spec, RouteSeal::Sealed)) => (plan, Some(spec), None, None),
+        Ok((plan, spec, RouteSeal::Open(family))) => (
+            plan,
+            Some(spec),
+            Some(format!("{family} {} {spec:?}", gpu.arch)),
+            None,
+        ),
+        Err(reason) if sealed_replay => {
+            eprintln!(
+                "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN_SEAL=1: no closed route plan: {reason}]"
+            );
             return Ok(None);
         }
+        Err(reason) => (
+            RouteKernelPlan {
+                entries: Vec::new(),
+            },
+            None,
+            None,
+            Some(reason),
+        ),
     };
-    // Walked plans (Flash-Next) preload but stay open: a kernel the walks
-    // missed loads lazily with a warning instead of failing the request.
-    let open =
-        matches!(req.source, ModelSource::Hfq(hfq) if hfq.arch_id == hipfire_arch_qwen4::ARCH_ID)
-            .then(|| format!("Flash-Next {} {spec:?}", gpu.arch));
+    // A sealed plan is an exact closure and takes no speculative extras.
+    let predicted = if open.is_none() && refusal.is_none() {
+        None
+    } else {
+        let model_arch = match req.source {
+            ModelSource::Hfq(hfq) => Some(hfq.arch_id),
+            _ => None,
+        };
+        match rdna_compute::kernel_registry::predicted_kernels(
+            &PredictKernelInput {
+                arch: gpu.arch.as_str(),
+                model_arch,
+                hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
+                pm_decode: gpu.flags.pm_decode,
+                // Only an exact recognised plan lets the family trace choose binds.
+                exact_plan: refusal.is_none(),
+            },
+            &plan,
+        ) {
+            Ok(predicted) => Some(predicted),
+            Err(e) => {
+                eprintln!(
+                    "  kernels: no predicted kernel set for {} ({e:?})",
+                    gpu.arch
+                );
+                None
+            }
+        }
+    };
+    if let Some(reason) = &refusal {
+        // No registry inventory for this arch: nothing is predictable.
+        let Some(predicted) = &predicted else {
+            eprintln!("  kernels: {LAZY_KERNELS_NOTE} [no closed route plan: {reason}]");
+            return Ok(None);
+        };
+        open = Some(format!(
+            "{} {} predicted fallback",
+            predicted.family, gpu.arch
+        ));
+    }
+    let summary = predicted.as_ref().map(|p| PredictedRoute {
+        family: p.family,
+        basis: p.basis.label(),
+        modules: p.modules.len(),
+    });
+    let predicted_note = predicted.as_ref().map_or_else(String::new, |p| {
+        format!(
+            " + {} predicted {} modules [{}] ({} symbols in {} modules bound, {} compile-only, {} omitted)",
+            p.modules.len(),
+            p.family,
+            p.basis.label(),
+            p.bound_symbols(),
+            p.bound_modules(),
+            p.modules.len() - p.bound_modules(),
+            p.omitted.len(),
+        )
+    });
+    let route_note = match (&spec, &refusal) {
+        (Some(spec), _) => format!("{spec:?} route plan ({} modules)", plan.entries.len()),
+        (None, Some(reason)) => format!("no closed route plan ({reason}); predicted fallback"),
+        (None, None) => unreachable!("a refusal or a plan"),
+    };
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
@@ -3321,7 +3485,6 @@ fn begin_route_kernels(
             .as_deref(),
     )?;
     let available = host_available_memory();
-    let modules = plan.entries.len();
     let overlap = compile_job_budget(
         cores,
         available,
@@ -3331,10 +3494,10 @@ fn begin_route_kernels(
     let started = std::time::Instant::now();
     match overlap {
         Ok(jobs) => {
-            gpu.begin_route_kernel_load(plan, jobs, open)
+            gpu.begin_route_kernel_load_predicted(plan, predicted, jobs, open)
                 .map_err(|e| format!("kernel route compile: {e}"))?;
             eprintln!(
-                "  kernels: {spec:?} route plan ({modules} modules), compiling with up to {jobs} jobs during weight load"
+                "  kernels: {route_note}{predicted_note}, compiling with up to {jobs} jobs during weight load"
             );
         }
         Err(overlap) => {
@@ -3342,57 +3505,100 @@ fn begin_route_kernels(
                 .map_err(|e| {
                     format!("load refused: not enough free host memory to start even one GPU-kernel compile worker ({overlap}; before weights: {e}). Free some system memory and retry")
                 })?;
-            gpu.begin_route_kernel_load(plan, jobs, open)
+            gpu.begin_route_kernel_load_predicted(plan, predicted, jobs, open)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
                 .map_err(|e| {
                     let _ = gpu.abort_route_kernel_load();
                     format!("kernel route compile: {e}")
                 })?;
             eprintln!(
-                "  kernels: {spec:?} route plan ({modules} modules) loaded before weights with {jobs} jobs in {:.2}s ({overlap})",
+                "  kernels: {route_note}{predicted_note} loaded before weights with {jobs} jobs in {:.2}s ({overlap})",
                 started.elapsed().as_secs_f64()
             );
         }
     }
-    Ok(Some(PlannedRoute { spec }))
+    Ok(Some(PlannedRoute {
+        spec,
+        predicted: summary,
+    }))
 }
 
-/// Seal a begun route once the model loaded: every planned module is on the
-/// GPU before ready, and an unplanned kernel can no longer compile or load.
-/// A model that resolved outside the plan returns to lazy loading instead.
+/// Log how a route finished: where its kernels were compiled (before ready
+/// versus lazily during load) and the open-route contract after ready.
+fn log_open_route(
+    route: &str,
+    predicted: Option<&PredictedRoute>,
+    stats: rdna_compute::scratch::RouteKernelStats,
+) {
+    match predicted {
+        Some(predicted) => eprintln!(
+            "  kernels: {route} ready, open (never sealed): {}/{} predicted {} modules [{}] compiled before ready \
+             ({} symbols in {} modules bound, {} compile-only); {} unplanned kernel requests during load \
+             (counts requests, not compiles: includes binds of already compiled or embedded modules); \
+             off-plan loads after ready stay lazy, warn and are counted",
+            stats.predicted_compiled,
+            predicted.modules,
+            predicted.family,
+            predicted.basis,
+            stats.predicted_bound_symbols,
+            stats.predicted_bound_modules,
+            stats.predicted_compiled.saturating_sub(stats.predicted_bound_modules),
+            stats.lazy_during_load,
+        ),
+        None => eprintln!(
+            "  kernels: {route} preloaded (open: off-plan loads stay lazy and warn); \
+             {} unplanned kernel requests during load (counts requests, not compiles)",
+            stats.lazy_during_load
+        ),
+    }
+}
+
+/// Finish a begun route once the model loaded: every planned and predicted
+/// module is compiled and on the GPU before ready. A sealed route then
+/// refuses an unplanned kernel; an open one (walked plans and every
+/// predicted fallback) loads it lazily, warns and counts it. A model that
+/// resolved outside a closed plan still completes its predictable
+/// compilation and finishes open, never sealed, keeping the counters.
 fn finish_route_kernels(
     planned: PlannedRoute,
     model: &LoadedModel,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
     use rdna_compute::kernel_registry::KernelSpecRoute;
-    let mismatch = if model.kv_adaptive.is_some() {
-        Some("adaptive KV engaged")
-    } else if model.eviction.is_some() {
-        Some("eviction engaged")
-    } else if model.speculator.is_some()
-        && !(planned.spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
-    {
-        Some("a speculator outside the plan")
-    } else {
-        None
+    let route = match planned.spec {
+        Some(spec) => format!("{spec:?} route"),
+        None => "predicted fallback".to_owned(),
+    };
+    let mismatch = match planned.spec {
+        None => None,
+        Some(spec) => {
+            if model.kv_adaptive.is_some() {
+                Some("adaptive KV engaged")
+            } else if model.eviction.is_some() {
+                Some("eviction engaged")
+            } else if model.speculator.is_some()
+                && !(spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
+            {
+                Some("a speculator outside the plan")
+            } else {
+                None
+            }
+        }
     };
     if let Some(why) = mismatch {
-        eprintln!("  kernels: {LAZY_KERNELS_NOTE} [left the planned route: {why}]");
-        return gpu
-            .abort_route_kernel_load()
-            .map_err(|e| format!("kernel route compile: {e}"));
+        eprintln!("  kernels: {route} left the planned route: {why}; completing its predictable kernels, route stays open");
+        gpu.finish_route_kernel_load_open(format!("{route} (left the plan: {why})"))
+            .map_err(|e| format!("kernel route preload: {e}"))?;
+        log_open_route(&route, planned.predicted.as_ref(), gpu.route_kernel_stats());
+        return Ok(());
     }
     gpu.finish_route_kernel_load()
         .map_err(|e| format!("kernel route preload: {e}"))?;
     if gpu.route_kernels_sealed() {
-        eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
-    } else {
-        eprintln!(
-            "  kernels: {:?} route preloaded (open: off-plan loads stay lazy and warn)",
-            planned.spec
-        );
+        eprintln!("  kernels: {route} preloaded and sealed");
+        return Ok(());
     }
+    log_open_route(&route, planned.predicted.as_ref(), gpu.route_kernel_stats());
     Ok(())
 }
 
@@ -3460,6 +3666,7 @@ pub fn load_admitted_with_gemma4_drafter(
         pp_layer_counts,
         mesh,
         pp_bands,
+        batch_request,
         ..
     } = admission;
     let carrier =
@@ -3544,6 +3751,7 @@ pub fn load_admitted_with_gemma4_drafter(
         // Slice 4 (integration) populates this from the daemon `xdna` param
         // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
         xdna: None,
+        batch_request,
     };
     let mut result = match carrier.load(source, &mut ctx) {
         Ok(result) => result,

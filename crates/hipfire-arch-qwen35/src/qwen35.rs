@@ -13,9 +13,11 @@ pub mod config;
 pub mod ep_batch;
 pub mod forward;
 pub mod load;
+pub mod mesh_tp;
 #[cfg(feature = "moe-oracle")]
 pub mod oracle;
 pub mod prefill;
+pub(crate) mod program;
 pub mod tp_output;
 pub mod weights;
 
@@ -55,11 +57,7 @@ pub use prefill::{
     prefill_max_batch_ep, prefill_max_batch_tp, qwen35_layer_batch_admissible,
     upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
 };
-pub(crate) use prefill::{
-    moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
-    run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
-    run_residual_gemm_key,
-};
+pub(crate) use prefill::{moe_prefill_dtypes, prefill_moe_ffn_body_batched};
 pub use weights::{
     mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,
     FullAttnLayerWeights, FullAttnMoeLayerWeights, GpuTensorDescriptor, LayerWeights,

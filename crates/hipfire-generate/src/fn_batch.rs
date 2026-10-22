@@ -35,6 +35,12 @@
 //! values. `cached_tokens` is zero: S3 uses cold lane state, not singleton
 //! session restore. Content/reasoning bytes and semantic finish classification
 //! use the singleton code; compute-ID identity is the lane executor's oracle.
+//! One scheduler loop serves every topology through `Owner`/`LaneExec`: single
+//! and expert-parallel models run the bundle's executor on the rank-0 device;
+//! a pipeline-parallel model (`qwen4_mesh_mut`) admits, releases, force-seeds
+//! and steps through the `pp_*` lane APIs and `Qwen4PpLaneExecutor` over the
+//! mesh's `Gpus`. Promotion of a running singleton into a lane is single-only
+//! (PP and EP refuse it), so the promoted-adoption path only runs on single.
 
 use crate::ar::*;
 use crate::batch::{
@@ -42,16 +48,18 @@ use crate::batch::{
     Qwen4PromotedRequest,
 };
 use crate::common::{emit_committed_event, fit_max_tokens_if};
+use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::lane::LaneStatus;
-use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute};
+use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::ThinkBudget;
 use hipfire_runtime::external_rows::ServingGuard;
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
-    BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange,
+    BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, StepOutput,
 };
 use rdna_compute::Gpu;
 use std::collections::{HashSet, VecDeque};
@@ -100,17 +108,163 @@ struct LaneCtl {
     _serving: Option<ServingGuard>,
 }
 
+/// Whether the lanes live on a pipeline-parallel mesh (band-scoped stores on
+/// every band, driven through the mesh's `Gpus`) rather than on the single
+/// or expert-parallel bundle (rank-0 `Gpu`).
+fn pp_active(model: &LoadedModel) -> Result<bool, String> {
+    Ok(model
+        .qwen4()
+        .ok_or("qwen4 bundle disappeared")?
+        .pp_mesh_active())
+}
+
+/// Free `epoch`'s lane on every owner of the topology (host-only).
+fn release_epoch(model: &mut LoadedModel, epoch: &RequestEpoch) -> Result<(), String> {
+    if pp_active(model)? {
+        let (bundle, gpus) = model
+            .qwen4_mesh_mut()
+            .ok_or("qwen4 topology.pp: the pipeline devices are not attached")?;
+        bundle
+            .pp_release_lane(gpus, epoch)
+            .map_err(|e| e.to_string())
+    } else {
+        model
+            .qwen4_mut()
+            .ok_or("qwen4 bundle disappeared")?
+            .release_lane(epoch)
+            .map_err(|e| e.to_string())
+    }
+}
+
 fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
     if !ctl.epoch.is_admitted() {
         return Ok(());
     }
-    model
-        .qwen4_mut()
-        .ok_or("qwen4 bundle disappeared")?
-        .release_lane(&ctl.epoch)
-        .map_err(|e| e.to_string())?;
+    release_epoch(model, &ctl.epoch)?;
     ctl.epoch.owner_generation = 0;
     Ok(())
+}
+
+/// The lane owner of the loaded topology: the Qwen4 bundle with the device
+/// handles its lane operations need. Single and expert-parallel models use
+/// the rank-0 `gpu`; a pipeline-parallel model uses the mesh's `Gpus` (the
+/// output-band root bundle owns the mesh and its authoritative lane table).
+struct Owner<'a> {
+    bundle: &'a mut Qwen4Bundle,
+    gpu: &'a mut Gpu,
+    gpus: Option<&'a mut Gpus>,
+}
+
+impl<'a> Owner<'a> {
+    fn of(model: &'a mut LoadedModel, gpu: &'a mut Gpu) -> Result<Self, String> {
+        if pp_active(model)? {
+            let (bundle, gpus) = model
+                .qwen4_mesh_mut()
+                .ok_or("qwen4 topology.pp: the pipeline devices are not attached")?;
+            Ok(Self {
+                bundle,
+                gpu,
+                gpus: Some(gpus),
+            })
+        } else {
+            Ok(Self {
+                bundle: model.qwen4_mut().ok_or("qwen4 bundle disappeared")?,
+                gpu,
+                gpus: None,
+            })
+        }
+    }
+
+    fn admit(&mut self, epoch: RequestEpoch, prompt: Vec<u32>) -> Result<usize, String> {
+        let admitted = match self.gpus.as_deref_mut() {
+            Some(gpus) => self.bundle.pp_admit_lane(gpus, epoch, prompt),
+            None => self.bundle.admit_lane(&mut *self.gpu, epoch, prompt),
+        };
+        admitted.map_err(|e| e.to_string())
+    }
+
+    fn force_seed(&mut self, epoch: &RequestEpoch, token: u32) -> Result<(), String> {
+        let forced = match self.gpus.as_deref_mut() {
+            Some(gpus) => self.bundle.pp_force_lane_seed(gpus, epoch, token),
+            None => self.bundle.force_lane_seed(epoch, token),
+        };
+        forced.map_err(|e| e.to_string())
+    }
+
+    fn executor(&mut self) -> Result<LaneExec<'_>, String> {
+        let executor = match self.gpus.as_deref_mut() {
+            Some(gpus) => self.bundle.pp_lane_executor(gpus).map(LaneExec::Pp),
+            None => self
+                .bundle
+                .lane_executor()
+                .map(|executor| LaneExec::Single(executor, &mut *self.gpu)),
+        };
+        executor.map_err(|e| e.to_string())
+    }
+}
+
+/// The exact AR lane executor of the topology behind one call surface.
+enum LaneExec<'a> {
+    /// Single or expert-parallel (the executor fans out across EP ranks itself).
+    Single(Qwen4LaneExecutor<'a>, &'a mut Gpu),
+    Pp(Qwen4PpLaneExecutor<'a>),
+}
+
+impl LaneExec<'_> {
+    fn exact_prefill_chunk_len(&self, epoch: &RequestEpoch) -> Result<usize, String> {
+        match self {
+            Self::Single(executor, _) => executor.exact_prefill_chunk_len(epoch),
+            Self::Pp(executor) => executor.exact_prefill_chunk_len(epoch),
+        }
+    }
+
+    fn map_ahead_decode(&mut self, epoch: &RequestEpoch, remaining_new_tokens: usize) {
+        match self {
+            Self::Single(executor, gpu) => {
+                executor.map_ahead_decode(gpu, epoch, remaining_new_tokens)
+            }
+            Self::Pp(executor) => executor.map_ahead_decode(epoch, remaining_new_tokens),
+        }
+    }
+
+    fn draft_step(&mut self, requests: &[(RequestEpoch, usize)]) -> Result<Vec<LaneDraft>, String> {
+        match self {
+            Self::Single(executor, gpu) => executor.draft_step(gpu, requests),
+            Self::Pp(executor) => executor.draft_step(requests),
+        }
+    }
+
+    fn provision_step(&mut self, plan: &BatchStepPlan) -> Result<(), String> {
+        match self {
+            Self::Single(executor, gpu) => executor.provision_step(gpu, plan),
+            Self::Pp(executor) => executor.provision_step(plan),
+        }
+    }
+
+    fn forward_step(&mut self, plan: &BatchStepPlan) -> Result<StepOutput, String> {
+        match self {
+            Self::Single(executor, gpu) => executor.forward_step(gpu, plan),
+            Self::Pp(executor) => executor.forward_step(plan),
+        }
+    }
+
+    fn commit_step(
+        &mut self,
+        plan: &BatchStepPlan,
+        output: StepOutput,
+    ) -> Result<Vec<RequestAdvance>, String> {
+        match self {
+            Self::Single(executor, gpu) => executor.commit_step(gpu, plan, output),
+            Self::Pp(executor) => executor.commit_step(plan, output),
+        }
+    }
+
+    fn abort_step(&mut self, plan: &BatchStepPlan) {
+        match self {
+            Self::Single(executor, _) => executor.abort_step(plan),
+            Self::Pp(executor) => executor.abort_step(plan),
+        }
+    }
 }
 
 /// The tokens a decode advance forwarded: the plan seed, then every committed
@@ -138,10 +292,7 @@ fn fail_promoted(
     epoch: &RequestEpoch,
     message: &str,
 ) {
-    let released = model
-        .qwen4_mut()
-        .ok_or("qwen4 bundle disappeared".to_string())
-        .and_then(|b| b.release_lane(epoch).map_err(|e| e.to_string()));
+    let released = release_epoch(model, epoch);
     let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
     emit_generation_error(
         ROUTE,
@@ -412,7 +563,7 @@ fn plan_step(
     max_lanes: usize,
 ) -> Result<Result<BatchStepPlan, DraftFailure>, String> {
     let max_seq = model.max_seq;
-    let bundle = model.qwen4_mut().ok_or("qwen4 bundle disappeared")?;
+    let mut owner = Owner::of(model, gpu)?;
     let mut order: Vec<_> = controls
         .iter()
         .flatten()
@@ -420,7 +571,7 @@ fn plan_step(
         .map(|c| (c.slot, c.epoch))
         .collect();
     order.sort_by_key(|&(slot, _)| slot);
-    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let store = owner.bundle.lanes().ok_or("qwen4 lanes not staged")?;
     let spec_k = store.spec().map(|s| s.k);
     let decoding: Vec<_> = order
         .iter()
@@ -444,16 +595,14 @@ fn plan_step(
         .filter(|c| chosen.contains(&c.slot))
     {
         if let Some(token) = c.forced.pop_front() {
-            bundle
-                .force_lane_seed(&c.epoch, token)
-                .map_err(|e| e.to_string())?;
+            owner.force_seed(&c.epoch, token)?;
         }
     }
     // Once per request, before its first draft/decode step (and so before
     // any provision): map the lane's context for the rest of its token
     // budget (best effort, `provision_step` grows on demand otherwise).
     if !chosen.is_empty() {
-        let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+        let mut executor = owner.executor()?;
         for (idx, c) in controls.iter_mut().enumerate() {
             let Some(c) = c
                 .as_mut()
@@ -462,7 +611,7 @@ fn plan_step(
                 continue;
             };
             c.mapped_ahead = true;
-            executor.map_ahead_decode(gpu, &c.epoch, c.max_tokens.saturating_sub(streamed[idx]));
+            executor.map_ahead_decode(&c.epoch, c.max_tokens.saturating_sub(streamed[idx]));
         }
     }
     let mut drafts: Vec<LaneDraft> = Vec::new();
@@ -472,7 +621,8 @@ fn plan_step(
             let Some(c) = c.as_ref().filter(|c| chosen.contains(&c.slot)) else {
                 continue;
             };
-            let position = bundle
+            let position = owner
+                .bundle
                 .lanes()
                 .and_then(|s| s.lane(&c.epoch))
                 .map(|l| l.state.position)
@@ -486,8 +636,8 @@ fn plan_step(
             requests.push((c.epoch, budget));
         }
         if !requests.is_empty() {
-            let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
-            match executor.draft_step(gpu, &requests) {
+            let mut executor = owner.executor()?;
+            match executor.draft_step(&requests) {
                 Ok(d) => drafts = d,
                 Err(error) => {
                     return Ok(Err(DraftFailure {
@@ -498,7 +648,7 @@ fn plan_step(
             }
         }
     }
-    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let store = owner.bundle.lanes().ok_or("qwen4 lanes not staged")?;
     let mut rows = Vec::new();
     for (slot, epoch) in order {
         let lane = store
@@ -549,14 +699,14 @@ fn plan_step(
         }
     }
     {
-        let executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+        let executor = owner.executor()?;
         for (_, epoch, kind, _, len, _) in &mut rows {
             if *kind == RequestStepKind::Prefill {
                 *len = executor.exact_prefill_chunk_len(epoch)?;
             }
         }
     }
-    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let store = owner.bundle.lanes().ok_or("qwen4 lanes not staged")?;
     let mut plan = BatchStepPlan::default();
     plan.batch.m_per_slot = vec![0; max_lanes];
     for (slot, epoch, kind, position, len, drafted) in rows {
@@ -987,11 +1137,8 @@ pub fn drive_qwen4_lane_batch(
                     hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop"))
                         .map_err(|e| e.to_string())?;
                 let epoch = next_lane_epoch()?;
-                let slot = match m.qwen4_mut().ok_or("qwen4 bundle disappeared")?.admit_lane(
-                    gpu,
-                    epoch,
-                    prompt.clone(),
-                ) {
+                let admitted = Owner::of(m, gpu)?.admit(epoch, prompt.clone());
+                let slot = match admitted {
                     Ok(slot) => slot,
                     Err(e) => {
                         lane_error(
@@ -1089,14 +1236,14 @@ pub fn drive_qwen4_lane_batch(
             let t_fwd = Instant::now();
             let mut t_commit = t_fwd;
             let stepped = {
-                let bundle = m.qwen4_mut().ok_or("qwen4 bundle disappeared")?;
-                let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+                let mut owner = Owner::of(m, gpu)?;
+                let mut executor = owner.executor()?;
                 let result = executor
-                    .provision_step(gpu, &plan)
-                    .and_then(|()| executor.forward_step(gpu, &plan))
+                    .provision_step(&plan)
+                    .and_then(|()| executor.forward_step(&plan))
                     .and_then(|out| {
                         t_commit = Instant::now();
-                        executor.commit_step(gpu, &plan, out)
+                        executor.commit_step(&plan, out)
                     });
                 if result.is_err() {
                     executor.abort_step(&plan);

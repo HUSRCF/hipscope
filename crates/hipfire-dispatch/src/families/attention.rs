@@ -28,15 +28,16 @@ pub struct AttnParams<'a> {
     /// TODO(ship 3.1b): llama HFQ8/INT8 attend scales
     pub v_scales: Option<&'a GpuTensor>,
     // ── Position (dual-type coexistence per D4/F8) ──
-    /// Single-token position buffer. Used when `batch_size == 1`.
-    /// Ignored when `batch_size > 1` (use `positions` instead).
+    /// Single-token position buffer. Used when `batch_size == 1` and
+    /// `positions` is `None` (decode). Ignored otherwise.
     pub pos_buf: &'a DeviceBuffer,
     /// 0-based physical position index. `dispatch_*` internally computes
     /// `seq_len = pos + 1`. Callers MUST pass `pos`, never `pos + 1`.
     /// Used only for single-token (`batch_size == 1`).
     pub pos: usize,
-    /// Batched position tensor `[n]` i32. Used when `batch_size > 1`.
-    /// `None` when `batch_size == 1` (use `pos_buf` instead).
+    /// Batched position tensor `[n]` i32. A batched caller passes it for every
+    /// chunk; a one-row chunk reads its position from element 0 instead of
+    /// `pos_buf`, which only decode uploads. `None` for decode.
     pub positions: Option<&'a GpuTensor>,
     // ── Dimensions ──
     pub n_heads: usize,
@@ -85,6 +86,17 @@ impl<'a> AttnParams<'a> {
         );
         self.positions
             .expect("positions required for batch_size > 1")
+    }
+
+    /// `self` with a one-row batched call's position read from `positions`:
+    /// the single-token kernels read `pos_buf`, and a prefill chunk never
+    /// uploads that decode scratch (stale slot, or a fault before any decode).
+    fn with_row_position(&self) -> AttnParams<'a> {
+        let pos_buf = match self.positions {
+            Some(positions) if self.batch_size == 1 => &positions.buf,
+            _ => self.pos_buf,
+        };
+        AttnParams { pos_buf, ..*self }
     }
 }
 
@@ -360,6 +372,7 @@ impl AttentionFamily {
         plan: &crate::families::kv_tier::KvTierPlan,
         io: &AttnParams,
     ) -> Result<(), DispatchError> {
+        let io = &io.with_row_position();
         let shape = ShapeInfo {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
@@ -415,6 +428,7 @@ impl AttentionFamily {
         plan: &crate::families::kv_tier::KvTierPlan,
         io: &AttnParams,
     ) -> Result<(), DispatchError> {
+        let io = &io.with_row_position();
         let shape = ShapeInfo {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
@@ -451,6 +465,30 @@ impl AttentionFamily {
         };
         let variant = self.resolve(io.key, ctx, Some(&shape))?;
         dispatch_full_attention(gpu, io.key, variant.tile, io)
+    }
+
+    /// [`Self::run_full_attention`] on one registered `tile` of `io.key`
+    /// instead of the best admitted one: a caller whose numerics contract is
+    /// a specific kernel (the DFlash drafters' scalar tile) pins it here.
+    pub fn run_full_attention_on(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        io: &FullAttnParams,
+        tile: TileImpl,
+    ) -> Result<(), DispatchError> {
+        let registered = self
+            .registry
+            .variants_for(io.key)
+            .iter()
+            .any(|v| v.tile == tile && v.arch_required.eval_arch(ctx));
+        if !registered {
+            return Err(DispatchError::Hip(format!(
+                "attention {:?}: tile {tile:?} is not admitted on this arch",
+                io.key
+            )));
+        }
+        dispatch_full_attention(gpu, io.key, tile, io)
     }
 }
 
@@ -1379,6 +1417,23 @@ fn dispatch_attend(
                         io.head_dim,
                         io.physical_cap,
                         fp,
+                    )),
+                    // The flash tile walks head_dim in 128-wide halves (32
+                    // lanes x 4): a 64-wide head (SmolLM2, Llama-3.2-1B) would
+                    // read the next head's Q/K and write past its partials row.
+                    // attention_q8_0_kv reads the position from pos_buf on a
+                    // fixed grid, so it is graph/replay-safe as well.
+                    (None, None) if io.head_dim % 128 != 0 => hip!(gpu.attention_q8_0_kv(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
                     )),
                     (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
@@ -3040,6 +3095,50 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HIPF-151: a one-row prefill chunk must take its KV slot from the
+    /// chunk's `positions`, not the decode scratch `pos_buf`.
+    #[test]
+    fn one_row_batched_call_reads_positions() {
+        // Non-owning fake handles: only pointer identity is inspected.
+        let t = |addr: usize| GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, 4) },
+            shape: vec![1],
+            dtype: DType::F32,
+        };
+        let (x, positions, pos_buf) = (t(0x1000), t(0x2000), t(0x3000));
+        let io = |batch_size, positions| AttnParams {
+            q: &x,
+            k: &x,
+            v: &x,
+            k_cache: &x,
+            v_cache: &x,
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &pos_buf.buf,
+            pos: 7,
+            positions,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 1,
+            physical_cap: 8,
+            batch_size,
+            max_ctx_len: 8,
+            flash_partials: None,
+            givens_cos: None,
+            givens_sin: None,
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output_gate: None,
+            output_awq_scale: None,
+            output: &x,
+        };
+        let row_pos = |batch_size, p| io(batch_size, p).with_row_position().pos_buf.as_ptr();
+        assert_eq!(row_pos(1, Some(&positions)), positions.buf.as_ptr());
+        assert_eq!(row_pos(1, None), pos_buf.buf.as_ptr());
+        assert_eq!(row_pos(2, Some(&positions)), pos_buf.buf.as_ptr());
+    }
 
     fn gfx1100_split_model() -> Gfx1100SplitVerifyModel<'static> {
         Gfx1100SplitVerifyModel {

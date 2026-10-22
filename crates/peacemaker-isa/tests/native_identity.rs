@@ -16,6 +16,7 @@
 #![cfg(feature = "toolchain")]
 use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, MmaIu4, Workgroup};
 use peacemaker_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
+use peacemaker_isa::kernels::mq6_i8_gemm;
 use peacemaker_isa::kernels::{
     e8p_i4_moe_gemv, fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4,
     mq_i4_a4, mq_i4_moe_gemv, mq_i4_moe_gemv_c1, mq_i4_moe_gemv_cn, mq_i4_rows,
@@ -201,6 +202,19 @@ fn corpus() -> Vec<Unit> {
             }
         }
         if let Ok((_, text, proof)) = qwen4_mq6_x4::emit_module(arch) {
+            module(&mut units, proof.module, arch, text)
+        }
+        // Exact-INT8 MQ6 prefill GEMM (gfx1201 only): the two entries and their module.
+        for epi in [mq6_i8_gemm::Epi::Set, mq6_i8_gemm::Epi::SetBf16] {
+            if let Ok(e) = mq6_i8_gemm::emit(mq6_i8_gemm::Spec {
+                epi,
+                raster: mq6_i8_gemm::Raster::Banded,
+                arch,
+            }) {
+                single(&mut units, e)
+            }
+        }
+        if let Ok((_, text, proof)) = mq6_i8_gemm::emit_module(arch) {
             module(&mut units, proof.module, arch, text)
         }
         // Qwen4 MQ6 trunk GEMM U3 twin (gfx1151 only): the six entries and their module.

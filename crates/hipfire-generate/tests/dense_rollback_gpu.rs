@@ -234,7 +234,6 @@ fn spawn_committer(
     (handle, stop)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_generate(
     m: &mut hipfire_loader::LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -242,6 +241,21 @@ fn run_generate(
     id: &str,
     attempt: u64,
     commit: bool,
+) -> Vec<u8> {
+    let prompt = "Say hello in one short sentence.";
+    run_generate_with(m, gpu, tag, id, attempt, commit, prompt, 8)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generate_with(
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    tag: &str,
+    id: &str,
+    attempt: u64,
+    commit: bool,
+    prompt: &str,
+    max_tokens: usize,
 ) -> Vec<u8> {
     fresh_attempt(id, attempt);
     let committer = if commit {
@@ -258,7 +272,7 @@ fn run_generate(
             None,
             &mut stdout,
             id,
-            "Say hello in one short sentence.",
+            prompt,
             None,
             false,
             0.0,
@@ -266,7 +280,7 @@ fn run_generate(
             None,
             None,
             0.0,
-            8,
+            max_tokens,
             1.0,
             64,
             0.0,
@@ -515,6 +529,86 @@ const MINIMAX_FIXTURE: &str = "MiniMax-M2.7.mq2";
 #[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with MiniMax-M2.7.mq2"]
 fn dense_minimax_fault_rolls_back_and_retry_matches_fresh() {
     exercise_dense_fixture(MINIMAX_FIXTURE, 73_000);
+}
+
+/// HIPF-86: a greedy DFlash request that fits `max_seq` completes like the AR
+/// one. Near the cap the next 16-row verify window would end past the KV
+/// cache; the spec loop finishes those tokens on AR decode instead of letting
+/// the sandwich cache bound fail the request.
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with muse-glimmer-30b.mq4 and muse-glimmer-30b-dflash.mq4"]
+fn glimmer_dflash_request_that_fits_max_seq_completes() {
+    let _guard = lock();
+    // The wall-clock profit guard may retire DFlash to AR before the cap; keep
+    // the speculative route so the request reaches the window that would cross.
+    // The process config is snapshotted once, so this holds only before any
+    // other hipfire call in the process (run this test alone, or export it).
+    std::env::set_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD", "0");
+    assert_eq!(
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD").as_deref(),
+        Ok("0"),
+        "export HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD=0 or run this test alone"
+    );
+    let (Some(model), Some(draft)) = (
+        dense_fixture("muse-glimmer-30b.mq4"),
+        dense_fixture("muse-glimmer-30b-dflash.mq4"),
+    ) else {
+        return;
+    };
+    let Some(mut gpu) = dense_gpu() else {
+        return;
+    };
+    let spec = SpecLoadCfg {
+        dflash: Some(true),
+        ..dense_spec_off()
+    };
+    let mut m = hipfire_loader::load_model(
+        &model.to_string_lossy(),
+        384,
+        Some(&draft.to_string_lossy()),
+        None,
+        None,
+        None,
+        &CaskConfig::default(),
+        1,
+        spec,
+        &mut gpu,
+    )
+    .unwrap_or_else(|e| panic!("load {}: {e}", model.display()));
+    // About 70 prompt tokens; 312 more end two rows below the 384-row cache.
+    let prompt = "Count from 1 to 600 in English words, one number per line, with no other text.";
+    let out = run_generate_with(
+        &mut m,
+        &mut gpu,
+        "glimmer_cap",
+        "cap",
+        74_000,
+        true,
+        prompt,
+        312,
+    );
+    // The spec path also prints diagnostics to stdout; events are the JSON lines.
+    let events: Vec<serde_json::Value> = std::str::from_utf8(&out)
+        .expect("UTF-8 output")
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str(line).expect("JSON event"))
+        .collect();
+    assert!(
+        events.iter().all(|e| e["type"] != "error"),
+        "request that fits max_seq failed: {events:?}"
+    );
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .expect("done event");
+    assert_eq!(done["tokens"], 312, "{done}");
+    assert_eq!(done["dflash"], true, "{done}");
+    assert_ne!(done["dflash_retired"], true, "{done}");
+    hipfire_loader::unload_model(m, &mut gpu).expect("unload glimmer fixture");
+    batch_clear_all_terminals();
+    clear_terminal_control();
+    set_active_attempt_id(0);
 }
 
 /// COR-007: eight MiniMax load / generate / reset / unload cycles. Cycle 0

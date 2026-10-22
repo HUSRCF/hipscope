@@ -396,9 +396,180 @@ impl Gpu {
         result
     }
 
+    /// Slots per workgroup of the multi-workgroup scatter's chunks.
+    const MOE_SCATTER_STABLE_CHUNK: usize = 1024;
+    /// Most chunks (workgroups) of one multi-workgroup scatter.
+    const MOE_SCATTER_STABLE_MAX_GROUPS: usize = 128;
+    /// Largest expert count the multi-workgroup scatter's LDS arrays hold.
+    const MOE_SCATTER_STABLE_MAX_EXPERTS: usize = 1024;
+
+    /// Chunk count of the multi-workgroup scatter (`moe_scatter_stable_k8.hip`)
+    /// for a launch, or `None` when the single-workgroup
+    /// `moe_scatter_fused_k8` runs: exact gfx1201 only, at least four chunks of
+    /// work, at most 1024 experts, and the per-chunk histograms
+    /// (`groups * num_experts` words) must fit in `inverse_perm`
+    /// (`total_slots` words), which holds them until its final launch.
+    fn moe_scatter_stable_groups(&self, total_slots: usize, num_experts: usize) -> Option<usize> {
+        if !self.arch_caps.is_gfx1201() || num_experts == 0 {
+            return None;
+        }
+        if num_experts > Self::MOE_SCATTER_STABLE_MAX_EXPERTS {
+            return None;
+        }
+        let groups = total_slots
+            .div_ceil(Self::MOE_SCATTER_STABLE_CHUNK)
+            .min(Self::MOE_SCATTER_STABLE_MAX_GROUPS);
+        (groups >= 4 && groups * num_experts <= total_slots).then_some(groups)
+    }
+
+    /// Multi-workgroup scatter: histogram, offsets + stable placement,
+    /// inverse permutation (three launches; same six outputs as the single
+    /// workgroup kernel, ascending flat slot within each expert).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_scatter_stable_k8_launch(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        total_slots: usize,
+        num_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+        groups: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "moe_scatter_stable_k8";
+        for symbol in [
+            "moe_scatter_stable_hist_k8",
+            "moe_scatter_stable_place_k8",
+            "moe_scatter_stable_inverse_k8",
+        ] {
+            self.ensure_kernel(MODULE, kernels::MOE_SCATTER_STABLE_K8_SRC, symbol)?;
+        }
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mtm_val = m_total_max as i32;
+        let bm_val = block_m as i32;
+        let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_stable_k8", bytes);
+
+        // 1. Per-chunk histograms (into inverse_perm) + -1 fills.
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &mtm_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let mut result = self.launch_maybe_blob(
+            "moe_scatter_stable_hist_k8",
+            [groups as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(invp);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b.push_i32(mtm_val);
+                b.push_i32(bm_val);
+                b
+            },
+        );
+
+        // 2. Offsets, counts, tile ids and stable placement.
+        if result.is_ok() {
+            let mut params: Vec<*mut c_void> = vec![
+                &ip as *const _ as *mut c_void,
+                &invp as *const _ as *mut c_void,
+                &cp as *const _ as *mut c_void,
+                &op as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &tp as *const _ as *mut c_void,
+                &ts_val as *const _ as *mut c_void,
+                &ne_val as *const _ as *mut c_void,
+                &bm_val as *const _ as *mut c_void,
+            ];
+            result = self.launch_maybe_blob(
+                "moe_scatter_stable_place_k8",
+                [groups as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ip);
+                    b.push_ptr(invp);
+                    b.push_ptr(cp);
+                    b.push_ptr(op);
+                    b.push_ptr(sp);
+                    b.push_ptr(tp);
+                    b.push_i32(ts_val);
+                    b.push_i32(ne_val);
+                    b.push_i32(bm_val);
+                    b
+                },
+            );
+        }
+
+        // 3. Inverse permutation (overwrites the histogram cells).
+        if result.is_ok() {
+            let mut params: Vec<*mut c_void> = vec![
+                &ip as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &invp as *const _ as *mut c_void,
+                &ts_val as *const _ as *mut c_void,
+                &ne_val as *const _ as *mut c_void,
+                &mtm_val as *const _ as *mut c_void,
+            ];
+            let span = total_slots.max(m_total_max);
+            result = self.launch_maybe_blob(
+                "moe_scatter_stable_inverse_k8",
+                [span.div_ceil(4 * 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ip);
+                    b.push_ptr(sp);
+                    b.push_ptr(invp);
+                    b.push_i32(ts_val);
+                    b.push_i32(ne_val);
+                    b.push_i32(mtm_val);
+                    b
+                },
+            );
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused single-CTA scatter pipeline. Replaces histogram + offsets +
     /// permute with one launch — saves ~2 launches × ~75µs per MoE layer
-    /// (≈2-3ms across 40 A3B layers).
+    /// (≈2-3ms across 40 A3B layers). On exact gfx1201 with at least four
+    /// 1024-slot chunks of work (see [`Self::moe_scatter_stable_groups`]) the
+    /// same six outputs come from the three-launch multi-workgroup twin
+    /// (`moe_scatter_stable_k8.hip`), which places slots in ascending flat-slot
+    /// order within each expert instead of LDS-atomic arrival order.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_scatter_fused_k8(
         &mut self,
@@ -414,6 +585,21 @@ impl Gpu {
         block_m: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if let Some(groups) = self.moe_scatter_stable_groups(total_slots, num_experts) {
+            return self.moe_scatter_stable_k8_launch(
+                topk_indices,
+                expert_token_counts,
+                expert_offsets,
+                sorted_slot_index,
+                expert_tile_ids,
+                inverse_perm,
+                total_slots,
+                num_experts,
+                m_total_max,
+                block_m,
+                groups,
+            );
+        }
         self.ensure_kernel(
             "moe_scatter_fused_k8",
             kernels::moe_scatter_fused_k8_src(self.arch_caps.is_gfx1151()),
@@ -2912,11 +3098,25 @@ impl Gpu {
             &[batch_size, k_top, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded indices",
         )?;
-        const FUNC: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
+        // K = 640 on exact gfx1151, eager: four weight rows per wave reuse the
+        // pick's x (bitwise the one-row kernel).
+        let r4 = k == 640
+            && self.flags.qwen4_moe_down_r4_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        const MODULE: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
+        let (func, rows_per_block) = if r4 {
+            (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+            )
+        } else {
+            (MODULE, 1)
+        };
         self.ensure_kernel(
-            FUNC,
+            MODULE,
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            FUNC,
+            func,
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -2943,10 +3143,14 @@ impl Gpu {
                 .saturating_add(k.saturating_mul(4))
                 .saturating_add(m.saturating_mul(4)),
         );
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
-            [m as u32, k_top as u32, batch_size as u32],
+            func,
+            [
+                m.div_ceil(rows_per_block) as u32,
+                k_top as u32,
+                batch_size as u32,
+            ],
             [32, 1, 1],
             0,
             &mut params,

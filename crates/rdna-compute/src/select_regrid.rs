@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Railgun E0 / L6d: re-gridded row selectors (gfx1201).
+//! Railgun E0 / L6d: re-gridded row selectors (gfx1201, gfx1151).
 //!
 //! `topk_values_batched_f32` (DFlash2 selector, raw top-K) and
 //! `argmax_f32_batched` (verify argmax) launch one 256-thread block per row;
 //! the top-K merges 256 x K candidates on a single thread. On exact gfx1201
-//! (opt out with `HIPFIRE_SELECT_REGRID_OFF=1`) both route through
+//! and gfx1151 (opt out with `HIPFIRE_SELECT_REGRID_OFF=1`) both route through
 //! `kernels/src/select_regrid.hip` instead: 1024 threads per row with wave32
 //! butterflies. Outputs are byte-identical to the shipping kernels for every
 //! input (see the kernel header for the argument; `test_select_regrid`
@@ -40,39 +40,13 @@ pub const TOPK_VALUES_FIXUP_SYMBOL: &str = "topk_values_fixup_f32";
 pub const SELECT_REGRID_BLOCK: u32 = 1024;
 
 impl Gpu {
-    /// Exact gfx1201, not opted out, and no open Redline recording (the
-    /// re-grid kernels are not in Redline's kernel tables).
+    /// Exact gfx1201 or gfx1151 (the archs `test_select_regrid` byte-checks),
+    /// not opted out, and no open Redline recording (the re-grid kernels are
+    /// not in Redline's kernel tables).
     pub fn select_regrid_enabled(&self) -> bool {
-        self.arch_caps.is_gfx1201() && !self.flags.select_regrid_off && !self.replay.is_recording()
-    }
-
-    /// Raw top-K for callers outside the shipping selector gate (the
-    /// developer online draft tuner): re-grid on the archs where the
-    /// byte-identity gate `test_select_regrid` was run (gfx1201; gfx1151,
-    /// 15 x 248320 K=16 1349 -> 63 us), shipping elsewhere and while a
-    /// Redline recording is open.
-    pub fn topk_values_batched_f32_verified_regrid(
-        &mut self,
-        logits: &GpuTensor,
-        top_idx: &GpuTensor,
-        top_values: &GpuTensor,
-        vocab: usize,
-        k: usize,
-        b: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            (1..=16).contains(&k),
-            "topk_batched: K={k} must be in [1,16]"
-        );
-        if (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151())
+        (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151())
             && !self.flags.select_regrid_off
             && !self.replay.is_recording()
-        {
-            self.topk_values_regrid_f32(logits, top_idx, top_values, vocab, k, b)
-        } else {
-            self.launch_topk_batched_f32_shipping(logits, top_idx, top_values, vocab, k, b, true)
-        }
     }
 
     /// Raw top-K over `[b x vocab]` rows: re-grid launch, then the fixup

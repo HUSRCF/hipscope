@@ -80,13 +80,13 @@ n-gram arch gate in `build_speculator`:
 | minimax | 10 | MiniMax-M2 MoE | n-gram + SpecTarget | No | n-gram opt-in; route `MiniMaxSpec` when a speculator exists |
 | lfm2moe | 11 | LFM2.5 hybrid conv+attn (+MoE variants) | n-gram + SpecTarget (conv-state snapshot/rollback) | No | n-gram opt-in; route `LfmSpec` when a speculator exists. **Not** a Redline or batched-prefill admission |
 | cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | n-gram + SpecTarget + `Cohere2MoeEmit` | No | n-gram opt-in; route `CohereSpec` when a speculator exists |
-| gemma4 | 13 (+22 drafter) | Gemma 4 dense text | EAGLE draft (arch 22) via `params.drafter` only; **no** `build_speculator` mechanism (not in the n-gram gate; `params.draft` DFlash refused) | Arch-22 EAGLE drafter exists but is **gated off** | The EAGLE path runs only with `HIPFIRE_GEMMA4_EAGLE=1` (developer), greedy-only; E2B/E4B targets refuse a drafter. Default serve is plain AR |
+| gemma4 | 13 (+22 drafter) | Gemma 4 dense text | EAGLE draft (arch 22) via `params.drafter` only; **no** `build_speculator` mechanism (not in the n-gram gate; `params.draft` DFlash refused) | Arch-22 EAGLE drafter exists but is **gated off** | The EAGLE path runs only with `HIPFIRE_GEMMA4_EAGLE=1` (developer; it is slower than AR on gfx1151). Greedy requests verify by argmax; sampled and penalized requests by naive sampling (each verify row drawn with the AR sampler against the request's penalty history); `logprobs` come from the verify rows. E2B/E4B targets refuse a drafter. Default serve is plain AR |
 | muse-glimmer | 14 (+23 drafter) | Muse Glimmer dense text | DFlash with the arch-23 `muse_glimmer_assistant` draft | DFlash arch-23 drafter when supplied | Draft is loaded only when a draft path is set and `dflash_mode != off`; load failure falls back to AR. Route `GlimmerSpec` when a speculator exists. Gemma EAGLE `params.drafter` refused; n-gram not in the gate |
 | maple | 15 | Maple-Preview natively-ternary MoE | None | No | `MapleCarrier::caps()` declares no DFlash and no MTP; route is always `MapleAr` |
-| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + SpecTarget (`mtp_spec.rs`) | Yes — native MTP | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). Admission **refuses** DFlash, DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash and a draft path. Route `Qwen4Spec` greedy, and sampled via rejection sampling when `mtp_sampled` is on. EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
+| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + **DFlash2** (arch-20 draft, explicit only) + SpecTarget (`mtp_spec.rs`, `dflash_target.rs`) | Yes — native MTP; external DFlash2 draft | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). DFlash2 runs only on `--spec dflash` / `speculation.dflash = on` with a draft (`--model-draft`), single card, GPU-resident experts. Admission **refuses** DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash, a draft path without `dflash = on`, and DFlash under EP/PP. Route `Qwen4Spec` greedy, and sampled via rejection sampling (MTP when `mtp_sampled` is on; DFlash2 always, unpenalized requests). EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
 
 **Has a learned or diffusion drafter path in-tree today:** qwen35 (DSpark ± DFlash ± MTP),
-qwen4 (native MTP), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
+qwen4 (native MTP, or DFlash2 on request), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
 DFlash when draft/sidecar loaded), muse-glimmer (DFlash arch-23 draft). gemma4 has an EAGLE
 drafter path that is gated off. **n-gram-capable with SpecTarget:** arch ids in the gate above
 (qwen4 excluded by admission). Everything else remains plain autoregressive unless source gains
@@ -94,7 +94,7 @@ a new arm.
 
 ## Mechanism notes
 
-### DFlash (qwen35, dense generic, muse-glimmer)
+### DFlash (qwen35, dense generic, qwen4 DFlash2, muse-glimmer)
 
 - **Default:** `speculation.dflash = "off"` in `crates/hipfire-config/src/lib.rs`. `"auto"` turns dense
   Qwen3.5-style targets on and skips known-loss A3B/MoE cases ([`CONFIG.md`](CONFIG.md)). The registry
@@ -112,6 +112,22 @@ a new arm.
   supported path; see [Lifecycle](#lifecycle).
 - **llama 0/1:** `dflash_generic` requires arch_id=20 HFQ from `dflash_convert`.
   Chain is default; the tree arm is opt-in (`HIPFIRE_DFLASH_TREE=1`).
+- **qwen4 16 (DFlash2):** `Qwen4Carrier` builds the shared
+  `hipfire_runtime::dflash2_spec::Dflash2Speculator` (name `dflash2`) from an arch-20 DFlash2 draft
+  (`dflash_convert`, candidate selector + dynamic convs) only on `--spec dflash` /
+  `speculation.dflash = on` with `--model-draft`; native MTP stays the default and the two never load
+  together. The target captures the drafter's `target_layer_ids` as each layer's completed output
+  averaged over the 4 hyper-connection streams (`hc_mean_capture_f32`, run between interpreter steps
+  so the verify program is unchanged) in prefill and every verify; a capturing prefill is planned
+  GPU-only (the NPU trunk pair executor and the S1 layer-major prefill build their own steps, so
+  they are bypassed). Block width: `speculation.dflash_block`, Qwen4 `auto` = 8 (with the confidence
+  cut that verifies only the draft's confident prefix, the fastest measured on gfx1151), an explicit width clamped to the GPU's row-exact verify rows
+  (8 on gfx1151). The host keeps only the draft's 2048-row window of feature rows (≤ 2 × 2048 ×
+  51,200 B). Chain only: greedy is the selector's argmax walk (output = AR); sampled draws from the
+  selector's softmax over its top-16 and accepts with sparse-q rejection sampling against the AR
+  sampler's law (temperature, top_k, top_p, min_p). Penalized requests stay AR. EP, PP and
+  CPU-hosted routed experts refuse DFlash2. **Known gap:** the DFlash2 route never reuses the Qwen4
+  session / prefix cache (every request prefills cold; HIPF-143).
 - **muse-glimmer 14:** a distinct arch-23 draft (not a `dflash_convert` arch-20 artifact), loaded via
   `HIPFIRE_DFLASH_DRAFT` / `params.draft` while `dflash_mode != off`.
 - **Genre conditionality** is a measured property (see the historical table in

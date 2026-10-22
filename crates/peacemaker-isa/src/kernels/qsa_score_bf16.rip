@@ -15,6 +15,10 @@
 // Instructions carry explicit defs/uses; waits and branches go through
 // peacemaker-author's sealed runtime driver, then object-level certification.
 
+/// The `check` channel: variant names and target arches (front-door discovery).
+pub const VARIANTS: &[&str] = &["score-bf16", "score-bf16-rows32"];
+pub const ARCHES: &[&str] = &["gfx1151"];
+
 /// `sqrtf(128.0f)` correctly rounded.
 const SQRT_INDEX_DIM: u32 = 0x4135_04f3;
 /// Query rows per workgroup: the only geometry that differs between the R16

@@ -333,6 +333,7 @@ pub fn is_batch_request_eligible(
         pp: m.pp,
         has_speculator: has_spec,
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: false,
         ngram_can_sample,
         temp: sampling.temp,
@@ -1852,6 +1853,7 @@ fn vmm_singleton_route(
         pp: m.pp,
         has_speculator: spec.is_some(),
         speculator_is_mtp: spec.is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: spec.is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: false,
         ngram_can_sample: spec.map(|s| !s.requires_greedy()).unwrap_or(false),
         temp: sampling.temp,
@@ -2178,6 +2180,7 @@ fn spec_request_config(
         // A lane window's tickets are its own (`finish_native_window` consumes
         // them); only the singleton drafter retains a window for a terminal repair.
         stop_sequences: false,
+        logprobs: false,
     }
 }
 
@@ -2392,10 +2395,14 @@ pub(crate) struct Qwen4Boundary<'a> {
     pub tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
     pub started_in_think: bool,
     pub prompt_tokens: &'a [u32],
-    /// Every committed token, ending with the pending seed.
+    /// Every streamed token; ends with the pending seed when `seed_emitted`.
     pub emitted: &'a [u32],
     pub position: usize,
     pub seed_token: u32,
+    /// The singleton already streamed the seed (spec windows). An AR
+    /// singleton's seed is picked but neither fed nor streamed; the lane
+    /// streams it after its first forward, like any lane pick.
+    pub seed_emitted: bool,
     pub max_tokens: usize,
     pub created_at: Instant,
     pub prefill_done_at: Instant,
@@ -2415,8 +2422,13 @@ pub(crate) fn promote_qwen4_singleton(
     drafter: Option<&hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>,
     b: Qwen4Boundary<'_>,
 ) -> Result<Qwen4PromotedRequest, String> {
-    if b.emitted.last() != Some(&b.seed_token) {
+    if b.seed_emitted && b.emitted.last() != Some(&b.seed_token) {
         return Err("pending seed is not the last committed token".into());
+    }
+    // The lane's committed picks end with its pending seed either way.
+    let mut generated = b.emitted.to_vec();
+    if !b.seed_emitted {
+        generated.push(b.seed_token);
     }
     let spec_store = bundle
         .lanes()
@@ -2438,7 +2450,7 @@ pub(crate) fn promote_qwen4_singleton(
             gpu,
             epoch,
             b.prompt_tokens.to_vec(),
-            b.emitted.to_vec(),
+            generated,
             b.seed_token,
             b.position,
             parts,
@@ -2495,7 +2507,7 @@ pub(crate) fn promote_qwen4_singleton(
         bytes_fed_to_filter: bytes_fed,
         created_at: b.created_at,
         prefill_done_at: Some(b.prefill_done_at),
-        first_token_at: Some(b.prefill_done_at),
+        first_token_at: (!b.emitted.is_empty()).then_some(b.prefill_done_at),
         max_active_lanes: 1,
     };
     Ok(Qwen4PromotedRequest {
@@ -2504,7 +2516,7 @@ pub(crate) fn promote_qwen4_singleton(
         producer,
         epoch,
         slot,
-        seed_emitted: true,
+        seed_emitted: b.seed_emitted,
         max_tokens: b.max_tokens,
     })
 }
@@ -2823,7 +2835,7 @@ fn vmm_retire_free(
 /// and the tool-call parser), images (vision path), invalid stops (the
 /// singleton reports them), logprobs (the singleton sampler's envelopes),
 /// budget alerts (mid-stream text injection), adaptive KV/eviction/PFlash
-/// (per-request KV rewriting), PP/EP. A loaded
+/// (per-request KV rewriting), and PP/EP outside the Qwen4 fn-lanes route. A loaded
 /// speculator does not exclude a greedy request — batched rows are AR, and a
 /// lonely request keeps its singleton spec route.
 pub fn is_vmm_batch_request_eligible(
@@ -2869,7 +2881,7 @@ pub fn is_vmm_batch_request_eligible(
     if m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
         return false;
     }
-    if m.pp != 1 || m.ep.is_some() {
+    if !lane_batch_topology_supported(qwen4_lanes_staged(m), m.pp, m.ep.is_some()) {
         return false;
     }
     if msg.get("budget_alert_at_tok").is_some() || msg.get("budget_alert_text").is_some() {
@@ -2892,6 +2904,15 @@ pub fn vmm_route_active(vmm_batch: Option<VmmBatchParams>, m: &LoadedModel) -> b
 /// A Qwen4 model whose AR lane store is staged (`Qwen4Bundle::stage_lanes`).
 fn qwen4_lanes_staged(m: &LoadedModel) -> bool {
     m.qwen4().is_some_and(|b| b.lanes().is_some())
+}
+
+/// Only the staged Qwen4 lane executor implements multi-device batches.
+fn lane_batch_topology_supported(qwen4_lanes: bool, pp: usize, ep: bool) -> bool {
+    qwen4_lanes || (pp == 1 && !ep)
+}
+
+fn qwen4_lane_promotion_supported(topology: &str) -> bool {
+    topology == "single"
 }
 
 /// Qwen4 lane request gate beyond the shared greedy/text-chat predicate. A
@@ -2925,6 +2946,8 @@ fn qwen4_lane_request_supported(
 fn qwen4_lane_ack_fields(
     v: &mut serde_json::Value,
     r: &hipfire_arch_qwen4::lane::LaneStoreReceipt,
+    topology: &str,
+    device_receipts: &[hipfire_arch_qwen4::lane::LaneStoreReceipt],
     slots: usize,
     row_budget: usize,
     p: VmmBatchParams,
@@ -2946,6 +2969,14 @@ fn qwen4_lane_ack_fields(
     v["continuous_batch_nonexact"] = serde_json::json!(false);
     v["continuous_batch_exact"] = serde_json::json!(true);
     v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    v["continuous_batch_promotion"] = serde_json::json!(qwen4_lane_promotion_supported(topology));
+    v["fn_lanes_topology"] = serde_json::json!(topology);
+    v["fn_lanes_device_receipts"] = serde_json::Value::Array(
+        device_receipts
+            .iter()
+            .map(qwen4_lane_device_receipt)
+            .collect(),
+    );
     v["fn_lanes_kv_backend"] = serde_json::json!(r.kv_backend);
     v["fn_lanes_qsa_format"] = serde_json::json!(r.qsa_format);
     v["fn_lanes_gdn_format"] = serde_json::json!(r.gdn_format);
@@ -2955,6 +2986,22 @@ fn qwen4_lane_ack_fields(
     v["fn_lanes_mapped_bytes"] = serde_json::json!(r.mapped_bytes);
     v["fn_lanes_stage_policy"] = serde_json::json!(r.stage_policy);
     v["fn_lanes_stage_evidence"] = serde_json::json!(r.stage_evidence);
+}
+
+fn qwen4_lane_device_receipt(r: &hipfire_arch_qwen4::lane::LaneStoreReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "kv_backend": r.kv_backend,
+        "qsa_format": r.qsa_format,
+        "gdn_format": r.gdn_format,
+        "ring_rows": r.ring_rows,
+        "max_lanes": r.max_lanes,
+        "row_budget": r.row_budget,
+        "mapped_bytes": r.mapped_bytes,
+        "stage_policy": r.stage_policy,
+        "stage_evidence": r.stage_evidence,
+        "spec": r.spec,
+        "spec_k": r.spec_k,
+    })
 }
 
 /// Daemon load: the loader's VMM staging request for the parsed
@@ -3010,21 +3057,41 @@ pub fn vmm_loaded_ack(
     vmm_batch: Option<VmmBatchParams>,
     slots: usize,
     row_budget: usize,
-    gpu: &rdna_compute::Gpu,
+    gpu: &mut rdna_compute::Gpu,
 ) -> String {
     let ack = qwen4_ep_ack(ack, m);
     let Some(p) = vmm_batch else {
         return ack;
     };
     if m.qwen4().is_some() {
-        let Some(store) = m.qwen4().and_then(|b| b.lanes()) else {
+        if !qwen4_lanes_staged(m) {
             return ack;
+        }
+        let topology = m.qwen4().unwrap().lane_topology();
+        let receipts = if topology == "pp" {
+            let (bundle, gpus) = m.qwen4_mesh_mut().expect("staged Qwen4 PP mesh");
+            bundle.pp_lane_receipts(gpus)
+        } else {
+            m.qwen4_mut().unwrap().ep_lane_receipts(gpu)
         };
-        let receipt = store.receipt(gpu);
+        let receipts = match receipts {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                eprintln!("[daemon] qwen4 fn-lanes: load receipt failed: {error}");
+                return ack;
+            }
+        };
+        // PP's authoritative root is its output band; EP's is rank zero.
+        let receipt = if topology == "pp" {
+            receipts.last()
+        } else {
+            receipts.first()
+        }
+        .expect("staged Qwen4 lanes have a device receipt");
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
             return ack;
         };
-        qwen4_lane_ack_fields(&mut v, &receipt, slots, row_budget, p);
+        qwen4_lane_ack_fields(&mut v, receipt, topology, &receipts, slots, row_budget, p);
         return v.to_string();
     }
     let (receipt, spec_mode, dflash_receipt, sampling_ack) =
@@ -3161,15 +3228,17 @@ pub fn arm_promotion(
     client_seed: Option<u64>,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 ) {
-    // Qwen4 is armed iff its lane store is staged (the promoted request moves
-    // into a lane); qwen35 needs only the eligible request.
+    // Multi-device Qwen4 lanes cannot import a running singleton's state.
+    // Single-device Qwen4 requires a staged store; qwen35 needs only eligibility.
     let sampling = resolve_batch_sampling(msg, m);
     // A sampled request promotes only as an AR lane: the AR singleton
     // boundary moves its advanced rng/history/sampler. A sampled speculative
     // singleton would be continued as AR (reseeded), never promoted. Qwen4
     // lanes are greedy-only, so a sampled Qwen4 request never promotes.
     let permit = (armed
-        && m.qwen4().is_none_or(|b| b.lanes().is_some())
+        && m.qwen4().is_none_or(|b| {
+            b.lanes().is_some() && qwen4_lane_promotion_supported(b.lane_topology())
+        })
         && is_vmm_batch_request_eligible(
             msg,
             m,
@@ -5219,6 +5288,18 @@ pub fn drive_lfm_continuous_batch(
             |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
         )
         .collect();
+    // LFM tool-call span suppression (mirrors dense::generate_lfm2moe):
+    // the span — markers + body — is held back from the client stream and
+    // parsed into `tool_calls` at the lane's finish. The flag resets itself
+    // whenever the lane's `streamed_tokens` is empty (fresh lane), so no
+    // explicit per-reset-site clearing is needed.
+    let tool_open_tok = tokenizer.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E");
+    let tool_close_tok = tokenizer.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E");
+    let mut in_tool_span = vec![false; batch_size];
+    let mut tool_span_tokens: Vec<Vec<u32>> = (0..batch_size).map(|_| Vec::new()).collect();
+    let mut tool_body_tokens: Vec<Vec<u32>> = (0..batch_size).map(|_| Vec::new()).collect();
+    let mut tool_calls: Vec<Vec<hipfire_runtime::prompt_frame::ToolCall>> =
+        (0..batch_size).map(|_| Vec::new()).collect();
     let mut tokens = vec![0u32; batch_size];
     let mut positions = vec![0usize; batch_size];
     let fail_all = |sched: &mut ContinuousBatchScheduler,
@@ -6263,6 +6344,35 @@ pub fn drive_lfm_continuous_batch(
                 to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
+            // Tool-call span divert (mirrors dense::generate_lfm2moe): the
+            // span is suppressed from the stream; everything still lands in
+            // `lane.streamed_tokens` below. On close the body parses into
+            // `tool_calls`; an unclosed span at finish is re-emitted raw.
+            // The flag clears itself when the lane's `streamed_tokens` is
+            // empty (fresh lane) — no per-reset-site clearing needed.
+            if in_tool_span[idx] && lane.streamed_tokens.is_empty() {
+                in_tool_span[idx] = false;
+            }
+            let mut span_diverted = false;
+            if tool_open_tok.is_some_and(|t| cur_token == t) && !in_tool_span[idx] {
+                in_tool_span[idx] = true;
+                tool_span_tokens[idx].clear();
+                tool_span_tokens[idx].push(cur_token);
+                tool_body_tokens[idx].clear();
+                span_diverted = true;
+            } else if in_tool_span[idx] {
+                tool_span_tokens[idx].push(cur_token);
+                if tool_close_tok.is_some_and(|t| cur_token == t) {
+                    in_tool_span[idx] = false;
+                    let body_text = tokenizer.decode(&tool_body_tokens[idx]);
+                    tool_calls[idx].extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
+                        &body_text,
+                    ));
+                } else {
+                    tool_body_tokens[idx].push(cur_token);
+                }
+                span_diverted = true;
+            }
             let mut future_streamed = lane.streamed_tokens.clone();
             future_streamed.push(cur_token);
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
@@ -6286,6 +6396,13 @@ pub fn drive_lfm_continuous_batch(
                     lane.prompt_len,
                     generated,
                 );
+                // Unclosed tool span at end-of-turn: re-emit the buffered
+                // raw text (treat-as-text); closed spans already parsed.
+                if in_tool_span[idx] {
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                    emit_visible_token(stdout, &key.id, &tokenizer.decode(&tool_span_tokens[idx]));
+                }
                 let mut pending_done = serde_json::json!({
                     "type": "done",
                     "id": key.id,
@@ -6297,11 +6414,16 @@ pub fn drive_lfm_continuous_batch(
                     "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
                     "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
                     "cached_tokens": 0,
-                    "finish_reason": "stop",
+                    "finish_reason": if !tool_calls[idx].is_empty() { "tool_calls" } else { "stop" },
                     "attempt_id": key.attempt_id,
                 });
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                let finish_reason = if !tool_calls[idx].is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 attach_continuous_batch_route_evidence(
                     &mut pending_done,
                     batch_size,
@@ -6309,10 +6431,20 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
+                {
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                    hipfire_engine::emit::stage_terminal_tool_calls(
+                        &mut pending_done,
+                        finish_reason,
+                        &tool_calls[idx],
+                    );
+                    hipfire_engine::emit::emit_tool_calls_event(stdout, &key.id, &tool_calls[idx]);
+                }
                 to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
-            let has_visible = !frag.is_empty();
+            let has_visible = !frag.is_empty() && !span_diverted;
             if has_visible {
                 if lane.first_token_at.is_none() {
                     lane.first_token_at = Some(Instant::now());
@@ -6333,7 +6465,20 @@ pub fn drive_lfm_continuous_batch(
             if should_finish {
                 let hit_length_cap =
                     batch_hit_length_cap(hit_max, hit_lane_cap, is_eos, false, loop_hit);
-                let finish_reason = if hit_length_cap { "length" } else { "stop" };
+                // Unclosed tool span at a length/loop-cap finish: re-emit raw
+                // text; a closed span already parsed into tool_calls.
+                if in_tool_span[idx] {
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                    emit_visible_token(stdout, &key.id, &tokenizer.decode(&tool_span_tokens[idx]));
+                }
+                let finish_reason = if hit_length_cap {
+                    "length"
+                } else if !tool_calls[idx].is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
                     lane.created_at,
@@ -6366,6 +6511,16 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
+                {
+                    let _scope =
+                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                    hipfire_engine::emit::stage_terminal_tool_calls(
+                        &mut pending_done,
+                        finish_reason,
+                        &tool_calls[idx],
+                    );
+                    hipfire_engine::emit::emit_tool_calls_event(stdout, &key.id, &tool_calls[idx]);
+                }
                 to_await.push((idx, key.clone(), admission, pending_done));
             } else {
                 survivors.push(idx);
@@ -6619,6 +6774,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: false,
         ngram_can_sample: m
             .speculator
@@ -7732,7 +7888,7 @@ mod tests {
             row_budget: 32,
             mapped_bytes: 123_456,
             stage_policy: "embed=once,argmax=once".to_string(),
-            stage_evidence: "g0-receipt",
+            stage_evidence: "g0-receipt".to_string(),
             spec: "mtp",
             spec_k: 3,
         };
@@ -7744,7 +7900,15 @@ mod tests {
             prefill_min_tokens: 1,
             sampled: false,
         };
-        qwen4_lane_ack_fields(&mut v, &receipt, 4, 32, params);
+        qwen4_lane_ack_fields(
+            &mut v,
+            &receipt,
+            "single",
+            std::slice::from_ref(&receipt),
+            4,
+            32,
+            params,
+        );
         assert_eq!(v["continuous_batch_route"], "fn-lanes");
         assert_eq!(v["continuous_batch_history_capable"], true);
         assert_eq!(v["continuous_batch_slots"], 4);
@@ -7766,17 +7930,62 @@ mod tests {
         assert_eq!(v["fn_lanes_mapped_bytes"], 123_456);
         assert_eq!(v["fn_lanes_stage_policy"], "embed=once,argmax=once");
         assert_eq!(v["fn_lanes_stage_evidence"], "g0-receipt");
+        assert_eq!(v["fn_lanes_topology"], "single");
+        assert_eq!(v["fn_lanes_device_receipts"][0]["mapped_bytes"], 123_456);
+        assert_eq!(v["continuous_batch_promotion"], true);
         let off = hipfire_arch_qwen4::lane::LaneStoreReceipt {
             spec: "off",
             spec_k: 0,
             ..receipt
         };
         let mut w = serde_json::json!({"type": "loaded"});
-        qwen4_lane_ack_fields(&mut w, &off, 4, 32, params);
+        qwen4_lane_ack_fields(
+            &mut w,
+            &off,
+            "single",
+            std::slice::from_ref(&off),
+            4,
+            32,
+            params,
+        );
         assert_eq!(w["continuous_batch_spec"], false);
         assert_eq!(w["continuous_batch_spec_mode"], "off");
         assert!(w.get("continuous_batch_spec_k").is_none());
         assert_eq!(w["continuous_batch_spec_requested"], true);
+        for topology in ["ep", "pp"] {
+            let mut mesh = serde_json::json!({"type": "loaded"});
+            let receipts = [
+                off.clone(),
+                hipfire_arch_qwen4::lane::LaneStoreReceipt {
+                    mapped_bytes: 654_321,
+                    ..off.clone()
+                },
+            ];
+            qwen4_lane_ack_fields(&mut mesh, &off, topology, &receipts, 4, 32, params);
+            assert_eq!(mesh["fn_lanes_topology"], topology);
+            assert_eq!(mesh["continuous_batch_promotion"], false);
+            assert_eq!(mesh["continuous_batch_spec"], false);
+            assert_eq!(
+                mesh["fn_lanes_device_receipts"].as_array().unwrap().len(),
+                2
+            );
+            assert_eq!(mesh["fn_lanes_device_receipts"][1]["mapped_bytes"], 654_321);
+        }
+    }
+
+    #[test]
+    fn lane_batch_topology_requires_qwen4_lanes_for_multi_device() {
+        for (pp, ep) in [(1, false), (2, false), (1, true)] {
+            assert!(lane_batch_topology_supported(true, pp, ep));
+            assert_eq!(lane_batch_topology_supported(false, pp, ep), pp == 1 && !ep);
+        }
+    }
+
+    #[test]
+    fn qwen4_lane_promotion_is_single_device_only() {
+        assert!(qwen4_lane_promotion_supported("single"));
+        assert!(!qwen4_lane_promotion_supported("ep"));
+        assert!(!qwen4_lane_promotion_supported("pp"));
     }
 
     #[test]

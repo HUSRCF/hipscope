@@ -26,6 +26,7 @@ fn base() -> GenerationRouteInputs {
         pp: 1,
         has_speculator: false,
         speculator_is_mtp: false,
+        speculator_is_dflash2: false,
         deepseek4_spec_requested: false,
         ngram_can_sample: false,
         temp: 0.0,
@@ -969,11 +970,11 @@ fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
     assert_plan(&got, &divergent, 37, Some(37), "cache enabled divergence");
 }
 
-/// Route isolation: only the native MTP speculator selects the Qwen4 spec
-/// route; an n-gram (non-MTP) speculator on arch 16 stays on Qwen4 AR even
-/// when it can sample. Both routes plan their prefix through the bundle's
-/// session cache (`SessionRoute::Ar` / `SessionRoute::Mtp`), never through the
-/// shared conversation planner.
+/// Route isolation: only the native MTP speculator and the DFlash2 drafter
+/// select the Qwen4 spec route; an n-gram (non-MTP, non-DFlash2) speculator
+/// on arch 16 stays on Qwen4 AR even when it can sample. Both routes plan
+/// their prefix through the bundle's session cache (`SessionRoute::Ar` /
+/// `SessionRoute::Mtp`), never through the shared conversation planner.
 #[test]
 fn non_mtp_speculators_on_qwen4_stay_on_ar() {
     for ngram_can_sample in [false, true] {
@@ -990,6 +991,68 @@ fn non_mtp_speculators_on_qwen4_stay_on_ar() {
             "{ngram:?}"
         );
     }
+}
+
+/// DFlash2 on Qwen4: greedy and sampled requests take the spec route on one
+/// card; any token penalty (DFlash2 applies none), pipeline parallelism,
+/// adaptive KV and the force-AR switches keep the AR producer.
+#[test]
+fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
+    let dflash2 = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_dflash2: true,
+        supports_temp_swor: true,
+        supports_chain_nucleus_verify: true,
+        ..base()
+    };
+    for temp in [0.0f32, 1.0] {
+        let request = GenerationRouteInputs { temp, ..dflash2 };
+        assert_eq!(
+            select_generation_route(&request),
+            GenerationRoute::Qwen4Spec,
+            "{request:?}"
+        );
+        for refused in [
+            GenerationRouteInputs {
+                nonneutral_penalties: true,
+                ..request
+            },
+            GenerationRouteInputs { pp: 2, ..request },
+            GenerationRouteInputs {
+                kv_adaptive: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                force_ar_chat: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                temp_spec_env_off: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                has_speculator: false,
+                ..request
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&refused),
+                GenerationRoute::Qwen4Ar,
+                "{refused:?}"
+            );
+        }
+    }
+    // A sampled request needs a drafter that verifies at temperature.
+    let greedy_only = GenerationRouteInputs {
+        temp: 1.0,
+        supports_temp_swor: false,
+        ..dflash2
+    };
+    assert_eq!(
+        select_generation_route(&greedy_only),
+        GenerationRoute::Qwen4Ar
+    );
 }
 
 /// Native MTP stays the native Qwen4 route whether or not an n-gram-style

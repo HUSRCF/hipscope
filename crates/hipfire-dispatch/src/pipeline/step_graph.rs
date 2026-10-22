@@ -19,9 +19,11 @@
 //! [`OpKind`] discriminants are part of the contract: one per [`Step`] variant
 //! (`1..`) plus hand-route ops (`1000..`); a hand-route op that later gains a
 //! `Step` variant keeps its ID (`Step::SiluMul` is `SiluMul = 1001`). Values
-//! are frozen — never renumber, never reuse, append only. The
+//! are frozen — never renumber, never reuse, append only. A retired ID stays
+//! retired (`18` `DenseFfn` and `20` `SandwichMlp`, both now `GatedMlp`). The
 //! `op_kind_ids_frozen` test pins every value.
 
+use super::gated_mlp::MlpLadder;
 use super::steps::Step;
 
 /// Dense op handle: the index of the op in [`StepGraph::ops`].
@@ -71,12 +73,10 @@ pub enum OpKind {
     Project = 16,
     /// [`Step::BroadcastAdd`].
     BroadcastAdd = 17,
-    /// [`Step::DenseFfn`].
-    DenseFfn = 18,
+    // 18: retired (`DenseFfn`, now `GatedMlp`); never reuse.
     /// [`Step::SandwichAttention`].
     SandwichAttention = 19,
-    /// [`Step::SandwichMlp`].
-    SandwichMlp = 20,
+    // 20: retired (`SandwichMlp`, now `GatedMlp`); never reuse.
     /// [`Step::ParallelMoeMlp`].
     ParallelMoeMlp = 21,
     /// [`Step::PerLayerInput`].
@@ -91,6 +91,61 @@ pub enum OpKind {
     MoeStage = 26,
     /// [`Step::GatedShortConv`] (#666 G10, LFM2).
     GatedShortConv = 27,
+    /// [`Step::GatedMlp`].
+    GatedMlp = 28,
+    /// [`Step::DeltaNetMixer`] (hybrid decoder linear attention).
+    DeltaNetMixer = 29,
+    /// [`Step::GatedAttention`] (hybrid decoder full attention).
+    GatedAttention = 30,
+    /// [`Step::SandwichMlp`] (#666 G11, Glimmer's pre-norm / sandwich MLP).
+    /// Appended: `20` stays retired.
+    SandwichMlp = 31,
+    /// [`Step::HcPre`] (#666 G9, DeepSeek4).
+    HcPre = 32,
+    /// [`Step::HcPost`] (#666 G9, DeepSeek4).
+    HcPost = 33,
+    /// [`Step::HcHead`] (#666 G9, DeepSeek4).
+    HcHead = 34,
+    /// [`Step::QLoraPrepare`] (#666 G9, DeepSeek4).
+    QLoraPrepare = 35,
+    /// [`Step::PackedProjections`] (#666 G9, DeepSeek4).
+    PackedProjections = 36,
+    /// [`Step::QLoraProject`] (#666 G9, DeepSeek4).
+    QLoraProject = 37,
+    /// [`Step::KvJoint`] (#666 G9, DeepSeek4).
+    KvJoint = 38,
+    /// [`Step::ApplyTailRope`] (#666 G9, DeepSeek4).
+    ApplyTailRope = 39,
+    /// [`Step::ExpertFfn`] (#666 G9, DeepSeek4).
+    ExpertFfn = 40,
+    /// [`Step::SparseIndex`] (#666 G9, DeepSeek4).
+    SparseIndex = 41,
+    /// [`Step::KvCompress`] (#666 G9, DeepSeek4).
+    KvCompress = 42,
+    /// [`Step::PreparedProjection`] (#666 G9, DeepSeek4).
+    PreparedProjection = 43,
+    /// [`Step::SwaRingWrite`] (#666 G9, DeepSeek4).
+    SwaRingWrite = 44,
+    /// [`Step::IdentityGather`] (#666 G9, DeepSeek4).
+    IdentityGather = 45,
+    /// [`Step::SwaAttention`] (#666 G9, DeepSeek4).
+    SwaAttention = 46,
+    /// [`Step::SparseAttention`] (#666 G9, DeepSeek4).
+    SparseAttention = 47,
+    /// [`Step::OLora`] (#666 G9, DeepSeek4).
+    OLora = 48,
+    /// [`Step::CompressorProject`] (#666 G9, DeepSeek4).
+    CompressorProject = 49,
+    /// [`Step::EmbedStreams`] (#666 G9 slice 2, DeepSeek4 rows).
+    EmbedStreams = 50,
+    /// [`Step::StreamMeanCapture`] (#666 G9 slice 2, DeepSeek4 rows).
+    StreamMeanCapture = 51,
+    /// [`Step::RingKv`] (#666 G9 slice 2, DeepSeek4 rows).
+    RingKv = 52,
+    /// [`Step::BlockStage`] (#666 G9 slice 2, DeepSeek4 rows).
+    BlockStage = 53,
+    /// [`Step::SwaStage`] (#666 G9 slice 2, DeepSeek4 rows).
+    SwaStage = 54,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -120,9 +175,8 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::HyperNorm(..) => OpKind::HyperNorm,
         Step::Project(..) => OpKind::Project,
         Step::BroadcastAdd(..) => OpKind::BroadcastAdd,
-        Step::DenseFfn(..) => OpKind::DenseFfn,
+        Step::GatedMlp(..) => OpKind::GatedMlp,
         Step::SandwichAttention(..) => OpKind::SandwichAttention,
-        Step::SandwichMlp(..) => OpKind::SandwichMlp,
         Step::ParallelMoeMlp(..) => OpKind::ParallelMoeMlp,
         Step::PerLayerInput(..) => OpKind::PerLayerInput,
         Step::Scale(..) => OpKind::Scale,
@@ -130,7 +184,35 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::Moe(..) => OpKind::Moe,
         Step::MoeStage(..) => OpKind::MoeStage,
         Step::GatedShortConv(..) => OpKind::GatedShortConv,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(..) => OpKind::DeltaNetMixer,
+        #[cfg(feature = "deltanet")]
+        Step::GatedAttention(..) => OpKind::GatedAttention,
+        Step::SandwichMlp(..) => OpKind::SandwichMlp,
         Step::SiluMul { .. } => OpKind::SiluMul,
+        Step::HcPre(..) => OpKind::HcPre,
+        Step::HcPost(..) => OpKind::HcPost,
+        Step::HcHead(..) => OpKind::HcHead,
+        Step::QLoraPrepare(..) => OpKind::QLoraPrepare,
+        Step::PackedProjections(..) => OpKind::PackedProjections,
+        Step::QLoraProject(..) => OpKind::QLoraProject,
+        Step::KvJoint(..) => OpKind::KvJoint,
+        Step::ApplyTailRope(..) => OpKind::ApplyTailRope,
+        Step::ExpertFfn(..) => OpKind::ExpertFfn,
+        Step::SparseIndex(..) => OpKind::SparseIndex,
+        Step::KvCompress(..) => OpKind::KvCompress,
+        Step::PreparedProjection(..) => OpKind::PreparedProjection,
+        Step::SwaRingWrite(..) => OpKind::SwaRingWrite,
+        Step::IdentityGather(..) => OpKind::IdentityGather,
+        Step::SwaAttention(..) => OpKind::SwaAttention,
+        Step::SparseAttention(..) => OpKind::SparseAttention,
+        Step::OLora(..) => OpKind::OLora,
+        Step::EmbedStreams(..) => OpKind::EmbedStreams,
+        Step::StreamMeanCapture(..) => OpKind::StreamMeanCapture,
+        Step::RingKv(..) => OpKind::RingKv,
+        Step::BlockStage(..) => OpKind::BlockStage,
+        Step::SwaStage(..) => OpKind::SwaStage,
+        Step::CompressorProject(..) => OpKind::CompressorProject,
     }
 }
 
@@ -231,8 +313,53 @@ pub enum SplitRule {
         /// KV heads.
         kv_heads: usize,
     },
-    /// No declared split point (compound sandwich/MoE/DenseFfn): every operand
-    /// must be Whole.
+    /// Dense gated MLP `output = down(act(gate(n)) * up(n))`, `n` the
+    /// optional pre-norm of `input`. `input` must be Whole (the pre-norm needs
+    /// complete rows). gate and up `ColumnShard { axis: 0 }` with down
+    /// `RowShard { axis: 1 }` split the intermediate: every rank runs `ladder`
+    /// on its `intermediate / parts` slice and `output` is a Partial, which its
+    /// consumer reduces (an `Accumulate` fuses one `AllReduceAdd`, any other
+    /// Whole reader takes an `AllReduce`). All-`Replicate` weights, or a single
+    /// TP part, keep `output` Whole.
+    GatedMlp {
+        /// FFN input (pre-norm input when the op norms).
+        input: ResourceId,
+        /// `[intermediate, hidden]` gate weight.
+        gate: ResourceId,
+        /// `[intermediate, hidden]` up weight.
+        up: ResourceId,
+        /// `[hidden, intermediate]` down weight.
+        down: ResourceId,
+        /// Down-projection output.
+        output: ResourceId,
+        /// The kernel ladder the op runs; only a shard-safe ladder may split.
+        ladder: MlpLadder,
+    },
+    /// Head-parallel mixer (gated attention, gated DeltaNet): the op norms
+    /// `input`, projects it per head, mixes each head against its own state
+    /// (KV cache, recurrent and conv state) and projects the heads back with
+    /// `out_proj`. `input` must be Whole (the pre-norm needs complete rows).
+    /// The op's other weight reads are its per-head input projections; with
+    /// those head-split (`HeadSharded`, `FusedQkv`, `ColumnShard { axis: 0 }`)
+    /// and `out_proj` `RowShard { axis: 1 }` over the same heads, every rank
+    /// mixes `heads / parts` heads (`kv_heads / parts` KV or key heads) and
+    /// `output` is a Partial, reduced by its consumer as `GatedMlp`'s is.
+    /// State operands take the head layout. All-`Replicate` weights, or a
+    /// single TP part, keep the op whole and local.
+    HeadMixer {
+        /// Mixer input (pre-norm input).
+        input: ResourceId,
+        /// `[hidden, heads * head_dim]` output projection.
+        out_proj: ResourceId,
+        /// Output-projection result.
+        output: ResourceId,
+        /// Query heads (attention) or value heads (DeltaNet).
+        heads: usize,
+        /// KV heads (attention) or key heads (DeltaNet).
+        kv_heads: usize,
+    },
+    /// No declared split point (compound sandwich/MoE): every operand must be
+    /// Whole.
     Opaque,
 }
 
@@ -275,8 +402,12 @@ pub enum StepGraphError {
         /// The undeclared operand.
         operand: ResourceId,
     },
-    /// `Project.weight` is not a [`ResourceClass::Weight`] resource.
+    /// A `Project.weight`, `GatedMlp` weight or `HeadMixer.out_proj` is not a
+    /// [`ResourceClass::Weight`] resource.
     NotAWeight(ResourceId),
+    /// A rule that writes one declared operand (`GatedMlp.output`) lists
+    /// another write, whose layout the split rule would not track.
+    UndeclaredWrite(ResourceId),
     /// More resources or ops than fit a dense `u32` id.
     TooMany,
 }
@@ -303,6 +434,9 @@ impl std::fmt::Display for StepGraphError {
                 write!(f, "rule operand {} not in op reads/writes", operand.0)
             }
             Self::NotAWeight(r) => write!(f, "resource {} is not a weight", r.0),
+            Self::UndeclaredWrite(r) => {
+                write!(f, "resource {} is written but not a rule operand", r.0)
+            }
             Self::TooMany => write!(f, "too many resources or ops for u32 ids"),
         }
     }
@@ -355,7 +489,8 @@ impl StepGraph {
 
     /// Append an op in issue order; its id is its index. Every referenced
     /// resource must exist, rule operands must be a subset of `reads ∪ writes`,
-    /// and `Project.weight` must be a Weight resource.
+    /// and `Project.weight`, the `GatedMlp` weights and `HeadMixer.out_proj`
+    /// must be Weight resources.
     pub fn add_op(&mut self, decl: OpDecl) -> Result<OpId, StepGraphError> {
         let id = OpId(u32::try_from(self.ops.len()).map_err(|_| StepGraphError::TooMany)?);
         let n = self.resources.len();
@@ -378,6 +513,13 @@ impl StepGraph {
                 Err(StepGraphError::RuleOperandNotDeclared { operand: r })
             }
         };
+        let check_weight = |r: ResourceId| -> Result<(), StepGraphError> {
+            check_operand(r)?;
+            match self.resources[r.0 as usize].class {
+                ResourceClass::Weight { .. } => Ok(()),
+                _ => Err(StepGraphError::NotAWeight(r)),
+            }
+        };
         match decl.rule {
             SplitRule::Project {
                 weight,
@@ -387,12 +529,34 @@ impl StepGraph {
                 check_operand(weight)?;
                 check_operand(input)?;
                 check_operand(output)?;
-                if !matches!(
-                    self.resources[weight.0 as usize].class,
-                    ResourceClass::Weight { .. }
-                ) {
-                    return Err(StepGraphError::NotAWeight(weight));
+                check_weight(weight)?;
+            }
+            SplitRule::GatedMlp {
+                input,
+                gate,
+                up,
+                down,
+                output,
+                ..
+            } => {
+                check_operand(input)?;
+                check_operand(output)?;
+                for weight in [gate, up, down] {
+                    check_weight(weight)?;
                 }
+                if let Some(&extra) = decl.writes.iter().find(|&&w| w != output) {
+                    return Err(StepGraphError::UndeclaredWrite(extra));
+                }
+            }
+            SplitRule::HeadMixer {
+                input,
+                out_proj,
+                output,
+                ..
+            } => {
+                check_operand(input)?;
+                check_operand(output)?;
+                check_weight(out_proj)?;
             }
             SplitRule::Accumulate { dst, src } => {
                 check_operand(dst)?;
@@ -483,9 +647,7 @@ mod tests {
             (OpKind::HyperNorm, 15),
             (OpKind::Project, 16),
             (OpKind::BroadcastAdd, 17),
-            (OpKind::DenseFfn, 18),
             (OpKind::SandwichAttention, 19),
-            (OpKind::SandwichMlp, 20),
             (OpKind::ParallelMoeMlp, 21),
             (OpKind::PerLayerInput, 22),
             (OpKind::Scale, 23),
@@ -493,6 +655,33 @@ mod tests {
             (OpKind::Moe, 25),
             (OpKind::MoeStage, 26),
             (OpKind::GatedShortConv, 27),
+            (OpKind::GatedMlp, 28),
+            (OpKind::DeltaNetMixer, 29),
+            (OpKind::GatedAttention, 30),
+            (OpKind::SandwichMlp, 31),
+            (OpKind::HcPre, 32),
+            (OpKind::HcPost, 33),
+            (OpKind::HcHead, 34),
+            (OpKind::QLoraPrepare, 35),
+            (OpKind::PackedProjections, 36),
+            (OpKind::QLoraProject, 37),
+            (OpKind::KvJoint, 38),
+            (OpKind::ApplyTailRope, 39),
+            (OpKind::ExpertFfn, 40),
+            (OpKind::SparseIndex, 41),
+            (OpKind::KvCompress, 42),
+            (OpKind::PreparedProjection, 43),
+            (OpKind::SwaRingWrite, 44),
+            (OpKind::IdentityGather, 45),
+            (OpKind::SwaAttention, 46),
+            (OpKind::SparseAttention, 47),
+            (OpKind::OLora, 48),
+            (OpKind::CompressorProject, 49),
+            (OpKind::EmbedStreams, 50),
+            (OpKind::StreamMeanCapture, 51),
+            (OpKind::RingKv, 52),
+            (OpKind::BlockStage, 53),
+            (OpKind::SwaStage, 54),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),
@@ -684,5 +873,36 @@ mod tests {
             g.add_op(op(rule, &[x.0], &[x.0])).unwrap();
         }
         assert_eq!(g.ops().len(), 4);
+    }
+
+    #[test]
+    fn gated_mlp_weights_must_be_declared_weights() {
+        let mut g = StepGraph::new();
+        let x = g.add_resource(act(&[8])).unwrap();
+        let w = g.add_resource(weight(&[4, 8])).unwrap();
+        let y = g.add_resource(act(&[8])).unwrap();
+        let rule = |down| SplitRule::GatedMlp {
+            input: x,
+            gate: w,
+            up: w,
+            down,
+            output: y,
+            ladder: MlpLadder::Trunk,
+        };
+        assert_eq!(
+            g.add_op(op(rule(y), &[0, 1, 2], &[2])),
+            Err(StepGraphError::NotAWeight(y))
+        );
+        assert_eq!(
+            g.add_op(op(rule(w), &[0], &[2])),
+            Err(StepGraphError::RuleOperandNotDeclared { operand: w })
+        );
+        // A second write (here the input) has no tracked layout.
+        assert_eq!(
+            g.add_op(op(rule(w), &[0, 1], &[2, 0])),
+            Err(StepGraphError::UndeclaredWrite(x))
+        );
+        assert!(g.ops().is_empty());
+        g.add_op(op(rule(w), &[0, 1], &[2])).unwrap();
     }
 }

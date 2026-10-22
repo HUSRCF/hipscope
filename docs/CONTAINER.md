@@ -67,8 +67,11 @@ Prebuilt kernels for gfx1100, gfx1151 and gfx1201 are baked into the image, so
 the first run loads packaged kernels instead of compiling them. A route whose
 kernel is not in the packs yet compiles once into the `hipfire-kernels` cache
 (the default `full` image carries hipcc). Measured on Strix Halo with the slim
-`runtime` image, the default tag failed its first chat request because
-`tape_copy_batched` is not in the packs, which is why `full` is the default.
+`runtime` image before this fix, the default tag failed its first chat request
+because `tape_copy_batched` was not in the packs. That module and the
+lane-batched verify conv `conv1d_silu_split_f32_lanes` are now registered in
+`kernel_registry`, so packs rebuilt from this source carry them; the slim image
+has not been re-measured, and `full` stays the default.
 Other arches need a build with the `HIPFIRE_GPU_ARCHES` build arg.
 
 Multi-GPU host: export `HIPFIRE_DEVICES` or `ROCR_VISIBLE_DEVICES` in the shell
@@ -112,8 +115,9 @@ docker build -f Containerfile --build-arg HIPFIRE_GPU_ARCHES="gfx1030" --target 
 
 Without hipcc, a kernel module missing from the baked pack is a hard error, not
 a fallback, so `runtime` only suits models whose routes the packs fully cover
-(measured: `qwen3.5:0.8b` yes; `qwen3.8:27b-mq4-xts` no, on gfx1151 its draft
-route needs `tape_copy_batched`).
+(measured before the registry fix: `qwen3.5:0.8b` yes; `qwen3.8:27b-mq4-xts` no,
+on gfx1151 its draft route needed `tape_copy_batched`, now registered and
+awaiting a pack rebuild and re-measurement).
 
 Non-root: the entrypoint starts as root only to add the groups that own
 `/dev/kfd`, `/dev/dri` and `/dev/accel`, then drops to user `hipfire`

@@ -29,6 +29,7 @@ pub use local_files::{
 };
 pub mod xdna;
 pub use xdna::{XdnaManifest, XdnaProfile, XdnaSidecarDescriptor};
+pub mod receipts;
 
 pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_REGISTRY_URL: &str =

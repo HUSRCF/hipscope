@@ -104,6 +104,11 @@ required-features = ["lab"]
 name = "qwen4_placement_receipt"
 required-features = ["lab"]
 
+# GDN in-projection group byte probe: grouped MQ6 x4 / MQ4 rows_x4 routes vs the singletons (GPU; optional real layer).
+[[example]]
+name = "qwen4_gdn_in_probe"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]

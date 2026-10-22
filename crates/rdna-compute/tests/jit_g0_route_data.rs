@@ -301,6 +301,9 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
             assert!(m["g0_fixture_exclusion"].is_null());
         }
     }
+    // The G0 fixtures once recorded four live `tensor_ops` exports the registry
+    // did not declare (a pack index without them rejected the packaged object);
+    // the registry now declares them, so no fixture entry may record a gap.
     let m = fixture("flash-next-gfx1201.routes.json");
     let tensor_ops = m["default_entries"]
         .as_array()
@@ -308,16 +311,7 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
         .iter()
         .find(|e| e["module"] == "tensor_ops")
         .unwrap();
-    let missing = strings(&tensor_ops["registry_missing_symbols"]);
-    assert!(missing.contains(&"indexed_attention_cache_append_q8_batched"));
-    assert!(missing.contains(&"indexed_attention_decode_prologue_q8"));
-    let live = kernel_registry::lookup("gfx1201", "tensor_ops", "-DIU4_A4_CANDIDATES=2").unwrap();
-    for symbol in missing {
-        assert!(
-            live.symbols.contains(&symbol),
-            "live registry still omits {symbol}"
-        );
-    }
+    assert!(strings(&tensor_ops["registry_missing_symbols"]).is_empty());
 }
 
 /// Every Q8 symbol a measured flash-next route (state, prefill, decode and

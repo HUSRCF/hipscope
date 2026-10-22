@@ -3038,6 +3038,7 @@ fn main() {
                     repeat_window,
                     None, // max_accept: uncapped demo
                     Some(&mut verify_pm4),
+                    None, // lookup: demo never splices verbatim-copy candidates
                 )
                 .expect("spec step")
             };

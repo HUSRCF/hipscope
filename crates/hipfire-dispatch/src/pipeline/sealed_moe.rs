@@ -87,7 +87,7 @@ fn moe_router_fused_prefill_on(arch: &str) -> bool {
 /// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` (`developer.moe_router_topk_multirow`, a
 /// typed boolean): the explicit value, read once. Unset follows the
 /// exact-gfx1201 qualification (on there, off elsewhere); `false`/`0` kills it and
-/// `true`/`1` selects the two-row fused router wherever the raw capability
+/// `true`/`1` selects the wave-per-row fused router wherever the raw capability
 /// inventory of `arch` is present.
 /// The caller still requires the fused-prefill route itself to be enabled and
 /// admitted (an explicit `HIPFIRE_MOE_ROUTER_FUSED_PREFILL=0` therefore keeps the
@@ -2537,9 +2537,9 @@ pub(super) fn produce_prefill_route<'a>(
                         super::router_observer::RouterScoresAfterRoute::Logits,
                         false,
                     );
-                    // Two-row launch (unset on at exact gfx1201 by qualification), nested under
-                    // the fused route's own flag and admission: top-8, 256 experts, wave32, even
-                    // batch.
+                    // Wave-per-row launch (unset on at exact gfx1201 by qualification), nested
+                    // under the fused route's own flag and admission: top-8, 256 experts,
+                    // wave32, non-empty batch.
                     if Gpu::moe_router_topk_multirow_admitted(
                         moe_router_topk_multirow_on(&gpu.arch),
                         params.k_top,

@@ -455,3 +455,27 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
         }
     }
 }
+
+#[test]
+fn swmmac_index_key_prints_before_neg_lo_and_roundtrips() {
+    for (words, expected) in [
+        (
+            [0xcc50_4b00, 0x7c52_1908],
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]",
+        ),
+        (
+            [0xcc57_4800, 0x1c3a_1508],
+            "v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14 index_key:1",
+        ),
+        (
+            [0xcc54_4000, 0x1c3a_1508],
+            "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14",
+        ),
+    ] {
+        let (inst, used) = gfx12::decode(&words).unwrap();
+        assert_eq!(used, 2);
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), expected);
+        let parsed = crate::text::parse_line(expected, Arch::Gfx1201).unwrap();
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
+    }
+}

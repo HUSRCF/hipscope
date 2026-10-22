@@ -43,6 +43,8 @@ pub struct Int4MmqReservation {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane: records per K128 group (`m_total`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqReservation {
@@ -77,6 +79,8 @@ pub struct Int4MmqPrepared {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane (record `g * plane_rows + position`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqPrepared {
@@ -88,6 +92,7 @@ impl Int4MmqPrepared {
             k: res.k,
             n: res.n,
             generation: res.generation,
+            plane_rows: res.plane_rows,
         }
     }
 
@@ -127,7 +132,15 @@ impl Int4MmqPrepared {
             k,
             n,
             generation,
+            plane_rows: 0,
         }
+    }
+
+    /// Records per K128 group when this is a grouped-position down plane, `None` for the flat-slot sidecar
+    /// (consumed only by the position-indexed `..._gp` down entries).
+    #[inline]
+    pub fn grouped_plane_rows(&self) -> Option<usize> {
+        (self.plane_rows != 0).then_some(self.plane_rows)
     }
 
     #[inline]
@@ -143,6 +156,12 @@ impl Int4MmqPrepared {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Records per K128 group of a grouped-position down plane (`m_total`), 0 for the flat-slot layout.
+    #[inline]
+    pub fn plane_rows(&self) -> usize {
+        self.plane_rows
     }
 }
 
@@ -339,6 +358,10 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// Dedicated F32 `x_out` operand for `Gpu::mq6_fp8_prepare_x` (the MQ4v2 FP8
+    /// producer's rotated-row output, `[batch * k]`; the in-register producer
+    /// never writes it). Lazily allocated, grown on demand, never shrunk.
+    pub mq6_fp8_x_rot: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -491,6 +514,24 @@ pub struct ScratchState {
 
 // ── Planned-route kernel barrier ─────────────────────────────────────────
 
+/// Counters of one begun route's kernel preload, for the loader's log. A
+/// module counts as compiled when its object is in the kernel cache before
+/// ready; `lazy_during_load` counts kernels the route did not cover that a
+/// dispatch requested between begin and ready.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteKernelStats {
+    /// Predicted-family modules requested for compilation.
+    pub predicted_modules: usize,
+    /// Of those, modules with a compiled object before ready.
+    pub predicted_compiled: usize,
+    /// Modules with at least one symbol bound.
+    pub predicted_bound_modules: usize,
+    /// Symbols bound from predicted modules (conflict-free subset only).
+    pub predicted_bound_symbols: usize,
+    /// Unplanned kernels requested while the model was loading.
+    pub lazy_during_load: usize,
+}
+
 /// Load-time kernel state of a planner-closed route.
 ///
 /// `Pending` holds the frozen plan while its missing HIP modules compile on
@@ -499,9 +540,9 @@ pub struct ScratchState {
 /// planned HIP and embedded image loaded and every planned symbol bound.
 /// After a successful model load a route without an `open` label is
 /// `Sealed`: an unplanned module request then fails instead of compiling or
-/// loading between dispatches. A route with one (walked plans) is `Open`: an
-/// unplanned kernel still loads lazily, with one warning line naming it and
-/// the route, and is counted.
+/// loading between dispatches. A route with one (walked plans, and every
+/// predicted-family fallback) is `Open`: an unplanned kernel still loads
+/// lazily, with one warning line naming it and the route, and is counted.
 #[derive(Default)]
 pub(crate) enum RouteLoad {
     #[default]
@@ -509,16 +550,50 @@ pub(crate) enum RouteLoad {
     Pending {
         plan: crate::kernel_registry::RouteKernelPlan,
         batch: Option<crate::compiler::KernelBatch>,
+        /// Predicted-family modules compiled in the same batch as `plan`
+        /// and bound after it. Their compile or bind failure fails the load
+        /// exactly like a planned module's. Empty for a plan-only route; only
+        /// an `open` route has any.
+        predicted: Vec<crate::kernel_registry::PredictedModule>,
         open: Option<String>,
     },
     Prepared {
         open: Option<String>,
+        stats: RouteKernelStats,
     },
     Sealed,
     Open {
         route: String,
         unplanned: usize,
+        stats: RouteKernelStats,
     },
+}
+
+/// What an unplanned kernel request does, so the warning never claims a
+/// compile that did not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyKind {
+    /// A native embedded image: loaded and bound, never compiled.
+    EmbeddedImage,
+    /// A HIP module whose object the compiler already holds from before the
+    /// request (planned/predicted compile, or an earlier load): bound only.
+    HipPrecompiled,
+    /// A HIP module with no pre-request module record under this name. It
+    /// compiles only if its cache entry is missing; a module compiled
+    /// earlier under a compiler-family alias name only loads and binds.
+    HipNoRecord,
+}
+
+impl LazyKind {
+    fn what(self) -> &'static str {
+        match self {
+            Self::EmbeddedImage => "native image loaded lazily (embedded; no compile)",
+            Self::HipPrecompiled => "bound lazily (module already compiled)",
+            Self::HipNoRecord => {
+                "loaded lazily (no pre-ready module record; compiled now only if not in the kernel cache)"
+            }
+        }
+    }
 }
 
 impl RouteLoad {
@@ -529,19 +604,107 @@ impl RouteLoad {
 
     /// Gate a kernel request the preloaded plan did not bind: a sealed route
     /// refuses it, an open route counts it and warns once per request with
-    /// the module and route, and any other state loads it silently.
-    pub(crate) fn admit_unplanned(&mut self, module_name: &str, func_name: &str) -> HipResult<()> {
+    /// the module, route, phase (during load / after ready) and what the
+    /// request does ([`LazyKind`]), and any other state loads it silently.
+    /// The counters count unplanned requests, not compiles: a bind of an
+    /// already compiled or embedded module counts like any other miss.
+    pub(crate) fn admit_unplanned(
+        &mut self,
+        module_name: &str,
+        func_name: &str,
+        kind: LazyKind,
+    ) -> HipResult<()> {
+        let what = kind.what();
         match self {
             Self::Sealed => Err(unplanned_route_kernel(module_name, func_name)),
-            Self::Open { route, unplanned } => {
+            Self::Open {
+                route, unplanned, ..
+            } => {
                 *unplanned += 1;
                 eprintln!(
-                    "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) loaded lazily on \
-                     the {route} route plan [{unplanned} unplanned this load]"
+                    "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) {what} after \
+                     ready on the {route} route plan [{unplanned} unplanned after ready]"
                 );
                 Ok(())
             }
+            Self::Prepared { open, stats } => {
+                stats.lazy_during_load += 1;
+                if let Some(route) = open {
+                    eprintln!(
+                        "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) {what} during \
+                         load on the {route} route plan [{} unplanned during load]",
+                        stats.lazy_during_load
+                    );
+                }
+                Ok(())
+            }
             _ => Ok(()),
+        }
+    }
+
+    /// A begun route. Predicted-family modules are only ever speculative
+    /// coverage, never a closure, so they require an `open` label: a
+    /// fallback route can not seal.
+    pub(crate) fn pending_route(
+        plan: crate::kernel_registry::RouteKernelPlan,
+        batch: Option<crate::compiler::KernelBatch>,
+        predicted: Vec<crate::kernel_registry::PredictedModule>,
+        open: Option<String>,
+    ) -> HipResult<Self> {
+        if !predicted.is_empty() && open.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "predicted kernels need an open route (a predicted fallback can never be sealed)",
+            ));
+        }
+        Ok(Self::Pending {
+            plan,
+            batch,
+            predicted,
+            open,
+        })
+    }
+
+    /// The state a drained route takes once its model loaded: `Open` (counting
+    /// from zero) when it has an `open` label, else `Sealed`.
+    pub(crate) fn finished(self) -> Self {
+        match self {
+            Self::Prepared {
+                open: Some(route),
+                stats,
+            } => Self::Open {
+                route,
+                unplanned: 0,
+                stats,
+            },
+            _ => Self::Sealed,
+        }
+    }
+
+    /// Complete a drained route as `Open` under `route` whatever its plan's
+    /// label was: a route whose model left the closed plan keeps every
+    /// predictable module compiled and bound and its counters, and can no
+    /// longer seal. Any other state is unchanged.
+    pub(crate) fn finished_open(self, route: String) -> Self {
+        match self {
+            Self::Prepared { stats, .. } => Self::Open {
+                route,
+                unplanned: 0,
+                stats,
+            },
+            other => other,
+        }
+    }
+
+    /// Counters of the begun route (zero when none was begun).
+    pub(crate) fn stats(&self) -> RouteKernelStats {
+        match self {
+            Self::Prepared { stats, .. } | Self::Open { stats, .. } => *stats,
+            Self::Pending { predicted, .. } => RouteKernelStats {
+                predicted_modules: predicted.len(),
+                ..RouteKernelStats::default()
+            },
+            _ => RouteKernelStats::default(),
         }
     }
 }
@@ -550,9 +713,12 @@ impl RouteLoad {
 /// planned HIP and embedded module and bind every planned symbol to it. All
 /// on the GPU owner thread, before the first dispatch. Planned bindings
 /// replace any same-named function cached by an earlier load, so one entry
-/// name resolves to the one image this plan selected. Idempotent; a no-op
-/// unless `Pending`. On error the route returns to `Idle` (the caller's load
-/// fails and unwinds).
+/// name resolves to the one image this plan selected. Predicted-family
+/// modules then bind only their proven conflict-free symbols and never
+/// replace an existing binding. A compile or bind failure of a planned or a
+/// predicted module is a load error: a known module is predictable work, not
+/// a lazy miss. Idempotent; a no-op unless `Pending`. On error the route
+/// returns to `Idle` (the caller's load fails and unwinds).
 pub(crate) fn prepare_route_modules(
     route: &mut RouteLoad,
     compiler: &mut crate::compiler::KernelCompiler,
@@ -564,7 +730,13 @@ pub(crate) fn prepare_route_modules(
     if !route.pending() {
         return Ok(());
     }
-    let RouteLoad::Pending { plan, batch, open } = std::mem::take(route) else {
+    let RouteLoad::Pending {
+        plan,
+        batch,
+        predicted,
+        open,
+    } = std::mem::take(route)
+    else {
         unreachable!("checked pending");
     };
     if let Some(batch) = batch {
@@ -607,8 +779,60 @@ pub(crate) fn prepare_route_modules(
             }
         }
     }
-    *route = RouteLoad::Prepared { open };
+    let stats = bind_predicted_modules(compiler, hip, modules, functions, pm_decode, &predicted)?;
+    *route = RouteLoad::Prepared { open, stats };
     Ok(())
+}
+
+/// Bind the proven conflict-free symbols of each predicted module. Every
+/// predicted module must have a compiled object after the batch joined; a
+/// symbol already in the function cache keeps its binding.
+fn bind_predicted_modules(
+    compiler: &mut crate::compiler::KernelCompiler,
+    hip: &HipRuntime,
+    modules: &mut HashMap<String, Module>,
+    functions: &mut HashMap<String, Function>,
+    pm_decode: bool,
+    predicted: &[crate::kernel_registry::PredictedModule],
+) -> HipResult<RouteKernelStats> {
+    let mut stats = RouteKernelStats {
+        predicted_modules: predicted.len(),
+        ..RouteKernelStats::default()
+    };
+    for module in predicted {
+        let name = module.entry.module;
+        if !compiler.compiled_kernels().contains_key(name) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "predicted kernel module {name} has no compiled object after the route compile"
+                ),
+            ));
+        }
+        stats.predicted_compiled += 1;
+        let mut bound = 0;
+        for &symbol in &module.bind {
+            if functions.contains_key(symbol) {
+                continue;
+            }
+            load_kernel_module(
+                compiler,
+                hip,
+                modules,
+                functions,
+                pm_decode,
+                name,
+                module.entry.source(),
+                symbol,
+            )?;
+            bound += 1;
+        }
+        if bound > 0 {
+            stats.predicted_bound_modules += 1;
+            stats.predicted_bound_symbols += bound;
+        }
+    }
+    Ok(stats)
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -636,7 +860,15 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    route.admit_unplanned(module_name, func_name)?;
+    route.admit_unplanned(
+        module_name,
+        func_name,
+        if compiler.compiled_kernels().contains_key(module_name) {
+            LazyKind::HipPrecompiled
+        } else {
+            LazyKind::HipNoRecord
+        },
+    )?;
     load_kernel_module(
         compiler,
         hip,
@@ -966,7 +1198,7 @@ pub(crate) fn module_load_or_recompile(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            path = compiler.recompile(module_name, source, symbol)?;
+            path = compiler.recompile(module_name, source)?;
             image = read(&path)?;
             hip.module_load_data(&image)?
         }
@@ -1715,6 +1947,35 @@ impl ScratchState {
             });
         }
         Ok(self.gemv_residual_tmp.as_ref().unwrap())
+    }
+
+    /// Ensure the MQ6 FP8 producer `x_out` scratch holds at least `min_elems` F32
+    /// values (same grow-on-demand contract as [`Self::ensure_gemv_residual_tmp`]:
+    /// the `Gpu` caller invalidated captured graphs first when it will grow).
+    pub fn ensure_mq6_fp8_x_rot(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .mq6_fp8_x_rot
+            .as_ref()
+            .map_or(true, |t| t.buf.size() < needed_bytes);
+        if needs_grow {
+            if let Some(old) = self.mq6_fp8_x_rot.take() {
+                hip.device_synchronize()?;
+                let _ = hip.free(old.buf);
+            }
+            self.mq6_fp8_x_rot = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
@@ -2804,6 +3065,7 @@ impl ScratchState {
             k,
             n,
             generation: self.int4_mmq_generation,
+            plane_rows: 0,
         })
     }
 
@@ -2899,15 +3161,29 @@ impl ScratchState {
         k: usize,
         n: usize,
     ) -> HipResult<Int4MmqReservation> {
+        self.reserve_qwen4_moe_down_i4_plane(hip, k, n, 0)
+    }
+
+    /// [`Self::reserve_qwen4_moe_down_i4`] for either layout: `plane_rows == 0` is the flat-slot
+    /// sidecar `[k/128, n]`; otherwise the grouped-position plane `[k/128, plane_rows]` (`plane_rows`
+    /// = the grouped row count), whose handle still reports `n` real slots.
+    pub fn reserve_qwen4_moe_down_i4_plane(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+        plane_rows: usize,
+    ) -> HipResult<Int4MmqReservation> {
         if k == 0 || n == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "reserve_qwen4_moe_down_i4: need k%128==0 and n>0",
             ));
         }
-        let needed = qwen4_moe_down_i4_bytes(k, n).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
-        })?;
+        let needed = qwen4_moe_down_i4_bytes(k, if plane_rows == 0 { n } else { plane_rows })
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
+            })?;
         grow_scratch_buffer(
             hip,
             &mut self.qwen4_moe_down_i4_scratch,
@@ -2920,6 +3196,7 @@ impl ScratchState {
             k,
             n,
             generation: self.qwen4_moe_down_i4_generation,
+            plane_rows,
         })
     }
 
@@ -3729,26 +4006,138 @@ mod route_load_tests {
         let mut open = RouteLoad::Open {
             route: "Flash-Next gfx1201 NativeMtp".into(),
             unplanned: 0,
+            stats: RouteKernelStats::default(),
         };
         assert!(open
-            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
             .is_ok());
         assert!(open
-            .admit_unplanned("topk8_rescore_mq6g256v2", "topk8_rescore_mq6g256v2_k2560")
+            .admit_unplanned(
+                "topk8_rescore_mq6g256v2",
+                "topk8_rescore_mq6g256v2_k2560",
+                LazyKind::EmbeddedImage
+            )
             .is_ok());
         assert!(matches!(open, RouteLoad::Open { unplanned: 2, .. }));
         let mut sealed = RouteLoad::Sealed;
         let error = sealed
-            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
             .unwrap_err();
         assert!(error
             .to_string()
             .contains("outside this load's planned kernel route"));
-        for mut lazy in [RouteLoad::Idle, RouteLoad::Prepared { open: None }] {
+        for mut lazy in [
+            RouteLoad::Idle,
+            RouteLoad::Prepared {
+                open: None,
+                stats: RouteKernelStats::default(),
+            },
+        ] {
             assert!(lazy
-                .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+                .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
                 .is_ok());
         }
+    }
+
+    fn predicted_module(module: &'static str) -> crate::kernel_registry::PredictedModule {
+        let entry = crate::kernel_registry::entries("gfx1151", "")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.module == module)
+            .unwrap();
+        crate::kernel_registry::PredictedModule {
+            bind: entry.symbols.to_vec(),
+            entry,
+        }
+    }
+
+    /// A predicted-family fallback can never be sealed: predicted modules
+    /// need an open label, and only an open `Prepared` route finishes `Open`.
+    #[test]
+    fn predicted_route_is_always_open() {
+        let empty = || crate::kernel_registry::RouteKernelPlan {
+            entries: Vec::new(),
+        };
+        let refused = RouteLoad::pending_route(empty(), None, vec![predicted_module("add")], None);
+        assert!(refused.err().unwrap().to_string().contains("open route"));
+        let route = RouteLoad::pending_route(
+            empty(),
+            None,
+            vec![predicted_module("add")],
+            Some("qwen3.5 gfx1151 predicted".into()),
+        )
+        .unwrap();
+        assert!(route.pending());
+        assert_eq!(route.stats().predicted_modules, 1);
+        // Sealing is only reachable for a plan without predicted modules.
+        let sealed = RouteLoad::pending_route(empty(), None, Vec::new(), None).unwrap();
+        assert!(matches!(sealed, RouteLoad::Pending { open: None, .. }));
+        let stats = RouteKernelStats {
+            predicted_modules: 3,
+            predicted_compiled: 2,
+            ..Default::default()
+        };
+        let prepared = RouteLoad::Prepared {
+            open: Some("fallback".into()),
+            stats,
+        };
+        assert!(matches!(
+            prepared.finished(),
+            RouteLoad::Open { unplanned: 0, stats: s, .. } if s == stats
+        ));
+        assert!(matches!(
+            RouteLoad::Prepared { open: None, stats }.finished(),
+            RouteLoad::Sealed
+        ));
+    }
+
+    /// Kernels requested between begin and ready and after ready are
+    /// counted in separate phases; the open counter is unchanged by load.
+    #[test]
+    fn lazy_misses_count_per_phase() {
+        let mut route = RouteLoad::Prepared {
+            open: Some("qwen3.8-flash-next gfx1100 predicted".into()),
+            stats: RouteKernelStats::default(),
+        };
+        route
+            .admit_unplanned("a", "a_f32", LazyKind::HipNoRecord)
+            .unwrap();
+        route
+            .admit_unplanned("b", "b_f32", LazyKind::HipPrecompiled)
+            .unwrap();
+        route
+            .admit_unplanned("n", "n_f32", LazyKind::EmbeddedImage)
+            .unwrap();
+        assert_eq!(route.stats().lazy_during_load, 3);
+        let mut open = route.finished();
+        assert!(matches!(open, RouteLoad::Open { unplanned: 0, .. }));
+        open.admit_unplanned("c", "c_f32", LazyKind::HipNoRecord)
+            .unwrap();
+        assert!(matches!(open, RouteLoad::Open { unplanned: 1, .. }));
+        assert_eq!(open.stats().lazy_during_load, 3);
+    }
+
+    /// A model that left its closed plan finishes open with the preload's
+    /// counters kept (never sealed, never reset), even from a sealed plan.
+    #[test]
+    fn model_leaving_the_plan_finishes_open_and_keeps_stats() {
+        let stats = RouteKernelStats {
+            predicted_modules: 4,
+            predicted_compiled: 4,
+            ..Default::default()
+        };
+        for open in [None, Some("walked".to_owned())] {
+            let route =
+                RouteLoad::Prepared { open, stats }.finished_open("left the planned route".into());
+            assert!(matches!(
+                &route,
+                RouteLoad::Open { route, unplanned: 0, stats: s } if route == "left the planned route" && *s == stats
+            ));
+        }
+        assert!(matches!(
+            RouteLoad::Sealed.finished_open("x".into()),
+            RouteLoad::Sealed
+        ));
     }
 }
 

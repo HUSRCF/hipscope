@@ -744,6 +744,14 @@ metric looks attractive.
 | 7. Stationary matched performance | Certified baseline and retained route use identical binary, model, prompt/token stream, settings, process policy, and clocks; tok/s and ms/token reported | Cross-harness, cross-binary, cross-prompt, nonstationary, silent-fallback, or microkernel-only comparison |
 | 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim |
 
+Automatic captures enforce the launch half of gate 2 at prepare: when the
+window issued more kernel launches on the capturing thread than the tape holds
+(a launcher that calls `hip.launch_kernel` directly instead of the
+`Gpu::launch_maybe_blob*` funnel), prepare refuses with `unrecorded launch` and
+the route falls back to HIP (sticky), because every replay would skip that
+kernel. A per-token input staged before the window opens (the embedding row) is
+outside the window, not an unrecorded launch.
+
 Harness success without route proof is insufficient. A ratio from two nominal
 arms that both executed ordinary HIP is invalid evidence. A stable manual-capture
 fingerprint is discovery evidence; it does not install a plan or prove that a

@@ -147,7 +147,7 @@ fn require_span(tensor: &GpuTensor, bytes: usize, name: &str) -> HipResult<()> {
 
 impl Gpu {
     /// Pure admission of the PM prep: the resolved `HIPFIRE_GDN_CHUNK_PREP_PM` flag (explicit
-    /// `1` wins, explicit `0` kills, unset is off: the route has no `QUALIFIED` row), the raw
+    /// `1` wins, explicit `0` kills, unset follows the exact-gfx1201 qualification), the raw
     /// exact-gfx1201 inventory, 16 key / 32 value heads and `1..=8192` rows. Callers add the
     /// chunk-scan admission (which refuses capture and recording).
     pub fn gdn_chunk_prep_pm_admission(
@@ -425,14 +425,18 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_has_no_qualification_so_unset_is_off_and_one_opts_in() {
+    fn unset_follows_the_exact_gfx1201_qualification_and_zero_kills() {
         use crate::prefill_route_capabilities::{enabled, PrefillRoute};
         let route = PrefillRoute::GdnChunkPrepPm;
         for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "unknown"] {
             let admit = |explicit: Option<bool>| {
                 Gpu::gdn_chunk_prep_pm_admission(enabled(explicit, arch, route), arch, 4096, 16, 32)
             };
-            assert!(admit(None).is_err(), "{arch}: unset is the incumbent");
+            assert_eq!(
+                admit(None).is_ok(),
+                arch == "gfx1201",
+                "{arch}: unset follows the qualification"
+            );
             assert!(admit(Some(false)).is_err(), "{arch}: 0 kills");
             assert_eq!(
                 admit(Some(true)).is_ok(),

@@ -1248,6 +1248,7 @@ fn quant_block_bytes(dtype: DType) -> usize {
         DType::F32 => 4,
         DType::F16 | DType::BF16 => 2,
         DType::ParoQ4G128 => 72,
+        DType::ParoQ4G64 => 40,
         DType::Raw => 1,
         // Keep this arm in sync if a new storage dtype is added. `size()` is
         // a conservative byte alignment for formats without a block codec.

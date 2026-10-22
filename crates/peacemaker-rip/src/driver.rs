@@ -8,14 +8,19 @@
 
 use crate::interp::{Cx, R};
 use peacemaker_author::runtime::{
-    Arrived, Breaks, Cond, Driver, Exit, Forward, Phase, Place, RegionId, RingId, Transition,
+    Arrived, Breaks, Cond, Driver, Exit, Forward, Lend, Phase, Place, RegionId, RingId, Transition,
     WgCond,
 };
-use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Target};
+use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Target, Workgroup};
 use peacemaker_isa::insn::Instruction;
 use peacemaker_isa::{Arch, Builder};
 
 type Res<T> = Result<T, String>;
+
+/// A body for `Driver::typed` on gfx1201: the typed workgroup scope and the
+/// ring lend of the driver it runs in.
+pub type TypedBody<'a> =
+    dyn FnMut(&mut Workgroup<'_, Gfx1201, Builder>, &mut Lend<'_>) -> Res<()> + 'a;
 
 pub trait DynDriver {
     fn isa(&mut self) -> &mut Builder;
@@ -119,12 +124,18 @@ pub trait DynDriver {
         write: &mut dyn FnMut(&mut dyn DynDriver, RegionId) -> Res<()>,
         read: &mut dyn FnMut(&mut dyn DynDriver, RegionId, &Exit) -> Res<()>,
     ) -> Res<()>;
+    /// `Driver::typed`, for the gfx1201-typed production blocks: run `body`
+    /// with the typed `Workgroup` and ring `Lend` over this driver. Other
+    /// targets refuse with an error.
+    fn typed(&mut self, body: &mut TypedBody<'_>) -> Res<()>;
 }
 
 /// Targets with and without the split barrier (`signal` / `wait_arrived`).
 pub trait SplitOps: Target {
     fn sig(d: &mut Driver<'_, Self, Builder>, ts: &[Transition]) -> Res<Arrived>;
     fn wait_arr(d: &mut Driver<'_, Self, Builder>, a: Arrived) -> Res<()>;
+    /// The typed bridge: only the target the production blocks are typed for.
+    fn typed_body(d: &mut Driver<'_, Self, Builder>, body: &mut TypedBody<'_>) -> Res<()>;
 }
 macro_rules! no_split {
     ($($t:ty),*) => {$(
@@ -134,6 +145,12 @@ macro_rules! no_split {
             }
             fn wait_arr(_: &mut Driver<'_, Self, Builder>, _: Arrived) -> Res<()> {
                 Err(format!("{} has one s_barrier: no split barrier to wait", <$t as Target>::NAME))
+            }
+            fn typed_body(
+                _: &mut Driver<'_, Self, Builder>,
+                _: &mut TypedBody<'_>,
+            ) -> Res<()> {
+                Err(format!("`typed` blocks are gfx1201-typed: not available on {}", <$t as Target>::NAME))
             }
         }
     )*};
@@ -145,6 +162,9 @@ impl SplitOps for Gfx1201 {
     }
     fn wait_arr(d: &mut Driver<'_, Self, Builder>, a: Arrived) -> Res<()> {
         d.wait_arrived(a)
+    }
+    fn typed_body(d: &mut Driver<'_, Self, Builder>, body: &mut TypedBody<'_>) -> Res<()> {
+        d.typed(|wg, lend| body(wg, lend))
     }
 }
 
@@ -347,6 +367,9 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
             |d, r| write(d, r),
             |d, r, e| read(d, r, e),
         )
+    }
+    fn typed(&mut self, body: &mut TypedBody<'_>) -> Res<()> {
+        T::typed_body(self, body)
     }
 }
 

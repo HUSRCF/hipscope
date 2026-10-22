@@ -344,6 +344,7 @@ fn norm_into<'a>(
             k: state.h.numel(),
             eps,
             rotation: RotationPlan::None,
+            rows: 1,
         },
         GemvInput::Raw(&state.tmp),
     )

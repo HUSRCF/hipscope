@@ -34,24 +34,33 @@ pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
+pub mod batched;
+#[cfg(feature = "deltanet")]
+pub mod batched_attention;
+#[cfg(feature = "deltanet")]
+pub mod batched_deltanet;
+#[cfg(feature = "deltanet")]
+pub mod batched_moe;
+pub mod gated_mlp;
+#[cfg(feature = "deltanet")]
+pub mod hybrid;
 pub(crate) mod layer_ops;
+pub mod mla;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
 pub use layer_ops::{
-    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
-    execute_final_hyper, execute_gated_delta_net, execute_gated_delta_net_arena,
-    execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
-    execute_grouped_depthwise, execute_grouped_depthwise_rows, execute_hyper_norm,
-    execute_hyper_read, execute_hyper_write, execute_indexed_attention,
+    execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
+    execute_gated_delta_net, execute_gated_delta_net_arena, execute_gated_delta_net_core_rows,
+    execute_gated_delta_net_uncovered, execute_grouped_depthwise, execute_grouped_depthwise_rows,
+    execute_hyper_norm, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
     execute_indexed_attention_arena, execute_indexed_attention_core_rows,
     execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
     project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
-    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseFfnOp,
-    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas,
-    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
-    QsaTrunkArenas,
+    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
+    GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
+    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
@@ -62,6 +71,28 @@ pub use steps::{
     execute_validated_steps_with_moe_hooks, validate_steps, FusedPattern, GemvInput,
     HcFusionCursor, MoeStepHooks, Step,
 };
+
+/// The rows an operation that serves both decode and batched rows runs.
+/// The route alone picks decode or batched kernels; `rows` is only the
+/// extent, so a one-row prefill chunk keeps its batched arithmetic.
+/// Operations whose batched chain needs route-only operands carry a per-op
+/// `XRoute::{Decode { .. }, Batched { .. }}` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsRoute {
+    /// One decode row.
+    Decode,
+    /// A prefill chunk.
+    Prefill,
+    /// A speculative-verify block.
+    Verify,
+}
+
+impl RowsRoute {
+    /// Whether the rows take the batched kernels.
+    pub fn batched(self) -> bool {
+        self != Self::Decode
+    }
+}
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -1853,6 +1884,7 @@ pub fn execute_pipeline(
                         givens_theta: None,
                         givens_scales: None,
                         givens_krot: None,
+                        givens_group_size: None,
                     },
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -4139,6 +4171,7 @@ pub(super) fn prefill_shared_gate_up_stage(
                 n,
                 gate.k,
                 gate_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let gate_key = prefill_shared_gemm_key(gate.dtype)
@@ -4163,6 +4196,7 @@ pub(super) fn prefill_shared_gate_up_stage(
                 n,
                 up.k,
                 up_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             gemm.run_key(
@@ -4425,9 +4459,9 @@ fn prefill_shared_down_producer_fused_admitted(
 }
 
 /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` (`developer.moe_shared_down_sigmoid_epi`, a
-/// typed boolean): the explicit value, read once. The route has NO qualified row, so
-/// unset is off on every architecture, `0` is off, and only `1` opts in (where the
-/// raw exact-gfx1201 inventory and the admission below hold).
+/// typed boolean): the explicit value, read once. Unset follows the route's exact-gfx1201
+/// qualification, `0` is off and `1` opts in (where the raw exact-gfx1201 inventory and the
+/// admission below hold).
 static SHARED_DOWN_SIGMOID_EPI: LazyLock<Option<bool>> =
     LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI"));
 
@@ -5391,6 +5425,23 @@ fn decode_shared_down_stage(
                     shared_down_w.m,
                     shared_down_w.k,
                 ))?;
+                return Ok(());
+            }
+            // Q8_0 K=640 shared down with the same BF16 fold in its epilogue
+            // (exact gfx1151, eager; bitwise the GEMV + scaled-add launches).
+            if p.recipe.bf16_round_trip()
+                && shared_down_w.dtype == DType::Q8_0
+                && shared_down_w.awq_scale.is_none()
+                && hip!(gpu.gemv_q8_0_k640_bf16_scaled_add(
+                    shared_down_w.buf,
+                    &shared_hid,
+                    p.ffn_out,
+                    out_target,
+                    scalar_buf,
+                    shared_down_w.m,
+                    shared_down_w.k,
+                ))?
+            {
                 return Ok(());
             }
             if shared_down_w.dtype == DType::MQ4G128V2 {
@@ -6369,6 +6420,7 @@ fn decode_input_basis_stage(
                 1,
                 p.hidden,
                 paro.krot,
+                128,
             ))?;
         } else if res.gate_side_mq4 {
             if let Some(awq) = p.router.awq_scale {
@@ -6738,6 +6790,7 @@ fn prefill_input_basis_stage(
         p.batch_size,
         p.gate_up_k,
         paro.krot,
+        128,
     ))?;
     Ok(())
 }
@@ -7478,7 +7531,8 @@ fn prefill_expert_iu4_gate_up_stage(
 }
 
 /// BF16 grouped SwiGLU rows -> FWHT128/C2 A4 (compact flat-slot record) ->
-/// symmetric down into BF16 `y_down_grouped [grouped_rows, H]`.
+/// symmetric down into BF16 `y_down_grouped [grouped_rows, H]`. The PM producer writes the grouped-position plane the
+/// byte-identical `..._gp` down entry reads (`Gpu::qwen4_moe_rotate128_i4_gp`).
 fn prefill_expert_iu4_down_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
@@ -7497,7 +7551,7 @@ fn prefill_expert_iu4_down_stage(
         plan.hidden,
         "down rows",
     )?;
-    let xq = hip!(gpu.qwen4_moe_rotate128_i4(
+    let xq = hip!(gpu.qwen4_moe_rotate128_i4_gp(
         &h,
         p.sorted_slot_index,
         plan.intermediate,

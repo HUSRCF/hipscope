@@ -30,8 +30,14 @@
 //! the GDN step.
 
 use crate::bundle::Qwen4Bundle;
-use crate::config::Qwen4Config;
-use crate::gpu_forward_lanes::{LaneStagePolicy, LANE_MAX_ROWS};
+use crate::config::{LayerType, Qwen4Config};
+use crate::expert_arena::{ExpertArenaLayer, ExpertArenaPlan};
+use crate::expert_slabs::ExpertFormat;
+use crate::gpu_forward::{EpLaneExpertKind, Qwen4GpuForward, DECODE_Q8_PER_LAYER};
+use crate::gpu_forward_lanes::{
+    LaneExpertRoute, LaneStagePolicy, LaneStageRoutes, LaneTopology, StageName, StageRoute,
+    LANE_MAX_ROWS,
+};
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
@@ -40,14 +46,751 @@ use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
 };
-use crate::state::{Qwen4State, Qwen4StateFormat};
+use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat};
+use crate::weights::{
+    HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
+    Qwen4TierRecipe, Qwen4Weights, TensorRef,
+};
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::slot_batch::RequestEpoch;
+use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+pub(crate) mod groups;
+use groups::GroupPlanner;
+
 /// Most lanes one store holds.
 const MAX_LANES: usize = 64;
+
+/// Topology of THIS rank's bundle. Expert parallelism is read from the
+/// rank's own weights (peers hold no root `bundle.ep`); a band that is not the
+/// whole model, or that carries pipeline metadata, is pipeline parallel.
+fn lane_topology(bundle: &Qwen4Bundle) -> LaneTopology {
+    if bundle.weights.ep_placement().is_some() {
+        LaneTopology::Ep
+    } else if *bundle.weights.band_scope() != Qwen4BandScope::single(&bundle.config)
+        || bundle.pp_band.is_some()
+    {
+        LaneTopology::Pp
+    } else {
+        LaneTopology::Single
+    }
+}
+
+/// Expert route of THIS owned band, from the executing forward and the
+/// assembled plan metadata only. Anything not positively recognised is
+/// [`LaneExpertRoute::Unclassified`], which no stage proof admits.
+fn lane_expert_route(bundle: &Qwen4Bundle) -> LaneExpertRoute {
+    if bundle.execution.is_none() {
+        LaneExpertRoute::Unclassified
+    } else if !bundle.split_layers().is_empty() {
+        LaneExpertRoute::Split
+    } else if bundle.has_cpu_deferred_experts() {
+        LaneExpertRoute::CpuDeferred
+    } else if bundle.weights.expert_tiers().is_some() {
+        LaneExpertRoute::Unclassified
+    } else if bundle.weights.ep_placement().is_some() {
+        classify_ep_owned_experts(bundle)
+    } else {
+        classify_owned_experts(&bundle.weights, &bundle.config)
+    }
+}
+
+/// What one owned layer's experts were observed to be.
+struct OwnedLayerExperts {
+    host_mapped: bool,
+    /// E8P experts of a slab arena (0 for a packed layer).
+    e8p_experts: usize,
+}
+
+/// Classify every layer of the owned band. Any host-mapped expert storage
+/// observed is [`LaneExpertRoute::HostMapped`]; any other layer that is not
+/// positively recognised makes the whole band `Unclassified`.
+fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneExpertRoute {
+    let band = weights.band_scope().band.clone();
+    if band.is_empty() {
+        return LaneExpertRoute::Unclassified;
+    }
+    let arenas = match &weights.manifest.identity.recipe {
+        Qwen4TierRecipe::FlashNextSlab { arenas, .. } => Some(arenas.as_ref()),
+        Qwen4TierRecipe::FlashNextPacked { .. } => None,
+        _ => return LaneExpertRoute::Unclassified,
+    };
+    let (mut host_mapped, mut refused, mut e8p_experts) = (false, false, 0usize);
+    for absolute in band {
+        match classify_owned_layer(weights, config, arenas, absolute) {
+            Ok(layer) => {
+                host_mapped |= layer.host_mapped;
+                e8p_experts += layer.e8p_experts;
+            }
+            Err(_) => refused = true,
+        }
+    }
+    if host_mapped {
+        LaneExpertRoute::HostMapped
+    } else if refused {
+        LaneExpertRoute::Unclassified
+    } else if arenas.is_none() {
+        LaneExpertRoute::ResidentPacked
+    } else if e8p_experts > 0 {
+        // The strict mq2 family: MQ4-XTS plus E8P experts, at least one E8P.
+        LaneExpertRoute::ResidentMq2Slab
+    } else {
+        LaneExpertRoute::Unclassified
+    }
+}
+
+/// One owned EP layer's observed expert binding (see
+/// [`classify_ep_owned_experts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpOwnedLayer {
+    /// The pair the two resident aggregates' actual dtypes name.
+    qt: Option<ExpertQt>,
+    gate_up_mapped: bool,
+    down_mapped: bool,
+    /// The forward's own kind of this layer
+    /// ([`crate::gpu_forward::Qwen4GpuForward::lane_ep_expert_kind`]).
+    kind: Option<EpLaneExpertKind>,
+}
+
+/// Every owned layer positively one valid kind: QT44/QT53, both aggregates
+/// resident (the static runtime) or both host-mapped (the live balanced
+/// runtime), and the forward's kind agreeing with that residence. Any mix of
+/// the two kinds across layers qualifies; there is no layer, expert or rank
+/// count in the rule. An empty band owns nothing to classify.
+fn classify_ep_layers(layers: impl IntoIterator<Item = Option<EpOwnedLayer>>) -> LaneExpertRoute {
+    let mut owned = false;
+    for layer in layers {
+        let valid = layer.is_some_and(|layer| {
+            layer.qt == Some(expert_capabilities::QT_MQ4_XTS)
+                && layer.gate_up_mapped == layer.down_mapped
+                && matches!(
+                    (layer.kind, layer.gate_up_mapped),
+                    (Some(EpLaneExpertKind::StaticResidentPacked), false)
+                        | (Some(EpLaneExpertKind::BalancedHostMappedPacked), true)
+                )
+        });
+        if !valid {
+            return LaneExpertRoute::Unclassified;
+        }
+        owned = true;
+    }
+    if owned {
+        LaneExpertRoute::EpPackedStaticOrBalanced
+    } else {
+        LaneExpertRoute::Unclassified
+    }
+}
+
+/// EP expert route of THIS rank's whole-model band, from its actual forward
+/// and bound weights: the forward's EP placement is the weights', the recipe
+/// is Flash-Next packed (no slab arena, tier, pipeline band or other recipe)
+/// and every owned layer is a MoE layer of one valid kind
+/// ([`classify_ep_layers`]). Anything else is `Unclassified`.
+fn classify_ep_owned_experts(bundle: &Qwen4Bundle) -> LaneExpertRoute {
+    let weights = &bundle.weights;
+    let (Some(forward), Some(placement)) = (bundle.execution.as_ref(), weights.ep_placement())
+    else {
+        return LaneExpertRoute::Unclassified;
+    };
+    if forward.ep_placement() != Some(placement)
+        || !matches!(
+            weights.manifest.identity.recipe,
+            Qwen4TierRecipe::FlashNextPacked { .. }
+        )
+        || *weights.band_scope() != Qwen4BandScope::single(&bundle.config)
+        || bundle.pp_band.is_some()
+        || weights.expert_tiers().is_some()
+    {
+        return LaneExpertRoute::Unclassified;
+    }
+    classify_ep_layers(
+        weights
+            .band_scope()
+            .band
+            .clone()
+            .map(|absolute| ep_owned_layer(weights, forward, absolute)),
+    )
+}
+
+/// What the bound weights and the forward say of one owned EP layer; `None`
+/// when it is not an assembled arena-free MoE layer with resolvable aggregates.
+fn ep_owned_layer(
+    weights: &Qwen4Weights,
+    forward: &Qwen4GpuForward,
+    absolute: usize,
+) -> Option<EpOwnedLayer> {
+    let moe = weights.layer(absolute)?.ffn.moe()?;
+    if moe.expert_arena.is_some() {
+        return None;
+    }
+    let gate_up = weights.resident(&moe.experts_gate_up).ok()?;
+    let down = weights.resident(&moe.experts_down).ok()?;
+    Some(EpOwnedLayer {
+        qt: ExpertQt::of_dtypes(gate_up.dtype, down.dtype),
+        gate_up_mapped: gate_up.buf.is_host_mapped(),
+        down_mapped: down.buf.is_host_mapped(),
+        kind: forward.lane_ep_expert_kind(absolute),
+    })
+}
+
+/// One owned layer under the recipe's route: a slab layer holds its single
+/// arena and per-expert plan, a packed layer its two resident aggregates.
+fn classify_owned_layer(
+    weights: &Qwen4Weights,
+    config: &Qwen4Config,
+    arenas: Option<&ExpertArenaPlan>,
+    absolute: usize,
+) -> Result<OwnedLayerExperts, String> {
+    let layer = weights
+        .layer(absolute)
+        .ok_or_else(|| format!("layer {absolute} is not assembled on this rank"))?;
+    let moe = layer
+        .ffn
+        .moe()
+        .ok_or_else(|| format!("layer {absolute} is not a MoE layer"))?;
+    let resident = |reference| {
+        weights
+            .resident(reference)
+            .map_err(|error| format!("layer {absolute}: {error}"))
+    };
+    match (arenas, moe.expert_arena.as_ref()) {
+        (Some(plan), Some(arena_ref)) => {
+            if resident(arena_ref)?.buf.is_host_mapped() {
+                return Ok(OwnedLayerExperts {
+                    host_mapped: true,
+                    e8p_experts: 0,
+                });
+            }
+            let planned = plan
+                .layer(absolute)
+                .ok_or_else(|| format!("layer {absolute}: the arena plan has no such layer"))?;
+            Ok(OwnedLayerExperts {
+                host_mapped: false,
+                e8p_experts: slab_layer_e8p_experts(planned, config.num_experts)
+                    .map_err(|error| format!("layer {absolute}: {error}"))?,
+            })
+        }
+        (None, None) => {
+            let gate_up = resident(&moe.experts_gate_up)?;
+            let down = resident(&moe.experts_down)?;
+            let host_mapped = gate_up.buf.is_host_mapped() || down.buf.is_host_mapped();
+            if !host_mapped && (gate_up.dtype != DType::MQ4G256V2 || down.dtype != DType::MQ4G128V2)
+            {
+                return Err(format!(
+                    "layer {absolute}: packed experts are {:?}/{:?}, not MQ4G256V2/MQ4G128V2",
+                    gate_up.dtype, down.dtype
+                ));
+            }
+            Ok(OwnedLayerExperts {
+                host_mapped,
+                e8p_experts: 0,
+            })
+        }
+        _ => Err(format!(
+            "layer {absolute}: the recipe and the layer disagree on an expert arena"
+        )),
+    }
+}
+
+/// The E8P expert count of a slab layer whose plan is exactly `num_experts`
+/// present MQ4-XTS / E8P experts. An absent (pruned) expert, a W3 or W2 expert,
+/// or any other expert count is refused: the lane proof covers complete
+/// layers of MQ4-XTS and E8P only.
+fn slab_layer_e8p_experts(layer: &ExpertArenaLayer, num_experts: usize) -> Result<usize, String> {
+    if num_experts == 0 || layer.experts.len() != num_experts {
+        return Err(format!(
+            "the arena plans {} experts, the model has {num_experts}",
+            layer.experts.len()
+        ));
+    }
+    let mut e8p = 0usize;
+    for (expert, entry) in layer.experts.iter().enumerate() {
+        if entry.is_absent() {
+            return Err(format!("expert {expert} is absent"));
+        }
+        match entry.format {
+            ExpertFormat::Mq4Xts => {}
+            ExpertFormat::E8pI4 => e8p += 1,
+            other => {
+                return Err(format!(
+                    "expert {expert} is {other:?}, not MQ4-XTS or E8P-I4"
+                ))
+            }
+        }
+    }
+    Ok(e8p)
+}
+
+/// Dtype one projection or tensor binds in the lane forward; `None` when its
+/// reference or resident weight could not be resolved.
+type Bound = Option<DType>;
+
+/// The bound dtypes of one hyper-connection read: norm, down, up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HyperFacts {
+    norm: Bound,
+    down: Bound,
+    up: Bound,
+}
+
+impl HyperFacts {
+    const UNRESOLVED: Self = Self {
+        norm: None,
+        down: None,
+        up: None,
+    };
+}
+
+/// One layer's token mixer: the input projections in lane order (GDN: qkv, z,
+/// in_proj_a, in_proj_b; QSA: indexer_qk, q, k, v) and the output projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MixerFacts {
+    Gdn { input: [Bound; 4], output: Bound },
+    Qsa { input: [Bound; 4], output: Bound },
+}
+
+/// One owned MoE layer's bound dense dtypes (router, shared gate, shared up,
+/// shared down, shared-gate scalar) and its routed experts' exact quant pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MoeFacts {
+    dense: [Bound; 5],
+    /// Each distinct quant pair of the experts present on the layer (an absent,
+    /// pruned expert names none); `None` when the layer's expert storage is not
+    /// positively known (tier layout, an EP band that is not positively the
+    /// packed static/balanced class, other recipe, unreadable plan).
+    expert_qts: Option<Vec<ExpertQt>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FfnFacts {
+    Moe(MoeFacts),
+    Dense,
+    /// The layer or its FFN weights could not be resolved.
+    Missing,
+}
+
+/// Everything the lane forward binds for one owned layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayerFacts {
+    attn_hyper: HyperFacts,
+    mlp_hyper: HyperFacts,
+    /// `block_inject` dtype of the attention and MLP hyper writes.
+    attn_inject: Bound,
+    mlp_inject: Bound,
+    /// `None`: the layer kind is unknown, so no mixer stage can be named.
+    mixer: Option<MixerFacts>,
+    ffn: FfnFacts,
+}
+
+/// What the PLE row staging of the input band delivers to the lane step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedRows {
+    /// The model has no PLE: the stage does not exist.
+    Absent,
+    /// The model has PLE but the rows provider is not bound.
+    Unresolved,
+    Known(DType),
+}
+
+/// Plain-data facts of every stage instance one owned band executes, gathered
+/// from the bound weights and the executing forward
+/// ([`gather_stage_facts`]) and turned into routes by
+/// [`derive_stage_routes`], which needs no device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StageFacts {
+    topology: LaneTopology,
+    /// The band embeds tokens and stages PLE rows.
+    input: bool,
+    /// The band runs the final hyper read, the LM head and the top-1.
+    output: bool,
+    embedding: Bound,
+    ple_rows: StagedRows,
+    /// Whole-band expert class ([`lane_expert_route`]); only the MoE stage
+    /// falls back to it.
+    experts: LaneExpertRoute,
+    layers: Vec<LayerFacts>,
+    final_hyper: HyperFacts,
+    head: Bound,
+}
+
+/// Quant pair of the experts present on one slab layer, each distinct pair
+/// once, in format order. Four presence flags: no per-expert allocation or
+/// repeated capability lookups.
+fn slab_layer_expert_qts(layer: &ExpertArenaLayer) -> Vec<ExpertQt> {
+    const FORMATS: [ExpertFormat; 4] = [
+        ExpertFormat::Mq4Xts,
+        ExpertFormat::Mq3I4,
+        ExpertFormat::Mq2I4,
+        ExpertFormat::E8pI4,
+    ];
+    let mut present = [false; 4];
+    for expert in layer.experts.iter().filter(|expert| !expert.is_absent()) {
+        if let Some(slot) = FORMATS.iter().position(|format| *format == expert.format) {
+            present[slot] = true;
+        }
+    }
+    FORMATS
+        .iter()
+        .zip(present)
+        .filter(|(_, present)| *present)
+        .map(|(format, _)| {
+            let (gate_up, down) = format.pair();
+            ExpertQt::new(gate_up, down)
+        })
+        .collect()
+}
+
+/// Gather the stage facts of THIS rank's owned band. Every dtype is the
+/// resolved `weights.resident(ref).dtype`, never a name, recipe or manifest
+/// dtype; an HC down/up or shared-expert projection binds its Q8_0 decode copy
+/// when the forward holds one (`decode_q8`, `DECODE_Q8_PER_LAYER` per absolute
+/// layer: HC attn down/up 0/1, HC mlp down/up 2/3, shared gate/up/down 4/5/6,
+/// as `decode_copy` binds it for every AR row count), else its source. A
+/// reference that does not resolve (or a missing forward, which decides the
+/// copies) leaves `None` for the stage it feeds only.
+fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
+    let weights = &bundle.weights;
+    let config = &bundle.config;
+    let scope = weights.band_scope();
+    let topology = lane_topology(bundle);
+    let copies: Option<&[GpuTensor]> = bundle
+        .execution
+        .as_ref()
+        .map(|forward| forward.decode_q8.as_slice());
+    let source =
+        |reference: &TensorRef| -> Bound { weights.resident(reference).ok().map(|t| t.dtype) };
+    let bound = |reference: &TensorRef, layer: usize, slot: usize| -> Bound {
+        let source_dtype = source(reference)?;
+        let copies = copies?;
+        Some(
+            copies
+                .get(layer * DECODE_Q8_PER_LAYER + slot)
+                .map_or(source_dtype, |copy| copy.dtype),
+        )
+    };
+    let hyper = |hyper: &HyperConnectionWeights, layer: usize, slot: usize| HyperFacts {
+        norm: source(&hyper.hc_norm),
+        down: bound(&hyper.input_mix_down, layer, slot),
+        up: bound(&hyper.input_mix_up, layer, slot + 1),
+    };
+    let recipe = &weights.manifest.identity.recipe;
+    let experts = lane_expert_route(bundle);
+    let expert_qts = |layer: usize, moe: &MoeWeights| -> Option<Vec<ExpertQt>> {
+        // Under EP the pair is read only for a band that positively classified
+        // as packed static/balanced ([`classify_ep_owned_experts`]).
+        if weights.expert_tiers().is_some()
+            || (topology == LaneTopology::Ep
+                && experts != LaneExpertRoute::EpPackedStaticOrBalanced)
+        {
+            return None;
+        }
+        match recipe {
+            Qwen4TierRecipe::FlashNextSlab { arenas, .. } => {
+                source(moe.expert_arena.as_ref()?)?;
+                Some(slab_layer_expert_qts(arenas.layer(layer)?))
+            }
+            Qwen4TierRecipe::FlashNextPacked { .. } => {
+                ExpertQt::of_dtypes(source(&moe.experts_gate_up)?, source(&moe.experts_down)?)
+                    .map(|qt| vec![qt])
+            }
+            _ => None,
+        }
+    };
+    let layer_facts = |layer: &Qwen4LayerWeights| -> LayerFacts {
+        let absolute = layer.layer;
+        let mixer = match layer.kind {
+            LayerType::LinearAttention => Some(layer.gdn.as_ref().map_or(
+                MixerFacts::Gdn {
+                    input: [None; 4],
+                    output: None,
+                },
+                |gdn| MixerFacts::Gdn {
+                    input: [
+                        source(&gdn.qkv),
+                        source(&gdn.z),
+                        source(&gdn.in_proj_a),
+                        source(&gdn.in_proj_b),
+                    ],
+                    output: source(&gdn.output),
+                },
+            )),
+            LayerType::FullAttention => Some(layer.attention.as_ref().map_or(
+                MixerFacts::Qsa {
+                    input: [None; 4],
+                    output: None,
+                },
+                |qsa| MixerFacts::Qsa {
+                    input: [
+                        source(&qsa.indexer_qk),
+                        source(&qsa.q),
+                        source(&qsa.k),
+                        source(&qsa.v),
+                    ],
+                    output: source(&qsa.output),
+                },
+            )),
+        };
+        let ffn = match &layer.ffn {
+            Qwen4FfnWeights::Moe(moe) => FfnFacts::Moe(MoeFacts {
+                dense: [
+                    source(&moe.gate),
+                    bound(&moe.shared_gate, absolute, 4),
+                    bound(&moe.shared_up, absolute, 5),
+                    bound(&moe.shared_down, absolute, 6),
+                    source(&moe.shared_gate_scalar),
+                ],
+                expert_qts: expert_qts(absolute, moe),
+            }),
+            Qwen4FfnWeights::Dense(_) => FfnFacts::Dense,
+        };
+        LayerFacts {
+            attn_hyper: hyper(&layer.attn_hyper, absolute, 0),
+            mlp_hyper: hyper(&layer.mlp_hyper, absolute, 2),
+            attn_inject: source(&layer.attn_hyper.block_inject),
+            mlp_inject: source(&layer.mlp_hyper.block_inject),
+            mixer,
+            ffn,
+        }
+    };
+    let layers = scope
+        .band
+        .clone()
+        .map(|absolute| match weights.layer(absolute) {
+            Some(layer) => layer_facts(layer),
+            None => LayerFacts {
+                attn_hyper: HyperFacts::UNRESOLVED,
+                mlp_hyper: HyperFacts::UNRESOLVED,
+                attn_inject: None,
+                mlp_inject: None,
+                mixer: config.layer_types.get(absolute).map(|kind| match kind {
+                    LayerType::LinearAttention => MixerFacts::Gdn {
+                        input: [None; 4],
+                        output: None,
+                    },
+                    LayerType::FullAttention => MixerFacts::Qsa {
+                        input: [None; 4],
+                        output: None,
+                    },
+                }),
+                ffn: FfnFacts::Missing,
+            },
+        })
+        .collect();
+    let root = &weights.root;
+    StageFacts {
+        topology,
+        input: scope.input,
+        output: scope.output,
+        embedding: source(&root.embedding),
+        // The lane AR step converts BF16 staged rows (`grouped_gather_convert_bf16`
+        // requires BF16) and refuses F16 staging (`qwen4_ple_rows_f16` needs
+        // >= 512 routed rows), so a bound PLE row provider stages BF16.
+        ple_rows: match (&bundle.ple, &config.ple) {
+            (Some(_), _) => StagedRows::Known(DType::BF16),
+            (None, Some(_)) => StagedRows::Unresolved,
+            (None, None) => StagedRows::Absent,
+        },
+        experts,
+        layers,
+        final_hyper: HyperFacts {
+            norm: source(&root.final_hyper.hc_norm),
+            down: source(&root.final_hyper.input_mix_down),
+            up: source(&root.final_hyper.input_mix_up),
+        },
+        head: source(&root.lm_head),
+    }
+}
+
+fn all_bound<const N: usize>(dtypes: [Bound; N]) -> Option<[DType; N]> {
+    let mut bound = [DType::F32; N];
+    for (slot, dtype) in bound.iter_mut().zip(dtypes) {
+        *slot = dtype?;
+    }
+    Some(bound)
+}
+
+fn hyper_read_route(hyper: &HyperFacts) -> StageRoute {
+    all_bound([hyper.norm, hyper.down, hyper.up])
+        .map_or(StageRoute::Unclassified, StageRoute::HyperRead)
+}
+
+fn add_route(routes: &mut LaneStageRoutes, stage: StageName, route: StageRoute) {
+    let list = &mut routes[stage.index()];
+    if !list.contains(&route) {
+        list.push(route);
+    }
+}
+
+/// One owned MoE layer's route: its dense dtypes, the band's expert class
+/// (under EP only [`LaneExpertRoute::EpPackedStaticOrBalanced`] survives) and
+/// whether the decode K1 route admits EVERY
+/// expert quant pair present on the layer. Capability alone never certifies
+/// residence: a host-mapped, CPU-deferred, split or unclassified band keeps
+/// its own `experts` class. `verdicts` memoises one capability lookup per
+/// distinct quant pair across the band's layers.
+fn moe_route(
+    arch: &str,
+    facts: &StageFacts,
+    moe: &MoeFacts,
+    verdicts: &mut Vec<(ExpertQt, bool)>,
+) -> StageRoute {
+    let Some(dense) = all_bound(moe.dense) else {
+        return StageRoute::Unclassified;
+    };
+    // Only the positively classified EP band keeps its class under EP, and
+    // that class never labels another topology; every other class is an
+    // unproven EP route.
+    let experts = match (facts.topology, facts.experts) {
+        (LaneTopology::Ep, LaneExpertRoute::EpPackedStaticOrBalanced) => facts.experts,
+        (LaneTopology::Ep, _) | (_, LaneExpertRoute::EpPackedStaticOrBalanced) => {
+            LaneExpertRoute::Unclassified
+        }
+        (_, experts) => experts,
+    };
+    let decode_admitted = moe.expert_qts.as_deref().is_some_and(|qts| {
+        !qts.is_empty()
+            && qts.iter().all(|&qt| {
+                if let Some((_, admitted)) = verdicts.iter().find(|(known, _)| *known == qt) {
+                    return *admitted;
+                }
+                let admitted =
+                    expert_capabilities::capability(arch, qt, Route::DecodeGemv).admitted();
+                verdicts.push((qt, admitted));
+                admitted
+            })
+    });
+    StageRoute::Moe {
+        experts,
+        dense,
+        decode_admitted,
+    }
+}
+
+/// Per-stage routes of every stage instance the owned band executes. A stage
+/// the band does not execute stays empty (stateful stages are always per lane
+/// and carry no route); an executed instance whose weight, reference or owner
+/// is missing yields [`StageRoute::Unclassified`] for its own stage only.
+fn derive_stage_routes(arch: &str, facts: &StageFacts) -> LaneStageRoutes {
+    let mut routes: LaneStageRoutes = std::array::from_fn(|_| Vec::new());
+    let mut verdicts: Vec<(ExpertQt, bool)> = Vec::new();
+    if facts.input {
+        add_route(
+            &mut routes,
+            StageName::Embed,
+            facts
+                .embedding
+                .map_or(StageRoute::Unclassified, StageRoute::Embed),
+        );
+        match facts.ple_rows {
+            StagedRows::Absent => {}
+            StagedRows::Unresolved => {
+                add_route(&mut routes, StageName::PleRows, StageRoute::Unclassified)
+            }
+            StagedRows::Known(dtype) => {
+                add_route(&mut routes, StageName::PleRows, StageRoute::PleRows(dtype))
+            }
+        }
+    }
+    for layer in &facts.layers {
+        for (hyper, inject) in [
+            (&layer.attn_hyper, layer.attn_inject),
+            (&layer.mlp_hyper, layer.mlp_inject),
+        ] {
+            add_route(&mut routes, StageName::HcRead, hyper_read_route(hyper));
+            add_route(
+                &mut routes,
+                StageName::HcWrite,
+                inject.map_or(StageRoute::Unclassified, StageRoute::HyperWrite),
+            );
+        }
+        let projection =
+            |dtype: Bound| dtype.map_or(StageRoute::Unclassified, StageRoute::Projection);
+        match &layer.mixer {
+            Some(MixerFacts::Gdn { input, output }) => {
+                add_route(
+                    &mut routes,
+                    StageName::GdnInProj,
+                    all_bound(*input).map_or(StageRoute::Unclassified, StageRoute::GdnIn),
+                );
+                add_route(&mut routes, StageName::GdnOutProj, projection(*output));
+            }
+            Some(MixerFacts::Qsa { input, output }) => {
+                add_route(
+                    &mut routes,
+                    StageName::QsaInProj,
+                    all_bound(*input).map_or(StageRoute::Unclassified, StageRoute::QsaIn),
+                );
+                add_route(&mut routes, StageName::QsaOutProj, projection(*output));
+            }
+            None => {
+                for stage in [
+                    StageName::GdnInProj,
+                    StageName::GdnOutProj,
+                    StageName::QsaInProj,
+                    StageName::QsaOutProj,
+                ] {
+                    add_route(&mut routes, stage, StageRoute::Unclassified);
+                }
+            }
+        }
+        let moe = match &layer.ffn {
+            FfnFacts::Moe(moe) => moe_route(arch, facts, moe, &mut verdicts),
+            FfnFacts::Dense | FfnFacts::Missing => StageRoute::Unclassified,
+        };
+        add_route(&mut routes, StageName::Moe, moe);
+    }
+    if facts.output {
+        add_route(
+            &mut routes,
+            StageName::FinalHyper,
+            hyper_read_route(&facts.final_hyper),
+        );
+        add_route(
+            &mut routes,
+            StageName::Head,
+            facts
+                .head
+                .map_or(StageRoute::Unclassified, StageRoute::Projection),
+        );
+        // The step logits are an F32 scratch (`Qwen4LaneStore::logits`).
+        add_route(
+            &mut routes,
+            StageName::Argmax,
+            StageRoute::Argmax(DType::F32),
+        );
+    }
+    routes
+}
+
+/// The store's one stage-policy log line: proof receipts and the reason each
+/// stage runs per lane, `none` when empty.
+fn stage_policy_log(
+    policy: &LaneStagePolicy,
+    evidence: &str,
+    per_lane: &[(StageName, String)],
+) -> String {
+    let proofs = if evidence.is_empty() {
+        "none"
+    } else {
+        evidence
+    };
+    let reasons = per_lane
+        .iter()
+        .map(|(stage, reason)| format!("{}={reason}", stage.key()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let reasons = if reasons.is_empty() {
+        "none"
+    } else {
+        reasons.as_str()
+    };
+    format!(
+        "  qwen4 lanes: stage policy {} (proofs {proofs}; per-lane: {reasons})",
+        policy.describe()
+    )
+}
 
 /// What a staged lane store reports (load ack, oracle receipts).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,7 +806,7 @@ pub struct LaneStoreReceipt {
     /// Device bytes the lanes' QSA context arenas commit right now.
     pub mapped_bytes: u64,
     pub stage_policy: String,
-    pub stage_evidence: &'static str,
+    pub stage_evidence: String,
     /// `"mtp"` when every lane is an MTP lane, else `"off"`.
     pub spec: &'static str,
     /// Most drafts one window carries (0 without spec).
@@ -605,16 +1348,28 @@ pub struct Qwen4LaneStore {
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
+    /// Receipts of the stage proofs that bound `policy` (comma-joined), frozen
+    /// at construction; empty for an env override or an explicit
+    /// [`Self::set_stage_policy`].
+    evidence: String,
+    /// Micro-batch group count policy of the PP decode wavefront (consulted
+    /// only on the output-band root; see [`groups`]).
+    groups: GroupPlanner,
     /// Decode rows the step buffers hold (`max_lanes * (k + 1)` with spec,
     /// else `max_lanes`).
     rows_cap: usize,
     /// Rows `[0, rows_cap)`: the decode rows of a step (the planned decode
     /// requests' rows concatenated in plan order); `[rows_cap, rows_cap +
-    /// max_lanes)`: the prompt-completing prefill rows.
-    logits: GpuTensor,
-    top1: GpuTensor,
+    /// max_lanes)`: the prompt-completing prefill rows. `None` on a band
+    /// that does not run the LM head (only the single scope and the output
+    /// band hold step outputs).
+    logits: Option<GpuTensor>,
+    top1: Option<GpuTensor>,
+    /// Host mirror of `top1` (empty without step outputs).
     top1_host: Vec<u8>,
     spec: Option<SpecStore>,
+    /// The band this store's lane states are scoped to.
+    scope: Qwen4BandScope,
     pub(crate) phase: LanePhase,
     pub(crate) next_step_id: u64,
     /// Start of the step's wall clock: set by `draft_step` (or provision when
@@ -647,6 +1402,47 @@ impl Qwen4LaneStore {
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
         }
+        // Developer overrides, refused before any device allocation.
+        let group_override =
+            groups::groups_override_from_env().map_err(|e| format!("lane store: {e}"))?;
+        let policy_override =
+            groups::policy_override_from_env().map_err(|e| format!("lane store: {e}"))?;
+        if let Some(requested) = group_override {
+            eprintln!(
+                "  qwen4 lanes: {} = {requested} fixes the PP decode micro-batch count (clamped to min(lanes, 2 * stages))",
+                groups::GROUPS_ENV
+            );
+        }
+        let (policy, evidence) = match policy_override {
+            Some(policy) => {
+                eprintln!(
+                    "  qwen4 lanes: {} selects stage policy {}",
+                    groups::POLICY_ENV,
+                    policy.describe()
+                );
+                (policy, String::new())
+            }
+            // Shared stages only where every stage instance this band runs
+            // matches a proof: routes come from the bound weights.
+            None => {
+                let facts = gather_stage_facts(bundle);
+                let routes = derive_stage_routes(&gpu.arch, &facts);
+                let resolution =
+                    LaneStagePolicy::for_bound_routes(&gpu.arch, facts.topology, &routes);
+                let evidence = resolution.receipts.join(",");
+                eprintln!(
+                    "{}",
+                    stage_policy_log(&resolution.policy, &evidence, &resolution.per_lane)
+                );
+                (resolution.policy, evidence)
+            }
+        };
+        // This band's ownership: the single scope allocates the historical
+        // whole-model store.
+        let scope = bundle.weights.band_scope().clone();
+        if spec.is_some() && !scope.output {
+            return Err("lane store: MTP lanes need the output band".to_string());
+        }
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -675,25 +1471,33 @@ impl Qwen4LaneStore {
         };
         let rows = rows_cap + max_lanes;
         let vocab = bundle.lane_vocab();
-        let logit_elements = rows
-            .checked_mul(vocab)
-            .ok_or_else(|| "lane store: logits extent overflow".to_string())?;
-        let logits = gpu
-            .zeros(&[logit_elements], DType::F32)
-            .map_err(|e| format!("lane store: logits: {e}"))?;
-        let top1 = match gpu.zeros(&[rows * std::mem::size_of::<i32>()], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(logits);
-                return Err(format!("lane store: top1: {error}"));
-            }
+        // Step logits and top-1 exist only where the LM head runs: the
+        // single scope or the output band.
+        let (logits, top1) = if scope.output {
+            let logit_elements = rows
+                .checked_mul(vocab)
+                .ok_or_else(|| "lane store: logits extent overflow".to_string())?;
+            let logits = gpu
+                .zeros(&[logit_elements], DType::F32)
+                .map_err(|e| format!("lane store: logits: {e}"))?;
+            let top1 = match gpu.zeros(&[rows * std::mem::size_of::<i32>()], DType::Raw) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    let _ = gpu.free_tensor(logits);
+                    return Err(format!("lane store: top1: {error}"));
+                }
+            };
+            (Some(logits), Some(top1))
+        } else {
+            (None, None)
         };
         let spec_store = match spec {
             Some(config) => match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
                 Ok(store) => Some(store),
                 Err(error) => {
-                    let _ = gpu.free_tensor(logits);
-                    let _ = gpu.free_tensor(top1);
+                    for tensor in [logits, top1].into_iter().flatten() {
+                        let _ = gpu.free_tensor(tensor);
+                    }
                     return Err(error);
                 }
             },
@@ -705,13 +1509,19 @@ impl Qwen4LaneStore {
             ring_rows: spec.map_or(0, |spec| spec.k + 1),
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
-            // Shared stages only where G0 evidenced them (gfx1151).
-            policy: LaneStagePolicy::for_arch(&gpu.arch),
+            policy,
+            evidence,
+            groups: GroupPlanner::new(group_override),
             rows_cap,
             logits,
             top1,
-            top1_host: vec![0; rows * std::mem::size_of::<i32>()],
+            top1_host: if scope.output {
+                vec![0; rows * std::mem::size_of::<i32>()]
+            } else {
+                Vec::new()
+            },
             spec: spec_store,
+            scope,
             phase: LanePhase::Idle,
             next_step_id: 0,
             step_started: None,
@@ -727,28 +1537,69 @@ impl Qwen4LaneStore {
     /// `min(MTP_FILL_ROWS, forward max_chunk)` rows). `_row_budget` is
     /// accepted for the frozen signature: decode rows share the
     /// `max_lanes * (k + 1)` output rows, so the budget adds nothing.
+    /// The whole model: [`Self::device_bytes_scoped`] over
+    /// [`Qwen4BandScope::single`].
     pub fn device_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        max_lanes: usize,
+        row_budget: usize,
+        spec_k: Option<usize>,
+    ) -> Option<u64> {
+        Self::device_bytes_scoped(
+            config,
+            format,
+            context,
+            max_lanes,
+            row_budget,
+            spec_k,
+            &Qwen4BandScope::single(config),
+        )
+    }
+
+    /// [`Self::device_bytes`] of the store one pipeline band holds: the
+    /// lane states cover only the band's layers
+    /// ([`Qwen4State::device_bytes_scoped`]; the verify ring only its GDN
+    /// layers), and the step logits/top-1 buffers and every MTP charge only
+    /// exist on the output band (`scope.output`, the band that holds the
+    /// head). `None` on overflow, or for MTP lanes off the output band,
+    /// which [`Self::new`] refuses.
+    pub fn device_bytes_scoped(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
         max_lanes: usize,
         _row_budget: usize,
         spec_k: Option<usize>,
+        scope: &Qwen4BandScope,
     ) -> Option<u64> {
         let f32_bytes = std::mem::size_of::<f32>();
-        let mut per_lane = Qwen4State::device_bytes(config, format, context)?;
+        let mut per_lane = Qwen4State::device_bytes_scoped(config, format, context, scope)?;
         let rows_cap = match spec_k {
             Some(k) => max_lanes.checked_mul(k.checked_add(1)?)?,
             None => max_lanes,
         };
         let rows = rows_cap.checked_add(max_lanes)?;
-        let mut shared = rows
-            .checked_mul(config.vocab_size)?
-            .checked_mul(f32_bytes)?
-            .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?;
+        let mut shared = if scope.output {
+            rows.checked_mul(config.vocab_size)?
+                .checked_mul(f32_bytes)?
+                .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?
+        } else {
+            0
+        };
         if let Some(k) = spec_k {
+            if !scope.output {
+                return None;
+            }
             let wide = config.hc_count.checked_mul(config.hidden_size)?;
-            let ring = Qwen4State::row_capture_bytes(config, format.gdn, k.checked_add(1)?)?;
+            let (gdn_layers, _) = scope_layer_counts(config, scope);
+            let ring = Qwen4State::row_capture_bytes_scoped(
+                config,
+                format.gdn,
+                k.checked_add(1)?,
+                gdn_layers,
+            )?;
             per_lane = per_lane
                 .checked_add(MtpGpuState::device_bytes(config, context)?)?
                 .checked_add(ring)?
@@ -929,9 +1780,10 @@ impl Qwen4LaneStore {
     /// an AR lane; an MTP lane's prompt-completing pick is read by the
     /// singleton chunk path and leaves no logits row). `rows_cap` is
     /// `max_lanes` without spec, so an AR-only plan is the S3 layout.
-    /// Valid until the next forward; read it before `commit_step`.
-    pub fn logits(&self) -> &GpuTensor {
-        &self.logits
+    /// Valid until the next forward; read it before `commit_step`. `None`
+    /// on a store without step outputs ([`Self::has_step_outputs`]).
+    pub fn logits(&self) -> Option<&GpuTensor> {
+        self.logits.as_ref()
     }
 
     /// First prompt-completing logits row: `rows_cap` (`max_lanes * (k + 1)`
@@ -1020,7 +1872,10 @@ impl Qwen4LaneStore {
     }
 
     /// Disjoint borrows of the `epochs` lanes (plan order) and the step
-    /// output buffers.
+    /// output buffers. Only a store with output buffers
+    /// ([`Self::has_step_outputs`]: the single scope or the output band)
+    /// has a step; a non-output band reaches its lanes through
+    /// [`Self::band_lanes_mut`].
     pub(crate) fn step_parts(&mut self, epochs: &[RequestEpoch]) -> Result<StepParts<'_>, String> {
         let Self {
             table,
@@ -1030,8 +1885,15 @@ impl Qwen4LaneStore {
             top1_host,
             rows_cap,
             spec,
+            scope,
             ..
         } = self;
+        let (Some(logits), Some(top1)) = (logits.as_ref(), top1.as_ref()) else {
+            return Err(format!(
+                "lane store: band {:?} is not the output band and has no step logits",
+                scope.band
+            ));
+        };
         Ok(StepParts {
             lanes: table.pick_mut(epochs)?,
             logits,
@@ -1041,6 +1903,26 @@ impl Qwen4LaneStore {
             rows_cap: *rows_cap,
             spec: spec.as_mut(),
         })
+    }
+
+    /// Disjoint borrows of the `epochs` lanes (plan order) of any band, with
+    /// no step buffers: what a non-output band's lane step runs on.
+    pub(crate) fn band_lanes_mut(
+        &mut self,
+        epochs: &[RequestEpoch],
+    ) -> Result<Vec<&mut Qwen4LaneState>, String> {
+        self.table.pick_mut(epochs)
+    }
+
+    /// The band this store's lane states are scoped to.
+    pub fn band_scope(&self) -> &Qwen4BandScope {
+        &self.scope
+    }
+
+    /// The store holds the step logits and top-1 buffers: the single scope
+    /// or the output band.
+    pub fn has_step_outputs(&self) -> bool {
+        self.logits.is_some()
     }
 
     /// Disjoint borrows of the `epochs` lanes (request order) and the MTP
@@ -1076,7 +1958,7 @@ impl Qwen4LaneStore {
             row_budget: self.row_budget,
             mapped_bytes: mapped as u64,
             stage_policy: self.policy.describe(),
-            stage_evidence: self.policy.evidence(),
+            stage_evidence: self.evidence.clone(),
             spec: if self.spec.is_some() { "mtp" } else { "off" },
             spec_k: self.spec.as_ref().map_or(0, |s| s.config.k),
         }
@@ -1086,8 +1968,45 @@ impl Qwen4LaneStore {
         self.policy
     }
 
+    /// Receipts of the stage proofs behind the current policy; empty when it
+    /// is an override.
+    pub fn evidence(&self) -> &str {
+        &self.evidence
+    }
+
+    /// An explicit policy is never proof-bound, even when it equals the
+    /// resolved one: the evidence is cleared.
     pub fn set_stage_policy(&mut self, policy: LaneStagePolicy) {
+        if self.policy != policy {
+            // Walls measured under one policy say nothing about another.
+            self.groups.clear();
+        }
         self.policy = policy;
+        self.evidence.clear();
+    }
+
+    /// Micro-batch group count for a PP decode step over `rows` (rows per
+    /// lane, plan order); see [`groups::GroupPlanner::select`].
+    pub(crate) fn select_decode_groups<I>(&mut self, stages: usize, rows: I) -> usize
+    where
+        I: ExactSizeIterator<Item = usize> + Clone,
+    {
+        self.groups.select(&self.policy, stages, rows)
+    }
+
+    /// Record one complete successful PP decode step's wall (microseconds).
+    pub(crate) fn observe_decode_groups<I>(
+        &mut self,
+        stages: usize,
+        rows: I,
+        groups: usize,
+        wall_us: f64,
+    ) -> bool
+    where
+        I: Iterator<Item = usize> + Clone,
+    {
+        self.groups
+            .observe(&self.policy, stages, rows, groups, wall_us)
     }
 
     pub fn max_lanes(&self) -> usize {
@@ -1152,6 +2071,7 @@ impl Qwen4LaneStore {
             }
         }
         for (name, tensor) in [("logits", logits), ("top1", top1)] {
+            let Some(tensor) = tensor else { continue };
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(format!("lane {name}: {error}"));
             }
@@ -1163,6 +2083,7 @@ impl Qwen4LaneStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expert_arena::ArenaExpert;
 
     struct TestCell {
         host: LaneHost,
@@ -1469,5 +2390,735 @@ mod tests {
         );
         assert!(table.pick_mut(&[epoch(1, 1), epoch(1, 1)]).is_err());
         assert!(table.pick_mut(&[epoch(1, 9)]).is_err());
+    }
+
+    fn arena_layer(formats: &[ExpertFormat]) -> ExpertArenaLayer {
+        let mut cursor = 0usize;
+        let experts = formats
+            .iter()
+            .map(|&format| {
+                let entry = ArenaExpert {
+                    format,
+                    gate_up_offset: cursor,
+                    down_offset: cursor + format.gate_up_bytes(),
+                };
+                cursor += format.slab_bytes();
+                entry
+            })
+            .collect();
+        ExpertArenaLayer {
+            file_offset: 0,
+            bytes: cursor,
+            experts,
+        }
+    }
+
+    #[test]
+    fn slab_layer_counts_e8p_in_a_mixed_mq4_e8p_group() {
+        let mut formats = vec![ExpertFormat::Mq4Xts; 6];
+        formats[1] = ExpertFormat::E8pI4;
+        formats[4] = ExpertFormat::E8pI4;
+        assert_eq!(slab_layer_e8p_experts(&arena_layer(&formats), 6), Ok(2));
+        assert_eq!(
+            slab_layer_e8p_experts(&arena_layer(&[ExpertFormat::Mq4Xts; 3]), 3),
+            Ok(0)
+        );
+        assert_eq!(
+            slab_layer_e8p_experts(&arena_layer(&[ExpertFormat::E8pI4; 3]), 3),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn slab_layer_refuses_w3_w2_and_mixed_cold_groups() {
+        for cold in [ExpertFormat::Mq3I4, ExpertFormat::Mq2I4] {
+            let mut formats = vec![ExpertFormat::Mq4Xts; 4];
+            formats[2] = cold;
+            let error = slab_layer_e8p_experts(&arena_layer(&formats), 4).unwrap_err();
+            assert!(error.contains("expert 2"), "{cold:?}: {error}");
+            assert!(error.contains(&format!("{cold:?}")), "{cold:?}: {error}");
+        }
+        // E8P with a W3 expert in the same layer is refused too.
+        let mixed = [
+            ExpertFormat::E8pI4,
+            ExpertFormat::Mq3I4,
+            ExpertFormat::Mq4Xts,
+        ];
+        assert!(slab_layer_e8p_experts(&arena_layer(&mixed), 3).is_err());
+    }
+
+    #[test]
+    fn slab_layer_refuses_absent_experts_and_a_wrong_expert_count() {
+        let mut layer = arena_layer(&[ExpertFormat::E8pI4; 4]);
+        layer.experts[3].down_offset = layer.experts[3].gate_up_offset;
+        let error = slab_layer_e8p_experts(&layer, 4).unwrap_err();
+        assert!(error.contains("expert 3 is absent"), "{error}");
+        let layer = arena_layer(&[ExpertFormat::E8pI4; 4]);
+        assert!(slab_layer_e8p_experts(&layer, 5).is_err());
+        assert!(slab_layer_e8p_experts(&arena_layer(&[]), 0).is_err());
+    }
+
+    const MQ6: DType = DType::MQ6G256V2;
+
+    fn hyper_facts(down: DType) -> HyperFacts {
+        HyperFacts {
+            norm: Some(DType::BF16),
+            down: Some(down),
+            up: Some(down),
+        }
+    }
+
+    fn moe_ffn(qts: Option<Vec<ExpertQt>>) -> FfnFacts {
+        FfnFacts::Moe(MoeFacts {
+            dense: [Some(DType::BF16); 5],
+            expert_qts: qts,
+        })
+    }
+
+    fn layer_facts(mixer: MixerFacts, ffn: FfnFacts) -> LayerFacts {
+        LayerFacts {
+            attn_hyper: hyper_facts(DType::BF16),
+            mlp_hyper: hyper_facts(DType::BF16),
+            attn_inject: Some(DType::BF16),
+            mlp_inject: Some(DType::BF16),
+            mixer: Some(mixer),
+            ffn,
+        }
+    }
+
+    fn gdn() -> MixerFacts {
+        MixerFacts::Gdn {
+            input: [Some(MQ6); 4],
+            output: Some(MQ6),
+        }
+    }
+
+    fn qsa() -> MixerFacts {
+        MixerFacts::Qsa {
+            input: [Some(MQ6); 4],
+            output: Some(MQ6),
+        }
+    }
+
+    /// One GDN layer then one QSA layer on a whole-model band over resident
+    /// packed MQ4-XTS experts.
+    fn stage_facts() -> StageFacts {
+        let qts = || Some(vec![expert_capabilities::QT_MQ4_XTS]);
+        StageFacts {
+            topology: LaneTopology::Single,
+            input: true,
+            output: true,
+            embedding: Some(DType::Q8_0),
+            ple_rows: StagedRows::Known(DType::BF16),
+            experts: LaneExpertRoute::ResidentPacked,
+            layers: vec![
+                layer_facts(gdn(), moe_ffn(qts())),
+                layer_facts(qsa(), moe_ffn(qts())),
+            ],
+            final_hyper: hyper_facts(DType::BF16),
+            head: Some(MQ6),
+        }
+    }
+
+    const ARCH: &str = "gfx1151";
+
+    fn moe_stage(facts: &StageFacts) -> Vec<StageRoute> {
+        derive_stage_routes(ARCH, facts)[StageName::Moe.index()].clone()
+    }
+
+    #[test]
+    fn every_executed_stage_instance_yields_its_actual_route() {
+        let routes = derive_stage_routes(ARCH, &stage_facts());
+        let bf16 = DType::BF16;
+        let stage = |name: StageName| routes[name.index()].clone();
+        assert_eq!(
+            stage(StageName::Embed),
+            vec![StageRoute::Embed(DType::Q8_0)]
+        );
+        assert_eq!(stage(StageName::PleRows), vec![StageRoute::PleRows(bf16)]);
+        assert_eq!(
+            stage(StageName::HcRead),
+            vec![StageRoute::HyperRead([bf16; 3])]
+        );
+        assert_eq!(
+            stage(StageName::HcWrite),
+            vec![StageRoute::HyperWrite(bf16)]
+        );
+        assert_eq!(
+            stage(StageName::GdnInProj),
+            vec![StageRoute::GdnIn([MQ6; 4])]
+        );
+        assert_eq!(
+            stage(StageName::GdnOutProj),
+            vec![StageRoute::Projection(MQ6)]
+        );
+        assert_eq!(
+            stage(StageName::QsaInProj),
+            vec![StageRoute::QsaIn([MQ6; 4])]
+        );
+        assert_eq!(
+            stage(StageName::QsaOutProj),
+            vec![StageRoute::Projection(MQ6)]
+        );
+        assert_eq!(
+            stage(StageName::Moe),
+            vec![StageRoute::Moe {
+                experts: LaneExpertRoute::ResidentPacked,
+                dense: [bf16; 5],
+                decode_admitted: true,
+            }]
+        );
+        assert_eq!(
+            stage(StageName::FinalHyper),
+            vec![StageRoute::HyperRead([bf16; 3])]
+        );
+        assert_eq!(stage(StageName::Head), vec![StageRoute::Projection(MQ6)]);
+        assert_eq!(
+            stage(StageName::Argmax),
+            vec![StageRoute::Argmax(DType::F32)]
+        );
+        // Stateful stages carry no route.
+        for name in StageName::ALL.into_iter().filter(|name| name.stateful()) {
+            assert!(stage(name).is_empty(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_differing_dtype_isolates_only_its_own_stage() {
+        let base = derive_stage_routes(ARCH, &stage_facts());
+        let mut facts = stage_facts();
+        let Some(MixerFacts::Qsa { input, .. }) = facts.layers[1].mixer.as_mut() else {
+            panic!("layer 1 is QSA");
+        };
+        input[1] = Some(DType::Q8_0);
+        let routes = derive_stage_routes(ARCH, &facts);
+        for name in StageName::ALL {
+            if name == StageName::QsaInProj {
+                assert_eq!(
+                    routes[name.index()],
+                    vec![StageRoute::QsaIn([MQ6, DType::Q8_0, MQ6, MQ6])]
+                );
+            } else {
+                assert_eq!(routes[name.index()], base[name.index()], "{name:?}");
+            }
+        }
+        // A second layer with another dtype keeps both routes of the stage.
+        let mut facts = stage_facts();
+        let mut extra = layer_facts(gdn(), moe_ffn(Some(vec![expert_capabilities::QT_MQ4_XTS])));
+        extra.attn_hyper = hyper_facts(DType::Q8_0);
+        facts.layers.push(extra);
+        let routes = derive_stage_routes(ARCH, &facts);
+        assert_eq!(
+            routes[StageName::HcRead.index()],
+            vec![
+                StageRoute::HyperRead([DType::BF16; 3]),
+                StageRoute::HyperRead([DType::BF16, DType::Q8_0, DType::Q8_0]),
+            ]
+        );
+        assert_eq!(
+            routes[StageName::GdnInProj.index()],
+            base[StageName::GdnInProj.index()]
+        );
+    }
+
+    #[test]
+    fn a_missing_weight_is_unclassified_for_its_stage_only() {
+        let base = derive_stage_routes(ARCH, &stage_facts());
+        type Mutation = Box<dyn Fn(&mut StageFacts)>;
+        let cases: Vec<(StageName, Mutation)> = vec![
+            (
+                StageName::Embed,
+                Box::new(|facts: &mut StageFacts| facts.embedding = None),
+            ),
+            (
+                StageName::Head,
+                Box::new(|facts: &mut StageFacts| facts.head = None),
+            ),
+            (
+                StageName::GdnOutProj,
+                Box::new(|facts: &mut StageFacts| {
+                    if let Some(MixerFacts::Gdn { output, .. }) = facts.layers[0].mixer.as_mut() {
+                        *output = None;
+                    }
+                }),
+            ),
+            (
+                StageName::HcWrite,
+                Box::new(|facts: &mut StageFacts| facts.layers[1].mlp_inject = None),
+            ),
+        ];
+        for (stage, mutate) in cases {
+            let mut facts = stage_facts();
+            mutate(&mut facts);
+            let routes = derive_stage_routes(ARCH, &facts);
+            assert!(
+                routes[stage.index()].contains(&StageRoute::Unclassified),
+                "{stage:?}"
+            );
+            for name in StageName::ALL.into_iter().filter(|name| *name != stage) {
+                assert_eq!(
+                    routes[name.index()],
+                    base[name.index()],
+                    "{stage:?} {name:?}"
+                );
+            }
+        }
+        // An unresolved layer degrades the stages that layer feeds, not the
+        // band's root stages.
+        let mut facts = stage_facts();
+        facts.layers[0] = LayerFacts {
+            attn_hyper: HyperFacts::UNRESOLVED,
+            mlp_hyper: HyperFacts::UNRESOLVED,
+            attn_inject: None,
+            mlp_inject: None,
+            mixer: Some(MixerFacts::Gdn {
+                input: [None; 4],
+                output: None,
+            }),
+            ffn: FfnFacts::Missing,
+        };
+        let routes = derive_stage_routes(ARCH, &facts);
+        for name in [
+            StageName::HcRead,
+            StageName::HcWrite,
+            StageName::GdnInProj,
+            StageName::GdnOutProj,
+            StageName::Moe,
+        ] {
+            assert!(
+                routes[name.index()].contains(&StageRoute::Unclassified),
+                "{name:?}"
+            );
+        }
+        for name in [
+            StageName::Embed,
+            StageName::PleRows,
+            StageName::QsaInProj,
+            StageName::QsaOutProj,
+            StageName::FinalHyper,
+            StageName::Head,
+            StageName::Argmax,
+        ] {
+            assert_eq!(routes[name.index()], base[name.index()], "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_dense_ffn_or_missing_ple_provider_is_unclassified() {
+        let mut facts = stage_facts();
+        facts.layers[1].ffn = FfnFacts::Dense;
+        assert!(moe_stage(&facts).contains(&StageRoute::Unclassified));
+        let mut facts = stage_facts();
+        facts.ple_rows = StagedRows::Unresolved;
+        assert_eq!(
+            derive_stage_routes(ARCH, &facts)[StageName::PleRows.index()],
+            vec![StageRoute::Unclassified]
+        );
+        facts.ple_rows = StagedRows::Absent;
+        assert!(derive_stage_routes(ARCH, &facts)[StageName::PleRows.index()].is_empty());
+    }
+
+    #[test]
+    fn only_the_owner_bands_run_their_root_stages() {
+        let mut facts = stage_facts();
+        facts.input = false;
+        facts.output = false;
+        let routes = derive_stage_routes(ARCH, &facts);
+        for name in [
+            StageName::Embed,
+            StageName::PleRows,
+            StageName::FinalHyper,
+            StageName::Head,
+            StageName::Argmax,
+        ] {
+            assert!(routes[name.index()].is_empty(), "{name:?}");
+        }
+        assert!(!routes[StageName::HcRead.index()].is_empty());
+        assert!(!routes[StageName::Moe.index()].is_empty());
+        // A band without a GDN layer has no GDN stage instance.
+        let mut facts = stage_facts();
+        facts.layers.remove(0);
+        let routes = derive_stage_routes(ARCH, &facts);
+        assert!(routes[StageName::GdnInProj.index()].is_empty());
+        assert!(routes[StageName::GdnOutProj.index()].is_empty());
+        assert!(!routes[StageName::QsaInProj.index()].is_empty());
+    }
+
+    #[test]
+    fn decode_admission_needs_every_present_expert_pair() {
+        use expert_capabilities::{QT_E8P, QT_MQ4_XTS, QT_W2, QT_W3};
+        let admitted = |arch: &str, qts: Option<Vec<ExpertQt>>| {
+            let mut facts = stage_facts();
+            facts.layers[0].ffn = moe_ffn(qts);
+            let routes = derive_stage_routes(arch, &facts);
+            match &routes[StageName::Moe.index()][0] {
+                StageRoute::Moe {
+                    decode_admitted, ..
+                } => *decode_admitted,
+                other => panic!("not a MoE route: {other:?}"),
+            }
+        };
+        assert!(admitted(ARCH, Some(vec![QT_MQ4_XTS])));
+        assert!(admitted(ARCH, Some(vec![QT_MQ4_XTS, QT_E8P])));
+        // W2 has no kernel anywhere: one missing pair refuses the layer.
+        assert!(!admitted(ARCH, Some(vec![QT_MQ4_XTS, QT_W2])));
+        assert!(!admitted(ARCH, Some(vec![QT_W2])));
+        // No W3 kernel on gfx1100; an unknown architecture serves nothing.
+        assert!(!admitted("gfx1100", Some(vec![QT_W3])));
+        assert!(!admitted("gfx0000", Some(vec![QT_MQ4_XTS])));
+        // Unknown or empty expert storage is never admitted.
+        assert!(!admitted(ARCH, None));
+        assert!(!admitted(ARCH, Some(Vec::new())));
+    }
+
+    #[test]
+    fn capability_never_certifies_the_residence_route() {
+        for experts in [
+            LaneExpertRoute::HostMapped,
+            LaneExpertRoute::CpuDeferred,
+            LaneExpertRoute::Split,
+            LaneExpertRoute::Unclassified,
+        ] {
+            let mut facts = stage_facts();
+            facts.experts = experts;
+            let routes = derive_stage_routes(ARCH, &facts);
+            // Only the MoE stage takes the class; the dense stages do not.
+            assert_eq!(
+                routes[StageName::Moe.index()],
+                vec![StageRoute::Moe {
+                    experts,
+                    dense: [DType::BF16; 5],
+                    decode_admitted: true,
+                }]
+            );
+            assert_eq!(
+                routes[StageName::HcRead.index()],
+                vec![StageRoute::HyperRead([DType::BF16; 3])]
+            );
+        }
+        // EP never carries an expert class.
+        let mut facts = stage_facts();
+        facts.topology = LaneTopology::Ep;
+        assert_eq!(
+            moe_stage(&facts),
+            vec![StageRoute::Moe {
+                experts: LaneExpertRoute::Unclassified,
+                dense: [DType::BF16; 5],
+                decode_admitted: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn ep_moe_stage_keeps_only_the_positive_ep_class() {
+        let ep_facts = |experts: LaneExpertRoute| {
+            let mut facts = stage_facts();
+            facts.topology = LaneTopology::Ep;
+            facts.experts = experts;
+            facts
+        };
+        assert_eq!(
+            moe_stage(&ep_facts(LaneExpertRoute::EpPackedStaticOrBalanced)),
+            vec![StageRoute::Moe {
+                experts: LaneExpertRoute::EpPackedStaticOrBalanced,
+                dense: [DType::BF16; 5],
+                decode_admitted: true,
+            }]
+        );
+        // Every other class stays unproven under EP.
+        for experts in [
+            LaneExpertRoute::ResidentMq2Slab,
+            LaneExpertRoute::ResidentPacked,
+            LaneExpertRoute::HostMapped,
+            LaneExpertRoute::CpuDeferred,
+            LaneExpertRoute::Split,
+            LaneExpertRoute::Unclassified,
+        ] {
+            assert_eq!(
+                moe_stage(&ep_facts(experts)),
+                vec![StageRoute::Moe {
+                    experts: LaneExpertRoute::Unclassified,
+                    dense: [DType::BF16; 5],
+                    decode_admitted: true,
+                }],
+                "{experts:?}"
+            );
+        }
+        // The EP class never labels a non-EP topology.
+        for topology in [LaneTopology::Single, LaneTopology::Pp] {
+            let mut facts = stage_facts();
+            facts.topology = topology;
+            facts.experts = LaneExpertRoute::EpPackedStaticOrBalanced;
+            assert_eq!(
+                moe_stage(&facts),
+                vec![StageRoute::Moe {
+                    experts: LaneExpertRoute::Unclassified,
+                    dense: [DType::BF16; 5],
+                    decode_admitted: true,
+                }],
+                "{topology:?}"
+            );
+        }
+    }
+
+    /// One owned EP layer of the given residence, bound as its kind says.
+    fn ep_layer(mapped: bool) -> Option<EpOwnedLayer> {
+        Some(EpOwnedLayer {
+            qt: Some(expert_capabilities::QT_MQ4_XTS),
+            gate_up_mapped: mapped,
+            down_mapped: mapped,
+            kind: Some(if mapped {
+                EpLaneExpertKind::BalancedHostMappedPacked
+            } else {
+                EpLaneExpertKind::StaticResidentPacked
+            }),
+        })
+    }
+
+    fn ep_band(resident: usize, mapped: usize) -> Vec<Option<EpOwnedLayer>> {
+        std::iter::repeat_n(ep_layer(false), resident)
+            .chain(std::iter::repeat_n(ep_layer(true), mapped))
+            .collect()
+    }
+
+    #[test]
+    fn ep_class_takes_any_mix_of_static_resident_and_balanced_mapped_layers() {
+        // 27/21 and 28/20 trunk splits, every resident, every mapped, one
+        // layer, and an interleaved order: each layer only needs one valid kind.
+        for (resident, mapped) in [(27, 21), (28, 20), (48, 0), (0, 48), (1, 0), (0, 1), (5, 3)] {
+            assert_eq!(
+                classify_ep_layers(ep_band(resident, mapped)),
+                LaneExpertRoute::EpPackedStaticOrBalanced,
+                "{resident}/{mapped}"
+            );
+        }
+        let interleaved: Vec<_> = (0..7).map(|layer| ep_layer(layer % 3 == 0)).collect();
+        assert_eq!(
+            classify_ep_layers(interleaved),
+            LaneExpertRoute::EpPackedStaticOrBalanced
+        );
+    }
+
+    #[test]
+    fn ep_class_refuses_any_layer_that_is_not_positively_one_kind() {
+        let unclassified = LaneExpertRoute::Unclassified;
+        // An empty band owns no layer to classify.
+        assert_eq!(classify_ep_layers(Vec::new()), unclassified);
+        let spoil = |mutate: &dyn Fn(&mut EpOwnedLayer)| {
+            let mut band = ep_band(27, 21);
+            let mut layer = band[30].unwrap();
+            mutate(&mut layer);
+            band[30] = Some(layer);
+            classify_ep_layers(band)
+        };
+        // A layer that is not an assembled MoE layer.
+        let mut band = ep_band(27, 21);
+        band[3] = None;
+        assert_eq!(classify_ep_layers(band), unclassified);
+        // Not the QT44/QT53 pair (other pair, or unresolved dtypes).
+        assert_eq!(
+            spoil(&|layer| layer.qt = Some(expert_capabilities::QT_E8P)),
+            unclassified
+        );
+        assert_eq!(spoil(&|layer| layer.qt = None), unclassified);
+        // Mixed residence between a layer's two tensors.
+        assert_eq!(spoil(&|layer| layer.down_mapped = false), unclassified);
+        assert_eq!(spoil(&|layer| layer.gate_up_mapped = false), unclassified);
+        // The forward's kind is missing or disagrees with the mapped bit.
+        assert_eq!(spoil(&|layer| layer.kind = None), unclassified);
+        assert_eq!(
+            spoil(&|layer| layer.kind = Some(EpLaneExpertKind::StaticResidentPacked)),
+            unclassified
+        );
+        let mut band = ep_band(27, 21);
+        band[0] = Some(EpOwnedLayer {
+            kind: Some(EpLaneExpertKind::BalancedHostMappedPacked),
+            ..band[0].unwrap()
+        });
+        assert_eq!(classify_ep_layers(band), unclassified);
+    }
+
+    #[test]
+    fn capability_lookups_are_memoised_per_quant_pair() {
+        use expert_capabilities::{QT_E8P, QT_MQ4_XTS};
+        let facts = stage_facts();
+        let moe = MoeFacts {
+            dense: [Some(DType::BF16); 5],
+            expert_qts: Some(vec![QT_MQ4_XTS, QT_E8P]),
+        };
+        let mut verdicts = Vec::new();
+        for _ in 0..4 {
+            moe_route(ARCH, &facts, &moe, &mut verdicts);
+        }
+        assert_eq!(verdicts.len(), 2);
+    }
+
+    #[test]
+    fn slab_layer_expert_pairs_list_each_present_format_once() {
+        use expert_capabilities::{QT_E8P, QT_MQ4_XTS, QT_W2, QT_W3};
+        let formats = [
+            ExpertFormat::E8pI4,
+            ExpertFormat::Mq4Xts,
+            ExpertFormat::E8pI4,
+            ExpertFormat::Mq4Xts,
+        ];
+        assert_eq!(
+            slab_layer_expert_qts(&arena_layer(&formats)),
+            vec![QT_MQ4_XTS, QT_E8P]
+        );
+        // An absent (pruned) expert is not present, whatever its format.
+        let mut layer = arena_layer(&[ExpertFormat::Mq3I4, ExpertFormat::Mq4Xts]);
+        layer.experts[0].down_offset = layer.experts[0].gate_up_offset;
+        assert_eq!(slab_layer_expert_qts(&layer), vec![QT_MQ4_XTS]);
+        let layer = arena_layer(&[ExpertFormat::Mq2I4, ExpertFormat::Mq3I4]);
+        assert_eq!(slab_layer_expert_qts(&layer), vec![QT_W3, QT_W2]);
+        assert!(slab_layer_expert_qts(&arena_layer(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_stage_policy_log_names_proofs_and_per_lane_reasons() {
+        let policy = LaneStagePolicy::production();
+        assert_eq!(
+            stage_policy_log(&policy, "", &[]),
+            format!(
+                "  qwen4 lanes: stage policy {} (proofs none; per-lane: none)",
+                policy.describe()
+            )
+        );
+        let reasons = [
+            (StageName::Moe, "no proof".to_string()),
+            (StageName::GdnCore, "stateful".to_string()),
+        ];
+        assert_eq!(
+            stage_policy_log(&policy, "r1,r2", &reasons),
+            format!(
+                "  qwen4 lanes: stage policy {} (proofs r1,r2; per-lane: moe=no proof,gdn_core=stateful)",
+                policy.describe()
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod band_accounting_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+
+    fn partition(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
+        assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
+        let mut start = 0;
+        counts
+            .iter()
+            .map(|&count| {
+                let band = start..start + count;
+                start += count;
+                let scope = Qwen4BandScope {
+                    input: band.start == 0,
+                    output: band.end == config.num_hidden_layers,
+                    band,
+                };
+                scope.validate(config).expect("valid band");
+                scope
+            })
+            .collect()
+    }
+
+    #[test]
+    fn band_store_bytes_sum_to_the_single_scope_store() {
+        let config = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let format = Qwen4StateFormat::F32;
+        let single = Qwen4BandScope::single(&config);
+        for lanes in [1usize, 4, 8] {
+            let whole = Qwen4LaneStore::device_bytes_scoped(
+                &config, format, &context, lanes, lanes, None, &single,
+            )
+            .unwrap();
+            assert_eq!(
+                Qwen4LaneStore::device_bytes(&config, format, &context, lanes, lanes, None),
+                Some(whole)
+            );
+            for counts in [
+                &[24usize, 24][..],
+                &[20, 28][..],
+                &[16, 16, 16][..],
+                &[9, 17, 22][..],
+            ] {
+                let scopes = partition(&config, counts);
+                let bands: Vec<u64> = scopes
+                    .iter()
+                    .map(|scope| {
+                        Qwen4LaneStore::device_bytes_scoped(
+                            &config, format, &context, lanes, lanes, None, scope,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                // The step logits and top-1 are charged once, on the output
+                // band; every lane's state is split with no duplication.
+                assert_eq!(bands.iter().sum::<u64>(), whole, "{counts:?} lanes={lanes}");
+                let head = (2 * lanes * (config.vocab_size * 4 + 4)) as u64;
+                let output = scopes.iter().position(|scope| scope.output).unwrap();
+                let states: u64 = scopes
+                    .iter()
+                    .map(|scope| {
+                        lanes as u64
+                            * Qwen4State::device_bytes_scoped(&config, format, &context, scope)
+                                .unwrap() as u64
+                    })
+                    .sum();
+                assert_eq!(states + head, whole);
+                for (index, (&bytes, scope)) in bands.iter().zip(&scopes).enumerate() {
+                    let own = lanes as u64
+                        * Qwen4State::device_bytes_scoped(&config, format, &context, scope).unwrap()
+                            as u64;
+                    assert_eq!(bytes, own + if index == output { head } else { 0 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_output_band_refuses_mtp_lane_bytes() {
+        let config = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let format = Qwen4StateFormat::F32;
+        let single = Qwen4BandScope::single(&config);
+        assert!(Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &single
+        )
+        .is_some());
+        let scopes = partition(&config, &[24, 24]);
+        assert!(Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &scopes[0]
+        )
+        .is_none());
+        let output = Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &scopes[1],
+        )
+        .unwrap();
+        let ar_output =
+            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, None, &scopes[1])
+                .unwrap();
+        // The MTP head, ring and wide buffers add bytes on the output band only.
+        assert!(output > ar_output);
     }
 }

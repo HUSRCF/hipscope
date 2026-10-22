@@ -1242,6 +1242,7 @@ mod tests {
             gemma4_drafter_path: None,
             gemma4_draft_len: 3,
             xdna: None,
+            batch_request: Default::default(),
         }
     }
 

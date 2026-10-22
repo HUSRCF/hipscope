@@ -4,8 +4,8 @@
 
 //! PeaceMaker twins of the exact (`cand_mode = 8`) gfx1201 IU4 C8 producers that feed the A3B
 //! F3 prefill route (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`), behind
-//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`], raw inventory only, no
-//! qualified row: unset is off, `1` opts in, `0` kills).
+//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`], qualified on exact gfx1201:
+//! unset follows the qualification, `1` opts in, `0` kills).
 //!
 //! * [`Gpu::mq_rotate_x_i4_c8_pm`]: twin of `Gpu::rotate_x_mq_i4_gfx12_exact_batched`
 //!   (`iu4_c8_rotate_pm_gfx1201`, block 32, grid `rows * K / 256`, K 2048 or 4096).
@@ -20,6 +20,22 @@
 //! [`Gpu::iu4_c8_pm_admitted`] holds (both flags, raw inventory, eager, supported shape and
 //! operands) and otherwise run the unchanged HIP exact path. The shared-down SwiGLU producer and
 //! the sigmoid transform keep the incumbent.
+//!
+//! Two folded producers (same module, 80-byte kernarg block = the frozen block + one pointer @72)
+//! remove the standalone passes that only feed the exact C8 producer on the A3B MoE prefill route:
+//!
+//! * [`Gpu::mq_sigmoid_rotate_x_i4_c8_pm`] (`iu4_c8_sigmoid_rotate_pm_gfx1201`): the gate
+//!   `x = attn * sigmoid(gate)` (the exact `sigmoid_mul_f32` expression) formed in registers in
+//!   front of the rotate; the attention buffer is not modified. Byte-identical to
+//!   `Gpu::sigmoid_mul_f32` followed by [`Gpu::mq_rotate_x_i4_c8_pm`].
+//! * [`Gpu::fused_rmsnorm_out_mq_rotate_i4_c8_pm`] (`iu4_c8_rmsnorm_out_rotate_pm_gfx1201`): the
+//!   `rmsnorm_f32` reduction order (not the fused RMSNorm export's), the normalized f32 row stored
+//!   to `norm_out`, then the rotate. Byte-identical to `Gpu::rmsnorm_batched` followed by
+//!   [`Gpu::mq_rotate_x_i4_c8_pm`] (rotated f32 row, sidecar and normalized row).
+//!
+//! [`Gpu::iu4_c8_pm_sigmoid_rotate_admitted`] / [`Gpu::iu4_c8_pm_norm_out_admitted`] are the
+//! production admissions (same flags, eager and shape rules as the plain producers, plus the
+//! extra operand); a refusal keeps the unfused chain.
 //!
 //! The kernarg ABI is the frozen 72-byte block of the PeaceMaker family
 //! (`peacemaker_isa::kernels::iu4_c8_producer`): x f32 `@0`, rotated f32 output `@8`, sidecar u8
@@ -36,7 +52,11 @@ pub const MODULE: &str = "iu4_c8_producer_pm_gfx1201";
 pub const ROTATE_SYMBOL: &str = "iu4_c8_rotate_pm_gfx1201";
 pub const NORM_SYMBOL: &str = "iu4_c8_rmsnorm_rotate_pm_gfx1201";
 pub const IMAGE: &[u8] = include_bytes!("../../../kernels/iu4_c8_producer_pm_gfx1201.hxaco");
+pub const SIGMOID_ROTATE_SYMBOL: &str = "iu4_c8_sigmoid_rotate_pm_gfx1201";
+pub const NORM_OUT_SYMBOL: &str = "iu4_c8_rmsnorm_out_rotate_pm_gfx1201";
 pub const KERNARG_BYTES: usize = 72;
+/// Kernarg bytes of the two folded exports (the frozen block plus one pointer @72).
+pub const KERNARG_BYTES_EXT: usize = 80;
 pub const ROTATE_BLOCK: [u32; 3] = [32, 1, 1];
 pub const NORM_BLOCK: [u32; 3] = [256, 1, 1];
 /// Elements of one `block_i4_128` pair (one 256-element FWHT group per wave).
@@ -149,11 +169,12 @@ fn kernargs(
     signs2: *mut c_void,
     weight: *mut c_void,
     awq: *mut c_void,
+    extra: *mut c_void,
     rows: usize,
     k: usize,
     eps: f32,
-) -> [u8; KERNARG_BYTES] {
-    let mut args = [0u8; KERNARG_BYTES];
+) -> [u8; KERNARG_BYTES_EXT] {
+    let mut args = [0u8; KERNARG_BYTES_EXT];
     for (offset, ptr) in [
         (0, x),
         (8, rotated),
@@ -162,6 +183,7 @@ fn kernargs(
         (32, signs2),
         (40, weight),
         (48, awq),
+        (72, extra),
     ] {
         args[offset..offset + 8].copy_from_slice(&(ptr as u64).to_le_bytes());
     }
@@ -183,7 +205,7 @@ fn operands_valid(
     weight: Option<&GpuTensor>,
     awq: Option<&GpuTensor>,
     out: Option<&GpuTensor>,
-    reservation: &Int4MmqReservation,
+    reservation: Option<&Int4MmqReservation>,
     k: usize,
     rows: usize,
 ) -> bool {
@@ -191,8 +213,7 @@ fn operands_valid(
     if !c8_pm_supported_shape(is_norm, k, rows) {
         return false;
     }
-    reservation.k() == k
-        && reservation.n() == rows
+    reservation.is_none_or(|r| r.k() == k && r.n() == rows)
         && f32_span(x, rows * k)
         && out.is_some_and(|t| f32_span(t, rows * k))
         && awq.is_none_or(|t| f32_span(t, k))
@@ -201,6 +222,70 @@ fn operands_valid(
             (true, None) => false,
             (false, _) => true,
         }
+}
+
+/// Which of the four exports a launch runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Rotate,
+    Norm,
+    SigmoidRotate,
+    NormOut,
+}
+
+impl Variant {
+    fn is_norm(self) -> bool {
+        matches!(self, Self::Norm | Self::NormOut)
+    }
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Rotate => ROTATE_SYMBOL,
+            Self::Norm => NORM_SYMBOL,
+            Self::SigmoidRotate => SIGMOID_ROTATE_SYMBOL,
+            Self::NormOut => NORM_OUT_SYMBOL,
+        }
+    }
+    /// The kernarg bytes the export reads (the folded exports carry one extra pointer @72).
+    fn kernarg_bytes(self) -> usize {
+        match self {
+            Self::Rotate | Self::Norm => KERNARG_BYTES,
+            Self::SigmoidRotate | Self::NormOut => KERNARG_BYTES_EXT,
+        }
+    }
+}
+
+/// The two `[rows, k]` f32 spans starting at `a` and `b` do not overlap.
+fn spans_disjoint(a: &GpuTensor, b: &GpuTensor, floats: usize) -> bool {
+    let (a, b) = (a.buf.as_ptr() as usize, b.buf.as_ptr() as usize);
+    let bytes = floats * std::mem::size_of::<f32>();
+    a + bytes <= b || b + bytes <= a
+}
+
+/// Extra-pointer operand of a folded export (`gate` for the sigmoid rotate, `norm_out` for the
+/// RMSNorm): an f32 `[rows, k]` span; the rotated output must not overlap the input (nor the
+/// gate / the stored normalized row), and the normalized row must not overlap the input. The
+/// plain exports take no extra pointer. Call after the shape check.
+fn extra_valid(
+    variant: Variant,
+    x: &GpuTensor,
+    extra: Option<&GpuTensor>,
+    out: Option<&GpuTensor>,
+    k: usize,
+    rows: usize,
+) -> bool {
+    match variant {
+        Variant::Rotate | Variant::Norm => extra.is_none(),
+        Variant::SigmoidRotate | Variant::NormOut => {
+            let (Some(extra), Some(out)) = (extra, out) else {
+                return false;
+            };
+            let floats = rows * k;
+            f32_span(extra, floats)
+                && spans_disjoint(out, x, floats)
+                && spans_disjoint(out, extra, floats)
+                && (variant == Variant::SigmoidRotate || spans_disjoint(extra, x, floats))
+        }
+    }
 }
 
 impl Gpu {
@@ -225,6 +310,92 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> bool {
+        let variant = if is_norm {
+            Variant::Norm
+        } else {
+            Variant::Rotate
+        };
+        self.iu4_c8_pm_variant_admitted(
+            variant,
+            x,
+            weight,
+            awq,
+            None,
+            out,
+            Some(reservation),
+            k,
+            rows,
+        )
+    }
+
+    /// [`Self::iu4_c8_pm_admitted`] for the folded sigmoid rotate: `attn` and `gate` f32
+    /// `[rows, k]` (K 2048 or 4096), `out` the f32 rotated side output. Admitted before the
+    /// sidecar is reserved: the reservation `(k, rows)` is the caller's own, and a refusal
+    /// leaves the scratch untouched for the unfused chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn iu4_c8_pm_sigmoid_rotate_admitted(
+        &self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        out: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> bool {
+        self.iu4_c8_pm_variant_admitted(
+            Variant::SigmoidRotate,
+            attn,
+            None,
+            awq,
+            Some(gate),
+            Some(out),
+            None,
+            k,
+            rows,
+        )
+    }
+
+    /// [`Self::iu4_c8_pm_sigmoid_rotate_admitted`] for the folded RMSNorm (K 2048): `x` the
+    /// residual, `weight` the norm weight, `norm_out` the f32 normalized row, `out` the f32
+    /// rotated row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn iu4_c8_pm_norm_out_admitted(
+        &self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        norm_out: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> bool {
+        self.iu4_c8_pm_variant_admitted(
+            Variant::NormOut,
+            x,
+            Some(weight),
+            awq,
+            Some(norm_out),
+            Some(out),
+            None,
+            k,
+            rows,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn iu4_c8_pm_variant_admitted(
+        &self,
+        variant: Variant,
+        x: &GpuTensor,
+        weight: Option<&GpuTensor>,
+        awq: Option<&GpuTensor>,
+        extra: Option<&GpuTensor>,
+        out: Option<&GpuTensor>,
+        reservation: Option<&Int4MmqReservation>,
+        k: usize,
+        rows: usize,
+    ) -> bool {
+        let is_norm = variant.is_norm();
         match c8_pm_admission(
             self.flags.prefill_iu4_c8_pm,
             self.flags.prefill_iu4_producer_fused,
@@ -233,7 +404,8 @@ impl Gpu {
             is_norm,
             k,
             rows,
-            operands_valid(is_norm, x, weight, awq, out, reservation, k, rows),
+            operands_valid(is_norm, x, weight, awq, out, reservation, k, rows)
+                && extra_valid(variant, x, extra, out, k, rows),
         ) {
             Ok(()) => true,
             Err(reason) => {
@@ -270,10 +442,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<Int4MmqPrepared> {
         self.launch_iu4_c8_pm(
-            false,
+            Variant::Rotate,
             x_in,
             None,
             awq,
+            None,
             x_out,
             reservation,
             k,
@@ -299,10 +472,73 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<Int4MmqPrepared> {
         self.launch_iu4_c8_pm(
-            true,
+            Variant::Norm,
             x,
             Some(weight),
             awq,
+            None,
+            x_rot,
+            reservation,
+            k,
+            eps,
+            batch_size,
+        )
+    }
+
+    /// PeaceMaker fold of `Gpu::sigmoid_mul_f32(attn, gate)` into
+    /// [`Gpu::mq_rotate_x_i4_c8_pm`]: the rotate input is `attn * sigmoid(gate)` formed per
+    /// element in registers (`attn` is not written), then the identical AWQ / FWHT / f32
+    /// side output / C8 sidecar. `gate` is the compact f32 `[rows, k]` gate. K 2048 or 4096,
+    /// rows `1..=8192`. Eager gfx1201 only, no HIP fallback; reads no flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq_sigmoid_rotate_x_i4_c8_pm(
+        &mut self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_out: Option<&GpuTensor>,
+        reservation: Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<Int4MmqPrepared> {
+        self.launch_iu4_c8_pm(
+            Variant::SigmoidRotate,
+            attn,
+            None,
+            awq,
+            Some(gate),
+            x_out,
+            reservation,
+            k,
+            0.0,
+            batch_size,
+        )
+    }
+
+    /// PeaceMaker fold of `Gpu::rmsnorm_batched(x, weight, norm_out, rows, k, eps)` into
+    /// [`Gpu::mq_rotate_x_i4_c8_pm`] on `norm_out`: the `rmsnorm_f32` reduction order, the
+    /// normalized f32 row stored to `norm_out`, then the identical AWQ / FWHT / f32 side
+    /// output / C8 sidecar. K 2048, rows `1..=8192`, `norm_out`, `x` and `x_rot` pairwise
+    /// disjoint. Eager gfx1201 only, no HIP fallback; reads no flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_rmsnorm_out_mq_rotate_i4_c8_pm(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        norm_out: &GpuTensor,
+        x_rot: Option<&GpuTensor>,
+        reservation: Int4MmqReservation,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<Int4MmqPrepared> {
+        self.launch_iu4_c8_pm(
+            Variant::NormOut,
+            x,
+            Some(weight),
+            awq,
+            Some(norm_out),
             x_rot,
             reservation,
             k,
@@ -314,10 +550,11 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn launch_iu4_c8_pm(
         &mut self,
-        is_norm: bool,
+        variant: Variant,
         x: &GpuTensor,
         weight: Option<&GpuTensor>,
         awq: Option<&GpuTensor>,
+        extra: Option<&GpuTensor>,
         out: Option<&GpuTensor>,
         reservation: Int4MmqReservation,
         k: usize,
@@ -331,13 +568,25 @@ impl Gpu {
                 "the f32 rotated side output is always written: x_out/x_rot must be Some",
             ));
         };
-        if !operands_valid(is_norm, x, weight, awq, Some(out), &reservation, k, rows) {
+        let is_norm = variant.is_norm();
+        if !operands_valid(
+            is_norm,
+            x,
+            weight,
+            awq,
+            Some(out),
+            Some(&reservation),
+            k,
+            rows,
+        ) || !extra_valid(variant, x, extra, Some(out), k, rows)
+        {
             return Err(err(format!(
-                "unsupported or invalid operands: norm={is_norm} k={k} rows={rows} (rotate K 2048|4096, \
-                 norm K 2048, rows 1..=8192, F32 operands sized for rows*k, reservation (k,n) match)"
+                "unsupported or invalid operands: {variant:?} k={k} rows={rows} (rotate K 2048|4096, \
+                 norm K 2048, rows 1..=8192, F32 operands sized for rows*k, reservation (k,n) match, \
+                 folded exports: extra f32 [rows, k] operand, output spans disjoint)"
             )));
         }
-        let symbol = if is_norm { NORM_SYMBOL } else { ROTATE_SYMBOL };
+        let symbol = variant.symbol();
         self.ensure_mq_signs()?;
         self.ensure_embedded_kernel(MODULE, IMAGE, symbol)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -351,6 +600,7 @@ impl Gpu {
             s2,
             weight.map_or(std::ptr::null_mut(), |w| w.buf.as_ptr()),
             awq.map_or(std::ptr::null_mut(), |a| a.buf.as_ptr()),
+            extra.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr()),
             rows,
             k,
             eps,
@@ -360,7 +610,8 @@ impl Gpu {
         } else {
             ([((k / GROUP) * rows) as u32, 1, 1], ROTATE_BLOCK)
         };
-        let bytes = (k * 4 * if is_norm { 3 } else { 2 } + (k / 128) * 72) * rows;
+        let streams = if is_norm { 3 } else { 2 } + usize::from(extra.is_some());
+        let bytes = (k * 4 * streams + (k / 128) * 72) * rows;
         let timer = crate::profile::begin_timer(
             &self.hip,
             if is_norm { "fused" } else { "fwht" },
@@ -372,13 +623,18 @@ impl Gpu {
             grid,
             block,
             0,
-            &mut args,
+            &mut args[..variant.kernarg_bytes()],
             crate::dispatch::ReplayLaunchBindings::NONE,
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         self.invalidate_x_caches_for(out_ptr);
+        if variant == Variant::SigmoidRotate {
+            // The unfused chain's `sigmoid_mul_f32` drops the conversions cached for the attention
+            // buffer it rewrote; the fold leaves the buffer untouched but keeps that invalidation.
+            self.invalidate_x_caches_for(x.buf.as_ptr());
+        }
         result?;
         Ok(Int4MmqPrepared::from_reservation(reservation))
     }
@@ -405,6 +661,9 @@ mod tests {
         assert_eq!(MODULE, author::MODULE);
         assert_eq!(ROTATE_SYMBOL, author::ROTATE_SYMBOL);
         assert_eq!(NORM_SYMBOL, author::NORM_SYMBOL);
+        assert_eq!(SIGMOID_ROTATE_SYMBOL, author::SIGMOID_ROTATE_SYMBOL);
+        assert_eq!(NORM_OUT_SYMBOL, author::NORM_OUT_SYMBOL);
+        assert_eq!(KERNARG_BYTES_EXT as u32, author::KERNARG_BYTES_EXT);
         assert_eq!(KERNARG_BYTES as u32, author::KERNARG_BYTES);
         assert_eq!(ROTATE_BLOCK[0], author::ROTATE_BLOCK);
         assert_eq!(NORM_BLOCK[0], author::NORM_BLOCK);
@@ -412,8 +671,13 @@ mod tests {
     }
 
     #[test]
-    fn embedded_image_carries_both_exports() {
-        for symbol in [ROTATE_SYMBOL, NORM_SYMBOL] {
+    fn embedded_image_carries_all_exports() {
+        for symbol in [
+            ROTATE_SYMBOL,
+            NORM_SYMBOL,
+            SIGMOID_ROTATE_SYMBOL,
+            NORM_OUT_SYMBOL,
+        ] {
             assert!(contains(IMAGE, symbol.as_bytes()), "{symbol} missing");
             assert!(
                 contains(IMAGE, format!("{symbol}.kd").as_bytes()),
@@ -432,11 +696,12 @@ mod tests {
             0x5000usize as *mut c_void,
             0x6000usize as *mut c_void,
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
             8191,
             2048,
             1e-6,
         );
-        assert_eq!(args.len(), 72);
+        assert_eq!(args.len(), 80);
         let ptr = |at: usize| u64::from_le_bytes(args[at..at + 8].try_into().unwrap());
         for (at, want) in [
             (0, 0x1000u64),
@@ -453,6 +718,39 @@ mod tests {
         assert_eq!(i32::from_le_bytes(args[60..64].try_into().unwrap()), 2048);
         assert_eq!(f32::from_le_bytes(args[64..68].try_into().unwrap()), 1e-6);
         assert_eq!(&args[68..72], &[0; 4], "padding stays zero");
+        assert_eq!(ptr(72), 0, "the plain exports read no extra pointer");
+        let folded = kernargs(
+            0x1000usize as *mut c_void,
+            0x2000usize as *mut c_void,
+            0x3000usize as *mut c_void,
+            0x4000usize as *mut c_void,
+            0x5000usize as *mut c_void,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0x7000usize as *mut c_void,
+            8192,
+            4096,
+            0.0,
+        );
+        assert_eq!(
+            u64::from_le_bytes(folded[72..80].try_into().unwrap()),
+            0x7000,
+            "gate / norm_out @72"
+        );
+        assert_eq!(
+            &folded[..72],
+            &{
+                let mut frozen = [0u8; 72];
+                frozen[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+                frozen[8..16].copy_from_slice(&0x2000u64.to_le_bytes());
+                frozen[16..24].copy_from_slice(&0x3000u64.to_le_bytes());
+                frozen[24..32].copy_from_slice(&0x4000u64.to_le_bytes());
+                frozen[32..40].copy_from_slice(&0x5000u64.to_le_bytes());
+                frozen[56..60].copy_from_slice(&8192i32.to_le_bytes());
+                frozen[60..64].copy_from_slice(&4096i32.to_le_bytes());
+                frozen
+            }[..]
+        );
     }
 
     #[test]
@@ -546,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn route_is_off_unless_explicit_and_nests_beneath_f3() {
+    fn route_follows_its_qualification_and_nests_beneath_f3() {
         use crate::prefill_route_capabilities::enabled;
         // Resolve both flags exactly as `FeatureFlags` does, then admit.
         let admit = |arch: &str, f3: Option<bool>, c8: Option<bool>| {
@@ -564,9 +862,10 @@ mod tests {
         use C8PmRefusal as R;
         for arch in ARCHES {
             let gfx1201 = arch == "gfx1201";
-            // Unset: the route has no qualified row, so it is off wherever F3 is on.
-            assert_eq!(admit(arch, None, None), Err(R::Disabled), "{arch}");
-            assert_eq!(admit(arch, Some(true), None), Err(R::Disabled), "{arch}");
+            // Unset: the route follows its exact-gfx1201 qualification beneath the resolved F3.
+            let unset = if gfx1201 { Ok(()) } else { Err(R::Disabled) };
+            assert_eq!(admit(arch, None, None), unset, "{arch}");
+            assert_eq!(admit(arch, Some(true), None), unset, "{arch}");
             // Explicit 0 kills.
             assert_eq!(admit(arch, None, Some(false)), Err(R::Disabled), "{arch}");
             assert_eq!(

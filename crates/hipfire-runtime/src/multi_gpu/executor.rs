@@ -4,17 +4,19 @@
 //! Default-off, single-threaded execution of an admitted split schedule.
 //!
 //! Preparation is CPU-only and validates the entire epoch before any submission.
-//! Submission never synchronizes HIP. Local marks are enqueued frontiers, not a
+//! Submission never synchronizes HIP, except the host-staged TP transport
+//! (`TpTransport::Host`). Local marks are enqueued frontiers, not a
 //! committed model position: only a successful all-device drain acknowledges an
 //! epoch. A failed drain permanently quarantines the mesh's leases.
 
 use super::transport::{self, EdgeDescriptor, EdgeId, EdgeLease, EdgeSpec};
 use super::Gpus;
-use crate::device_mesh::{DimKind, MeshEpoch};
+use crate::device_mesh::{DeviceMesh, DimKind, MeshEpoch};
 use crate::mesh_placement::{AdmittedMesh, BandPlacement, EdgeTransport};
 use crate::mesh_split::{CollectiveKind, PlannedCollective, RankItem, SplitPlan};
+use hip_bridge::DeviceBuffer;
 use hipfire_dispatch::pipeline::step_graph::OpId;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +44,17 @@ pub struct ForwardEpoch {
 }
 
 /// Borrowed local activation, never an alias on another rank. `descriptor.epoch`
-/// is the provisioned transport epoch returned by `Gpus::mesh_edge_epoch`.
+/// is the provisioned transport epoch: `Gpus::mesh_edge_epoch` for a
+/// `BandXfer`, `Gpus::mesh_tp_epoch` for `AllReduce`/`AllReduceAdd`.
+///
+/// `view` is the collective's operand on `owner`. `into` is the owner's
+/// accumulation target (the `into` resource) of an `AllReduceAdd` and `None`
+/// for every other collective. TP collectives fold F32 rows only. After an
+/// `AllReduceAdd` the operand's contents are unspecified (they depend on the
+/// transport); the splitter refuses any later read of it.
 pub struct BoundaryIo<'a> {
     pub view: &'a GpuTensor,
+    pub into: Option<&'a GpuTensor>,
     pub descriptor: EdgeDescriptor,
 }
 
@@ -67,6 +77,13 @@ pub trait MeshStepBindings {
         epoch: &ForwardEpoch,
     ) -> Result<BoundaryIo<'_>>;
     fn apply_rank_marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()>;
+    /// Host-only capability: whether this family implements
+    /// [`Self::repair_prefix_rank`]. `Gpus::repair_mesh_prefix` refuses a
+    /// family without it before the first callback, so the refusal leaves the
+    /// mesh healthy instead of poisoning it.
+    fn admits_prefix_repair(&self) -> bool {
+        true
+    }
     fn repair_prefix_rank(
         &mut self,
         owner: usize,
@@ -497,11 +514,47 @@ struct OwnedEdge {
     max_bytes: usize,
 }
 
+/// How a pure-TP group moves partials. Decided once at provisioning; there is
+/// no per-call route choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TpTransport {
+    /// Every rank pair is byte-qualified peer, or one device under emulation.
+    /// Each rank pulls every partial with the kernel copy `qualify_peer`
+    /// proved (never `hipMemcpyPeer`, which writes nothing into allocations
+    /// made after peer enable) and folds `p0 + p1 + …` locally.
+    Peer,
+    /// Some pair is not peer-qualified: the hand dense-TP route's host-staged
+    /// rank-order reduction (`Gpus::all_reduce_sum_f32_host`). It synchronizes
+    /// the rank streams, the one exception to "submission never waits".
+    Host,
+}
+
+/// The provisioned pure-TP group: every rank, in rank order.
+#[derive(Clone, Copy, Debug)]
+struct TpGroup {
+    transport: TpTransport,
+    epoch: u64,
+    max_bytes: usize,
+}
+
+/// One rank's `TpTransport::Peer` buffers, allocated at provisioning.
+struct TpScratch {
+    /// `ranks` F32 slots of `max_bytes`: slot `q` holds rank `q`'s partial,
+    /// slot 0 then accumulates the rank-order sum.
+    stage: GpuTensor,
+    /// The 16-byte zero owner table of `transport::copy_bytes`.
+    owners: GpuTensor,
+}
+
 #[derive(Default)]
 pub(super) struct MeshExecutionState {
     edges: HashMap<EdgeId, OwnedEdge>,
     mesh_epoch: Option<MeshEpoch>,
     output_owner: Option<usize>,
+    /// `Some` exactly for a provisioned pure-TP mesh.
+    tp: Option<TpGroup>,
+    /// Index == rank; empty unless `tp` is `TpTransport::Peer`.
+    tp_scratch: Vec<TpScratch>,
     issuer: u64,
     last_op: Option<u64>,
     scope: Option<(u64, u64)>,
@@ -636,6 +689,8 @@ struct BoundaryMeta {
     extent: usize,
     capacity: usize,
     transport_epoch: u64,
+    /// `AllReduceAdd` accumulation target `(address, extent)`; `None` otherwise.
+    into: Option<(usize, usize)>,
 }
 
 /// Small internal seam: CPU tests exercise the very same prepare/issue/drain
@@ -664,6 +719,14 @@ trait Backend: DrainBackend {
         meta: BoundaryMeta,
         publish: bool,
     ) -> Result<()>;
+    /// Enqueue one `AllReduce`/`AllReduceAdd` on every rank of its group;
+    /// `metas` are its prepared boundaries in group order.
+    fn reduce(
+        &mut self,
+        collective: &PlannedCollective,
+        epoch: &ForwardEpoch,
+        metas: &[BoundaryMeta],
+    ) -> Result<()>;
     fn marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()>;
     /// Host-side validation hook run before any enqueue of `epoch`.
     fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()>;
@@ -682,6 +745,11 @@ enum Action {
         meta: BoundaryMeta,
         publish: bool,
     },
+    /// One group reduction; boundaries are `Prepared::metas[start..start + group.len()]`.
+    Reduce {
+        collective: usize,
+        start: usize,
+    },
     Marks(usize),
 }
 
@@ -690,17 +758,77 @@ struct Prepared {
     actions: Vec<Action>,
     ops: Vec<OpId>,
     issued: Vec<u64>,
+    /// Every collective's validated boundaries, one per participant in group order.
+    metas: Vec<BoundaryMeta>,
+}
+
+/// How the walk schedules a collective.
+#[derive(Clone, Copy)]
+enum Route {
+    /// Point-to-point PP edge `(src, dst)`.
+    Band(usize, usize),
+    /// Reduction over every rank of a pure-TP mesh.
+    Group,
 }
 
 fn endpoints(collective: &PlannedCollective, ranks: usize) -> Result<(usize, usize)> {
     let CollectiveKind::BandXfer { src, dst } = collective.kind else {
-        return Err("mesh executor does not support AllReduce collectives in this slice".into());
+        return Err("collective is not a BandXfer".into());
     };
-    // S3 is PP-only. Composed TP/EP groups require a later collective executor.
     if src >= ranks || dst >= ranks || src == dst || collective.group != [src, dst] {
         return Err("BandXfer must name exactly its two logical PP owners".into());
     }
     Ok((src, dst))
+}
+
+fn route(collective: &PlannedCollective, ranks: usize) -> Result<Route> {
+    if let CollectiveKind::BandXfer { .. } = collective.kind {
+        let (src, dst) = endpoints(collective, ranks)?;
+        return Ok(Route::Band(src, dst));
+    }
+    // Pure TP: the group is every rank, ascending, and the sum is taken in that
+    // order (`x + (p0 + p1 + …)`, the hand dense-TP routes' numeric contract).
+    if ranks < 2 || !collective.group.iter().copied().eq(0..ranks) {
+        return Err("TP collective group must be every mesh rank in ascending rank order".into());
+    }
+    Ok(Route::Group)
+}
+
+/// Group reductions fold F32 rows, and every operand and accumulation target
+/// must be distinct memory: under emulation all ranks share one device, so an
+/// aliased binding would fold a rank into itself.
+fn validate_group(metas: &[BoundaryMeta], add: bool) -> Result<()> {
+    let bytes = metas[0].descriptor.bytes;
+    if metas[0].descriptor.dtype_bytes != 4 {
+        return Err("TP collectives reduce F32 activations only".into());
+    }
+    let mut spans = Vec::with_capacity(metas.len() * 2);
+    for meta in metas {
+        spans.push((meta.address, bytes));
+        match meta.into {
+            Some((address, extent))
+                if add && address != 0 && address % 16 == 0 && extent >= bytes =>
+            {
+                spans.push((address, bytes));
+            }
+            None if !add => {}
+            _ => {
+                return Err(
+                    "AllReduceAdd needs one accumulation target per rank holding the \
+                     operand bytes; AllReduce takes none"
+                        .into(),
+                )
+            }
+        }
+    }
+    spans.sort_unstable();
+    if spans
+        .windows(2)
+        .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+    {
+        return Err("TP collective operands and accumulation targets overlap".into());
+    }
+    Ok(())
 }
 
 fn validate_boundary(meta: BoundaryMeta, epoch: &ForwardEpoch) -> Result<()> {
@@ -741,23 +869,39 @@ fn prepare(plan: &SplitPlan, epoch: &ForwardEpoch, backend: &impl Backend) -> Re
     if plan.ranks.is_empty() || plan.ranks.len() != backend.rank_count() {
         return Err("split plan rank count does not match devices".into());
     }
+    let ranks = plan.ranks.len();
     let mut seen_ops = HashSet::new();
-    let mut occurrences = vec![[0usize; 2]; plan.collectives.len()];
-    let mut metas = Vec::with_capacity(plan.collectives.len());
+    let mut routes = Vec::with_capacity(plan.collectives.len());
+    let mut starts = Vec::with_capacity(plan.collectives.len());
+    let mut metas = Vec::new();
     for (index, c) in plan.collectives.iter().enumerate() {
         if c.id.0 as usize != index || c.operand.0 as usize >= plan.resources.len() {
             return Err("invalid collective id or resource".into());
         }
-        let (src, dst) = endpoints(c, plan.ranks.len())?;
-        let source = backend.boundary(src, c, epoch)?;
-        let destination = backend.boundary(dst, c, epoch)?;
-        validate_boundary(source, epoch)?;
-        validate_boundary(destination, epoch)?;
-        if source.descriptor != destination.descriptor {
-            return Err("BandXfer producer and consumer descriptors differ".into());
+        let route = route(c, ranks)?;
+        let start = metas.len();
+        for &owner in &c.group {
+            let meta = backend.boundary(owner, c, epoch)?;
+            validate_boundary(meta, epoch)?;
+            metas.push(meta);
         }
-        metas.push([source, destination]);
+        let own = &metas[start..];
+        if own.iter().any(|meta| meta.descriptor != own[0].descriptor) {
+            return Err("collective participants' boundary descriptors differ".into());
+        }
+        match route {
+            Route::Band(..) if own.iter().any(|meta| meta.into.is_some()) => {
+                return Err("BandXfer boundary names an accumulation target".into());
+            }
+            Route::Band(..) => {}
+            Route::Group => {
+                validate_group(own, matches!(c.kind, CollectiveKind::AllReduceAdd { .. }))?
+            }
+        }
+        routes.push(route);
+        starts.push(start);
     }
+    let mut occurrences = vec![0usize; metas.len()];
     let mut item_count = 0;
     for (owner, rank) in plan.ranks.iter().enumerate() {
         if rank.device != owner || !backend.ready(owner) {
@@ -771,35 +915,45 @@ fn prepare(plan: &SplitPlan, epoch: &ForwardEpoch, backend: &impl Backend) -> Re
                     }
                 }
                 RankItem::Collective(id) => {
+                    let index = id.0 as usize;
                     let c = plan
                         .collectives
-                        .get(id.0 as usize)
+                        .get(index)
                         .ok_or("invalid rank collective id")?;
-                    let (src, dst) = endpoints(c, plan.ranks.len())?;
-                    let side = if owner == src {
-                        0
-                    } else if owner == dst {
-                        1
-                    } else {
-                        return Err("collective placed on a nonparticipant rank".into());
-                    };
-                    occurrences[id.0 as usize][side] += 1;
+                    let side = c
+                        .group
+                        .iter()
+                        .position(|&device| device == owner)
+                        .ok_or("collective placed on a nonparticipant rank")?;
+                    occurrences[starts[index] + side] += 1;
                 }
             }
         }
         item_count += rank.items.len();
     }
-    if occurrences.iter().any(|count| *count != [1, 1]) {
-        return Err("BandXfer must appear exactly once on each endpoint".into());
+    if occurrences.iter().any(|&count| count != 1) {
+        return Err("collective must appear exactly once on each participant".into());
+    }
+    // The fused reduction replaces the Accumulate; running both adds twice.
+    for c in &plan.collectives {
+        if let CollectiveKind::AllReduceAdd { replaces, .. } = c.kind {
+            if c.group
+                .iter()
+                .any(|&owner| seen_ops.contains(&(owner, replaces)))
+            {
+                return Err("AllReduceAdd's replaced Accumulate is also scheduled as an op".into());
+            }
+        }
     }
     // Build the topological walk before submission. One action per rank per pass
     // allows chunk overlap while receiving each bank before it can be reused.
     let mut prepared = Prepared {
-        actions: Vec::with_capacity(item_count + plan.ranks.len()),
+        actions: Vec::with_capacity(item_count + ranks),
         ops: Vec::with_capacity(seen_ops.len()),
         issued: Vec::new(),
+        metas,
     };
-    let mut cursors = vec![0; plan.ranks.len()];
+    let mut cursors = vec![0; ranks];
     let mut published = vec![false; plan.collectives.len()];
     let mut received = vec![false; plan.collectives.len()];
     let mut busy_edges = HashSet::new();
@@ -807,16 +961,15 @@ fn prepare(plan: &SplitPlan, epoch: &ForwardEpoch, backend: &impl Backend) -> Re
     while remaining != 0 {
         let before = remaining;
         for (owner, rank) in plan.ranks.iter().enumerate() {
-            let cursor = &mut cursors[owner];
-            if *cursor == rank.items.len() {
+            if cursors[owner] == rank.items.len() {
                 continue;
             }
-            match rank.items[*cursor] {
+            match rank.items[cursors[owner]] {
                 RankItem::Op(_) => {
                     let start = prepared.ops.len();
-                    while let Some(RankItem::Op(id)) = rank.items.get(*cursor) {
+                    while let Some(RankItem::Op(id)) = rank.items.get(cursors[owner]) {
                         prepared.ops.push(*id);
-                        *cursor += 1;
+                        cursors[owner] += 1;
                         remaining -= 1;
                     }
                     prepared.actions.push(Action::Ops {
@@ -827,39 +980,65 @@ fn prepare(plan: &SplitPlan, epoch: &ForwardEpoch, backend: &impl Backend) -> Re
                 }
                 RankItem::Collective(id) => {
                     let index = id.0 as usize;
-                    let c = &plan.collectives[index];
-                    let (src, dst) = endpoints(c, plan.ranks.len())?;
-                    let edge = (src, dst);
-                    let publish = owner == src;
-                    if publish {
-                        if busy_edges.contains(&edge) {
-                            continue;
+                    match routes[index] {
+                        Route::Band(src, dst) => {
+                            let edge = (src, dst);
+                            let publish = owner == src;
+                            if publish {
+                                if busy_edges.contains(&edge) {
+                                    continue;
+                                }
+                                published[index] = true;
+                                busy_edges.insert(edge);
+                            } else {
+                                if !published[index] {
+                                    continue;
+                                }
+                                received[index] = true;
+                                busy_edges.remove(&edge);
+                            }
+                            prepared.actions.push(Action::Transfer {
+                                owner,
+                                collective: index,
+                                meta: prepared.metas[starts[index] + usize::from(!publish)],
+                                publish,
+                            });
+                            cursors[owner] += 1;
+                            remaining -= 1;
                         }
-                        published[index] = true;
-                        busy_edges.insert(edge);
-                    } else {
-                        if !published[index] {
-                            continue;
+                        Route::Group => {
+                            // Enqueue once every rank has reached it, so every
+                            // rank's producers precede the reduction.
+                            let group = &plan.collectives[index].group;
+                            if group.iter().any(|&device| {
+                                plan.ranks[device].items.get(cursors[device])
+                                    != Some(&RankItem::Collective(id))
+                            }) {
+                                continue;
+                            }
+                            prepared.actions.push(Action::Reduce {
+                                collective: index,
+                                start: starts[index],
+                            });
+                            for &device in group {
+                                cursors[device] += 1;
+                                remaining -= 1;
+                                if device != owner
+                                    && cursors[device] == plan.ranks[device].items.len()
+                                {
+                                    prepared.actions.push(Action::Marks(device));
+                                }
+                            }
                         }
-                        received[index] = true;
-                        busy_edges.remove(&edge);
                     }
-                    prepared.actions.push(Action::Transfer {
-                        owner,
-                        collective: index,
-                        meta: metas[index][usize::from(!publish)],
-                        publish,
-                    });
-                    *cursor += 1;
-                    remaining -= 1;
                 }
             }
-            if *cursor == rank.items.len() {
+            if cursors[owner] == rank.items.len() {
                 prepared.actions.push(Action::Marks(owner));
             }
         }
         if before == remaining {
-            return Err("cyclic or inconsistent BandXfer schedule".into());
+            return Err("cyclic or inconsistent collective schedule".into());
         }
     }
     // Empty owners still participate in acknowledgements and marks.
@@ -868,7 +1047,10 @@ fn prepare(plan: &SplitPlan, epoch: &ForwardEpoch, backend: &impl Backend) -> Re
             prepared.actions.push(Action::Marks(owner));
         }
     }
-    debug_assert!(received.iter().all(|issued| *issued));
+    debug_assert!(routes
+        .iter()
+        .zip(&received)
+        .all(|(route, received)| matches!(route, Route::Group) || *received));
     prepared
         .issued
         .resize(prepared.actions.len().div_ceil(64), 0);
@@ -899,6 +1081,10 @@ fn issue(
                 meta,
                 publish,
             } => backend.transfer(owner, &plan.collectives[collective], epoch, meta, publish),
+            Action::Reduce { collective, start } => {
+                let c = &plan.collectives[collective];
+                backend.reduce(c, epoch, &prepared.metas[start..start + c.group.len()])
+            }
             Action::Marks(owner) => backend.marks(owner, epoch),
         };
         if let Err(error) = result {
@@ -972,36 +1158,53 @@ fn drain_tickets<B: DrainBackend + HasState>(
     Ok(())
 }
 
+/// The production backend. It borrows the whole `Gpus` because TP reductions
+/// run on its rank-order reduction primitives and their scratch.
 struct HipBackend<'a> {
-    devices: &'a mut Vec<Gpu>,
-    state: &'a mut MeshExecutionState,
+    gpus: &'a mut Gpus,
     bindings: &'a mut dyn MeshStepBindings,
+}
+
+/// Refuse a binding tensor that is not plain device memory of `gpu`.
+fn require_local(gpu: &Gpu, tensor: &GpuTensor) -> Result<()> {
+    let attributes = gpu
+        .hip
+        .pointer_get_attributes(&tensor.buf)
+        .map_err(|e| e.to_string())?;
+    if attributes.device != gpu.device_id
+        || hip_bridge::MemoryType::from_raw(attributes.mem_type)
+            != Some(hip_bridge::MemoryType::Device)
+        || attributes.is_managed != 0
+    {
+        return Err("boundary activation is not local device memory of its owner".into());
+    }
+    Ok(())
 }
 
 impl DrainBackend for HipBackend<'_> {
     fn rank_count(&self) -> usize {
-        self.devices.len()
+        self.gpus.devices.len()
     }
     fn synchronize(&mut self, owner: usize) -> Result<()> {
-        let gpu = &mut self.devices[owner];
+        let gpu = &mut self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
         gpu.hip.device_synchronize().map_err(|e| e.to_string())
     }
     fn poison(&mut self) {
-        self.state.poison();
+        self.gpus.mesh_execution.poison();
     }
     fn quarantine(&mut self) {
-        self.state.quarantined = true;
+        self.gpus.mesh_execution.quarantined = true;
         // Reached only after a failed device synchronization (see `drain` and
         // `reset_all`): like `HipDrain`, keep device ownership until teardown
         // because in-flight work may still reference registered VMM/host state.
-        std::mem::forget(std::mem::take(self.devices));
+        std::mem::forget(std::mem::take(&mut self.gpus.devices));
     }
 }
 
 impl Backend for HipBackend<'_> {
     fn ready(&self, owner: usize) -> bool {
-        self.devices[owner].active_stream.is_some()
+        self.gpus.devices[owner].active_stream.is_some()
     }
     fn boundary(
         &self,
@@ -1009,39 +1212,43 @@ impl Backend for HipBackend<'_> {
         c: &PlannedCollective,
         epoch: &ForwardEpoch,
     ) -> Result<BoundaryMeta> {
-        let (src, dst) = endpoints(c, self.devices.len())?;
-        let edge = self
-            .state
-            .edges
-            .get(&EdgeId {
-                src_device: src,
-                dst_device: dst,
-            })
-            .ok_or("BandXfer has no provisioned lease")?;
+        let state = &self.gpus.mesh_execution;
+        let (capacity, transport_epoch) = if let CollectiveKind::BandXfer { .. } = c.kind {
+            let (src, dst) = endpoints(c, self.gpus.devices.len())?;
+            let edge = state
+                .edges
+                .get(&EdgeId {
+                    src_device: src,
+                    dst_device: dst,
+                })
+                .ok_or("BandXfer has no provisioned lease")?;
+            (edge.max_bytes, edge.lease.epoch())
+        } else {
+            let tp = state
+                .tp
+                .ok_or("TP collective on a mesh without a provisioned TP group")?;
+            (tp.max_bytes, tp.epoch)
+        };
         let io = self.bindings.boundary(owner, c, epoch)?;
-        let gpu = &self.devices[owner];
+        let gpu = &self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
-        let attributes = gpu
-            .hip
-            .pointer_get_attributes(&io.view.buf)
-            .map_err(|e| e.to_string())?;
-        if attributes.device != gpu.device_id
-            || hip_bridge::MemoryType::from_raw(attributes.mem_type)
-                != Some(hip_bridge::MemoryType::Device)
-            || attributes.is_managed != 0
-        {
-            return Err("boundary activation is not local device memory of its owner".into());
+        require_local(gpu, io.view)?;
+        if let Some(into) = io.into {
+            require_local(gpu, into)?;
         }
         Ok(BoundaryMeta {
             descriptor: io.descriptor,
             address: io.view.buf.as_ptr() as usize,
             extent: io.view.buf.size(),
-            capacity: edge.max_bytes,
-            transport_epoch: edge.lease.epoch(),
+            capacity,
+            transport_epoch,
+            into: io
+                .into
+                .map(|into| (into.buf.as_ptr() as usize, into.buf.size())),
         })
     }
     fn run_ops(&mut self, owner: usize, epoch: &ForwardEpoch, ops: &[OpId]) -> Result<()> {
-        let gpu = &mut self.devices[owner];
+        let gpu = &mut self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
         self.bindings.run_ops(owner, gpu, epoch, ops)
     }
@@ -1056,18 +1263,48 @@ impl Backend for HipBackend<'_> {
         if self.boundary(owner, c, epoch)? != meta {
             return Err("prepared boundary binding changed during submission".into());
         }
-        let (src, dst) = endpoints(c, self.devices.len())?;
-        let edge = &self.state.edges[&EdgeId {
+        let (src, dst) = endpoints(c, self.gpus.devices.len())?;
+        let edge = &self.gpus.mesh_execution.edges[&EdgeId {
             src_device: src,
             dst_device: dst,
         }];
         let io = self.bindings.boundary(owner, c, epoch)?;
-        let gpu = &mut self.devices[owner];
+        let gpu = &mut self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
         if publish {
             edge.lease.publish(gpu, io.view, io.descriptor)
         } else {
             edge.lease.receive(gpu, io.view, io.descriptor)
+        }
+    }
+    fn reduce(
+        &mut self,
+        c: &PlannedCollective,
+        epoch: &ForwardEpoch,
+        metas: &[BoundaryMeta],
+    ) -> Result<()> {
+        for (&owner, meta) in c.group.iter().zip(metas) {
+            if self.boundary(owner, c, epoch)? != *meta {
+                return Err("prepared boundary binding changed during submission".into());
+            }
+        }
+        let tp = self
+            .gpus
+            .mesh_execution
+            .tp
+            .ok_or("TP collective on a mesh without a provisioned TP group")?;
+        let count = metas[0].descriptor.bytes / 4;
+        let mut partials = Vec::with_capacity(c.group.len());
+        let mut targets = Vec::with_capacity(c.group.len());
+        for &owner in &c.group {
+            let io = self.bindings.boundary(owner, c, epoch)?;
+            partials.push(&io.view.buf);
+            targets.extend(io.into.map(|into| &into.buf));
+        }
+        let gpus = &mut *self.gpus;
+        match tp.transport {
+            TpTransport::Peer => peer_reduce(gpus, tp.max_bytes, &partials, &targets, count),
+            TpTransport::Host => host_reduce(gpus, &partials, &targets, count),
         }
     }
     fn marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()> {
@@ -1078,9 +1315,128 @@ impl Backend for HipBackend<'_> {
     }
 }
 
+fn hip_error(error: hip_bridge::HipError) -> String {
+    error.to_string()
+}
+
+fn f32_view(buf: &DeviceBuffer, count: usize) -> GpuTensor {
+    GpuTensor {
+        // SAFETY: a borrowed, validated binding buffer; the view never
+        // outlives this enqueue.
+        buf: unsafe { buf.alias() },
+        shape: vec![count],
+        dtype: DType::F32,
+    }
+}
+
+fn rank_stream(gpu: &Gpu) -> Result<&hip_bridge::Stream> {
+    gpu.active_stream
+        .as_ref()
+        .ok_or_else(|| "TP rank has no launch stream".to_string())
+}
+
+/// `TpTransport::Peer`. Every rank pulls every partial into its own slots
+/// with the kernel copy `qualify_peer` proved, then folds `p0 + p1 + …` in
+/// rank order, so every rank computes the same bytes. `AllReduceAdd` adds the
+/// sum to the rank's target (`x + (p0 + p1 + …)`); `AllReduce` (`targets`
+/// empty) overwrites the rank's partial with it. Producer and read events order
+/// the cross-rank reads on the device streams; nothing waits on the host.
+fn peer_reduce(
+    gpus: &mut Gpus,
+    max_bytes: usize,
+    partials: &[&DeviceBuffer],
+    targets: &[&DeviceBuffer],
+    count: usize,
+) -> Result<()> {
+    let Gpus {
+        devices,
+        rank_barrier_events: produced,
+        rank_done_events: read,
+        mesh_execution,
+        ..
+    } = gpus;
+    let scratch = &mesh_execution.tp_scratch;
+    let n = devices.len();
+    if scratch.len() != n || produced.len() != n || read.len() != n {
+        return Err("TP peer scratch or events are not provisioned".into());
+    }
+    let bytes = count * 4;
+    // 1. Each rank's partial is complete at this point of its stream.
+    for (gpu, event) in devices.iter().zip(produced.iter()) {
+        gpu.bind_thread().map_err(hip_error)?;
+        gpu.hip
+            .event_record(event, Some(rank_stream(gpu)?))
+            .map_err(hip_error)?;
+    }
+    // 2. After every producer: pull partial q into slot q, fold into slot 0.
+    for (r, (gpu, rank)) in devices.iter_mut().zip(scratch).enumerate() {
+        gpu.bind_thread().map_err(hip_error)?;
+        for (_, event) in produced.iter().enumerate().filter(|&(q, _)| q != r) {
+            gpu.hip
+                .stream_wait_event(rank_stream(gpu)?, event)
+                .map_err(hip_error)?;
+        }
+        let sum = rank.stage.sub_offset(0, count);
+        for (q, partial) in partials.iter().enumerate() {
+            let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
+            transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
+            if q > 0 {
+                let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
+                gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+            }
+        }
+        gpu.hip
+            .event_record(&read[r], Some(rank_stream(gpu)?))
+            .map_err(hip_error)?;
+    }
+    // 3. Once no rank still reads this rank's partial, write the result.
+    for (r, (gpu, rank)) in devices.iter_mut().zip(scratch).enumerate() {
+        gpu.bind_thread().map_err(hip_error)?;
+        for (_, event) in read.iter().enumerate().filter(|&(q, _)| q != r) {
+            gpu.hip
+                .stream_wait_event(rank_stream(gpu)?, event)
+                .map_err(hip_error)?;
+        }
+        let sum = rank.stage.sub_offset(0, count);
+        match targets.get(r) {
+            Some(target) => {
+                let x = f32_view(target, count);
+                gpu.add_f32(&x, &sum, &x).map_err(hip_error)?;
+            }
+            None => transport::copy_bytes(
+                gpu,
+                &rank.owners,
+                sum.buf.as_ptr() as usize,
+                partials[r].as_ptr() as usize,
+                bytes,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// `TpTransport::Host`: exactly the hand dense-TP route without peer access
+/// (`qwen35` `dense_tp_allreduce_add`): host-staged rank-order sum into every
+/// partial, then `x + sum` on each rank for `AllReduceAdd`.
+fn host_reduce(
+    gpus: &mut Gpus,
+    partials: &[&DeviceBuffer],
+    targets: &[&DeviceBuffer],
+    count: usize,
+) -> Result<()> {
+    gpus.all_reduce_sum_f32_host(partials, count)
+        .map_err(hip_error)?;
+    for ((gpu, partial), target) in gpus.devices.iter_mut().zip(partials).zip(targets) {
+        let (sum, x) = (f32_view(partial, count), f32_view(target, count));
+        gpu.bind_thread().map_err(hip_error)?;
+        gpu.add_f32(&x, &sum, &x).map_err(hip_error)?;
+    }
+    Ok(())
+}
+
 impl HasState for HipBackend<'_> {
     fn state(&mut self) -> &mut MeshExecutionState {
-        self.state
+        &mut self.gpus.mesh_execution
     }
 }
 
@@ -1122,6 +1478,8 @@ trait OwnerOps: DrainBackend + HasState {
     ) -> Result<()>;
     /// Host-only and infallible; touches no `Gpu`.
     fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId);
+    /// Host-only; touches no `Gpu`.
+    fn admits_prefix_repair(&self) -> bool;
     /// Trunk owner `owner` runs on device `owner`.
     fn repair_prefix(
         &mut self,
@@ -1337,6 +1695,9 @@ fn repair_prefix_all<B: OwnerOps>(
 ) -> Result<()> {
     let owners = backend.rank_count();
     backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    if !backend.admits_prefix_repair() {
+        return Err("mesh prefix repair is not admitted by this family; nothing ran".into());
+    }
     for owner in 0..owners {
         let result = backend
             .bind(owner)
@@ -1525,7 +1886,7 @@ fn reset_all<B: OwnerOps>(backend: &mut B, epoch: &ForwardEpoch) -> Result<()> {
 
 impl OwnerOps for HipBackend<'_> {
     fn bind(&mut self, device: usize) -> Result<()> {
-        self.devices[device]
+        self.gpus.devices[device]
             .bind_thread()
             .map_err(|e| e.to_string())
     }
@@ -1536,7 +1897,7 @@ impl OwnerOps for HipBackend<'_> {
         key: &MeshCheckpointKey,
     ) -> Result<MeshCheckpointId> {
         self.bindings
-            .checkpoint_rank(owner, &mut self.devices[device], key)
+            .checkpoint_rank(owner, &mut self.gpus.devices[device], key)
     }
     fn restore(
         &mut self,
@@ -1546,7 +1907,7 @@ impl OwnerOps for HipBackend<'_> {
         ticket: MeshCheckpointId,
     ) -> Result<()> {
         self.bindings
-            .restore_rank(owner, &mut self.devices[device], key, ticket)
+            .restore_rank(owner, &mut self.gpus.devices[device], key, ticket)
     }
     fn validate_finalize(
         &mut self,
@@ -1559,6 +1920,9 @@ impl OwnerOps for HipBackend<'_> {
     fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId) {
         self.bindings.finalize_rank(owner, key, ticket);
     }
+    fn admits_prefix_repair(&self) -> bool {
+        self.bindings.admits_prefix_repair()
+    }
     fn repair_prefix(
         &mut self,
         owner: usize,
@@ -1567,11 +1931,11 @@ impl OwnerOps for HipBackend<'_> {
         tokens: &[u32],
     ) -> Result<()> {
         self.bindings
-            .repair_prefix_rank(owner, &mut self.devices[owner], epoch, keep, tokens)
+            .repair_prefix_rank(owner, &mut self.gpus.devices[owner], epoch, keep, tokens)
     }
     fn capture_session(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<MeshCheckpointId> {
         self.bindings
-            .capture_session_rank(owner, &mut self.devices[owner], epoch)
+            .capture_session_rank(owner, &mut self.gpus.devices[owner], epoch)
     }
     fn probe_session(
         &mut self,
@@ -1588,11 +1952,11 @@ impl OwnerOps for HipBackend<'_> {
         piece: MeshCheckpointId,
     ) -> Result<()> {
         self.bindings
-            .restore_session_rank(owner, &mut self.devices[owner], epoch, piece)
+            .restore_session_rank(owner, &mut self.gpus.devices[owner], epoch, piece)
     }
     fn reset(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()> {
         self.bindings
-            .reset_rank(owner, &mut self.devices[owner], epoch)
+            .reset_rank(owner, &mut self.gpus.devices[owner], epoch)
     }
 }
 
@@ -1646,8 +2010,21 @@ fn pair(devices: &mut [Gpu], src: usize, dst: usize) -> (&mut Gpu, &mut Gpu) {
 
 static NEXT_ISSUER: AtomicU64 = AtomicU64::new(1);
 
+/// The executor runs pure PP (TP = EP = 1) or pure TP (PP = EP = 1) meshes;
+/// composed TP×PP and any EP axis are refused before anything is touched.
+fn admit_mesh_shape(mesh: &DeviceMesh) -> Result<()> {
+    let (tp, pp) = (mesh.size_of(DimKind::Tp), mesh.size_of(DimKind::Pp));
+    if mesh.size_of(DimKind::Ep) != 1 || (tp != 1 && pp != 1) {
+        return Err(
+            "mesh executor admits pure PP or pure TP meshes only (TP×PP and EP are refused)".into(),
+        );
+    }
+    Ok(())
+}
+
 impl Gpus {
-    /// Provision transactionally from admitted logical-to-physical identities.
+    /// Provision transactionally from admitted logical-to-physical identities:
+    /// PP edge leases, or the pure-TP reduction group.
     /// Existing legacy layout/output accessors are deliberately untouched.
     pub fn provision_mesh_edges(
         &mut self,
@@ -1659,9 +2036,7 @@ impl Gpus {
         if self.mesh_execution.mesh_epoch.is_some() || self.mesh_execution.quarantined {
             return Err("mesh edges already provisioned or quarantined".into());
         }
-        if admitted.mesh.size_of(DimKind::Tp) != 1 || admitted.mesh.size_of(DimKind::Ep) != 1 {
-            return Err("S3 executor admission supports PP with TP=EP=1 only".into());
-        }
+        admit_mesh_shape(&admitted.mesh)?;
         if admitted.mesh.n_devices() != self.devices.len()
             || admitted.ranks.len() != self.devices.len()
             || max_bytes == 0
@@ -1712,6 +2087,12 @@ impl Gpus {
         let issuer = NEXT_ISSUER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "mesh ticket identity exhausted")?;
+        let (tp, tp_scratch) = if admitted.mesh.size_of(DimKind::Tp) > 1 {
+            let (group, scratch) = self.provision_tp_group(max_bytes)?;
+            (Some(group), scratch)
+        } else {
+            (None, Vec::new())
+        };
         let mut edges = HashMap::with_capacity(admitted.edges.len());
         let result = (|| {
             for decision in &admitted.edges {
@@ -1741,6 +2122,7 @@ impl Gpus {
             // A failed provision may already have quarantined its private lease.
             // Retain all successful leases until the explicit all-device drain.
             self.mesh_execution.edges = edges;
+            self.mesh_execution.tp_scratch = tp_scratch;
             self.mesh_execution.mesh_epoch = Some(admitted.mesh.epoch());
             self.mesh_execution.poison();
             return match self.drain_mesh_edges() {
@@ -1752,10 +2134,64 @@ impl Gpus {
             edges,
             mesh_epoch: Some(admitted.mesh.epoch()),
             output_owner: Some(placement.stages() - 1),
+            tp,
+            tp_scratch,
             issuer,
             ..Default::default()
         };
         Ok(())
+    }
+
+    /// Decide and warm the pure-TP reduction before any submission. Peer when
+    /// every rank pair is one device under `HIPFIRE_EMULATE_GPUS` or passes
+    /// `qualify_peer` (the kernel copy every peer read then uses); otherwise
+    /// the hand route's host-staged reduction. Scratch, events, host staging
+    /// and kernels exist before the first epoch, so submission allocates none.
+    fn provision_tp_group(&mut self, max_bytes: usize) -> Result<(TpGroup, Vec<TpScratch>)> {
+        let n = self.devices.len();
+        let emulated = crate::config::get().emulate_gpus.is_some();
+        let mut chosen = TpTransport::Peer;
+        'pairs: for a in 0..n {
+            for b in a + 1..n {
+                let (x, y) = pair(&mut self.devices, a, b);
+                let readable = if x.device_id == y.device_id {
+                    if !emulated {
+                        return Err(format!(
+                            "TP ranks {a} and {b} share device {} outside HIPFIRE_EMULATE_GPUS",
+                            x.device_id
+                        ));
+                    }
+                    true
+                } else {
+                    transport::qualify_peer(x, y)?
+                };
+                if !readable {
+                    chosen = TpTransport::Host;
+                    break 'pairs;
+                }
+            }
+        }
+        let epoch = transport::next_epoch()?;
+        let mut scratch = Vec::new();
+        match chosen {
+            TpTransport::Peer => {
+                self.ensure_rank_barrier_events().map_err(hip_error)?;
+                self.ensure_rank_done_events().map_err(hip_error)?;
+                if let Err(error) = alloc_tp_scratch(&mut self.devices, max_bytes, &mut scratch) {
+                    return match free_tp_scratch(&mut self.devices, scratch) {
+                        Ok(()) => Err(error),
+                        Err(free) => Err(format!("{error}; TP scratch leaked: {free}")),
+                    };
+                }
+            }
+            TpTransport::Host => self.host_ar_tmp = vec![vec![0.0; max_bytes / 4]; n],
+        }
+        let group = TpGroup {
+            transport: chosen,
+            epoch,
+            max_bytes,
+        };
+        Ok((group, scratch))
     }
 
     /// Logical output owner whose admitted physical identity is retained in the
@@ -1769,6 +2205,14 @@ impl Gpus {
             .edges
             .get(&edge)
             .map(|e| e.lease.epoch())
+    }
+
+    /// Transport epoch of the provisioned pure-TP group: the `descriptor.epoch`
+    /// of every `AllReduce`/`AllReduceAdd` boundary. `None` for a PP mesh or a
+    /// quarantined one.
+    pub fn mesh_tp_epoch(&self) -> Option<u64> {
+        let state = &self.mesh_execution;
+        state.tp.filter(|_| !state.quarantined).map(|tp| tp.epoch)
     }
 
     /// Submit one epoch. Epochs of the same request may be outstanding at once
@@ -1785,8 +2229,7 @@ impl Gpus {
             plan,
             epoch,
             &mut HipBackend {
-                devices: &mut self.devices,
-                state: &mut self.mesh_execution,
+                gpus: self,
                 bindings,
             },
         )
@@ -1929,8 +2372,7 @@ impl Gpus {
         bindings: &'a mut dyn MeshStepBindings,
     ) -> HipBackend<'a> {
         HipBackend {
-            devices: &mut self.devices,
-            state: &mut self.mesh_execution,
+            gpus: self,
             bindings,
         }
     }
@@ -1953,9 +2395,65 @@ impl Gpus {
                 return Err(error);
             }
         }
+        let scratch = std::mem::take(&mut self.mesh_execution.tp_scratch);
+        if let Err(error) = free_tp_scratch(&mut self.devices, scratch) {
+            self.mesh_execution.quarantined = true;
+            return Err(format!("TP scratch release failed: {error}"));
+        }
         self.mesh_execution = MeshExecutionState::default();
         Ok(())
     }
+}
+
+/// One `TpScratch` per rank, pushed as allocated so a failure can free the
+/// prefix. Warms every kernel the peer reduction launches.
+fn alloc_tp_scratch(
+    devices: &mut [Gpu],
+    max_bytes: usize,
+    scratch: &mut Vec<TpScratch>,
+) -> Result<()> {
+    let ranks = devices.len();
+    let bytes = ranks
+        .checked_mul(max_bytes)
+        .ok_or("TP scratch size overflow")?;
+    for gpu in devices.iter_mut() {
+        gpu.bind_thread().map_err(hip_error)?;
+        let stage = gpu.hip.malloc(bytes).map_err(hip_error)?;
+        let owners = match gpu.upload_raw(&[0; 16], &[16]) {
+            Ok(owners) => owners,
+            Err(error) => {
+                let _ = gpu.hip.free(stage);
+                return Err(hip_error(error));
+            }
+        };
+        scratch.push(TpScratch {
+            stage: GpuTensor {
+                buf: stage,
+                shape: vec![bytes / 4],
+                dtype: DType::F32,
+            },
+            owners,
+        });
+        let rank = scratch.last().expect("pushed above");
+        let base = rank.stage.buf.as_ptr() as usize;
+        let (a, b) = (rank.stage.sub_offset(0, 4), rank.stage.sub_offset(4, 4));
+        transport::copy_bytes(gpu, &rank.owners, base, base + 16, 16)?;
+        gpu.add_inplace_f32(&a, &b).map_err(hip_error)?;
+        gpu.add_f32(&a, &b, &a).map_err(hip_error)?;
+        gpu.hip.device_synchronize().map_err(hip_error)?;
+    }
+    Ok(())
+}
+
+/// Synchronize each owning device, then free its `TpScratch`.
+fn free_tp_scratch(devices: &mut [Gpu], scratch: Vec<TpScratch>) -> Result<()> {
+    for (gpu, rank) in devices.iter_mut().zip(scratch) {
+        gpu.bind_thread().map_err(hip_error)?;
+        gpu.hip.device_synchronize().map_err(hip_error)?;
+        gpu.hip.free(rank.stage.buf).map_err(hip_error)?;
+        gpu.hip.free(rank.owners.buf).map_err(hip_error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1972,6 +2470,7 @@ mod tests {
         Ops(usize, Vec<OpId>),
         Publish(u32),
         Receive(u32),
+        Reduce(u32),
         Marks(usize),
         Sync(usize),
     }
@@ -1989,6 +2488,10 @@ mod tests {
         prepared: Vec<u64>,
         poisoned: bool,
         quarantined: bool,
+        /// A TP group is provisioned (group collectives have boundaries).
+        tp: bool,
+        /// Every rank binds the same group memory (an aliased binding).
+        alias: bool,
         /// The real executor state machine, driven by the production
         /// `submit`/`drain_tickets` through `HasState`.
         state: MeshExecutionState,
@@ -2009,6 +2512,8 @@ mod tests {
                 prepared: Vec::new(),
                 poisoned: false,
                 quarantined: false,
+                tp: false,
+                alias: false,
                 state: MeshExecutionState::default(),
             }
         }
@@ -2060,13 +2565,19 @@ mod tests {
         }
         fn boundary(
             &self,
-            _: usize,
-            _: &PlannedCollective,
+            owner: usize,
+            c: &PlannedCollective,
             epoch: &ForwardEpoch,
         ) -> Result<BoundaryMeta> {
             if self.missing {
                 return Err("no lease".into());
             }
+            let band = matches!(c.kind, CollectiveKind::BandXfer { .. });
+            if !band && !self.tp {
+                return Err("TP collective on a mesh without a provisioned TP group".into());
+            }
+            // Group collectives get distinct per-rank memory unless `alias`.
+            let slot = if band || self.alias { 0 } else { owner };
             Ok(BoundaryMeta {
                 descriptor: EdgeDescriptor {
                     epoch: 17,
@@ -2075,10 +2586,12 @@ mod tests {
                     dtype_bytes: 4,
                     bytes: if self.oversize { 256 } else { 64 },
                 },
-                address: 0x1000,
+                address: 0x1000 * (slot + 1),
                 extent: 512,
                 capacity: 64,
                 transport_epoch: 17,
+                into: matches!(c.kind, CollectiveKind::AllReduceAdd { .. })
+                    .then_some((0x10_0000 + 0x1000 * slot, 512)),
             })
         }
         fn run_ops(&mut self, owner: usize, _: &ForwardEpoch, ops: &[OpId]) -> Result<()> {
@@ -2102,6 +2615,16 @@ mod tests {
             } else {
                 Call::Receive(c.id.0)
             });
+            Ok(())
+        }
+        fn reduce(
+            &mut self,
+            c: &PlannedCollective,
+            _: &ForwardEpoch,
+            metas: &[BoundaryMeta],
+        ) -> Result<()> {
+            assert_eq!(metas.len(), c.group.len());
+            self.calls.push(Call::Reduce(c.id.0));
             Ok(())
         }
         fn marks(&mut self, owner: usize, _: &ForwardEpoch) -> Result<()> {
@@ -2344,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn allreduce_kinds_refused_before_calls() {
+    fn allreduce_on_a_pp_mesh_refused_before_calls() {
         for kind in [
             CollectiveKind::AllReduce,
             CollectiveKind::AllReduceAdd {
@@ -2357,8 +2880,571 @@ mod tests {
             let toy = Toy::new(2);
             assert!(prepare(&plan, &epoch, &toy)
                 .unwrap_err()
-                .contains("AllReduce"));
+                .contains("TP group"));
             assert!(toy.calls.is_empty());
+        }
+    }
+
+    /// F32 elements per row of every TP fixture activation.
+    const TP_H: usize = 1024;
+    const TP_K: usize = 64;
+
+    /// A synthetic TP step graph split by the real splitter: `a = col(x)`
+    /// (Split), `p = row(a)` folded into `x` (`AllReduceAdd`), `q = row(a)`
+    /// read whole by `n` (`AllReduce`). `ops` = `[col, row_p, x += p, row_q, n]`.
+    struct TpFixture {
+        plan: SplitPlan,
+        p: ResourceId,
+        q: ResourceId,
+        ops: [OpId; 5],
+    }
+
+    fn tp_fixture(mesh: &DeviceMesh) -> TpFixture {
+        use crate::weight_manifest::{plan_manifest, ShardPolicy, WeightEntry};
+        let mut graph = StepGraph::new();
+        let mut entries = Vec::new();
+        let act = |graph: &mut StepGraph, len: usize| {
+            graph
+                .add_resource(ResourceDecl {
+                    class: ResourceClass::Activation,
+                    shape: vec![len],
+                    alias: None,
+                })
+                .unwrap()
+        };
+        let mut weight = |graph: &mut StepGraph, name: &str, shape: Vec<usize>, policy| {
+            entries.push(WeightEntry::layer(
+                name,
+                0,
+                shape.clone(),
+                DType::F16,
+                policy,
+            ));
+            graph
+                .add_resource(ResourceDecl {
+                    class: ResourceClass::Weight {
+                        name: name.into(),
+                        layer: Some(0),
+                        group: 1,
+                    },
+                    shape,
+                    alias: None,
+                })
+                .unwrap()
+        };
+        let col = weight(
+            &mut graph,
+            "col",
+            vec![TP_K, TP_H],
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        let row_p = weight(
+            &mut graph,
+            "row_p",
+            vec![TP_H, TP_K],
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        let row_q = weight(
+            &mut graph,
+            "row_q",
+            vec![TP_H, TP_K],
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        let [x, a, p, q, n] = [TP_H, TP_K, TP_H, TP_H, TP_H].map(|len| act(&mut graph, len));
+        let mut op = |kind, rule, reads: &[ResourceId], writes: &[ResourceId]| {
+            graph
+                .add_op(OpDecl {
+                    kind,
+                    layer: Some(0),
+                    rule,
+                    reads: reads.to_vec(),
+                    writes: writes.to_vec(),
+                })
+                .unwrap()
+        };
+        let project = |weight, input, output| SplitRule::Project {
+            weight,
+            input,
+            output,
+        };
+        let ops = [
+            op(OpKind::Project, project(col, x, a), &[col, x], &[a]),
+            op(OpKind::Project, project(row_p, a, p), &[row_p, a], &[p]),
+            op(
+                OpKind::ResidualAdd,
+                SplitRule::Accumulate { dst: x, src: p },
+                &[x, p],
+                &[x],
+            ),
+            op(OpKind::Project, project(row_q, a, q), &[row_q, a], &[q]),
+            op(OpKind::RmsnormAutomatic, SplitRule::RowComplete, &[q], &[n]),
+        ];
+        let placement = BandPlacement::uniform(mesh, 1).unwrap();
+        let manifest = plan_manifest(&entries, &[], mesh, 1, &placement).unwrap();
+        let plan = crate::mesh_split::split_program(&graph, &manifest, mesh).unwrap();
+        assert_eq!(
+            plan.collectives
+                .iter()
+                .map(|c| (c.kind, c.operand))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    CollectiveKind::AllReduceAdd {
+                        into: x,
+                        replaces: ops[2]
+                    },
+                    p
+                ),
+                (CollectiveKind::AllReduce, q),
+            ]
+        );
+        TpFixture { plan, p, q, ops }
+    }
+
+    fn tp_toy(ranks: usize) -> (TpFixture, ForwardEpoch, Toy) {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, ranks)]).unwrap();
+        let fixture = tp_fixture(&mesh);
+        let epoch = epoch(&mesh);
+        let mut toy = Toy::provisioned(ranks, &epoch, 9);
+        toy.tp = true;
+        (fixture, epoch, toy)
+    }
+
+    #[test]
+    fn tp_reductions_issue_once_after_every_rank_producer() {
+        for ranks in [2, 4] {
+            let (f, epoch, mut toy) = tp_toy(ranks);
+            let mut prepared = prepare(&f.plan, &epoch, &toy).unwrap();
+            issue(&mut prepared, &f.plan, &epoch, &mut toy).unwrap();
+            let ran = |owner: usize, op: OpId| {
+                toy.calls.iter().position(
+                    |call| matches!(call, Call::Ops(o, ops) if *o == owner && ops.contains(&op)),
+                )
+            };
+            for (id, producer, consumer) in [(0, f.ops[1], f.ops[3]), (1, f.ops[3], f.ops[4])] {
+                let reduces: Vec<_> = toy
+                    .calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, call)| **call == Call::Reduce(id))
+                    .map(|(at, _)| at)
+                    .collect();
+                assert_eq!(reduces.len(), 1, "TP{ranks} collective {id}");
+                for owner in 0..ranks {
+                    assert!(ran(owner, producer).unwrap() < reduces[0]);
+                    assert!(reduces[0] < ran(owner, consumer).unwrap());
+                }
+            }
+            assert!((0..ranks).all(|owner| ran(owner, f.ops[2]).is_none()));
+            let marks = toy
+                .calls
+                .iter()
+                .filter(|call| matches!(call, Call::Marks(_)))
+                .count();
+            assert_eq!(marks, ranks);
+        }
+    }
+
+    #[test]
+    fn malformed_tp_collectives_refused_without_side_effects() {
+        let (f, epoch, mut toy) = tp_toy(4);
+        let mut bad = Vec::new();
+        for group in [vec![1, 0, 2, 3], vec![0, 1, 2], vec![0, 0, 1, 2, 3]] {
+            let mut plan = f.plan.clone();
+            plan.collectives[0].group = group;
+            bad.push(plan);
+        }
+        // One rank skips the reduction.
+        let mut plan = f.plan.clone();
+        plan.ranks[3]
+            .items
+            .retain(|item| *item != RankItem::Collective(CollectiveId(1)));
+        bad.push(plan);
+        // The replaced Accumulate also runs as an op.
+        let mut plan = f.plan.clone();
+        plan.ranks[2].items.insert(0, RankItem::Op(f.ops[2]));
+        bad.push(plan);
+        for plan in &bad {
+            assert!(submit(plan, &epoch, &mut toy).is_err());
+        }
+        // An aliased binding (every rank names the same memory).
+        toy.alias = true;
+        assert!(submit(&f.plan, &epoch, &mut toy)
+            .unwrap_err()
+            .contains("overlap"));
+        toy.alias = false;
+        assert!(toy.calls.is_empty() && !toy.poisoned);
+        assert!(toy.state.outstanding.is_empty() && toy.state.last_op.is_none());
+        // The same epoch still submits once the plan is well formed.
+        submit(&f.plan, &epoch, &mut toy).unwrap();
+    }
+
+    #[test]
+    fn tp_drain_failure_quarantines_and_refuses_later_epochs() {
+        let (f, mut epoch, mut toy) = tp_toy(2);
+        let ticket = submit(&f.plan, &epoch, &mut toy).unwrap();
+        toy.fail_drain = Some(1);
+        assert!(drain_tickets(&[ticket], &mut toy)
+            .unwrap_err()
+            .contains("quarantined"));
+        assert!(toy.poisoned && toy.quarantined);
+        assert_eq!(toy.syncs(), vec![0, 1]);
+        let calls = toy.calls.len();
+        epoch.op_id += 1;
+        assert!(submit(&f.plan, &epoch, &mut toy).is_err());
+        assert_eq!(toy.calls.len(), calls);
+    }
+
+    #[test]
+    fn mesh_shape_admits_pure_pp_or_pure_tp_only() {
+        let rect = |axes: &[(DimKind, usize)]| DeviceMesh::rect(axes).unwrap();
+        for admitted in [
+            DeviceMesh::single().unwrap(),
+            rect(&[(DimKind::Pp, 4)]),
+            rect(&[(DimKind::Tp, 4)]),
+        ] {
+            assert!(admit_mesh_shape(&admitted).is_ok());
+        }
+        for refused in [
+            rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]),
+            rect(&[(DimKind::Tp, 2), (DimKind::Ep, 2)]),
+            rect(&[(DimKind::Pp, 2), (DimKind::Ep, 2)]),
+            rect(&[(DimKind::Ep, 2)]),
+        ] {
+            assert!(admit_mesh_shape(&refused).is_err());
+        }
+    }
+
+    /// One rank's buffers in the GPU TP oracle.
+    struct OracleRank {
+        x: GpuTensor,
+        p: GpuTensor,
+        q: GpuTensor,
+        n: GpuTensor,
+        p_src: GpuTensor,
+        q_src: GpuTensor,
+    }
+
+    /// Bindings of the GPU oracle. The row projections stand in for `W_r · a_r`
+    /// with per-rank, per-epoch partials; `n` copies the reduced `q`.
+    struct OracleBindings {
+        ranks: Vec<OracleRank>,
+        ops: [OpId; 5],
+        p: ResourceId,
+        q: ResourceId,
+        tp_epoch: u64,
+        bytes: usize,
+    }
+
+    impl MeshStepBindings for OracleBindings {
+        fn prepare_epoch(&mut self, _: &ForwardEpoch) -> Result<()> {
+            Ok(())
+        }
+        fn run_ops(
+            &mut self,
+            owner: usize,
+            gpu: &mut Gpu,
+            epoch: &ForwardEpoch,
+            ops: &[OpId],
+        ) -> Result<()> {
+            let rank = &self.ranks[owner];
+            let stream = gpu.active_stream.as_ref().ok_or("no launch stream")?;
+            // This epoch's slice of the per-epoch partials.
+            let slice = (epoch.op_id as usize - 1) * self.bytes;
+            for &op in ops {
+                let (dst, src, offset) = if op == self.ops[1] {
+                    (&rank.p, &rank.p_src, slice)
+                } else if op == self.ops[3] {
+                    (&rank.q, &rank.q_src, slice)
+                } else if op == self.ops[4] {
+                    (&rank.n, &rank.q, 0)
+                } else {
+                    continue;
+                };
+                gpu.hip
+                    .memcpy_dtod_async_at(&dst.buf, 0, &src.buf, offset, self.bytes, stream)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        fn boundary(
+            &self,
+            owner: usize,
+            c: &PlannedCollective,
+            epoch: &ForwardEpoch,
+        ) -> Result<BoundaryIo<'_>> {
+            let rank = &self.ranks[owner];
+            let view = match c.operand {
+                operand if operand == self.p => &rank.p,
+                operand if operand == self.q => &rank.q,
+                _ => return Err("unknown collective operand".into()),
+            };
+            Ok(BoundaryIo {
+                view,
+                into: matches!(c.kind, CollectiveKind::AllReduceAdd { .. }).then_some(&rank.x),
+                descriptor: EdgeDescriptor {
+                    epoch: self.tp_epoch,
+                    op: epoch.op_id,
+                    rows: epoch.actual_rows,
+                    dtype_bytes: 4,
+                    bytes: self.bytes,
+                },
+            })
+        }
+        fn apply_rank_marks(&mut self, _: usize, _: &ForwardEpoch) -> Result<()> {
+            Ok(())
+        }
+        fn repair_prefix_rank(
+            &mut self,
+            _: usize,
+            _: &mut Gpu,
+            _: &ForwardEpoch,
+            _: usize,
+            _: &[u32],
+        ) -> Result<()> {
+            Err("unused".into())
+        }
+        fn capture_session_rank(
+            &mut self,
+            _: usize,
+            _: &mut Gpu,
+            _: &ForwardEpoch,
+        ) -> Result<MeshCheckpointId> {
+            Err("unused".into())
+        }
+        fn probe_session_rank(
+            &mut self,
+            _: usize,
+            _: &ForwardEpoch,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            Err("unused".into())
+        }
+        fn restore_session_rank(
+            &mut self,
+            _: usize,
+            _: &mut Gpu,
+            _: &ForwardEpoch,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            Err("unused".into())
+        }
+        fn reset_rank(&mut self, _: usize, _: &mut Gpu, _: &ForwardEpoch) -> Result<()> {
+            Err("unused".into())
+        }
+        fn checkpoint_rank(
+            &mut self,
+            _: usize,
+            _: &mut Gpu,
+            _: &MeshCheckpointKey,
+        ) -> Result<MeshCheckpointId> {
+            Err("unused".into())
+        }
+        fn restore_rank(
+            &mut self,
+            _: usize,
+            _: &mut Gpu,
+            _: &MeshCheckpointKey,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            Err("unused".into())
+        }
+        fn validate_finalize_rank(
+            &mut self,
+            _: usize,
+            _: &MeshCheckpointKey,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            Err("unused".into())
+        }
+        fn finalize_rank(&mut self, _: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {}
+    }
+
+    /// `x + (p0 + p1 + …)` and `q0 + q1 + …` through the executor must equal
+    /// the single-device rank-order sum byte for byte on every rank, over three
+    /// undrained epochs with distinct partials (a stale read fails), for the
+    /// provisioned transport and for the forced host-staged one. Every oracle
+    /// buffer is allocated after provisioning enabled peer access, which is
+    /// where `hipMemcpyPeer` writes nothing. Rank count: `HIPFIRE_EMULATE_GPUS`,
+    /// else every visible device (the physical runbook arm).
+    #[test]
+    #[ignore = "GPU: run with HIPFIRE_EMULATE_GPUS=2 and =4, or on N physical devices"]
+    fn tp_collectives_match_single_device_rank_order_sum() {
+        use crate::mesh_placement::AdmittedRank;
+        const ROWS: usize = 3;
+        const EPOCHS: usize = 3;
+        let ranks = crate::config::get().emulate_gpus.unwrap_or_else(|| {
+            hip_bridge::HipRuntime::load()
+                .and_then(|hip| hip.device_count())
+                .unwrap() as usize
+        });
+        assert!(ranks >= 2, "needs HIPFIRE_EMULATE_GPUS>=2 or two devices");
+        let count = ROWS * TP_H;
+        let bytes = count * 4;
+        let mut gpus = Gpus::init_tp(ranks, 1).unwrap();
+        for gpu in &mut gpus.devices {
+            gpu.ensure_capture_stream().unwrap();
+        }
+        let mesh = gpus.mesh.clone();
+        let f = tp_fixture(&mesh);
+        let admitted = |mesh: &DeviceMesh, gpus: &Gpus| AdmittedMesh {
+            mesh: mesh.clone(),
+            ranks: gpus
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(logical, gpu)| AdmittedRank {
+                    logical,
+                    device_ordinal: gpu.device_id,
+                    pci_bus_id: None,
+                    arch: gpu.arch.clone(),
+                })
+                .collect(),
+            edges: Vec::new(),
+            family: "tp-oracle".into(),
+            numerical_policy: "f32".into(),
+        };
+        // A TP×EP mesh is refused and leaves nothing provisioned.
+        let composed = DeviceMesh::rect(&[(DimKind::Tp, ranks), (DimKind::Ep, 2)]).unwrap();
+        let refused = gpus
+            .provision_mesh_edges(
+                &admitted(&composed, &gpus),
+                &BandPlacement::uniform(&composed, 1).unwrap(),
+                bytes,
+            )
+            .unwrap_err();
+        assert!(refused.contains("EP are refused"), "{refused}");
+        assert_eq!(
+            (gpus.mesh_tp_epoch(), gpus.mesh_output_owner()),
+            (None, None)
+        );
+
+        // Values over 16 binades, so an f32 sum depends on its order.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut draw = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let unit = (state >> 40) as f32 / (1u32 << 24) as f32 - 0.5;
+                    unit * f32::powi(2.0, ((state >> 20) % 17) as i32 - 8)
+                })
+                .collect::<Vec<f32>>()
+        };
+        let x0 = draw(count);
+        // Rank r's partials for every epoch, epoch-major.
+        let ps: Vec<_> = (0..ranks).map(|_| draw(EPOCHS * count)).collect();
+        let qs: Vec<_> = (0..ranks).map(|_| draw(EPOCHS * count)).collect();
+        let at = |parts: &[Vec<f32>], e: usize, i: usize| -> Vec<f32> {
+            parts.iter().map(|part| part[e * count + i]).collect()
+        };
+        let fold = |terms: &[f32]| terms[1..].iter().fold(terms[0], |sum, t| sum + t);
+        let mut x = x0.clone();
+        // Controls: per-rank accumulation `(x + p0) + p1 + …` and, for three
+        // or more ranks, the reversed rank order.
+        let mut sequential = x0.clone();
+        let mut reversed = x0.clone();
+        for e in 0..EPOCHS {
+            for i in 0..count {
+                let terms = at(&ps, e, i);
+                x[i] += fold(&terms);
+                sequential[i] = terms.iter().fold(sequential[i], |acc, t| acc + t);
+                let back: Vec<f32> = terms.iter().rev().copied().collect();
+                reversed[i] += fold(&back);
+            }
+        }
+        let n: Vec<f32> = (0..count).map(|i| fold(&at(&qs, EPOCHS - 1, i))).collect();
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_ne!(
+            bits(&x),
+            bits(&sequential),
+            "control: summation order must matter"
+        );
+        if ranks >= 3 {
+            assert_ne!(bits(&x), bits(&reversed), "control: rank order must matter");
+        }
+        let digest = |values: &[f32]| {
+            values.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                (h ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3)
+            })
+        };
+
+        for (arm, force_host) in [("provisioned", false), ("host", true)] {
+            gpus.provision_mesh_edges(
+                &admitted(&mesh, &gpus),
+                &BandPlacement::uniform(&mesh, 1).unwrap(),
+                bytes,
+            )
+            .unwrap();
+            let tp = gpus.mesh_execution.tp.as_mut().unwrap();
+            if force_host {
+                tp.transport = TpTransport::Host;
+            }
+            let transport = tp.transport;
+            let mut bindings = OracleBindings {
+                ranks: Vec::new(),
+                ops: f.ops,
+                p: f.p,
+                q: f.q,
+                tp_epoch: gpus.mesh_tp_epoch().unwrap(),
+                bytes,
+            };
+            for (gpu, (p, q)) in gpus.devices.iter_mut().zip(ps.iter().zip(&qs)) {
+                gpu.bind_thread().unwrap();
+                let mut upload = |data: &[f32]| gpu.upload_f32(data, &[data.len()]).unwrap();
+                bindings.ranks.push(OracleRank {
+                    x: upload(&x0),
+                    p: upload(&vec![f32::NAN; count]),
+                    q: upload(&vec![f32::NAN; count]),
+                    n: upload(&vec![f32::NAN; count]),
+                    p_src: upload(p),
+                    q_src: upload(q),
+                });
+                gpu.hip.device_synchronize().unwrap();
+            }
+            let mut tickets = Vec::new();
+            for op_id in 1..=EPOCHS as u64 {
+                let epoch = ForwardEpoch {
+                    mesh_epoch: mesh.epoch(),
+                    load_id: 1,
+                    request_id: 1,
+                    op_id,
+                    route: MeshRoute::Prefill,
+                    start_position: (op_id as usize - 1) * ROWS,
+                    actual_rows: ROWS,
+                    route_rows: ROWS,
+                    policy_id: 1,
+                };
+                tickets.push(
+                    gpus.submit_mesh_epoch(&f.plan, &epoch, &mut bindings)
+                        .unwrap(),
+                );
+            }
+            gpus.drain_mesh_epochs(tickets).unwrap();
+            for (rank, (gpu, buffers)) in gpus.devices.iter().zip(&bindings.ranks).enumerate() {
+                gpu.bind_thread().unwrap();
+                assert_eq!(
+                    bits(&gpu.download_f32(&buffers.x).unwrap()),
+                    bits(&x),
+                    "TP{ranks} {transport:?} rank {rank} x"
+                );
+                assert_eq!(
+                    bits(&gpu.download_f32(&buffers.n).unwrap()),
+                    bits(&n),
+                    "TP{ranks} {transport:?} rank {rank} n"
+                );
+            }
+            eprintln!(
+                "TP{ranks} oracle ({arm} transport {transport:?}): {count} f32 x {EPOCHS} epochs \
+                 byte-identical on every rank; x fnv64 {:016x}, n fnv64 {:016x}, controls: \
+                 sequential {:016x}, reversed {:016x}",
+                digest(&x),
+                digest(&n),
+                digest(&sequential),
+                digest(&reversed)
+            );
+            gpus.drain_mesh_edges().unwrap();
         }
     }
 
@@ -3198,6 +4284,8 @@ mod lifecycle_tests {
         capture_wrong_owner: Option<usize>,
         capture_wrong_request: Option<usize>,
         repair_args: Vec<(usize, usize, Vec<u32>)>,
+        /// The family does not implement prefix repair.
+        no_repair: bool,
         poisoned: bool,
         quarantined: bool,
         state: MeshExecutionState,
@@ -3256,6 +4344,7 @@ mod lifecycle_tests {
                 capture_wrong_owner: None,
                 capture_wrong_request: None,
                 repair_args: Vec::new(),
+                no_repair: false,
                 poisoned: false,
                 quarantined: false,
                 state,
@@ -3355,6 +4444,9 @@ mod lifecycle_tests {
         }
         fn finalize(&mut self, owner: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {
             self.log.push(Ev::Finalize(owner));
+        }
+        fn admits_prefix_repair(&self) -> bool {
+            !self.no_repair
         }
         fn repair_prefix(
             &mut self,
@@ -3875,6 +4967,15 @@ mod lifecycle_tests {
         assert!(repair_prefix_all(&mut toy, &epoch(), 5, &[1]).is_err());
         assert_eq!(toy.log, vec![Ev::Bind(0)]);
         assert!(toy.fail_closed());
+
+        // A family without prefix repair is refused before any callback and
+        // the mesh stays healthy.
+        let mut toy = Toy::new(3);
+        toy.no_repair = true;
+        let error = repair_prefix_all(&mut toy, &epoch(), 5, &[1]).unwrap_err();
+        assert!(error.contains("not admitted"), "{error}");
+        assert!(toy.log.is_empty());
+        assert!(toy.healthy());
     }
 
     #[test]

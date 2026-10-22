@@ -414,6 +414,18 @@ pub trait SpecTarget {
         Err("target does not expose lm_head over hidden".into())
     }
 
+    /// [`lm_head_logits`](Self::lm_head_logits) left on the device: a
+    /// non-owning `[n, vocab]` F32 view of the target's logit scratch, valid
+    /// until the target's next forward or head call. Returns `Err` by default.
+    fn lm_head_logits_device(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<GpuTensor, String> {
+        Err("target does not expose a device lm_head over hidden".into())
+    }
+
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
     /// target logits (`block.len() × vocab`, row-major) instead of the per-position
     /// argmax. The caller uses the full logits to draw from the target distribution
@@ -538,6 +550,24 @@ pub trait SpecTarget {
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 
+    /// The drafter reads only the last `rows` rows of the `hidden_out` sink
+    /// of [`spec_advance`](Self::spec_advance): the target may drop leading
+    /// rows of the sink while it appends, keeping at least `rows` (the drafter
+    /// re-derives its base from the end position). Default: keep every row.
+    fn set_dflash_feature_window(&mut self, _rows: usize) {}
+
+    /// Roll back a verify whose window will not reach
+    /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
+    /// verify ran): restore whatever the verify snapshotted into `scratch`.
+    /// A no-op when no verify is outstanding. Default: nothing to restore.
+    fn abandon_verify(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
@@ -611,6 +641,10 @@ pub trait SpecScratch {
     /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
     /// would orphan device memory. Called from the speculator's `free`.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Forget per-window state that names target state a reset discarded
+    /// (an outstanding verify ticket). Default: nothing to forget.
+    fn clear(&mut self) {}
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
@@ -819,6 +853,29 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Whether [`Self::ar_step`] is implemented. The spec-retire policy
+    /// ([`crate::spec_retire`]) only arms for speculators that can continue a
+    /// request as plain AR.
+    fn supports_ar_step(&self) -> bool {
+        false
+    }
+
+    /// One greedy target-only token for a request the spec-retire policy
+    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// drafter-local per-position state in sync (a later request that hits
+    /// this prompt cache drafts from those rows), and return the target's
+    /// argmax next token. No draft runs.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let _ = (gpu, target, position, seed);
+        Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
@@ -967,6 +1024,16 @@ pub trait Speculator {
     fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+
+    /// The raw target logit row (full vocabulary, before penalties and
+    /// truncation) that produced token `index` of the most recent emission:
+    /// index 0 is the prefill's first token right after [`Self::prefill`],
+    /// otherwise `index` indexes the last [`Self::step`]'s `emit`. Rows are
+    /// kept only for a request configured with
+    /// [`SpecRequestConfig::logprobs`]. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -1025,6 +1092,10 @@ pub struct SpecRequestConfig {
     /// regardless. A caller sets it from `!stop.is_empty()`; the default is
     /// `false`, which keeps those windows snapshot-free.
     pub stop_sequences: bool,
+    /// The request asked for logprobs: a speculator that implements
+    /// [`Speculator::token_logits`] keeps the target logit row behind each
+    /// emitted token. Default `false`, which keeps no rows.
+    pub logprobs: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -1044,6 +1115,7 @@ impl Default for SpecRequestConfig {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             stop_sequences: false,
+            logprobs: false,
         }
     }
 }
@@ -1303,6 +1375,11 @@ pub trait MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         MtpRequestStats::default()
     }
+
+    /// [`Speculator::token_logits`] of this drafter. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -1505,6 +1582,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn request_stats(&self) -> MtpRequestStats {
         self.arch.request_stats()
+    }
+
+    fn token_logits(&self, index: usize) -> Option<&[f32]> {
+        self.arch.token_logits(index)
     }
 }
 

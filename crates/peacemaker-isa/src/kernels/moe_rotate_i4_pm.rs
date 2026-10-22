@@ -100,8 +100,26 @@ fn plan() -> Result<crate::RegPlan, String> {
     Ok(regs)
 }
 
+/// The grouped-position twin (`moe_rotate_i4_gp_pm_gfx1201`): the same ABI, grid, rotation, quantizer and record bytes,
+/// stored at record `g * P + row` (`xq + 72 * (g * P + row)`) instead of `g * L + sorted[row]`, so the down GEMM's tile
+/// reads 16 adjacent records. A pad row still returns before any load and writes nothing; the plane holds `K/128 * P`
+/// records (host-checked `(K/128) * P <= 2^32`). `L` is read by the ABI but unused.
+pub fn emit_gp(spec: Spec) -> Result<Emitted, String> {
+    spec.validate()?;
+    emit_impl(spec, true)
+}
+
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
+    emit_impl(spec, false)
+}
+
+/// Symbol of the grouped-position twin.
+pub fn symbol_gp(arch: Arch) -> String {
+    format!("moe_rotate_i4_gp_pm_{}", arch.name())
+}
+
+fn emit_impl(spec: Spec, gp: bool) -> Result<Emitted, String> {
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("h", 0, Access::ReadOnly)
         .pointer_access("sorted", 8, Access::ReadOnly)
@@ -113,9 +131,17 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         .hidden("L", 48, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "moe_rotate_i4_pm".into(),
-        variant: spec.tag().into(),
+        variant: if gp {
+            format!("{}_gp", spec.tag())
+        } else {
+            spec.tag().into()
+        },
         arch: spec.arch,
-        symbol: spec.symbol(),
+        symbol: if gp {
+            symbol_gp(spec.arch)
+        } else {
+            spec.symbol()
+        },
         kernargs,
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: true,
@@ -126,7 +152,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, plan()?);
     b.enable_delay_alu();
-    prologue(&mut b)?;
+    prologue(&mut b, gp)?;
     let e = a4::rotate(&mut b)?;
     a4::quantize(&mut b, e)?;
     a4::store(&mut b)?;
@@ -147,7 +173,7 @@ pub fn emit_module(
 
 /// Kernel arguments, the (row, group) of the workgroup (exit past `P` rows or `K/128` groups), the row's slot (exit on
 /// a pad row), the h / xq pointers, then `mq_i4_a4`'s lane setup and loads.
-fn prologue(b: &mut Builder) -> R {
+fn prologue(b: &mut Builder, gp: bool) -> R {
     let a = b.spec.arch;
     let exit = a4::lbl();
     smem(b, a4::ARG_H, 8, a4::KARG, 0)?;
@@ -230,17 +256,23 @@ fn prologue(b: &mut Builder) -> R {
     // xq + 72 * (g*L + slot). The record index goes to ROWB (the row pitch is dead by now), not T0: `mad64` clobbers T0
     // with the low product before the high product reads `x`, so `x` must not be T0. With `x = ROWB` the 64-bit product
     // is exact for every u32 index.
+    // The grouped-position twin indexes by (P, row): `g * P + row`.
+    let (stride, index) = if gp {
+        (ARG_P, a4::ROW)
+    } else {
+        (ARG_L, a4::SLOT)
+    };
     sop(
         b,
-        format!("s_mul_i32 s{ROWB}, s{}, s{ARG_L}", a4::GRP),
+        format!("s_mul_i32 s{ROWB}, s{}, s{stride}", a4::GRP),
         &[ROWB],
-        &[a4::GRP, ARG_L],
+        &[a4::GRP, stride],
     )?;
     sop(
         b,
-        format!("{} s{ROWB}, s{ROWB}, s{}", s_add_i32(a), a4::SLOT),
+        format!("{} s{ROWB}, s{ROWB}, s{index}", s_add_i32(a)),
         &[ROWB],
-        &[ROWB, a4::SLOT],
+        &[ROWB, index],
     )?;
     a4::mad64(b, a4::XQ_PTR, a4::ARG_XQ, ROWB, RECORD_BYTES)?;
     a4::lane_setup(b)

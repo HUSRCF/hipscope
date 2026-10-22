@@ -26,6 +26,7 @@ hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-client = { path = "../hipfire-client" }
+hipfire-loader = { path = "../hipfire-loader" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
 saddle-core = { path = "../saddle-core" }

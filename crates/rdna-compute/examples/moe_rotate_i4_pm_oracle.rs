@@ -643,6 +643,8 @@ fn free_dev(gpu: &mut Gpu, d: Dev) {
 enum Arm {
     Incumbent,
     Pm,
+    /// The grouped-position twin (`qwen4_moe_rotate128_i4_gp_pm`): record `g * P + row`.
+    Gp,
 }
 
 impl Arm {
@@ -650,6 +652,7 @@ impl Arm {
         match self {
             Arm::Incumbent => "incumbent",
             Arm::Pm => "pm",
+            Arm::Gp => "gp",
         }
     }
 }
@@ -658,6 +661,7 @@ fn launch(g: &mut Gpu, arm: Arm, d: &Dev, c: &Case) -> Result<(), String> {
     let r = match arm {
         Arm::Incumbent => g.qwen4_moe_rotate128_i4_incumbent(&d.h, &d.sorted, c.k, c.p, c.l),
         Arm::Pm => g.qwen4_moe_rotate128_i4_pm(&d.h, &d.sorted, c.k, c.p, c.l),
+        Arm::Gp => g.qwen4_moe_rotate128_i4_gp_pm(&d.h, &d.sorted, c.k, c.p, c.l),
     };
     r.map(|_| ())
         .map_err(|e| format!("{} launch: {e}", arm.name()))
@@ -742,28 +746,36 @@ fn time_arm(gpu: &mut Gpu, arm: Arm, d: &Dev, c: &Case) -> f64 {
 }
 
 fn time_case(gpu: &mut Gpu, d: &Dev, c: &Case) -> serde_json::Value {
-    let (mut inc, mut pm) = (Vec::new(), Vec::new());
+    let (mut inc, mut pm, mut gp) = (Vec::new(), Vec::new(), Vec::new());
     for rep in 0..WARMUPS + REPS {
-        let (a, b) = if rep % 2 == 0 {
+        let (a, b, e) = if rep % 2 == 0 {
             let a = time_arm(gpu, Arm::Incumbent, d, c);
-            (a, time_arm(gpu, Arm::Pm, d, c))
-        } else {
             let b = time_arm(gpu, Arm::Pm, d, c);
-            (time_arm(gpu, Arm::Incumbent, d, c), b)
+            (a, b, time_arm(gpu, Arm::Gp, d, c))
+        } else {
+            let e = time_arm(gpu, Arm::Gp, d, c);
+            let b = time_arm(gpu, Arm::Pm, d, c);
+            (time_arm(gpu, Arm::Incumbent, d, c), b, e)
         };
         if rep >= WARMUPS {
             inc.push(a);
             pm.push(b);
+            gp.push(e);
         }
     }
     let inc = stats_json(&mut inc);
     let pm = stats_json(&mut pm);
+    let gp = stats_json(&mut gp);
     let ratio = inc["median_us"].as_f64().unwrap() / pm["median_us"].as_f64().unwrap();
-    serde_json::json!({ "incumbent": inc, "pm": pm, "incumbent_over_pm_median": ratio })
+    serde_json::json!({ "incumbent": inc, "pm": pm, "gp": gp, "incumbent_over_pm_median": ratio })
 }
 
 fn hx(b: u8) -> String {
     format!("{b:02x}")
+}
+
+fn hex_record(r: &[u8]) -> String {
+    r.iter().map(|&b| hx(b)).collect()
 }
 
 struct CaseResult {
@@ -803,9 +815,12 @@ fn run_case(
     // Prime the sidecar scratch to its final size (and the sign tables / kernels) with the
     // incumbent; both measured arms then reuse one allocation and one poison pattern.
     launch(gpu, Arm::Incumbent, &d, &c)?;
+    launch(gpu, Arm::Gp, &d, &c)?;
     gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
     let inc = run_arm(gpu, Arm::Incumbent, &d, &c, bytes)?;
     let pm = run_arm(gpu, Arm::Pm, &d, &c, bytes)?;
+    let gp_bytes = groups * c.p * RECORD;
+    let gp = run_arm(gpu, Arm::Gp, &d, &c, gp_bytes)?;
 
     let named = named_records(&c);
     let mut mismatches = 0usize;
@@ -833,7 +848,34 @@ fn run_case(
             }
         }
     }
-    let identical = mismatches == 0 && inc.len() == pm.len();
+    let mut identical = mismatches == 0 && inc.len() == pm.len();
+
+    // Grouped-position twin: record `g * P + row` of every valid row equals the flat record
+    // `g * L + sorted[row]` byte for byte; every pad row's record stays poison.
+    let mut gp_mismatches = 0usize;
+    let mut gp_pad_touched = 0usize;
+    let mut gp_first = None;
+    for g in 0..groups {
+        for (row, &slot) in c.sorted.iter().enumerate() {
+            let at = (g * c.p + row) * RECORD;
+            let got = &gp[at..at + RECORD];
+            if slot < 0 {
+                gp_pad_touched += usize::from(got.iter().any(|&b| b != POISON));
+            } else {
+                let want = &inc[(g * l + slot as usize) * RECORD..][..RECORD];
+                let bad = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                gp_mismatches += bad;
+                if bad > 0 && gp_first.is_none() {
+                    gp_first = Some(serde_json::json!({
+                        "group": g, "grouped_row": row, "slot": slot,
+                        "gp_record": hex_record(got), "incumbent_record": hex_record(want),
+                    }));
+                }
+            }
+        }
+    }
+    let gp_identical = gp_mismatches == 0 && gp.len() == groups * c.p * RECORD;
+    identical &= gp_identical;
 
     let record_poison = |buf: &[u8], r: usize| {
         buf[r * RECORD..(r + 1) * RECORD]
@@ -858,7 +900,7 @@ fn run_case(
             unnamed += 1;
         }
     }
-    let padding_untouched = touched == [0, 0];
+    let padding_untouched = touched == [0, 0] && gp_pad_touched == 0;
     // A no-op pair must not pass: random / zero / padded kinds have to change records, empty none.
     let want_named = named.iter().filter(|&&n| n).count();
     let effect_ok = match kind {
@@ -886,6 +928,11 @@ fn run_case(
         "named_records_changed": { "incumbent": changed_named[0], "pm": changed_named[1] },
         "launch_effect_ok": effect_ok,
         "pm_selected_by_flag": gpu.moe_rotate_i4_pm_selected(k, c.p, l),
+        "gp_plane_bytes": gp_bytes,
+        "gp_byte_identical": gp_identical,
+        "gp_mismatching_bytes": gp_mismatches,
+        "gp_first_mismatch": gp_first,
+        "gp_pad_records_touched": gp_pad_touched,
     });
     if kind == Kind::Random {
         json["timing"] = time_case(gpu, &d, &c);

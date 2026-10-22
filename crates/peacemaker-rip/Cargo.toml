@@ -9,6 +9,9 @@ description = "Standalone .rip front end: a runtime parser, elaborator and lower
 default = ["certify"]
 # Object-level certification of emitted modules (llvm-mc, ld.lld, parse-back, M7).
 certify = ["peacemaker-isa/toolchain"]
+# The `hw_diff` example only. Keeps the GPU launcher and its `hip-bridge`
+# dev-dependency out of the default build (`ungated_examples` ratchet).
+hw-diff = []
 
 [dependencies]
 peacemaker-isa = { path = "../peacemaker-isa" }
@@ -20,6 +23,14 @@ quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 serde_json.workspace = true
 
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }
+
 [[bin]]
 name = "peacemaker-rip"
 path = "src/bin/peacemaker-rip.rs"
+
+[[example]]
+name = "hw_diff"
+path = "examples/hw_diff.rs"
+required-features = ["hw-diff"]

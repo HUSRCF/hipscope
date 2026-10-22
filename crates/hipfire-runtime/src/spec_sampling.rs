@@ -290,6 +290,16 @@ impl SparseDist {
         self.entries.clear();
         self.entries.push((token, 1.0));
     }
+
+    /// A draft distribution given outright as `(token, probability)` pairs
+    /// (a selector's softmax over its candidates): stored as given, zero
+    /// entries dropped, no renormalization, so `prob` is the exact `q` the
+    /// draft was drawn from.
+    pub fn set_entries(&mut self, entries: impl IntoIterator<Item = (u32, f32)>) {
+        self.entries.clear();
+        self.entries
+            .extend(entries.into_iter().filter(|&(_, p)| p > 0.0));
+    }
 }
 
 /// Write the last `min(prompt.len() + emitted.len(), window)` tokens of

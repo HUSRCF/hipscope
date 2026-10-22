@@ -268,6 +268,7 @@
       "moe_router_softmax_topk_k8_wave64_exact.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "moe_scatter_histogram_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "moe_scatter_offsets_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_scatter_stable_k8.hip": "new multi-workgroup twin of moe_scatter_fused_k8 (absent from the 38ce67a44 touched-kernels receipt: it does not exist there); MoE-family source reviewed and left outside the changed catalogue; its three launches are in Gpu::moe_scatter_stable_k8_launch",
       "moe_softmax_topk_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "moe_softmax_topk_k8_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
       "moe_topk_renorm_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",

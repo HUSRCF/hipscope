@@ -186,7 +186,9 @@ fn record_then_publish(
 
 /// Flatten validated whole rows into one uint4 row. The single owner entry and
 /// kernel are prepared at provision, so submission allocates no host storage.
-fn copy_bytes(
+/// This is the copy `qualify_peer` byte-qualifies; every cross-device read of
+/// the mesh executor (edge banks and TP partials) goes through it.
+pub(super) fn copy_bytes(
     gpu: &mut Gpu,
     owners: &GpuTensor,
     src: usize,
@@ -196,6 +198,16 @@ fn copy_bytes(
     let mut sources = [0; 8];
     sources[0] = src;
     hip(gpu.ep_gather_rows_by_slot_owner(owners, sources, dst, 1, 2, 1, bytes / 16))
+}
+
+/// Mint a transport epoch. Edge leases and the mesh executor's TP group share
+/// this namespace, so a descriptor for one can never name the other.
+pub(super) fn next_epoch() -> Result<u64> {
+    NEXT_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            (v < NEVER - 1).then_some(v + 1)
+        })
+        .map_err(|_| "transport epoch exhausted".into())
 }
 
 /// Provision exactly the admitted route. Peer requires prior byte qualification;
@@ -221,11 +233,7 @@ pub fn provision(src: &mut Gpu, dst: &mut Gpu, spec: EdgeSpec) -> Result<EdgeLea
     {
         return Err("peer edge has not passed byte qualification".into());
     }
-    let epoch = NEXT_EPOCH
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            (v < NEVER - 1).then_some(v + 1)
-        })
-        .map_err(|_| "transport epoch exhausted")?;
+    let epoch = next_epoch()?;
     let mut lease = EdgeLease {
         spec,
         epoch,

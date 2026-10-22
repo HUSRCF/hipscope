@@ -40,6 +40,12 @@ BOOTSTRAP_ENV = {
     # Test-only fixture path of the #[ignore]d packed-host-expert parity check in
     # hipfire-arch-qwen35 qwen35/load.rs #[cfg(test)]; never read by runtime code.
     "HIPFIRE_MOE_PARITY_FIXTURE",
+    # Test-only inputs of the #[ignore]d emulated/physical TP oracle in
+    # hipfire-arch-qwen35 qwen35/mesh_tp.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_QWEN35_TP_MODEL",
+    "HIPFIRE_QWEN35_TP_PARTS",
+    "HIPFIRE_QWEN35_TP_ROWS",
+    "HIPFIRE_QWEN35_TP_CHUNK",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").
@@ -50,6 +56,18 @@ BOOTSTRAP_ENV = {
     # contending for a card must read the same ambient dir before either has
     # its own config.
     "HIPFIRE_LOCK_DIR",
+    # M7 certification receipt cache root, read by peacemaker-isa
+    # cert_cache.rs. The peacemaker crates build standalone and deliberately
+    # have no hipfire-config dependency, so this is an ambient developer read;
+    # a directory selects the root, `0` disables the cache. Storage only: it
+    # never changes a receipt's contents.
+    "HIPFIRE_CERT_CACHE",
+    # Test-only harness inputs of the M7 cache cases in pm_check.rs
+    # #[cfg(test)]: the isolated child's case name and fixture root (the cache
+    # directory reaches it as HIPFIRE_CERT_CACHE above). Never read by runtime
+    # code.
+    "HIPFIRE_M7_TEST_CASE",
+    "HIPFIRE_M7_TEST_ROOT",
     # Shared-weight host opt-in, its socket and the dev-fabric admission
     # token: read before install_process_config() because they select the
     # GPU claim kind (shared vs exclusive), exactly like HIPFIRE_LOCK_DIR.

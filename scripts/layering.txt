@@ -70,10 +70,12 @@
  7 hipfire-arch-embeddinggemma2
  7 hipfire-quantize
  7 saddle-quant
- 8 hipfire-cli
  8 hipfire-loader
  8 hipfire-pflash
  9 hipfire-engine
+# hipfire-cli moved from 8 to 9 (2026-10-18): it is a leaf binary (no crate
+# depends on it) and `hipfire fit` calls hipfire-loader admission directly.
+ 9 hipfire-cli
 10 hipfire-generate
 10 saddle-lab
 11 hipfire-daemon

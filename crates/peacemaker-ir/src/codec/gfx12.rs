@@ -2055,6 +2055,26 @@ mod tests {
     }
 
     #[test]
+    fn swmmac_index_key_is_op_sel_bit_zero_and_renders_before_neg_lo() {
+        let (inst, _) = decode(&[0xcc504b00, 0x7c521908]).unwrap();
+        assert_eq!(inst.mods.op_sel, 1);
+        assert_eq!(
+            inst.text(Arch::Gfx1201).unwrap(),
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 \
+             index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]"
+        );
+        let (plain, _) = decode(&[0xcc504000, 0x1c521908]).unwrap();
+        assert_eq!(
+            plain.text(Arch::Gfx1201).unwrap(),
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20"
+        );
+        // Other packed rows keep their op_sel/op_sel_hi spelling.
+        let dot = [0xcc164000, 0x7c0e0501];
+        let (inst, _) = decode(&[(dot[0] & !(0x7 << 11)) | (2 << 11), dot[1]]).unwrap();
+        assert!(inst.text(Arch::Gfx1201).unwrap().contains("op_sel:[0,1,0]"));
+    }
+
+    #[test]
     fn kt48_vopd_y_dest_agrees_with_objdump() {
         const IMAGE: &[u8] =
             include_bytes!("../../../peacemaker-lift/tests/fixtures/kt48/hipcc.co");

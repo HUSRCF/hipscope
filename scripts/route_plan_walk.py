@@ -13,7 +13,10 @@ route plan (crates/rdna-compute/src/route_plans/). Never used by product loading
 usage: route_plan_walk.py --run DIR --daemon BIN --model M --route ar|mtp
                           [--prompt-dir DIR] [--max-seq N] [--env K=V ...]
 The environment (device selection, HIPFIRE_PLE_FORMAT, ...) is inherited; the
-run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache.
+run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache. Walks of Qwen3.5
+(27B, A3B) need a daemon whose loader logs `route plan axes:` (HIPFIRE_MODULE_LOAD_AUDIT=1);
+Flash-Next walks only need the older `qwen4 state:` line.
+`--sealed` replays the checked-in plan sealed (HIPFIRE_ROUTE_PLAN_SEAL=1) for the builder.
 """
 import argparse
 import hashlib
@@ -159,7 +162,14 @@ def main():
     env.update(HOME=str(run / "home"), HIPFIRE_HOME=str(run / "home" / ".hipfire"),
                HIPFIRE_LOCK_DIR=str(run / "lockdir"), HIPFIRE_KERNEL_CACHE=str(run / "kcache"),
                HIPFIRE_MODULE_LOAD_AUDIT="1")
-    if not a.sealed:
+    # An inherited switch of either mode must not leak into this run.
+    env.pop("HIPFIRE_ROUTE_PLAN", None)
+    env.pop("HIPFIRE_ROUTE_PLAN_SEAL", None)
+    if a.sealed:
+        # Replay of a checked-in plan: seal it (no predicted extras), so any kernel the plan
+        # did not name fails its request. route_plan_build.py --sealed-replay checks this.
+        env["HIPFIRE_ROUTE_PLAN_SEAL"] = "1"
+    else:
         # Observe the lazy closure, not a checked-in plan's preload.
         env["HIPFIRE_ROUTE_PLAN"] = "0"
     for kv in a.env:

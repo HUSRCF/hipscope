@@ -45,6 +45,8 @@ model on both arches (`tests/cookbook_a.rs`, `tests/cookbook_b.rs`).
 | [07 uniform branch](cookbook/07-uniform-branch.md) | `skip_if`/`skip_unless`, `wave_exit_unless`, labels |
 | [08 WMMA](cookbook/08-wmma.md) | 16x16x16 bf16 fragment layouts on gfx11 and gfx12 |
 | [09 kernarg loads and waits](cookbook/09-kernarg-loads-and-waits.md) | kernarg layout, `smem` widths, automatic waits, counters |
+| [10 SWMMAC](cookbook/10-swmmac.md) | gfx12 sparse (2:4) WMMA: compressed A, index word, `Wmma::swmmac` |
+| [11 production blocks](cookbook/11-production-blocks.md) | `iu4::*` phase blocks, a K-loop composed in script, `Iu4Gemm::emit` |
 
 Every ```` ```rip ```` block in these documents is compiled by
 `tests/docs.rs`, so the examples track the compiler.

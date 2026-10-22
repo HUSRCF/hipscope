@@ -111,6 +111,30 @@ pub struct SequenceHint {
     pub card_cap: usize,
 }
 
+/// Per-load continuous-batch request, carried from admission to the carrier
+/// so a load can size memory for the batch it will stage afterwards. The
+/// default is off (`vmm_batch == false`): every load that does not ask keeps
+/// its plan unchanged. Only Qwen4 expert-parallel loads read it; every other
+/// carrier ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchLoadRequest {
+    /// The VMM continuous-batching route is requested (`serve_vmm_batch`).
+    pub vmm_batch: bool,
+    /// Requested lane count (`continuous_batch_size`); below 2 is no batch.
+    pub continuous_batch_size: usize,
+    /// Requested step row budget (`serve.max_batch_tokens`); the staged
+    /// budget is `max(row_budget, continuous_batch_size)`.
+    pub row_budget: usize,
+}
+
+impl BatchLoadRequest {
+    /// Lanes to reserve for, when the request asks for a batch (VMM route and
+    /// more than one lane); `None` when it is off.
+    pub fn lanes(&self) -> Option<usize> {
+        (self.vmm_batch && self.continuous_batch_size > 1).then_some(self.continuous_batch_size)
+    }
+}
+
 /// Everything a carrier's `load` needs beyond the source itself.
 pub struct LoadCtx<'a> {
     pub path: &'a str,
@@ -188,6 +212,11 @@ pub struct LoadCtx<'a> {
     /// is `None`. Populated by the loader from the daemon `xdna` load param;
     /// projected CLI-side by `load_params` from the registry `xdna` slot.
     pub xdna: Option<hipfire_registry::XdnaSidecarDescriptor>,
+    /// Continuous-batch request of this load (default off). Read by
+    /// `Qwen4Carrier` for an expert-parallel load only: it reserves the AR
+    /// lane store's device bytes before splitting the experts. Populated
+    /// solely from `SourceAdmission::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through
@@ -259,6 +288,10 @@ pub struct SpecLoadCfg {
     /// [`crate::dflash::DFLASH_BLOCK_UNBATCHED`]. Legacy DFlash drafts keep
     /// their declared width.
     pub dflash_block: Option<usize>,
+    /// `speculation.dflash_block` was `auto` (the default): a producer with
+    /// its own measured default width may use it instead of `dflash_block`
+    /// (Qwen4 DFlash2). `false` = an explicit width, or no daemon resolution.
+    pub dflash_block_auto: bool,
 }
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -380,5 +413,39 @@ mod cask_config_tests {
             32_768,
             "adaptive floor reservation must not be clamped to the eviction window"
         );
+    }
+}
+
+#[cfg(test)]
+mod ep_lane_reservation_request_tests {
+    use super::BatchLoadRequest;
+
+    #[test]
+    fn ep_lane_reservation_request_is_off_by_default_and_for_one_lane() {
+        assert_eq!(BatchLoadRequest::default().lanes(), None);
+        let one = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 1,
+            row_budget: 4096,
+        };
+        assert_eq!(one.lanes(), None);
+        let no_vmm = BatchLoadRequest {
+            vmm_batch: false,
+            continuous_batch_size: 8,
+            row_budget: 4096,
+        };
+        assert_eq!(no_vmm.lanes(), None);
+        let zero = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 0,
+            row_budget: 0,
+        };
+        assert_eq!(zero.lanes(), None);
+        let on = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 4,
+            row_budget: 0,
+        };
+        assert_eq!(on.lanes(), Some(4));
     }
 }

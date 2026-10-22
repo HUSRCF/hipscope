@@ -18,6 +18,7 @@ use hipfire_dispatch::families::moe::{
     MoeSharedDtypes, MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
     NARROW_VERIFY_MAX_ROWS,
 };
+use hipfire_dispatch::pipeline::gated_mlp::MlpLadder;
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::pipeline::step_graph::{
     OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph,
@@ -255,7 +256,7 @@ pub struct Qwen4LayerDescription<'a> {
 }
 
 /// Dense FFN projections, source-bound once by the family and consumed by
-/// `Step::DenseFfn`.
+/// `Step::GatedMlp` on the trunk ladder.
 #[derive(Clone, Copy)]
 pub struct Qwen4DenseBinding<'a> {
     pub gate: WeightRef<'a>,
@@ -1221,6 +1222,14 @@ fn build_moe_prefill<'a>(
 /// resource of [`qwen4_step_graph_with_output`].
 pub const QWEN4_STREAMS_RESOURCE: ResourceId = ResourceId(0);
 
+/// The ladder of every Qwen4 dense FFN (`Step::GatedMlp` on the trunk), also
+/// declared on its [`SplitRule::GatedMlp`] so the splitter admits its shards.
+pub(crate) const QWEN4_DENSE_LADDER: MlpLadder = MlpLadder::Trunk;
+
+/// The FFN output rows (`scratch.ffn_output`): on a TP mesh the operand of
+/// every dense layer's `AllReduce`.
+pub const QWEN4_FFN_OUTPUT_RESOURCE: ResourceId = ResourceId(4);
+
 fn step_graph_error(error: StepGraphError) -> String {
     format!("Qwen4 step graph: {error}")
 }
@@ -1248,12 +1257,16 @@ pub fn qwen4_step_graph(config: &Qwen4Config, route: MeshRoute) -> Result<StepGr
 ///
 /// Per layer, in order: `GroupedDepthwise` (PLE layer only), `HyperRead`,
 /// `GatedDeltaNet` | `IndexedAttention`, `HyperWrite`, `HyperRead`, `Clear`
-/// (MoE only), `Moe` | `DenseFfn`, `HyperWrite`.
+/// (MoE only), `Moe` | `GatedMlp`, `HyperWrite`.
 ///
 /// Only [`QWEN4_STREAMS_RESOURCE`] is written in one layer and read in the
 /// next. Scratch activations are written before they are read within one
 /// layer, and the PLE rows are a host-fed input read only at the PLE layer
-/// (input band). The graph declares no weight and no state resources.
+/// (input band). The only weight resources are a dense layer's FFN gate, up
+/// and down (the manifest names, BF16 so unpacked): its
+/// [`SplitRule::GatedMlp`] splits them on a TP mesh, whose partial output the
+/// next `HyperWrite` reduces first. Every other op is replicated; the graph
+/// declares no state resources.
 pub fn qwen4_step_graph_with_output(
     config: &Qwen4Config,
     _route: MeshRoute,
@@ -1274,7 +1287,6 @@ pub fn qwen4_step_graph_with_output(
     if ple_layer.is_some_and(|layer| layer >= layers) {
         return Err("Qwen4 step graph: PLE layer is outside the trunk".to_string());
     }
-    let moe = matches!(config.ffn, Qwen4FfnConfig::Moe { .. });
     let mut graph = StepGraph::new();
     let mut resource = |class: ResourceClass, shape: &[usize]| {
         graph
@@ -1294,6 +1306,7 @@ pub fn qwen4_step_graph_with_output(
     let mixed = resource(ResourceClass::Activation, &[config.hidden_size])?;
     let attention_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
     let ffn_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    debug_assert_eq!(ffn_output, QWEN4_FFN_OUTPUT_RESOURCE);
     let ple_rows = match config.ple.as_ref() {
         Some(ple) => Some(resource(
             ResourceClass::Input,
@@ -1362,29 +1375,56 @@ pub fn qwen4_step_graph_with_output(
             &[streams],
             &[mixed],
         );
-        if moe {
-            op(
-                OpKind::Clear,
-                layer,
-                SplitRule::Pointwise,
-                &[],
-                &[ffn_output],
-            );
-            op(
-                OpKind::Moe,
-                layer,
-                SplitRule::Opaque,
-                &[mixed],
-                &[ffn_output],
-            );
-        } else {
-            op(
-                OpKind::DenseFfn,
-                layer,
-                SplitRule::Opaque,
-                &[mixed],
-                &[ffn_output],
-            );
+        match config.ffn {
+            Qwen4FfnConfig::Moe { .. } => {
+                op(
+                    OpKind::Clear,
+                    layer,
+                    SplitRule::Pointwise,
+                    &[],
+                    &[ffn_output],
+                );
+                op(
+                    OpKind::Moe,
+                    layer,
+                    SplitRule::Opaque,
+                    &[mixed],
+                    &[ffn_output],
+                );
+            }
+            Qwen4FfnConfig::Dense {
+                intermediate_size, ..
+            } => {
+                let hidden = config.hidden_size;
+                let mlp = format!("model.language_model.layers.{layer}.mlp");
+                let mut weight = |name: &str, shape: [usize; 2]| {
+                    resource(
+                        ResourceClass::Weight {
+                            name: format!("{mlp}.{name}.weight"),
+                            layer: Some(layer),
+                            group: 1,
+                        },
+                        &shape,
+                    )
+                };
+                let gate = weight("gate_proj", [intermediate_size, hidden])?;
+                let up = weight("up_proj", [intermediate_size, hidden])?;
+                let down = weight("down_proj", [hidden, intermediate_size])?;
+                op(
+                    OpKind::GatedMlp,
+                    layer,
+                    SplitRule::GatedMlp {
+                        input: mixed,
+                        gate,
+                        up,
+                        down,
+                        output: ffn_output,
+                        ladder: QWEN4_DENSE_LADDER,
+                    },
+                    &[mixed, gate, up, down],
+                    &[ffn_output],
+                );
+            }
         }
         op(
             OpKind::HyperWrite,
@@ -1471,7 +1511,7 @@ mod step_graph_tests {
                 out.push((OpKind::Clear, layer));
                 out.push((OpKind::Moe, layer));
             } else {
-                out.push((OpKind::DenseFfn, layer));
+                out.push((OpKind::GatedMlp, layer));
             }
             out.push((OpKind::HyperWrite, layer));
         }
@@ -1571,9 +1611,12 @@ mod step_graph_tests {
     }
 
     fn assert_split(counts: &[usize], head: bool, top1: bool) {
-        let config = compact_test_config();
+        assert_split_config(&compact_test_config(), counts, head, top1);
+    }
+
+    fn assert_split_config(config: &Qwen4Config, counts: &[usize], head: bool, top1: bool) {
         assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
-        let (graph, plan, placement) = split(&config, counts, head, top1);
+        let (graph, plan, placement) = split(config, counts, head, top1);
         let stages = counts.len();
         assert_eq!(plan.ranks.len(), stages);
 
@@ -1669,6 +1712,20 @@ mod step_graph_tests {
         assert_split(&[9, 8, 8, 8, 8, 7], true, true);
         assert_split(&[9, 8, 8, 8, 8, 7], true, false);
         assert_split(&[9, 8, 8, 8, 8, 7], false, false);
+    }
+
+    /// A dense profile's PP stage is one TP part: its declared FFN weights run
+    /// locally, so the streams transfers stay the only collectives.
+    #[test]
+    fn dense_pp_split_keeps_only_streams_edges() {
+        let ffn = Qwen4FfnConfig::Dense {
+            intermediate_size: 8,
+        };
+        let config = crate::config::synthetic_test_config(ffn, 16, 4, false, false);
+        for (head, top1) in [(true, true), (false, false)] {
+            assert_split_config(&config, &[2, 2], head, top1);
+            assert_split_config(&config, &[2, 1, 1], head, top1);
+        }
     }
 }
 

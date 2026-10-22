@@ -1304,6 +1304,7 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -1554,6 +1555,7 @@ dependencies = [
  "hipfire-client",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-loader",
  "hipfire-registry",
  "hipfire-runtime",
  "http-body-util",
@@ -2707,6 +2709,7 @@ version = "0.4.3"
 name = "peacemaker-rip"
 version = "0.4.3"
 dependencies = [
+ "hip-bridge",
  "peacemaker-author",
  "peacemaker-ir",
  "peacemaker-isa",
@@ -3241,6 +3244,7 @@ dependencies = [
  "peacemaker-isa",
  "peacemaker-lift",
  "peacemaker-npu",
+ "peacemaker-rip",
  "radiowave",
  "railgun",
  "railgun-corpus",

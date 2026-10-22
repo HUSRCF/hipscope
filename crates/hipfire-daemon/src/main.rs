@@ -1118,7 +1118,7 @@ fn main() {
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
     // Continuous-batch host scheduler + GPU batch state (if available).
     // Initialized on successful load when `continuous_batch_size` > 1 and
-    // the loaded arch is batch-capable (qwen 5/6, single-GPU, Q8 KV/state).
+    // the loaded route staged lane state (including Qwen4 single/EP/PP fn-lanes).
     // None => sequential fallback.
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
@@ -1851,7 +1851,7 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let Some(dflash_block) = request_guards::dflash_block(
+                let Some((dflash_block, dflash_block_auto)) = request_guards::dflash_block(
                     &mut stdout,
                     &msg,
                     parsed_vmm_batch.is_some(),
@@ -1913,6 +1913,7 @@ fn main() {
                     mtp_k,
                     dflash_adaptive_b: Some(adaptive_b),
                     dflash_block: Some(dflash_block),
+                    dflash_block_auto,
                 };
 
                 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -2256,7 +2257,7 @@ fn main() {
                         }
                     };
                 let open_admission_started = std::time::Instant::now();
-                let admission = match hipfire_loader::admission::admit_source_with_options(
+                let mut admission = match hipfire_loader::admission::admit_source_with_options(
                     path,
                     tp,
                     pp,
@@ -2298,6 +2299,16 @@ fn main() {
                     rdna_compute::load_phases::ns_since(open_admission_started),
                     0,
                 );
+                // The continuous-batch request staged after this load, so a
+                // Qwen4 expert-parallel load reserves the AR lane store's
+                // bytes before it splits the experts. Only the exact VMM
+                // route stages Qwen4 lanes; `vmm_batch` is false for the
+                // non-exact route and without `serve_vmm_batch`.
+                admission.batch_request = hipfire_loader::admission::BatchLoadRequest {
+                    vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
+                    continuous_batch_size: parsed_continuous_batch_size,
+                    row_budget: parsed_vmm_batch.map_or(0, |params| params.max_batch_tokens),
+                };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
                 // admission the prior model is torn down and VMM must be clean
@@ -2788,7 +2799,7 @@ fn main() {
                                 vmm_batch,
                                 staging.slots,
                                 staging.row_budget,
-                                &gpu,
+                                &mut gpu,
                             );
                             emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");

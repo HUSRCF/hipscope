@@ -2,13 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! `hipfire doctor`: with no flag, a GPU-free runtime/driver/version preflight
+//! ([`runtime`]) that names one fix per failed check before any model loads.
+//!
 //! `hipfire doctor --npu`: GPU-free fitness checks for the Strix Halo (gfx1151 +
 //! XDNA2) NPU trunk prefill route, a tier, then — after confirmation — a short
 //! calibration A/B against the GPU-only route and a greedy exactness check, or a
 //! long `--soak`. `--apply` only ever sets `npu_trunk off`.
 //!
 //! Exit status: 0 ok, 1 blocked (or a failed calibration/soak), 2 calibration
-//! refused because stdin is not a terminal and `--yes` was not given.
+//! refused because stdin is not a terminal and `--yes` was not given (`--npu`
+//! only; the runtime preflight exits 0 ok or 1 blocked).
 
 mod calibrate;
 mod checks;
@@ -16,6 +20,7 @@ mod power;
 mod probe;
 mod profiles;
 mod report;
+pub(crate) mod runtime;
 mod soak;
 
 use crate::Paths;
@@ -38,30 +43,32 @@ const SKIPPED_NOT_A_TTY: &str = "not confirmed: stdin is not a terminal (pass --
 
 #[derive(Args, Debug, Clone, PartialEq)]
 pub(crate) struct DoctorArgs {
-    /// Check the Strix Halo (gfx1151 + XDNA2) NPU trunk prefill route.
-    #[arg(long, required = true)]
-    npu: bool,
-    /// Run the calibration (or soak) without asking first.
+    /// Check the Strix Halo (gfx1151 + XDNA2) NPU trunk prefill route instead of
+    /// running the runtime preflight.
     #[arg(long)]
+    npu: bool,
+    /// Run the calibration (or soak) without asking first. Needs `--npu`.
+    #[arg(long, requires = "npu")]
     yes: bool,
     /// Print the report as one JSON object (no hostname, user, path or PCI address).
     #[arg(short, long)]
     json: bool,
     /// Set `npu_trunk` to `off` when the calibration measures a loss or an
-    /// exactness mismatch. Changes nothing else.
-    #[arg(long, conflicts_with = "soak")]
+    /// exactness mismatch. Changes nothing else. Needs `--npu`.
+    #[arg(long, requires = "npu", conflicts_with = "soak")]
     apply: bool,
-    /// Run a long stability soak instead of the calibration.
-    #[arg(long)]
+    /// Run a long stability soak instead of the calibration. Needs `--npu`.
+    #[arg(long, requires = "npu")]
     soak: bool,
     /// Soak duration in hours (default 4).
-    #[arg(long, value_name = "H", requires = "soak", value_parser = parse_hours)]
+    #[arg(long, value_name = "H", requires_all = ["soak", "npu"], value_parser = parse_hours)]
     hours: Option<f64>,
     /// Soak output directory (default: a new `npu-soak-<UTC timestamp>` here).
-    #[arg(long, value_name = "DIR", requires = "soak")]
+    #[arg(long, value_name = "DIR", requires_all = ["soak", "npu"])]
     out: Option<PathBuf>,
     /// Summarize a finished soak (including the previous boot's kernel log after a freeze).
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["soak", "apply"])]
+    /// Needs `--npu`.
+    #[arg(long, value_name = "DIR", requires = "npu", conflicts_with_all = ["soak", "apply"])]
     soak_report: Option<PathBuf>,
 }
 
@@ -615,6 +622,14 @@ fn side<'a>(io: &'a mut Io<'_>, json: bool) -> &'a mut dyn Write {
 }
 
 pub(crate) fn doctor_command(paths: &Paths, args: DoctorArgs) -> Result<()> {
+    if !args.npu {
+        let status = runtime::runtime_command(paths, args.json)?;
+        let _ = io::stdout().flush();
+        if status != 0 {
+            std::process::exit(status);
+        }
+        return Ok(());
+    }
     let probe = SystemProbe::new(paths);
     let mut actions = SystemActions { paths };
     let ctx = Ctx {
@@ -662,8 +677,11 @@ mod tests {
     // ---- clap -------------------------------------------------------------
 
     #[test]
-    fn npu_is_required_and_alone_is_enough() {
-        assert!(parse(&[]).is_err());
+    fn bare_doctor_is_the_runtime_preflight_and_npu_flags_need_npu() {
+        let args = parse(&[]).unwrap();
+        assert!(!args.npu && !args.yes && !args.json && !args.apply && !args.soak);
+        assert!(parse(&["--json"]).unwrap().json);
+        assert!(parse(&["-j"]).unwrap().json);
         assert!(parse(&["--yes"]).is_err());
         let args = parse(&["--npu"]).unwrap();
         assert!(args.npu && !args.yes && !args.json && !args.apply && !args.soak);
@@ -687,6 +705,18 @@ mod tests {
 
     #[test]
     fn soak_options_require_soak_and_conflicts_are_rejected() {
+        // Every NPU-only flag is an error without `--npu`.
+        let npu_only: [&[&str]; 6] = [
+            &["--yes"],
+            &["--apply"],
+            &["--soak"],
+            &["--soak", "--hours", "2"],
+            &["--soak", "--out", "x"],
+            &["--soak-report", "x"],
+        ];
+        for flags in npu_only {
+            assert!(parse(flags).is_err(), "{flags:?} must need --npu");
+        }
         assert!(parse(&["--npu", "--hours", "2"]).is_err());
         assert!(parse(&["--npu", "--out", "x"]).is_err());
         assert!(parse(&["--npu", "--apply", "--soak"]).is_err());
@@ -701,7 +731,11 @@ mod tests {
     fn cli_wires_the_doctor_subcommand() {
         let cli = crate::Cli::try_parse_from(["hipfire", "doctor", "--npu", "--yes"]).unwrap();
         assert!(matches!(cli.command, Some(crate::Commands::Doctor(_))));
-        assert!(crate::Cli::try_parse_from(["hipfire", "doctor"]).is_err());
+        let cli = crate::Cli::try_parse_from(["hipfire", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(crate::Commands::Doctor(_))));
+        let cli = crate::Cli::try_parse_from(["hipfire", "doctor", "--json"]).unwrap();
+        assert!(matches!(cli.command, Some(crate::Commands::Doctor(_))));
+        assert!(crate::Cli::try_parse_from(["hipfire", "doctor", "--yes"]).is_err());
     }
 
     // ---- confirmation -----------------------------------------------------

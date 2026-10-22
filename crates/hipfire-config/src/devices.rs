@@ -1115,7 +1115,7 @@ impl ActiveDevices {
 }
 
 /// `HSA_OVERRIDE_GFX_VERSION=11.0.0` → `gfx1100`.
-fn override_arch(value: &str) -> Option<String> {
+pub fn override_arch(value: &str) -> Option<String> {
     let mut parts = value.trim().split('.').map(|part| part.parse::<u64>().ok());
     let (Some(Some(major)), Some(Some(minor)), Some(Some(stepping)), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())

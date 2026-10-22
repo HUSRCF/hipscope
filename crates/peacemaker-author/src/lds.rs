@@ -49,6 +49,21 @@ impl sealed::State for Published {}
 pub trait State: sealed::State + 'static {}
 impl<S: sealed::State + 'static> State for S {}
 
+/// The states a ring may be in when it crosses between a typed body and the
+/// runtime `Driver` (`runtime::Lend`): `Free` and `Published`. A `Writing`
+/// buffer carries a `Pending` token, which has no dynamic form, so it never
+/// crosses.
+pub trait Lendable: State {
+    #[doc(hidden)]
+    const PHASE: crate::runtime::Phase;
+}
+impl Lendable for Free {
+    const PHASE: crate::runtime::Phase = crate::runtime::Phase::RtFree;
+}
+impl Lendable for Published {
+    const PHASE: crate::runtime::Phase = crate::runtime::Phase::RtPublished;
+}
+
 /// Backend slots of one region (a declared leaf, or joined leaves).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +81,22 @@ impl Slots {
     }
     pub(crate) fn ids(&self) -> &[usize] {
         &self.ids[..self.len]
+    }
+    /// Slots from build-time ids (the inverse of `ids`).
+    pub(crate) fn from_ids(ids: &[usize]) -> Result<Self, String> {
+        if ids.is_empty() || ids.len() > Self::MAX {
+            return Err(format!(
+                "a ring buffer holds 1 to {} slots, not {}",
+                Self::MAX,
+                ids.len()
+            ));
+        }
+        let mut out = Self {
+            ids: [ids[0]; Self::MAX],
+            len: ids.len(),
+        };
+        out.ids[..ids.len()].copy_from_slice(ids);
+        Ok(out)
     }
     fn join(a: Self, b: Self) -> Result<Self, String> {
         if a.len + b.len > Self::MAX {
@@ -171,6 +202,25 @@ impl<R, C: State, N: State> Ring<R, C, N> {
     pub(crate) fn next_slots(&self) -> Slots {
         self.bufs[1 - self.cur]
     }
+    /// A ring's whole build-time state, for a hand-over to the runtime
+    /// `Driver` (`runtime::Lend`).
+    pub(crate) fn into_parts(self) -> RingParts {
+        RingParts {
+            bufs: self.bufs,
+            cur: self.cur,
+            cur_live: self.cur_live,
+            last: self.last,
+        }
+    }
+    pub(crate) fn from_parts(p: RingParts) -> Self {
+        Ring {
+            bufs: p.bufs,
+            cur: p.cur,
+            cur_live: p.cur_live,
+            last: p.last,
+            _p: PhantomData,
+        }
+    }
     pub(crate) fn duplicate(&self) -> Self {
         Ring {
             bufs: self.bufs,
@@ -198,6 +248,14 @@ impl<R, C: State, N: State> Ring<R, C, N> {
             _p: PhantomData,
         }
     }
+}
+
+/// The fields of a `Ring` that cross to and from the runtime `Driver`.
+pub(crate) struct RingParts {
+    pub(crate) bufs: [Slots; 2],
+    pub(crate) cur: usize,
+    pub(crate) cur_live: bool,
+    pub(crate) last: Option<EventId>,
 }
 
 /// Something an LDS store may write: a `Free` region (or a ring's `Free`

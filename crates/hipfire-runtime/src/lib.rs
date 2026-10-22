@@ -34,6 +34,10 @@ pub mod ddtree;
 pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+/// Target-generic DFlash2 speculator (candidate selector, sparse-q sampled
+/// verify) over the `SpecTarget` seam.
+#[cfg(feature = "deltanet")]
+pub mod dflash2_spec;
 /// Adaptive DFlash verify-block controller — family-free policy object shared
 /// by arch speculators (`hipfire-arch-qwen35::dflash_spec`); the DSpark
 /// analogue is `dspark_block_controller`. Pure math, no GPU types.
@@ -104,7 +108,10 @@ pub mod spec;
 
 pub mod ngram_mod;
 pub mod offload;
+pub mod spec_lookup;
 pub mod spec_ngram;
+/// Per-request spec → AR retirement policy. Pure math, no GPU types.
+pub mod spec_retire;
 pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;

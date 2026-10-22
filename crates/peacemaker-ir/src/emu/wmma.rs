@@ -245,16 +245,82 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
 /// `(c&3)|((c&4)<<1)|((c&8)>>1)`; `neg_lo[0]`/`neg_hi[0]` negate A of even/odd SLOTS, `neg_lo[1]`/`neg_hi[1]` the
 /// selected B of even/odd slots (slot parity, not K parity). Integer kinds: `neg_lo[0]`/`neg_lo[1]` mark A/B signed;
 /// CLAMP is the two-half saturation of [`mma::swmmac_i32`].
-/// Refused as unmeasured: neg_lo[2]/neg_hi[2] (C), NEG_HI on integers, CLAMP on floats, any other OPSEL bit, and
-/// every other kind (16-bit-out accumulator and FP8/BF8 rounding/NaN are unresolved).
+/// Exact-domain kinds (`f16_16x16x32_f16`, `bf16_16x16x32_bf16`, `f32_16x16x32_{fp8,bf8}_{fp8,bf8}`) have no
+/// rounding/NaN/denormal model and execute only where the result is exactly determined ([`swmmac_exact`]): every
+/// A, selected-B and C value finite normal or zero, and `|C| + sum|a*b| <= 2^P * q` (P = 24/11/8 for f32/f16/bf16
+/// out, `q` the common power-of-two granule of C and the products), so every accumulation order yields the same
+/// exactly representable total; anything else is a hard error. 16-bit-out D is 4 VGPRs, row `r` col `c` at lane
+/// `c + 16*(r>>3)`, VGPR `(r&7)>>1`, half `r&1`. FP8 = E4M3 (`S.1111.111` NaN, no infinity), BF8 = E5M2.
+/// Refused as unmeasured: neg_lo[2]/neg_hi[2] (C), NEG_HI on integers, CLAMP on floats, any neg/clamp on the FP8
+/// kinds, and any other OPSEL bit.
 fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    // (floating kind, bf16 inputs, bits per element, nA, A regs, B regs)
-    let (float, bf16, bits, n_a, a_regs, b_regs) = match (arch, name) {
-        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16") => (true, false, 16, 8, 4, 8),
-        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_bf16") => (true, true, 16, 8, 4, 8),
-        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8") => (false, false, 8, 8, 2, 4),
-        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu4") => (false, false, 4, 8, 1, 2),
-        (Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4") => (false, false, 4, 16, 2, 4),
+    // (floating kind, bf16 inputs, bits per element, nA, A regs, B regs, D regs, exact-domain kind)
+    let (float, bf16, bits, n_a, a_regs, b_regs, d_regs, exact) = match (arch, name) {
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16") => (true, false, 16, 8, 4, 8, 8, None),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_bf16") => (true, true, 16, 8, 4, 8, 8, None),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8") => (false, false, 8, 8, 2, 4, 8, None),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu4") => (false, false, 4, 8, 1, 2, 8, None),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4") => (false, false, 4, 16, 2, 4, 8, None),
+        (Arch::Gfx1201, "v_swmmac_f16_16x16x32_f16") => (
+            true,
+            false,
+            16,
+            8,
+            4,
+            8,
+            4,
+            Some(Exact::new(FMT_F16, FMT_F16, FMT_F16, true)),
+        ),
+        (Arch::Gfx1201, "v_swmmac_bf16_16x16x32_bf16") => (
+            true,
+            true,
+            16,
+            8,
+            4,
+            8,
+            4,
+            Some(Exact::new(FMT_BF16, FMT_BF16, FMT_BF16, true)),
+        ),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_fp8_fp8") => (
+            true,
+            false,
+            8,
+            8,
+            2,
+            4,
+            8,
+            Some(Exact::new(FMT_FP8, FMT_FP8, FMT_F32, false)),
+        ),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_fp8_bf8") => (
+            true,
+            false,
+            8,
+            8,
+            2,
+            4,
+            8,
+            Some(Exact::new(FMT_FP8, FMT_BF8, FMT_F32, false)),
+        ),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_bf8_fp8") => (
+            true,
+            false,
+            8,
+            8,
+            2,
+            4,
+            8,
+            Some(Exact::new(FMT_BF8, FMT_FP8, FMT_F32, false)),
+        ),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_bf8_bf8") => (
+            true,
+            false,
+            8,
+            8,
+            2,
+            4,
+            8,
+            Some(Exact::new(FMT_BF8, FMT_BF8, FMT_F32, false)),
+        ),
         _ => {
             return Err(format!(
             "{name} on {arch:?}: no probed SWMMAC numerics/index model; refusing to approximate"
@@ -291,6 +357,13 @@ fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
             "{name}: CLAMP of a floating-point SWMMAC is not measured"
         ));
     }
+    if let Some(ex) = &exact {
+        if !ex.neg_ok && (m.neg_lo != 0 || m.neg_hi != 0) {
+            return Err(format!(
+                "{name}: neg_lo/neg_hi do not exist on the FP8/BF8 SWMMAC forms"
+            ));
+        }
+    }
     if !float && m.neg_hi != 0 {
         return Err(format!("{name}: NEG_HI is undefined for integer SWMMAC"));
     }
@@ -301,7 +374,7 @@ fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
             o.len()
         ));
     }
-    vgprs(&o[0], 8, "D")?;
+    vgprs(&o[0], d_regs, "D")?;
     vgprs(&o[1], a_regs, "A")?;
     vgprs(&o[2], b_regs, "B")?;
     vgprs(&o[3], 1, "index")?;
@@ -339,6 +412,31 @@ fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
                 b_slot[j] = field(s.read(&o[2], b_lane, e / per)?, e);
             }
             let (lane, vgpr) = acc_loc(arch, row, col);
+            if let Some(ex) = &exact {
+                // 16-bit-out D packs two rows per VGPR: row r -> VGPR (r&7)>>1, half r&1. f32-out is a whole word.
+                let wide = ex.out.mbits == 23;
+                let (vgpr, half) = if wide {
+                    (vgpr, 0)
+                } else {
+                    (vgpr >> 1, row & 1)
+                };
+                let word = s.read(&o[0], lane, vgpr)?;
+                let c_raw = if wide {
+                    word
+                } else {
+                    (word >> (16 * half)) & 0xffff
+                };
+                let r = swmmac_exact(
+                    name,
+                    ex,
+                    &a_slot[..2 * n_a],
+                    &b_slot[..2 * n_a],
+                    (m.neg_lo, m.neg_hi),
+                    c_raw,
+                )?;
+                out[vgpr][lane] |= r << (16 * half);
+                continue;
+            }
             let c = s.read(&o[0], lane, vgpr)?;
             out[vgpr][lane] = if float {
                 let flip = |lo: bool, hi: bool, j: usize| -> u16 {
@@ -370,7 +468,7 @@ fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
             };
         }
     }
-    for (vgpr, lanes) in out.iter().enumerate() {
+    for (vgpr, lanes) in out.iter().enumerate().take(usize::from(d_regs)) {
         for (lane, &value) in lanes.iter().enumerate() {
             s.put(&o[0], lane, vgpr, value)?;
         }
@@ -385,6 +483,193 @@ fn vgprs(op: &Operand, want: u8, role: &str) -> Result<()> {
             "WMMA {role} must be v[..] of {want} registers, got {other:?}"
         )),
     }
+}
+
+/// IEEE-style binary float layout for the exact-domain SWMMAC kinds. `e4m3` marks OCP FP8 E4M3 (`S.1111.111` is
+/// the only NaN, no infinity); every other format reserves the all-ones exponent for inf/NaN.
+#[derive(Clone, Copy)]
+struct Fmt {
+    ebits: u32,
+    mbits: u32,
+    bias: i32,
+    e4m3: bool,
+}
+const FMT_F32: Fmt = Fmt {
+    ebits: 8,
+    mbits: 23,
+    bias: 127,
+    e4m3: false,
+};
+const FMT_F16: Fmt = Fmt {
+    ebits: 5,
+    mbits: 10,
+    bias: 15,
+    e4m3: false,
+};
+const FMT_BF16: Fmt = Fmt {
+    ebits: 8,
+    mbits: 7,
+    bias: 127,
+    e4m3: false,
+};
+const FMT_FP8: Fmt = Fmt {
+    ebits: 4,
+    mbits: 3,
+    bias: 7,
+    e4m3: true,
+};
+const FMT_BF8: Fmt = Fmt {
+    ebits: 5,
+    mbits: 2,
+    bias: 15,
+    e4m3: false,
+};
+
+/// Operand/accumulator formats of one exact-domain SWMMAC kind. `neg_ok`: the 16-bit kinds accept neg_lo/neg_hi.
+#[derive(Clone, Copy)]
+struct Exact {
+    a: Fmt,
+    b: Fmt,
+    out: Fmt,
+    neg_ok: bool,
+}
+impl Exact {
+    const fn new(a: Fmt, b: Fmt, out: Fmt, neg_ok: bool) -> Self {
+        Exact { a, b, out, neg_ok }
+    }
+}
+
+/// A finite normal or zero value `(-1)^neg * m * 2^e` with `m` odd (`m == 0` is a zero of sign `neg`).
+#[derive(Clone, Copy)]
+struct Dyadic {
+    neg: bool,
+    m: u64,
+    e: i32,
+}
+
+fn exact_decode(name: &str, fmt: Fmt, raw: u32, role: &str) -> Result<Dyadic> {
+    let neg = (raw >> (fmt.ebits + fmt.mbits)) & 1 != 0;
+    let ef = (raw >> fmt.mbits) & ((1 << fmt.ebits) - 1);
+    let mf = raw & ((1 << fmt.mbits) - 1);
+    if ef == (1 << fmt.ebits) - 1 && !(fmt.e4m3 && mf != (1 << fmt.mbits) - 1) {
+        return Err(format!(
+            "{name}: {role} value {raw:#x} is NaN or infinite; non-finite SWMMAC numerics are not measured"
+        ));
+    }
+    if ef == 0 {
+        if mf != 0 {
+            return Err(format!(
+                "{name}: {role} value {raw:#x} is denormal; denormal SWMMAC numerics are not measured"
+            ));
+        }
+        return Ok(Dyadic { neg, m: 0, e: 0 });
+    }
+    let m = (1u64 << fmt.mbits) | u64::from(mf);
+    let tz = m.trailing_zeros();
+    Ok(Dyadic {
+        neg,
+        m: m >> tz,
+        e: ef as i32 - fmt.bias - fmt.mbits as i32 + tz as i32,
+    })
+}
+
+/// Encodes `total * 2^q_e` (`total != 0`, `|total| <= 2^P`, P = significand bits of `fmt`) as a normal number of
+/// `fmt`; the value is exactly representable by construction, only the exponent range can fail.
+fn exact_encode(name: &str, fmt: Fmt, total: i128, q_e: i32) -> Result<u32> {
+    let tz = total.trailing_zeros();
+    let m = total.unsigned_abs() >> tz;
+    let bl = 128 - m.leading_zeros() as i32;
+    let top = q_e + tz as i32 + bl - 1;
+    let emax = (1 << fmt.ebits) - 2 - fmt.bias;
+    if top < 1 - fmt.bias || top > emax {
+        return Err(format!(
+            "{name}: exact result 2^{top}-scale is outside the normal range of the output format"
+        ));
+    }
+    let p = fmt.mbits as i32 + 1;
+    let frac = ((m << (p - bl)) as u32) & ((1 << fmt.mbits) - 1);
+    Ok(u32::from(total < 0) << (fmt.ebits + fmt.mbits)
+        | ((top + fmt.bias) as u32) << fmt.mbits
+        | frac)
+}
+
+/// One output element of an exact-domain SWMMAC: `C + sum_j a_j * b_j` over the 16 compressed slots, computed as an
+/// exact dyadic rational. Executes only when the result is order-independent and exactly representable:
+/// every input finite normal or zero, `|C| + sum|t_j| <= 2^P * q` (`q` the smallest power of two dividing C and every
+/// nonzero product `t_j`), the total a normal number of the output format; an exact zero total only when C and every
+/// product are `+0` (a cancelled or negative zero has an unmeasured sign). Everything else is a hard error.
+/// `neg` = (neg_lo, neg_hi): bit 0 negates A and bit 1 negates B of even/odd slots respectively.
+fn swmmac_exact(
+    name: &str,
+    ex: &Exact,
+    a: &[u32],
+    b: &[u32],
+    neg: (u8, u8),
+    c_raw: u32,
+) -> Result<u32> {
+    let p = ex.out.mbits + 1;
+    let c = exact_decode(name, ex.out, c_raw, "C")?;
+    // (sign, odd mantissa, exponent) of every nonzero term; `c` first.
+    let mut terms = [(false, 0u64, 0i32); 17];
+    let mut n = 0;
+    let mut neg_zero = false;
+    let mut push = |d: Dyadic| {
+        if d.m == 0 {
+            neg_zero |= d.neg;
+        } else {
+            terms[n] = (d.neg, d.m, d.e);
+            n += 1;
+        }
+    };
+    push(c);
+    for j in 0..a.len() {
+        let negate = |bit: u8, fmt: Fmt| -> u32 {
+            let word = if j % 2 == 0 { neg.0 } else { neg.1 };
+            let on = word & bit != 0;
+            u32::from(on) << (fmt.ebits + fmt.mbits)
+        };
+        let x = exact_decode(name, ex.a, a[j] ^ negate(1, ex.a), "A")?;
+        let y = exact_decode(name, ex.b, b[j] ^ negate(2, ex.b), "B")?;
+        push(Dyadic {
+            neg: x.neg ^ y.neg,
+            m: if x.m == 0 || y.m == 0 { 0 } else { x.m * y.m },
+            e: x.e + y.e,
+        });
+    }
+    if n == 0 {
+        if neg_zero {
+            return Err(format!(
+                "{name}: exact zero total with a negative-zero input has an unmeasured sign"
+            ));
+        }
+        return Ok(0);
+    }
+    let q_e = terms[..n].iter().map(|t| t.2).min().unwrap_or(0);
+    let (mut total, mut abs_sum) = (0i128, 0i128);
+    for &(neg, m, e) in &terms[..n] {
+        // |t|/q = m * 2^(e - q_e) has bit length bl + (e - q_e); beyond P+1 bits it already exceeds 2^P.
+        let sh = (e - q_e) as u32;
+        let bl = 64 - m.leading_zeros();
+        if bl + sh > p + 1 {
+            return Err(format!(
+                "{name}: |C| + sum|a*b| exceeds 2^{p} granules; accumulation rounding is not measured"
+            ));
+        }
+        let v = i128::from(m) << sh;
+        abs_sum += v;
+        total += if neg { -v } else { v };
+    }
+    if abs_sum > 1i128 << p {
+        return Err(format!(
+            "{name}: |C| + sum|a*b| exceeds 2^{p} granules; accumulation rounding is not measured"
+        ));
+    }
+    if total == 0 {
+        return Err(format!(
+            "{name}: exact zero total by cancellation has an unmeasured sign"
+        ));
+    }
+    exact_encode(name, ex.out, total, q_e)
 }
 
 /// F16 A[r,k] / B[k,n] (`idx` = r or n) -> (lane, VGPR, half). gfx11 replicates
@@ -1369,18 +1654,36 @@ mod tests {
             &mut st
         )
         .is_err());
-        // 16-bit-out accumulation (inter-step truncation, 77-84% model match) and FP8/BF8 (rounding/NaN unprobed).
+        // The six exact-domain kinds (swmmac_exact_* tests) check their own register shapes: the iu8 operand shape
+        // (D 8, A 2, B 4) fits the FP8/BF8 kinds (all-zero inputs are in the exact domain) and not the 16-bit-out ones.
+        for name in ["v_swmmac_f16_16x16x32_f16", "v_swmmac_bf16_16x16x32_bf16"] {
+            let i = iu8(mods(0, 0));
+            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_err(), "{name}");
+        }
         for name in [
-            "v_swmmac_f16_16x16x32_f16",
-            "v_swmmac_bf16_16x16x32_bf16",
             "v_swmmac_f32_16x16x32_fp8_fp8",
             "v_swmmac_f32_16x16x32_fp8_bf8",
             "v_swmmac_f32_16x16x32_bf8_fp8",
             "v_swmmac_f32_16x16x32_bf8_bf8",
         ] {
             let i = iu8(mods(0, 0));
-            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_err(), "{name}");
+            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_ok(), "{name}");
         }
+        // Kinds without any model stay refused, and the exact-domain kinds exist on gfx1201 only.
+        assert!(execute(
+            Arch::Gfx1201,
+            "v_swmmac_f32_16x16x32_fp8_fp9",
+            &iu8(mods(0, 0)),
+            &mut st
+        )
+        .is_err());
+        assert!(execute(
+            Arch::Gfx1151,
+            "v_swmmac_f32_16x16x32_fp8_fp8",
+            &iu8(mods(0, 0)),
+            &mut st
+        )
+        .is_err());
     }
     // Raw gfx1201 hardware wave (rcpt/gfx1201-C-r1 swmmac f32_16x16x32_f16 `numerics` case 7, random 2:4 positions, index_key 0),
     // register-major, lane-minor.
@@ -1867,5 +2170,436 @@ mod tests {
             },
         );
         assert!(execute(Arch::Gfx1201, "v_wmma_f32_16x16x16_f16", &clamped, &mut st).is_err());
+    }
+
+    // ---- exact-domain SWMMAC kinds (16-bit-out and FP8/BF8): independent dense reference, packing, refusals ----
+    const EXACT_KINDS: [(&str, Fmt, Fmt, Fmt); 6] = [
+        ("v_swmmac_f16_16x16x32_f16", FMT_F16, FMT_F16, FMT_F16),
+        ("v_swmmac_bf16_16x16x32_bf16", FMT_BF16, FMT_BF16, FMT_BF16),
+        ("v_swmmac_f32_16x16x32_fp8_fp8", FMT_FP8, FMT_FP8, FMT_F32),
+        ("v_swmmac_f32_16x16x32_fp8_bf8", FMT_FP8, FMT_BF8, FMT_F32),
+        ("v_swmmac_f32_16x16x32_bf8_fp8", FMT_BF8, FMT_FP8, FMT_F32),
+        ("v_swmmac_f32_16x16x32_bf8_bf8", FMT_BF8, FMT_BF8, FMT_F32),
+    ];
+    const SET_FP8: &[f64] = &[
+        0.0, 1.0, -1.0, 0.5, -0.5, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0, 0.25,
+    ];
+    const SET_C_F32: &[f64] = &[0.0, 1.0, -1.0, 0.5, -0.25, 7.0, -3.5, 100.0, 0.0009765625];
+    const SET_F16: &[f64] = &[0.0, 1.0, -1.0, 0.5, -0.5, 1.5, -1.5, 2.0, -2.0];
+    const SET_C_F16: &[f64] = &[0.0, 1.0, -1.0, 0.5, -0.25, 3.0];
+    const SET_BF16: &[f64] = &[0.0, 1.0, -1.0, 0.5, -0.5, 1.5, -1.5];
+    const SET_C_BF16: &[f64] = &[0.0, 1.0, -1.0, 0.5, -0.25, 2.0];
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() >> 11) as usize % n
+        }
+    }
+    fn width(f: Fmt) -> u32 {
+        f.ebits + f.mbits + 1
+    }
+    fn kind(name: &str) -> (Fmt, Fmt, Fmt) {
+        let k = EXACT_KINDS.iter().find(|k| k.0 == name).unwrap();
+        (k.1, k.2, k.3)
+    }
+    /// (element bits, A regs, B regs, D regs) of a kind.
+    fn exact_regs(af: Fmt, of: Fmt) -> (u32, u8, u8, u8) {
+        let bits = width(af);
+        let per = 32 / bits;
+        (
+            bits,
+            (8 / per) as u8,
+            (16 / per) as u8,
+            if width(of) == 16 { 4 } else { 8 },
+        )
+    }
+    /// Bits of the exactly representable normal value (or +0) `v` in `f`.
+    fn enc(f: Fmt, v: f64) -> u32 {
+        if v == 0.0 {
+            return 0;
+        }
+        let b = v.to_bits();
+        let e = ((b >> 52) & 0x7ff) as i32 - 1023;
+        let frac = b & ((1u64 << 52) - 1);
+        let drop = 52 - f.mbits;
+        assert_eq!(
+            frac & ((1u64 << drop) - 1),
+            0,
+            "{v} is not exact in the format"
+        );
+        let ef = e + f.bias;
+        assert!(
+            ef >= 1 && ef < (1 << f.ebits) - 1,
+            "{v} is not a normal value"
+        );
+        (u32::from(v < 0.0) << (f.ebits + f.mbits))
+            | ((ef as u32) << f.mbits)
+            | (frac >> drop) as u32
+    }
+    fn nan(f: Fmt) -> u32 {
+        if f.e4m3 {
+            0x7f
+        } else {
+            (((1u32 << f.ebits) - 1) << f.mbits) | 1
+        }
+    }
+    fn inf(f: Fmt) -> u32 {
+        ((1u32 << f.ebits) - 1) << f.mbits
+    }
+    fn put_elem(st: &mut State, base: u16, lane: usize, e: usize, bits: u32, v: u32) {
+        let per = (32 / bits) as usize;
+        st.v[usize::from(base) + e / per][lane] |= v << (bits * (e % per) as u32);
+    }
+    fn exact_try(name: &str, m: Modifiers, setup: impl Fn(&mut State)) -> Result<State, String> {
+        let (af, _, of) = kind(name);
+        let (_, a_regs, b_regs, d_regs) = exact_regs(af, of);
+        let mut st = state();
+        setup(&mut st);
+        let i = insn(
+            Arch::Gfx1201,
+            name,
+            [reg(D, d_regs), reg(A, a_regs), reg(B, b_regs), reg(IDX, 1)],
+            m,
+        );
+        execute(Arch::Gfx1201, name, &i, &mut st)?;
+        Ok(st)
+    }
+    /// A[row 0][slot 0] = `a`, B[K 0][col 0] = `b`, C[0][0] = `c` (selector 0 -> K 0); every other input is +0.
+    fn probe(name: &str, a: u32, b: u32, c: u32) -> Result<State, String> {
+        let (af, _, _) = kind(name);
+        let bits = width(af);
+        exact_try(name, mods(0, 0), move |st| {
+            put_elem(st, A, 0, 0, bits, a);
+            put_elem(st, B, 0, 0, bits, b);
+            st.v[usize::from(D)][0] |= c;
+        })
+    }
+
+    /// One crafted wave (true 2:4 selectors, mixed signs, junk in the unused index half) against a dense reference:
+    /// A decompressed by the selectors, then an exact dense dot per element in f64.
+    fn exact_wave(name: &str, key: usize, neg: (u8, u8), seed: u64) {
+        let (af, bf, of) = kind(name);
+        let (bits, _, _, _) = exact_regs(af, of);
+        let out16 = width(of) == 16;
+        let (a_set, b_set, c_set) = match of.mbits {
+            23 => (SET_FP8, SET_FP8, SET_C_F32),
+            10 => (SET_F16, SET_F16, SET_C_F16),
+            _ => (SET_BF16, SET_BF16, SET_C_BF16),
+        };
+        let mut rng = Rng(seed | 1);
+        let mut a = [[0f64; 16]; 16]; // [row][compressed slot j = 8h + e]
+        let mut sel = [[0usize; 16]; 16];
+        let mut idx = [0u32; 32];
+        for r in 0..16 {
+            for h in 0..2 {
+                let mut fields = 0u32;
+                for p in 0..4 {
+                    let s0 = rng.below(4);
+                    let s1 = (s0 + 1 + rng.below(3)) % 4; // the two slots of a K-group pick different positions
+                    for (e, s) in [(2 * p, s0), (2 * p + 1, s1)] {
+                        a[r][8 * h + e] = a_set[rng.below(a_set.len())];
+                        sel[r][8 * h + e] = s;
+                        fields |= (s as u32) << (2 * e);
+                    }
+                }
+                let junk = rng.next() as u32;
+                idx[r + 16 * h] = if key == 0 {
+                    (junk & 0xffff_0000) | fields
+                } else {
+                    (junk & 0x0000_ffff) | (fields << 16)
+                };
+            }
+        }
+        let mut b = [[0f64; 16]; 32]; // [K][col]
+        for row in b.iter_mut() {
+            for v in row.iter_mut() {
+                *v = b_set[rng.below(b_set.len())];
+            }
+        }
+        // Dense decompression: slot j of row r sits at K = 4*(j>>1) + selector; neg modifiers follow the slot parity.
+        let mut ad = [[0f64; 32]; 16];
+        let mut sb = [[1f64; 32]; 16];
+        for r in 0..16 {
+            for j in 0..16 {
+                let k = 4 * (j >> 1) + sel[r][j];
+                let word = if j % 2 == 0 { neg.0 } else { neg.1 };
+                ad[r][k] = if word & 1 != 0 { -a[r][j] } else { a[r][j] };
+                if word & 2 != 0 {
+                    sb[r][k] = -1.0;
+                }
+            }
+        }
+        let mut c = [[0f64; 16]; 16];
+        let mut want = [[0f64; 16]; 16];
+        for r in 0..16 {
+            for col in 0..16 {
+                let dot: f64 = (0..32).map(|k| ad[r][k] * sb[r][k] * b[k][col]).sum();
+                let start = rng.below(c_set.len());
+                // An exactly cancelled zero has an unmeasured sign, so the wave never produces one.
+                let pick = (0..c_set.len())
+                    .map(|t| c_set[(start + t) % c_set.len()])
+                    .find(|&cand| dot + cand != 0.0)
+                    .unwrap();
+                c[r][col] = pick;
+                want[r][col] = dot + pick;
+            }
+        }
+        let m = Modifiers {
+            op_sel: key as u8,
+            ..mods(neg.0, neg.1)
+        };
+        let st = exact_try(name, m, |st| {
+            for r in 0..16 {
+                for h in 0..2 {
+                    for e in 0..8 {
+                        put_elem(st, A, r + 16 * h, e, bits, enc(af, a[r][8 * h + e]));
+                    }
+                }
+            }
+            for col in 0..16 {
+                for hb in 0..2 {
+                    for e in 0..16 {
+                        put_elem(st, B, col + 16 * hb, e, bits, enc(bf, b[16 * hb + e][col]));
+                    }
+                }
+            }
+            for r in 0..16 {
+                for col in 0..16 {
+                    let lane = col + 16 * (r >> 3);
+                    if out16 {
+                        put_half(st, D, (r & 7) >> 1, lane, r & 1, enc(of, c[r][col]) as u16);
+                    } else {
+                        st.v[usize::from(D) + (r & 7)][lane] |= enc(of, c[r][col]);
+                    }
+                }
+            }
+            st.v[usize::from(IDX)][..32].copy_from_slice(&idx);
+        })
+        .unwrap_or_else(|e| panic!("{name} key={key} neg={neg:?} seed={seed}: {e}"));
+        for r in 0..16 {
+            for col in 0..16 {
+                let lane = col + 16 * (r >> 3);
+                let got = if out16 {
+                    (st.v[usize::from(D) + ((r & 7) >> 1)][lane] >> (16 * (r & 1))) & 0xffff
+                } else {
+                    st.v[usize::from(D) + (r & 7)][lane]
+                };
+                assert_eq!(
+                    got,
+                    enc(of, want[r][col]),
+                    "{name} key={key} neg={neg:?} seed={seed} row {r} col {col}: want {}",
+                    want[r][col]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swmmac_exact_kinds_match_a_dense_reference() {
+        for (name, af, _, _) in EXACT_KINDS {
+            // neg_lo/neg_hi exist only on the 16-bit-input kinds.
+            let negs: &[(u8, u8)] = if width(af) == 16 {
+                &[(0, 0), (3, 3), (1, 2), (2, 1)]
+            } else {
+                &[(0, 0)]
+            };
+            for key in 0..2 {
+                for (n, &neg) in negs.iter().enumerate() {
+                    for seed in 0..3u64 {
+                        exact_wave(
+                            name,
+                            key,
+                            neg,
+                            0x9e37_79b9_7f4a_7c15 ^ (seed * 31 + n as u64 * 7 + key as u64),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 16-bit-out D: row r col c -> lane c + 16*(r>>3), VGPR (r&7)>>1, half r&1 (low half = even row). C is read from the
+    // same half and every half of D is rewritten: D[r][c] = r (C) + (c+1) (A=1 times B[0][c]).
+    #[test]
+    fn swmmac_exact_16bit_out_packs_two_rows_per_vgpr() {
+        for name in ["v_swmmac_f16_16x16x32_f16", "v_swmmac_bf16_16x16x32_bf16"] {
+            let (f, _, _) = kind(name);
+            let st = exact_try(name, mods(0, 0), |st| {
+                for r in 0..16 {
+                    put_elem(st, A, r, 0, 16, enc(f, 1.0));
+                }
+                for col in 0..16 {
+                    put_elem(st, B, col, 0, 16, enc(f, (col + 1) as f64));
+                }
+                for r in 0..16 {
+                    for col in 0..16 {
+                        let lane = col + 16 * (r >> 3);
+                        put_half(st, D, (r & 7) >> 1, lane, r & 1, enc(f, r as f64) as u16);
+                    }
+                }
+            })
+            .unwrap();
+            for r in 0..16 {
+                for col in 0..16 {
+                    let lane = col + 16 * (r >> 3);
+                    let word = st.v[usize::from(D) + ((r & 7) >> 1)][lane];
+                    assert_eq!(
+                        (word >> (16 * (r & 1))) & 0xffff,
+                        enc(f, (r + col + 1) as f64),
+                        "{name} row {r} col {col}"
+                    );
+                }
+            }
+            // Row 3, col 5: lane 5, VGPR 1, high half.
+            assert_eq!(st.v[usize::from(D) + 1][5] >> 16, enc(f, 9.0), "{name}");
+            // Row 12, col 2: lane 18, VGPR 2, low half.
+            assert_eq!(
+                st.v[usize::from(D) + 2][18] & 0xffff,
+                enc(f, 15.0),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn swmmac_exact_accepts_the_domain_edge_and_e4m3_without_infinity() {
+        let name = "v_swmmac_f32_16x16x32_fp8_fp8";
+        let one = enc(FMT_FP8, 1.0);
+        // C = 2^23, one product 1: |C| + |t| = 2^23 + 1 granules <= 2^24 and 2^23 + 1 is exact in f32.
+        let st = probe(name, one, one, (8388608.0f32).to_bits()).unwrap();
+        assert_eq!(st.v[usize::from(D)][0], 8388609.0f32.to_bits());
+        // C = 2^24: 2^24 + 1 granules > 2^24 (and 2^24 + 1 is not an f32).
+        let err = probe(name, one, one, (16777216.0f32).to_bits())
+            .err()
+            .unwrap();
+        assert!(err.contains("exceeds 2^24"), "{err}");
+        // E4M3 has no infinity: 0x78 (S.1111.000) is the normal value 256, 0x7f is the NaN.
+        let st = probe(name, 0x78, one, 0).unwrap();
+        assert_eq!(st.v[usize::from(D)][0], 256.0f32.to_bits());
+        assert!(probe(name, 0x7f, one, 0).err().unwrap().contains("NaN"));
+    }
+
+    #[test]
+    fn swmmac_exact_exact_values_have_the_expected_result() {
+        for (name, af, bf, of) in EXACT_KINDS {
+            // Positive operands only: a negative A or B against the other zeros would make a (refused) -0 product.
+            let st = probe(name, enc(af, 1.5), enc(bf, 2.0), enc(of, 1.0)).unwrap();
+            // 1.0 + 1.5 * 2.0 = 4.0
+            let mask = ((1u64 << width(of)) - 1) as u32;
+            assert_eq!(st.v[usize::from(D)][0] & mask, enc(of, 4.0), "{name}");
+        }
+    }
+
+    #[test]
+    fn swmmac_exact_refuses_everything_outside_the_domain() {
+        for (name, af, bf, of) in EXACT_KINDS {
+            let (one_a, one_b, one_c) = (enc(af, 1.0), enc(bf, 1.0), enc(of, 1.0));
+            let denorm = 1u32;
+            // NaN in A, selected B and C; denormal in A, selected B and C.
+            let cases = [
+                (nan(af), one_b, 0, "NaN or infinite"),
+                (one_a, nan(bf), 0, "NaN or infinite"),
+                (one_a, one_b, nan(of), "NaN or infinite"),
+                (denorm, one_b, 0, "denormal"),
+                (one_a, denorm, 0, "denormal"),
+                (one_a, one_b, denorm, "denormal"),
+                // Cancellation to zero and negative zeros: the sign of such a zero is unmeasured.
+                (one_a, one_b, enc(of, -1.0), "cancellation"),
+                (enc(af, -1.0), 0, 0, "negative-zero"),
+                (0, 0, 1u32 << (width(of) - 1), "negative-zero"),
+            ];
+            for (a, b, c, needle) in cases {
+                let err = probe(name, a, b, c).err().unwrap_or_else(|| {
+                    panic!("{name}: a={a:#x} b={b:#x} c={c:#x} should be refused ({needle})")
+                });
+                assert!(err.contains(needle), "{name}: {err} (wanted {needle})");
+            }
+            // Infinity exists in every format but E4M3 (so: bf8 inputs, and 16-bit A/B/C).
+            let infs = [
+                (!af.e4m3, inf(af), one_b, 0),
+                (!bf.e4m3, one_a, inf(bf), 0),
+                (true, one_a, one_b, inf(of)),
+            ];
+            for (exists, a, b, c) in infs {
+                if !exists {
+                    continue;
+                }
+                let err = probe(name, a, b, c).err().unwrap_or_else(|| {
+                    panic!("{name}: infinity a={a:#x} b={b:#x} c={c:#x} should be refused")
+                });
+                assert!(err.contains("NaN or infinite"), "{name}: {err}");
+            }
+            // Total beyond 2^P granules: C = 2^20 (f32 out) or 1.0 against the smallest-normal product.
+            let tiny = |f: Fmt| enc(f, 2f64.powi(1 - f.bias));
+            let big = if of.mbits == 23 {
+                enc(of, 1048576.0)
+            } else {
+                one_c
+            };
+            let err = probe(name, tiny(af), tiny(bf), big).err().unwrap();
+            assert!(err.contains("exceeds 2^"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn swmmac_exact_zero_without_cancellation_is_plus_zero() {
+        for (name, _, _, _) in EXACT_KINDS {
+            let st = probe(name, 0, 0, 0).unwrap();
+            assert!(
+                st.v[..8].iter().all(|row| row.iter().all(|&w| w == 0)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn swmmac_exact_modifier_rules() {
+        for (name, af, _, _) in EXACT_KINDS {
+            let clamp = Modifiers {
+                clamp: true,
+                ..mods(0, 0)
+            };
+            assert!(exact_try(name, clamp, |_| {}).is_err(), "{name} clamp");
+            assert!(
+                exact_try(name, mods(4, 0), |_| {}).is_err(),
+                "{name} NEG[2]"
+            );
+            let other_opsel = Modifiers {
+                op_sel: 2,
+                ..mods(0, 0)
+            };
+            assert!(
+                exact_try(name, other_opsel, |_| {}).is_err(),
+                "{name} OPSEL[1]"
+            );
+            // C = 1.0 everywhere keeps every total nonzero (a negated zero product is a refused -0 otherwise).
+            let (_, _, of) = kind(name);
+            let ones = move |st: &mut State| {
+                let word = if width(of) == 16 {
+                    enc(of, 1.0) * 0x0001_0001
+                } else {
+                    enc(of, 1.0)
+                };
+                for vgpr in 0..8 {
+                    st.v[usize::from(D) + vgpr] = [word; 32];
+                }
+            };
+            for (lo, hi) in [(1, 0), (0, 1), (2, 2), (3, 3)] {
+                let r = exact_try(name, mods(lo, hi), ones);
+                if width(af) == 8 {
+                    let err = r.err().unwrap();
+                    assert!(err.contains("neg_lo/neg_hi"), "{name}: {err}");
+                } else {
+                    assert!(r.is_ok(), "{name} neg_lo={lo} neg_hi={hi}");
+                }
+            }
+        }
     }
 }

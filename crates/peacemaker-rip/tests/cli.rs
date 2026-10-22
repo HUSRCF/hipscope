@@ -236,6 +236,113 @@ fn check_without_declared_variants_is_a_usage_error() {
 }
 
 #[test]
+fn check_discovers_const_variants_and_arches_with_no_flags() {
+    // `good()` declares neither const: the usage error still names VARIANTS.
+    let dir = scratch("check_discover");
+    let src = write(&dir, "k.rip", &good());
+    let r = rip(&["check", &src]);
+    assert_eq!(r.status.code(), Some(2), "{}", text(&r.stderr));
+    assert!(text(&r.stderr).contains("VARIANTS"), "{}", text(&r.stderr));
+    // A `const VARIANTS` script checks without `--variant`.
+    let with_variants = format!("pub const VARIANTS: &[&str] = &[\"v\"];\n{}", good());
+    let src = write(&dir, "c.rip", &with_variants);
+    let r = rip(&["check", &src]);
+    assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("ok gfx1151/v: ") && text(&r.stderr).contains("ok gfx1201/v: "),
+        "{}",
+        text(&r.stderr)
+    );
+    // A `const ARCHES` script narrows the default arch list ...
+    let with_arches = format!(
+        "pub const VARIANTS: &[&str] = &[\"v\"];\npub const ARCHES: &[&str] = &[\"gfx1151\"];\n{}",
+        good()
+    );
+    let src = write(&dir, "a.rip", &with_arches);
+    let r = rip(&["check", &src]);
+    let err = text(&r.stderr);
+    assert_eq!(r.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("ok gfx1151/v: ") && !err.contains("gfx1201"),
+        "{err}"
+    );
+    // ... and `--arch all` means the declared ARCHES, not all three arches.
+    let r = rip(&["check", &src, "--arch", "all"]);
+    let err = text(&r.stderr);
+    assert_eq!(r.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("ok gfx1151/v: ") && !err.contains("gfx1201"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_flags_beat_the_consts_on_both_axes() {
+    let dir = scratch("check_precedence");
+    let body = format!(
+        "pub const VARIANTS: &[&str] = &[\"v\"];\npub const ARCHES: &[&str] = &[\"gfx1151\"];\n{}",
+        good()
+    );
+    let src = write(&dir, "p.rip", &body);
+    // `--variant` beats `const VARIANTS`: the requested name is compiled,
+    // not the declared one (the fixture accepts any variant string).
+    let r = rip(&["check", &src, "--variant", "other", "--arch", "gfx1151"]);
+    let err = text(&r.stderr);
+    assert_eq!(r.status.code(), Some(0), "{err}");
+    assert!(err.contains("ok gfx1151/other: "), "{err}");
+    // `--arch` beats `const ARCHES`: the second arch is compiled too.
+    let r = rip(&["check", &src, "--arch", "gfx1151,gfx1201"]);
+    let err = text(&r.stderr);
+    assert_eq!(r.status.code(), Some(0), "{err}");
+    assert!(err.contains("ok gfx1201/v: "), "{err}");
+}
+
+#[test]
+fn check_empty_variants_and_bogus_arch_are_usage_errors() {
+    let dir = scratch("check_bad_lists");
+    let empty = format!("pub const VARIANTS: &[&str] = &[];\n{}", good());
+    let src = write(&dir, "e.rip", &empty);
+    let r = rip(&["check", &src]);
+    assert_eq!(r.status.code(), Some(2), "{}", text(&r.stderr));
+    assert!(text(&r.stderr).contains("VARIANTS"), "{}", text(&r.stderr));
+    // A bogus arch name from the flag is a usage error.
+    let with_variants = format!("pub const VARIANTS: &[&str] = &[\"v\"];\n{}", good());
+    let src = write(&dir, "b.rip", &with_variants);
+    let r = rip(&["check", &src, "--arch", "gfx9999"]);
+    assert_eq!(r.status.code(), Some(2), "{}", text(&r.stderr));
+    // ... and so is one from the script's own `const ARCHES`.
+    let bad_arches = format!(
+        "pub const VARIANTS: &[&str] = &[\"v\"];\npub const ARCHES: &[&str] = &[\"gfx9999\"];\n{}",
+        good()
+    );
+    let src = write(&dir, "ba.rip", &bad_arches);
+    let r = rip(&["check", &src]);
+    assert_eq!(r.status.code(), Some(2), "{}", text(&r.stderr));
+}
+
+#[test]
+fn check_refusal_under_an_explicit_arch_is_an_error() {
+    // `good()` builds on every arch; a gfx1151-only guard refuses gfx1201
+    // with the script's own `Err`, which stays exit 1 under the flag.
+    let dir = scratch("check_refuse");
+    let guarded = format!(
+        "pub const VARIANTS: &[&str] = &[\"v\"];\nfn guard(spec: Spec) -> Result<(), String> {{ if spec.arch != Arch::Gfx1151 {{ return Err(\"only gfx1151\".into()) }} Ok(()) }}\n{}",
+        good().replace(
+            "let mut p = RegPlan::new(256, 104)?;",
+            "guard(spec)?;\n    let mut p = RegPlan::new(256, 104)?;"
+        )
+    );
+    let src = write(&dir, "g.rip", &guarded);
+    let r = rip(&["check", &src, "--arch", "gfx1201"]);
+    assert_eq!(r.status.code(), Some(1), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("only gfx1151"),
+        "{}",
+        text(&r.stderr)
+    );
+}
+
+#[test]
 fn explain_prints_a_section_lists_codes_and_rejects_unknown_ones() {
     let r = rip(&["explain", "R0301"]);
     assert_eq!(r.status.code(), Some(0));

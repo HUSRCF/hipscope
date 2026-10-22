@@ -195,8 +195,12 @@ struct Args {
     /// `--chunk-dump LAYERS|default`: digest the prefill chunks of these layers
     /// (`hipfire_arch_qwen4::chunk_dump`).
     chunk_dump: Option<String>,
-    /// `--spec mtp`: drive the load's native MTP speculator instead of AR.
+    /// `--spec mtp|dflash`: drive the load's speculator (native MTP, or the
+    /// DFlash2 draft `--draft`) instead of AR.
     mtp: Option<MtpArgs>,
+    /// `--spec dflash`: the DFlash2 draft and `--dflash-block` (`None` = the
+    /// load's `auto` width).
+    dflash: Option<(String, Option<usize>)>,
 }
 
 /// The `--spec mtp` request: sampling (`--temp 0` = greedy), seed, the
@@ -250,6 +254,9 @@ fn parse_args() -> R<Args> {
     let mut seed = 0x1357_9BDFu64;
     let mut ngram = None;
     let mut state_every = 8usize;
+    let mut spec_dflash = false;
+    let mut draft = None;
+    let mut dflash_block = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -307,10 +314,15 @@ fn parse_args() -> R<Args> {
                 )
             }
             "--spec" => match value("--spec")?.as_str() {
-                "mtp" => spec_mtp = true,
-                "off" => spec_mtp = false,
-                other => return Err(format!("--spec takes mtp or off, got {other:?}")),
+                "mtp" => (spec_mtp, spec_dflash) = (true, false),
+                "dflash" => (spec_mtp, spec_dflash) = (true, true),
+                "off" => (spec_mtp, spec_dflash) = (false, false),
+                other => return Err(format!("--spec takes mtp, dflash or off, got {other:?}")),
             },
+            "--draft" => draft = Some(value("--draft")?),
+            "--dflash-block" => {
+                dflash_block = Some(value("--dflash-block")?.parse::<usize>().map_err(e)?)
+            }
             "--temp" => temp = value("--temp")?.parse::<f32>().map_err(e)?,
             "--top-p" => top_p = value("--top-p")?.parse::<f32>().map_err(e)?,
             "--top-k" => top_k = Some(value("--top-k")?.parse::<u32>().map_err(e)?),
@@ -341,6 +353,9 @@ fn parse_args() -> R<Args> {
     if spec_mtp && (perturb.is_some() || !moe_dump_positions.is_empty()) {
         return Err("--perturb-* and --moe-dump-positions are AR-mode options".into());
     }
+    if spec_dflash != draft.is_some() {
+        return Err("--spec dflash and --draft go together".into());
+    }
     Ok(Args {
         model: model.ok_or("--model is required")?,
         prompt_files,
@@ -367,6 +382,7 @@ fn parse_args() -> R<Args> {
             ngram,
             state_every,
         }),
+        dflash: draft.map(|draft| (draft, dflash_block)),
     })
 }
 
@@ -765,7 +781,11 @@ fn mtp_prompt(
             "emit": [first],
         }),
     )?;
-    mtp_digest(bundle, gpu, pp.as_deref_mut(), run, 0, sinks)?;
+    // DFlash2 owns no MTP head: its arm records the windows only.
+    let digests = speculator.name() == "mtp";
+    if digests {
+        mtp_digest(bundle, gpu, pp.as_deref_mut(), run, 0, sinks)?;
+    }
     let mut window = 0usize;
     let mut digested = 0usize;
     while emitted.len() < run.tokens {
@@ -808,7 +828,7 @@ fn mtp_prompt(
                 "accepted": step.accepted,
             }),
         )?;
-        if window % run.state_every == 0 {
+        if digests && window % run.state_every == 0 {
             mtp_digest(bundle, gpu, pp.as_deref_mut(), run, window, sinks)?;
             digested = window;
         }
@@ -821,7 +841,7 @@ fn mtp_prompt(
             );
         }
     }
-    if digested != window {
+    if digests && digested != window {
         mtp_digest(bundle, gpu, pp.as_deref_mut(), run, window, sinks)?;
     }
     emit(
@@ -875,12 +895,16 @@ fn run() -> R<()> {
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
     if args.mtp.is_some() {
-        spec_cfg.mtp = Some(true);
+        spec_cfg.mtp = Some(args.dflash.is_none());
+    }
+    if let Some((_, block)) = &args.dflash {
+        spec_cfg.dflash = Some(true);
+        spec_cfg.dflash_block = *block;
     }
     let mut model = hipfire_loader::load_model(
         &args.model,
         args.max_seq,
-        None,
+        args.dflash.as_ref().map(|(draft, _)| draft.as_str()),
         args.kv_mode.as_deref(),
         None,
         args.state_quant.as_deref(),
@@ -921,7 +945,7 @@ fn run() -> R<()> {
             model
                 .speculator
                 .take()
-                .ok_or("--spec mtp: the load attached no native MTP speculator")?,
+                .ok_or("--spec: the load attached no speculator")?,
         ),
         None => None,
     };
@@ -930,7 +954,7 @@ fn run() -> R<()> {
     // explicit `--ngram on` is refused. `meta.spec.ngram` records the effective
     // value, so an arm that really ran the pool never compares equal to it.
     let ngram = args.mtp.as_ref().map(|mtp| {
-        if pp > 1 {
+        if pp > 1 || args.dflash.is_some() {
             return false;
         }
         mtp.ngram.unwrap_or_else(|| {
@@ -1066,7 +1090,9 @@ fn run() -> R<()> {
         "prompts": prompt_meta,
         "completed": false,
         "spec": args.mtp.as_ref().map(|mtp| json!({
-            "kind": "mtp",
+            "kind": if args.dflash.is_some() { "dflash" } else { "mtp" },
+            "draft": args.dflash.as_ref().map(|(draft, _)| draft),
+            "dflash_block": args.dflash.as_ref().map(|(_, block)| block),
             "temp": mtp.temp,
             "top_p": mtp.top_p,
             "top_k": mtp.top_k,

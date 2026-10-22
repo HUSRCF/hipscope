@@ -466,6 +466,10 @@ impl SpecScratch for Qwen4SpecScratch {
             "Qwen4 verify scratch dropped with an active target snapshot"
         );
     }
+
+    fn clear(&mut self) {
+        self.target_snapshot = None;
+    }
 }
 
 /// The operations of the one native MTP driver that touch the target (and
@@ -989,7 +993,16 @@ impl Qwen4Bundle {
                 .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
                 .target_snapshot = Some(TargetTicket::Local(snapshot));
         }
+        // A single-GPU verify's row launchers may take the gfx1151 PM row
+        // kernels (column-identical to the 1-row incumbents, as in the lane step).
+        let rows_scope = match ops {
+            Qwen4Ops::Single(gpu) => Some(std::mem::replace(&mut gpu.lane_rows_scope, true)),
+            Qwen4Ops::Mesh(_) => None,
+        };
         let result = self.ops_spec_rows(ops, block, read_picks);
+        if let (Some(previous), Qwen4Ops::Single(gpu)) = (rows_scope, &mut *ops) {
+            gpu.lane_rows_scope = previous;
+        }
         self.ops_disarm(ops);
         if let Err(error) = &result {
             if mesh {
@@ -1041,7 +1054,9 @@ impl Qwen4Bundle {
     }
 
     /// The non-EP advance body of [`SpecTarget::spec_advance`]: reset when asked, validate, then run the rows. A reset
-    /// advance is re-entrant after an NPU fault (it starts cold again).
+    /// advance is re-entrant after an NPU fault (it starts cold again). With
+    /// `hidden_out` and an armed DFlash2 drafter every row's target features
+    /// are appended to it and the final row's logits are returned too.
     fn spec_advance_from(
         &mut self,
         gpu: &mut Gpu,
@@ -1049,7 +1064,12 @@ impl Qwen4Bundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if self.dflash.is_none() {
+            hidden_out = None;
+        }
+        let capture = hidden_out.is_some();
         if reset {
             self.reset_recurrent(gpu)?;
         }
@@ -1083,6 +1103,11 @@ impl Qwen4Bundle {
             .session_lineage_after(start_pos)
             .map_or(end_pos, |p| p.min(end_pos));
         if let Some(forward) = &mut self.execution {
+            // The pair executor runs layer-major outside the step
+            // interpreter, where the DFlash2 layer capture has no hook.
+            if capture {
+                forward.npu_trunk_request_gpu_only("DFlash2 layer capture");
+            }
             forward
                 .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
                 .map_err(|error| error.to_string())?;
@@ -1104,13 +1129,19 @@ impl Qwen4Bundle {
             let covered = planned && rows > max_chunk;
             self.set_ple_lookahead(&tokens[end..]);
             if covered && end < tokens.len() {
-                self.spec_prefill_rows_without_pick(gpu, &tokens[offset..end], false)
+                self.spec_prefill_rows_without_pick(gpu, &tokens[offset..end], capture)
                     .map_err(|error| error.to_string())?;
             } else {
                 last_argmax = Some(
-                    self.spec_prefill_rows(gpu, &tokens[offset..end], false)
+                    self.spec_prefill_rows(gpu, &tokens[offset..end], capture)
                         .map_err(|error| error.to_string())?,
                 );
+            }
+            if let Some(out) = hidden_out.as_deref_mut() {
+                self.read_dflash_capture(gpu, rows, out)
+                    .map_err(|error| error.to_string())?;
+                // A long prompt keeps only the rows the draft reads.
+                self.trim_dflash_rows(out);
             }
             if self.session_next_boundary() == Some(start_pos + end) {
                 self.spec_advance_session_boundary(gpu, start_pos + end)
@@ -1124,9 +1155,17 @@ impl Qwen4Bundle {
                 self.state.position
             ));
         }
+        let last_logits = if capture {
+            let mut logits = Vec::new();
+            self.spec_row_logits(gpu, 0, &mut logits)
+                .map_err(|error| error.to_string())?;
+            Some(logits)
+        } else {
+            None
+        };
         Ok(SpecAdvance::Ready {
             last_argmax: last_argmax.expect("non-empty spec advance produced no argmax"),
-            last_logits: None,
+            last_logits,
         })
     }
 
@@ -1162,8 +1201,14 @@ impl Qwen4Bundle {
                 "Qwen4 spec block size {block_size} exceeds forward capacity {max_chunk}"
             ));
         }
-        self.ensure_spec_hidden(ops.gpu()?, block_size)
-            .map_err(|error| error.to_string())?;
+        // An armed DFlash2 drafter reads its target layers, not the MTP
+        // head's wide hidden.
+        if self.dflash.is_some() {
+            self.ensure_dflash_capture(ops.gpu()?, block_size)
+        } else {
+            self.ensure_spec_hidden(ops.gpu()?, block_size)
+        }
+        .map_err(|error| error.to_string())?;
         Ok(Box::new(Qwen4SpecScratch {
             block_size,
             target_snapshot: None,
@@ -1248,7 +1293,7 @@ impl SpecTarget for Qwen4Bundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
-        _hidden_out: Option<&mut Vec<f32>>,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Expert parallelism: every rank advances in one fan-out. Rank 0
         // checks the request and polls the abort once, here; inside the
@@ -1263,6 +1308,9 @@ impl SpecTarget for Qwen4Bundle {
             if abort() {
                 self.reset_recurrent(gpu)?;
                 return Ok(SpecAdvance::Aborted);
+            }
+            if hidden_out.is_some() && self.dflash.is_some() {
+                return Err("DFlash2 is not supported under qwen4 expert parallelism".to_string());
             }
             let last_argmax = self
                 .ep_fanout(
@@ -1284,16 +1332,31 @@ impl SpecTarget for Qwen4Bundle {
         // An NPU fault latches the route off. A reset advance starts cold, so it reruns whole GPU-only (the replan is always
         // row 0); a forced advance mid-turn cannot be replayed and fails closed, the route staying off for later requests.
         if reset {
+            let mut hidden_out = hidden_out;
+            let start = hidden_out.as_deref().map_or(0, Vec::len);
             return crate::npu_trunk::containment::rerun_after_fault(
                 self,
                 tokens.len(),
                 0,
-                |bundle, _| bundle.spec_advance_from(gpu, tokens, start_pos, true, abort),
+                |bundle, _| {
+                    // A rerun starts cold: drop the faulted attempt's rows.
+                    if let Some(out) = hidden_out.as_deref_mut() {
+                        out.truncate(start);
+                    }
+                    bundle.spec_advance_from(
+                        gpu,
+                        tokens,
+                        start_pos,
+                        true,
+                        abort,
+                        hidden_out.as_deref_mut(),
+                    )
+                },
                 |bundle| bundle.take_npu_trunk_fault(),
                 |_| 0,
             );
         }
-        let result = self.spec_advance_from(gpu, tokens, start_pos, false, abort);
+        let result = self.spec_advance_from(gpu, tokens, start_pos, false, abort, hidden_out);
         if result.is_err() {
             self.take_npu_trunk_fault();
         }
@@ -1306,9 +1369,81 @@ impl SpecTarget for Qwen4Bundle {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
-        _hidden_out: Option<&mut Vec<f32>>,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
-        self.verify_block_rows(&mut Qwen4Ops::Single(gpu), block, position, scratch, true)
+        let picks =
+            self.verify_block_rows(&mut Qwen4Ops::Single(gpu), block, position, scratch, true)?;
+        if let Some(out) = hidden_out.filter(|_| self.dflash.is_some()) {
+            self.read_dflash_capture(gpu, block.len(), out)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(picks)
+    }
+
+    fn verify_block_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        self.verify_block_rows(&mut Qwen4Ops::Single(gpu), block, position, scratch, false)?;
+        let logits = self
+            .spec_logits_rows(0, block.len())
+            .and_then(|rows| gpu.download_f32(&rows).map_err(BundleError::Hip))
+            .map_err(|error| error.to_string())?;
+        if let Some(out) = hidden_out.filter(|_| self.dflash.is_some()) {
+            self.read_dflash_capture(gpu, block.len(), out)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(logits)
+    }
+
+    fn dflash_extract_layers(&self) -> Option<&[usize]> {
+        self.dflash_layers()
+    }
+
+    fn set_dflash_extract_layers(&mut self, layers: Vec<usize>) {
+        self.set_dflash_layers(layers);
+    }
+
+    fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
+        self.dflash_embed_row(gpu, token_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_dflash_feature_window(&mut self, rows: usize) {
+        self.set_dflash_window(rows);
+    }
+
+    fn abandon_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        let ticket = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 abandon_verify: scratch is not Qwen4SpecScratch")?
+            .target_snapshot
+            .take();
+        match ticket {
+            None => Ok(()),
+            Some(ticket) => self
+                .restore(gpu, ticket.local()?)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn lm_head_logits_device(
+        &mut self,
+        gpu: &mut Gpu,
+        hidden_rows: &GpuTensor,
+        n: usize,
+    ) -> Result<GpuTensor, String> {
+        self.dflash_lm_head(gpu, hidden_rows, n)
+            .map_err(|error| error.to_string())
     }
 
     fn commit_prefix(
@@ -1358,11 +1493,31 @@ impl SpecTarget for Qwen4Bundle {
                 .commit(gpu, snapshot)
                 .map_err(|error| error.to_string());
         }
-        self.restore(gpu, snapshot)
-            .map_err(|error| error.to_string())?;
-        self.spec_forward_rows(gpu, &block[..accept_len + 1], true)
-            .map(|_| ())
-            .map_err(|error| error.to_string())?;
+        // A verify that left per-row rollback points (row capture armed for
+        // this block) drops the rejected suffix in place, as native MTP
+        // does; otherwise restore and replay the kept rows.
+        if block.len() >= 2 && self.state.row_capture_rows() >= block.len() {
+            if let Err(error) =
+                self.rollback_verify_rows_retain(gpu, snapshot, accept_len + 1, block)
+            {
+                return Err(match self.restore(gpu, snapshot) {
+                    Ok(()) => error.to_string(),
+                    Err(restore) => format!("{error}; target restore failed: {restore}"),
+                });
+            }
+            self.commit(gpu, snapshot)
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.restore(gpu, snapshot)
+                .map_err(|error| error.to_string())?;
+            // The DFlash2 drafter already read this window's features from
+            // the verify; the replay re-captures only the MTP head's wide
+            // hidden.
+            let capture = self.dflash.is_none();
+            self.spec_forward_rows(gpu, &block[..accept_len + 1], capture)
+                .map(|_| ())
+                .map_err(|error| error.to_string())?;
+        }
         if self.state.position != committed_end {
             return Err(format!(
                 "Qwen4 commit_prefix replay ended at {}, expected {committed_end}",

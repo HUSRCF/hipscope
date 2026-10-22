@@ -14,6 +14,11 @@
 //!   variant of the script's own `enum Kind` named like `variant`
 //!   (case-insensitive), else the string itself. `fn emit(arch, variant)` is
 //!   accepted too.
+//! - Discovery: `const VARIANTS: &[&str]` names the channel's variants
+//!   (else the script's `enum Kind`), `const ARCHES: &[&str]` its arches
+//!   (else the default arch list). Explicit `--variant` / `--arch` flags
+//!   beat both consts; `--arch all` means the declared `ARCHES` when
+//!   present, else every arch.
 //! - Item keywords (token-level, see [`preprocess`]): `tile T { .. }` is a
 //!   register-tile layout, `chain f(..) { .. }` an emission routine,
 //!   `region R;` an LDS region tag.
@@ -45,16 +50,34 @@
 //! `let mut wg = Workgroup::new(&mut b, arch)?;` opens the sealed driver
 //! over the builder `b` for the rest of its block, up to the first
 //! statement that mentions `b` again (typically `b.finish()`).
+//!
+//! # Offline features
+//!
+//! [`features::collect`] and `peacemaker-rip features FILE [--json]` report
+//! shared [`check`] resources, linked-object schedule costs, and instruction-by-
+//! instruction emulator coverage without a GPU. Source and assembly SHA256
+//! receipts identify the inputs. Optional `--routes FILE` supplies the original
+//! cost-lint routes JSON; unavailable route-dependent facts remain null, and
+//! compile, link, lift, or routes errors are structured per-target failures.
+//!
+//! # Offline execution
+//!
+//! [`run`] implements `peacemaker-rip run FILE --case FILE.json`: compile,
+//! assemble natively, lift, execute the declared grid on the CPU emulator and
+//! check every buffer, including input immutability and output guards. See its
+//! module documentation for the strict case schema, reports and behavior dumps.
 
 pub mod builtin;
 pub mod diag;
 pub mod driver;
 pub mod expand;
+pub mod features;
 pub mod fmt;
 pub mod interp;
 pub mod native;
 pub mod ops;
 pub mod preprocess;
+pub mod run;
 pub mod srcfmt;
 pub mod validate;
 pub mod value;
@@ -227,6 +250,15 @@ fn descriptor_int(text: &str, key: &str) -> Option<u32> {
         .find_map(|l| l.trim().strip_prefix(key)?.trim().parse().ok())
 }
 
+/// Wave size declared by the emitted kernel, never inferred from its architecture.
+pub(crate) fn wave_size_of(e: &Emitted) -> Option<u32> {
+    match descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ")? {
+        0 => Some(64),
+        1 => Some(32),
+        _ => None,
+    }
+}
+
 fn resources_of(e: &Emitted) -> Option<Resources> {
     let symbol = symbol_of(e).ok()?;
     let label = format!("{symbol}:");
@@ -316,13 +348,52 @@ pub fn check(source: &str, name: &str, arch: Arch, variant: &str) -> Checked {
     }
 }
 
-/// The variants declared by the script's `enum Kind`, with the declared
-/// spelling ([`compile`] matches them case-insensitively); empty without one.
+/// Check every (arch, variant) of a `.rip` source without cargo: the default
+/// arches and variants below, unless the caller passes explicit lists.
+///
+/// - `const VARIANTS: &[&str]`: the channel's variant names. When absent,
+///   the variants of the script's own `enum Kind` (case-insensitive at the
+///   call site), else an empty list. An empty list is a usage error naming
+///   `VARIANTS`: pass `--variant`.
+/// - `const ARCHES: &[&str]`: the channel's architectures (any of
+///   `gfx1100`, `gfx1151`, `gfx1201`). When absent, the default arch list.
+///   An unknown name is a usage error; `--arch all` means the declared
+///   `ARCHES` when present, else all three arches.
+/// - Explicit `--arch` / `--variant` flags beat both consts. A refusal the
+///   script's own `emit` returns (an arch or variant it does not build) is
+///   an error, even when the arch came from an explicit flag.
+pub const DEFAULT_ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
+
+/// Every arch a `--arch` list or `--arch all` may name.
+pub const ALL_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+
+/// Parse one arch name of a `--arch` list or a script's `const ARCHES`.
+pub fn parse_arch(name: &str) -> Result<Arch, String> {
+    name.parse::<Arch>()
+        .map_err(|_| format!("unsupported architecture {name}"))
+}
+
+/// The variants declared by the script's `const VARIANTS`, else by its `enum
+/// Kind` with the declared spelling ([`compile`] matches them
+/// case-insensitively); empty only when the script declares neither.
 pub fn variants(source: &str, name: &str) -> Result<Vec<String>, String> {
     big_stack(|| {
         let file = parse(source, name)?;
         let it = Interp::load(&file, name);
-        Ok(it.enum_variants("Kind").unwrap_or_default())
+        match it.const_str_list("VARIANTS")? {
+            Some(v) => Ok(v),
+            None => Ok(it.enum_variants("Kind").unwrap_or_default()),
+        }
+    })
+}
+
+/// The arches declared by the script's `const ARCHES` (`None` when it
+/// declares none); a declared-but-malformed const is an error.
+pub fn arches(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    big_stack(|| {
+        let file = parse(source, name)?;
+        let it = Interp::load(&file, name);
+        it.const_str_list("ARCHES")
     })
 }
 

@@ -333,6 +333,40 @@ impl<'a> Interp<'a> {
             .get(ty)
             .map(|e| e.variants.iter().map(|(v, _, _)| v.clone()).collect())
     }
+
+    /// The `&str` items of `const NAME: &[&str]`: `None` when the script
+    /// declares no such const, a located error when it declares one that is
+    /// not an array of string literals.
+    pub fn const_str_list(&self, name: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(def) = self.consts.get(name) else {
+            return Ok(None);
+        };
+        let at = self.loc(def.expr);
+        let v = match self.const_value(name) {
+            Ok(Some(v)) => self.deref(v),
+            Ok(None) => return Err(format!("{at}: constant `{name}` depends on itself")),
+            Err(Ctl::Err(m)) => return Err(format!("{at}: {m}")),
+            Err(Ctl::Fatal(m)) => return Err(m),
+            Err(_) => return Err(format!("{at}: cannot evaluate constant `{name}`")),
+        };
+        match v {
+            Value::Array(xs) => xs
+                .into_iter()
+                .map(|x| match self.deref(x) {
+                    Value::Str(s) => Ok(s.to_string()),
+                    o => Err(format!(
+                        "{at}: `{name}` must be an array of `&str`, found {}",
+                        o.type_name()
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some),
+            o => Err(format!(
+                "{at}: `{name}` must be an array of `&str`, found {}",
+                o.type_name()
+            )),
+        }
+    }
     pub fn fn_arity(&self, name: &str) -> Option<usize> {
         self.fns.get(name).map(|f| f.params.len())
     }
