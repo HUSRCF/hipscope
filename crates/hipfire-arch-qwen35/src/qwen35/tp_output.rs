@@ -3,9 +3,9 @@
 // Copyright (c) 2026 HUSRCF
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Opt-in dense-TP2 output projection. Vocabulary rows are independent: each
-//! rank reads a non-owning row view of its existing replicated head, then rank
-//! zero gathers the second half. No weight, activation or logits allocation.
+//! Dense-TP2 output projection on measured exact gfx1100 pairs. Vocabulary rows
+//! are independent: each rank reads a non-owning row view of its replicated
+//! head, then rank zero gathers the second half. No new GPU allocation.
 
 use super::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{HipError, HipResult};
@@ -28,12 +28,23 @@ fn row_bytes(w: &WeightTensor) -> Option<usize> {
     (w.m.checked_mul(bytes)? == w.buf.buf.size()).then_some(bytes)
 }
 
-/// A source-wired experiment, not an architecture-wide admission. Requiring
-/// whole 128-row tiles also preserves all existing multirow kernel tails.
+fn supported_topology<'a>(mut arches: impl Iterator<Item = &'a str>) -> bool {
+    arches.next() == Some("gfx1100") && arches.next() == Some("gfx1100") && arches.next().is_none()
+}
+
+fn measured_default(dtype: DType, rows: usize, cols: usize) -> bool {
+    // The full TP2 end-to-end receipt covers the 27B MQ4V2 head. A row-local
+    // oracle for another shape/codec does not establish an end-to-end win:
+    // peer handoff and dispatch have a fixed cost even for tiny projections.
+    dtype == DType::MQ4G256V2 && rows == 248_320 && cols == 5_120
+}
+
+/// Default-on only for the measured TP2 topology and head profile. `=0`
+/// restores the root-only head; `=1` opts into other supported row layouts.
+/// This does not admit another architecture or a new weight layout.
+/// Whole 128-row tiles preserve all existing multirow kernel tails.
 pub fn enabled(gpus: &Gpus, weights: &[Qwen35Weights], configs: &[Qwen35Config]) -> bool {
-    hipfire_config::developer_bool("HIPFIRE_TP_SHARD_LM_HEAD", false)
-        && gpus.devices.len() == 2
-        && gpus.devices.iter().all(|gpu| gpu.arch == "gfx1100")
+    supported_topology(gpus.devices.iter().map(|gpu| gpu.arch.as_str()))
         && weights.len() == 2
         && configs.len() == 2
         && configs[0].vocab_size > 0
@@ -45,6 +56,12 @@ pub fn enabled(gpus: &Gpus, weights: &[Qwen35Weights], configs: &[Qwen35Config])
                 && w.output.k == cfg.dim
                 && row_bytes(&w.output).is_some()
         })
+        && hipfire_config::developer_bool(
+            "HIPFIRE_TP_SHARD_LM_HEAD",
+            weights
+                .iter()
+                .all(|w| measured_default(w.output.gpu_dtype, w.output.m, w.output.k)),
+        )
 }
 
 /// Project an exact set of vocabulary rows without decoding/requantizing the
@@ -154,6 +171,32 @@ pub(super) fn gather(gpus: &mut Gpus, scratches: &[Qwen35Scratch], vocab: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_is_exactly_two_gfx1100_devices() {
+        assert!(supported_topology(["gfx1100", "gfx1100"].into_iter()));
+        for arches in [
+            vec![],
+            vec!["gfx1100"],
+            vec!["gfx1100", "gfx1100", "gfx1100"],
+            vec!["gfx1100", "gfx1201"],
+            vec!["gfx1201", "gfx1100"],
+            vec!["gfx1151", "gfx1151"],
+            vec!["gfx1101", "gfx1101"],
+        ] {
+            assert!(!supported_topology(arches.into_iter()));
+        }
+    }
+
+    #[test]
+    fn default_is_limited_to_the_end_to_end_measured_head_profile() {
+        assert!(measured_default(DType::MQ4G256V2, 248_320, 5_120));
+        assert!(!measured_default(DType::MQ4G256, 248_320, 5_120));
+        assert!(!measured_default(DType::Q8_0, 248_320, 2_560));
+        assert!(!measured_default(DType::Q8_0, 248_320, 5_120));
+        assert!(!measured_default(DType::MQ4G256V2, 256, 5_120));
+        assert!(!measured_default(DType::MQ4G256V2, 248_320, 1_024));
+    }
 
     fn head(dtype: DType, m: usize, k: usize, bytes: usize) -> WeightTensor {
         WeightTensor {
