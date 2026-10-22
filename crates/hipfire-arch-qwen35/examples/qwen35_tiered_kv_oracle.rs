@@ -32,11 +32,11 @@ use std::sync::Arc;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BLOCK: usize = 128;
 
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn hash_file(path: &str) -> Result<String> {
+pub(crate) fn hash_file(path: &str) -> Result<String> {
     let mut source = fs::File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0; 8 << 20];
@@ -54,7 +54,12 @@ fn raw(gpu: &Gpu, t: &GpuTensor, bytes: usize, offset: usize) -> Result<Vec<u8>>
     raw_buffer(gpu, &t.buf, bytes, offset)
 }
 
-fn raw_buffer(gpu: &Gpu, buffer: &DeviceBuffer, bytes: usize, offset: usize) -> Result<Vec<u8>> {
+pub(crate) fn raw_buffer(
+    gpu: &Gpu,
+    buffer: &DeviceBuffer,
+    bytes: usize,
+    offset: usize,
+) -> Result<Vec<u8>> {
     if offset.checked_add(bytes).is_none_or(|n| n > buffer.size()) {
         return Err(format!(
             "oracle read offset={offset} bytes={bytes} exceeds backing={}",
@@ -154,7 +159,7 @@ fn verify_staged_history(
     Ok(verified_bytes)
 }
 
-fn logits(gpu: &Gpu, b: &Qwen35Bundle) -> Result<Vec<f32>> {
+pub(crate) fn logits(gpu: &Gpu, b: &Qwen35Bundle) -> Result<Vec<f32>> {
     gpu.hip.device_synchronize()?;
     let v = gpu.download_f32(&b.scratch.logits)?;
     if v.len() != b.config.vocab_size || v.iter().any(|v| !v.is_finite()) {
@@ -163,7 +168,7 @@ fn logits(gpu: &Gpu, b: &Qwen35Bundle) -> Result<Vec<f32>> {
     Ok(v)
 }
 
-fn float_hash(values: &[f32]) -> String {
+pub(crate) fn float_hash(values: &[f32]) -> String {
     let mut h = Sha256::new();
     for v in values {
         h.update(v.to_le_bytes());
@@ -171,7 +176,7 @@ fn float_hash(values: &[f32]) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn state_hash(gpu: &Gpu, b: &Qwen35Bundle, visible: usize) -> Result<Value> {
+pub(crate) fn state_hash(gpu: &Gpu, b: &Qwen35Bundle, visible: usize) -> Result<Value> {
     gpu.hip.device_synchronize()?;
     let mut dn = Sha256::new();
     // Legacy Q8 S deliberately has a byte-count shape but a historical F32
@@ -204,6 +209,15 @@ fn state_hash(gpu: &Gpu, b: &Qwen35Bundle, visible: usize) -> Result<Value> {
 }
 
 fn load(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
+    load_with_capacity(model, max_seq, None, gpu)
+}
+
+pub(crate) fn load_with_capacity(
+    model: &str,
+    max_seq: usize,
+    physical_cap: Option<usize>,
+    gpu: &mut Gpu,
+) -> Result<Qwen35Bundle> {
     let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path: model,
@@ -237,8 +251,12 @@ fn load(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
         gemma4_draft_len: 3,
         xdna: None,
     };
-    Ok(load_qwen35_bundle(ModelSource::from_path(model)?, &mut ctx)
-        .map_err(|e| format!("load: {e}"))?)
+    let source = ModelSource::from_path(model)?;
+    let loaded = match physical_cap {
+        Some(cap) => hipfire_arch_qwen35::load_qwen35_bundle_bounded_lab(source, &mut ctx, cap),
+        None => load_qwen35_bundle(source, &mut ctx),
+    };
+    Ok(loaded.map_err(|e| format!("load: {e}"))?)
 }
 
 struct Installed {

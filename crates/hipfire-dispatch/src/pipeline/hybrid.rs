@@ -1198,16 +1198,15 @@ impl GatedAttentionOp<'_> {
         // Fold the Q8_0 KV write into the prep epilogue. Requires the
         // non-compact decode route: pos_buf must hold the physical position
         // when the folded writer reads it.
-        let kv_write_fold =
-            if fused_prep
-                && kv_position.is_none()
-                && self.kv.compact_offset == 0
-                && fused_attention_kv_write(gpu, dims)
-            {
-                kv_write_fold_route_supported(&self.kv.tier_plan(gpu, row.position)?)
-            } else {
-                false
-            };
+        let kv_write_fold = if fused_prep
+            && kv_position.is_none()
+            && self.kv.compact_offset == 0
+            && fused_attention_kv_write(gpu, dims)
+        {
+            kv_write_fold_route_supported(&self.kv.tier_plan(gpu, row.position)?)
+        } else {
+            false
+        };
         if !fused_prep {
             gpu.deinterleave_f32(self.q_gate, row.q, row.gate, dims.n_heads, dims.head_dim)
                 .map_err(hip)?;

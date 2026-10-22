@@ -43,6 +43,10 @@ name = "qwen35_tiered_kv_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
+name = "qwen35_tiered_prefill_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"
 required-features = ["deltanet"]

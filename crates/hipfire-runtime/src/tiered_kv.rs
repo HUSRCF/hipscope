@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub mod streaming;
+
 fn invalid(message: impl AsRef<str>) -> HipError {
     HipError::new(0, message.as_ref())
 }
@@ -315,6 +317,43 @@ impl PinnedKvArchive {
 
     pub fn host_bytes(&self) -> usize {
         self.blocks.len() * self.layout.block_bytes
+    }
+
+    /// Diagnostic readback of every selected encoded byte against the immutable
+    /// archive. Deliberately synchronous; not a fast-path check.
+    pub fn verify_window(&mut self, window: &FixedKvWindow) -> HipResult<usize> {
+        if window.layout != self.layout || window.hip.current_device()? != window.device {
+            return Err(invalid("tiered KV: verification owner/layout mismatch"));
+        }
+        let keys = window
+            .keys()
+            .ok_or_else(|| invalid("tiered KV: unpublished window"))?;
+        window.hip.device_synchronize()?;
+        let mut actual = vec![0u8; self.layout.block_side_bytes];
+        let mut verified = 0;
+        for (slot, key) in keys.iter().enumerate() {
+            let block = self
+                .blocks
+                .get_mut(&key.start_token)
+                .filter(|block| block.key == *key)
+                .ok_or_else(|| invalid("tiered KV: stale verification key"))?;
+            for (side, target) in window.sides.iter().enumerate() {
+                window.hip.memcpy_dtoh_at(
+                    &mut actual,
+                    target,
+                    slot * self.layout.block_side_bytes,
+                )?;
+                let begin = side * self.layout.block_side_bytes;
+                if actual != block.bytes.as_bytes_mut()[begin..begin + self.layout.block_side_bytes]
+                {
+                    return Err(invalid(
+                        "tiered KV: staged bytes differ from archived bytes",
+                    ));
+                }
+                verified += actual.len();
+            }
+        }
+        Ok(verified)
     }
 
     /// Publish the next full block after ALL sides have copied successfully.
