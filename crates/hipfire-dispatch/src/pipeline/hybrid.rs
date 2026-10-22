@@ -1163,6 +1163,34 @@ impl GatedAttentionOp<'_> {
     /// Q/K preparation, KV write and attention. Returns whether the output
     /// gate (and the output projection's rotation) ran inside the epilogue.
     pub fn attend(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<bool, DispatchError> {
+        self.attend_with_position(gpu, ctx, None)
+    }
+
+    /// Prepare Q/K at `self.row`'s rotary position, but write/read KV at an
+    /// independently populated caller-owned scalar. The caller validates the
+    /// packed prefix and keeps the scalar live until this launch completes.
+    /// This cannot be combined with the production compaction or MRoPE paths.
+    pub fn attend_with_kv_position(
+        &self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        position: usize,
+        pos_buf: &DeviceBuffer,
+    ) -> Result<bool, DispatchError> {
+        if self.kv.compact_offset != 0 || self.mrope.is_some() {
+            return Err(DispatchError::Hip(
+                "independent KV position cannot use compaction or MRoPE".into(),
+            ));
+        }
+        self.attend_with_position(gpu, ctx, Some((position, pos_buf)))
+    }
+
+    fn attend_with_position(
+        &self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        kv_position: Option<(usize, &DeviceBuffer)>,
+    ) -> Result<bool, DispatchError> {
         let dims = &self.dims;
         let row = &self.row;
         let fused_prep =
@@ -1171,7 +1199,11 @@ impl GatedAttentionOp<'_> {
         // non-compact decode route: pos_buf must hold the physical position
         // when the folded writer reads it.
         let kv_write_fold =
-            if fused_prep && self.kv.compact_offset == 0 && fused_attention_kv_write(gpu, dims) {
+            if fused_prep
+                && kv_position.is_none()
+                && self.kv.compact_offset == 0
+                && fused_attention_kv_write(gpu, dims)
+            {
                 kv_write_fold_route_supported(&self.kv.tier_plan(gpu, row.position)?)
             } else {
                 false
@@ -1269,7 +1301,20 @@ impl GatedAttentionOp<'_> {
             gpu.memcpy_htod_auto(row.pos_buf, &physical.to_ne_bytes())
                 .map_err(hip)?;
         }
-        let fused_epilogue = kv_attention(gpu, ctx, dims, &self.kv, row, &self.wo, kv_write_fold)?;
+        let kv_row = kv_position.map(|(position, pos_buf)| AttentionRow {
+            position,
+            pos_buf,
+            ..*row
+        });
+        let fused_epilogue = kv_attention(
+            gpu,
+            ctx,
+            dims,
+            &self.kv,
+            kv_row.as_ref().unwrap_or(row),
+            &self.wo,
+            kv_write_fold,
+        )?;
         if !fused_epilogue {
             gpu.sigmoid_mul_f32(row.out, row.gate).map_err(hip)?;
         }
