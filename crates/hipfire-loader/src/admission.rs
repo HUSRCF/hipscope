@@ -1243,6 +1243,14 @@ fn vision_sidecar_family(
             "pack the tower with `hipfire-quantize <hf-dir> --include-vision \
              --include-prefix model.visual.`",
         )),
+        // Flash-Next uses the same visual.* tower layout, but a different
+        // projector width and token ids. Never accept a 27B (arch 5) pack.
+        QWEN4_ARCH_ID => Some((
+            &[QWEN4_ARCH_ID],
+            "16",
+            VISION_PROBE_TENSOR,
+            "pack the tower with `hipfire-quantize --qwen4-flash-next --vision-only --input hf://Qwen/Qwen3.8-Flash-Next@<40-hex-revision> --output <sidecar.hfq>`",
+        )),
         // EmbeddingGemma-2 (18): the trunk is tower-less by construction and
         // ships its own arch-18 `.vl` pack of the `vision_tower.*` group.
         18 => Some((
@@ -1280,7 +1288,7 @@ fn resolve_vision_sidecar(
     let Some((sidecar_archs, expected, probe, remedy)) = vision_sidecar_family(arch_id) else {
         return Err(format!(
             "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
-             only serve Qwen3.5-VL (arch_id 5|6) and EmbeddingGemma-2 (arch_id 18) trunks"
+             only serve Qwen3.5-VL (arch_id 5|6), Flash-Next (arch_id 16), and EmbeddingGemma-2 (arch_id 18) trunks"
         ));
     };
     let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
@@ -1296,7 +1304,27 @@ fn resolve_vision_sidecar(
             "vision sidecar '{path}' carries no vision tower tensor '{probe}': {remedy}"
         ));
     }
+    if arch_id == QWEN4_ARCH_ID {
+        let config = hipfire_arch_qwen4::vision::config_from_hfq(&sidecar)?;
+        hipfire_arch_qwen4::vision::validate_hfq(&sidecar, &config)?;
+    }
     Ok(Some(std::path::PathBuf::from(path)))
+}
+
+/// Flash-Next's sidecar is optional in auto mode and mandatory in on mode.
+/// Off must not even open a supplied path (including a stale one).
+fn resolve_qwen4_vision_mode(
+    mode: &str,
+    path: Option<&str>,
+    is_dir: bool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match mode {
+        "off" => Ok(None),
+        "auto" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir),
+        "on" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir)?.map(Some).ok_or_else(||
+            "qwen4: vision_mode=on requires the Flash-Next vision sidecar; provide --vision <qwen3.8-flash-next-vision.hfq>".into()),
+        _ => Err(format!("qwen4: invalid vision_mode '{mode}'; expected off, auto or on")),
+    }
 }
 
 /// Maple head-overlay arch id (`hipfire-quantize --head-only` carriers).
@@ -2732,7 +2760,20 @@ pub fn admit_source_with_options(
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
     // sidecar promotes a tower-less trunk to VL.
-    let vision_path = resolve_vision_sidecar(vision, arch_id, is_dir)?;
+    let vision_path = if arch_id == QWEN4_ARCH_ID {
+        resolve_qwen4_vision_mode(vision_mode, vision, is_dir)?
+    } else {
+        resolve_vision_sidecar(vision, arch_id, is_dir)?
+    };
+    if arch_id == QWEN4_ARCH_ID {
+        if vision_path.is_some()
+            && (topology != EffectiveTopology::Single || hipfire_config::topology::qwen4_ep()? > 1)
+        {
+            return Err(
+                "qwen4: image input currently requires a single-device load (tp=pp=ep=1)".into(),
+            );
+        }
+    }
     if vision_path.is_some() {
         has_vision = true;
     }
@@ -4538,6 +4579,42 @@ mod tests {
             assert!(err.contains("expected 5|6"), "names the family: {err}");
             cleanup(&qwen_trunk);
             cleanup(&eg2_sidecar);
+        }
+
+        #[test]
+        fn flash_next_modes_preserve_text_only_and_require_explicit_vision() {
+            let missing = "/does-not-exist/flash-next-vision.hfq";
+            assert!(
+                super::super::resolve_qwen4_vision_mode("off", Some(missing), false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("auto", None, false)
+                .unwrap()
+                .is_none());
+            assert!(super::super::resolve_qwen4_vision_mode("on", None, false)
+                .unwrap_err()
+                .contains("requires"));
+            assert!(
+                super::super::resolve_qwen4_vision_mode("auto", Some(missing), false)
+                    .unwrap_err()
+                    .contains("open failed")
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("invalid", None, false).is_err());
+        }
+
+        #[test]
+        fn flash_next_rejects_27b_and_incomplete_towers() {
+            let wrong = write_hfq("flash-next-wrong-family", 5, true);
+            let err =
+                super::super::resolve_qwen4_vision_mode("on", wrong.to_str(), false).unwrap_err();
+            assert!(err.contains("expected 16"), "{err}");
+            cleanup(&wrong);
+            let incomplete = write_hfq("flash-next-incomplete", 16, true);
+            assert!(
+                super::super::resolve_qwen4_vision_mode("on", incomplete.to_str(), false).is_err()
+            );
+            cleanup(&incomplete);
         }
 
         /// A sidecar requested for any arch outside the two VL families is

@@ -49,6 +49,7 @@ pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).
 pub mod host_link;
+pub mod image;
 pub mod kv_backend;
 /// Read-only lab observation of the production sampled MTP accepting window.
 #[cfg(feature = "lab")]
@@ -85,6 +86,7 @@ pub mod state;
 pub mod state_parity;
 pub mod sym_verdict_cache;
 pub mod trunk_overlay;
+pub mod vision;
 pub mod weights;
 #[cfg(feature = "reference-parity")]
 pub mod wide_verify_oracle;

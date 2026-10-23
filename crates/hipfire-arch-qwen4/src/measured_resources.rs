@@ -143,14 +143,15 @@ pub struct Qwen4HostCheckInputs {
 }
 
 /// Device-memory backing class of the producing load. Wire tokens are frozen
-/// as `discrete` / `uma_shared`; the loader (`Gpu::is_uma`) and E validators
-/// must match these exact tokens. A `gfx1151` load reports
-/// [`Qwen4BackingKind::UmaShared`]; a `gfx1201` load reports
-/// [`Qwen4BackingKind::Discrete`]. Never infer GTT budgets from a nonzero pool
-/// reading.
+/// as `discrete` / `uma_shared`. These classify allocation heaps, not GPU
+/// architecture: the historical `discrete` token includes an integrated GPU's
+/// BIOS VRAM carve-out. Only GTT-backed device allocations report `uma_shared`.
+/// The loader queries `Gpu::device_allocations_share_host_ram`; never infer
+/// backing from an architecture name or a nonzero parked-pool reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Qwen4BackingKind {
-    /// Discrete VRAM heap: pooled-parked bytes live on the device heap.
+    /// Dedicated VRAM heap (including APU carve-outs): parked device bytes
+    /// do not consume the remaining host RAM/GTT pool.
     #[serde(rename = "discrete")]
     Discrete,
     /// UMA-shared heap: the root device plan is device-backed host memory and
@@ -160,7 +161,7 @@ pub enum Qwen4BackingKind {
     UmaShared,
 }
 /// The ACTUAL backing inputs of one fresh rank load. `kind` comes from the
-/// real production `Gpu::is_uma()`; the pooled sizes come from the public pool
+/// real production `Gpu::device_allocations_share_host_ram()`; pool sizes come from the public pool
 /// accessor (`Gpu::pool_parked_bytes`) read at the preallocation instant and
 /// again at the settled instant. Never hand-fill these; an unsupported source
 /// path stays absent upstream with a named reason.
@@ -772,7 +773,10 @@ pub fn preload_component_union(
     // Host scope stays the existing disjoint host-mapped plus explicit-host-only
     // check; on UMA-shared backing the root device union is device-backed host
     // memory and is charged once more here, exactly as the settled record does.
-    let uma_shared = args.gpu.is_uma();
+    let uma_shared = args
+        .gpu
+        .device_allocations_share_host_ram()
+        .map_err(|error| format!("{HERE}: device allocation backing query: {error}"))?;
     let device_backed_host_bytes = if uma_shared { device_union_bytes } else { 0 };
     let host_union_bytes = host_mapped_bytes
         .checked_add(stage_mirror_bytes)
@@ -1385,6 +1389,40 @@ mod tests {
         )
         .expect_err("host plan overflows");
         assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn carveout_snapshot_keeps_device_owners_out_of_host_plan() {
+        const GIB: u64 = 1 << 30;
+        for (carveout, expected_shared) in [(96 * GIB, false), (4 * GIB, true)] {
+            let shared = rdna_compute::uma_memory::gtt_backed(96 * GIB, Some(carveout));
+            assert_eq!(shared, expected_shared);
+            let mut backing = synthetic_backing();
+            backing.kind = if shared {
+                Qwen4BackingKind::UmaShared
+            } else {
+                Qwen4BackingKind::Discrete
+            };
+            let snapshot = synthetic_snapshot_backed(Qwen4RingMode::DirectInitial64, 0, backing);
+            let host = synthetic_host();
+            let expected_host = host.host_check_bytes
+                + host.stage_mirror_bytes
+                + host.host_headroom_bytes
+                + if expected_shared {
+                    snapshot.device_plan_bytes()
+                } else {
+                    0
+                };
+            assert_eq!(snapshot.host_plan_bytes(), expected_host);
+            assert_eq!(
+                snapshot.value()["upper_bound"]["device_backed_host_bytes"],
+                if expected_shared {
+                    snapshot.device_plan_bytes()
+                } else {
+                    0
+                }
+            );
+        }
     }
 
     #[test]

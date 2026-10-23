@@ -3647,7 +3647,11 @@ fn main() {
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
-                        max_think_tokens: vl_max_think_tokens,
+                        max_think_tokens: if vision_route == hipfire_loader::VisionRoute::Qwen4Vl {
+                            max_think_tokens
+                        } else {
+                            vl_max_think_tokens
+                        },
                         assistant_prefix,
                         seed: vl_request_seed,
                     };
@@ -3658,6 +3662,24 @@ fn main() {
                                 &mut gpu,
                                 &mut stdout,
                                 &params,
+                            )
+                        }
+                        hipfire_loader::VisionRoute::Qwen4Vl => {
+                            let controls = hipfire_generate::qwen4_vision::Qwen4VisionControls {
+                                top_k,
+                                min_p,
+                                presence_penalty,
+                                frequency_penalty,
+                                stop: &stop_seqs,
+                                enable_thinking: enable_thinking_jinja,
+                                reasoning_effort: reasoning_effort_jinja.as_deref(),
+                            };
+                            hipfire_generate::qwen4_vision::generate_qwen4_vl(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                                &controls,
                             )
                         }
                         hipfire_loader::VisionRoute::Lfm2Vl => {

@@ -3665,6 +3665,19 @@ static __device__ __forceinline__ void qsa_index_store(__hip_bfloat16* slot, __h
 // One head's RMSNorm + HalfSplit RoPE at `position` (block 256, one channel
 // per thread; returns the channel's value, `head_dim` <= 256). Every block
 // thread must call it (it synchronizes).
+// Qwen4 image requests retain the prompt's full three-axis positions. Decode
+// positions continue at sequence_position + delta; pooled keys use the exact
+// block-start token's coordinates, including blocks crossing an image boundary.
+static __device__ __forceinline__ int qsa_mrope_position(
+    int position, int frequency, const int* positions, int prompt_rows,
+    int delta, int section_h, int section_w) {
+    if (positions == nullptr) return position;
+    if (position >= prompt_rows) return position + delta;
+    int axis = frequency % 3 == 1 && frequency < 3 * section_h ? 1
+        : frequency % 3 == 2 && frequency < 3 * section_w ? 2 : 0;
+    return positions[position * 3 + axis];
+}
+
 static __device__ __forceinline__ float qsa_norm_rope_head(
     const float* head_values,
     const __hip_bfloat16* norm,
@@ -3673,7 +3686,9 @@ static __device__ __forceinline__ float qsa_norm_rope_head(
     int rotary_dim,
     RopeYarn yarn,
     float* input_row,
-    float* row_sum) {
+    float* row_sum,
+    const int* positions = nullptr, int prompt_rows = 0, int delta = 0,
+    int section_h = 0, int section_w = 0) {
     const int channel = (int)threadIdx.x;
     if (channel < head_dim) {
         input_row[channel] = head_values[channel];
@@ -3700,7 +3715,8 @@ static __device__ __forceinline__ float qsa_norm_rope_head(
         float other = input_row[partner] * inv
             * (1.0f + bf16_to_f32(norm[partner]));
         int base = channel < half ? channel : partner;
-        float angle = (float)position
+        float angle = (float)qsa_mrope_position(position, base, positions,
+            prompt_rows, delta, section_h, section_w)
             * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
         float sine, cosine;
         rope_yarn_sincos(angle, base, yarn, &sine, &cosine);
@@ -3729,6 +3745,23 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     __shared__ float row_sum;
     const float value = qsa_norm_rope_head(values + start, norm, head_dim, position_start + row,
                                            rotary_dim, yarn, input_row, &row_sum);
+    if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
+}
+
+extern "C" __global__ void indexed_attention_norm_mrope_f32_batched(
+    float* values, const __hip_bfloat16* norm, const int* positions,
+    int rows, int row_stride, int heads, int head_dim, int head_stride,
+    int position_start, int rotary_dim, int prompt_rows, int delta,
+    int section_h, int section_w, RopeYarn yarn) {
+    int row = (int)blockIdx.z;
+    int head = (int)blockIdx.x;
+    if (row >= rows || head >= heads) return;
+    int start = row * row_stride + head * head_stride;
+    __shared__ float input_row[256];
+    __shared__ float row_sum;
+    const float value = qsa_norm_rope_head(values + start, norm, head_dim,
+        position_start + row, rotary_dim, yarn, input_row, &row_sum,
+        positions, prompt_rows, delta, section_h, section_w);
     if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
 }
 
@@ -4006,7 +4039,9 @@ static __device__ __forceinline__ void qsa_pool_rope(
     int compress,
     int index_dim,
     int first_block,
-    RopeYarn yarn) {
+    RopeYarn yarn,
+    const int* positions = nullptr, int prompt_rows = 0, int delta = 0,
+    int section_h = 0, int section_w = 0) {
     // The grid starts at `first_block` (0 for the full pool): blocks below it
     // already hold this kernel's output for their unchanged raw keys (the
     // incremental decode caller), so an incremental launch covers only the
@@ -4060,7 +4095,8 @@ static __device__ __forceinline__ void qsa_pool_rope(
         float other = bf16_to_f32(bf16_round(
             bf16_to_f32(other_bf16) * inv * (1.0f + other_norm)));
         int pair = channel < half ? channel : partner;
-        float angle = (float)(block * compress)
+        float angle = (float)qsa_mrope_position(block * compress, pair,
+            positions, prompt_rows, delta, section_h, section_w)
             * powf(10000000.0f, -((float)(2 * pair)) / (float)rotary_dim);
         float sine, cosine;
         rope_yarn_sincos(angle, pair, yarn, &sine, &cosine);
@@ -4080,6 +4116,24 @@ extern "C" __global__ void indexed_attention_pool_rope_bf16(
     const __hip_bfloat16* raw_keys, __hip_bfloat16* pooled, const __hip_bfloat16* norm,
     int block_count, int compress, int index_dim, int first_block, RopeYarn yarn) {
     qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block, yarn);
+}
+
+extern "C" __global__ void indexed_attention_pool_mrope_f32(
+    const float* raw_keys, float* pooled, const __hip_bfloat16* norm,
+    const int* positions, int block_count, int compress, int index_dim,
+    int first_block, int prompt_rows, int delta, int section_h, int section_w,
+    RopeYarn yarn) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim,
+        first_block, yarn, positions, prompt_rows, delta, section_h, section_w);
+}
+
+extern "C" __global__ void indexed_attention_pool_mrope_bf16(
+    const __hip_bfloat16* raw_keys, __hip_bfloat16* pooled,
+    const __hip_bfloat16* norm, const int* positions, int block_count,
+    int compress, int index_dim, int first_block, int prompt_rows, int delta,
+    int section_h, int section_w, RopeYarn yarn) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim,
+        first_block, yarn, positions, prompt_rows, delta, section_h, section_w);
 }
 
 static __device__ __forceinline__ float4 qsa_index_load4(const float* row, int d4) {

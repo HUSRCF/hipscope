@@ -2141,7 +2141,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             && forced_close.is_empty()
             && greedy_on_gpu
             && !decode_penalizes
-            && m.qwen4().is_some_and(|b| b.lanes().is_some())
+            && m.qwen4()
+                .is_some_and(|b| b.lanes().is_some() && !b.image_context_active())
         {
             if let Some(permit) = crate::batch::promotion_permit()
                 .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 HUSRCF
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Qwen3.5-VL vision encoder: SigLIP-2 ViT + spatial merger.
@@ -9,6 +10,10 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+#[path = "vision_scratch.rs"]
+mod vision_scratch;
+use vision_scratch::Scratch;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -148,6 +153,9 @@ impl VisionWeights {
         let _ = gpu.free_tensor(self.merger_fc2_b);
     }
 }
+
+#[path = "weight_load.rs"]
+mod weight_load;
 
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
@@ -360,7 +368,6 @@ pub fn load_vision_weights(
             ),
         ));
     }
-    let h = config.hidden_size;
 
     // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,
     // vit_attention_f32, apply_rope_2d_vision_f32, gelu_tanh_f32, etc.) are
@@ -395,61 +402,7 @@ pub fn load_vision_weights(
         };
         eprintln!("  vision weight format: {fmt}");
     }
-    eprintln!("  loading vision weights (GPU)...");
-    let patch_embed_w = load_f16_gpu(hfq, gpu, "model.visual.patch_embed.proj.weight")?;
-    let patch_embed_b = load_f32_gpu(hfq, gpu, "model.visual.patch_embed.proj.bias", h)?;
-    let pos_embed = load_f32_cpu(
-        hfq,
-        "model.visual.pos_embed.weight",
-        config.num_position_embeddings * h,
-    );
-
-    let mut layers = Vec::with_capacity(config.num_layers);
-    for i in 0..config.num_layers {
-        if i % 9 == 0 {
-            eprintln!("  loading vision block {i}/{}...", config.num_layers);
-        }
-        let p = format!("model.visual.blocks.{i}");
-        layers.push(VisionLayerWeights {
-            norm1_w: load_f32_gpu(hfq, gpu, &format!("{p}.norm1.weight"), h)?,
-            norm1_b: load_f32_gpu(hfq, gpu, &format!("{p}.norm1.bias"), h)?,
-            qkv_w: load_f16_gpu(hfq, gpu, &format!("{p}.attn.qkv.weight"))?,
-            qkv_b: load_f32_gpu(hfq, gpu, &format!("{p}.attn.qkv.bias"), 3 * h)?,
-            proj_w: load_f16_gpu(hfq, gpu, &format!("{p}.attn.proj.weight"))?,
-            proj_b: load_f32_gpu(hfq, gpu, &format!("{p}.attn.proj.bias"), h)?,
-            norm2_w: load_f32_gpu(hfq, gpu, &format!("{p}.norm2.weight"), h)?,
-            norm2_b: load_f32_gpu(hfq, gpu, &format!("{p}.norm2.bias"), h)?,
-            fc1_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc1.weight"))?,
-            fc1_b: load_f32_gpu(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.linear_fc1.bias"),
-                config.mlp_dim,
-            )?,
-            fc2_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc2.weight"))?,
-            fc2_b: load_f32_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc2.bias"), h)?,
-        });
-    }
-
-    let merge_dim = h * config.spatial_merge_size * config.spatial_merge_size;
-    eprintln!("  loading vision merger...");
-    Ok(VisionWeights {
-        patch_embed_w,
-        patch_embed_b,
-        pos_embed,
-        layers,
-        merger_norm_w: load_f32_gpu(hfq, gpu, "model.visual.merger.norm.weight", h)?,
-        merger_norm_b: load_f32_gpu(hfq, gpu, "model.visual.merger.norm.bias", h)?,
-        merger_fc1_w: load_f16_gpu(hfq, gpu, "model.visual.merger.linear_fc1.weight")?,
-        merger_fc1_b: load_f32_gpu(hfq, gpu, "model.visual.merger.linear_fc1.bias", merge_dim)?,
-        merger_fc2_w: load_f16_gpu(hfq, gpu, "model.visual.merger.linear_fc2.weight")?,
-        merger_fc2_b: load_f32_gpu(
-            hfq,
-            gpu,
-            "model.visual.merger.linear_fc2.bias",
-            config.out_hidden_size,
-        )?,
-    })
+    weight_load::load(hfq, config, gpu)
 }
 
 // ─── CPU-side per-image precomputes (pos_embed interp + 2D rotary) ───────────
@@ -950,7 +903,7 @@ mod tests {
 /// gfx12 sibling is covered by `rdna-compute/examples/test_dots_ocr_wmma_gfx12.rs`.
 /// Non-WMMA arches keep the naive `gemm_f16` + transpose fallback.
 fn linear_f16(
-    gpu: &mut Gpu,
+    gpu: &mut Scratch<'_>,
     w: &GpuTensor,
     x: &GpuTensor,
     bias: &GpuTensor,
@@ -1050,8 +1003,8 @@ pub struct VisionTowerJob {
 }
 
 impl VisionTowerJob {
-    /// Tower prologue: upload patches, patch-embed, interpolate + add the
-    /// learned position embedding, upload the 2D rope tables.
+    /// Tower prologue. Every allocation belongs to the transaction until
+    /// all three persistent buffers can transfer to the resumable job.
     pub fn new(
         gpu: &mut Gpu,
         weights: &VisionWeights,
@@ -1060,12 +1013,38 @@ impl VisionTowerJob {
         grid_h: usize,
         grid_w: usize,
     ) -> HipResult<Self> {
+        let mut gpu = Scratch::new(gpu);
+        let x_patches = gpu.upload_f32(patches, &[patches.len()])?;
+        Self::new_tracked(&mut gpu, weights, config, x_patches, grid_h, grid_w)
+    }
+
+    /// Device-patch variant. Adopt the input before any fallible operation
+    /// so copy, launch, allocation and diagnostic failures all fence it.
+    pub fn new_patches(
+        gpu: &mut Gpu,
+        weights: &VisionWeights,
+        config: &VisionConfig,
+        x_patches: GpuTensor,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> HipResult<Self> {
+        let mut gpu = Scratch::new(gpu);
+        let x_patches = gpu.adopt(x_patches);
+        Self::new_tracked(&mut gpu, weights, config, x_patches, grid_h, grid_w)
+    }
+
+    fn new_tracked(
+        gpu: &mut Scratch<'_>,
+        weights: &VisionWeights,
+        config: &VisionConfig,
+        x_patches: GpuTensor,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> HipResult<Self> {
         let h = config.hidden_size;
         let n = grid_h * grid_w;
         let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
         let t0 = std::time::Instant::now();
-
-        // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
         let dump_dir: Option<std::path::PathBuf> =
             hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
                 .ok()
@@ -1081,15 +1060,8 @@ impl VisionTowerJob {
             "  vision forward (GPU): {} patches, {}x{} grid",
             n, grid_h, grid_w
         );
+        vl_dump_tensor(gpu, dd, "pixel_values", &x_patches, &[n, patch_dim])?;
 
-        if let Some(d) = dd {
-            vl_dump_slice(d, "pixel_values", patches, &[n, patch_dim]);
-        }
-
-        // Upload patches [n, patch_dim]
-        let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
-
-        // Patch embedding: linear_f16 → [n, h]
         let x = linear_f16(
             gpu,
             &weights.patch_embed_w,
@@ -1101,19 +1073,11 @@ impl VisionTowerJob {
         )?;
         gpu.free_tensor(x_patches)?;
         vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
-
-        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
-        // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
-        // then add. HF's `fast_pos_embed_interpolate`.
         let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        // Defensive re-check (never a panic): `load_vision_weights` already
-        // refused a non-square table at model load, so reaching here with one
-        // means the weights bypassed that loader. A typed error keeps the
-        // engine thread alive instead of poisoning every slot.
         if num_grid_per_side == 0
             || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
         {
-            return Err(hip_bridge::HipError::new(
+            return Err(HipError::new(
                 0,
                 &format!(
                     "num_position_embeddings ({}) must be a perfect square",
@@ -1136,11 +1100,6 @@ impl VisionTowerJob {
         if let Some(d) = dd {
             vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
         }
-
-        // Compute the 2D rotary cos/sin tables once per image and upload. The
-        // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
-        // `cat((rope, rope), dim=-1)` makes the two head_dim halves see the same
-        // angle, so we store the half only).
         let rot_dim_half = config.head_dim / 2;
         let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
             grid_h,
@@ -1151,12 +1110,6 @@ impl VisionTowerJob {
         );
         let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
         let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
-
-        // Attention dispatch: the Q-tiled kernel is the production path (the
-        // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
-        // — the whole 25 s image-request stall). HIPFIRE_VIT_ATTN=naive forces
-        // the old kernel for rollback/A-B; head shapes outside the Q-tiled
-        // kernel's contract fall back to naive instead of asserting.
         let attn_naive = matches!(
             hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
             Ok("naive")
@@ -1164,137 +1117,9 @@ impl VisionTowerJob {
             || config.head_dim > 128;
 
         Ok(Self {
-            x,
-            rope_cos_gpu,
-            rope_sin_gpu,
-            n,
-            grid_h,
-            grid_w,
-            next_layer: 0,
-            attn_naive,
-            dump_dir,
-            t0,
-        })
-    }
-
-    /// Like [`Self::new`] but takes device-resident patches (the VCN JPEG
-    /// decode path in `image`). Skips the host→device upload — `x_patches`
-    /// is consumed by the patch embedding and freed immediately after.
-    pub fn new_patches(
-        gpu: &mut Gpu,
-        weights: &VisionWeights,
-        config: &VisionConfig,
-        x_patches: GpuTensor,
-        grid_h: usize,
-        grid_w: usize,
-    ) -> HipResult<Self> {
-        let h = config.hidden_size;
-        let n = grid_h * grid_w;
-        let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
-        let t0 = std::time::Instant::now();
-
-        let dump_dir: Option<std::path::PathBuf> =
-            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
-                .ok()
-                .map(Into::into);
-        let dd = dump_dir.as_deref();
-        if dd.is_some() {
-            eprintln!(
-                "  [VL-DUMP] stage dumps enabled ({} patches, {grid_h}x{grid_w})",
-                n
-            );
-        }
-        eprintln!(
-            "  vision forward (GPU): {} patches, {}x{} grid",
-            n, grid_h, grid_w
-        );
-
-        if let Some(d) = dd {
-            // Env-gated debug dump: a download failure must still release the
-            // owned input before propagating.
-            match gpu.download_f32(&x_patches) {
-                Ok(host) => vl_dump_slice(d, "pixel_values", &host, &[n, patch_dim]),
-                Err(e) => {
-                    let _ = gpu.free_tensor(x_patches);
-                    return Err(e);
-                }
-            }
-        }
-
-        // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
-        // release it here — not at tower end — on both success and failure.
-        let x = match linear_f16(
-            gpu,
-            &weights.patch_embed_w,
-            &x_patches,
-            &weights.patch_embed_b,
-            h,
-            patch_dim,
-            n,
-        ) {
-            Ok(x) => {
-                gpu.free_tensor(x_patches)?;
-                x
-            }
-            Err(e) => {
-                let _ = gpu.free_tensor(x_patches);
-                return Err(e);
-            }
-        };
-        vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
-
-        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
-        // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
-        // then add. HF's `fast_pos_embed_interpolate`.
-        let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        if num_grid_per_side == 0
-            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
-        {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "num_position_embeddings ({}) must be a perfect square",
-                    config.num_position_embeddings
-                ),
-            ));
-        }
-        let pos_embed_interp = fast_pos_embed_interpolate(
-            &weights.pos_embed,
-            h,
-            grid_h,
-            grid_w,
-            num_grid_per_side,
-            config.spatial_merge_size,
-        );
-        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
-        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
-        gpu.free_tensor(pos_embed_gpu)?;
-        vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
-        if let Some(d) = dd {
-            vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
-        }
-
-        let rot_dim_half = config.head_dim / 2;
-        let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
-            grid_h,
-            grid_w,
-            config.head_dim,
-            config.spatial_merge_size,
-            config.rope_theta,
-        );
-        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
-
-        let attn_naive = matches!(
-            hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
-            Ok("naive")
-        ) || config.head_dim % 16 != 0
-            || config.head_dim > 128;
-
-        Ok(Self {
-            x,
-            rope_cos_gpu,
-            rope_sin_gpu,
+            x: gpu.take(x),
+            rope_cos_gpu: gpu.take(rope_cos_gpu),
+            rope_sin_gpu: gpu.take(rope_sin_gpu),
             n,
             grid_h,
             grid_w,
@@ -1314,6 +1139,7 @@ impl VisionTowerJob {
         weights: &VisionWeights,
         config: &VisionConfig,
     ) -> HipResult<bool> {
+        let mut gpu = Scratch::new(gpu);
         assert!(
             self.next_layer < config.num_layers,
             "step_layer past the last tower layer"
@@ -1337,7 +1163,7 @@ impl VisionTowerJob {
         )?;
 
         // QKV projection → [n, 3h]
-        let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
+        let qkv = linear_f16(&mut gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
         gpu.free_tensor(tmp)?;
 
         // 2D rotary on Q and K
@@ -1361,7 +1187,7 @@ impl VisionTowerJob {
         gpu.free_tensor(qkv)?;
 
         // Output projection + residual
-        let proj = linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
+        let proj = linear_f16(&mut gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
         gpu.free_tensor(attn_out)?;
 
         // Residual: x += proj
@@ -1381,27 +1207,27 @@ impl VisionTowerJob {
         )?;
 
         // MLP: fc1 → GELU → fc2 + residual
-        let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
+        let fc1 = linear_f16(&mut gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
         gpu.free_tensor(tmp2)?;
         gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
-        let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
+        let fc2 = linear_f16(&mut gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
         gpu.free_tensor(fc1)?;
 
         // Residual: x += fc2
         gpu.add_inplace_f32(&self.x, &fc2)?;
         gpu.free_tensor(fc2)?;
 
-        vl_dump_tensor(gpu, dd, &format!("block_{li:02}"), &self.x, &[n, h])?;
+        vl_dump_tensor(&mut gpu, dd, &format!("block_{li:02}"), &self.x, &[n, h])?;
         self.next_layer += 1;
         let done = self.next_layer == config.num_layers;
         if done {
-            vl_dump_tensor(gpu, dd, "pre_merger", &self.x, &[n, h])?;
+            vl_dump_tensor(&mut gpu, dd, "pre_merger", &self.x, &[n, h])?;
         }
         Ok(done)
     }
 
-    /// Tower epilogue: final norm + spatial merge + merger MLP. Consumes the
-    /// job and frees its GPU buffers on the happy path.
+    /// Tower epilogue. Adopt persistent buffers and merger temporaries in
+    /// one transaction; every early return fences before returning owners.
     pub fn finish(
         self,
         gpu: &mut Gpu,
@@ -1419,18 +1245,14 @@ impl VisionTowerJob {
             t0,
             ..
         } = self;
+        let mut gpu = Scratch::new(gpu);
+        let x = gpu.adopt(x);
+        let rope_cos_gpu = gpu.adopt(rope_cos_gpu);
+        let rope_sin_gpu = gpu.adopt(rope_sin_gpu);
         let h = config.hidden_size;
 
-        // Single sync at end of all layers (avoids per-layer sync overhead).
-        // Every error arm below releases the tensors this epilogue owns: the
-        // tower's device buffers are neither pooled nor released by Drop, so a
-        // failure partway through the merger must not strand them.
-        if let Err(e) = gpu.hip.device_synchronize() {
-            let _ = gpu.free_tensor(x);
-            let _ = gpu.free_tensor(rope_cos_gpu);
-            let _ = gpu.free_tensor(rope_sin_gpu);
-            return Err(e);
-        }
+        // Existing single end-of-tower sync; successful layers add no fences.
+        gpu.hip.device_synchronize()?;
         gpu.free_tensor(rope_cos_gpu)?;
         gpu.free_tensor(rope_sin_gpu)?;
         eprintln!(
@@ -1438,16 +1260,13 @@ impl VisionTowerJob {
             t0.elapsed().as_secs_f32()
         );
 
-        // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
         let sms = config.spatial_merge_size;
         let merged_h = grid_h / sms;
         let merged_w = grid_w / sms;
         let n_merged = merged_h * merged_w;
         let merge_dim = h * sms * sms;
-
-        // LayerNorm all patches
         let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        if let Err(e) = gpu.layernorm_batched(
+        gpu.layernorm_batched(
             &x,
             &weights.merger_norm_w,
             &weights.merger_norm_b,
@@ -1455,26 +1274,12 @@ impl VisionTowerJob {
             n,
             h,
             config.norm_eps,
-        ) {
-            let _ = gpu.free_tensor(normed);
-            let _ = gpu.free_tensor(x);
-            return Err(e);
-        }
+        )?;
         gpu.free_tensor(x)?;
-
-        // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
-        let normed_data = match gpu.download_f32(&normed) {
-            Ok(data) => data,
-            Err(e) => {
-                let _ = gpu.free_tensor(normed);
-                return Err(e);
-            }
-        };
+        let normed_data = gpu.download_f32(&normed)?;
         gpu.free_tensor(normed)?;
 
-        // Patches in `normed_data` are stored in 2x2-block-grouped order (see
-        // `extract_patches`), so the 4 patches that merge into one output token
-        // are CONSECUTIVE in the buffer: src indices [out_idx*4 .. out_idx*4+4].
+        // Patches are already grouped by spatial merge block.
         let mut merged = vec![0.0f32; n_merged * merge_dim];
         for my in 0..merged_h {
             for mx in 0..merged_w {
@@ -1486,56 +1291,30 @@ impl VisionTowerJob {
                 }
             }
         }
-
-        // Merger MLP on GPU
         let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-        let m1 = match linear_f16(
-            gpu,
+        let m1 = linear_f16(
+            &mut gpu,
             &weights.merger_fc1_w,
             &merged_gpu,
             &weights.merger_fc1_b,
             merge_dim,
             merge_dim,
             n_merged,
-        ) {
-            Ok(m1) => m1,
-            Err(e) => {
-                let _ = gpu.free_tensor(merged_gpu);
-                return Err(e);
-            }
-        };
+        )?;
         gpu.free_tensor(merged_gpu)?;
-        if let Err(e) = gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim) {
-            let _ = gpu.free_tensor(m1);
-            return Err(e);
-        }
-
-        let m2 = match linear_f16(
-            gpu,
+        gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
+        let m2 = linear_f16(
+            &mut gpu,
             &weights.merger_fc2_w,
             &m1,
             &weights.merger_fc2_b,
             config.out_hidden_size,
             merge_dim,
             n_merged,
-        ) {
-            Ok(m2) => m2,
-            Err(e) => {
-                let _ = gpu.free_tensor(m1);
-                return Err(e);
-            }
-        };
+        )?;
         gpu.free_tensor(m1)?;
-
-        let result = match gpu.download_f32(&m2) {
-            Ok(result) => result,
-            Err(e) => {
-                let _ = gpu.free_tensor(m2);
-                return Err(e);
-            }
-        };
+        let result = gpu.download_f32(&m2)?;
         gpu.free_tensor(m2)?;
-
         if let Some(d) = dump_dir.as_deref() {
             vl_dump_slice(
                 d,
@@ -1545,7 +1324,6 @@ impl VisionTowerJob {
             );
             vl_dump_slice(d, "merged_pre_mlp", &merged, &[n_merged, merge_dim]);
         }
-
         eprintln!(
             "  vision done: {} tokens × {} dims ({:.2}s)",
             n_merged,
@@ -1555,9 +1333,8 @@ impl VisionTowerJob {
         Ok(result)
     }
 
-    /// Free a job that will never reach `finish` (slot aborted/evicted
-    /// mid-encode). Consumes the job; best-effort — keeps going after
-    /// individual free failures and returns the first error.
+    /// Abort a resumable job. A failed fence quarantines its buffers instead
+    /// of making outstanding readers race pool reuse by another request.
     pub fn free(self, gpu: &mut Gpu) -> HipResult<()> {
         let Self {
             x,
@@ -1565,18 +1342,11 @@ impl VisionTowerJob {
             rope_sin_gpu,
             ..
         } = self;
-        let mut first_err: Option<HipError> = None;
-        for t in [x, rope_cos_gpu, rope_sin_gpu] {
-            if let Err(e) = gpu.free_tensor(t) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        let mut scratch = Scratch::new(gpu);
+        scratch.adopt(x);
+        scratch.adopt(rope_cos_gpu);
+        scratch.adopt(rope_sin_gpu);
+        scratch.rollback()
     }
 }
 
@@ -1595,7 +1365,15 @@ pub fn vision_forward(
     let mut job = VisionTowerJob::new(gpu, weights, config, patches, grid_h, grid_w)?;
     let mut done = false;
     while !done {
-        done = job.step_layer(gpu, weights, config)?;
+        done = match job.step_layer(gpu, weights, config) {
+            Ok(done) => done,
+            Err(error) => {
+                if let Err(cleanup) = job.free(gpu) {
+                    return Err(HipError::new(error.code, &format!("{error}; {cleanup}")));
+                }
+                return Err(error);
+            }
+        };
     }
     job.finish(gpu, weights, config)
 }
@@ -1618,7 +1396,15 @@ pub fn vision_forward_patches(
     let mut job = VisionTowerJob::new_patches(gpu, weights, config, x_patches, grid_h, grid_w)?;
     let mut done = false;
     while !done {
-        done = job.step_layer(gpu, weights, config)?;
+        done = match job.step_layer(gpu, weights, config) {
+            Ok(done) => done,
+            Err(error) => {
+                if let Err(cleanup) = job.free(gpu) {
+                    return Err(HipError::new(error.code, &format!("{error}; {cleanup}")));
+                }
+                return Err(error);
+            }
+        };
     }
     job.finish(gpu, weights, config)
 }
