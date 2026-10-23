@@ -250,6 +250,7 @@ pub(crate) fn load_with_capacity(
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         xdna: None,
+        batch_request: Default::default(),
     };
     let source = ModelSource::from_path(model)?;
     let loaded = match physical_cap {
