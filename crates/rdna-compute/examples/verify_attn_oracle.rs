@@ -9,6 +9,12 @@
 // head_dim 256). On gfx1100 (Q8 only) it also checks the multi-row twin
 // (`Gpu::try_attention_verify_gqa_rows`) against the R4/R8 tile + reduce
 // (`attention_flash_q8_0_rows_masked`), the eager Q8 verify route there.
+// `fwht4` / `fwht3` kinds compare `attention_verify_gqa_fwht{4,3}_<arch>`
+// (gfx1201 and gfx1100; Q8_0 V) against `attention_flash_fwht{4,3}_tile_batched`
+// (`Gpu::attention_flash_fwht{4,3}_batched_masked`, v_mode 8) + the same reduce,
+// on synthetic fwht K records (random cnorm incl. zero / denormal, random
+// 4-/3-bit codes) and +-1 sign tables of 128 / 256 entries; the K kind is
+// selected as the positional kv argument or `--kv fwht4|fwht3`.
 // On gfx1151 (Q8 only) it checks `Gpu::attention_verify_wmma_with` (the
 // production geometry and the other P.V walkers) against the single-slot WMMA
 // flash prefill it replaces (`attention_q8_0_flash_prefill_wmma_slots`); the
@@ -22,7 +28,7 @@
 // candidate must match byte for byte over the full allocations.
 //
 // Modes:
-//   oracle [fp8|q8|both]      B {1,4,16} (+2,5,9,32) x ctx {1,127,128,2K,8K,16K,32K,64K},
+//   oracle [fp8|q8|fwht4|fwht3|both]  B {1,4,16} (+2,5,9,32) x ctx {1,127,128,2K,8K,16K,32K,64K},
 //                             eager and graph-capture max_ctx_len, full and
 //                             sub-batched partials, cap 262144 capture grid.
 //                             gfx1100: plus the R4/R8 reference, B {4,16}
@@ -133,9 +139,20 @@ fn half_from_f32(x: f32) -> u16 {
     sign | r as u16
 }
 
-fn row_bytes(kv: VerifyKv) -> usize {
+/// Bytes of one K row (all kv heads): the fwht records are `4 + head_dim * bits / 8`
+/// per head (f32 cnorm + packed codes), everything else is the V row layout.
+fn k_row_bytes(kv: VerifyKv) -> usize {
     match kv {
-        VerifyKv::Q8 => NKV * (HD / 32) * 34,
+        VerifyKv::Fwht4 => NKV * (4 + HD / 2),
+        VerifyKv::Fwht3 => NKV * (4 + HD * 3 / 8),
+        VerifyKv::Q8 | VerifyKv::Fp8 => v_row_bytes(kv),
+    }
+}
+
+/// Bytes of one V row: the fwht K tiers store V as Q8_0.
+fn v_row_bytes(kv: VerifyKv) -> usize {
+    match kv {
+        VerifyKv::Q8 | VerifyKv::Fwht4 | VerifyKv::Fwht3 => NKV * (HD / 32) * 34,
         VerifyKv::Fp8 => NKV * (HD + 2),
     }
 }
@@ -152,31 +169,42 @@ fn scale_f16(rng: &mut Rng) -> u16 {
     }
 }
 
+/// fwht K record norm: mostly a positive O(1) norm, with some zero and
+/// subnormal values to pin signed-zero and denormal paths.
+fn cnorm_f32(rng: &mut Rng) -> f32 {
+    match rng.below(64) {
+        0 => 0.0,
+        1 => f32::from_bits(1 + rng.below(0x7f_ffff) as u32),
+        _ => 0.05 + 3.0 * rng.unit(),
+    }
+}
+
 /// K or V cache: `valid` random rows, then NaN-poisoned rows up to `cap`.
-fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
-    let rb = row_bytes(kv);
+/// `is_k` selects the K layout (fwht kinds: per-head f32 cnorm + packed codes;
+/// V is Q8_0 for every kind but fp8).
+fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize, is_k: bool) -> Vec<u8> {
+    let rb = if is_k {
+        k_row_bytes(kv)
+    } else {
+        v_row_bytes(kv)
+    };
     let mut buf = vec![0u8; cap * rb];
     for t in 0..cap {
         let row = &mut buf[t * rb..(t + 1) * rb];
         let poison = t >= valid;
-        match kv {
-            VerifyKv::Q8 => {
-                for blk in 0..NKV * (HD / 32) {
-                    let o = blk * 34;
-                    let s = if poison { 0x7e00 } else { scale_f16(rng) };
-                    row[o..o + 2].copy_from_slice(&s.to_le_bytes());
-                    for j in 0..32 {
-                        row[o + 2 + j] = if poison {
-                            0x7f
-                        } else if rng.below(16) == 0 {
-                            [0x80u8, 0x00, 0x7f, 0x81][rng.below(4) as usize]
-                        } else {
-                            rng.next() as u8
-                        };
+        match (kv, is_k) {
+            (VerifyKv::Fwht4 | VerifyKv::Fwht3, true) => {
+                let head_bytes = rb / NKV;
+                for h in 0..NKV {
+                    let head = &mut row[h * head_bytes..(h + 1) * head_bytes];
+                    let cn = if poison { f32::NAN } else { cnorm_f32(rng) };
+                    head[..4].copy_from_slice(&cn.to_le_bytes());
+                    for b in &mut head[4..] {
+                        *b = if poison { 0xff } else { rng.next() as u8 };
                     }
                 }
             }
-            VerifyKv::Fp8 => {
+            (VerifyKv::Fp8, _) => {
                 for i in 0..NKV * HD {
                     row[i] = if poison {
                         0x7f
@@ -195,9 +223,32 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
                 }
             }
+            _ => {
+                for blk in 0..NKV * (HD / 32) {
+                    let o = blk * 34;
+                    let s = if poison { 0x7e00 } else { scale_f16(rng) };
+                    row[o..o + 2].copy_from_slice(&s.to_le_bytes());
+                    for j in 0..32 {
+                        row[o + 2 + j] = if poison {
+                            0x7f
+                        } else if rng.below(16) == 0 {
+                            [0x80u8, 0x00, 0x7f, 0x81][rng.below(4) as usize]
+                        } else {
+                            rng.next() as u8
+                        };
+                    }
+                }
+            }
         }
     }
     buf
+}
+
+/// +-1 sign table of the fwht rotation (`n` = 128 for fwht4, 256 for fwht3).
+fn signs_table(rng: &mut Rng, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|_| if rng.next() & 1 == 0 { 1.0 } else { -1.0 })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -274,6 +325,8 @@ struct Bufs {
     out_full: GpuTensor,
     part: GpuTensor,
     part_full: GpuTensor,
+    /// fwht kinds: the rotation's (signs1, signs2) tables.
+    signs: Option<(GpuTensor, GpuTensor)>,
 }
 
 impl Bufs {
@@ -293,8 +346,20 @@ impl Bufs {
         }
         let q_full = gpu.upload_f32(&qh, &[qh.len()]).expect("q");
         let q = q_full.sub_offset(0, c.b * qdim());
-        let kh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
-        let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
+        let kh = fill_kv(c.kv, &mut rng, c.valid(), c.cap, true);
+        let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap, false);
+        let signs = match c.kv {
+            VerifyKv::Fwht4 | VerifyKv::Fwht3 => {
+                let n = if c.kv == VerifyKv::Fwht4 { HD / 2 } else { HD };
+                let s1 = signs_table(&mut rng, n);
+                let s2 = signs_table(&mut rng, n);
+                Some((
+                    gpu.upload_f32(&s1, &[n]).expect("signs1"),
+                    gpu.upload_f32(&s2, &[n]).expect("signs2"),
+                ))
+            }
+            VerifyKv::Q8 | VerifyKv::Fp8 => None,
+        };
         let k = gpu.upload_raw(&kh, &[kh.len()]).expect("k");
         let v = gpu.upload_raw(&vh, &[vh.len()]).expect("v");
         let mut posh: Vec<i32> = (0..c.b).map(|i| (c.start() + i) as i32).collect();
@@ -319,6 +384,7 @@ impl Bufs {
             out_full,
             part,
             part_full,
+            signs,
         }
     }
 
@@ -332,6 +398,10 @@ impl Bufs {
             self.part_full,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some((s1, s2)) = self.signs {
+            let _ = gpu.free_tensor(s1);
+            let _ = gpu.free_tensor(s2);
         }
         let _ = (self.q, self.out, self.part);
     }
@@ -433,6 +503,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
         return;
     }
     if candidate {
+        let signs = bf.signs.as_ref().map(|(s1, s2)| (s1, s2));
         let ran = gpu
             .try_attention_verify_gqa(
                 c.kv,
@@ -449,6 +520,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.part,
                 None,
                 0,
+                signs,
             )
             .expect("verify_attn launch");
         assert!(ran, "VerifyAttn declined an admitted case: {c:?}");
@@ -492,6 +564,54 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     0,
                 )
                 .expect("reference q8"),
+            VerifyKv::Fwht4 | VerifyKv::Fwht3 => {
+                let (s1, s2) = bf.signs.as_ref().expect("fwht sign tables");
+                // v_mode 8 = Q8_0 V (`V_MODE_Q8`): the only mode the twin covers.
+                if c.kv == VerifyKv::Fwht4 {
+                    gpu.attention_flash_fwht4_batched_masked(
+                        &bf.q,
+                        &bf.k,
+                        &bf.v,
+                        &bf.out,
+                        &bf.pos,
+                        s1,
+                        s2,
+                        nh(),
+                        NKV,
+                        HD,
+                        c.cap,
+                        c.max_ctx_len(),
+                        c.b,
+                        &bf.part,
+                        None,
+                        0,
+                        0,
+                        8,
+                    )
+                } else {
+                    gpu.attention_flash_fwht3_batched_masked(
+                        &bf.q,
+                        &bf.k,
+                        &bf.v,
+                        &bf.out,
+                        &bf.pos,
+                        s1,
+                        s2,
+                        nh(),
+                        NKV,
+                        HD,
+                        c.cap,
+                        c.max_ctx_len(),
+                        c.b,
+                        &bf.part,
+                        None,
+                        0,
+                        0,
+                        8,
+                    )
+                }
+                .expect("reference fwht")
+            }
         }
     }
 }
@@ -561,6 +681,8 @@ fn kv_name(kv: VerifyKv) -> &'static str {
     match kv {
         VerifyKv::Fp8 => "fp8",
         VerifyKv::Q8 => "q8",
+        VerifyKv::Fwht4 => "fwht4",
+        VerifyKv::Fwht3 => "fwht3",
     }
 }
 
@@ -725,6 +847,8 @@ fn parse_kvs(arg: Option<&str>) -> Vec<VerifyKv> {
     match arg.unwrap_or("both") {
         "fp8" => vec![VerifyKv::Fp8],
         "q8" => vec![VerifyKv::Q8],
+        "fwht4" => vec![VerifyKv::Fwht4],
+        "fwht3" => vec![VerifyKv::Fwht3],
         _ => vec![VerifyKv::Fp8, VerifyKv::Q8],
     }
 }
@@ -1316,7 +1440,14 @@ fn bench_rows(gpu: &mut Gpu) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // `--kv <kind>` (fp8|q8|fwht4|fwht3|both) is the named form of the
+    // positional kv argument.
+    let kv_flag = args.iter().position(|a| a == "--kv").map(|i| {
+        let v = args.get(i + 1).cloned().expect("--kv needs a value");
+        args.drain(i..=i + 1);
+        v
+    });
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
@@ -1325,11 +1456,14 @@ fn main() {
         gpu.arch
     );
     println!("VERIFY_ATTN_ORACLE arch={} mode={mode}", gpu.arch);
-    // fp8 KV (and its VerifyAttn twin) is gfx1201-only.
+    // fp8 KV (and its VerifyAttn twin) is gfx1201-only; the fwht twins are
+    // gfx1201 and gfx1100; gfx1151 is the Q8 WMMA twin only.
     let kvs = |arg: Option<&String>, gpu: &Gpu| -> Vec<VerifyKv> {
-        let mut v = parse_kvs(arg.map(String::as_str));
-        if gpu.arch != "gfx1201" {
-            v.retain(|&k| k == VerifyKv::Q8);
+        let mut v = parse_kvs(kv_flag.as_deref().or(arg.map(String::as_str)));
+        match gpu.arch.as_str() {
+            "gfx1201" => {}
+            "gfx1100" => v.retain(|&k| k != VerifyKv::Fp8),
+            _ => v.retain(|&k| k == VerifyKv::Q8),
         }
         v
     };

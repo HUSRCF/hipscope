@@ -289,6 +289,9 @@ pub fn load_vision_weights(
             )?,
             fc2_w: up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc2.weight"))?,
             fc2_b: up_vec(gpu, src, offload, &format!("{p}.mlp.linear_fc2.bias"), h)?,
+            // Packed (not K-padded): the shared tower routes a packed fc2
+            // with `mlp_dim % 64 != 0` through `gemm_f16_wmma_mb8`.
+            fc2_ld: vis.mlp_dim,
         });
     }
     let merge_dim = h * vis.spatial_merge_size * vis.spatial_merge_size;

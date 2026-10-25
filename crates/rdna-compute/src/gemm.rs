@@ -279,7 +279,7 @@ pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
         hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
 /// `HIPFIRE_QWEN4_MOE_FRONT_FUSE` (default on, `0` restores the unfused chain): the
-/// sealed grouped MoE prefill on exact gfx1201's symmetric IU4 route reads the HC `mixed`
+/// sealed grouped MoE prefill on exact gfx1201's or exact gfx1151's symmetric IU4 route reads the HC `mixed`
 /// rows once in `mq_rotate_x_i4_f16out`, which emits both the router / shared-expert F16 X
 /// (the bytes of `convert_f32_to_f16`) and the routed gate/up IU4 sidecar (the bytes of
 /// `mq_rotate_x_i4`), and skips the F32 `mq_rotate_x` whose output no reader on that route
@@ -516,11 +516,17 @@ pub(crate) fn hc_down_tile_selected(
         }
 }
 
-/// Smallest route-row count the fused HC-down + activation kernel takes; below it the
+/// Smallest route-row count the gfx1201 fused HC-down + activation kernel takes; below it the
 /// three-launch chain wins.
 pub const HC_DOWN_FUSED_MIN_ROWS: usize = 1536;
 
-/// gfx1201 HC-down (320 x 10240) + activation fused into one launch
+/// Smallest route-row count the gfx1151 fused HC-down + activation kernel takes. Measured on
+/// Halo (fused vs the chain's GEMM + activation, us per call, 3 runs agree to 1 %): 512 rows
+/// 209 vs 178, 1024 rows 272 vs 309, 1536 rows 508 vs 557, 2048 rows 527 vs 862; the chain
+/// (64 x 64 tile below 2048 rows, 160 x 64 from there) stays below 1024.
+pub const HC_DOWN_FUSED_GFX1151_MIN_ROWS: usize = 1024;
+
+/// gfx1201 / gfx1151 HC-down (320 x 10240) + activation fused into one launch
 /// (`HIPFIRE_QWEN4_HC_DOWN_FUSED`, default on, `0` keeps the chain).
 pub(crate) fn hc_down_fused_selected(
     arch: &str,
@@ -531,11 +537,15 @@ pub(crate) fn hc_down_fused_selected(
     recording: bool,
     capturing: bool,
 ) -> bool {
+    let min_rows = match arch {
+        "gfx1201" => HC_DOWN_FUSED_MIN_ROWS,
+        "gfx1151" => HC_DOWN_FUSED_GFX1151_MIN_ROWS,
+        _ => return false,
+    };
     enabled
-        && arch == "gfx1201"
         && m == 320
         && k == 10240
-        && rows >= HC_DOWN_FUSED_MIN_ROWS
+        && rows >= min_rows
         && rows.checked_mul(k * 2).is_some_and(|b| b < (1usize << 32))
         && !recording
         && !capturing
@@ -551,7 +561,7 @@ pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
 /// of the 64 x 128 / k64 split-K tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true));
-/// Fused HC-down + activation (gfx1201), default on, `0` restores the three-launch chain.
+/// Fused HC-down + activation (gfx1201, gfx1151), default on, `0` restores the chain.
 static QWEN4_HC_DOWN_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_FUSED", true)
 });
@@ -18657,7 +18667,11 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // The kernel advances 16 tokens per `blockIdx.y` (macro default of one
+        // tile).  Dividing by 64 left every token past the first 16 of each 64
+        // unwritten: stale scratch read back as the projection (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 16;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -18726,7 +18740,10 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // Two 16-token tiles per `blockIdx.y`: dividing by 64 left tokens 32..63
+        // of every 64 unwritten (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 32;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -18799,7 +18816,10 @@ impl Gpu {
             &b_val as *const _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(64) as u32;
+        // The kernel advances 16 tokens per `blockIdx.y`; dividing by 64 left
+        // every token past the first 16 of each 64 unwritten (HIPF-93).
+        const BATCH_ROWS_PER_BLOCK: usize = 16;
+        let batch_tiles = batch_size.div_ceil(BATCH_ROWS_PER_BLOCK) as u32;
         let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
@@ -29123,8 +29143,12 @@ impl Gpu {
         let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
             hip_bridge::HipError::new(1, "F32 GEMM dimensions or byte extents overflow")
         })?;
-        if a.dtype != DType::F32
-            || b.dtype != DType::F32
+        // Either input may be a loaded weight (A for the PARO/DeltaNet alpha/beta
+        // projections, B for the DFlash fc). Loaded weights are untyped `Raw`
+        // byte buffers whose logical F32 dtype the caller has already matched.
+        let f32_view = |t: &GpuTensor| matches!(t.dtype, DType::F32 | DType::Raw);
+        if !f32_view(a)
+            || !f32_view(b)
             || y.dtype != DType::F32
             || a.buf.size() < bytes[0]
             || b.buf.size() < bytes[1]
@@ -29457,7 +29481,10 @@ impl Gpu {
     /// exactly as [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`] launches them), then
     /// [`Gpu::qwen4_shared_gu_pm_launch`] over that conversion in place of the gate and up
     /// GEMMs, the activation and the hidden's conversion. `hidden` is the F16 `[batch_size, m]`
-    /// destination (the shared down reads it as its F16 input). Returns `false` with nothing
+    /// destination (the shared down reads it as its F16 input). `x16`, when given, is the F16
+    /// conversion of `x` the fused MoE front already left in the shared F16 scratch
+    /// ([`Gpu::qwen4_moe_front_producer`]): no `convert_f32_to_f16` is launched, and nothing may
+    /// have converted into that scratch since. Returns `false` with nothing
     /// launched unless the route applies ([`Gpu::qwen4_shared_gu_pm_applies`] and the groups'
     /// own conditions).
     #[allow(clippy::too_many_arguments)]
@@ -29469,21 +29496,24 @@ impl Gpu {
         up: &GpuTensor,
         hidden: &GpuTensor,
         x: &GpuTensor,
+        x16: Option<&GpuTensor>,
         m: usize,
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
         if !self.qwen4_shared_gu_pm_applies(gate, up, m, k, batch_size)
-            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups(
+            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(
                 &[&[router][..], &[selector][..]],
                 x,
+                x16,
                 k,
                 batch_size,
             )?
         {
             return Ok(false);
         }
-        // Nothing since the groups' conversion wrote the F16 scratch: the view is the same bytes.
+        // Nothing since the groups' conversion (or the front producer's store) wrote the F16
+        // scratch: the view is the same bytes.
         let x16 = self.qwen4_f16_x_scratch(batch_size * k)?;
         self.qwen4_shared_gu_pm_launch(
             QWEN4_SHARED_GU_PM_WAVES,
@@ -29791,10 +29821,10 @@ impl Gpu {
         )
     }
 
-    /// gfx1201 HC-down (BF16 `weight` [m, k] on its F16 shadow, F16 `x_f16` [rows, k]) fused with
-    /// `hc_activation_fused_f32`: writes only the packed BF16 activation `low_bf16` [rows, m],
-    /// byte-identical to `gemm_bf16_xf16_f16_wmma` + `hc_activation_fused_f32(bf16_out)`.
-    /// Callers gate on [`Gpu::qwen4_hc_down_fused_applies`].
+    /// gfx1201 / gfx1151 HC-down (BF16 `weight` [m, k] on its F16 shadow, F16 `x_f16` [rows, k])
+    /// fused with `hc_activation_fused_f32`: writes only the packed BF16 activation `low_bf16`
+    /// [rows, m], byte-identical to `gemm_bf16_xf16_f16_wmma` + `hc_activation_fused_f32(bf16_out)`
+    /// on the same arch. Callers gate on [`Gpu::qwen4_hc_down_fused_applies`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf16_hc_down_fused(
         &mut self,
@@ -29808,8 +29838,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            self.arch == "gfx1201" && m == 320 && k == 10240,
-            "gemm_bf16_xf16_hc_down_fused: gfx1201 M=320 K=10240 only (arch {}, m {m}, k {k})",
+            matches!(self.arch.as_str(), "gfx1201" | "gfx1151") && m == 320 && k == 10240,
+            "gemm_bf16_xf16_hc_down_fused: gfx1201/gfx1151 M=320 K=10240 only (arch {}, m {m}, k {k})",
             self.arch
         );
         assert!(
@@ -29835,9 +29865,27 @@ impl Gpu {
             (w16 as usize) % 16 == 0 && (xp as usize) % 16 == 0 && (op as usize) % 16 == 0,
             "gemm_bf16_xf16_hc_down_fused: operands must be 16-byte aligned"
         );
-        const MODULE: &str = "qwen4_hc_down_fused";
-        const ENTRY: &str = "qwen4_hc_down_fused_b64_k32";
-        self.ensure_kernel(MODULE, kernels::QWEN4_HC_DOWN_FUSED_SRC, ENTRY)?;
+        // (module, source, entry, tokens per workgroup, threads per workgroup): gfx1151 runs
+        // five 64-row M waves over 32 tokens, gfx1201 four 80-row waves over 64.
+        let (module, src, entry, tile_rows, threads): (&str, &str, &str, usize, u32) =
+            if self.arch == "gfx1151" {
+                (
+                    "qwen4_hc_down_fused_gfx1151",
+                    kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
+                    "qwen4_hc_down_fused_gfx1151",
+                    32,
+                    160,
+                )
+            } else {
+                (
+                    "qwen4_hc_down_fused",
+                    kernels::QWEN4_HC_DOWN_FUSED_SRC,
+                    "qwen4_hc_down_fused_b64_k32",
+                    64,
+                    256,
+                )
+            };
+        self.ensure_kernel(module, src, entry)?;
         let ap = w16;
         let ki = k as i32;
         let bi = batch_size as i32;
@@ -29850,9 +29898,9 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            ENTRY,
-            [batch_size.div_ceil(64) as u32, 1, 1],
-            [256, 1, 1],
+            entry,
+            [batch_size.div_ceil(tile_rows) as u32, 1, 1],
+            [threads, 1, 1],
             0,
             &mut params,
             || {
@@ -49074,6 +49122,8 @@ const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
 /// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
 const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_STREAM8_MODULE: &str = "qwen4_moe_gate_up_stream8_pm_gfx1151";
+const QWEN4_MOE_SYM_STREAM8_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 /// Module key of the grouped-position down twins (`kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201`: the grouped
 /// producer `moe_rotate_i4_gp_pm_gfx1201` plus `qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt{4,8}`).
@@ -50619,6 +50669,27 @@ impl Gpu {
         Some(pair)
     }
 
+    /// Gate/up entry for `[m, k, top_k, live_source_rows, experts]`.
+    /// The streamed variant is a positive gfx1151/VRAM/7168..8192-row
+    /// allowlist for the measured Flash-Next shape; smaller skewed banks
+    /// and all other architectures/residencies keep the baseline entries.
+    pub fn qwen4_moe_sym_gate_up_symbol(
+        &self,
+        host_mapped: bool,
+        shape: [usize; 5],
+    ) -> Option<&'static str> {
+        let total_slots = qwen4_moe_sym_total_slots(shape[3], shape[2]);
+        let [base, _] = self.qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, shape[4])?;
+        let pm = base == QWEN4_MOE_SYM_PM_GATE_UP[0][0];
+        Some(
+            if qwen4_moe_stream8_selected(&self.arch, pm, host_mapped, shape) {
+                QWEN4_MOE_SYM_STREAM8_GATE_UP
+            } else {
+                base
+            },
+        )
+    }
+
     /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
     /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
     /// applies on a descriptor with row-repeat entries (the gfx1151 builder PM
@@ -50659,7 +50730,15 @@ impl Gpu {
     pub fn ensure_qwen4_moe_sym_pm_entry(&mut self, func: &str) -> HipResult<()> {
         let kernel = self.qwen4_moe_sym_require(func)?;
         self.bind_thread()?;
-        self.ensure_embedded_kernel(kernel.module, kernel.image, func)
+        if self.arch.as_str() == "gfx1151" && func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
+            self.ensure_embedded_kernel(
+                QWEN4_MOE_SYM_STREAM8_MODULE,
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                func,
+            )
+        } else {
+            self.ensure_embedded_kernel(kernel.module, kernel.image, func)
+        }
     }
 
     /// `[gate/up, down]` entries of the MQ3-I4 NT1 module on this device (the
@@ -51178,12 +51257,12 @@ impl Gpu {
 
     /// Whether the Qwen4 MoE front producer ([`Gpu::qwen4_moe_front_producer`]) may replace
     /// the sealed grouped prefill's `convert_f32_to_f16` + `mq_rotate_x_i4` (and the dead
-    /// F32 `mq_rotate_x`): exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not `0`, the
-    /// aggregate symmetric IU4 descriptor present, and no recorder or graph capture (the F16
-    /// scratch is written by a fresh producer launch, not a recorded conversion).
+    /// F32 `mq_rotate_x`): exact gfx1201 or exact gfx1151, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not
+    /// `0`, the aggregate symmetric IU4 descriptor present, and no recorder or graph capture
+    /// (the F16 scratch is written by a fresh producer launch, not a recorded conversion).
     pub fn qwen4_moe_front_fuse_applies(&self) -> bool {
         *QWEN4_MOE_FRONT_FUSE
-            && self.arch_caps.is_gfx1201()
+            && (self.arch_caps.is_gfx1201() || self.arch == "gfx1151")
             && self.qwen4_moe_sym_kernel().is_some()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -52223,12 +52302,21 @@ impl Gpu {
         let nev = moe_expert_table_len(ptrs);
         let n_experts = usize::try_from(nev).unwrap_or(0);
         let total_slots = qwen4_moe_sym_total_slots(dims[4], dims[2]);
-        let func = self
+        let baseline_func = self
             .qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
             .unwrap_or_else(|| {
                 moe_sym_iu4_symbols(kernel, *QWEN4_MOE_SYM_PM, rr, host_mapped)[usize::from(down)]
             });
+        let func = if down {
+            baseline_func
+        } else {
+            self.qwen4_moe_sym_gate_up_symbol(
+                host_mapped,
+                [dims[0], dims[1], dims[2], dims[4], n_experts],
+            )
+            .unwrap_or(baseline_func)
+        };
         let block = kernel.block_threads[usize::from(down)];
         // The grouped-position twin of the selected NT entry: same grid, ABI and bytes, its own bundle.
         let func = qwen4_moe_down_gp_entry(func, grouped_plane);
@@ -52238,10 +52326,18 @@ impl Gpu {
             moe_sym_iu4_extents(func, down, rr, pm.then_some(kernel.max_slots), dims)?;
         let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         self.bind_thread()?;
-        let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
-        match (pm, kernel.hipcc_twin.as_ref()) {
-            (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
-            _ => self.ensure_embedded_kernel(module, image, func)?,
+        if pm && func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
+            self.ensure_embedded_kernel(
+                QWEN4_MOE_SYM_STREAM8_MODULE,
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                func,
+            )?;
+        } else {
+            let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
+            match (pm, kernel.hipcc_twin.as_ref()) {
+                (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
+                _ => self.ensure_embedded_kernel(module, image, func)?,
+            }
         }
         let pp = ptrs.buf.as_ptr();
         let tp = tiles.buf.as_ptr();
@@ -52325,9 +52421,33 @@ mod tests {
         assert!(!ok("gfx1201", true, 321, 10240, 4096, false, false));
         assert!(!ok("gfx1201", true, 320, 10239, 4096, false, false));
         assert!(!ok("gfx1201", true, 320, 10496, 4096, false, false));
-        for arch in ["gfx1151", "gfx1200", "gfx1100", "gfx1030", "gfx1201x", ""] {
+        for arch in ["gfx1200", "gfx1100", "gfx1030", "gfx1201x", "gfx1151x", ""] {
             assert!(!ok(arch, true, 320, 10240, 4096, false, false), "{arch}");
         }
+        // gfx1151: the measured 1024-row crossover, same shape / flag / size rules.
+        let min1151 = HC_DOWN_FUSED_GFX1151_MIN_ROWS;
+        assert_eq!(min1151, 1024);
+        assert!(ok("gfx1151", true, 320, 10240, min1151, false, false));
+        assert!(ok(
+            "gfx1151",
+            true,
+            320,
+            10240,
+            HC_DOWN_FUSED_MIN_ROWS,
+            false,
+            false
+        ));
+        assert!(ok("gfx1151", true, 320, 10240, 8192, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, 16384, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, min1151 - 1, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 512, false, false));
+        assert!(!ok("gfx1151", false, 320, 10240, 8192, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 8192, true, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 8192, false, true));
+        assert!(!ok("gfx1151", true, 319, 10240, 8192, false, false));
+        assert!(!ok("gfx1151", true, 320, 10496, 8192, false, false));
+        assert!(ok("gfx1151", true, 320, 10240, 209_715, false, false));
+        assert!(!ok("gfx1151", true, 320, 10240, 209_716, false, false));
         // rows * k * 2 < 2^32: 209715 rows * 20480 B = 4_294_963_200 (< 2^32), 209716 is over.
         assert!(ok("gfx1201", true, 320, 10240, 209_715, false, false));
         assert!(!ok("gfx1201", true, 320, 10240, 209_716, false, false));
@@ -53939,18 +54059,24 @@ mod tests {
     }
 
     /// The fused HC-down + activation launch (`HIPFIRE_QWEN4_HC_DOWN_FUSED`) must write the
-    /// chain's packed BF16 bytes: the production split-K GEMM + reducer followed by
-    /// `hc_activation_fused_f32` with `bf16_out`, on the real 320 x 10240 shape, with a ragged
-    /// last 64-row block, NaN/inf/zero/subnormal-F16 operands and a guard region past the output.
+    /// chain's packed BF16 bytes: the production GEMM (gfx1201: split-K + reducer; gfx1151: the
+    /// ascending-K 160 x 64 tile) followed by `hc_activation_fused_f32` with `bf16_out`, on the
+    /// real 320 x 10240 shape, with a ragged last tile, NaN/inf/zero/subnormal-F16 operands and
+    /// a guard region past the output.
     #[test]
-    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    #[ignore = "requires a gfx1201 or gfx1151 GPU and working HIP toolchain"]
     fn hc_down_fused_matches_chain_bytes() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            Ok(gpu) if matches!(gpu.arch.as_str(), "gfx1201" | "gfx1151") => gpu,
             _ => {
-                eprintln!("skip: needs exact gfx1201");
+                eprintln!("skip: needs exact gfx1201 or gfx1151");
                 return;
             }
+        };
+        let min_rows = if gpu.arch.as_str() == "gfx1151" {
+            HC_DOWN_FUSED_GFX1151_MIN_ROWS
+        } else {
+            HC_DOWN_FUSED_MIN_ROWS
         };
         let (m, k) = (320usize, 10240usize);
         let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
@@ -53964,7 +54090,7 @@ mod tests {
             .expect("weight upload");
         weight.dtype = DType::BF16;
         let specials = [0x7e00u16, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x83ff];
-        for rows in [HC_DOWN_FUSED_MIN_ROWS, 4099usize] {
+        for rows in [min_rows, 4099usize] {
             let x_bits: Vec<u16> = (0..rows * k)
                 .map(|i| {
                     let row = i / k;
@@ -55913,6 +56039,52 @@ mod miscompiled_optin_refusal_tests {
     fn miscompiled_optin_explicit_zero_runs_default_route_without_refusal() {
         for var in VARS {
             assert_eq!(miscompiled_optin_decision(var, Some("0")), (false, None));
+        }
+    }
+}
+
+fn qwen4_moe_stream8_selected(
+    arch: &str,
+    pm: bool,
+    host: bool,
+    [m, k, top, rows, experts]: [usize; 5],
+) -> bool {
+    arch == "gfx1151"
+        && pm
+        && !host
+        && m == 1280
+        && k == 2560
+        && top == 10
+        && experts == 512
+        && (7168..=8192).contains(&rows)
+}
+
+#[cfg(test)]
+mod qwen4_moe_stream8_selection {
+    use super::qwen4_moe_stream8_selected as selected;
+    #[test]
+    fn only_measured_shape_and_arch_enter_stream8() {
+        for rows in [1, 8, 512, 4096, 4672, 5198, 7167, 8193, 16384] {
+            assert!(!selected(
+                "gfx1151",
+                true,
+                false,
+                [1280, 2560, 10, rows, 512]
+            ));
+        }
+        for rows in [7168, 8191, 8192] {
+            let shape = [1280, 2560, 10, rows, 512];
+            assert!(selected("gfx1151", true, false, shape));
+            for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942", "unknown"] {
+                assert!(!selected(arch, true, false, shape));
+            }
+            assert!(!selected("gfx1151", false, false, shape));
+            assert!(!selected("gfx1151", true, true, shape));
+            for (i, value) in [(0, 640), (1, 1280), (2, 8), (4, 128)] {
+                let mut other = shape;
+                other[i] = value;
+                assert!(!selected("gfx1151", true, false, other));
+            }
         }
     }
 }

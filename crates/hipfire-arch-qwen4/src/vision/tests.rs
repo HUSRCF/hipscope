@@ -133,7 +133,7 @@ fn refuses_truncated_or_unadmitted_quant_payload_before_upload() {
 
 #[test]
 fn scratch_admission_includes_pool_retention_and_refuses_unbounded_images() {
-    assert_eq!(device_scratch_bytes(16_128, true).unwrap(), 868_589_568);
+    assert_eq!(device_scratch_bytes(16_128, true).unwrap(), 1_219_534_848);
     assert_eq!(device_scratch_bytes(16_128, false).unwrap(), 1_484_808_192);
     assert!(device_scratch_bytes(0, true).is_err());
     assert!(device_scratch_bytes(16_132, true).is_err());

@@ -28,11 +28,13 @@
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
 pub mod copy;
+pub mod index_bind;
 pub mod kernel;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod plan;
 pub mod shadow;
+pub mod window;
 
 use std::ops::RangeInclusive;
 
@@ -90,7 +92,7 @@ impl Formula {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ResourceId(pub u32);
 
 /// §1.1 `Resource.kind`.

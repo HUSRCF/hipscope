@@ -1313,6 +1313,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-flash-next-gfx1151-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: exact gfx1201 or exact gfx1151, symmetric IU4 descriptor present; on gfx1151 the producer also feeds the fused shared gate/up PeaceMaker launch's router + selector groups)",
+        effect: KernelSelection,
+        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer mq_rotate_x_i4_f16out; recorded/captured: the incumbent launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracles on Halo (gfx1151) of every output byte against the incumbent launches: HC down 36/36 vs the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal), halo-prefill-044/a-down/ORACLE.md; HC up v2 152/152 vs hyper_read_up_wmma_bf16_swap, random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region, halo-prefill-044/a-up/ORACLE.md; MoE front 55/55 (examples/qwen4_moe_front_oracle.rs) over rows 1..16384 with ragged tails and adversarial rows, F16 X and IU4 sidecar vs convert_f32_to_f16 + mq_rotate_x_i4 and the router/selector/gate/up and shared gate/up PM outputs vs the chain, halo-prefill-044/a-front/ORACLE.md. Eager exact-gfx1151 prefill arms; the recorded body keeps the incumbent launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-shared-int8-prefill",
         predicates: &[IsRecording, CaptureMode],
         condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
@@ -1332,6 +1343,28 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &[],
         verdict: ByteExact,
         evidence: "no arithmetic changes, only where the unchanged expert bytes are read from; Flash-Next 16K logits on gfx1201 are byte-identical with HIPFIRE_QWEN4_EXPERT_STAGE on and off (CHANGELOG 0.4.1, Flash-Next performance); default on for exact gfx1201 and, for the borrowed-donor packed stage, for any discrete device whose load-time measured host-to-device link is narrow (< 16 GB/s, measured after the expert placement is frozen so it never changes the resident layers; unified memory and an unmeasured link stay off; dedicated slab and tier stages stay on only for gfx1201 or an explicit 1), and no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-decode-share-loan-capture-guard",
+        predicates: &[GraphSlotCapturing],
+        condition: "hipfire-arch-qwen4 decode-share donor loan (decode_share_loan.rs LoanController::{acquire, finish_prompt, require_resident, recover}, through the LoanOps::capturing seam whose GPU implementation GpuLoanOps::capturing in gpu_forward.rs is `stream_is_capturing(active_stream)`): a borrowed prompt tile (>= 512 rows, never retained-eligible) refuses before its first write into the donor tail when the active stream is capturing; a dirty tail met under capture at a prompt end or a resident-bank entry poisons the loan; error recovery (drain + blocking restore) runs only outside capture, otherwise the loan is poisoned",
+        effect: Refusal,
+        switches: "outside capture: zero-fill, scratch writes into the donor tail and the restore copy (compute stream) proceed; under capture: an error (refusal or poison) before any donor write, restore or recovery launch",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the capturing branch launches nothing and only returns an error, so no recorded or captured body can contain a borrow, a restore or a recovery. Decode, verify and retained replay run on the resident bank behind require_resident, which host-waits the restore before any replay submit. Redline `redline_daemon_harness.py --qwen4 --pm4` on gfx1201 Flash-Next with decode-share on (borrow/restore engaged) keeps the beta decode hash 16b0944ce452884d with shadow bit_exact and blob_bit_exact (release-0.4.3/decode-share/runs/redline/{land-on,lazy-on,shadows-on}). No railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "vl-batched-prefill-capture-refusal",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Qwen3.5/3.8 batched image-token prefill (qwen35 vl_prefill.rs `vl_batched_prefill_admitted`, evaluated by generate_vl before any prefill work, and `ChunkRoute::refusal`, whose `capturing` input is `gpu.graphs.capture_mode || gpu.replay.is_recording()` in forward_batch_chunk_impl before any scratch, KV or recurrent write): a VL prompt refuses the batched route when HIP graph capture or Redline recording is active",
+        effect: Refusal,
+        switches: "outside capture and recording: the image prompt prefills in batched chunks (tower embeddings spliced over the image-pad rows, batched M-RoPE); under capture or recording: the batched route is refused up front and generate_vl falls back to the per-token VL prefill path (forward_scratch_embed_mrope)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branch launches nothing and returns Err (admission) or the refusal string (chunk route) before any prefill work, so no captured or recorded body can contain a batched image prefill; the fallback is the existing per-token VL path, which is unchanged. No railgun default program is a batched-VL prefill",
         reaches: &[],
     },
     Decision {
@@ -1747,6 +1780,12 @@ pub const SITES: &[Site] = &[
         decisions: &["kv-tier-capture-forces-flash"],
     },
     Site {
+        file: "hipfire-arch-qwen35/src/dflash_verify_emit.rs",
+        function: "plan_phases",
+        occurrences: 6,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
         file: "hipfire-arch-qwen35/src/dflash_cb.rs",
         function: "dflash_cb_verify",
         occurrences: 2,
@@ -1836,12 +1875,13 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_batch_chunk_impl",
-        occurrences: 7,
+        occurrences: 10,
         decisions: &[
             "q8-multirow-verify-attention",
             "captured-batch-attention-physical-cap",
             "captured-verify-attention-physical-cap",
             "gdn-chunk-scan",
+            "vl-batched-prefill-capture-refusal",
         ],
     },
     Site {
@@ -1886,6 +1926,24 @@ pub const SITES: &[Site] = &[
         function: "lane_fa_plan_ok",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "vl_batched_prefill_admitted",
+        occurrences: 2,
+        decisions: &["vl-batched-prefill-capture-refusal"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/arch.rs",
@@ -1946,6 +2004,42 @@ pub const SITES: &[Site] = &[
             "qwen4-ple-async-upload",
             "qwen4-wide-verify-recorded-ar-guard",
         ],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "acquire",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "capturing",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "finish_prompt",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "recover",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "require_resident",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "capturing",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
@@ -3589,19 +3683,28 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/gemm.rs",
         function: "hc_down_fused_selected",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_hc_down_fused_applies",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_moe_front_fuse_applies",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/hc_row_fold.rs",
@@ -3613,13 +3716,19 @@ pub const SITES: &[Site] = &[
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hc_up_v2_selected",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
         function: "hyper_read_up_wmma_launch",
         occurrences: 2,
-        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
     },
     Site {
         file: "rdna-compute/src/shared_i8.rs",

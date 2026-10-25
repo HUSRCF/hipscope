@@ -4799,6 +4799,7 @@ pub fn forward_prefill_dense_tp_with_hidden(
     scratches: &[Qwen35Scratch],
     per_token_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    super::vl_prefill::refuse_active("dense tensor-parallel prefill")?;
     if tokens.is_empty() {
         return Ok(());
     }

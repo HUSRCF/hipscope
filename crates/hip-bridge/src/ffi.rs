@@ -6,6 +6,7 @@
 //! No link-time dependency — runtime loads the shared library.
 
 use crate::error::{HipError, HipResult};
+use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
@@ -635,6 +636,8 @@ pub struct HipRuntime {
     launch_grid_yz_limit: AtomicU32,
     /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
     stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
+    /// Plan-mode tape (railgun design A authoring); idle unless a plan is active.
+    plan: PlanGate,
     #[cfg(feature = "kernel-timing")]
     kernel_timing_control: std::sync::OnceLock<Arc<kernel_timing::TimingControl>>,
 }
@@ -1505,6 +1508,7 @@ impl HipRuntime {
             _lib: Arc::new(lib),
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
             stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
+            plan: PlanGate::default(),
             #[cfg(feature = "kernel-timing")]
             kernel_timing_control: std::sync::OnceLock::new(),
         };
@@ -1521,6 +1525,146 @@ impl HipRuntime {
         let code = unsafe { (runtime.fn_init)(0) };
         runtime.check(code, "hipInit")?;
         Ok(runtime)
+    }
+
+    // ── Plan mode (railgun design A authoring) ──────────────────
+
+    /// Begin a plan tape on this thread. Blob launches, D2D copies and memsets
+    /// are recorded instead of issued; every other HIP API refuses.
+    pub fn plan_begin(&self) -> HipResult<()> {
+        self.plan.begin()
+    }
+
+    /// Finish the plan tape and take its events / first refusal.
+    pub fn plan_end(&self) -> PlanTape {
+        self.plan.end()
+    }
+
+    /// True on the thread that began an active plan tape.
+    pub fn plan_active(&self) -> bool {
+        self.plan.active()
+    }
+
+    /// Mark the active plan refused (a no-op outside plan mode).
+    pub fn plan_refuse(&self, why: &str) {
+        if self.plan.active() {
+            let _ = self.plan.refuse(why);
+        }
+    }
+
+    /// Label stamped on every launch recorded from now on.
+    pub fn plan_set_label(&self, label: &'static str) {
+        if self.plan.active() {
+            self.plan.set_label(label);
+        }
+    }
+
+    /// Events recorded so far (0 outside plan mode).
+    pub fn plan_event_count(&self) -> usize {
+        self.plan.event_count()
+    }
+
+    /// Index of the most recent recorded launch.
+    pub fn plan_last_launch_index(&self) -> Option<usize> {
+        self.plan.last_launch_index()
+    }
+
+    /// Start recording every real blob launch of this thread (they still
+    /// execute / get graph-captured): the oracle's ground truth for what an
+    /// ordinary window launches, compared against a plan's launch list.
+    pub fn launch_witness_begin(&self) -> HipResult<()> {
+        self.plan.witness_begin()
+    }
+
+    /// Stop the launch witness and take its launches (in order).
+    pub fn launch_witness_end(&self) -> Vec<PlanEvent> {
+        self.plan.witness_end()
+    }
+
+    #[inline]
+    fn plan_deny(&self, api: &str) -> HipResult<()> {
+        if self.plan.active() {
+            Err(self
+                .plan
+                .refuse(&format!("HIP API {api} reached in plan mode")))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn plan_copy_at(
+        &self,
+        api: &str,
+        dst: &DeviceBuffer,
+        dst_off: usize,
+        src: &DeviceBuffer,
+        src_off: usize,
+        size: usize,
+    ) -> Option<HipResult<()>> {
+        if !self.plan.active() {
+            return None;
+        }
+        Some(self.plan.copy_range(
+            api,
+            dst.as_ptr() as u64,
+            dst.size(),
+            dst_off,
+            src.as_ptr() as u64,
+            src.size(),
+            src_off,
+            size,
+        ))
+    }
+
+    /// Stream-ordered D2D copy of raw device addresses (the emitted-twin
+    /// runner of a plan's `Copy` op). Not plan-recorded.
+    ///
+    /// # Safety
+    /// `[src, src+size)` and `[dst, dst+size)` must lie in live, disjoint
+    /// device allocations that outlive the copy.
+    pub unsafe fn memcpy_dtod_async_raw(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: the caller guarantees both ranges are live disjoint device
+        // allocations; Rust does not deref device pointers.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst,
+                src,
+                size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream_raw,
+            )
+        };
+        memory_effects::dtod();
+        self.check(code, "hipMemcpyAsync D2D raw")
+    }
+
+    /// Stream-ordered 32-bit fill of raw device words (the emitted-twin
+    /// runner of a plan's `Fill` op). Not plan-recorded.
+    ///
+    /// # Safety
+    /// `[dst, dst + 4*words)` must lie in a live device allocation that
+    /// outlives the fill.
+    pub unsafe fn memset_d32_async_raw(
+        &self,
+        dst: *mut c_void,
+        value: i32,
+        words: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: the caller guarantees the word range is a live device
+        // allocation; Rust does not deref device pointers.
+        let code = unsafe { (self.fn_memset_d32_async)(dst, value, words, stream_raw) };
+        memory_effects::memset();
+        self.check(code, "hipMemsetD32Async raw")
     }
 
     fn check(&self, code: u32, context: &str) -> HipResult<()> {
@@ -1666,6 +1810,7 @@ impl HipRuntime {
         src_device: i32,
         size: usize,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyPeer")?;
         assert!(
             size <= dst.size(),
             "size ({size}) exceeds dst ({})",
@@ -1702,6 +1847,7 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyPeerAsync")?;
         assert!(
             size <= dst.size(),
             "size ({size}) exceeds dst ({})",
@@ -1741,6 +1887,7 @@ impl HipRuntime {
     // ── Memory management ───────────────────────────────────────
 
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
+        self.plan_deny("hipMalloc")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_raw(size);
         };
@@ -1774,6 +1921,7 @@ impl HipRuntime {
     /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
     /// callers receive a scoped error only when they request signal memory.
     pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        self.plan_deny("hipMalloc(signal)")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_signal_raw(size);
         };
@@ -1811,6 +1959,7 @@ impl HipRuntime {
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, mut buf: DeviceBuffer) -> HipResult<()> {
+        self.plan_deny("hipFree")?;
         if !buf.is_hip_allocation() {
             return Err(HipError::new(
                 0,
@@ -1837,6 +1986,7 @@ impl HipRuntime {
     /// is then the *host* pointer — use [`Self::host_get_device_pointer`] for the
     /// address to hand a kernel.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        self.plan_deny("hipHostMalloc")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.host_malloc_raw(size, flags);
         };
@@ -1865,6 +2015,7 @@ impl HipRuntime {
     /// HIP treats `host` as an opaque address; Rust never dereferences it.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
+        self.plan_deny("hipHostGetDevicePointer")?;
         let func =
             self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
         let mut dev: *mut c_void = ptr::null_mut();
@@ -1880,6 +2031,7 @@ impl HipRuntime {
     /// HIP treats `host` as an opaque address; Rust never dereferences it.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
+        self.plan_deny("hipHostFree")?;
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let raw = || {
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -1923,6 +2075,7 @@ impl HipRuntime {
     /// Own reusable pinned host storage, portable across devices. The library
     /// stays loaded until the allocation is freed, even if the runtime drops.
     pub fn host_buffer(&self, size: usize) -> HipResult<PinnedHostBuffer> {
+        self.plan_deny("pinned host_buffer alloc")?;
         if size == 0 {
             return Err(HipError::new(0, "host_buffer requires non-zero size"));
         }
@@ -1955,6 +2108,7 @@ impl HipRuntime {
     /// Reusable pinned CPU/GPU transfer storage. Same-stream downloads may be
     /// queued after an outstanding upload without exposing host references.
     pub fn transfer_buffer(&self, size: usize) -> HipResult<PinnedTransferBuffer> {
+        self.plan_deny("pinned transfer_buffer alloc")?;
         Ok(PinnedTransferBuffer {
             storage: Some(self.host_buffer(size)?),
             device: self.current_device()?,
@@ -1975,6 +2129,7 @@ impl HipRuntime {
     /// alias); there is no host-pointer fallback. Starts zeroed, `Retired`,
     /// generation 0. The library stays loaded until the allocation is freed.
     pub fn mapped_host_buffer(&self, size: usize) -> HipResult<MappedHostBuffer> {
+        self.plan_deny("mapped_host_buffer alloc")?;
         check_mapped_extent(size)?;
         let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let device = self.current_device()?;
@@ -2078,6 +2233,7 @@ impl HipRuntime {
         Ok(prop)
     }
     pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
+        self.plan_deny("hipMemAddressReserve")?;
         let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -2092,6 +2248,7 @@ impl HipRuntime {
         size: usize,
         prop: &HipMemAllocationProp,
     ) -> HipResult<HipMemGenericAllocationHandle> {
+        self.plan_deny("hipMemCreate")?;
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
         let raw = || {
             let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
@@ -2125,6 +2282,7 @@ impl HipRuntime {
         size: usize,
         handle: HipMemGenericAllocationHandle,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemMap")?;
         let func = self.missing_vmm_symbol("hipMemMap", self.fn_mem_map)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2141,6 +2299,7 @@ impl HipRuntime {
     /// # Safety
     /// `ptr..ptr+size` must describe a currently mapped VMM range.
     pub unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        self.plan_deny("hipMemUnmap")?;
         let func = self.missing_vmm_symbol("hipMemUnmap", self.fn_mem_unmap)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2159,6 +2318,7 @@ impl HipRuntime {
         size: usize,
         descs: &[HipMemAccessDesc],
     ) -> HipResult<()> {
+        self.plan_deny("hipMemSetAccess")?;
         let func = self.missing_vmm_symbol("hipMemSetAccess", self.fn_mem_set_access)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2170,6 +2330,7 @@ impl HipRuntime {
     /// `handle` must be live, owned by the caller, and no mapped range may
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
+        self.plan_deny("hipMemRelease")?;
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
         let raw = || {
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -2339,6 +2500,7 @@ impl HipRuntime {
         offset: usize,
         src: &[u8],
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy H2D offset")?;
         assert!(
             offset + src.len() <= dst.size,
             "offset ({}) + source ({}) exceeds device buffer ({})",
@@ -2373,6 +2535,16 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpy D2D at offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -2401,6 +2573,9 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at("hipMemcpy D2D offset", dst, 0, src, src_offset, size) {
+            return r;
+        }
         assert!(size <= dst.size, "size ({size}) exceeds dst ({})", dst.size);
         assert!(src_offset + size <= src.size, "src_offset+size exceeds src");
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -2419,6 +2594,7 @@ impl HipRuntime {
     }
 
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        self.plan_deny("hipMemcpy H2D")?;
         if hip_fault_consume(0, "upload") {
             return Err(hip_fault_err("upload"));
         }
@@ -2447,6 +2623,7 @@ impl HipRuntime {
 
     #[track_caller]
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: &DeviceBuffer) -> HipResult<()> {
+        self.plan_deny("hipMemcpy D2H")?;
         assert!(
             dst.len() <= src.size,
             "destination ({}) exceeds device buffer ({})",
@@ -2497,6 +2674,7 @@ impl HipRuntime {
         src: &DeviceBuffer,
         src_offset: usize,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy D2H at offset")?;
         assert!(
             src_offset + dst.len() <= src.size,
             "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
@@ -2548,6 +2726,9 @@ impl HipRuntime {
         src: &DeviceBuffer,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at("hipMemcpy D2D", dst, 0, src, 0, size) {
+            return r;
+        }
         assert!(size <= dst.size && size <= src.size);
         let t = std::time::Instant::now();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2577,6 +2758,10 @@ impl HipRuntime {
         src: *const c_void,
         size: usize,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            self.plan.copy_raw(dst as u64, src as u64, size as u64);
+            return Ok(());
+        }
         let f = self.fn_memcpy_dtod.ok_or_else(|| {
             HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
         })?;
@@ -2591,6 +2776,15 @@ impl HipRuntime {
 
     #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_bytes(
+                "hipMemset",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
+        }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
@@ -2629,6 +2823,15 @@ impl HipRuntime {
         count: usize,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_words(
+                "hipMemsetD32Async",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                count,
+            );
+        }
         assert!(count * 4 <= buf.size);
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2649,6 +2852,15 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_bytes(
+                "hipMemsetAsync",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
+        }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
@@ -2681,6 +2893,7 @@ impl HipRuntime {
     // ── Streams ─────────────────────────────────────────────────
 
     pub fn stream_create(&self) -> HipResult<Stream> {
+        self.plan_deny("hipStreamCreate")?;
         let mut stream: HipStream = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2693,6 +2906,7 @@ impl HipRuntime {
     /// A stream that does not synchronize with the legacy null stream
     /// (`hipStreamNonBlocking`).
     pub fn stream_create_non_blocking(&self) -> HipResult<Stream> {
+        self.plan_deny("hipStreamCreateWithFlags")?;
         let mut stream: HipStream = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2703,6 +2917,7 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        self.plan_deny("hipStreamSynchronize")?;
         if hip_fault_consume(2, "sync") {
             return Err(hip_fault_err("sync"));
         }
@@ -2721,10 +2936,12 @@ impl HipRuntime {
     /// whole device. `Stream` has no `Drop`, so the temporary NULL handle is never
     /// destroyed.
     pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        self.plan_deny("hipStreamSynchronize(default)")?;
         self.stream_synchronize(&Stream(ptr::null_mut()))
     }
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
+        self.plan_deny("hipStreamDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -2735,6 +2952,7 @@ impl HipRuntime {
     // ── Modules & Kernels ───────────────────────────────────────
 
     pub fn module_load(&self, path: &str) -> HipResult<Module> {
+        self.plan_deny("hipModuleLoad")?;
         let c_path =
             CString::new(path).map_err(|_| HipError::new(1, "invalid path for module_load"))?;
         let mut module: HipModule = ptr::null_mut();
@@ -2750,6 +2968,7 @@ impl HipRuntime {
     }
 
     pub fn module_load_data(&self, image: &[u8]) -> HipResult<Module> {
+        self.plan_deny("hipModuleLoadData")?;
         let mut module: HipModule = ptr::null_mut();
         let code =
             // SAFETY: module/function handles are live HIP objects from earlier loads;
@@ -2769,6 +2988,7 @@ impl HipRuntime {
     }
 
     pub fn module_get_function(&self, module: &Module, name: &str) -> HipResult<Function> {
+        self.plan_deny("hipModuleGetFunction")?;
         let c_name = CString::new(name)
             .map_err(|_| HipError::new(1, "invalid kernel name for module_get_function"))?;
         let mut func: HipFunction = ptr::null_mut();
@@ -2823,6 +3043,17 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return Err(self.plan.refuse(&format!(
+                "HIP API hipModuleLaunchKernel(kernelParams) function handle {:#x} reached in plan mode",
+                func.0 as usize
+            )));
+        }
+        if self.plan.witnessing() {
+            // kernelParams form: the kernarg bytes are not recoverable here.
+            self.plan
+                .witness_launch(func.0 as usize, grid, block, shared_mem, &[]);
+        }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
@@ -2888,6 +3119,16 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        if self.plan.active() {
+            self.validate_launch_grid(grid)?;
+            self.plan
+                .launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
+            return Ok(());
+        }
+        if self.plan.witnessing() {
+            self.plan
+                .witness_launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
+        }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
@@ -2967,6 +3208,7 @@ impl HipRuntime {
     // ── Events ──────────────────────────────────────────────────
 
     pub fn event_create(&self) -> HipResult<Event> {
+        self.plan_deny("hipEventCreate")?;
         let mut event: HipEvent = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2982,6 +3224,7 @@ impl HipRuntime {
     /// without `hipEventDisableSystemFence`. Cross-device producers may add
     /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
     pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
+        self.plan_deny("hipEventCreateWithFlags")?;
         let mut event: HipEvent = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2992,6 +3235,7 @@ impl HipRuntime {
     }
 
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
+        self.plan_deny("hipEventRecord")?;
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3001,6 +3245,7 @@ impl HipRuntime {
     }
 
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipEventSynchronize")?;
         let t = std::time::Instant::now();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3011,6 +3256,7 @@ impl HipRuntime {
     }
 
     pub fn event_query(&self, event: &Event) -> HipResult<bool> {
+        self.plan_deny("hipEventQuery")?;
         // Non-blocking by construction: hipSuccess = recorded and complete,
         // hipErrorNotReady (600) = work still outstanding, anything else is
         // a real failure (invalid handle, device lost) and propagates.
@@ -3030,6 +3276,7 @@ impl HipRuntime {
     }
 
     pub fn event_elapsed_ms(&self, start: &Event, stop: &Event) -> HipResult<f32> {
+        self.plan_deny("hipEventElapsedTime")?;
         let mut ms: f32 = 0.0;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3040,6 +3287,7 @@ impl HipRuntime {
     }
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
+        self.plan_deny("hipEventDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3048,6 +3296,7 @@ impl HipRuntime {
     }
 
     pub fn stream_wait_event(&self, stream: &Stream, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitEvent")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3073,6 +3322,7 @@ impl HipRuntime {
         src: &[u8],
         stream: &Stream,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D")?;
         if hip_fault_consume(0, "upload") {
             return Err(hip_fault_err("upload"));
         }
@@ -3096,6 +3346,7 @@ impl HipRuntime {
     /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
     /// stay unchanged until the stream reaches the copy.
     pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D(default stream)")?;
         assert!(src.len() <= dst.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3119,6 +3370,7 @@ impl HipRuntime {
         src: &DeviceBuffer,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync D2H")?;
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3149,6 +3401,16 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -3186,6 +3448,16 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset default stream",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -3244,6 +3516,7 @@ impl HipRuntime {
         height: usize,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy2DAsync D2D")?;
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -3308,6 +3581,7 @@ impl HipRuntime {
     /// Begin capturing all operations on `stream` into a graph.
     /// mode=0 is hipStreamCaptureModeGlobal.
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        self.plan_deny("hipStreamBeginCapture")?;
         #[cfg(feature = "kernel-timing")]
         kernel_timing::reject_active(self, "graph capture unsupported by kernel timing")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
@@ -3319,6 +3593,7 @@ impl HipRuntime {
 
     /// End capture on `stream`, returning the captured graph.
     pub fn stream_end_capture(&self, stream: &Stream) -> HipResult<Graph> {
+        self.plan_deny("hipStreamEndCapture")?;
         let mut graph: HipGraph = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3331,6 +3606,7 @@ impl HipRuntime {
     /// Whether `stream` is inside a `hipStreamBeginCapture` window. An
     /// invalidated capture still counts: work issued to it is not executed.
     pub fn stream_is_capturing(&self, stream: &Stream) -> HipResult<bool> {
+        self.plan_deny("hipStreamIsCapturing")?;
         let mut status: c_uint = 0;
         // SAFETY: `stream` is a live opaque HIP handle owned by the wrapper;
         // `status` is a stack out-param.
@@ -3342,6 +3618,7 @@ impl HipRuntime {
 
     /// Instantiate an executable graph from a captured graph.
     pub fn graph_instantiate(&self, graph: &Graph) -> HipResult<GraphExec> {
+        self.plan_deny("hipGraphInstantiate")?;
         let mut exec: HipGraphExec = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3355,6 +3632,7 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        self.plan_deny("hipGraphLaunch")?;
         #[cfg(feature = "kernel-timing")]
         kernel_timing::reject_active(self, "graph replay unsupported by kernel timing")?;
         let t = std::time::Instant::now();
@@ -3367,6 +3645,7 @@ impl HipRuntime {
     }
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
+        self.plan_deny("hipGraphExecDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3375,6 +3654,7 @@ impl HipRuntime {
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
+        self.plan_deny("hipGraphDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3393,6 +3673,7 @@ impl HipRuntime {
         value: u32,
         flags: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWriteValue32")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3445,6 +3726,7 @@ impl HipRuntime {
         flags: u32,
         mask: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitValue32")?;
         let Some(wait_value32) = self.fn_stream_wait_value32 else {
             return Err(HipError::new(
                 0,
@@ -3509,6 +3791,7 @@ impl HipRuntime {
         word: &SignalWord,
         value: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWriteSignal")?;
         if !SignalGen::is_generation(value) {
             return Err(mapped_err("signal write value is not a generation"));
         }
@@ -3531,6 +3814,7 @@ impl HipRuntime {
         word: &SignalWord,
         generation: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitSignal")?;
         if !SignalGen::is_generation(generation) {
             return Err(mapped_err("signal wait value is not a generation"));
         }
@@ -3545,6 +3829,7 @@ impl HipRuntime {
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
+        self.plan_deny("hipDeviceSynchronize")?;
         if hip_fault_consume(2, "sync") {
             return Err(hip_fault_err("sync"));
         }
@@ -4988,6 +5273,13 @@ pub struct Function(HipFunction);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for Function {}
+
+impl Function {
+    /// Raw `hipFunction_t` handle, for identity keys only (never dereferenced).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
 
 /// GPU event for timing.
 pub struct Event(HipEvent);

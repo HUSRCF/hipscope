@@ -1160,6 +1160,7 @@ pub fn forward_prefill_batch_multi(
     reqs: &mut [MultiChunkRequest<'_>],
     hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    crate::qwen35::vl_prefill::refuse_active("multi-request lane prefill")?;
     let refuse = |why: &str| {
         Err(HipError::new(
             0,

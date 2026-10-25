@@ -2989,6 +2989,7 @@ pub fn forward_prefill_batch_ep(
     partials: &[GpuTensor],
     peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
 ) -> HipResult<()> {
+    super::vl_prefill::refuse_active("expert-parallel prefill")?;
     let n_rank = gpus.devices.len();
     assert_eq!(
         weights_per_rank.len(),
@@ -4943,6 +4944,7 @@ pub fn forward_prefill_batch_multi(
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
+    super::vl_prefill::refuse_active("multi-GPU band prefill")?;
     let n_total = tokens.len();
     if n_total == 0 {
         return Ok(());

@@ -939,7 +939,7 @@ pub fn batch_chunk_full_attn_prepare(
     _start_pos: usize,
     _max_ctx_len: usize,
     _ctx: &DispatchCtx,
-    _batch_semantics: BatchSemantics<'_>,
+    batch_semantics: BatchSemantics<'_>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     _kv_layer_idx: usize,
     layer_idx: usize,
@@ -952,6 +952,44 @@ pub fn batch_chunk_full_attn_prepare(
     fa_gate_in_place: bool,
     tap: Option<BatchedAttentionTap<'_>>,
 ) -> HipResult<()> {
+    // VL prompt chunk (`pbs.mrope`): explicit absolute (t, h, w) phases. The
+    // fused preps carry only 1D phases (and the fp8-Q prep a different Q
+    // format), so take the unfused deinterleave+Q-norm / K-norm chain and
+    // rotate with the batched M-RoPE kernel — the twin of the per-token
+    // `rope_mrope_halfsplit_f32` arm. KV write + attend are unchanged (they
+    // read the physical slots in `pbs.positions`). `pos_offset` is the
+    // cache's compact offset, like `upload_mrope_pos3`.
+    if let Some(mrope) = pbs.mrope {
+        if tree_verify.is_some() || batch_semantics.is_independent() {
+            return Err(HipError::new(
+                0,
+                "VL mrope rows cannot run under tree verify or independent batches",
+            ));
+        }
+        if gfx12_fa_prep || gfx12_fa_prep_fp8q || fa_gate_in_place {
+            return Err(HipError::new(
+                0,
+                "VL mrope rows cannot use the fused gfx12 FA prep (it bakes 1D rope)",
+            ));
+        }
+        fa_prep_unfused_qk_norm(gpu, layer, config, pbs, n)?;
+        if let Some(tap) = tap {
+            tap(gpu, layer_idx, &pbs.fa_q_batch, &pbs.fa_k_batch, n)?;
+        }
+        return gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &mrope.pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.n_rot,
+            config.rope_theta,
+            n,
+            kv_cache.compact_offset as i32,
+            mrope.section,
+        );
+    }
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
@@ -2520,25 +2558,31 @@ pub fn batch_chunk_full_attn_attn(
     // launch covers all N tokens at once.
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
-    let gfx12_fa_prep_f32 = gfx12_fa_prep_admitted(gpu, config, fusion, n, tap.is_some());
+    // VL mrope chunks (`pbs.mrope`) rotate in `batch_chunk_full_attn_prepare`'s
+    // unfused mrope arm: every fused prep below bakes 1D rope, and the fp8-Q
+    // prep additionally feeds an fp8-Q attend, so all stay off for them.
+    let vl_mrope = pbs.mrope.is_some();
+    let gfx12_fa_prep_f32 =
+        !vl_mrope && gfx12_fa_prep_admitted(gpu, config, fusion, n, tap.is_some());
     let math = verify_dense_math(gpu);
     // The PM FP8 verify scope has no in-place-gate / A4 out-projection arm
     // (`SingletonWmma` refuses them), so the fp8q prep stays off there.
-    let gfx12_fa_prep_fp8q = gfx12_fa_prep_fp8q_admitted(
-        gpu,
-        config,
-        kv_cache,
-        s,
-        n,
-        start_pos,
-        max_ctx_len,
-        batch_semantics,
-        tree_verify,
-        fa_attn_multirow,
-        fusion,
-        commit_stride,
-        tap.is_some(),
-    );
+    let gfx12_fa_prep_fp8q = !vl_mrope
+        && gfx12_fa_prep_fp8q_admitted(
+            gpu,
+            config,
+            kv_cache,
+            s,
+            n,
+            start_pos,
+            max_ctx_len,
+            batch_semantics,
+            tree_verify,
+            fa_attn_multirow,
+            fusion,
+            commit_stride,
+            tap.is_some(),
+        );
     let gfx12_fa_prep = gfx12_fa_prep_f32 || gfx12_fa_prep_fp8q;
     // Only the new ragged shape is admitted outside the incumbent n/commit
     // predicate. It keeps the F32 attention output (no A4 attention epilogue:
@@ -2594,6 +2638,7 @@ pub fn batch_chunk_full_attn_attn(
         math,
     )?;
     let fa_pm_qprep = fusion == DflashFusionCtx::Off
+        && !vl_mrope
         && !gfx12_fa_prep
         && !gfx12_fa_prep_fp8q
         && !fa_gate_in_place

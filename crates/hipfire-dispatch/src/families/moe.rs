@@ -509,8 +509,10 @@ fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Opti
     if dtypes.routed_has_mixed_experts {
         let (gate_up, down) = (dtypes.per_expert_gate_up?, dtypes.per_expert_down?);
         let (mut cold, mut mq4) = (None, false);
+        // `admits` once per distinct codec, not per expert: it resolves the arch's
+        // capability table and this pass runs per layer on every decode step.
         for (g, d) in gate_up.iter().zip(down) {
-            let codec = slab_codec_of_pair(*g, *d).filter(|codec| admits(*codec))?;
+            let codec = slab_codec_of_pair(*g, *d)?;
             if codec == 0 {
                 mq4 = true;
             } else if cold.map_or(true, |seen| seen == codec) {
@@ -519,7 +521,7 @@ fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Opti
                 return None;
             }
         }
-        (mq4 && cold.is_some()).then_some(cold)
+        (mq4 && admits(0) && cold.is_some_and(|codec| admits(codec))).then_some(cold)
     } else {
         let codec = slab_codec_of_pair(dtypes.routed_gate_up, dtypes.routed_down)
             .filter(|codec| admits(*codec))?;

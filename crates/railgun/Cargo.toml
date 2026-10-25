@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 railgun-corpus = { path = "../railgun-corpus" }
 serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
 thiserror.workspace = true
 parking_lot = { version = "0.12", optional = true }
 # `railgun::npu` HIP interop resolves libamdhip64 through the shared ROCm candidate list (layer 0).
@@ -33,6 +34,8 @@ mc-g2 = []
 g4-probe = []
 # `examples/boundary_bench.rs`: the gfx11 PM4 boundary-cost microbenchmark.
 boundary-bench = []
+# `examples/cond_probe.rs`: #867 conditional nodes (IF, bounded WHILE) on a gfx1151 compute queue.
+cond-probe = []
 # `railgun::npu`: the XDNA2 / AIE2P NPU runtime (amdxdna DRM ioctls, BOs, submit, ring, tape, FCLK guard,
 # dlopen'd HIP interop). Experimental and dark: no hipfire runtime path enables it.
 npu = ["dep:parking_lot", "dep:hipfire-config"]
@@ -48,3 +51,7 @@ required-features = ["mc-g2"]
 [[example]]
 name = "boundary_bench"
 required-features = ["boundary-bench"]
+
+[[example]]
+name = "cond_probe"
+required-features = ["cond-probe"]

@@ -1964,7 +1964,12 @@ fn pull_with_sidecar_pins(
         eprintln!("Already downloaded: {}", path.display());
         false
     } else if destination.exists()
-        && existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes)
+        && existing_artifact_valid(
+            &VerifiedCache::in_home(&paths.root),
+            &destination,
+            entry.sha256.as_deref(),
+            entry.size_bytes,
+        )
     {
         eprintln!("Already downloaded: {}", destination.display());
         false
@@ -2005,6 +2010,7 @@ fn pull_with_sidecar_pins(
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
         download_verified(
+            &VerifiedCache::in_home(&paths.root),
             &url,
             &destination,
             entry.sha256.as_deref(),
@@ -2031,6 +2037,7 @@ fn pull_with_sidecar_pins(
     if let Some(plan) = &ple_plan {
         for (format, sidecar) in &plan.sidecars {
             ple::fetch_ple_sidecar(
+                &VerifiedCache::in_home(&paths.root),
                 entry,
                 *format,
                 sidecar,
@@ -2049,6 +2056,7 @@ fn pull_with_sidecar_pins(
             continue;
         }
         fetch_registry_sidecar(
+            &VerifiedCache::in_home(&paths.root),
             declared.label,
             &entry.repo,
             declared.sidecar,
@@ -2072,6 +2080,7 @@ fn pull_with_sidecar_pins(
     if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, overlay_pins) {
         if pull_select::trunk_overlay_wanted(&ple::local_gpu_arches()) {
             fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
                 "Trunk overlay",
                 overlay.repo,
                 &overlay.sidecar,
@@ -2088,6 +2097,7 @@ fn pull_with_sidecar_pins(
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
                 "Expert hot set",
                 hotset.repo,
                 &hotset.sidecar,
@@ -2099,8 +2109,12 @@ fn pull_with_sidecar_pins(
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
         if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
+            if existing_artifact_valid(
+                &VerifiedCache::in_home(&paths.root),
+                &destination,
+                sidecar.sha256.as_deref(),
+                sidecar.size_bytes,
+            ) {
                 eprintln!("  head {name} already present: {}", sidecar.file);
                 continue;
             }
@@ -2108,6 +2122,7 @@ fn pull_with_sidecar_pins(
         }
         eprintln!("  Fetching head {name}: {}", sidecar.file);
         download_verified(
+            &VerifiedCache::in_home(&paths.root),
             &artifact_url(entry, &sidecar.file),
             &destination,
             sidecar.sha256.as_deref(),
@@ -2122,6 +2137,7 @@ fn pull_with_sidecar_pins(
 /// kept, a stale one (or any under `force`) is refreshed through
 /// [`download_verified`]. A failed download only warns; the base stays usable.
 fn fetch_registry_sidecar(
+    cache: &VerifiedCache,
     label: &str,
     repo: &str,
     sidecar: &Sidecar,
@@ -2129,7 +2145,12 @@ fn fetch_registry_sidecar(
     force: bool,
 ) {
     if destination.exists() && !force {
-        if existing_artifact_valid(destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+        if existing_artifact_valid(
+            cache,
+            destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+        ) {
             eprintln!("  {label} sidecar already present: {}", sidecar.file);
             return;
         }
@@ -2137,6 +2158,7 @@ fn fetch_registry_sidecar(
     }
     eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
     if let Err(error) = download_verified(
+        cache,
         &artifact_url_in(repo, &sidecar.file),
         destination,
         sidecar.sha256.as_deref(),
@@ -2167,6 +2189,7 @@ fn artifact_url_in(repo: &str, file: &str) -> String {
 thread_local! { static DOWNLOAD_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 pub(crate) fn download_verified(
+    cache: &VerifiedCache,
     url: &str,
     destination: &Path,
     expected_sha256: Option<&str>,
@@ -2241,6 +2264,17 @@ pub(crate) fn download_verified(
                 destination.display()
             )
         })?;
+        // The digest above is the proof: record it against the installed file's
+        // stat so later loads and proof-requiring checks never re-hash it.
+        if expected_sha256.is_some() {
+            if let Ok(installed) = fs::metadata(destination) {
+                cache.remember(
+                    destination,
+                    verified_cache::StatKey::of(&installed),
+                    &actual,
+                );
+            }
+        }
         eprintln!(
             "  Saved: {} ({:.3} GB, sha256 {})",
             destination.display(),
@@ -2278,7 +2312,12 @@ fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
     let _ = std::io::stderr().flush();
 }
 
+/// True when `path` is the pinned artifact: size, and SHA-256 when pinned. A
+/// file the cache already proved (same stat, same digest) is not hashed again;
+/// a file hashed here is recorded, so one verification serves every later
+/// load, pull and proof-requiring check ([`verified_metadata`]).
 pub(crate) fn existing_artifact_valid(
+    cache: &VerifiedCache,
     path: &Path,
     expected_sha256: Option<&str>,
     expected_size: Option<u64>,
@@ -2291,15 +2330,10 @@ pub(crate) fn existing_artifact_valid(
             return false;
         }
     }
-    if let Some(expected) = expected_sha256 {
-        let Ok(digest) = sha256_path(path) else {
-            return false;
-        };
-        if !digest.eq_ignore_ascii_case(expected) {
-            return false;
-        }
+    match expected_sha256 {
+        Some(expected) => verified_metadata(cache, path, expected, metadata.len()).is_ok(),
+        None => true,
     }
-    true
 }
 
 fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
@@ -20204,17 +20238,25 @@ effort = "high"
         hasher.update(content);
         let sha = format!("{:x}", hasher.finalize());
         let size = content.len() as u64;
-        assert!(existing_artifact_valid(&path, Some(&sha), Some(size)));
-        assert!(!existing_artifact_valid(&path, Some(&sha), Some(size + 1)));
+        let off = VerifiedCache::disabled();
+        assert!(existing_artifact_valid(&off, &path, Some(&sha), Some(size)));
         assert!(!existing_artifact_valid(
+            &off,
+            &path,
+            Some(&sha),
+            Some(size + 1)
+        ));
+        assert!(!existing_artifact_valid(
+            &off,
             &path,
             Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             Some(size)
         ));
         // No expectations means existence alone is valid
-        assert!(existing_artifact_valid(&path, None, None));
+        assert!(existing_artifact_valid(&off, &path, None, None));
         // Missing file is invalid
         assert!(!existing_artifact_valid(
+            &off,
             &dir.join("missing"),
             Some(&sha),
             Some(size)
@@ -20484,6 +20526,7 @@ effort = "high"
         // Place stale artifact with same name but wrong hash/size
         fs::write(paths.models.join("test-model.mq4"), stale).unwrap();
         assert!(!existing_artifact_valid(
+            &VerifiedCache::disabled(),
             &paths.models.join("test-model.mq4"),
             Some(&sha(fresh)),
             Some(fresh.len() as u64)
@@ -20592,6 +20635,7 @@ effort = "high"
         fs::create_dir_all(&dir).unwrap();
         let destination = dir.join("model.mq4");
         let error = download_verified(
+            &VerifiedCache::disabled(),
             "http://127.0.0.1:1/model.mq4",
             &destination,
             None,
@@ -22225,6 +22269,146 @@ effort = "high"
             }
             fs::remove_dir_all(&paths.root).unwrap();
         }
+    }
+
+    /// A pull records the verification proof of every artifact it verifies (the
+    /// split base, its PLE sidecar, the trunk overlay, the expert hot set), with
+    /// the identity `verified_metadata` records for a retired monolithic. Nothing
+    /// is hashed again afterwards: not by the validity check, not by a second
+    /// pull, not by the loader's read-only proof lookup.
+    #[test]
+    fn pull_records_a_proof_for_the_split_base_and_every_sidecar() {
+        use hipfire_config::memory::{expert_hotset_sidecar_path, trunk_overlay_sidecar_path};
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[]);
+        let _arch = ple::GpuArchOverride::set(&["gfx1151"]);
+        let paths = test_paths("pull-proof");
+        write_test_registry_cache(&paths, &gf_registry_raw());
+        let overlay_pins = gf_overlay_pins();
+        let hotset_pins = gf_hotset_pins();
+        let pull = |paths: &Paths| {
+            pull_with_sidecar_pins(
+                paths,
+                PullArgs::defaults("qwen3.8:flash-next"),
+                &overlay_pins,
+                &hotset_pins,
+                &grandfather_table(),
+            )
+        };
+        let (base_url, handle) = serve_files(&[
+            (SHARED_FILE_A, SHARED_BASE_A),
+            (SHARED_Q4_FILE, PLE_Q4),
+            (
+                "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+                GF_OVERLAY_BYTES,
+            ),
+            (
+                "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+                GF_HOTSET_BYTES,
+            ),
+        ]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base_url);
+        HASH_INVOCATIONS.with(|count| count.set(0));
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        let base = pull(&paths).unwrap().unwrap();
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS
+            .with(|count| assert_eq!(count.get(), 4, "base + q4 + overlay + hotset"));
+        assert_eq!(base, paths.models.join(SHARED_FILE_A));
+
+        let artifacts = [
+            (base.clone(), SHARED_BASE_A),
+            (paths.models.join(SHARED_Q4_FILE), PLE_Q4),
+            (trunk_overlay_sidecar_path(&base), GF_OVERLAY_BYTES),
+            (expert_hotset_sidecar_path(&base), GF_HOTSET_BYTES),
+        ];
+        let cache = VerifiedCache::in_home(&paths.root);
+        for (path, bytes) in artifacts.clone() {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+            let record = cached_record(&paths, &path)
+                .unwrap_or_else(|| panic!("no proof recorded for {}", path.display()));
+            let stat = verified_cache::StatKey::of(&fs::metadata(&path).unwrap());
+            let expected = format!("{:x}", Sha256::digest(bytes));
+            assert_eq!(record["sha256"], expected.as_str());
+            assert_eq!(record["size"], bytes.len() as u64);
+            assert!(record["verified_at"].as_u64().unwrap() > 0);
+            // The proof the loader and the identity gates read.
+            assert_eq!(cache.verified_digest(&path, &stat), Some(expected.clone()));
+            assert!(cache.satisfies(&path, &stat, &expected));
+        }
+        assert_eq!(hash_invocations(), 0, "the download hashed in stream");
+
+        // A validity check hashes nothing: the proof stands.
+        for (path, bytes) in artifacts {
+            for _ in 0..2 {
+                assert!(existing_artifact_valid(
+                    &cache,
+                    &path,
+                    Some(&format!("{:x}", Sha256::digest(bytes))),
+                    Some(bytes.len() as u64),
+                ));
+            }
+        }
+        assert_eq!(hash_invocations(), 0);
+
+        // A second pull finds everything present and re-hashes nothing.
+        let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+        assert_eq!(pull(&paths).unwrap().unwrap(), base);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 4));
+        assert_eq!(hash_invocations(), 0);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// An artifact already on disk (an older pull, a copied-in file) is hashed by
+    /// the first pull that finds it, the proof is recorded, and no later check
+    /// hashes it again until its stat changes.
+    #[test]
+    fn existing_artifact_valid_records_its_proof_and_hashes_once_per_stat() {
+        let paths = test_paths("valid-records");
+        fs::create_dir_all(&paths.models).unwrap();
+        let cache = VerifiedCache::in_home(&paths.root);
+        let path = paths.models.join("split-base.mq4-xts");
+        let bytes = b"synthetic split base";
+        fs::write(&path, bytes).unwrap();
+        let sha = format!("{:x}", Sha256::digest(bytes));
+        let size = bytes.len() as u64;
+        HASH_INVOCATIONS.with(|count| count.set(0));
+
+        assert!(existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 1);
+        assert!(cached_record(&paths, &path).is_some(), "proof recorded");
+        assert!(existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 1, "second check hits the proof");
+
+        // Same size, new bytes: the stat moves, the old proof no longer applies,
+        // and wrong bytes never earn one.
+        fs::write(&path, b"synthetic split BASE").unwrap();
+        assert!(!existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 2);
+        assert!(!existing_artifact_valid(
+            &cache,
+            &path,
+            Some(&sha),
+            Some(size)
+        ));
+        assert_eq!(hash_invocations(), 3, "a failed proof is never remembered");
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     /// A local HTTP server that serves `files` for any number of requests and

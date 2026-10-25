@@ -24,7 +24,8 @@ pub const IMAGE_TOKEN_ID: u32 = 248056;
 pub const VISION_START_TOKEN_ID: u32 = 248053;
 pub const VISION_END_TOKEN_ID: u32 = 248054;
 pub const VISION_TENSOR_COUNT: usize = 333;
-/// F16 matrices and F32 bias/norm vectors; the position table stays on CPU.
+/// Packed F16 matrices and F32 bias/norm vectors; the position table stays
+/// on CPU. Backend-specific fc2 row padding is additional resident storage.
 pub const DEVICE_WEIGHT_BYTES: u64 = 893_367_232;
 
 /// Maximum admitted patch count, bounded by the shared attention LDS contract.
@@ -34,18 +35,28 @@ pub const MAX_IMAGE_PATCHES: usize = 16_128;
 /// free-list-retained scratch of every size used by `VisionTowerJob`, not just
 /// simultaneously live tensors. We deliberately assume no cross-size reuse.
 ///
-/// WMMA: patches(1536), hidden(3*1152), QKV(3456), MLP(4304), rotary(2*36),
-/// projected(2560/4) floats per patch. Non-WMMA adds one transpose destination
-/// for each linear output size and a fourth hidden-width buffer. Layers reuse
-/// the same shapes, so the budget does not grow with tower depth. Model weights
-/// and caller-owned projected prompt rows are charged separately.
+/// Base WMMA: patches(1536), hidden(3*1152), QKV(3456), MLP(4304),
+/// rotary(2*36), projected(2560/4) floats per patch. The LDS GEMMs also retain
+/// F16 cast buffers at widths 1536, 1152 and padded 4352; the merger's
+/// `[patches/4, 4608]` cast reuses the same-size 1152 buffer. WMMA attention
+/// adds three F16 `[patches, 16, 80]` Q/K/V packs. Charge these even when an
+/// override selects mb8/naive, so the bound covers either backend selection.
+/// Non-WMMA keeps its transpose destinations and fourth hidden-width buffer.
+/// Layers reuse the same shapes, so the budget does not grow with tower depth.
+/// Model weights and caller-owned projected prompt rows are charged separately.
 pub fn device_scratch_bytes(max_patches: usize, has_wmma: bool) -> Result<u64, String> {
     if max_patches == 0 || max_patches > MAX_IMAGE_PATCHES || !max_patches.is_multiple_of(4) {
         return Err(
             "qwen4 vision: scratch patch budget must be a multiple of four in 4..=16128".into(),
         );
     }
-    let bytes_per_patch = if has_wmma { 53_856 } else { 92_064 };
+    let bytes_per_patch = if has_wmma {
+        let cast_bytes = 2 * (1536 + 1152 + 4352);
+        let attention_pack_bytes = 3 * 16 * 80 * 2;
+        53_856 + cast_bytes + attention_pack_bytes
+    } else {
+        92_064
+    };
     Ok(max_patches as u64 * bytes_per_patch)
 }
 

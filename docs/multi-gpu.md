@@ -1319,8 +1319,11 @@ partial sum that its consumer reduces: an `Accumulate` fuses one
 weights, or a single TP part (a PP stage), keep the op whole and local.
 Admission refuses, without allocating, a mixed policy, gate/up/down that do
 not share one intermediate, `intermediate % (parts * group)` on the down
-weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
-epilogue cannot take a partial sum).
+weight, and a ladder that has not opted in (`MlpLadder::tp_shardable`). Every
+ladder admits its `Write` form; the sandwich ladders (`SandwichWide`,
+`SandwichSteps`) split before their post-norm epilogue, which cannot take a
+partial sum, so a TP route binds the epilogue as a separate whole-row op
+after the reduction.
 
 The first end-to-end use is the Qwen4 dense developer profile: each rank
 holds the whole model with only its BF16 FFN slice
@@ -1398,6 +1401,57 @@ not show localizes to the two transports. Record per model the two `TP2` lines, 
 binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
 emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
 same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
+
+The third use is Muse Glimmer (`muse_glimmer::mesh_tp`, #927 item 5). Both
+Glimmer sublayers end in the sandwich epilogue `x + post_norm(out)`, and the
+RMS post-norm cannot take a partial sum, so each sublayer is split at that
+boundary: the attention (`SplitRule::HeadMixer`, `SandwichAttention`) writes
+the rank's `o_proj` partial and the MLP (`SplitRule::GatedMlp`,
+`MlpLadder::SandwichSteps`) its `down` partial, and the whole-row epilogue op
+after each takes one rank-ordered `AllReduce` of the partial, then runs the
+single-card post-norm residual kernels on the reduced rows
+(`execute_sandwich_attention_partial`, `execute_sandwich_mlp_partial`,
+`execute_sandwich_epilogue`; the single-card ops are unchanged). Each rank
+holds an even block of the query and KV heads, the `o_proj` columns and the
+FFN intermediate in whole G256 groups (`GlimmerWeights::load_shard`); the
+embedding and LM head are replicated. `muse-glimmer-30b` (32 query / 2 KV
+heads, intermediate 19968) splits over two ranks only: TP4 is refused by the
+plan (`n_heads=2 not divisible by Tp=4`). The loader still serves Glimmer on
+one device only (`muse_glimmer: single-device only`); this route is the
+executor program and its oracle, with no loader TP route yet. Oracle
+(`HIPFIRE_GLIMMER_TP_ROWS` prompt rows, default 16, as prefill epochs of at
+most `HIPFIRE_GLIMMER_TP_CHUNK` rows, default 16; then
+`HIPFIRE_GLIMMER_TP_GREEDY` tokens, default 480, teacher-forced to the plain
+card's greedy tokens, the first and the ninth as 1-row Prefill epochs; byte
+identity of the executor against the single-device rank-order oracle, which
+runs every rank's program on one device and folds the partials
+`p0 + p1 + …` with the executor's kernels; tokens and the maximum logit
+difference reported against the plain card):
+
+```sh
+cargo test --release -p hipfire-arch-muse-glimmer --lib --no-run
+HIPFIRE_EMULATE_GPUS=2 HIPFIRE_GLIMMER_TP_MODEL=<models>/muse-glimmer-30b.mq4 \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+```
+
+Physical Glimmer TP2 runbook (gfx1201, e.g. hiptrx). Fixture
+`muse-glimmer-30b.mq4` (sha256 `87bc776a…c052`, 18614785024 B; about 10.7 GB
+of weights per rank, the Q8 embedding and LM head replicated, so it fits two
+16 GB cards; the plain card and the oracle arm load
+the whole model on device 0, which needs a 32 GB card such as the R9700):
+
+```sh
+HIP_VISIBLE_DEVICES=0,1 HIPFIRE_GLIMMER_TP_PARTS=2 \
+  HIPFIRE_GLIMMER_TP_MODEL=<models>/muse-glimmer-30b.mq4 \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+```
+
+Pass: the test asserts the executor rows bitwise equal to the oracle's; record
+the `TP2 muse-glimmer-30b.mq4` line (oracle, TP and plain FNV-64, argmax
+agreement, max logit difference), the binary MD5, `HIP_VISIBLE_DEVICES`, the
+ROCm version and the transport `provision_mesh_edges` chose, plus the same
+line from the gfx1201 emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card) as a
+same-box reference.
 
 ### Architectural limits (current)
 

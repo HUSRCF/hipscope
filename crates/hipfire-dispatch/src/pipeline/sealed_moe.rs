@@ -962,10 +962,12 @@ pub struct ExpertTable {
     identity: u64,
     experts: Vec<ExpertMetadata>,
     contract: Option<ExpertExecutionContract>,
-    /// Every record has the same projection layout (dtype, basis and shape of
-    /// each gate/up/down source), so a per-call shape/dtype check of record 0
-    /// decides it for all of them.
-    uniform_layout: bool,
+    /// First record of each distinct projection layout (dtype, basis and shape
+    /// of each gate/up/down source), and per record the first record of its
+    /// layout: a per-call shape/dtype check of the first records decides every
+    /// record (one for a uniform table, two for an MQ4 + cold-codec slab layer).
+    layout_reps: Vec<usize>,
+    layout_rep_of: Vec<usize>,
 }
 
 impl ExpertTable {
@@ -985,14 +987,30 @@ impl ExpertTable {
                 key(Some(r.down())),
             ]
         }
-        let uniform_layout = experts
-            .first()
-            .is_some_and(|first| experts.iter().all(|record| layout(record) == layout(first)));
+        let mut layout_reps: Vec<usize> = Vec::new();
+        let layout_rep_of = experts
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let key = layout(record);
+                match layout_reps
+                    .iter()
+                    .find(|&&rep| layout(&experts[rep]) == key)
+                {
+                    Some(&rep) => rep,
+                    None => {
+                        layout_reps.push(index);
+                        index
+                    }
+                }
+            })
+            .collect();
         Ok(Self {
             identity,
             experts,
             contract: None,
-            uniform_layout,
+            layout_reps,
+            layout_rep_of,
         })
     }
 
@@ -1791,16 +1809,13 @@ impl<'a> BoundMoeExperts<'a> {
         &self.table.experts
     }
 
-    /// Records that decide a layout-only check (dtype, basis, shape against
-    /// expectations shared by every expert): record 0 of a uniform table,
-    /// otherwise all of them.
-    fn layout_records(&self) -> &[ExpertMetadata] {
-        let records = &self.table.experts;
-        if self.table.uniform_layout {
-            &records[..records.len().min(1)]
-        } else {
-            records
-        }
+    /// `(index, record)` of the first record of each distinct layout: the
+    /// records that decide a layout-only check (dtype, basis, shape).
+    fn layout_reps(&self) -> impl Iterator<Item = (usize, &ExpertMetadata)> {
+        self.table
+            .layout_reps
+            .iter()
+            .map(|&index| (index, &self.table.experts[index]))
     }
 
     /// The deterministic execution contract adapted from the sealed plan, if
@@ -4077,14 +4092,10 @@ fn validate_expert_shape_and_dtype(
         )));
     }
     let separate_gate_up_rows = gate_up_rows / 2;
-    // Without per-expert dtype tables every record is checked against the same
-    // expectations, so a uniform table's record 0 decides every record.
-    let records = if per_gate_up.is_none() && per_down.is_none() {
-        experts.layout_records()
-    } else {
-        experts.records()
-    };
-    for (index, expert) in records.iter().enumerate() {
+    // Records of one layout share dtype, basis and shape: the first record of
+    // each layout is checked in full, every other one only declares its
+    // layout's dtypes (below).
+    for (index, expert) in experts.layout_reps() {
         let resources = expert.resources();
         let expected_gate_up = per_gate_up.map_or(representative_gate_up, |values| values[index]);
         let gate_up_dtype = if let Some(gate_up) = resources.gate_up() {
@@ -4169,6 +4180,22 @@ fn validate_expert_shape_and_dtype(
             )));
         }
         validate_logical_shape(down.shape(), down_rows, down_cols, "down", index)?;
+    }
+    // A record's dtypes are its layout's, checked above against the first
+    // record's declarations: every record must declare the same.
+    if let (Some(per_gate_up), Some(per_down)) = (per_gate_up, per_down) {
+        for (index, &rep) in experts.table.layout_rep_of.iter().enumerate() {
+            if per_gate_up[index] != per_gate_up[rep] {
+                return Err(invalid(format!(
+                    "expert {index} gate/up dtype differs from the declared source metadata"
+                )));
+            }
+            if per_down[index] != per_down[rep] {
+                return Err(invalid(format!(
+                    "expert {index} down dtype differs from the declared source metadata"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -4880,7 +4907,7 @@ fn expected_basis(
     representative: DType,
 ) -> Result<RotationPlan, DispatchError> {
     let basis = dtype_rotation_plan(representative);
-    for (index, expert) in experts.layout_records().iter().enumerate() {
+    for (index, expert) in experts.layout_reps() {
         let resource = expert
             .resources()
             .gate_up()
@@ -5927,6 +5954,72 @@ mod tests {
             .matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags")
             .is_err());
         assert!(LiveTensorIdentity::capture_with_tail(&tags, "tags", 4).is_err());
+    }
+
+    #[test]
+    fn mixed_layout_validation_checks_every_record_not_only_each_layouts_first() {
+        const MQ4: (DType, DType) = (DType::MQ4G256V2, DType::MQ4G128V2);
+        const W3: (DType, DType) = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
+        let expert = |index: usize, (gate, down): (DType, DType), k: usize| {
+            ExpertMetadata::new(
+                index,
+                0,
+                index,
+                ExpertResources::fused(
+                    resource(&format!("gu{index}"), gate, &[8, k]),
+                    resource(&format!("dn{index}"), down, &[4, 256]),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let check = |table: &ExpertTable, pairs: &[(DType, DType)]| {
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let mut fixture = live_fixture(table, 0xc0_0000);
+            let n = table.n_experts();
+            let tags = n + dtype_tag_tail_bytes(table).unwrap();
+            fixture.dtype_tags = Some(live_tensor(0xe0_0000, tags, &[n], DType::Raw));
+            bind_fixture(table, &mut cache, &fixture);
+            let bound = BoundMoeExperts::from_cache(table, &cache).unwrap();
+            let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
+            let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
+            validate_expert_shape_and_dtype(
+                &bound,
+                pairs.len(),
+                8,
+                256,
+                4,
+                256,
+                MQ4.0,
+                MQ4.1,
+                true,
+                Some(&gate_up),
+                Some(&down),
+            )
+            .map_err(|error| format!("{error:?}"))
+        };
+        let pairs = [MQ4, W3, MQ4, W3];
+        let slab = ExpertTable::new(
+            (0..4)
+                .map(|index| expert(index, pairs[index], 256))
+                .collect(),
+        )
+        .unwrap();
+        check(&slab, &pairs).unwrap();
+        // A declaration that differs from a later record of its layout.
+        let error = check(&slab, &[MQ4, W3, MQ4, MQ4]).unwrap_err();
+        assert!(error.contains("expert 3 gate/up dtype differs"), "{error}");
+        let error = check(&slab, &[MQ4, W3, (MQ4.0, W3.1), W3]).unwrap_err();
+        assert!(error.contains("expert 2 down dtype differs"), "{error}");
+        // A record whose shape differs is its own layout and is checked in full.
+        let narrow = ExpertTable::new(vec![
+            expert(0, MQ4, 256),
+            expert(1, W3, 256),
+            expert(2, MQ4, 128),
+        ])
+        .unwrap();
+        let error = check(&narrow, &[MQ4, W3, MQ4]).unwrap_err();
+        assert!(error.contains("expert 2 gate/up logical shape"), "{error}");
     }
 
     #[test]
@@ -8859,6 +8952,72 @@ mod tests {
                 "rows={rows}"
             );
         }
+    }
+
+    /// HIPF-137: a Paro shared gate/up rotates into `x_rot_batch`, so the routed
+    /// Paro input basis must be lowered after the shared stages, not before
+    /// them (otherwise the routed GEMMs read the shared up's rotation).
+    #[test]
+    fn paro_prefill_lowers_the_routed_input_basis_after_the_shared_stages() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_1000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = prefill_scratch(0xE9_1000);
+        let params = MoePrefillParams {
+            batch_size: 21,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            )
+        };
+        let resolution = crate::families::moe::MoePrefillResolution {
+            use_path2: true,
+            paro_mode: true,
+            ..crate::families::moe::MoePrefillResolution::sealed_fp8()
+        };
+        let selection = MoeKernelSelection::Prefill(MoePrefillSelection {
+            resolution,
+            path2_m_total: params.m_total_max,
+            force_mq4_grouped_fp16: false,
+            coalesced_verify: false,
+            route: None,
+            cpu_deferred_experts: false,
+            cpu_split: false,
+            cpwait: false,
+        });
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+        let stages = moe_program::lowered_stages(&call).unwrap();
+        let at = |stage: MoeStage| stages.iter().position(|s| *s == stage).unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|s| **s == MoeStage::InputBasis)
+                .count(),
+            1,
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::SharedGateUp) < at(MoeStage::InputBasis),
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::SharedDown) < at(MoeStage::InputBasis),
+            "{stages:?}"
+        );
+        assert!(
+            at(MoeStage::InputBasis) < at(MoeStage::Scatter),
+            "{stages:?}"
+        );
     }
 
     /// `with` is `without` plus exactly one `RowGather`, right after the

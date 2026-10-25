@@ -110,8 +110,16 @@ pub struct VisionLayerWeights {
     pub norm2_b: GpuTensor,
     pub fc1_w: GpuTensor,
     pub fc1_b: GpuTensor,
+    /// MLP down-projection weight, F16 `[hidden, fc2_ld]` row-major. When the
+    /// LDS GEMM route is active and `mlp_dim % 64 != 0` (4304 on the 27B
+    /// tower) each row carries `fc2_ld - mlp_dim` trailing zero columns;
+    /// otherwise `fc2_ld == mlp_dim` and the matrix is packed.
     pub fc2_w: GpuTensor,
     pub fc2_b: GpuTensor,
+    /// Row pitch (elements) of `fc2_w`: `mlp_dim` rounded up to 64 on the LDS
+    /// route when `mlp_dim % 64 != 0`, else `mlp_dim`. Fixed at load by the
+    /// same predicate (`vit_lds_route`) `linear_f16_ld` re-evaluates.
+    pub fc2_ld: usize,
 }
 
 pub struct VisionWeights {
@@ -257,16 +265,19 @@ fn f32_bytes_to_f16_bytes_checked(data: &[u8], n: usize, tensor: &str) -> HipRes
     Ok(out)
 }
 
-fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
+/// Raw F16 bytes of a vision weight (F16 / F32-oracle / HFQ4 sources) and its
+/// element count. Borrowed for native F16, owned when a conversion ran.
+fn load_f16_bytes<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> HipResult<(std::borrow::Cow<'a, [u8]>, usize)> {
     let (info, data) = hfq
         .tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
-        1 => {
-            // F16 — upload directly. Shape records element count, not byte count.
-            gpu.upload_raw(data, &[n])
-        }
+        // F16 — use directly. Shape records element count, not byte count.
+        1 => Ok((std::borrow::Cow::Borrowed(data), n)),
         2 => {
             // F32 oracle — the vision kernels consume F16 matrices, so narrow
             // the lossless decoder-oracle container at load time just as the
@@ -277,7 +288,7 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             // truncation/length checks and the per-element F16-range validation
             // so the production path is mechanically tied to focused tests.
             let f16_bytes = f32_bytes_to_f16_bytes_checked(data, n, name)?;
-            gpu.upload_raw(&f16_bytes, &[n])
+            Ok((std::borrow::Cow::Owned(f16_bytes), n))
         }
         6 | 7 => {
             // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
@@ -287,7 +298,7 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
-            gpu.upload_raw(&f16_bytes, &[n])
+            Ok((std::borrow::Cow::Owned(f16_bytes), n))
         }
         other => {
             panic!(
@@ -296,6 +307,41 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             )
         }
     }
+}
+
+fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
+    let (bytes, n) = load_f16_bytes(hfq, name)?;
+    gpu.upload_raw(&bytes, &[n])
+}
+
+/// Upload a `[rows, cols]` F16 weight at row pitch `pitch >= cols`, the
+/// `pitch - cols` trailing columns of every row being exact zeros. Shape is
+/// recorded as the element count `rows * pitch`, like every other vision
+/// weight.
+fn load_f16_gpu_padded(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    pitch: usize,
+) -> HipResult<GpuTensor> {
+    let (bytes, n) = load_f16_bytes(hfq, name)?;
+    if n != rows * cols || bytes.len() < n * 2 || pitch < cols {
+        return Err(HipError::new(
+            1,
+            &format!("{name}: cannot pad {n} elements to [{rows}, {cols}] at pitch {pitch}"),
+        ));
+    }
+    let mut padded = vec![0u8; rows * pitch * 2];
+    for r in 0..rows {
+        padded[r * pitch * 2..(r * pitch + cols) * 2]
+            .copy_from_slice(&bytes[r * cols * 2..(r + 1) * cols * 2]);
+    }
+    // Typed F16: the pitched LDS entries assert their operand dtype.
+    let mut t = gpu.upload_raw(&padded, &[rows * pitch])?;
+    t.dtype = DType::F16;
+    Ok(t)
 }
 
 /// Dequantize HFQ4 blocks to F32, using actual group_size (128 or 256).
@@ -894,14 +940,46 @@ mod tests {
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
 
+/// `HIPFIRE_VIT_GEMM=mb8` forces every tower linear onto the register-blocked
+/// `gemm_f16_wmma_mb8` (the pre-LDS path); anything else (default `auto`)
+/// lets [`vit_lds_route`] pick the LDS-tiled WMMA GEMM. Read once.
+fn vit_gemm_mb8() -> bool {
+    use std::sync::LazyLock;
+    static MB8: LazyLock<bool> = LazyLock::new(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_VIT_GEMM").as_deref(),
+            Ok("mb8")
+        )
+    });
+    *MB8
+}
+
+/// K granularity of the LDS GEMM entries (`K % 64 == 0`).
+const VIT_LDS_K_ALIGN: usize = 64;
+
+/// Whether a tower linear with `out_dim` outputs takes the LDS-tiled WMMA
+/// route: gfx1201 (exact) or a gfx11 wave32-WMMA arch, `out_dim >= 256`, and
+/// `HIPFIRE_VIT_GEMM` is not `mb8`. Pure function of process-constant state,
+/// so the loader (fc2 weight padding) and `linear_f16_ld` always agree.
+fn vit_lds_route(gpu: &Gpu, out_dim: usize) -> bool {
+    !vit_gemm_mb8() && out_dim >= 256 && (gpu.arch == "gfx1201" || gpu.arch_caps.has_wmma_w32())
+}
+
+/// gfx1201 tile policy, copied from the qwen35-embed encoder's
+/// `projection_gfx1201_tile` (all three tiles are admitted by both the
+/// packed and the pitched split-1 entries).
+fn vit_gfx1201_tile(out_dim: usize) -> rdna_compute::gemm::LdsTileSplitK {
+    use rdna_compute::gemm::LdsTileSplitK;
+    match out_dim {
+        0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+        512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+        _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+    }
+}
+
 /// Vision linear: Y[n, out_dim] = W_f16[out_dim, in_dim] @ X_f32[n, in_dim]^T + bias.
-///
-/// On wave32-WMMA arches (gfx11 and gfx12/RDNA4) this goes through
-/// `gemm_f16_wmma_mb8`, which writes row-major `[n, out_dim]` directly and so
-/// drops the separate `transpose_f32` pass the naive path needs. Same routing
-/// dots.ocr already uses (`hipfire-arch-dots-ocr/src/dots_ocr.rs`), and the
-/// gfx12 sibling is covered by `rdna-compute/examples/test_dots_ocr_wmma_gfx12.rs`.
-/// Non-WMMA arches keep the naive `gemm_f16` + transpose fallback.
+/// Weights are packed (row pitch == `in_dim`); see [`linear_f16_ld`] for the
+/// zero-padded fc2 weight.
 fn linear_f16(
     gpu: &mut Scratch<'_>,
     w: &GpuTensor,
@@ -911,7 +989,89 @@ fn linear_f16(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
+    linear_f16_ld(gpu, w, in_dim, x, bias, out_dim, in_dim, n)
+}
+
+/// [`linear_f16`] with an explicit weight row pitch `w_ld` (elements).
+///
+/// Routing (see [`vit_lds_route`]):
+/// * **LDS route** (gfx1201 exact, or gfx11 `has_wmma_w32`; `out_dim >= 256`;
+///   `HIPFIRE_VIT_GEMM != mb8`): X is cast F32 → F16 into a scratch
+///   `[n, K_pad]` (`K_pad = round_up(in_dim, 64)`, pad columns written as
+///   zeros), then the LDS-staged WMMA GEMM runs with `K = K_pad`. The weight
+///   must be stored at pitch `K_pad` (`w_ld == K_pad`; zero pad columns), so
+///   the extra terms are exact `0 * 0`. gfx1201 uses the split-1 tiles of
+///   `gemm_f16_x_f16_wmma_lds_splitk[_ld]` (no fused bias, so `bias_add_f32`
+///   follows); gfx11 uses `gemm_f16_x_f16_wmma_lds_auto_ld` with the bias fused.
+/// * **mb8**: `gemm_f16_wmma_mb8` (F32 X) + `bias_add_f32`, on any other WMMA
+///   arch and whenever the LDS route is off (also for a packed weight with
+///   `in_dim % 64 != 0`).
+/// * Non-WMMA arches keep the naive `gemm_f16` + transpose fallback.
+///
+/// Precision: unchanged. `gemm_f16_wmma_mb8` already rounds each X element
+/// to F16 for its WMMA B operand, so the explicit F32 -> F16 cast here is the
+/// same rounding; both accumulate in F32 over ascending 16-wide K steps (the
+/// tower shapes measured bit-identical to mb8 on gfx1201, see
+/// `bench_vit_gemm_shapes`). Weights unchanged (already F16). No bf16/fp8.
+#[allow(clippy::too_many_arguments)]
+fn linear_f16_ld(
+    gpu: &mut Scratch<'_>,
+    w: &GpuTensor,
+    w_ld: usize,
+    x: &GpuTensor,
+    bias: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let k_pad = in_dim.next_multiple_of(VIT_LDS_K_ALIGN);
+    let lds = vit_lds_route(gpu, out_dim) && w_ld == k_pad;
+    if !lds && w_ld != in_dim {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "linear_f16: weight row pitch {w_ld} needs the LDS GEMM route \
+                 (in_dim {in_dim}, K_pad {k_pad}, out_dim {out_dim}) but it is not active"
+            ),
+        ));
+    }
     let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+    if lds {
+        // The outer scratch transaction owns both outputs and cast buffers.
+        // An allocation/cast/launch error fences before reclaiming either.
+        let x16 = gpu.alloc_tensor(&[n * k_pad], DType::F16)?;
+        if k_pad == in_dim {
+            gpu.cast_f32_to_f16(x, &x16)?;
+        } else {
+            gpu.cast_f32_to_f16_pitched(x, &x16, n, in_dim, k_pad)?;
+        }
+        if gpu.arch == "gfx1201" {
+            let tile = vit_gfx1201_tile(out_dim);
+            if k_pad == in_dim {
+                gpu.gemm_f16_x_f16_wmma_lds_splitk(w, &x16, &y, out_dim, k_pad, n, tile)?;
+            } else {
+                gpu.gemm_f16_x_f16_wmma_lds_splitk_ld(
+                    w, &x16, &y, out_dim, k_pad, n, tile, k_pad, k_pad,
+                )?;
+            }
+            gpu.bias_add_f32(&y, bias, n, out_dim)?;
+        } else {
+            // gfx11: bias fused into the GEMM epilogue.
+            gpu.gemm_f16_x_f16_wmma_lds_auto_ld(
+                w,
+                &x16,
+                &y,
+                Some(bias),
+                out_dim,
+                k_pad,
+                n,
+                k_pad,
+                k_pad,
+            )?;
+        }
+        gpu.free_tensor(x16)?;
+        return Ok(y);
+    }
     if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
         gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
@@ -995,11 +1155,56 @@ pub struct VisionTowerJob {
     grid_w: usize,
     /// Next tower layer to run (`0..num_layers`).
     next_layer: usize,
-    /// Naive per-(head, query) attention fallback (HIPFIRE_VIT_ATTN=naive or
-    /// head shapes outside the Q-tiled kernel's contract).
-    attn_naive: bool,
+    /// Self-attention kernel for this image (HIPFIRE_VIT_ATTN / arch / head_dim).
+    attn: VitAttn,
     dump_dir: Option<std::path::PathBuf>,
     t0: std::time::Instant,
+}
+
+/// ViT self-attention kernel choice, made once per image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VitAttn {
+    /// WMMA flash kernel, head_dim <= 80 (zero-padded to 80), gfx11/gfx12.
+    Wmma,
+    /// Scalar Q-tiled flash kernel, any head_dim <= 128.
+    QTiled,
+    /// Per-(head, query) fallback, any head_dim.
+    Naive,
+}
+
+/// Resolve `HIPFIRE_VIT_ATTN` (`auto|wmma|qtiled|naive`, default auto).
+/// auto: Wmma when the arch has wave32 WMMA and head_dim <= 80, else QTiled
+/// when head_dim <= 128, else Naive. Explicit `wmma` errors if the arch lacks
+/// WMMA or head_dim > 80; explicit `qtiled` with head_dim > 128 falls back to
+/// naive inside the dispatcher.
+fn select_vit_attn(gpu: &Gpu, head_dim: usize) -> HipResult<VitAttn> {
+    let has_wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
+    let var = hipfire_config::developer_var("HIPFIRE_VIT_ATTN");
+    match var.as_deref() {
+        Ok("naive") => Ok(VitAttn::Naive),
+        Ok("qtiled") => Ok(VitAttn::QTiled),
+        Ok("wmma") => {
+            if has_wmma && head_dim <= 80 {
+                Ok(VitAttn::Wmma)
+            } else {
+                Err(HipError::new(
+                    0,
+                    &format!(
+                        "HIPFIRE_VIT_ATTN=wmma needs wave32 WMMA and head_dim <= 80 \
+                         (arch={}, head_dim={head_dim})",
+                        gpu.arch
+                    ),
+                ))
+            }
+        }
+        _ => Ok(if has_wmma && head_dim <= 80 {
+            VitAttn::Wmma
+        } else if head_dim <= 128 {
+            VitAttn::QTiled
+        } else {
+            VitAttn::Naive
+        }),
+    }
 }
 
 impl VisionTowerJob {
@@ -1110,11 +1315,9 @@ impl VisionTowerJob {
         );
         let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
         let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
-        let attn_naive = matches!(
-            hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
-            Ok("naive")
-        ) || config.head_dim % 16 != 0
-            || config.head_dim > 128;
+        // Preserve beta's attention routing while transferring only real
+        // owners out of the prologue transaction after every step succeeds.
+        let attn = select_vit_attn(gpu, config.head_dim)?;
 
         Ok(Self {
             x: gpu.take(x),
@@ -1124,7 +1327,7 @@ impl VisionTowerJob {
             grid_h,
             grid_w,
             next_layer: 0,
-            attn_naive,
+            attn,
             dump_dir,
             t0,
         })
@@ -1179,10 +1382,26 @@ impl VisionTowerJob {
 
         // Self-attention
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        if self.attn_naive {
-            gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
-        } else {
-            gpu.vit_attention_qtiled_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+        match self.attn {
+            VitAttn::Naive => {
+                gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?
+            }
+            VitAttn::QTiled => gpu.vit_attention_qtiled_f32(
+                &qkv,
+                &attn_out,
+                n,
+                h,
+                config.num_heads,
+                config.head_dim,
+            )?,
+            VitAttn::Wmma => gpu.vit_attention_wmma_f32(
+                &qkv,
+                &attn_out,
+                n,
+                h,
+                config.num_heads,
+                config.head_dim,
+            )?,
         }
         gpu.free_tensor(qkv)?;
 
@@ -1210,7 +1429,16 @@ impl VisionTowerJob {
         let fc1 = linear_f16(&mut gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
         gpu.free_tensor(tmp2)?;
         gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
-        let fc2 = linear_f16(&mut gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
+        let fc2 = linear_f16_ld(
+            &mut gpu,
+            &lw.fc2_w,
+            lw.fc2_ld,
+            &fc1,
+            &lw.fc2_b,
+            h,
+            config.mlp_dim,
+            n,
+        )?;
         gpu.free_tensor(fc1)?;
 
         // Residual: x += fc2

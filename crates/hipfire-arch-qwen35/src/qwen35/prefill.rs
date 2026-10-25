@@ -2558,7 +2558,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
 /// singleton after a full ceiling: shorten that chunk by one row so the
 /// 512-row recurrent segments end in a 511-row partial and the final chunk has
 /// two rows. The same rule maps a final in-ceiling 513 rows to 511 + 2.
-pub(crate) fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+pub fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining < MIN_BATCH || ceiling < MIN_BATCH {
         return None;
     }
@@ -2807,6 +2807,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    // VL: a captured replay would bake the image splice / phase staging into
+    // the graph, and this entry bypasses the eligibility gate.
+    super::vl_prefill::refuse_overlap(start_pos, tokens.len(), "captured prefill")?;
     let n = tokens.len();
     debug_assert!(
         n > 0 && n <= pbs.max_batch,
@@ -3452,6 +3455,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     }
 
     if !eligible {
+        // VL: the per-token loop below cannot splice image embeddings or rotate
+        // at mrope phases. Surfaces before any KV / recurrent state is touched.
+        super::vl_prefill::refuse_overlap(start_pos, n, "per-token prefill fallback")?;
         assert!(
             tree_verify.is_none(),
             "tree-verify mode requires the batched-FA-eligible prefill path; \
@@ -3772,7 +3778,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             } else {
                 None
             };
+            // VL chunks take the single-chunk route below (hooked); the F2
+            // pair route has no splice / mrope staging.
             if pair_b == Some(FA_PAIR_ROWS)
+                && !super::vl_prefill::overlaps(start_pos + chunk_start, 2 * FA_PAIR_ROWS)
                 && fa_pair_merge_admitted(
                     chunk_n,
                     FA_PAIR_ROWS,
@@ -6282,6 +6291,7 @@ fn forward_prefill_chunk_pair(
     debug_assert!(tokens_c.len() == n && tokens_n.len() == n);
     debug_assert!(pbs_c.max_batch >= n && pbs_n.max_batch >= n);
     let start_c = start_pos + chunk_start_c;
+    super::vl_prefill::refuse_overlap(start_c, 2 * n, "F2 chunk-pair")?;
     let start_n = start_c + n;
     let max_ctx_c = start_c + n;
     let max_ctx_n = start_n + n;
@@ -6967,6 +6977,29 @@ fn forward_prefill_chunk_pair(
     Ok(())
 }
 
+/// Every full-attention layer takes the batched FA route (KV tier with
+/// batched keys + batch-admissible layer weights); else the per-token FA
+/// fallback runs. Shared by the chunk body and the VL route check.
+fn fa_layers_batched_ok(
+    kv_cache: &llama::KvCache,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    arch: &str,
+) -> bool {
+    // Slice-B admission: native fp8 KV takes the batched FA path.
+    (kv_cache.quant_q8
+        || kv_cache.quant_asym4
+        || kv_cache.quant_asym3
+        || kv_cache.quant_asym2
+        || kv_cache.quant_fp8)
+        && weights.layers.iter().all(|lw| match lw {
+            LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
+                qwen35_layer_batch_admissible(lw, config, arch).is_ok()
+            }
+            _ => true,
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_batch_chunk_impl(
     gpu: &mut Gpu,
@@ -7016,6 +7049,28 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         gdn_tape.as_deref(),
     )?;
+    // VL prompt chunk: refuse every route that cannot splice image rows and
+    // rotate at mrope phases BEFORE any scratch / KV / recurrent write.
+    if super::vl_prefill::overlaps(start_pos, n) {
+        super::vl_prefill::check_chunk_route(
+            start_pos,
+            n,
+            &super::vl_prefill::ChunkRoute {
+                sequential: matches!(batch_semantics, BatchSemantics::Sequential),
+                tree_verify: tree_verify.is_some(),
+                pre_embedded,
+                pre_uploaded,
+                banded: band.is_some(),
+                mask_override: mask_override.is_some(),
+                capturing: gpu.graphs.capture_mode || gpu.replay.is_recording(),
+                fa_unbatched: !fa_layers_batched_ok(kv_cache, weights, config, gpu.arch.as_str()),
+                moe_fa: weights
+                    .layers
+                    .iter()
+                    .any(|lw| matches!(lw, LayerWeights::FullAttnMoe(_))),
+            },
+        )?;
+    }
     let inactive_mask = match batch_semantics.active_mask() {
         Some(active_mask) => {
             let full_mask = valid_lane_mask(n)?;
@@ -7118,22 +7173,18 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         pre_uploaded,
     )?;
+    // VL: splice the vision tower's embeddings over this chunk's image rows
+    // (after the token embedding + mask override, before layer 0) and stage
+    // the chunk's absolute mrope phases into `pbs.pos3`. No-ops without an
+    // installed `vl_prefill` scope overlapping the chunk.
+    super::vl_prefill::splice_image_rows(gpu, &pbs.x_batch, start_pos, n)?;
+    let vl_rope_section = super::vl_prefill::stage_rope_rows(gpu, &pbs.pos3, start_pos, n)?;
 
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
     // Slice-B admission (see above): native fp8 KV takes the batched FA path.
-    let fa_batched_ok = (kv_cache.quant_q8
-        || kv_cache.quant_asym4
-        || kv_cache.quant_asym3
-        || kv_cache.quant_asym2
-        || kv_cache.quant_fp8)
-        && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
-                qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()
-            }
-            _ => true,
-        });
+    let fa_batched_ok = fa_layers_batched_ok(kv_cache, weights, config, fa_arch);
     // Attention only: the batched masked FA kernel grids [n_heads, tiles, ROW]
     // and re-scans the whole KV once per row, so a small verify block over a
     // long context pays the scan n times (202 vs 103 ms at 33k). The layer's
@@ -7222,8 +7273,13 @@ pub(crate) fn forward_batch_chunk_impl(
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
         && (gpu.flags.iu4_prefill_enabled()
             || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
-        // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
-        && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
+        // The scan never reads KV, so the clause only names qualified tiers:
+        // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
+        // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
+        && (kv_cache.quant_fp8
+            || (gpu.arch != "gfx1201" && kv_cache.quant_q8)
+            || kv_cache.quant_asym4
+            || kv_cache.quant_asym3)
         && dn_state.quant == StateQuant::Q8
         && !dn_state.s_matrices.is_empty()
         && dn_state.s_matrices.len() == dn_state.s_scales.len()
@@ -7294,7 +7350,13 @@ pub(crate) fn forward_batch_chunk_impl(
         .with_verify_tile_attend(fusion.is_chain_verify())
         .with_batch_size(n);
     let dims = hybrid_dims(config);
-    let batch = pbs.view();
+    let mut batch = pbs.view();
+    if let Some(section) = vl_rope_section {
+        batch.mrope = Some(hipfire_dispatch::pipeline::batched::MropeRows {
+            pos3: &pbs.pos3,
+            section,
+        });
+    }
     let flash = flash_scratch(s);
     let tap_fn = batched_attention_tap(config);
     let tap = tap_fn.get();

@@ -1467,6 +1467,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "railgun",
  "rdna-compute",
  "saddle-core",
  "serde",
@@ -1498,6 +1499,7 @@ dependencies = [
  "libjpeg-turbo-rs",
  "rdna-compute",
  "serde_json",
+ "sha2",
  "va-bridge",
 ]
 
@@ -2666,6 +2668,7 @@ name = "peacemaker-ir"
 version = "0.4.4"
 dependencies = [
  "insta",
+ "peacemaker-lift",
  "petgraph",
  "proptest",
  "serde_json",

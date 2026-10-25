@@ -3446,8 +3446,8 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // Keep the sealed inventory unchanged; beta later added the
-                // HC-write widening, and vision adds mRoPE to the shared source.
+                // Keep the sealed inventory unchanged; the later rope table and
+                // vision mRoPE exports extend it. HC x8 stays gfx1201-only.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3456,7 +3456,6 @@ mod tests {
                         .iter()
                         .copied()
                         .chain([
-                            "hyper_write_bf16x8_gfx1201",
                             "indexed_attention_rope_table_f32",
                             "indexed_attention_norm_mrope_f32_batched",
                             "indexed_attention_pool_mrope_bf16",

@@ -1386,9 +1386,10 @@ fn execute_hyper_read_inner(
             }
             None => hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?,
         }
-        // gfx1201 HC-down + activation as one launch (byte-identical to the
-        // F16 WMMA GEMM + `hc_activation_fused_f32` chain): the packed BF16
-        // `low_bf16` is the only output the WMMA read consumes.
+        // gfx1201 / gfx1151 HC-down + activation as one launch (byte-identical to the
+        // F16 WMMA GEMM + `hc_activation_fused_f32` chain on the same arch): the packed BF16
+        // `low_bf16` is the only output the WMMA read consumes.  The NPU trunk pair route
+        // (`HcFusionCursor` windows) reaches this same call through `execute_hyper_read_inner`.
         match low_bf16.as_ref().filter(|_| {
             wmma_read
                 && op.low_rank == op.input_mix_down.m

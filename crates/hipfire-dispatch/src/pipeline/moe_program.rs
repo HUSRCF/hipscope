@@ -2599,7 +2599,14 @@ fn lower_prefill<'a>(
     );
     match params.recipe {
         MoeRecipe::SoftmaxGatedShared { .. } => {
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            // Paro: the routed basis is the routed experts' own Givens rotation
+            // in `x_rot_batch`, which a Paro shared gate/up reuses as its
+            // rotation scratch. Produce it after the shared stages, right
+            // before the routed tail reads it.
+            let paro = selection.resolution.paro_mode;
+            if !paro {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            }
             if !adopted {
                 append_step(
                     &mut steps,
@@ -2618,6 +2625,9 @@ fn lower_prefill<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+            if paro {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            }
         }
         MoeRecipe::SigmoidRoutedNoShared => {
             if !adopted {

@@ -54,6 +54,9 @@
 //       runtime compile has no -I to kernels/src), applied to the f32 row
 //       BEFORE the cast. Everything downstream of the K plane (fragment
 //       layout, QK/PV, softmax, epilogue) is untouched.
+//   4 = fwht4 K (132 B/head: f32 cnorm + 128 B of 4-bit codes, per-128-half
+//       signed-FWHT rotation, TURBO_C4 codebook; V stays Q8_0). Same K-plane
+//       fill contract as KMODE=3; pre-convert rotates with fwht_shfl_forward.
 //   8 = native fp8 KV, Q0 fill-time decode (slice-B): K and V rows are
 //       token-local [codes: 4*256 bytes, head-major][scales: 4 f16]
 //       (stride 1032). The fill decodes f16(f32(scale)*decode_e4m3(code))
@@ -340,7 +343,44 @@ __device__ __forceinline__ void fa2_gqa_body(
             }
         }
 #else
-#if HIPFIRE_FA2_KMODE == 3
+#if HIPFIRE_FA2_KMODE == 4
+        // fwht4 K: per (position, kv head) record = [f32 cnorm][128 B of
+        // 4-bit codes] (k_bytes_per_head = 132, k_bytes_per_pos = 4*132 =
+        // 528, head offset kv_h*132 — the contract of
+        // attention_flash_fwht4_tile_batched and kv_cache_write_asym_k_fwht4*).
+        // Dim d lives in byte 4 + d/2, low nibble for even d; value = cnorm *
+        // TURBO_C4[nibble] (128-wide codebook). Slot (k, b) owns dims
+        // b*32..b*32+31 = 16 bytes at rec+4+b*16 (4 dwords, 8 dims each, one
+        // fragment per dword).
+        for (int t = 0; t < 4; ++t) {
+            const int s = tid + t * 128;
+            const int k = s >> 3;
+            const int b = s & 7;
+            const int gk = ktile + k;
+            const unsigned char* rec = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * 528ULL
+                    + (unsigned long long)(kv_h * 132)
+                : nullptr;
+            float cnorm = 0.0f;
+            if (rec != nullptr)
+                __builtin_memcpy(&cnorm, rec, 4);
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+#pragma unroll 1
+            for (int w = 0; w < 4; ++w) {
+                uint32_t packed = 0;
+                if (rec != nullptr)
+                    __builtin_memcpy(&packed, rec + 4 + b * 16 + w * 4, 4);
+                const int d0 = b * 32 + w * 8;
+                const int dc = d0 >> 4;
+                const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, 0);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    K16[o + i] = (_Float16)(cnorm * TURBO_C4[(packed >> (4 * i)) & 0xF]);
+            }
+        }
+#elif HIPFIRE_FA2_KMODE == 3
         // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
         // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
         // kv_h*100 — the same contract as attention_flash_fwht3_tile_batched
@@ -1496,7 +1536,9 @@ extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gq
 // (module, symbol): one shared name across the two module builds silently
 // binds whichever build registered first. Distinct symbols make each
 // launcher resolve its own module's build.
-#if HIPFIRE_FA2_KMODE == 3
+#if HIPFIRE_FA2_KMODE == 4
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx1201
+#elif HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx1201
 #elif HIPFIRE_FA2_KMODE == 8
 // Q0 body is f16 with no rotation, same as KMODE=0, but the symbol must be
@@ -1533,6 +1575,23 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     const int h = r % FA2_HEADS;
     const float* rp = q + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
     _Float16* wp = q16 + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
+#if HIPFIRE_FA2_KMODE == 4
+    // fwht4 K is rotated per 128-half (signed FWHT-128, 4 dims/lane); signs
+    // tables are the 128-entry fwht4 tables indexed by lane*4 inside the helper.
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int d0 = half * 128 + lane * 4;
+        float a = rp[d0 + 0], b = rp[d0 + 1], c = rp[d0 + 2], d = rp[d0 + 3];
+        if (do_rotate)
+            fwht_shfl_forward(a, b, c, d, signs1, signs2, lane);
+        typedef _Float16 __attribute__((ext_vector_type(4))) half4_t;
+        half4_t o4;
+        o4[0] = (_Float16)a; o4[1] = (_Float16)b;
+        o4[2] = (_Float16)c; o4[3] = (_Float16)d;
+        *(half4_t*)(wp + d0) = o4;
+    }
+    return;
+#else
     float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
     float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
     float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
@@ -1552,6 +1611,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     o[4] = (_Float16)v4; o[5] = (_Float16)v5;
     o[6] = (_Float16)v6; o[7] = (_Float16)v7;
     *(half8_t*)(wp + lane * 8) = o;
+#endif
 }
 
 #if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
@@ -1627,6 +1687,37 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_q_pr
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201(
 #else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+#endif
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#endif
+
+// ---- KMODE=4 entry: fwht4 K (4-bit, per-128-half rotation), identical to the fwht3k entry ----
+#if HIPFIRE_FA2_KMODE == 4
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_gfx1201(
 #endif
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,

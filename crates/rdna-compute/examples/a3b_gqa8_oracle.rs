@@ -415,6 +415,7 @@ fn vlaunch(gpu: &mut Gpu, c: &VCase, bf: &VBufs, candidate: bool) {
                 &bf.part,
                 None,
                 0,
+                None,
             )
             .expect("verify_attn launch");
         assert!(ran, "VerifyAttn declined an admitted case: {c:?}");

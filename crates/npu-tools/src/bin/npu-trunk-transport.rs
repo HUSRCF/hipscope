@@ -16,14 +16,6 @@ const ROWS: usize = 8192;
 const CLASSES: usize = 16;
 const DEFAULT_ROUNDS: usize = 20;
 const POISON: u8 = 0xa5;
-/// Reduction dimension of the shape's program: 2560 (input shapes) or 6144 (out shapes).
-fn shape_k(shape: Shape) -> usize {
-    if shape.is_out() {
-        OUT_PANEL_K
-    } else {
-        PANEL_K
-    }
-}
 fn a_code(row: usize, k: usize, round: usize) -> i8 {
     ((k * 5 + (row % CLASSES) * 7 + round * 11) % 23) as i8 - 11
 }
@@ -60,12 +52,16 @@ fn at<T>(round: Option<usize>, stage: &str, result: Result<T, String>) -> Result
 fn resume_latency_ns(anchor_ns: u64, elapsed_ms: f32, done_ns: u64) -> i128 {
     i128::from(anchor_ns) + (f64::from(elapsed_ms) * 1e6) as i128 - i128::from(done_ns)
 }
-fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
+fn consumer_columns(shape: Shape) -> Vec<std::ops::Range<usize>> {
     match shape {
-        Shape::GdnIn => [0..10240, 10240..16384, 16384..16432, 16432..16480],
-        Shape::QsaIn => [0..12288, 12288..12800, 12800..13312, 13312..13952],
+        Shape::GdnIn | Shape::DenseGdnIn => {
+            vec![0..10240, 10240..16384, 16384..16432, 16432..16480]
+        }
+        Shape::QsaIn => vec![0..12288, 12288..12800, 12800..13312, 13312..13952],
         // The out projection feeds the whole 2560-wide residual: quarters stand in for the consumer windows.
-        Shape::GdnOut | Shape::QsaO => [0..640, 640..1280, 1280..1920, 1920..2560],
+        Shape::GdnOut | Shape::QsaO => vec![0..640, 640..1280, 1280..1920, 1920..2560],
+        // 27B gated q, k, v: 28 panels exactly, no padding.
+        Shape::DenseFaIn => vec![0..12288, 12288..13312, 13312..14336],
     }
 }
 
@@ -75,18 +71,18 @@ const CORUN_BYTES: usize = 256 << 20;
 const CORUN_COPIES: usize = 64;
 
 fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String> {
-    let (kdim, pn) = (shape_k(shape), shape.panel_n());
+    let (kdim, pn) = (shape.k(), shape.panel_n());
     let panels_count = shape.panels();
     let columns = consumer_columns(shape);
-    let live = columns[3].end;
+    let live = columns.last().unwrap().end;
     // The consumer launch geometry uses precisely these live windows, not a
     // panel-rounded width. Diagnostic full-C downloads below also check padding.
-    // (The out shapes have no padding: five 512-column panels exactly fill the 2560-column residual.)
+    // (The N512 shapes need no padding: out = five 512-column panels, dense FA = 28; dense GDN pads 16480 to 16896.)
     if columns[0].start != 0
         || columns.windows(2).any(|w| w[0].end != w[1].start)
         || columns.iter().any(|r| r.is_empty() || r.end > live)
         || live > shape.pitch()
-        || (live == shape.pitch() && !shape.is_out())
+        || (live == shape.pitch() && !shape.is_n512())
     {
         return at(
             None,
@@ -97,8 +93,8 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
     let design = at(
         None,
         "build-panel",
-        if shape.is_out() {
-            gemm_g80_n512::build_panel_program_out(ROWS, shape.pitch(), 0)
+        if shape.is_n512() {
+            gemm_g80_n512::build_panel_program_n512(ROWS, shape.pitch(), 0, kdim)
         } else {
             gemm_g80::build_panel_program_rowmajor(ROWS, shape.pitch(), 0)
         },
@@ -228,6 +224,7 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         let mut scales = vec![(0u16, 0i16); ROWS];
         let mut reference = vec![0u16; panels_count * CLASSES * CLASSES * 3];
         let mut latencies = Vec::with_capacity(rounds);
+        let mut busies = Vec::with_capacity(rounds);
         let mut resumes = Vec::with_capacity(rounds);
         let mut busy = Duration::ZERO;
         let mut last_seq = [None; 2];
@@ -269,7 +266,7 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             let av = at(
                 Some(round),
                 "A-arena",
-                if shape.is_out() {
+                if shape.is_n512() {
                     runtime.a_out_arena(bank)
                 } else {
                     runtime.a_arena(bank)
@@ -414,13 +411,19 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             let ms = completion.kick_to_done.as_secs_f64() * 1000.0;
             busy += completion.npu_busy;
             latencies.push(ms);
+            busies.push(completion.npu_busy.as_secs_f64() * 1000.0);
             println!("round={round:02} bank={bank} seq={} exact enqueue_ahead=true gpu_wait_enqueue_ns={wait_enqueue_ns} npu_done_ns={} kick->done={ms:.3} ms npu_submit_wait={:.3} ms npu_done->gpu_resume={:.3} us", seq.value, completion.done_ns, completion.npu_busy.as_secs_f64() * 1000.0, resume_ns as f64 / 1000.0);
         }
         latencies.sort_by(f64::total_cmp);
+        busies.sort_by(f64::total_cmp);
         println!("EXACT rounds={rounds} p50={:.3} p99={:.3} max={:.3} ms npu_busy_envelope={:.3} ms wall={:.3} ms (busy=submit-to-timeline host envelope, wall includes CPU oracle/copies)",
             percentile(&latencies, 0.5), percentile(&latencies, 0.99), latencies[rounds - 1], busy.as_secs_f64() * 1000.0, wall.elapsed().as_secs_f64() * 1000.0);
-        resumes.sort_by(f64::total_cmp);
-        println!("RESUME npu_done->GPU_event p50={:.3} p99={:.3} max={:.3} us anchor_uncertainty_ns={anchor_uncertainty_ns}", percentile(&resumes, 0.5), percentile(&resumes, 0.99), resumes[rounds-1]);
+        // Useful work counts the live columns only (padding columns are computed but not useful).
+        let ops = 2.0 * (ROWS * live * kdim) as f64;
+        let tops = |ms: f64| ops / (ms * 1e-3) / 1e12;
+        let (busy50, wall50) = (percentile(&busies, 0.5), percentile(&latencies, 0.5));
+        println!("RATE shape={shape:?} m={ROWS} n_live={live} n_padded={} k={kdim} corun={corun} busy_p50={busy50:.3} ms busy_TOPS={:.2} kick->done_p50={wall50:.3} ms wall_TOPS={:.2} (measured, live columns)",
+            shape.pitch(), tops(busy50), tops(wall50));
         // Negative controls run only AFTER every exact round has reported.
         // This generation was never submitted; Shared::wait rejects it in
         // process, without a DRM wait, relay request or GPU wait.
@@ -752,7 +755,7 @@ fn coexistence(reps: usize) -> Result<(), String> {
     let d_out = at(
         None,
         "build-out",
-        gemm_g80_n512::build_panel_program_out(rows, OUT_PANEL_N, 0),
+        gemm_g80_n512::build_panel_program_n512(rows, OUT_PANEL_N, 0, OUT_PANEL_K),
     )?;
     let (mut a, create_in, config_in) = at(
         None,
@@ -805,9 +808,9 @@ fn coexistence(reps: usize) -> Result<(), String> {
     Ok(())
 }
 
-const USAGE: &str = "npu-trunk-transport [--pci 0000:c0:00.0] [--shape gdn_in|qsa_in|gdn_out|qsa_o]... [--rounds N] [--corun] [--coexist [--reps N]]\n\
+const USAGE: &str = "npu-trunk-transport [--pci 0000:c0:00.0] [--shape gdn_in|qsa_in|gdn_out|qsa_o|dense_gdn_in|dense_fa_in]... [--rounds N] [--corun] [--coexist [--reps N]]\n\
 Default (no --shape/--coexist): 8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 enqueue-ahead exact rounds/shape FIRST; negatives AFTER include forced chain timeout and bounded GPU release. Prints npu_done->GPU resume event latency; 3 s ready waits, 300 ms chain watchdog, default shim AXI.\n\
---shape selects shapes (repeatable): gdn_out / qsa_o are the K=6144 out-projection programs (N512 panels, 5 panels/chain, own PDI), oracle = whole-K int32 sum + bf16_direct, exact on both banks every round.\n\
+--shape selects shapes (repeatable): gdn_out / qsa_o are the K=6144 out-projection programs (N512 panels, 5 panels/chain, own PDI); dense_gdn_in / dense_fa_in are the qwen3.8-27b K=5120 in-projections (N512 panels, 33 / 28 panels/chain, own PDI). Oracle = whole-K int32 sum + bf16_direct, exact on both banks every round.\n\
 --corun: queue 16 GiB of GPU copies per round concurrently with every NPU chain (co-run rate).\n\
 --coexist: second-HwCtx probe (create + config_cu cost, context-switch cost, no transport/HIP).";
 fn usage(why: &str) -> ! {
@@ -858,6 +861,8 @@ fn main() {
                 "qsa_in" => Shape::QsaIn,
                 "gdn_out" => Shape::GdnOut,
                 "qsa_o" => Shape::QsaO,
+                "dense_gdn_in" => Shape::DenseGdnIn,
+                "dense_fa_in" => Shape::DenseFaIn,
                 other => usage(&format!("unknown shape {other:?}")),
             }),
             other => usage(&format!("unknown argument {other:?}")),
@@ -916,18 +921,22 @@ mod tests {
             for pair in columns.windows(2) {
                 assert_eq!(pair[0].end, pair[1].start);
             }
+            assert_eq!((shape.k(), shape.panel_n(), shape.panels()), (6144, 512, 5));
+        }
+        assert_eq!((Shape::GdnIn.k(), Shape::QsaIn.k()), (2560, 2560));
+        // 27B dense in-projections: K5120, 16480 live of 16896 (GDN) and 14336 of 14336 (FA).
+        for (shape, live) in [(Shape::DenseGdnIn, 16480), (Shape::DenseFaIn, 14336)] {
             assert_eq!(
-                (shape_k(shape), shape.panel_n(), shape.panels()),
-                (6144, 512, 5)
+                (shape.k(), consumer_columns(shape).last().unwrap().end),
+                (5120, live)
             );
         }
-        assert_eq!((shape_k(Shape::GdnIn), shape_k(Shape::QsaIn)), (2560, 2560));
     }
 
     #[test]
     fn class_reference_is_the_whole_k_twin_of_one_class_pair() {
         // Whole-K dot of class (r, n), twin per row % 3 exponent: recompute one entry independently.
-        for kdim in [2560usize, 6144] {
+        for kdim in [2560usize, 5120, 6144] {
             let reference = class_reference(kdim, 2, 3);
             let (r, n, rem) = (5usize, 9usize, 1usize);
             let mut dot = 0i32;

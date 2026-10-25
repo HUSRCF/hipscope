@@ -169,6 +169,39 @@ pub struct DecodeShareTail {
     /// The BorrowPrefill view: identical to the plan's entries except donors, which are
     /// `Placement::HostMapped` with offsets into the host owner (inside the mirror window).
     pub borrow_entries: Vec<ExpertTierEntry>,
+    /// Dirty byte prefix of each prefill capacity class, ascending: class `c`
+    /// overwrites `[donor_offset, donor_offset + class_spans[c])` while it is
+    /// the largest class of a borrow epoch. One entry (the whole tail) until
+    /// [`ExpertTierPlan::with_decode_share_classes`] sets the real spans; empty
+    /// without donors.
+    pub class_spans: Vec<u64>,
+    /// `class_donors[c]`: donors (physical order) whose device extent starts
+    /// below `donor_offset + class_spans[c]`, i.e. the donors class `c` dirties
+    /// (a partially overlapped donor counts). Nested ascending; the last is
+    /// `donors.len()`.
+    pub class_donors: Vec<usize>,
+    /// Bytes at the START of the donor tail (`donor_offset ..`) that hold the
+    /// borrowed F16 / INT8 weight shadows, rebuilt at the first acquire of
+    /// every borrow epoch ([`ExpertTierPlan::with_decode_share_shadows`]); the
+    /// scratch backing starts right after them. 0 when the shadows stay
+    /// resident. Every class span includes these bytes (the shadow region is
+    /// dirtied by every class).
+    pub shadow_bytes: u64,
+}
+
+impl DecodeShareTail {
+    /// Donors (physical order) whose device extent starts below the first
+    /// `span` bytes of the donor tail: the donors a scratch span of `span`
+    /// bytes dirties. Donor `k` starts at the mirror-relative offset of its
+    /// gate/up payload (mirror byte `i` == device donor byte `i`).
+    pub fn donors_dirtied_by(&self, span: u64) -> usize {
+        self.donors.partition_point(|&id| {
+            self.borrow_entries[id as usize]
+                .gate_up_offset
+                .saturating_sub(self.mirror_offset)
+                < span
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +214,8 @@ pub enum DecodeShareError {
     Overflow,
     /// The plan already carries a donor tail; a plan is re-laid out once.
     AlreadyShared,
+    /// The class spans are empty, descending, or do not end at the last donor.
+    BadClasses(String),
 }
 
 impl fmt::Display for DecodeShareError {
@@ -192,6 +227,7 @@ impl fmt::Display for DecodeShareError {
             ),
             Self::Overflow => write!(f, "decode-share plan arithmetic overflowed u64"),
             Self::AlreadyShared => write!(f, "plan already carries a decode-share donor tail"),
+            Self::BadClasses(why) => write!(f, "decode-share class spans are invalid: {why}"),
         }
     }
 }
@@ -290,6 +326,11 @@ impl ExpertTierPlan {
 
     pub fn entry(&self, layer: usize, expert: usize) -> Option<&ExpertTierEntry> {
         self.entries.get(Self::index(layer, expert)?)
+    }
+
+    /// Every entry in model id order (`layer * 512 + expert`).
+    pub fn entries(&self) -> &[ExpertTierEntry] {
+        &self.entries
     }
 
     /// `(gate_up, down)` source spans in the artifact.
@@ -448,6 +489,9 @@ impl ExpertTierPlan {
                 donor_bytes: 0,
                 mirror_offset: 0,
                 borrow_entries: self.entries.clone(),
+                class_spans: Vec::new(),
+                class_donors: Vec::new(),
+                shadow_bytes: 0,
             };
             return Ok((self, tail));
         }
@@ -560,6 +604,7 @@ impl ExpertTierPlan {
             return Err(Overflow);
         }
 
+        let donors_len = donors.len();
         let tail = DecodeShareTail {
             donors,
             guard_offset,
@@ -567,9 +612,87 @@ impl ExpertTierPlan {
             donor_bytes,
             mirror_offset,
             borrow_entries,
+            class_spans: vec![donor_bytes],
+            class_donors: vec![donors_len],
+            shadow_bytes: 0,
         };
         plan.decode_share = Some(tail.clone());
         Ok((plan, tail))
+    }
+
+    /// Set the prefill capacity classes of this plan's donor tail: `spans[c]` is
+    /// the byte prefix of the tail class `c` dirties (scratch span of the class,
+    /// ascending). Computes `class_donors` (the donors each class dirties; a
+    /// donor partially overlapped counts) and requires the last class to dirty
+    /// every donor and no span to exceed the tail. A plan without donors is
+    /// returned unchanged.
+    pub fn with_decode_share_classes(mut self, spans: &[u64]) -> Result<Self, DecodeShareError> {
+        let Some(tail) = self.decode_share.as_mut() else {
+            return Ok(self);
+        };
+        if tail.donors.is_empty() {
+            return Ok(self);
+        }
+        let bad = |why: &str| Err(DecodeShareError::BadClasses(why.to_string()));
+        if spans.is_empty() {
+            return bad("no classes");
+        }
+        if spans.windows(2).any(|pair| pair[0] > pair[1]) {
+            return bad("spans descend");
+        }
+        if spans.last().is_some_and(|&last| last > tail.donor_bytes) {
+            return bad("a span exceeds the donor tail");
+        }
+        let class_donors: Vec<usize> = spans
+            .iter()
+            .map(|&span| tail.donors_dirtied_by(span))
+            .collect();
+        if class_donors.last() != Some(&tail.donors.len()) {
+            return bad("the largest class does not dirty every donor");
+        }
+        tail.class_spans = spans.to_vec();
+        tail.class_donors = class_donors;
+        Ok(self)
+    }
+
+    /// Declare the first `shadow_bytes` of this plan's donor tail to be the
+    /// borrowed shadow region (every class span already includes it, so
+    /// `class_spans[0] >= shadow_bytes`; the region is 256-aligned). A plan
+    /// without donors is returned unchanged (and `shadow_bytes` must be 0).
+    pub fn with_decode_share_shadows(
+        mut self,
+        shadow_bytes: u64,
+    ) -> Result<Self, DecodeShareError> {
+        let Some(tail) = self.decode_share.as_mut() else {
+            return if shadow_bytes == 0 {
+                Ok(self)
+            } else {
+                Err(DecodeShareError::BadClasses(
+                    "shadow bytes without a donor tail".to_string(),
+                ))
+            };
+        };
+        if shadow_bytes % 256 != 0 {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region is not 256-aligned".to_string(),
+            ));
+        }
+        if tail
+            .class_spans
+            .first()
+            .is_some_and(|&first| first < shadow_bytes)
+        {
+            return Err(DecodeShareError::BadClasses(
+                "a class span is smaller than the shadow region".to_string(),
+            ));
+        }
+        if shadow_bytes > tail.donor_bytes {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region exceeds the donor tail".to_string(),
+            ));
+        }
+        tail.shadow_bytes = shadow_bytes;
+        Ok(self)
     }
 
     fn recompute_digest(&self) -> [u8; 32] {

@@ -855,3 +855,8 @@ required-features = ["lab"]
 [[example]]
 name = "moe_nan_guard_regress"
 required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_selector_greedy_oracle"
+required-features = ["lab"]

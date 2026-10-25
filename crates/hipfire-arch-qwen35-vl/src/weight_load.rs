@@ -7,7 +7,8 @@
 //! The fake uploader exercises failure at every allocation without a GPU.
 
 use super::{
-    load_f16_gpu, load_f32_cpu, load_f32_gpu, VisionConfig, VisionLayerWeights, VisionWeights,
+    load_f16_gpu, load_f16_gpu_padded, load_f32_cpu, load_f32_gpu, vit_lds_route, VisionConfig,
+    VisionLayerWeights, VisionWeights, VIT_LDS_K_ALIGN,
 };
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
@@ -16,6 +17,13 @@ use rdna_compute::{Gpu, GpuTensor};
 trait Upload {
     type Tensor;
     fn f16(&mut self, name: &str) -> HipResult<Self::Tensor>;
+    fn f16_padded(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        pitch: usize,
+    ) -> HipResult<Self::Tensor>;
     fn f32(&mut self, name: &str, len: usize) -> HipResult<Self::Tensor>;
     fn free(&mut self, tensor: Self::Tensor) -> HipResult<()>;
 }
@@ -28,6 +36,11 @@ struct Pending<'a, U: Upload> {
 impl<U: Upload> Pending<'_, U> {
     fn f16(&mut self, name: &str) -> HipResult<()> {
         let tensor = self.uploader.f16(name)?;
+        self.tensors.push(tensor);
+        Ok(())
+    }
+    fn f16_padded(&mut self, name: &str, rows: usize, cols: usize, pitch: usize) -> HipResult<()> {
+        let tensor = self.uploader.f16_padded(name, rows, cols, pitch)?;
         self.tensors.push(tensor);
         Ok(())
     }
@@ -49,7 +62,11 @@ impl<U: Upload> Drop for Pending<'_, U> {
     }
 }
 
-fn stage<U: Upload>(config: &VisionConfig, uploader: &mut U) -> HipResult<Vec<U::Tensor>> {
+fn stage<U: Upload>(
+    config: &VisionConfig,
+    fc2_ld: usize,
+    uploader: &mut U,
+) -> HipResult<Vec<U::Tensor>> {
     let h = config.hidden_size;
     let mut pending = Pending {
         uploader,
@@ -69,7 +86,16 @@ fn stage<U: Upload>(config: &VisionConfig, uploader: &mut U) -> HipResult<Vec<U:
         pending.f32(&format!("{p}.norm2.bias"), h)?;
         pending.f16(&format!("{p}.mlp.linear_fc1.weight"))?;
         pending.f32(&format!("{p}.mlp.linear_fc1.bias"), config.mlp_dim)?;
-        pending.f16(&format!("{p}.mlp.linear_fc2.weight"))?;
+        if fc2_ld != config.mlp_dim {
+            pending.f16_padded(
+                &format!("{p}.mlp.linear_fc2.weight"),
+                h,
+                config.mlp_dim,
+                fc2_ld,
+            )?;
+        } else {
+            pending.f16(&format!("{p}.mlp.linear_fc2.weight"))?;
+        }
         pending.f32(&format!("{p}.mlp.linear_fc2.bias"), h)?;
     }
     let merge = h * config.spatial_merge_size * config.spatial_merge_size;
@@ -94,6 +120,15 @@ impl Upload for HfqUpload<'_> {
     fn f16(&mut self, name: &str) -> HipResult<GpuTensor> {
         load_f16_gpu(self.hfq, self.gpu, name)
     }
+    fn f16_padded(
+        &mut self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        pitch: usize,
+    ) -> HipResult<GpuTensor> {
+        load_f16_gpu_padded(self.hfq, self.gpu, name, rows, cols, pitch)
+    }
     fn f32(&mut self, name: &str, len: usize) -> HipResult<GpuTensor> {
         load_f32_gpu(self.hfq, self.gpu, name, len)
     }
@@ -116,7 +151,13 @@ pub(super) fn load(
         "  loading vision weights (GPU, {} blocks)...",
         config.num_layers
     );
-    let mut uploaded = stage(config, &mut HfqUpload { hfq, gpu })?.into_iter();
+    // Match beta's LDS linear route: fc2 rows carry zero-padded K columns.
+    let fc2_ld = if vit_lds_route(gpu, config.hidden_size) {
+        config.mlp_dim.next_multiple_of(VIT_LDS_K_ALIGN)
+    } else {
+        config.mlp_dim
+    };
+    let mut uploaded = stage(config, fc2_ld, &mut HfqUpload { hfq, gpu })?.into_iter();
     // All fallible GPU work has completed. The fixed field order below is the
     // stage order above; consuming it transfers each owner exactly once.
     let mut take = || uploaded.next().expect("staged vision tensor");
@@ -136,6 +177,7 @@ pub(super) fn load(
             fc1_b: take(),
             fc2_w: take(),
             fc2_b: take(),
+            fc2_ld,
         })
         .collect();
     Ok(VisionWeights {
@@ -176,6 +218,9 @@ mod tests {
         fn f16(&mut self, _: &str) -> HipResult<usize> {
             self.next()
         }
+        fn f16_padded(&mut self, _: &str, _: usize, _: usize, _: usize) -> HipResult<usize> {
+            self.next()
+        }
         fn f32(&mut self, _: &str, _: usize) -> HipResult<usize> {
             self.next()
         }
@@ -208,7 +253,7 @@ mod tests {
                 created: 0,
                 freed: Vec::new(),
             };
-            assert!(stage(&config(), &mut uploader).is_err());
+            assert!(stage(&config(), config().mlp_dim, &mut uploader).is_err());
             assert_eq!(uploader.created, fail_at);
             assert_eq!(uploader.freed, (0..fail_at).rev().collect::<Vec<_>>());
         }
@@ -221,7 +266,7 @@ mod tests {
             freed: Vec::new(),
         };
         assert_eq!(
-            stage(&config(), &mut uploader).unwrap(),
+            stage(&config(), config().mlp_dim, &mut uploader).unwrap(),
             (0..332).collect::<Vec<_>>()
         );
         assert!(uploader.freed.is_empty());

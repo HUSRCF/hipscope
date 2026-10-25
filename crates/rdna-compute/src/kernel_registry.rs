@@ -77,6 +77,7 @@ mod kernels {
     );
     /// `railgun::copy::SOURCE` (`crates/railgun/src/copy.rs`) includes the same file.
     pub const RAILGUN_COPY_SRC: &str = include_str!("../../../kernels/src/railgun_copy.hip");
+    pub const RAILGUN_FILL_SRC: &str = include_str!("../../../kernels/src/railgun_fill.hip");
 }
 
 pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
@@ -1327,6 +1328,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_gqa_q8_gfx1201",
                 "attention_verify_gqa_fp8_gfx1201",
                 "attention_verify_gqa_fp8_gqa8_gfx1201",
+                "attention_verify_gqa_fwht4_gfx1201",
+                "attention_verify_gqa_fwht3_gfx1201",
                 "attention_verify_reduce_gfx1201"
             ]
         );
@@ -1508,6 +1511,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
             [
                 "attention_verify_gqa_q8_gfx1100",
+                "attention_verify_gqa_fwht4_gfx1100",
+                "attention_verify_gqa_fwht3_gfx1100",
                 "attention_verify_gqa_q8_rows_gfx1100",
                 "attention_verify_reduce_gfx1100"
             ]
@@ -1789,6 +1794,20 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1151" {
+        // Qwen4 HC input_mix_down (320 x 10240) + activation, one launch
+        // (HIPFIRE_QWEN4_HC_DOWN_FUSED; gemm.rs gemm_bf16_xf16_hc_down_fused).
+        add!(
+            "qwen4_hc_down_fused_gfx1151",
+            kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
+            ["qwen4_hc_down_fused_gfx1151"]
+        );
+        // Qwen4 HC read up+mix, persistent W-stationary (HIPFIRE_QWEN4_HC_UP_V2;
+        // tensor_ops.rs hyper_read_up_wmma_launch).
+        add!(
+            "hyper_read_up_wmma_gfx1151_v2",
+            crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1151_V2_SRC,
+            ["hyper_read_up_wmma_bf16_gfx1151_v2"]
+        );
         // QSA gathered F16 WMMA attention (`tensor_ops::qsa_gathered_wmma_launch_with`
         // and the QSA F16 arena producer): the route is gfx1151-only for F32/Q8
         // K/V (`qsa_gathered_wmma_enabled`); the Q8 converter stays HIP even when
@@ -1904,7 +1923,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_pool_mrope_f32",
                 "gated_delta_gate_batched_rotate_arena",
                 "indexed_attention_cache_append_q8_batch_arena",
-                "hyper_write_bf16x8_gfx1201",
             ]
         );
         add!(
@@ -2156,7 +2174,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -2289,6 +2306,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC,
             [
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse",
+                "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560",
                 "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
             ]
         );
@@ -2361,6 +2380,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
             ]
         );
+        // Match the exact gfx1151-only launcher admission in moe_few.rs.
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq4g128v2_moe_down_top10_k640",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_K640_SRC,
+                ["gemv_mq4g128v2_moe_down_top10_k640",]
+            );
+        }
         add!(
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
             kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
@@ -2580,6 +2607,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_MQ6G256V2_SRC,
             ["gemv_mq6g256v2"]
         );
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq6g256v2_k2560_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_SRC,
+                ["gemv_mq6g256v2_k2560"]
+            );
+            add!(
+                "gemv_mq6g256v2_k2560_u2_mq6v2",
+                kernels::GEMV_MQ6G256V2_K2560_U2_SRC,
+                ["gemv_mq6g256v2_k2560_u2"]
+            );
+        }
+
         // Default-on `HIPFIRE_QWEN4_ROUTER_FAST`: every eager multi-row router call.
         add!(
             "moe_router_softmax_top10_f32_fast",
@@ -2787,7 +2827,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hyper_read_projected_f32",
                 "hyper_read_up_fused_f32",
                 "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
                 "hyper_write_f32",
                 "indexed_attention_attention_f32",
                 "indexed_attention_attention_f32_batched",
@@ -3519,6 +3558,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "mq_rotate_x_i4",
             kernels::MQ_ROTATE_X_I4_SRC,
             ["mq_rotate_x_i4"]
+        );
+        // Qwen4 MoE front producer (HIPFIRE_QWEN4_MOE_FRONT_FUSE): the F16-output twin.
+        add!(
+            "mq_rotate_x_i4_f16out",
+            kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
+            ["mq_rotate_x_i4_f16out"]
         );
         add!(
             "qwen4_gemv_q8_0_wide",
@@ -4713,6 +4758,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
                 "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_k5120",
                 "npu_trunk_pack_a_bf16_old",
             ]
         );
@@ -5759,7 +5805,8 @@ pub fn default_route_entries(
 /// Modules railgun's own lowering launches (design §1.1 `Node::Copy` and
 /// `Node::CopyBatch`): the hipfire-owned copy kernels, JIT-compiled as module
 /// `railgun::copy::MODULE` from `railgun::copy::SOURCE`, on every arch
-/// railgun certifies. No Redline program loads them.
+/// railgun certifies, the typed fill, and on exact gfx1201 the DFlash window's
+/// device selector. No Redline program loads them.
 pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
     let arch: &'static str = SUPPORTED_ARCHES
         .iter()
@@ -5773,6 +5820,26 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
             "railgun_copy",
             &["railgun_copy", "railgun_copy_batch"],
             kernels::RAILGUN_COPY_SRC.into(),
+            extra_flags,
+        ));
+        entries.push(entry(
+            arch,
+            "railgun_fill",
+            &["railgun_fill_u32"],
+            kernels::RAILGUN_FILL_SRC.into(),
+            extra_flags,
+        ));
+    }
+    // The certified DFlash window's (design A, exact gfx1201) device greedy
+    // selector: a node of the window program, JIT-loaded by
+    // `Gpu::ensure_dflash_selector_greedy_exact`. The window refuses any node
+    // whose exact object has no corpus record, so it is inventoried here.
+    if arch == "gfx1201" {
+        entries.push(entry(
+            arch,
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_MODULE,
+            &[crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SYMBOL],
+            crate::dflash_selector::DFLASH_SELECTOR_GREEDY_EXACT_SRC.into(),
             extra_flags,
         ));
     }
@@ -8186,6 +8253,52 @@ mod tests {
     }
 
     #[test]
+    fn k640_registry_matches_gfx1151_only_launcher_admission() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let registry = entries(arch, "").unwrap();
+            assert_eq!(
+                registry
+                    .iter()
+                    .any(|entry| entry.module == "gemv_mq4g128v2_moe_down_top10_k640"),
+                arch == "gfx1151",
+                "{arch}: K640 registry must match the launchers architecture guard",
+            );
+        }
+    }
+
+    #[test]
+    fn native_qwen4_gfx1151_route_entries_refuses_partial_closed_plan() {
+        let flags = default_feature_flags("gfx1151").unwrap();
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            let input = RouteKernelInput {
+                arch: "gfx1151",
+                model_arch: 16,
+                tensors: &[],
+                n_heads: 32,
+                n_kv_heads: 4,
+                head_dim: 128,
+                max_seq: 32768,
+                prefill_chunk_rows: 8192,
+                kv_k: "fp8",
+                kv_v: "fp8",
+                state_quant: "q8",
+                spec,
+                host_mapped_experts: false,
+                retained_decode: true,
+                hipcc_extra_flags: "",
+                flags: &flags,
+                route_axes: &[],
+            };
+            match route_entries(&input) {
+                Err(RegistryError::UnsupportedRoute(reason)) => {
+                    assert_eq!(reason, "model arch 16 on gfx1151 has no closed route",)
+                }
+                other => panic!("gfx1151 must keep lazy loading, not a partial plan: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn mq4v2_k5120_inventory_preserves_generic_and_limits_arch() {
         let module = "fused_gate_up_mq4g256v2_k5120_gfx1100";
         let registry = entries("gfx1100", "").unwrap();
@@ -9520,6 +9633,11 @@ mod tests {
         // qualification twins) at the 64-byte ABI.
         for (label, image, count) in [
             ("gfx1151 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151, 6),
+            (
+                "gfx1151 streamed GU K2",
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                1,
+            ),
             ("gfx1201 MQ4 K2", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201, 6),
             ("gfx1201 W3 K2", kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201, 4),
             (
@@ -10402,7 +10520,8 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap, while accounting explicitly for later beta and vision source additions.
+    /// gap, accounting for later rope-table and vision mRoPE exports.
+    /// The gfx1201-only HC x8 export does not alter gfx11 exports.
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10423,7 +10542,6 @@ mod tests {
             .iter()
             .cloned()
             .chain([
-                "hyper_write_bf16x8_gfx1201".to_owned(),
                 "indexed_attention_rope_table_f32".to_owned(),
                 "indexed_attention_norm_mrope_f32_batched".to_owned(),
                 "indexed_attention_pool_mrope_bf16".to_owned(),
@@ -10446,7 +10564,7 @@ mod tests {
                 "indexed_attention_decode_prologue_q8",
             ]
         );
-        // The current registry includes the measured exports and the later beta addition.
+        // The current gfx11 registry contains the sealed exports and later additions.
         for arch in ["gfx1100", "gfx1151"] {
             let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
                 .unwrap()
@@ -10497,6 +10615,8 @@ mod tests {
             }
         }
         for (symbol, gfx11, gfx12) in [
+            ("hyper_write_bf16x2", true, true),
+            ("hyper_write_bf16x8_gfx1201", false, true),
             ("indexed_attention_decode_prologue_fp8", false, true),
             ("gated_delta_step_pipe128_q8", false, true),
         ] {
@@ -10604,6 +10724,8 @@ mod tests {
                     "attention_verify_gqa_q8_gfx1201",
                     "attention_verify_gqa_fp8_gfx1201",
                     "attention_verify_gqa_fp8_gqa8_gfx1201",
+                    "attention_verify_gqa_fwht4_gfx1201",
+                    "attention_verify_gqa_fwht3_gfx1201",
                     "attention_verify_reduce_gfx1201",
                 ][..],
             ),
@@ -10613,6 +10735,8 @@ mod tests {
                 kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
                 &[
                     "attention_verify_gqa_q8_gfx1100",
+                    "attention_verify_gqa_fwht4_gfx1100",
+                    "attention_verify_gqa_fwht3_gfx1100",
                     "attention_verify_gqa_q8_rows_gfx1100",
                     "attention_verify_reduce_gfx1100",
                 ][..],
@@ -12566,5 +12690,52 @@ extern "C" __global__ void NAMED(int* p) {}
         assert!(parse_walked_route_plan(concat!(base!(), "#! sealed turbo\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,4\n")).is_err());
         assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,x,256\n")).is_err());
+    }
+
+    /// Every node kernel of the certified DFlash window that is not a default
+    /// Redline route kernel has a corpus record on exact gfx1201: the window
+    /// refuses a node whose object the corpus lacks.
+    #[test]
+    fn corpus_entries_cover_the_dflash_window_node_kernels_on_gfx1201() {
+        let entries = corpus_entries("gfx1201", "").unwrap();
+        let has = |module: &str, symbol: &str| {
+            entries
+                .iter()
+                .any(|e| e.module == module && e.symbols.contains(&symbol))
+        };
+        for (module, symbol) in [
+            (
+                "dflash_selector_greedy_exact",
+                "dflash_selector_greedy_exact",
+            ),
+            ("railgun_copy", "railgun_copy"),
+            ("railgun_fill", "railgun_fill_u32"),
+            ("select_regrid", "topk_values_regrid_f32"),
+            ("topk_values_fixup_f32", "topk_values_fixup_f32"),
+            ("select_regrid", "argmax_f32_batched_regrid"),
+            (
+                "attention_dflash_sliding_f32",
+                "attention_dflash_sliding_f32",
+            ),
+            (
+                "dflash_hidden_commit5_gfx1100",
+                "dflash_hidden_commit5_gfx1100",
+            ),
+            ("embedding_q8_batched", "embedding_q8_batched"),
+        ] {
+            assert!(
+                has(module, symbol),
+                "gfx1201 corpus lacks {module}/{symbol}"
+            );
+        }
+        for arch in ["gfx1100", "gfx1151"] {
+            assert!(
+                !corpus_entries(arch, "")
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.module == "dflash_selector_greedy_exact"),
+                "{arch} must not inventory the gfx1201 window selector"
+            );
+        }
     }
 }

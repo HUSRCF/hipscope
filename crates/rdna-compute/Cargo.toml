@@ -982,6 +982,10 @@ name = "vit_qtiled_parity_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "vit_attention_hd72_probe"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_vit_attention_shapes"
 required-features = ["lab"]
 
@@ -1152,4 +1156,13 @@ required-features = ["lab"]
 
 [[example]]
 name = "qsa_mrope_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_gemm_shapes"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "railgun_copy_fill_oracle"
 required-features = ["lab"]
