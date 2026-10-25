@@ -1898,6 +1898,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_gate_arena",
                 "gated_delta_gate_batched_arena",
                 "indexed_attention_norm_rope_batch_arena",
+                // ARENA_SRC includes tensor_ops exports; image launchers still use tensor_ops.
+                "indexed_attention_norm_mrope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32",
                 "gated_delta_gate_batched_rotate_arena",
                 "indexed_attention_cache_append_q8_batch_arena",
                 "hyper_write_bf16x8_gfx1201",
@@ -2171,8 +2175,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_decode_prologue_f32",
                 "indexed_attention_decode_prologue_q8",
                 "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_mrope_f32_batched",
                 "indexed_attention_norm_rope_f32",
                 "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32",
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
@@ -2799,8 +2806,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_decode_prologue_f32",
                 "indexed_attention_decode_prologue_q8",
                 "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_mrope_f32_batched",
                 "indexed_attention_norm_rope_f32",
                 "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32",
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
@@ -3028,8 +3038,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_decode_prologue_fp8",
                 "indexed_attention_decode_prologue_q8",
                 "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_mrope_f32_batched",
                 "indexed_attention_norm_rope_f32",
                 "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32",
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
@@ -10389,7 +10402,7 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap, while accounting explicitly for the later beta source addition.
+    /// gap, while accounting explicitly for later beta and vision source additions.
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10412,6 +10425,9 @@ mod tests {
             .chain([
                 "hyper_write_bf16x8_gfx1201".to_owned(),
                 "indexed_attention_rope_table_f32".to_owned(),
+                "indexed_attention_norm_mrope_f32_batched".to_owned(),
+                "indexed_attention_pool_mrope_bf16".to_owned(),
+                "indexed_attention_pool_mrope_f32".to_owned(),
             ])
             .collect();
         assert_eq!(tensor_ops_source_exports("gfx1100"), current);

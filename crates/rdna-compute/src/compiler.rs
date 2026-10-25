@@ -3447,7 +3447,7 @@ mod tests {
                 .collect();
             if arch == "gfx1100" {
                 // Keep the sealed inventory unchanged; beta later added the
-                // HC-write widening to the shared source on every arch.
+                // HC-write widening, and vision adds mRoPE to the shared source.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3457,7 +3457,10 @@ mod tests {
                         .copied()
                         .chain([
                             "hyper_write_bf16x8_gfx1201",
-                            "indexed_attention_rope_table_f32"
+                            "indexed_attention_rope_table_f32",
+                            "indexed_attention_norm_mrope_f32_batched",
+                            "indexed_attention_pool_mrope_bf16",
+                            "indexed_attention_pool_mrope_f32",
                         ])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
