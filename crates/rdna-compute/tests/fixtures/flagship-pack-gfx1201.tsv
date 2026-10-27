@@ -1,6 +1,7 @@
 # Measured flagship module sets, gfx1201, hipfire v0.4.4 (binary 75c28fc06486), clean HOME/HIPFIRE_HOME/HIPFIRE_KERNEL_CACHE per case.
 # Source: qcal release-0.4.3 night-1027 pack-coverage discover-before/<case>/case.json (audit_hip + audit_embedded from HIPFIRE_MODULE_LOAD_AUDIT=1);
 # 195 prompt tokens, 6 decode tokens, --max-seq 4096, registry fetch disabled. Copied verbatim, never regenerated at test time.
+# Flash-Next Q4 PLE was separately captured in q4-discover-before/{fn-ar,fn-mtp}: every source, symbol, flag, profile and embedded-image identity matched these rows exactly; Q4-only staging was used for strict-after.
 # columns: route<TAB>arch<TAB>kind<TAB>module<TAB>symbol<TAB>flags<TAB>scheduler_profile<TAB>sha256
 #   kind=hip: sha256 = source_sha256 of the hipcc-compiled source; kind=embedded: sha256 = native image_sha256 (not a registry source).
 #   flags: audited hipcc core flags joined by single spaces (hip rows only).

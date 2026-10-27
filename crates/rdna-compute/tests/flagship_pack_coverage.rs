@@ -208,7 +208,7 @@ fn formerly_missing_modules_are_measured_and_registered() {
         );
         let e = registry.iter().find(|e| e.module == m);
         let e = e.unwrap_or_else(|| panic!("{m} not registered for gfx1201"));
-        let expected: &[&str] = match *m {
+        let expected: &[&str] = match m {
             "attention_fp8_e4m3_kv_batched_segs" => &[
                 "attention_fp8_e4m3_kv_batched_segs",
                 "attention_q8_0_kv_batched",
@@ -218,7 +218,7 @@ fn formerly_missing_modules_are_measured_and_registered() {
                 "gated_delta_net_q8_compact3_b2_rows",
                 "gated_delta_net_q8_fast_independent_masked",
             ],
-            _ => std::slice::from_ref(m),
+            _ => std::slice::from_ref(&m),
         };
         let mut actual: Vec<&str> = e.symbols.iter().copied().collect();
         actual.sort_unstable();
