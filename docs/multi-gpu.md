@@ -1178,8 +1178,10 @@ throughput improvement alone does not qualify this route for automatic use.
 
 Dense Qwen3.5/3.6 TP decode reduces each layer's attention and FFN partials
 into the residual through `Gpus::all_reduce_sum_f32_peer_add_routed`
-(`hipfire-runtime`). Every route evaluates the same rank-ordered
-`x + (p0 + p1)`, so the output is the same bytes on each route. With two
+(`hipfire-runtime`). Every route evaluates the same rank-ordered sum, so the
+output is the same bytes on each route: with the default 16-bit exchange
+(next section) `x + (r(p0) + r(p1))`, with `HIPFIRE_TP_EXCHANGE=f32`
+`x + (p0 + p1)`. With two
 peer-access ranks the default is a symmetric direct-peer read; each reduction
 waits on the peer's producer event and, before the next layer overwrites a
 partial, on the peer's consumer-complete event.
@@ -1241,6 +1243,81 @@ token. The first decode token after load runs direct and the second captures
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
 
+### Dense TP partial exchange: 16-bit (developer)
+
+The row-parallel stages (attention out-projection, FFN down-projection) leave
+one f32 partial per rank, and the all-reduce moves those partials between
+ranks. The residual stream is f32 and replicated. `HIPFIRE_TP_EXCHANGE`
+selects the format the ranks exchange:
+
+| value | exchange |
+|---|---|
+| unset / `bf16` | each rank converts its f32 partial to bf16 once (round to nearest even); every rank sums the rounded, rank-ordered partials in f32 into its f32 residual |
+| `f16` | the same with IEEE half (three more mantissa bits, but a partial above 65,504 in magnitude becomes infinity and poisons the residual: overflow is not guarded) |
+| `f32` | the f32 exchange: rank-ordered f32 sums of the f32 partials, as before |
+
+Only the exchange is 16-bit; the residual stream, the sums and the rooted
+route's broadcast of the finished f32 residual stay f32. Every rank, the
+producer included, adds the rounded value of every partial (`r(p) =
+up(pack(p))`) in the same order, so the replicated residual stays bit-identical
+across ranks and the hand and the generic dense TP routes, which reduce
+through the same `Gpus::all_reduce_sum_f32_peer_add_routed` (hand route, and
+the generic route's TP2) or the executor's `peer_reduce` (generic TP>2), stay
+byte-identical to each other (the `tp_prefill_decode_matches_hand_route`
+hardware test). The result is **not** byte-identical to the f32 exchange: the
+16-bit route is a numeric route, judged by KLD against the f32 exchange and
+the single-card pins, not by byte identity.
+
+The 16-bit route covers every peer-access reduction between distinct devices
+with 2 to 4 ranks and a row count x dim that is a multiple of 8:
+
+- **TP2 direct-peer read**: each rank packs its partial into its own slot of a
+  16-bit buffer (`tp_pack16_*`), records the producer event, waits the peer's,
+  and `tp_fold16_*` adds `r(p0) + r(p1)`, reading the peer's slot through its
+  P2P mapping, into the f32 residual. The alternating-slot protocol keeps one
+  slot per partial buffer.
+- **TP2 whole-token graph**: `tp_graph_signal_reduce16_*_gfx1100` publishes the
+  16-bit copy into the peer's coherent shadow (half the bytes of the f32
+  exchange), then reduces as above. The shadow segments the loader sizes for
+  f32 hold either format.
+- **TP>2**: the rooted fold gathers the peers' 16-bit partials (the root folds
+  its own f32 partial rounded in register), adds the sum to its residual and
+  broadcasts the f32 residual; the generic executor's small-payload all-pull
+  pulls the 16-bit slots and every rank folds them itself.
+
+The host-staged transport, same-device (`HIPFIRE_EMULATE_GPUS`) ranks, rank
+counts above 4, the no-target `AllReduce` and the expert-parallel reductions
+keep the f32 exchange. The dense TP load log reports the choice
+(`[loader] dense qwen TP exchange=bf16 (HIPFIRE_TP_EXCHANGE)`).
+
+Measured 2026-10-27 on hiptrx (R9700, gfx1201), Qwen3.8-27B mq4-xts (sha256
+`3e38ccba…`), `eval_hipfire --scoring-mode prefill --max-chunks 24 --tp N
+--kv-mode q8 --kv-v q8` (the hand dense-TP prefill with per-token hidden
+capture; `HIPFIRE_GRAPH=0`, fresh HOME and kernel cache per run), 24 chunks,
+mean KLD and the paired per-chunk difference against the f32 exchange of the
+same TP degree (95% t interval):
+
+| corpus | TP | f32 | bf16 | bf16 - f32 | f16 | f16 - f32 |
+|---|---|---:|---:|---|---:|---|
+| WT2 | 2 | 0.061277 | 0.059057 | -0.002220 [-0.004432, -0.000007] | 0.059953 | -0.001323 [-0.002996, +0.000350] |
+| code24 | 2 | 0.045400 | 0.045685 | +0.000286 [-0.002197, +0.002768] | 0.043671 | -0.001728 [-0.005858, +0.002401] |
+| WT2 | 4 | 0.059522 | 0.060439 | +0.000917 [-0.000328, +0.002161] | 0.059898 | +0.000375 [-0.001609, +0.002360] |
+| code24 | 4 | 0.042194 | 0.044125 | +0.001931 [-0.002018, +0.005880] | 0.044575 | +0.002381 [-0.001549, +0.006311] |
+
+Both 16-bit formats sit inside the f32 exchange's noise at TP2 and TP4. The
+single-card pins (gfx1201 A4, `--kv-mode fp8 --kv-v q8`: WT2 0.069571, code24
+0.052119) reproduce in the same harness. The TP route's own KLD is lower than
+the single-card pin for every exchange, f32 included (the cause is not
+established here), so the pin comparison does not bound the exchange error:
+the judged quantity is the paired difference above, and none of the 16-bit
+rows is worse than the single-card pin. bf16 is the default because it has the
+f32 range, so no partial can overflow, whereas f16 turns a partial above
+65,504 into infinity. A probe of the f32 partials over the same two TP2 runs
+(6,144 reductions, both ranks, prefill rows) found a largest magnitude of
+436.5 on WT2 and 412.9 on code24 and none above 1,000, so f16 has more than
+100x headroom on these corpora; that is a measurement, not a bound for other
+prompts.
+
 ### Generic mesh executor: TP collectives (developer)
 
 `Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
@@ -1248,7 +1325,9 @@ meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
 is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
 and `AllReduce` collectives over the group of every rank in rank order, with
 the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
-`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+`p0 + p1 + …` (with the default 16-bit exchange the `AllReduceAdd` partials are
+the rounded `r(p)` of the previous section; the no-target `AllReduce` stays
+f32), the same bytes on every rank. The transport is chosen once at
 provisioning, and each transport has exactly one route (no per-call choice;
 `peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
 not apply to it):

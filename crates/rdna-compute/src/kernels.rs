@@ -10486,7 +10486,17 @@ pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str = concat!(
 /// keep their original `gfx1100` spelling.
 pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp_exchange16.h"),
     include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip")
+);
+
+/// 16-bit partial-sum exchange for the dense TP residual reduction
+/// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
+/// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit
+/// partials in f32 into the f32 residual. See `kernels/src/tp_exchange16.hip`.
+pub const TP_EXCHANGE16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/tp_exchange16.h"),
+    include_str!("../../../kernels/src/tp_exchange16.hip")
 );
 
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");

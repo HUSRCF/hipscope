@@ -5453,6 +5453,10 @@ fn load_model_tp_qwen35_dense(
     eprintln!(
         "[loader] dense qwen TP route=hand (hand dense-TP forward): {tp} ranks, peer_access={peer}"
     );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(peer)
+    );
     let mtp_present = mtp_head.is_some();
     // Block-verify drafters cannot run on the mesh (`Qwen35DenseTpTarget`
     // refuses `verify_block`), so an `ngram=on` request must not build one
@@ -5843,6 +5847,10 @@ fn load_model_tp_qwen35_mesh(
         "[loader] dense qwen TP route=mesh (generic mesh executor): {tp} ranks, \
          transport={transport}, prefill chunk={chunk}, {} collectives/epoch",
         plan.collectives.len()
+    );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(transport == "peer")
     );
 
     let (gpus, ranks) = staging.into_parts();

@@ -22255,6 +22255,89 @@ impl Gpu {
         )
     }
 
+    /// Resolve the 16-bit-exchange graph reduce kernel before graph capture
+    /// (JIT compilation is not capture-safe).
+    pub fn ensure_tp_graph_signal_reduce16_gfx1100_kernel(
+        &mut self,
+        fmt: crate::norm::TpExchange16,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_reduce16 requires gfx1100 or gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            fmt.graph_reduce_kernel(),
+        )
+    }
+
+    /// 16-bit-exchange twin of [`Self::tp_graph_signal_reduce_gfx1100`]: the
+    /// local f32 partial is published as `2 * count` bytes of 16-bit `fmt`
+    /// into the peer's coherent shadow, and both ranks add
+    /// `x + (r(p0) + r(p1))` (`r` = the 16-bit round trip) in rank order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_graph_signal_reduce16_gfx1100(
+        &mut self,
+        fmt: crate::norm::TpExchange16,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+        x: &DeviceBuffer,
+        local_partial: &DeviceBuffer,
+        peer_shadow: *mut c_void,
+        local_shadow: *const c_void,
+        local_is_first: bool,
+        count: usize,
+    ) -> HipResult<()> {
+        self.ensure_tp_graph_signal_reduce16_gfx1100_kernel(fmt)?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let x_ptr = x.as_ptr();
+        let local_partial_ptr = local_partial.as_ptr();
+        let local_is_first_arg = i32::from(local_is_first);
+        let count_arg = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 9] = [
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &local_partial_ptr as *const _ as *mut c_void,
+            &peer_shadow as *const _ as *mut c_void,
+            &local_shadow as *const _ as *mut c_void,
+            &local_is_first_arg as *const _ as *mut c_void,
+            &count_arg as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            fmt.graph_reduce_kernel(),
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(local_partial_ptr);
+                b.push_ptr(peer_shadow);
+                b.push_ptr(local_shadow);
+                b.push_i32(local_is_first_arg);
+                b.push_i32(count_arg);
+                b.push_ptr(wait_block);
+                b
+            },
+        )
+    }
+
     /// Publish one TP graph barrier epoch with system-scope release semantics.
     pub fn tp_graph_signal_store_gfx1201(
         &mut self,
