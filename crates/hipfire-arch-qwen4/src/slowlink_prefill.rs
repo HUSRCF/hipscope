@@ -4538,8 +4538,8 @@ mod slowlink_prompt {
         let plan = plan(0, 40000, &[]);
         assert_chronology(&plan);
         let windows: Vec<usize> = plan.windows.iter().map(|w| w.rows).collect();
-        // A window ends at a tile end, so ten 1536-row tiles (15360 rows) fill it.
-        assert_eq!(windows, vec![15360, 15360, 9280]);
+        // A window ends at a tile end, so eleven 1536-row tiles (16896 rows) fill it.
+        assert_eq!(windows, vec![16896, 16896, 6208]);
         // One sweep per window: a long request can never claim one per prompt.
         let reports = vec![WindowReport::default(); plan.windows.len()];
         let receipt = layer_major_receipt(&ReceiptInputs {
@@ -5658,7 +5658,7 @@ mod slowlink_prompt {
             let profile = product_profile_on(route);
             assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
             assert_eq!(profile.tile_rows, 768);
-            assert_eq!(profile.window_rows, 16384, "the full 16,384-row window");
+            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "the full 22-tile window");
             let plan = plan_for_profile(&profile, 0, 16384, &[], &gfx1100_routing, 8)
                 .unwrap()
                 .expect("the product tile plans a full window");
@@ -6895,12 +6895,12 @@ mod slowlink_eager_load {
             }
             let sym = product_profile_on(SYM);
             let f16 = product_profile_on(F16);
-            assert_eq!(sym.window_rows, 16384);
-            // Both A4 sidecars (gate 20 * N * 72, down 5 * N * 10 * 72): 78.75 MiB at 16K.
-            assert_eq!(sym.census.a4_sidecars, 82_575_360);
+            assert_eq!(sym.window_rows, crate::slowlink_admission::S1_WINDOW_ROWS);
+            // Both A4 sidecars (gate 20 * N * 72, down 5 * N * 10 * 72): 78.75 MiB at the former 16,384-row window, 81.21 MiB at 16,896.
+            assert_eq!(sym.census.a4_sidecars, 85_155_840);
             assert_eq!(
                 sym.census.a4_sidecars,
-                20 * 16384 * 72 + 5 * 16384 * 10 * 72
+                20 * 16896 * 72 + 5 * 16896 * 10 * 72
             );
             assert_eq!(f16.census.a4_sidecars, 0);
             // No window F16 input and no panel-local F16 slot map on the IU4 route.
@@ -6908,7 +6908,7 @@ mod slowlink_eager_load {
             assert_eq!(layout.x_f16_bytes(), 0);
             assert_eq!(
                 f16.census.route_storage - sym.census.route_storage,
-                83_886_080 + 2048 * 4
+                86_507_520 + 2048 * 4
             );
             // The F32 tail cohort and decode rows keep the aggregate bounds on both routes.
             assert_eq!(sym.route_dims().tail_rows, f16.route_dims().tail_rows);
@@ -6930,7 +6930,7 @@ mod slowlink_eager_load {
             let profile = product_profile_on(SYM);
             let args = window_scratch_args(&profile);
             assert_eq!(args.route, SYM);
-            assert_eq!(args.rows, 16384);
+            assert_eq!(args.rows, crate::slowlink_admission::S1_WINDOW_ROWS);
             assert_eq!(args.hidden, 2560);
             assert_eq!(args.intermediate, 640);
             // The reserve entry's own byte formula (`reserve_qwen4_moe_sym`: grouping scratch, down
