@@ -37,11 +37,30 @@
 //! expected to be true. The record gains `sparse: {mma, base_mma,
 //! groups_per_block, kept_per_group, seed}`.
 //!
+//! # Generator knobs (`iu4_gemm::Tune`)
+//! `ring` (`2`|`3`), `wait` (`after`|`mid`|`before`: where a K-loop block
+//! publishes its next slab relative to the slab's WMMAs, see
+//! `iu4_gemm::WaitPlace`) and `fold-op` (`fma`|`muladd`, `iu4_gemm::FoldOp`),
+//! as `--ring 2 --wait mid --fold-op fma`. `ring` and `wait` are schedule
+//! knobs: the candidate must stay `identical_to_baseline`. `ring 3` is refused
+//! by `Spec::validate` (no generator). `fold-op muladd` is a deliberately
+//! NUMERIC candidate (non-fused `v_mul_f32` + `v_add_f32` stage-2 accumulate,
+//! the hipcc DAG): the record declares `numeric_contract.relation = "numeric"`,
+//! reports `identical_to_baseline` honestly and, for set/add, checks the
+//! candidate against the `muladd` CPU reference (the baseline against `fma`);
+//! for silu there is no CPU reference and the candidate passes when it is
+//! finite and NaN-pattern-equal to the baseline (the KLD/state gate decides).
+//! The knobs reach the record's `candidate.knobs` only when non-default.
+//! Baseline overrides: `base-ring|base-wait|base-fold-op` (the baseline is
+//! otherwise the default tune). Not combinable with `--rip` (the `.rip`
+//! `Iu4Spec` carries no tune).
+//!
 //! # Extra knobs
 //! `ref-rows`: `full` (default while `M*N*K <= 2e9` MACs) or `sample:<n>`
 //! (default `sample:192` beyond that): rows `0..64`, the last 64, and `n`
 //! evenly spread rows, every token column. `max_abs_diff` always covers the
-//! whole output. `ref-fold`: `fma` (default) or `muladd`, see below.
+//! whole output. `ref-fold`: `fma` or `muladd` (default: each arm's own
+//! `fold-op`), see below.
 //!
 //! # Reference numerics
 //! Symmetric fold DAG (production `mq4v2_symmetric`): per K128 block
@@ -56,7 +75,7 @@
 
 use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::iu4_gemm::{self, sparse24, ALayout, Epi, Mma, Spec};
+use peacemaker_isa::kernels::iu4_gemm::{self, sparse24, ALayout, Epi, FoldOp, Mma, Spec, Tune};
 use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
@@ -421,12 +440,34 @@ struct Strs {
     epi: String,
     alayout: String,
     mma: String,
+    /// Generator knobs (`iu4_gemm::Tune`), the spellings `RingDepth`/`WaitPlace`/`FoldOp` parse.
+    ring: String,
+    wait: String,
+    fold_op: String,
 }
 
 impl Strs {
     fn json(&self) -> Value {
-        json!({"fold": self.fold, "tile": self.tile, "cacc": self.cacc,
-               "epi": self.epi, "alayout": self.alayout, "mma": self.mma})
+        let mut v = json!({"fold": self.fold, "tile": self.tile, "cacc": self.cacc,
+               "epi": self.epi, "alayout": self.alayout, "mma": self.mma});
+        // Only non-default generator knobs are recorded: every existing record keeps its bytes.
+        for (key, val, default) in [
+            ("ring", &self.ring, "2"),
+            ("wait", &self.wait, "after"),
+            ("fold-op", &self.fold_op, "fma"),
+        ] {
+            if val != default {
+                v[key] = json!(val);
+            }
+        }
+        v
+    }
+    fn tune(&self) -> Result<Tune> {
+        Ok(Tune {
+            ring: self.ring.parse()?,
+            wait: self.wait.parse()?,
+            fold_op: self.fold_op.parse()?,
+        })
     }
     fn spec(&self) -> Result<Spec> {
         let mut spec = Spec::from_knobs(
@@ -438,6 +479,7 @@ impl Strs {
             Arch::Gfx1201,
         )?;
         spec.mma = self.mma.parse()?;
+        spec.tune = self.tune()?;
         Ok(spec)
     }
 }
@@ -474,10 +516,12 @@ pub struct Iu4 {
     base_emitted: bool,
     rows: Vec<usize>,
     rows_desc: String,
-    ref_fold: RefFold,
+    /// `--ref-fold`: overrides every arm's reference fold (default: the arm's own `fold-op`).
+    ref_fold: Option<RefFold>,
     host: Option<Host>,
     dev: Option<Dev>,
-    reference: OnceCell<Vec<f32>>,
+    /// CPU reference rows per [`RefFold`] (`fma`, `muladd`), computed on first use.
+    reference: [OnceCell<Vec<f32>>; 2],
     /// Seed of the 2:4 pruning (`sparse-seed`).
     sparse_seed: u64,
     /// `--rip`: the candidate arm is this source, not `iu4_gemm::emit`.
@@ -585,8 +629,17 @@ pub fn new_with_rip(
         epi: knobs.take_or("epi", "set"),
         alayout: knobs.take_or("alayout", "token"),
         mma: knobs.take_or("mma", "dense"),
+        ring: knobs.take_or("ring", "2"),
+        wait: knobs.take_or("wait", "after"),
+        fold_op: knobs.take_or("fold-op", "fma"),
     };
     let cand = cand_strs.spec()?;
+    if rip.is_some() && !cand.tune.is_default() {
+        return Err(
+            "--ring/--wait/--fold-op cannot be combined with --rip (the `.rip` Iu4Spec carries no tune)"
+                .into(),
+        );
+    }
     if cand.epi == Epi::QkvzaGdn {
         return Err("epi qkvzagdn is not supported by pm_loop (120-byte fused GDN ABI)".into());
     }
@@ -596,7 +649,13 @@ pub fn new_with_rip(
             cand.epi.name()
         ));
     }
-    let mut base_strs = cand_strs.clone();
+    // The baseline is the incumbent: the default tune unless a `base-` generator knob is given.
+    let mut base_strs = Strs {
+        ring: "2".into(),
+        wait: "after".into(),
+        fold_op: "fma".into(),
+        ..cand_strs.clone()
+    };
     let mut base_emitted = false;
     for (key, slot) in [
         ("base-fold", &mut base_strs.fold),
@@ -604,6 +663,9 @@ pub fn new_with_rip(
         ("base-cacc", &mut base_strs.cacc),
         ("base-alayout", &mut base_strs.alayout),
         ("base-mma", &mut base_strs.mma),
+        ("base-ring", &mut base_strs.ring),
+        ("base-wait", &mut base_strs.wait),
+        ("base-fold-op", &mut base_strs.fold_op),
     ] {
         if let Some(v) = knobs.take(key) {
             *slot = v;
@@ -619,6 +681,9 @@ pub fn new_with_rip(
             tile: "128x128x8".into(),
             cacc: "1".into(),
             mma: "dense".into(),
+            ring: "2".into(),
+            wait: "after".into(),
+            fold_op: "fma".into(),
             ..cand_strs.clone()
         };
         Spec {
@@ -632,10 +697,11 @@ pub fn new_with_rip(
             .map_err(|e| format!("--sparse-seed {v}: {e}"))?,
         None => DEFAULT_SPARSE_SEED,
     };
-    let ref_fold = match knobs.take_or("ref-fold", "fma").as_str() {
-        "fma" => RefFold::Fma,
-        "muladd" => RefFold::MulAdd,
-        o => return Err(format!("--ref-fold {o}: expected fma|muladd")),
+    let ref_fold = match knobs.take("ref-fold").as_deref() {
+        None => None,
+        Some("fma") => Some(RefFold::Fma),
+        Some("muladd") => Some(RefFold::MulAdd),
+        Some(o) => return Err(format!("--ref-fold {o}: expected fma|muladd")),
     };
     let macs = (m as u128) * (n as u128) * (k as u128);
     let mode = knobs.take_or(
@@ -668,7 +734,7 @@ pub fn new_with_rip(
         ref_fold,
         host: None,
         dev: None,
-        reference: OnceCell::new(),
+        reference: [OnceCell::new(), OnceCell::new()],
         sparse_seed,
         rip,
     }))
@@ -688,6 +754,15 @@ impl Iu4 {
             Arm::Baseline => self.base,
             Arm::Candidate => self.cand,
         }
+    }
+
+    /// The CPU fold `arm`'s reference follows: `--ref-fold`, else the arm's own `fold-op`.
+    fn ref_fold_of(&self, arm: Arm) -> RefFold {
+        self.ref_fold
+            .unwrap_or(match self.spec_of(arm).tune.fold_op {
+                FoldOp::Fma => RefFold::Fma,
+                FoldOp::MulAdd => RefFold::MulAdd,
+            })
     }
 
     /// Either arm runs a 2:4 sparse MMA, so the generated weights are pruned.
@@ -864,7 +939,7 @@ impl Iu4 {
         }
         let got = mem.read(yva, n * m * 4)?;
         let rows: Vec<usize> = (0..m).collect();
-        let want = reference(&host, m, n, k, add, &rows, self.ref_fold);
+        let want = reference(&host, m, n, k, add, &rows, self.ref_fold_of(Arm::Candidate));
         let mismatches = (0..m)
             .flat_map(|r| (0..n).map(move |c| (r, c)))
             .filter(|&(r, c)| {
@@ -1056,6 +1131,10 @@ impl Workload for Iu4 {
     }
 
     fn check(&self, out: &[u8]) -> Result<RefReport> {
+        self.check_arm(Arm::Candidate, out)
+    }
+
+    fn check_arm(&self, arm: Arm, out: &[u8]) -> Result<RefReport> {
         if self.cand.epi.is_silu() {
             return Err(format!(
                 "no CPU reference for epi {} (v_exp-approximated SiLU region not reproduced); \
@@ -1072,9 +1151,9 @@ impl Workload for Iu4 {
         }
         let host = self.host.as_ref().ok_or("check before setup")?;
         let add = self.cand.epi == Epi::Add;
-        let want = self.reference.get_or_init(|| {
-            reference(host, self.m, self.n, self.k, add, &self.rows, self.ref_fold)
-        });
+        let fold = self.ref_fold_of(arm);
+        let want = self.reference[fold as usize]
+            .get_or_init(|| reference(host, self.m, self.n, self.k, add, &self.rows, fold));
         let (mut mismatches, mut worst) = (0usize, 0f64);
         for (ri, &r) in self.rows.iter().enumerate() {
             for col in 0..self.n {
@@ -1089,7 +1168,7 @@ impl Workload for Iu4 {
             reference: format!(
                 "cpu_iu4_symfold_rn(rows={},fold={}{},mismatching_elements={mismatches})",
                 self.rows_desc,
-                match self.ref_fold {
+                match fold {
                     RefFold::Fma => "fma",
                     RefFold::MulAdd => "muladd",
                 },
@@ -1102,6 +1181,21 @@ impl Workload for Iu4 {
             max_abs_err: worst,
             tolerance: 0.0,
             pass: mismatches == 0,
+        })
+    }
+
+    fn numeric_contract(&self) -> Value {
+        if self.cand.tune.fold_op == self.base.tune.fold_op {
+            return Value::Null;
+        }
+        let name = |s: Spec| match s.tune.fold_op {
+            FoldOp::Fma => "fma(t, float(C) - magic, acc) (hipcc-K1-exact builder fold)",
+            FoldOp::MulAdd => "acc + RN(t * (float(C) - magic)) (non-fused v_mul_f32 + v_add_f32)",
+        };
+        json!({
+            "baseline": name(self.base),
+            "candidate": name(self.cand),
+            "relation": "numeric",
         })
     }
 
@@ -1516,6 +1610,110 @@ mod tests {
                 assert_eq!(v["ran"], true, "{epi} {mma}: {v}");
                 assert_eq!(v["bit_exact"], true, "{epi} {mma}: {v}");
                 assert_eq!(v["mma"], mma);
+            }
+        }
+    }
+
+    #[test]
+    fn generator_knobs_reach_the_spec_and_the_record_only_when_non_default() {
+        let shape = "M=128,N=64,K=256";
+        let plain = new(shape, &mut knobs(&[])).unwrap();
+        let k = plain.candidate_knobs();
+        for key in ["ring", "wait", "fold-op"] {
+            assert!(
+                k.get(key).is_none(),
+                "{key} is recorded only when non-default"
+            );
+        }
+        assert!(plain.numeric_contract().is_null());
+        let mut kn = knobs(&[("wait", "mid"), ("ring", "2"), ("fold-op", "fma")]);
+        let w = new(shape, &mut kn).unwrap();
+        assert!(kn.0.is_empty(), "{:?}", kn.0);
+        let k = w.candidate_knobs();
+        assert_eq!(k["wait"], "mid");
+        assert!(k.get("ring").is_none() && k.get("fold-op").is_none());
+        assert_eq!(k["variant"], "k128-128x128x8-cacc1-set-wmid");
+        // A schedule knob changes the emitted code, not the declared numerics.
+        assert!(w.numeric_contract().is_null());
+        let (a, b) = (w.candidate().unwrap(), plain.candidate().unwrap());
+        assert_ne!(a.bytes, b.bytes);
+        assert_eq!(a.launch_symbol, b.launch_symbol);
+        // The baseline stays the incumbent unless a `base-` generator knob is given.
+        let w = new(
+            shape,
+            &mut knobs(&[("wait", "before"), ("base-tile", "128x128x8")]),
+        )
+        .unwrap();
+        assert_eq!(w.baseline().unwrap().desc["knobs"].get("wait"), None);
+        let w = new(
+            shape,
+            &mut knobs(&[("base-tile", "128x128x8"), ("base-wait", "mid")]),
+        )
+        .unwrap();
+        assert_eq!(w.baseline().unwrap().desc["knobs"]["wait"], "mid");
+        for (key, bad) in [("ring", "4"), ("wait", "late"), ("fold-op", "fused")] {
+            assert!(
+                new(shape, &mut knobs(&[(key, bad)])).is_err(),
+                "{key} {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn ring_three_surfaces_the_generators_reason() {
+        let w = new("M=128,N=64,K=256", &mut knobs(&[("ring", "3")])).unwrap();
+        let e = w.candidate().unwrap_err();
+        assert!(e.contains("ring depth 3 has no generator"), "{e}");
+    }
+
+    #[test]
+    fn generator_knobs_refuse_a_rip_candidate() {
+        let dir = std::env::temp_dir().join(format!("iu4-rip-tune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.rip");
+        std::fs::write(&p, "fn emit() {}").unwrap();
+        let e = new_with_rip("M=128,N=64,K=256", &mut knobs(&[("wait", "mid")]), Some(&p))
+            .err()
+            .unwrap();
+        assert!(e.contains("--rip"), "{e}");
+    }
+
+    #[test]
+    fn muladd_is_a_declared_numeric_candidate_checked_against_its_own_fold() {
+        let shape = "M=128,N=128,K=256";
+        for epi in ["set", "add", "silu"] {
+            let w = new(shape, &mut knobs(&[("fold-op", "muladd"), ("epi", epi)])).unwrap();
+            let c = w.numeric_contract();
+            assert_eq!(c["relation"], "numeric", "{epi}");
+            assert!(c["candidate"].as_str().unwrap().contains("v_mul_f32"));
+            assert!(c["baseline"].as_str().unwrap().contains("fma"));
+            assert_eq!(w.candidate_knobs()["fold-op"], "muladd");
+            assert!(!w.requires_baseline_identity());
+            // Emitted and linkable: the object is not the incumbent's.
+            let plain = new(shape, &mut knobs(&[("epi", epi)])).unwrap();
+            assert_ne!(
+                w.candidate().unwrap().bytes,
+                plain.candidate().unwrap().bytes
+            );
+        }
+        // Two arms with the same fold are an exact comparison again.
+        let w = new(
+            shape,
+            &mut knobs(&[("fold-op", "muladd"), ("base-fold-op", "muladd")]),
+        )
+        .unwrap();
+        assert!(w.numeric_contract().is_null());
+        // The emulator reproduces the candidate's own CPU fold bit for bit.
+        for (epi, ko) in [("set", "muladd"), ("add", "muladd"), ("set", "fma")] {
+            for wait in ["after", "mid", "before"] {
+                let w = new(
+                    shape,
+                    &mut knobs(&[("epi", epi), ("fold-op", ko), ("wait", wait)]),
+                )
+                .unwrap();
+                let v = w.emu();
+                assert_eq!(v["ran"], true, "{epi} {ko} {wait}: {v}");
+                assert_eq!(v["bit_exact"], true, "{epi} {ko} {wait}: {v}");
             }
         }
     }

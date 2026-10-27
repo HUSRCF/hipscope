@@ -47,9 +47,10 @@
 //! retire = `barrier(&[Retire])`.
 
 use crate::backend::{Auth, Backend, EventId, SlotTransition};
-use crate::lds::{Lendable, Ring, RingParts, Slots};
+use crate::lds::{Lendable, Ring, RingParts, Slots, Writing};
 use crate::scope::{End, Scc, WgUniform, Workgroup};
 use crate::target::{SplitBarrier, Target, WaitModel};
+use crate::wait::{LdsWrite, Pending};
 use std::any::TypeId;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -1607,13 +1608,29 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
 /// kernel exits and conditions of the script side. It cannot mint a ring, a
 /// region or an `Auth`; it only moves what the typed core built.
 ///
-/// A ring crosses only in a state with no `Pending` token (`Free` or
-/// `Published` buffers, [`Lendable`]) and only under its own tag, which is
+/// A ring crosses with `Free` or `Published` buffers ([`Lendable`], `take` /
+/// `give_back`) or with a `Writing` next buffer and its `Pending` token
+/// (`take_writing` / `give_writing`), and only under its own tag, which is
 /// what makes a ring of the wrong payload kind a refusal instead of a
-/// misread LDS plane.
+/// misread LDS plane. [`Lend::view`] reads a ring's phases without taking it.
 pub struct Lend<'a> {
     st: &'a mut St,
     owner: u64,
+}
+
+/// A ring as the driver holds it ([`Lend::view`]).
+#[derive(Clone, Debug)]
+pub struct RingView {
+    pub name: String,
+    pub cur: Phase,
+    pub next: Phase,
+    /// Physical index (0 or 1) of the current and of the next buffer.
+    pub cur_index: usize,
+    pub next_index: usize,
+    /// The current buffer holds data a barrier published.
+    pub cur_live: bool,
+    /// The next buffer's `Pending` token has not been waited.
+    pub pending: bool,
 }
 
 impl Lend<'_> {
@@ -1750,6 +1767,121 @@ impl Lend<'_> {
             events: p.last.into_iter().collect(),
             pending: false,
         };
+        r.hold = Hold::Live;
+        Ok(())
+    }
+    /// What the driver currently holds for ring `id`, tag-checked as `Tag`
+    /// and live (not lent, not in a split barrier, not consumed), without
+    /// taking it: the phases and physical indices a typed body picks its
+    /// typed states by. A ring is lent in `Free`/`Published` buffers by
+    /// [`take`](Self::take) and with a `Writing` next buffer by
+    /// [`take_writing`](Self::take_writing).
+    pub fn view<Tag: 'static>(&self, id: RingId) -> Result<RingView, String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        Self::live_check(r)?;
+        Self::tag_check::<Tag>(r)?;
+        Ok(RingView {
+            name: r.name.clone(),
+            cur: r.cur_phase,
+            next: r.next,
+            cur_index: r.cur,
+            next_index: 1 - r.cur,
+            cur_live: r.cur_live,
+            pending: r.stores.undrained(),
+        })
+    }
+    fn live_check(r: &RingBuf) -> Result<(), String> {
+        match r.hold {
+            Hold::Live => Ok(()),
+            Hold::Lent => Err(format!("ring {} is already lent", r.name)),
+            Hold::Barrier => Err(format!(
+                "ring {} is held by a split barrier in flight until wait_arrived",
+                r.name
+            )),
+            Hold::Gone => Err(format!("ring {} was re-laid out or consumed", r.name)),
+        }
+    }
+    /// [`take`](Self::take) for a ring whose next buffer is `Writing`: the
+    /// typed `Ring<Tag, C, Writing>` with its `Pending` token (the youngest
+    /// store the driver knows of; stores from several incoming paths
+    /// cannot be lent). The driver's own record of the buffer is left as it
+    /// was, so a typed body that only reads the current buffer hands the
+    /// ring back with its token still pending, or already waited, as it was
+    /// ([`give_writing`](Self::give_writing)).
+    pub fn take_writing<Tag: 'static, W: WaitModel, C: Lendable>(
+        &mut self,
+        id: RingId,
+    ) -> Result<(Ring<Tag, C, Writing>, Pending<W, LdsWrite<Tag>>), String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        Self::live_check(r)?;
+        Self::tag_check::<Tag>(r)?;
+        if r.cur_phase != C::PHASE || r.next != Phase::RtWriting {
+            return Err(format!(
+                "ring {} is [cur {:?}, next {:?}]; the typed body takes it as [cur {:?}, next Writing]",
+                r.name,
+                r.cur_phase,
+                r.next,
+                C::PHASE
+            ));
+        }
+        if r.stores.events.len() > 1 {
+            return Err(format!(
+                "ring {} has stores from several paths: it cannot be lent as one Pending token",
+                r.name
+            ));
+        }
+        let last = r.stores.events.first().copied();
+        let parts = RingParts {
+            bufs: [Slots::from_ids(&r.bufs[0])?, Slots::from_ids(&r.bufs[1])?],
+            cur: r.cur,
+            cur_live: r.cur_live,
+            last,
+        };
+        self.st.rings[i].hold = Hold::Lent;
+        Ok((Ring::from_parts(parts), Pending::new(last)))
+    }
+    /// Return a ring in the `Writing` state ([`take_writing`](Self::take_writing),
+    /// or a [`take`](Self::take)n `Free` ring a body wrote into). A new store
+    /// makes its token pending; a ring whose youngest store is the one it was
+    /// taken with keeps the driver's record (pending, or already waited).
+    pub fn give_writing<Tag: 'static, W: WaitModel, C: Lendable>(
+        &mut self,
+        id: RingId,
+        (ring, pending): (Ring<Tag, C, Writing>, Pending<W, LdsWrite<Tag>>),
+    ) -> Result<(), String> {
+        let i = self.ring_slot(id)?;
+        let r = &self.st.rings[i];
+        if r.hold != Hold::Lent {
+            return Err(format!("ring {} is not lent: nothing to give back", r.name));
+        }
+        Self::tag_check::<Tag>(r)?;
+        let p = ring.into_parts();
+        if r.bufs[0] != p.bufs[0].ids() || r.bufs[1] != p.bufs[1].ids() {
+            return Err(format!(
+                "ring {}: the ring given back is not the one that was taken",
+                r.name
+            ));
+        }
+        if pending.last != p.last {
+            return Err(format!(
+                "ring {}: the Pending token does not cover the ring's youngest store",
+                r.name
+            ));
+        }
+        let r = &mut self.st.rings[i];
+        r.cur = p.cur;
+        r.cur_live = p.cur_live;
+        r.cur_phase = C::PHASE;
+        let unchanged = r.next == Phase::RtWriting && r.stores.events.first().copied() == p.last;
+        r.next = Phase::RtWriting;
+        if !unchanged {
+            r.stores = Stores {
+                events: p.last.into_iter().collect(),
+                pending: true,
+            };
+        }
         r.hold = Hold::Live;
         Ok(())
     }

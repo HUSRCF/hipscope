@@ -398,3 +398,108 @@ fn a_typed_block_that_leaves_the_ring_in_another_state_is_refused_by_the_loop() 
         "{e}"
     );
 }
+
+// ---- a ring that crosses with a pending `Writing` buffer ---------------------
+
+fn primed_ring(d: &mut Driver<'_, Gfx1201, Trace>) -> peacemaker_author::runtime::RingId {
+    let id = d
+        .typed(|wg, lend| {
+            let k0 = wg.lds::<Tile>("K0", 0, 4096)?;
+            let k1 = wg.lds::<Tile>("K1", 4096, 4096)?;
+            Ok(lend.give(Ring::new(k0, k1), "K"))
+        })
+        .unwrap();
+    d.ds_store(id, STAGE.into()).unwrap();
+    d.wait(id).unwrap();
+    d.barrier(&[Transition::Prime(id)]).unwrap();
+    id
+}
+
+/// `middle` split at its wait: the typed body stages the next buffer and hands
+/// the ring back `Writing` with its token pending; the driver waits and rotates.
+/// The trace is the pure typed `middle`'s.
+#[test]
+fn a_publish_split_from_its_wait_emits_the_same_trace() {
+    let mut whole = Trace::new("gfx1201");
+    {
+        let mut d = Driver::<Gfx1201, Trace>::new(&mut whole).unwrap();
+        let id = primed_ring(&mut d);
+        d.typed(|wg, lend| {
+            let ring = lend.take::<Tile, Published, Free>(id)?;
+            lend.give_back(id, middle(wg, ring)?)
+        })
+        .unwrap();
+    }
+    let mut split = Trace::new("gfx1201");
+    {
+        let mut d = Driver::<Gfx1201, Trace>::new(&mut split).unwrap();
+        let id = primed_ring(&mut d);
+        d.typed(|wg, lend| {
+            let ring = lend.take::<Tile, Published, Free>(id)?;
+            wg.ds_load_cur(&ring, LOAD.into())?;
+            lend.give_writing(id, wg.ds_store(ring, STAGE.into())?)
+        })
+        .unwrap();
+        // Writing, pending: the driver knows it, and a barrier needs the wait.
+        let v = d.typed(|_, lend| lend.view::<Tile>(id)).unwrap();
+        assert!(v.pending);
+        let e = err(d.barrier(&[Transition::Rotate(id)]));
+        assert!(e.contains("undrained LDS store"), "{e}");
+        d.wait(id).unwrap();
+        d.barrier(&[Transition::Rotate(id)]).unwrap();
+    }
+    assert_eq!(whole.text, split.text);
+}
+
+/// A body that only reads a `Writing` ring gives it back as it was: still
+/// pending before the wait, still drained after it.
+#[test]
+fn reading_a_writing_ring_keeps_its_token_state() {
+    let mut b = Trace::new("gfx1201");
+    let mut d = Driver::<Gfx1201, Trace>::new(&mut b).unwrap();
+    let id = primed_ring(&mut d);
+    d.typed(|wg, lend| {
+        let ring = lend.take::<Tile, Published, Free>(id)?;
+        lend.give_writing(id, wg.ds_store(ring, STAGE.into())?)
+    })
+    .unwrap();
+    let read = |d: &mut Driver<'_, Gfx1201, Trace>| {
+        d.typed(|wg, lend| {
+            let (ring, tok) =
+                lend.take_writing::<Tile, peacemaker_author::Gfx12Waits, Published>(id)?;
+            wg.ds_load_cur(&ring, LOAD.into())?;
+            lend.give_writing(id, (ring, tok))
+        })
+        .unwrap()
+    };
+    read(&mut d);
+    assert!(d.typed(|_, lend| lend.view::<Tile>(id)).unwrap().pending);
+    d.wait(id).unwrap();
+    read(&mut d);
+    assert!(!d.typed(|_, lend| lend.view::<Tile>(id)).unwrap().pending);
+    // Drained as it was: the rotate goes through without another wait.
+    d.barrier(&[Transition::Rotate(id)]).unwrap();
+}
+
+/// The `Free` take still refuses a `Writing` ring, and `take_writing` refuses a
+/// ring whose next buffer is `Free`.
+#[test]
+fn the_writing_lend_checks_the_next_buffer() {
+    let mut b = Trace::new("gfx1201");
+    let mut d = Driver::<Gfx1201, Trace>::new(&mut b).unwrap();
+    let id = primed_ring(&mut d);
+    let e = err(d.typed(|_, lend| {
+        lend.take_writing::<Tile, peacemaker_author::Gfx12Waits, Published>(id)
+            .map(|_| ())
+    }));
+    assert!(e.contains("next Writing"), "{e}");
+    d.typed(|wg, lend| {
+        let ring = lend.take::<Tile, Published, Free>(id)?;
+        lend.give_writing(id, wg.ds_store(ring, STAGE.into())?)
+    })
+    .unwrap();
+    let e = err(d.typed(|_, lend| lend.take::<Tile, Published, Free>(id).map(|_| ())));
+    assert!(e.contains("Pending") || e.contains("next"), "{e}");
+    let e = err(d.typed(|_, lend| lend.view::<Other>(id).map(|_| ())));
+    assert!(e.contains("tag"), "{e}");
+}

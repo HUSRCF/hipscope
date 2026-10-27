@@ -9,6 +9,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("  pm-census inventory [--repo DIR]                  embedded PM object inventory");
     eprintln!("  pm-census census ...                              see `pm-census census --help`");
+    eprintln!("  pm-census ledger ...                              retained-PM4 dispatch ledger -> CensusV1 (see `pm-census ledger --help`)");
     eprintln!("  pm-census extract ...                             see `pm-census extract --help`");
     eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
     eprintln!("  pm-census tune plan|run|export ...                R4-R6 autotuner (see `pm-census tune`)");
@@ -25,6 +26,7 @@ fn main() {
         "inventory" => pm_census::inventory::cli(rest),
         "census" => pm_census::census::cli(rest),
         "extract" => pm_census::extract::cli(rest),
+        "ledger" => pm_census::ledger::cli(rest),
         "noise" => pm_census::noise::cli(rest),
         "tune" => match rest.split_first() {
             Some((sub, tail)) if sub == "export" => pm_census::tune::store::cli(tail),

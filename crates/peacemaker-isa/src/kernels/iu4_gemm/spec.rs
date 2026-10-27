@@ -89,6 +89,118 @@ impl std::str::FromStr for Mma {
     }
 }
 
+/// Depth of the A/W payload rings (the DS/SZ planes stay per-block).
+/// `Three` would prefetch two slabs ahead; it has no generator (see
+/// [`Spec::validate`]): the typed core has only two-buffer rings and the
+/// 4-slab K-loop trip cannot rotate through three slots with immediate
+/// LDS addresses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RingDepth {
+    #[default]
+    Two,
+    Three,
+}
+impl RingDepth {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Two => "2",
+            Self::Three => "3",
+        }
+    }
+}
+impl std::str::FromStr for RingDepth {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "2" => Ok(Self::Two),
+            "3" => Ok(Self::Three),
+            _ => Err(format!("unknown ring depth {s} (2|3)")),
+        }
+    }
+}
+
+/// Where a K-loop block publishes its next slab: the `flip_weights` + LDS
+/// stores, which carry the vector-memory wait (`s_wait_loadcnt`) for the
+/// slab's global fetch (the builder places that wait at the first use of
+/// the fetched registers), relative to the slab's WMMA bundles. The stores
+/// target the ring's free next buffer, so every placement is legal for the
+/// typed rings; the block's drain (`s_wait_dscnt`) and rendezvous still
+/// follow the last WMMA. Scheduling only: every result bit is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WaitPlace {
+    /// After the slab's last WMMA bundle (the shipped order).
+    #[default]
+    AfterMma,
+    /// Between the slab's two 32-K sub-block bundles.
+    MidMma,
+    /// After the slab's fragment loads, before its first WMMA bundle.
+    BeforeMma,
+}
+impl WaitPlace {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AfterMma => "after",
+            Self::MidMma => "mid",
+            Self::BeforeMma => "before",
+        }
+    }
+}
+impl std::str::FromStr for WaitPlace {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "after" => Ok(Self::AfterMma),
+            "mid" => Ok(Self::MidMma),
+            "before" => Ok(Self::BeforeMma),
+            _ => Err(format!("unknown wait placement {s} (after|mid|before)")),
+        }
+    }
+}
+
+/// Stage-2 accumulate of the fold. `Fma` is hipcc K1's
+/// `sum = fma(t, float(C) - magic, sum)`; `MulAdd` is the deliberately
+/// numeric twin `sum = sum + RN(t * (float(C) - magic))` (non-fused
+/// `v_mul_f32` + `v_add_f32`): not bit-identical to the shipped kernel.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FoldOp {
+    #[default]
+    Fma,
+    MulAdd,
+}
+impl FoldOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fma => "fma",
+            Self::MulAdd => "muladd",
+        }
+    }
+}
+impl std::str::FromStr for FoldOp {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "fma" => Ok(Self::Fma),
+            "muladd" => Ok(Self::MulAdd),
+            _ => Err(format!("unknown fold op {s} (fma|muladd)")),
+        }
+    }
+}
+
+/// Generator knobs that leave the product's math unchanged (`ring`, `wait`)
+/// or change it on purpose (`fold_op`). The default is today's exact codegen:
+/// every emitted byte of a default-`Tune` spec is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Tune {
+    pub ring: RingDepth,
+    pub wait: WaitPlace,
+    pub fold_op: FoldOp,
+}
+impl Tune {
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Spec {
     pub fold: Fold,
@@ -98,6 +210,7 @@ pub struct Spec {
     pub act: ALayout,
     pub arch: Arch,
     pub mma: Mma,
+    pub tune: Tune,
 }
 
 /// Every variant keeps occupancy only at or below this many VGPRs (G0g:
@@ -250,6 +363,7 @@ impl Spec {
             act,
             arch,
             mma: Mma::Dense,
+            tune: Tune::default(),
         })
     }
     pub fn control(epi: Epi) -> Self {
@@ -261,6 +375,7 @@ impl Spec {
             act: ALayout::Token,
             arch: Arch::Gfx1201,
             mma: Mma::Dense,
+            tune: Tune::default(),
         }
     }
     /// Product symbol suffix. The control keeps the plan's `_b1`; the 16-wave
@@ -368,7 +483,7 @@ impl Spec {
     }
     pub fn variant_name(self) -> String {
         format!(
-            "{}-{}-{}{}-{}{}",
+            "{}-{}-{}{}-{}{}{}",
             match self.fold {
                 Fold::K128 => "k128",
                 Fold::K256Shared => "k256s",
@@ -391,8 +506,25 @@ impl Spec {
                 format!("-{}", self.mma.name())
             } else {
                 String::new()
-            }
+            },
+            self.tune_suffix()
         )
+    }
+    /// Variant-name suffix of the non-default generator knobs (empty for the
+    /// default, so every existing variant name is unchanged).
+    fn tune_suffix(self) -> String {
+        let t = self.tune;
+        let mut s = String::new();
+        if t.ring != RingDepth::Two {
+            s += &format!("-r{}", t.ring.name());
+        }
+        if t.wait != WaitPlace::AfterMma {
+            s += &format!("-w{}", t.wait.name());
+        }
+        if t.fold_op != FoldOp::Fma {
+            s += &format!("-f{}", t.fold_op.name());
+        }
+        s
     }
     /// Reject combinations that have no generator: closed fold tracks, the
     /// dropped second accumulator set, and non-gfx12 targets.
@@ -461,6 +593,21 @@ impl Spec {
             return Err(
                 "the fused GDN projection needs the 128-row tile (one head per tile)".into(),
             );
+        }
+        if self.tune.ring == RingDepth::Three {
+            return Err(
+                "ring depth 3 has no generator: the typed LDS core has only two-buffer rings \
+                 (peacemaker-author Ring) and a 4-slab K-loop trip cannot rotate three slots \
+                 through immediate LDS addresses (a 12-slab period would be needed)"
+                    .into(),
+            );
+        }
+        if self.tune.wait != WaitPlace::AfterMma && self.mma.is_sparse() {
+            return Err(format!(
+                "wait placement {} is generated for the dense K-loop block only (mma axis is {})",
+                self.tune.wait.name(),
+                self.mma.name()
+            ));
         }
         Ok(())
     }

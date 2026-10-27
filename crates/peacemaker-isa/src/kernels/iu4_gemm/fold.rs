@@ -5,7 +5,7 @@
 //! Fold wiring for the K-loop: which physical ranges hold the scale rows and
 //! products at fold time, the phase-B placement of the two fold stages, and
 //! the (closed, never emitted into a product module) `K256Pow2` re-seed.
-use super::Gen;
+use super::{FoldOp, Gen};
 use crate::kernels::common::{op, v};
 use crate::{
     kernels::iu4_k1::{self, FoldRegisters},
@@ -52,11 +52,30 @@ pub(crate) fn unbias_after_wmma(b: &mut Builder, g: &Gen, i: usize) -> Result<()
 /// first, whose scale rows landed during the slab-1 WMMAs, each carrying
 /// stage 1 of its row-group-1 partner; then row group 1.
 pub(crate) fn scale(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    if g.spec.tune.fold_op == FoldOp::MulAdd {
+        return scale_muladd(b, g);
+    }
     for i in 0..PAIRED {
         iu4_k1::emit_fold_scale_paired(b, registers(g), BUNDLE_ORDER[i], BUNDLE_ORDER[i + PAIRED])?;
     }
     for &k in &BUNDLE_ORDER[PAIRED..] {
         iu4_k1::emit_fold_scale(b, registers(g), k)?;
+    }
+    Ok(())
+}
+
+/// Stage 2 as the non-fused `FoldOp::MulAdd` twin of [`scale`]: the same
+/// accumulator order, each element `acc = RN(acc + RN(t * x))`
+/// ([`iu4_k1::emit_fold_scale_muladd`]); the stage-1 `subrev` packets of the
+/// row-group-1 partners, which `scale` rides in the fmac packets, issue after
+/// their partner's stage 2 instead.
+fn scale_muladd(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    for i in 0..PAIRED {
+        iu4_k1::emit_fold_scale_muladd(b, registers(g), BUNDLE_ORDER[i])?;
+        iu4_k1::emit_fold_unbias(b, registers(g), BUNDLE_ORDER[i + PAIRED])?;
+    }
+    for &k in &BUNDLE_ORDER[PAIRED..] {
+        iu4_k1::emit_fold_scale_muladd(b, registers(g), k)?;
     }
     Ok(())
 }

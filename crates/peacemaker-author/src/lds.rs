@@ -51,8 +51,9 @@ impl<S: sealed::State + 'static> State for S {}
 
 /// The states a ring may be in when it crosses between a typed body and the
 /// runtime `Driver` (`runtime::Lend`): `Free` and `Published`. A `Writing`
-/// buffer carries a `Pending` token, which has no dynamic form, so it never
-/// crosses.
+/// buffer carries a `Pending` token; it crosses only through
+/// `Lend::take_writing` / `Lend::give_writing`, which move the token with the
+/// ring and leave the driver's record of the buffer's stores alone.
 pub trait Lendable: State {
     #[doc(hidden)]
     const PHASE: crate::runtime::Phase;

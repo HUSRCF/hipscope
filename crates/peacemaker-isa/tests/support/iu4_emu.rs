@@ -205,6 +205,12 @@ pub fn to_slab(recs: &[u8], n: usize) -> Vec<u8> {
 
 /// Exact CPU fold of the dense kernel: `Y[col * M + row]` for `add` (`y0 + sum`) or SET.
 pub fn reference(p: &Problem, add: bool) -> Vec<f32> {
+    reference_with(p, add, true)
+}
+
+/// [`reference`] with the stage-2 accumulate chosen: `fused` is `fma(t1, dot, sum)`, otherwise the non-fused
+/// `sum + RN(t1 * dot)` (`FoldOp::MulAdd`).
+pub fn reference_with(p: &Problem, add: bool, fused: bool) -> Vec<f32> {
     let (m, n, k) = (p.m, p.n, p.k);
     let (gpr, nkb) = (k / 256, k / 128);
     let mut xq = Vec::with_capacity(nkb * n * 128);
@@ -238,7 +244,11 @@ pub fn reference(p: &Problem, add: bool) -> Vec<f32> {
                 let w = &wq[kb * 128..][..128];
                 let dot: i32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
                 let t1 = sc[kb] * xd[kb * n + col];
-                sum = t1.mul_add(dot as f32, sum);
+                sum = if fused {
+                    t1.mul_add(dot as f32, sum)
+                } else {
+                    sum + t1 * dot as f32
+                };
             }
             y[col * m + row] = if add { p.y0[col * m + row] + sum } else { sum };
         }

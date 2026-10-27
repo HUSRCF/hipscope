@@ -441,7 +441,7 @@ The [diagnostic reference](ERRORS.md) explains each stable code. R01xx is parsin
 
 ### Source map
 
-Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`; the fine `iu4_gemm` K-loop natives: `src/native_kloop.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs` (the typed-ring bridge `Lend`: `take`, `take_writing`, `give_writing`, `view`). Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
 
 ## 13. Production generators: `iu4_gemm` and `qwen4_moe_sym`
 
@@ -508,9 +508,46 @@ Each block is one checked `Driver::typed` call. The native takes the four rings 
 - any typed call under wave-uniform control (`skip_if`, `exec_if`, `if_else`, `forward`, `loop_until`), after a wave-uniform kernel exit, or on a target other than gfx1201 (the blocks are gfx1201-typed);
 - a typed body that leaves a taken ring out. After any `Err` from a typed call the lowering is dead, like any backend `Err`: stop at the first one.
 
-The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
+A block's fold stage is two natives (`iu4::wmma(.., fold, ..)` interleaves stage 1 between the sub-block-1 WMMAs; `iu4::fold_scale` is stage 2): `iu4::block` is their composition with the fetches, publishes, waits and rendezvous in the generator's order, and the next section splits it.
 
 The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). The sparse variants carry a trailing `-s24x64` / `-s24x32` (`k128-128x128x8-cacc1-set-s24x64`) and take the sparse blocks. A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec, sparse included; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
+
+### `iu4_gemm` fine K-loop natives
+
+`iu4::block` is itself a composition of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block this way and emits the shipped bytes). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` is composed of; each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
+
+| call | rings in -> out (A W DS SZ) | meaning |
+|---|---|---|
+| `iu4::block_begin(wg, gen, tag, h, end_label, entry_label, lds)?` | none changed | places the block's label (`entry_label`) and declares its register lifetimes (fragments, the fold's scale rows and products; `.Liu4_<tag>_s0` / `_s1` and `end_label` close them); refuses a plane the rings are not on (A current slot 0, DS current plane `h`); returns `lds` |
+| `iu4::fetch_slab1(wg, gen, h)?` | none | the slab-1 loads of block `h` into the prefetch registers |
+| `iu4::fetch_slab1_next_group(wg, gen)?` | none | the odd block's form: the next group's even block, before the group offset advances |
+| `iu4::fetch_next(wg, gen, h)?` | none | the next block's slab 0 into the prefetch registers |
+| `iu4::fetch_next_meta(wg, gen, h)?` | none | the next block's token scale and packed row header |
+| `iu4::publish_slab(wg, gen, lds)?` | A, W: `Published`/`Free` -> `Published`/`Writing`, pending | the weight sign flip and the LDS stores of the staged slab into the next buffers |
+| `iu4::publish_meta(wg, gen, lds)?` | DS, SZ: `Published`/`Free` -> `Published`/`Writing`, pending | the next block's token scale and converted row scale |
+| `iu4::wait(wg, lds, set)?` | `Writing`, pending -> `Writing`, drained | the counter wait for `"slab"` (A, W), `"meta"` (DS, SZ) or `"all"`; returns the tuple of `Drained` tokens in ring order |
+| `iu4::fragments(wg, gen, lds)?` | A, W current `Published` (next `Free` or `Writing`), unchanged | the fragment loads of both 32-K sub-blocks |
+| `iu4::d_loads(wg, gen, lds)?` | DS current `Published`, unchanged | phase B's token-scale loads |
+| `iu4::scale_loads(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s0`, then the first three row-scale loads |
+| `iu4::scale_tail(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s1`, then the last row-scale load |
+| `iu4::wmma(wg, gen, sb, first, fold, lds)?` | A, W current `Published`, unchanged | the eight WMMAs of 32-K sub-block `sb` (0 or 1); `first` seeds the accumulators, `fold` interleaves the fold's stage 1 |
+| `iu4::fold_scale(wg, gen)?` | none | the fold's stage 2 |
+
+`iu4::step_descriptor(wg, gen, which)?` (above) is the descriptor step. The rendezvous is the generic driver's: `wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?` rotates the drained slab (retires the current buffer, publishes the next one), `wg.signal((rotate(..), ..))?` / `wg.wait_arrived(arrived)?` split it. `fetch_*`, `fold_scale`, `wmma` and `step_descriptor` emit through the builder, so they may sit between `signal` and `wait_arrived`, where a `typed` call is refused.
+
+What the driver refuses, each a build error with a stable code ([ERRORS.md](ERRORS.md)):
+
+| rule | refusal | code | test |
+|---|---|---|---|
+| publish into a buffer that is not `Free` | `iu4::publish_slab: ring .. next buffer is Writing ..` | R0399 | `publish_into_a_non_free_buffer_is_refused` |
+| rotate before the wait | `barrier would publish .. with an undrained LDS store` | R0301 | `rotating_before_the_wait_is_refused` |
+| wait with no store in flight | `wait on ring ..: no store of this wave is in flight` | R0399 | `waiting_without_a_publish_is_refused` |
+| read or WMMA of an unpublished slot | `iu4::fragments: ring .. current buffer is Free, not published` | R0303 | `reading_or_wmma_of_an_unpublished_slot_is_refused` |
+| a ring of the wrong kind / one the script made | the typed lend's tag check | R0399 | `a_ring_of_the_wrong_kind_is_refused_by_the_fine_natives`, `a_ring_the_script_made_cannot_enter_the_fine_natives` |
+| a fine step under wave-uniform control | `.. is workgroup scope` | R0304 | `a_fine_step_under_wave_uniform_control_is_refused` |
+| a loop trip that leaves a publish in flight | the driver's loop rule | R0399 | `a_trip_that_leaves_a_publish_in_flight_is_refused` |
+
+(The tests are in `tests/iu4_gemm_fine_twin.rs`.) The sparse blocks (`sparse_block`, `sparse_block_stepping`) are not split. The ring is two-buffer: a ring of three or more buffers needs the typed `Ring` generalised and the LDS layout and the immediate fragment/publish addresses made rotating ([cookbook 17](cookbook/17-iu4-kloop-natives.md#ring-depth-3)).
 
 ### 2:4-sparse weights (`Mma::S24X64`, `Mma::S24X32`)
 

@@ -46,6 +46,12 @@
 //! object). Selection file:line and the object sha256 go in
 //! `baseline.source`.
 //!
+//! `--base-shipped 128x256` (`128x128`, the default, | `128x256`) makes the baseline the shipped
+//! object's `_t128x256` entry (launched with the 128x256 geometry) instead: the entry the runtime
+//! takes for wide launches (`mq6_i8_pm_token_tile`). Use it when the runtime's selector picks the
+//! wide tile at the shape, so the incumbent and the code-identical control are the product's
+//! actual tile. Mutually exclusive with `--base-tile` / `--base-rip`.
+//!
 //! # Correctness
 //! The candidate must be bitwise equal to the shipped baseline (the driver
 //! requires `identical_to_baseline` for this workload) AND equal, bit for bit,
@@ -500,6 +506,9 @@ pub struct Mq6 {
     /// `--base-tile` / `--base-rip`: the baseline is an emitted (or scripted) variant of this spec
     /// instead of the shipped object (hill-climbing against a tile's generator output).
     base: Option<(Spec, Option<(String, String)>)>,
+    /// `--base-shipped`: the baseline is the shipped PM object's entry of this tile (the entry the
+    /// runtime launches for the shape), not the `128x128` product entry.
+    base_shipped: Option<Tile>,
     rows: Vec<usize>,
     rows_desc: String,
     cols: Vec<usize>,
@@ -541,6 +550,25 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
     );
     let cand = parse_spec(&epi_k, &raster_k, &tile_k)?;
     let (base_tile, base_rip) = (knobs.take("base-tile"), knobs.take("base-rip"));
+    let base_shipped = match knobs.take("base-shipped") {
+        None => None,
+        Some(_) if base_tile.is_some() || base_rip.is_some() => {
+            return Err(
+                "--base-shipped selects a shipped entry; it excludes --base-tile/--base-rip".into(),
+            )
+        }
+        Some(t) => match t
+            .parse::<Tile>()
+            .map_err(|e| format!("--base-shipped: {e}"))?
+        {
+            t @ (Tile::T128x128 | Tile::T128x256) => Some(t),
+            _ => {
+                return Err(format!(
+                "--base-shipped {t}: the shipped object has the 128x128 and 128x256 entries only"
+            ))
+            }
+        },
+    };
     let base = if base_tile.is_some() || base_rip.is_some() {
         let spec = parse_spec(&epi_k, &raster_k, base_tile.as_deref().unwrap_or(&tile_k))?;
         let rip = match &base_rip {
@@ -576,6 +604,7 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
         cand,
         rip,
         base,
+        base_shipped,
         rows,
         rows_desc,
         cols,
@@ -634,10 +663,13 @@ impl Mq6 {
     /// or the emitted `--base-tile` / `--base-rip` spec.
     fn arm_spec(&self, arm: Arm) -> Spec {
         match arm {
-            Arm::Baseline => self
-                .base
-                .as_ref()
-                .map_or_else(|| Spec::product(self.cand.epi), |(s, _)| *s),
+            Arm::Baseline => self.base.as_ref().map_or_else(
+                || Spec {
+                    tile: self.base_shipped.unwrap_or(Tile::T128x128),
+                    ..Spec::product(self.cand.epi)
+                },
+                |(s, _)| *s,
+            ),
             Arm::Candidate => self.cand,
         }
     }
@@ -869,16 +901,17 @@ impl Workload for Mq6 {
             });
         }
         let bytes = rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201;
-        let symbol =
-            match self.cand.epi {
-                Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
-                Epi::SetBf16 => "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
-                Epi::SetNr => return Err(
-                    "epi set_nr takes the QSA norm and RoPE-table kernel arguments, which this \
-                     harness does not pass: tests/qsa_norm_epi_oracle.rs checks and times it"
-                        .into(),
-                ),
-            };
+        if self.cand.epi == Epi::SetNr {
+            return Err(
+                "epi set_nr takes the QSA norm and RoPE-table kernel arguments, which this \
+                 harness does not pass: tests/qsa_norm_epi_oracle.rs checks and times it"
+                    .into(),
+            );
+        }
+        // The shipped entry of the baseline's tile: the product symbol (128x128) or its
+        // `_t128x256` sibling (`Spec::symbol` of the banded spec), the runtime's two PM entries.
+        let symbol = self.arm_spec(Arm::Baseline).symbol();
+        let symbol = symbol.as_str();
         if !contains(bytes, symbol.as_bytes()) {
             return Err(format!(
                 "symbol {symbol} is not in the shipped object {OBJECT}"
@@ -888,9 +921,9 @@ impl Workload for Mq6 {
             bytes: bytes.to_vec(),
             launch_symbol: symbol.to_owned(),
             exports: vec![symbol.to_owned()],
-            desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded"}}),
+            desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded", "tile": self.arm_spec(Arm::Baseline).tile.name()}}),
             source: json!({
-                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries); \
+                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries) or, with --base-shipped 128x256, the _T256 entries; \
                            entry choice mq6_i8_pm_launch / mq6_i8_pm_token_tile and embedded-module load (gemm_mq6g256v2_i8_prequant), \
                            admission mq6_i8_pm_admits, 128x128 launch (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
                 "artifact": OBJECT,
@@ -1149,6 +1182,50 @@ mod tests {
             assert_eq!(b.launch_symbol, sym);
             assert_eq!(b.source["artifact"], OBJECT);
             assert_eq!(b.source["sha256"].as_str().unwrap().len(), 64);
+        }
+    }
+
+    #[test]
+    fn base_shipped_selects_the_shipped_wide_entry() {
+        for (epi, sym) in [
+            ("set", "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256"),
+            (
+                "set_bf16",
+                "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256",
+            ),
+        ] {
+            let w = new(
+                "M=10240,N=4096,K=2560",
+                &mut knobs(&[
+                    ("epi", epi),
+                    ("tile", "128x256"),
+                    ("base-shipped", "128x256"),
+                ]),
+                None,
+            )
+            .unwrap();
+            let b = w.baseline().unwrap();
+            assert_eq!(b.launch_symbol, sym);
+            assert_eq!(b.source["artifact"], OBJECT);
+            // The generator twin of the same tile launches the same symbol.
+            assert_eq!(w.candidate().unwrap().launch_symbol, sym);
+        }
+        let w = new(
+            "M=128,N=128,K=256",
+            &mut knobs(&[("base-shipped", "128x128")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"
+        );
+        for bad in [
+            &[("base-shipped", "256x128")][..],
+            &[("base-shipped", "64x64")],
+            &[("base-shipped", "128x256"), ("base-tile", "128x128")],
+        ] {
+            assert!(new("M=128,N=128,K=256", &mut knobs(bad), None).is_err());
         }
     }
 

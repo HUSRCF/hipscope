@@ -8,7 +8,7 @@
 //! `iu4_gemm::emit` (a scratch worktree of origin/beta, this file copied in). A change to any digest is a change
 //! to a production kernel and must be intentional.
 
-use peacemaker_isa::kernels::iu4_gemm::{emit, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
+use peacemaker_isa::kernels::iu4_gemm::{emit, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile, Tune};
 use peacemaker_isa::Arch;
 use sha2::{Digest, Sha256};
 
@@ -94,6 +94,7 @@ fn digests() -> Vec<(String, String)> {
                             act,
                             arch: Arch::Gfx1201,
                             mma: Mma::Dense,
+                            tune: Tune::default(),
                         };
                         if spec.validate().is_err() {
                             continue;

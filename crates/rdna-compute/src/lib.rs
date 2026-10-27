@@ -83,6 +83,7 @@ pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
 pub mod plan_sink;
+pub mod pm4_ledger;
 pub mod pm_decode_twins;
 pub mod pm_mtp_gemm;
 pub mod pm_tune;

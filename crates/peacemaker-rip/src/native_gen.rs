@@ -18,6 +18,13 @@
 //!   (`Lend::give_back`) to the same driver slots, so the driver's own loop
 //!   and branch rule covers script loops around blocks. `Lds` is the array of
 //!   the four `RingId`s; blocks return it for single-assignment style.
+//! - Fine steps (`native_kloop.rs`): the dense block split into
+//!   `iu4::block_begin`, `fragments`, `wmma`, `publish_slab` / `publish_meta`,
+//!   `wait`, `fetch_*`, ... with the rings lent in `Free`, `Published` or
+//!   `Writing` (token pending) state, so a script places the waits itself.
+
+#[path = "native_kloop.rs"]
+mod kloop;
 
 use super::{
     arch_of, check_args, done, done_with, driver, nat, nat_of, ring_of, spec_value, str_of, u8_of,
@@ -62,7 +69,7 @@ const FNS: &[&str] = &[
 ];
 
 pub(super) fn is_fn(name: &str) -> bool {
-    FNS.contains(&name)
+    FNS.contains(&name) || kloop::is_fn(name)
 }
 
 pub(super) fn is_type(n: &str) -> bool {
@@ -244,6 +251,7 @@ fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
         act: layout_of(it, &field(&mut fs, n, "act")?)?,
         arch: arch_of(it, &field(&mut fs, n, "arch")?)?,
         mma: mma_of(it, &field(&mut fs, n, "mma")?)?,
+        tune: iu4::Tune::default(),
     };
     no_more(&fs, n)?;
     Ok(spec)
@@ -566,6 +574,7 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
                 ids.iter().try_for_each(|&id| lend.consumed(id))
             })?))
         }
+        n if kloop::is_fn(n) => kloop::call(it, n, a, cx),
         n => Err(format!("native function `{n}` is not implemented").into()),
     }
 }

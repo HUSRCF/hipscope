@@ -19,7 +19,7 @@
 use super::{
     blocks, fold,
     publish::{self, ds_load},
-    Gen, Lds, MetaS, Mma, PayA, PayW, Wg, Wv, EPI, K_LOOP, K_LOOP_END,
+    Gen, Lds, MetaD, MetaS, Mma, PayA, PayW, Staged, WaitPlace, Wg, Wv, EPI, K_LOOP, K_LOOP_END,
 };
 use crate::kernels::common::{op, s, sr, v, vr};
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
     reg::Live,
     Builder, V,
 };
-use peacemaker_author::{rotate, MmaIu4, Published, Ring, Scc, State, Wave, WgUniform};
+use peacemaker_author::{rotate, Free, Published, Ring, Scc, State, WgUniform};
 
 fn between(a: &str, b: &str) -> Live {
     Live::Between(a.into(), b.into())
@@ -140,37 +140,37 @@ pub(crate) fn label(tag: &str) -> String {
 pub(crate) fn tail_label(h: usize) -> String {
     label(&format!("t{h}"))
 }
-/// One K128 block on token/row plane `h`; `after_slab1_fetch` runs when its
-/// preceding fetch has issued. `entry_label`: emit the block's label (the
-/// peeled group's first block is the K-loop skip target, which emits it).
+/// The head of a block on plane `h`: the block's own label (`entry_label`;
+/// the peeled group's first block is the K-loop skip target, which places
+/// it) and the lifetimes of the registers its phases alias (fragments, then
+/// the fold's scale rows and products). `ra_cur` / `rd_cur` are the physical
+/// indices of the payload and token-scale rings' current buffers: block `h`
+/// starts with the payload ring on slot 0 and the metadata ring on plane `h`.
+/// The sub-block labels `x0` / `x1` the lifetimes end at are placed by
+/// [`scale_loads`] / [`scale_tail`]; `end` closes the fold registers.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn block_with(
+pub(crate) fn block_begin(
     wg: &mut Wg,
     g: &Gen,
     tag: &str,
     h: usize,
-    fetch_next: bool,
     end: &str,
     entry_label: bool,
-    after_slab1_fetch: impl Fn(&mut Builder) -> Result<(), String>,
-    (ra, rw, rd, rs): Lds,
-) -> Result<Lds, String> {
+    ra_cur: usize,
+    rd_cur: usize,
+) -> Result<(), String> {
     if g.spec.mma.is_sparse() {
         return Err(format!(
             "block {tag}: the spec is {}: use the sparse blocks (`sparse_block`)",
             g.spec.mma.name()
         ));
     }
-    if rd.cur_index() != h || ra.cur_index() != 0 {
+    if rd_cur != h || ra_cur != 0 {
         return Err(format!(
             "block {tag}: LDS rings out of phase with plane {h}"
         ));
     }
-    let (x, x0, x1) = (
-        label(tag),
-        label(&format!("{tag}_s0")),
-        label(&format!("{tag}_s1")),
-    );
+    let (x, x0, x1) = sub_labels(tag);
     let b = wg.isa();
     if entry_label {
         b.label(&x)?;
@@ -184,14 +184,80 @@ pub(crate) fn block_with(
     b.regs.v::<4>("sc_rg1_lo", f0, between(&x0, end))?;
     b.regs.v::<4>("sc_rg1_hi", f1, between(&x1, end))?;
     b.regs.v::<8>("fold_t", f1 + 4, between(&x1, end))?;
+    Ok(())
+}
 
-    // Phase A: slab 0 from slot 0, slab 1 staged into slot 1.
-    after_slab1_fetch(b)?;
+/// A block's own label and its two sub-block labels (`.Liu4_<tag>`,
+/// `.Liu4_<tag>_s0`, `.Liu4_<tag>_s1`).
+pub(crate) fn sub_labels(tag: &str) -> (String, String, String) {
+    (
+        label(tag),
+        label(&format!("{tag}_s0")),
+        label(&format!("{tag}_s1")),
+    )
+}
+
+/// One K128 block on token/row plane `h`; `after_slab1_fetch` runs when its
+/// preceding fetch has issued. `entry_label`: emit the block's label (the
+/// peeled group's first block is the K-loop skip target, which emits it).
+///
+/// The block is a composition of the fine steps ([`block_begin`],
+/// [`fragments`], [`wmma_group`], [`publish::publish_slab`] /
+/// [`publish::publish_meta`], the `publish::fetch_*` loads, [`d_loads`],
+/// [`scale_loads`], [`scale_tail`], `fold::scale`) which `blocks` exposes and
+/// `.rip` scripts call one by one; `Tune::wait` picks where the publishes sit
+/// between the WMMA groups.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_with(
+    wg: &mut Wg,
+    g: &Gen,
+    tag: &str,
+    h: usize,
+    fetch_next: bool,
+    end: &str,
+    entry_label: bool,
+    after_slab1_fetch: impl Fn(&mut Builder) -> Result<(), String>,
+    (ra, rw, rd, rs): Lds,
+) -> Result<Lds, String> {
+    block_begin(
+        wg,
+        g,
+        tag,
+        h,
+        end,
+        entry_label,
+        ra.cur_index(),
+        rd.cur_index(),
+    )?;
+    let (_, x0, x1) = sub_labels(tag);
+
+    let place = g.spec.tune.wait;
+    // Phase A: slab 0 from slot 0, slab 1 staged into slot 1. The publish
+    // (`WaitPlace`) writes the free next buffer, so it may precede the reads
+    // of the current one.
+    after_slab1_fetch(wg.isa())?;
     fragments(wg, g, &ra, &rw)?;
-    for sb in 0..2 {
-        bundle(wg, g, sb, sb == 0, |_, _| Ok(()))?;
-    }
-    let ((ra, pa), (rw, pw)) = publish::publish_slab(wg, g, ra, rw)?;
+    let ((ra, pa), (rw, pw)) = match place {
+        WaitPlace::AfterMma => {
+            for sb in 0..2 {
+                wmma_group(wg.isa(), g, sb, sb == 0, false)?;
+            }
+            publish::publish_slab(wg, g, ra, rw)?
+        }
+        WaitPlace::MidMma => {
+            wmma_group(wg.isa(), g, 0, true, false)?;
+            let staged = publish::publish_slab(wg, g, ra, rw)?;
+            wmma_group(wg.isa(), g, 1, false, false)?;
+            staged
+        }
+        WaitPlace::BeforeMma => {
+            let staged = publish::publish_slab(wg, g, ra, rw)?;
+            for sb in 0..2 {
+                wmma_group(wg.isa(), g, sb, sb == 0, false)?;
+            }
+            staged
+        }
+    };
     // The next block's scale/header registers are independent of the
     // published slab; overlap their VMEM with the B1 wave rendezvous.
     if fetch_next {
@@ -204,66 +270,45 @@ pub(crate) fn block_with(
     if fetch_next {
         publish::fetch_next(wg.isa(), g, h)?;
     }
-    fragments(wg, g, &ra, &rw)?;
-    let l = g.layout;
-    let dp = h as u32 * (l.ds[1] - l.ds[0]) / 4;
-    for pair in 0..2u32 {
-        wg.ds_load_cur(
-            &rd,
-            ds_load(
-                format!(
-                    "ds_load_2addr_b32 v[{}:{}], v{}{}",
-                    g.d + 2 * pair as u8,
-                    g.d + 2 * pair as u8 + 1,
-                    g.d_addr,
-                    super::ds_offsets(dp + 32 * pair, dp + 32 * pair + 16)
-                ),
-                vr(g.d + 2 * pair as u8, 2),
-                g.d_addr,
-            ),
-        )?;
-    }
-    bundle(wg, g, 0, false, |_, _| Ok(()))?;
-    wg.label(&x0)?;
-    let sz = l.sz[h];
-    for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16), (f0, 64)] {
-        wg.ds_load_cur(
-            &rs,
-            ds_load(
-                format!(
-                    "ds_load_b128 v[{}:{}], v{}{}",
-                    dst,
-                    dst + 3,
-                    g.sc_addr,
-                    super::ds_offset(sz + off)
-                ),
-                vr(dst, 4),
-                g.sc_addr,
-            ),
-        )?;
-    }
-    bundle(wg, g, 1, false, |b, i| fold::unbias_after_wmma(b, g, i))?;
-    wg.label(&x1)?;
-    wg.ds_load_cur(
-        &rs,
-        ds_load(
-            format!(
-                "ds_load_b128 v[{}:{}], v{}{}",
-                f1,
-                f1 + 3,
-                g.sc_addr,
-                super::ds_offset(sz + 80)
-            ),
-            vr(f1, 4),
-            g.sc_addr,
-        ),
-    )?;
     if !fetch_next {
+        fragments(wg, g, &ra, &rw)?;
+        d_loads(wg, g, &rd)?;
+        wmma_group(wg.isa(), g, 0, false, false)?;
+        scale_loads(wg, g, &x0, &rs)?;
+        wmma_group(wg.isa(), g, 1, false, true)?;
+        scale_tail(wg, g, &x1, &rs)?;
         fold::scale(wg.isa(), g)?;
         return Ok((ra, rw, rd, rs));
     }
-    let ((ra, pa), (rw, pw)) = publish::publish_slab(wg, g, ra, rw)?;
-    let ((rd, pd), (rs, ps)) = publish::publish_meta(wg, g, rd, rs)?;
+    // Next block's slab 0 and metadata publish (`WaitPlace`): the stores go to
+    // the free next buffers; the B2 signal needs them drained after the last read.
+    fragments(wg, g, &ra, &rw)?;
+    d_loads(wg, g, &rd)?;
+    let ((ra, pa), (rw, pw), (rd, pd), (rs, ps)) = match place {
+        WaitPlace::AfterMma => {
+            wmma_group(wg.isa(), g, 0, false, false)?;
+            scale_loads(wg, g, &x0, &rs)?;
+            wmma_group(wg.isa(), g, 1, false, true)?;
+            scale_tail(wg, g, &x1, &rs)?;
+            publish_next(wg, g, ra, rw, rd, rs)?
+        }
+        WaitPlace::MidMma => {
+            wmma_group(wg.isa(), g, 0, false, false)?;
+            scale_loads(wg, g, &x0, &rs)?;
+            let (sa, sw, sd, ss) = publish_next(wg, g, ra, rw, rd, rs)?;
+            wmma_group(wg.isa(), g, 1, false, true)?;
+            scale_tail(wg, g, &x1, &ss.0)?;
+            (sa, sw, sd, ss)
+        }
+        WaitPlace::BeforeMma => {
+            let (sa, sw, sd, ss) = publish_next(wg, g, ra, rw, rd, rs)?;
+            wmma_group(wg.isa(), g, 0, false, false)?;
+            scale_loads(wg, g, &x0, &ss.0)?;
+            wmma_group(wg.isa(), g, 1, false, true)?;
+            scale_tail(wg, g, &x1, &ss.0)?;
+            (sa, sw, sd, ss)
+        }
+    };
     let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
     let b2 = wg.signal((
         rotate(ra, da),
@@ -284,10 +329,115 @@ pub(crate) fn block_with(
     wg.wait_arrived(b2)
 }
 
+type StagedRings = (
+    Staged<PayA, Published>,
+    Staged<PayW, Published>,
+    Staged<MetaD, Published>,
+    Staged<MetaS, Published>,
+);
+
+/// Publish the next block's slab 0 into the payload rings' free next buffer
+/// and its token/row metadata into the metadata rings'.
+fn publish_next(
+    wg: &mut Wg,
+    g: &Gen,
+    ra: Ring<PayA, Published, Free>,
+    rw: Ring<PayW, Published, Free>,
+    rd: Ring<MetaD, Published, Free>,
+    rs: Ring<MetaS, Published, Free>,
+) -> Result<StagedRings, String> {
+    let (sa, sw) = publish::publish_slab(wg, g, ra, rw)?;
+    let (sd, ss) = publish::publish_meta(wg, g, rd, rs)?;
+    Ok((sa, sw, sd, ss))
+}
+
+/// Phase B: the token-scale (`d`) loads of the plane the `d` ring's current
+/// buffer is (the block's plane `h`).
+pub(crate) fn d_loads<ND: State>(
+    w: &mut Wv,
+    g: &Gen,
+    rd: &Ring<MetaD, Published, ND>,
+) -> Result<(), String> {
+    let l = g.layout;
+    let dp = rd.cur_index() as u32 * (l.ds[1] - l.ds[0]) / 4;
+    for pair in 0..2u32 {
+        w.ds_load_cur(
+            rd,
+            ds_load(
+                format!(
+                    "ds_load_2addr_b32 v[{}:{}], v{}{}",
+                    g.d + 2 * pair as u8,
+                    g.d + 2 * pair as u8 + 1,
+                    g.d_addr,
+                    super::ds_offsets(dp + 32 * pair, dp + 32 * pair + 16)
+                ),
+                vr(g.d + 2 * pair as u8, 2),
+                g.d_addr,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Phase B: the row-scale loads of row group 0 and the first half of row
+/// group 1, issued at the sub-block-0 label `x0`.
+pub(crate) fn scale_loads<NS: State>(
+    w: &mut Wv,
+    g: &Gen,
+    x0: &str,
+    rs: &Ring<MetaS, Published, NS>,
+) -> Result<(), String> {
+    let [f0, _] = g.f;
+    w.label(x0)?;
+    let sz = g.layout.sz[rs.cur_index()];
+    for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16), (f0, 64)] {
+        w.ds_load_cur(
+            rs,
+            ds_load(
+                format!(
+                    "ds_load_b128 v[{}:{}], v{}{}",
+                    dst,
+                    dst + 3,
+                    g.sc_addr,
+                    super::ds_offset(sz + off)
+                ),
+                vr(dst, 4),
+                g.sc_addr,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Phase B: the last row-scale load, issued at the sub-block-1 label `x1`.
+pub(crate) fn scale_tail<NS: State>(
+    w: &mut Wv,
+    g: &Gen,
+    x1: &str,
+    rs: &Ring<MetaS, Published, NS>,
+) -> Result<(), String> {
+    let [_, f1] = g.f;
+    w.label(x1)?;
+    w.ds_load_cur(
+        rs,
+        ds_load(
+            format!(
+                "ds_load_b128 v[{}:{}], v{}{}",
+                f1,
+                f1 + 3,
+                g.sc_addr,
+                super::ds_offset(g.layout.sz[rs.cur_index()] + 80)
+            ),
+            vr(f1, 4),
+            g.sc_addr,
+        ),
+    )
+}
+
 /// Fragment loads of both 32-K sub-blocks from the payload rings' current
 /// slot: per sub-block one W load (both row groups) and two A loads
 /// (column blocks 0-1, 2-3).
-fn fragments<N: State>(
+pub(crate) fn fragments<N: State>(
     w: &mut Wv,
     g: &Gen,
     ra: &Ring<PayA, Published, N>,
@@ -334,16 +484,17 @@ fn fragments<N: State>(
     Ok(())
 }
 
-/// Eight WMMAs of sub-block `sb` in `fold::BUNDLE_ORDER`; `after(b, i)` runs
-/// after the `i`-th.
-fn bundle<T: MmaIu4>(
-    w: &mut Wave<T, Builder>,
+/// Eight WMMAs of sub-block `sb` in `fold::BUNDLE_ORDER`. `first` seeds the
+/// accumulators (`C = magic8`) instead of accumulating; `fold` interleaves
+/// the fold's stage 1 (`fold::unbias_after_wmma`) between them. Registers
+/// only: the fragments were loaded by [`fragments`].
+pub(crate) fn wmma_group(
+    b: &mut Builder,
     g: &Gen,
     sb: usize,
     first: bool,
-    after: impl Fn(&mut Builder, usize) -> Result<(), String>,
+    fold: bool,
 ) -> Result<(), String> {
-    let b = w.isa();
     let f = g.f[sb];
     for (i, &k) in fold::BUNDLE_ORDER.iter().enumerate() {
         let (nb, rg) = (k / 2, k % 2);
@@ -356,7 +507,9 @@ fn bundle<T: MmaIu4>(
             V::<2>(f + 4 + 2 * nb as u8),
             Some(c),
         ))?;
-        after(b, i)?;
+        if fold {
+            fold::unbias_after_wmma(b, g, i)?;
+        }
     }
     Ok(())
 }

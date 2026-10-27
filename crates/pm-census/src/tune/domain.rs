@@ -20,13 +20,19 @@
 //!   intermediate M = 17408) is checked against the grid: `grid.x = 2*M/128` virtual
 //!   128-row tiles and `grid.y = ceil(tokens/128)`. The candidates are the generator
 //!   twin of the incumbent (the negative control), the one other tile (illegal for the
-//!   slab silu symbol, so the offline screen prunes it with the generator's reason) and
-//!   one candidate per `.rip` script, whose path is the `rip` knob (`pm_loop --rip`).
+//!   slab silu symbol, so the offline screen prunes it with the generator's reason), the
+//!   generator knob space `ring {2,3} x wait {after,mid,before}` (ring-major; the
+//!   control point is the twin, the legal points carry their non-default `--ring` /
+//!   `--wait` knobs, the illegal ones are recorded in the derivation with the reason),
+//!   the opt-in numeric `--fold-op muladd` candidate ([`IU4_NUMERIC_VAR`]) and one
+//!   candidate per `.rip` script, whose path is the `rip` knob (`pm_loop --rip`).
 //!   The scripts are given to [`enumerate_with_rips`], or for the CLI (which calls
 //!   [`enumerate`]) as the `*.rip` files of the directory named by the environment
 //!   variable [`RIP_DIR_VAR`]. Their sha256 enter the derivation and the domain hash.
 //!
-//! This module decides **no legality**: a listed candidate may still be
+//! This module decides **no legality** (the one exception is the `iu4_gemm` `ring`
+//! axis, whose generator refusal is mirrored so the pruned points are recorded in the
+//! derivation): a listed candidate may still be
 //! rejected by the generator, by M7 or by `pm_loop`'s baseline resolution. That
 //! screen is the offline phase of [`super::run`], which prunes with a recorded
 //! reason. The incumbent's own knob set is listed on purpose: it emits code
@@ -41,11 +47,18 @@ use std::path::{Path, PathBuf};
 
 const KERNEL: &str = "qwen4_moe_sym";
 const IU4_KERNEL: &str = "iu4_gemm";
+const MQ6_KERNEL: &str = "mq6_i8_gemm";
 const ARCH: &str = "gfx1201";
 
 /// Environment variable naming a directory whose `*.rip` files [`enumerate`]
 /// lists as the `rip` candidates of an `iu4_gemm` node.
 pub const RIP_DIR_VAR: &str = "PM_CENSUS_RIP_DIR";
+
+/// Environment variable that, set to `1`, adds the deliberately NUMERIC
+/// `fold-op muladd` candidate (non-fused stage-2 accumulate; `pm_loop` declares
+/// `numeric_contract.relation = "numeric"`) to an `iu4_gemm` node's domain. It
+/// exists to exercise the KLD/state gate; it is never part of the default space.
+pub const IU4_NUMERIC_VAR: &str = "PM_CENSUS_IU4_NUMERIC";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -147,6 +160,8 @@ struct Iu4Knobs {
 /// What a corpus launch symbol is tunable as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Node {
+    /// `mq6_i8_gemm`: the entry the corpus profile observed.
+    Mq6(Mq6Entry),
     /// `qwen4_moe_sym`: its kind and incumbent `--epi`.
     Moe(Kind, &'static str),
     /// `iu4_gemm`: the knob set of the shipped symbol.
@@ -163,6 +178,11 @@ fn classify(symbol: &str) -> Option<Node> {
             epi: "silu",
             alayout: "slab",
         }));
+    }
+    match symbol {
+        MQ6_SYM_128 => return Some(Node::Mq6(Mq6Entry::Narrow)),
+        MQ6_SYM_WIDE => return Some(Node::Mq6(Mq6Entry::Wide)),
+        _ => {}
     }
     classify_moe(symbol).map(|(k, e)| Node::Moe(k, e))
 }
@@ -217,16 +237,30 @@ pub fn enumerate(case: &WorkloadCaseV1, node: usize, tokens: u64) -> Result<Doma
         Some(dir) if is_iu4 => rips_in_dir(Path::new(&dir))?,
         _ => Vec::new(),
     };
-    enumerate_with_rips(case, node, tokens, &rips)
+    let numeric = is_iu4 && std::env::var_os(IU4_NUMERIC_VAR).is_some_and(|v| v == "1");
+    enumerate_inner(case, node, tokens, &rips, numeric)
 }
 
 /// [`enumerate`] with explicit `.rip` candidate scripts (`iu4_gemm` nodes only; a
-/// node of another kernel refuses a non-empty list).
+/// node of another kernel refuses a non-empty list). The deliberately numeric
+/// `iu4_gemm` candidate ([`IU4_NUMERIC_VAR`]) is not enumerated.
 pub fn enumerate_with_rips(
     case: &WorkloadCaseV1,
     node: usize,
     tokens: u64,
     rips: &[PathBuf],
+) -> Result<DomainV1, String> {
+    enumerate_inner(case, node, tokens, rips, false)
+}
+
+/// The shared body of [`enumerate`] / [`enumerate_with_rips`]; `iu4_numeric`
+/// adds the numeric `fold-op muladd` candidate to an `iu4_gemm` node.
+fn enumerate_inner(
+    case: &WorkloadCaseV1,
+    node: usize,
+    tokens: u64,
+    rips: &[PathBuf],
+    iu4_numeric: bool,
 ) -> Result<DomainV1, String> {
     if case.arch != ARCH {
         return Err(format!(
@@ -251,10 +285,20 @@ pub fn enumerate_with_rips(
             }
             enumerate_moe(case, n, node, tokens, kind, incumbent_epi)
         }
-        Some(Node::Iu4(k)) => enumerate_iu4(case, n, node, tokens, k, rips),
+        Some(Node::Iu4(k)) => enumerate_iu4(case, n, node, tokens, k, rips, iu4_numeric),
+        Some(Node::Mq6(entry)) => {
+            if !rips.is_empty() {
+                return Err(format!(
+                    "node {node} symbol {} is an {MQ6_KERNEL} entry: .rip candidates are enumerated \
+                     for {IU4_KERNEL} nodes only",
+                    n.symbol
+                ));
+            }
+            enumerate_mq6(case, n, node, tokens, entry)
+        }
         None => Err(format!(
             "node {node} symbol {:?} is not an enumerable {ARCH} entry \
-             ({KERNEL} entries, {IU4_GATE_UP_SILU_B1S})",
+             ({KERNEL} entries, {IU4_GATE_UP_SILU_B1S}, {MQ6_SYM_128}, {MQ6_SYM_WIDE})",
             n.symbol
         )),
     }
@@ -307,6 +351,49 @@ const IU4_TILE_ROWS: u64 = 128;
 /// Tokens per workgroup tile of that tile.
 const IU4_TILE_TOKENS: u64 = 128;
 
+/// `pm_loop` `--ring` / `--wait` values the generator knows (`iu4_gemm::RingDepth`,
+/// `iu4_gemm::WaitPlace`). The first of each is the shipped codegen.
+const IU4_RINGS: [&str; 2] = ["2", "3"];
+const IU4_WAITS: [&str; 3] = ["after", "mid", "before"];
+
+/// Why a ring depth has no generator: the refusal `iu4_gemm::Spec::validate` gives (pm-census
+/// does not link the generator, so the rule is mirrored here; `pm_loop --ring 3` surfaces the
+/// generator's own text, and an iu4 candidate this table lists as legal that the generator
+/// refuses is pruned by the offline screen with the generator's reason).
+fn iu4_ring_refusal(ring: &str) -> Option<&'static str> {
+    (ring == "3").then_some(
+        "ring depth 3 has no generator: the typed LDS core has only two-buffer rings \
+         (peacemaker-author Ring) and a 4-slab K-loop trip cannot rotate three slots \
+         through immediate LDS addresses (a 12-slab period would be needed)",
+    )
+}
+
+/// The generator knob points other than the control, `(legal candidates, pruned-point
+/// derivation lines)`, in ring-major order. A point carries only its non-default knobs.
+fn iu4_generator_space(shape: &str, k: Iu4Knobs) -> (Vec<CandidateSpecV1>, Vec<String>) {
+    let (mut legal, mut pruned) = (Vec::new(), Vec::new());
+    for ring in IU4_RINGS {
+        for wait in IU4_WAITS {
+            if (ring, wait) == (IU4_RINGS[0], IU4_WAITS[0]) {
+                continue;
+            }
+            if let Some(why) = iu4_ring_refusal(ring) {
+                pruned.push(format!("pruned ring={ring} wait={wait}: {why}"));
+                continue;
+            }
+            let mut overrides = Vec::new();
+            if ring != IU4_RINGS[0] {
+                overrides.push(("ring", ring));
+            }
+            if wait != IU4_WAITS[0] {
+                overrides.push(("wait", wait));
+            }
+            legal.push(iu4_spec(shape, k, &overrides));
+        }
+    }
+    (legal, pruned)
+}
+
 fn enumerate_iu4(
     case: &WorkloadCaseV1,
     n: &ChainNodeV1,
@@ -314,6 +401,7 @@ fn enumerate_iu4(
     tokens: u64,
     k: Iu4Knobs,
     rips: &[PathBuf],
+    numeric: bool,
 ) -> Result<DomainV1, String> {
     let p = dense_preset(&case.model.family)?;
     let mut derivation = vec![
@@ -366,11 +454,31 @@ fn enumerate_iu4(
 
     let shape = format!("M={},N={tokens},K={}", p.inter, p.hidden);
     let incumbent = iu4_spec(&shape, k, &[]);
-    // Deterministic order: the generator twin (control), the other tile, then the scripts.
+    // Deterministic order: the generator twin (control), the other tile, the generator
+    // knob space (ring x wait, ring-major), the numeric candidate if asked, then the scripts.
     let mut candidates = vec![
         incumbent.clone(),
         iu4_spec(&shape, k, &[("tile", "256x128x16")]),
     ];
+    let (legal, pruned) = iu4_generator_space(&shape, k);
+    derivation.push(format!(
+        "generator knob space ring {{{}}} x wait {{{}}} = {} points: control (ring=2 wait=after) \
+         is the incumbent twin, {} further legal, {} pruned",
+        IU4_RINGS.join(","),
+        IU4_WAITS.join(","),
+        IU4_RINGS.len() * IU4_WAITS.len(),
+        legal.len(),
+        pruned.len()
+    ));
+    candidates.extend(legal);
+    derivation.extend(pruned);
+    if numeric {
+        derivation.push(format!(
+            "numeric candidate fold-op=muladd ({IU4_NUMERIC_VAR}=1): non-fused stage-2 accumulate, \
+             pm_loop declares numeric_contract relation numeric; never part of the default space"
+        ));
+        candidates.push(iu4_spec(&shape, k, &[("fold-op", "muladd")]));
+    }
     let mut rip_shas = Vec::new();
     for path in rips {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -490,6 +598,243 @@ fn enumerate_moe(
         node_index: node,
         node_symbol: n.symbol.clone(),
         kernel: KERNEL.to_owned(),
+        arch: ARCH.to_owned(),
+        shape,
+        incumbent,
+        candidates,
+        derivation,
+        domain_hash,
+    })
+}
+
+/// The shipped F32 `set` entry of the 128 x 128 PM tile (`gemm_mq6_i8.rs` `MQ6_I8_PM_ENTRY_F32`).
+pub const MQ6_SYM_128: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201";
+/// The shipped F32 `set` entry of the 128 x 256 PM tile (`MQ6_I8_PM_ENTRY_F32_T256`).
+pub const MQ6_SYM_WIDE: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256";
+
+/// The PM tile a corpus launch symbol (the profile) ran.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mq6Entry {
+    /// `MQ6_SYM_128`: 128 x 128, 256 threads, grid `[ceil(M/128), ceil(N/128)]`.
+    Narrow,
+    /// `MQ6_SYM_WIDE`: 128 x 256, 512 threads, grid `[ceil(M/128), ceil(N/256)]`.
+    Wide,
+}
+
+/// CUs the runtime selector sees on the gfx1201 R9700: `cu_count_or_default`
+/// (`rdna-compute/src/gemm.rs:32519`) = HIP's multiprocessor count (32 WGPs) x 2
+/// (`profiler.rs:142` `hip_mp_count_to_cu_count`); the selector's own tests use 64
+/// (`gemm_mq6_i8.rs:776`).
+const MQ6_CU_COUNT: u64 = 64;
+
+/// Flash-Next gfx1201 MQ6 PM shapes keyed by the narrow grid's x extent (`ceil(M/128)`):
+/// `(grid.x, M, K)`, the `pm_loop mq6` `fn:` presets (`pm_loop/mq6.rs` `FN_MK`). The rocprof
+/// corpus node has no params; its grid names M and the model geometry names K. Grid x values
+/// that do not name one preset M (`1`: M = 48 or 128; `5`: M = 640) are refused.
+const MQ6_FN_SHAPES: [(u64, u64, u64); 5] = [
+    (80, 10240, 2560),
+    (48, 6144, 2560),
+    (96, 12288, 2560),
+    (20, 2560, 6144),
+    (4, 512, 2560),
+];
+
+/// Token-tile width the runtime launches for `m` rows x `n` tokens on `cu_count` CUs: a
+/// transcription of `mq6_i8_pm_token_tile` (`rdna-compute/src/gemm_mq6_i8.rs:101-116`),
+/// called by `mq6_i8_pm_launch` (`:118`) from `gemm_mq6g256v2_i8_prequant` (`:409`).
+fn mq6_runtime_token_tile(m: u64, n: u64, cu_count: u64) -> u64 {
+    let r = n % 256;
+    if r != 0 && r <= 128 {
+        return 128;
+    }
+    let wgps = (cu_count / 2).max(1);
+    let rows = m.div_ceil(128);
+    let rounds256 = (rows * n.div_ceil(256)).div_ceil(wgps);
+    let rounds128 = (rows * n.div_ceil(128)).div_ceil(wgps);
+    if 188 * rounds256 <= 100 * rounds128 {
+        256
+    } else {
+        128
+    }
+}
+
+/// `pm_loop mq6_i8_gemm` knob set of one candidate: F32 `set` epilogue, `raster` and `tile`, and
+/// `base-shipped` = the runtime's tile, so every arm is measured against the shipped entry the
+/// runtime launches at the shape.
+fn mq6_spec(shape: &str, tile: &str, raster: &str, runtime_tile: &str) -> CandidateSpecV1 {
+    CandidateSpecV1 {
+        kernel: MQ6_KERNEL.to_owned(),
+        arch: ARCH.to_owned(),
+        shape: shape.to_owned(),
+        knobs: [
+            ("epi", "set"),
+            ("raster", raster),
+            ("tile", tile),
+            ("base-shipped", runtime_tile),
+        ]
+        .iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect(),
+    }
+}
+
+/// The launch symbol `pm_loop`'s baseline must resolve to for `d`: the entry the runtime
+/// selects (the incumbent's `base-shipped` tile) for an `mq6_i8_gemm` domain, else the corpus
+/// node's own symbol. The corpus symbol of an `mq6_i8_gemm` node can be a profile of an older
+/// selector, so it is not the incumbent there.
+pub fn baseline_symbol(d: &DomainV1) -> String {
+    if d.kernel == MQ6_KERNEL {
+        return match d.incumbent.knobs.get("base-shipped").map(String::as_str) {
+            Some("128x256") => MQ6_SYM_WIDE.to_owned(),
+            _ => MQ6_SYM_128.to_owned(),
+        };
+    }
+    d.node_symbol.clone()
+}
+
+/// The legal-tile x raster domain of a Flash-Next `gemm_mq6g256v2_mmq_i8_pm_set` node at one
+/// shape. The incumbent (and the code-identical control, listed first) is the tile the
+/// runtime's selector takes at that shape, not the `128x128` tile `pm_loop` pairs by default.
+/// Every candidate must reproduce the baseline bit for bit (`pm_loop` requires
+/// `identical_to_baseline` for this workload), so all are numeric contract `exact`.
+fn enumerate_mq6(
+    case: &WorkloadCaseV1,
+    n: &ChainNodeV1,
+    node: usize,
+    tokens: u64,
+    entry: Mq6Entry,
+) -> Result<DomainV1, String> {
+    if case.model.family != "flash-next" {
+        return Err(format!(
+            "model family {:?} has no {MQ6_KERNEL} shape table (flash-next)",
+            case.model.family
+        ));
+    }
+    if tokens == 0 {
+        return Err("tokens must be at least 1".to_owned());
+    }
+    let mut derivation = vec![format!(
+        "node {node} symbol {} -> kernel {MQ6_KERNEL}, F32 epilogue `set`, corpus entry {}",
+        n.symbol,
+        if entry == Mq6Entry::Narrow {
+            "128x128 (grid.y = ceil(N/128))"
+        } else {
+            "128x256 (grid.y = ceil(N/256))"
+        }
+    )];
+    let grid = n.grid.ok_or_else(|| {
+        format!("node {node} has no launch grid: the {MQ6_KERNEL} shape is bound by the grid")
+    })?;
+    let gx = u64::from(grid[0]);
+    let &(_, m, k) = MQ6_FN_SHAPES
+        .iter()
+        .find(|(x, _, _)| *x == gx)
+        .ok_or_else(|| {
+            format!(
+                "node {node} grid.x is {gx}: no unique Flash-Next MQ6 preset has \
+                 ceil(M/128) = {gx} (one of {})",
+                MQ6_FN_SHAPES
+                    .iter()
+                    .map(|(x, m, k)| format!("{x} -> M={m},K={k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if let Some(&pm) = n.params.get("M") {
+        if pm != m {
+            return Err(format!(
+                "node {node} param M is {pm}, grid.x = {gx} names M = {m}"
+            ));
+        }
+    }
+    let tile_tokens = if entry == Mq6Entry::Narrow { 128 } else { 256 };
+    let want_y = tokens.div_ceil(tile_tokens);
+    if u64::from(grid[1]) != want_y {
+        return Err(format!(
+            "node {node} grid.y is {}, tokens={tokens} needs ceil(tokens/{tile_tokens}) = {want_y}",
+            grid[1]
+        ));
+    }
+    derivation.push(format!(
+        "grid [{gx}, {}] equals [ceil({m}/128), ceil({tokens}/{tile_tokens})]: M={m}, K={k} \
+         (model geometry; the corpus node has no params), N={tokens}",
+        grid[1]
+    ));
+    let sibling: Vec<String> = case
+        .chain
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.symbol == n.symbol)
+        .map(|(i, c)| {
+            format!(
+                "node {i} grid {:?} {} ns",
+                c.grid,
+                c.time_ns.map_or_else(|| "?".to_owned(), |t| t.to_string())
+            )
+        })
+        .collect();
+    if sibling.len() > 1 {
+        derivation.push(format!(
+            "same-symbol nodes of the case (pick the highest-time node for the headline shape): {}",
+            sibling.join("; ")
+        ));
+    }
+
+    let runtime = mq6_runtime_token_tile(m, tokens, MQ6_CU_COUNT);
+    let runtime_tile = if runtime == 256 { "128x256" } else { "128x128" };
+    derivation.push(format!(
+        "runtime selector mq6_i8_pm_token_tile(m={m}, n={tokens}, cu={MQ6_CU_COUNT}) = {runtime} \
+         (rdna-compute/src/gemm_mq6_i8.rs:101-116; launch at :409 via mq6_i8_pm_launch :118; \
+         cu_count_or_default gemm.rs:32519, WGP x2 profiler.rs:142): the incumbent tile is \
+         {runtime_tile} entry {}",
+        if runtime == 256 {
+            MQ6_SYM_WIDE
+        } else {
+            MQ6_SYM_128
+        }
+    ));
+    let observed = if entry == Mq6Entry::Narrow { 128 } else { 256 };
+    if observed != runtime {
+        derivation.push(format!(
+            "NOTE corpus symbol {} ran the {observed}-token tile, the current selector takes the \
+             {runtime}-token tile at this shape: the profile predates the selector or ran another \
+             device; the incumbent is the current selector's tile and pm_loop's baseline is \
+             that shipped entry (--base-shipped {runtime_tile})",
+            n.symbol
+        ));
+    }
+
+    let shape = format!("M={m},N={tokens},K={k}");
+    let incumbent = mq6_spec(&shape, runtime_tile, "banded", runtime_tile);
+    // Control first (the incumbent's own knobs), then tile-major, banded before linear.
+    let mut candidates = vec![incumbent.clone()];
+    for tile in ["128x128", "256x128", "128x256"] {
+        for raster in ["banded", "linear"] {
+            let c = mq6_spec(&shape, tile, raster, runtime_tile);
+            if c != incumbent {
+                candidates.push(c);
+            }
+        }
+    }
+    derivation.push(
+        "numerics: all tiles and rasters run the same exact integer dot and per-element fold \
+         order; pm_loop requires identical_to_baseline for this workload, so every candidate is \
+         exact (none routed to the KLD gate)"
+            .to_owned(),
+    );
+    let domain_hash = canonical_sha256(&json!({
+        "kernel": MQ6_KERNEL,
+        "arch": ARCH,
+        "shape": shape,
+        "incumbent": incumbent,
+        "candidates": candidates,
+    }));
+    Ok(DomainV1 {
+        schema: DOMAIN_SCHEMA.to_owned(),
+        case_id: case.case_id.clone(),
+        node_index: node,
+        node_symbol: n.symbol.clone(),
+        kernel: MQ6_KERNEL.to_owned(),
         arch: ARCH.to_owned(),
         shape,
         incumbent,
@@ -643,11 +988,85 @@ mod tests {
             ["k128", "128x128x8", "1", "silu", "slab"]
         );
         assert!(!k.contains_key("rip"));
-        assert_eq!(d.candidates.len(), 2);
+        // control, the other tile, then the legal (ring x wait) points: ring 2 with wait mid / before.
+        assert_eq!(d.candidates.len(), 4);
         assert_eq!(d.candidates[0], d.incumbent);
         assert_eq!(d.candidates[1].knobs["tile"], "256x128x16");
         assert_eq!(d.candidates[1].knobs["alayout"], "slab");
-        assert_eq!(d.derivation.len(), 3);
+        // A generator-knob point keeps every incumbent knob and adds only its non-default knobs.
+        for (i, wait) in [(2, "mid"), (3, "before")] {
+            let mut k = d.candidates[i].knobs.clone();
+            assert_eq!(k.remove("wait").as_deref(), Some(wait));
+            assert_eq!(k, d.incumbent.knobs);
+        }
+        // 3 header lines, the knob-space summary, and the three ring=3 points pruned with the reason.
+        assert_eq!(d.derivation.len(), 7);
+        assert!(
+            d.derivation[3].contains("6 points") && d.derivation[3].contains("2 further legal")
+        );
+        for (line, wait) in d.derivation[4..].iter().zip(["after", "mid", "before"]) {
+            assert!(
+                line.starts_with(&format!(
+                    "pruned ring=3 wait={wait}: ring depth 3 has no generator"
+                )),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn iu4_numeric_candidate_is_opt_in() {
+        let case = iu4_case();
+        let off = enumerate_with_rips(&case, 0, 8192, &[]).unwrap();
+        assert!(off
+            .candidates
+            .iter()
+            .all(|c| !c.knobs.contains_key("fold-op")));
+        let on = enumerate_inner(&case, 0, 8192, &[], true).unwrap();
+        assert_eq!(on.candidates.len(), off.candidates.len() + 1);
+        assert_eq!(on.candidates[..off.candidates.len()], off.candidates[..]);
+        let last = on.candidates.last().unwrap();
+        assert_eq!(last.knobs["fold-op"], "muladd");
+        let mut k = last.knobs.clone();
+        k.remove("fold-op");
+        assert_eq!(k, on.incumbent.knobs);
+        let args = last.pm_loop_args();
+        let i = args.iter().position(|a| a == "--fold-op").unwrap();
+        assert_eq!(args[i + 1], "muladd");
+        assert!(on
+            .derivation
+            .iter()
+            .any(|l| l.starts_with("numeric candidate fold-op=muladd")));
+        assert_ne!(on.domain_hash, off.domain_hash);
+    }
+
+    #[test]
+    fn iu4_generator_points_become_pm_loop_flags_in_ring_major_order() {
+        let d = enumerate_with_rips(&iu4_case(), 0, 8192, &[]).unwrap();
+        let flags = |c: &CandidateSpecV1| -> Vec<(String, String)> {
+            let a = c.pm_loop_args();
+            ["--ring", "--wait"]
+                .iter()
+                .filter_map(|f| {
+                    a.iter()
+                        .position(|x| x == f)
+                        .map(|i| ((*f).to_owned(), a[i + 1].clone()))
+                })
+                .collect()
+        };
+        assert!(flags(&d.candidates[0]).is_empty());
+        assert_eq!(
+            flags(&d.candidates[2]),
+            [("--wait".to_owned(), "mid".to_owned())]
+        );
+        assert_eq!(
+            flags(&d.candidates[3]),
+            [("--wait".to_owned(), "before".to_owned())]
+        );
+        let ids: std::collections::BTreeSet<_> = d.candidates.iter().map(|c| c.id()).collect();
+        assert_eq!(ids.len(), d.candidates.len(), "candidate ids are distinct");
+        // Deterministic.
+        assert_eq!(d, enumerate_with_rips(&iu4_case(), 0, 8192, &[]).unwrap());
     }
 
     #[test]
@@ -665,16 +1084,16 @@ mod tests {
         assert!(rips[0].ends_with("a.rip") && rips[1].ends_with("b.rip"));
         assert!(rips[0].is_absolute());
         let d = enumerate_with_rips(&iu4_case(), 0, 8192, &rips).unwrap();
-        assert_eq!(d.candidates.len(), 4);
+        assert_eq!(d.candidates.len(), 6);
         let rip_of = |i: usize| d.candidates[i].knobs["rip"].clone();
-        assert_eq!(rip_of(2), rips[0].to_str().unwrap());
-        assert_eq!(rip_of(3), rips[1].to_str().unwrap());
+        assert_eq!(rip_of(4), rips[0].to_str().unwrap());
+        assert_eq!(rip_of(5), rips[1].to_str().unwrap());
         // The rip candidate keeps every incumbent knob and adds only `rip`.
-        let mut k = d.candidates[2].knobs.clone();
+        let mut k = d.candidates[4].knobs.clone();
         k.remove("rip");
         assert_eq!(k, d.incumbent.knobs);
         // `pm_loop` gets `--rip PATH` and the five knob flags.
-        let args = d.candidates[2].pm_loop_args();
+        let args = d.candidates[4].pm_loop_args();
         let at = |flag: &str| {
             let i = args.iter().position(|a| a == flag).unwrap();
             args[i + 1].clone()
@@ -695,8 +1114,8 @@ mod tests {
             2
         );
         // Distinct ids: the resume key tells the scripts apart.
-        assert_ne!(d.candidates[2].id(), d.candidates[3].id());
-        assert_ne!(d.candidates[0].id(), d.candidates[2].id());
+        assert_ne!(d.candidates[4].id(), d.candidates[5].id());
+        assert_ne!(d.candidates[0].id(), d.candidates[4].id());
     }
 
     #[test]
@@ -779,6 +1198,128 @@ mod tests {
     #[test]
     fn rips_in_dir_errors_on_missing_dir() {
         assert!(rips_in_dir(Path::new("/nonexistent/rip-dir")).is_err());
+    }
+
+    fn mq6_case(symbol: &str, grid: [u32; 3]) -> WorkloadCaseV1 {
+        test_case_grid("flash-next", symbol, &[], Some(grid))
+    }
+
+    fn mq6_ids(d: &DomainV1) -> Vec<(String, String)> {
+        d.candidates
+            .iter()
+            .map(|c| (c.knobs["tile"].clone(), c.knobs["raster"].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn mq6_runtime_selector_matches_the_runtime_tests() {
+        // `gemm_mq6_i8.rs` tests: (m, n, 64 CUs) -> token tile.
+        for (m, n, want) in [
+            (10240, 4096, 256),
+            (10240, 16384, 256),
+            (6144, 4096, 256),
+            (2560, 4096, 256),
+            (512, 4096, 256),
+            (128, 4096, 128),
+            (48, 4096, 128),
+            (384, 4096, 128),
+            (10240, 4097, 128),
+            (10240, 4096 + 129, 256),
+        ] {
+            assert_eq!(mq6_runtime_token_tile(m, n, 64), want, "m={m} n={n}");
+        }
+    }
+
+    #[test]
+    fn mq6_node_is_classified_and_enumerated_control_first() {
+        assert_eq!(classify(MQ6_SYM_128), Some(Node::Mq6(Mq6Entry::Narrow)));
+        assert_eq!(classify(MQ6_SYM_WIDE), Some(Node::Mq6(Mq6Entry::Wide)));
+        assert_eq!(classify("gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201"), None);
+        // FN pp16384, node 14 of the corpus: grid [80, 32] = M 10240, K 2560, N 4096 (the
+        // highest-time of the six shapes, 220.4 ms of 632.6 ms).
+        let case = mq6_case(MQ6_SYM_128, [80, 32, 1]);
+        let d = enumerate(&case, 0, 4096).unwrap();
+        assert_eq!(d.kernel, MQ6_KERNEL);
+        assert_eq!(d.shape, "M=10240,N=4096,K=2560");
+        // The runtime takes 128x256 here: the incumbent is that tile, not pm_loop's 128x128.
+        assert_eq!(d.incumbent.knobs["tile"], "128x256");
+        assert_eq!(d.incumbent.knobs["base-shipped"], "128x256");
+        assert_eq!(d.incumbent.knobs["raster"], "banded");
+        assert_eq!(d.incumbent.knobs["epi"], "set");
+        assert_eq!(d.candidates[0], d.incumbent);
+        assert_eq!(
+            mq6_ids(&d),
+            [
+                ("128x256", "banded"),
+                ("128x128", "banded"),
+                ("128x128", "linear"),
+                ("256x128", "banded"),
+                ("256x128", "linear"),
+                ("128x256", "linear"),
+            ]
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        );
+        assert!(d
+            .candidates
+            .iter()
+            .all(|c| c.knobs["base-shipped"] == "128x256"));
+        assert_eq!(baseline_symbol(&d), MQ6_SYM_WIDE);
+        let text = d.derivation.join("\n");
+        assert!(text.contains("gemm_mq6_i8.rs:101-116"), "{text}");
+        assert!(
+            text.contains("NOTE corpus symbol"),
+            "stale-profile note: {text}"
+        );
+        let again = enumerate(&case, 0, 4096).unwrap();
+        assert_eq!(again, d);
+        assert_eq!(
+            d.incumbent.pm_loop_args()[..6],
+            [
+                "--kernel",
+                "mq6_i8_gemm",
+                "--arch",
+                "gfx1201",
+                "--shape",
+                "M=10240,N=4096,K=2560"
+            ]
+        );
+    }
+
+    #[test]
+    fn mq6_narrow_runtime_tile_makes_the_128_entry_the_incumbent() {
+        // M=128 at N=4096: one row tile, the selector keeps 128 x 128 (ratio 1.336 measured).
+        let case = mq6_case(MQ6_SYM_128, [1, 32, 1]);
+        assert!(
+            enumerate(&case, 0, 4096).is_err(),
+            "grid.x = 1 is ambiguous"
+        );
+        // M=512 (grid.x 4) at N=4097 is a ragged token tile: narrow.
+        let case = mq6_case(MQ6_SYM_128, [4, 33, 1]);
+        let d = enumerate(&case, 0, 4097).unwrap();
+        assert_eq!(d.shape, "M=512,N=4097,K=2560");
+        assert_eq!(d.incumbent.knobs["tile"], "128x128");
+        assert_eq!(baseline_symbol(&d), MQ6_SYM_128);
+        assert_eq!(d.candidates[0], d.incumbent);
+        assert_eq!(d.candidates.len(), 6);
+        assert!(!d.derivation.join("\n").contains("NOTE corpus symbol"));
+    }
+
+    #[test]
+    fn mq6_wide_corpus_symbol_and_refusals() {
+        let case = mq6_case(MQ6_SYM_WIDE, [80, 16, 1]);
+        let d = enumerate(&case, 0, 4096).unwrap();
+        assert_eq!(d.incumbent.knobs["tile"], "128x256");
+        assert!(!d.derivation.join("\n").contains("NOTE corpus symbol"));
+        // grid.y of the wide entry is ceil(N/256).
+        assert!(enumerate(&mq6_case(MQ6_SYM_WIDE, [80, 32, 1]), 0, 4096).is_err());
+        assert!(enumerate(&mq6_case(MQ6_SYM_128, [80, 31, 1]), 0, 4096).is_err());
+        assert!(enumerate(&mq6_case(MQ6_SYM_128, [7, 32, 1]), 0, 4096).is_err());
+        assert!(enumerate(&mq6_case(MQ6_SYM_128, [80, 32, 1]), 0, 0).is_err());
+        let mut a3b = mq6_case(MQ6_SYM_128, [80, 32, 1]);
+        a3b.model.family = "a3b".to_owned();
+        assert!(enumerate(&a3b, 0, 4096).is_err());
+        let rip = vec![PathBuf::from("/x.rip")];
+        assert!(enumerate_with_rips(&mq6_case(MQ6_SYM_128, [80, 32, 1]), 0, 4096, &rip).is_err());
     }
 
     #[test]

@@ -34,7 +34,7 @@ use peacemaker_author::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-pub use spec::{ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
+pub use spec::{ALayout, Cacc, Epi, Fold, FoldOp, Mma, RingDepth, Spec, Tile, Tune, WaitPlace};
 
 /// The program's first label (the kernel entry); `Live` ranges start here.
 pub const ENTRY: &str = "entry";
@@ -573,8 +573,9 @@ pub type Lds = (
     Ring<MetaD, Published, Free>,
     Ring<MetaS, Published, Free>,
 );
-/// A ring's next buffer with its pending stores.
-pub(crate) type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrite<R>>);
+/// A ring's next buffer with its pending stores: what a publish returns and a
+/// wait consumes.
+pub type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrite<R>>);
 
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
@@ -703,6 +704,7 @@ pub fn emit_module(
                 act,
                 arch,
                 mma: Mma::Dense,
+                tune: Tune::default(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -716,6 +718,7 @@ pub fn emit_module(
             act,
             arch,
             mma: Mma::Dense,
+            tune: Tune::default(),
         }
         .module(),
     )?;

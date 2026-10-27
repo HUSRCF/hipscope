@@ -381,7 +381,14 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
                 "--null-control aa cannot be combined with --rip (no candidate is emitted)".into(),
             );
         }
-        if let Some(k) = o.knobs.0.keys().find(|k| k.starts_with("base-")) {
+        // `--base-shipped` only picks WHICH shipped object is the baseline (the
+        // incumbent); the A/A then times that baseline against itself.
+        if let Some(k) = o
+            .knobs
+            .0
+            .keys()
+            .find(|k| k.starts_with("base-") && k.as_str() != "base-shipped")
+        {
             return Err(format!(
                 "--null-control aa cannot be combined with --{k} (the candidate is the resolved baseline)"
             ));
@@ -990,6 +997,10 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         rec[key] = value;
     }
     rec["candidate"] = json!({"knobs": w.candidate_knobs()});
+    let contract = w.numeric_contract();
+    if !contract.is_null() {
+        rec["numeric_contract"] = contract;
+    }
     let out_dir = out_dir_of(o);
 
     // 1. emit + link. `--null-control aa`: no candidate is emitted; it is a
@@ -1142,8 +1153,8 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Ok(v) => v,
         Err(e) => return fail(rec, "launch", e),
     };
-    let reference = w.check(&cand_out);
-    let base_report = w.check(&base_out);
+    let reference = w.check_arm(Arm::Candidate, &cand_out);
+    let base_report = w.check_arm(Arm::Baseline, &base_out);
     let diff = match w.max_abs_diff(&base_out, &cand_out) {
         Ok(d) => d,
         Err(e) => return fail(rec, "compare", e),
@@ -1152,8 +1163,13 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     // Without a CPU reference (e.g. an epilogue whose device intrinsics are not
     // reproducible) bit identity with the shipped baseline is the only
     // admissible evidence: `pass` is then `identical_to_baseline`.
+    // A declared NUMERIC candidate with no CPU reference cannot be identical;
+    // it passes when finite and NaN-pattern-equal to the baseline (`diff` is
+    // `inf` otherwise), and the KLD/state gate decides promotion.
+    let numeric = w.numeric_contract()["relation"] == "numeric";
     let pass = match &reference {
         Ok(r) => r.pass && (identical || !w.requires_baseline_identity()),
+        Err(_) if numeric => diff.is_finite(),
         Err(_) => identical,
     };
     rec["correctness"] = json!({
@@ -1162,7 +1178,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "max_abs_err": reference.as_ref().ok().map(|r| r.max_abs_err),
         "tolerance": reference.as_ref().ok().map(|r| r.tolerance),
         "pass": pass,
-        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else { "identical_to_baseline (no CPU reference)" },
+        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else if numeric { "numeric_contract (no CPU reference; candidate finite and NaN-pattern-equal to baseline)" } else { "identical_to_baseline (no CPU reference)" },
         "baseline_max_abs_err": base_report.as_ref().ok().map(|r| r.max_abs_err),
         "baseline_pass": base_report.as_ref().ok().map(|r| r.pass),
         "baseline_reference_error": base_report.as_ref().err(),

@@ -4964,6 +4964,9 @@ fn main() {
             }
         }
     }
+    // stdin closed: persist the retained-PM4 dispatch ledger's replay counters
+    // (`HIPFIRE_REDLINE_LEDGER`; a no-op when unset).
+    rdna_compute::pm4_ledger::flush_all();
 }
 
 #[cfg(test)]

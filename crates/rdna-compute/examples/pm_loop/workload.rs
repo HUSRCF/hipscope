@@ -129,6 +129,18 @@ pub trait Workload {
     fn output(&self, gpu: &Gpu, arm: Arm) -> Result<Vec<u8>>;
     /// Compare a downloaded output to the CPU reference.
     fn check(&self, out: &[u8]) -> Result<RefReport>;
+    /// [`Workload::check`] of `arm`'s output, for a workload whose arms follow
+    /// different references (a numeric candidate against an exact baseline).
+    fn check_arm(&self, _arm: Arm, out: &[u8]) -> Result<RefReport> {
+        self.check(out)
+    }
+    /// Declared numeric contract `{baseline, candidate, relation}` of the record
+    /// (`relation` `"exact"` or `"numeric"`, as [`ChainWorkload::numeric_contract`]);
+    /// `Null`: the workload declares none and the record carries no
+    /// `numeric_contract` field.
+    fn numeric_contract(&self) -> Value {
+        Value::Null
+    }
     /// Max absolute element difference between two outputs (interpreting the
     /// bytes in the kernel's output dtype); `inf` if any element differs in
     /// NaN-ness. 0.0 iff element-wise equal.
