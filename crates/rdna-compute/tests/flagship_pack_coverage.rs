@@ -15,7 +15,7 @@
 //! gfx1100 and gfx1151 as well) that must be registered on every release arch.
 //! gfx1201-only modules are asserted for gfx1201 only.
 
-use rdna_compute::kernel_registry::{entries, SUPPORTED_ARCHES};
+use rdna_compute::kernel_registry::{SUPPORTED_ARCHES, entries};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,7 +185,11 @@ fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
             ));
         }
     }
-    assert!(failures.is_empty(), "pack coverage regressions:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "pack coverage regressions:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -198,10 +202,29 @@ fn formerly_missing_modules_are_measured_and_registered() {
         .collect();
     let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
     for m in FORMERLY_MISSING {
-        assert!(measured.contains(m), "{m} missing from the measured fixture");
+        assert!(
+            measured.contains(m),
+            "{m} missing from the measured fixture"
+        );
         let e = registry.iter().find(|e| e.module == m);
         let e = e.unwrap_or_else(|| panic!("{m} not registered for gfx1201"));
-        assert_eq!(e.symbols, [m], "{m}: symbol is the module name");
+        let expected: &[&str] = match *m {
+            "attention_fp8_e4m3_kv_batched_segs" => &[
+                "attention_fp8_e4m3_kv_batched_segs",
+                "attention_q8_0_kv_batched",
+                "attention_q8_0_kv_independent_masked_windowed",
+            ],
+            "gated_delta_net_q8_compact3_b2_rows" => &[
+                "gated_delta_net_q8_compact3_b2_rows",
+                "gated_delta_net_q8_fast_independent_masked",
+            ],
+            _ => std::slice::from_ref(m),
+        };
+        let mut actual: Vec<&str> = e.symbols.iter().copied().collect();
+        actual.sort_unstable();
+        let mut want: Vec<&str> = expected.to_vec();
+        want.sort_unstable();
+        assert_eq!(actual, want, "{m}: exported symbol set");
     }
 }
 
@@ -229,7 +252,10 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
         .map(|r| (r.module, r.symbol))
         .collect();
     let mut shared = Vec::new();
-    for l in SHARED.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+    for l in SHARED
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    {
         let c: Vec<&str> = l.split('\t').collect();
         assert_eq!(c.len(), 3, "bad shared row: {l}");
         assert!(
@@ -237,7 +263,11 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
             "{}: shared row is not a measured gfx1201 module",
             c[0]
         );
-        assert!(!c[0].contains("gfx12"), "{}: arch-specific module in shared set", c[0]);
+        assert!(
+            !c[0].contains("gfx12"),
+            "{}: arch-specific module in shared set",
+            c[0]
+        );
         shared.push((c[0], c[1]));
     }
     assert!(shared.len() >= 80);
@@ -252,12 +282,20 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
                     if !e.symbols.contains(symbol) {
                         failures.push(format!("{arch}: {module} lacks symbol {symbol}"));
                     }
-                    if !e.flags.iter().any(|f| f == &format!("--offload-arch={arch}")) {
+                    if !e
+                        .flags
+                        .iter()
+                        .any(|f| f == &format!("--offload-arch={arch}"))
+                    {
                         failures.push(format!("{arch}: {module} flags target another arch"));
                     }
                 }
             }
         }
     }
-    assert!(failures.is_empty(), "portable coverage regressions:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "portable coverage regressions:\n{}",
+        failures.join("\n")
+    );
 }
