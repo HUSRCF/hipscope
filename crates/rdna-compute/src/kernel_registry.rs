@@ -1676,11 +1676,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"
             ]
         );
-        add!(
-            "select_regrid",
-            crate::select_regrid::SELECT_REGRID_SRC,
-            ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]
-        );
+        // select_regrid / topk_values_fixup_f32 live in the gfx1201|gfx1151 block below.
         add!(
             "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab",
             kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC,
@@ -1690,6 +1686,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab",
             kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC,
             ["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"]
+        );
+    }
+    // `Gpu::select_regrid_enabled` routes the row selectors through these on
+    // gfx1201 and gfx1151 (measured: Halo 27B DFlash/MTP request them first
+    // on a host without hipcc).
+    if matches!(arch, "gfx1201" | "gfx1151") {
+        add!(
+            "select_regrid",
+            crate::select_regrid::SELECT_REGRID_SRC,
+            ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]
         );
         add!(
             "topk_values_fixup_f32",

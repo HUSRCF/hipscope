@@ -20,8 +20,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const FLAGSHIP: &str = include_str!("fixtures/flagship-pack-gfx1201.tsv");
+const FLAGSHIP_1151: &str = include_str!("fixtures/flagship-pack-gfx1151.tsv");
+const FLAGSHIP_1100: &str = include_str!("fixtures/flagship-pack-gfx1100.tsv");
 const SHARED: &str = include_str!("fixtures/flagship-pack-shared.tsv");
-/// Extra hipcc flags the runtime derives on the measured gfx1201 hosts.
+/// Extra hipcc flags the registry CLI prints for every measured release arch.
 const EXTRA_FLAGS: &str = "-DIU4_A4_CANDIDATES=2";
 const RELEASE_ARCHES: [&str; 3] = ["gfx1201", "gfx1100", "gfx1151"];
 const ROUTES: [&str; 6] = [
@@ -57,8 +59,11 @@ struct Row {
 }
 
 fn rows() -> Vec<Row> {
-    FLAGSHIP
-        .lines()
+    rows_of(FLAGSHIP)
+}
+
+fn rows_of(text: &str) -> Vec<Row> {
+    text.lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| {
             let c: Vec<&str> = l.split('\t').collect();
@@ -80,6 +85,10 @@ fn rows() -> Vec<Row> {
 
 /// `#route` header counts: route -> (hip, embedded).
 fn header_counts() -> BTreeMap<String, (usize, usize)> {
+    header_counts_of(FLAGSHIP)
+}
+
+fn header_counts_of(text: &str) -> BTreeMap<String, (usize, usize)> {
     let field = |c: &[&str], key: &str| -> usize {
         c.iter()
             .find_map(|f| f.strip_prefix(key))
@@ -87,8 +96,7 @@ fn header_counts() -> BTreeMap<String, (usize, usize)> {
             .parse()
             .unwrap()
     };
-    FLAGSHIP
-        .lines()
+    text.lines()
         .filter_map(|l| l.strip_prefix("#route "))
         .map(|l| {
             let c: Vec<&str> = l.split('\t').collect();
@@ -145,13 +153,15 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
     }
 }
 
-#[test]
-fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
-    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
+    let registry = entries(arch, EXTRA_FLAGS).unwrap();
     let mut failures = Vec::new();
-    for r in rows().iter().filter(|r| r.kind == "hip") {
+    for r in rows_of(fixture).iter().filter(|r| r.kind == "hip") {
         let Some(e) = registry.iter().find(|e| e.module == r.module) else {
-            failures.push(format!("{} [{}]: not registered", r.module, r.route));
+            failures.push(format!(
+                "{arch}: {} [{}]: not registered",
+                r.module, r.route
+            ));
             continue;
         };
         if !e.symbols.contains(&r.symbol.as_str()) {
@@ -190,6 +200,77 @@ fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
         "pack coverage regressions:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201() {
+    assert_measured_hip_modules_registered("gfx1201", FLAGSHIP);
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1151() {
+    assert_measured_hip_modules_registered("gfx1151", FLAGSHIP_1151);
+}
+
+#[test]
+fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1100() {
+    assert_measured_hip_modules_registered("gfx1100", FLAGSHIP_1100);
+}
+
+#[test]
+fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
+    let cases: [(&str, &str, &[(&str, usize)]); 2] = [
+        (
+            "gfx1151",
+            FLAGSHIP_1151,
+            &[("27b-ar", 41), ("27b-dflash-default", 59), ("27b-mtp", 58)],
+        ),
+        (
+            "gfx1100",
+            FLAGSHIP_1100,
+            &[
+                ("27b-ar", 34),
+                ("27b-dflash-default", 55),
+                ("27b-mtp", 65),
+                ("fn-ar", 30),
+                ("fn-mtp", 36),
+            ],
+        ),
+    ];
+    for (arch, fixture, expected) in cases {
+        let rows = rows_of(fixture);
+        let counts = header_counts_of(fixture);
+        assert_eq!(counts.len(), expected.len(), "{arch}: route set");
+        for (route, hip) in expected {
+            assert_eq!(counts[*route], (*hip, 0), "{arch} {route}: header counts");
+            let mine: Vec<&Row> = rows.iter().filter(|r| r.route == *route).collect();
+            assert_eq!(mine.len(), *hip, "{arch} {route}: row count");
+            assert!(mine.iter().all(|r| r.arch == arch && r.kind == "hip"));
+            let unique: BTreeSet<&str> = mine.iter().map(|r| r.module.as_str()).collect();
+            assert_eq!(
+                unique.len(),
+                mine.len(),
+                "{arch} {route}: duplicate modules"
+            );
+        }
+    }
+}
+
+#[test]
+fn halo_select_regrid_and_topk_fixup_are_registered_on_gfx1151() {
+    let registry = entries("gfx1151", EXTRA_FLAGS).unwrap();
+    for m in ["select_regrid", "topk_values_fixup_f32"] {
+        assert!(
+            rows_of(FLAGSHIP_1151)
+                .iter()
+                .any(|r| r.module == m && r.kind == "hip"),
+            "{m} missing from the measured gfx1151 fixture"
+        );
+        assert!(
+            registry.iter().any(|e| e.module == m),
+            "{m} not registered for gfx1151"
+        );
+    }
 }
 
 #[test]
