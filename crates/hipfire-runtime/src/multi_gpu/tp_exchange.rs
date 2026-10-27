@@ -46,44 +46,89 @@ pub const TP_EXCHANGE_ENV: &str = "HIPFIRE_TP_EXCHANGE";
 /// fold's root contributes its own partial as an f32 first term).
 const MAX_EXCHANGE_RANKS: usize = 4;
 
-/// What `HIPFIRE_TP_EXCHANGE` resolves to when unset.
-const DEFAULT_EXCHANGE: Option<TpExchange16> = Some(TpExchange16::Bf16);
+/// What `HIPFIRE_TP_EXCHANGE` selects: a fixed exchange for every reduction
+/// (`None`: f32) or the measured policy ([`auto_exchange`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TpExchangeMode {
+    Auto,
+    Fixed(Option<TpExchange16>),
+}
 
-/// Parse `HIPFIRE_TP_EXCHANGE`: `f32` (`None`: the f32 exchange), `bf16`,
-/// `f16`; unset or empty takes the default. Anything else is an error.
-pub fn parse_tp_exchange(raw: Option<&str>) -> Result<Option<TpExchange16>, String> {
+/// What `HIPFIRE_TP_EXCHANGE` resolves to when unset.
+const DEFAULT_MODE: TpExchangeMode = TpExchangeMode::Auto;
+
+/// The `auto` policy for a reduction of `rows` rows over `tp` ranks: bf16 for
+/// multi-row exchanges (prefill, verify) at any degree and for single-row
+/// decode at TP>=3; f32 for single-row decode at TP2, where the extra pack
+/// launch costs more than the halved peer read saves (measured -1.4%).
+pub fn auto_exchange(rows: usize, tp: usize) -> Option<TpExchange16> {
+    if rows <= 1 && tp <= 2 {
+        None
+    } else {
+        Some(TpExchange16::Bf16)
+    }
+}
+
+impl TpExchangeMode {
+    /// The format for a `rows`-row reduction over `tp` ranks (`None`: f32).
+    pub fn resolve(self, rows: usize, tp: usize) -> Option<TpExchange16> {
+        match self {
+            Self::Auto => auto_exchange(rows, tp),
+            Self::Fixed(fmt) => fmt,
+        }
+    }
+
+    /// The widest format any reduction may use, for kernel preparation.
+    pub fn widest(self) -> Option<TpExchange16> {
+        match self {
+            Self::Auto => Some(TpExchange16::Bf16),
+            Self::Fixed(fmt) => fmt,
+        }
+    }
+}
+
+/// Parse `HIPFIRE_TP_EXCHANGE`: `auto`, `f32`, `bf16`, `f16`; unset or empty
+/// takes the default (`auto`). Anything else is an error.
+pub fn parse_tp_exchange(raw: Option<&str>) -> Result<TpExchangeMode, String> {
     match raw.map(str::trim) {
-        None | Some("") => Ok(DEFAULT_EXCHANGE),
-        Some("f32") => Ok(None),
-        Some("bf16") => Ok(Some(TpExchange16::Bf16)),
-        Some("f16") => Ok(Some(TpExchange16::F16)),
+        None | Some("") => Ok(DEFAULT_MODE),
+        Some("auto") => Ok(TpExchangeMode::Auto),
+        Some("f32") => Ok(TpExchangeMode::Fixed(None)),
+        Some("bf16") => Ok(TpExchangeMode::Fixed(Some(TpExchange16::Bf16))),
+        Some("f16") => Ok(TpExchangeMode::Fixed(Some(TpExchange16::F16))),
         Some(other) => Err(format!(
-            "{TP_EXCHANGE_ENV}={other:?} is not one of f32, bf16, f16"
+            "{TP_EXCHANGE_ENV}={other:?} is not one of auto, f32, bf16, f16"
         )),
     }
 }
 
-/// The requested exchange format, resolved once per process (`None`: f32).
-/// An unrecognised value is reported on stderr and falls back to f32, the
-/// lossless route.
-pub fn tp_exchange_format() -> Option<TpExchange16> {
-    static FORMAT: LazyLock<Option<TpExchange16>> = LazyLock::new(|| {
+/// The requested exchange mode, resolved once per process. An unrecognised
+/// value is reported on stderr and falls back to f32, the lossless route.
+pub fn tp_exchange_mode() -> TpExchangeMode {
+    static MODE: LazyLock<TpExchangeMode> = LazyLock::new(|| {
         let raw = hipfire_config::developer_var(TP_EXCHANGE_ENV).ok();
         parse_tp_exchange(raw.as_deref()).unwrap_or_else(|error| {
             eprintln!("  {error}; using the f32 exchange");
-            None
+            TpExchangeMode::Fixed(None)
         })
     });
-    *FORMAT
+    *MODE
+}
+
+/// The widest format the process may exchange (`None`: f32 only); what kernel
+/// preparation compiles.
+pub fn tp_exchange_format() -> Option<TpExchange16> {
+    tp_exchange_mode().widest()
 }
 
 /// What the dense TP load log reports for the partial exchange: the requested
-/// format when the transport is peer access, `f32` otherwise (the host-staged
+/// mode when the transport is peer access, `f32` otherwise (the host-staged
 /// transport never uses the 16-bit route).
 pub fn tp_exchange_label(peer_transport: bool) -> &'static str {
-    match (peer_transport, tp_exchange_format()) {
-        (true, Some(TpExchange16::Bf16)) => "bf16",
-        (true, Some(TpExchange16::F16)) => "f16",
+    match (peer_transport, tp_exchange_mode()) {
+        (true, TpExchangeMode::Auto) => "auto (bf16; f32 for TP2 single-row decode)",
+        (true, TpExchangeMode::Fixed(Some(TpExchange16::Bf16))) => "bf16",
+        (true, TpExchangeMode::Fixed(Some(TpExchange16::F16))) => "f16",
         _ => "f32",
     }
 }
@@ -98,12 +143,12 @@ fn exch16_slot_bytes(count: usize) -> HipResult<usize> {
 }
 
 impl Gpus {
-    /// The 16-bit exchange format for a `count`-element reduction on this
-    /// mesh, `None` when the f32 exchange applies (knob, rank count, shared
-    /// devices, no peer access, missing rank streams or a count that is not
-    /// a multiple of 8).
-    pub fn tp_exchange16_for(&self, count: usize) -> Option<TpExchange16> {
-        let fmt = tp_exchange_format()?;
+    /// The 16-bit exchange format for a `rows`-row, `count`-element
+    /// reduction on this mesh, `None` when the f32 exchange applies (mode,
+    /// rank count, shared devices, no peer access, missing rank streams or a
+    /// count that is not a multiple of 8).
+    pub fn tp_exchange16_for(&self, rows: usize, count: usize) -> Option<TpExchange16> {
+        let fmt = tp_exchange_mode().resolve(rows, self.devices.len())?;
         self.tp_exchange16_admitted(count).then_some(fmt)
     }
 
@@ -118,11 +163,11 @@ impl Gpus {
     }
 
     /// The generic executor's peer transport, which does not depend on
-    /// `peer_access_enabled`: the format for `count` elements over `n` ranks
-    /// that live on distinct devices.
-    pub(crate) fn tp_exchange16_executor(&self, count: usize) -> Option<TpExchange16> {
-        let fmt = tp_exchange_format()?;
+    /// `peer_access_enabled`: the format for `rows` rows / `count` elements
+    /// over `n` ranks that live on distinct devices.
+    pub(crate) fn tp_exchange16_executor(&self, rows: usize, count: usize) -> Option<TpExchange16> {
         let n = self.devices.len();
+        let fmt = tp_exchange_mode().resolve(rows, n)?;
         (count > 0
             && count.is_multiple_of(8)
             && (2..=MAX_EXCHANGE_RANKS).contains(&n)
@@ -623,20 +668,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exchange_env_parses_each_format_and_rejects_unknown() {
-        assert_eq!(parse_tp_exchange(None), Ok(DEFAULT_EXCHANGE));
-        assert_eq!(parse_tp_exchange(Some("")), Ok(DEFAULT_EXCHANGE));
-        assert_eq!(parse_tp_exchange(Some("f32")), Ok(None));
+    fn exchange_env_parses_each_mode_and_rejects_unknown() {
+        use TpExchangeMode::{Auto, Fixed};
+        assert_eq!(parse_tp_exchange(None), Ok(Auto));
+        assert_eq!(parse_tp_exchange(Some("")), Ok(Auto));
+        assert_eq!(parse_tp_exchange(Some("auto")), Ok(Auto));
+        assert_eq!(parse_tp_exchange(Some("f32")), Ok(Fixed(None)));
         assert_eq!(
             parse_tp_exchange(Some("bf16")),
-            Ok(Some(TpExchange16::Bf16))
+            Ok(Fixed(Some(TpExchange16::Bf16)))
         );
         assert_eq!(
             parse_tp_exchange(Some(" f16 ")),
-            Ok(Some(TpExchange16::F16))
+            Ok(Fixed(Some(TpExchange16::F16)))
         );
         assert!(parse_tp_exchange(Some("fp8")).is_err());
         assert!(parse_tp_exchange(Some("BF16")).is_err());
+    }
+
+    #[test]
+    fn auto_policy_table_by_rows_and_tp() {
+        let bf16 = Some(TpExchange16::Bf16);
+        // (rows, tp, expected)
+        let table = [
+            (1, 2, None),
+            (1, 3, bf16),
+            (1, 4, bf16),
+            (2, 2, bf16),
+            (16, 2, bf16),
+            (2048, 2, bf16),
+            (2, 3, bf16),
+            (2048, 4, bf16),
+        ];
+        for (rows, tp, want) in table {
+            assert_eq!(auto_exchange(rows, tp), want, "rows={rows} tp={tp}");
+            assert_eq!(TpExchangeMode::Auto.resolve(rows, tp), want);
+        }
+        // Explicit overrides ignore rows and tp.
+        for (rows, tp) in [(1, 2), (1, 4), (2048, 2)] {
+            assert_eq!(TpExchangeMode::Fixed(None).resolve(rows, tp), None);
+            assert_eq!(TpExchangeMode::Fixed(bf16).resolve(rows, tp), bf16);
+        }
+        assert_eq!(TpExchangeMode::Auto.widest(), bf16);
+        assert_eq!(TpExchangeMode::Fixed(None).widest(), None);
     }
 
     #[test]

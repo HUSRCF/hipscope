@@ -1334,6 +1334,7 @@ impl Backend for HipBackend<'_> {
                 tp.max_bytes,
                 &partials,
                 &targets,
+                metas[0].descriptor.rows,
                 count,
                 metas[0].partial_slot,
             ),
@@ -1381,6 +1382,7 @@ fn peer_reduce(
     max_bytes: usize,
     partials: &[&DeviceBuffer],
     targets: &[&DeviceBuffer],
+    rows: usize,
     count: usize,
     partial_slot: Option<usize>,
 ) -> Result<()> {
@@ -1394,14 +1396,14 @@ fn peer_reduce(
         && gpus.devices[0].device_id != gpus.devices[1].device_id
     {
         return gpus
-            .all_reduce_sum_f32_peer_add_routed(partials, targets, count, partial_slot)
+            .all_reduce_sum_f32_peer_add_routed(partials, targets, rows, count, partial_slot)
             .map_err(hip_error);
     }
-    // `HIPFIRE_TP_EXCHANGE=bf16|f16`: the ranks exchange 16-bit partials
+    // `HIPFIRE_TP_EXCHANGE` bf16|f16 (or `auto` per rows/TP): the ranks exchange 16-bit partials
     // (`AllReduceAdd` only; the no-target `AllReduce` keeps f32). The same
     // rounded, rank-ordered sum the hand route's `peer_add_routed` adds.
     let fmt = if targets.len() == gpus.devices.len() {
-        gpus.tp_exchange16_executor(count)
+        gpus.tp_exchange16_executor(rows, count)
     } else {
         None
     };

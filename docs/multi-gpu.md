@@ -1179,8 +1179,8 @@ throughput improvement alone does not qualify this route for automatic use.
 Dense Qwen3.5/3.6 TP decode reduces each layer's attention and FFN partials
 into the residual through `Gpus::all_reduce_sum_f32_peer_add_routed`
 (`hipfire-runtime`). Every route evaluates the same rank-ordered sum, so the
-output is the same bytes on each route: with the default 16-bit exchange
-(next section) `x + (r(p0) + r(p1))`, with `HIPFIRE_TP_EXCHANGE=f32`
+output is the same bytes on each route: with a 16-bit exchange
+(next section; `auto` picks it for multi-row and TP>=3 reductions) `x + (r(p0) + r(p1))`, with `HIPFIRE_TP_EXCHANGE=f32`
 `x + (p0 + p1)`. With two
 peer-access ranks the default is a symmetric direct-peer read; each reduction
 waits on the peer's producer event and, before the next layer overwrites a
@@ -1252,9 +1252,10 @@ selects the format the ranks exchange:
 
 | value | exchange |
 |---|---|
-| unset / `bf16` | each rank converts its f32 partial to bf16 once (round to nearest even); every rank sums the rounded, rank-ordered partials in f32 into its f32 residual |
+| unset / `auto` | the default: `bf16` for every multi-row reduction (prefill, speculative verify) at any TP degree and for single-row decode at TP>=3; `f32` for single-row decode at TP2, the one measured loss (bf16 there: -1.4% decode). One pure function, `tp_exchange::auto_exchange(rows, tp)` |
+| `bf16` | forced everywhere: each rank converts its f32 partial to bf16 once (round to nearest even); every rank sums the rounded, rank-ordered partials in f32 into its f32 residual |
 | `f16` | the same with IEEE half (three more mantissa bits, but a partial above 65,504 in magnitude becomes infinity and poisons the residual: overflow is not guarded) |
-| `f32` | the f32 exchange: rank-ordered f32 sums of the f32 partials, as before |
+| `f32` | forced everywhere: the f32 exchange, rank-ordered f32 sums of the f32 partials, as before |
 
 Only the exchange is 16-bit; the residual stream, the sums and the rooted
 route's broadcast of the finished f32 residual stay f32. Every rank, the

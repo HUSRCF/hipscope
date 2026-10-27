@@ -12,7 +12,7 @@
 //! trip of every partial.
 
 use hip_bridge::{Graph, GraphExec};
-use hipfire_runtime::multi_gpu::tp_exchange::{tp_exchange_format, TpExchange16};
+use hipfire_runtime::multi_gpu::tp_exchange::{tp_exchange_mode, TpExchange16};
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
@@ -70,7 +70,8 @@ fn main() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100);
     assert!(replays > 1);
-    let fmt = tp_exchange_format();
+    // The capture reduces one row over two ranks.
+    let fmt = tp_exchange_mode().resolve(1, 2);
 
     let mut gpus = Gpus::init_uniform(2, 2).expect("init TP2 GPUs");
     let arch = gpus.devices[0].arch.clone();
@@ -137,6 +138,7 @@ fn main() {
         gpus.all_reduce_sum_f32_peer_add_routed(
             &partial_refs,
             &residual_refs,
+            1,
             ELEMS,
             Some(barrier & 1),
         )

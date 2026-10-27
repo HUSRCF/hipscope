@@ -2848,10 +2848,11 @@ impl Gpus {
     /// protocol. Every route computes the same rank-ordered sum.
     ///
     /// `HIPFIRE_TP_EXCHANGE` (see [`tp_exchange`]) selects what the ranks
-    /// exchange: the default 16-bit partials (each rank converts its f32
-    /// partial once, every rank sums the rounded, rank-ordered partials in
-    /// f32 into its f32 residual) or, with `HIPFIRE_TP_EXCHANGE=f32`, the f32
-    /// partials themselves. The 16-bit route covers the TP2 direct-peer read,
+    /// exchange: 16-bit partials (each rank converts its f32 partial once,
+    /// every rank sums the rounded, rank-ordered partials in f32 into its f32
+    /// residual) or the f32 partials themselves. The default `auto` picks per
+    /// `rows` and rank count ([`tp_exchange::auto_exchange`]); `rows` is the
+    /// row count of the reduction (`count` = `rows` x dim). The 16-bit route covers the TP2 direct-peer read,
     /// the TP2 whole-token graph and the rooted TP>2 fold alike, so the hand
     /// and the generic dense TP routes, which both reduce through here and
     /// through `executor::peer_reduce`, add identical bytes.
@@ -2859,10 +2860,11 @@ impl Gpus {
         &mut self,
         partials: &[&DeviceBuffer],
         residuals: &[&DeviceBuffer],
+        rows: usize,
         count: usize,
         partial_slot: Option<usize>,
     ) -> HipResult<()> {
-        if let Some(fmt) = self.tp_exchange16_for(count) {
+        if let Some(fmt) = self.tp_exchange16_for(rows, count) {
             return self.all_reduce_peer_add16(fmt, partials, residuals, count, partial_slot);
         }
         if self.devices.len() != 2 || !self.peer_access_enabled || !tp_peer_direct_enabled() {
