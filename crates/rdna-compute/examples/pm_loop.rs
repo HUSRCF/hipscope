@@ -9,8 +9,10 @@
 //! ```text
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
 //!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
-//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
+//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
+//!         (--offline: stop after step 2 below, no device opened, record `offline: true`; the
+//!          legality screen of `pm-census tune run`; not qwen4_moe_verify)
 //!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
 //!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm; not qwen4_moe_verify)
 //! ```
@@ -241,11 +243,13 @@ struct Opts {
     noise_floor: Option<PathBuf>,
     /// Parsed `noise_floor` (loaded by `main` before the run).
     noise_floor_doc: Option<Value>,
+    /// `--offline`: stop after emit + M7 + baseline resolution (no device).
+    offline: bool,
     knobs: Knobs,
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -263,6 +267,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         null_control: false,
         noise_floor: None,
         noise_floor_doc: None,
+        offline: false,
         knobs: Knobs::default(),
     };
     while let Some(arg) = a.next() {
@@ -272,6 +277,10 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             .to_owned();
         if key == "emu" {
             o.emu = true;
+            continue;
+        }
+        if key == "offline" {
+            o.offline = true;
             continue;
         }
         let value = a
@@ -341,6 +350,11 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel == CHAIN_KERNEL && o.rip.is_some() {
         return Err(format!(
             "--rip is not supported with --kernel {CHAIN_KERNEL}: there are no .rip candidates for chains yet"
+        ));
+    }
+    if o.kernel == CHAIN_KERNEL && o.offline {
+        return Err(format!(
+            "--offline is not supported with --kernel {CHAIN_KERNEL}: chain arms are enqueued through the device launchers"
         ));
     }
     if o.rip.is_some()
@@ -468,6 +482,7 @@ fn resources(program: &peacemaker_ir::Program, symbols: &[String]) -> Result<Vec
             "lds_bytes": descriptor.group_segment_fixed_size,
             "scratch_bytes": descriptor.private_segment_fixed_size,
             "code_bytes": code.len(),
+            "code_sha256": sha256_hex(&code),
             "kernarg_bytes": descriptor.kernarg_size,
             "vgpr_spills": m.vgpr_spill_count,
             "sgpr_spills": m.sgpr_spill_count,
@@ -1085,6 +1100,12 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             let msg = m7["error"].to_string();
             return fail(rec, "m7", msg);
         }
+    }
+    if o.offline {
+        // Offline legality screen (R4 pruning): emit + link + M7 + baseline
+        // resolution only; no device is opened and nothing is timed.
+        rec["offline"] = json!(true);
+        return (rec, Outcome::Ok);
     }
 
     // 3. correctness on the card

@@ -11,6 +11,7 @@ fn usage() -> ! {
     eprintln!("  pm-census census ...                              see `pm-census census --help`");
     eprintln!("  pm-census extract ...                             see `pm-census extract --help`");
     eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
+    eprintln!("  pm-census tune plan|run|export ...                R4-R6 autotuner (see `pm-census tune`)");
     std::process::exit(2);
 }
 
@@ -24,6 +25,10 @@ fn main() {
         "census" => pm_census::census::cli(rest),
         "extract" => pm_census::extract::cli(rest),
         "noise" => pm_census::noise::cli(rest),
+        "tune" => match rest.split_first() {
+            Some((sub, tail)) if sub == "export" => pm_census::tune::store::cli(tail),
+            _ => pm_census::tune::run::cli(rest),
+        },
         _ => usage(),
     };
     if let Err(e) = result {

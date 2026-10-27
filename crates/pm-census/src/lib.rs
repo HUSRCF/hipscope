@@ -21,3 +21,4 @@ pub mod extract;
 pub mod inventory;
 pub mod noise;
 pub mod rocprof;
+pub mod tune;
