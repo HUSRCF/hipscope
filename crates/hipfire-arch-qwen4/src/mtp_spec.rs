@@ -506,6 +506,10 @@ pub fn window_to_spec_step(window: MtpWindow) -> Result<SpecStep, String> {
 pub struct Qwen4SpecScratch {
     block_size: usize,
     target_snapshot: Option<TargetTicket>,
+    /// The pre-window ticket of the last committed window (start, end)
+    /// kept for [`SpecTarget::repair_committed_prefix`]; the next snapshot,
+    /// reset or restore supersedes it.
+    retained: Option<(Qwen4StateSnapshot, usize, usize)>,
     #[cfg(feature = "reference-parity")]
     fault_after_snapshot: Option<usize>,
     #[cfg(feature = "reference-parity")]
@@ -548,6 +552,7 @@ impl SpecScratch for Qwen4SpecScratch {
 
     fn clear(&mut self) {
         self.target_snapshot = None;
+        self.retained = None;
     }
 }
 
@@ -1385,6 +1390,7 @@ impl Qwen4Bundle {
         Ok(Box::new(Qwen4SpecScratch {
             block_size,
             target_snapshot: None,
+            retained: None,
             #[cfg(feature = "reference-parity")]
             fault_after_snapshot: None,
             #[cfg(feature = "reference-parity")]
@@ -1792,18 +1798,22 @@ impl SpecTarget for Qwen4Bundle {
         let committed_end = position
             .checked_add(accept_len + 1)
             .ok_or_else(|| "Qwen4 commit position overflow".to_string())?;
-        let snapshot = scratch
+        let scratch = scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
-            .ok_or("Qwen4 commit_prefix: scratch is not Qwen4SpecScratch")?
+            .ok_or("Qwen4 commit_prefix: scratch is not Qwen4SpecScratch")?;
+        scratch.retained = None;
+        let snapshot = scratch
             .target_snapshot
             .take()
             .ok_or("Qwen4 commit_prefix: target snapshot is not active")?
             .local()?;
         if accept_len == draft_len {
-            return self
-                .commit(gpu, snapshot)
-                .map_err(|error| error.to_string());
+            self.validate_commit(snapshot)
+                .map_err(|error| error.to_string())?;
+            self.retain_target_validated(snapshot);
+            scratch.retained = Some((snapshot, position, committed_end));
+            return Ok(());
         }
         // A verify that left per-row rollback points (row capture armed for
         // this block) drops the rejected suffix in place, as native MTP
@@ -1817,8 +1827,10 @@ impl SpecTarget for Qwen4Bundle {
                     Err(restore) => format!("{error}; target restore failed: {restore}"),
                 });
             }
-            self.commit(gpu, snapshot)
+            self.validate_commit(snapshot)
                 .map_err(|error| error.to_string())?;
+            self.retain_target_validated(snapshot);
+            scratch.retained = Some((snapshot, position, committed_end));
         } else {
             self.restore(gpu, snapshot)
                 .map_err(|error| error.to_string())?;
@@ -1829,6 +1841,7 @@ impl SpecTarget for Qwen4Bundle {
             self.spec_forward_rows(gpu, &block[..accept_len + 1], capture)
                 .map(|_| ())
                 .map_err(|error| error.to_string())?;
+            // No window retained: the restore consumed the ticket.
         }
         if self.state.position != committed_end {
             return Err(format!(
@@ -1837,6 +1850,56 @@ impl SpecTarget for Qwen4Bundle {
             ));
         }
         Ok(())
+    }
+
+    fn repair_committed_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut dyn SpecScratch,
+        position: usize,
+        replay: &[u32],
+    ) -> Result<bool, String> {
+        let Some((ticket, start, end)) = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 repair_committed_prefix: scratch is not Qwen4SpecScratch")?
+            .retained
+            .take()
+        else {
+            return Ok(false);
+        };
+        let live = self.validate_commit(ticket).is_ok();
+        if !live
+            || start != position
+            || replay.is_empty()
+            || start + replay.len() > end
+            || self.state.position != end
+        {
+            if live {
+                self.commit_validated(ticket);
+            }
+            return Ok(false);
+        }
+        let replayed = self
+            .restore_retain(gpu, ticket)
+            .map_err(|error| format!("Qwen4 terminal repair restore: {error}"))
+            .and_then(|()| {
+                // The drafter keeps the window's feature rows: no capture.
+                self.spec_forward_rows(gpu, replay, self.dflash.is_none())
+                    .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))
+            });
+        if self.validate_commit(ticket).is_ok() {
+            self.commit_validated(ticket);
+        }
+        replayed?;
+        if self.state.position != start + replay.len() {
+            return Err(format!(
+                "Qwen4 terminal repair ended at {}, expected {}",
+                self.state.position,
+                start + replay.len()
+            ));
+        }
+        Ok(true)
     }
 
     fn eos_token(&self) -> u32 {
