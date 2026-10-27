@@ -1166,7 +1166,7 @@ CLI-resolved `.mtp` sidecar, or the trunk's sibling `.mtp`); the request drafts 
 rank 0 and verifies across ranks. A missing head is a load error, as `mtp=on` is
 on one GPU. `auto` (the default) and `off` keep the AR mesh loop even when a head
 sits beside the trunk, so existing `tp>1` serves are unchanged. Block-verify
-drafters (n-gram, DFlash, DSpark) stay refused on dense TP, and the n-gram-mod
+drafters (n-gram, DFlash, DSpark) stay refused on dense TP (an `auto`-paired DFlash draft is dropped with a log line at `tp>1` by `serve`/`bench`; explicit `on` is still refused), and the n-gram-mod
 composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts natively there.
 
 Dense-TP MTP is not a byte-identical replacement for TP AR: speculative
@@ -1259,6 +1259,13 @@ not apply to it):
   nothing into allocations made after peer enable) and folds the sum locally.
   Producer and read events order the cross-rank reads; nothing waits on the
   host.
+  A TP2 `AllReduceAdd` between two distinct devices instead uses the hand
+  route's direct-peer add kernel (`add_peer_residual_f32`, one launch per
+  rank); other shapes (TP>2, `AllReduce`, same-device emulation) use the
+  copy-fold.
+  For TP>2 payloads above 256 KiB (prefill) the copy-fold is rooted instead:
+  rank 0 gathers and folds in rank order, then each other rank pulls the
+  finished sum (`2(N-1)` copies, identical bytes).
 - **Host**: some pair is not peer-qualified. The hand route's host-staged
   rank-order reduction (`Gpus::all_reduce_sum_f32_host`), then `x + sum` on
   each rank. It synchronizes the rank streams. RCCL is never used, as in the
@@ -1272,7 +1279,10 @@ ascending, one occurrence per rank, F32 descriptors equal on every rank,
 as for PP edges. Family bindings return the operand as `BoundaryIo::view`, the
 `AllReduceAdd` target as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as
 the descriptor epoch. An `AllReduceAdd` operand's contents are unspecified
-afterwards.
+afterwards. A boundary's memory attributes (plain local device memory of its
+owner) are validated once per submission, in the preparation pass; the
+`reduce`/`transfer` re-check only compares the binding's identity (addresses,
+extents, descriptor, transport epoch, slot) and makes no HIP call.
 
 Oracle: byte identity against the single-device rank-order sum over three
 undrained epochs with distinct partials, for the provisioned transport and the
@@ -1362,9 +1372,10 @@ rank's slice with the layout it records); a prefill past the batch scratch,
 sessions, checkpoints and prefix repair are refused before any launch.
 Prefix repair is refused through the host-only
 `MeshStepBindings::admits_prefix_repair` capability, checked before the
-first callback, so the mesh stays healthy. The loader has no generic
-Qwen3.5 TP route; product dense TP stays on the hand route (see
-`docs/design/qwen35-declarative-program.md`, "What stays on the hand route").
+first callback, so the mesh stays healthy. The loader reaches this route by
+default (`HIPFIRE_DENSE_TP_ROUTE=auto`, below); `hand` is the rollback to the
+hand route (see `docs/design/qwen35-declarative-program.md`,
+"What stays on the hand route").
 Oracle (`HIPFIRE_QWEN35_TP_ROWS` prompt rows, default 16, as prefill epochs
 of at most `HIPFIRE_QWEN35_TP_CHUNK` rows, default 16; then 16 tokens
 teacher-forced to the plain card's greedy tokens, the first and the ninth as
@@ -1401,6 +1412,80 @@ not show localizes to the two transports. Record per model the two `TP2` lines, 
 binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
 emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
 same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
+On a TP2 pair the runtime admits for the whole-token graph (both arms prepare
+it as the loaders do) the test also prints `whole-token graph admitted: true`
+and each rank's `whole-token graph epochs` counts, and asserts at least one
+capture and two replays among the 14 decode epochs; where the graph is not
+admitted (TP4) it asserts that decode ran no graphs.
+
+Loader route (developer): `HIPFIRE_DENSE_TP_ROUTE` picks the route
+`hipfire serve --tp N` loads for a dense Qwen3.5/3.6/3.8 model. `auto` (the
+default; also unset or empty) loads the generic mesh route whenever it admits
+the load, else the hand route (`load_model_tp_qwen35_dense`,
+`EpArch::Qwen35DenseTp`) with the log line
+`[loader] dense qwen TP route=auto -> hand: <reason>`; the reasons are
+`speculation.mtp = on` (the mesh route has no MTP verify) and an uneven
+head/FFN split (TP3/TP5). `mesh` forces the mesh route and refuses MTP and
+uneven splits; `hand` is the rollback to the hand route. Any other value is a
+load error naming the accepted values (`parse_dense_tp_route` /
+`resolve_dense_tp_route`, `crates/hipfire-loader/src/lib.rs`). The mesh load
+builds one `Qwen35TpRank` per device (`EpArch::Qwen35MeshTp`),
+prepares the TP2 whole-token graph exactly as the hand loader does (signal
+tape and payload exchange before peer access is enabled; a no-op unless the
+runtime admits the graph), provisions the reduction with
+`provision_mesh_edges` (peer when every rank pair passes byte qualification,
+else the host-staged reduction), calls `enable_peer_all` once the ranks'
+buffers exist when the transport is peer, and builds the program and plan
+once (`Qwen35TpProgram`; the load is refused unless the plan holds two
+collectives per layer, the signal tape's barriers). Each request epoch runs
+through `Qwen35TpProgram::run_epoch`. It serves the hand route's loop:
+chunked prefill (the rank's batch scratch rows, the hand route's prefill
+chunk) and single-token AR decode, on every KV backend (the VMM default
+included).
+DFlash and n-gram drafters are not built, and sessions, checkpoints and
+prefix repair are refused by the bindings. The load prints
+`[loader] dense qwen TP route=mesh (generic mesh executor): <tp> ranks,
+transport=<peer|host>, prefill chunk=<rows>, <n> collectives/epoch`; the
+hand route prints `[loader] dense qwen TP route=hand ...`. A failed epoch
+poisons the mesh (every later epoch is refused) until the model is reloaded.
+`serve` only enqueues mesh epochs (`run_epoch` returns the executor ticket) and
+drains them together at the rank-0 logits read, like the hand route's
+enqueue-then-download, so the first token no longer waits on a drained epoch.
+The mesh route is byte-identical to the hand route at TP2 and TP4 (physical
+hardware test, logits fnv64 equal).
+
+Measured on a 4x gfx1201 (R9700) host, Qwen3.8-27B mq4-xts,
+`hipfire bench --matrix --spec off --runs 3`, 3 fresh processes per arm,
+median tok/s:
+
+| Case | Mesh | Hand | Single card |
+|---|---:|---:|---:|
+| TP2 pp512 | 3289.5 | 2873.5 | 4892.6 |
+| TP2 pp2048 | 3355.2 | 2753.8 | 5251.9 |
+| TP2 tg64@128 | 54.67 | 54.94 | 41.36 |
+| TP2 tg64@4096 | 53.99 | 54.27 | 40.78 |
+| TP4 pp512 | 2061.0 | 1919.4 | - |
+| TP4 pp2048 | 2113.4 | 1997.4 | - |
+| TP4 tg64@128 | 51.77 | 43.96 | - |
+| TP4 tg64@4096 | 51.28 | 43.56 | - |
+
+Decode graphs on the mesh route: TP2 decode on an exact gfx1201 or gfx1100
+pair uses the same whole-token graph as the hand route
+(`HIPFIRE_TP_FULL_GRAPH`, on by default for those pairs). `run_epoch` runs each
+rank's embed eagerly, captures the executor submission of the rest on both
+ranks (the reductions record the signal-barrier kernels) and replays the
+graphs on every later token, so a replayed token costs the host only the
+epoch bookkeeping. The decode partials alternate two slots
+(`BoundaryIo::partial_slot`: mixer 0, FFN 1), which selects the alternating
+direct-peer reduction the graph can capture; prefill reuses one partial
+buffer and takes the ordinary protocol. Any other decode (TP4, another pair,
+`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`, a KV eviction offset) decodes
+eager through the executor. Per-segment hipGraphs (one per rank program
+segment between the collectives) measured slower than eager at TP4 on
+gfx1201 (45.99 vs 51.13 tok/s, Qwen3.8-27B) and were removed: TP2 uses the
+whole-token graph, TP>2 decodes eager. `HIPFIRE_AR_GRAPH_TRACE=1` prints
+`[qwen-mesh-tp-graph]` lines for whole-token captures and replays. Every mode
+computes the same bytes.
 
 The third use is Muse Glimmer (`muse_glimmer::mesh_tp`, #927 item 5). Both
 Glimmer sublayers end in the sandwich epilogue `x + post_norm(out)`, and the

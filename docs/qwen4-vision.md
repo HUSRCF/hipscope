@@ -2,11 +2,16 @@
 
 # Flash Next vision: implementation and reproduction
 
-Status (2026-10-23): branch implementation for [issue #938](https://github.com/warpfront/hipfire/issues/938).
-The independent QSA and vision-tower checks below have receipts, and the local
-single-GPU image HTTP route passed 17/17 cases on Strix Halo (gfx1151). The registry has **no published, paired Flash Next
-vision sidecar**. Export one and pass its path explicitly. The current validation
-route is [Flash-Next image pathway in VALIDATION.md](VALIDATION.md).
+Branch implementation for [issue #938](https://github.com/warpfront/hipfire/issues/938).
+The registry has **no published, paired Flash Next vision sidecar**. Export one
+and pass its path explicitly. The current validation route is
+[Flash-Next image pathway in VALIDATION.md](VALIDATION.md).
+
+Historical evidence (2026-10-23): the independent QSA and vision-tower checks
+below have receipts, and the single-GPU image HTTP route passed 17/17 cases on
+Strix Halo (gfx1151). The later beta vision-contract adaptation has not been
+revalidated; those results apply to the recorded artifacts, not the current
+branch head.
 
 ## Checkpoint and artifact
 
@@ -58,19 +63,37 @@ not a registry publication or a claim that a future export has identical metadat
 With the separately downloaded text trunk already available:
 
 ```bash
-HIPFIRE_VISION_MODE=on target/release/hipfire serve \
-  --model qwen3.8:flash-next --spec off \
+HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon" HIPFIRE_VISION_MODE=resident \
+  target/release/hipfire serve --model qwen3.8:flash-next --spec off \
   --vision "$HOME/.hipfire/models/qwen3.8-flash-next-vision.hfq"
 ```
 
-`--vision` overrides the environment/registry sidecar path; `vision_mode=off`
-still prevents the tower from loading. The loader allocates the tower before
-planning text placement and reserves the maximum admitted image scratch until
-text and optional draft allocation finish. Device allocation backing is queried
-separately from integrated-GPU identity: a BIOS VRAM carve-out is not charged
-again against the host RAM left outside it. Image discovery
-reflects the loaded tower, not merely a configured filename. See the existing
-[vision configuration contract](CONFIG.md#vision-tower) for `on`, `auto`, and `off`.
+`--vision` overrides the environment/registry sidecar path. The shared
+[vision configuration contract](CONFIG.md#vision-tower) accepts all four modes;
+an omitted mode comes from `hipfire_config::vision_mode_default()` (currently
+`auto`). **Flash Next is resident-only in this implementation:**
+
+| Mode | Flash Next behavior |
+| --- | --- |
+| `auto` (default) | Load a discovered or explicit sidecar as a resident tower. If no sidecar is available, retain the text-only path. An explicit missing or invalid sidecar fails the load. |
+| `resident` | Discover the sidecar as in `auto` and upload the whole tower at load. If no sidecar is available, retain the text-only path. An explicit missing or invalid sidecar fails the load. |
+| `on` | Require a valid sidecar, using the same resident backend. Missing or invalid sidecars fail the load; there is no silent text-only fallback. |
+| `off` | Skip the tower, including an explicit sidecar, and refuse image requests. |
+
+The `auto`/`on` resident mapping is a Flash Next exception. The shared
+Qwen3.5/3.8-VL route keeps beta's per-block streamed tower for `auto`/`on`; its
+`resident` policy and the other vision routes are unchanged. Image discovery
+reflects a successfully loaded tower, not merely a configured filename.
+
+Before text placement, the loader validates the sidecar and accounts for its
+resident device weights (including FC2 row padding) and maximum admitted image
+scratch (including the projected 2560-wide rows). It passes this reservation
+through `SequenceHint.reserve_bytes` and the shared `AutoReserve` budget, then
+uploads the tower after placement. The reservation is bookkeeping, not a dummy
+GPU allocation. Record the `vision_reserve=` budget entry and placement logs
+when checking admission. Device allocation backing is queried separately from
+integrated-GPU identity: a BIOS VRAM carve-out is not charged again against the
+host RAM left outside it.
 
 The implemented image route is **one image, one GPU, cold autoregressive
 generation**. Video, multiple images, and distributed image execution are
@@ -103,6 +126,9 @@ The implementation lives in `hipfire-arch-qwen4`'s `vision` and
 optional QSA mRoPE bindings in `rdna-compute/src/qsa_mrope.rs`.
 
 ## Validation
+
+The commands below define the required route; the historical receipts later in
+this section do not validate the current beta merge or its reservation changes.
 
 CPU checks:
 
@@ -159,12 +185,22 @@ python3 scripts/check_qwen4_vision.py --base-url http://127.0.0.1:11435 \
 
 This covers streaming/non-streaming image requests, image replacement, OCR and
 description fixtures, disconnect/follow-up behavior, and text after an image.
-Repeat after restarting the service with `HIPFIRE_VISION_MODE=off`, using
-`--expect-vision off` and a separate report; discovery must omit image support,
-image requests must be refused, and text must still work. Record exact trunk,
-sidecar, CLI, and daemon identities alongside both reports.
+`--expect-vision` describes the service's loaded image capability; it does not
+set `vision_mode`. Use `--expect-vision on` when `auto`, `resident`, or `on` has
+loaded the tower. Restart with `HIPFIRE_VISION_MODE=off` and use
+`--expect-vision off` with a separate report: discovery must omit image support,
+image requests must be refused, and text must still work. An `auto` or `resident`
+load without a sidecar also uses `--expect-vision off`.
 
-Local result (2026-10-23, gfx1151/HIP 7.16, single GPU, q8 KV, eager HIP,
+Check load admission separately from this HTTP script: a missing sidecar under
+`on`, and an explicit bad sidecar under `auto` or `resident`, must fail closed.
+Compare default-mode text output in fresh processes with and without the valid
+sidecar, using identical prompt bytes and settings. Save the load/placement logs
+and `vision_reserve=` entry as well as the HTTP reports; the script does not
+exercise load failures or prove the memory budget. Record exact trunk, sidecar,
+CLI, and daemon identities alongside every receipt.
+
+Historical local result (2026-10-23, gfx1151/HIP 7.16, single GPU, q8 KV, eager HIP,
 `--spec off`, `--max-seq 8192`, NPU trunk off): **17/17 image HTTP cases passed**.
 Red/green/blue answers matched across streaming modes; all five French direction
 signs were transcribed correctly; the dog was correctly described as lying on
@@ -176,7 +212,7 @@ Decoded OCR and description answers were inspected against the committed images.
 These are functional results, not a performance comparison. Mixed speculative
 text/image serving and NPU-enabled text loads were not exercised in this run.
 
-Final image-report identities:
+Historical image-report identities (2026-10-23):
 
 - Trunk SHA-256: `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`.
 - CLI MD5: `9418bfeb06e3829e41253a61f51465c8`.
@@ -188,9 +224,9 @@ Final image-report identities:
   and exhausted its small output budget. Successful text runs explicitly pass
   `--thinking-effort none --max-tokens 512`; the unsuccessful receipt is retained.
 
-### Text capture diagnostic on Halo
+### Historical text capture diagnostic on Halo
 
-The additional text-only `redline_daemon_harness.py --qwen4 --pm4` check uses
+The additional 2026-10-23 text-only `redline_daemon_harness.py --qwen4 --pm4` check uses
 BF16 QSA state, context 128, maximum context 2048, and five shadow positions
 129–133. On gfx1151, `HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0` is required to compare
 the same attention reduction route: eager split-K is enabled by default on

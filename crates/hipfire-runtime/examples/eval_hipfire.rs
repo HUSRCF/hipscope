@@ -18,6 +18,7 @@
 //!                [--arch <name>=auto-from-gpu] \
 //!                [--kv-mode <mode>=asym3] \
 //!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
+//!                [--scored-max-batch <N>]
 //!
 //! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5), with
 //! the kernel admission each one runs (qwen35). Hidden rows are captured
@@ -74,6 +75,15 @@
 //!              prompt route; not comparable with `prefill-whole` kldseqs
 //!              where a route is capture-gated.
 //!
+//! `--scored-max-batch N` (split `prefill` mode only, qwen35, N >= 2): the
+//! scored-region call goes through `forward_prefill_batch_capped` with cap N,
+//! so the scored rows run as consecutive N-row verify-capture forwards (the
+//! shape of an MTP K = N-1 verify) instead of one 1023-row call. The prefix
+//! call is unchanged. Use it to measure routes that gate on a small row count
+//! (e.g. the exact-gfx1100 2..=5-row verify GEMV); compare like with like,
+//! since the KV/state commit cadence differs from the default split mode.
+//! Absent (the default), the scored call is byte-for-byte the historical one.
+//!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
 //!
@@ -111,6 +121,7 @@ fn main() {
         kv_v: String,
         scoring_mode: String,
         max_chunks: Option<usize>,
+        scored_max_batch: Option<usize>,
     }
     // Every mode's kernel admission, shared by the --scoring-mode error and
     // --help text (kept in sync with the module docs above).
@@ -135,6 +146,7 @@ fn main() {
     let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
+    let mut scored_max_batch: Option<usize> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -198,8 +210,19 @@ fn main() {
                 max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
                 i += 2;
             }
+            "--scored-max-batch" => {
+                let n: usize = argv[i + 1]
+                    .parse()
+                    .expect("--scored-max-batch must be integer");
+                if n < 2 {
+                    eprintln!("--scored-max-batch must be >= 2 (got {n})");
+                    std::process::exit(1);
+                }
+                scored_max_batch = Some(n);
+                i += 2;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N]\n{SCORING_MODE_HELP}");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N]\n{SCORING_MODE_HELP}");
                 std::process::exit(0);
             }
             other => {
@@ -216,7 +239,12 @@ fn main() {
         kv_v,
         scoring_mode,
         max_chunks,
+        scored_max_batch,
     };
+    if args.scored_max_batch.is_some() && args.scoring_mode != "prefill" {
+        eprintln!("--scored-max-batch applies to --scoring-mode prefill only");
+        std::process::exit(1);
+    }
 
     // -------- eval-mode env vars (must precede Gpu::init / forward) --------
     // Per plan §"Eval-mode hipfire flags": force OFF for prompt normalize +
@@ -728,6 +756,43 @@ fn main() {
                         plan.scored_rows * config.dim,
                     );
                     &whole_scored
+                } else if let Some(cap) = args.scored_max_batch {
+                    // `--scored-max-batch`: the same prefix call, then the
+                    // scored region as consecutive `cap`-row verify-capture
+                    // forwards (the shape of an MTP K = cap-1 verify).
+                    qwen35::forward_prefill_batch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[0..scoring_start],
+                        0,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("forward_prefill_batch prefix (scored-max-batch)");
+                    let scored_rows = scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail));
+                    qwen35::forward_prefill_batch_capped(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[scored_rows],
+                        scoring_start,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        Some(h_buf),
+                        None,
+                        None,
+                        cap,
+                    )
+                    .expect("forward_prefill_batch_capped scored");
+                    h_buf
                 } else {
                     qwen35::forward_prefill_batch(
                         &mut gpu,
@@ -1404,7 +1469,7 @@ fn main() {
         // ----- lfm2 11 — WIRED (dense 1.2b/350m, num_experts==0) -----
         // Quant dtypes admitted: dense projections Q8_0/HFQ4G256/MQ4G256 (batch_weight_formats_supported);
         // embeddings Q8/HFQ4; lm_head Q8/HFQ4/MQ4/HFQ6/MQ6/MQ3 (+F32/BF16 teachers).
-        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and forward_batch::batched_proj.
+        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and dispatch's ProjectLadder::Gemm.
         // Uses forward_decode_batch_lfm with explicit positions; KV is q8 and only some layers carry KV
         // (KvCache q8 filtered on is_kv_layer, lane_capacity = n_ctx+16).
         use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;

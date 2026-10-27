@@ -629,6 +629,17 @@ impl NpuTrunkRuntime {
             OpenOptions::default(),
         )
     }
+    /// Address of the relay's resolved `hipEventRecord`. Compare to the serving
+    /// runtime while both owners remain alive, before passing it serving streams.
+    pub fn hip_event_record_address(&self) -> usize {
+        self.hip.event_record_address()
+    }
+
+    /// Loader-reported library path for diagnostics, not live object identity.
+    pub fn hip_mapped_library(&self) -> Option<String> {
+        self.hip.mapped_hip_library()
+    }
+
     /// CPU oracle access requires `cpu_reads`; a 1 ns watchdog forces the real
     /// timeout path in the transport gate without a production environment flag.
     pub fn open_with_options(

@@ -178,6 +178,10 @@ name = "bench_flash_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_verify_attn_wmma"
+required-features = ["lab"]
+
+[[example]]
 name = "test_mq4v2_residual_ksplit_gfx1100"
 required-features = ["lab"]
 

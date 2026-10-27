@@ -217,6 +217,9 @@ impl Gfx11ComputeResourceLimitsPolicy {
 pub struct Gfx10Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
+    /// `dwords.len()` at the last [`Self::end_cond_exec`]: a flush right
+    /// before it may be skipped, so it does not make the tail idle.
+    cond_exec_end: usize,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
     resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
 }
@@ -255,6 +258,7 @@ impl Gfx10Pm4CommandBuffer {
         Self {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         }
@@ -563,6 +567,7 @@ impl Gfx10Pm4CommandBuffer {
             return Err(count);
         }
         self.dwords[region.count_at] = count;
+        self.cond_exec_end = self.dwords.len();
         self.clear_register_state();
         Ok(())
     }
@@ -668,8 +673,10 @@ impl Gfx10Pm4CommandBuffer {
     }
 
     pub fn ends_with_compute_idle(&self) -> bool {
-        self.dwords
-            .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
+        self.dwords.len() != self.cond_exec_end
+            && self
+                .dwords
+                .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -1295,6 +1302,7 @@ mod tests {
         let empty_value = Gfx10Pm4CommandBuffer {
             dwords: vec![packet3(PACKET3_SET_SH_REG, 1, true), COMPUTE_PGM_LO],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1308,6 +1316,7 @@ mod tests {
                 1,
             ],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1317,6 +1326,7 @@ mod tests {
         let short_dispatch = Gfx10Pm4CommandBuffer {
             dwords: vec![packet3(PACKET3_DISPATCH_DIRECT, 2, true), 1, 1],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1382,7 +1392,12 @@ mod tests {
         let region = c.begin_cond_exec(0x1000);
         c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
         c.wait_compute_idle();
+        assert!(c.ends_with_compute_idle());
         c.end_cond_exec(region).unwrap();
+        assert!(
+            !c.ends_with_compute_idle(),
+            "a flush inside the region may be skipped"
+        );
         c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
         let d = c.dwords();
         assert_eq!(&d[3..8], [0xc003_2200, 0x1000, 0, 0, 5]);

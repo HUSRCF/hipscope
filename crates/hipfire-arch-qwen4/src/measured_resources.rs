@@ -46,6 +46,18 @@ use std::sync::Arc;
 use crate::expert_residency::AutoReserve;
 use crate::measured_identity::Qwen4MeasuredLoadIdentity;
 
+/// Preserve text-only records byte for byte. A vision load reports the
+/// planner's independent weight-and-scratch reservation outside the text
+/// census; it is already included in reserve_bytes and the device/host sums.
+fn record_vision_reserve(value: &mut serde_json::Value, reserve: &AutoReserve) {
+    if reserve.vision_reserve_bytes != 0 {
+        value["vision_reserve_bytes"] = serde_json::json!(reserve.vision_reserve_bytes);
+        value["vision_reserve_scope"] = serde_json::json!(
+            "resident_weights_including_padding_plus_activation_and_projected_rows"
+        );
+    }
+}
+
 /// Schema marker of the frozen resource snapshot.
 pub const LOAD_RESOURCE_SNAPSHOT_SCHEMA: &str = "fn-oracle.load-resource-snapshot.v1";
 
@@ -281,6 +293,9 @@ impl Qwen4LoadResourceSnapshot {
                 reserve.census.mtp, admitted.new_capture_bytes
             ));
         }
+        let reserve = reserve
+            .with_vision_reserve(reserve.vision_reserve_bytes)
+            .map_err(|err| format!("{HERE}: {err}"))?;
         let reserve_bytes = reserve.bytes();
         // Base device plan: the OLD settled-owner formula, verbatim.
         let mut base_device_plan_bytes = placement
@@ -324,7 +339,7 @@ impl Qwen4LoadResourceSnapshot {
             .iter()
             .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
             .collect();
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "schema": LOAD_RESOURCE_SNAPSHOT_SCHEMA,
             "evidence_kind": LOAD_RESOURCE_EVIDENCE_KIND,
             "measured_load": measured_load,
@@ -397,6 +412,7 @@ impl Qwen4LoadResourceSnapshot {
             "device_plan_bytes": device_plan_bytes,
             "host_plan_bytes": host_plan_bytes,
         });
+        record_vision_reserve(&mut value["reserve"], &reserve);
         let canonical = serde_json::to_string(&value)
             .map_err(|err| format!("{HERE}: snapshot JSON does not render: {err}"))?;
         Ok(Self {
@@ -611,6 +627,7 @@ pub fn preload_component_union(
     }
     if reserve.historical != inputs.reserve.historical
         || reserve.census_total != inputs.reserve.census_total
+        || reserve.vision_reserve_bytes != inputs.reserve.vision_reserve_bytes
     {
         return Err(format!(
             "{HERE}: caller reserve differs from the placement_inputs reserve"
@@ -626,6 +643,9 @@ pub fn preload_component_union(
             reserve.census_total
         ));
     }
+    let reserve = reserve
+        .with_vision_reserve(reserve.vision_reserve_bytes)
+        .map_err(|err| format!("{HERE}: {err}"))?;
     let reserve_bytes = reserve.bytes();
     // Per-owner backing slack of the same reserve, from the owners' own
     // allocation lists (individual-allocation counterfactual: no arena plan).
@@ -788,7 +808,7 @@ pub fn preload_component_union(
         .iter()
         .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
         .collect();
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "evidence_kind": PRELOAD_UNION_EVIDENCE_KIND,
         "owner_contract_version": LOAD_RESOURCE_OWNER_CONTRACT_VERSION,
         "parked_policy": PRELOAD_UNION_PARKED_POLICY,
@@ -863,7 +883,9 @@ pub fn preload_component_union(
         "device_backed_host_bytes": device_backed_host_bytes,
         "device_union_upper_bound_bytes": device_union_bytes,
         "host_union_upper_bound_bytes": host_union_bytes,
-    }))
+    });
+    record_vision_reserve(&mut value["planned"]["reserve"], &reserve);
+    Ok(value)
 }
 
 #[cfg(test)]

@@ -52,10 +52,19 @@ pub struct ForwardEpoch {
 /// for every other collective. TP collectives fold F32 rows only. After an
 /// `AllReduceAdd` the operand's contents are unspecified (they depend on the
 /// transport); the splitter refuses any later read of it.
+///
+/// `partial_slot` is `Some(0 | 1)` only when the family alternates two
+/// distinct partial buffers on consecutive TP collectives of an epoch (the
+/// hand dense-TP route's mixer and FFN partials): the TP2 peer reduction then
+/// takes the alternating protocol, which is the one the whole-token graph can
+/// capture. Every rank of a group names the same slot. `None` is the ordinary
+/// protocol (a partial buffer the next collective reuses) and the only value
+/// for non-TP collectives.
 pub struct BoundaryIo<'a> {
     pub view: &'a GpuTensor,
     pub into: Option<&'a GpuTensor>,
     pub descriptor: EdgeDescriptor,
+    pub partial_slot: Option<usize>,
 }
 
 /// Family adapters own state, not GPUs, streams, topology or token decisions.
@@ -691,6 +700,8 @@ struct BoundaryMeta {
     transport_epoch: u64,
     /// `AllReduceAdd` accumulation target `(address, extent)`; `None` otherwise.
     into: Option<(usize, usize)>,
+    /// The operand's alternating partial slot ([`BoundaryIo::partial_slot`]).
+    partial_slot: Option<usize>,
 }
 
 /// Small internal seam: CPU tests exercise the very same prepare/issue/drain
@@ -801,6 +812,12 @@ fn validate_group(metas: &[BoundaryMeta], add: bool) -> Result<()> {
     let bytes = metas[0].descriptor.bytes;
     if metas[0].descriptor.dtype_bytes != 4 {
         return Err("TP collectives reduce F32 activations only".into());
+    }
+    // The alternating protocol has two slots, and every rank must be in the
+    // same one: the TP2 reduction reads both ranks' partials under one slot.
+    let slot = metas[0].partial_slot;
+    if slot.is_some_and(|slot| slot > 1) || metas.iter().any(|meta| meta.partial_slot != slot) {
+        return Err("TP collective participants must name the same partial slot, 0 or 1".into());
     }
     let mut spans = Vec::with_capacity(metas.len() * 2);
     for meta in metas {
@@ -1202,6 +1219,40 @@ impl DrainBackend for HipBackend<'_> {
     }
 }
 
+/// The identity of a boundary binding, from its transport state and the
+/// binding's buffers; no device calls. `require_local` validation is the
+/// preparation pass's job (`HipBackend::boundary`), once per boundary.
+fn boundary_meta(gpus: &Gpus, c: &PlannedCollective, io: &BoundaryIo<'_>) -> Result<BoundaryMeta> {
+    let state = &gpus.mesh_execution;
+    let (capacity, transport_epoch) = if let CollectiveKind::BandXfer { .. } = c.kind {
+        let (src, dst) = endpoints(c, gpus.devices.len())?;
+        let edge = state
+            .edges
+            .get(&EdgeId {
+                src_device: src,
+                dst_device: dst,
+            })
+            .ok_or("BandXfer has no provisioned lease")?;
+        (edge.max_bytes, edge.lease.epoch())
+    } else {
+        let tp = state
+            .tp
+            .ok_or("TP collective on a mesh without a provisioned TP group")?;
+        (tp.max_bytes, tp.epoch)
+    };
+    Ok(BoundaryMeta {
+        descriptor: io.descriptor,
+        address: io.view.buf.as_ptr() as usize,
+        extent: io.view.buf.size(),
+        capacity,
+        transport_epoch,
+        into: io
+            .into
+            .map(|into| (into.buf.as_ptr() as usize, into.buf.size())),
+        partial_slot: io.partial_slot,
+    })
+}
+
 impl Backend for HipBackend<'_> {
     fn ready(&self, owner: usize) -> bool {
         self.gpus.devices[owner].active_stream.is_some()
@@ -1212,23 +1263,6 @@ impl Backend for HipBackend<'_> {
         c: &PlannedCollective,
         epoch: &ForwardEpoch,
     ) -> Result<BoundaryMeta> {
-        let state = &self.gpus.mesh_execution;
-        let (capacity, transport_epoch) = if let CollectiveKind::BandXfer { .. } = c.kind {
-            let (src, dst) = endpoints(c, self.gpus.devices.len())?;
-            let edge = state
-                .edges
-                .get(&EdgeId {
-                    src_device: src,
-                    dst_device: dst,
-                })
-                .ok_or("BandXfer has no provisioned lease")?;
-            (edge.max_bytes, edge.lease.epoch())
-        } else {
-            let tp = state
-                .tp
-                .ok_or("TP collective on a mesh without a provisioned TP group")?;
-            (tp.max_bytes, tp.epoch)
-        };
         let io = self.bindings.boundary(owner, c, epoch)?;
         let gpu = &self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
@@ -1236,16 +1270,7 @@ impl Backend for HipBackend<'_> {
         if let Some(into) = io.into {
             require_local(gpu, into)?;
         }
-        Ok(BoundaryMeta {
-            descriptor: io.descriptor,
-            address: io.view.buf.as_ptr() as usize,
-            extent: io.view.buf.size(),
-            capacity,
-            transport_epoch,
-            into: io
-                .into
-                .map(|into| (into.buf.as_ptr() as usize, into.buf.size())),
-        })
+        boundary_meta(self.gpus, c, &io)
     }
     fn run_ops(&mut self, owner: usize, epoch: &ForwardEpoch, ops: &[OpId]) -> Result<()> {
         let gpu = &mut self.gpus.devices[owner];
@@ -1260,7 +1285,8 @@ impl Backend for HipBackend<'_> {
         meta: BoundaryMeta,
         publish: bool,
     ) -> Result<()> {
-        if self.boundary(owner, c, epoch)? != meta {
+        let io = self.bindings.boundary(owner, c, epoch)?;
+        if boundary_meta(self.gpus, c, &io)? != meta {
             return Err("prepared boundary binding changed during submission".into());
         }
         let (src, dst) = endpoints(c, self.gpus.devices.len())?;
@@ -1268,7 +1294,6 @@ impl Backend for HipBackend<'_> {
             src_device: src,
             dst_device: dst,
         }];
-        let io = self.bindings.boundary(owner, c, epoch)?;
         let gpu = &mut self.gpus.devices[owner];
         gpu.bind_thread().map_err(|e| e.to_string())?;
         if publish {
@@ -1283,11 +1308,6 @@ impl Backend for HipBackend<'_> {
         epoch: &ForwardEpoch,
         metas: &[BoundaryMeta],
     ) -> Result<()> {
-        for (&owner, meta) in c.group.iter().zip(metas) {
-            if self.boundary(owner, c, epoch)? != *meta {
-                return Err("prepared boundary binding changed during submission".into());
-            }
-        }
         let tp = self
             .gpus
             .mesh_execution
@@ -1296,14 +1316,26 @@ impl Backend for HipBackend<'_> {
         let count = metas[0].descriptor.bytes / 4;
         let mut partials = Vec::with_capacity(c.group.len());
         let mut targets = Vec::with_capacity(c.group.len());
-        for &owner in &c.group {
+        for (&owner, meta) in c.group.iter().zip(metas) {
+            // Memory attributes were validated when the boundary was prepared;
+            // here only the binding's identity is re-checked.
             let io = self.bindings.boundary(owner, c, epoch)?;
+            if boundary_meta(self.gpus, c, &io)? != *meta {
+                return Err("prepared boundary binding changed during submission".into());
+            }
             partials.push(&io.view.buf);
             targets.extend(io.into.map(|into| &into.buf));
         }
         let gpus = &mut *self.gpus;
         match tp.transport {
-            TpTransport::Peer => peer_reduce(gpus, tp.max_bytes, &partials, &targets, count),
+            TpTransport::Peer => peer_reduce(
+                gpus,
+                tp.max_bytes,
+                &partials,
+                &targets,
+                count,
+                metas[0].partial_slot,
+            ),
             TpTransport::Host => host_reduce(gpus, &partials, &targets, count),
         }
     }
@@ -1341,13 +1373,29 @@ fn rank_stream(gpu: &Gpu) -> Result<&hip_bridge::Stream> {
 /// sum to the rank's target (`x + (p0 + p1 + …)`); `AllReduce` (`targets`
 /// empty) overwrites the rank's partial with it. Producer and read events order
 /// the cross-rank reads on the device streams; nothing waits on the host.
+/// `partial_slot` is the group's [`BoundaryIo::partial_slot`], used by the TP2
+/// direct-peer route only.
 fn peer_reduce(
     gpus: &mut Gpus,
     max_bytes: usize,
     partials: &[&DeviceBuffer],
     targets: &[&DeviceBuffer],
     count: usize,
+    partial_slot: Option<usize>,
 ) -> Result<()> {
+    // TP2 `AllReduceAdd` across two devices: the hand route's direct-peer add
+    // (`Gpus::all_reduce_sum_f32_peer_add_routed`), one launch per rank
+    // computing `x + (p0 + p1)` (same fp32 order as the copy-fold below). A
+    // `partial_slot` takes its alternating protocol, the one the whole-token
+    // graph captures. Same-device (emulated) ranks keep the copy-fold.
+    if gpus.devices.len() == 2
+        && targets.len() == 2
+        && gpus.devices[0].device_id != gpus.devices[1].device_id
+    {
+        return gpus
+            .all_reduce_sum_f32_peer_add_routed(partials, targets, count, partial_slot)
+            .map_err(hip_error);
+    }
     let Gpus {
         devices,
         rank_barrier_events: produced,
@@ -1367,6 +1415,11 @@ fn peer_reduce(
         gpu.hip
             .event_record(event, Some(rank_stream(gpu)?))
             .map_err(hip_error)?;
+    }
+    if n > 2 && bytes > ROOTED_REDUCE_MIN_BYTES {
+        return peer_reduce_rooted(
+            devices, scratch, produced, read, max_bytes, partials, targets, count,
+        );
     }
     // 2. After every producer: pull partial q into slot q, fold into slot 0.
     for (r, (gpu, rank)) in devices.iter_mut().zip(scratch).enumerate() {
@@ -1411,6 +1464,108 @@ fn peer_reduce(
                 bytes,
             )?,
         }
+    }
+    Ok(())
+}
+
+/// Smallest payload that takes the rooted peer reduction for three or more
+/// ranks. The all-pull path moves `N(N-1)` copies of the payload but keeps
+/// every rank symmetric with no second dependency hop, which wins for
+/// latency-bound decode rows (one row of the 27B is 20 KB). Prefill payloads
+/// (rows x dim x 4 bytes, up to ~40 MB) are bandwidth-bound, where the rooted
+/// path's `2(N-1)` copies win. 256 KiB sits far above any decode row and far
+/// below the smallest prefill chunk that matters.
+const ROOTED_REDUCE_MIN_BYTES: usize = 256 * 1024;
+
+/// Rooted `TpTransport::Peer` reduction (`N > 2`, large payloads). Rank 0
+/// pulls partials `1..N` into its slots `1..N`, folds
+/// `((p0 + p1) + p2) + …` into slot 0 (`p0` is read in place by the first
+/// add, which is the same fp32 sum the all-pull path's copy-then-add forms),
+/// and every other rank pulls that finished slot 0 into its own slot 0, then
+/// applies it exactly as the all-pull path does. Every rank therefore ends
+/// with the same bytes as the all-pull fold.
+///
+/// Events (the producers' `produced`, plus `read`): `read[0]` is recorded on
+/// rank 0 after its last partial read and the fold, so it doubles as "sum
+/// ready" for the broadcast pulls and as "rank 0 no longer reads partial `r`"
+/// for rank `r`'s next write of its partial. `read[r]` (`r > 0`) is recorded on
+/// rank `r` right after it pulled rank 0's slot 0; rank 0 waits those before
+/// returning, so the next collective cannot overwrite slot 0 under a reader.
+/// Nothing waits on the host and nothing is allocated.
+#[allow(clippy::too_many_arguments)]
+fn peer_reduce_rooted(
+    devices: &mut [Gpu],
+    scratch: &[TpScratch],
+    produced: &[hip_bridge::Event],
+    read: &[hip_bridge::Event],
+    max_bytes: usize,
+    partials: &[&DeviceBuffer],
+    targets: &[&DeviceBuffer],
+    count: usize,
+) -> Result<()> {
+    let bytes = count * 4;
+    // 2. Rank 0, after every producer: pull p1.., fold into slot 0.
+    {
+        let (gpu, rank) = (&mut devices[0], &scratch[0]);
+        gpu.bind_thread().map_err(hip_error)?;
+        for event in &produced[1..] {
+            gpu.hip
+                .stream_wait_event(rank_stream(gpu)?, event)
+                .map_err(hip_error)?;
+        }
+        for (q, partial) in partials.iter().enumerate().skip(1) {
+            let slot = rank.stage.buf.as_ptr() as usize + q * max_bytes;
+            transport::copy_bytes(gpu, &rank.owners, partial.as_ptr() as usize, slot, bytes)?;
+        }
+        let sum = rank.stage.sub_offset(0, count);
+        let first = rank.stage.sub_offset(max_bytes / 4, count);
+        gpu.add_f32(&f32_view(partials[0], count), &first, &sum)
+            .map_err(hip_error)?;
+        for q in 2..partials.len() {
+            let addend = rank.stage.sub_offset(q * (max_bytes / 4), count);
+            gpu.add_inplace_f32(&sum, &addend).map_err(hip_error)?;
+        }
+        gpu.hip
+            .event_record(&read[0], Some(rank_stream(gpu)?))
+            .map_err(hip_error)?;
+    }
+    // 3. Every other rank pulls the finished sum into its own slot 0 and
+    // applies it; rank 0 applies its own.
+    let root_sum = scratch[0].stage.buf.as_ptr() as usize;
+    for (r, (gpu, rank)) in devices.iter_mut().zip(scratch).enumerate() {
+        gpu.bind_thread().map_err(hip_error)?;
+        let sum = rank.stage.sub_offset(0, count);
+        if r > 0 {
+            gpu.hip
+                .stream_wait_event(rank_stream(gpu)?, &read[0])
+                .map_err(hip_error)?;
+            let slot = sum.buf.as_ptr() as usize;
+            transport::copy_bytes(gpu, &rank.owners, root_sum, slot, bytes)?;
+            gpu.hip
+                .event_record(&read[r], Some(rank_stream(gpu)?))
+                .map_err(hip_error)?;
+        }
+        match targets.get(r) {
+            Some(target) => {
+                let x = f32_view(target, count);
+                gpu.add_f32(&x, &sum, &x).map_err(hip_error)?;
+            }
+            None => transport::copy_bytes(
+                gpu,
+                &rank.owners,
+                sum.buf.as_ptr() as usize,
+                partials[r].as_ptr() as usize,
+                bytes,
+            )?,
+        }
+    }
+    // 4. Rank 0's slot 0 is free once every other rank has pulled it.
+    let gpu = &mut devices[0];
+    gpu.bind_thread().map_err(hip_error)?;
+    for event in &read[1..] {
+        gpu.hip
+            .stream_wait_event(rank_stream(gpu)?, event)
+            .map_err(hip_error)?;
     }
     Ok(())
 }
@@ -2215,6 +2370,30 @@ impl Gpus {
         state.tp.filter(|_| !state.quarantined).map(|tp| tp.epoch)
     }
 
+    /// How the provisioned pure-TP group moves partials: `"peer"` (every
+    /// rank pair byte-qualified, or one device under emulation) or `"host"`
+    /// (the host-staged rank-order reduction). `None` for a PP mesh or a
+    /// quarantined one.
+    pub fn mesh_tp_transport(&self) -> Option<&'static str> {
+        let state = &self.mesh_execution;
+        state
+            .tp
+            .filter(|_| !state.quarantined)
+            .map(|tp| match tp.transport {
+                TpTransport::Peer => "peer",
+                TpTransport::Host => "host",
+            })
+    }
+
+    /// The admission [`Self::submit_mesh_epoch`] applies first, without
+    /// submitting: refuses a stale, poisoned, quarantined or unprovisioned mesh,
+    /// another request's undrained epochs, a non-increasing op id and a changed
+    /// load/numerical policy. Mutates nothing. For a family that replays a
+    /// captured whole-token program instead of submitting the epoch.
+    pub fn admit_mesh_epoch(&self, epoch: &ForwardEpoch) -> Result<()> {
+        self.mesh_execution.admit(epoch)
+    }
+
     /// Submit one epoch. Epochs of the same request may be outstanding at once
     /// (strictly increasing op ids); every ticket must be drained together by
     /// `drain_mesh_epochs`. A submission failure after any device enqueue
@@ -2440,6 +2619,11 @@ fn alloc_tp_scratch(
         transport::copy_bytes(gpu, &rank.owners, base, base + 16, 16)?;
         gpu.add_inplace_f32(&a, &b).map_err(hip_error)?;
         gpu.add_f32(&a, &b, &a).map_err(hip_error)?;
+        if ranks == 2 {
+            // The TP2 direct-peer add (`peer_reduce`) launches this kernel.
+            gpu.add_peer_residual_f32(&a, &b, b.buf.as_ptr() as *const std::ffi::c_void, 4)
+                .map_err(hip_error)?;
+        }
         gpu.hip.device_synchronize().map_err(hip_error)?;
     }
     Ok(())
@@ -2492,6 +2676,9 @@ mod tests {
         tp: bool,
         /// Every rank binds the same group memory (an aliased binding).
         alias: bool,
+        /// Per-rank `BoundaryIo::partial_slot` of every group collective
+        /// (empty: `None` on every rank).
+        partial_slots: Vec<Option<usize>>,
         /// The real executor state machine, driven by the production
         /// `submit`/`drain_tickets` through `HasState`.
         state: MeshExecutionState,
@@ -2514,6 +2701,7 @@ mod tests {
                 quarantined: false,
                 tp: false,
                 alias: false,
+                partial_slots: Vec::new(),
                 state: MeshExecutionState::default(),
             }
         }
@@ -2592,6 +2780,7 @@ mod tests {
                 transport_epoch: 17,
                 into: matches!(c.kind, CollectiveKind::AllReduceAdd { .. })
                     .then_some((0x10_0000 + 0x1000 * slot, 512)),
+                partial_slot: self.partial_slots.get(owner).copied().flatten(),
             })
         }
         fn run_ops(&mut self, owner: usize, _: &ForwardEpoch, ops: &[OpId]) -> Result<()> {
@@ -3080,6 +3269,28 @@ mod tests {
     }
 
     #[test]
+    fn tp_partial_slots_must_agree_and_stay_within_the_alternating_pair() {
+        let (f, epoch, mut toy) = tp_toy(2);
+        for slots in [
+            vec![Some(0), None],
+            vec![Some(0), Some(1)],
+            vec![Some(2), Some(2)],
+        ] {
+            toy.partial_slots = slots;
+            assert!(submit(&f.plan, &epoch, &mut toy)
+                .unwrap_err()
+                .contains("partial slot"));
+        }
+        assert!(toy.calls.is_empty() && !toy.poisoned);
+        for slots in [vec![], vec![Some(0), Some(0)], vec![Some(1), Some(1)]] {
+            toy.partial_slots = slots;
+            let ticket = submit(&f.plan, &epoch, &mut toy).unwrap();
+            drain_tickets(&[ticket], &mut toy).unwrap();
+            toy.state.last_op = None;
+        }
+    }
+
+    #[test]
     fn tp_drain_failure_quarantines_and_refuses_later_epochs() {
         let (f, mut epoch, mut toy) = tp_toy(2);
         let ticket = submit(&f.plan, &epoch, &mut toy).unwrap();
@@ -3189,6 +3400,7 @@ mod tests {
                     dtype_bytes: 4,
                     bytes: self.bytes,
                 },
+                partial_slot: None,
             })
         }
         fn apply_rank_marks(&mut self, _: usize, _: &ForwardEpoch) -> Result<()> {
@@ -3270,8 +3482,20 @@ mod tests {
     #[test]
     #[ignore = "GPU: run with HIPFIRE_EMULATE_GPUS=2 and =4, or on N physical devices"]
     fn tp_collectives_match_single_device_rank_order_sum() {
+        tp_collective_oracle(3);
+    }
+
+    /// The same oracle over a payload above `ROOTED_REDUCE_MIN_BYTES` (80 rows
+    /// x 1024 x 4 = 320 KiB), which takes the rooted peer reduction for TP3+.
+    #[test]
+    #[ignore = "GPU: run with HIPFIRE_EMULATE_GPUS=4, or on N>2 physical devices"]
+    fn tp_collectives_rooted_large_payload_match_rank_order_sum() {
+        assert!(80 * TP_H * 4 > ROOTED_REDUCE_MIN_BYTES);
+        tp_collective_oracle(80);
+    }
+
+    fn tp_collective_oracle(rows: usize) {
         use crate::mesh_placement::AdmittedRank;
-        const ROWS: usize = 3;
         const EPOCHS: usize = 3;
         let ranks = crate::config::get().emulate_gpus.unwrap_or_else(|| {
             hip_bridge::HipRuntime::load()
@@ -3279,7 +3503,7 @@ mod tests {
                 .unwrap() as usize
         });
         assert!(ranks >= 2, "needs HIPFIRE_EMULATE_GPUS>=2 or two devices");
-        let count = ROWS * TP_H;
+        let count = rows * TP_H;
         let bytes = count * 4;
         let mut gpus = Gpus::init_tp(ranks, 1).unwrap();
         for gpu in &mut gpus.devices {
@@ -3411,9 +3635,9 @@ mod tests {
                     request_id: 1,
                     op_id,
                     route: MeshRoute::Prefill,
-                    start_position: (op_id as usize - 1) * ROWS,
-                    actual_rows: ROWS,
-                    route_rows: ROWS,
+                    start_position: (op_id as usize - 1) * rows,
+                    actual_rows: rows,
+                    route_rows: rows,
                     policy_id: 1,
                 };
                 tickets.push(

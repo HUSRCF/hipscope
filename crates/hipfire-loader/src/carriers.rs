@@ -826,7 +826,61 @@ impl Carrier for Qwen4Carrier {
         let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
+        // Flash Next currently keeps its tower resident. Auto/on select that
+        // implementation explicitly; beta's other VL carriers still stream.
+        // Price both weights and the largest image before placement, then
+        // upload the tower after the text rank has preserved this room.
+        let vision_request = if ctx.vision_mode == "off" {
+            None
+        } else {
+            ctx.vision_path
+                .as_ref()
+                .map(|path| {
+                    let sidecar = hipfire_runtime::hfq::HfqFile::open(path)
+                        .map_err(|error| format!("qwen4 vision sidecar: {error}"))?;
+                    let config = hipfire_arch_qwen4::vision::config_from_hfq(&sidecar)?;
+                    let pitch =
+                        hipfire_arch_qwen35_vl::qwen35_vl::vision_fc2_pitch(ctx.gpu, &config);
+                    let padding = config.num_layers as u64
+                        * config.hidden_size as u64
+                        * (pitch - config.mlp_dim) as u64
+                        * 2;
+                    let weights = hipfire_arch_qwen4::vision::DEVICE_WEIGHT_BYTES
+                        .checked_add(padding)
+                        .ok_or("qwen4: vision weight reserve overflows")?;
+                    let has_wmma =
+                        ctx.gpu.arch_caps.has_wmma_w32() || ctx.gpu.arch_caps.has_wmma_w32_gfx12();
+                    let patches = hipfire_arch_qwen4::vision::MAX_IMAGE_PATCHES;
+                    let scratch =
+                        hipfire_arch_qwen4::vision::device_scratch_bytes(patches, has_wmma)?
+                            .checked_add((patches as u64 / 4) * config.out_hidden_size as u64 * 4)
+                            .and_then(|bytes| bytes.checked_add(1 << 20))
+                            .ok_or("qwen4: vision activation reserve overflows")?;
+                    let total = weights
+                        .checked_add(scratch)
+                        .ok_or("qwen4: vision reserve overflows")?;
+                    Ok::<_, String>((path.clone(), config, weights, scratch, total))
+                })
+                .transpose()?
+        };
+        let vision_reserve_bytes = vision_request.as_ref().map_or(0, |request| request.4);
+        let vision_activation_bytes = vision_request.as_ref().map_or(0, |request| request.3);
+        if vision_reserve_bytes != 0 {
+            if let Some(sequence) = ctx.sequence.as_mut() {
+                let bytes = usize::try_from(vision_reserve_bytes)
+                    .map_err(|_| "qwen4: vision reserve exceeds platform address space")?;
+                sequence.reserve_bytes = sequence
+                    .reserve_bytes
+                    .checked_add(bytes)
+                    .ok_or("qwen4: sequence vision reserve overflows")?;
+            }
+            if let Some((_, _, weights, scratch, _)) = &vision_request {
+                eprintln!("qwen4 vision: mode={} -> resident; vision_reserve={} bytes ({} resident weights incl. row padding + {} largest-image scratch incl. projected rows)",
+                    ctx.vision_mode, vision_reserve_bytes, weights, scratch);
+            }
+        }
         let shared = Qwen4RankShared {
+            vision_reserve_bytes,
             continuous_batch: ctx.batch_request.lanes().is_some(),
             path: ctx.path.to_string(),
             max_seq: ctx.max_seq,
@@ -875,57 +929,6 @@ impl Carrier for Qwen4Carrier {
                 eprintln!("{line}");
             }
         }
-        // Allocate the optional tower before text placement. The ordinary
-        // free-VRAM measurement therefore includes its resident cost instead
-        // of consuming the expert cache's already-budgeted memory afterward.
-        let vision = if ctx.vision_mode != "off" {
-            ctx.vision_path.as_ref().map(|path| {
-                let sidecar = hipfire_runtime::hfq::HfqFile::open(path)
-                    .map_err(|error| format!("qwen4 vision sidecar: {error}"))?;
-                let config = hipfire_arch_qwen4::vision::config_from_hfq(&sidecar)?;
-                let weights = hipfire_arch_qwen4::vision::load_weights(&sidecar, &config, ctx.gpu)
-                    .map_err(|error| format!("qwen4 vision upload: {error}"))?;
-                let packed_bytes = hipfire_arch_qwen4::vision::DEVICE_WEIGHT_BYTES;
-                // The shared loader pads fc2 rows on the LDS route. Both the
-                // packed payload and this padding are already resident before
-                // the free-VRAM placement quote; report the actual total.
-                let padding_bytes: u64 = weights.layers.iter().map(|layer| {
-                    (layer.fc2_ld - config.mlp_dim) as u64 * config.hidden_size as u64 * 2
-                }).sum();
-                eprintln!("qwen4 vision: {} resident bytes reserved before text/expert placement ({} packed + {} row padding; {})",
-                    packed_bytes + padding_bytes, packed_bytes, padding_bytes, path.display());
-                Ok::<_, String>((config, weights))
-            }).transpose()?
-        } else {
-            None
-        };
-        // Hold a real allocation during the existing placement/admission
-        // passes. Free it directly afterward (not into Gpu's tensor pool),
-        // leaving room for every supported image size and its projected rows.
-        let vision_scratch_reserve = if vision.is_some() {
-            let has_wmma =
-                ctx.gpu.arch_caps.has_wmma_w32() || ctx.gpu.arch_caps.has_wmma_w32_gfx12();
-            let patches = hipfire_arch_qwen4::vision::MAX_IMAGE_PATCHES;
-            let bytes = hipfire_arch_qwen4::vision::device_scratch_bytes(patches, has_wmma)?
-                + (patches as u64 / 4) * 2560 * 4
-                + (1 << 20);
-            match ctx.gpu.hip.malloc(bytes as usize) {
-                Ok(reserve) => {
-                    eprintln!(
-                        "qwen4 vision: {bytes} scratch bytes reserved during text/expert placement"
-                    );
-                    Some(reserve)
-                }
-                Err(error) => {
-                    if let Some((_, weights)) = vision {
-                        weights.free_gpu(ctx.gpu);
-                    }
-                    return Err(format!("qwen4 vision scratch reservation: {error}"));
-                }
-            }
-        } else {
-            None
-        };
         let result = (|| -> Result<LoadedModel, String> {
             let loaded = load_qwen4_rank(
                 ctx.gpu,
@@ -938,18 +941,22 @@ impl Carrier for Qwen4Carrier {
                 }),
                 src,
             );
-            let mut loaded = match loaded {
-                Ok(mut loaded) => {
-                    loaded.bundle.vision = vision;
-                    loaded
-                }
-                Err(error) => {
-                    if let Some((_, weights)) = vision {
-                        weights.free_gpu(ctx.gpu);
+            let mut loaded = loaded?;
+            if let Some((path, config, _, _, _)) = &vision_request {
+                let tower = (|| {
+                    let sidecar = hipfire_runtime::hfq::HfqFile::open(path)
+                        .map_err(|error| format!("qwen4 vision sidecar: {error}"))?;
+                    hipfire_arch_qwen4::vision::load_weights(&sidecar, config, ctx.gpu)
+                        .map_err(|error| format!("qwen4 vision upload: {error}"))
+                })();
+                match tower {
+                    Ok(weights) => loaded.bundle.vision = Some((config.clone(), weights)),
+                    Err(error) => {
+                        let _ = loaded.bundle.free_gpu(ctx.gpu);
+                        return Err(error);
                     }
-                    return Err(error);
                 }
-            };
+            }
             // Seam: the EP mesh owner builds peer ranks 1..N-1 here, after rank 0
             // is loaded (see `attach_qwen4_ep_peers`).
             if let Some(plan) = &ep_plan {
@@ -1029,19 +1036,67 @@ impl Carrier for Qwen4Carrier {
             apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
             Ok(model)
         })();
-        // Keep the reservation alive through optional draft/verify allocation.
-        // It has never been passed to a GPU launch and is safe to free here on
-        // either result; an image turn needs these bytes even with a drafter
-        // resident for subsequent text requests.
-        if let Some(reserve) = vision_scratch_reserve {
-            if let Err(error) = ctx.gpu.hip.free(reserve) {
-                if let Ok(model) = result {
-                    let _ = crate::unload_model(model, ctx.gpu);
+        // Optional draft/verify construction may allocate after rank admission.
+        // With the tower now resident, check actual remaining image/context
+        // room again. A refused load releases every model owner through the
+        // common teardown path; no scratch allocation is used as a budget.
+        match result {
+            Ok(model) if vision_activation_bytes != 0 => {
+                let fit = (|| {
+                    let bundle = model.qwen4().ok_or("qwen4 vision: missing loaded bundle")?;
+                    let mtp_request = if model.mtp_weights_present {
+                        let config = &bundle.config;
+                        let drafts = hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(
+                            model.mtp_k,
+                            &ctx.gpu.arch,
+                        );
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_request_bytes(
+                            config,
+                            model.max_seq,
+                            bundle.spec_chunk_rows().unwrap_or(1).max(1),
+                            drafts,
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+                                ctx.gpu,
+                                config,
+                                bundle.state_format().gdn,
+                                drafts,
+                            )
+                            .filter(|(_, rows)| bundle.native_mtp_capture_rows() < *rows),
+                            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(ctx.gpu),
+                        )
+                        .ok_or("qwen4 vision: native MTP request bytes overflow")?
+                    } else {
+                        0
+                    };
+                    let (free, _) = ctx
+                        .gpu
+                        .device_mem_info()
+                        .map_err(|error| format!("qwen4 vision: final memory query: {error}"))?;
+                    crate::admission::qwen4_memory_admission_with_reserve(
+                        model.max_seq,
+                        Some(model.max_seq),
+                        free as u64,
+                        mtp_request,
+                        0,
+                        crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
+                        vision_activation_bytes,
+                        |tokens| bundle.context_growth_bytes(ctx.gpu, tokens),
+                    )
+                    .map(|_| ())
+                })();
+                if let Err(error) = fit {
+                    let cleanup = crate::unload_model(model, ctx.gpu);
+                    return Err(match cleanup {
+                        Ok(()) => format!("qwen4 vision reserve after draft allocation: {error}"),
+                        Err(cleanup) => {
+                            format!("qwen4 vision reserve: {error}; cleanup: {cleanup}")
+                        }
+                    });
                 }
-                return Err(format!("qwen4 vision scratch reservation release: {error}"));
+                Ok(model)
             }
+            result => result,
         }
-        result
     }
 
     /// Bench-prefill for Qwen4: the daemon has reset the request state; run
@@ -1410,6 +1465,9 @@ fn qwen4_pp_session_budget(pp_native_mtp: bool, configured: u64) -> u64 {
 /// touched the device.
 #[derive(Clone)]
 pub struct Qwen4RankShared {
+    /// The same per-load reserve as SequenceHint.reserve_bytes; retained
+    /// explicitly for discrete ranks that do not use automatic max_seq.
+    pub vision_reserve_bytes: u64,
     pub path: String,
     pub max_seq: usize,
     pub sequence: Option<hipfire_runtime::loader_api::SequenceHint>,
@@ -2363,6 +2421,7 @@ fn qwen4_placement_inputs(
     ranks: usize,
     chunk_rows: usize,
     share: Option<hipfire_arch_qwen4::expert_residency::DecodeShareForward>,
+    vision_reserve_bytes: u64,
 ) -> Result<
     (
         u64,
@@ -2385,6 +2444,7 @@ fn qwen4_placement_inputs(
         );
     let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(
         &hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
+            vision_reserve_bytes,
             gpu,
             config,
             weights,
@@ -2903,6 +2963,7 @@ pub fn qwen4_ep_vram_layers(
         ranks,
         chunk_rows,
         None,
+        shared.vision_reserve_bytes,
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -3088,6 +3149,7 @@ pub fn qwen4_preload_resource_plan(
             usize::from(routed_experts),
         );
     let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
+        vision_reserve_bytes: shared.vision_reserve_bytes,
         gpu,
         config: &config,
         weights: &manifest.weights,
@@ -3143,6 +3205,7 @@ pub fn qwen4_preload_resource_plan(
         routed_experts,
         use_ranges,
         &shared.path,
+        shared.vision_reserve_bytes,
     )?;
     // Shared cohesive metadata: fixed-N / auto / hotset / native intent resolved
     // through the genuine owners before byte accounting, with no fake admission.
@@ -3672,6 +3735,7 @@ pub fn qwen4_preload_resource_plan(
     );
     let component_union = hipfire_arch_qwen4::measured_resources::preload_component_union(
         &residency::PlacementInputsArgs {
+            vision_reserve_bytes: shared.vision_reserve_bytes,
             gpu,
             config: &config,
             weights: &manifest.weights,
@@ -3913,6 +3977,7 @@ fn preload_s1_union(
     routed_experts: bool,
     use_ranges: bool,
     model_path: &str,
+    vision_reserve_bytes: u64,
 ) -> Result<(u64, String, serde_json::Value), String> {
     use hipfire_arch_qwen4::slowlink_admission as s1;
     let declined = |reason: String| {
@@ -4007,6 +4072,7 @@ fn preload_s1_union(
     // the layout route holds (the blessed no-artifact-bytes answer).
     let no_scan = || Ok::<bool, String>(false);
     let load = s1::SingleDeviceLoad {
+        vision_reserve_bytes,
         gpu,
         config,
         weights,
@@ -4230,6 +4296,9 @@ fn load_qwen4_rank_scoped(
     src: ModelSource,
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
 ) -> Result<Qwen4RankLoad, String> {
+    // Keep metadata, EP/S1 placement and final admission on the same quote,
+    // including discrete loads without an automatic sequence hint.
+    let vision_reserve_bytes = shared.vision_reserve_bytes;
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
     let max_k = shared.max_k;
@@ -4698,6 +4767,7 @@ fn load_qwen4_rank_scoped(
             ep_ranks,
             placement_chunk,
             None,
+            vision_reserve_bytes,
         )?)
     } else {
         None
@@ -4793,6 +4863,7 @@ fn load_qwen4_rank_scoped(
                     borrowed,
                     shadows_borrowed: decode_share_shadow_bytes,
                 }),
+                vision_reserve_bytes,
             )
             .ok(),
             _ => None,
@@ -5012,6 +5083,7 @@ fn load_qwen4_rank_scoped(
             },
             || {
                 let load = s1::SingleDeviceLoad {
+                    vision_reserve_bytes,
                     gpu: &*ctx.gpu,
                     config: &config,
                     weights: &manifest.weights,
@@ -6946,13 +7018,14 @@ fn load_qwen4_rank_scoped(
                 .device_mem_info()
                 .map_err(|error| format!("qwen4: device memory query: {error}"))?;
             let gpu = &*ctx.gpu;
-            crate::admission::qwen4_memory_admission(
+            crate::admission::qwen4_memory_admission_with_reserve(
                 ctx.max_seq,
                 (!automatic).then_some(ctx.max_seq),
                 free as u64,
                 mtp_request,
                 ple_resident,
                 crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
+                vision_reserve_bytes,
                 |tokens| bundle.context_growth_bytes(gpu, tokens),
             )
         },
@@ -6973,6 +7046,10 @@ fn load_qwen4_rank_scoped(
                     admission.card_cap,
                     admission.card_cap
                 );
+            if admission.vision_reserve != 0 {
+                eprintln!("  qwen4 memory admission: vision_reserve={} bytes (tower weights plus maximum image scratch; excluded from automatic context capacity)",
+                    admission.vision_reserve);
+            }
             if admission.ple_shrunk() {
                 eprintln!(
                     "  qwen4 ple budget: {} MiB of {} MiB kept resident so the {}-token context fits (the context takes precedence over the reclaimable PLE page cache)",
@@ -7821,6 +7898,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
     let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
     let meta = resolve_source_meta(&src, ctx.path)?;
     let shared = Qwen4RankShared {
+        vision_reserve_bytes: 0,
         continuous_batch: false,
         path: ctx.path.to_string(),
         max_seq: ctx.max_seq,
@@ -8243,8 +8321,34 @@ impl Carrier for Qwen35Carrier {
                 // sidecars, so a sidecar failure here fails the load closed —
                 // an explicitly requested tower must never silently serve text.
                 let (vision_config, vision_weights) = {
+                    use hipfire_arch_qwen35_vl::qwen35_vl::{
+                        self, load_vision_weights, TowerResidency,
+                    };
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
+
+                    let residency = TowerResidency::from_vision_mode(&ctx.vision_mode);
+                    // After a tower loads (either residency) the automatic
+                    // max_seq must leave room for its activation scratch.
+                    fn reserve_tower_activation(
+                        ctx: &mut LoadCtx<'_>,
+                        vc: &qwen35_vl::VisionConfig,
+                        residency: TowerResidency,
+                    ) {
+                        let patches = qwen35_vl::max_image_patches(vc);
+                        let bytes = qwen35_vl::tower_activation_peak_bytes(vc, patches);
+                        if let Some(seq) = ctx.sequence.as_mut() {
+                            seq.reserve_bytes = seq.reserve_bytes.saturating_add(bytes);
+                        }
+                        eprintln!(
+                            "  vision tower: {}; activation reserve {} MiB for {patches} patches",
+                            match residency {
+                                TowerResidency::Resident => "resident",
+                                TowerResidency::Streamed => "streamed",
+                            },
+                            bytes >> 20
+                        );
+                    }
 
                     // Vision tower sidecar resolution: an explicit
                     // `--vision-path` (or HIPFIRE_VL_FILE) must never be
@@ -8275,7 +8379,7 @@ impl Carrier for Qwen35Carrier {
                             "  loading vision weights from .vl sidecar: {}",
                             vl.display()
                         );
-                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                        let vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                         let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
                             .map_err(|e| format!(".vl vision_config: {e}"))?;
@@ -8318,8 +8422,9 @@ impl Carrier for Qwen35Carrier {
                         // misleading "no vision encoder" message. A corrupt
                         // or truncated .vl must be a load-time error the
                         // operator can see.
-                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                        let vw = load_vision_weights(&vl_hfq, &vc, ctx.gpu, residency)
                             .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model: vision encoder (hidden={}, layers={})",
                             vc.hidden_size, vc.num_layers
@@ -8329,9 +8434,12 @@ impl Carrier for Qwen35Carrier {
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                         match vc {
                             Some(vc) => {
-                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                let vw = load_vision_weights(&hfq_file, &vc, ctx.gpu, residency)
                                     .map_err(|e| eprintln!("  VL weight load failed: {e}"))
                                     .ok();
+                                if vw.is_some() {
+                                    reserve_tower_activation(ctx, &vc, residency);
+                                }
                                 eprintln!(
                                     "  VL model: vision encoder (hidden={}, layers={})",
                                     vc.hidden_size, vc.num_layers
@@ -8340,11 +8448,11 @@ impl Carrier for Qwen35Carrier {
                             }
                             _ => (None, None),
                         }
-                    } else if let Some(p) = ctx.vision_path.as_ref() {
-                        let mut sidecar =
-                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
-                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
-                            )?;
+                    } else if let Some(p) = ctx.vision_path.clone().as_ref() {
+                        let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p))
+                            .map_err(|e| {
+                                format!("vision sidecar '{}': open failed: {e}", p.display())
+                            })?;
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file)
                             .ok()
                             .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
@@ -8354,10 +8462,10 @@ impl Carrier for Qwen35Carrier {
                                  the sidecar with --include-vision"
                                     .to_string()
                             })?;
-                        let vw =
-                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
-                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
-                            })?;
+                        let vw = load_vision_weights(&sidecar, &vc, ctx.gpu, residency).map_err(
+                            |e| format!("vision sidecar '{}': tower load failed: {e}", p.display()),
+                        )?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
                             p.display(),
@@ -8631,6 +8739,9 @@ impl Carrier for Qwen35Carrier {
             swap_disk_bytes: cfg.swap_disk_bytes,
             is_vl: cfg.is_vl,
             vl_path: cfg.vl_path,
+            vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::from_vision_mode(
+                &cfg.vision_mode,
+            ),
             mtp_k: cfg.mtp_k,
             mtp_mode: cfg.mtp_mode,
             kv_mode_raw: cfg.kv_mode_raw,

@@ -101,6 +101,16 @@
 #if HIPFIRE_FA2_KMODE == 0 && !defined(HIPFIRE_FA2_FP8)
 #define HIPFIRE_FA2_SPLIT_LSE_ENTRY 1
 #endif
+// Native-fp8-KV split-KV verifier (HIPFIRE_FA2_SPLIT_LSE_FP8, KMODE=8, f16
+// body): the same LSE + normalized-Oacc records as the Q8 verifier, behind
+// distinct `_lse_` entry symbols so the KMODE=8 Q0 module keeps its
+// 258-float records and symbols byte-identical.
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+#if HIPFIRE_FA2_KMODE != 8 || defined(HIPFIRE_FA2_FP8)
+#error "HIPFIRE_FA2_SPLIT_LSE_FP8 needs KMODE=8 and the f16 body"
+#endif
+#define HIPFIRE_FA2_SPLIT_LSE_ENTRY 1
+#endif
 
 // U0 scaffold: HIPFIRE_FA2_FP8 renames entry symbols only. Body stays the
 // f16 kernel until Ua (planes) / Ub (QK) / Uc (PV). gfx120x-only.
@@ -162,6 +172,18 @@ static __device__ __forceinline__ float fa2_fp8_e4m3_to_f32(unsigned char b) {
     }
     return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
 }
+// Split-KV verifier fill: four E4M3 codes of one dword through the gfx12
+// v_cvt_pk_f32_fp8 pair. Equal to fa2_fp8_e4m3_to_f32 for every non-NaN
+// code (the VerifyAttn twin relies on the same identity), so the f16 plane
+// values are unchanged; NaN codes still decode to NaN.
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+static __device__ __forceinline__ void fa2_fp8x4_to_f32(uint32_t u, float (&d)[4]) {
+    typedef float fa2_f32x2 __attribute__((ext_vector_type(2)));
+    const fa2_f32x2 lo = __builtin_amdgcn_cvt_pk_f32_fp8(u, false);
+    const fa2_f32x2 hi = __builtin_amdgcn_cvt_pk_f32_fp8(u, true);
+    d[0] = lo.x; d[1] = lo.y; d[2] = hi.x; d[3] = hi.y;
+}
+#endif
 #endif
 
 // Shared workgroup body. PARTIAL=false writes normalized O to `out`;
@@ -320,6 +342,29 @@ __device__ __forceinline__ void fa2_gqa_body(
             const unsigned char* codes = (row != nullptr)
                 ? row + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
                 : nullptr;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+            // Split verifier: the 32 codes as four 8-byte loads issued up
+            // front (rows are 1032 B = 8-byte aligned; the head/run offsets
+            // are multiples of 32), then the hardware fp8 pair decode.
+            uint32_t uw[8];
+            if (codes != nullptr) {
+                const uint2* c8 = (const uint2*)codes;
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const uint2 v = c8[h];
+                    uw[2 * h] = v.x;
+                    uw[2 * h + 1] = v.y;
+                }
+            } else {
+#pragma unroll
+                for (int w = 0; w < 8; ++w) uw[w] = 0;
+            }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float dv[4];
+                fa2_fp8x4_to_f32(uw[w], dv);
+                const float d0 = dv[0], d1 = dv[1], d2 = dv[2], d3 = dv[3];
+#else
 #pragma unroll 1
             // 8 dwords cover the 32 codes (memcpy emits a correct load at any
             // alignment; 1032 / 516 % 4 == 0 so rows stay dword-aligned anyway).
@@ -331,6 +376,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 const float d1 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 8));
                 const float d2 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 16));
                 const float d3 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 24));
+#endif
                 // 4-wide dim run at 4-aligned dd (template K:355-365).
                 const int dd = b * 32 + w * 4;
                 const int dc = dd >> 4;
@@ -513,6 +559,28 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int sub = (2 * m) >> 4;
             const int kgm = ((2 * m) >> 3) & 1;
             const int j0 = (2 * m) & 7;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+            // Split verifier: both rows' 32 codes as 8-byte loads up front,
+            // hardware fp8 pair decode per dword (see the K fill above).
+            uint32_t uw0[8], uw1[8];
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const uint2 a = (vc0 != nullptr) ? ((const uint2*)vc0)[h] : make_uint2(0u, 0u);
+                const uint2 c2 = (vc1 != nullptr) ? ((const uint2*)vc1)[h] : make_uint2(0u, 0u);
+                uw0[2 * h] = a.x; uw0[2 * h + 1] = a.y;
+                uw1[2 * h] = c2.x; uw1[2 * h + 1] = c2.y;
+            }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float dv0[4], dv1[4];
+                fa2_fp8x4_to_f32(uw0[w], dv0);
+                fa2_fp8x4_to_f32(uw1[w], dv1);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float v0 = dv0[c];
+                    const float v1 = dv1[c];
+#else
 #pragma unroll 1
             for (int w = 0; w < 8; ++w) {
                 uint32_t u0 = 0, u1 = 0;
@@ -525,6 +593,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int d = b * 32 + w * 4 + c;
                     const float v0 = fa2_fp8_e4m3_to_f32((unsigned char)(u0 >> (c * 8)));
                     const float v1 = fa2_fp8_e4m3_to_f32((unsigned char)(u1 >> (c * 8)));
+#endif
                     const int dc = d >> 4;
                     const int ln = 16 * kgm + (d & 15);
                     const int o = fa2_voff(sub, dc, ln, j0);
@@ -1540,6 +1609,8 @@ extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gq
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx1201
 #elif HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx1201
+#elif HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201
 #elif HIPFIRE_FA2_KMODE == 8
 // Q0 body is f16 with no rotation, same as KMODE=0, but the symbol must be
 // distinct: the host function cache is keyed by symbol alone.
@@ -1781,7 +1852,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
                            split, n_splits);
 }
 #elif !defined(HIPFIRE_FA2_Q0_A3B)
-#if HIPFIRE_FA2_KMODE == 8
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201(
+#elif HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
@@ -1802,7 +1875,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
 {
     if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
         return;
-    if (n_splits < 1 || n_splits > 8)
+    if (n_splits < 1 || n_splits > 64)
         return;
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
@@ -1879,7 +1952,9 @@ extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_mer
     }
 }
 #elif !defined(HIPFIRE_FA2_Q0_A3B)
-#if HIPFIRE_FA2_KMODE == 8
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201(
+#elif HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
 extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_fp8_gfx1201(
@@ -1895,7 +1970,7 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
 {
     if (n_heads != 24 || head_dim != 256)
         return;
-    if (n_splits < 1 || n_splits > 8)
+    if (n_splits < 1 || n_splits > 64)
         return;
     const int tid = (int)threadIdx.x;
     const int wave = tid >> 5;

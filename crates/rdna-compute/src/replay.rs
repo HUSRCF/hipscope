@@ -1484,6 +1484,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
+        | "attention_flash_q8_0_tile_hd64"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
@@ -1974,6 +1975,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816" => Some(64),
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
+        | "attention_flash_q8_0_tile_hd64"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"

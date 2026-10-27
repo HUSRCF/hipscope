@@ -6,6 +6,8 @@
 //! Flash-Next single-image generation. Image turns are cold AR requests:
 //! their image identity is never confused with a text-only prefix cache key.
 //! The ordinary AR producer owns sampling, typed emission and cancellation.
+//! Flash-Next tower admission is resident-only: `auto` and `on` use the same
+//! resident backend as `resident`; `on` requires a tower at load.
 
 use base64::Engine;
 use hipfire_arch_qwen35_vl::mrope::ImageSpan;
@@ -83,7 +85,7 @@ pub fn generate_qwen4_vl(
         refuse(
             stdout,
             id,
-            "qwen4 vision tower is not loaded; set vision_mode=auto and provide its sidecar",
+            "qwen4 vision tower is not loaded; provide its sidecar and reload with vision_mode=resident",
         );
         return;
     };

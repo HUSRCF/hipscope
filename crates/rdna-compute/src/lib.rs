@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod attention_wmma_verify;
 pub mod byte_arena;
 pub mod cdna;
 pub mod code_object;
@@ -48,6 +49,7 @@ mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
+mod gemv_q8x;
 #[cfg(test)]
 mod gpu_test;
 pub mod graph;

@@ -5681,6 +5681,7 @@ pub(crate) fn seal_moe_decode<'a>(
     };
     let params = MoeParams {
         dtypes,
+        mq2_lloyd: None,
         recipe: MoeRecipe::SoftmaxGatedShared {
             bf16_round_trip: true,
             shared_after_combine: true,

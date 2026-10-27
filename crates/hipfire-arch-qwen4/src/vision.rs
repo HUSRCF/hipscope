@@ -310,7 +310,9 @@ pub fn validate_tensor_infos(
     Ok(())
 }
 
-/// Upload the admitted tower through the existing Qwen vision loader.
+/// Upload the admitted tower through the shared Qwen vision loader.
+/// Flash Next currently requires resident matrices, including for its
+/// `auto` and `on` modes; the Qwen3.5/VL streamed route remains independent.
 /// Release with `Qwen4VisionWeights::free_gpu` at model unload.
 pub fn load_weights(
     hfq: &HfqFile,
@@ -318,7 +320,7 @@ pub fn load_weights(
     gpu: &mut Gpu,
 ) -> HipResult<Qwen4VisionWeights> {
     validate_hfq(hfq, config).map_err(|error| HipError::new(1, &error))?;
-    qwen35_vl::load_vision_weights(hfq, config, gpu)
+    qwen35_vl::load_vision_weights(hfq, config, gpu, qwen35_vl::TowerResidency::Resident)
 }
 
 /// Encode a resized, normalized RGB CHW image. Returns row-major F32 visual

@@ -8,11 +8,175 @@
 use crate::error::{HipError, HipResult};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::{DeviceBuffer, MemcpyKind};
+#[cfg(unix)]
+use core::ffi::CStr;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(unix)]
+extern "C" {
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+#[repr(C)]
+#[cfg(unix)]
+struct DlInfo {
+    dli_fname: *const c_char,
+    dli_fbase: *mut c_void,
+    dli_sname: *const c_char,
+    dli_saddr: *mut c_void,
+}
+
+/// Loader-reported path backing `ptr`, for diagnostics only, not object identity.
+#[cfg(unix)]
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = DlInfo {
+        dli_fname: ptr::null(),
+        dli_fbase: ptr::null_mut(),
+        dli_sname: ptr::null(),
+        dli_saddr: ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call.
+    if unsafe { dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Kernel32 entry points for [`dladdr_fname`]. Declared directly with an
+/// explicit link so hip-bridge gains no dependency edge (and no Cargo.lock
+/// change).
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub(super) fn GetModuleHandleExW(
+            flags: u32,
+            module_name_or_address: *const u16,
+            module: *mut *mut c_void,
+        ) -> i32;
+        pub(super) fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32)
+            -> u32;
+    }
+}
+
+/// Loader-reported path backing `ptr` (the DLL that contains that address), for
+/// diagnostics only, not object identity.
+#[cfg(windows)]
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    use win32::*;
+    let mut module: *mut c_void = ptr::null_mut();
+    // SAFETY: FROM_ADDRESS makes the second argument an address, not a string;
+    // UNCHANGED_REFCOUNT means the returned handle needs no FreeLibrary and
+    // cannot outlive the caller's own hold on the mapping. `module` is a valid
+    // out-pointer.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            ptr as *const u16,
+            &mut module,
+        )
+    };
+    if ok == 0 || module.is_null() {
+        return None;
+    }
+    // Grow until the path fits: GetModuleFileNameW truncates silently and
+    // returns the buffer size when it does. 32768 UTF-16 units is the NT limit.
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `buf` is valid for `buf.len()` UTF-16 units and the length is
+        // passed as the size.
+        let len =
+            unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..len]));
+        }
+        if buf.len() >= 32768 {
+            return None;
+        }
+        let grown = buf.len() * 2;
+        buf.resize(grown, 0);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn dladdr_fname(_ptr: *const c_void) -> Option<String> {
+    None
+}
+
+/// Map one HIP runtime candidate. Non-Windows hosts keep plain `Library::new`.
+///
+/// # Safety
+/// Same contract as `libloading::Library::new`: loading runs the library's
+/// initialisation routines.
+#[cfg(not(windows))]
+unsafe fn open_library(candidate: &str) -> Result<Library, libloading::Error> {
+    Library::new(candidate)
+}
+
+/// Map one HIP runtime candidate on Windows.
+///
+/// Plain `Library::new` is `LoadLibraryExW(path, NULL, 0)`: the named DLL loads
+/// from its absolute path, but its own dependencies (amd_comgr*.dll, ...) go
+/// through the standard search order, where System32 precedes PATH. The AMD
+/// display driver installs an older amdhip64/comgr into System32, so a HIP SDK
+/// (or shipped runtime) DLL would silently pair with the driver's comgr.
+/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` makes the DLL's own directory the first
+/// place its dependencies resolve; `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` keeps the
+/// application directory, System32 and AddDllDirectory entries as fallbacks.
+///
+/// Both flags reject relative names, and DEFAULT_DIRS excludes PATH, so a bare
+/// name (the legacy PATH fallback) keeps `Library::new`. If the flagged load of
+/// an existing absolute path fails (a lone runtime DLL, e.g. the installer's
+/// `~\.hipfire\runtime` copy, whose dependencies are reachable only through
+/// PATH), the pre-flag `Library::new` load is retried so a setup that loaded
+/// before still loads.
+///
+/// # Safety
+/// Same contract as `libloading::Library::new`.
+#[cfg(windows)]
+unsafe fn open_library(candidate: &str) -> Result<Library, libloading::Error> {
+    use libloading::os::windows::{
+        Library as WinLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    if !std::path::Path::new(candidate).is_absolute() {
+        return Library::new(candidate);
+    }
+    // The SEARCH_* flags want a normalised backslash path; a root taken from an
+    // env var may carry forward slashes. Verbatim (`\\?\`) paths are literal.
+    let normalized;
+    let path = if candidate.starts_with(r"\\?\") || !candidate.contains('/') {
+        candidate
+    } else {
+        normalized = candidate.replace('/', "\\");
+        normalized.as_str()
+    };
+    match WinLibrary::load_with_flags(
+        path,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+    ) {
+        Ok(lib) => Ok(Library::from(lib)),
+        Err(_) if std::path::Path::new(path).is_file() => Library::new(path),
+        Err(error) => Err(error),
+    }
+}
 
 #[cfg(feature = "kernel-timing")]
 pub mod kernel_timing;
@@ -857,6 +1021,22 @@ fn host_maps_qwen4_experts() -> bool {
 }
 
 impl HipRuntime {
+    /// Address of this runtime's resolved `hipEventRecord` implementation.
+    ///
+    /// Compare only while both runtime owners are alive, in the same process.
+    /// Unlike a pathname, this identifies the live implementation even after a
+    /// library is renamed or replaced. It makes no HIP call and does not use a
+    /// process-global first-loader cache: each GPU's actual runtime is checked.
+    pub fn event_record_address(&self) -> usize {
+        self.fn_event_record as usize
+    }
+
+    /// Loader-reported library path for diagnostics. Identity comparisons must
+    /// use [`Self::event_record_address`]; a missing path never proves equality.
+    pub fn mapped_hip_library(&self) -> Option<String> {
+        dladdr_fname(self.fn_event_record as *const c_void)
+    }
+
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
@@ -875,14 +1055,14 @@ impl HipRuntime {
         // the host's preferred filenames (amdhip64*.dll vs libamdhip64.so*).
         let candidates =
             hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
-        // SAFETY: libloading::Library::new maps a shared object by path; on success
-        // the Library owns the mapping for the process. Failure paths only
-        // read the error value.
+        // SAFETY: open_library maps a shared object by path (plain
+        // libloading::Library::new off Windows); on success the Library owns the
+        // mapping for the process. Failure paths only read the error value.
         let lib = unsafe {
             let mut loaded = None;
             let mut last_err = None;
             for candidate in &candidates {
-                match Library::new(candidate) {
+                match open_library(candidate) {
                     Ok(l) => {
                         loaded = Some(l);
                         break;
@@ -1687,17 +1867,46 @@ impl HipRuntime {
 
     // ── Version ────────────────────────────────────────────────
 
-    /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
-    pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
+    /// Raw `hipRuntimeGetVersion` value (HIP encoding:
+    /// `major * 10_000_000 + minor * 100_000 + patch`).
+    pub fn runtime_version_raw(&self) -> HipResult<i32> {
         let mut version: c_int = 0;
         // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
         // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_runtime_get_version)(&mut version) };
         self.check(code, "hipRuntimeGetVersion")?;
+        Ok(version)
+    }
+
+    /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
+    pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
+        let version = self.runtime_version_raw()?;
         // HIP version encoding: major * 10000000 + minor * 100000 + patch
         let major = version / 10_000_000;
         let minor = (version % 10_000_000) / 100_000;
         Ok((major, minor))
+    }
+
+    /// Raw `hipDriverGetVersion` value. The symbol is resolved from the held
+    /// library on each call rather than in the eager table in [`Self::load`], so
+    /// a runtime that lacks it still loads; the error names the missing symbol.
+    pub fn driver_version(&self) -> HipResult<i32> {
+        let mut version: c_int = 0;
+        // SAFETY: the symbol is resolved from the live `Library` owned by
+        // `_lib` and called while that borrow is held; the out-param is a stack
+        // local.
+        let code = unsafe {
+            let f: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> u32> =
+                self._lib.get(b"hipDriverGetVersion").map_err(|e| {
+                    HipError::new(
+                        0,
+                        &format!("failed to load symbol hipDriverGetVersion: {e}"),
+                    )
+                })?;
+            f(&mut version)
+        };
+        self.check(code, "hipDriverGetVersion")?;
+        Ok(version)
     }
 
     // ── Device management ───────────────────────────────────────
@@ -3301,6 +3510,19 @@ impl HipRuntime {
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_wait_event)(stream.0, event.0, 0) };
+        self.check(code, "hipStreamWaitEvent")
+    }
+
+    /// [`Self::stream_wait_event`] on an optional stream: `None` is the
+    /// legacy/default (null) stream, the one `rdna_compute::Gpu` launches on
+    /// while it has no active stream.
+    pub fn stream_wait_event_on(&self, stream: Option<&Stream>, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitEvent")?;
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
+        let code = unsafe { (self.fn_stream_wait_event)(stream_raw, event.0, 0) };
         self.check(code, "hipStreamWaitEvent")
     }
 
@@ -5301,6 +5523,24 @@ pub struct GraphExec(HipGraphExec);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
+
+#[cfg(test)]
+mod mapped_library_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_lookup_resolves_a_live_symbol_without_hip() {
+        let path = dladdr_fname(dladdr as *const c_void)
+            .expect("the dynamic loader must resolve its own dladdr symbol");
+        assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_lookup_handles_an_unknown_address() {
+        assert_eq!(dladdr_fname(ptr::null()), None);
+    }
+}
 
 #[cfg(test)]
 mod pageable_copy_staging_tests {

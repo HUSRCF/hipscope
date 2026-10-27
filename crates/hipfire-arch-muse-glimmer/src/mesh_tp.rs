@@ -658,6 +658,7 @@ impl MeshStepBindings for GlimmerTpBindings<'_> {
                 dtype_bytes: 4,
                 bytes: rows * rank.config.dim * std::mem::size_of::<f32>(),
             },
+            partial_slot: None,
         })
     }
 

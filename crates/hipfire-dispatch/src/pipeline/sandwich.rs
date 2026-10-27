@@ -744,6 +744,38 @@ impl Rope {
         }
         .map_err(hip)
     }
+
+    /// RoPE of `rows` rows, row `r` at the I32 position `positions[r]`;
+    /// `n_kv_heads == 0` leaves K untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_rows(
+        &self,
+        gpu: &mut Gpu,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rows: usize,
+    ) -> Result<(), DispatchError> {
+        let theta = self.theta;
+        match self.kind {
+            RopeKind::RotateHalf => {
+                gpu.rope_batched_f32(q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows)
+            }
+            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
+                q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
+            ),
+            RopeKind::PrefixHalfSplit { .. } => {
+                return Err(DispatchError::Hip(
+                    "prefix half-split RoPE is single-row only".into(),
+                ))
+            }
+            RopeKind::NoPe => return Ok(()),
+        }
+        .map_err(hip)
+    }
 }
 
 /// The K/V one attention sublayer attends. A sublayer with its own
@@ -1247,37 +1279,16 @@ impl SandwichAttentionOp<'_> {
                 .rope
                 .apply_row(gpu, self.q, self.k, self.pos_buf, n_heads, rope_kv, hd);
         }
-        let theta = self.rope.theta;
-        match self.rope.kind {
-            RopeKind::RotateHalf => gpu.rope_batched_f32(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                theta,
-                rows,
-            ),
-            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                rot_pairs,
-                theta,
-                rows,
-            ),
-            RopeKind::PrefixHalfSplit { .. } => {
-                return Err(DispatchError::Hip(
-                    "sandwich attention: prefix half-split RoPE is single-row only".into(),
-                ))
-            }
-            RopeKind::NoPe => return Ok(()),
-        }
-        .map_err(hip)
+        self.rope.apply_rows(
+            gpu,
+            self.q,
+            self.k,
+            self.positions()?,
+            n_heads,
+            rope_kv,
+            hd,
+            rows,
+        )
     }
 
     fn positions(&self) -> Result<&GpuTensor, DispatchError> {

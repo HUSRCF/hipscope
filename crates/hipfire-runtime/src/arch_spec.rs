@@ -236,6 +236,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             q: s.q,
             k: s.k,
             pos_buf: s.pos_buf,
+            positions: None,
             n_heads: k.n_heads,
             n_kv_heads: k.n_kv_heads,
             head_dim: k.head_dim,

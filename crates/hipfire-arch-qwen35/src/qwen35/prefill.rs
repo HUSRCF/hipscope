@@ -14,7 +14,6 @@ use super::config::Qwen35Config;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
 use super::forward::forward_scratch_with_hidden;
-use super::forward::kv_cache_attention_dispatch;
 use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
 use super::forward::moe_ffn_has_unsupported_mq3_experts_uniform;
@@ -50,9 +49,9 @@ use hipfire_dispatch::pipeline::batched::{
 use hipfire_dispatch::pipeline::batched_attention::{
     batch_chunk_fa_attend, batch_chunk_full_attn_attn, batch_chunk_full_attn_input_projection,
     batch_chunk_full_attn_output_projection, batch_chunk_full_attn_prepare,
-    dflash_fa_batch_fusion_admitted, execute_fa_attend_step, fa_pertoken_min_ctx,
-    fa_prep_unfused_qk_norm, fa_prep_unfused_rope, gfx12_fa_prep_admitted,
-    q8_multirow_attn_admitted,
+    dflash_fa_batch_fusion_admitted, fa_pertoken_min_ctx, fa_prep_unfused_qk_norm,
+    fa_prep_unfused_rope, gfx12_fa_prep_admitted, q8_multirow_attn_admitted, FaPairHalf,
+    FaPairStage, FA_PAIR_ROWS,
 };
 use hipfire_dispatch::pipeline::batched_deltanet::{
     batch_chunk_delta_net_attn, batch_chunk_delta_net_input_projection,
@@ -70,7 +69,6 @@ use hipfire_dispatch::pipeline::gated_mlp::MlpOutput;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama;
-use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use rdna_compute::norm::GdnScanOut;
 use rdna_compute::prefill_route_capabilities;
 use rdna_compute::prefill_route_capabilities::PrefillRoute;
@@ -79,8 +77,6 @@ use rdna_compute::prefill_route_capabilities::PrefillRoute;
 #[path = "prefill_multi.rs"]
 pub mod multi;
 
-use hipfire_runtime::llama::weight_gemv_prerotated;
-use hipfire_runtime::llama::weight_gemv_swiglu_residual;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::DType;
@@ -3801,7 +3797,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // shared by the rest of this call. Transactional: the stage
                 // is freed when the PBS allocation fails, so no leak.
                 if pair_scratch.is_none() {
-                    let stage = FaPairStage::alloc(gpu, config)?;
+                    let stage = FaPairStage::alloc(gpu, &hybrid_dims(config))?;
                     match PrefillBatchScratch::new_opt(gpu, config, FA_PAIR_ROWS, false) {
                         Ok(pbs2) => pair_scratch = Some((pbs2, stage)),
                         Err(e) => {
@@ -5786,16 +5782,16 @@ fn batch_chunk_full_attn_fallback(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     layer_idx: usize,
-    kv_layer_idx: usize,
     start_pos: usize,
     n: usize,
     dim_row_bytes: usize,
-    kv_cache: &mut llama::KvCache,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
 ) -> HipResult<()> {
-    // Per-token gather/scatter fallback for FA layers that don't
-    // qualify for batched FA (non-MQ4 weights, non-Q8_0 KV, etc).
+    // Per-row decode steps for FA layers the batched attention does not
+    // admit (non-MQ4 weights, non-Q8_0 KV, etc).
     for i in 0..n {
         let pos = start_pos + i;
         gpu.hip.memcpy_dtod_at(
@@ -5807,15 +5803,8 @@ fn batch_chunk_full_attn_fallback(
         )?;
         let pos_i32 = pos as i32;
         gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
-        run_fa_layer_body(
-            gpu,
-            weights,
-            config,
-            layer_idx,
-            kv_layer_idx,
-            pos,
-            kv_cache,
-            s,
+        super::forward::forward_scratch_dense_layer(
+            gpu, weights, config, layer_idx, pos, kv_cache, dn_state, s,
         )?;
         gpu.hip.memcpy_dtod_at(
             &pbs.x_batch.buf,
@@ -5988,11 +5977,15 @@ fn restore_inactive_residual_rows(
 // MoE-LA expert FFN (row-parallel grouped GEMM) is out of scope: not a
 // sequential-recurrence kernel, same copy-trap economics as the glue.
 
-/// Rows per F2 pair half. Only two complete halves ever merge — never a
-/// partial chunk.
-pub(crate) const FA_PAIR_ROWS: usize = 512;
-/// Merged FA2 batch for one F2 pair.
-pub(crate) const FA_PAIR_BATCH: usize = 1024;
+fn fa_pair_half(pbs: &PrefillBatchScratch) -> FaPairHalf<'_> {
+    FaPairHalf {
+        q: &pbs.fa_q_batch,
+        k: &pbs.fa_k_batch,
+        v: &pbs.fa_v_batch,
+        positions: &pbs.positions,
+        out: &pbs.fa_attn_out_batch,
+    }
+}
 
 /// Pure F2 pairing decision: which consecutive chunk lengths merge, on which
 /// arch, under which capture/replay state. CPU-only, unit-tested.
@@ -6083,171 +6076,6 @@ fn fa_pair_env_admitted(
         }
         _ => false,
     }
-}
-
-/// Device-side staging for one F2 pair's merged FA2 step: contiguous
-/// 1024-row Q/K/V/positions inputs plus the 1024-row output. The halves'
-/// own prep writes into their own PBS tensors; the merged step reads the
-/// staged concatenation and the halves' outputs are copied back afterwards.
-/// Allocated once per prefill call that forms at least one pair and shared
-/// by every FA layer of every pair (never per-layer).
-struct FaPairStage {
-    q: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    pos: GpuTensor,
-    out: GpuTensor,
-}
-
-impl FaPairStage {
-    fn alloc(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
-        let pair = FA_PAIR_BATCH;
-        let q_dim = config.n_heads * config.head_dim;
-        let kv_dim = config.n_kv_heads * config.head_dim;
-        // Transactional: free whatever was allocated if a later alloc fails.
-        let mut done: Vec<GpuTensor> = Vec::with_capacity(5);
-        macro_rules! stage {
-            ($shape:expr) => {{
-                match gpu.alloc_tensor($shape, DType::F32) {
-                    Ok(t) => {
-                        done.push(t);
-                    }
-                    Err(e) => {
-                        for t in done.drain(..) {
-                            let _ = gpu.free_tensor(t);
-                        }
-                        return Err(e);
-                    }
-                }
-            }};
-        }
-        stage!(&[pair * q_dim]);
-        stage!(&[pair * kv_dim]);
-        stage!(&[pair * kv_dim]);
-        stage!(&[pair]);
-        stage!(&[pair * q_dim]);
-        let mut it = done.into_iter();
-        let mut take = || it.next().expect("FaPairStage slot");
-        Ok(Self {
-            q: take(),
-            k: take(),
-            v: take(),
-            pos: take(),
-            out: take(),
-        })
-    }
-
-    fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
-        let mut first_err: Option<HipError> = None;
-        for t in [self.q, self.k, self.v, self.pos, self.out] {
-            if let Err(e) = gpu.free_tensor(t) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
-/// One merged FA2 step for an F2 pair: stage both halves' Q/K/V/positions
-/// contiguously, run the shared write-then-attend dispatch once at batch
-/// 1024, split the outputs back into the halves' own PBS tensors.
-/// `start_c` is the first half's absolute start; the merged max_ctx is
-/// `start_c + 1024` (the value the second half would see).
-#[allow(clippy::too_many_arguments)]
-fn batch_chunk_fa_attend_merged(
-    gpu: &mut Gpu,
-    config: &Qwen35Config,
-    pbs_c: &PrefillBatchScratch,
-    pbs_n: &PrefillBatchScratch,
-    stage: &FaPairStage,
-    s: &Qwen35Scratch,
-    kv_cache: &llama::KvCache,
-    start_c: usize,
-    max_ctx_len: usize,
-    ctx: &DispatchCtx,
-    layer_idx: usize,
-) -> HipResult<()> {
-    let q_dim = config.n_heads * config.head_dim;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let half_q_bytes = FA_PAIR_ROWS * q_dim * 4;
-    let half_kv_bytes = FA_PAIR_ROWS * kv_dim * 4;
-    let half_pos_bytes = FA_PAIR_ROWS * 4;
-    // Same stream throughout: no sync is needed between the staging copies
-    // and the attend step, or between the attend step and the split copies.
-    gpu.hip
-        .memcpy_dtod_at(&stage.q.buf, 0, &pbs_c.fa_q_batch.buf, 0, half_q_bytes)?;
-    gpu.hip.memcpy_dtod_at(
-        &stage.q.buf,
-        half_q_bytes,
-        &pbs_n.fa_q_batch.buf,
-        0,
-        half_q_bytes,
-    )?;
-    gpu.hip
-        .memcpy_dtod_at(&stage.k.buf, 0, &pbs_c.fa_k_batch.buf, 0, half_kv_bytes)?;
-    gpu.hip.memcpy_dtod_at(
-        &stage.k.buf,
-        half_kv_bytes,
-        &pbs_n.fa_k_batch.buf,
-        0,
-        half_kv_bytes,
-    )?;
-    gpu.hip
-        .memcpy_dtod_at(&stage.v.buf, 0, &pbs_c.fa_v_batch.buf, 0, half_kv_bytes)?;
-    gpu.hip.memcpy_dtod_at(
-        &stage.v.buf,
-        half_kv_bytes,
-        &pbs_n.fa_v_batch.buf,
-        0,
-        half_kv_bytes,
-    )?;
-    gpu.hip
-        .memcpy_dtod_at(&stage.pos.buf, 0, &pbs_c.positions.buf, 0, half_pos_bytes)?;
-    gpu.hip.memcpy_dtod_at(
-        &stage.pos.buf,
-        half_pos_bytes,
-        &pbs_n.positions.buf,
-        0,
-        half_pos_bytes,
-    )?;
-    execute_fa_attend_step(
-        gpu,
-        &hybrid_dims(config),
-        &stage.q,
-        &stage.k,
-        &stage.v,
-        &stage.pos,
-        &stage.out,
-        &flash_scratch(s),
-        &kv_view(kv_cache),
-        FA_PAIR_BATCH,
-        start_c,
-        max_ctx_len,
-        ctx,
-        None,
-        layer_idx,
-        None,
-    )?;
-    gpu.hip.memcpy_dtod_at(
-        &pbs_c.fa_attn_out_batch.buf,
-        0,
-        &stage.out.buf,
-        0,
-        half_q_bytes,
-    )?;
-    gpu.hip.memcpy_dtod_at(
-        &pbs_n.fa_attn_out_batch.buf,
-        0,
-        &stage.out.buf,
-        half_q_bytes,
-        half_q_bytes,
-    )?;
-    Ok(())
 }
 
 /// F2 pair chunk: run two complete consecutive 512-row chunks of one request
@@ -6597,14 +6425,12 @@ fn forward_prefill_chunk_pair(
                         false,
                         tap,
                     )?;
-                    batch_chunk_fa_attend_merged(
+                    stage.attend(
                         gpu,
-                        config,
-                        pbs_c,
-                        pbs_n,
-                        stage,
-                        s,
-                        kv_cache,
+                        &hybrid_dims(config),
+                        [fa_pair_half(pbs_c), fa_pair_half(pbs_n)],
+                        &flash_scratch(s),
+                        &kv_view(kv_cache),
                         start_c,
                         max_ctx_merged,
                         &ctx,
@@ -6744,11 +6570,11 @@ fn forward_prefill_chunk_pair(
                     weights,
                     config,
                     layer_idx,
-                    kv_layer_idx,
                     start_c,
                     n,
                     dim_row_bytes,
                     kv_cache,
+                    dn_state,
                     s,
                     pbs_c,
                 )?;
@@ -6757,11 +6583,11 @@ fn forward_prefill_chunk_pair(
                     weights,
                     config,
                     layer_idx,
-                    kv_layer_idx,
                     start_n,
                     n,
                     dim_row_bytes,
                     kv_cache,
+                    dn_state,
                     s,
                     pbs_n,
                 )?;
@@ -6839,14 +6665,12 @@ fn forward_prefill_chunk_pair(
                             tap,
                         )?;
                     }
-                    batch_chunk_fa_attend_merged(
+                    stage.attend(
                         gpu,
-                        config,
-                        pbs_c,
-                        pbs_n,
-                        stage,
-                        s,
-                        kv_cache,
+                        &hybrid_dims(config),
+                        [fa_pair_half(pbs_c), fa_pair_half(pbs_n)],
+                        &flash_scratch(s),
+                        &kv_view(kv_cache),
                         start_c,
                         max_ctx_merged,
                         &ctx,
@@ -7465,11 +7289,11 @@ pub(crate) fn forward_batch_chunk_impl(
                     weights,
                     config,
                     layer_idx,
-                    kv_layer_idx,
                     start_pos,
                     n,
                     dim_row_bytes,
                     kv_cache,
+                    dn_state,
                     s,
                     pbs,
                 )?;
@@ -7601,361 +7425,6 @@ pub(crate) fn forward_batch_chunk_impl(
         do_lm_head,
         &ctx,
     )?;
-
-    Ok(())
-}
-
-/// Run a single FullAttn layer body on s.x at position `pos`. Extracted
-/// for use from the batched prefill path's FA-layer fallback. Byte-exact
-/// with the FA branch of forward_scratch_layers.
-#[allow(clippy::too_many_arguments)]
-fn run_fa_layer_body(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    layer_idx: usize,
-    _kv_layer_idx: usize,
-    pos: usize,
-    kv_cache: &mut llama::KvCache,
-    s: &Qwen35Scratch,
-) -> HipResult<()> {
-    let layer = match &weights.layers[layer_idx] {
-        LayerWeights::FullAttn(l) => l,
-        _ => unreachable!(),
-    };
-
-    // Fused rmsnorm + FWHT rotation for wq/wk/wv (MQ-family).
-    let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.wq,
-        &s.x,
-        &layer.attn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
-    )?;
-    // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
-    let dt = layer.wq.gpu_dtype;
-    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-    let fused_fa3_mq4 = fa3_same_dtype
-        && (matches!(
-            dt,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
-        ));
-    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
-    let fused_fa3_hfq6 = fa3_same_dtype
-        && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-        && gpu.arch_caps.gemv_dp4a_enabled();
-    if fused_fa3_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        if dt == DType::MQ4CG256 || dt == DType::MQ4G256V2 {
-            let key = hipfire_dispatch::families::fused_qkv::fused_qkv_key_for(dt);
-            let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
-                kind: key,
-                weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
-                x: eff_x,
-                outputs: &[&s.fa_q_full, &s.fa_k, &s.fa_v],
-                m: &[layer.wq.m, layer.wk.m, layer.wv.m],
-                k: layer.wq.k,
-                rot_scratch: &[],
-                batch_size: None,
-            };
-            hipfire_runtime::llama::fused_qkv_family()
-                .run(&ctx, gpu, &params)
-                .map_err(hip_bridge::HipError::from)?;
-        } else {
-            gpu.fused_qkv_hfq4g256(
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                eff_x,
-                &s.fa_q_full,
-                &s.fa_k,
-                &s.fa_v,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-            )?;
-        }
-    } else if fused_fa3_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_mq3g256_lloyd(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_mq4g256_lloyd(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_hfq6g256_dp4a(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else {
-        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-    }
-
-    gpu.deinterleave_f32(
-        &s.fa_q_full,
-        &s.fa_q,
-        &s.fa_gate,
-        config.n_heads,
-        config.head_dim,
-    )?;
-    gpu.rmsnorm_batched(
-        &s.fa_q,
-        &layer.q_norm,
-        &s.fa_q,
-        config.n_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    gpu.rmsnorm_batched(
-        &s.fa_k,
-        &layer.k_norm,
-        &s.fa_k,
-        config.n_kv_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-
-    if hipfire_runtime::triattn::tap_enabled() {
-        // Try GPU path first (matches the batched FA tap at line ~3499 in
-        // forward_prefill_batch). When the calibration tap is GPU-resident
-        // (CalibrateGpu) we MUST dispatch the kernel here — falling
-        // through to record_prerope_qk would either silently drop the
-        // sample (pre-Phase-2) or panic (post-Phase-2).
-        let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-            gpu,
-            layer_idx,
-            &s.fa_q.buf,
-            1,
-            config.n_heads,
-            config.head_dim,
-        )?;
-        if !gpu_handled {
-            let n_q = config.n_heads * config.head_dim;
-            let q_cpu = gpu.download_f32(&s.fa_q)?;
-            if hipfire_runtime::triattn::tap_needs_k() {
-                let n_k = config.n_kv_heads * config.head_dim;
-                let k_cpu = gpu.download_f32(&s.fa_k)?;
-                hipfire_runtime::triattn::record_prerope_qk(
-                    layer_idx,
-                    &q_cpu[..n_q],
-                    Some(&k_cpu[..n_k]),
-                );
-            } else {
-                hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
-            }
-        }
-    }
-
-    // If TriAttention has compacted the cache, absolute RoPE phase diverges
-    // from the physical cache index. Temporarily load the absolute position
-    // into pos_buf for the rope call, then restore the physical position
-    // for kv_cache_write + flash attention (which both want the write slot).
-    if kv_cache.compact_offset > 0 {
-        let abs = (pos + kv_cache.compact_offset) as i32;
-        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
-    }
-    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32(
-        &s.fa_q,
-        &s.fa_k,
-        &s.pos_buf,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-    )?;
-    if kv_cache.compact_offset > 0 {
-        let phys = pos as i32;
-        gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
-    }
-    let ctx = DispatchCtx::new(gpu);
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
-
-    if !fused_epilogue {
-        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-    }
-    {
-        let wr = layer.wo.dispatch_ref();
-        let input = if fused_epilogue {
-            GemvInput::Prerotated(&s.fa_attn_out)
-        } else {
-            GemvInput::Raw(&s.fa_attn_out)
-        };
-        execute_steps(
-            gpu,
-            &ctx,
-            &[Step::GemvResidual {
-                w: &wr,
-                input,
-                residual: &s.x,
-                out: &s.x,
-            }],
-        )
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-    }
-
-    // FFN: fused rmsnorm + rotate for w_gate/w_up.
-    let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.w_gate,
-        &s.x,
-        &layer.ffn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
-    )?;
-    let dt_g = layer.w_gate.gpu_dtype;
-    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-    let fused_gu_mq4 = same_dtype
-        && (matches!(
-            dt_g,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
-        ));
-    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
-    let fused_gu_hfq6 = same_dtype
-        && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-        && gpu.arch_caps.gemv_dp4a_enabled();
-    if fused_gu_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        if dt_g == DType::MQ4CG256 || dt_g == DType::MQ4G256V2 {
-            let key = hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
-            let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-            let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
-                kind: key,
-                weights: &[&layer.w_gate.buf, &layer.w_up.buf],
-                x: eff_x,
-                outputs: &[&s.gate_ffn, &s.up],
-                m: &[layer.w_gate.m, layer.w_up.m],
-                k: layer.w_gate.k,
-                rot_scratch: &[],
-                batch_size: None,
-            };
-            hipfire_runtime::llama::fused_qkv_family()
-                .run(&ctx, gpu, &params)
-                .map_err(hip_bridge::HipError::from)?;
-        } else {
-            gpu.fused_gate_up_hfq4g256(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                eff_x,
-                &s.gate_ffn,
-                &s.up,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-            )?;
-        }
-    } else if fused_gu_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq3g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq4g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_hfq6g256_dp4a(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else {
-        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-    }
-    weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
 
     Ok(())
 }
@@ -12850,9 +12319,6 @@ mod tests {
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, false));
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", false, true));
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, true));
-        // Geometry consts stay consistent with the merged launch.
-        assert_eq!(FA_PAIR_ROWS, 512);
-        assert_eq!(FA_PAIR_BATCH, 2 * FA_PAIR_ROWS);
     }
 
     #[test]

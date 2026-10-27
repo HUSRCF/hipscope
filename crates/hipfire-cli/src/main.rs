@@ -5259,13 +5259,14 @@ fn resolve_xdna_sidecar(
 /// Call only once the final `vision_mode` is known (`load_params` projects it
 /// from `vision.mode`). `off` is a hard override mirroring the daemon's
 /// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
-/// one. `auto` uses the registry/sibling sidecar when present and runs
-/// silently text-only when absent. `on` requires the declared sidecar and
+/// one. `auto` and `resident` use the registry/sibling sidecar when present
+/// and run silently text-only when absent (they differ only in tower
+/// residency, decided at load). `on` requires the declared sidecar and
 /// fails the load closed when it cannot be resolved (same shape as the
 /// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
 /// and is unaffected by this key under every mode.
 ///
-/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// Priority under `auto`/`resident`/`on`: an already-projected `params["vision"]`
 /// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
 /// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
 /// `entry.vision`, looked up in `models_dir` first — `find_model_path`
@@ -5284,8 +5285,10 @@ fn resolve_vision_sidecar(
     // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
     // override and the only place that decides; leaving the resolved path in
     // the params lets it tell an image request which sidecar it declined.
-    let mode = params["vision_mode"].as_str().unwrap_or("off");
-    if !matches!(mode, "off" | "auto" | "on") {
+    let mode = params["vision_mode"]
+        .as_str()
+        .unwrap_or(hipfire_config::vision_mode_default());
+    if !matches!(mode, "off" | "auto" | "resident" | "on") {
         return Ok(());
     }
     if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
@@ -6006,13 +6009,30 @@ pub(crate) fn apply_http_reasoning_request(
                             }
                         }
                         "high" | "max" | "minimal" | "med" => {
+                            // Off-ladder aliases normalize to the nearest
+                            // supported tier instead of dropping to the
+                            // default, so intent-ordered clients
+                            // (minimal<low<medium<high<xhigh<max) keep their
+                            // ordering. When the model's advertised ladder
+                            // excludes the nearest tier, fall as before.
+                            let nearest: &str = match raw.as_str() {
+                                "minimal" => "low",
+                                "med" => "medium",
+                                _ => "xhigh",
+                            };
+                            let target = if !supported_efforts.is_empty()
+                                && !supported_efforts.iter().any(|e| e == nearest)
+                            {
+                                QWEN_JINJA_DEFAULT_EFFORT
+                            } else {
+                                nearest
+                            };
                             push_warn(format!(
-                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                "reasoning_effort '{}' normalized to {target} (qwen_jinja ladder is low|medium|xhigh)",
                                 raw
                             ));
-                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
-                            request["reasoning_effort"] =
-                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
+                            effective_effort = Some(target.to_string());
+                            request["reasoning_effort"] = serde_json::json!(target);
                         }
                         "native" => {
                             push_warn(format!(
@@ -7221,6 +7241,21 @@ struct BenchLoadOpts {
     continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
+/// `bench` measures text generation and has no image/audio/video input, so
+/// its load is text-only whatever `vision.mode` resolves to. Under the schema
+/// default `auto` a pulled `qwen3.8-27b-vision.hfq` would otherwise be wired
+/// into every bench load: ~1.05 GB of resident tower VRAM that shifts KV and
+/// admission headroom (and, on cards where `max_seq` is derived from free
+/// memory, the context the run is sized to) relative to earlier releases.
+/// Projects `off` and drops the resolved sidecar so no `skipping tower
+/// sidecar` line fires either.
+fn pin_bench_text_only(params: &mut serde_json::Value) {
+    params["vision_mode"] = serde_json::json!("off");
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("vision");
+    }
+}
+
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
@@ -7300,6 +7335,7 @@ fn open_bench_engine(
         // No --head on this path yet; the model's own head is used.
         None,
     )?;
+    pin_bench_text_only(&mut params);
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
@@ -9461,6 +9497,25 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0)
             );
+            // Windows daemon only: the amdhip64*.dll that actually loaded (a
+            // System32 driver copy can shadow an SDK's) and the raw versions.
+            // Fields are null/absent when the daemon could not read them.
+            #[cfg(windows)]
+            {
+                let raw = |key: &str| {
+                    live.get(key)
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+                };
+                println!(
+                    "HIP runtime:   {} (runtime {}, driver {})",
+                    live.get("hip_runtime_library")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    raw("hip_runtime_version_raw"),
+                    raw("hip_driver_version_raw")
+                );
+            }
             if matches!(
                 live.get("arch").and_then(serde_json::Value::as_str),
                 Some("gfx1150" | "gfx1151" | "gfx1152")
@@ -13465,6 +13520,41 @@ effort = "high"
         fs::remove_dir_all(&paths.root).unwrap();
     }
     #[test]
+    pub(crate) fn resident_vision_mode_projects_and_resolves_like_auto() {
+        let paths = test_paths("vision-sidecar-resident");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(&entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some("qwen3.8:27b"),
+                false,
+                None,
+            )
+        };
+        let resolved = resolved_with_vision_mode("resident");
+        let missing = load(&resolved).unwrap();
+        assert_eq!(missing["vision_mode"], "resident");
+        assert!(
+            missing.get("vision").is_none(),
+            "missing sidecar stays text-only"
+        );
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let present = load(&resolved).unwrap();
+        assert_eq!(present["vision_mode"], "resident");
+        assert_eq!(present["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
     pub(crate) fn derived_packs_finds_the_tower_pack_beside_the_trunk() {
         // `hipfire quantize --install` must carry the arch-18 `.vl` pack the
         // quantizer wrote beside the trunk: installing the trunk alone left the
@@ -13501,7 +13591,7 @@ effort = "high"
         let pack = paths.models.join("embeddinggemma-2.vl");
         fs::write(&pack, b"towers").unwrap();
         let entry = vision_sidecar_entry("embeddinggemma-2.vl");
-        for mode in ["auto", "on"] {
+        for mode in ["auto", "resident", "on"] {
             let params = embed_load_params(
                 &resolved_with_vision_mode(mode),
                 Some(&entry),
@@ -13815,6 +13905,38 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn bench_load_is_text_only_under_the_default_vision_mode() {
+        // The schema default is `auto`, which wires a pulled sidecar into
+        // `run`/`serve`; `bench` has no media input and must not pay the tower.
+        let paths = test_paths("bench-vision-pin");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut params = load_params(
+            &defaults,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "auto");
+        assert!(params["vision"].is_string());
+        pin_bench_text_only(&mut params);
+        assert_eq!(params["vision_mode"], "off");
+        assert!(params.get("vision").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -19836,6 +19958,50 @@ effort = "high"
         )
         .unwrap_err();
         assert!(format!("{err3}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_qwen_jinja_off_ladder_effort_normalizes_to_nearest() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for (raw, want) in [
+            ("high", "xhigh"),
+            ("max", "xhigh"),
+            ("med", "medium"),
+            ("minimal", "low"),
+        ] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": raw }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], want, "{raw}");
+            assert_eq!(res.effective_effort.as_deref(), Some(want), "{raw}");
+            assert!(
+                res.warnings.iter().any(|w| w.contains("normalized")),
+                "{raw}"
+            );
+        }
+        // A restricted ladder that excludes the nearest tier still falls to the
+        // qwen_jinja default.
+        let restricted = vec!["low".to_string(), "medium".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &restricted,
+        )
+        .unwrap();
+        assert_eq!(req["reasoning_effort"], "medium");
+        assert_eq!(res.effective_effort.as_deref(), Some("medium"));
     }
 
     #[test]

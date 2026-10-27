@@ -1684,6 +1684,8 @@ pub struct GenerationRouteInputs {
     pub ep: bool,
     /// EP-shaped topology that is actually a dense tensor-parallel trunk
     /// (`EpArch::Qwen35DenseTp`), the one mesh route that carries a drafter.
+    /// The generic mesh-executor route (`EpArch::Qwen35MeshTp`) carries none
+    /// (no MTP/DFlash/n-gram), so it stays `false` and serves on the EP AR arm.
     pub dense_tp: bool,
     pub pp: usize,
     pub has_speculator: bool,
@@ -2136,7 +2138,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         // neither fed nor streamed, so the request moves into an exact lane
         // that feeds and streams it, instead of the peer waiting for this
         // whole generation. A refusal changes nothing: the same token is fed
-        // below.
+        // below. Image contexts stay on the singleton because text-only lanes
+        // cannot carry their per-token mRoPE positions.
         if !promotion_tried
             && forced_close.is_empty()
             && greedy_on_gpu
@@ -6068,9 +6071,8 @@ pub fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = request_seed;
-        let batched_prefill = llama::llama_qwen3_batched_prefill_eligible(
+        let batched_prefill = llama::llama_batched_prefill_eligible(
             &gpu.arch,
-            config.arch,
             hipfire_runtime::config::get().prefill_batched,
             kv.quant_q8,
             has_eviction,

@@ -1138,7 +1138,7 @@ pub fn load_weight_tensor(
     // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
     // straight from the page-cache-backed slice — no heap staging copy.
     // Pread fallback preserves UMA behavior (mmap dropped there).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
@@ -1193,7 +1193,7 @@ pub fn load_weight_tensor(
         }
         return Ok(wt);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let (info, data, matched_name) = {
             let mut found = None;
@@ -3045,16 +3045,23 @@ impl WeightSource for HfqSource<'_> {
         // `hipfire_runtime::offload`), which also prints the residency line; this
         // source no longer decides or announces placement.
         // Keep the mmap alive on discrete GPUs (the carrier cleared
-        // `evict_page_cache` there): weight uploads DMA straight out of
-        // page-cache pages with no heap staging copy — measured 11–16 GB/s
-        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // `evict_page_cache` there, on Linux and Windows alike): weight uploads
+        // DMA straight out of page-cache pages with no heap staging copy —
+        // measured 11–16 GB/s end-to-end vs ~4 GB/s through a pread staging
+        // buffer (measured on Linux).
         // UMA keeps the drop — evict=true is exactly the carrier's UMA
-        // signal — so cached model pages can't starve hipMalloc of RAM.
+        // signal (`Gpu::is_uma`, hipDeviceAttributeIntegrated, which is also
+        // queried on Windows) — so mapped model pages and the GPU copy are
+        // not both resident and cached model pages can't starve hipMalloc of
+        // RAM. After the drop every tensor read in this source goes through
+        // `tensor_data_pread` / `tensor_data_vec`, which use positioned reads
+        // (`pread` on unix, `seek_read` on Windows) on a normally buffered
+        // handle; no unbuffered (FILE_FLAG_NO_BUFFERING) reopen is used.
         //
         // NOTE: do NOT madvise-populate the mapping here. A blocking
         // MAP_POPULATE measured identical totals (it relocates the same
         // soft-fault work out of the upload loop into one serial stall).
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }

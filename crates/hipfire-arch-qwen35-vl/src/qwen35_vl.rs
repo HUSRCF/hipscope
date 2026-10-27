@@ -6,10 +6,16 @@
 //! Qwen3.5-VL vision encoder: SigLIP-2 ViT + spatial merger.
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
-use hip_bridge::{HipError, HipResult};
+use hip_bridge::{
+    DeviceBuffer, Event, HipError, HipResult, HipRuntime, PinnedHostBuffer, Stream,
+    HIP_EVENT_DISABLE_TIMING,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
+use hipfire_runtime::model_source::SourceRangeDescriptor;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::mem::ManuallyDrop;
+use std::sync::Mutex;
 
 #[path = "vision_scratch.rs"]
 mod vision_scratch;
@@ -99,27 +105,85 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
 
 // ─── GPU-side weights ────────────────────────────────────────────────────────
 
+/// Where the tower's large F16 matrices live between image encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TowerResidency {
+    /// Every matrix is uploaded to VRAM at load.
+    Resident,
+    /// The matrices stay on host/disk. Each block streams through two fixed
+    /// VRAM staging slots while an image encodes ([`TowerStream`]), so no
+    /// tower weights hold VRAM between encodes.
+    Streamed,
+}
+
+impl TowerResidency {
+    /// `vision.mode` -> residency: `"resident"` => [`Self::Resident`], every
+    /// other mode => [`Self::Streamed`].
+    pub fn from_vision_mode(mode: &str) -> Self {
+        if mode == "resident" {
+            Self::Resident
+        } else {
+            Self::Streamed
+        }
+    }
+}
+
+/// The small per-block tensors, VRAM-resident under every [`TowerResidency`].
+/// The block's four large matrices are [`VisionLayerMats`].
 pub struct VisionLayerWeights {
     pub norm1_w: GpuTensor,
     pub norm1_b: GpuTensor,
-    pub qkv_w: GpuTensor,
     pub qkv_b: GpuTensor,
-    pub proj_w: GpuTensor,
     pub proj_b: GpuTensor,
     pub norm2_w: GpuTensor,
     pub norm2_b: GpuTensor,
-    pub fc1_w: GpuTensor,
     pub fc1_b: GpuTensor,
+    pub fc2_b: GpuTensor,
+    /// Row pitch (elements) of the block's `fc2_w`: `mlp_dim` rounded up to 64
+    /// on the LDS route when `mlp_dim % 64 != 0`, else `mlp_dim`. Fixed at load
+    /// by the same predicate (`vit_lds_route`) `linear_f16_ld` re-evaluates.
+    pub fc2_ld: usize,
+}
+
+/// One block's large F16 matrices, row-major `[out, in]`.
+pub struct VisionLayerMats {
+    pub qkv_w: GpuTensor,
+    pub proj_w: GpuTensor,
+    pub fc1_w: GpuTensor,
     /// MLP down-projection weight, F16 `[hidden, fc2_ld]` row-major. When the
     /// LDS GEMM route is active and `mlp_dim % 64 != 0` (4304 on the 27B
     /// tower) each row carries `fc2_ld - mlp_dim` trailing zero columns;
     /// otherwise `fc2_ld == mlp_dim` and the matrix is packed.
     pub fc2_w: GpuTensor,
-    pub fc2_b: GpuTensor,
-    /// Row pitch (elements) of `fc2_w`: `mlp_dim` rounded up to 64 on the LDS
-    /// route when `mlp_dim % 64 != 0`, else `mlp_dim`. Fixed at load by the
-    /// same predicate (`vit_lds_route`) `linear_f16_ld` re-evaluates.
-    pub fc2_ld: usize,
+}
+
+/// The tower's large F16 matrices (every block's [`VisionLayerMats`] and the
+/// two merger linears), held per [`TowerResidency`].
+pub enum TowerMats {
+    Resident {
+        layers: Vec<VisionLayerMats>,
+        merger_fc1_w: GpuTensor,
+        merger_fc2_w: GpuTensor,
+    },
+    Streamed(TowerStream),
+}
+
+impl TowerMats {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Self::Resident {
+                layers,
+                merger_fc1_w,
+                merger_fc2_w,
+            } => {
+                for m in layers {
+                    free_layer_mats(gpu, m);
+                }
+                free_all(gpu, [merger_fc1_w, merger_fc2_w]);
+            }
+            Self::Streamed(stream) => stream.free_gpu(gpu),
+        }
+    }
 }
 
 pub struct VisionWeights {
@@ -134,36 +198,137 @@ pub struct VisionWeights {
     pub layers: Vec<VisionLayerWeights>,
     pub merger_norm_w: GpuTensor,
     pub merger_norm_b: GpuTensor,
-    pub merger_fc1_w: GpuTensor,
     pub merger_fc1_b: GpuTensor,
-    pub merger_fc2_w: GpuTensor,
     pub merger_fc2_b: GpuTensor,
+    /// The large matrices; see [`TowerMats`].
+    pub mats: TowerMats,
+}
+
+/// Which merger linear [`VisionWeights::with_merger_w`] hands out; the
+/// discriminant is the offset from the first merger streaming unit.
+#[derive(Clone, Copy)]
+enum MergerFc {
+    Fc1 = 0,
+    Fc2 = 1,
 }
 
 impl VisionWeights {
+    pub fn residency(&self) -> TowerResidency {
+        match self.mats {
+            TowerMats::Resident { .. } => TowerResidency::Resident,
+            TowerMats::Streamed(_) => TowerResidency::Streamed,
+        }
+    }
+
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.patch_embed_w);
-        let _ = gpu.free_tensor(self.patch_embed_b);
+        free_all(gpu, [self.patch_embed_w, self.patch_embed_b]);
         for l in self.layers {
-            for t in [
-                l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b, l.norm2_w, l.norm2_b,
-                l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b,
-            ] {
-                let _ = gpu.free_tensor(t);
-            }
+            free_layer_small(gpu, l);
         }
-        let _ = gpu.free_tensor(self.merger_norm_w);
-        let _ = gpu.free_tensor(self.merger_norm_b);
-        let _ = gpu.free_tensor(self.merger_fc1_w);
-        let _ = gpu.free_tensor(self.merger_fc1_b);
-        let _ = gpu.free_tensor(self.merger_fc2_w);
-        let _ = gpu.free_tensor(self.merger_fc2_b);
+        free_all(
+            gpu,
+            [
+                self.merger_norm_w,
+                self.merger_norm_b,
+                self.merger_fc1_b,
+                self.merger_fc2_b,
+            ],
+        );
+        self.mats.free_gpu(gpu);
+    }
+
+    /// VRAM bytes of the always-resident tensors (everything but the large
+    /// matrices; `pos_embed` lives on the host).
+    fn small_tensor_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                [
+                    &l.norm1_w, &l.norm1_b, &l.qkv_b, &l.proj_b, &l.norm2_w, &l.norm2_b, &l.fc1_b,
+                    &l.fc2_b,
+                ]
+                .iter()
+                .map(|t| t.buf.size())
+                .sum::<usize>()
+            })
+            .sum();
+        let rest: usize = [
+            &self.patch_embed_w,
+            &self.patch_embed_b,
+            &self.merger_norm_w,
+            &self.merger_norm_b,
+            &self.merger_fc1_b,
+            &self.merger_fc2_b,
+        ]
+        .iter()
+        .map(|t| t.buf.size())
+        .sum();
+        layers + rest
+    }
+
+    /// Streamed residency: queue the copy of `unit` ahead of its use (no-op
+    /// when resident).
+    fn prefetch_unit(&self, gpu: &Gpu, unit: usize) {
+        if let TowerMats::Streamed(stream) = &self.mats {
+            stream.prefetch(gpu, unit);
+        }
+    }
+
+    /// Run `f` with a merger matrix: the resident tensor, or the staged view
+    /// of its streaming unit (released when `f` returns, on success or not).
+    fn with_merger_w<R>(
+        &self,
+        gpu: &mut Gpu,
+        fc: MergerFc,
+        f: impl FnOnce(&mut Gpu, &GpuTensor) -> HipResult<R>,
+    ) -> HipResult<R> {
+        match &self.mats {
+            TowerMats::Resident {
+                merger_fc1_w,
+                merger_fc2_w,
+                ..
+            } => f(
+                gpu,
+                match fc {
+                    MergerFc::Fc1 => merger_fc1_w,
+                    MergerFc::Fc2 => merger_fc2_w,
+                },
+            ),
+            TowerMats::Streamed(stream) => stream.with_unit(
+                gpu,
+                self.layers.len() + fc as usize,
+                |gpu, staged| match staged {
+                    [w] => f(gpu, w),
+                    _ => Err(HipError::new(
+                        1,
+                        "vision tower stream: merger unit is not one matrix",
+                    )),
+                },
+            ),
+        }
     }
 }
 
-#[path = "weight_load.rs"]
-mod weight_load;
+fn free_all(gpu: &mut Gpu, tensors: impl IntoIterator<Item = GpuTensor>) {
+    for t in tensors {
+        let _ = gpu.free_tensor(t);
+    }
+}
+
+fn free_layer_small(gpu: &mut Gpu, l: VisionLayerWeights) {
+    free_all(
+        gpu,
+        [
+            l.norm1_w, l.norm1_b, l.qkv_b, l.proj_b, l.norm2_w, l.norm2_b, l.fc1_b, l.fc2_b,
+        ],
+    );
+}
+
+fn free_layer_mats(gpu: &mut Gpu, m: VisionLayerMats) {
+    free_all(gpu, [m.qkv_w, m.proj_w, m.fc1_w, m.fc2_w]);
+}
 
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
@@ -378,10 +543,241 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     out
 }
 
+/// One deferred tensor upload of a [`load_group`].
+type Upload<'a> = &'a dyn Fn(&mut Gpu) -> HipResult<GpuTensor>;
+
+/// Upload a fixed group of tensors in order. A failure frees the members
+/// already uploaded (dropping a `GpuTensor` leaks its VRAM) before it
+/// propagates.
+fn load_group<const N: usize>(gpu: &mut Gpu, loads: [Upload<'_>; N]) -> HipResult<[GpuTensor; N]> {
+    let mut got = Vec::with_capacity(N);
+    for load in loads {
+        match load(gpu) {
+            Ok(t) => got.push(t),
+            Err(e) => {
+                free_all(gpu, got);
+                return Err(e);
+            }
+        }
+    }
+    let Ok(group) = <[GpuTensor; N]>::try_from(got) else {
+        unreachable!("one uploaded tensor per load");
+    };
+    Ok(group)
+}
+
+fn load_layer_small(
+    hfq: &HfqFile,
+    config: &VisionConfig,
+    gpu: &mut Gpu,
+    i: usize,
+    fc2_ld: usize,
+) -> HipResult<VisionLayerWeights> {
+    let h = config.hidden_size;
+    let p = format!("model.visual.blocks.{i}");
+    let [norm1_w, norm1_b, qkv_b, proj_b, norm2_w, norm2_b, fc1_b, fc2_b] = load_group(
+        gpu,
+        [
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.norm1.weight"), h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.norm1.bias"), h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.attn.qkv.bias"), 3 * h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.attn.proj.bias"), h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.norm2.weight"), h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.norm2.bias"), h),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.mlp.linear_fc1.bias"), config.mlp_dim),
+            &|g| load_f32_gpu(hfq, g, &format!("{p}.mlp.linear_fc2.bias"), h),
+        ],
+    )?;
+    Ok(VisionLayerWeights {
+        norm1_w,
+        norm1_b,
+        qkv_b,
+        proj_b,
+        norm2_w,
+        norm2_b,
+        fc1_b,
+        fc2_b,
+        fc2_ld,
+    })
+}
+
+/// The tensors resident under every [`TowerResidency`]: all but the large
+/// matrices.
+struct ResidentTensors {
+    patch_embed_w: GpuTensor,
+    patch_embed_b: GpuTensor,
+    layers: Vec<VisionLayerWeights>,
+    merger_norm_w: GpuTensor,
+    merger_norm_b: GpuTensor,
+    merger_fc1_b: GpuTensor,
+    merger_fc2_b: GpuTensor,
+}
+
+impl ResidentTensors {
+    fn free(self, gpu: &mut Gpu) {
+        for l in self.layers {
+            free_layer_small(gpu, l);
+        }
+        free_all(
+            gpu,
+            [
+                self.patch_embed_w,
+                self.patch_embed_b,
+                self.merger_norm_w,
+                self.merger_norm_b,
+                self.merger_fc1_b,
+                self.merger_fc2_b,
+            ],
+        );
+    }
+}
+
+fn load_resident_tensors(
+    hfq: &HfqFile,
+    config: &VisionConfig,
+    gpu: &mut Gpu,
+    fc2_ld: usize,
+) -> HipResult<ResidentTensors> {
+    let h = config.hidden_size;
+    let merge_dim = h * config.spatial_merge_size * config.spatial_merge_size;
+    let [patch_embed_w, patch_embed_b] = load_group(
+        gpu,
+        [
+            &|g| load_f16_gpu(hfq, g, "model.visual.patch_embed.proj.weight"),
+            &|g| load_f32_gpu(hfq, g, "model.visual.patch_embed.proj.bias", h),
+        ],
+    )?;
+    let mut layers = Vec::with_capacity(config.num_layers);
+    let mut failure = None;
+    for i in 0..config.num_layers {
+        match load_layer_small(hfq, config, gpu, i, fc2_ld) {
+            Ok(l) => layers.push(l),
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    let tail = match failure {
+        Some(e) => Err(e),
+        None => load_group(
+            gpu,
+            [
+                &|g| load_f32_gpu(hfq, g, "model.visual.merger.norm.weight", h),
+                &|g| load_f32_gpu(hfq, g, "model.visual.merger.norm.bias", h),
+                &|g| load_f32_gpu(hfq, g, "model.visual.merger.linear_fc1.bias", merge_dim),
+                &|g| {
+                    load_f32_gpu(
+                        hfq,
+                        g,
+                        "model.visual.merger.linear_fc2.bias",
+                        config.out_hidden_size,
+                    )
+                },
+            ],
+        ),
+    };
+    match tail {
+        Ok([merger_norm_w, merger_norm_b, merger_fc1_b, merger_fc2_b]) => Ok(ResidentTensors {
+            patch_embed_w,
+            patch_embed_b,
+            layers,
+            merger_norm_w,
+            merger_norm_b,
+            merger_fc1_b,
+            merger_fc2_b,
+        }),
+        Err(e) => {
+            for l in layers {
+                free_layer_small(gpu, l);
+            }
+            free_all(gpu, [patch_embed_w, patch_embed_b]);
+            Err(e)
+        }
+    }
+}
+
+/// [`TowerResidency::Resident`]: upload every large matrix to VRAM.
+fn load_resident_mats(
+    hfq: &HfqFile,
+    config: &VisionConfig,
+    gpu: &mut Gpu,
+    fc2_ld: usize,
+) -> HipResult<TowerMats> {
+    let h = config.hidden_size;
+    let mut layers: Vec<VisionLayerMats> = Vec::with_capacity(config.num_layers);
+    let mut failure = None;
+    for i in 0..config.num_layers {
+        if i % 9 == 0 {
+            eprintln!("  loading vision block {i}/{}...", config.num_layers);
+        }
+        let p = format!("model.visual.blocks.{i}");
+        let fc2_name = format!("{p}.mlp.linear_fc2.weight");
+        let group = load_group(
+            gpu,
+            [
+                &|g| load_f16_gpu(hfq, g, &format!("{p}.attn.qkv.weight")),
+                &|g| load_f16_gpu(hfq, g, &format!("{p}.attn.proj.weight")),
+                &|g| load_f16_gpu(hfq, g, &format!("{p}.mlp.linear_fc1.weight")),
+                &|g| {
+                    if fc2_ld != config.mlp_dim {
+                        load_f16_gpu_padded(hfq, g, &fc2_name, h, config.mlp_dim, fc2_ld)
+                    } else {
+                        load_f16_gpu(hfq, g, &fc2_name)
+                    }
+                },
+            ],
+        );
+        match group {
+            Ok([qkv_w, proj_w, fc1_w, fc2_w]) => layers.push(VisionLayerMats {
+                qkv_w,
+                proj_w,
+                fc1_w,
+                fc2_w,
+            }),
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    let merger = match failure {
+        Some(e) => Err(e),
+        None => {
+            eprintln!("  loading vision merger...");
+            load_group(
+                gpu,
+                [
+                    &|g| load_f16_gpu(hfq, g, "model.visual.merger.linear_fc1.weight"),
+                    &|g| load_f16_gpu(hfq, g, "model.visual.merger.linear_fc2.weight"),
+                ],
+            )
+        }
+    };
+    match merger {
+        Ok([merger_fc1_w, merger_fc2_w]) => Ok(TowerMats::Resident {
+            layers,
+            merger_fc1_w,
+            merger_fc2_w,
+        }),
+        Err(e) => {
+            for m in layers {
+                free_layer_mats(gpu, m);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Load the vision tower. `residency` decides where the large F16 matrices
+/// live ([`TowerResidency`]); the small tensors and the host-side position
+/// table are the same either way, and on any error everything already
+/// uploaded is released.
 pub fn load_vision_weights(
     hfq: &HfqFile,
     config: &VisionConfig,
     gpu: &mut Gpu,
+    residency: TowerResidency,
 ) -> HipResult<VisionWeights> {
     // Load-time geometry validation: the learned position table is a square
     // grid indexed by `sqrt(num_position_embeddings)`. A non-square value
@@ -414,6 +810,7 @@ pub fn load_vision_weights(
             ),
         ));
     }
+    let h = config.hidden_size;
 
     // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,
     // vit_attention_f32, apply_rope_2d_vision_f32, gelu_tanh_f32, etc.) are
@@ -448,7 +845,792 @@ pub fn load_vision_weights(
         };
         eprintln!("  vision weight format: {fmt}");
     }
-    weight_load::load(hfq, config, gpu)
+    if residency == TowerResidency::Resident {
+        eprintln!("  loading vision weights (GPU)...");
+    }
+    // Host-only; read before any upload so a missing table strands no VRAM.
+    let pos_embed = load_f32_cpu(
+        hfq,
+        "model.visual.pos_embed.weight",
+        config.num_position_embeddings * h,
+    );
+
+    // fc2's contraction dim (mlp_dim = 4304 on the 27B tower) is not a
+    // multiple of 64, which the LDS GEMM requires. On the LDS route the
+    // weight is stored zero-padded to K_pad = round_up(mlp_dim, 64) so the
+    // whole tower stays on that route; the pad is decided here and
+    // re-derived by `linear_f16_ld` from the same predicate.
+    let fc2_ld = vision_fc2_pitch(gpu, config);
+    let small = load_resident_tensors(hfq, config, gpu, fc2_ld)?;
+    let mats = match residency {
+        TowerResidency::Resident => load_resident_mats(hfq, config, gpu, fc2_ld),
+        TowerResidency::Streamed => {
+            TowerStream::new(hfq, config, gpu, fc2_ld).map(TowerMats::Streamed)
+        }
+    };
+    let mats = match mats {
+        Ok(mats) => mats,
+        Err(e) => {
+            small.free(gpu);
+            return Err(e);
+        }
+    };
+    let weights = VisionWeights {
+        patch_embed_w: small.patch_embed_w,
+        patch_embed_b: small.patch_embed_b,
+        pos_embed,
+        layers: small.layers,
+        merger_norm_w: small.merger_norm_w,
+        merger_norm_b: small.merger_norm_b,
+        merger_fc1_b: small.merger_fc1_b,
+        merger_fc2_b: small.merger_fc2_b,
+        mats,
+    };
+    if let TowerMats::Streamed(stream) = &weights.mats {
+        const MIB: f64 = (1 << 20) as f64;
+        eprintln!(
+            "  vision tower: streamed from host ({} units, 2 x {:.1} MiB VRAM staging, \
+             2 x {:.1} MiB pinned host, {:.1} MiB resident small tensors)",
+            stream.units.len(),
+            stream.slot_bytes as f64 / MIB,
+            stream.slot_bytes as f64 / MIB,
+            weights.small_tensor_bytes() as f64 / MIB,
+        );
+    }
+    Ok(weights)
+}
+
+// ─── Streamed tower matrices ─────────────────────────────────────────────────
+//
+// `TowerResidency::Streamed` keeps the large F16 matrices on host/disk and
+// moves one *unit* at a time through two fixed VRAM staging slots: unit
+// `i < num_layers` is block `i`'s qkv/proj/fc1/fc2, unit `num_layers` the
+// merger fc1, unit `num_layers + 1` the merger fc2. A private non-blocking
+// copy stream does the H2D copies, double-buffered: while the kernels of
+// one slot run on the launch stream, the next unit is read into a pinned
+// bounce buffer and copied into the other slot. Per slot, `ready` (recorded
+// on the copy stream after the copy) orders the kernels after the copy, and
+// `free` (recorded on the launch stream after the kernels that read the
+// slot) orders the next copy after those kernels.
+
+/// Bytes per F16 element.
+const F16_BYTES: usize = 2;
+
+/// Alignment (bytes) of every matrix inside a staging slot.
+const STAGE_ALIGN: usize = 4096;
+
+/// Host source of one matrix's PACKED F16 bytes (row pitch == `cols`).
+enum HostSrc {
+    /// Native F16 tensor: positional reads straight from the container
+    /// (identity-checked; works with or without an mmap). The tower owns no
+    /// host copy between encodes; the kernel page cache serves repeats.
+    Range(SourceRangeDescriptor),
+    /// F32-oracle / HFQ4 tensor, converted to F16 once at load.
+    Owned(Vec<u8>),
+}
+
+impl HostSrc {
+    fn open(hfq: &HfqFile, name: &str, elems: usize) -> HipResult<Self> {
+        let bad = |what: String| HipError::new(1, &format!("{name}: {what}"));
+        let info = hfq
+            .find_tensor_info(name)
+            .ok_or_else(|| bad("vision tensor not found".into()))?;
+        let n: usize = info.shape.iter().map(|&s| s as usize).product();
+        if n != elems {
+            return Err(bad(format!(
+                "{n} elements, the tower geometry needs {elems}"
+            )));
+        }
+        if info.quant_type != 1 {
+            // F32 oracle / HFQ4: convert exactly as the resident loader does.
+            let (bytes, _) = load_f16_bytes(hfq, name)?;
+            if bytes.len() != elems * F16_BYTES {
+                return Err(bad(format!(
+                    "converted F16 payload is {} bytes, expected {}",
+                    bytes.len(),
+                    elems * F16_BYTES
+                )));
+            }
+            return Ok(Self::Owned(bytes.into_owned()));
+        }
+        let range = hfq
+            .tensor_range(name)
+            .map_err(|e| bad(format!("source range: {e}")))?
+            .ok_or_else(|| bad("vision tensor not found".into()))?;
+        if range.length != (elems * F16_BYTES) as u64 {
+            return Err(bad(format!(
+                "F16 payload is {} bytes, expected {}",
+                range.length,
+                elems * F16_BYTES
+            )));
+        }
+        Ok(Self::Range(range))
+    }
+
+    /// Fill `dst` (exactly the packed byte count) with the matrix. A container
+    /// range is read by up to [`READ_THREADS`] concurrent positional reads of
+    /// [`READ_CHUNK`]-byte pieces: one `pread` stream copies the page cache
+    /// into the pinned buffer at roughly half the H2D rate, which would make
+    /// the host read, not the copy, the per-block floor.
+    fn read_into(&self, name: &str, dst: &mut [u8]) -> HipResult<()> {
+        match self {
+            Self::Range(range) => read_range_parallel(range, dst)
+                .map_err(|e| HipError::new(1, &format!("{name}: read from container: {e}"))),
+            Self::Owned(bytes) => {
+                dst.copy_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Bytes per concurrent positional read of a streamed matrix.
+const READ_CHUNK: usize = 2 << 20;
+/// Concurrent positional reads per streamed matrix.
+const READ_THREADS: usize = 4;
+
+/// `range.read_exact(dst)` split over up to [`READ_THREADS`] scoped threads,
+/// each reading every `READ_THREADS`-th [`READ_CHUNK`] piece.
+fn read_range_parallel(
+    range: &SourceRangeDescriptor,
+    dst: &mut [u8],
+) -> Result<(), hipfire_runtime::model_source::SourceError> {
+    if dst.len() as u64 != range.length || dst.len() <= READ_CHUNK {
+        return range.read_exact(dst);
+    }
+    let mut lanes: Vec<Vec<(u64, &mut [u8])>> = (0..READ_THREADS).map(|_| Vec::new()).collect();
+    for (i, piece) in dst.chunks_mut(READ_CHUNK).enumerate() {
+        lanes[i % READ_THREADS].push((range.offset + (i * READ_CHUNK) as u64, piece));
+    }
+    std::thread::scope(|s| {
+        let workers: Vec<_> = lanes
+            .into_iter()
+            .filter(|lane| !lane.is_empty())
+            .map(|lane| {
+                s.spawn(move || {
+                    lane.into_iter()
+                        .try_for_each(|(offset, piece)| range.read_exact_at(offset, piece))
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|w| w.join().expect("tower range reader panicked"))
+    })
+}
+
+/// Pull the streamed matrices' container bytes into the page cache in the
+/// background, so the first image after a load reads RAM rather than disk
+/// (the resident load reads the same bytes at load). Detached: the reader
+/// clones keep the file open until it finishes; nothing waits on it, and a
+/// read error only means the first encode goes to disk.
+fn warm_page_cache(units: &[UnitPlan]) {
+    let ranges: Vec<SourceRangeDescriptor> = units
+        .iter()
+        .flat_map(|u| &u.parts)
+        .filter_map(|p| match &p.src {
+            HostSrc::Range(range) => Some(range.clone()),
+            HostSrc::Owned(_) => None,
+        })
+        .collect();
+    if ranges.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("vl-tower-warm".into())
+        .spawn(move || {
+            let mut scratch = vec![0u8; READ_CHUNK];
+            for range in &ranges {
+                let end = range.offset + range.length;
+                let mut offset = range.offset;
+                while offset < end {
+                    let len = (end - offset).min(READ_CHUNK as u64) as usize;
+                    if range.read_exact_at(offset, &mut scratch[..len]).is_err() {
+                        return;
+                    }
+                    offset += len as u64;
+                }
+            }
+        });
+}
+
+/// Geometry of one matrix of a streaming unit.
+struct PartSpec {
+    name: String,
+    rows: usize,
+    cols: usize,
+    /// Row pitch in elements (`>= cols`); the `pitch - cols` pad columns are
+    /// zeros.
+    pitch: usize,
+    /// dtype the resident upload of this matrix carries.
+    dtype: DType,
+}
+
+impl PartSpec {
+    /// Device bytes of the matrix including its pad columns.
+    fn region_bytes(&self) -> usize {
+        self.rows * self.pitch * F16_BYTES
+    }
+}
+
+struct PartPlan {
+    spec: PartSpec,
+    src: HostSrc,
+    /// Byte offset inside the slot ([`STAGE_ALIGN`]-aligned).
+    offset: usize,
+}
+
+/// The matrices one staging slot holds at a time, laid out back to back at
+/// [`STAGE_ALIGN`]-aligned offsets.
+struct UnitPlan {
+    parts: Vec<PartPlan>,
+    /// Slot bytes the unit occupies (end of its last matrix).
+    bytes: usize,
+}
+
+impl UnitPlan {
+    fn new(parts: Vec<(PartSpec, HostSrc)>) -> Self {
+        let regions: Vec<usize> = parts.iter().map(|(spec, _)| spec.region_bytes()).collect();
+        let (offsets, bytes) = stage_offsets(&regions);
+        let parts = parts
+            .into_iter()
+            .zip(offsets)
+            .map(|((spec, src), offset)| PartPlan { spec, src, offset })
+            .collect();
+        Self { parts, bytes }
+    }
+
+    fn open(hfq: &HfqFile, specs: Vec<PartSpec>) -> HipResult<Self> {
+        let mut parts = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let src = HostSrc::open(hfq, &spec.name, spec.rows * spec.cols)?;
+            parts.push((spec, src));
+        }
+        Ok(Self::new(parts))
+    }
+}
+
+/// Offsets of consecutive regions, each [`STAGE_ALIGN`]-aligned, and the end
+/// of the last one.
+fn stage_offsets(regions: &[usize]) -> (Vec<usize>, usize) {
+    let mut offsets = Vec::with_capacity(regions.len());
+    let mut end = 0usize;
+    for &region in regions {
+        let offset = end.next_multiple_of(STAGE_ALIGN);
+        offsets.push(offset);
+        end = offset + region;
+    }
+    (offsets, end)
+}
+
+/// Streaming units in execution order: one per block (qkv, proj, fc1, fc2),
+/// then the merger's fc1 and fc2.
+fn unit_specs(config: &VisionConfig, fc2_ld: usize) -> Vec<Vec<PartSpec>> {
+    let h = config.hidden_size;
+    let mlp = config.mlp_dim;
+    let merge_dim = h * config.spatial_merge_size * config.spatial_merge_size;
+    let part = |name: String, rows: usize, cols: usize, pitch: usize, dtype: DType| PartSpec {
+        name,
+        rows,
+        cols,
+        pitch,
+        dtype,
+    };
+    let mut units = Vec::with_capacity(config.num_layers + 2);
+    for i in 0..config.num_layers {
+        let p = format!("model.visual.blocks.{i}");
+        units.push(vec![
+            part(format!("{p}.attn.qkv.weight"), 3 * h, h, h, DType::Raw),
+            part(format!("{p}.attn.proj.weight"), h, h, h, DType::Raw),
+            part(format!("{p}.mlp.linear_fc1.weight"), mlp, h, h, DType::Raw),
+            // A padded fc2 is typed F16 (the pitched LDS entries assert it),
+            // exactly as the resident upload types it.
+            part(
+                format!("{p}.mlp.linear_fc2.weight"),
+                h,
+                mlp,
+                fc2_ld,
+                if fc2_ld != mlp {
+                    DType::F16
+                } else {
+                    DType::Raw
+                },
+            ),
+        ]);
+    }
+    units.push(vec![part(
+        "model.visual.merger.linear_fc1.weight".to_string(),
+        merge_dim,
+        merge_dim,
+        merge_dim,
+        DType::Raw,
+    )]);
+    units.push(vec![part(
+        "model.visual.merger.linear_fc2.weight".to_string(),
+        config.out_hidden_size,
+        merge_dim,
+        merge_dim,
+        DType::Raw,
+    )]);
+    units
+}
+
+/// Expand `rows` packed rows of `cols` F16 elements stored at the start of
+/// `region` to row pitch `pitch` in place, zeroing every row's pad. `region`
+/// is `rows * pitch` elements. Rows move last-first, so no move overwrites a
+/// row that has not moved yet (`pitch >= cols`).
+fn expand_pitched_rows_in_place(region: &mut [u8], rows: usize, cols: usize, pitch: usize) {
+    debug_assert!(pitch >= cols && region.len() == rows * pitch * F16_BYTES);
+    if pitch == cols {
+        return;
+    }
+    let (row_bytes, pitch_bytes) = (cols * F16_BYTES, pitch * F16_BYTES);
+    for r in (0..rows).rev() {
+        let (from, to) = (r * row_bytes, r * pitch_bytes);
+        if from != to {
+            region.copy_within(from..from + row_bytes, to);
+        }
+        region[to + row_bytes..to + pitch_bytes].fill(0);
+    }
+}
+
+/// Write `plan`'s matrices into `dst` (the slot image): each at its offset,
+/// padded rows expanded, the alignment gaps zeroed — the image is a pure
+/// function of the unit, whatever `dst` held before.
+fn fill_unit(plan: &UnitPlan, dst: &mut [u8]) -> HipResult<()> {
+    if dst.len() < plan.bytes {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "vision tower stream: {} byte bounce buffer for a {} byte unit",
+                dst.len(),
+                plan.bytes
+            ),
+        ));
+    }
+    let mut end = 0usize;
+    for part in &plan.parts {
+        let spec = &part.spec;
+        dst[end..part.offset].fill(0);
+        end = part.offset + spec.region_bytes();
+        let region = &mut dst[part.offset..end];
+        part.src
+            .read_into(&spec.name, &mut region[..spec.rows * spec.cols * F16_BYTES])?;
+        expand_pitched_rows_in_place(region, spec.rows, spec.cols, spec.pitch);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SlotMeta {
+    /// Unit the slot holds (its copy queued or landed); `None` = empty.
+    unit: Option<usize>,
+    /// Acquired at least once since it was loaded.
+    consumed: bool,
+    /// `SlotTable::tick` at the last acquire.
+    last_acquire: u64,
+    /// `SlotTable::tick` when the load was queued.
+    loaded_at: u64,
+}
+
+impl SlotMeta {
+    const EMPTY: Self = Self {
+        unit: None,
+        consumed: false,
+        last_acquire: 0,
+        loaded_at: 0,
+    };
+}
+
+/// The slot a new unit goes into: an empty one, else the consumed one
+/// acquired longest ago. With every slot holding an unconsumed prefetch,
+/// `allow_unconsumed` evicts the older-loaded one (a demand load), otherwise
+/// there is no victim (a prefetch must not evict a prefetch).
+fn pick_victim(slots: &[SlotMeta; 2], allow_unconsumed: bool) -> Option<usize> {
+    if let Some(empty) = slots.iter().position(|s| s.unit.is_none()) {
+        return Some(empty);
+    }
+    let pick = |consumed_only: bool, key: fn(&SlotMeta) -> u64| {
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.consumed || !consumed_only)
+            .min_by_key(|(_, s)| key(s))
+            .map(|(i, _)| i)
+    };
+    pick(true, |s| s.last_acquire).or_else(|| {
+        allow_unconsumed
+            .then(|| pick(false, |s| s.loaded_at))
+            .flatten()
+    })
+}
+
+/// What each staging slot holds and the order they were loaded and used in:
+/// the pure bookkeeping behind [`TowerStream::acquire`] and
+/// [`TowerStream::prefetch`].
+#[derive(Clone, Copy)]
+struct SlotTable {
+    slots: [SlotMeta; 2],
+    /// Monotonic counter ordering loads and acquires.
+    tick: u64,
+}
+
+impl SlotTable {
+    const EMPTY: Self = Self {
+        slots: [SlotMeta::EMPTY; 2],
+        tick: 0,
+    };
+
+    fn holding(&self, unit: usize) -> Option<usize> {
+        self.slots.iter().position(|s| s.unit == Some(unit))
+    }
+
+    /// `(slot, load)` serving an acquire of `unit`: the slot already holding
+    /// it, else the victim slot, which `load` says must be staged first.
+    fn plan_acquire(&self, unit: usize) -> Option<(usize, bool)> {
+        match self.holding(unit) {
+            Some(slot) => Some((slot, false)),
+            None => pick_victim(&self.slots, true).map(|slot| (slot, true)),
+        }
+    }
+
+    /// The slot a prefetch of `unit` stages into; `None` when a slot holds it
+    /// already or both hold unconsumed prefetches.
+    fn plan_prefetch(&self, unit: usize) -> Option<usize> {
+        if self.holding(unit).is_some() {
+            return None;
+        }
+        pick_victim(&self.slots, false)
+    }
+
+    fn mark_empty(&mut self, slot: usize) {
+        self.slots[slot].unit = None;
+    }
+
+    fn mark_loaded(&mut self, slot: usize, unit: usize) {
+        self.tick += 1;
+        self.slots[slot] = SlotMeta {
+            unit: Some(unit),
+            consumed: false,
+            last_acquire: 0,
+            loaded_at: self.tick,
+        };
+    }
+
+    fn mark_acquired(&mut self, slot: usize) {
+        self.tick += 1;
+        let meta = &mut self.slots[slot];
+        meta.consumed = true;
+        meta.last_acquire = self.tick;
+    }
+}
+
+struct Slot {
+    /// `hipMalloc` staging buffer of `slot_bytes` (not pooled).
+    buf: DeviceBuffer,
+    /// `ready[slot]` / `free[slot]` have been recorded at least once.
+    ready_recorded: bool,
+    free_recorded: bool,
+}
+
+struct StreamState {
+    slots: [Slot; 2],
+    table: SlotTable,
+    /// Pinned host staging, one per slot. Never freed implicitly: a copy may
+    /// still be reading it, so only [`TowerStream::free_gpu`] releases it,
+    /// after draining the copy stream.
+    bounce: ManuallyDrop<[PinnedHostBuffer; 2]>,
+    copy: Stream,
+    /// Recorded on `copy` after a slot's H2D.
+    ready: [Event; 2],
+    /// Recorded on the launch stream after the kernels reading a slot.
+    free: [Event; 2],
+}
+
+// SAFETY: `PinnedHostBuffer` (a raw `hipHostMalloc` pointer it exclusively
+// owns) is the only member that is not already `Send`; `DeviceBuffer`,
+// `Stream` and `Event` are `Send` handles. The state sits behind
+// `TowerStream`'s mutex and is driven by the one thread that owns the GPU;
+// `TowerStream::free_gpu` drains the copy stream before releasing the pinned
+// buffers.
+unsafe impl Send for StreamState {}
+
+impl StreamState {
+    /// Allocate both staging slots, both pinned bounce buffers, the copy
+    /// stream and the four events; on failure everything already created is
+    /// released.
+    fn create(hip: &HipRuntime, slot_bytes: usize) -> HipResult<Self> {
+        let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(2);
+        let mut bounces: Vec<PinnedHostBuffer> = Vec::with_capacity(2);
+        let mut events: Vec<Event> = Vec::with_capacity(4);
+        let mut copy: Option<Stream> = None;
+        let built = (|| -> HipResult<()> {
+            for _ in 0..2 {
+                bufs.push(hip.malloc(slot_bytes)?);
+            }
+            for _ in 0..2 {
+                bounces.push(hip.host_buffer(slot_bytes)?);
+            }
+            copy = Some(hip.stream_create_non_blocking()?);
+            for _ in 0..4 {
+                events.push(hip.event_create_with_flags(HIP_EVENT_DISABLE_TIMING)?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = built {
+            for event in events {
+                let _ = hip.event_destroy(event);
+            }
+            if let Some(stream) = copy {
+                let _ = hip.stream_destroy(stream);
+            }
+            for buf in bufs {
+                let _ = hip.free(buf);
+            }
+            // `bounces` drop here: nothing was ever copied out of them.
+            return Err(e);
+        }
+        let (Ok([buf0, buf1]), Ok(bounces), Ok([ready0, ready1, free0, free1]), Some(copy)) = (
+            <[DeviceBuffer; 2]>::try_from(bufs),
+            <[PinnedHostBuffer; 2]>::try_from(bounces),
+            <[Event; 4]>::try_from(events),
+            copy,
+        ) else {
+            unreachable!("every resource was created");
+        };
+        let slot = |buf| Slot {
+            buf,
+            ready_recorded: false,
+            free_recorded: false,
+        };
+        Ok(Self {
+            slots: [slot(buf0), slot(buf1)],
+            table: SlotTable::EMPTY,
+            bounce: ManuallyDrop::new(bounces),
+            copy,
+            ready: [ready0, ready1],
+            free: [free0, free1],
+        })
+    }
+
+    /// Stage `plan` (unit `unit`) into `slot`: read it into the slot's pinned
+    /// bounce buffer, then queue ONE H2D on the copy stream (after the
+    /// kernels that last read the slot) and record `ready`. On error the
+    /// slot is left empty.
+    fn load_into(
+        &mut self,
+        hip: &HipRuntime,
+        plan: &UnitPlan,
+        unit: usize,
+        slot: usize,
+    ) -> HipResult<()> {
+        self.table.mark_empty(slot);
+        if self.slots[slot].ready_recorded {
+            // The previous H2D out of this bounce buffer has completed.
+            hip.event_synchronize(&self.ready[slot])?;
+        }
+        fill_unit(plan, &mut self.bounce[slot].as_bytes_mut()[..plan.bytes])?;
+        let waited = if self.slots[slot].free_recorded {
+            hip.stream_wait_event(&self.copy, &self.free[slot])
+        } else {
+            Ok(())
+        };
+        let src: &[u8] = &self.bounce[slot].as_bytes_mut()[..plan.bytes];
+        let queued = waited
+            .and_then(|()| {
+                hip.memcpy_htod_async(
+                    &self.slots[slot].buf.byte_view(0, plan.bytes),
+                    src,
+                    &self.copy,
+                )
+            })
+            .and_then(|()| hip.event_record(&self.ready[slot], Some(&self.copy)));
+        if let Err(e) = queued {
+            // A queued copy may still be reading the bounce buffer.
+            let _ = hip.stream_synchronize(&self.copy);
+            return Err(e);
+        }
+        self.slots[slot].ready_recorded = true;
+        self.table.mark_loaded(slot, unit);
+        Ok(())
+    }
+}
+
+/// A unit staged for the launch stream. Its kernels' enqueue must be followed
+/// by [`TowerStream::release`] (success or not).
+struct StagedUnit {
+    slot: usize,
+    /// Non-owning views of the unit's matrices, in [`unit_specs`] order, with
+    /// the dtype/shape the resident upload would carry.
+    mats: Vec<GpuTensor>,
+}
+
+/// Streamed large matrices of the tower (see the section comment above).
+/// Interior mutability: the encode paths hold `&VisionWeights`.
+pub struct TowerStream {
+    units: Vec<UnitPlan>,
+    /// Bytes of each staging slot and pinned bounce buffer: the largest unit
+    /// rounded up to [`STAGE_ALIGN`].
+    slot_bytes: usize,
+    state: Mutex<Box<StreamState>>,
+}
+
+impl TowerStream {
+    /// Open every matrix's host source and allocate the staging resources;
+    /// nothing large is uploaded. The container bytes are pulled into the
+    /// page cache in the background ([`warm_page_cache`]).
+    fn new(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu, fc2_ld: usize) -> HipResult<Self> {
+        let units = unit_specs(config, fc2_ld)
+            .into_iter()
+            .map(|specs| UnitPlan::open(hfq, specs))
+            .collect::<HipResult<Vec<_>>>()?;
+        let slot_bytes = units
+            .iter()
+            .map(|u| u.bytes)
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(STAGE_ALIGN);
+        gpu.bind_thread()?;
+        let state = StreamState::create(&gpu.hip, slot_bytes)?;
+        warm_page_cache(&units);
+        Ok(Self {
+            units,
+            slot_bytes,
+            state: Mutex::new(Box::new(state)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<StreamState>> {
+        // Every field is individually valid at each point a panic can occur
+        // (slot tags advance only after the work they describe is queued),
+        // so a poisoned lock is still usable.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Make `unit` available to the launch stream: use the slot already
+    /// holding it, else demand-load it into the victim slot; then order the
+    /// launch stream after the slot's `ready` event.
+    fn acquire(&self, gpu: &Gpu, unit: usize) -> HipResult<StagedUnit> {
+        let plan = self
+            .units
+            .get(unit)
+            .ok_or_else(|| HipError::new(1, &format!("vision tower stream: no unit {unit}")))?;
+        gpu.bind_thread()?;
+        let mut st = self.lock();
+        let (slot, load) = st
+            .table
+            .plan_acquire(unit)
+            .ok_or_else(|| HipError::new(1, "vision tower stream: no staging slot"))?;
+        if load {
+            st.load_into(&gpu.hip, plan, unit, slot)?;
+        }
+        gpu.hip
+            .stream_wait_event_on(gpu.active_stream.as_ref(), &st.ready[slot])?;
+        st.table.mark_acquired(slot);
+        let mats = plan
+            .parts
+            .iter()
+            .map(|part| GpuTensor {
+                buf: st.slots[slot]
+                    .buf
+                    .byte_view(part.offset, part.spec.region_bytes()),
+                shape: vec![part.spec.rows * part.spec.pitch],
+                dtype: part.spec.dtype,
+            })
+            .collect();
+        Ok(StagedUnit { slot, mats })
+    }
+
+    /// Record `free[slot]` on the launch stream: the copy stream may
+    /// overwrite the slot once every kernel enqueued since its `acquire` has
+    /// run. MUST follow every successful `acquire`, after whatever kernels
+    /// were enqueued (even when a launch failed).
+    fn release(&self, gpu: &Gpu, slot: usize) {
+        let mut st = self.lock();
+        let recorded = gpu.bind_thread().and_then(|()| {
+            gpu.hip
+                .event_record(&st.free[slot], gpu.active_stream.as_ref())
+        });
+        match recorded {
+            Ok(()) => st.slots[slot].free_recorded = true,
+            Err(e) => {
+                // The copy stream can no longer be ordered after this unit's
+                // kernels: drain the device so the slot is idle before
+                // anything overwrites it.
+                eprintln!(
+                    "  vision tower stream: releasing slot {slot} failed ({e}); draining the device"
+                );
+                let _ = gpu.hip.device_synchronize();
+                st.slots[slot].free_recorded = false;
+            }
+        }
+    }
+
+    /// Queue the copy of `unit` ahead of its use. No-op past the last unit,
+    /// when a slot already holds it, or when both slots hold unconsumed
+    /// prefetches. A failed prefetch leaves its slot empty; the demand
+    /// [`Self::acquire`] repeats the load and reports the error.
+    fn prefetch(&self, gpu: &Gpu, unit: usize) {
+        let Some(plan) = self.units.get(unit) else {
+            return;
+        };
+        let mut st = self.lock();
+        let Some(victim) = st.table.plan_prefetch(unit) else {
+            return;
+        };
+        if gpu.bind_thread().is_ok() {
+            let _ = st.load_into(&gpu.hip, plan, unit, victim);
+        }
+    }
+
+    /// Run `f` with `unit`'s matrices staged; `release` always follows `f`.
+    fn with_unit<R>(
+        &self,
+        gpu: &mut Gpu,
+        unit: usize,
+        f: impl FnOnce(&mut Gpu, &[GpuTensor]) -> HipResult<R>,
+    ) -> HipResult<R> {
+        let staged = self.acquire(gpu, unit)?;
+        let result = f(gpu, &staged.mats);
+        self.release(gpu, staged.slot);
+        result
+    }
+
+    /// Drain the copy stream and the device, then release the staging
+    /// buffers, events, stream and pinned memory. Best-effort, never panics.
+    fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.bind_thread();
+        let state = *self
+            .state
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let StreamState {
+            slots,
+            bounce,
+            copy,
+            ready,
+            free,
+            ..
+        } = state;
+        let drained = gpu
+            .hip
+            .stream_synchronize(&copy)
+            .and_then(|()| gpu.hip.device_synchronize());
+        for event in ready.into_iter().chain(free) {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        let _ = gpu.hip.stream_destroy(copy);
+        for slot in slots {
+            let _ = gpu.hip.free(slot.buf);
+        }
+        // An undrained copy may still read the pinned buffers: leak them
+        // rather than free memory under the DMA engine.
+        if drained.is_ok() {
+            drop(ManuallyDrop::into_inner(bounce));
+        }
+    }
 }
 
 // ─── CPU-side per-image precomputes (pos_embed interp + 2D rotary) ───────────
@@ -936,6 +2118,281 @@ mod tests {
         assert!(err2.message.contains("vision.test_malformed"));
         assert!(err2.message.contains("multiple of 4") || err2.message.contains("trailing"));
     }
+
+    // ── Streamed-tower pure helpers (no GPU) ─────────────────────────────────
+
+    /// The 27B Qwen3.8 tower geometry.
+    fn config_27b() -> VisionConfig {
+        VisionConfig {
+            hidden_size: 1152,
+            num_heads: 16,
+            head_dim: 72,
+            num_layers: 27,
+            mlp_dim: 4304,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            out_hidden_size: 5120,
+            spatial_merge_size: 2,
+            num_position_embeddings: 2304,
+            rope_theta: 10000.0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// Deterministic non-zero bytes for a packed `[rows, cols]` F16 matrix.
+    fn packed_rows(rows: usize, cols: usize) -> Vec<u8> {
+        (0..rows * cols * F16_BYTES)
+            .map(|i| (i % 251) as u8 + 1)
+            .collect()
+    }
+
+    fn part_spec(name: &str, rows: usize, cols: usize, pitch: usize) -> PartSpec {
+        PartSpec {
+            name: name.to_string(),
+            rows,
+            cols,
+            pitch,
+            dtype: DType::Raw,
+        }
+    }
+
+    #[test]
+    fn residency_follows_vision_mode() {
+        assert_eq!(
+            TowerResidency::from_vision_mode("resident"),
+            TowerResidency::Resident
+        );
+        for mode in ["auto", "on", "off", "", "Resident"] {
+            assert_eq!(
+                TowerResidency::from_vision_mode(mode),
+                TowerResidency::Streamed,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_pitched_rows_matches_the_padded_upload_layout() {
+        for (rows, cols, pitch) in [(1, 3, 8), (5, 7, 8), (4, 6, 6), (9, 13, 16), (3, 1, 64)] {
+            let packed = packed_rows(rows, cols);
+            // `load_f16_gpu_padded`'s construction.
+            let mut want = vec![0u8; rows * pitch * F16_BYTES];
+            for r in 0..rows {
+                want[r * pitch * 2..(r * pitch + cols) * 2]
+                    .copy_from_slice(&packed[r * cols * 2..(r + 1) * cols * 2]);
+            }
+            // The slot region starts out dirty (a previous unit's bytes).
+            let mut region = vec![0xAAu8; rows * pitch * F16_BYTES];
+            region[..packed.len()].copy_from_slice(&packed);
+            expand_pitched_rows_in_place(&mut region, rows, cols, pitch);
+            assert_eq!(region, want, "rows={rows} cols={cols} pitch={pitch}");
+        }
+    }
+
+    #[test]
+    fn stage_offsets_align_every_region() {
+        let (offsets, end) = stage_offsets(&[100, 5000, 4096]);
+        assert_eq!(offsets, [0, 4096, 12288]);
+        assert_eq!(end, 12288 + 4096);
+        assert_eq!(stage_offsets(&[]), (vec![], 0));
+    }
+
+    #[test]
+    fn unit_layout_27b() {
+        let cfg = config_27b();
+        // fc2_ld 4352 = 4304 rounded up to 64 (LDS route).
+        let specs = unit_specs(&cfg, 4352);
+        assert_eq!(specs.len(), 27 + 2);
+        let regions = |u: &Vec<PartSpec>| u.iter().map(PartSpec::region_bytes).collect::<Vec<_>>();
+        // Block: qkv 3456x1152, proj 1152x1152, fc1 4304x1152, fc2 1152x4352.
+        assert_eq!(
+            regions(&specs[0]),
+            [7_962_624, 2_654_208, 9_916_416, 10_027_008]
+        );
+        let (offsets, block_bytes) = stage_offsets(&regions(&specs[0]));
+        assert_eq!(offsets, [0, 7_962_624, 10_616_832, 20_533_248]);
+        assert_eq!(block_bytes, 30_560_256);
+        // Merger fc1 4608x4608 and fc2 5120x4608.
+        let merger_fc1 = stage_offsets(&regions(&specs[27])).1;
+        let merger_fc2 = stage_offsets(&regions(&specs[28])).1;
+        assert_eq!((merger_fc1, merger_fc2), (42_467_328, 47_185_920));
+        let slot_bytes = specs
+            .iter()
+            .map(|u| stage_offsets(&regions(u)).1)
+            .max()
+            .unwrap()
+            .next_multiple_of(STAGE_ALIGN);
+        assert_eq!(slot_bytes, 47_185_920); // 45 MiB
+                                            // A padded fc2 is typed F16 like its resident upload; every other
+                                            // matrix (and an unpadded fc2) is Raw.
+        let dtypes = |u: &Vec<PartSpec>| u.iter().map(|p| p.dtype).collect::<Vec<_>>();
+        assert_eq!(
+            dtypes(&specs[3]),
+            [DType::Raw, DType::Raw, DType::Raw, DType::F16]
+        );
+        assert_eq!(dtypes(&specs[28]), [DType::Raw]);
+        assert_eq!(dtypes(&unit_specs(&cfg, 4304)[0])[3], DType::Raw);
+    }
+
+    #[test]
+    fn fill_unit_lays_out_matrices_and_zeroes_gaps_and_pads() {
+        let a = packed_rows(3, 5);
+        let b = packed_rows(2, 6);
+        let plan = UnitPlan::new(vec![
+            (part_spec("a", 3, 5, 5), HostSrc::Owned(a.clone())),
+            (part_spec("b", 2, 6, 8), HostSrc::Owned(b.clone())),
+        ]);
+        assert_eq!(plan.parts[0].offset, 0);
+        assert_eq!(plan.parts[1].offset, 4096);
+        assert_eq!(plan.bytes, 4096 + 2 * 8 * F16_BYTES);
+
+        let mut dst = vec![0xAAu8; plan.bytes + 16];
+        fill_unit(&plan, &mut dst).unwrap();
+        assert_eq!(&dst[..a.len()], &a[..]);
+        assert!(dst[a.len()..4096].iter().all(|&v| v == 0), "gap not zeroed");
+        for r in 0..2 {
+            let row = 4096 + r * 16;
+            assert_eq!(&dst[row..row + 12], &b[r * 12..(r + 1) * 12]);
+            assert!(dst[row + 12..row + 16].iter().all(|&v| v == 0), "pad {r}");
+        }
+        assert!(dst[plan.bytes..].iter().all(|&v| v == 0xAA), "overran unit");
+        assert!(fill_unit(&plan, &mut dst[..plan.bytes - 1]).is_err());
+    }
+
+    fn slot_meta(
+        unit: Option<usize>,
+        consumed: bool,
+        last_acquire: u64,
+        loaded_at: u64,
+    ) -> SlotMeta {
+        SlotMeta {
+            unit,
+            consumed,
+            last_acquire,
+            loaded_at,
+        }
+    }
+
+    #[test]
+    fn victim_is_empty_then_older_consumed_then_older_loaded() {
+        let held = slot_meta(Some(0), true, 5, 1);
+        // An empty slot goes first, whichever it is and whoever asks.
+        assert_eq!(pick_victim(&[held, SlotMeta::EMPTY], false), Some(1));
+        assert_eq!(pick_victim(&[SlotMeta::EMPTY, held], true), Some(0));
+        // Both consumed: the one acquired longest ago.
+        let consumed = [
+            slot_meta(Some(0), true, 7, 1),
+            slot_meta(Some(1), true, 3, 2),
+        ];
+        assert_eq!(pick_victim(&consumed, false), Some(1));
+        // A consumed slot is evicted before an (older-loaded) unconsumed prefetch.
+        let mixed = [
+            slot_meta(Some(2), false, 0, 1),
+            slot_meta(Some(1), true, 9, 5),
+        ];
+        assert_eq!(pick_victim(&mixed, false), Some(1));
+        assert_eq!(pick_victim(&mixed, true), Some(1));
+        // Both hold unconsumed prefetches: a prefetch declines, a demand load
+        // evicts the older-loaded one.
+        let unconsumed = [
+            slot_meta(Some(4), false, 0, 8),
+            slot_meta(Some(5), false, 0, 6),
+        ];
+        assert_eq!(pick_victim(&unconsumed, false), None);
+        assert_eq!(pick_victim(&unconsumed, true), Some(1));
+    }
+
+    /// `TowerStream::acquire`'s bookkeeping; `true` when the unit was already
+    /// staged (no demand load).
+    fn sim_acquire(t: &mut SlotTable, unit: usize) -> bool {
+        let (slot, load) = t.plan_acquire(unit).unwrap();
+        if load {
+            t.mark_empty(slot);
+            t.mark_loaded(slot, unit);
+        }
+        t.mark_acquired(slot);
+        !load
+    }
+
+    /// `TowerStream::prefetch`'s bookkeeping.
+    fn sim_prefetch(t: &mut SlotTable, unit: usize, units: usize) {
+        if unit >= units {
+            return;
+        }
+        if let Some(slot) = t.plan_prefetch(unit) {
+            t.mark_empty(slot);
+            t.mark_loaded(slot, unit);
+        }
+    }
+
+    /// One tower encode as `VisionTowerJob` drives the stream: prologue
+    /// prefetches 0 and 1, block `i` acquires `i` then prefetches `i + 2`
+    /// (reaching the merger units), `finish` acquires both merger units.
+    /// Returns the number of demand loads.
+    fn sim_encode(t: &mut SlotTable, blocks: usize) -> usize {
+        let units = blocks + 2;
+        let mut demand = 0;
+        sim_prefetch(t, 0, units);
+        sim_prefetch(t, 1, units);
+        for unit in 0..units {
+            demand += usize::from(!sim_acquire(t, unit));
+            sim_prefetch(t, unit + 2, units);
+        }
+        demand
+    }
+
+    #[test]
+    fn double_buffering_never_demand_loads_in_steady_state() {
+        let mut t = SlotTable::EMPTY;
+        // A cold first encode and every later one on the same table stage
+        // each unit one step ahead of its use.
+        for _ in 0..3 {
+            assert_eq!(sim_encode(&mut t, 27), 0);
+        }
+        // A one-block tower (the merger units are prefetched straight away).
+        let mut one_block = SlotTable::EMPTY;
+        assert_eq!(sim_encode(&mut one_block, 1), 0);
+    }
+
+    #[test]
+    fn prefetch_never_evicts_an_unconsumed_prefetch() {
+        let mut t = SlotTable::EMPTY;
+        sim_prefetch(&mut t, 0, 29);
+        sim_prefetch(&mut t, 1, 29);
+        sim_prefetch(&mut t, 2, 29);
+        assert_eq!(t.holding(0), Some(0));
+        assert_eq!(t.holding(1), Some(1));
+        assert_eq!(t.holding(2), None);
+        // A demand load of a unit nobody prefetched evicts the older-loaded
+        // prefetch, and the table then serves it without another load.
+        assert!(!sim_acquire(&mut t, 9));
+        assert_eq!(t.holding(0), None);
+        assert_eq!(t.holding(9), Some(0));
+        assert!(sim_acquire(&mut t, 1));
+        // Re-prefetching a held unit is a no-op.
+        assert_eq!(t.plan_prefetch(1), None);
+    }
+
+    #[test]
+    fn activation_peak_27b() {
+        let cfg = config_27b();
+        // The binding phase is the block's fc1 linear. Per patch: x 4608 +
+        // rope cos/sin 288 + tmp2 4608 + fc1 output 17216 + the larger of the
+        // LDS route's F16 input copy (2304) and the non-WMMA transposed
+        // output (17216) = 43936 bytes.
+        assert_eq!(tower_activation_peak_bytes(&cfg, 4096), 43_936 * 4096);
+        assert_eq!(tower_activation_peak_bytes(&cfg, 7812), 43_936 * 7812);
+        assert_eq!(tower_activation_peak_bytes(&cfg, 0), 0);
+    }
+
+    #[test]
+    fn max_patches_is_the_pixel_budget_over_one_patch() {
+        let cfg = config_27b();
+        assert_eq!(
+            max_image_patches(&cfg),
+            crate::image::vision_max_pixels() / (16 * 16)
+        );
+    }
 }
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
@@ -963,6 +2420,18 @@ const VIT_LDS_K_ALIGN: usize = 64;
 /// so the loader (fc2 weight padding) and `linear_f16_ld` always agree.
 fn vit_lds_route(gpu: &Gpu, out_dim: usize) -> bool {
     !vit_gemm_mb8() && out_dim >= 256 && (gpu.arch == "gfx1201" || gpu.arch_caps.has_wmma_w32())
+}
+
+/// F16 row pitch of each block's MLP down-projection weight.
+/// Admission and weight upload share the same process-cached GEMM route:
+/// the LDS route pads K to 64 elements, while the mb8/fallback route keeps
+/// the source's packed pitch. This plans no allocation or transfer.
+pub fn vision_fc2_pitch(gpu: &Gpu, config: &VisionConfig) -> usize {
+    if vit_lds_route(gpu, config.hidden_size) {
+        config.mlp_dim.next_multiple_of(VIT_LDS_K_ALIGN)
+    } else {
+        config.mlp_dim
+    }
 }
 
 /// gfx1201 tile policy, copied from the qwen35-embed encoder's
@@ -1137,14 +2606,20 @@ fn vl_dump_tensor(
 /// other slots' decode batches between tower layers, bounding the
 /// co-tenant stall to one layer instead of the whole encode.
 ///
-/// Stream invariant (unchanged from the monolithic form): every kernel is
-/// enqueued on the same default stream, and per-layer scratch tensors
-/// (`tmp`, `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`) are freed within
-/// the same step. Pool reuse of a freed buffer stays submission-ordered even
-/// with other slots' kernels interleaved between steps: everything shares the
-/// one stream. If `rdna_compute` ever uses multiple streams for the vision
-/// path, this must be revisited (per-step syncs or stream-attached frees).
-/// See review notes in `vision_rev_claude.md`.
+/// Stream invariant: every kernel is enqueued on the same launch stream
+/// (`gpu.active_stream`; the default stream when unset), and per-layer
+/// scratch tensors (`tmp`, `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`)
+/// are freed within the same step. Pool reuse of a freed buffer stays
+/// submission-ordered even with other slots' kernels interleaved between
+/// steps: all activations share that one stream. Streamed tower weights
+/// ([`TowerResidency::Streamed`]) add ONE more stream, a private copy stream
+/// that carries only the weight H2D copies and is ordered against the launch
+/// stream by per-slot events (see [`TowerStream`]): a block's kernels wait on
+/// the `ready` event of its copy, and the next copy into that staging slot
+/// waits on the `free` event recorded after those kernels. Activations never
+/// leave the launch stream. If `rdna_compute` ever uses multiple streams for
+/// the vision activations, this must be revisited (per-step syncs or
+/// stream-attached frees). See review notes in `vision_rev_claude.md`.
 pub struct VisionTowerJob {
     /// Hidden residual `[n, h]`, live across all layers.
     x: GpuTensor,
@@ -1204,6 +2679,41 @@ fn select_vit_attn(gpu: &Gpu, head_dim: usize) -> HipResult<VitAttn> {
         } else {
             VitAttn::Naive
         }),
+    }
+}
+
+/// One block's large matrices as the kernels take them: borrowed from the
+/// resident tensors, or non-owning views into a staging slot.
+struct LayerMats<'a> {
+    qkv_w: &'a GpuTensor,
+    proj_w: &'a GpuTensor,
+    fc1_w: &'a GpuTensor,
+    fc2_w: &'a GpuTensor,
+}
+
+impl<'a> LayerMats<'a> {
+    fn resident(m: &'a VisionLayerMats) -> Self {
+        Self {
+            qkv_w: &m.qkv_w,
+            proj_w: &m.proj_w,
+            fc1_w: &m.fc1_w,
+            fc2_w: &m.fc2_w,
+        }
+    }
+
+    fn staged(views: &'a [GpuTensor]) -> HipResult<Self> {
+        match views {
+            [qkv_w, proj_w, fc1_w, fc2_w] => Ok(Self {
+                qkv_w,
+                proj_w,
+                fc1_w,
+                fc2_w,
+            }),
+            _ => Err(HipError::new(
+                1,
+                "vision tower stream: block unit is not four matrices",
+            )),
+        }
     }
 }
 
@@ -1276,6 +2786,7 @@ impl VisionTowerJob {
             patch_dim,
             n,
         )?;
+        weights.prefetch_unit(gpu, 0);
         gpu.free_tensor(x_patches)?;
         vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
         let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
@@ -1318,6 +2829,7 @@ impl VisionTowerJob {
         // Preserve beta's attention routing while transferring only real
         // owners out of the prologue transaction after every step succeeds.
         let attn = select_vit_attn(gpu, config.head_dim)?;
+        weights.prefetch_unit(gpu, 1);
 
         Ok(Self {
             x: gpu.take(x),
@@ -1342,7 +2854,6 @@ impl VisionTowerJob {
         weights: &VisionWeights,
         config: &VisionConfig,
     ) -> HipResult<bool> {
-        let mut gpu = Scratch::new(gpu);
         assert!(
             self.next_layer < config.num_layers,
             "step_layer past the last tower layer"
@@ -1350,8 +2861,45 @@ impl VisionTowerJob {
         let h = config.hidden_size;
         let n = self.n;
         let li = self.next_layer;
-        let dd = self.dump_dir.as_deref();
         let lw = &weights.layers[li];
+
+        match &weights.mats {
+            TowerMats::Resident { layers, .. } => {
+                self.layer_kernels(gpu, config, lw, LayerMats::resident(&layers[li]))?;
+            }
+            TowerMats::Streamed(stream) => {
+                // `with_unit` records the slot's release after the kernels
+                // were enqueued, also when one of them failed to launch.
+                stream.with_unit(gpu, li, |gpu, staged| {
+                    self.layer_kernels(gpu, config, lw, LayerMats::staged(staged)?)
+                })?;
+                // Block `li + 2` (or a merger matrix) takes this slot next,
+                // copying while the next block computes.
+                stream.prefetch(gpu, li + 2);
+            }
+        }
+
+        let dd = self.dump_dir.as_deref();
+        vl_dump_tensor(gpu, dd, &format!("block_{li:02}"), &self.x, &[n, h])?;
+        self.next_layer += 1;
+        let done = self.next_layer == config.num_layers;
+        if done {
+            vl_dump_tensor(gpu, dd, "pre_merger", &self.x, &[n, h])?;
+        }
+        Ok(done)
+    }
+
+    /// The kernel sequence of one block, `mats` being its large matrices.
+    fn layer_kernels(
+        &self,
+        gpu: &mut Gpu,
+        config: &VisionConfig,
+        lw: &VisionLayerWeights,
+        mats: LayerMats<'_>,
+    ) -> HipResult<()> {
+        let mut gpu = Scratch::new(gpu);
+        let h = config.hidden_size;
+        let n = self.n;
 
         // LayerNorm1 → tmp
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
@@ -1366,7 +2914,7 @@ impl VisionTowerJob {
         )?;
 
         // QKV projection → [n, 3h]
-        let qkv = linear_f16(&mut gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
+        let qkv = linear_f16(&mut gpu, mats.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
         gpu.free_tensor(tmp)?;
 
         // 2D rotary on Q and K
@@ -1406,7 +2954,7 @@ impl VisionTowerJob {
         gpu.free_tensor(qkv)?;
 
         // Output projection + residual
-        let proj = linear_f16(&mut gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
+        let proj = linear_f16(&mut gpu, mats.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
         gpu.free_tensor(attn_out)?;
 
         // Residual: x += proj
@@ -1426,12 +2974,12 @@ impl VisionTowerJob {
         )?;
 
         // MLP: fc1 → GELU → fc2 + residual
-        let fc1 = linear_f16(&mut gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
+        let fc1 = linear_f16(&mut gpu, mats.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
         gpu.free_tensor(tmp2)?;
         gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
         let fc2 = linear_f16_ld(
             &mut gpu,
-            &lw.fc2_w,
+            mats.fc2_w,
             lw.fc2_ld,
             &fc1,
             &lw.fc2_b,
@@ -1444,14 +2992,7 @@ impl VisionTowerJob {
         // Residual: x += fc2
         gpu.add_inplace_f32(&self.x, &fc2)?;
         gpu.free_tensor(fc2)?;
-
-        vl_dump_tensor(&mut gpu, dd, &format!("block_{li:02}"), &self.x, &[n, h])?;
-        self.next_layer += 1;
-        let done = self.next_layer == config.num_layers;
-        if done {
-            vl_dump_tensor(&mut gpu, dd, "pre_merger", &self.x, &[n, h])?;
-        }
-        Ok(done)
+        Ok(())
     }
 
     /// Tower epilogue. Adopt persistent buffers and merger temporaries in
@@ -1520,26 +3061,36 @@ impl VisionTowerJob {
             }
         }
         let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-        let m1 = linear_f16(
-            &mut gpu,
-            &weights.merger_fc1_w,
-            &merged_gpu,
-            &weights.merger_fc1_b,
-            merge_dim,
-            merge_dim,
-            n_merged,
-        )?;
+        let m1 = weights.with_merger_w(&mut gpu, MergerFc::Fc1, |gpu, w| {
+            let mut scratch = Scratch::new(gpu);
+            let output = linear_f16(
+                &mut scratch,
+                w,
+                &merged_gpu,
+                &weights.merger_fc1_b,
+                merge_dim,
+                merge_dim,
+                n_merged,
+            )?;
+            Ok(scratch.take(output))
+        })?;
+        let m1 = gpu.adopt(m1);
         gpu.free_tensor(merged_gpu)?;
         gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
-        let m2 = linear_f16(
-            &mut gpu,
-            &weights.merger_fc2_w,
-            &m1,
-            &weights.merger_fc2_b,
-            config.out_hidden_size,
-            merge_dim,
-            n_merged,
-        )?;
+        let m2 = weights.with_merger_w(&mut gpu, MergerFc::Fc2, |gpu, w| {
+            let mut scratch = Scratch::new(gpu);
+            let output = linear_f16(
+                &mut scratch,
+                w,
+                &m1,
+                &weights.merger_fc2_b,
+                config.out_hidden_size,
+                merge_dim,
+                n_merged,
+            )?;
+            Ok(scratch.take(output))
+        })?;
+        let m2 = gpu.adopt(m2);
         gpu.free_tensor(m1)?;
         let result = gpu.download_f32(&m2)?;
         gpu.free_tensor(m2)?;
@@ -1635,4 +3186,70 @@ pub fn vision_forward_patches(
         };
     }
     job.finish(gpu, weights, config)
+}
+
+/// Largest patch count the product preprocessing can emit: the image pixel
+/// budget (`HIPFIRE_VL_MAX_PIXELS`, default 2 MP) over the pixels of one
+/// patch.
+pub fn max_image_patches(config: &VisionConfig) -> usize {
+    crate::image::vision_max_pixels() / (config.patch_size * config.patch_size).max(1)
+}
+
+/// Upper bound on the device bytes the tower's activations hold at once while
+/// encoding one image of `n_patches` patches. Weights are not counted
+/// (resident ones are separate, streamed ones are the two fixed staging
+/// slots). It is the maximum, over every allocation phase of the prologue,
+/// of one block ([`VisionTowerJob::step_layer`]) and of the merger epilogue
+/// ([`VisionTowerJob::finish`]), of the device tensors live at that phase,
+/// taken in allocation order. A `linear_f16_ld` holds its output plus the
+/// larger of the LDS route's F16 copy of its input and the non-WMMA route's
+/// transposed output, whichever route the arch takes; the WMMA attention adds
+/// its three packed F16 q/k/v buffers (the Q-tiled and naive kernels allocate
+/// nothing). The pool returns its idle buffers to HIP before an allocation
+/// would otherwise fail, so the live-set maximum is what must stay free.
+pub fn tower_activation_peak_bytes(config: &VisionConfig, n_patches: usize) -> usize {
+    const F32: usize = 4;
+    let n = n_patches;
+    let h = config.hidden_size;
+    let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
+    let merge_sq = config.spatial_merge_size * config.spatial_merge_size;
+    let merge_dim = h * merge_sq;
+    let n_merged = n.div_ceil(merge_sq.max(1));
+    let k_pad = |k: usize| k.next_multiple_of(VIT_LDS_K_ALIGN);
+    let linear = |rows: usize, in_dim: usize, out_dim: usize| {
+        rows * out_dim * F32 + (rows * k_pad(in_dim) * F16_BYTES).max(rows * out_dim * F32)
+    };
+    // `[n, h]` F32: the residual `x`, and each of tmp / attn_out / proj /
+    // tmp2 / fc2.
+    let act = n * h * F32;
+    let qkv = act * 3;
+    let fc1 = n * config.mlp_dim * F32;
+    // Live through every block: the residual and the rope cos/sin tables.
+    let block = act + 2 * n * (config.head_dim / 2) * F32;
+    let attn_pack = if config.head_dim <= 80 {
+        3 * n * config.num_heads * 80 * F16_BYTES
+    } else {
+        0
+    };
+    [
+        // Prologue: patch upload + patch-embed linear; pos-embed upload
+        // (also the merger's layernorm: x + normed).
+        n * patch_dim * F32 + linear(n, patch_dim, h),
+        act + act,
+        // Block: layernorm1 / layernorm2 output; qkv linear; attention; output
+        // projection; fc1 linear; fc2 linear.
+        block + act,
+        block + act + linear(n, h, 3 * h),
+        block + qkv + act + attn_pack,
+        block + act + linear(n, h, h),
+        block + act + linear(n, h, config.mlp_dim),
+        block + fc1 + linear(n, config.mlp_dim, h),
+        // Merger epilogue: fc1 linear (merged upload live); fc2 linear (m1
+        // live).
+        n_merged * merge_dim * F32 + linear(n_merged, merge_dim, merge_dim),
+        n_merged * merge_dim * F32 + linear(n_merged, merge_dim, config.out_hidden_size),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
 }

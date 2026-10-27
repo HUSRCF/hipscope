@@ -12,9 +12,12 @@ Save the JSON and read every decoded answer, especially the OCR/description.
     python3 scripts/check_qwen4_vision.py --base-url http://127.0.0.1:11435 \
         --model qwen3.8:flash-next --output /tmp/qwen4-vision-http.json
 
-An off-mode run checks that discovery omits image and every image request is
-refused, then verifies a text request still succeeds. It does not reload models:
-start serve with the desired vision mode before invoking this instrument.
+--expect-vision describes loaded image capability, not a vision_mode setting.
+Use on when Flash Next auto, resident, or on has loaded a resident tower.
+Use off for vision_mode=off or auto/resident without a sidecar: discovery must omit image,
+every image request must be refused, and a text request must still succeed.
+Start serve with the desired mode before invoking this instrument; it neither
+reloads models nor tests required-sidecar load failures or the memory budget.
 """
 
 import argparse
@@ -167,7 +170,8 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:11435", help="serve origin without /v1")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--expect-vision", choices=["on", "off"], default="on")
+    parser.add_argument("--expect-vision", choices=["on", "off"], default="on",
+                        help="expected loaded image capability, not a mode setter: on means a loaded tower; off includes auto/resident without a sidecar")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--api-key-env", default="HIPFIRE_API_KEY", help="environment variable name; key is never stored")

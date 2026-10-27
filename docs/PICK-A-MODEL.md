@@ -43,7 +43,7 @@ the family notes.
 | 128 GB | `qwen3.8:flash` → `qwen3.8:flash-next` (128) | 125.3 GB | Flash-Next (arch 16) |
 
 Qwen 3.8 27B tiers also pull the shared vision tower (`vision_mode`, default
-`off`) and the shared MTP head. Image generation (`flux.schnell:1`, 24 GB) is a
+`auto`, streamed from host/disk per image; `resident` keeps it in ~0.94 GiB of VRAM) and the shared MTP head. Image generation (`flux.schnell:1`, 24 GB) is a
 separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Fixtures

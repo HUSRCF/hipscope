@@ -8,7 +8,7 @@
 //! ```text
 //! cargo run --release -p hipfire-arch-qwen35-vl --features lab --example vl_tower_dump -- \
 //!   --model qwen3.8-27b-vision.hfq (--patches pixel_values.bin --grid-h H --grid-w W | --image IMG) \
-//!   --out DIR [--reps R] [--stages 1]
+//!   --out DIR [--reps R] [--stages 1] [--residency resident|streamed]
 //! ```
 //!
 //! * `--patches` is raw little-endian F32 `[grid_h*grid_w, 1536]` in HF
@@ -17,7 +17,12 @@
 //! * One warm-up `vision_forward` (kernel JIT), then `--reps` (default 3) timed
 //!   runs. `DIR/post_merger.bin` (F32 `[n/4, out_hidden]`) comes from the last
 //!   run; `DIR/receipt.json` records sha256 of the model, grid, per-rep ms,
-//!   median ms, arch and the `HIPFIRE_VIT_ATTN` / `HIPFIRE_VIT_GEMM` selectors.
+//!   median ms, arch, the tower residency and the `HIPFIRE_VIT_ATTN` /
+//!   `HIPFIRE_VIT_GEMM` selectors.
+//! * `--residency` places the tower's large matrices: `streamed` (default, the
+//!   product's `vision.mode` auto/on placement: streamed per block from the
+//!   sidecar through two VRAM staging slots) or `resident` (whole tower in
+//!   VRAM). Both run the same kernels on the same weight bytes.
 //! * `--stages 1` additionally produces the per-block stage dumps
 //!   (`HIPFIRE_VL_DUMP_DIR`) in DIR. The dump directory is latched in the
 //!   process config snapshot at first use, so enabling it for only one
@@ -27,7 +32,7 @@
 
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl::{
-    load_vision_weights, vision_config_from_hfq, vision_forward,
+    load_vision_weights, vision_config_from_hfq, vision_forward, TowerResidency,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -42,7 +47,8 @@ use std::time::Instant;
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "usage: vl_tower_dump --model VISION.hfq \
-(--patches F32.bin --grid-h H --grid-w W | --image IMG) --out DIR [--reps R] [--stages 1]";
+(--patches F32.bin --grid-h H --grid-w W | --image IMG) --out DIR [--reps R] [--stages 1] \
+[--residency resident|streamed]";
 
 fn digest(path: &Path) -> Res<String> {
     let mut file = fs::File::open(path)?;
@@ -102,6 +108,13 @@ fn main() -> Res<()> {
         Some(&"1") => true,
         Some(&"0") | None => false,
         Some(other) => return Err(format!("--stages takes 0 or 1, got {other}").into()),
+    };
+    let residency = match flags.get("--residency") {
+        Some(&"resident") => TowerResidency::Resident,
+        Some(&"streamed") | None => TowerResidency::Streamed,
+        Some(other) => {
+            return Err(format!("--residency takes resident or streamed, got {other}").into())
+        }
     };
     let dump_child = flags.get("--dump-child") == Some(&"1");
     fs::create_dir_all(out)?;
@@ -177,7 +190,7 @@ fn main() -> Res<()> {
 
     let mut gpu = Gpu::init()?;
     let arch = gpu.arch.clone();
-    let weights = load_vision_weights(&hfq, &config, &mut gpu)?;
+    let weights = load_vision_weights(&hfq, &config, &mut gpu, residency)?;
 
     if dump_child {
         // Single untimed run; per-stage dumps land in `out` via HIPFIRE_VL_DUMP_DIR.
@@ -270,6 +283,10 @@ fn main() -> Res<()> {
         "rep_ms": rep_ms,
         "median_ms": median,
         "stages": stages,
+        "residency": match residency {
+            TowerResidency::Resident => "resident",
+            TowerResidency::Streamed => "streamed",
+        },
         "HIPFIRE_VIT_ATTN": selector("HIPFIRE_VIT_ATTN"),
         "HIPFIRE_VIT_GEMM": selector("HIPFIRE_VIT_GEMM"),
     });

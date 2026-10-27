@@ -2764,6 +2764,79 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
 
+/// Exact-gfx1100 int8-activation small-batch MQ4G256V2 GEMV for speculative
+/// verify (default on exact gfx1100, `HIPFIRE_GFX1100_Q8X_VERIFY=0` off; see
+/// `gemv_q8x.rs`; registered in `kernel_registry.rs` for the gfx1100 pack): the
+/// activation quantizer and the v4 (persistent, all of K in LDS) / v3
+/// (LDS-staged chunks, two rows per warp) GEMVs, one module per batch (2..=5)
+/// and residual flavour, each with a `_multi` twin for up to four weights.
+pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
+    "#define Q8X_QUANT 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+);
+macro_rules! gemv_mq4g256v2_q8x_v4_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
+            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+macro_rules! gemv_mq4g256v2_q8x_v3_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
+            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "", "mq4v2_q8x_v4_b2");
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "", "mq4v2_q8x_v4_b3");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "", "mq4v2_q8x_v4_b4");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "", "mq4v2_q8x_v3_b2");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "", "mq4v2_q8x_v3_b3");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "", "mq4v2_q8x_v3_b4");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "", "mq4v2_q8x_v3_b5");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -8429,6 +8502,17 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Native-fp8-KV split-KV verifier ([`ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC`]
+/// + `HIPFIRE_FA2_SPLIT_LSE_FP8=1`): the KMODE=8 f16 body with the Q8
+/// verifier's LSE + normalized-Oacc partial/merge records. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_{partial,merge}_lse_gfx1201` and
+/// `attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201`, distinct from the Q0
+/// module's. JIT-only via `Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    "#define HIPFIRE_FA2_SPLIT_LSE_FP8 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 /// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
 /// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
 /// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from
@@ -8626,6 +8710,13 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str =
 /// for its tile of positions, writing partials to global memory.
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
+
+/// head_dim 64 twin of [`ATTENTION_FLASH_Q8_0_TILE_SRC`]
+/// (`attention_flash_q8_0_tile_hd64`): same ABI and partials, so it pairs with
+/// the shared `attention_flash_q8_0_reduce`. The reference tile only covers
+/// head_dim in multiples of 128.
+pub const ATTENTION_FLASH_Q8_0_TILE_HD64_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_hd64.hip");
 
 /// Flat-BF16 sibling of the Q8_0 flash tile. Same partials layout and same
 /// per-thread dim mapping, so it shares `attention_flash_q8_0_reduce`
@@ -8847,6 +8938,12 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// `turbo_common.h` rotation helpers; the runtime compile has no `-I` to
 /// `kernels/src`, so the header is prepended and the source's guarded
 /// `#include` is skipped via `VA_TURBO_COMMON_INLINED`.
+/// Exact-gfx1100 WMMA split-K verify attention over plain Q8_0 KV (H24/KV4/
+/// HD256, 1..=8 rows; default on, `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` off;
+/// see `attention_wmma_verify.rs`): `attention_verify_wmma_q8_qt{1,2,3}_gfx1100`
+/// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
+pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),
@@ -8857,8 +8954,8 @@ pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
 /// S = Q.K^T tiles, one K dequant per kv head, f16 S to scratch) and
 /// `attention_verify_wmma_pv{1s_d4,2_d2}_gfx1151` (the per-16-dim-chunk online
 /// softmax + P.V walk), the byte-identical parallel twin of
-/// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256,
-/// GQA 4 or 6) that every gfx1151 speculative verify runs.
+/// [`ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC`] (legacy single slot, hd 256 or
+/// 128 (`_hd128` entries), GQA 4 or 6) that every gfx1151 speculative verify runs.
 pub const ATTENTION_VERIFY_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_wmma.gfx1151.hip");
 

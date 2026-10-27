@@ -358,6 +358,9 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// Int8 activation scratch `(xq, dx)` of the opt-in exact-gfx1100
+    /// small-batch verify GEMV (`gemv_q8x.rs`), allocated on first use.
+    pub q8x_act: Option<(GpuTensor, GpuTensor)>,
     /// Dedicated F32 `x_out` operand for `Gpu::mq6_fp8_prepare_x` (the MQ4v2 FP8
     /// producer's rotated-row output, `[batch * k]`; the in-register producer
     /// never writes it). Lazily allocated, grown on demand, never shrunk.

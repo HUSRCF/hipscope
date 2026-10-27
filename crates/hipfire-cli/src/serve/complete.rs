@@ -4694,7 +4694,7 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_high["reasoning_effort"], "medium");
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
         assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),

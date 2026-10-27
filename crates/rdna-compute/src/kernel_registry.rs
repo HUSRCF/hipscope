@@ -429,6 +429,84 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
             ["kv_cache_write_asym3_q8_pair_gfx1100"]
         );
+        // Default-on int8 small-batch verify GEMV (`gemv_q8x.rs`): the
+        // activation quantizer and every v4/v3 batch x residual variant, each
+        // module with its `_multi` twin, so the pack carries them precompiled.
+        add!(
+            "mq4v2_q8x_quant",
+            kernels::GEMV_MQ4G256V2_Q8X_QUANT_SRC,
+            ["mq4v2_q8x_quant"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b2",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B2_SRC,
+            ["mq4v2_q8x_v4_b2", "mq4v2_q8x_v4_b2_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b2_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B2_RES_SRC,
+            ["mq4v2_q8x_v4_b2_res", "mq4v2_q8x_v4_b2_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b3",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B3_SRC,
+            ["mq4v2_q8x_v4_b3", "mq4v2_q8x_v4_b3_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b3_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B3_RES_SRC,
+            ["mq4v2_q8x_v4_b3_res", "mq4v2_q8x_v4_b3_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b4",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B4_SRC,
+            ["mq4v2_q8x_v4_b4", "mq4v2_q8x_v4_b4_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v4_b4_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V4_B4_RES_SRC,
+            ["mq4v2_q8x_v4_b4_res", "mq4v2_q8x_v4_b4_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b2",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B2_SRC,
+            ["mq4v2_q8x_v3_b2", "mq4v2_q8x_v3_b2_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b2_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B2_RES_SRC,
+            ["mq4v2_q8x_v3_b2_res", "mq4v2_q8x_v3_b2_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b3",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B3_SRC,
+            ["mq4v2_q8x_v3_b3", "mq4v2_q8x_v3_b3_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b3_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B3_RES_SRC,
+            ["mq4v2_q8x_v3_b3_res", "mq4v2_q8x_v3_b3_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b4",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B4_SRC,
+            ["mq4v2_q8x_v3_b4", "mq4v2_q8x_v3_b4_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b4_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B4_RES_SRC,
+            ["mq4v2_q8x_v3_b4_res", "mq4v2_q8x_v3_b4_res_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b5",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B5_SRC,
+            ["mq4v2_q8x_v3_b5", "mq4v2_q8x_v3_b5_multi"]
+        );
+        add!(
+            "mq4v2_q8x_v3_b5_res",
+            kernels::GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC,
+            ["mq4v2_q8x_v3_b5_res", "mq4v2_q8x_v3_b5_res_multi"]
+        );
     }
     if matches!(arch, "gfx906" | "gfx942") {
         add!(
@@ -566,6 +644,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "attention_flash_q8_0_tile",
         kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
         ["attention_flash_q8_0_tile"]
+    );
+    add!(
+        "attention_flash_q8_0_tile_hd64",
+        kernels::ATTENTION_FLASH_Q8_0_TILE_HD64_SRC,
+        ["attention_flash_q8_0_tile_hd64"]
     );
     add!(
         "attention_flash_q8_0_reduce",
@@ -1515,6 +1598,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_gqa_fwht3_gfx1100",
                 "attention_verify_gqa_q8_rows_gfx1100",
                 "attention_verify_reduce_gfx1100"
+            ]
+        );
+        // Default-on WMMA split-K verify attention (`attention_wmma_verify.rs`).
+        add!(
+            "attention_verify_wmma_gfx1100",
+            kernels::ATTENTION_VERIFY_WMMA_GFX1100_SRC,
+            [
+                "attention_verify_wmma_q8_qt1_gfx1100",
+                "attention_verify_wmma_q8_qt2_gfx1100",
+                "attention_verify_wmma_q8_qt3_gfx1100",
+                "attention_verify_wmma_reduce_gfx1100"
             ]
         );
         add!(
@@ -3991,8 +4085,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
             [
                 "attention_verify_wmma_pv1s_d4_gfx1151",
+                "attention_verify_wmma_pv1s_d4_hd128_gfx1151",
                 "attention_verify_wmma_pv2_d2_gfx1151",
+                "attention_verify_wmma_pv2_d2_hd128_gfx1151",
                 "attention_verify_wmma_qk_gfx1151",
+                "attention_verify_wmma_qk_hd128_gfx1151",
             ]
         );
         add!(
@@ -10161,6 +10258,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The head_dim 64 Q8 flash decode tile (HIPF-124).
+        const HD64_FLASH_TILE_ADDED_MODULES: [&str; 1] = ["attention_flash_q8_0_tile_hd64"];
+        for module in HD64_FLASH_TILE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing hd64 flash tile module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10174,7 +10285,8 @@ mod tests {
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
-                + MQ4RS_DECODE_ADDED_MODULES.len(),
+                + MQ4RS_DECODE_ADDED_MODULES.len()
+                + HD64_FLASH_TILE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

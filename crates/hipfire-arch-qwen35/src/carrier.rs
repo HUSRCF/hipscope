@@ -510,6 +510,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // The real card bound is determined only now: weights (including any
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
+        let reserve = sequence.reserve_bytes;
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
             let (free, _) = ctx
                 .gpu
@@ -524,7 +525,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 plan.adaptive.is_some(),
             )
             .ok_or("Qwen KV stride overflow")?;
-            let card_cap = free.saturating_sub(minimum).saturating_sub(128 << 20) / stride;
+            let card_cap = free
+                .saturating_sub(minimum)
+                .saturating_sub(reserve)
+                .saturating_sub(128 << 20)
+                / stride;
             Ok((free, minimum, stride, card_cap))
         })();
         let (free, minimum, stride, card_cap) = match capacity {
@@ -535,7 +540,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             }
         };
         eprintln!(
-            "max_seq budget: free_after_weights={free} min_prefill={minimum} page_rounding={} kv_bytes_per_token={stride}",
+            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} page_rounding={} kv_bytes_per_token={stride}",
             128 << 20,
         );
         if sequence.automatic {

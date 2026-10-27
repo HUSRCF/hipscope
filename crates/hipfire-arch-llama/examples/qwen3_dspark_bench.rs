@@ -32,7 +32,7 @@ use hipfire_runtime::dspark_core::build_dspark_speculator;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
-use hipfire_runtime::spec::{PrefillOutcome, Speculator};
+use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu};
@@ -67,7 +67,12 @@ fn decode_loop(
     let mut accepted: u64 = 0;
 
     // Stash sampling on the speculator (top_p/top_k); temp also rides each step.
-    spec.set_sampling(temp, top_p, top_k, 0.0);
+    spec.configure_request(SpecRequestConfig {
+        temp,
+        top_p,
+        top_k: u32::try_from(top_k).ok().filter(|&k| k > 0),
+        ..SpecRequestConfig::default()
+    });
 
     if !raw && first_token == eos {
         return Ok((generated, windows, proposed, accepted));

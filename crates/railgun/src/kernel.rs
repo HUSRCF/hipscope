@@ -1242,8 +1242,9 @@ impl KernelProgram {
     /// non-empty, in range and disjoint from every other conditional (no
     /// nesting); `flag` is a resource of at least 4 bytes; every body node
     /// is PM4. `KernelGuard` also needs every body node's certified guard on
-    /// `flag` and no body node but the last writing `flag` (each node reads
-    /// it at its own start, so earlier writes would split the decision).
+    /// `flag`, and a node writing `flag` must be the body's last and a single
+    /// wave (`grid × block ≤ 32`): the guard runs once per wave, so an earlier
+    /// node's write, or a later wave of the writer, would split the decision.
     /// `CpSkip` needs [`crate::plan::cp_skip_admitted`] for the arch.
     pub fn add_conditional(&mut self, c: Conditional) -> Result<(), String> {
         let Conditional {
@@ -1292,14 +1293,21 @@ impl KernelProgram {
                         node.symbol, flag.0
                     ));
                 }
-                if j + 1 < body.end
+                let threads: u64 = node
+                    .grid
+                    .iter()
+                    .chain(&node.block)
+                    .map(|&d| d as u64)
+                    .product();
+                if (j + 1 < body.end || threads > 32)
                     && node
                         .effects
                         .iter()
                         .any(|e| e.resource == flag && e.writes())
                 {
                     return Err(format!(
-                        "node {j} ({}) writes the flag before the body's last node",
+                        "node {j} ({}) writes the flag but is not the body's last \
+                         single-wave node ({threads} threads)",
                         node.symbol
                     ));
                 }
@@ -1328,13 +1336,17 @@ impl KernelProgram {
         iterations: usize,
         lowering: CondLowering,
     ) -> Result<(), String> {
+        let before = self.conditionals.clone();
         for k in 0..iterations {
             let start = first + k * len;
-            self.add_conditional(Conditional {
+            if let Err(e) = self.add_conditional(Conditional {
                 flag,
                 body: start..start + len,
                 lowering,
-            })?;
+            }) {
+                self.conditionals = before;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -1679,18 +1691,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn kernel_guard_needs_the_certificate_on_the_flag_and_a_last_writer() {
+    fn kernel_guard_needs_the_certificate_on_the_flag_and_a_single_wave_last_writer() {
         let (flag, x, y) = (0x7000_0000u64, 0x7100_0000u64, 0x7200_0000u64);
         let body = vec![
             ptr(0, &[MemClass::SmemLoad]),
             ptr(8, &[MemClass::VmemStore]),
         ];
         let step = vec![ptr(0, &[MemClass::SmemLoad, MemClass::VmemStore])];
+        let mut writer = guarded(launch(&[(0, flag)], 8, step.clone()));
+        (writer.grid, writer.block) = ([1, 1, 1], [32, 1, 1]);
         let launches = vec![
             guarded(launch(&[(0, flag), (8, y)], 16, body.clone())),
-            guarded(launch(&[(0, flag)], 8, step.clone())),
+            writer,
             launch(&[(0, flag), (8, x)], 16, body.clone()),
             guarded(launch(&[(0, x), (8, y)], 16, body)),
+            // The guard runs per wave: a 4-wave writer's later waves could
+            // read the flag after its first wave cleared it.
+            guarded(launch(&[(0, flag)], 8, step.clone())),
         ];
         let mut p = author("gfx1151", &launches);
         let f = p.nodes[0].guard.unwrap();
@@ -1702,7 +1719,7 @@ pub(crate) mod tests {
             body,
             lowering,
         };
-        for refused in [2..3, 3..4, 1..3, 0..0, 3..5] {
+        for refused in [2..3, 3..4, 1..3, 0..0, 3..6, 4..5] {
             assert!(
                 p.add_conditional(c(refused.clone(), CondLowering::KernelGuard))
                     .is_err(),
@@ -1722,6 +1739,20 @@ pub(crate) mod tests {
         );
         p.add_conditional(c(2..4, CondLowering::CpSkip)).unwrap();
         assert_eq!(p.conditionals.len(), 2);
+        // A refused copy leaves no earlier copy behind.
+        let mut w = author(
+            "gfx1151",
+            &[
+                launches[0].clone(),
+                launches[1].clone(),
+                launches[0].clone(),
+                launches[4].clone(),
+            ],
+        );
+        assert!(w
+            .bounded_while(f, 0, 2, 2, CondLowering::KernelGuard)
+            .is_err());
+        assert!(w.conditionals.is_empty(), "{:?}", w.conditionals);
 
         let mut gfx12 = author("gfx1201", &launches);
         assert!(gfx12

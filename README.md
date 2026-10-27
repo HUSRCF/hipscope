@@ -497,9 +497,10 @@ curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.3/scripts/un
 `--dry-run` previews the uninstall. `--purge` also deletes `~/.hipfire` and
 asks for confirmation first.
 
-For Windows, source builds and install verification, see
-[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md). NixOS has a flake and a
-module ([docs/NIXOS.md](docs/NIXOS.md)):
+Native Windows and WSL2 are untested on GPU hardware; install notes, limits, and
+how to help test (`scripts/windows-check.ps1`) are in
+[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#help-test-windows). NixOS has
+a flake and a module ([docs/NIXOS.md](docs/NIXOS.md)):
 
 ```bash
 nix develop github:warpfront/hipfire  # dev shell with Rust + ROCm

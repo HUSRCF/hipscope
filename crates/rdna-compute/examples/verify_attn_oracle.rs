@@ -50,7 +50,8 @@
 //                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
 //   sweep                     (gfx1151) candidate wall-clock per launch geometry.
 // VA_NH=16 runs every mode at 16 q heads / 4 kv heads (GQA 4, Qwen3.5-9B;
-// gfx1151 WMMA twin only); default 24.
+// gfx1151 WMMA twin only); default 24. VA_HD=128 (default 256) sets head_dim
+// (gfx1151 WMMA twin only; VA_NH=16 VA_HD=128 = Qwen3-8B).
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::{VerifyKv, VerifyWmmaGeometry, VerifyWmmaPv};
@@ -69,11 +70,22 @@ fn nh() -> usize {
     *NH
 }
 const NKV: usize = 4;
-const HD: usize = 256;
+/// head_dim: `VA_HD` (default 256; 128 = Qwen3-8B, gfx1151 only).
+static HD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VA_HD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+});
+fn hd() -> usize {
+    *HD
+}
 const TILE: usize = 128;
-const STRIDE: usize = 2 + HD;
+fn stride() -> usize {
+    2 + hd()
+}
 fn qdim() -> usize {
-    nh() * HD
+    nh() * hd()
 }
 /// Guard elements on each side of the output view and after the partials view.
 const GUARD: usize = 4096;
@@ -143,8 +155,8 @@ fn half_from_f32(x: f32) -> u16 {
 /// per head (f32 cnorm + packed codes), everything else is the V row layout.
 fn k_row_bytes(kv: VerifyKv) -> usize {
     match kv {
-        VerifyKv::Fwht4 => NKV * (4 + HD / 2),
-        VerifyKv::Fwht3 => NKV * (4 + HD * 3 / 8),
+        VerifyKv::Fwht4 => NKV * (4 + hd() / 2),
+        VerifyKv::Fwht3 => NKV * (4 + hd() * 3 / 8),
         VerifyKv::Q8 | VerifyKv::Fp8 => v_row_bytes(kv),
     }
 }
@@ -152,8 +164,8 @@ fn k_row_bytes(kv: VerifyKv) -> usize {
 /// Bytes of one V row: the fwht K tiers store V as Q8_0.
 fn v_row_bytes(kv: VerifyKv) -> usize {
     match kv {
-        VerifyKv::Q8 | VerifyKv::Fwht4 | VerifyKv::Fwht3 => NKV * (HD / 32) * 34,
-        VerifyKv::Fp8 => NKV * (HD + 2),
+        VerifyKv::Q8 | VerifyKv::Fwht4 | VerifyKv::Fwht3 => NKV * (hd() / 32) * 34,
+        VerifyKv::Fp8 => NKV * (hd() + 2),
     }
 }
 
@@ -205,7 +217,7 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize, is_k: bool) ->
                 }
             }
             (VerifyKv::Fp8, _) => {
-                for i in 0..NKV * HD {
+                for i in 0..NKV * hd() {
                     row[i] = if poison {
                         0x7f
                     } else {
@@ -219,12 +231,12 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize, is_k: bool) ->
                 }
                 for h in 0..NKV {
                     let s = if poison { 0x7e00 } else { scale_f16(rng) };
-                    let o = NKV * HD + 2 * h;
+                    let o = NKV * hd() + 2 * h;
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
                 }
             }
             _ => {
-                for blk in 0..NKV * (HD / 32) {
+                for blk in 0..NKV * (hd() / 32) {
                     let o = blk * 34;
                     let s = if poison { 0x7e00 } else { scale_f16(rng) };
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
@@ -289,7 +301,7 @@ impl Case {
         if self.wmma.is_some() {
             self.wmma_scratch_bytes() / 4
         } else {
-            self.partial_rows * nh() * self.max_tiles() * STRIDE
+            self.partial_rows * nh() * self.max_tiles() * stride()
         }
     }
     /// f16 S tiles of the gfx1151 twin: row groups x kv heads x 6 x key tiles x 512 B.
@@ -350,7 +362,11 @@ impl Bufs {
         let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap, false);
         let signs = match c.kv {
             VerifyKv::Fwht4 | VerifyKv::Fwht3 => {
-                let n = if c.kv == VerifyKv::Fwht4 { HD / 2 } else { HD };
+                let n = if c.kv == VerifyKv::Fwht4 {
+                    hd() / 2
+                } else {
+                    hd()
+                };
                 let s1 = signs_table(&mut rng, n);
                 let s2 = signs_table(&mut rng, n);
                 Some((
@@ -434,7 +450,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.max_ctx_len(),
                     c.b,
                     &bf.part,
@@ -451,7 +467,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 None,
@@ -473,7 +489,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -489,7 +505,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -514,7 +530,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.pos,
                 nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -535,7 +551,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -554,7 +570,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.pos,
                     nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -578,7 +594,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                         s2,
                         nh(),
                         NKV,
-                        HD,
+                        hd(),
                         c.cap,
                         c.max_ctx_len(),
                         c.b,
@@ -599,7 +615,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                         s2,
                         nh(),
                         NKV,
-                        HD,
+                        hd(),
                         c.cap,
                         c.max_ctx_len(),
                         c.b,
@@ -668,8 +684,8 @@ fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
             let seq = c.start() + off + last + 1;
             let nt = seq.div_ceil(TILE).min(mt);
             for h in 0..nh() {
-                let base = ((lr * nh() + h) * mt) * STRIDE * 4;
-                r.push((base, base + nt * STRIDE * 4));
+                let base = ((lr * nh() + h) * mt) * stride() * 4;
+                r.push((base, base + nt * stride() * 4));
             }
         }
         off += chunk;
@@ -936,8 +952,8 @@ fn describe_out(what: &str, a: &[u8], b: &[u8]) -> String {
             let want = f32::from_ne_bytes(b[e * 4..e * 4 + 4].try_into().unwrap());
             format!(
                 "{what}={n}B first(row={row} head={} dim={} got={got:e} want={want:e})",
-                rem / HD,
-                rem % HD
+                rem / hd(),
+                rem % hd()
             )
         }
     }
@@ -1313,6 +1329,223 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
     }
 }
 
+/// Serve-shaped candidate timing: graph-capture max_ctx_len = cap = 131072,
+/// B {8,16}, live ctx {32K, 64K, 128K}; the reference only with VA_REF=1.
+fn bench_serve(gpu: &mut Gpu, kvs: &[VerifyKv]) {
+    let with_ref = std::env::var_os("VA_REF").is_some();
+    for &kv in kvs {
+        if !matches!(kv, VerifyKv::Fp8 | VerifyKv::Q8) {
+            continue; // the FA2 split verifier is fp8/q8 only
+        }
+        for &b in &[8usize, 16] {
+            for &ctx in &[32768usize, 65536, 130048] {
+                let c = Case {
+                    kv,
+                    b,
+                    ctx,
+                    capture: true,
+                    cap: 131072,
+                    partial_rows: 16,
+                    rows: false,
+                    wmma: None,
+                };
+                let bf = Bufs::new(gpu, &c, 0xBE4C);
+                let cand = time_ms(gpu, &c, &bf, true, 20);
+                let refm = if with_ref {
+                    time_ms(gpu, &c, &bf, false, 5)
+                } else {
+                    f64::NAN
+                };
+                // FA2 split-KV verifier (gfx1201): S = 16 splits on the same buffers.
+                let fa2_s: usize = std::env::var("VA_FA2_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let fa2 = if gpu.arch == "gfx1201" {
+                    let run = |gpu: &mut Gpu| match kv {
+                        VerifyKv::Fp8 => gpu.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            fa2_s,
+                        ),
+                        VerifyKv::Q8 => gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            fa2_s,
+                        ),
+                        VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                    };
+                    for _ in 0..3 {
+                        run(gpu).expect("fa2 split");
+                    }
+                    gpu.hip.device_synchronize().expect("sync");
+                    let t = Instant::now();
+                    for _ in 0..20 {
+                        run(gpu).expect("fa2 split");
+                    }
+                    gpu.hip.device_synchronize().expect("sync");
+                    t.elapsed().as_secs_f64() * 1e3 / 20.0
+                } else {
+                    f64::NAN
+                };
+                println!(
+                    "SERVE_FA2 kv={} B={} ctx={} S={} fa2_ms={:.4}",
+                    kv_name(kv),
+                    b,
+                    ctx,
+                    fa2_s,
+                    fa2
+                );
+                // K+V bytes of the live context (fp8: 1 B/elem + per-head scale; q8: 34/32 B/elem)
+                let elem = match kv {
+                    VerifyKv::Fp8 => 1.0,
+                    VerifyKv::Q8 => 34.0 / 32.0,
+                    VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                };
+                let gb = (ctx * NKV * hd() * 2) as f64 * elem / 1e9;
+                println!(
+                    "SERVE kv={} B={} ctx={} cand_ms={:.4} ref_ms={:.4} kv_GB={:.3} eff_GBps={:.0}",
+                    kv_name(kv),
+                    b,
+                    ctx,
+                    cand,
+                    refm,
+                    gb,
+                    gb / (cand / 1e3)
+                );
+                bf.free(gpu);
+            }
+        }
+    }
+}
+
+/// Tolerance check of the gfx1201 FA2 split-KV verifier (S splits) against
+/// VerifyAttn on the same buffers. Not a byte oracle: the FA2 body rounds
+/// Q, K, V and P to f16. Reports max |diff|, relative RMS error and
+/// non-finite counts per shape; FAIL on any non-finite candidate value or a
+/// relative RMS error above 5e-3. The bound was set after a first run on the
+/// R9700 (fp8 max 4.2e-3, q8 max 2.1e-3 over these shapes): it guards
+/// against gross breakage, it is not a quality claim.
+fn fa2_check(gpu: &mut Gpu, kvs: &[VerifyKv], splits: usize) -> bool {
+    let mut ok = true;
+    let mut worst = 0f64;
+    for &kv in kvs {
+        if !matches!(kv, VerifyKv::Fp8 | VerifyKv::Q8) {
+            continue; // the FA2 split verifier is fp8/q8 only
+        }
+        for &b in &[2usize, 4, 8, 16] {
+            for &ctx in &[1usize, 127, 128, 129, 2048, 4097, 32768, 130048] {
+                for &capture in &[false, true] {
+                    let cap = if capture { 131072 } else { ctx + 64 };
+                    let c = Case {
+                        kv,
+                        b,
+                        ctx,
+                        capture,
+                        cap,
+                        partial_rows: 16,
+                        rows: false,
+                        wmma: None,
+                    };
+                    let bf = Bufs::new(gpu, &c, 0xFA2C ^ (ctx as u64) ^ ((b as u64) << 20));
+                    if bf.part.numel()
+                        < Gpu::fa2_gqa_split_gfx1201_partials_len(splits, b, nh(), hd())
+                    {
+                        // The production arm falls back to VerifyAttn here too.
+                        println!("FA2_CHECK kv={} S={splits} B={b} ctx={ctx} capture={capture} SKIP (partials too small)", kv_name(kv));
+                        bf.free(gpu);
+                        continue;
+                    }
+                    launch(gpu, &c, &bf, true);
+                    let r = bytes_of(gpu, &bf.out);
+                    match kv {
+                        VerifyKv::Fp8 => gpu.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            splits,
+                        ),
+                        VerifyKv::Q8 => gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            splits,
+                        ),
+                        VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                    }
+                    .expect("fa2 split");
+                    let k = bytes_of(gpu, &bf.out);
+                    let n = b * qdim();
+                    let f = |v: &[u8], i: usize| {
+                        f32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap()) as f64
+                    };
+                    let (mut max_abs, mut se, mut sr, mut bad_ref, mut bad_cand) =
+                        (0f64, 0f64, 0f64, 0usize, 0usize);
+                    for i in 0..n {
+                        let (x, y) = (f(&r, i), f(&k, i));
+                        if !x.is_finite() {
+                            bad_ref += 1;
+                            continue;
+                        }
+                        if !y.is_finite() {
+                            bad_cand += 1;
+                            continue;
+                        }
+                        max_abs = max_abs.max((x - y).abs());
+                        se += (x - y) * (x - y);
+                        sr += x * x;
+                    }
+                    let rel_rms = (se / sr.max(1e-30)).sqrt();
+                    let pass = bad_cand == 0 && bad_ref == 0 && rel_rms <= 5e-3;
+                    ok &= pass;
+                    worst = worst.max(rel_rms);
+                    println!(
+                        "FA2_CHECK kv={} S={splits} B={b} ctx={ctx} capture={capture} max_abs={max_abs:.3e} rel_rms={rel_rms:.3e} nonfinite_ref={bad_ref} nonfinite_cand={bad_cand} {}",
+                        kv_name(kv),
+                        if pass { "PASS" } else { "FAIL" }
+                    );
+                    bf.free(gpu);
+                }
+            }
+        }
+    }
+    println!(
+        "FA2_CHECK_SUMMARY worst_rel_rms={worst:.3e} {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
+}
+
 fn time_ms(gpu: &mut Gpu, c: &Case, bf: &Bufs, cand: bool, iters: usize) -> f64 {
     for _ in 0..3 {
         launch(gpu, c, bf, cand);
@@ -1403,7 +1636,7 @@ fn bench_rows(gpu: &mut Gpu) {
                                 &bf.pos,
                                 nh(),
                                 NKV,
-                                HD,
+                                hd(),
                                 c.max_ctx_len(),
                                 c.b,
                                 &bf.part,
@@ -1484,6 +1717,16 @@ fn main() {
         "bench" => {
             let k = kvs(args.get(2), &gpu);
             bench(&mut gpu, &k);
+            true
+        }
+        "fa2_check" if gpu.arch == "gfx1201" => {
+            let k = kvs(args.get(2), &gpu);
+            let s = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
+            fa2_check(&mut gpu, &k, s)
+        }
+        "bench_serve" => {
+            let k = kvs(args.get(2), &gpu);
+            bench_serve(&mut gpu, &k);
             true
         }
         "sweep" if gpu.arch == "gfx1151" => {

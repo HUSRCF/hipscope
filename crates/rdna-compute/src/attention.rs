@@ -756,6 +756,19 @@ enum VerifyGqaRef {
     Rows(usize),
 }
 
+/// `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<splits>` (2..=64): opt-in native-fp8
+/// split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`. Unset,
+/// `0` or out of range keeps VerifyAttn. Read once per process.
+fn fp8_fa2_split_verify_splits() -> Option<usize> {
+    static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (2..=64).contains(n))
+    });
+    *SPLITS
+}
+
 /// Query rows one group-6 VerifyAttn workgroup serves (compile-time in the
 /// kernel; `VA_ROWS`).
 const VERIFY_GQA_ROWS: usize = 8;
@@ -820,6 +833,12 @@ fn verify_gqa_splits(
 struct VerifyWmmaKernels {
     module: &'static str,
     src: &'static str,
+    /// Entries per admitted head_dim.
+    hds: [VerifyWmmaHd; 2],
+}
+
+struct VerifyWmmaHd {
+    head_dim: usize,
     qk: &'static str,
     /// P.V walkers, indexed by [`VerifyWmmaPv`].
     pv: [&'static str; 2],
@@ -828,10 +847,23 @@ struct VerifyWmmaKernels {
 const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
-    qk: "attention_verify_wmma_qk_gfx1151",
-    pv: [
-        "attention_verify_wmma_pv1s_d4_gfx1151",
-        "attention_verify_wmma_pv2_d2_gfx1151",
+    hds: [
+        VerifyWmmaHd {
+            head_dim: 256,
+            qk: "attention_verify_wmma_qk_gfx1151",
+            pv: [
+                "attention_verify_wmma_pv1s_d4_gfx1151",
+                "attention_verify_wmma_pv2_d2_gfx1151",
+            ],
+        },
+        VerifyWmmaHd {
+            head_dim: 128,
+            qk: "attention_verify_wmma_qk_hd128_gfx1151",
+            pv: [
+                "attention_verify_wmma_pv1s_d4_hd128_gfx1151",
+                "attention_verify_wmma_pv2_d2_hd128_gfx1151",
+            ],
+        },
     ],
 };
 
@@ -9607,6 +9639,55 @@ impl Gpu {
         batch_size: usize,
         n_splits: usize,
     ) -> HipResult<()> {
+        self.fa2_gqa_split_gfx1201(
+            false, q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits,
+        )
+    }
+
+    /// Native-fp8-KV twin of [`Self::attention_q8_0_fa2_gqa_split_gfx1201`]:
+    /// the same f16 FA2 body and LSE partial/merge records, with the
+    /// cooperative fill decoding native E4M3 rows (`HIPFIRE_FA2_KMODE=8`).
+    /// Module `ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC`, entry
+    /// symbols `attention_fp8_e4m3_fa2_gqa_{partial,merge}_lse_gfx1201` and
+    /// `attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+    ) -> HipResult<()> {
+        self.fa2_gqa_split_gfx1201(
+            true, q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fa2_gqa_split_gfx1201(
+        &mut self,
+        fp8_kv: bool,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
             return Err(hip_bridge::HipError::new(
@@ -9634,11 +9715,11 @@ impl Gpu {
                 ),
             ));
         }
-        if n_splits < 1 || n_splits > 8 {
+        if n_splits < 1 || n_splits > 64 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 8, got {n_splits}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 64, got {n_splits}"
                 ),
             ));
         }
@@ -9656,20 +9737,34 @@ impl Gpu {
         }
         // No stage-b route-Q twin for the bench split path (B4 pending):
         // the split bench always runs the f16 partial/merge entries.
-        let partial = "attention_q8_0_fa2_gqa_partial_gfx1201";
-        let merge = "attention_q8_0_fa2_gqa_merge_gfx1201";
-        let src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
-        let merge_src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
+        let (partial, merge, src) = if fp8_kv {
+            (
+                "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+                "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+                kernels::ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC,
+            )
+        } else {
+            (
+                "attention_q8_0_fa2_gqa_partial_gfx1201",
+                "attention_q8_0_fa2_gqa_merge_gfx1201",
+                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
+            )
+        };
+        let merge_src = src;
         // F4b: the partial body reads f16 Q from Gpu-owned scratch
         // (pre-converted on the same stream just below); the pre-convert
         // symbol resolves out of this same Q8 module object, so a
         // standalone bench run compiles exactly one module.
-        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1201";
+        let precon: &'static str = if fp8_kv {
+            "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
+        } else {
+            "attention_fa2_q_preconvert_gfx1201"
+        };
         if !self.functions.contains_key(partial) {
             self.ensure_kernel(partial, src, partial)?;
         }
-        if !self.functions.contains_key(PRECONVERT) {
-            self.ensure_kernel(partial, src, PRECONVERT)?;
+        if !self.functions.contains_key(precon) {
+            self.ensure_kernel(partial, src, precon)?;
         }
         if !self.functions.contains_key(merge) {
             self.ensure_kernel(merge, merge_src, merge)?;
@@ -9717,7 +9812,7 @@ impl Gpu {
         // the partial body against the scratch (q16 reuses the old f32 Q
         // slot: same offset 0, same size).
         self.launch_fa2_q_preconvert_gfx11(
-            PRECONVERT,
+            precon,
             q.buf.as_ptr(),
             q16_ptr,
             std::ptr::null(),
@@ -10602,20 +10697,22 @@ impl Gpu {
         let Some(set) = verify_wmma_kernels(self) else {
             return Ok(false);
         };
-        // The reference module must be the default gfx11 hd256 WMMA body:
-        // split-Q changes its arithmetic, and the dynamic-head_dim build is
-        // not the one this twin was proven against.
+        // The reference module must be the default gfx11 fixed-head_dim WMMA
+        // body: split-Q changes its arithmetic, and the dynamic-head_dim build
+        // is not the one this twin was proven against.
         let dev = |name: &str| hipfire_config::developer_var(name).ok();
         if dev("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() == Some("1")
             || dev("HIPFIRE_FLASH_PREFILL_FIXED_HD").as_deref() == Some("0")
         {
             return Ok(false);
         }
-        // GQA 6 (27B, Flash-Next) and GQA 4 (Qwen3.5-9B); the kernel's
-        // `group` only indexes heads, so the arithmetic is the same.
+        // GQA 6 (27B, Flash-Next) and GQA 4 (Qwen3.5-9B, Qwen3-8B); the
+        // kernel's `group` only indexes heads, so the arithmetic is the same.
         let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
-        if head_dim != 256
-            || n_heads != group * n_kv_heads
+        let Some(hd) = set.hds.iter().find(|e| e.head_dim == head_dim) else {
+            return Ok(false);
+        };
+        if n_heads != group * n_kv_heads
             || !matches!(group, 4 | 6)
             || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
             || max_ctx_len == 0
@@ -10650,9 +10747,9 @@ impl Gpu {
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
-        let pv_func = set.pv[pv as usize];
+        let pv_func = hd.pv[pv as usize];
 
-        self.ensure_kernel(set.module, set.src, set.qk)?;
+        self.ensure_kernel(set.module, set.src, hd.qk)?;
         self.ensure_kernel(set.module, set.src, pv_func)?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -10682,7 +10779,7 @@ impl Gpu {
                 &scale as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                set.qk,
+                hd.qk,
                 [grid_x, qk_splits as u32, 1],
                 [qk_block, 1, 1],
                 0,
@@ -10717,7 +10814,7 @@ impl Gpu {
             ];
             self.launch_maybe_blob(
                 pv_func,
-                [grid_x, (16 / pv_chunks) as u32, 1],
+                [grid_x, (head_dim / 16 / pv_chunks) as u32, 1],
                 [pv_block, 1, 1],
                 0,
                 &mut params,
@@ -10854,6 +10951,31 @@ impl Gpu {
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_flash_fp8_e4m3_tile_batched",
         )?;
+        // Opt-in native-fp8 split-KV FA2 verifier (gfx1201 H24/KV4/D256):
+        // WMMA QK/PV over KT64 tiles split across `splits` workgroups per kv
+        // head, then a stable LSE merge. Not byte-identical to VerifyAttn
+        // (f16 Q/K/V/P operands); every unadmitted shape keeps the routes
+        // below.
+        if let Some(splits) = fp8_fa2_split_verify_splits() {
+            if self.arch == "gfx1201"
+                && n_heads == 24
+                && n_kv_heads == 4
+                && head_dim == 256
+                && tree_bias.is_none()
+                && block_cols == 0
+                && (2..=32).contains(&batch_size)
+                && !self.replay.is_recording()
+                && partials.numel()
+                    >= Self::fa2_gqa_split_gfx1201_partials_len(
+                        splits, batch_size, n_heads, head_dim,
+                    )
+            {
+                return self.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                    q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+                    batch_size, splits,
+                );
+            }
+        }
         if self.try_attention_verify_gqa(
             VerifyKv::Fp8,
             q,
@@ -11736,6 +11858,13 @@ impl Gpu {
                 "attention_flash_q8_0_tile_gqa_gemma_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC,
                 func,
+            )
+        } else if head_dim == 64 && !gemma_tiles {
+            // The reference tile covers head_dim in 128-wide halves only.
+            (
+                "attention_flash_q8_0_tile_hd64",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_HD64_SRC,
+                "attention_flash_q8_0_tile_hd64",
             )
         } else if gfx1151_tile_dpp {
             (

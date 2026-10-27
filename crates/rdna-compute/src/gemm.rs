@@ -40370,6 +40370,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.q8x_verify_active(k, batch_size) {
+            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            return self.gemm_mq4g256v2_q8x(
+                &[
+                    (a_qkv, y_qkv, qkv_m),
+                    (a_z, y_z, z_m),
+                    (a_beta, y_beta, beta_m),
+                    (a_alpha, y_alpha, alpha_m),
+                ],
+                x,
+                k,
+                batch_size,
+                false,
+            );
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
@@ -40403,6 +40418,16 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.q8x_verify_active(k, batch_size) {
+            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            return self.gemm_mq4g256v2_q8x(
+                &[(a_q, y_q, q_m), (a_k, y_k, k_m), (a_v, y_v, v_m)],
+                x,
+                k,
+                batch_size,
+                false,
+            );
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -40431,6 +40456,16 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.q8x_verify_active(k, batch_size) {
+            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            return self.gemm_mq4g256v2_q8x(
+                &[(a_gate, y_gate, gate_m), (a_up, y_up, up_m)],
+                x,
+                k,
+                batch_size,
+                false,
+            );
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -40456,6 +40491,10 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.q8x_verify_active(k, batch_size) {
+            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
+            return self.gemm_mq4g256v2_q8x(&[(a_raw, y, m)], x, k, batch_size, true);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
         }

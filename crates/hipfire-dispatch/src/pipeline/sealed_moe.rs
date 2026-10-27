@@ -16,8 +16,8 @@ use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
     ExpertTierIdentity, MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries,
-    MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability,
-    RoutedExpertWeights, MOE_BIASED_SIGMOID_MAX_K,
+    MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability, MoeScores,
+    MoeSelectionBias, RoutedExpertWeights, MOE_BIASED_SIGMOID_MAX_K,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -3625,12 +3625,21 @@ fn validate_decode(
     validate_selection_bias(params)?;
     validate_normalization(&params.normalization, params.hidden, params.hidden)?;
     validate_shared_decode(params, params.hidden)?;
-    validate_weight_ref(
-        &params.router,
-        params.n_exp,
-        params.hidden,
-        "decode router weight",
-    )?;
+    // Precomputed never lowers the router projection, so the gate is not read.
+    if !matches!(
+        params.selection_bias,
+        Some(MoeSelectionBias {
+            scores: MoeScores::Precomputed,
+            ..
+        })
+    ) {
+        validate_weight_ref(
+            &params.router,
+            params.n_exp,
+            params.hidden,
+            "decode router weight",
+        )?;
+    }
     let gate_up_rows = params
         .mi
         .checked_mul(2)
@@ -6857,6 +6866,7 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            mq2_lloyd: None,
             recipe: MoeRecipe::SoftmaxGatedShared {
                 bf16_round_trip: false,
                 shared_after_combine: false,
@@ -7063,6 +7073,7 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            mq2_lloyd: None,
             recipe: MoeRecipe::SoftmaxGatedShared {
                 bf16_round_trip: false,
                 shared_after_combine: false,
@@ -7208,7 +7219,7 @@ mod tests {
     #[test]
     #[cfg(feature = "deltanet")]
     fn biased_sigmoid_decode_admits_narrow_k_only_as_normalized_sigmoid() {
-        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeScores, MoeSelectionBias};
         let table = table(8, DType::MQ4G256);
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         let fixture = live_fixture(&table, 0x95_0000);
@@ -7239,6 +7250,7 @@ mod tests {
             params.selection_bias = which.map(|i| MoeSelectionBias {
                 bias: biases[i],
                 route_scale: 1.0,
+                scores: MoeScores::Sigmoid,
             });
             params
         };
@@ -7278,6 +7290,7 @@ mod tests {
         softmax.selection_bias = Some(MoeSelectionBias {
             bias: &bias,
             route_scale: 1.0,
+            scores: MoeScores::Sigmoid,
         });
         let error = seal_decode(experts, &ctx, softmax)
             .err()
@@ -7290,8 +7303,10 @@ mod tests {
 
     #[test]
     #[cfg(feature = "deltanet")]
-    fn biased_sigmoid_decode_admits_lloyd_experts_only_at_top8() {
-        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+    fn biased_sigmoid_decode_admits_declared_lloyd_experts_at_any_width() {
+        use crate::families::moe::{
+            MoeEpMode, MoeMq2Lloyd, MoeRecipe, MoeScores, MoeSelectionBias,
+        };
         let table = table(8, DType::MQ2G256Lloyd);
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         let fixture = live_fixture(&table, 0x99_0000);
@@ -7300,7 +7315,7 @@ mod tests {
         let ctx = DispatchCtx::for_test("gfx1151");
         let scratch = decode_scratch(0x9a_0000);
         let bias = f32_elems(0x9b_0000, 8);
-        let params = |k| {
+        let params = |k, declared: bool| {
             let mut params = ep_decode_params(
                 &scratch,
                 &fixture.routed,
@@ -7323,16 +7338,34 @@ mod tests {
             params.selection_bias = Some(MoeSelectionBias {
                 bias: &bias,
                 route_scale: 1.0,
+                scores: MoeScores::Sigmoid,
+            });
+            params.mq2_lloyd = declared.then_some(MoeMq2Lloyd {
+                swiglu_limit: 7.0,
+                uses_atomic_down: false,
+                native: None,
+                nonowned_gate_up_dummy: None,
             });
             params
         };
-        let call = seal_decode(experts, &ctx, params(8)).unwrap();
-        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
-        // The Lloyd routed kernels read a fixed top-8 width.
-        let error = seal_decode(experts, &ctx, params(4))
+        // A declaration admits any width; undeclared Lloyd experts keep top-8.
+        for k in [6, 8] {
+            let call = seal_decode(experts, &ctx, params(k, true)).unwrap();
+            assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+        }
+        let error = seal_decode(experts, &ctx, params(4, false))
             .err()
-            .expect("biased Lloyd k=4 must fail");
+            .expect("undeclared biased Lloyd k=4 must fail");
         assert!(format!("{error:?}").contains("runtime-width"), "{error:?}");
+        let mut mixed = params(6, true);
+        mixed.dtypes.routed_down = DType::MQ4G256;
+        let error = seal_decode(experts, &ctx, mixed)
+            .err()
+            .expect("declared Lloyd with a non-Lloyd down must fail");
+        assert!(
+            format!("{error:?}").contains("mq2-lloyd-declaration"),
+            "{error:?}"
+        );
     }
     #[cfg(not(feature = "deltanet"))]
     #[test]

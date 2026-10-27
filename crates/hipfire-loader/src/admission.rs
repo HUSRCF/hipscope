@@ -738,6 +738,10 @@ pub struct Qwen4MemoryAdmission {
     /// context; this is 0 when only the context itself fits.
     pub resident_ple: u64,
     pub headroom: u64,
+    /// Additional device bytes left for a vision tower and its largest image.
+    /// The tower is uploaded after the text rank is admitted, so this includes
+    /// its resident weights once, as well as image activation scratch.
+    pub vision_reserve: u64,
     /// Largest context whose growth fits with no PLE page cache resident
     /// (at most the assembled capacity).
     pub card_cap: usize,
@@ -759,6 +763,7 @@ impl Qwen4MemoryAdmission {
         self.growth()
             .saturating_add(self.resident_ple)
             .saturating_add(self.headroom)
+            .saturating_add(self.vision_reserve)
     }
 
     /// Whether the context took part of the requested PLE page cache budget
@@ -789,7 +794,34 @@ pub fn qwen4_memory_admission(
     headroom: u64,
     growth: impl Fn(usize) -> (u64, u64),
 ) -> Result<Qwen4MemoryAdmission, String> {
-    let fixed = mtp_request.saturating_add(headroom);
+    qwen4_memory_admission_with_reserve(
+        capacity,
+        requested,
+        free,
+        mtp_request,
+        resident_ple,
+        headroom,
+        0,
+        growth,
+    )
+}
+
+/// The same admission with an explicit per-load vision reserve. A zero
+/// reserve follows the text-only arithmetic and diagnostics unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_memory_admission_with_reserve(
+    capacity: usize,
+    requested: Option<usize>,
+    free: u64,
+    mtp_request: u64,
+    resident_ple: u64,
+    headroom: u64,
+    vision_reserve: u64,
+    growth: impl Fn(usize) -> (u64, u64),
+) -> Result<Qwen4MemoryAdmission, String> {
+    let fixed = mtp_request
+        .saturating_add(headroom)
+        .saturating_add(vision_reserve);
     let fits = |tokens: usize| {
         let (context, gather) = growth(tokens);
         context.saturating_add(gather).saturating_add(fixed) <= free
@@ -823,13 +855,19 @@ pub fn qwen4_memory_admission(
         ple_budget: resident_ple,
         resident_ple: resident_ple.min(left_for_ple),
         headroom,
+        vision_reserve,
         card_cap,
         max_seq,
     };
     let detail = || {
+        let vision = if vision_reserve == 0 {
+            String::new()
+        } else {
+            format!(" + {vision_reserve} bytes vision reserve")
+        };
         format!(
-            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom), and {free} bytes is free after load",
-            admission.growth().saturating_add(headroom),
+            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom{vision}), and {free} bytes is free after load",
+            admission.growth().saturating_add(headroom).saturating_add(vision_reserve),
             admission.growth(),
         )
     };
@@ -1039,7 +1077,7 @@ pub struct SourceAdmission {
     /// arch crate opens at load. `None` = trunk-only (or explicit opt-out via
     /// empty string).
     pub vision_path: Option<std::path::PathBuf>,
-    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// The resolved `vision.mode` ladder value (`auto`/`resident`/`on`/`off`). The
     /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
     /// alone cannot distinguish "off" (never probe a sibling) from "auto with
     /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
@@ -1311,19 +1349,25 @@ fn resolve_vision_sidecar(
     Ok(Some(std::path::PathBuf::from(path)))
 }
 
-/// Flash-Next's sidecar is optional in auto mode and mandatory in on mode.
-/// Off must not even open a supplied path (including a stale one).
+/// Match beta's four modes. Auto/resident allow a missing tower, on requires
+/// one, and off does not open a path. Flash Next maps every loaded tower to
+/// resident storage; the shared streamed route remains available to other arches.
 fn resolve_qwen4_vision_mode(
     mode: &str,
     path: Option<&str>,
     is_dir: bool,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    let mode = if mode.is_empty() {
+        hipfire_config::vision_mode_default()
+    } else {
+        mode
+    };
     match mode {
         "off" => Ok(None),
-        "auto" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir),
+        "auto" | "resident" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir),
         "on" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir)?.map(Some).ok_or_else(||
             "qwen4: vision_mode=on requires the Flash-Next vision sidecar; provide --vision <qwen3.8-flash-next-vision.hfq>".into()),
-        _ => Err(format!("qwen4: invalid vision_mode '{mode}'; expected off, auto or on")),
+        _ => Err(format!("qwen4: invalid vision_mode '{mode}'; expected auto, resident, on or off")),
     }
 }
 
@@ -4582,7 +4626,7 @@ mod tests {
         }
 
         #[test]
-        fn flash_next_modes_preserve_text_only_and_require_explicit_vision() {
+        fn flash_next_modes_preserve_optional_tower_and_require_on() {
             let missing = "/does-not-exist/flash-next-vision.hfq";
             assert!(
                 super::super::resolve_qwen4_vision_mode("off", Some(missing), false)
@@ -4590,6 +4634,14 @@ mod tests {
                     .is_none()
             );
             assert!(super::super::resolve_qwen4_vision_mode("auto", None, false)
+                .unwrap()
+                .is_none());
+            assert!(
+                super::super::resolve_qwen4_vision_mode("resident", None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("", None, false)
                 .unwrap()
                 .is_none());
             assert!(super::super::resolve_qwen4_vision_mode("on", None, false)

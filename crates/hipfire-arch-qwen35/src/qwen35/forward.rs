@@ -636,6 +636,7 @@ fn moe_params_for_decode<'a>(
     });
     hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
+        mq2_lloyd: None,
         recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
             bf16_round_trip: false,
             shared_after_combine: false,
@@ -2515,6 +2516,41 @@ fn forward_scratch_layers(
     execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))
 }
 
+/// One dense layer's decode steps on `s.x` at `pos` (position already in
+/// `s.pos_buf`): the batched prefill's per-row fallback for full-attention
+/// layers the batched attention does not admit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_scratch_dense_layer(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    pos: usize,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let binding = super::program::DecodeBinding {
+        dims: super::program::hybrid_dims(config),
+        s,
+        kv_cache,
+        dn_state,
+        position: pos,
+        mrope_section: None,
+    };
+    let layer = &weights.layers[layer_idx];
+    let tap_fn = |gpu: &mut Gpu| {
+        triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
+    };
+    let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
+    let mixer = binding.mixer(layer, layer_idx, 0, false, tap, MixerOutput::Residual);
+    let ffn = super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual)
+        .expect("dense layer");
+    execute_steps(gpu, &ctx, &[mixer, Step::GatedMlp(ffn)])
+        .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 // ── Dispatch helpers ─────────────────────────────────────────────────────
 
 /// Unified QKVZA (4-way) projection for DeltaNet layers through the shared
@@ -3534,32 +3570,6 @@ fn triattn_tap(
         }
     }
     Ok(())
-}
-
-/// KV cache write + attention of one decode row through the shared hybrid
-/// attention stage; returns whether the fused epilogue applied the output gate
-/// and `wo`'s input rotation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn kv_cache_attention_dispatch(
-    ctx: &DispatchCtx,
-    gpu: &mut Gpu,
-    kv_cache: &mut llama::KvCache,
-    s: &Qwen35Scratch,
-    config: &Qwen35Config,
-    wo: &WeightTensor,
-    layer_idx: usize,
-    pos: usize,
-) -> HipResult<bool> {
-    hybrid::kv_attention(
-        gpu,
-        ctx,
-        &super::program::hybrid_dims(config),
-        &super::program::attention_kv(kv_cache, s, layer_idx),
-        &super::program::attention_row(s, pos),
-        &wo.dispatch_ref(),
-        false,
-    )
-    .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 fn deltanet_sigmoid_alpha_gate(

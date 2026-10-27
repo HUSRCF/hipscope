@@ -77,6 +77,29 @@ struct EmulationScratch {
 fn fail(e: impl std::fmt::Display) -> Qwen4GpuForwardError {
     invalid(format!("npu-trunk: {e}"))
 }
+/// Compare the live `hipEventRecord` implementations before passing serving
+/// streams to the relay (#926). Both runtime owners stay alive for this check.
+/// Paths are only diagnostic: renamed/replaced libraries and failed `dladdr`
+/// lookups must not let distinct implementations pass as one runtime.
+pub(super) fn two_hip_runtime_reason(
+    relay_address: usize,
+    serving_address: usize,
+    relay: Option<&str>,
+    serving: Option<&str>,
+) -> Option<String> {
+    if relay_address != 0 && relay_address == serving_address {
+        return None;
+    }
+    let relay = relay.unwrap_or("<unknown library>");
+    let serving = serving.unwrap_or("<unknown library>");
+    Some(format!(
+        "two HIP runtimes: the NPU relay loaded {relay} but the serving GPU runtime \
+         runs {serving}; hipEventRecord identity differs \
+         (relay={relay_address:#x}, serving={serving_address:#x}); \
+         point HIPFIRE_ROCM_PATH (and LD_LIBRARY_PATH) at one install \
+         so a single runtime serves both"
+    ))
+}
 fn stream(gpu: &Gpu) -> *mut c_void {
     gpu.active_stream
         .as_ref()
@@ -806,21 +829,35 @@ impl NpuForward {
                     Ok(n) if n > 0 => Some(n),
                     _ => { eprintln!("npu-trunk: HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN={v:?} ignored (expects a chain number >= 1)"); None }
                 });
-                Some(
-                    NpuTrunkRuntime::open_with_builder(
-                        programs,
-                        resident,
-                        trunk::TRUNK_BANKS,
-                        trunk::TRUNK_ROWS_MAX,
-                        &pci,
-                        OpenOptions {
-                            fault_chain,
-                            ..OpenOptions::default()
-                        },
-                        Some(builder),
-                    )
-                    .map_err(fail)?,
+                let opened = NpuTrunkRuntime::open_with_builder(
+                    programs,
+                    resident,
+                    trunk::TRUNK_BANKS,
+                    trunk::TRUNK_ROWS_MAX,
+                    &pci,
+                    OpenOptions {
+                        fault_chain,
+                        ..OpenOptions::default()
+                    },
+                    Some(builder),
                 )
+                .map_err(fail)?;
+                // Fail closed on the residual #926 shape: `open_hip` reuses an
+                // already-mapped runtime by SONAME, so a second runtime only
+                // enters through a pre-existing mapping of another install. Two
+                // coexisting runtimes do not order their events against each
+                // other, so paired prefill would read stale panels; refuse
+                // instead. Under `auto` the admission barrier renders this as one
+                // WARN line and a GPU-only load; under `on` it fails the load.
+                if let Some(reason) = two_hip_runtime_reason(
+                    opened.hip_event_record_address(),
+                    gpu.hip.event_record_address(),
+                    opened.hip_mapped_library().as_deref(),
+                    gpu.hip.mapped_hip_library().as_deref(),
+                ) {
+                    return Err(fail(reason));
+                }
+                Some(opened)
             } else {
                 None
             };
@@ -2753,6 +2790,48 @@ mod tests {
     use super::*;
     use crate::npu_trunk::load_calibration;
     use hipfire_runtime::coproc::Calibration;
+    #[test]
+    fn two_hip_runtime_guard_uses_live_symbol_identity() {
+        let path = "/opt/rocm/lib/libamdhip64.so";
+        // One live implementation passes even if a path lookup failed or two
+        // diagnostic paths name different aliases. No filesystem lookup is needed.
+        for (relay, serving) in [
+            (None, None),
+            (Some(path), None),
+            (None, Some(path)),
+            (Some(path), Some("/opt/rocm/lib/libamdhip64.so.7")),
+        ] {
+            assert_eq!(two_hip_runtime_reason(0x1000, 0x1000, relay, serving), None);
+        }
+        // Distinct mappings refuse even when their recorded paths are identical
+        // (a library was replaced) or when either diagnostic lookup failed.
+        for (relay, serving) in [
+            (Some(path), Some(path)),
+            (Some(path), Some("/tmp/other/libamdhip64.so")),
+            (None, Some(path)),
+            (Some(path), None),
+            (None, None),
+        ] {
+            let reason = two_hip_runtime_reason(0x1000, 0x2000, relay, serving)
+                .expect("distinct implementations must refuse");
+            assert!(reason.starts_with("two HIP runtimes:"), "{reason}");
+            assert!(
+                reason.contains(relay.unwrap_or("<unknown library>")),
+                "{reason}"
+            );
+            assert!(
+                reason.contains(serving.unwrap_or("<unknown library>")),
+                "{reason}"
+            );
+            assert!(reason.contains("HIPFIRE_ROCM_PATH"), "{reason}");
+            assert!(
+                reason.contains("hipEventRecord identity differs"),
+                "{reason}"
+            );
+        }
+        assert!(two_hip_runtime_reason(0, 0, None, None).is_some());
+        assert!(two_hip_runtime_reason(0, 0x1000, None, None).is_some());
+    }
     #[test]
     fn family_override_parser_selects_groups_and_rejects_unknowns() {
         assert_eq!(parse_family_override("all").unwrap(), FamilyMask::ALL);

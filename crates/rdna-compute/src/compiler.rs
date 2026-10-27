@@ -983,6 +983,10 @@ impl KernelCompiler {
         source: &str,
         symbol: &str,
     ) -> Result<Option<PathBuf>, String> {
+        #[cfg(windows)]
+        let local_toolchain = "";
+        #[cfg(not(windows))]
+        let local_toolchain = self.toolchain_id.as_str();
         Self::check_indexed_object(
             dir,
             &self.arch,
@@ -991,7 +995,10 @@ impl KernelCompiler {
             &[symbol],
             &self.extra_flags,
             &self.packaging_hash(module, source),
-            &self.toolchain_id,
+            // Windows: installed pack objects come from the Linux release
+            // build and are loaded by the HIP runtime, so a differing local
+            // hipcc identity must not reject them ("" skips the comparison).
+            local_toolchain,
         )
         .map(|found| found.map(|(object, _)| object))
     }

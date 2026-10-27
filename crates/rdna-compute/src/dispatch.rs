@@ -2797,6 +2797,21 @@ impl Gpu {
             hip_major,
             hip_minor
         );
+        // Windows only: System32 can shadow an SDK's amdhip64/comgr, so log which
+        // DLL actually loaded alongside the raw runtime/driver versions.
+        #[cfg(windows)]
+        {
+            let raw = |v: hip_bridge::HipResult<i32>| {
+                v.map(|n| n.to_string())
+                    .unwrap_or_else(|_| "unknown".into())
+            };
+            eprintln!(
+                "HIP runtime: {} (runtime {}, driver {})",
+                hip.mapped_hip_library().as_deref().unwrap_or("unknown"),
+                raw(hip.runtime_version_raw()),
+                raw(hip.driver_version()),
+            );
+        }
 
         let flags = Arc::new(FeatureFlags::from_active_config(&arch));
         crate::scratch::enable_qsa_code_check(&flags);
@@ -2908,6 +2923,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,

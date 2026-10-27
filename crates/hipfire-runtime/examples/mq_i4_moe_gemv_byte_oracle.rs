@@ -2461,6 +2461,9 @@ fn run_case(
         let r = old_kernel_parity(gpu, case, &gate.expected, &down.expected)?;
         t.old_kernel_cases += 1;
         t.old_kernel_mismatches += r["mismatch_count"].as_u64().unwrap_or(1);
+        if r["mismatch_count"].as_u64() != Some(0) {
+            row["pass"] = json!(false);
+        }
         row["old_kernel_parity"] = r;
     }
     let mut samples = gate.timing;

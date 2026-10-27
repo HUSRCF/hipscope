@@ -4,7 +4,7 @@
 
 // VerifyAttn (gfx1151): the byte-identical parallel twin of
 // `attention_q8_0_flash_prefill_wmma` (legacy single-slot, module
-// `attention_q8_0_flash_prefill_wmma_gfx11_hd256`), the kernel every gfx1151
+// `attention_q8_0_flash_prefill_wmma_gfx11_hd{256,128}`), the kernel every gfx1151
 // DFlash / MTP verify (and every prefill tail below 64 rows) runs today.
 //
 // The reference runs one wave per (q head, 16-row query tile) that walks the
@@ -55,7 +55,8 @@ typedef _Float16 __attribute__((ext_vector_type(8))) vw_half8;
 typedef float __attribute__((ext_vector_type(8))) vw_float8;
 typedef float __attribute__((ext_vector_type(4))) vw_float4;
 
-#define VW_HD 256
+// VW_HD (head_dim, 128 or 256) is the template parameter of vw_qk / vw_pv;
+// the macros below expand against it.
 #define VW_GROUP_MAX 6                 // q heads per kv head (kernarg `group`)
 #define VW_NT 16                       // keys per tile (reference N_TILE)
 #define VW_MT 16                       // rows per fragment (reference M_TILE)
@@ -63,10 +64,11 @@ typedef float __attribute__((ext_vector_type(4))) vw_float4;
 #define VW_NFMAX VW_GROUP_MAX          // fragments per (kv head, row group)
 #define VW_THREADS (VW_NFMAX * 32)
 #define VW_BLK 34
-#define VW_SEG (VW_HD / 32 * VW_BLK)   // bytes of one (key, kv head): 272
+#define VW_SEG (VW_HD / 32 * VW_BLK)   // bytes of one (key, kv head): 272 at hd256
 #define VW_KS (VW_HD + 8)              // LDS K row stride in halfs (bank spread)
 #define VW_VS 24                       // LDS V^T row stride in halfs (bank spread)
-#define VW_KUNITS (VW_NT * VW_HD / 8)  // 8-dim K chunks per tile: 512
+#define VW_KCH (VW_HD / 8)             // 8-dim K chunks per key
+#define VW_KUNITS (VW_NT * VW_KCH)     // 8-dim K chunks per tile: 512 at hd256
 #define VW_QK_MIN_WAVES 4              // S launch block is >= 4 waves
 #define VW_KU_MAX (VW_KUNITS / (VW_QK_MIN_WAVES * 32))  // K chunks per thread
 #define VW_RSRC 0x31004000u
@@ -142,8 +144,8 @@ __device__ __forceinline__ size_t vw_s_base(int rg, int kv, int n_kv_heads, int 
 // Grid [n_kv * n_rg, splits], block 32 * max(NF(row group 0), 4). Workgroup
 // x = kv * n_rg + rg; workgroup y scores tiles y, y + splits, ... below
 // ceil(seq_len / 16) (clamped to t_stride, the scratch stride).
-extern "C" __launch_bounds__(VW_THREADS)
-__global__ void attention_verify_wmma_qk_gfx1151(
+template <int VW_HD>
+__device__ __forceinline__ void vw_qk(
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
     const int* __restrict__ positions, _Float16* __restrict__ s_scr, int n_rows, int n_kv_heads,
     int group, int t_stride, int packed, float scale_attn) {
@@ -211,7 +213,7 @@ __global__ void attention_verify_wmma_qk_gfx1151(
     }
     _Float16* s_out = s_scr + vw_s_base(rg, kv, n_kv_heads, active ? wave : 0, t_stride);
 
-    // K staging: unit u = key (u >> 5), 8-dim chunk (u & 31). Loads are
+    // K staging: unit u = key (u / VW_KCH), 8-dim chunk (u % VW_KCH). Loads are
     // unconditional (units past the tile repeat the last one, never staged).
     unsigned int k_lo[VW_KU_MAX], k_hi[VW_KU_MAX];
     unsigned short k_sc[VW_KU_MAX];
@@ -219,8 +221,8 @@ __global__ void attention_verify_wmma_qk_gfx1151(
 #pragma unroll
         for (int i = 0; i < VW_KU_MAX; ++i) {
             const int u = min(tid + i * nthreads, VW_KUNITS - 1);
-            const int kr = u >> 5;
-            const int c = u & 31;
+            const int kr = u / VW_KCH;
+            const int c = u % VW_KCH;
             const unsigned blk = (unsigned)(t * VW_NT + kr) * row_stride + head_off + (unsigned)(c >> 2) * VW_BLK;
             const auto w = __builtin_amdgcn_raw_buffer_load_b64(k_rsrc, blk + 2u + 8u * (unsigned)(c & 3), 0, 0);
             k_lo[i] = w[0];
@@ -233,8 +235,8 @@ __global__ void attention_verify_wmma_qk_gfx1151(
         for (int i = 0; i < VW_KU_MAX; ++i) {
             const int u = tid + i * nthreads;
             if (u < VW_KUNITS) {
-                const int kr = u >> 5;
-                const int c = u & 31;
+                const int kr = u / VW_KCH;
+                const int c = u % VW_KCH;
                 *(vw_half8*)&k_lds[buf + kr * VW_KS + c * 8] = vw_dequant8(k_lo[i], k_hi[i], k_sc[i]);
             }
         }
@@ -274,6 +276,16 @@ __global__ void attention_verify_wmma_qk_gfx1151(
         if (tn < n_tiles) k_stage(boff);
     }
 }
+
+#define VW_QK_ENTRY(HD, SFX)                                                                          \
+    extern "C" __launch_bounds__(VW_THREADS) __global__ void attention_verify_wmma_qk##SFX##_gfx1151( \
+        const float* __restrict__ q, const unsigned char* __restrict__ k_cache,                      \
+        const int* __restrict__ positions, _Float16* __restrict__ s_scr, int n_rows, int n_kv_heads,  \
+        int group, int t_stride, int packed, float scale_attn) {                                     \
+        vw_qk<HD>(q, k_cache, positions, s_scr, n_rows, n_kv_heads, group, t_stride, packed, scale_attn); \
+    }
+VW_QK_ENTRY(256, )
+VW_QK_ENTRY(128, _hd128)
 
 // Value of `v` in lane (lane ^ 16), the other 16-lane row.
 __device__ __forceinline__ unsigned vw_x16u(unsigned v) {
@@ -378,13 +390,13 @@ __device__ __forceinline__ void vw_step(const vw_svec<SPLIT>& sv, bool my_ok, in
     }
 }
 
-// Grid [n_kv * n_rg, 16 / DCW], block 32 * max(NF(row group 0), DCW) (so
+// Grid [n_kv * n_rg, VW_DC / DCW], block 32 * max(NF(row group 0), DCW) (so
 // each thread stages at most one 8-dim V chunk). Workgroup x = kv * n_rg +
 // rg; workgroup y owns dim chunks [DCW*y, DCW*y + DCW). The walk is serial
 // over tiles, so every thread keeps PD tiles of S and V loads in flight
 // (a register ring, loop unrolled by PD); loads are unconditional with
 // clamped addresses so the waits stay partial.
-template <int DCW, bool SPLIT, int PD>
+template <int VW_HD, int DCW, bool SPLIT, int PD>
 __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
                                       const int* __restrict__ positions,
                                       const _Float16* __restrict__ s_scr, float* __restrict__ out,
@@ -499,15 +511,17 @@ __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
     }
 }
 
-#define VW_PV_ENTRY(DCW, SPLIT, SFX, PD)                                                              \
-    extern "C" __launch_bounds__(VW_THREADS) __global__ void attention_verify_wmma_pv##DCW##SFX##_d##PD##_gfx1151( \
+#define VW_PV_ENTRY(HD, DCW, SPLIT, SFX, PD, HSFX)                                                    \
+    extern "C" __launch_bounds__(VW_THREADS) __global__ void attention_verify_wmma_pv##DCW##SFX##_d##PD##HSFX##_gfx1151( \
         const unsigned char* __restrict__ v_cache, const int* __restrict__ positions,                 \
         const _Float16* __restrict__ s_scr, float* __restrict__ out, int n_rows, int n_kv_heads,      \
         int group, int t_stride, int packed) {                                                        \
-        vw_pv<DCW, SPLIT, PD>(v_cache, positions, s_scr, out, n_rows, n_kv_heads, group, t_stride, packed); \
+        vw_pv<HD, DCW, SPLIT, PD>(v_cache, positions, s_scr, out, n_rows, n_kv_heads, group, t_stride, packed); \
     }
 // The two P.V walkers kept from the Halo geometry sweep (24 variants of
 // DCW 1/2/4 x SPLIT x PD 1/2/4/8): pv1s_d4 wins at B 1..4 (1-3 fragments),
 // pv2_d2 at B 16 (6 fragments; GQA 6). The host picks by fragment count.
-VW_PV_ENTRY(1, true, s, 4)
-VW_PV_ENTRY(2, false, , 2)
+VW_PV_ENTRY(256, 1, true, s, 4, )
+VW_PV_ENTRY(256, 2, false, , 2, )
+VW_PV_ENTRY(128, 1, true, s, 4, _hd128)
+VW_PV_ENTRY(128, 2, false, , 2, _hd128)

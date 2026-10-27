@@ -95,14 +95,13 @@ impl SpecTarget for LlamaBundle {
         // the captured hidden are AR's bytes. The batched and per-token forwards
         // are not bitwise equal; on a near-tie logit a mismatched prompt KV flips
         // the verifier's argmax off AR's greedy pick (bielik/code diverged at
-        // token 2: pos 261 logit gap 15.93 vs 15.88). Qwen3 on gfx11/gfx1201
-        // with Q8 KV: one batched `forward_prefill_batch` call (same chunking as
+        // token 2: pos 261 logit gap 15.93 vs 15.88). gfx11/gfx1201 with Q8
+        // KV: one batched `forward_prefill_batch` call (same chunking as
         // AR's). Otherwise: per token through the AR decode forward, which appends
         // one position's `num_extract × dim` residual per call (extract order).
         // The spec loop never evicts, so `has_eviction` is false.
-        let batched = llama::llama_qwen3_batched_prefill_eligible(
+        let batched = llama::llama_batched_prefill_eligible(
             &gpu.arch,
-            self.config.arch,
             hipfire_runtime::config::get().prefill_batched,
             self.kv.quant_q8,
             false,

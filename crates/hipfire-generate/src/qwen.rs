@@ -273,7 +273,9 @@ pub fn generate_ep(
     let serve_target = match m.ep.as_ref().map(|ep| &ep.inner) {
         Some(EpArch::Minimax { .. }) => EpServeTarget::Minimax,
         Some(EpArch::Qwen35 { .. }) => EpServeTarget::Qwen35Moe,
-        Some(EpArch::Qwen35DenseTp { .. }) => EpServeTarget::Qwen35DenseTp,
+        Some(EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }) => {
+            EpServeTarget::Qwen35DenseTp
+        }
         Some(EpArch::Ds4 { .. }) => EpServeTarget::Deepseek4,
         None => ep_serve_target(m.arch_id),
     };
@@ -375,11 +377,87 @@ pub fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str) {
 /// than the chunk the TP prefill re-chunks to internally).
 pub fn dense_tp_prefill_chunk_len(m: &LoadedModel) -> Result<usize, String> {
     match m.ep.as_ref() {
+        // The mesh route's prefill epochs are bounded by the rank batch scratch.
+        Some(EpState {
+            inner: EpArch::Qwen35MeshTp { ranks, .. },
+            ..
+        }) => ranks
+            .first()
+            .map(|rank| rank.max_batch())
+            .ok_or_else(|| "dense TP mesh serve without ranks".to_string()),
         Some(EpState { gpus, .. }) => {
             Ok(qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1))
         }
         None => Err("dense TP serve without EP state".to_string()),
     }
+}
+
+/// Rank 0's logits tensor of a dense-TP load, either route.
+fn dense_tp_rank0_logits(inner: &EpArch) -> Option<&rdna_compute::GpuTensor> {
+    match inner {
+        EpArch::Qwen35DenseTp { scratches, .. } => scratches.first().map(|s| &s.logits),
+        EpArch::Qwen35MeshTp { ranks, .. } => ranks.first().map(|rank| rank.logits()),
+        _ => None,
+    }
+}
+
+/// Drain every undrained mesh epoch of `pending` (oldest first) with ONE
+/// `Gpus::drain_mesh_epochs`; leaves `pending` empty whatever the outcome.
+fn dense_tp_mesh_drain(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    pending: &mut Vec<hipfire_runtime::multi_gpu::executor::MeshTicket>,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    gpus.drain_mesh_epochs(std::mem::take(pending))
+}
+
+/// [`dense_tp_mesh_drain`] for whichever route `inner` is: a no-op off the
+/// mesh route.
+pub(crate) fn dense_tp_mesh_drain_inner(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    inner: &mut EpArch,
+) -> Result<(), String> {
+    match inner {
+        EpArch::Qwen35MeshTp { pending, .. } => dense_tp_mesh_drain(gpus, pending),
+        _ => Ok(()),
+    }
+}
+
+/// One epoch of the mesh route: `tokens` as `route` at `start` on every rank.
+/// `next_op` is the load's strictly increasing op id. The epoch runs through
+/// `Qwen35TpProgram::run_epoch`, which only ENQUEUES it: the ticket of a
+/// submitted epoch is pushed on `pending` (a replayed whole-token graph has
+/// none) and drained at the serve loop's rank-0 logits read, at reset and
+/// abort, at unload and by the bench sync, like the hand route's
+/// enqueue-then-download.
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_mesh_epoch(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    ranks: &mut [qwen35::mesh_tp::Qwen35TpRank],
+    plan: &hipfire_runtime::mesh_split::SplitPlan,
+    program: &qwen35::mesh_tp::Qwen35TpProgram,
+    next_op: &mut u64,
+    pending: &mut Vec<hipfire_runtime::multi_gpu::executor::MeshTicket>,
+    route: hipfire_runtime::multi_gpu::executor::MeshRoute,
+    tokens: &[u32],
+    start: usize,
+) -> Result<(), String> {
+    *next_op += 1;
+    let epoch = hipfire_runtime::multi_gpu::executor::ForwardEpoch {
+        mesh_epoch: gpus.mesh.epoch(),
+        load_id: 1,
+        request_id: 1,
+        op_id: *next_op,
+        route,
+        start_position: start,
+        actual_rows: tokens.len(),
+        route_rows: tokens.len(),
+        policy_id: 1,
+    };
+    pending.extend(program.run_epoch(gpus, ranks, plan, &epoch, tokens)?);
+    Ok(())
 }
 
 /// One dense-TP prefill chunk written at absolute position `start_pos`.
@@ -391,21 +469,39 @@ pub fn dense_tp_prefill_chunk(
     let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
         return Err("dense TP prefill without EP state".to_string());
     };
-    let EpArch::Qwen35DenseTp {
-        shard,
-        configs,
-        weights,
-        kv_caches,
-        dn_states,
-        scratches,
-    } = inner
-    else {
-        return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
-    };
-    qwen35::forward_prefill_dense_tp(
-        gpus, shard, weights, configs, chunk, start_pos, kv_caches, dn_states, scratches,
-    )
-    .map_err(|e| format!("dense TP prefill: {e:?}"))
+    match inner {
+        EpArch::Qwen35DenseTp {
+            shard,
+            configs,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+        } => qwen35::forward_prefill_dense_tp(
+            gpus, shard, weights, configs, chunk, start_pos, kv_caches, dn_states, scratches,
+        )
+        .map_err(|e| format!("dense TP prefill: {e:?}")),
+        EpArch::Qwen35MeshTp {
+            ranks,
+            plan,
+            program,
+            next_op,
+            pending,
+            ..
+        } => dense_tp_mesh_epoch(
+            gpus,
+            ranks,
+            plan,
+            program,
+            next_op,
+            pending,
+            hipfire_runtime::multi_gpu::executor::MeshRoute::Prefill,
+            chunk,
+            start_pos,
+        )
+        .map_err(|e| format!("dense TP mesh prefill: {e}")),
+        _ => Err("EP arch mismatch (expected dense Qwen TP)".to_string()),
+    }
 }
 
 /// One dense-TP single-token decode forward at KV position `pos`.
@@ -413,21 +509,39 @@ pub fn dense_tp_decode_forward(m: &mut LoadedModel, token: u32, pos: usize) -> R
     let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
         return Err("dense TP decode without EP state".to_string());
     };
-    let EpArch::Qwen35DenseTp {
-        shard,
-        configs,
-        weights,
-        kv_caches,
-        dn_states,
-        scratches,
-    } = inner
-    else {
-        return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
-    };
-    qwen35::forward_scratch_dense_tp(
-        gpus, shard, weights, configs, token, pos, kv_caches, dn_states, scratches,
-    )
-    .map_err(|e| format!("dense TP decode: {e:?}"))
+    match inner {
+        EpArch::Qwen35DenseTp {
+            shard,
+            configs,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+        } => qwen35::forward_scratch_dense_tp(
+            gpus, shard, weights, configs, token, pos, kv_caches, dn_states, scratches,
+        )
+        .map_err(|e| format!("dense TP decode: {e:?}")),
+        EpArch::Qwen35MeshTp {
+            ranks,
+            plan,
+            program,
+            next_op,
+            pending,
+            ..
+        } => dense_tp_mesh_epoch(
+            gpus,
+            ranks,
+            plan,
+            program,
+            next_op,
+            pending,
+            hipfire_runtime::multi_gpu::executor::MeshRoute::Decode,
+            std::slice::from_ref(&token),
+            pos,
+        )
+        .map_err(|e| format!("dense TP mesh decode: {e}")),
+        _ => Err("EP arch mismatch (expected dense Qwen TP)".to_string()),
+    }
 }
 
 /// One batched Qwen3.5-MoE EP prefill window starting at `off` into
@@ -649,19 +763,38 @@ pub fn ep_serve_qwen35_dense_tp(
     let reset_error = {
         let mut error = None;
         if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
-            if let EpArch::Qwen35DenseTp { dn_states, .. } = inner {
-                for (rank, state) in dn_states.iter_mut().enumerate() {
-                    let gpu = &mut gpus.devices[rank];
-                    if let Err(e) = gpu.bind_thread() {
-                        error = Some(format!("dense TP bind_thread rank {rank}: {e:?}"));
-                        break;
+            match inner {
+                EpArch::Qwen35DenseTp { dn_states, .. } => {
+                    for (rank, state) in dn_states.iter_mut().enumerate() {
+                        let gpu = &mut gpus.devices[rank];
+                        if let Err(e) = gpu.bind_thread() {
+                            error = Some(format!("dense TP bind_thread rank {rank}: {e:?}"));
+                            break;
+                        }
+                        if let Err(e) = state.reset(gpu) {
+                            error = Some(format!("dense TP state reset rank {rank}: {e:?}"));
+                            break;
+                        }
+                        gpu.invalidate_graph_state();
                     }
-                    if let Err(e) = state.reset(gpu) {
-                        error = Some(format!("dense TP state reset rank {rank}: {e:?}"));
-                        break;
-                    }
-                    gpu.invalidate_graph_state();
                 }
+                EpArch::Qwen35MeshTp { ranks, pending, .. } => {
+                    if let Err(e) = dense_tp_mesh_drain(gpus, pending) {
+                        error = Some(format!("dense TP mesh pending drain: {e}"));
+                    }
+                    for (rank, state) in ranks.iter_mut().enumerate() {
+                        let Some(gpu) = gpus.devices.get_mut(rank) else {
+                            error = Some(format!("dense TP mesh rank {rank} has no device"));
+                            break;
+                        };
+                        if let Err(e) = state.reset(gpu) {
+                            error = Some(format!("dense TP mesh state reset rank {rank}: {e}"));
+                            break;
+                        }
+                        gpu.invalidate_graph_state();
+                    }
+                }
+                _ => {}
             }
         }
         error
@@ -721,15 +854,19 @@ pub fn ep_serve_qwen35_dense_tp(
         let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
             return Err("dense TP first-logits without EP state".to_string());
         };
-        let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
+        let Some(logits_tensor) = dense_tp_rank0_logits(inner) else {
             return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
         };
         if let Err(e) = gpus.devices[0].bind_thread() {
             return Err(format!("dense TP first-logits bind_thread: {e:?}"));
         }
         let logits = gpus.devices[0]
-            .download_f32(&scratches[0].logits)
+            .download_f32(logits_tensor)
             .map_err(|e| format!("dense TP first-logits download: {e:?}"));
+        // Rank 0's download synchronized rank 0; the drain synchronizes the
+        // other ranks and surfaces executor errors for the enqueued epochs.
+        let drained = dense_tp_mesh_drain_inner(gpus, inner)
+            .map_err(|e| format!("dense TP first-logits mesh drain: {e}"));
         // Whole-token TP2 graphs use bounded device barriers; rank 0's download
         // checks only rank 0. Check (and clear) every rank whatever the download
         // returned, so no rank's timeout leaks into the next request.
@@ -737,6 +874,7 @@ pub fn ep_serve_qwen35_dense_tp(
             .take_device_wait_errors()
             .map_err(|e| format!("dense TP first-logits: {e}"));
         let logits = logits?;
+        drained?;
         waits?;
         Ok(logits)
     })();
@@ -853,19 +991,24 @@ pub fn ep_serve_qwen35_dense_tp(
             let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
                 return Err("dense TP decode logits without EP state".to_string());
             };
-            let EpArch::Qwen35DenseTp { scratches, .. } = inner else {
+            let Some(logits_tensor) = dense_tp_rank0_logits(inner) else {
                 return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
             };
             if let Err(e) = gpus.devices[0].bind_thread() {
                 return Err(format!("dense TP decode logits bind_thread: {e:?}"));
             }
             let logits = gpus.devices[0]
-                .download_f32(&scratches[0].logits)
+                .download_f32(logits_tensor)
                 .map_err(|e| format!("dense TP decode logits download: {e:?}"));
+            // Rank 0's download synchronized rank 0; the drain synchronizes the
+            // other ranks and surfaces executor errors for the enqueued epochs.
+            let drained = dense_tp_mesh_drain_inner(gpus, inner)
+                .map_err(|e| format!("dense TP decode mesh drain: {e}"));
             let waits = gpus
                 .take_device_wait_errors()
                 .map_err(|e| format!("dense TP decode: {e}"));
             let logits = logits?;
+            drained?;
             waits?;
             Ok(logits)
         })();
@@ -1462,6 +1605,52 @@ pub fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                             &mut first_err,
                             &format!("dense qwen TP rank{rank} KV cache"),
                             "missing",
+                        );
+                    }
+                    gpu.invalidate_graph_state();
+                }
+            }
+            EpArch::Qwen35MeshTp { ranks, pending, .. } => {
+                // Retire every undrained epoch first.
+                if let Err(e) = dense_tp_mesh_drain(gpus, pending) {
+                    push_reset_err(&mut first_err, "dense qwen TP mesh pending drain", e);
+                }
+                let rank_count = gpus.devices.len();
+                if ranks.len() != rank_count {
+                    push_reset_err(
+                        &mut first_err,
+                        "dense qwen TP mesh rank count",
+                        format!("got {}, expected {rank_count}", ranks.len()),
+                    );
+                }
+                for (rank, state) in ranks.iter_mut().enumerate() {
+                    let Some(gpu) = gpus.devices.get_mut(rank) else {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP mesh rank{rank} device"),
+                            "missing",
+                        );
+                        continue;
+                    };
+                    if let Err(e) = gpu.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP mesh rank{rank} bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = state.reset(gpu) {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP mesh rank{rank} state reset"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = state.clear_kv(gpu) {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("dense qwen TP mesh rank{rank} KV clear"),
+                            e,
                         );
                     }
                     gpu.invalidate_graph_state();

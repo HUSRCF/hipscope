@@ -590,7 +590,7 @@ fn media_refusal_message(tower: MediaTower, vision_gated_off: Option<&str>) -> S
     let noun = tower.noun();
     match vision_gated_off {
         Some(sidecar) => format!(
-            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `resident`/`on`) and reload"
         ),
         None => format!("model has no {noun} encoder"),
     }
@@ -1704,29 +1704,40 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                // DFlash is not served on an EP/TP mesh (tp>1 refuses a draft
+                // below). An `auto` mode only pairs the registry draft when one
+                // exists, so on tp>1 it drops the pairing instead of failing
+                // the load; an explicit `on` still reaches that refusal.
+                let draft_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 let draft_path = if dflash_mode == "off" {
                     if let Some(d) = raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
                     }
                     None
+                } else if dflash_mode == "auto" && draft_tp > 1 {
+                    if let Some(d) = raw_draft {
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=auto with tp={draft_tp} — DFlash is not served on EP/TP; skipping draft load ({d})"
+                        );
+                    }
+                    None
                 } else {
                     raw_draft
                 };
-                // Shared Qwen3.5-VL tower sidecar (`qwen3.8-27b-vision.hfq`).
-                // Same override ladder as the DFlash draft: `HIPFIRE_VISION_SIDECAR`
-                // non-empty wins over `params.vision`; explicitly EMPTY opts out;
-                // unset → `params.vision` as sent. Arch-free string plumbing —
-                // admission validates (arch 5|6, tower tensor present) and the
-                // Qwen35 carrier loads the tower from it.
+                // Vision-tower sidecars use the same override ladder as the
+                // DFlash draft: non-empty `HIPFIRE_VISION_SIDECAR` wins over
+                // `params.vision`; explicitly EMPTY opts out; unset uses the
+                // request as sent. Admission and the carrier validate tower
+                // data and choose the architecture's supported residency.
                 //
-                // `vision_mode=off` (the default) is a hard daemon-side override,
-                // mirroring the `dflash_mode=off` guard above: even an explicit
-                // sidecar is skipped, so a default load never pays the +~1 GB
-                // tower VRAM. CLI-side gating is the primary path; this guard
-                // makes the flag durable for non-hipfire-CLI clients.
-                //
-                // One implementation for both load arms: `resolve_vision_ladder`
-                // (next to `apply_vision_mode_gate`).
+                // `vision_mode=off` skips even an explicit sidecar, so direct
+                // daemon clients receive the same allocation opt-out as CLI
+                // clients. Both load arms use `resolve_vision_ladder`, which
+                // takes an omitted mode from `hipfire_config::vision_mode_default()`.
                 let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
                 vision_gated_off = gated_off;
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
@@ -3468,8 +3479,8 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
-                // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
-                // lfm2-vl (arch-11 bundle) in one declared-capability probe.
+                // Declared bundle capability covers streamed and resident
+                // towers, including the Flash-Next Qwen4 (arch 16) route.
                 let has_vl = m.has_vision_encoder();
                 let tp = m.ep.is_some();
                 if request_guards::refuse_ep_request(&mut stdout, id, &msg, tp, has_image) {
@@ -3493,11 +3504,9 @@ fn main() {
                     // produce garbage. Force a reset so VL always starts
                     // from a clean KV state.
                     //
-                    // Must mirror the "reset" command handler (line ~2098).
-                    // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
-                    // and lfm2-vl (arch_id 11); other arch states are None
-                    // here — but clear them anyway for defense-in-depth in
-                    // case a future arch adds VL support.
+                    // Must mirror the "reset" command handler. Clear all
+                    // architecture states for defense-in-depth; the Qwen4
+                    // image handler also performs its canonical cold reset.
                     if m.seq_pos > 0 {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
@@ -4859,6 +4868,23 @@ fn main() {
                     kv_warning_json,
                     kv_mode_json,
                 );
+                // Windows only: which amdhip64*.dll actually loaded (System32's
+                // driver copy can shadow an SDK's) and the raw runtime/driver
+                // version ints. null when unavailable. Same splice as
+                // `append_diag_emu` below.
+                #[cfg(windows)]
+                {
+                    let lib_json = serde_json::to_string(&gpu.hip.mapped_hip_library())
+                        .expect("hip_runtime_library serializable");
+                    let rt_json = serde_json::to_string(&gpu.hip.runtime_version_raw().ok())
+                        .expect("hip_runtime_version_raw serializable");
+                    let drv_json = serde_json::to_string(&gpu.hip.driver_version().ok())
+                        .expect("hip_driver_version_raw serializable");
+                    diag_line.pop();
+                    diag_line.push_str(&format!(
+                        r#","hip_runtime_library":{lib_json},"hip_runtime_version_raw":{rt_json},"hip_driver_version_raw":{drv_json}}}"#
+                    ));
+                }
                 emu_daemon::append_diag_emu(&gpu, &mut diag_line);
                 let _ = writeln!(stdout, "{diag_line}");
                 let _ = stdout.flush();
@@ -5058,8 +5084,8 @@ mod tests {
     }
 
     #[test]
-    fn vision_mode_auto_and_on_pass_the_ladder_result_through() {
-        for mode in ["auto", "on"] {
+    fn vision_mode_auto_resident_and_on_pass_the_ladder_result_through() {
+        for mode in ["auto", "resident", "on"] {
             assert_eq!(
                 apply_vision_mode_gate(mode, Some("/models/qwen3.8-27b-vision.hfq".into())),
                 Some("/models/qwen3.8-27b-vision.hfq".to_owned())

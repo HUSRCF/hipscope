@@ -914,6 +914,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
             model_ctx,
             automatic: true,
             card_cap: 0,
+            reserve_bytes: 0,
         }),
         deepseek4_compute_placement: Default::default(),
         deepseek4_experts_per_token: None,

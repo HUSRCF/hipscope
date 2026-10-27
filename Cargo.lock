@@ -2474,6 +2474,7 @@ dependencies = [
 name = "npu-tools"
 version = "0.4.4"
 dependencies = [
+ "hip-bridge",
  "peacemaker-npu",
  "railgun",
  "regex",
