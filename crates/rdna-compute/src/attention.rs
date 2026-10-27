@@ -759,7 +759,7 @@ enum VerifyGqaRef {
 /// Resolved native-fp8 split-KV FA2 verifier route
 /// (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Fp8Fa2SplitRoute {
+pub(crate) struct Fp8Fa2SplitRoute {
     /// KV splits (workgroups per kv head).
     splits: usize,
     /// First live context length (`max_position + 1`) the route serves.
@@ -792,7 +792,7 @@ fn fp8_fa2_split_verify_route() -> Option<Fp8Fa2SplitRoute> {
 }
 
 /// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value.
-fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<Fp8Fa2SplitRoute> {
+pub(crate) fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<Fp8Fa2SplitRoute> {
     match raw {
         None => Some(Fp8Fa2SplitRoute {
             splits: FP8_FA2_SPLIT_DEFAULT_SPLITS,
@@ -832,7 +832,7 @@ const FP8_FA2_SPLIT_DEFAULT_MAX_ROWS: usize = 16;
 /// serves a non-tree, non-recording call of `batch_size` rows at `route_ctx`
 /// live context over `partials_numel` f32 of caller scratch.
 #[allow(clippy::too_many_arguments)]
-fn fp8_fa2_split_verify_admission(
+pub(crate) fn fp8_fa2_split_verify_admission(
     route: Option<Fp8Fa2SplitRoute>,
     arch: &str,
     route_ctx: usize,
@@ -859,7 +859,7 @@ fn fp8_fa2_split_verify_admission(
 /// the bench split path (B4 pending): it always runs the f16 partial/merge
 /// entries. The pre-convert and merge symbols are bound from the partial
 /// symbol's module object.
-fn fa2_gqa_split_gfx1201_symbols(
+pub(crate) fn fa2_gqa_split_gfx1201_symbols(
     fp8_kv: bool,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     if fp8_kv {

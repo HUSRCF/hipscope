@@ -6323,6 +6323,20 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
         "attention_flash_reduce_dsplit_gfx1201",
         &["attention_flash_reduce_dsplit_gfx1201"],
     ),
+    // Native-fp8 split-KV FA2 verifier (`Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`),
+    // on by default in `attention_flash_fp8_e4m3_tile_batched` for 2..=16-row
+    // calls at >= 8192 live context: every AR prefill tail chunk of 2..=16
+    // rows past 8192 positions and every MTP verify block. The module is
+    // named for its partial symbol; the launcher binds the partial,
+    // Q pre-convert and merge entries out of the one object.
+    (
+        "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+        &[
+            "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+            "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+            "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201",
+        ],
+    ),
     (
         "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201",
         &["attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201"],
@@ -12639,6 +12653,151 @@ extern "C" __global__ void NAMED(int* p) {}
                 .entries
                 .iter()
                 .any(|e| e.module() == module));
+        }
+    }
+
+    /// Resolve the 27B closed route for one (arch, spec, KV pair).
+    fn route_27b(
+        arch: &str,
+        spec: KernelSpecRoute,
+        kv: (&str, &str),
+    ) -> Result<RouteKernelPlan, RegistryError> {
+        let owned = qwen36_27b_native_mtp_fixture();
+        let tensors: Vec<_> = owned
+            .iter()
+            .map(|(name, dtype, shape)| KernelTensorMeta {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect();
+        let flags = default_feature_flags("gfx1201").unwrap();
+        route_entries(&RouteKernelInput {
+            arch,
+            model_arch: 5,
+            tensors: &tensors,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 262_144,
+            prefill_chunk_rows: 8192,
+            kv_k: kv.0,
+            kv_v: kv.1,
+            state_quant: "q8",
+            spec,
+            host_mapped_experts: false,
+            retained_decode: false,
+            hipcc_extra_flags: "",
+            flags: &flags,
+            route_axes: &[],
+        })
+    }
+
+    /// Regression: the v0.4.4 sealed 27B AR/MTP plan omitted the native-fp8
+    /// split-KV FA2 verifier, so `hipfire bench --spec off` died in the 12-row
+    /// tail chunk of a 65,548 / 131,084-token prompt and `--spec mtp` died in
+    /// `spec_step` at >= 8192 live context ("outside this load's planned
+    /// kernel route"). Every (rows, live context) the dispatch admits to the
+    /// split route must find all three launcher entries planned, for both
+    /// closed spec routes, under the default route and the explicit-split
+    /// developer override (2..=32 rows, no context floor).
+    #[test]
+    fn closed_27b_plans_cover_the_fp8_split_verify_route() {
+        use crate::attention::{
+            fa2_gqa_split_gfx1201_symbols, fp8_fa2_split_verify_admission,
+            fp8_fa2_split_verify_route_for,
+        };
+        let (partial, merge, precon, _) = fa2_gqa_split_gfx1201_symbols(true);
+        let ctxs = [1, 8191, 8192, 8193, 8204, 65_548, 131_084, 260_000, 262_144];
+        let routes = [
+            fp8_fa2_split_verify_route_for(None),
+            fp8_fa2_split_verify_route_for(Some("8")),
+        ];
+        let mut admitted = 0;
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            let plan = route_27b("gfx1201", spec, ("fp8", "fp8")).expect("closed 27B route");
+            for route in routes {
+                for rows in 1..=32 {
+                    for ctx in ctxs {
+                        let Some(splits) = fp8_fa2_split_verify_admission(
+                            route,
+                            "gfx1201",
+                            ctx,
+                            24,
+                            4,
+                            256,
+                            rows,
+                            1 << 30,
+                        ) else {
+                            continue;
+                        };
+                        admitted += 1;
+                        assert!(splits >= 2, "{spec:?} rows {rows} ctx {ctx}");
+                        let entry = plan
+                            .entries
+                            .iter()
+                            .find(|e| e.module() == partial)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{spec:?}: rows {rows} at ctx {ctx} dispatch the fp8 \
+                                     split-KV FA2 verifier but its module {partial} is not planned"
+                                )
+                            });
+                        for symbol in [partial, merge, precon] {
+                            assert!(
+                                entry.symbols().contains(&symbol),
+                                "{spec:?}: {symbol} missing from the planned {partial} module"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(admitted > 0, "the sweep never reached the split route");
+        // The default route covers exactly the tail/verify rows 2..=16 from
+        // 8192 live context (the failing 8192+12 prompt included).
+        let default = fp8_fa2_split_verify_route_for(None);
+        for rows in 2..=16 {
+            assert!(
+                fp8_fa2_split_verify_admission(default, "gfx1201", 8204, 24, 4, 256, rows, 1 << 30)
+                    .is_some(),
+                "rows {rows} at ctx 8204 must reach the split route"
+            );
+        }
+    }
+
+    /// The sealed 27B plan exists only for native fp8 K/V on exact gfx1201;
+    /// every other KV mode or arch resolves to no closed route (lazy loading),
+    /// so none of them can dispatch the split verifier against a sealed plan.
+    #[test]
+    fn closed_27b_route_is_refused_outside_native_fp8_gfx1201() {
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            for kv in [
+                ("q8", "q8"),
+                ("q8_0", "q8_0"),
+                ("fp8", "q8"),
+                ("q8", "fp8"),
+                ("asym4", "asym4"),
+                ("asym3", "asym3"),
+                ("fwht4", "fwht4"),
+                ("fp16", "fp16"),
+            ] {
+                assert!(
+                    matches!(
+                        route_27b("gfx1201", spec, kv),
+                        Err(RegistryError::UnsupportedRoute(_))
+                    ),
+                    "{spec:?} {kv:?} must not resolve to a sealed 27B route"
+                );
+            }
+            for arch in [
+                "gfx1100", "gfx1151", "gfx1150", "gfx1101", "gfx1102", "gfx1200",
+            ] {
+                assert!(
+                    route_27b(arch, spec, ("fp8", "fp8")).is_err(),
+                    "{spec:?} {arch} must not resolve to a sealed 27B route"
+                );
+            }
         }
     }
 
