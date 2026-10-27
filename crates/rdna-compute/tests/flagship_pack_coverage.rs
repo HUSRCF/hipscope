@@ -15,7 +15,7 @@
 //! gfx1100 and gfx1151 as well) that must be registered on every release arch.
 //! gfx1201-only modules are asserted for gfx1201 only.
 
-use rdna_compute::kernel_registry::{SUPPORTED_ARCHES, entries};
+use rdna_compute::kernel_registry::{entries, SUPPORTED_ARCHES};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
