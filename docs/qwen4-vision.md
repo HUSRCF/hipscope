@@ -8,8 +8,8 @@ and pass its path explicitly. The current validation route is
 [Flash-Next image pathway in VALIDATION.md](VALIDATION.md).
 
 Post-merge Halo validation is recorded below for source
-`95e69b9669f87f1b5de960c26e3c2bd840100691` and the exact binaries in the
-[2026-10-27 receipt](../benchmarks/vision/halo-gate-20261027.json). Default
+`428e2e63627228cd3b5f79759ef40550979e123a` and the exact binaries in the
+[2026-10-27 receipt](../benchmarks/vision/halo-gate-20261027-beta3a01.json). Default
 `auto` loads with and without the tower have identical text; image serving and
 automatic admission passed. **Stock beta could not load on this 96 GiB BIOS
 carve-out configuration**; its separate text reference required
@@ -127,15 +127,17 @@ The carrier follows these upstream semantics:
 
 The implementation lives in `hipfire-arch-qwen4`'s `vision` and
 `bundle/image_context` modules, `hipfire-generate/src/qwen4_vision.rs`, and the
-optional QSA mRoPE bindings in `rdna-compute/src/qsa_mrope.rs`.
+optional QSA mRoPE bindings in `rdna-compute/src/qsa_mrope.rs`. The three image
+exports live in their own `qsa_mrope` module; the shared `tensor_ops` source is
+byte-identical to beta, preserving the measured text-route pack hashes.
 
 ## Halo validation (2026-10-27)
 
 This is fixture-bound evidence, not an admission record or a speed claim.
-Tested source: `95e69b9669f87f1b5de960c26e3c2bd840100691`, including beta
-`035c0ddd604d6154a153f9b68a560afe5fb59a33`. Hardware: gfx1151, HIP
+Tested source: `428e2e63627228cd3b5f79759ef40550979e123a`, including beta
+`3a01cc447bceec99ec28ed81d07460a61b395f4f`. Hardware: gfx1151, HIP
 `7.16.26385-0000000`, kernel `7.0.0-38-generic`, 96 GiB BIOS-reserved VRAM.
-The [receipt](../benchmarks/vision/halo-gate-20261027.json) includes complete
+The [receipt](../benchmarks/vision/halo-gate-20261027-beta3a01.json) includes complete
 text, request/prompt identities, image answers, load logs, memory snapshots,
 and model/binary digests. Later documentation-only commits do not extend it
 to changed runtime code.
@@ -157,6 +159,7 @@ are the committed five-genre battery in `scripts/serve_harness.py`.
 | No-sidecar text-only capability | 11/11 image-refusal and follow-up text cases |
 | Text chain after image/cancellation | 5/5 coherent, clean stop terminals |
 | CPU vision/load/image/resource/admission tests | 61 passed across six filters; the exploratory zero-match filter is not counted |
+| Frozen flagship pack / kernel registry / sealed compiler checks | 5 / 61 / 1 passed; historical source-hash fixtures unchanged |
 | GPU channel | 18 passed, zero failed/skipped |
 | Independent QSA mRoPE oracle | Five cases pass; max norm/rotation error `8.9407e-7`, chunk/pooling comparisons exact |
 
@@ -167,13 +170,14 @@ MTP (`K=7`); default NPU planning selected GPU-only plans (`families=none`), so
 this is not proof of NPU-executed inference. The transcript digest shared by
 all three successful arms is `578a6f19180b6e65e95a36eb0fe6bd32`.
 
-**Beta limitation.** Stock `035c0ddd` rejected the load because its host-union
+**Beta limitation.** Stock `3a01cc44` rejected the load because its host-union
 check counted device allocations in the BIOS carve-out against the remaining
-host RAM: 80.7 GiB required plus 4 GiB headroom versus 22.3 GiB available.
+host RAM: 80.7 GiB required plus 4 GiB headroom versus 22.5 GiB available.
 The PR's allocation-backing query avoids that double count. The separate
 beta binary was rerun with `HIPFIRE_OOM_GUARD=0` only for the text reference;
-that switch also disables other host-headroom checks. Observed fully-resident
-placement, KV/GDN format, automatic context and MTP route matched. PR admission
+that switch also disables other host-headroom checks. Routed experts were fully resident in both builds; KV/GDN format, automatic
+context and MTP route matched. Retained PLE was availability-dependent: the
+beta reference kept 5,590 MiB, versus 8,162 MiB in the no-tower PR arm. PR admission
 was tested with the default guard enabled. Strict stock-beta default-load
 parity is therefore **not established on this BIOS configuration**.
 
@@ -185,7 +189,7 @@ tower upload; it must not be mistaken for final resident free memory.
 | --- | ---: | ---: |
 | Free device memory at rank admission, MiB | 18,864 | 18,864 |
 | Remaining context/gather/MTP request growth, MiB | 8,238 | 8,238 |
-| Resident PLE retained, MiB | 8,380 | 6,519 |
+| Resident PLE retained, MiB | 8,162 | 6,519 |
 | Device headroom, MiB | 2,048 | 2,048 |
 | Admitted automatic context / card cap | 262,144 | 262,144 |
 | Independent vision reserve, bytes | 0 | 2,158,224,320 |
@@ -193,17 +197,22 @@ tower upload; it must not be mistaken for final resident free memory.
 The vision quote is 896,353,216 bytes of resident weights including FC2 padding
 plus 1,261,871,104 bytes for maximum-image scratch, projected rows and allowance.
 It reduces reclaimable PLE residency rather than taking the context's reserved
-space. Both PR loads and subsequent requests passed; all test services stopped,
+space. The observed PLE difference is 1,643 MiB, not the full vision reserve;
+residency also depends on currently available memory. Both PR loads and
+subsequent requests passed; all test services stopped,
 and device usage returned to 302,886,912 bytes (desktop baseline). The admitted
 262,144 capacity was not exercised with a full-length prompt; snapshots are
 not peak-memory measurements. No throughput/TTFT or new PM4 claim is made.
 
-PR binary MD5s: CLI `6b07ce81db9b14f3376a8bf229b75936`, daemon
-`49d7dbc15bd0be4a2f3916b515490996`. Beta reference MD5s: CLI
-`03a5d5d0f69499619e0a00b9bfcb93d3`, daemon
-`a9261fba8ef5ddab153d6f7575e58f8f`. Full SHA-256 identities and commands are in
+PR binary MD5s: CLI `2ab92e9b4bdf3cf231f32d32d3195a9b`, daemon
+`f1c9286c4f73ccc788dbe9c28eb04bfe`. Beta reference MD5s: CLI
+`fe34a1c29e982f55df184b38c50bac85`, daemon
+`9ac9197ce3e644b815e9d9ad95bf79d5`. Full SHA-256 identities and commands are in
 the receipt. Local raw files are under
-`.codeinsight+research/vision-938/halo-gate-20261027/`.
+`.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/`.
+
+The [earlier same-day receipt](../benchmarks/vision/halo-gate-20261027.json)
+remains unchanged and applies only to source `95e69b966` / beta `035c0ddd`.
 
 ## Validation
 
