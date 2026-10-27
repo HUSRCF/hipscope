@@ -152,6 +152,11 @@ use crate::common::sha256_hex;
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use half::f16;
 use hip_bridge::DeviceBuffer;
+use hipfire_kernel_abi::families::{find_export, qwen4_moe_sym as moe_abi};
+use hipfire_kernel_abi::{
+    check_export, eval, validate_invocation, Arch as AbiArch, ArgEvidence, Drift, EvidenceSource,
+    ExportEvidence, InvocationV1, OperandBinding,
+};
 use peacemaker_isa::kernels::qwen4_moe_down_gp;
 use peacemaker_isa::kernels::qwen4_moe_sym::{
     self, ExpertGeometry, Kind, Spec, WeightCodec, KERNARG_BYTES, MAX_SLOTS,
@@ -996,38 +1001,188 @@ impl Problem {
         })
     }
 
-    /// The 64-byte kernarg blob (`Spec::kernargs`): five device pointers, then
-    /// `M, K, x_row_div, m_total, x_src_rows, n_experts` as i32.
-    fn kernarg(&self, [wptrs, tiles, sorted, xq, y]: [u64; 5]) -> Vec<u8> {
-        let mut a = Vec::with_capacity(KERNARG_BYTES as usize);
-        for p in [wptrs, tiles, sorted, xq, y] {
-            a.extend_from_slice(&p.to_le_bytes());
-        }
-        for v in [
-            self.m,
-            self.k,
-            self.x_row_div,
-            self.pmax,
-            self.x_src_rows,
-            self.geo.experts,
-        ] {
-            a.extend_from_slice(&(v as i32).to_le_bytes());
-        }
-        assert_eq!(a.len(), KERNARG_BYTES as usize);
-        a
-    }
-
-    fn launch_for(&self, spec: Spec, ptrs: [u64; 5]) -> Launch {
-        Launch {
-            kernarg: self.kernarg(ptrs),
-            grid: [
+    /// Launch geometry `(grid, block, dynamic LDS)` of `spec`: grid `(M / (64 rr), tiles, 1)`,
+    /// block `Spec::threads`, no dynamic LDS.
+    fn geometry(&self, spec: Spec) -> ([u32; 3], [u32; 3], u32) {
+        (
+            [
                 (self.m / (64 * usize::from(spec.rr.max(1)))) as u32,
                 self.ntiles() as u32,
                 1,
             ],
-            block: [spec.threads(), 1, 1],
-            lds: 0,
+            [spec.threads(), 1, 1],
+            0,
+        )
+    }
+
+    /// The 64-byte kernarg image of `entry`'s launch, encoded by the `hipfire-kernel-abi`
+    /// contract (`families::qwen4_moe_sym`): five device pointers, then
+    /// `M, K, x_row_div, m_total, x_src_rows, n_experts` as i32.
+    ///
+    /// `ptrs` is `(address, allocation bytes)` of `expert_weight_ptrs, expert_tile_ids,
+    /// sorted_slot_index, Xq, Y_grouped`. An entry whose symbol is a contract export is
+    /// validated with its own geometry; any other (another NT or row repeat) encodes through
+    /// the NT4 product export of the same kind, and its generator layout must agree with the
+    /// contract on every argument and the segment.
+    fn kernarg(&self, entry: Entry, ptrs: [(u64, u64); 5]) -> Result<Vec<u8>> {
+        self.kernarg_with_layout(entry, entry.spec.kernargs(), ptrs)
+    }
+
+    fn kernarg_with_layout(
+        &self,
+        entry: Entry,
+        layout: peacemaker_isa::KernargLayout,
+        ptrs: [(u64, u64); 5],
+    ) -> Result<Vec<u8>> {
+        let spec = entry.spec;
+        let exact = if spec.arch == ARCH && spec.codec == WeightCodec::Mq4Sym {
+            find_export(AbiArch::Gfx1201, &entry.symbol())
+        } else {
+            None
+        };
+        let (abi, export) = match exact {
+            Some(found) => found,
+            None => {
+                let product = Entry {
+                    spec: Spec {
+                        arch: ARCH,
+                        kind: spec.kind,
+                        nt: 4,
+                        rr: 1,
+                        codec: WeightCodec::Mq4Sym,
+                    },
+                    gp: entry.gp,
+                };
+                find_export(AbiArch::Gfx1201, &product.symbol()).ok_or_else(|| {
+                    format!("no kernel-abi contract export for {}", product.symbol())
+                })?
+            }
+        };
+        let evidence = ExportEvidence {
+            source: EvidenceSource::Generator,
+            arch: Some(AbiArch::Gfx1201),
+            symbol: export.symbol.to_owned(),
+            args: layout
+                .args
+                .iter()
+                .map(|a| ArgEvidence {
+                    name: a.name.clone(),
+                    offset: a.offset,
+                    size: a.size,
+                    value_kind: a.value_kind.clone(),
+                    access: a.actual_access.clone(),
+                })
+                .collect(),
+            segment_bytes: Some(layout.size),
+            segment_align: None,
+            max_flat_workgroup_size: None,
+            threads: None,
+            dynamic_lds: None,
+            group_segment_fixed: None,
+            wave: None,
+            object_sha256: None,
+        };
+        let drift: Vec<String> = check_export(abi, export, &evidence)
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Drift::MissingArg { .. }
+                        | Drift::ExtraArg { .. }
+                        | Drift::ArgName { .. }
+                        | Drift::ArgWidth { .. }
+                        | Drift::ArgKind { .. }
+                        | Drift::ArgAccess { .. }
+                        | Drift::Segment { .. }
+                        | Drift::SegmentAlign { .. }
+                )
+            })
+            .map(|d| d.to_string())
+            .collect();
+        if !drift.is_empty() {
+            return Err(format!(
+                "{}: kernarg layout differs from contract {} ({}): {}",
+                entry.variant(),
+                abi.id,
+                export.symbol,
+                drift.join("; ")
+            ));
         }
+        let formats = match (spec.kind, entry.gp) {
+            (Kind::GateUp, _) => [
+                moe_abi::FORMAT_EXPERT_PTRS_GATE_UP_QT44,
+                moe_abi::FORMAT_EXPERT_TILE_IDS,
+                moe_abi::FORMAT_SORTED_SLOT_INDEX,
+                moe_abi::FORMAT_XQ_GATE_UP_FWHT256_TOKEN_ROWS,
+                moe_abi::FORMAT_Y_GATE_UP_SWIGLU_BF16,
+            ],
+            (Kind::Down, gp) => [
+                moe_abi::FORMAT_EXPERT_PTRS_DOWN_QT53,
+                moe_abi::FORMAT_EXPERT_TILE_IDS,
+                moe_abi::FORMAT_SORTED_SLOT_INDEX,
+                if gp {
+                    moe_abi::FORMAT_XQ_DOWN_ROT128_GROUPED_POSITION
+                } else {
+                    moe_abi::FORMAT_XQ_DOWN_ROT128_FLAT_SLOTS
+                },
+                moe_abi::FORMAT_Y_DOWN_BF16,
+            ],
+        };
+        let binds: [OperandBinding; 5] = std::array::from_fn(|i| OperandBinding {
+            address: ptrs[i].0,
+            bytes: Some(ptrs[i].1),
+            format: formats[i],
+        });
+        let params = [
+            self.m as u64,
+            self.k as u64,
+            self.x_row_div as u64,
+            self.pmax as u64,
+            self.x_src_rows as u64,
+            self.geo.experts as u64,
+        ];
+        let (grid, block, dynamic_lds) = if exact.is_some() {
+            self.geometry(spec)
+        } else {
+            let mut grid = [0u32; 3];
+            for (g, e) in grid.iter_mut().zip(&export.grid) {
+                let v = eval(e, abi, export, &params).map_err(|e| format!("{}: {e}", abi.id))?;
+                *g = u32::try_from(v).map_err(|_| format!("{}: grid {v} exceeds u32", abi.id))?;
+            }
+            (grid, export.block, export.dynamic_lds)
+        };
+        let v = validate_invocation(
+            abi,
+            &InvocationV1 {
+                arch: AbiArch::Gfx1201,
+                symbol: export.symbol,
+                params: &params,
+                operands: &binds,
+                grid,
+                block,
+                dynamic_lds,
+            },
+        )
+        .map_err(|e| format!("{}: {e}", entry.variant()))?;
+        let image = v.explicit().to_vec();
+        if image.len() != KERNARG_BYTES as usize {
+            return Err(format!(
+                "{}: contract image is {} B, the generator kernarg is {KERNARG_BYTES}",
+                abi.id,
+                image.len()
+            ));
+        }
+        Ok(image)
+    }
+
+    fn launch_for(&self, entry: Entry, ptrs: [(u64, u64); 5]) -> Result<Launch> {
+        let (grid, block, lds) = self.geometry(entry.spec);
+        Ok(Launch {
+            kernarg: self.kernarg(entry, ptrs)?,
+            grid,
+            block,
+            lds,
+        })
     }
 
     fn i32_bytes(v: &[i32]) -> Vec<u8> {
@@ -1352,6 +1507,30 @@ impl Moe {
             .ok_or_else(|| "qwen4_moe_sym workload used before setup".to_owned())
     }
 
+    /// `arm`'s launch with its kernarg encoded by the contract over the live allocations.
+    fn checked_launch(&self, arm: Arm) -> Result<Launch> {
+        let dev = self.dev()?;
+        let entry = match arm {
+            Arm::Baseline => self.base.entry(),
+            Arm::Candidate => self.cand,
+        };
+        let op = |b: &DeviceBuffer| (b.as_ptr() as u64, b.size() as u64);
+        let xq = match (&dev.xq_gp, entry.gp) {
+            (Some(gp), true) => gp,
+            _ => &dev.xq,
+        };
+        self.problem.launch_for(
+            entry,
+            [
+                op(&dev.ptrs),
+                op(&dev.tiles),
+                op(&dev.sorted),
+                op(xq),
+                op(&dev.y[arm_index(arm)]),
+            ],
+        )
+    }
+
     fn baseline_object(&self) -> Result<Object> {
         let entry = self.base.entry();
         let spec = entry.spec;
@@ -1517,23 +1696,34 @@ impl Moe {
             table.extend_from_slice(&base.to_le_bytes());
             mem.map(format!("expert{e}"), base, w)?;
         }
+        let table_len = table.len() as u64;
         mem.map("table".into(), TABLE, table)?;
-        mem.map("tiles".into(), TILES, Problem::i32_bytes(&p.tiles))?;
-        mem.map("sorted".into(), SORTED, Problem::i32_bytes(&p.sorted))?;
+        let tiles = Problem::i32_bytes(&p.tiles);
+        let sorted = Problem::i32_bytes(&p.sorted);
+        let (tiles_len, sorted_len) = (tiles.len() as u64, sorted.len() as u64);
+        mem.map("tiles".into(), TILES, tiles)?;
+        mem.map("sorted".into(), SORTED, sorted)?;
         let mut xq = if self.cand.gp {
             p.make_xq_gp()
         } else {
             p.xq().to_vec()
         };
         xq.resize(xq.len() + SLACK, 0);
+        let xq_len = xq.len() as u64;
         mem.map("xq".into(), XQ, xq)?;
-        mem.map("y".into(), Y, vec![0u8; p.y_bytes()])?;
-        mem.map(
-            "kernarg".into(),
-            KERNARG,
-            p.kernarg([TABLE, TILES, SORTED, XQ, Y]),
+        let y_len = p.y_bytes();
+        mem.map("y".into(), Y, vec![0u8; y_len])?;
+        let launch = p.launch_for(
+            self.cand,
+            [
+                (TABLE, table_len),
+                (TILES, tiles_len),
+                (SORTED, sorted_len),
+                (XQ, xq_len),
+                (Y, y_len as u64),
+            ],
         )?;
-        let launch = p.launch_for(self.cand.spec, [TABLE, TILES, SORTED, XQ, Y]);
+        mem.map("kernarg".into(), KERNARG, launch.kernarg.clone())?;
         for gy in 0..launch.grid[1] {
             for gx in 0..launch.grid[0] {
                 emu.run_workgroup(
@@ -1648,32 +1838,16 @@ impl Workload for Moe {
             _weights: weights,
         };
         self.dev = Some(dev);
+        // Refuse a wrong layout / extent / alignment before any launch.
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            self.checked_launch(arm)?;
+        }
         Ok(())
     }
 
     fn launch(&self, arm: Arm) -> Launch {
-        let dev = self
-            .dev()
-            .expect("Workload::setup must run before Workload::launch");
-        let entry = match arm {
-            Arm::Baseline => self.base.entry(),
-            Arm::Candidate => self.cand,
-        };
-        let ptr = |b: &DeviceBuffer| b.as_ptr() as u64;
-        let xq = match (&dev.xq_gp, entry.gp) {
-            (Some(gp), true) => gp,
-            _ => &dev.xq,
-        };
-        self.problem.launch_for(
-            entry.spec,
-            [
-                ptr(&dev.ptrs),
-                ptr(&dev.tiles),
-                ptr(&dev.sorted),
-                ptr(xq),
-                ptr(&dev.y[arm_index(arm)]),
-            ],
-        )
+        self.checked_launch(arm)
+            .expect("Workload::setup (kernarg contract) must succeed before Workload::launch")
     }
 
     fn reset(&self, gpu: &Gpu, arm: Arm) -> Result<()> {
@@ -1851,17 +2025,37 @@ mod tests {
         assert_eq!(p.live_rows().len(), l);
     }
 
+    use hipfire_kernel_abi::FormatId;
+
+    /// Aligned fake device addresses and the exact allocation sizes the workload creates.
+    fn fake_ptrs(p: &Problem, gp: bool) -> [(u64, u64); 5] {
+        [
+            (0x10_0000, p.geo.experts as u64 * 8),
+            (0x20_0000, p.ntiles() as u64 * 4),
+            (0x30_0000, p.pmax as u64 * 4),
+            (
+                0x40_0000,
+                if gp { p.xq_gp_bytes() } else { p.xq().len() } as u64,
+            ),
+            (0x50_0000, p.y_bytes() as u64),
+        ]
+    }
+
+    fn entry(epi: &str) -> Entry {
+        Entry::parse(epi).unwrap()
+    }
+
     #[test]
     fn kernarg_packing_layout() {
         let p = tiny(Kind::Down);
-        let a = p.kernarg([0x1111, 0x2222, 0x3333, 0x4444, 0x5555]);
+        let a = p.kernarg(entry("down_nt4"), fake_ptrs(&p, false)).unwrap();
         assert_eq!(KERNARG_BYTES, 64);
         assert_eq!(a.len(), 64);
         let u64_at = |o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
         let i32_at = |o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
         assert_eq!(
             [u64_at(0), u64_at(8), u64_at(16), u64_at(24), u64_at(32)],
-            [0x1111, 0x2222, 0x3333, 0x4444, 0x5555]
+            [0x10_0000, 0x20_0000, 0x30_0000, 0x40_0000, 0x50_0000]
         );
         assert_eq!(
             [
@@ -1882,7 +2076,7 @@ mod tests {
             ]
         );
         let g = tiny(Kind::GateUp);
-        let a = g.kernarg([0; 5]);
+        let a = g.kernarg(entry("gate_up"), fake_ptrs(&g, false)).unwrap();
         assert_eq!(i32::from_le_bytes(a[48..52].try_into().unwrap()), 2);
         assert_eq!(i32::from_le_bytes(a[56..60].try_into().unwrap()), 12);
         // Launch: grid (M/64, tiles), block per spec, no dynamic LDS.
@@ -1891,16 +2085,193 @@ mod tests {
             ("gate_up_nt4", 4, 128),
             ("gate_up_nt8", 4, 128),
         ] {
-            let spec = Spec::from_epi(epi, ARCH).unwrap();
-            let l = g.launch_for(spec, [0; 5]);
+            let l = g.launch_for(entry(epi), fake_ptrs(&g, false)).unwrap();
             assert_eq!(
                 (l.grid, l.block, l.lds),
                 ([grid_x, g.ntiles() as u32, 1], [block, 1, 1], 0),
                 "{epi}"
             );
         }
-        let spec = Spec::from_epi("down_nt4", ARCH).unwrap();
-        assert_eq!(p.launch_for(spec, [0; 5]).grid[0], (p.m / 64) as u32);
+        let l = p
+            .launch_for(entry("down_nt4"), fake_ptrs(&p, false))
+            .unwrap();
+        assert_eq!(l.grid[0], (p.m / 64) as u32);
+    }
+
+    /// The workload's kernarg equals an independent contract encoding
+    /// (`validate_invocation` + `encode_into` on the family's explicit static) for every
+    /// shipped gfx1201 entry, and a non-exported entry (`nt4r2`) encodes through the NT4
+    /// product's contract.
+    #[test]
+    fn moe_kernarg_is_contract_encoding() {
+        use hipfire_kernel_abi::families::qwen4_moe_sym as f;
+        use hipfire_kernel_abi::{encode_into, KernelAbiV1};
+        let rr2 = Entry {
+            spec: Spec {
+                arch: ARCH,
+                kind: Kind::Down,
+                nt: 4,
+                rr: 2,
+                codec: WeightCodec::Mq4Sym,
+            },
+            gp: false,
+        };
+        let cases: [(Kind, Entry, &KernelAbiV1, [FormatId; 5]); 8] = [
+            (
+                Kind::GateUp,
+                entry("gate_up"),
+                &f::QWEN4_MOE_SYM_GATE_UP,
+                gate_up_formats(),
+            ),
+            (
+                Kind::GateUp,
+                entry("gate_up_nt4"),
+                &f::QWEN4_MOE_SYM_GATE_UP,
+                gate_up_formats(),
+            ),
+            (
+                Kind::GateUp,
+                entry("gate_up_nt8"),
+                &f::QWEN4_MOE_SYM_GATE_UP,
+                gate_up_formats(),
+            ),
+            (
+                Kind::Down,
+                entry("down_nt4"),
+                &f::QWEN4_MOE_SYM_DOWN,
+                down_formats(false),
+            ),
+            (
+                Kind::Down,
+                entry("down_nt8"),
+                &f::QWEN4_MOE_SYM_DOWN,
+                down_formats(false),
+            ),
+            (
+                Kind::Down,
+                entry("down_gp_nt4"),
+                &f::QWEN4_MOE_SYM_DOWN_GP,
+                down_formats(true),
+            ),
+            (
+                Kind::Down,
+                entry("down_gp_nt8"),
+                &f::QWEN4_MOE_SYM_DOWN_GP,
+                down_formats(true),
+            ),
+            (Kind::Down, rr2, &f::QWEN4_MOE_SYM_DOWN, down_formats(false)),
+        ];
+        for (kind, e, abi, formats) in cases {
+            let p = tiny(kind);
+            let ptrs = fake_ptrs(&p, e.gp);
+            let got = p.kernarg(e, ptrs).unwrap();
+            // The reference export: the entry itself when the contract has it, else NT4.
+            let reference = if find_export(AbiArch::Gfx1201, &e.symbol()).is_some() {
+                e
+            } else {
+                Entry {
+                    spec: Spec {
+                        nt: 4,
+                        rr: 1,
+                        ..e.spec
+                    },
+                    gp: e.gp,
+                }
+            };
+            let export = abi
+                .export(AbiArch::Gfx1201, &reference.symbol())
+                .unwrap_or_else(|| panic!("{} not in {}", reference.symbol(), abi.id));
+            let binds: Vec<OperandBinding> = ptrs
+                .iter()
+                .zip(formats)
+                .map(|(&(address, bytes), format)| OperandBinding {
+                    address,
+                    bytes: Some(bytes),
+                    format,
+                })
+                .collect();
+            let (grid, block, lds) = p.geometry(reference.spec);
+            let v = validate_invocation(
+                abi,
+                &InvocationV1 {
+                    arch: AbiArch::Gfx1201,
+                    symbol: export.symbol,
+                    params: &[
+                        p.m as u64,
+                        p.k as u64,
+                        p.x_row_div as u64,
+                        p.pmax as u64,
+                        p.x_src_rows as u64,
+                        p.geo.experts as u64,
+                    ],
+                    operands: &binds,
+                    grid,
+                    block,
+                    dynamic_lds: lds,
+                },
+            )
+            .unwrap();
+            let mut want = [0u8; 64];
+            encode_into(&v, &mut want).unwrap();
+            assert_eq!(got, want, "{}", e.variant());
+        }
+    }
+
+    fn gate_up_formats() -> [FormatId; 5] {
+        use hipfire_kernel_abi::families::qwen4_moe_sym as f;
+        [
+            f::FORMAT_EXPERT_PTRS_GATE_UP_QT44,
+            f::FORMAT_EXPERT_TILE_IDS,
+            f::FORMAT_SORTED_SLOT_INDEX,
+            f::FORMAT_XQ_GATE_UP_FWHT256_TOKEN_ROWS,
+            f::FORMAT_Y_GATE_UP_SWIGLU_BF16,
+        ]
+    }
+
+    fn down_formats(gp: bool) -> [FormatId; 5] {
+        use hipfire_kernel_abi::families::qwen4_moe_sym as f;
+        [
+            f::FORMAT_EXPERT_PTRS_DOWN_QT53,
+            f::FORMAT_EXPERT_TILE_IDS,
+            f::FORMAT_SORTED_SLOT_INDEX,
+            if gp {
+                f::FORMAT_XQ_DOWN_ROT128_GROUPED_POSITION
+            } else {
+                f::FORMAT_XQ_DOWN_ROT128_FLAT_SLOTS
+            },
+            f::FORMAT_Y_DOWN_BF16,
+        ]
+    }
+
+    /// A candidate whose generator layout drifts from the contract (a moved scalar, a renamed
+    /// pointer, a larger segment) is refused before any launch; so are a short extent, a null
+    /// operand and a misaligned one.
+    #[test]
+    fn moe_wrong_candidate_layout_is_rejected_before_launch() {
+        let p = tiny(Kind::GateUp);
+        let e = entry("gate_up_nt4");
+        let ptrs = fake_ptrs(&p, false);
+        assert!(p.kernarg_with_layout(e, e.spec.kernargs(), ptrs).is_ok());
+        let mutate: [(&str, fn(&mut peacemaker_isa::KernargLayout)); 3] = [
+            ("moved M", |l| l.args[5].offset = 44),
+            ("renamed Xq", |l| l.args[3].name = "X".into()),
+            ("segment", |l| l.size = 72),
+        ];
+        for (what, f) in mutate {
+            let mut layout = e.spec.kernargs();
+            f(&mut layout);
+            let err = p.kernarg_with_layout(e, layout, ptrs).unwrap_err();
+            assert!(err.contains("kernarg layout"), "{what}: {err}");
+        }
+        let mut short = ptrs;
+        short[4].1 -= 2;
+        assert!(p.kernarg(e, short).is_err());
+        let mut null = ptrs;
+        null[1].0 = 0;
+        assert!(p.kernarg(e, null).is_err());
+        let mut odd = ptrs;
+        odd[4].0 += 8;
+        assert!(p.kernarg(e, odd).is_err(), "Y needs 16-byte alignment");
     }
 
     #[test]

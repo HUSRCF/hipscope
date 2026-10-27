@@ -56,6 +56,7 @@ pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;
 pub mod iu4_c8_pm;
+mod kernel_abi;
 pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;

@@ -17,6 +17,7 @@ flash-attn-ck = ["dep:libloading"]
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 railgun = { path = "../railgun" }
