@@ -7,11 +7,15 @@ The registry has **no published, paired Flash Next vision sidecar**. Export one
 and pass its path explicitly. The current validation route is
 [Flash-Next image pathway in VALIDATION.md](VALIDATION.md).
 
-Historical evidence (2026-10-23): the independent QSA and vision-tower checks
-below have receipts, and the single-GPU image HTTP route passed 17/17 cases on
-Strix Halo (gfx1151). The later beta vision-contract adaptation has not been
-revalidated; those results apply to the recorded artifacts, not the current
-branch head.
+Post-merge Halo validation is recorded below for source
+`95e69b9669f87f1b5de960c26e3c2bd840100691` and the exact binaries in the
+[2026-10-27 receipt](../benchmarks/vision/halo-gate-20261027.json). Default
+`auto` loads with and without the tower have identical text; image serving and
+automatic admission passed. **Stock beta could not load on this 96 GiB BIOS
+carve-out configuration**; its separate text reference required
+`HIPFIRE_OOM_GUARD=0`. That comparison is explicitly non-default. The earlier
+2026-10-23 CPU tower reference and historical capture diagnostic remain scoped
+to their original artifacts.
 
 ## Checkpoint and artifact
 
@@ -125,10 +129,87 @@ The implementation lives in `hipfire-arch-qwen4`'s `vision` and
 `bundle/image_context` modules, `hipfire-generate/src/qwen4_vision.rs`, and the
 optional QSA mRoPE bindings in `rdna-compute/src/qsa_mrope.rs`.
 
+## Halo validation (2026-10-27)
+
+This is fixture-bound evidence, not an admission record or a speed claim.
+Tested source: `95e69b9669f87f1b5de960c26e3c2bd840100691`, including beta
+`035c0ddd604d6154a153f9b68a560afe5fb59a33`. Hardware: gfx1151, HIP
+`7.16.26385-0000000`, kernel `7.0.0-38-generic`, 96 GiB BIOS-reserved VRAM.
+The [receipt](../benchmarks/vision/halo-gate-20261027.json) includes complete
+text, request/prompt identities, image answers, load logs, memory snapshots,
+and model/binary digests. Later documentation-only commits do not extend it
+to changed runtime code.
+
+Each arm used a fresh process and isolated `HIPFIRE_HOME`, the same monolithic
+`8b15b6fe...` trunk, external Q4LM row-order PLE, and default gfx1151-zab-v1
+trunk overlay. This is not a fresh split-layout pull. `vision_mode`, `max_seq`,
+MTP, NPU trunk and graph policy were omitted from the serving command and
+resolved through product defaults; only the tower arm supplied `--vision`.
+The text harness attached with `--no-spawn --mtp auto --sampling greedy
+--seed 0 --thinking off --thinking-effort none --max-tokens 512`. The prompts
+are the committed five-genre battery in `scripts/serve_harness.py`.
+
+| Check | Observed result |
+| --- | --- |
+| PR default text, no sidecar vs auto-loaded sidecar | 5/5 complete transcripts byte-identical, including reasoning/tool fields, request hashes, input/output token counts and terminals |
+| Separate beta reference | Same 5/5 transcripts, but **OOM guard explicitly off**; not a stock-default pass |
+| Auto-loaded image tower | 17/17 HTTP/lifecycle cases plus image capability discovery |
+| No-sidecar text-only capability | 11/11 image-refusal and follow-up text cases |
+| Text chain after image/cancellation | 5/5 coherent, clean stop terminals |
+| CPU vision/load/image/resource/admission tests | 61 passed across six filters; the exploratory zero-match filter is not counted |
+| GPU channel | 18 passed, zero failed/skipped |
+| Independent QSA mRoPE oracle | Five cases pass; max norm/rotation error `8.9407e-7`, chunk/pooling comparisons exact |
+
+RGB answers agree across stream modes. OCR transcribes all five direction
+signs, including accents; both dog answers identify it sleeping on its back.
+These were checked against the source images. Text serving actually ran native
+MTP (`K=7`); default NPU planning selected GPU-only plans (`families=none`), so
+this is not proof of NPU-executed inference. The transcript digest shared by
+all three successful arms is `578a6f19180b6e65e95a36eb0fe6bd32`.
+
+**Beta limitation.** Stock `035c0ddd` rejected the load because its host-union
+check counted device allocations in the BIOS carve-out against the remaining
+host RAM: 80.7 GiB required plus 4 GiB headroom versus 22.3 GiB available.
+The PR's allocation-backing query avoids that double count. The separate
+beta binary was rerun with `HIPFIRE_OOM_GUARD=0` only for the text reference;
+that switch also disables other host-headroom checks. Observed fully-resident
+placement, KV/GDN format, automatic context and MTP route matched. PR admission
+was tested with the default guard enabled. Strict stock-beta default-load
+parity is therefore **not established on this BIOS configuration**.
+
+The loader reported these automatic-admission values (MiB are truncated log
+values). The first free-memory sample is after text-rank construction, before
+tower upload; it must not be mistaken for final resident free memory.
+
+| Budget | No sidecar | Auto-loaded tower |
+| --- | ---: | ---: |
+| Free device memory at rank admission, MiB | 18,864 | 18,864 |
+| Remaining context/gather/MTP request growth, MiB | 8,238 | 8,238 |
+| Resident PLE retained, MiB | 8,380 | 6,519 |
+| Device headroom, MiB | 2,048 | 2,048 |
+| Admitted automatic context / card cap | 262,144 | 262,144 |
+| Independent vision reserve, bytes | 0 | 2,158,224,320 |
+
+The vision quote is 896,353,216 bytes of resident weights including FC2 padding
+plus 1,261,871,104 bytes for maximum-image scratch, projected rows and allowance.
+It reduces reclaimable PLE residency rather than taking the context's reserved
+space. Both PR loads and subsequent requests passed; all test services stopped,
+and device usage returned to 302,886,912 bytes (desktop baseline). The admitted
+262,144 capacity was not exercised with a full-length prompt; snapshots are
+not peak-memory measurements. No throughput/TTFT or new PM4 claim is made.
+
+PR binary MD5s: CLI `6b07ce81db9b14f3376a8bf229b75936`, daemon
+`49d7dbc15bd0be4a2f3916b515490996`. Beta reference MD5s: CLI
+`03a5d5d0f69499619e0a00b9bfcb93d3`, daemon
+`a9261fba8ef5ddab153d6f7575e58f8f`. Full SHA-256 identities and commands are in
+the receipt. Local raw files are under
+`.codeinsight+research/vision-938/halo-gate-20261027/`.
+
 ## Validation
 
-The commands below define the required route; the historical receipts later in
-this section do not validate the current beta merge or its reservation changes.
+The commands below define the route for future runtime changes. The dated
+post-merge receipt above covers its pinned source and fixture; historical
+receipts later in this section do not validate newer changes.
 
 CPU checks:
 
