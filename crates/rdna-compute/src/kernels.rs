@@ -4601,7 +4601,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// (`gemm_mq6_i8::mq6_i8_pm_admits`).
 /// Default on exact gfx1201 where the launch meets those preconditions
 /// (`HIPFIRE_MQ6_I8_PM=0` keeps the hipcc kernel).
-/// SHA-256 af4142cabd70f923125fea1610223f370aaf088ebf27096a9b660f373d764e49
+/// SHA-256 1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da
 /// (`sha256sum kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`).
 pub const GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco");
@@ -10486,7 +10486,17 @@ pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str = concat!(
 /// keep their original `gfx1100` spelling.
 pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp_exchange16.h"),
     include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip")
+);
+
+/// 16-bit partial-sum exchange for the dense TP residual reduction
+/// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
+/// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit
+/// partials in f32 into the f32 residual. See `kernels/src/tp_exchange16.hip`.
+pub const TP_EXCHANGE16_SRC: &str = concat!(
+    include_str!("../../../kernels/src/tp_exchange16.h"),
+    include_str!("../../../kernels/src/tp_exchange16.hip")
 );
 
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");

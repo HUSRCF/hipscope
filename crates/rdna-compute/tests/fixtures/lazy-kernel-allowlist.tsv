@@ -1190,6 +1190,7 @@ module	swa_ring_write_batched_pos	non-core-family	Non-core family route: DeepSee
 module	swa_ring_write_f32_buf	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22822
 module	swa_visibility_stage_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22872
 module	swa_visibility_stage_batched_pos	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22916
+module	tp_exchange16	config-opt-in	Requires tp>1 / --tp; default single-device load uses tp=1; rdna-compute/src/norm.rs:673
 module	tp_graph_signal_barrier_gfx1100	config-opt-in	Non-default configuration: attention.rs; rdna-compute/src/attention.rs:20493
 module	tp_graph_signal_reduce_gfx1100	config-opt-in	Non-default configuration: attention.rs; rdna-compute/src/attention.rs:20498
 module	tp_graph_signal_store_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:20645

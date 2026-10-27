@@ -1197,6 +1197,24 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "tp2-graph-fused-reduce16",
+        predicates: &[CaptureMode],
+        condition: "direct_add16 (hipfire-runtime multi_gpu/tp_exchange.rs): `HIPFIRE_TP_EXCHANGE=bf16|f16` (default bf16) alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph) → `tp_graph_signal_reduce16_{bf16,f16}_gfx1100`",
+        effect: KernelSelection,
+        switches: "captured: one fused signal barrier + 16-bit coherent payload exchange + rank-ordered residual add kernel per rank; eager: `tp_pack16_*` + event record/wait + `tp_fold16_*` reading both ranks' 16-bit slots",
+        kernels: &[
+            "tp_graph_signal_reduce16_bf16_gfx1100",
+            "tp_graph_signal_reduce16_f16_gfx1100",
+            "tp_pack16_bf16",
+            "tp_pack16_f16",
+            "tp_fold16_bf16",
+            "tp_fold16_f16",
+        ],
+        verdict: ByteExact,
+        evidence: "both routes compute `x + (r(p0) + r(p1))` per element, r = the shared round-to-nearest-even 16-bit round trip of kernels/src/tp_exchange16.h, with fp32 adds only (no contraction) in rank order on every rank; the captured payload exchange copies the packed 16-bit bits. Capture and eager agree bit for bit; the 16-bit sum itself is a numeric route against the f32 exchange (KLD-judged, see docs/multi-gpu.md); multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
         id: "redline-oracle-diagnostics",
         predicates: &[DeclaredCaptureBody, ReplayState],
         condition: "hipfire-generate redline.rs and hipfire-daemon oracle handlers: capture_safe arms of the DSpark oracle, replay state in JSON responses",
@@ -2499,6 +2517,12 @@ pub const SITES: &[Site] = &[
         function: "drop_rank_graphs",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu/tp_exchange.rs",
+        function: "direct_add16",
+        occurrences: 1,
+        decisions: &["tp2-graph-fused-reduce16"],
     },
     Site {
         file: "rdna-compute/src/attention.rs",
