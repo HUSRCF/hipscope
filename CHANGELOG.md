@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- **Release: prebuilt Linux ROCm binary archives (`hipfire-<tag>-linux-rocm-<arch>-x64.tar.gz` + `.sha256`, gfx1151 / gfx1201 / gfx1100) are attached to the release.** `scripts/build-binary-archive.sh` builds the CLI and daemon once from the tag in the release image (same toolchain as the kernel packs), strips both binaries (~100 MB unstripped each), and packs `bin/hipfire`, `bin/daemon`, `bin/kernels/compiled/<arch>/` (the pack's kernels, SHA-256 checked), `LICENSE` and `NOTICE` into a reproducible tarball. The HIP runtime is not bundled; the host needs ROCm.
+- **Release: prebuilt Linux ROCm binary archives (`hipfire-<tag>-linux-rocm-<arch>-x64.tar.gz` + `.sha256`, gfx1151 / gfx1201 / gfx1100) are attached to the release.** `scripts/build-binary-archive.sh` builds the CLI and daemon once from the tag in the release image (same toolchain as the kernel packs), strips both binaries (`strip --strip-unneeded` on the staged copies), and packs `bin/hipfire`, `bin/daemon`, `bin/kernels/compiled/<arch>/` (the pack's kernels, SHA-256 checked), `LICENSE` and `NOTICE` into a reproducible tarball. The HIP runtime is not bundled; the host needs ROCm.
+- **Fixed: the CLI now finds a daemon sitting beside its own executable.** `find_daemon` probed only `HIPFIRE_DAEMON_BIN`, `$HIPFIRE_HOME/bin` (default `~/.hipfire/bin`) and the source tree, so an extracted `bin/hipfire` + `bin/daemon` pair outside an install needed `HIPFIRE_DAEMON_BIN`. The order is now `HIPFIRE_DAEMON_BIN`, `<dir of the running hipfire>/daemon` (`daemon.exe` first on Windows), the hipfire home's `bin/`, then the source-tree `target/`. The daemon found is still checked by the same doctor/version checks as any other.
 
 ## v0.4.4 — 2026-10-27
 
