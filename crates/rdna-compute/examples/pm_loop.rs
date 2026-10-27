@@ -9,6 +9,7 @@
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
+//!         [--null-control aa] [--noise-floor FILE]
 //!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
 //!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm)
 //! ```
@@ -61,6 +62,33 @@
 //!    (default 0.005); the human verdict says `faster/slower (material)` or
 //!    `separable but below min-effect`. Sampling is refused when the
 //!    candidate fails correctness.
+//!
+//!    Noise fields (additive, schema stays 1): `timing.noise` carries
+//!    `round_ratios` (the per-ABBA-round candidate/baseline ratios the sign test
+//!    runs over), `round_ratio` / `baseline_block_median` /
+//!    `candidate_block_median` (dispersion objects `{n, median, mad, iqr, p05,
+//!    p95, min, max, cv, log_sd}`; block medians in us, `mad` unscaled, quantiles
+//!    linearly interpolated, `log_sd` = sample sd of ln) and
+//!    `baseline_drift_per_block` / `candidate_drift_per_block` (OLS slope of the
+//!    block median over the block index, divided by the mean block median).
+//!
+//!    `--null-control aa`: A/A run. No candidate is emitted (no `--rip`, no
+//!    `--base-*`: usage error); the candidate object is a clone of the resolved
+//!    baseline object (same bytes, launch symbol and exports) loaded as a
+//!    SEPARATE module, so the two arms are distinct loaded objects of identical
+//!    code. The launch layout (grid/kernarg) still comes from the workload's
+//!    candidate knobs, so pass knobs that describe the baseline launch; the
+//!    correctness stage (`identical_to_baseline`) enforces that. The record gains
+//!    top-level `null_control: {kind: "aa", identical_objects, baseline_sha256,
+//!    ..}`; the candidate's M7 certification is the baseline's (same bytes) and
+//!    `candidate.m7.reused_from` says so. Everything else is unchanged.
+//!
+//!    `--noise-floor FILE`: a `pm-census noise` output (`hipfire.pm_noise.v1`).
+//!    The A/A group with the same kernel, shape and baseline sha256 supplies
+//!    `timing.vs_noise_floor = {floor, effect: |block_ratio - 1|, exceeds,
+//!    group}`, or `{status: "no matching A/A group"}` (also `{status, group}` when
+//!    the matching group has too few runs for a floor). It never changes
+//!    `material`.
 //!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
@@ -163,11 +191,17 @@ struct Opts {
     out: Option<PathBuf>,
     /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
     rip: Option<PathBuf>,
+    /// `--null-control aa`: time the baseline object against a clone of itself.
+    null_control: bool,
+    /// `--noise-floor FILE`: a `pm-census noise` document.
+    noise_floor: Option<PathBuf>,
+    /// Parsed `noise_floor` (loaded by `main` before the run).
+    noise_floor_doc: Option<Value>,
     knobs: Knobs,
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -181,6 +215,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         emu: false,
         out: None,
         rip: None,
+        null_control: false,
+        noise_floor: None,
+        noise_floor_doc: None,
         knobs: Knobs::default(),
     };
     while let Some(arg) = a.next() {
@@ -222,6 +259,15 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             }
             "out" => o.out = Some(PathBuf::from(value)),
             "rip" => o.rip = Some(PathBuf::from(value)),
+            "null-control" => {
+                if value != "aa" {
+                    return Err(format!(
+                        "--null-control {value}: the only null control is `aa`"
+                    ));
+                }
+                o.null_control = true;
+            }
+            "noise-floor" => o.noise_floor = Some(PathBuf::from(value)),
             _ => {
                 if o.knobs.0.insert(key.clone(), value).is_some() {
                     return Err(format!("--{key} given twice"));
@@ -249,6 +295,18 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym, iu4_c8_producer_pm, moe_rotate_i4_pm or gdn_chunk_prep_pm: only those generators are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
+    }
+    if o.null_control {
+        if o.rip.is_some() {
+            return Err(
+                "--null-control aa cannot be combined with --rip (no candidate is emitted)".into(),
+            );
+        }
+        if let Some(k) = o.knobs.0.keys().find(|k| k.starts_with("base-")) {
+            return Err(format!(
+                "--null-control aa cannot be combined with --{k} (the candidate is the resolved baseline)"
+            ));
+        }
     }
     if o.max_rounds < o.rounds {
         return Err(format!(
@@ -479,6 +537,16 @@ fn timing_record(
             v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         )
     };
+    let ratios = abba::round_ratios(&s.base_ns, &s.cand_ns, n)?;
+    let block_us = |v: &[f64]| v.iter().map(|x| us(*x)).collect::<Vec<_>>();
+    let noise = json!({
+        "round_ratios": ratios,
+        "round_ratio": abba::dispersion(&ratios)?.json(),
+        "baseline_block_median": abba::dispersion(&block_us(&r.baseline_block_medians))?.json(),
+        "candidate_block_median": abba::dispersion(&block_us(&r.candidate_block_medians))?.json(),
+        "baseline_drift_per_block": abba::drift_per_round(&r.baseline_block_medians),
+        "candidate_drift_per_block": abba::drift_per_round(&r.candidate_block_medians),
+    });
     let (bmin, bmax) = ext(&r.baseline_block_medians);
     let (cmin, cmax) = ext(&r.candidate_block_medians);
     Ok(json!({
@@ -500,7 +568,47 @@ fn timing_record(
         "observed_spread_us": us(spread), "median_delta_us": us(delta),
         "unit": "us per launch (hipEvent, default stream)",
         "rule": RULE,
+        "noise": noise,
     }))
+}
+
+/// `timing.vs_noise_floor` from a `pm-census noise` document: the A/A group
+/// with the same kernel, shape and baseline sha256 gives the floor (the
+/// largest, if several match); the effect is `|block_ratio - 1|`.
+fn vs_noise_floor(
+    doc: &Value,
+    kernel: &str,
+    shape: &Value,
+    baseline_sha: &str,
+    block_ratio: f64,
+) -> Value {
+    let empty = Vec::new();
+    let matching: Vec<&Value> = doc["groups"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|g| {
+            g["aa"] == true
+                && g["kernel"] == kernel
+                && g["shape"] == *shape
+                && g["baseline_sha256"] == baseline_sha
+        })
+        .collect();
+    if matching.is_empty() {
+        return json!({"status": "no matching A/A group"});
+    }
+    let best = matching
+        .iter()
+        .filter_map(|g| g["floor"].as_f64().map(|f| (f, g["id"].clone())))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    match best {
+        Some((floor, id)) => {
+            let effect = (block_ratio - 1.0).abs();
+            json!({"floor": floor, "effect": effect, "exceeds": effect > floor, "group": id})
+        }
+        None => json!({"status": "matching A/A group has no floor (insufficient runs)",
+            "group": matching[0]["id"].clone()}),
+    }
 }
 
 /// An emulator refusal carries the faulting instruction's full register dump
@@ -658,43 +766,52 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join(format!("pm_loop-{}", std::process::id())));
 
-    // 1. emit + link
-    let cand = match w.candidate() {
-        Ok(c) => c,
-        Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
+    // 1. emit + link. `--null-control aa`: no candidate is emitted; it is a
+    // clone of the baseline object (loaded as a separate module below).
+    let aa = o.null_control;
+    let emitted = if aa {
+        None
+    } else {
+        match w.candidate() {
+            Ok(c) => Some(c),
+            Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
+        }
     };
     let base = match w.baseline() {
         Ok(b) => b,
         Err(e) => return fail(rec, "baseline", e),
     };
+    let cand = emitted.unwrap_or_else(|| base.clone());
 
     // 2. certify + resources
-    let cand_path = match write_object(&out_dir, "candidate", &cand) {
-        Ok(p) => p,
-        Err(e) => return fail(rec, "write", e),
-    };
-    let m7 = certify(&cand_path, &cand.exports);
-    let (cand_res, cand_lint) = match lift(&cand.bytes).and_then(|p| {
-        let r = resources(&p, &cand.exports)?;
-        Ok((r, cost_lint(&p)))
-    }) {
-        Ok((r, l)) => (json!(r), l),
-        Err(e) => (json!({"error": e}), Value::Null),
-    };
-    let mut cextra = serde_json::Map::new();
-    cextra.insert("m7".into(), {
-        let mut v = m7.clone();
-        v.as_object_mut().map(|o| o.remove("receipts"));
-        v
-    });
-    cextra.insert("m7_receipts".into(), m7["receipts"].clone());
-    cextra.insert("cost_lint".into(), cand_lint);
-    cextra.insert("object_path".into(), json!(cand_path.display().to_string()));
-    cextra.insert("knobs".into(), w.candidate_knobs());
-    rec["candidate"] = object_json(&cand, cand_res, cextra);
-    if m7["status"] != "pass" {
-        let msg = m7["error"].to_string();
-        return fail(rec, "m7", msg);
+    if !aa {
+        let cand_path = match write_object(&out_dir, "candidate", &cand) {
+            Ok(p) => p,
+            Err(e) => return fail(rec, "write", e),
+        };
+        let m7 = certify(&cand_path, &cand.exports);
+        let (cand_res, cand_lint) = match lift(&cand.bytes).and_then(|p| {
+            let r = resources(&p, &cand.exports)?;
+            Ok((r, cost_lint(&p)))
+        }) {
+            Ok((r, l)) => (json!(r), l),
+            Err(e) => (json!({"error": e}), Value::Null),
+        };
+        let mut cextra = serde_json::Map::new();
+        cextra.insert("m7".into(), {
+            let mut v = m7.clone();
+            v.as_object_mut().map(|o| o.remove("receipts"));
+            v
+        });
+        cextra.insert("m7_receipts".into(), m7["receipts"].clone());
+        cextra.insert("cost_lint".into(), cand_lint);
+        cextra.insert("object_path".into(), json!(cand_path.display().to_string()));
+        cextra.insert("knobs".into(), w.candidate_knobs());
+        rec["candidate"] = object_json(&cand, cand_res, cextra);
+        if m7["status"] != "pass" {
+            let msg = m7["error"].to_string();
+            return fail(rec, "m7", msg);
+        }
     }
     let (base_res, base_lint) = match lift(&base.bytes).and_then(|p| {
         let r = resources(&p, std::slice::from_ref(&base.launch_symbol))?;
@@ -708,6 +825,8 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Ok(p) => certify(p, std::slice::from_ref(&base.launch_symbol)),
         Err(e) => json!({"status": "skipped", "error": e}),
     };
+    let base_receipts = base_m7["receipts"].clone();
+    let base_res_for_cand = base_res.clone();
     let mut bextra = serde_json::Map::new();
     bextra.insert("source".into(), base.source.clone());
     bextra.insert("m7".into(), {
@@ -724,6 +843,38 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         },
     );
     rec["baseline"] = object_json(&base, base_res, bextra);
+    if aa {
+        // The candidate is the baseline object: its certification IS the
+        // baseline's (same bytes), reported as such.
+        let mut m7 = rec["baseline"]["m7"].clone();
+        if let Some(m) = m7.as_object_mut() {
+            m.insert("reused_from".into(), json!("baseline"));
+        }
+        let mut cextra = serde_json::Map::new();
+        cextra.insert("m7".into(), m7.clone());
+        cextra.insert("m7_receipts".into(), base_receipts);
+        cextra.insert("cost_lint".into(), rec["baseline"]["cost_lint"].clone());
+        cextra.insert(
+            "object_path".into(),
+            json!(base_path.as_ref().ok().map(|p| p.display().to_string())),
+        );
+        cextra.insert("knobs".into(), w.candidate_knobs());
+        rec["candidate"] = object_json(&cand, base_res_for_cand, cextra);
+        rec["null_control"] = json!({
+            "kind": "aa",
+            "identical_objects": cand.bytes == base.bytes
+                && cand.launch_symbol == base.launch_symbol
+                && cand.exports == base.exports,
+            "separate_modules": true,
+            "baseline_sha256": sha256_hex(&base.bytes),
+            "candidate_sha256": sha256_hex(&cand.bytes),
+            "certification": "candidate certification reuses the baseline's (same bytes)",
+        });
+        if m7["status"] == "fail" {
+            let msg = m7["error"].to_string();
+            return fail(rec, "m7", msg);
+        }
+    }
 
     // 3. correctness on the card
     let gpu = match Gpu::init() {
@@ -805,6 +956,15 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         (Ok((s, stop, secs)), Ok(true)) => {
             match timing_record(&s, o.time, o.rounds, stop, secs, o.min_effect) {
                 Ok(mut t) => {
+                    if let Some(doc) = &o.noise_floor_doc {
+                        t["vs_noise_floor"] = vs_noise_floor(
+                            doc,
+                            &o.kernel,
+                            &rec["shape"],
+                            rec["baseline"]["co_sha256"].as_str().unwrap_or(""),
+                            t["block_ratio"].as_f64().unwrap_or(f64::NAN),
+                        );
+                    }
                     t["post_outputs_unchanged"] = json!(true);
                     rec["timing"] = t;
                 }
@@ -864,6 +1024,25 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(path) = &opts.noise_floor {
+        match std::fs::read_to_string(path)
+            .map_err(err)
+            .and_then(|t| serde_json::from_str::<Value>(&t).map_err(err))
+        {
+            Ok(v) if v["schema"] == "hipfire.pm_noise.v1" => opts.noise_floor_doc = Some(v),
+            Ok(_) => {
+                eprintln!(
+                    "pm_loop: --noise-floor {}: not a hipfire.pm_noise.v1 document",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("pm_loop: --noise-floor {}: {e}", path.display());
+                std::process::exit(2);
+            }
+        }
+    }
     let (rec, outcome) = run(&mut opts);
     println!(
         "{}",
@@ -1246,5 +1425,115 @@ mod tests {
         use peacemaker_isa::pm_check::M7Cache;
         let all = [M7Cache::Hit, M7Cache::Miss, M7Cache::Disabled].map(M7Cache::as_str);
         assert_eq!(all, ["hit", "miss", "disabled"]);
+    }
+
+    #[test]
+    fn noise_fields_on_synthetic_samples() {
+        use abba::ExtendStop::Separable;
+        let t = timing_record(
+            &flat(2, 12, 100_000.0, 200_000.0),
+            2,
+            6,
+            Separable,
+            1.0,
+            0.005,
+        )
+        .unwrap();
+        let n = &t["noise"];
+        assert_eq!(n["round_ratios"].as_array().unwrap().len(), 12);
+        assert!(n["round_ratios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| *r == 2.0));
+        assert_eq!(n["round_ratio"]["n"], 12);
+        assert_eq!(n["round_ratio"]["median"], 2.0);
+        assert_eq!(n["round_ratio"]["mad"], 0.0);
+        assert_eq!(n["baseline_block_median"]["n"], 24);
+        assert_eq!(n["baseline_block_median"]["median"], 100.0);
+        assert_eq!(n["candidate_block_median"]["median"], 200.0);
+        assert_eq!(n["baseline_drift_per_block"], 0.0);
+        assert_eq!(n["candidate_drift_per_block"], 0.0);
+        // Existing fields keep their meaning next to the new block.
+        assert_eq!(t["block_ratio"], 2.0);
+        // A ramping baseline drifts upward, a flat candidate does not (n=1: one launch per block).
+        let base: Vec<f64> = (0..8)
+            .map(|i| 100_000.0 + 10_000.0 * f64::from(i))
+            .collect();
+        let ramp = timing_record(
+            &samples(&base, &[100_000.0; 8]),
+            1,
+            2,
+            Separable,
+            1.0,
+            0.005,
+        )
+        .unwrap();
+        assert!(ramp["noise"]["baseline_drift_per_block"].as_f64().unwrap() > 0.0);
+        assert_eq!(ramp["noise"]["candidate_drift_per_block"], 0.0);
+        // 8 launches per arm at n = 1 are 4 ABBA rounds (2 blocks per arm per round).
+        assert_eq!(ramp["noise"]["round_ratios"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn null_control_and_noise_floor_flags_parse() {
+        let o = parse_args(args(
+            "--kernel iu4_gemm --null-control aa --noise-floor /tmp/n.json",
+        ))
+        .unwrap();
+        assert!(o.null_control);
+        assert_eq!(o.noise_floor, Some(PathBuf::from("/tmp/n.json")));
+        assert!(o.knobs.0.is_empty(), "driver flags are not knobs");
+        let d = parse_args(args("--kernel iu4_gemm")).unwrap();
+        assert!(!d.null_control && d.noise_floor.is_none());
+        for bad in [
+            "--kernel k --null-control bb",
+            "--kernel k --null-control",
+            "--kernel k --null-control aa --rip /tmp/a.rip",
+            "--kernel k --null-control aa --base-tile 128x128x8",
+            "--kernel k --noise-floor",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad}");
+        }
+        // --base-* without the null control is still a knob.
+        assert!(parse_args(args("--kernel k --base-tile 1")).is_ok());
+    }
+
+    #[test]
+    fn vs_noise_floor_matches_aa_group_and_never_guesses() {
+        let shape = json!({"M": 128, "N": 128});
+        let doc = json!({"schema": "hipfire.pm_noise.v1", "groups": [
+            {"id": "g1", "aa": true, "kernel": "iu4_gemm", "shape": {"M": 128, "N": 128},
+             "baseline_sha256": "aa", "floor": 0.002},
+            {"id": "g2", "aa": true, "kernel": "iu4_gemm", "shape": {"M": 128, "N": 128},
+             "baseline_sha256": "aa", "floor": 0.004},
+            {"id": "g3", "aa": false, "kernel": "iu4_gemm", "shape": {"M": 128, "N": 128},
+             "baseline_sha256": "aa", "floor": 0.5},
+            {"id": "g4", "aa": true, "kernel": "iu4_gemm", "shape": {"M": 1, "N": 1},
+             "baseline_sha256": "aa", "floor": 0.5},
+            {"id": "g5", "aa": true, "kernel": "mq6_i8_gemm", "shape": {"M": 128, "N": 128},
+             "baseline_sha256": "bb", "floor": Value::Null},
+        ]});
+        // The largest matching floor wins; A/B groups and other shapes are ignored.
+        let v = vs_noise_floor(&doc, "iu4_gemm", &shape, "aa", 0.99);
+        assert_eq!(v["group"], "g2");
+        assert_eq!(v["floor"], 0.004);
+        assert!((v["effect"].as_f64().unwrap() - 0.01).abs() < 1e-12);
+        assert_eq!(v["exceeds"], true);
+        let v = vs_noise_floor(&doc, "iu4_gemm", &shape, "aa", 1.003);
+        assert_eq!(v["exceeds"], false);
+        // No match: wrong sha, wrong kernel.
+        assert_eq!(
+            vs_noise_floor(&doc, "iu4_gemm", &shape, "cc", 0.9)["status"],
+            "no matching A/A group"
+        );
+        assert_eq!(
+            vs_noise_floor(&doc, "fp8_gemm", &shape, "aa", 0.9)["status"],
+            "no matching A/A group"
+        );
+        // A matching group without a floor does not invent one.
+        let v = vs_noise_floor(&doc, "mq6_i8_gemm", &shape, "bb", 0.9);
+        assert!(v["floor"].is_null() && v["status"].is_string());
+        assert_eq!(v["group"], "g5");
     }
 }

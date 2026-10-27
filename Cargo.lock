@@ -1542,6 +1542,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1723,6 +1724,16 @@ dependencies = [
  "saddle-core",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "hipfire-kernel-abi"
+version = "0.4.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2845,6 +2856,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pm-census"
+version = "0.4.4"
+dependencies = [
+ "hipfire-atlas",
+ "hipfire-kernel-abi",
+ "peacemaker-lift",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2996,7 +3019,9 @@ version = "0.4.4"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-kernel-abi",
  "parking_lot",
+ "railgun-cert",
  "railgun-corpus",
  "rdna-compute",
  "redline-rocr",
@@ -3245,6 +3270,7 @@ dependencies = [
  "half",
  "hip-bridge",
  "hipfire-config",
+ "hipfire-kernel-abi",
  "libloading",
  "peacemaker-ir",
  "peacemaker-isa",

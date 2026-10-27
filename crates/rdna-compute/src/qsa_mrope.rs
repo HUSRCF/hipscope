@@ -7,7 +7,7 @@
 //! The prompt retains three coordinates per token; decode and pooled keys
 //! resolve their coordinates from the same owner, independently of KV offsets.
 
-use crate::tensor_ops::{IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, TENSOR_OPS_SRC};
+use crate::tensor_ops::{IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
@@ -111,7 +111,7 @@ pub fn norm_mrope(
         return Err(invalid("QSA mRoPE values extent mismatch"));
     }
     let kernel = "indexed_attention_norm_mrope_f32_batched";
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    gpu.ensure_kernel_public("qsa_mrope", crate::kernels::QSA_MROPE_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.values, p.norm, m.positions] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -187,7 +187,7 @@ pub fn pool_mrope(
     if first >= p.block_count {
         return Ok(());
     }
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    gpu.ensure_kernel_public("qsa_mrope", crate::kernels::QSA_MROPE_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.raw_keys.buf.as_ptr());
     args.push_ptr(p.pooled.buf.as_ptr());

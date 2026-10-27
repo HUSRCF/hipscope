@@ -9,6 +9,8 @@ members = [
     "crates/railgun",
     "crates/railgun-cert",
     "crates/railgun-corpus",
+    "crates/hipfire-kernel-abi",
+    "crates/pm-census",
     "crates/railgun-jitcorpus",
     "crates/peacemaker-isa",
     "crates/peacemaker-rip",

@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! `pm-census` CLI. Every subcommand prints one JSON document on stdout.
+
+fn usage() -> ! {
+    eprintln!("pm-census — PM/railgun bedrock developer tooling");
+    eprintln!();
+    eprintln!("  pm-census inventory [--repo DIR]                  embedded PM object inventory");
+    eprintln!("  pm-census census ...                              see `pm-census census --help`");
+    eprintln!("  pm-census extract ...                             see `pm-census extract --help`");
+    eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
+    std::process::exit(2);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some((cmd, rest)) = args.split_first() else {
+        usage();
+    };
+    let result = match cmd.as_str() {
+        "inventory" => pm_census::inventory::cli(rest),
+        "census" => pm_census::census::cli(rest),
+        "extract" => pm_census::extract::cli(rest),
+        "noise" => pm_census::noise::cli(rest),
+        _ => usage(),
+    };
+    if let Err(e) = result {
+        eprintln!("pm-census {cmd}: {e}");
+        std::process::exit(1);
+    }
+}
