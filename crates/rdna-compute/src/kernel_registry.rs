@@ -1051,11 +1051,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemv_hfq4g256_residual"]
         );
         add!(
-            "gemv_q8_0_wide",
-            kernels::GEMV_Q8_0_WIDE_SRC,
-            ["gemv_q8_0_wide"]
-        );
-        add!(
             "rope_partial_halfsplit_batched",
             kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC,
             ["rope_partial_halfsplit_batched_f32"]
@@ -1094,6 +1089,30 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen36_27b_fa_prep_gfx1201",
             kernels::qwen36_27b_fa_prep_gfx1201_src(),
             ["qwen36_27b_fa_prep_gfx1201"]
+        );
+    }
+    // Modules the shared runtime launchers request on every arch the pack
+    // ships: the plain Q8_0 GEMV (K <= 1536), and the LFM2 decode path's
+    // generic RoPE, gated short-conv and sampler kernels. A host without hipcc
+    // can only run what the pack carries, so each is packaged for all three
+    // (`pack_carries_every_shared_launcher_module_on_every_arch`).
+    if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
+        add!(
+            "gemv_q8_0_wide",
+            kernels::GEMV_Q8_0_WIDE_SRC,
+            ["gemv_q8_0_wide"]
+        );
+        add!("rope", kernels::ROPE_SRC, ["rope_f32"]);
+        add!(
+            "conv1d_gated_decode",
+            kernels::CONV1D_GATED_DECODE_SRC,
+            ["conv1d_gated_decode_f32"]
+        );
+        add!("sample_top_p", kernels::SAMPLE_TOP_P_SRC, ["sample_top_p"]);
+        add!(
+            "sample_rows_pf",
+            kernels::SAMPLE_ROWS_PF_SRC,
+            ["sample_rows_pf_f32"]
         );
     }
     // H2 (Qwen3.8-27B MQ4v2) prefill, MTP and DFlash modules JIT-compiled by
@@ -10295,6 +10314,25 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Shared-launcher modules the packs lacked (LFM2 decode, plain Q8 GEMV).
+        const SHARED_LAUNCHER_ADDED_MODULES: [&str; 4] = [
+            "rope",
+            "conv1d_gated_decode",
+            "sample_top_p",
+            "sample_rows_pf",
+        ];
+        for module in SHARED_LAUNCHER_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing shared launcher module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10310,7 +10348,8 @@ mod tests {
                 + MOE_FRONT_ADDED_MODULES.len()
                 + MQ4RS_DECODE_ADDED_MODULES.len()
                 + HD64_FLASH_TILE_ADDED_MODULES.len()
-                + FP8_SPLIT_LSE_ADDED_MODULES.len(),
+                + FP8_SPLIT_LSE_ADDED_MODULES.len()
+                + SHARED_LAUNCHER_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -10329,6 +10368,79 @@ mod tests {
         );
     }
 
+    /// Modules the shared launchers request on every arch (the plain Q8_0 GEMV
+    /// and the LFM2 decode path's RoPE, gated short-conv and samplers) are in
+    /// every arch's registry, hence in every release kernel pack, with the
+    /// runtime's exact source. A pack that lacks one makes a host without hipcc
+    /// fail on first use. Each row is checked against the launcher's own
+    /// `ensure_kernel` call text so the table cannot drift from the runtime.
+    /// Not a general "every requested module is packaged" check: ~470 modules
+    /// the runtime can request are deliberately JIT-only (lab, vision and
+    /// older-family paths), so a blanket scrape needs an allowlist as large as
+    /// the gap; this table is the set known to be hit on supported models.
+    #[test]
+    fn pack_carries_every_shared_launcher_module_on_every_arch() {
+        fn squeeze(text: &str) -> String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let gemv = squeeze(include_str!("gemv.rs"));
+        let norm = squeeze(include_str!("norm.rs"));
+        let sampling = squeeze(include_str!("sampling.rs"));
+        let rows: [(&str, &str, &str, &str, &str); 5] = [
+            (
+                "gemv_q8_0_wide",
+                "GEMV_Q8_0_WIDE_SRC",
+                "gemv_q8_0_wide",
+                "gemv",
+                kernels::GEMV_Q8_0_WIDE_SRC,
+            ),
+            ("rope", "ROPE_SRC", "rope_f32", "norm", kernels::ROPE_SRC),
+            (
+                "conv1d_gated_decode",
+                "CONV1D_GATED_DECODE_SRC",
+                "conv1d_gated_decode_f32",
+                "norm",
+                kernels::CONV1D_GATED_DECODE_SRC,
+            ),
+            (
+                "sample_top_p",
+                "SAMPLE_TOP_P_SRC",
+                "sample_top_p",
+                "sampling",
+                kernels::SAMPLE_TOP_P_SRC,
+            ),
+            (
+                "sample_rows_pf",
+                "SAMPLE_ROWS_PF_SRC",
+                "sample_rows_pf_f32",
+                "sampling",
+                kernels::SAMPLE_ROWS_PF_SRC,
+            ),
+        ];
+        for (module, src_const, symbol, file, source) in rows {
+            let call = squeeze(&format!(
+                "ensure_kernel(\"{module}\",kernels::{src_const},\"{symbol}\""
+            ));
+            let text = match file {
+                "gemv" => &gemv,
+                "norm" => &norm,
+                _ => &sampling,
+            };
+            assert!(
+                text.contains(&call),
+                "launcher no longer requests {module}/{symbol}"
+            );
+            for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+                let entry = lookup(arch, module, "")
+                    .unwrap_or_else(|e| panic!("{arch} pack lacks module {module}: {e:?}"));
+                assert!(
+                    entry.symbols.contains(&symbol),
+                    "{arch} {module} lacks {symbol}"
+                );
+                assert_eq!(entry.source(), source, "{arch} {module} source");
+            }
+        }
+    }
     #[test]
     fn corpus_entries_name_each_module_once_per_arch() {
         for arch in SUPPORTED_ARCHES {
