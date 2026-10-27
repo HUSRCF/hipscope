@@ -79,7 +79,14 @@ pub const S1_PRIMITIVE_TILE_ROWS: usize = 512;
 /// Prompt rows one S1 window admits. A longer prompt runs several windows
 /// (each its own expert sweep) and is receipted as such; it never claims one
 /// sweep per prompt.
-pub const S1_WINDOW_ROWS: usize = 16384;
+///
+/// Whole product tiles: the planner closes a window before the tile that would
+/// pass it, so a window of `S1_WINDOW_TILES` 768-row tiles carries every row.
+/// 21 tiles (16,128 rows) left a 32,780-row prompt a 524-row third window that
+/// still paid a full expert sweep; 22 tiles (16,896 rows) makes it two. The
+/// window is also a whole number of the 1536-row and 512-row tiles (11 and 33).
+pub const S1_WINDOW_TILES: usize = 22;
+pub const S1_WINDOW_ROWS: usize = S1_WINDOW_TILES * S1_PRODUCT_TILE_ROWS;
 
 /// Fewest request rows S1 runs when forced: one row past a tile, the first
 /// genuinely multi-chunk request (a request of at most one tile is a named
@@ -1643,10 +1650,12 @@ impl SlowlinkProfile {
         })
     }
 
-    /// Windows a request of `rows` rows runs ([`S1_WINDOW_ROWS`] each, the
-    /// last possibly short).
+    /// Windows a request of `rows` rows runs: the planner packs whole tiles,
+    /// so a window holds `window_rows / tile_rows` of them (the last possibly
+    /// short). Session cuts may close more windows; this is the cut-free count.
     pub fn windows_for(&self, rows: usize) -> usize {
-        rows.div_ceil(self.window_rows)
+        let tiles_per_window = (self.window_rows / self.tile_rows).max(1);
+        rows.div_ceil(self.tile_rows).div_ceil(tiles_per_window)
     }
 
     /// The dispatch crate's route-storage dimensions at this window
@@ -2749,6 +2758,13 @@ pub fn qualify_request(
 mod tests {
     use super::*;
     use crate::expert_residency::{auto_placement_layers, PlacementCharges};
+    /// The 16,384-row window the pinned j1778/j1786 reference ledgers were
+    /// measured at. The product window is [`S1_WINDOW_ROWS`] (22 tiles); the
+    /// reference fixtures keep their historical window so their slack pins stay
+    /// real measurements, and the window change is pinned as a delta in
+    /// `slowlink_admission_window_charge_delta_is_pinned`.
+    const REFERENCE_WINDOW_ROWS: usize = 16_384;
+
 
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
@@ -2797,7 +2813,7 @@ mod tests {
             base_runtime_reserved_bytes: 0,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS,
+            window_rows: REFERENCE_WINDOW_ROWS,
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
             sym_iu4_source_symmetric: None,
@@ -3268,7 +3284,7 @@ mod tests {
         let geometry = geometry();
         let arena = PromptArenaLayout::new(&geometry, S1_WINDOW_ROWS, S1_TILE_ROWS).unwrap();
         assert_eq!(arena.tiles, 11);
-        assert_eq!(arena.rows, 16384);
+        assert_eq!(arena.rows, S1_WINDOW_ROWS);
         let wide = (geometry.hc_count * geometry.hidden) as u64;
         let rows = S1_WINDOW_ROWS as u64;
         // Saved prepared input, route maps and accumulator belong to the
@@ -3433,7 +3449,7 @@ mod tests {
             base_runtime_reserved_bytes: reserve.census.runtime,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS.min(J1778_MAX_SEQ),
+            window_rows: REFERENCE_WINDOW_ROWS.min(J1778_MAX_SEQ),
             link_gbps: 7.09,
             purpose,
             sym_iu4_source_symmetric: None,
@@ -3786,7 +3802,7 @@ mod tests {
             assert_eq!(profile.purpose, purpose, "{label}");
             assert_eq!(profile.tile_rows, tile, "{label}");
             assert_eq!(profile.tile_rows, purpose_tile_rows(purpose), "{label}");
-            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS, "{label}");
             assert_eq!(profile.resident_layers, 10, "{label}");
             assert_eq!(profile.pages.total_pages(), 18, "{label}");
             assert_eq!(profile.arena.tile_rows, tile, "{label}");
@@ -4027,11 +4043,11 @@ mod tests {
                     assert!(point.tile_rows >= S1_MIN_TILE_ROWS);
                     assert_eq!(
                         point.tiles_per_window,
-                        S1_WINDOW_ROWS.div_ceil(point.tile_rows)
+                        REFERENCE_WINDOW_ROWS.div_ceil(point.tile_rows)
                     );
                     assert_eq!(
                         point.final_tile_rows + (point.tiles_per_window - 1) * point.tile_rows,
-                        S1_WINDOW_ROWS
+                        REFERENCE_WINDOW_ROWS
                     );
                     if point.final_tile_rows < S1_MIN_TILE_ROWS {
                         assert!(point.final_tile_rows <= S1_F32_TILE_ROWS_MAX);
@@ -4271,7 +4287,7 @@ mod tests {
                 base_runtime_reserved_bytes: reserve.census.runtime,
                 granule: GranuleInputs::default(),
                 checkpoint_stride_rows: 8192,
-                window_rows: S1_WINDOW_ROWS,
+                window_rows: REFERENCE_WINDOW_ROWS,
                 link_gbps: 7.09,
                 purpose: AdmissionPurpose::Product,
                 sym_iu4_source_symmetric: None,
@@ -4404,7 +4420,7 @@ mod tests {
             base_runtime_reserved_bytes: 0,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS.min(max_seq),
+            window_rows: REFERENCE_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
             sym_iu4_source_symmetric: None,
@@ -4740,7 +4756,7 @@ mod tests {
         assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
         assert_eq!(profile.purpose, AdmissionPurpose::Product);
         assert!(profile.tile_rows <= S1_TILE_ROWS);
-        assert_eq!(profile.window_rows, 16384);
+        assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS);
         // Seven owned terms then two budget terms, every one itemised in log order.
         let names: Vec<&str> = profile
             .census
@@ -4918,8 +4934,16 @@ mod tests {
             .is_err());
     }
 
+    fn product_window_inputs(free: u64) -> AdmissionInputs {
+        AdmissionInputs {
+            window_rows: S1_WINDOW_ROWS,
+            ..inputs(free)
+        }
+    }
+
+    /// The product profile: [`S1_WINDOW_ROWS`] window, ten layers resident.
     fn profile_at_ten() -> SlowlinkProfile {
-        admit(&inputs(free_for(&inputs(0), 10))).unwrap()
+        admit(&product_window_inputs(free_for(&inputs(0), 10))).unwrap()
     }
 
     #[test]
@@ -4955,17 +4979,17 @@ mod tests {
             })
         );
         assert_eq!(
-            qualify_request(SlowlinkMode::Force, &profile, &req(16384)),
+            qualify_request(SlowlinkMode::Force, &profile, &req(S1_WINDOW_ROWS)),
             Ok(RequestVerdict {
-                rows: 16384,
+                rows: S1_WINDOW_ROWS,
                 windows: 1
             })
         );
         // A prompt past the window runs superwindows and says so.
         assert_eq!(
-            qualify_request(SlowlinkMode::Force, &profile, &req(16385)),
+            qualify_request(SlowlinkMode::Force, &profile, &req(S1_WINDOW_ROWS + 1)),
             Ok(RequestVerdict {
-                rows: 16385,
+                rows: S1_WINDOW_ROWS + 1,
                 windows: 2
             })
         );
@@ -5092,6 +5116,86 @@ mod tests {
         );
         assert_eq!(profile.windows_for(1), 1);
         assert_eq!(profile.windows_for(32768), 2);
+        // 22 x 768-row tiles per window: fills (cache on/off do not change the
+        // cut-free count) 8,192 / 32,768 / 32,780 / 131,084 / 250,012.
+        assert_eq!(S1_WINDOW_ROWS, 16_896);
+        assert_eq!(profile.tile_rows, 768);
+        for (rows, windows) in [
+            (8_192usize, 1usize),
+            (16_896, 1),
+            (16_897, 2),
+            (32_768, 2),
+            (32_780, 2),
+            (33_792, 2),
+            (33_793, 3),
+            (131_084, 8),
+            (250_012, 15),
+        ] {
+            assert_eq!(profile.windows_for(rows), windows, "{rows} rows");
+        }
+    }
+
+    /// The REAL planner's window and sweep counts at the 22-tile window: every
+    /// window is one expert sweep, so windows == sweeps. Cache off has no
+    /// session cuts; cache on cuts every 8192-row stride boundary.
+    #[test]
+    fn slowlink_admission_window_sweeps_at_the_tile_aligned_window() {
+        use crate::slowlink_prefill::{plan_prompt_verdict, PromptPlanInputs, TileRouting};
+        use hipfire_runtime::session_cache::stride_boundaries;
+        let profile = profile_at_ten();
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+        assert_eq!(profile.window_rows, S1_WINDOW_TILES * S1_PRODUCT_TILE_ROWS);
+        let routing = |rows: usize| TileRouting {
+            route_rows: rows,
+            bf16_streams: rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+        };
+        let stride = profile.checkpoint_stride_rows;
+        for (rows, expect_off, expect_on) in [
+            (8_192usize, 1usize, 1usize),
+            (32_768, 2, 2),
+            (32_780, 2, 2),
+            (131_084, 8, 8),
+            (250_012, 15, 16),
+        ] {
+            for cache in [false, true] {
+                let cuts: Vec<usize> = if cache {
+                    stride_boundaries(stride, &[], None, 0, rows)
+                        .into_iter()
+                        .filter(|&b| b < rows)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let plan = plan_prompt_verdict(&PromptPlanInputs {
+                    profile: &profile,
+                    entry_pos: 0,
+                    rows,
+                    cuts: &cuts,
+                    routing: &routing,
+                    few_row_limit: 8,
+                })
+                .unwrap()
+                .expect("a qualified request plans");
+                let expect = if cache { expect_on } else { expect_off };
+                assert_eq!(plan.windows.len(), expect, "{rows} rows, cache {cache}");
+                assert_eq!(plan.windows.iter().map(|w| w.rows).sum::<usize>(), rows);
+                assert!(plan.windows.iter().all(|w| w.rows <= S1_WINDOW_ROWS));
+            }
+        }
+    }
+
+    /// The window change's whole charge, same fixture, 16,384 -> 16,896 rows.
+    #[test]
+    fn slowlink_admission_window_charge_delta_is_pinned() {
+        let free = free_for(&inputs(0), 10);
+        let old = admit(&inputs(free)).unwrap();
+        let new = admit(&product_window_inputs(free)).unwrap();
+        let delta = new.reserve_bytes().unwrap() - old.reserve_bytes().unwrap();
+        assert_eq!(new.census.arena - old.census.arena, 10_485_760);
+        assert_eq!(new.census.route_storage - old.census.route_storage, 11_902_208);
+        assert_eq!(new.census.a4_sidecars - old.census.a4_sidecars, 2_580_480);
+        assert_eq!(new.census.group_scatter - old.census.group_scatter, 102_400);
+        assert_eq!(delta, 25_070_848, "23.9 MiB");
     }
 
     #[test]
@@ -5121,10 +5225,11 @@ mod tests {
             profile.census.group_scatter,
             layout.group_scatter_bytes() as u64
         );
-        // Full window grouped-scatter scratch at N=16384 slots=163840, E=512:
-        // the 1536-tile's 309,248 B stays in the base reserve (replacement
-        // peak holds old + new), so the full figure is charged on top.
-        assert_eq!(profile.census.group_scatter, 3_278_848);
+        // Full window grouped-scatter scratch at N=16896 slots=168960, E=512
+        // (3,278,848 B at the former 16384-row window): the 1536-tile's
+        // 309,248 B stays in the base reserve (replacement peak holds old +
+        // new), so the full figure is charged on top.
+        assert_eq!(profile.census.group_scatter, 3_381_248);
     }
 
     #[test]
@@ -7305,7 +7410,7 @@ mod tests {
             let profile = admit(&inputs).unwrap();
             let label = format!("{purpose:?}");
             assert_eq!(profile.geometry.route, sym_route, "{label}");
-            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS, "{label}");
             assert_eq!(profile.resident_layers, 10, "{label}");
             // Both A4 sidecars (78.75 MiB at 16K) and no window F16 input or F16 slot map.
             assert_eq!(profile.census.a4_sidecars, 82_575_360, "{label}");
