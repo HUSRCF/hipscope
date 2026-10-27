@@ -1148,9 +1148,6 @@ impl Qwen4Bundle {
         if self.npu_trunk_planned() {
             return Err("NPU trunk planned for this request");
         }
-        if self.has_cpu_deferred_experts() {
-            return Err("CPU routed-expert splice armed");
-        }
         if self.state.row_capture_armed {
             return Err("speculative row capture armed");
         }

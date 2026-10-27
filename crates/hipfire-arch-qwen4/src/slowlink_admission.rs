@@ -21,7 +21,7 @@
 //!
 //! 1. a single-device, whole-model, auto-placed discrete load: no expert
 //!    parallelism, bands, hot set, `whole-first`, explicit expert layer count,
-//!    `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out, or CPU expert splice;
+//!    `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out;
 //! 2. a context long enough to hold a multi-chunk window;
 //! 3. the measured host link ([`link_verdict`]): discrete and **below**
 //!    16 GB/s. A fast link, unified memory and an unmeasured link never select

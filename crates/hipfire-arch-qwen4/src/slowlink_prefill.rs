@@ -1049,6 +1049,14 @@ impl PromptOutput<'_> {
 
 // ── errors ───────────────────────────────────────────────────────────
 
+/// The CPU-deferred flag an S1 tile hands the MoE seal: always `false`.
+/// `offload_exec` (the D1 splice, an explicit D2 split) governs decode and
+/// <=4-row verify only; every S1 row, 1..=4-row tails included, runs GPU
+/// arithmetic.
+const fn s1_tile_cpu_deferred(_layer_armed: bool) -> bool {
+    false
+}
+
 fn bundle_err(what: &'static str) -> impl Fn(crate::bundle::BundleError) -> Qwen4GpuForwardError {
     move |error| invalid(format!("slow-link {what}: {error}"))
 }
@@ -1367,7 +1375,7 @@ fn plan_runtime(
             host_layer[layer] = true;
             sources.push(
                 runtime
-                    .s1_host_sources(&mut *gpu, bundle, layer, forward.cpu_split_explicit())
+                    .s1_host_sources(&mut *gpu, bundle, layer)
                     .map_err(|error| error.to_string())?,
             );
         } else {
@@ -1609,7 +1617,7 @@ fn load_decline(
     for layer in forward.band_layers() {
         if let Some(runtime) = forward.moe.get(layer).and_then(Option::as_ref) {
             if runtime.s1_host_mapped() {
-                if let Err(why) = runtime.s1_layer_check(forward.cpu_split_explicit()) {
+                if let Err(why) = runtime.s1_layer_check() {
                     return Some(format!("host layer {layer}: {why}"));
                 }
             }
@@ -2352,7 +2360,7 @@ fn select(
         if let Some(runtime) = forward.moe.get(layer).and_then(Option::as_ref) {
             if runtime.s1_host_mapped() {
                 runtime
-                    .s1_layer_check(forward.cpu_split_explicit())
+                    .s1_layer_check()
                     .map_err(|why| format!("host layer {layer}: {why}"))?;
             }
         }
@@ -2500,6 +2508,12 @@ fn with_tile_frames<T>(
                 None,
             )?;
             if let Qwen4FfnBinding::Moe(moe) = &mut description.ffn {
+                // S1 runs no host arithmetic: `layer_desc` copied the layer's D1
+                // flag, and a 1..=4-row tile (`rows == route_rows` on gfx1100)
+                // would seal as a CPU-deferred call that dispatch refuses
+                // mid-window. D2 is already splitless through
+                // `routed_view(false, ..)`.
+                moe.cpu_deferred_experts = s1_tile_cpu_deferred(moe.cpu_deferred_experts);
                 moe.routed_experts = crate::gpu_forward::bind_routed_view(
                     layer_moe,
                     moe.routed_experts,
@@ -3927,7 +3941,7 @@ fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> 
                 .moe
                 .get(layer)
                 .and_then(Option::as_ref)
-                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check(forward.cpu_split_explicit()).is_ok())
+                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
         })
         .ok_or_else(|| {
             invalid(format!(
@@ -4543,6 +4557,37 @@ mod slowlink_prompt {
         assert_eq!(receipt["sweeps"], 3);
         assert_eq!(receipt["windows"].as_array().unwrap().len(), 3);
         assert!(plan.windows.len() >= profile().windows_for(plan.rows));
+    }
+
+    /// S1 binds no CPU mode on any tile. The override exists because a
+    /// 1..=4-row tile on gfx1100 (`rows == route_rows`) is exactly the D1
+    /// splice window; a 768-row tile is not.
+    #[test]
+    fn s1_tile_never_cpu_deferred() {
+        assert!(!s1_tile_cpu_deferred(false) && !s1_tile_cpu_deferred(true));
+        for rows in 1..=4 {
+            assert!(hipfire_dispatch::cpu_split::cpu_splice_window(
+                true, rows, rows
+            ));
+        }
+        assert!(!hipfire_dispatch::cpu_split::cpu_splice_window(
+            true, 768, 768
+        ));
+
+        // The plan shapes that used to hit the D1 window: a 1..=4-row tail
+        // after one full 768-row tile (route_rows == rows on gfx1100).
+        for route in BOTH_ROUTES {
+            let profile = product_profile_on(route);
+            for tail in 1..=4usize {
+                let plan = plan_for_profile(&profile, 0, 768 + tail, &[], &gfx1100_routing, 8)
+                    .unwrap()
+                    .expect("plans");
+                let last = plan.tiles.last().unwrap();
+                assert_eq!(last.rows, tail);
+                assert_eq!(last.routing.route_rows, tail);
+                assert!(!s1_tile_cpu_deferred(true));
+            }
+        }
     }
 
     #[test]
