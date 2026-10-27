@@ -265,20 +265,40 @@ impl BalancedOwners {
 }
 
 impl Qwen4EpRowGatherHook {
+    /// The static gather reads owner `e % ranks` in-kernel
+    /// (`EpSlotOwners::ExpertModulo`); `seal`'s ownership must be exactly that
+    /// placement over `QWEN4_EP_OWNER_EXPERTS` experts, and `rank` its rank.
     fn new(
         rank: usize,
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
         trunk_layers: usize,
         gather: Arc<EpRowGather>,
         buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let owners = seal.seal.owner_ranks();
+        let ranks = seal.seal.ranks();
+        if rank != seal.rank
+            || owners.len() != QWEN4_EP_OWNER_EXPERTS
+            || owners
+                .iter()
+                .enumerate()
+                .any(|(expert, &owner)| owner != expert % ranks)
+        {
+            return Err(format!(
+                "qwen4 EP row gather: rank {rank} (sealed rank {}) ownership over {} experts is \
+                 not the expert-modulo placement the gather kernel reads",
+                seal.rank,
+                owners.len()
+            ));
+        }
+        Ok(Self {
             rank,
             trunk_layers,
             gather,
             buffer_ptrs,
             last_buffer: AtomicUsize::new(NO_BUFFER),
             balanced: OnceLock::new(),
-        }
+        })
     }
 
     /// Install the rank's balanced layers (once, after `attach_ep`).
@@ -1027,12 +1047,16 @@ impl Qwen4Bundle {
                 .as_ref()
                 .and_then(|forward| forward.ep_gather_buffers())
                 .ok_or("no EP gather buffers (the forward has no EP placement)")?;
+            let seal = bundle
+                .ep_seal()
+                .ok_or("the rank is not bound to an EP seal")?;
             let hook = Arc::new(Qwen4EpRowGatherHook::new(
                 rank,
+                seal,
                 trunk_layers,
                 gather.clone(),
                 buffers.map(|buffer| buffer.buf.as_ptr() as usize),
-            ));
+            )?);
             let mut forward = bundle
                 .execution
                 .take()
