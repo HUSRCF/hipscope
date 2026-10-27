@@ -16,7 +16,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sha256": "aedfe31be68213dbcd13cff3a63ba150c330d0d0547df30f2c629e76ab5dda39",
@@ -37,7 +37,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -46,7 +46,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -62,7 +62,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -84,7 +84,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -93,7 +93,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -109,7 +109,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -135,7 +135,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -144,7 +144,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -160,7 +160,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -186,7 +186,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -195,7 +195,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -211,7 +211,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -412,7 +412,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -421,7 +421,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -437,7 +437,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -453,7 +453,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -462,7 +462,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -478,7 +478,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -503,7 +503,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -512,7 +512,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -528,7 +528,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -553,7 +553,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -562,7 +562,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -578,7 +578,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -603,7 +603,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -612,7 +612,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -628,7 +628,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -653,7 +653,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -662,7 +662,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -678,7 +678,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -703,7 +703,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -712,7 +712,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -728,7 +728,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -753,7 +753,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -762,7 +762,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -778,7 +778,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },
@@ -803,7 +803,7 @@
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "repeat_penalty": 1.0
       },
       "sampling_profiles": {
@@ -812,7 +812,7 @@
           "top_p": 0.95,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         },
         "coding": {
@@ -828,7 +828,7 @@
           "top_p": 0.8,
           "top_k": 20,
           "min_p": 0.0,
-          "presence_penalty": 1.5,
+          "presence_penalty": 0.0,
           "repeat_penalty": 1.0
         }
       },

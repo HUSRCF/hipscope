@@ -24230,6 +24230,70 @@ impl Gpu {
         result
     }
 
+    /// gfx1151 twin of `gemm_f16_batched_lmhead` for F16 weights stored with a
+    /// padded row pitch of `ldw` halfs (`ldw >= k`, `ldw % 8 == 0`, `k % 128 == 0`).
+    /// `gemm_mw16_residual_wmma_gfx1151_xlds` keeps the mw16 per-tile WMMA order,
+    /// so `y` is bitwise equal to `gemm_f16_batched_lmhead` on the dense weight;
+    /// the pitch lets a power-of-two K stream at full bandwidth (see the kernel).
+    pub fn gemm_f16_pitched_gfx1151(
+        &mut self,
+        w_f16: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        ldw: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(k % 128 == 0 && ldw >= k && ldw % 8 == 0);
+        let func = "gemm_mw16_residual_wmma_gfx1151_xlds";
+        self.ensure_kernel(
+            "gemm_mw16_residual_wmma",
+            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            func,
+        )?;
+        // Same prologue as gemm_f16_batched_lmhead: pre-zero Y (Y += acc) and
+        // force FP16-X reconversion (draft scratch pointers are reused).
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        let xp = self.ensure_fp16_x(x, batch_size * k)?;
+        let (wp, yp) = (w_f16.buf.as_ptr(), y.buf.as_ptr());
+        let (mi, ki, ni, li) = (m as i32, k as i32, batch_size as i32, ldw as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &li as *const _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(64) as u32, batch_size.div_ceil(16) as u32, 1];
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
+        let result = self.launch_maybe_blob(func, grid, [128, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b.push_i32(li);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).

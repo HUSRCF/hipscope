@@ -1163,6 +1163,10 @@ name = "qsa_mrope_parity"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_railgun_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_vit_gemm_shapes"
 required-features = ["lab"]
 

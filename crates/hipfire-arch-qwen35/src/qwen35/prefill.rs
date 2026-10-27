@@ -5792,21 +5792,35 @@ fn batch_chunk_full_attn_fallback(
 ) -> HipResult<()> {
     // Per-row decode steps for FA layers the batched attention does not
     // admit (non-MQ4 weights, non-Q8_0 KV, etc).
+    // Capture-safe: the per-row copies are stream-ordered on the active
+    // (capturing) stream via the `_auto` helpers, and the row position is a
+    // device-to-device copy out of `pbs.positions` (already uploaded for this
+    // chunk by every caller, including the pre-uploaded captured verify
+    // path). A host upload here would be baked into a verify graph as a
+    // dangling host pointer and replay the first cycle's position; the legacy
+    // blocking `hipMemcpy` would fail capture with HipError 906. Decode
+    // kernels read the position from `s.pos_buf` on the device, so replay
+    // sees the live window's positions.
     for i in 0..n {
         let pos = start_pos + i;
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_at_auto(
             &s.x.buf,
             0,
             &pbs.x_batch.buf,
             i * dim_row_bytes,
             dim_row_bytes,
         )?;
-        let pos_i32 = pos as i32;
-        gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.memcpy_dtod_at_auto(
+            &s.pos_buf,
+            0,
+            &pbs.positions.buf,
+            i * std::mem::size_of::<i32>(),
+            std::mem::size_of::<i32>(),
+        )?;
         super::forward::forward_scratch_dense_layer(
             gpu, weights, config, layer_idx, pos, kv_cache, dn_state, s,
         )?;
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_at_auto(
             &pbs.x_batch.buf,
             i * dim_row_bytes,
             &s.x.buf,

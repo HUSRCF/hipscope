@@ -12293,6 +12293,72 @@ impl Gpu {
         result
     }
 
+    /// `n` x rows through `gemv_hfq4g256_multirow_r2` arithmetic in one launch:
+    /// `x` is `[n, k]`, `y` is `[n, m]`, both row-major. Bitwise equal to `n`
+    /// separate default-path `gemv_hfq4g256` calls where that path is the
+    /// multirow r2 kernel (gfx1151 outside the 248320x2048 lm_head specials;
+    /// callers gate on that). Streams the weights ceil(n/8) times instead of n.
+    pub fn gemv_hfq4g256_r2_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // x8 for n > 4, x4 below: fastest of x4/x8/x16 at the 151936x4096
+        // lm_head over n 3..16 (HIPF-177; x16 is occupancy-bound).
+        let (nb, func_name) = if n <= 4 {
+            (4, "gemv_hfq4g256_multirow_r2_x4")
+        } else {
+            (8, "gemv_hfq4g256_multirow_r2_x8")
+        };
+        self.ensure_kernel(
+            "gemv_hfq4g256_multirow_default",
+            crate::kernels::GEMV_HFQ4G256_MULTIROW_SRC,
+            func_name,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(n_val);
+            b
+        };
+        let grid = (m.div_ceil(2) * n.div_ceil(nb)) as u32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the

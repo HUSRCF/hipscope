@@ -1677,6 +1677,18 @@ pub enum EpArch {
 }
 
 impl EpArch {
+    /// Whether this EP load's serve loop applies a request's repeat, presence
+    /// and frequency penalties to its logits. The Qwen3.5 loops (dense TP on
+    /// either route, MoE EP) do, over rank 0's logits with the single-GPU host
+    /// arithmetic; DeepSeek4 and MiniMax sample without a penalty stage, so
+    /// the daemon refuses penalties for them.
+    pub fn applies_request_penalties(&self) -> bool {
+        matches!(
+            self,
+            EpArch::Qwen35 { .. } | EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }
+        )
+    }
+
     // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
     pub fn model_dims(&self) -> (usize, usize, usize) {
         match self {
@@ -2685,7 +2697,17 @@ fn finish_qwen35_load(
         }
     }
     let mtp_present = mtp.is_some();
-    let mtp = mtp.map(|(head, _source)| head);
+    let mtp = mtp.map(|(mut head, _source)| {
+        // Exact gfx1100: draft over a fixed token subset sliced from the trunk
+        // lm_head (`HIPFIRE_GFX1100_DRAFT_VOCAB=0` keeps the full-vocab draft).
+        hipfire_arch_qwen35::draft_vocab::attach_trunk_draft_vocab(
+            &mut *ctx.gpu,
+            &mut head,
+            &bundle.weights.output,
+            &tokenizer,
+        );
+        head
+    });
     // Auto-attached drafters (mode `auto`, not forced `on`) get one line that
     // names the artifact and the switch, so an A/B never starts with a hunt.
     let auto_draft = match (ctx.spec.dflash, &dflash, ctx.draft_path) {

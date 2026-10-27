@@ -503,7 +503,7 @@ pub struct WeightTensor {
     pub gpu_dtype: DType,  // dispatch type for kernel selection
     pub m: usize,          // output dim (rows)
     pub k: usize,          // input dim (cols)
-    pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    pub row_stride: usize, // padded row bytes (Q8HFQ, gfx1151 DFlash draft F16; 0 for others)
     /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
     pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
@@ -2464,19 +2464,20 @@ pub fn forward_prefill_batch_capture(
     let eligible = !force_fallback && n >= MIN_BATCH && kv_ok && weights_ok;
 
     if !eligible {
-        // The per-token fallback does not run the batched per-layer loop that
-        // feeds the capture sink. DFlash always conditions on the batched path,
-        // so a capture request on an ineligible model is a usage error, not a
-        // silent no-op.
-        assert!(
-            capture.is_none(),
-            "forward_prefill_batch_capture: hidden capture requested but model \
-             is ineligible for the batched path (n={n}, kv_ok={kv_ok}, \
-             weights_ok={weights_ok}); DFlash requires the batched forward"
-        );
+        // Per-token fallback: capture through the decode body's own sink, as
+        // `llama_spec::verify_block_logits_or_argmax`'s fallback does.
         for (i, &tok) in tokens.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
-            forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
+            let host_sink = capture.as_deref_mut().filter(|c| c.hidden_gpu.is_none());
+            forward_scratch_compute_capture(
+                gpu,
+                weights,
+                config,
+                start_pos + i,
+                kv_cache,
+                scratch,
+                host_sink,
+            )?;
         }
         return Ok(());
     }

@@ -688,6 +688,17 @@ const fn reach(program: Program, domain: &'static str, seen_by: &'static str) ->
 
 pub const DECISIONS: &[Decision] = &[
     Decision {
+        id: "mq6-explicit-railgun-refusal",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "rdna-compute mq6_railgun::check_gpu rejects Redline recording, G0 observation and HIP graph capture before preparing or replaying an explicit fixed-binding MQ6 program; an active stream capture is also refused",
+        effect: Refusal,
+        switches: "error before authoring/submission; the explicit railgun API never becomes a node of an enclosing recorder or captured graph",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branches submit no work. This API owns its independent certified program and PM4 transport; model dispatch, Redline recording/default admission and name-based pointer effects are unchanged",
+        reaches: &[],
+    },
+    Decision {
         id: "launch-funnel-blob-path",
         predicates: &[IsRecording, CaptureMode],
         condition: "`record || capture_mode || force_blob_path` in Gpu::launch_maybe_blob_bound (dispatch.rs:2416-2522) and scratch::launch_maybe_blob (scratch.rs:356-431); `use_blob_path` (scratch.rs:457); the recorder's own `if !is_recording() return` (replay.rs:6107, 6186)",
@@ -926,6 +937,17 @@ pub const DECISIONS: &[Decision] = &[
         verdict: NotEquivalent,
         evidence: "int8-quantized activations, numeric not byte-identical (CHANGELOG 0.4.4, PR #987 KLD verify-shaped deltas <= 1e-4). Recorded windows keep the WMMA route; reaches no default recorded program",
         reaches: &[],
+    },
+    Decision {
+        id: "gfx1201-fp8-fa2-split-verify",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "fp8_fa2_split_verify_admitted (fp8_fa2_split_verify_route(): HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8 unset = 16 splits from 8192 LIVE context for 2..=16 rows, =<2..=64> = that many splits, no floor, 2..=32 rows, =0 off) && gfx1201 && H24/KV4/D256 && no tree bias && block_cols == 0 && !is_recording() && partials large enough, and under capture additionally live_ctx given (DFlash ChainVerify only; pos + batch) && fp8_fa2_split_verify_capture_ready (module + merge + pre-convert loaded, Q16 scratch grown) (attention.rs attention_flash_fp8_e4m3_tile_batched)",
+        effect: KernelSelection,
+        switches: "eager and captured (route-class graph, re-captured when the live context crosses the floor): native-fp8 split-KV FA2 verifier; recorded: VerifyAttn and the existing tile routes",
+        kernels: &["attention_fp8_e4m3_fa2_gqa_*_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "f16 Q/K/V/P operands, not byte-identical to VerifyAttn (verify_route_logits B=16 KL pooled 1.0e-4 nats, max 9.2e-3); below the floor and above 16 rows byte-identical. Recorded windows keep VerifyAttn, so a railgun recording of an fp8 DFlash verify at live context >= 8192 differs from the eager window",
+        reaches: &[reach(DflashGfx1201, "live context >= 8192 (default 16 splits), 2..=16 rows, native fp8 KV, H24/KV4/D256 (the stock 27B DFlash B=16 verify window)", "g0; arm3")],
     },
     Decision {
         id: "gfx1100-wmma-verify-attn",
@@ -1645,6 +1667,12 @@ pub const DECISIONS: &[Decision] = &[
     },
 ];
 pub const SITES: &[Site] = &[
+    Site {
+        file: "rdna-compute/src/mq6_railgun.rs",
+        function: "check_gpu",
+        occurrences: 3,
+        decisions: &["mq6-explicit-railgun-refusal"],
+    },
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
         function: "compressor_op",
@@ -2820,6 +2848,24 @@ pub const SITES: &[Site] = &[
         function: "q8x_verify_active",
         occurrences: 2,
         decisions: &["gfx1100-q8x-verify-gemv"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fp8_e4m3_tile_batched",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "fp8_fa2_split_verify_admitted",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/attention.rs",
+        function: "dispatch_attend",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
     },
     Site {
         file: "rdna-compute/src/attention_wmma_verify.rs",

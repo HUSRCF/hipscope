@@ -1153,7 +1153,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "gemv_hfq4g256_multirow_r2",
                 "gemv_hfq4g256_multirow_r4",
-                "gemv_hfq4g256_multirow_r8"
+                "gemv_hfq4g256_multirow_r8",
+                "gemv_hfq4g256_multirow_r2_x4",
+                "gemv_hfq4g256_multirow_r2_x8"
             ]
         );
         add!(
@@ -1471,6 +1473,22 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201",
                 "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
                 "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201"
+            ]
+        );
+        // Native-fp8 split-KV FA2 DFlash verifier (`Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`,
+        // HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8). One module named for the partial
+        // symbol, the name the launcher requests; the merge and Q pre-convert
+        // entries bind out of the same object. The direct `_f16_` entry is
+        // defined by the same source and declared here but never bound (the
+        // Q0 module owns the launcher that requests it).
+        add!(
+            "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC,
+            [
+                "attention_fp8_e4m3_fa2_gqa_f16_gfx1201",
+                "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+                "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+                "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
             ]
         );
         add!(
@@ -4415,7 +4433,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_mw16_residual_wmma",
             kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
-            ["gemm_mw16_residual_wmma"]
+            [
+                "gemm_mw16_residual_wmma",
+                "gemm_mw16_residual_wmma_gfx1151_xlds"
+            ]
         );
         // Sparse sampled DFlash host-accept target rows (speculative.rs
         // `dflash_target_rows_into`; the device accept path is gfx1201-only).
@@ -10272,6 +10293,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The native-fp8 split-KV FA2 DFlash verifier (HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8).
+        const FP8_SPLIT_LSE_ADDED_MODULES: [&str; 1] =
+            ["attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201"];
+        for module in FP8_SPLIT_LSE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing fp8 split LSE module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10286,7 +10322,8 @@ mod tests {
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
                 + MQ4RS_DECODE_ADDED_MODULES.len()
-                + HD64_FLASH_TILE_ADDED_MODULES.len(),
+                + HD64_FLASH_TILE_ADDED_MODULES.len()
+                + FP8_SPLIT_LSE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

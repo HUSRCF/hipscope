@@ -1662,13 +1662,20 @@ fn ar_graph_trace_enabled() -> bool {
 }
 
 #[inline]
-fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
+fn ar_graph_eligible_for_kv(
+    requested: bool,
+    compact_offset: usize,
+    seq_sized_attend: bool,
+) -> bool {
     // The captured single-token route is built while compact_offset is zero.
     // After eviction, Q/K RoPE must use physical_pos + compact_offset, and the
     // offset changes again at every later eviction. Neither hipGraph nor the
     // retained replay route currently has a dynamic offset input, so replaying
     // the old route silently rotates at the physical slot and corrupts decode.
-    requested && compact_offset == 0
+    // The int8/int8c/hfq4 decode attends size block and LDS (scores[seq_len])
+    // from the host seq_len, which a replay freezes at the capture position;
+    // longer contexts then overrun LDS and decode goes degenerate (HIPF-192).
+    requested && compact_offset == 0 && !seq_sized_attend
 }
 
 /// Identity of the caller buffers the AR hipGraph bakes at capture: the
@@ -1898,8 +1905,11 @@ pub fn forward_scratch(
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
     let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
-    let graph_eligible =
-        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
+    let graph_eligible = ar_graph_eligible_for_kv(
+        requested_graph_eligible,
+        kv_cache.compact_offset,
+        kv_cache.quant_int8 || kv_cache.quant_hfq4,
+    );
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -5755,10 +5765,11 @@ mod tests {
 
     #[test]
     fn ar_graph_is_ineligible_after_kv_compaction() {
-        assert!(ar_graph_eligible_for_kv(true, 0));
-        assert!(!ar_graph_eligible_for_kv(true, 1));
-        assert!(!ar_graph_eligible_for_kv(true, 128));
-        assert!(!ar_graph_eligible_for_kv(false, 0));
+        assert!(ar_graph_eligible_for_kv(true, 0, false));
+        assert!(!ar_graph_eligible_for_kv(true, 1, false));
+        assert!(!ar_graph_eligible_for_kv(true, 128, false));
+        assert!(!ar_graph_eligible_for_kv(false, 0, false));
+        assert!(!ar_graph_eligible_for_kv(true, 0, true));
     }
 
     // ── MQ6V2 / MQ4V2 FFN dtype recognition ───────────────────────────────

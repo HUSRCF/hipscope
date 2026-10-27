@@ -74,6 +74,7 @@ pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
     SlabLayerCodecError,
 };
+pub mod mq6_railgun;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;

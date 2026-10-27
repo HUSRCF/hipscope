@@ -509,13 +509,30 @@ fn hfq_weight(
                     m * k * 2,
                     "dflash {name} F16 byte-size mismatch"
                 );
-                let buf = upload_raw_weight(gpu, data, &[m * k])?;
+                // gfx1151: a power-of-two row pitch (K % 2048 == 0) camps every
+                // wave on the same DRAM channels (~50 GB/s); 128 pad halfs per
+                // row restore ~200 GB/s. Only gemm_dispatch reads these
+                // weights, and it routes padded ones to gemm_f16_pitched_gfx1151.
+                let ld = if gpu.arch_caps.is_gfx1151() && k % 2048 == 0 {
+                    k + 128
+                } else {
+                    k
+                };
+                let buf = if ld == k {
+                    upload_raw_weight(gpu, data, &[m * k])?
+                } else {
+                    let mut padded = vec![0u8; m * ld * 2];
+                    for (dst, src) in padded.chunks_exact_mut(ld * 2).zip(data.chunks_exact(k * 2)) {
+                        dst[..k * 2].copy_from_slice(src);
+                    }
+                    upload_raw_weight(gpu, &padded, &[m * ld])?
+                };
                 Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
                     buf,
                     gpu_dtype: DType::F16,
                     m,
                     k,
-                    row_stride: 0,
+                    row_stride: if ld == k { 0 } else { ld * 2 },
                     paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
@@ -2464,6 +2481,9 @@ fn gemm_dispatch(
     };
     let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F16 if w.row_stride != 0 => {
+            gpu.gemm_f16_pitched_gfx1151(&w.buf, x, y, w.m, w.k, w.row_stride / 2, batch)
+        }
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G128V2 => Err(hip_bridge::HipError::new(
             0,

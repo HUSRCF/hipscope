@@ -8161,6 +8161,38 @@ pub(crate) fn decode_share_prefill_tile(
     rows >= QWEN4_DECODE_SHARE_RESIDENT_ROWS && !argmax_forward && !lane_scope && !mesh_segment
 }
 
+/// Whether a call inside a whole-prompt entry continues a dirty borrow epoch
+/// (the S6b tail rule): the entry is live (`prompt_depth > 0`), it has itself
+/// borrowed a prefill bank (`prompt_borrowed`, set by the first prompt tile
+/// the entry acquired and cleared when the outermost entry ends) and the donor
+/// tail is dirty. A dirty loan left by an earlier, finished prompt (the
+/// deferred restore) never continues in a later entry: its first call below
+/// the resident rows restores like AR decode, and only a tile of at least the
+/// resident rows borrows again.
+pub(crate) fn decode_share_continues_epoch(
+    prompt_depth: u32,
+    prompt_borrowed: bool,
+    loan_dirty: bool,
+) -> bool {
+    prompt_depth > 0 && prompt_borrowed && loan_dirty
+}
+
+/// Whether a call borrows a prefill bank and the BorrowPrefill runtimes: a
+/// prompt tile ([`decode_share_prefill_tile`]) or a non-empty continuation of
+/// the entry's own dirty borrow ([`decode_share_continues_epoch`], `continues`)
+/// that is none of a device-argmax decode forward, a lane step or a mesh
+/// segment.
+pub(crate) fn decode_share_borrows_tile(
+    rows: usize,
+    argmax_forward: bool,
+    lane_scope: bool,
+    mesh_segment: bool,
+    continues: bool,
+) -> bool {
+    let continuation = rows > 0 && !argmax_forward && !lane_scope && !mesh_segment && continues;
+    continuation || decode_share_prefill_tile(rows, argmax_forward, lane_scope, mesh_segment)
+}
+
 /// The per-layer runtimes a tile reads ([`Qwen4GpuForward::tile_moe`]): the
 /// BorrowPrefill runtimes of class view `view` while a prompt tile borrows,
 /// the Resident ones otherwise.
@@ -8338,6 +8370,14 @@ pub(crate) struct DecodeShareBanks {
     stats: DecodeShareStats,
     /// Nesting depth of whole-prompt entries ([`Qwen4GpuForward::share_prompt_begin`]).
     prompt_depth: u32,
+    /// The current outermost whole-prompt entry itself acquired a prefill
+    /// bank (a tile of at least [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows ran
+    /// with `prompt_depth > 0`). Only such an entry continues the dirty borrow
+    /// for its own sub-resident tail tiles ([`decode_share_continues_epoch`]);
+    /// cleared when the outermost entry ends (whatever its result) and when a
+    /// resident call restores the donor tail. A dirty loan left by a finished
+    /// prompt must not leak into the next entry's verify, draft or decode calls.
+    prompt_borrowed: bool,
 }
 
 impl DecodeShareBanks {
@@ -9915,6 +9955,7 @@ impl Qwen4GpuForward {
             dirty_bytes: 0,
             stats: DecodeShareStats::default(),
             prompt_depth: 0,
+            prompt_borrowed: false,
         };
         let mut host_token_bytes = vec![0u8; ids_bytes];
         // The scratch backing starts right after the borrowed weight shadows.
@@ -11275,18 +11316,25 @@ impl Qwen4GpuForward {
     }
 
     /// Whether this call continues a dirty borrow epoch inside a whole-prompt
-    /// entry: once a prompt has dirtied the donor tail, every later tile of
-    /// the same prompt (a tail below the resident rows included) stays on a
-    /// borrowed bank and the BorrowPrefill runtimes, so the restore happens
-    /// once, at the next resident call after the prompts, never mid-prompt
-    /// (design 5.2).
+    /// entry that itself borrowed: once a tile of the entry has dirtied the
+    /// donor tail, every later tile of the same entry (a tail below the
+    /// resident rows included) stays on a borrowed bank and the BorrowPrefill
+    /// runtimes, so the restore happens once, at the next resident call after
+    /// the prompts, never mid-prompt (design 5.2). A dirty loan left by an
+    /// earlier, finished entry does not continue (`prompt_borrowed` is clear):
+    /// the first sub-resident call of a later entry (an MTP verify block, a
+    /// draft forward, a one-row capture) restores first, as AR decode does.
+    /// See [`decode_share_continues_epoch`].
     fn share_continues_epoch(&self) -> bool {
         self.share.as_ref().is_some_and(|share| {
-            share.prompt_depth > 0
-                && share
+            decode_share_continues_epoch(
+                share.prompt_depth,
+                share.prompt_borrowed,
+                share
                     .loan
                     .as_ref()
-                    .is_some_and(|loan| loan.controller.dirty_extent().is_some())
+                    .is_some_and(|loan| loan.controller.dirty_extent().is_some()),
+            )
         })
     }
 
@@ -11313,23 +11361,22 @@ impl Qwen4GpuForward {
 
     /// Whether the call is a decode-share prompt tile: the single predicate
     /// behind both scratch-bank selection (`share` banks) and BorrowPrefill
-    /// runtime selection (`moe_borrow`). See [`decode_share_prefill_tile`].
+    /// runtime selection (`moe_borrow`). A tile of at least the resident rows
+    /// ([`decode_share_prefill_tile`]) always borrows; a smaller non-argmax,
+    /// non-lane, non-mesh call borrows only as the tail of an entry that
+    /// itself borrowed ([`Self::share_continues_epoch`]). See
+    /// [`decode_share_borrows_tile`].
     fn share_prefill_tile(&self, tokens: &[u32], argmax_of: Option<&GpuTensor>) -> bool {
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return false;
         }
-        let continuation = !tokens.is_empty()
-            && argmax_of.is_none()
-            && !self.lane_scope
-            && self.mesh_route_rows.is_none()
-            && self.share_continues_epoch();
-        continuation
-            || decode_share_prefill_tile(
-                tokens.len(),
-                argmax_of.is_some(),
-                self.lane_scope,
-                self.mesh_route_rows.is_some(),
-            )
+        decode_share_borrows_tile(
+            tokens.len(),
+            argmax_of.is_some(),
+            self.lane_scope,
+            self.mesh_route_rows.is_some(),
+            self.share_continues_epoch(),
+        )
     }
 
     /// The BorrowPrefill class view the prompt tile about to run reads
@@ -11477,6 +11524,10 @@ impl Qwen4GpuForward {
         &mut self,
         gpu: &mut Gpu,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if let Some(share) = self.share.as_mut() {
+            // The donor tail is about to be whole: the epoch is clean.
+            share.prompt_borrowed = false;
+        }
         match self.share.as_mut().and_then(|share| share.loan.as_mut()) {
             Some(loan) => loan
                 .with_ops(gpu, |controller, ops| controller.require_resident(ops))
@@ -11537,6 +11588,9 @@ impl Qwen4GpuForward {
         };
         share.prompt_depth = share.prompt_depth.saturating_sub(1);
         if share.prompt_depth == 0 {
+            // The entry that borrowed is over, whatever `finish_prompt` returns:
+            // a dirty tail it leaves is no later entry's continuation.
+            share.prompt_borrowed = false;
             self.share_finish_prompt(gpu, ok)
         } else {
             Ok(())
@@ -11545,8 +11599,9 @@ impl Qwen4GpuForward {
 
     /// The last scratch consumer of a whole prompt has run. A dirty tail of a
     /// prompt that ended `Ok` stays dirty with nothing enqueued (the first
-    /// token came from the prefill head; a following prompt continues the same
-    /// borrow, and the next [`Self::share_require_resident`] restores it;
+    /// token came from the prefill head; a following prompt's tiles of at
+    /// least the resident rows continue the same borrow, any other call of a
+    /// later entry and the next [`Self::share_require_resident`] restore it;
     /// `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` enqueues and waits here). A prompt
     /// that ended with an error takes the blocking recovery.
     pub(crate) fn share_finish_prompt(
@@ -12896,6 +12951,11 @@ impl Qwen4GpuForward {
             Some(class) => {
                 self.share_acquire(gpu, class)?;
                 if let Some(share) = self.share.as_mut() {
+                    // Inside a whole-prompt entry this entry now owns the
+                    // dirty borrow and may continue it with its tail tiles.
+                    if share.prompt_depth > 0 {
+                        share.prompt_borrowed = true;
+                    }
                     share.swap_in(&mut self.scratch, class);
                 }
             }
@@ -16123,6 +16183,56 @@ mod tests {
     }
 
     #[test]
+    fn decode_share_dirty_borrow_continues_only_inside_the_entry_that_borrowed() {
+        use super::{decode_share_borrows_tile as borrows, decode_share_continues_epoch as epoch};
+        let resident = super::QWEN4_DECODE_SHARE_RESIDENT_ROWS;
+        // Epoch rule (prompt_depth, prompt_borrowed, loan dirty).
+        assert!(epoch(1, true, true));
+        assert!(epoch(2, true, true));
+        assert!(!epoch(0, true, true));
+        assert!(!epoch(1, false, true));
+        assert!(!epoch(1, true, false));
+        assert!(!epoch(0, false, false));
+        // (rows, argmax, lane, mesh, continues) -> borrows a prefill bank.
+        // Same-entry tail below the resident rows continues the borrow (S6b).
+        for rows in [1, 4, resident - 1] {
+            assert!(borrows(rows, false, false, false, epoch(1, true, true)));
+        }
+        // Fresh entry after a finished prompt (dirty loan, nothing borrowed
+        // yet): an MTP verify block, draft forward or one-row capture does not
+        // borrow, so `share_require_resident` restores first.
+        for rows in [1, 2, 4, 17, resident - 1] {
+            assert!(!borrows(rows, false, false, false, epoch(1, false, true)));
+            assert!(!borrows(rows, false, false, false, epoch(0, false, true)));
+        }
+        // A fresh entry's tile of at least the resident rows borrows (back to
+        // back prefills share the dirty borrow), with or without a dirty loan.
+        for dirty in [false, true] {
+            assert!(borrows(
+                resident,
+                false,
+                false,
+                false,
+                epoch(1, false, dirty)
+            ));
+            assert!(borrows(16384, false, false, false, epoch(1, false, dirty)));
+        }
+        // A clean loan never continues, whatever the entry state.
+        for rows in [1, resident - 1] {
+            assert!(!borrows(rows, false, false, false, epoch(1, true, false)));
+        }
+        // A device-argmax decode forward, a lane step and a mesh segment are
+        // never prefill tiles, not even in an entry that borrowed.
+        for rows in [1, resident - 1, resident, 4096] {
+            assert!(!borrows(rows, true, false, false, epoch(1, true, true)));
+            assert!(!borrows(rows, false, true, false, epoch(1, true, true)));
+            assert!(!borrows(rows, false, false, true, epoch(1, true, true)));
+        }
+        // An empty call never continues.
+        assert!(!borrows(0, false, false, false, epoch(1, true, true)));
+    }
+
+    #[test]
     fn decode_share_tile_moe_selects_the_borrow_twins_only_while_active() {
         use super::tile_moe_of;
         let resident = [Some(1u8), None, Some(3)];
@@ -16352,6 +16462,7 @@ mod tests {
             stats: Default::default(),
             loan: None,
             prompt_depth: 0,
+            prompt_borrowed: false,
         };
         let prompt_rows = |share: &super::DecodeShareBanks, scratch: &Scratch| {
             super::prompt_chunk_rows_of(Some(share), scratch)

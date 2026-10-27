@@ -144,12 +144,41 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let max_seq = 4096usize;
-
     eprintln!("Loading Qwen3-8B trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found in HFQ metadata: {e:?}"))?;
+    // ── Prompt ─────────────────────────────────────────────────────────────────
+    // Prompt text comes from env or the committed benchmark file.  Both paths
+    // are committed files — byte-identical prompts are mandatory for cross-session
+    // comparisons (CLAUDE.md: prompt md5 must be recorded alongside tok/s).
+    let prompt = std::env::var("HIPFIRE_QWEN3_PROMPT").unwrap_or_else(|_| {
+        // Default: the canonical LRU-code bench prompt used across all spec-decode gates.
+        std::fs::read_to_string("benchmarks/prompts/lru_cache_pep8_strict.txt")
+            .unwrap_or_else(|_| "Implement a least-recently-used cache in Python.".to_string())
+    });
+
+    // Build chat-framed token sequence (or raw for base-model mode).
+    let prompt_tokens: Vec<u32> = if raw {
+        tokenizer.encode(&prompt)
+    } else {
+        ChatFrame {
+            tokenizer: &tokenizer,
+            system: None,
+            user: &prompt,
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        }
+        .build()
+    };
+
+    // Stable FNV fingerprint for cross-session identity check (NOT cryptographic).
+    let prompt_md5 = fnv64(&prompt_tokens);
+
+    // KV covers the prompt, the longer of warmup/timed decode, plus one
+    // speculative window of headroom (verify writes up to a block past the end).
+    let max_seq = (prompt_tokens.len() + max.max(warmup) + 256).max(4096);
+
     // Do NOT drop_mmap on the trunk: load_llama_bundle → Architecture::load_weights
     // uses tensor_data (mmap path). The sidecar does call drop_mmap because its
     // loader (load_qwen3_dspark) uses tensor_data_pread throughout.
@@ -244,33 +273,6 @@ fn main() -> Result<(), String> {
     } else {
         false
     };
-
-    // ── Prompt ─────────────────────────────────────────────────────────────────
-    // Prompt text comes from env or the committed benchmark file.  Both paths
-    // are committed files — byte-identical prompts are mandatory for cross-session
-    // comparisons (CLAUDE.md: prompt md5 must be recorded alongside tok/s).
-    let prompt = std::env::var("HIPFIRE_QWEN3_PROMPT").unwrap_or_else(|_| {
-        // Default: the canonical LRU-code bench prompt used across all spec-decode gates.
-        std::fs::read_to_string("benchmarks/prompts/lru_cache_pep8_strict.txt")
-            .unwrap_or_else(|_| "Implement a least-recently-used cache in Python.".to_string())
-    });
-
-    // Build chat-framed token sequence (or raw for base-model mode).
-    let prompt_tokens: Vec<u32> = if raw {
-        tokenizer.encode(&prompt)
-    } else {
-        ChatFrame {
-            tokenizer: &tokenizer,
-            system: None,
-            user: &prompt,
-            assistant_prefix: AssistantPrefix::ClosedThink,
-            raw: false,
-        }
-        .build()
-    };
-
-    // Stable FNV fingerprint for cross-session identity check (NOT cryptographic).
-    let prompt_md5 = fnv64(&prompt_tokens);
 
     let eos_tok = bundle.config.eos_token;
     eprintln!(

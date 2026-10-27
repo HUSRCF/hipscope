@@ -2602,7 +2602,8 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 /// per-tensor `quant_type` bytes and, if running on RDNA2 with any RDNA3+-only
 /// dtype present, prints a clear warning listing the offending formats. RDNA2 is
 /// wave32 (so the WMMA-free MQ3-Lloyd scalar kernels now resolve — W4 fix), but
-/// MQ5/MQ6/HFQ6 (HasMmq, RDNA3/4 only), the WMMA-only HFP4G32-fused prefill path,
+/// MQ5 (HasMmq, RDNA3/4 only), MQ6/HFQ6 (the GEMV rows resolve on RDNA2 since #478 but
+/// are untested on RDNA2 hardware), the WMMA-only HFP4G32-fused prefill path,
 /// and the E8-lattice formats have NO validated RDNA2 kernel and are best-effort.
 ///
 /// Additive and arch-gated to RDNA2 — no effect on RDNA3/4/CDNA loads.
@@ -2611,7 +2612,8 @@ fn warn_rdna2_unvalidated_dtypes(hfq: &HfqFile, gpu: &Gpu) {
         return;
     }
     // (quant_type byte, human label) for dtypes with NO validated RDNA2 kernel.
-    //   8=HFQ6G256, 15=MQ6G256, 31=MQ5G256  → HasMmq (RDNA3/4 only)
+    //   8=HFQ6G256, 15=MQ6G256              → resolve via HasHfq6Gemv (#478), unvalidated
+    //   31=MQ5G256                          → HasMmq (RDNA3/4 only)
     //   24=MFP4G32, 33=MFP4G32P             → HFP4G32-fused (WMMA-only prefill)
     //   34/35=MFP4G32E8/SOA, 36=MFP3G32E8, 37=MFP2G32E8 → E8 lattice (RDNA3/4)
     const RDNA3PLUS_ONLY: &[(u8, &str)] = &[

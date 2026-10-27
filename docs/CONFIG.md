@@ -501,6 +501,14 @@ without an independent V axis. Typed `memory.kv_k` / `memory.kv_v` (CLI
 omitted from IPC when unset. They replace their respective axis of a split
 pair; see the native override refusal below.
 
+DeepSeek V4 `f16` on gfx1151, measured on a Ryzen AI Max+ PRO 495 (single
+device, MQ2R 0731 artifact, DSpark sidecar): loads and generates coherent
+text; decode is neutral (25.4 -> 25.8 tok/s short-context with DSpark,
+drafter acceptance 24% -> 25%) while pp16384 pays for the storage convert
+(163.5 -> 139.3 tok/s; single runs each, the f32 reference measured on the
+same host and shape). Pick `f16` on gfx1151 for long-context capacity, not
+throughput; the capacity delta itself is not yet measured on this host.
+
 **Qwen K names** (shared table for `--kv-mode` preset K and `--kv-k`):
 
 - `q8` → Q8 K

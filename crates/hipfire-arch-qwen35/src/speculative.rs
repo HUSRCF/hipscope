@@ -6026,6 +6026,34 @@ pub(crate) fn dflash_verify_fusion_ctx(
     }
 }
 
+/// Route class of one DFlash verify window for the HipGraph cache: does the
+/// gfx1201 native-fp8 split-KV verifier (`Gpu::fp8_fa2_split_verify_admitted`)
+/// serve it at its LIVE context (`start_pos + b`)? A captured graph replays
+/// at any context, so it is re-captured whenever this class changes (the
+/// graph's attend is sized by `physical_cap`, which says nothing about the
+/// window). Plain chain verify only: tree windows and non-fp8 KV never take
+/// the route.
+fn dflash_fp8_split_verify_class(
+    gpu: &Gpu,
+    target: &ModelSlot,
+    start_pos: usize,
+    b: usize,
+    tree: bool,
+) -> bool {
+    !tree
+        && target.kv_cache.quant_fp8
+        && gpu
+            .fp8_fa2_split_verify_admitted(
+                start_pos + b,
+                target.config.n_heads,
+                target.config.n_kv_heads,
+                target.config.head_dim,
+                b,
+                target.scratch.flash_partials.numel(),
+            )
+            .is_some()
+}
+
 /// Whether this verify window takes the HIP-graph body (warmup / capture /
 /// replay of `forward_prefill_batch_single_chunk_captured_opts`). Shared by
 /// the verify body and the railgun plan emitter so both read one decision.
@@ -6277,6 +6305,30 @@ fn verify_dflash_block_inner_body(
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
+        // gfx1201 native-fp8 split-KV verifier: the route depends on this
+        // window's LIVE context (`start_pos + b`), which a replay cannot
+        // change, so the graph carries the route class it was captured in.
+        // Load the launcher's kernels and grow its Q scratch HERE, outside
+        // any capture (growth may drop graph state, so before the cache is
+        // consulted); then a graph whose class differs from this window's is
+        // dropped and re-warmed/captured at the new class.
+        let split_class =
+            dflash_fp8_split_verify_class(gpu, target, start_pos, b, tree_verify.is_some());
+        if split_class && !gpu.fp8_fa2_split_verify_capture_ready(b) {
+            gpu.fp8_fa2_split_verify_prepare_capture(b)?;
+        }
+        if gpu.graphs.verify_has_graph(b) && gpu.graphs.verify_graph_has_fp8_split(b) != split_class
+        {
+            gpu.hip
+                .stream_synchronize(gpu.active_stream.as_ref().unwrap())?;
+            gpu.graphs.verify_graph_destroy(&gpu.hip, gpu.device_id, b);
+            eprintln!(
+                "[verify-graph] B={} route class changed at ctx {} (fp8 split-KV verify {}) — re-warming",
+                b,
+                start_pos + b,
+                if split_class { "on" } else { "off" },
+            );
+        }
         if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
             graph_includes_lmhead_argmax =
@@ -6416,6 +6468,9 @@ fn verify_dflash_block_inner_body(
                 if capture_lmhead_argmax {
                     gpu.graphs.verify_mark_graph_lmhead_argmax(b);
                     graph_includes_lmhead_argmax = true;
+                }
+                if split_class {
+                    gpu.graphs.verify_mark_graph_fp8_split(b);
                 }
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",

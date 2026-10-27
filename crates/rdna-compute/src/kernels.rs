@@ -8507,7 +8507,7 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
 /// verifier's LSE + normalized-Oacc partial/merge records. Entry symbols
 /// `attention_fp8_e4m3_fa2_gqa_{partial,merge}_lse_gfx1201` and
 /// `attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201`, distinct from the Q0
-/// module's. JIT-only via `Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`.
+/// module's. Registered in the gfx1201 inventory (DFlash cold helpers).
 pub const ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     "#define HIPFIRE_FA2_SPLIT_LSE_FP8 1\n",

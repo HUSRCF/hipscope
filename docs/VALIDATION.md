@@ -60,9 +60,9 @@ for the surfaces it touches. The author or reviewer may gather that evidence
 with the manual harnesses below and/or optional automation; the maintainer
 who approves judges that the evidence matches the claim.
 
-The `Windows MSVC (advisory, no GPU)` job in the same workflow is initially
-advisory (`continue-on-error: true`), to be promoted to required after its first
-green run on `beta`. It builds the native CLI/daemon, runs config/registry/client
+The `Windows MSVC (no GPU)` job in the same workflow is required (it was
+advisory until its first green run on `beta`, 2026-10-26). It builds the native
+CLI/daemon, runs config/registry/client
 library tests, checks that `scripts/*.ps1` parse and that `install.ps1`'s
 parameters bind (guard for #979), smoke-checks version and parseable JSON
 diagnostics without HIP, lists the DLLs the packaged `daemon.exe` and
@@ -267,7 +267,7 @@ claim-specific oracles named below, or replace the approving review.
 | Route | Path | Role |
 |---|---|---|
 | No-GPU CI (required jobs) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (+ [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) body) | **Required** automatic CI: workspace build, lib unit tests, ratchets/layering/registers gates. |
-| Windows MSVC (advisory) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) + [`scripts/package-windows.ps1`](../scripts/package-windows.ps1) | Native Windows CPU build/tests/smoke and unsigned developer artifact; no GPU certification. |
+| Windows MSVC (required) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) + [`scripts/package-windows.ps1`](../scripts/package-windows.ps1) | Native Windows CPU build/tests/smoke and unsigned developer artifact; no GPU certification. |
 | **hw-gate (optional)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Optional** evidence automation: path → buckets, pinned fixtures, hardware run, seat commentary. See [§ hw-gate](#hw-gate-optional-evidence-automation). |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |

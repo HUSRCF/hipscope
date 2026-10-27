@@ -559,6 +559,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     None,
                     0,
                     0,
+                    None,
                 )
                 .expect("reference fp8"),
             VerifyKv::Q8 => gpu
@@ -1333,22 +1334,47 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
 /// B {8,16}, live ctx {32K, 64K, 128K}; the reference only with VA_REF=1.
 fn bench_serve(gpu: &mut Gpu, kvs: &[VerifyKv]) {
     let with_ref = std::env::var_os("VA_REF").is_some();
+    // `VA_SERVE_CTXS=4096,16384` overrides the live-context list (default
+    // 32K/64K/128K) to time the short-context side of the split threshold.
+    let ctxs: Vec<usize> = std::env::var("VA_SERVE_CTXS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![32768, 65536, 130048]);
+    // `VA_SERVE_CAPTURE=0` times the eager (non-graph) shape: max_ctx_len =
+    // live ctx instead of the 131072 graph-capture grid.
+    let capture = std::env::var("VA_SERVE_CAPTURE").map_or(true, |v| v != "0");
     for &kv in kvs {
         if !matches!(kv, VerifyKv::Fp8 | VerifyKv::Q8) {
             continue; // the FA2 split verifier is fp8/q8 only
         }
         for &b in &[8usize, 16] {
-            for &ctx in &[32768usize, 65536, 130048] {
-                let c = Case {
+            for &ctx in &ctxs {
+                let mut c = Case {
                     kv,
                     b,
                     ctx,
-                    capture: true,
-                    cap: 131072,
+                    capture,
+                    cap: if capture { 131072 } else { ctx + 64 },
                     partial_rows: 16,
                     rows: false,
                     wmma: None,
                 };
+                // Eager short contexts: serve sizes the partials for the full
+                // context window, so give the split's records the room they
+                // need (`partial_rows` only grows the scratch).
+                let fa2_need = Gpu::fa2_gqa_split_gfx1201_partials_len(
+                    std::env::var("VA_FA2_S")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(16),
+                    b,
+                    nh(),
+                    hd(),
+                );
+                while c.partials_len() < fa2_need {
+                    c.partial_rows += 16;
+                }
                 let bf = Bufs::new(gpu, &c, 0xBE4C);
                 let cand = time_ms(gpu, &c, &bf, true, 20);
                 let refm = if with_ref {
@@ -1682,6 +1708,11 @@ fn main() {
         v
     });
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
+    // The fp8 reference is the VerifyAttn tile + reduce. The native-fp8
+    // split-KV verifier (default on from 8,192 tokens on gfx1201) would
+    // replace it at long contexts, so pin it off before the process config
+    // snapshot is first read.
+    std::env::set_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8", "0");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
         matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100" | "gfx1151"),

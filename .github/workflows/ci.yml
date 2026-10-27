@@ -107,11 +107,10 @@ jobs:
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
   windows:
-    name: Windows MSVC (advisory, no GPU)
+    name: Windows MSVC (no GPU)
     runs-on: windows-latest
-    # Promote to a required check after the first green run on beta.
+    # Required: build, package smoke and PE-import checks must pass.
     # Compile/smoke coverage is not Windows GPU/runtime certification.
-    continue-on-error: true
     defaults:
       run:
         shell: pwsh

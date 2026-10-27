@@ -756,17 +756,127 @@ enum VerifyGqaRef {
     Rows(usize),
 }
 
-/// `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8=<splits>` (2..=64): opt-in native-fp8
-/// split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`. Unset,
-/// `0` or out of range keeps VerifyAttn. Read once per process.
-fn fp8_fa2_split_verify_splits() -> Option<usize> {
-    static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| (2..=64).contains(n))
+/// Resolved native-fp8 split-KV FA2 verifier route
+/// (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fp8Fa2SplitRoute {
+    /// KV splits (workgroups per kv head).
+    splits: usize,
+    /// First live context length (`max_position + 1`) the route serves.
+    min_ctx: usize,
+    /// Most query rows the route serves.
+    max_rows: usize,
+}
+
+/// Native-fp8 split-KV FA2 verifier in `attention_flash_fp8_e4m3_tile_batched`
+/// (exact gfx1201, H24/KV4/D256, non-tree). `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8`
+/// unset: on by default at [`FP8_FA2_SPLIT_DEFAULT_SPLITS`] splits, only from
+/// [`FP8_FA2_SPLIT_DEFAULT_MIN_CTX`] live context and only for blocks of at
+/// most [`FP8_FA2_SPLIT_DEFAULT_MAX_ROWS`] rows; `0` (or any value outside
+/// `2..=64`) keeps VerifyAttn; `2..=64` picks the split count with no context
+/// floor and admits 2..=32 rows. Read once per process.
+///
+/// Under hipGraph capture the route is taken only when the caller names the
+/// live context and the launcher's assets are already resident
+/// ([`Gpu::fp8_fa2_split_verify_capture_ready`]); see
+/// [`Gpu::attention_flash_fp8_e4m3_tile_batched`].
+fn fp8_fa2_split_verify_route() -> Option<Fp8Fa2SplitRoute> {
+    static ROUTE: std::sync::LazyLock<Option<Fp8Fa2SplitRoute>> = std::sync::LazyLock::new(|| {
+        fp8_fa2_split_verify_route_for(
+            hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8")
+                .ok()
+                .as_deref(),
+        )
     });
-    *SPLITS
+    *ROUTE
+}
+
+/// Pure body of [`fp8_fa2_split_verify_route`] for the raw env value.
+fn fp8_fa2_split_verify_route_for(raw: Option<&str>) -> Option<Fp8Fa2SplitRoute> {
+    match raw {
+        None => Some(Fp8Fa2SplitRoute {
+            splits: FP8_FA2_SPLIT_DEFAULT_SPLITS,
+            min_ctx: FP8_FA2_SPLIT_DEFAULT_MIN_CTX,
+            max_rows: FP8_FA2_SPLIT_DEFAULT_MAX_ROWS,
+        }),
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (2..=64).contains(n))
+            .map(|splits| Fp8Fa2SplitRoute {
+                splits,
+                min_ctx: 0,
+                max_rows: VERIFY_GQA_MAX_ROWS,
+            }),
+    }
+}
+
+/// Default split count of the fp8 split-KV verifier (R9700, B=8/16, 32K-128K:
+/// S16 is the fastest count; S32/S64 never beat it).
+const FP8_FA2_SPLIT_DEFAULT_SPLITS: usize = 16;
+/// Default-route context floor, compared with the LIVE context
+/// (`start_pos + rows`), never with a graph's `physical_cap` grid. Below it
+/// the route is byte-identical to VerifyAttn. R9700 eager B=8 kernel time,
+/// VerifyAttn / split: 0.62x at 512 tokens, 0.81x at 1K, 1.07x at 2K, 1.44x
+/// at 4K, 1.84x at 8K. The serve A/B at 3.7-5K contexts (floor 4,096)
+/// measured -0.9% with different text, so the floor sits one step above,
+/// where the split is clearly ahead.
+const FP8_FA2_SPLIT_DEFAULT_MIN_CTX: usize = 8192;
+/// Default-route row ceiling: DFlash verify blocks (B <= 16). The kernel
+/// oracles cover B = 2, 4, 8, 16 only; 17..=32-row prefill tails keep
+/// VerifyAttn unless an explicit split count is set.
+const FP8_FA2_SPLIT_DEFAULT_MAX_ROWS: usize = 16;
+
+/// Pure admission of the fp8 split-KV verifier: the split count when `route`
+/// serves a non-tree, non-recording call of `batch_size` rows at `route_ctx`
+/// live context over `partials_numel` f32 of caller scratch.
+#[allow(clippy::too_many_arguments)]
+fn fp8_fa2_split_verify_admission(
+    route: Option<Fp8Fa2SplitRoute>,
+    arch: &str,
+    route_ctx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+    partials_numel: usize,
+) -> Option<usize> {
+    let route = route?;
+    (arch == "gfx1201"
+        && route_ctx >= route.min_ctx
+        && n_heads == 24
+        && n_kv_heads == 4
+        && head_dim == 256
+        && (2..=route.max_rows).contains(&batch_size)
+        && partials_numel
+            >= Gpu::fa2_gqa_split_gfx1201_partials_len(route.splits, batch_size, n_heads, head_dim))
+    .then_some(route.splits)
+}
+
+/// `(partial, merge, pre-convert, source)` of the gfx1201 split-KV FA2
+/// launcher for the Q8 or native-fp8 KV variant. No stage-b route-Q twin for
+/// the bench split path (B4 pending): it always runs the f16 partial/merge
+/// entries. The pre-convert and merge symbols are bound from the partial
+/// symbol's module object.
+fn fa2_gqa_split_gfx1201_symbols(
+    fp8_kv: bool,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    if fp8_kv {
+        (
+            "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
+            "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
+            "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC,
+        )
+    } else {
+        (
+            "attention_q8_0_fa2_gqa_partial_gfx1201",
+            "attention_q8_0_fa2_gqa_merge_gfx1201",
+            "attention_fa2_q_preconvert_gfx1201",
+            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
+        )
+    }
 }
 
 /// Query rows one group-6 VerifyAttn workgroup serves (compile-time in the
@@ -9612,6 +9722,102 @@ impl Gpu {
         n_splits * batch_size * n_heads * (head_dim + 1)
     }
 
+    /// The split count the native-fp8 split-KV verifier serves a plain
+    /// (non-tree) call of `batch_size` rows at `live_ctx` (`start_pos +
+    /// rows`, the LIVE context, never a capture grid) with `partials_numel`
+    /// f32 of caller scratch, or `None` when the call keeps VerifyAttn
+    /// (route off, below the context floor, more than the route's rows,
+    /// other shape, other arch, partials too small, Redline recording). The
+    /// single predicate of the launcher, the lane-batched CB verify and the
+    /// verify graph's route class.
+    pub fn fp8_fa2_split_verify_admitted(
+        &self,
+        live_ctx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        partials_numel: usize,
+    ) -> Option<usize> {
+        if self.replay.is_recording() {
+            return None;
+        }
+        fp8_fa2_split_verify_admission(
+            fp8_fa2_split_verify_route(),
+            &self.arch,
+            live_ctx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            partials_numel,
+        )
+    }
+
+    /// Whether [`Self::attention_fp8_e4m3_fa2_gqa_split_gfx1201`] can be
+    /// recorded into a hipGraph capture for `batch_size` rows: its module and
+    /// every entry it binds are already loaded (no JIT) and its f16 Q scratch
+    /// already holds `batch_size` H24/D256 rows (no growth, which would
+    /// synchronize, free and malloc mid-capture). A cold capture keeps the
+    /// incumbent route instead of failing the capture; prime it with
+    /// [`Self::fp8_fa2_split_verify_prepare_capture`].
+    pub fn fp8_fa2_split_verify_capture_ready(&self, batch_size: usize) -> bool {
+        let (partial, merge, precon, _) = fa2_gqa_split_gfx1201_symbols(true);
+        self.functions.contains_key(partial)
+            && self.functions.contains_key(merge)
+            && self.functions.contains_key(precon)
+            && !crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                batch_size * 24 * 256 * 2,
+            )
+    }
+
+    /// Load every entry and grow the Q scratch the fp8 split-KV verifier
+    /// needs for `batch_size` rows, outside any capture, so
+    /// [`Self::fp8_fa2_split_verify_capture_ready`] holds for the capture
+    /// that follows. Call it right before beginning a verify-graph capture
+    /// whose window the route admits; it must never run inside one.
+    pub fn fp8_fa2_split_verify_prepare_capture(&mut self, batch_size: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_fa2_gqa_split_gfx1201_assets(true, batch_size * 24 * 256 * 2)
+            .map(|_| ())
+    }
+
+    /// Kernels and f16 Q scratch of the gfx1201 split-KV launcher; returns
+    /// the Q scratch base. The pre-convert and merge symbols resolve out of
+    /// the partial symbol's module object (named for the partial symbol,
+    /// which is also the registry module name of the fp8 build), so a run
+    /// compiles or binds exactly one module. The scratch grows monotonically;
+    /// growth announces itself (`invalidate_for_scratch_growth`) so graphs
+    /// that baked the old pointer are dropped.
+    fn ensure_fa2_gqa_split_gfx1201_assets(
+        &mut self,
+        fp8_kv: bool,
+        need_q16_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        let (partial, merge, precon, src) = fa2_gqa_split_gfx1201_symbols(fp8_kv);
+        if !self.functions.contains_key(partial) {
+            self.ensure_kernel(partial, src, partial)?;
+        }
+        if !self.functions.contains_key(precon) {
+            self.ensure_kernel(partial, src, precon)?;
+        }
+        if !self.functions.contains_key(merge) {
+            self.ensure_kernel(partial, src, merge)?;
+        }
+        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)
+    }
+
     /// gfx1201 split-KV FA2 GQA path (S partitions + stable merge), used by
     /// the opt-in DFlash verifier route (`HIPFIRE_GFX12_FA2_SPLIT_VERIFY=1`).
     ///
@@ -9735,53 +9941,9 @@ impl Gpu {
                 ),
             ));
         }
-        // No stage-b route-Q twin for the bench split path (B4 pending):
-        // the split bench always runs the f16 partial/merge entries.
-        let (partial, merge, src) = if fp8_kv {
-            (
-                "attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201",
-                "attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201",
-                kernels::ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC,
-            )
-        } else {
-            (
-                "attention_q8_0_fa2_gqa_partial_gfx1201",
-                "attention_q8_0_fa2_gqa_merge_gfx1201",
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-            )
-        };
-        let merge_src = src;
-        // F4b: the partial body reads f16 Q from Gpu-owned scratch
-        // (pre-converted on the same stream just below); the pre-convert
-        // symbol resolves out of this same Q8 module object, so a
-        // standalone bench run compiles exactly one module.
-        let precon: &'static str = if fp8_kv {
-            "attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201"
-        } else {
-            "attention_fa2_q_preconvert_gfx1201"
-        };
-        if !self.functions.contains_key(partial) {
-            self.ensure_kernel(partial, src, partial)?;
-        }
-        if !self.functions.contains_key(precon) {
-            self.ensure_kernel(partial, src, precon)?;
-        }
-        if !self.functions.contains_key(merge) {
-            self.ensure_kernel(merge, merge_src, merge)?;
-        }
-        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
-        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
-        // Same pre-growth invalidation contract as above.
-        if crate::scratch::scratch_will_grow(
-            self.scratch.fa2_q16_scratch_bytes,
-            self.scratch.fa2_q16_scratch.is_some(),
-            need_q16_bytes,
-        ) {
-            self.invalidate_for_scratch_growth();
-        }
-        let q16_ptr = self
-            .scratch
-            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let (partial, merge, precon, _) = fa2_gqa_split_gfx1201_symbols(fp8_kv);
+        let q16_ptr =
+            self.ensure_fa2_gqa_split_gfx1201_assets(fp8_kv, batch_size * n_heads * head_dim * 2)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -10919,6 +11081,16 @@ impl Gpu {
     /// tree_bias passes through; slot descriptors stay null (noslots).
     /// `V_MODE_Q8` keeps the kernarg blob shape identical to the Q8 path the
     /// shared launcher was written for (consumed-but-unused by the tile).
+    ///
+    /// `live_ctx` is the caller's LIVE context length (`start_pos + rows`)
+    /// where `max_ctx_len` is only a grid bound: a verify-graph capture sizes
+    /// the attend by the cache's `physical_cap`, so `max_ctx_len` says
+    /// nothing about the window being recorded. `None` takes `max_ctx_len`
+    /// as the live context eagerly and disables the native-fp8 split-KV
+    /// verifier under capture; `Some` is passed only by a caller that
+    /// re-captures when the route's context class changes (the DFlash verify
+    /// graph), and under capture the route is taken only when
+    /// [`Self::fp8_fa2_split_verify_capture_ready`] holds.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fp8_e4m3_tile_batched(
         &mut self,
@@ -10937,6 +11109,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        live_ctx: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         check_native_kv_capacity(
@@ -10951,29 +11124,32 @@ impl Gpu {
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_flash_fp8_e4m3_tile_batched",
         )?;
-        // Opt-in native-fp8 split-KV FA2 verifier (gfx1201 H24/KV4/D256):
+        // Native-fp8 split-KV FA2 verifier (gfx1201 H24/KV4/D256):
         // WMMA QK/PV over KT64 tiles split across `splits` workgroups per kv
         // head, then a stable LSE merge. Not byte-identical to VerifyAttn
         // (f16 Q/K/V/P operands); every unadmitted shape keeps the routes
         // below.
-        if let Some(splits) = fp8_fa2_split_verify_splits() {
-            if self.arch == "gfx1201"
-                && n_heads == 24
-                && n_kv_heads == 4
-                && head_dim == 256
-                && tree_bias.is_none()
-                && block_cols == 0
-                && (2..=32).contains(&batch_size)
-                && !self.replay.is_recording()
-                && partials.numel()
-                    >= Self::fa2_gqa_split_gfx1201_partials_len(
-                        splits, batch_size, n_heads, head_dim,
-                    )
-            {
-                return self.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
-                    q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
-                    batch_size, splits,
-                );
+        let in_stream_capture = self.graphs.capture_mode;
+        let route_ctx = match live_ctx {
+            Some(ctx) => Some(ctx),
+            None if in_stream_capture => None,
+            None => Some(max_ctx_len),
+        };
+        if let Some(route_ctx) = route_ctx.filter(|_| tree_bias.is_none() && block_cols == 0) {
+            if let Some(splits) = self.fp8_fa2_split_verify_admitted(
+                route_ctx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                partials.numel(),
+            ) {
+                if !in_stream_capture || self.fp8_fa2_split_verify_capture_ready(batch_size) {
+                    return self.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                        q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads,
+                        head_dim, batch_size, splits,
+                    );
+                }
             }
         }
         if self.try_attention_verify_gqa(
@@ -26058,6 +26234,83 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fp8_fa2_split_verify_route_default_and_overrides() {
+        use super::{
+            fp8_fa2_split_verify_route_for as f, Fp8Fa2SplitRoute, FP8_FA2_SPLIT_DEFAULT_MAX_ROWS,
+            FP8_FA2_SPLIT_DEFAULT_MIN_CTX, FP8_FA2_SPLIT_DEFAULT_SPLITS,
+        };
+        // Unset: on by default, 16 splits, live-context floor, <= 16 rows.
+        assert_eq!(
+            f(None),
+            Some(Fp8Fa2SplitRoute {
+                splits: FP8_FA2_SPLIT_DEFAULT_SPLITS,
+                min_ctx: FP8_FA2_SPLIT_DEFAULT_MIN_CTX,
+                max_rows: FP8_FA2_SPLIT_DEFAULT_MAX_ROWS,
+            })
+        );
+        assert_eq!(FP8_FA2_SPLIT_DEFAULT_SPLITS, 16);
+        assert_eq!(FP8_FA2_SPLIT_DEFAULT_MIN_CTX, 8192);
+        assert_eq!(FP8_FA2_SPLIT_DEFAULT_MAX_ROWS, 16);
+        // `0`, `1`, out of range and garbage: VerifyAttn.
+        for off in ["0", "1", "65", "", "off", "-3", "16x"] {
+            assert_eq!(f(Some(off)), None, "{off:?}");
+        }
+        // An explicit split count has no context floor and keeps 2..=32 rows.
+        for (raw, splits) in [("8", 8), (" 64 ", 64), ("2", 2)] {
+            assert_eq!(
+                f(Some(raw)),
+                Some(Fp8Fa2SplitRoute {
+                    splits,
+                    min_ctx: 0,
+                    max_rows: 32,
+                }),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_fa2_split_verify_admission_floor_rows_and_shape() {
+        use super::{fp8_fa2_split_verify_admission as adm, fp8_fa2_split_verify_route_for as f};
+        let on = f(None);
+        let big = usize::MAX;
+        // The live-context floor: 8191 stays VerifyAttn, 8192 splits.
+        assert_eq!(adm(on, "gfx1201", 8191, 24, 4, 256, 16, big), None);
+        assert_eq!(adm(on, "gfx1201", 8192, 24, 4, 256, 16, big), Some(16));
+        // Default rows: 2..=16 only.
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 1, big), None);
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 2, big), Some(16));
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 17, big), None);
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 32, big), None);
+        // Explicit split count: no floor, up to 32 rows.
+        let explicit = f(Some("8"));
+        assert_eq!(adm(explicit, "gfx1201", 100, 24, 4, 256, 17, big), Some(8));
+        assert_eq!(adm(explicit, "gfx1201", 100, 24, 4, 256, 33, big), None);
+        // Other arch / shape, route off.
+        assert_eq!(adm(on, "gfx1100", 9000, 24, 4, 256, 8, big), None);
+        assert_eq!(adm(on, "gfx1201", 9000, 16, 2, 256, 8, big), None);
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 128, 8, big), None);
+        assert_eq!(adm(f(Some("0")), "gfx1201", 9000, 24, 4, 256, 8, big), None);
+        // Partials one float short of 16 splits x 8 rows x 24 heads x 257.
+        let need = 16 * 8 * 24 * 257;
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 8, need - 1), None);
+        assert_eq!(adm(on, "gfx1201", 9000, 24, 4, 256, 8, need), Some(16));
+    }
+
+    #[test]
+    fn fp8_fa2_split_launcher_symbols_are_one_module() {
+        use super::fa2_gqa_split_gfx1201_symbols as s;
+        let (partial, merge, precon, _) = s(true);
+        assert!(partial.starts_with("attention_fp8_e4m3_fa2_gqa_partial"));
+        assert!(merge.starts_with("attention_fp8_e4m3_fa2_gqa_merge"));
+        assert!(precon.starts_with("attention_fp8_e4m3_fa2_q_preconvert"));
+        let (partial, merge, precon, _) = s(false);
+        assert!(partial.starts_with("attention_q8_0_fa2_gqa_partial"));
+        assert!(merge.starts_with("attention_q8_0_fa2_gqa_merge"));
+        assert!(precon.starts_with("attention_fa2_q_preconvert"));
+    }
+
     #[test]
     fn a3b_qresident_full_planes_and_ragged_ranges() {
         use super::a3b_qresident_spans;

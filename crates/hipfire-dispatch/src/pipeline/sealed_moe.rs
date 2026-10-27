@@ -719,8 +719,19 @@ pub enum ContractAxis {
 /// Dispatch-owned mirror of one collective schedule row hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContractCollectiveHint {
-    AllReduce { kind: ContractAxis },
-    BandXfer { src: usize, dst: usize },
+    AllReduce {
+        kind: ContractAxis,
+    },
+    /// Copy-only owner-routed row gather (the Flash-Next EP exchange): each
+    /// rank copies its owned rows to every other rank, no arithmetic, then the
+    /// slot-order combine runs replicated. Not a reduction.
+    OwnerRowGather {
+        kind: ContractAxis,
+    },
+    BandXfer {
+        src: usize,
+        dst: usize,
+    },
 }
 
 /// One ordered collective row carried by the execution contract.
@@ -888,6 +899,11 @@ impl ExpertExecutionContract {
                     ContractAxis::Pp => "AR:Pp",
                     ContractAxis::Tp => "AR:Tp",
                     ContractAxis::Ep => "AR:Ep",
+                },
+                ContractCollectiveHint::OwnerRowGather { kind } => match kind {
+                    ContractAxis::Pp => "ORG:Pp",
+                    ContractAxis::Tp => "ORG:Tp",
+                    ContractAxis::Ep => "ORG:Ep",
                 },
                 ContractCollectiveHint::BandXfer { src, dst } => {
                     rows.push_str(&format!("{}:{}:BX:{src}>{dst};", row.name, row.layer));

@@ -4113,7 +4113,7 @@ impl Qwen4Bundle {
     /// ([`SessionDriver::begin`]): a live continuation of this conversation's
     /// previous turn, a snapshot restore, or a cold start. Message-end
     /// boundaries of a live continuation are captured when active.
-    pub(crate) fn session_begin(
+    pub fn session_begin(
         &mut self,
         gpu: &mut Gpu,
         prompt: &[u32],

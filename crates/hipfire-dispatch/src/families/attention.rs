@@ -3033,6 +3033,13 @@ fn dispatch_attend(
                     ))
                 } else {
                     let fp = io.flash_partials.unwrap();
+                    // Eagerly `max_ctx_len` is the live context. A DFlash
+                    // verify-graph capture sizes it by `physical_cap`; there
+                    // the window's live context is `pos + batch_size`, which
+                    // the native-fp8 split-KV route's floor and the graph's
+                    // route class are keyed on.
+                    let live_ctx = (ctx.verify_tile_attend && gpu.graphs.capture_mode)
+                        .then(|| io.pos + io.batch_size);
                     hip!(gpu.attention_flash_fp8_e4m3_tile_batched(
                         io.q,
                         io.k_cache,
@@ -3049,6 +3056,7 @@ fn dispatch_attend(
                         io.tree_bias,
                         io.block_start,
                         io.block_cols,
+                        live_ctx,
                     ))
                 }
             }

@@ -709,6 +709,18 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         ctx.cask.cask_m_folding,
         ctx.max_seq,
     )?;
+    // DDTree + CASK/TriAttention eviction (#272): refuse before any allocation.
+    // Mirrors `load_dflash_state`'s budget resolution (env wins, else the spec param).
+    validate_ddtree_cask(
+        ctx.gpu
+            .flags
+            .ddtree_budget
+            .or(ctx.spec.ddtree_budget)
+            .unwrap_or(0)
+            > 0,
+        ctx.draft_path.is_some_and(|d| !d.is_empty()),
+        ctx.cask.sidecar.is_some(),
+    )?;
     validate_gfx1100_split_verify_kv(
         crate::qwen35::prefill::gfx1100_split_verify_min_ctx(&*ctx.gpu, config).is_some(),
         adaptive_req.is_none()
@@ -850,6 +862,25 @@ pub fn validate_native_kv_admission(
         return Err(format!(
             "kv_mode {mode:?} requires neutral V (no typed kv_v / HIPFIRE_KV_V); native Fp8/Bf16 pairs are indivisible"
         ));
+    }
+    Ok(())
+}
+
+/// #272: DDTree keeps a CPU `target_hidden_host` shadow that eviction does not
+/// compact (`position` shrinks, the shadow keeps the pre-eviction rows), which
+/// panics at `target_hidden_host size mismatches position`. CASK/TriAttention
+/// eviction is deprecated since 0.4.0, so the combination is refused instead
+/// of growing a host-mirror contract. `ddtree` is "budget > 0"; it only matters
+/// with a DFlash draft attached.
+pub fn validate_ddtree_cask(ddtree: bool, has_draft: bool, cask: bool) -> Result<(), String> {
+    if ddtree && has_draft && cask {
+        return Err(
+            "DDTree (speculation.ddtree_budget / HIPFIRE_DDTREE_BUDGET > 0) cannot be combined with \
+             CASK/TriAttention eviction (memory.cask.sidecar): eviction does not compact DDTree's \
+             hidden-state shadow and the run would panic (#272). CASK is deprecated since 0.4.0; \
+             drop the CASK sidecar or set ddtree_budget = 0 (chain DFlash)."
+                .into(),
+        );
     }
     Ok(())
 }
@@ -1559,6 +1590,19 @@ mod tests {
     use hipfire_runtime::kv_adaptive::{KMode, Preset};
     use hipfire_runtime::llama::VMode;
 
+    #[test]
+    fn ddtree_with_cask_is_refused_up_front() {
+        let e = validate_ddtree_cask(true, true, true).unwrap_err();
+        assert!(
+            e.contains("DDTree") && e.contains("CASK") && e.contains("#272"),
+            "{e}"
+        );
+        // Each leg alone, or no draft (ddtree inert), is accepted.
+        assert!(validate_ddtree_cask(true, true, false).is_ok());
+        assert!(validate_ddtree_cask(false, true, true).is_ok());
+        assert!(validate_ddtree_cask(true, false, true).is_ok());
+        assert!(validate_ddtree_cask(false, false, false).is_ok());
+    }
     #[test]
     fn parse_presets_agree_with_controller_floors() {
         let cases = [
