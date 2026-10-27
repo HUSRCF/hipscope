@@ -1090,6 +1090,78 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::qwen36_27b_fa_prep_gfx1201_src(),
             ["qwen36_27b_fa_prep_gfx1201"]
         );
+        // Qwen3.6-27B CbVmm exact route (forward_slots/vmm/exact.rs) and the
+        // cross-request batched MTP verify (verify_twins.rs), observed
+        // JIT-compiled on the shipped gfx1201 pack (v0.4.4 27B AR/MTP). Each
+        // source is the launcher's own module assembly (the shared helpers
+        // below), never a divergent copy. gfx1201 only: the VMM fp8 KV write
+        // and the GQA fp8 flash tile `#error` off gfx1201, and `ensure_rows_twin`
+        // / `ensure_seg_twin` refuse every other arch, so no gfx1100/gfx1151
+        // launcher can load any of these modules.
+        {
+            use crate::attention::{
+                kv_slot_desc_vmm_source, vmm_rows_source, KV_CACHE_WRITE_FP8_E4M3_VMM_SRC,
+            };
+            let recipe_err = |e: hip_bridge::HipError| {
+                RegistryError::ConflictingPlan(format!("vmm exact route source: {e}"))
+            };
+            // attention.rs `kv_cache_write_batched_vmm` (Fp8E4M3 arm).
+            add!(
+                "kv_cache_write_fp8_e4m3_batched_vmm",
+                kv_slot_desc_vmm_source(
+                    KV_CACHE_WRITE_FP8_E4M3_VMM_SRC,
+                    "kv_cache_write_fp8_e4m3_batched_vmm",
+                    "kv_cache_write_fp8_e4m3_batched_vmm"
+                ),
+                ["kv_cache_write_fp8_e4m3_batched_vmm"]
+            );
+            // attention.rs `attention_flash_decode_vmm` (Fp8GqaGfx1201 route):
+            // the define drops the gqa8 entry, so each module exports one kernel.
+            add!(
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+                vmm_rows_source(
+                    kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                    "VMM_ROWS_FP8_GQA_TILE"
+                )
+                .map_err(recipe_err)?,
+                ["attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"]
+            );
+            add!(
+                "attention_flash_reduce_dsplit_gfx1201_vmm",
+                vmm_rows_source(
+                    kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                    "attention_flash_reduce_dsplit_gfx1201",
+                    "VMM_ROWS_DSPLIT_REDUCE"
+                )
+                .map_err(recipe_err)?,
+                ["attention_flash_reduce_dsplit_gfx1201_vmm"]
+            );
+            // rows_batched.rs twins (`rows_twin_module_source`).
+            for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP {
+                entries.push(entry(
+                    arch,
+                    module,
+                    symbols,
+                    crate::attention::rows_batched::rows_twin_module_source(module)
+                        .map_err(recipe_err)?
+                        .into(),
+                    extra_flags,
+                ));
+            }
+            // verify_twins.rs segment twin (`seg_twin_module_source`).
+            for &(module, symbols) in QWEN36_27B_GFX1201_SPEC_CB_HIP {
+                entries.push(entry(
+                    arch,
+                    module,
+                    symbols,
+                    crate::verify_twins::seg_twin_module_source(module)
+                        .map_err(recipe_err)?
+                        .into(),
+                    extra_flags,
+                ));
+            }
+        }
     }
     // Modules the shared runtime launchers request on every arch the pack
     // ships: the plain Q8_0 GEMV (K <= 1536), and the LFM2 decode path's
@@ -7193,76 +7265,9 @@ fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regis
     let arch = all.first().map(|e| e.arch).unwrap_or("");
     if arch == "gfx1201" {
         // `softmax_temp_topp_batched` (norm.rs `softmax_temp_topp_batched_into_f32`,
-        // MTP temperature verify) is in the installer inventory.
-        // VMM continuous batching exact route (forward_slots/vmm/exact.rs):
-        // the batched VMM KV write and row-batched flash decode, and the
-        // rows-batched singleton twins — the launchers' own module sources.
-        use crate::attention::{
-            kv_slot_desc_vmm_source, vmm_rows_source, KV_CACHE_WRITE_FP8_E4M3_VMM_SRC,
-        };
-        let recipe_err = |e: hip_bridge::HipError| {
-            RegistryError::ConflictingPlan(format!("vmm exact route source: {e}"))
-        };
-        all.push(entry(
-            arch,
-            "kv_cache_write_fp8_e4m3_batched_vmm",
-            &["kv_cache_write_fp8_e4m3_batched_vmm"],
-            kv_slot_desc_vmm_source(
-                KV_CACHE_WRITE_FP8_E4M3_VMM_SRC,
-                "kv_cache_write_fp8_e4m3_batched_vmm",
-                "kv_cache_write_fp8_e4m3_batched_vmm",
-            )
-            .into(),
-            extra_flags,
-        ));
-        all.push(entry(
-            arch,
-            "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
-            &["attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"],
-            vmm_rows_source(
-                kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
-                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
-                "VMM_ROWS_FP8_GQA_TILE",
-            )
-            .map_err(recipe_err)?
-            .into(),
-            extra_flags,
-        ));
-        all.push(entry(
-            arch,
-            "attention_flash_reduce_dsplit_gfx1201_vmm",
-            &["attention_flash_reduce_dsplit_gfx1201_vmm"],
-            vmm_rows_source(
-                kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
-                "attention_flash_reduce_dsplit_gfx1201",
-                "VMM_ROWS_DSPLIT_REDUCE",
-            )
-            .map_err(recipe_err)?
-            .into(),
-            extra_flags,
-        ));
-        for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP {
-            all.push(entry(
-                arch,
-                module,
-                symbols,
-                crate::attention::rows_batched::rows_twin_module_source(module)
-                    .map_err(recipe_err)?
-                    .into(),
-                extra_flags,
-            ));
-        }
-        for &(module, symbols) in QWEN36_27B_GFX1201_SPEC_CB_HIP {
-            all.push(entry(
-                arch,
-                module,
-                symbols,
-                crate::verify_twins::seg_twin_module_source(module)
-                    .map_err(recipe_err)?
-                    .into(),
-                extra_flags,
-            ));
-        }
+        // MTP temperature verify), the VMM exact route's KV write / row-batched
+        // flash decode, the rows twins and the segment twin are all in the
+        // installer inventory (`entries`).
         all.push(entry(
             arch,
             "gemv_mq4g256v2_xbatch",
