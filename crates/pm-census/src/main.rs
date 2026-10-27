@@ -12,6 +12,7 @@ fn usage() -> ! {
     eprintln!("  pm-census extract ...                             see `pm-census extract --help`");
     eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
     eprintln!("  pm-census tune plan|run|export ...                R4-R6 autotuner (see `pm-census tune`)");
+    eprintln!("  pm-census tune kld|promote|trial-table ...        R7 KLD/state gate (see `pm-census tune`)");
     std::process::exit(2);
 }
 
@@ -27,6 +28,9 @@ fn main() {
         "noise" => pm_census::noise::cli(rest),
         "tune" => match rest.split_first() {
             Some((sub, tail)) if sub == "export" => pm_census::tune::store::cli(tail),
+            Some((sub, _)) if matches!(sub.as_str(), "kld" | "promote" | "trial-table") => {
+                pm_census::tune::kld::cli(rest)
+            }
             _ => pm_census::tune::run::cli(rest),
         },
         _ => usage(),

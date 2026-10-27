@@ -233,6 +233,24 @@ fn infer_exit(rec: &Value) -> i32 {
     }
 }
 
+/// Whether a stored record may be reused for `spec`: always for non-`.rip`
+/// candidates; for a `rip` knob only when the record's `candidate.rip.sha256`
+/// equals the sha256 of the script's current bytes (an edited or missing script,
+/// or a record without that field, is re-run).
+fn rip_record_current(spec: &CandidateSpecV1, rec: &Value) -> bool {
+    let Some(path) = spec.knobs.get("rip") else {
+        return true;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let now: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    at(rec, &["candidate", "rip", "sha256"]).and_then(Value::as_str) == Some(now.as_str())
+}
+
 impl Driver<'_> {
     fn budget_cut(&self) -> Option<&'static str> {
         if self.processes >= self.cfg.max_processes {
@@ -270,7 +288,9 @@ impl Driver<'_> {
 
         if let Ok(bytes) = std::fs::read(&json_path) {
             if let Ok(rec) = serde_json::from_slice::<Value>(&bytes) {
-                if rec.is_object() {
+                // A `.rip` candidate's id hashes the script path, not its bytes:
+                // reuse only a record measured from the current script content.
+                if rec.is_object() && rip_record_current(spec, &rec) {
                     let exit_code = std::fs::read_to_string(rec_dir.join(format!("{stem}.exit")))
                         .ok()
                         .and_then(|s| s.trim().parse().ok())
@@ -529,6 +549,7 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
         confirms: c.confirms.clone(),
         noise_floor,
         aa_runs,
+        kld_state: None,
     };
     if drv.stop.is_none() {
         let screen = ClaimPolicyV1 {
@@ -1100,8 +1121,8 @@ mod tests {
         assert_eq!(cand(&r, "gate_up_nt8")["role"], "code_identical_control");
         assert_eq!(cand(&r, "gate_up_nt8")["verdict"], "not_winner");
 
-        // Records exist for the control and the winner only; the winner is refused
-        // at the unwired KLD/state hook.
+        // Records exist for the control and the winner only; the winner is
+        // bit-identical, so the kld_state stage passes on the exact-output proof.
         let (recs, bad) = store::import(&std::fs::read_to_string(dir.join("store.jsonl")).unwrap());
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(recs.len(), 2);
@@ -1114,7 +1135,7 @@ mod tests {
         assert_eq!(win.key.candidate_co_sha256, h("co_cand"));
         assert_eq!(win.domain_hash, d.domain_hash);
         assert_eq!(win.evidence.confirms.len(), 1);
-        assert_eq!(win.promotion.as_ref().unwrap_err().stage, "kld_state");
+        assert!(win.promotion.is_ok(), "{:?}", win.promotion);
         let ctl = recs
             .iter()
             .find(|x| x.candidate == d.candidates[2])
@@ -1255,5 +1276,37 @@ mod tests {
         assert!(load_domain(&path, "", 0, 8192).is_err());
         assert!(cli(&["plan".into(), "--bogus".into(), "1".into()]).is_err());
         assert!(cli(&[]).is_err());
+    }
+
+    #[test]
+    fn rip_record_reused_only_for_current_script_bytes() {
+        let d = tmp("ripsha");
+        std::fs::create_dir_all(&d).unwrap();
+        let rip = d.join("c.rip");
+        std::fs::write(&rip, b"one").unwrap();
+        let mut knobs = BTreeMap::new();
+        knobs.insert("rip".to_owned(), rip.display().to_string());
+        let spec = CandidateSpecV1 {
+            kernel: "iu4_gemm".into(),
+            arch: "gfx1201".into(),
+            shape: "M=128,N=128,K=256".into(),
+            knobs,
+        };
+        let sha = |b: &[u8]| -> String {
+            Sha256::digest(b)
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect()
+        };
+        let rec = json!({"candidate": {"rip": {"sha256": sha(b"one")}}});
+        assert!(rip_record_current(&spec, &rec));
+        std::fs::write(&rip, b"two").unwrap();
+        assert!(!rip_record_current(&spec, &rec));
+        assert!(!rip_record_current(&spec, &json!({"candidate": {}})));
+        std::fs::remove_file(&rip).unwrap();
+        assert!(!rip_record_current(&spec, &rec));
+        let mut plain = spec.clone();
+        plain.knobs.clear();
+        assert!(rip_record_current(&plain, &json!({})));
     }
 }

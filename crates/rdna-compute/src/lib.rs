@@ -85,6 +85,7 @@ pub mod page_pool;
 pub mod plan_sink;
 pub mod pm_decode_twins;
 pub mod pm_mtp_gemm;
+pub mod pm_tune;
 pub mod pm_xbatch;
 pub mod pool;
 pub mod prefill_invariant;

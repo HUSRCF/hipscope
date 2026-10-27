@@ -36985,15 +36985,24 @@ impl Gpu {
             )
         };
         if isa {
-            self.ensure_embedded_kernel(
-                module,
-                if slab {
-                    g12_iu4_b1s_image()?
-                } else {
-                    g12_iu4_b1_image()?
-                },
-                kernel,
-            )?;
+            let image = if slab {
+                g12_iu4_b1s_image()?
+            } else {
+                g12_iu4_b1_image()?
+            };
+            // PM tune table (`HIPFIRE_PM_TUNE_TABLE`): only the non-bf16 slab
+            // gate_up symbol is table-eligible (`pm_tune::lookup` checks the
+            // symbol). Unset: `lookup` returns `None` after one LazyLock load
+            // and the shipped image loads exactly as before.
+            let variant = if slab {
+                crate::pm_tune::lookup(&self.arch, kernel, m, k, image)?
+            } else {
+                None
+            };
+            match variant {
+                Some(variant) => self.ensure_pm_tune_variant(variant, kernel)?,
+                None => self.ensure_embedded_kernel(module, image, kernel)?,
+            }
         } else {
             self.ensure_kernel(module, source, kernel)?;
         }

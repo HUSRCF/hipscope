@@ -13,13 +13,16 @@
 //!   subprocesses, with a resumable ledger and work/time budgets.
 //! * [`store`] (R5): append-only JSONL store of [`TuneRecordV1`], deterministic
 //!   [`TableV1`] export and exact-key `lookup`. Only promoted rows are exported
-//!   as selectable; nothing in the product reads this today.
-//! * [`promote`] (R6): `can_promote(&TuneEvidenceV1, &ClaimPolicyV1)`; the
-//!   KLD/state stage is an explicit unwired hook that always refuses.
+//!   as selectable; the product reads them only via `HIPFIRE_PM_TUNE_TABLE`.
+//! * [`promote`] (R6/R7): `can_promote(&TuneEvidenceV1, &ClaimPolicyV1)`; the
+//!   `kld_state` stage judges model-level KLD / state-equality evidence.
+//! * [`kld`] (R7): HFKSEQ reader, paired per-chunk KLD statistics and the
+//!   `pm-census tune kld|promote|trial-table` CLI.
 //!
 //! The types below are the frozen contract between those modules.
 
 pub mod domain;
+pub mod kld;
 pub mod promote;
 pub mod run;
 pub mod store;
@@ -138,6 +141,9 @@ pub struct TuneEvidenceV1 {
     /// A/A floor (q95 |block_ratio - 1|) of the incumbent at this shape.
     pub noise_floor: Option<f64>,
     pub aa_runs: usize,
+    /// Model-level KLD / state-equality evidence (see [`kld`]).
+    #[serde(default)]
+    pub kld_state: Option<KldStateEvidenceV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,6 +154,16 @@ pub struct ClaimPolicyV1 {
     pub confirm_processes: usize,
     /// A/A processes required for the noise floor.
     pub aa_processes: usize,
+    /// Admit candidates whose output differs from the incumbent (numeric), subject
+    /// to the `kld_state` stage.
+    #[serde(default = "default_admit_numeric")]
+    pub admit_numeric: bool,
+    /// Minimum `max_chunks` (and paired n) of a promotion-grade KLD run.
+    #[serde(default = "default_kld_min_chunks")]
+    pub kld_promotion_min_chunks: usize,
+    /// Max allowed `ci95_hi` of the mean per-chunk KLD increase (candidate - incumbent).
+    #[serde(default = "default_kld_margin")]
+    pub kld_margin: f64,
 }
 
 impl Default for ClaimPolicyV1 {
@@ -157,6 +173,9 @@ impl Default for ClaimPolicyV1 {
             min_effect: 0.005,
             confirm_processes: 1,
             aa_processes: 3,
+            admit_numeric: true,
+            kld_promotion_min_chunks: 24,
+            kld_margin: 0.0005,
         }
     }
 }
@@ -170,7 +189,7 @@ pub struct Refusal {
     pub passed: Vec<String>,
 }
 
-/// A granted promotion (unreachable while the KLD/state hook is unwired).
+/// A granted promotion.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromotionV1 {
     pub passed: Vec<String>,
@@ -215,6 +234,10 @@ pub struct PromotedVariantV1 {
     pub key: TuneKeyV1,
     pub candidate: CandidateSpecV1,
     pub speedup: f64,
+    /// What the product reader needs to select this row; `None` in tables built
+    /// without a code-object directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<ProductSelectV1>,
 }
 
 /// Deterministic export of a store.
@@ -229,4 +252,86 @@ pub struct TableV1 {
     pub malformed: Vec<String>,
     /// sha256 of the canonical JSON of `rows`.
     pub rows_digest: String,
+    /// `kld_trial` for a single-row trial table used only by a KLD run; exported
+    /// store tables leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+fn default_admit_numeric() -> bool {
+    true
+}
+fn default_kld_min_chunks() -> usize {
+    24
+}
+fn default_kld_margin() -> f64 {
+    0.0005
+}
+
+/// One `eval_hipfire` run (JSON written by the driver script).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KldRunV1 {
+    /// `incumbent` or `candidate`.
+    pub role: String,
+    pub model_path: String,
+    pub model_sha256: String,
+    pub reference_path: String,
+    pub reference_sha256: String,
+    pub evaluator_path: String,
+    pub evaluator_sha256: String,
+    pub hipfire_commit: String,
+    /// Must be `prefill`.
+    pub scoring_mode: String,
+    pub max_chunks: usize,
+    pub kv_mode: String,
+    pub kv_v: String,
+    pub env: BTreeMap<String, String>,
+    pub fresh_home: bool,
+    pub tune_table_path: Option<String>,
+    pub tune_table_sha256: Option<String>,
+    /// Candidate role: must equal the attempt's `candidate_co_sha256`.
+    pub selected_code_object_sha256: Option<String>,
+    pub kldseq_path: String,
+    pub kldseq_sha256: String,
+    pub device_uuid: String,
+    /// Fabric job id when known (the hold's child does not see it).
+    #[serde(default)]
+    pub fabric_job: Option<String>,
+    /// Slice mean KLD parsed from the evaluator's stderr.
+    pub slice_mean_kld: f64,
+}
+
+/// Paired per-chunk mean-KLD statistics, candidate - incumbent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PairedKldV1 {
+    pub n: usize,
+    pub mean_diff: f64,
+    pub sd_diff: f64,
+    pub ci95_lo: f64,
+    pub ci95_hi: f64,
+}
+
+/// Model-level KLD / state-equality evidence for one candidate.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KldStateEvidenceV1 {
+    /// `screen` or `promotion`.
+    pub grade: String,
+    pub incumbent: KldRunV1,
+    pub candidate: KldRunV1,
+    pub paired: PairedKldV1,
+    /// kldseq bytes of both runs are identical.
+    pub exact: bool,
+}
+
+/// How the product reader selects a promoted row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProductSelectV1 {
+    pub symbol: String,
+    pub arch: String,
+    pub m: u64,
+    pub k: u64,
+    pub incumbent_image_sha256: String,
+    /// Relative to the table file's directory (absolute also accepted).
+    pub code_object: String,
+    pub code_object_sha256: String,
 }

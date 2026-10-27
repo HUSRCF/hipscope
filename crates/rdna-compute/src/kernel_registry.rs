@@ -6707,6 +6707,71 @@ const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
     "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
 ];
+/// [`QWEN36_27B_GFX1201_B1S_SYMBOLS`] minus the gate_up export a PM tune
+/// variant replaces (`pm_tune`).
+const QWEN36_27B_GFX1201_B1S_SYMBOLS_NO_GATE_UP: &[&str] = &[
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+];
+const QWEN36_27B_GFX1201_B1S_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s";
+const QWEN36_27B_GATE_UP_B1S_SYMBOLS: &[&str] = &[crate::pm_tune::GATE_UP_B1S_SYMBOL];
+
+/// The PM tune variant for the 27B gate_up b1s symbol, if a table is
+/// configured and selects one. The planner knows the gate_up shape: the
+/// route fingerprint pins `layers.0.mlp.gate_proj.weight` at `[17408, 5120]`
+/// and every dense layer (and the MTP head's `ffn_gate`) shares it, so the
+/// table key is `(arch, symbol, gate rows, hidden)`. A dispatch at any other
+/// shape then fails loudly (one image per symbol per process).
+fn gate_up_pm_tune_variant(
+    input: &RouteKernelInput<'_>,
+) -> Result<Option<&'static crate::pm_tune::PmVariant>, RegistryError> {
+    if !crate::pm_tune::enabled() {
+        return Ok(None);
+    }
+    let Some(gate) = input
+        .tensors
+        .iter()
+        .find(|t| t.name == "model.language_model.layers.0.mlp.gate_proj.weight")
+    else {
+        return Ok(None);
+    };
+    let [m, k] = *gate.shape else {
+        return Ok(None);
+    };
+    crate::pm_tune::lookup(
+        input.arch,
+        crate::pm_tune::GATE_UP_B1S_SYMBOL,
+        m,
+        k,
+        crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+    )
+    .map_err(|e| RegistryError::UnsupportedRoute(format!("qwen3.6-27b: {e}")))
+}
+
+/// Move the gate_up export of the shipped b1s bundle to `variant`'s module:
+/// the plan keeps one image per symbol.
+fn apply_gate_up_pm_tune_variant(
+    embedded: &mut Vec<PlannedKernel>,
+    variant: &'static crate::pm_tune::PmVariant,
+) {
+    for entry in embedded.iter_mut() {
+        if let PlannedKernel::Embedded {
+            module, symbols, ..
+        } = entry
+        {
+            if *module == QWEN36_27B_GFX1201_B1S_MODULE {
+                *symbols = QWEN36_27B_GFX1201_B1S_SYMBOLS_NO_GATE_UP;
+            }
+        }
+    }
+    embedded.push(PlannedKernel::Embedded {
+        module: variant.module.as_str(),
+        image: variant.bytes.as_slice(),
+        radiowave_json: None,
+        symbols: QWEN36_27B_GATE_UP_B1S_SYMBOLS,
+    });
+}
 
 /// No-AWQ plain rotate producers of the 27B route, planned only for the
 /// families whose projection weights lack a sidecar (`Qwen36PlainRotate`).
@@ -6807,6 +6872,13 @@ pub fn route_entries_sealed(
                 symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
             };
             let mut embedded = vec![b1s];
+            // PM tune table (`HIPFIRE_PM_TUNE_TABLE`): preload the selected
+            // gate_up variant instead of the shipped image, so the dispatch
+            // selector finds the symbol already bound to that same image.
+            // Unset (the default): nothing here runs and the plan is unchanged.
+            if let Some(variant) = gate_up_pm_tune_variant(input)? {
+                apply_gate_up_pm_tune_variant(&mut embedded, variant);
+            }
             if mtp {
                 let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
                 embedded.push(PlannedKernel::Embedded {
@@ -12453,8 +12525,8 @@ extern "C" __global__ void NAMED(int* p) {}
         assert_eq!(with_twins.modules.len() + skipped, without.modules.len());
     }
 
-    #[test]
-    fn native_mtp_plans_pm_fill_before_ready() {
+    /// Tensor table of the dense 27B plus its sidecar native-MTP head.
+    fn qwen36_27b_native_mtp_fixture() -> Vec<(String, crate::DType, Vec<usize>)> {
         use crate::DType;
         let mut owned: Vec<(String, DType, Vec<usize>)> = vec![
             (
@@ -12512,6 +12584,12 @@ extern "C" __global__ void NAMED(int* p) {}
         ] {
             owned.push((name.into(), DType::MQ4G256, shape.to_vec()));
         }
+        owned
+    }
+
+    #[test]
+    fn native_mtp_plans_pm_fill_before_ready() {
+        let owned = qwen36_27b_native_mtp_fixture();
         let tensors: Vec<_> = owned
             .iter()
             .map(|(name, dtype, shape)| KernelTensorMeta {
@@ -12562,6 +12640,129 @@ extern "C" __global__ void NAMED(int* p) {}
                 .iter()
                 .any(|e| e.module() == module));
         }
+    }
+
+    /// With no table configured (the product default) the 27B plan keeps the
+    /// whole shipped b1s bundle and plans no `pm_tune:` module: the planner
+    /// output is unchanged.
+    #[test]
+    fn pm_tune_unset_leaves_the_27b_b1s_plan_unchanged() {
+        if crate::pm_tune::enabled() {
+            return; // a developer table is configured in this environment
+        }
+        let owned = qwen36_27b_native_mtp_fixture();
+        let tensors: Vec<_> = owned
+            .iter()
+            .map(|(name, dtype, shape)| KernelTensorMeta {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect();
+        let flags = default_feature_flags("gfx1201").unwrap();
+        for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+            let input = RouteKernelInput {
+                arch: "gfx1201",
+                model_arch: 5,
+                tensors: &tensors,
+                n_heads: 24,
+                n_kv_heads: 4,
+                head_dim: 256,
+                max_seq: 16448,
+                prefill_chunk_rows: 512,
+                kv_k: "fp8",
+                kv_v: "fp8",
+                state_quant: "q8",
+                spec,
+                host_mapped_experts: false,
+                retained_decode: false,
+                hipcc_extra_flags: "",
+                flags: &flags,
+                route_axes: &[],
+            };
+            let plan = route_entries(&input).unwrap();
+            assert!(
+                !plan
+                    .entries
+                    .iter()
+                    .any(|e| e.module().starts_with("pm_tune:")),
+                "{spec:?}: no pm_tune module without a table"
+            );
+            let b1s = plan
+                .entries
+                .iter()
+                .find(|e| e.module() == QWEN36_27B_GFX1201_B1S_MODULE)
+                .expect("b1s bundle planned");
+            assert_eq!(b1s.symbols(), QWEN36_27B_GFX1201_B1S_SYMBOLS, "{spec:?}");
+            assert!(matches!(
+                b1s,
+                PlannedKernel::Embedded { image, .. }
+                    if *image == crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S
+            ));
+        }
+    }
+
+    /// A selected variant takes over exactly the gate_up export: the shipped
+    /// bundle keeps its other three symbols and the plan stays valid (one
+    /// image per symbol).
+    #[test]
+    fn pm_tune_variant_takes_only_the_gate_up_export_in_the_plan() {
+        static VARIANT: std::sync::LazyLock<crate::pm_tune::PmVariant> =
+            std::sync::LazyLock::new(|| crate::pm_tune::PmVariant {
+                module: "pm_tune:0123456789abcdef".to_owned(),
+                bytes: b"variant image".to_vec(),
+                row_id: "rows[0]:test".to_owned(),
+            });
+        let owned = qwen36_27b_native_mtp_fixture();
+        let tensors: Vec<_> = owned
+            .iter()
+            .map(|(name, dtype, shape)| KernelTensorMeta {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect();
+        let flags = default_feature_flags("gfx1201").unwrap();
+        let input = RouteKernelInput {
+            arch: "gfx1201",
+            model_arch: 5,
+            tensors: &tensors,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 16448,
+            prefill_chunk_rows: 512,
+            kv_k: "fp8",
+            kv_v: "fp8",
+            state_quant: "q8",
+            spec: KernelSpecRoute::Ar,
+            host_mapped_experts: false,
+            retained_decode: false,
+            hipcc_extra_flags: "",
+            flags: &flags,
+            route_axes: &[],
+        };
+        let mut plan = route_entries(&input).unwrap();
+        apply_gate_up_pm_tune_variant(&mut plan.entries, &VARIANT);
+        validate_route_plan(&plan).expect("variant plan is valid");
+        let owner_of = |symbol: &str| {
+            plan.entries
+                .iter()
+                .filter(|e| e.symbols().contains(&symbol))
+                .map(|e| e.module())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            owner_of(crate::pm_tune::GATE_UP_B1S_SYMBOL),
+            ["pm_tune:0123456789abcdef"]
+        );
+        for symbol in QWEN36_27B_GFX1201_B1S_SYMBOLS_NO_GATE_UP {
+            assert_eq!(owner_of(symbol), [QWEN36_27B_GFX1201_B1S_MODULE]);
+        }
+        assert!(matches!(
+            plan.entries.last().unwrap(),
+            PlannedKernel::Embedded { image, .. } if *image == b"variant image"
+        ));
     }
 
     // ── Generic (Qwen3.5 A3B/27B) walked-plan matching ──────────────────
