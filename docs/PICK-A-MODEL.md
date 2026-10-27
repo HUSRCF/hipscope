@@ -36,12 +36,12 @@ host. Decode is tok/s per request.
 | Card | Tag or file | Route | Result | Date, build |
 |---|---|---|---|---|
 | 7900 XTX (24 GB) | `qwen3.8:27b-mq4-xts` | native MTP (`--spec mtp`), Q8 KV | decode 136.5–136.8 (code 1K), 141.1 (prose 1K), 129.5–129.9 (code 32K), 79.7–80.1 (prose 32K) | 2026-10-26, beta `085dd189b5` + #998 |
-| R9700 (32 GB) | `qwen3.8:27b-mq4-xts` + paired DFlash draft | DFlash | decode 314.7 (code), 60.5 (prose) | 2026-10-24, `0a75dec554` |
+| R9700 (32 GB) | `qwen3.8:27b-mq4-xts` (+ paired DFlash draft, + MTP head) | AR / DFlash / native MTP, committed `humaneval_0_has_close_elements` (code) and `fiction_lighthouse` (prose) prompts | decode AR 41.2; DFlash 313.6 (code), 63.4 (prose); MTP 95.0 (code), 55.5 (prose); prefill 4,936 (pp512), 5,278 (pp2048), 4,888 (pp16384) | 2026-10-27, published v0.4.4 binary |
 | R9700 (32 GB) | `qwen3.8:27b-mq4-xts` + paired DFlash draft, fp8 KV | DFlash, long context | decode 59.60 (16K), 51.40 (32K), 43.37 (64K), 33.70 (128K) | 2026-10-26, 0.4.4 cycle beta |
 | Strix Halo | `qwen3.8:27b-mq4-xts` + paired DFlash draft | DFlash | decode 135.3 (code) | 2026-10-13, v0.4.2 |
-| R9700 (32 GB) + host RAM | `qwen3.8:flash-next` (split base) | `--spec auto` (native MTP), hot set | decode 49.7 (prose), 80.6 and 78.6 (code); pp16384 6,648 | 2026-10-26, beta `f3ae992a17` |
+| R9700 (32 GB) + host RAM | `qwen3.8:flash-next` (split base) | AR / native MTP (`--spec mtp`), hot set, same two prompts, 640 tokens | decode AR 49.7 (code), 45.6 (prose); MTP 82.9 (code), 48.5 (prose); prefill 6,647.8 (pp16384) | 2026-10-27, published v0.4.4 binary |
 | Strix Halo + XDNA2 | `qwen3.8-flash-next-gptq3.mq4` | NPU trunk prefill | 16,355-token prefill 2,472.7 tok/s | 2026-10-27, `943b5323da` |
-| R9700 (32 GB) | `qwen3.6:35b-a3b-mq4rs` (gfx1201 only) | AR | decode 197.0 (HIP route) at 128 context; prefill 19,828 tok/s at pp4096 | 2026-10-24, `61f778b1d1` (decode), v0.4.3 RC (prefill) |
+| R9700 (32 GB) | `qwen3.6:35b-a3b-mq4rs` (gfx1201 only) | AR, `bench --matrix` | decode 242.2 (tg128 at 128 context); prefill 11,788 (pp512), 19,867 (pp4096), 18,567 (pp16384) | 2026-10-27, published v0.4.4 binary |
 
 ## Larger and newer families (registry floors)
 
