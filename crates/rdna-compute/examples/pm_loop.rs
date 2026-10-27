@@ -3,16 +3,23 @@
 
 //! PM loop: one command that emits a PeaceMaker production-generator variant,
 //! certifies it, checks it on the card, and ABBA-times it against the shipped
-//! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
+//! kernel (gfx1201 by default; `--arch gfx1151|gfx1100` for the tri-arch kernels
+//! `qwen4_moe_sym` and `qwen4_moe_verify`). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym --shape <S> [kernel knobs]
-//!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
+//!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
 //!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
-//!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm)
+//!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm; not qwen4_moe_verify)
 //! ```
+//!
+//! `--arch` (default `gfx1201`) is the target the candidate is emitted, M7-certified and
+//! timed for; the record's top-level `arch` is the workload's arch, and a device of another
+//! arch is refused (`device is X, --arch Y`, stage `device`). Only `qwen4_moe_sym` and
+//! `qwen4_moe_verify` are tri-arch; every other kernel with `--arch` other than gfx1201 is a
+//! usage error.
 //!
 //! Pipeline (every step lands in the JSON record):
 //! 1. Emit + link the candidate with the native writer (the path of
@@ -90,6 +97,32 @@
 //!    the matching group has too few runs for a floor). It never changes
 //!    `material`.
 //!
+//! Complete chains (`--kernel qwen4_moe_verify`, `pm_loop/moe_verify.rs`): each arm is an
+//! ordered multi-kernel chain enqueued through `rdna_compute::Gpu`'s public launchers (the
+//! baseline arm is the chain the shipped selector issues; the candidate arm swaps in PM
+//! objects). The record keeps schema 1 and adds `mode` (`eager`), `numeric_contract`,
+//! `chain` (per-arm stages, selector provenance, residency, scratch), and per arm
+//! `sha256` (sha256 of the canonical JSON of `chain.<arm>`; the pm-census noise group key)
+//! and `pm_objects` (one entry per PM object the arm launches: M7 per export, resources,
+//! cost lint). Every candidate export is M7-certified (a fail is stage `m7`, exit 3); the
+//! baseline's certification is recorded, not gating. Correctness runs each arm's chain
+//! twice: warm on each arm's own buffer set, repeat on the swapped sets (`correctness` adds
+//! `baseline_repeat_identical`, `candidate_repeat_identical`, `repeat_on_swapped_buffers`
+//! and `numeric_relation`); `pass` needs both arms to pass their own CPU reference, both
+//! repeats bit-identical, and (relation `exact`) candidate == baseline. `emu` is `not
+//! applicable (chain)`. Timing is the same ABBA machinery with hipEvents around the WHOLE
+//! chain per launch slot (`timing.unit` says so), accumulating state restored outside the
+//! interval, as a crossover: the arms swap buffer sets every ABBA round
+//! (`ChainWorkload::set_buffer_swap`), because a fixed binding let buffer placement alone
+//! separate an A/A by up to 0.9% (gfx1201, host-mapped T=2/3). `timing.crossover` splits the
+//! round ratios by binding (`round_ratio_own`, `round_ratio_swapped`) and reports
+//! `crossover_ratio` (geometric mean of their medians, placement cancelled) and
+//! `placement_ratio`. `--null-control aa` runs the BASELINE chain as the candidate arm
+//! through the same launchers and loaded modules (no `--rip`/`--base-*`); the record gains
+//! `null_control: {kind: "aa", identical_chains, separate_modules: false, baseline_sha256,
+//! candidate_sha256, note}` and the candidate's M7 is the baseline's (`reused_from:
+//! "baseline"`). `--rip` is refused for chains.
+//!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
 //! error); 2 usage error.
@@ -133,6 +166,10 @@ mod gdn;
 mod iu4;
 #[path = "pm_loop/moe.rs"]
 mod moe;
+#[path = "pm_loop/moe_verify.rs"]
+mod moe_verify;
+#[path = "pm_loop/moe_verify_iu4.rs"]
+mod moe_verify_iu4;
 #[path = "pm_loop/mq6.rs"]
 mod mq6;
 #[path = "pm_loop/prod.rs"]
@@ -147,10 +184,15 @@ use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use workload::{Arm, Knobs, Object, Result, Workload};
+use workload::{Arm, ChainCtx, ChainWorkload, Knobs, Object, Result, Workload};
 
 const SCHEMA: u32 = 1;
-const ARCH: &str = "gfx1201";
+/// The kernel that takes the complete-chain path (`run_chain`).
+const CHAIN_KERNEL: &str = "qwen4_moe_verify";
+/// `--arch` values.
+const ARCHES: [&str; 3] = ["gfx1201", "gfx1151", "gfx1100"];
+/// Kernels that accept an `--arch` other than gfx1201.
+const TRI_ARCH_KERNELS: [&str; 2] = ["qwen4_moe_sym", "qwen4_moe_verify"];
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 6;
 const DEFAULT_MAX_ROUNDS: usize = 256;
@@ -178,6 +220,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Debug)]
 struct Opts {
     kernel: String,
+    /// `--arch`: target arch (default gfx1201).
+    arch: &'static str,
     shape: Option<String>,
     time: usize,
     rounds: usize,
@@ -201,11 +245,12 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
         kernel: String::new(),
+        arch: ARCHES[0],
         shape: None,
         time: DEFAULT_TIME,
         rounds: DEFAULT_ROUNDS,
@@ -234,6 +279,15 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             .ok_or_else(|| format!("--{key} needs a value (usage: {DRIVER_FLAGS})"))?;
         match key.as_str() {
             "kernel" => o.kernel = value,
+            "arch" => {
+                o.arch = ARCHES
+                    .iter()
+                    .copied()
+                    .find(|a| *a == value)
+                    .ok_or_else(|| {
+                        format!("--arch {value}: expected one of {}", ARCHES.join("|"))
+                    })?
+            }
             "shape" => o.shape = Some(value),
             "time" => o.time = abba::positive_count(&value).map_err(|e| format!("--time: {e}"))?,
             "rounds" => {
@@ -278,6 +332,17 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
+    if o.arch != ARCHES[0] && !TRI_ARCH_KERNELS.contains(&o.kernel.as_str()) {
+        return Err(format!(
+            "--kernel {} targets gfx1201 only (got --arch {})",
+            o.kernel, o.arch
+        ));
+    }
+    if o.kernel == CHAIN_KERNEL && o.rip.is_some() {
+        return Err(format!(
+            "--rip is not supported with --kernel {CHAIN_KERNEL}: there are no .rip candidates for chains yet"
+        ));
+    }
     if o.rip.is_some()
         && !matches!(
             o.kernel.as_str(),
@@ -318,6 +383,15 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     Ok(o)
 }
 
+fn arch_enum(arch: &str) -> Result<peacemaker_isa::Arch> {
+    match arch {
+        "gfx1201" => Ok(peacemaker_isa::Arch::Gfx1201),
+        "gfx1151" => Ok(peacemaker_isa::Arch::Gfx1151),
+        "gfx1100" => Ok(peacemaker_isa::Arch::Gfx1100),
+        other => Err(format!("unsupported --arch {other}")),
+    }
+}
+
 fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
     let shape = o.shape.clone().unwrap_or_default();
     let mut knobs = std::mem::take(&mut o.knobs);
@@ -326,15 +400,32 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
-        "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "qwen4_moe_sym" => {
+            moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref(), arch_enum(o.arch)?)?
+        }
         "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
             ))
         }
+    };
+    knobs.finish()?;
+    Ok(w)
+}
+
+fn build_chain(o: &mut Opts) -> Result<Box<dyn ChainWorkload>> {
+    let shape = o.shape.clone().unwrap_or_default();
+    let mut knobs = std::mem::take(&mut o.knobs);
+    let ctx = ChainCtx {
+        arch: o.arch,
+        null_control: o.null_control,
+    };
+    let w = match o.kernel.as_str() {
+        CHAIN_KERNEL => moe_verify::new(&shape, &mut knobs, ctx)?,
+        other => return Err(format!("--kernel {other} is not a chain kernel")),
     };
     knobs.finish()?;
     Ok(w)
@@ -417,13 +508,13 @@ fn cost_lint(program: &peacemaker_ir::Program) -> Value {
 
 /// M7 on every export through the cert cache. Err only when M7 itself rejects;
 /// the cache status of each export is kept alongside its receipt.
-fn certify(path: &Path, symbols: &[String]) -> Value {
+fn certify(path: &Path, symbols: &[String], arch: &str) -> Value {
     let mut cache = Vec::new();
     let mut receipts = serde_json::Map::new();
     let mut status = "pass";
     let mut error = Value::Null;
     for symbol in symbols {
-        match peacemaker_isa::pm_check::m7_status(path, ARCH, symbol) {
+        match peacemaker_isa::pm_check::m7_status(path, arch, symbol) {
             Ok((receipt, c)) => {
                 cache.push(json!({"symbol": symbol, "cache": c.as_str()}));
                 receipts.insert(symbol.clone(), receipt);
@@ -629,39 +720,94 @@ struct Sampled {
     cand_ns: Vec<f64>,
 }
 
+/// What the ABBA sampler drives: one timing arm = `reset` (outside the event
+/// interval) then `launch` (inside it). A single-object workload launches one
+/// kernel per slot; a chain workload enqueues its whole chain.
+trait ArmExec {
+    fn hip(&self) -> &hip_bridge::HipRuntime;
+    /// Called before the first launch of ABBA round `round` (0-based, counted
+    /// across extension batches). Single-object workloads ignore it.
+    fn begin_round(&mut self, _round: usize) {}
+    fn reset(&mut self, arm: Arm) -> Result<()>;
+    fn launch(&mut self, arm: Arm) -> Result<()>;
+}
+
+/// Single-object workload: the workload plus the two loaded modules.
+struct SingleExec<'a> {
+    gpu: &'a Gpu,
+    w: &'a dyn Workload,
+    base: &'a Loaded,
+    cand: &'a Loaded,
+}
+
+impl ArmExec for SingleExec<'_> {
+    fn hip(&self) -> &hip_bridge::HipRuntime {
+        &self.gpu.hip
+    }
+    fn reset(&mut self, arm: Arm) -> Result<()> {
+        self.w.reset(self.gpu, arm)
+    }
+    fn launch(&mut self, arm: Arm) -> Result<()> {
+        let f = match arm {
+            Arm::Baseline => self.base,
+            Arm::Candidate => self.cand,
+        };
+        launch(self.gpu, self.w, arm, f)
+    }
+}
+
+/// Complete-chain workload: `encode_chain` is the launch.
+struct ChainExec<'a> {
+    gpu: &'a mut Gpu,
+    w: &'a mut dyn ChainWorkload,
+}
+
+impl ArmExec for ChainExec<'_> {
+    fn hip(&self) -> &hip_bridge::HipRuntime {
+        &self.gpu.hip
+    }
+    /// Crossover: even rounds bind the arms to their own buffer sets, odd
+    /// rounds swap them (`ChainWorkload::set_buffer_swap`).
+    fn begin_round(&mut self, round: usize) {
+        self.w.set_buffer_swap(round % 2 == 1);
+    }
+    fn reset(&mut self, arm: Arm) -> Result<()> {
+        self.w.reset(&mut *self.gpu, arm)
+    }
+    fn launch(&mut self, arm: Arm) -> Result<()> {
+        self.w.encode_chain(&mut *self.gpu, arm)
+    }
+}
+
 /// Append `rounds` whole ABBA rounds of `n` launches per block to `s`.
-fn sample_rounds(
-    gpu: &Gpu,
-    w: &dyn Workload,
-    base: &Loaded,
-    cand: &Loaded,
-    n: usize,
-    rounds: usize,
-    s: &mut Sampled,
-) -> Result<()> {
+fn sample_rounds(ex: &mut dyn ArmExec, n: usize, rounds: usize, s: &mut Sampled) -> Result<()> {
+    let done = s.base_ns.len() / (2 * n);
     let (calls, _) = abba::timing_counts(n, rounds)?;
     s.base_ns.reserve(calls);
     s.cand_ns.reserve(calls);
-    let start = gpu.hip.event_create().map_err(err)?;
-    let stop = match gpu.hip.event_create() {
+    let start = ex.hip().event_create().map_err(err)?;
+    let stop = match ex.hip().event_create() {
         Ok(e) => e,
         Err(e) => {
-            let _ = gpu.hip.event_destroy(start);
+            let _ = ex.hip().event_destroy(start);
             return Err(err(e));
         }
     };
     let measured = (|| -> Result<()> {
-        for which in timing_schedule(n, rounds)? {
-            let (arm, f) = match which {
-                TimingArm::Incumbent => (Arm::Baseline, base),
-                TimingArm::Candidate => (Arm::Candidate, cand),
+        for (i, which) in timing_schedule(n, rounds)?.enumerate() {
+            if i % (4 * n) == 0 {
+                ex.begin_round(done + i / (4 * n));
+            }
+            let arm = match which {
+                TimingArm::Incumbent => Arm::Baseline,
+                TimingArm::Candidate => Arm::Candidate,
             };
-            w.reset(gpu, arm)?;
-            gpu.hip.event_record(&start, None).map_err(err)?;
-            launch(gpu, w, arm, f)?;
-            gpu.hip.event_record(&stop, None).map_err(err)?;
-            gpu.hip.event_synchronize(&stop).map_err(err)?;
-            let ns = f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6;
+            ex.reset(arm)?;
+            ex.hip().event_record(&start, None).map_err(err)?;
+            ex.launch(arm)?;
+            ex.hip().event_record(&stop, None).map_err(err)?;
+            ex.hip().event_synchronize(&stop).map_err(err)?;
+            let ns = f64::from(ex.hip().event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6;
             match which {
                 TimingArm::Incumbent => s.base_ns.push(ns),
                 TimingArm::Candidate => s.cand_ns.push(ns),
@@ -669,8 +815,8 @@ fn sample_rounds(
         }
         Ok(())
     })();
-    let d1 = gpu.hip.event_destroy(start).map_err(err);
-    let d2 = gpu.hip.event_destroy(stop).map_err(err);
+    let d1 = ex.hip().event_destroy(start).map_err(err);
+    let d2 = ex.hip().event_destroy(stop).map_err(err);
     measured?;
     d1?;
     d2
@@ -703,13 +849,7 @@ fn drive_sampling(
     }
 }
 
-fn sample(
-    gpu: &Gpu,
-    w: &dyn Workload,
-    base: &Loaded,
-    cand: &Loaded,
-    o: &Opts,
-) -> Result<(Sampled, abba::ExtendStop, f64)> {
+fn sample(ex: &mut dyn ArmExec, o: &Opts) -> Result<(Sampled, abba::ExtendStop, f64)> {
     let start = std::time::Instant::now();
     drive_sampling(
         o.time,
@@ -717,7 +857,7 @@ fn sample(
         o.max_rounds,
         o.time_budget_s,
         &mut || start.elapsed().as_secs_f64(),
-        &mut |extra, s| sample_rounds(gpu, w, base, cand, o.time, extra, s),
+        &mut |extra, s| sample_rounds(&mut *ex, o.time, extra, s),
     )
 }
 
@@ -746,25 +886,96 @@ fn object_json(obj: &Object, resources: Value, extra: serde_json::Map<String, Va
     v
 }
 
+fn fail(mut rec: Value, stage: &str, e: String) -> (Value, Outcome) {
+    rec["error"] = json!({"stage": stage, "message": e});
+    (rec, Outcome::CandidateUnusable)
+}
+
+fn out_dir_of(o: &Opts) -> PathBuf {
+    o.out
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("pm_loop-{}", std::process::id())))
+}
+
+/// The sampled record of a run that reached timing: `timing_record` plus the
+/// noise-floor comparison keyed by `baseline_sha`.
+fn timed_record(
+    o: &Opts,
+    shape: &Value,
+    baseline_sha: &str,
+    s: &Sampled,
+    stop: abba::ExtendStop,
+    secs: f64,
+) -> Result<Value> {
+    let mut t = timing_record(s, o.time, o.rounds, stop, secs, o.min_effect)?;
+    if let Some(doc) = &o.noise_floor_doc {
+        t["vs_noise_floor"] = vs_noise_floor(
+            doc,
+            &o.kernel,
+            shape,
+            baseline_sha,
+            t["block_ratio"].as_f64().unwrap_or(f64::NAN),
+        );
+    }
+    t["post_outputs_unchanged"] = json!(true);
+    Ok(t)
+}
+
+/// `timing.crossover` of a chain record: the per-round ratios split by the
+/// buffer binding of their round (even rounds: each arm on its own set; odd:
+/// swapped). With a pure buffer-placement effect `p` the two medians sit at
+/// about `1 - p` and `1 + p`; `crossover_ratio` (their geometric mean) cancels
+/// it and `placement_ratio` (sqrt of their quotient) measures it.
+fn crossover_json(t: &Value) -> Result<Value> {
+    let ratios: Vec<f64> = t["noise"]["round_ratios"]
+        .as_array()
+        .ok_or("timing.noise.round_ratios missing")?
+        .iter()
+        .map(|v| v.as_f64().ok_or("non-numeric round ratio"))
+        .collect::<std::result::Result<_, _>>()?;
+    let (own, swapped): (Vec<(usize, f64)>, Vec<(usize, f64)>) = ratios
+        .iter()
+        .copied()
+        .enumerate()
+        .partition(|(i, _)| i % 2 == 0);
+    let strip = |v: Vec<(usize, f64)>| v.into_iter().map(|(_, r)| r).collect::<Vec<f64>>();
+    let (own, swapped) = (strip(own), strip(swapped));
+    let mut rec = json!({
+        "kind": "buffer sets alternate every ABBA round (even rounds: own sets, odd rounds: swapped)",
+        "rounds_own": own.len(),
+        "rounds_swapped": swapped.len(),
+    });
+    if own.is_empty() || swapped.is_empty() {
+        return Ok(rec);
+    }
+    let (a, b) = (abba::dispersion(&own)?, abba::dispersion(&swapped)?);
+    rec["round_ratio_own"] = a.json();
+    rec["round_ratio_swapped"] = b.json();
+    rec["crossover_ratio"] = json!((a.median * b.median).sqrt());
+    rec["placement_ratio"] = json!((a.median / b.median).sqrt());
+    Ok(rec)
+}
+
 fn run(o: &mut Opts) -> (Value, Outcome) {
-    let mut rec = json!({"schema": SCHEMA, "kernel": o.kernel, "arch": ARCH});
-    let fail = |mut rec: Value, stage: &str, e: String| {
-        rec["error"] = json!({"stage": stage, "message": e});
-        (rec, Outcome::CandidateUnusable)
-    };
+    let mut rec = json!({"schema": SCHEMA, "kernel": o.kernel, "arch": o.arch});
+    if o.kernel == CHAIN_KERNEL {
+        return match build_chain(o) {
+            Ok(w) => run_chain(o, w),
+            Err(e) => fail(rec, "args", e),
+        };
+    }
     let mut w = match build_workload(o) {
         Ok(w) => w,
         Err(e) => return fail(rec, "args", e),
     };
+    let arch = w.arch();
+    rec["arch"] = json!(arch);
     rec["shape"] = w.shape_json();
     for (key, value) in w.record_extra() {
         rec[key] = value;
     }
     rec["candidate"] = json!({"knobs": w.candidate_knobs()});
-    let out_dir = o
-        .out
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("pm_loop-{}", std::process::id())));
+    let out_dir = out_dir_of(o);
 
     // 1. emit + link. `--null-control aa`: no candidate is emitted; it is a
     // clone of the baseline object (loaded as a separate module below).
@@ -789,7 +1000,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             Ok(p) => p,
             Err(e) => return fail(rec, "write", e),
         };
-        let m7 = certify(&cand_path, &cand.exports);
+        let m7 = certify(&cand_path, &cand.exports, arch);
         let (cand_res, cand_lint) = match lift(&cand.bytes).and_then(|p| {
             let r = resources(&p, &cand.exports)?;
             Ok((r, cost_lint(&p)))
@@ -822,7 +1033,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     };
     let base_path = write_object(&out_dir, "baseline", &base);
     let base_m7 = match &base_path {
-        Ok(p) => certify(p, std::slice::from_ref(&base.launch_symbol)),
+        Ok(p) => certify(p, std::slice::from_ref(&base.launch_symbol), arch),
         Err(e) => json!({"status": "skipped", "error": e}),
     };
     let base_receipts = base_m7["receipts"].clone();
@@ -882,8 +1093,8 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Err(e) => return fail(rec, "gpu_init", err(e)),
     };
     rec["device"] = device_json(&gpu);
-    if gpu.arch != ARCH {
-        let msg = format!("device is {}, pm_loop requires {ARCH}", gpu.arch);
+    if gpu.arch != arch {
+        let msg = format!("device is {}, --arch {arch}", gpu.arch);
         return fail(rec, "device", msg);
     }
     let staged = (|| -> Result<(Loaded, Loaded)> {
@@ -945,7 +1156,15 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     }
 
     // 4. ABBA timing
-    let sampled = sample(&gpu, &*w, &bf, &cf, o);
+    let sampled = sample(
+        &mut SingleExec {
+            gpu: &gpu,
+            w: &*w,
+            base: &bf,
+            cand: &cf,
+        },
+        o,
+    );
     let post = (|| -> Result<bool> {
         // The last timed launch of each arm must still equal its warm output.
         gpu.hip.device_synchronize().map_err(err)?;
@@ -954,18 +1173,246 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     })();
     match (sampled, post) {
         (Ok((s, stop, secs)), Ok(true)) => {
-            match timing_record(&s, o.time, o.rounds, stop, secs, o.min_effect) {
+            let baseline_sha = rec["baseline"]["co_sha256"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            match timed_record(o, &rec["shape"], &baseline_sha, &s, stop, secs) {
+                Ok(t) => rec["timing"] = t,
+                Err(e) => return fail(rec, "timing", e),
+            }
+        }
+        (Ok(_), Ok(false)) => {
+            rec["timing"] =
+                json!({"status": "post-sampling outputs changed; no performance claim"});
+            return (rec, Outcome::CorrectnessFailed);
+        }
+        (Err(e), _) | (_, Err(e)) => return fail(rec, "timing", e),
+    }
+    rec["device_after"] = device_json(&gpu);
+    (rec, Outcome::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Complete chains (`--kernel qwen4_moe_verify`)
+
+/// Write and M7-certify every export of every PM object of one chain arm.
+/// Returns one `object_json` row per object and the first failure as
+/// `(stage, message)` (`write` or `m7`); the caller decides whether it gates.
+fn certify_chain_objects(
+    dir: &Path,
+    tag: &str,
+    objs: &[Object],
+    arch: &str,
+) -> (Vec<Value>, Option<(&'static str, String)>) {
+    let mut rows = Vec::new();
+    let mut failure: Option<(&'static str, String)> = None;
+    for obj in objs {
+        let (path, m7) = match write_object(dir, tag, obj) {
+            Ok(p) => {
+                let m7 = certify(&p, &obj.exports, arch);
+                (Some(p), m7)
+            }
+            Err(e) => {
+                failure.get_or_insert(("write", e.clone()));
+                (None, json!({"status": "skipped", "error": e}))
+            }
+        };
+        if m7["status"] == "fail" {
+            failure.get_or_insert(("m7", m7["error"].to_string()));
+        }
+        let (res, lint) = match lift(&obj.bytes).and_then(|p| {
+            let r = resources(&p, &obj.exports)?;
+            Ok((r, cost_lint(&p)))
+        }) {
+            Ok((r, l)) => (json!(r), l),
+            Err(e) => (json!({"error": e}), Value::Null),
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("m7".into(), {
+            let mut v = m7.clone();
+            v.as_object_mut().map(|o| o.remove("receipts"));
+            v
+        });
+        extra.insert("m7_receipts".into(), m7["receipts"].clone());
+        extra.insert("cost_lint".into(), lint);
+        extra.insert(
+            "object_path".into(),
+            json!(path.as_ref().map(|p| p.display().to_string())),
+        );
+        rows.push(object_json(obj, res, extra));
+    }
+    (rows, failure)
+}
+
+/// sha256 of the canonical JSON of one arm of `chain_json()`: the identity
+/// `pm-census noise` groups chains by.
+fn chain_sha(chain: &Value, arm: &str) -> String {
+    sha256_hex(&serde_json::to_vec(&chain[arm]).unwrap_or_default())
+}
+
+/// One checked pass: per arm reset, enqueue the whole chain, synchronize and
+/// download the outputs. Returns `(baseline, candidate)` outputs.
+fn chain_pass(gpu: &mut Gpu, w: &mut dyn ChainWorkload) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut one = |arm: Arm| -> Result<Vec<u8>> {
+        w.reset(gpu, arm)?;
+        w.encode_chain(gpu, arm)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        w.outputs(gpu, arm)
+    };
+    let base = one(Arm::Baseline)?;
+    let cand = one(Arm::Candidate)?;
+    Ok((base, cand))
+}
+
+fn run_chain(o: &Opts, mut w: Box<dyn ChainWorkload>) -> (Value, Outcome) {
+    let arch = w.arch();
+    let aa = o.null_control;
+    let mut rec = json!({
+        "schema": SCHEMA, "kernel": w.kernel(), "arch": arch, "mode": w.mode(),
+        "shape": w.shape_json(), "numeric_contract": w.numeric_contract(),
+        "candidate": {"knobs": w.candidate_knobs()},
+    });
+    let out_dir = out_dir_of(o);
+
+    // 1. certify the PM objects of each arm (no GPU needed). Baseline first:
+    // `--null-control aa` reuses it for the candidate.
+    let base_objs = match w.pm_objects(Arm::Baseline) {
+        Ok(v) => v,
+        Err(e) => return fail(rec, "baseline", e),
+    };
+    let (base_rows, base_fail) = certify_chain_objects(&out_dir, "baseline", &base_objs, arch);
+    rec["baseline"] = json!({"pm_objects": base_rows});
+    let (cand_rows, cand_fail) = if aa {
+        let rows: Vec<Value> = base_rows
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if let Some(m) = r.get_mut("m7").and_then(Value::as_object_mut) {
+                    m.insert("reused_from".into(), json!("baseline"));
+                }
+                r
+            })
+            .collect();
+        (rows, base_fail.filter(|(stage, _)| *stage == "m7"))
+    } else {
+        let objs = match w.pm_objects(Arm::Candidate) {
+            Ok(v) => v,
+            Err(e) => return fail(rec, "emit", e),
+        };
+        certify_chain_objects(&out_dir, "candidate", &objs, arch)
+    };
+    rec["candidate"]["pm_objects"] = json!(cand_rows);
+    if let Some((stage, msg)) = cand_fail {
+        return fail(rec, stage, msg);
+    }
+
+    // 2. the card
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => return fail(rec, "gpu_init", err(e)),
+    };
+    rec["device"] = device_json(&gpu);
+    if gpu.arch != arch {
+        let msg = format!("device is {}, --arch {arch}", gpu.arch);
+        return fail(rec, "device", msg);
+    }
+    if let Err(e) = w.setup(&mut gpu) {
+        return fail(rec, "setup", e);
+    }
+    let chain = w.chain_json();
+    let (base_sha, cand_sha) = (
+        chain_sha(&chain, "baseline"),
+        chain_sha(&chain, "candidate"),
+    );
+    rec["chain"] = chain;
+    rec["baseline"]["sha256"] = json!(base_sha);
+    rec["candidate"]["sha256"] = json!(cand_sha);
+    if aa {
+        rec["null_control"] = json!({
+            "kind": "aa",
+            "identical_chains": base_sha == cand_sha,
+            "separate_modules": false,
+            "baseline_sha256": base_sha,
+            "candidate_sha256": cand_sha,
+            "note": "candidate arm runs the baseline chain through the same rdna-compute launchers and loaded modules into its own buffers",
+        });
+    }
+
+    // 3. correctness: warm pass on the arms' own buffer sets, then a repeat
+    // pass on the swapped sets (the crossover binding timing alternates) that
+    // must reproduce it bit for bit.
+    w.set_buffer_swap(false);
+    let (base_out, cand_out) = match chain_pass(&mut gpu, &mut *w) {
+        Ok(v) => v,
+        Err(e) => return fail(rec, "launch", e),
+    };
+    w.set_buffer_swap(true);
+    let (base_rep, cand_rep) = match chain_pass(&mut gpu, &mut *w) {
+        Ok(v) => v,
+        Err(e) => return fail(rec, "launch", e),
+    };
+    let reference = w.reference(Arm::Candidate, &cand_out);
+    let base_report = w.reference(Arm::Baseline, &base_out);
+    let diff = match w.max_abs_diff(&base_out, &cand_out) {
+        Ok(d) => d,
+        Err(e) => return fail(rec, "compare", e),
+    };
+    let identical = base_out == cand_out;
+    let (base_repeat, cand_repeat) = (base_out == base_rep, cand_out == cand_rep);
+    let pass = reference.as_ref().is_ok_and(|r| r.pass)
+        && base_report.as_ref().is_ok_and(|r| r.pass)
+        && base_repeat
+        && cand_repeat
+        && (identical || !w.requires_baseline_identity());
+    rec["correctness"] = json!({
+        "reference": reference.as_ref().map(|r| r.reference.as_str()).unwrap_or("none"),
+        "reference_error": reference.as_ref().err(),
+        "max_abs_err": reference.as_ref().ok().map(|r| r.max_abs_err),
+        "tolerance": reference.as_ref().ok().map(|r| r.tolerance),
+        "pass": pass,
+        "pass_basis": "candidate and baseline each pass their own cpu_reference, both arms reproduce their outputs bit-for-bit on a repeat pass, and (numeric_relation exact) candidate is identical_to_baseline",
+        "baseline_max_abs_err": base_report.as_ref().ok().map(|r| r.max_abs_err),
+        "baseline_pass": base_report.as_ref().ok().map(|r| r.pass),
+        "baseline_reference_error": base_report.as_ref().err(),
+        "identical_to_baseline": identical,
+        "max_abs_diff_vs_baseline": diff,
+        "output_bytes": cand_out.len(),
+        "baseline_repeat_identical": base_repeat,
+        "candidate_repeat_identical": cand_repeat,
+        "numeric_relation": rec["numeric_contract"]["relation"].clone(),
+        "repeat_on_swapped_buffers": true,
+        "emu": "not applicable (chain)",
+    });
+    if !pass {
+        rec["timing"] = json!({"status": "refused: candidate failed correctness"});
+        return (rec, Outcome::CorrectnessFailed);
+    }
+
+    // 4. ABBA timing, events around one whole chain per launch slot
+    let sampled = sample(
+        &mut ChainExec {
+            gpu: &mut gpu,
+            w: &mut *w,
+        },
+        o,
+    );
+    let post = (|| -> Result<bool> {
+        // The last timed chain of each arm must still equal its warm output.
+        gpu.hip.device_synchronize().map_err(err)?;
+        Ok(w.outputs(&mut gpu, Arm::Baseline)? == base_out
+            && w.outputs(&mut gpu, Arm::Candidate)? == cand_out)
+    })();
+    match (sampled, post) {
+        (Ok((s, stop, secs)), Ok(true)) => {
+            match timed_record(o, &rec["shape"], &base_sha, &s, stop, secs) {
                 Ok(mut t) => {
-                    if let Some(doc) = &o.noise_floor_doc {
-                        t["vs_noise_floor"] = vs_noise_floor(
-                            doc,
-                            &o.kernel,
-                            &rec["shape"],
-                            rec["baseline"]["co_sha256"].as_str().unwrap_or(""),
-                            t["block_ratio"].as_f64().unwrap_or(f64::NAN),
-                        );
-                    }
-                    t["post_outputs_unchanged"] = json!(true);
+                    t["unit"] =
+                        json!("us per chain (hipEvent around the whole chain, default stream)");
+                    t["crossover"] = match crossover_json(&t) {
+                        Ok(c) => c,
+                        Err(e) => return fail(rec, "timing", e),
+                    };
                     rec["timing"] = t;
                 }
                 Err(e) => return fail(rec, "timing", e),
@@ -1065,6 +1512,25 @@ mod tests {
 
     fn args(s: &str) -> impl Iterator<Item = String> + '_ {
         s.split_whitespace().map(str::to_owned)
+    }
+
+    #[test]
+    fn crossover_splits_rounds_by_binding() {
+        // Pure placement effect: own-binding rounds 1% faster, swapped 1% slower.
+        let t = json!({"noise": {"round_ratios": [0.99, 1.01, 0.99, 1.01, 0.99]}});
+        let c = crossover_json(&t).unwrap();
+        assert_eq!(
+            (c["rounds_own"].as_u64(), c["rounds_swapped"].as_u64()),
+            (Some(3), Some(2))
+        );
+        let cross = c["crossover_ratio"].as_f64().unwrap();
+        let place = c["placement_ratio"].as_f64().unwrap();
+        assert!((cross - (0.99f64 * 1.01).sqrt()).abs() < 1e-12, "{cross}");
+        assert!((place - (0.99f64 / 1.01).sqrt()).abs() < 1e-12, "{place}");
+        // A single round has no swapped half: counts only.
+        let c = crossover_json(&json!({"noise": {"round_ratios": [1.0]}})).unwrap();
+        assert!(c.get("crossover_ratio").is_none());
+        assert!(crossover_json(&json!({})).is_err());
     }
 
     #[test]
@@ -1497,6 +1963,54 @@ mod tests {
         }
         // --base-* without the null control is still a knob.
         assert!(parse_args(args("--kernel k --base-tile 1")).is_ok());
+    }
+
+    #[test]
+    fn arch_flag_defaults_parses_and_is_tri_arch_only_for_moe_kernels() {
+        assert_eq!(
+            parse_args(args("--kernel iu4_gemm")).unwrap().arch,
+            "gfx1201"
+        );
+        for a in ["gfx1201", "gfx1151", "gfx1100"] {
+            let o = parse_args(args(&format!("--kernel qwen4_moe_sym --arch {a}"))).unwrap();
+            assert_eq!(o.arch, a);
+            assert!(o.knobs.0.is_empty(), "--arch is not a knob");
+        }
+        let e = parse_args(args("--kernel qwen4_moe_sym --arch gfx942")).unwrap_err();
+        assert!(e.contains("--arch gfx942"), "{e}");
+        assert!(parse_args(args("--kernel qwen4_moe_sym --arch")).is_err());
+        // gfx1201 stays accepted everywhere; every other arch is tri-arch kernels only.
+        assert!(parse_args(args("--kernel iu4_gemm --arch gfx1201")).is_ok());
+        let e = parse_args(args("--kernel iu4_gemm --arch gfx1151")).unwrap_err();
+        assert_eq!(
+            e,
+            "--kernel iu4_gemm targets gfx1201 only (got --arch gfx1151)"
+        );
+        assert!(parse_args(args("--kernel fa_prefill --arch gfx1100")).is_err());
+        assert!(parse_args(args("--kernel qwen4_moe_sym --arch gfx1151")).is_ok());
+        assert!(parse_args(args("--kernel qwen4_moe_verify --arch gfx1151")).is_ok());
+        assert!(parse_args(args("--kernel qwen4_moe_verify --arch gfx1100")).is_ok());
+    }
+
+    #[test]
+    fn chain_kernel_refuses_rip_and_takes_the_null_control() {
+        let e = parse_args(args("--kernel qwen4_moe_verify --rip /tmp/a.rip")).unwrap_err();
+        assert!(
+            e.contains("--rip is not supported with --kernel qwen4_moe_verify"),
+            "{e}"
+        );
+        let o = parse_args(args(
+            "--kernel qwen4_moe_verify --null-control aa --arch gfx1151 --shape T=4",
+        ))
+        .unwrap();
+        assert!(o.null_control && o.rip.is_none());
+        assert_eq!(o.arch, "gfx1151");
+        assert!(parse_args(args(
+            "--kernel qwen4_moe_verify --null-control aa --base-tile 1"
+        ))
+        .is_err());
+        assert_eq!(arch_enum("gfx1151"), Ok(peacemaker_isa::Arch::Gfx1151));
+        assert!(arch_enum("gfx942").is_err());
     }
 
     #[test]
