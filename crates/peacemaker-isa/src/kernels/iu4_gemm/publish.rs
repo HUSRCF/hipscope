@@ -100,6 +100,65 @@ fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Res
     })
 }
 
+/// The prefetch registers of set `set` (A rounds, W rounds): set 0 is the
+/// only set at ring depth 2; depth 3 adds set 1 (a block's slab 1).
+pub(crate) fn pf_set(g: &Gen, set: usize) -> Result<(&[u8], &[u8]), String> {
+    match set {
+        0 => Ok((&g.a_pf, &g.w_pf)),
+        1 if !g.a_pf1.is_empty() => Ok((&g.a_pf1, &g.w_pf1)),
+        1 => Err("prefetch set 1 exists at ring depth 3 only".into()),
+        _ => Err(format!("prefetch set {set} is not 0 or 1")),
+    }
+}
+
+/// Ring depth 3: fetch slab `slab` (0 or 1) of the block one group ahead on
+/// plane `h` (the block after next) into prefetch set `slab`. The even/odd
+/// block's activation descriptor has already moved to that group (the depth-3
+/// K-loop steps it at the head of the block); the weight offset is the
+/// group-relative one plus the group stride.
+pub(crate) fn fetch_ahead(b: &mut Builder, g: &Gen, h: usize, slab: u32) -> Result<(), String> {
+    if h > 1 {
+        return Err(format!("fetch_ahead: plane {h} is not 0 or 1"));
+    }
+    fetch_slab_at(
+        b,
+        g,
+        slab as usize,
+        slab,
+        h,
+        GROUP_BYTES + h as u32 * 64 + 8 + 32 * slab,
+    )
+}
+
+/// Fetch slab `slab` of the block whose activations descriptor is
+/// `srd_a[desc]` and whose weight offset (relative to `goff`) is
+/// `weight_offset`, into prefetch set `set`.
+pub(crate) fn fetch_slab_at(
+    b: &mut Builder,
+    g: &Gen,
+    set: usize,
+    slab: u32,
+    desc: usize,
+    weight_offset: u32,
+) -> Result<(), String> {
+    if slab > 1 || desc > 1 {
+        return Err(format!(
+            "fetch_slab_at: slab {slab} / descriptor {desc} is not 0 or 1"
+        ));
+    }
+    let (a_pf, w_pf) = pf_set(g, set)?;
+    b.clause(|b| {
+        for (r, &dst) in a_pf.iter().enumerate() {
+            let (soff, offset) = a_offset(g, slab, r);
+            vload(b, dst, 2, g.st_a, g.srd_a[desc], soff, offset)?;
+        }
+        for (r, &dst) in w_pf.iter().enumerate() {
+            vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), weight_offset)?;
+        }
+        Ok(())
+    })
+}
+
 /// Issue next-block token scale and packed row header before B1: neither
 /// payload register is still live after the preceding block's B2 publication.
 pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
@@ -126,9 +185,11 @@ pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Strin
     })
 }
 
-/// Flip each uint4 code's sign bit so the signed WMMA consumes `q - 8`.
-pub(crate) fn flip_weights(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    for &w in &g.w_pf {
+/// Flip each uint4 code's sign bit so the signed WMMA consumes `q - 8`, on
+/// prefetch set `set`.
+pub(crate) fn flip_weights_set(b: &mut Builder, g: &Gen, set: usize) -> Result<(), String> {
+    let (_, w_pf) = pf_set(g, set)?;
+    for &w in w_pf {
         for r in [w, w + 1] {
             op(
                 b,
@@ -142,22 +203,35 @@ pub(crate) fn flip_weights(b: &mut Builder, g: &Gen) -> Result<(), String> {
 }
 
 /// Publish the staged slab in `A_pf/W_pf` to the payload rings' next slot.
-pub(crate) fn publish_slab<C: State>(
+pub(crate) fn publish_slab<C: State, const D: usize>(
     w: &mut Wv,
     g: &Gen,
-    ra: Ring<PayA, C, Free>,
-    rw: Ring<PayW, C, Free>,
-) -> Result<(Staged<PayA, C>, Staged<PayW, C>), String> {
+    ra: Ring<PayA, C, Free, D>,
+    rw: Ring<PayW, C, Free, D>,
+) -> Result<(Staged<PayA, C, D>, Staged<PayW, C, D>), String> {
+    publish_slab_set(w, g, 0, ra, rw)
+}
+
+/// [`publish_slab`] of prefetch set `set` (ring depth 3 publishes a block's
+/// slab 0 from set 0 and its slab 1 from set 1).
+pub(crate) fn publish_slab_set<C: State, const D: usize>(
+    w: &mut Wv,
+    g: &Gen,
+    set: usize,
+    ra: Ring<PayA, C, Free, D>,
+    rw: Ring<PayW, C, Free, D>,
+) -> Result<(Staged<PayA, C, D>, Staged<PayW, C, D>), String> {
     let slot = ra.next_index();
-    flip_weights(w.isa(), g)?;
+    let (a_pf, w_pf) = pf_set(g, set)?;
+    flip_weights_set(w.isa(), g, set)?;
     let l = g.layout;
     let step = g.tile.round_rows() / 16; // 512-byte units per staging round
     let (a, wo) = (l.a[slot] / 512, l.w[slot] / 512);
     let (mut sa, mut sw) = (w.begin_write(ra), w.begin_write(rw));
     match g.tile {
         Tile::T128x128x8 => {
-            for r in 0..g.a_pf.len() {
-                let (ar, wr) = (g.a_pf[r], g.w_pf[r]);
+            for r in 0..a_pf.len() {
+                let (ar, wr) = (a_pf[r], w_pf[r]);
                 (sa, sw) = w.ds_store2(
                     sa,
                     sw,
@@ -177,7 +251,7 @@ pub(crate) fn publish_slab<C: State>(
             }
         }
         Tile::T256x128x16 => {
-            let ar = g.a_pf[0];
+            let ar = a_pf[0];
             sa = w.ds_store(
                 sa,
                 ds_store(
@@ -191,7 +265,7 @@ pub(crate) fn publish_slab<C: State>(
                     vec![v(g.st_lds), vr(ar, 2)],
                 ),
             )?;
-            let (w0, w1) = (g.w_pf[0], g.w_pf[1]);
+            let (w0, w1) = (w_pf[0], w_pf[1]);
             sw = w.ds_store(
                 sw,
                 ds_store(

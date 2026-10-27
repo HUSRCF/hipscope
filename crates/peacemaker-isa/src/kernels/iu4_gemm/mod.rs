@@ -24,13 +24,15 @@ pub mod kloop;
 pub mod prologue;
 pub mod publish;
 pub mod region;
+pub mod ring3;
 pub mod sparse24;
 pub mod spec;
 
 use crate::kernels::common::op;
 use crate::{reg::Live, Builder, Emitted, KernelSpec, RegPlan};
 use peacemaker_author::{
-    Free, Gfx1201, Gfx12Waits, LdsWrite, Pending, Published, Ring, Wave, Workgroup, Writing,
+    Free, Gfx1201, Gfx12Waits, LdsRegion, LdsWrite, Pending, Published, Ring, Wave, Workgroup,
+    Writing,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -106,7 +108,10 @@ pub(crate) struct Args {
 /// `cacc v[0:63]` (prologue/epilogue temporaries alias it), `acc v[64:127]`,
 /// `magic8 v[128:135]`, fragment sets F0/F1 `v[136:159]` (fold scale rows and
 /// products alias them once their WMMAs have issued), `d v[160:163]`, the
-/// prefetch payload, then hoisted addresses: 187 VGPRs (T256: 186).
+/// prefetch payload, then hoisted addresses: 187 VGPRs (T256: 186). Ring depth
+/// 3 (`ring3.rs`) has no `magic8`: its second prefetch set takes `v[128:135]`
+/// (each block's first WMMA group seeds from `cacc[3][1]` instead), so the
+/// count is the same.
 #[derive(Clone, Debug)]
 pub struct Gen {
     pub(crate) spec: Spec,
@@ -120,6 +125,11 @@ pub struct Gen {
     pub(crate) d: u8,
     pub(crate) a_pf: Vec<u8>,
     pub(crate) w_pf: Vec<u8>,
+    /// Ring depth 3 only: the second prefetch set (a block's slab 1 while set
+    /// 0 holds its slab 0), in the eight VGPRs depth 3 frees by seeding the
+    /// WMMA accumulators from `cacc[3][1]` instead of `magic8`. Empty at depth 2.
+    pub(crate) a_pf1: Vec<u8>,
+    pub(crate) w_pf1: Vec<u8>,
     pub(crate) ds_nx: u8,
     pub(crate) sz_nx: u8,
     pub(crate) fr_a: [u8; 2],
@@ -171,6 +181,24 @@ impl Gen {
     pub fn spec(&self) -> Spec {
         self.spec
     }
+    /// The payload rings are three deep (`Tune::ring`).
+    pub fn ring3(&self) -> bool {
+        self.spec.tune.ring == RingDepth::Three
+    }
+    /// The register assignment's VGPR count: one past the highest register any
+    /// phase names.
+    pub fn vgprs(&self) -> u16 {
+        let sets = [&self.a_pf, &self.w_pf, &self.a_pf1, &self.w_pf1];
+        let top_pf = sets
+            .iter()
+            .filter_map(|v| v.last())
+            .map(|&r| u16::from(r) + 2)
+            .max()
+            .unwrap_or(0);
+        top_pf
+            .max(u16::from(self.d_addr) + 1)
+            .max(u16::from(self.sz_voff) + 1)
+    }
     /// The kernel header (symbol, kernargs, workgroup size) of this spec.
     pub fn kernel_spec(&self) -> KernelSpec {
         let spec = self.spec;
@@ -183,7 +211,7 @@ impl Gen {
             user_sgpr_count: 2,
             system_sgpr_workgroup_id_y: true,
             workgroup_size: spec.tile.threads() as u16,
-            group_segment_fixed_size: 0,
+            group_segment_fixed_size: self.layout.fixed,
             wave32: true,
             cu_mode: false,
         }
@@ -191,7 +219,7 @@ impl Gen {
     /// A physical register base of this assignment by name (read-only):
     /// `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a
     /// meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i>
-    /// st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips
+    /// pf1_a<i> pf1_w<i> (depth 3) st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips
     /// rs bs wave gpr136 mm1 hs tmp epi_s a_slab1` and kernel arguments
     /// `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None`
     /// for an unknown name and for an absent optional register (`arg_u`
@@ -253,7 +281,9 @@ impl Gen {
             "arg_bcx" => a.bcx,
             "arg_bcy" => a.bcy,
             _ => {
-                return indexed("a_pf", &self.a_pf)
+                return indexed("pf1_a", &self.a_pf1)
+                    .or_else(|| indexed("pf1_w", &self.w_pf1))
+                    .or_else(|| indexed("a_pf", &self.a_pf))
                     .or_else(|| indexed("w_pf", &self.w_pf))
                     .or_else(|| indexed("st_w", &self.st_w))
             }
@@ -326,6 +356,21 @@ impl Gen {
         };
         let a_pf = (0..tile.a_rounds()).map(|_| take(2)).collect::<Vec<_>>();
         let w_pf = (0..tile.w_rounds()).map(|_| take(2)).collect::<Vec<_>>();
+        // Depth 3: the second prefetch set takes the `magic8` slot (v128..135);
+        // `Spec::validate` refuses a tile whose set is wider than those 8.
+        let mut p1 = 128u8;
+        let mut take1 = |n: u8| {
+            let b = p1;
+            p1 += n;
+            b
+        };
+        let ring3 = spec.tune.ring == RingDepth::Three;
+        let a_pf1 = (0..if ring3 { tile.a_rounds() } else { 0 })
+            .map(|_| take1(2))
+            .collect::<Vec<_>>();
+        let w_pf1 = (0..if ring3 { tile.w_rounds() } else { 0 })
+            .map(|_| take1(2))
+            .collect::<Vec<_>>();
         let ds_nx = take(1);
         let sz_nx = take(1);
         let fr_a = [take(1), take(1)];
@@ -347,7 +392,7 @@ impl Gen {
         Self {
             spec,
             tile,
-            layout: tile.layout(),
+            layout: tile.layout_for(spec.tune.ring),
             args,
             cacc: 0,
             acc: 64,
@@ -356,6 +401,8 @@ impl Gen {
             d: 160,
             a_pf,
             w_pf,
+            a_pf1,
+            w_pf1,
             ds_nx,
             sz_nx,
             fr_a,
@@ -423,13 +470,21 @@ impl Gen {
         for i in 0..8u8 {
             p.v::<8>(ACC_NAMES[usize::from(i)], self.acc + 8 * i, Live::Whole)?;
         }
-        p.v::<8>("magic8", self.magic, kernel())?;
+        if !self.ring3() {
+            p.v::<8>("magic8", self.magic, kernel())?;
+        }
         p.v::<4>("d_x", self.d, kl())?;
         for &r in &self.a_pf {
             p.v::<2>("a_pf", r, kernel())?;
         }
         for &r in &self.w_pf {
             p.v::<2>("w_pf", r, kernel())?;
+        }
+        for &r in &self.a_pf1 {
+            p.v::<2>("a_pf1", r, kernel())?;
+        }
+        for &r in &self.w_pf1 {
+            p.v::<2>("w_pf1", r, kernel())?;
         }
         p.v::<1>("ds_nx", self.ds_nx, kernel())?;
         p.v::<1>("sz_nx", self.sz_nx, kernel())?;
@@ -549,6 +604,39 @@ impl Gen {
     }
 }
 
+impl Gen {
+    /// Ring depth 3: slots A0 W0 A1 W1 A2 W2 and the metadata planes (builder
+    /// ids by declaration order), the payload rings three deep.
+    pub(crate) fn declare_lds3(&self, wg: &mut Wg) -> Result<FreeRings3, String> {
+        let l = self.layout;
+        let (mut a, mut w) = (Vec::new(), Vec::new());
+        for i in 0..3 {
+            a.push(wg.lds(&format!("A{i}"), l.a[i], l.a_bytes)?);
+            w.push(wg.lds(&format!("W{i}"), l.w[i], l.w_bytes)?);
+        }
+        let (d0, d1) = (
+            wg.lds("DS0", l.ds[0], l.ds_bytes)?,
+            wg.lds("DS1", l.ds[1], l.ds_bytes)?,
+        );
+        let (s0, s1) = (
+            wg.lds("SZ0", l.sz[0], l.sz_bytes)?,
+            wg.lds("SZ1", l.sz[1], l.sz_bytes)?,
+        );
+        if l.end > l.fixed + l.launch {
+            return Err("LDS layout exceeds the launch size".into());
+        }
+        fn three<R>(v: Vec<LdsRegion<R, Free>>) -> Result<[LdsRegion<R, Free>; 3], String> {
+            v.try_into().map_err(|_| "three slabs".to_string())
+        }
+        Ok((
+            Ring::new_n(three(a)?)?,
+            Ring::new_n(three(w)?)?,
+            Ring::new(d0, d1),
+            Ring::new(s0, s1),
+        ))
+    }
+}
+
 /// LDS tags: activation and weight payload of one 64-K slab, the token
 /// scale (`d`) plane and the converted row-scale (`sc`) plane.
 pub enum PayA {}
@@ -565,6 +653,22 @@ pub type FreeRings = (
     Ring<MetaD, Free, Free>,
     Ring<MetaS, Free, Free>,
 );
+/// Ring depth 3: the payload rings three deep, the metadata rings as declared.
+pub type FreeRings3 = (
+    Ring<PayA, Free, Free, 3>,
+    Ring<PayW, Free, Free, 3>,
+    Ring<MetaD, Free, Free>,
+    Ring<MetaS, Free, Free>,
+);
+/// Ring depth 3 steady state at a block boundary: each payload ring's current
+/// and ahead buffers published, the next one free; the metadata rings as at
+/// depth 2.
+pub type Lds3 = (
+    Ring<PayA, Published, Free, 3>,
+    Ring<PayW, Published, Free, 3>,
+    Ring<MetaD, Published, Free>,
+    Ring<MetaS, Published, Free>,
+);
 /// Steady state at a block boundary: each ring's current buffer published,
 /// the next one free.
 pub type Lds = (
@@ -575,13 +679,24 @@ pub type Lds = (
 );
 /// A ring's next buffer with its pending stores: what a publish returns and a
 /// wait consumes.
-pub type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrite<R>>);
+pub type Staged<R, C, const D: usize = 2> =
+    (Ring<R, C, Writing, D>, Pending<Gfx12Waits, LdsWrite<R>>);
 
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     let g = Gen::new(spec)?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     let mut wg = Wg::new(&mut b)?;
+    if g.ring3() {
+        let lds = g.declare_lds3(&mut wg)?;
+        let end = wg.exit(END)?;
+        op(wg.isa(), "s_setprio 1", &[], &[])?;
+        prologue::setup3(&mut wg, &g, &end)?;
+        ring3::emit(&mut wg, &g, lds)?;
+        blocks::epilogue(&mut wg, &g, &end)?;
+        wg.end(end)?;
+        return b.finish();
+    }
     let lds = blocks::declare_lds(&mut wg, &g)?;
     let end = wg.exit(END)?;
     // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its

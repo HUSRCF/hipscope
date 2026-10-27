@@ -14,6 +14,8 @@ fn usage() -> ! {
     eprintln!("  pm-census noise ...                               see `pm-census noise --help`");
     eprintln!("  pm-census tune plan|run|export ...                R4-R6 autotuner (see `pm-census tune`)");
     eprintln!("  pm-census tune kld|promote|trial-table ...        R7 KLD/state gate (see `pm-census tune`)");
+    eprintln!("  pm-census tune kld --stat token-bootstrap ...     R9 token-level KLD statistic over HFKTOK per-token files");
+    eprintln!("  pm-census tune kld-power --sd SD --margin M ...   R9 chunks needed for a margin / minimum resolvable margin");
     std::process::exit(2);
 }
 
@@ -30,7 +32,12 @@ fn main() {
         "noise" => pm_census::noise::cli(rest),
         "tune" => match rest.split_first() {
             Some((sub, tail)) if sub == "export" => pm_census::tune::store::cli(tail),
-            Some((sub, _)) if matches!(sub.as_str(), "kld" | "promote" | "trial-table") => {
+            Some((sub, _))
+                if matches!(
+                    sub.as_str(),
+                    "kld" | "kld-power" | "promote" | "trial-table"
+                ) =>
+            {
                 pm_census::tune::kld::cli(rest)
             }
             _ => pm_census::tune::run::cli(rest),

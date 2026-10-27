@@ -26,6 +26,11 @@ use crate::{insn::Instruction, Builder};
 use peacemaker_author::{rotate, Free, Published, Ring, Scc, WgUniform};
 use std::collections::VecDeque;
 
+/// The depth-3 ring K-loop (prologue split on `K`, three-group period; shares this module's
+/// interleaver).
+#[path = "kloop3.rs"]
+pub mod ring3;
+
 pub(crate) fn label(tag: &str) -> String {
     format!(".Lmq6i8_{tag}")
 }
@@ -71,12 +76,12 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, lds: Lds) -> Result<Lds, String> {
 }
 
 /// A ring as the interleaver holds it: not yet staging, or staging (next buffer `Writing`).
-enum Pr<R: 'static> {
-    Free(Ring<R, Published, Free>),
-    Stg(Staged<R, Published>),
+enum Pr<R: 'static, const D: usize = 2> {
+    Free(Ring<R, Published, Free, D>),
+    Stg(Staged<R, Published, D>),
     Taken,
 }
-impl<R: 'static> Pr<R> {
+impl<R: 'static, const D: usize> Pr<R, D> {
     fn ds_load(&self, wg: &mut Wg, insn: Instruction) -> Result<(), String> {
         match self {
             Self::Free(r) => wg.ds_load_cur(r, insn),
@@ -94,13 +99,13 @@ impl<R: 'static> Pr<R> {
             _ => Err("begin on a ring that is not Free".into()),
         }
     }
-    fn staged(&mut self) -> Result<Staged<R, Published>, String> {
+    fn staged(&mut self) -> Result<Staged<R, Published, D>, String> {
         match std::mem::replace(self, Self::Taken) {
             Self::Stg(s) => Ok(s),
             _ => Err("ring is not staging".into()),
         }
     }
-    fn free(&mut self) -> Result<Ring<R, Published, Free>, String> {
+    fn free(&mut self) -> Result<Ring<R, Published, Free, D>, String> {
         match std::mem::replace(self, Self::Taken) {
             Self::Free(r) => Ok(r),
             _ => Err("ring is not Free".into()),
@@ -118,15 +123,20 @@ enum Work {
 }
 
 /// The four rings plus the queue of work to interleave between WMMAs.
-struct Stage {
+/// The queue is the slab publication of one block; `drain_before_fetch` keeps the shipped
+/// ledger-wide wait before a half-1 refetch of the raw staging registers (depth 2), or leaves the
+/// wait to the builder's store-source hazard (depth 3, where the other prefetch set's loads are
+/// in flight and must not be drained).
+struct Stage<const D: usize = 2> {
     slot: usize,
     work: VecDeque<Work>,
-    a: Pr<PayA>,
-    w: Pr<PayW>,
+    drain_before_fetch: bool,
+    a: Pr<PayA, D>,
+    w: Pr<PayW, D>,
     d: Pr<MetaD>,
     s: Pr<MetaS>,
 }
-impl Stage {
+impl<const D: usize> Stage<D> {
     fn push_insns(&mut self, insns: Vec<Instruction>) {
         self.work.extend(insns.into_iter().map(Work::Insn));
     }
@@ -147,7 +157,9 @@ impl Stage {
                 }
                 Work::FetchA { slab, sb, srd } => {
                     // The raw staging registers are still sources of the previous half's stores.
-                    blocks::wait_all(wg.isa())?;
+                    if self.drain_before_fetch {
+                        blocks::wait_all(wg.isa())?;
+                    }
                     publish::fetch_a(wg.isa(), g, slab, sb, srd)?
                 }
                 Work::Meta => {
@@ -255,6 +267,7 @@ fn block_with(
     let mut st = Stage {
         slot: 0,
         work: VecDeque::new(),
+        drain_before_fetch: true,
         a: Pr::Free(ra),
         w: Pr::Free(rw),
         d: Pr::Free(rd),
@@ -339,25 +352,65 @@ fn block_with(
     st.flush(wg, g)?;
 
     // ------------------------------------------------------------------ fold
-    wg.label(&xf)?;
+    fold_and_b2(
+        wg,
+        g,
+        &mut st,
+        h,
+        &xf,
+        fetch_next,
+        &|b| {
+            // Next block's slab 1 (K32 half 0 and the weight codes): `goff` has not advanced at
+            // the odd-to-even boundary, so its offsets carry the group stride.
+            publish::fetch_a(b, g, 1, 0, g.srd_a[h ^ 1])?;
+            publish::fetch_w(
+                b,
+                g,
+                if h == 0 {
+                    8 + 96 + 48
+                } else {
+                    spec::GROUP_BYTES + 8 + 48
+                },
+            )
+        },
+        fetch_next,
+    )
+}
+
+/// The fold of block plane `h` (label `xf`) and the block-end barrier B2: the plane's `(d, float(s))`
+/// pairs and row `sc` / `z'` octets are loaded from the DS / SZ rings and folded into `acc`.
+/// With `b2`, B2 is signalled once the fold's LDS reads are issued (`after_signal` issues the
+/// fetch that overlaps the rendezvous) and waited at the block end; with `seed`, the next block's
+/// WMMA seed octet is refilled after row group 1's fold. Returns the four rings.
+fn fold_and_b2<const D: usize>(
+    wg: &mut Wg,
+    g: &Gen,
+    st: &mut Stage<D>,
+    h: usize,
+    xf: &str,
+    b2: bool,
+    after_signal: &dyn Fn(&mut Builder) -> Result<(), String>,
+    seed: bool,
+) -> Result<Lds<D>, String> {
+    wg.label(xf)?;
     let scratch = g.scratch;
     // Plane `h` addresses: token (d, float(s)) pairs via `msn` as the address temporary, rows' sc / z'
     // from `sc_addr`.
     blocks::fold_addr(wg.isa(), g, h)?;
-    let sz_load = |wg: &mut Wg, st: &Stage, dst: u8, rel: u32| -> Result<(), String> {
+    let sz_load = |wg: &mut Wg, st: &Stage<D>, dst: u8, rel: u32| -> Result<(), String> {
         st.s.ds_load(wg, blocks::fold_sz_load_insn(g, h, dst, rel)?)
     };
     for nb in 0..4usize {
         st.d.ds_load(wg, blocks::fold_token_load_insn(g, nb)?)?;
     }
     // Row group 0: sc octet then z' octet (planar, 8 rows of this lane's row half).
-    sz_load(wg, &st, fold::SC, 0)?;
-    sz_load(wg, &st, fold::SC + 4, 16)?;
-    sz_load(wg, &st, fold::ZP, 512)?;
-    sz_load(wg, &st, fold::ZP + 4, 512 + 16)?;
+    sz_load(wg, st, fold::SC, 0)?;
+    sz_load(wg, st, fold::SC + 4, 16)?;
+    sz_load(wg, st, fold::ZP, 512)?;
+    sz_load(wg, st, fold::ZP + 4, 512 + 16)?;
     // Row group 1's z' into the decode scratch (free until the next block's decode).
-    sz_load(wg, &st, scratch, 64 + 512)?;
-    sz_load(wg, &st, scratch + 4, 64 + 512 + 16)?;
+    sz_load(wg, st, scratch, 64 + 512)?;
+    sz_load(wg, st, scratch + 4, 64 + 512 + 16)?;
 
     let frag = |wg: &mut Wg, nb: usize, rg: usize, sc: u8, zp: u8| -> Result<(), String> {
         let b = wg.isa();
@@ -366,11 +419,11 @@ fn block_with(
     };
     frag(wg, 0, 0, fold::SC, fold::ZP)?;
     // Fragment k = 0 is folded: its int32 registers now hold row group 1's sc.
-    sz_load(wg, &st, g.cacc, 64)?;
-    sz_load(wg, &st, g.cacc + 4, 64 + 16)?;
+    sz_load(wg, st, g.cacc, 64)?;
+    sz_load(wg, st, g.cacc + 4, 64 + 16)?;
     frag(wg, 1, 0, fold::SC, fold::ZP)?;
 
-    let arrived = if fetch_next {
+    let arrived = if b2 {
         let ((ra, pa), (rw, pw)) = (st.a.staged()?, st.w.staged()?);
         let ((rd, pd), (rs, ps)) = (st.d.staged()?, st.s.staged()?);
         let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
@@ -380,19 +433,7 @@ fn block_with(
             rotate(rd, dd),
             rotate(rs, ds),
         ))?;
-        // Next block's slab 1 (K32 half 0 and the weight codes): `goff` has not advanced at
-        // the odd-to-even boundary, so its offsets carry the group stride.
-        let b = wg.isa();
-        publish::fetch_a(b, g, 1, 0, g.srd_a[h ^ 1])?;
-        publish::fetch_w(
-            b,
-            g,
-            if h == 0 {
-                8 + 96 + 48
-            } else {
-                spec::GROUP_BYTES + 8 + 48
-            },
-        )?;
+        after_signal(wg.isa())?;
         Some(b2)
     } else {
         None
@@ -402,7 +443,7 @@ fn block_with(
     for nb in 0..4 {
         frag(wg, nb, 1, g.cacc, scratch)?;
     }
-    if fetch_next {
+    if seed {
         // Next block's WMMA seed octet (the scratch is dead after row group 1's fold).
         seed_fill(wg.isa(), g)?;
     }

@@ -678,7 +678,7 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 
 ### In a fine `iu4_gemm` K-loop schedule
 
-`iu4::fragments`, `iu4::d_loads`, `iu4::scale_loads`, `iu4::scale_tail` read a ring's *current* buffer, and `iu4::wmma` consumes fragments loaded from the payload rings' current slot. Each refuses a ring whose current buffer is not `Published` (`iu4::fragments: ring iu4.A current buffer is Free, not published: a read needs a buffer a barrier has published (publish, wait, then rotate it)`), so a WMMA group on a slab nobody published, and a read of a slot before its barrier, are build errors.
+`iu4::fragments`, `iu4::d_loads`, `iu4::scale_loads`, `iu4::scale_tail` (and the sparse `iu4::sparse_fragments`, `iu4::sparse_scale_loads`, `iu4::sparse_scale_tail`) read a ring's *current* buffer, and `iu4::wmma` (`iu4::sparse_wmma`) consumes fragments loaded from the payload rings' current slot. Each refuses a ring whose current buffer is not `Published` (`iu4::fragments: ring iu4.A current buffer is Free, not published: a read needs a buffer a barrier has published (publish, wait, then rotate it)`), so a WMMA group on a slab nobody published, and a read of a slot before its barrier, are build errors.
 
 The whole failing script (the first WMMA group before the prologue published anything) and its fix are in [cookbook 17, "What the driver refuses"](cookbook/17-iu4-kloop-natives.md#what-the-driver-refuses); `tests/docs.rs` compiles it on gfx1201 and requires `R0303`.
 

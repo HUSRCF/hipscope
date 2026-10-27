@@ -1,6 +1,6 @@
 # 17. Fine K-loop natives: place the waits, publishes and fetches of an `iu4_gemm` block yourself
 
-[Chapter 11](11-production-blocks.md) composes `iu4_gemm` from whole blocks: `iu4::block` is one opaque native, so where a block's slab fetches, LDS publishes, waits and WMMA groups sit is not reachable from a script. This chapter splits the block. The dense K128 block is a composition of finer typed natives that the generator itself is written over, and a script can spell the block out with them, in the generator's order (the committed twin does, byte for byte) or in another one. The driver's typing is unchanged: a schedule that publishes into a buffer that is not `Free`, rotates before the wait, or reads or WMMAs a slot nobody published is a build error, not a wrong answer on the GPU.
+[Chapter 11](11-production-blocks.md) composes `iu4_gemm` from whole blocks: `iu4::block` is one opaque native, so where a block's slab fetches, LDS publishes, waits and WMMA groups sit is not reachable from a script. This chapter splits the block. The K128 block, dense and 2:4-sparse, is a composition of finer typed natives that the generator itself is written over, and a script can spell the block out with them, in the generator's order (the committed twin does, byte for byte, for every variant) or in another one. The driver's typing is unchanged: a schedule that publishes into a buffer that is not `Free`, rotates before the wait, or reads or WMMAs a slot nobody published is a build error, not a wrong answer on the GPU.
 
 The reference table of the natives is [reference §13](../REFERENCE.md); this chapter explains how they compose.
 
@@ -43,8 +43,11 @@ The peeled last block of the K-loop (`fetch_next = false`) has no next block: no
 | `iu4::wait(wg, lds, set)?` | the counter wait for `"slab"`, `"meta"` or `"all"` rings; returns the `Drained` tokens |
 | `iu4::fragments(wg, g, lds)?`, `iu4::d_loads(wg, g, lds)?`, `iu4::scale_loads(wg, g, tag, lds)?`, `iu4::scale_tail(wg, g, tag, lds)?` | LDS reads of the `Published` current buffers |
 | `iu4::wmma(wg, g, sb, first, fold, lds)?` | the eight WMMAs of 32-K sub-block `sb`; `first` seeds the accumulators; `fold` interleaves the fold's stage 1 |
+| `iu4::publish_slab_set(wg, g, set, lds)?`, `iu4::fetch_ahead(wg, g, h, slab)?`, `iu4::fetch_slab(wg, g, set, slab, desc, woff)?` | ring depth 3: publish prefetch set `set`; fetch a block one group on into set `slab`; fetch any block's slab into a set |
+| `iu4::setup`, `iu4::split_trips`, `iu4::ring_cmp`, `iu4::group_end` | ring depth 3: the prologue without its ring part, the `q`/`r` split of the trip count, the entry branch's condition, a group's trip end |
 | `iu4::fold_scale(wg, g)?` | the fold's stage 2 |
 | `iu4::step_descriptor(wg, g, which)?` | the descriptor advance |
+| `iu4::sparse_block_begin(wg, g, tag, h, end_label, entry_label, lds)?`, `iu4::sparse_fragments(wg, g, lds)?`, `iu4::sparse_wmma(wg, g, sb, first, fold, lds)?`, `iu4::sparse_scale_loads(wg, g, tag, lds)?`, `iu4::sparse_scale_tail(wg, g, tag, lds)?` | the sparse K-loop's steps that differ from the dense ones ([below](#the-sparse-k-loop)) |
 
 Ring-touching natives take `lds` (the array of the four rings) and return it. The rendezvous is the generic driver's `wg.barrier((rotate(lds[0], da), ..))` or the split `wg.signal(..)` / `wg.wait_arrived(..)`; `iu4::wait` returns the tokens `rotate` takes (`rotate(ring)` alone also works: the driver checks the ring's own state, not the token).
 
@@ -61,10 +64,12 @@ A ring crosses between a native and the driver in the state the Rust step is typ
 | a ring of the wrong kind, or one the script made | R0399 | `a_ring_of_the_wrong_kind_is_refused_by_the_fine_natives`, `a_ring_the_script_made_cannot_enter_the_fine_natives` |
 | a fine step under wave-uniform control | R0304 | `a_fine_step_under_wave_uniform_control_is_refused` |
 | a loop trip that ends with a publish in flight | R0399 | `a_trip_that_leaves_a_publish_in_flight_is_refused` |
+| a dense step on a sparse spec, or a sparse step on a dense one | R0000 | `a_fine_step_of_the_other_mma_family_is_refused` |
+| an `s24x64` second sub-block or `_s1` scale tail | R0000 | `an_x64_block_has_no_second_sub_block` |
 
 Each has a test in `tests/iu4_gemm_fine_twin.rs`, and the four below a whole failing script ([ERRORS.md](../ERRORS.md) points here from R0301, R0303 and R0399). The ring tags (`PayA`, `PayW`, `MetaD`, `MetaS`) are the typed lend's, so `iu4::publish_slab` with the W ring where the A ring belongs is refused. The loop rule is the driver's: `loop_carried` demands every ring leave the trip in the state it entered, which is why a block that publishes also waits and rotates inside the trip.
 
-`fetch_*`, `fold_scale`, `wmma` and `step_descriptor` emit through the builder rather than `Driver::typed` (which the driver refuses while a split barrier is in flight), so they may sit between `signal` and `wait_arrived`; `wmma` is gated on the payload rings' phases instead (the current buffer must be `Published`).
+`fetch_*`, `fold_scale`, `wmma`, `sparse_wmma` and `step_descriptor` emit through the builder rather than `Driver::typed` (which the driver refuses while a split barrier is in flight), so they may sit between `signal` and `wait_arrived`; `wmma` and `sparse_wmma` are gated on the payload rings' phases instead (the current buffer must be `Published`).
 
 ## What the driver refuses
 
@@ -178,7 +183,25 @@ Fix: run the prologue first (it stages and publishes block 0), then `iu4::fragme
 
 ## The twin composition
 
-`iu4::block` is `kloop::block_with`, and `block_with` is the sequence above written in Rust over the same functions the natives call. [`iu4_gemm_fine.rip`](../../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) is the committed twin of `iu4_gemm.rip` with `mma_block` calling a script function `fine_block` (the block above, only fine natives) for the dense variants. `tests/iu4_gemm_fine_twin.rs` requires it to emit, for every dense variant, the bytes and proof of `iu4_gemm::emit`, so `iu4::block` and the spelled-out block are provably equal. The sparse variants keep the opaque sparse blocks.
+`iu4::block` is `kloop::block_with`, and `block_with` is the sequence above written in Rust over the same functions the natives call; `iu4::sparse_block` is `kloop::sparse_block_with`, the sequence of the next section. [`iu4_gemm_fine.rip`](../../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) is the committed twin of `iu4_gemm.rip` with `mma_block` calling a script function `fine_block` (the block above, only fine natives) for the dense variants and `fine_sparse_block` (only fine natives, no opaque `iu4::sparse_block*`) for the sparse ones. `tests/iu4_gemm_fine_twin.rs` requires it to emit, for every dense variant (`the_fine_composition_emits_the_shipped_bytes`) and for every sparse variant (`the_fine_sparse_composition_emits_the_shipped_bytes`: `k128-128x128x8-cacc1-{set,add}-{s24x64,s24x32}`), the bytes and proof of `iu4_gemm::emit`, so the opaque blocks and the spelled-out blocks are provably equal.
+
+## The sparse K-loop
+
+The 2:4-sparse blocks (`Mma::S24X64`, `Mma::S24X32`) are the same block with SWMMAC in place of WMMA: the same rings, publishes, next-block fetches, `d_loads` and fold, so those natives serve both. What differs is split into five steps, each the `iu4::sparse_*` twin of a dense one, and each refuses a dense spec; the dense `block_begin`, `fragments`, `wmma`, `scale_loads` and `scale_tail` refuse a sparse spec in turn (`a_fine_step_of_the_other_mma_family_is_refused`), so a WMMA never lands in a SWMMAC kernel:
+
+```text
+                dense                   s24x64                       s24x32
+head            block_begin             sparse_block_begin           sparse_block_begin
+                                        (fragments end at _s0)       (W/index regs end at _s1)
+fragments       fragments               sparse_fragments             sparse_fragments
+                (W + 2 A loads/sb)      (W + 8 ds_load_b64 B)        (= dense loads)
+MMA groups      wmma sb0, wmma sb1      sparse_wmma sb0 (one K64     sparse_wmma sb0, sb1
+                                        bundle; sb1 refused)         (index_key = sb)
+scale loads     scale_loads (3, _s0)    sparse_scale_loads           sparse_scale_loads (2, _s0)
+                scale_tail  (1, _s1)    (all 4, _s0; no _s1)         sparse_scale_tail  (2, _s1)
+```
+
+`first` seeds each accumulator with `magic8` (SWMMAC has no C operand; the dense WMMA passes `C = magic8`), and `fold` interleaves the fold's stage 1 between the SWMMACs, as dense. x64's single bundle per slab means `sparse_wmma` takes `sb = 0` only and its four scale loads all sit after the bundle; x32 keeps dense's two sub-blocks, so two scale loads sit between them and two after the second. A sparse spec admits the shipped wait placement (publishes after the slab's last bundle) only, so `fine_sparse_block` has no `WAIT` choice. `an_x64_block_has_no_second_sub_block` and `a_sparse_read_or_wmma_of_an_unpublished_slot_is_refused` pin the sparse-specific refusals.
 
 ## A wait-moved block
 
@@ -317,11 +340,26 @@ pm_loop --kernel iu4_gemm --arch gfx1201 --shape M=17408,N=8192,K=5120 \
 
 ## Ring depth 3
 
-Not delivered. The two-buffer ring is not an accident of one type: it is the shape of the typed core, the runtime driver and the iu4 kernel at once, and a three-slot ring is a change in each.
+`const RING = 3` in the twin builds the generator's `Tune { ring: RingDepth::Three }` for the dense K128 variants (every epilogue but the fused GDN projection, whose epilogue re-lays out the K-loop's LDS): the A and W payload rings are three LDS slabs deep (+8192 bytes on the 128x128x8 tile: the launch's dynamic LDS stays the shipped 20480 and the object declares the extra slab as static LDS, `group_segment_fixed_size` 8192, so a launcher that passes 20480 is right for it: 28672 per workgroup), two slabs are published ahead, and the metadata rings (DS, SZ) stay two deep. `tests/iu4_gemm_fine_twin.rs` (`a_ring_3_script_equals_the_generators_tune`) requires the script to emit exactly the generator's depth-3 bytes for all three `WAIT` placements and all twelve variants that have a generator; the result bits equal depth 2's (the schedule moves, not the math: `tests/iu4_gemm_ring3.rs` on the CPU emulator at K = 256, 512, 768, 1024, 5120).
 
-- **Typed ring** (`peacemaker-author/src/lds.rs`): `Ring<R, C, N>` holds `bufs: [Slots; 2]`, roles `cur` and `next`, and `next_index()` is `1 - cur`; `Rotate`, `Prime`, `RetireCur` and the `StoreTarget` impls swap those two. A depth-D ring has `cur`, D-2 buffers published ahead, and a `next`: the phase of the middle buffers is a third type parameter (or a runtime vector the type does not see), and `Rotate` becomes `cur = (cur + 1) % D` with the oldest buffer retired.
-- **Runtime driver** (`peacemaker-author/src/runtime.rs`): `RingBuf.bufs: [Vec<usize>; 2]`, `next = 1 - cur`, `Driver::ring(name, first, second)`, and `Lend::take`/`give`/`view` carry exactly `(cur, next)` phases. They need the same generalisation, and `Ring::new` in a script a three-region form.
-- **The kernel**: `Layout` (`spec.rs`) is `[u32; 2]` per payload ring, and every fragment load and publish store carries its slot as an *immediate* (`kloop.rs` `fragments`, `publish.rs` `publish_slab`). A K-loop trip is four slabs (two K128 blocks, two slabs each); with three slots the slot of slab `k` is `k mod 3`, so the immediates repeat every twelve slabs: either unroll three trips (3x code) or keep the slot base in a register and add it per access (extra VALU on the critical path, and `ds_load` offsets stop being constants). LDS is not the limit (a third A+W slab buffer is +8192 bytes on the 128x128x8 tile: 26624 of 65536).
-- **Prefetch**: depth 3 only helps if a slab is fetched two ahead, and the generator has one prefetch set (`a_pf` / `w_pf`). A second set is another 8+8 VGPRs against the same register plan.
+**Schedule.** Two prefetch register sets hold the next block's slabs, set 0 its slab 0 and set 1 its slab 1 (the second set takes the eight VGPRs `magic8` held: each block's first WMMA group seeds its accumulators from `cacc[3][1]`, which no WMMA writes until the group's last, instead of from a constant register; the 128x128x8 kernel stays at 187 VGPRs). At block `b`'s entry slab `2b` is the current buffer, slab `2b + 1` is published ahead and the sets hold block `b + 1`:
 
-Delivering it means the typed ring and driver generalisation first (contained to `peacemaker-author`, tests in `tests/ui`), then a depth-parameterised `Layout` and a rotating-base or unrolled K-loop in `iu4_gemm`, then the fine natives take the slot as an argument. The fine natives of this chapter already take the ring, not a slot number, so none of their signatures needs to change for it.
+```text
+phase A   fragments(cur) ; WMMA groups ; publish set 0 (b+1's slab 0) into next
+          fetch_next_meta ; wait ; barrier rotate(A, W) ; fetch b+2's slab 0 -> set 0
+phase B   fragments(cur) ; d_loads ; WMMA groups ; publish set 1 (b+1's slab 1) and metadata
+          wait ; signal rotate(A, W, DS, SZ) ; fetch b+2's slab 1 -> set 1 ; fold ; wait_arrived
+```
+
+Block `b + 2` is the same plane one group on, so each plane's activation descriptor steps at the head of its block (`iu4::step_descriptor(wg, g, h)`) and the group's trip end only advances the group offset (`iu4::group_end`). The peeled group's even block publishes the odd block's slabs and fetches nothing (`"t0"`); its odd block publishes nothing, so phase A's barrier is `advance(lds[0]), advance(lds[1])`: a store-free rotation (retire the current buffer, the ahead buffer becomes current).
+
+**Addressing.** Every LDS address stays an immediate. With `n = K/256 - 1` full groups, `r = n mod 3` and `q = n / 3`, slab `s` lives in slot `(s - r) mod 3`: after `r` groups the next group starts on slot 0, and so does the peeled group after the loop's `q` trips of three groups. The script (`author3`) is the entry branch (`iu4::split_trips`, then `wg.wg_if_else(iu4::ring_cmp(wg, g, 0)?, ..)` nested once for `r` = 0, 1, 2), arm `r` = `lds[0].starting_at((3 - r) % 3)` and `lds[1].starting_at(..)`, the prologue's ring part (`ring_part3`: `publish_slab`, `publish_meta`, `wait`, `signal(prime(..))`, `fetch_slab`, `wait_arrived`, `publish_slab_set`, `wait`, `barrier(rotate(..))` over the vacant current buffer, `fetch_slab`), and `r` full groups; then `wg_skip_if(q == 0)` around a `loop_carried` body of three groups counted by `q`; then the peeled group. Three arms, three body groups and the tail: about 2.3 times the depth-2 code (the 27B gate/up kernel: 14084 -> 32192 code bytes).
+
+**Legality.** `Spec::validate` refuses what depth 3 does not generate, with the numbers: the sparse blocks (their fine steps exist, but no depth-3 composition of them is written), the fused GDN projection, a tile whose second prefetch set is wider than the eight freed VGPRs, a VGPR count over the occupancy ceiling (192) and an LDS size (static + dynamic) that does not fit per workgroup (64 KiB) or per WGP at the occupancy the ceiling allows. The 27B gate/up node (`--fold k128 --tile 128x128x8 --cacc 1 --epi silu --alayout slab`) and the 16-wave tile are legal.
+
+```sh
+pm_loop --kernel iu4_gemm --arch gfx1201 --shape M=17408,N=8192,K=5120 \
+        --fold k128 --tile 128x128x8 --cacc 1 --epi silu --alayout slab --ring 3 --offline
+```
+
+`pm_loop --rip` takes the twin with `const RING = 3` (the candidate's depth is read from that line); `--ring` is the generator's own knob and is refused with `--rip`.

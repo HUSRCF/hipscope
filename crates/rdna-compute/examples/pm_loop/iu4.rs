@@ -42,8 +42,13 @@
 //! publishes its next slab relative to the slab's WMMAs, see
 //! `iu4_gemm::WaitPlace`) and `fold-op` (`fma`|`muladd`, `iu4_gemm::FoldOp`),
 //! as `--ring 2 --wait mid --fold-op fma`. `ring` and `wait` are schedule
-//! knobs: the candidate must stay `identical_to_baseline`. `ring 3` is refused
-//! by `Spec::validate` (no generator). `fold-op muladd` is a deliberately
+//! knobs: the candidate must stay `identical_to_baseline`. `ring 3` publishes two
+//! slabs ahead (a third A/W LDS slab, a second prefetch set; dense K128 variants,
+//! not the fused GDN projection: `Spec::validate` refuses the rest with the
+//! numbers); its launch passes the shipped dynamic LDS size
+//! (`Spec::lds_launch`) and the object declares the third slab as static
+//! LDS (`group_segment_fixed_size`), so the product launcher's constant is
+//! right for it too. `fold-op muladd` is a deliberately
 //! NUMERIC candidate (non-fused `v_mul_f32` + `v_add_f32` stage-2 accumulate,
 //! the hipcc DAG): the record declares `numeric_contract.relation = "numeric"`,
 //! reports `identical_to_baseline` honestly and, for set/add, checks the
@@ -52,8 +57,9 @@
 //! finite and NaN-pattern-equal to the baseline (the KLD/state gate decides).
 //! The knobs reach the record's `candidate.knobs` only when non-default.
 //! Baseline overrides: `base-ring|base-wait|base-fold-op` (the baseline is
-//! otherwise the default tune). Not combinable with `--rip` (the `.rip`
-//! `Iu4Spec` carries no tune).
+//! otherwise the default tune). Not combinable with `--rip`: the script
+//! chooses its own tune (its `const RING`, read from the source, sets the
+//! candidate's ring depth, i.e. the generator the script is compared with).
 //!
 //! # Extra knobs
 //! `ref-rows`: `full` (default while `M*N*K <= 2e9` MACs) or `sample:<n>`
@@ -75,7 +81,9 @@
 
 use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::iu4_gemm::{self, sparse24, ALayout, Epi, FoldOp, Mma, Spec, Tune};
+use peacemaker_isa::kernels::iu4_gemm::{
+    self, sparse24, ALayout, Epi, FoldOp, Mma, RingDepth, Spec, Tune,
+};
 use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
@@ -572,12 +580,30 @@ pub fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
     ))
 }
 
+/// The payload ring depth a `.rip` script builds: its `const RING: usize = 2|3;` (absent: the
+/// shipped depth 2).
+fn rip_ring(source: &str) -> Result<RingDepth> {
+    for line in source.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("const RING: usize =") {
+            let v = rest.trim().trim_end_matches(';').trim();
+            return v.parse().map_err(|e| format!("`{l}`: {e}"));
+        }
+    }
+    Ok(RingDepth::Two)
+}
+
 /// Compile `.rip` source for `spec`, refuse unless its ABI equals that of
 /// `iu4_gemm::emit(spec)`, and return the linked ELF, the symbol and the
 /// `candidate.rip` record fields (`variant`, `sha256`, `identical_to_generator`).
 fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
     let variant = spec.variant_name();
-    let compiled = peacemaker_rip::compile(source, spec.arch, &variant)?;
+    // The script names the base variant; its own `const RING` picks the depth.
+    let base = Spec {
+        tune: Tune::default(),
+        ..spec
+    };
+    let compiled = peacemaker_rip::compile(source, spec.arch, &base.variant_name())?;
     let generator = iu4_gemm::emit(spec)?;
     let symbol = spec.symbol();
     let elf = peacemaker_isa::native::assemble(&compiled.s_text, spec.arch)?;
@@ -633,12 +659,19 @@ pub fn new_with_rip(
         wait: knobs.take_or("wait", "after"),
         fold_op: knobs.take_or("fold-op", "fma"),
     };
-    let cand = cand_strs.spec()?;
+    let mut cand = cand_strs.spec()?;
+    let mut cand_strs = cand_strs;
     if rip.is_some() && !cand.tune.is_default() {
         return Err(
-            "--ring/--wait/--fold-op cannot be combined with --rip (the `.rip` Iu4Spec carries no tune)"
+            "--ring/--wait/--fold-op cannot be combined with --rip (the script chooses its tune: `const RING`, `const WAIT`)"
                 .into(),
         );
+    }
+    if let Some(r) = &rip {
+        // The script's `const RING` sets the candidate's depth: the generator the
+        // script is compared with (`identical_to_generator`).
+        cand.tune.ring = rip_ring(&r.text)?;
+        cand_strs.ring = cand.tune.ring.name().to_owned();
     }
     if cand.epi == Epi::QkvzaGdn {
         return Err("epi qkvzagdn is not supported by pm_loop (120-byte fused GDN ABI)".into());
@@ -925,7 +958,7 @@ impl Iu4 {
                         kernarg_ptr: kva,
                         workgroup: [x as u32, y as u32, 0],
                         block: [tile.threads(), 1, 1],
-                        dynamic_lds: tile.layout().launch,
+                        dynamic_lds: self.cand.lds_launch(),
                     },
                     &mut mem,
                 )?;
@@ -1104,7 +1137,7 @@ impl Workload for Iu4 {
                 1,
             ],
             block: [spec.tile.threads(), 1, 1],
-            lds: spec.tile.layout().launch,
+            lds: spec.lds_launch(),
         }
     }
 
@@ -1660,10 +1693,51 @@ mod tests {
     }
 
     #[test]
-    fn ring_three_surfaces_the_generators_reason() {
+    fn ring_three_emits_and_surfaces_the_generators_reason_where_it_has_none() {
         let w = new("M=128,N=64,K=256", &mut knobs(&[("ring", "3")])).unwrap();
+        let c = w.candidate().unwrap();
+        assert_eq!(
+            c.launch_symbol,
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1"
+        );
+        assert_eq!(w.candidate_knobs()["ring"], "3");
+        // The depth-3 launch passes the shipped dynamic size; the third slab is static LDS in the descriptor.
+        let spec =
+            Spec::from_knobs("k128", "128x128x8", "1", "set", "token", Arch::Gfx1201).unwrap();
+        assert_eq!(spec.lds_launch(), 20480);
+        let r3 = Spec {
+            tune: Tune {
+                ring: RingDepth::Three,
+                ..Tune::default()
+            },
+            ..spec
+        };
+        assert_eq!(
+            (r3.lds_launch(), r3.lds_fixed(), r3.lds_total()),
+            (20480, 8192, 28672)
+        );
+        // The sparse K-loop blocks have no depth-3 form.
+        let w = new(
+            "M=128,N=64,K=256",
+            &mut knobs(&[("ring", "3"), ("mma", "s24x64")]),
+        )
+        .unwrap();
         let e = w.candidate().unwrap_err();
-        assert!(e.contains("ring depth 3 has no generator"), "{e}");
+        assert!(e.contains("ring depth 3") && e.contains("dense"), "{e}");
+    }
+
+    #[test]
+    fn a_rip_scripts_ring_constant_sets_the_candidates_depth() {
+        assert_eq!(
+            rip_ring("const RING: usize = 3;\nfn emit() {}").unwrap(),
+            RingDepth::Three
+        );
+        assert_eq!(
+            rip_ring("  const RING: usize = 2;").unwrap(),
+            RingDepth::Two
+        );
+        assert_eq!(rip_ring("fn emit() {}").unwrap(), RingDepth::Two);
+        assert!(rip_ring("const RING: usize = 4;").is_err());
     }
 
     #[test]

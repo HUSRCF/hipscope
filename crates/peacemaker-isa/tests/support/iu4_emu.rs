@@ -336,7 +336,7 @@ pub fn run_gemm(spec: Spec, p: &Problem) -> Result<Vec<f32>, String> {
                     kernarg_ptr: kva,
                     workgroup: [x as u32, y as u32, 0],
                     block: [tile.threads(), 1, 1],
-                    dynamic_lds: tile.layout().launch,
+                    dynamic_lds: spec.lds_launch(),
                 },
                 &mut mem,
             )

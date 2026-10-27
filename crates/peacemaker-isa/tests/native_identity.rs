@@ -214,6 +214,7 @@ fn corpus() -> Vec<Unit> {
                     raster: mq6_i8_gemm::Raster::Banded,
                     tile,
                     arch,
+                    tune: Default::default(),
                 }) {
                     single(&mut units, e)
                 }

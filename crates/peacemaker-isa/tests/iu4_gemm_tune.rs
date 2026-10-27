@@ -156,26 +156,17 @@ fn fold_op_muladd_emits_and_replaces_the_fused_accumulate() {
 #[test]
 fn validate_rejects_what_has_no_generator() {
     let spec = node();
-    let e = with(
-        spec,
-        Tune {
-            ring: RingDepth::Three,
-            ..Tune::default()
-        },
-    )
-    .validate()
-    .unwrap_err();
+    // Ring depth 3 has a generator for the dense K-loop (`tests/iu4_gemm_ring3.rs`); the fused GDN projection, whose
+    // epilogue reuses the K-loop's LDS, has none, and the reason survives `emit`.
+    let gdn = Spec::control(Epi::QkvzaGdn);
+    let ring3 = Tune {
+        ring: RingDepth::Three,
+        ..Tune::default()
+    };
+    assert!(with(spec, ring3).validate().is_ok());
+    let e = with(gdn, ring3).validate().unwrap_err();
     assert!(e.contains("ring depth 3"), "{e}");
-    // The reason survives `emit`.
-    let e = emit(with(
-        spec,
-        Tune {
-            ring: RingDepth::Three,
-            ..Tune::default()
-        },
-    ))
-    .err()
-    .unwrap();
+    let e = emit(with(gdn, ring3)).err().unwrap();
     assert!(e.contains("ring depth 3"), "{e}");
     // A non-default wait placement is for the dense K-loop block only.
     let sparse = Spec {

@@ -11,7 +11,7 @@ use crate::{
     insn::{Instruction, MemoryClass},
     Builder,
 };
-use peacemaker_author::{prime, End, Free, Ring};
+use peacemaker_author::{prime, rotate, End, Free, Ring};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
 /// reciprocal refined once, then two quotient corrections. Exact for all
@@ -71,17 +71,87 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
     op(b, text, &[v(vdst)], &uses)
 }
 
+/// The whole prologue at ring depth 2.
 pub(crate) fn emit(
     wg: &mut Wg,
     g: &Gen,
     end: &End,
-    (ra, rw, rd, rs): (
+    rings: (
         Ring<PayA, Free, Free>,
         Ring<PayW, Free, Free>,
         Ring<MetaD, Free, Free>,
         Ring<MetaS, Free, Free>,
     ),
 ) -> Result<Lds, String> {
+    setup(wg, g, end)?;
+    block0_publish(wg, g, rings)
+}
+
+/// Ring depth 3's prologue before the rings: everything of [`emit`] up to
+/// block 0's staging, then block 0's slab 0 and slab 1 and its metadata are
+/// fetched (into prefetch sets 0 and 1) and the accumulators cleared. The
+/// ring part (`ring_part3`) follows once the K-loop's slot phase is known.
+pub(crate) fn setup3(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
+    setup(wg, g, end)?;
+    let b = wg.isa();
+    let a0 = g.srd_a[0];
+    b.clause(|b| {
+        for (r, &dst) in g.a_pf.iter().enumerate() {
+            let (soff, offset) = publish::a_offset(g, 0, r);
+            publish::vload(b, dst, 2, g.st_a, a0, soff, offset)?;
+        }
+        for (r, &dst) in g.w_pf.iter().enumerate() {
+            publish::vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), 8)?;
+        }
+        publish::vload(b, g.ds_nx, 1, g.ds_voff, a0, None, 0)?;
+        publish::vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), 0)
+    })?;
+    // Block 0's slab 1, in flight behind slab 0 (a depth-2 kernel fetches it
+    // only after slab 0 has been published).
+    publish::fetch_slab_at(b, g, 1, 1, 0, 40)?;
+    for i in (0..64u8).step_by(2) {
+        let r = g.acc + i;
+        op(
+            b,
+            format!("v_dual_mov_b32 v{r}, 0 :: v_dual_mov_b32 v{}, 0", r + 1),
+            &[v(r), v(r + 1)],
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+/// Ring depth 3: block 0's slab 0 and metadata go into the rings' first
+/// buffers (`prime`); with its slab 1 still to publish, block 1's slab 0
+/// is fetched into the freed prefetch set 0 behind the first rendezvous; then
+/// slab 1 goes into the second buffer behind a second rendezvous (the vacant
+/// current buffer rotates), and block 1's slab 1 is fetched into set 1.
+/// Leaves slab 0 current, slab 1 ahead, blocks 1's slabs in flight.
+pub(crate) fn ring_part3(
+    wg: &mut Wg,
+    g: &Gen,
+    (ra, rw, rd, rs): (
+        Ring<PayA, Free, Free, 3>,
+        Ring<PayW, Free, Free, 3>,
+        Ring<MetaD, Free, Free>,
+        Ring<MetaS, Free, Free>,
+    ),
+) -> Result<super::Lds3, String> {
+    let ((ra, pa), (rw, pw)) = publish::publish_slab_set(wg, g, 0, ra, rw)?;
+    let ((rd, pd), (rs, ps)) = publish::publish_meta(wg, g, rd, rs)?;
+    let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
+    let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
+    // Block 1's slab 0 (the plane-1 descriptor and weight plane, group 0).
+    publish::fetch_slab_at(wg.isa(), g, 0, 0, 1, 64 + 8)?;
+    let (ra, rw, rd, rs) = wg.wait_arrived(arrived)?;
+    let ((ra, pa), (rw, pw)) = publish::publish_slab_set(wg, g, 1, ra, rw)?;
+    let (da, dw) = wg.wait_all((pa, pw))?;
+    let (ra, rw) = wg.barrier((rotate(ra, da), rotate(rw, dw)))?;
+    publish::fetch_slab_at(wg.isa(), g, 1, 1, 1, 64 + 40)?;
+    Ok((ra, rw, rd, rs))
+}
+
+fn setup(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
     let b = wg.isa();
     let a = g.args;
     let silu = g.spec.epi.is_silu();
@@ -829,9 +899,16 @@ pub(crate) fn emit(
         &[x],
     )?;
     sop(b, format!("s_lshl_b32 s{x}, s{th}, 8"), &[x], &[th])?;
+    // `s_addk_co_i32` takes a signed 16-bit immediate: a plane base past
+    // 0x7fff (the 16-wave tile at ring depth 3) goes through a literal.
+    let ds0 = g.layout.ds[0];
     sop(
         b,
-        format!("s_addk_co_i32 s{x}, {}", lit(g.layout.ds[0])),
+        if ds0 <= 0x7fff {
+            format!("s_addk_co_i32 s{x}, {}", lit(ds0))
+        } else {
+            format!("s_add_co_i32 s{x}, s{x}, {}", lit(ds0))
+        },
         &[x],
         &[x],
     )?;
@@ -850,6 +927,22 @@ pub(crate) fn emit(
         &[x],
     )?;
 
+    Ok(())
+}
+
+/// Depth 2: block 0's staging, publication and the first rendezvous.
+fn block0_publish(
+    wg: &mut Wg,
+    g: &Gen,
+    (ra, rw, rd, rs): (
+        Ring<PayA, Free, Free>,
+        Ring<PayW, Free, Free>,
+        Ring<MetaD, Free, Free>,
+        Ring<MetaS, Free, Free>,
+    ),
+) -> Result<Lds, String> {
+    let b = wg.isa();
+    let [a0, _] = g.srd_a;
     // Block 0: slab 0, d plane 0, sc plane 0.
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {

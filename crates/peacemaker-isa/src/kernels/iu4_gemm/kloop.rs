@@ -5,7 +5,8 @@
 //! The rolled K-loop. One trip is a whole 256-K group (two 128-K blocks,
 //! plane parity 0 then 1), so every LDS address is an immediate and the
 //! trip ends in the state it started in. The last group is peeled: its
-//! second block fetches and publishes nothing.
+//! second block fetches and publishes nothing. (Ring depth 3, `Tune::ring`, is
+//! the same trip structure over three payload slots: `ring3.rs`.)
 //!
 //! Block (plane `h`), after hipcc K1-ILP's measured order:
 //! - Phase A: slab-1 was fetched by the preceding block (or the prologue);
@@ -165,7 +166,8 @@ pub(crate) fn block_begin(
             g.spec.mma.name()
         ));
     }
-    if rd_cur != h || ra_cur != 0 {
+    // Depth 2 starts every block on payload slot 0; depth 3's slot rotates.
+    if rd_cur != h || (ra_cur != 0 && !g.ring3()) {
         return Err(format!(
             "block {tag}: LDS rings out of phase with plane {h}"
         ));
@@ -437,11 +439,11 @@ pub(crate) fn scale_tail<NS: State>(
 /// Fragment loads of both 32-K sub-blocks from the payload rings' current
 /// slot: per sub-block one W load (both row groups) and two A loads
 /// (column blocks 0-1, 2-3).
-pub(crate) fn fragments<N: State>(
+pub(crate) fn fragments<N: State, const D: usize>(
     w: &mut Wv,
     g: &Gen,
-    ra: &Ring<PayA, Published, N>,
-    rw: &Ring<PayW, Published, N>,
+    ra: &Ring<PayA, Published, N, D>,
+    rw: &Ring<PayW, Published, N, D>,
 ) -> Result<(), String> {
     let slot = ra.cur_index();
     let l = g.layout;
@@ -484,6 +486,24 @@ pub(crate) fn fragments<N: State>(
     Ok(())
 }
 
+/// `seed` (eight VGPRs) = the fold magic, as `magic8` holds it at depth 2.
+fn seed_magic(b: &mut Builder, seed: V<8>) -> Result<(), String> {
+    for i in (0..8u8).step_by(2) {
+        let r = seed.0 + i;
+        op(
+            b,
+            format!(
+                "v_dual_mov_b32 v{r}, {m} :: v_dual_mov_b32 v{}, {m}",
+                r + 1,
+                m = crate::kernels::common::lit(crate::kernels::iu4_fold::MAGIC)
+            ),
+            &[v(r), v(r + 1)],
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
 /// Eight WMMAs of sub-block `sb` in `fold::BUNDLE_ORDER`. `first` seeds the
 /// accumulators (`C = magic8`) instead of accumulating; `fold` interleaves
 /// the fold's stage 1 (`fold::unbias_after_wmma`) between them. Registers
@@ -496,10 +516,21 @@ pub(crate) fn wmma_group(
     fold: bool,
 ) -> Result<(), String> {
     let f = g.f[sb];
+    // Depth 3 has no `magic8`: the last accumulator of the bundle (not
+    // written until the bundle's final WMMA) holds the seed for the whole
+    // group, and its own WMMA accumulates onto it in place.
+    let seed = V::<8>(g.cacc + 8 * *fold::BUNDLE_ORDER.last().unwrap() as u8);
+    if first && g.ring3() {
+        seed_magic(b, seed)?;
+    }
     for (i, &k) in fold::BUNDLE_ORDER.iter().enumerate() {
         let (nb, rg) = (k / 2, k % 2);
         let dst = V::<8>(g.cacc + 8 * k as u8);
-        let c = if first { V::<8>(g.magic) } else { dst };
+        let c = match (first, g.ring3()) {
+            (false, _) => dst,
+            (true, false) => V::<8>(g.magic),
+            (true, true) => seed,
+        };
         b.push(Wmma::iu4(
             g.spec.arch,
             dst,
@@ -559,11 +590,11 @@ fn seed_accumulator(b: &mut Builder, g: &Gen, k: usize) -> Result<(), String> {
 /// x64 fragment loads of a slab: the W loads as dense, then per column block
 /// two `ds_load_b64` from the exact LDS addresses dense uses for `act(sb0, nb)`
 /// and `act(sb1, nb)`, into one contiguous four-VGPR B operand.
-fn fragments_s24x64<N: State>(
+fn fragments_s24x64<N: State, const D: usize>(
     w: &mut Wv,
     g: &Gen,
-    ra: &Ring<PayA, Published, N>,
-    rw: &Ring<PayW, Published, N>,
+    ra: &Ring<PayA, Published, N, D>,
+    rw: &Ring<PayW, Published, N, D>,
 ) -> Result<(), String> {
     let slot = ra.cur_index();
     let l = g.layout;
@@ -696,45 +727,48 @@ fn sc_load<N: State>(
     )
 }
 
-/// One K128 block of the sparse K-loop on plane `h`; the sparse twin of
-/// [`block_with`] (same arguments, same ring transitions, same publication,
-/// next-block fetches and fold; only the fragment loads and the MMA differ).
+/// Whether the sparse spec's SWMMAC is the x64 form (`Mma::S24X64`: one K64
+/// bundle per slab) or the x32 form (`Mma::S24X32`: one bundle per 32-K
+/// sub-block). A dense spec is refused: the fine sparse steps below exist for
+/// the sparse K-loop only (the dense steps are `block_begin`, `fragments`,
+/// `wmma_group`, `scale_loads`, `scale_tail`).
+fn sparse_x64(what: &str, g: &Gen) -> Result<bool, String> {
+    match g.spec.mma {
+        Mma::S24X64 => Ok(true),
+        Mma::S24X32 => Ok(false),
+        Mma::Dense => Err(format!(
+            "{what}: the spec is dense: use the dense blocks (`block`) and their steps"
+        )),
+    }
+}
+
+/// The head of a sparse block on plane `h`; the sparse twin of
+/// [`block_begin`]. The block's own label (`entry_label`) and the lifetimes of
+/// the registers its phases alias, which differ from dense's with the MMA:
 ///
-/// - x64: per slab, W loads as dense, eight `ds_load_b64` for the activations,
-///   eight SWMMACs. Phase B issues the scale loads after the last SWMMAC.
-/// - x32: dense fragment loads, per sub-block eight SWMMACs with `index_key`;
-///   the scale loads sit between the sub-blocks as in dense.
+/// - x64: the slab's SWMMACs read all of F0 and F1, so fragments live to `x0`
+///   and the scale rows / fold products reuse them from there ([`sparse_scale_loads`]
+///   places `x0`; there is no `x1`).
+/// - x32: sub-block 1's SWMMACs still read F0's codes (VGPR 1 of each W pair)
+///   and F1's indices, so those stay live to `x1` ([`sparse_scale_tail`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sparse_block_with(
+pub(crate) fn sparse_block_begin(
     wg: &mut Wg,
     g: &Gen,
     tag: &str,
     h: usize,
-    fetch_next: bool,
     end: &str,
     entry_label: bool,
-    after_slab1_fetch: impl Fn(&mut Builder) -> Result<(), String>,
-    (ra, rw, rd, rs): Lds,
-) -> Result<Lds, String> {
-    let x64 = match g.spec.mma {
-        Mma::S24X64 => true,
-        Mma::S24X32 => false,
-        Mma::Dense => {
-            return Err(format!(
-                "block {tag}: the spec is dense: use the dense blocks (`block`)"
-            ))
-        }
-    };
-    if rd.cur_index() != h || ra.cur_index() != 0 {
+    ra_cur: usize,
+    rd_cur: usize,
+) -> Result<(), String> {
+    let x64 = sparse_x64(&format!("block {tag}"), g)?;
+    if rd_cur != h || ra_cur != 0 {
         return Err(format!(
             "block {tag}: LDS rings out of phase with plane {h}"
         ));
     }
-    let (x, x0, x1) = (
-        label(tag),
-        label(&format!("{tag}_s0")),
-        label(&format!("{tag}_s1")),
-    );
+    let (x, x0, x1) = sub_labels(tag);
     let b = wg.isa();
     if entry_label {
         b.label(&x)?;
@@ -763,16 +797,164 @@ pub(crate) fn sparse_block_with(
         b.regs.v::<4>("sc_rg1_hi", f1, between(&x1, end))?;
         b.regs.v::<8>("fold_t", f1 + 4, between(&x1, end))?;
     }
+    Ok(())
+}
+
+/// Fragment loads of a sparse slab from the payload rings' current slot: the
+/// x64 form's contiguous four-VGPR B operands ([`fragments_s24x64`]), or, for
+/// x32, the dense [`fragments`].
+pub(crate) fn sparse_fragments<N: State, const D: usize>(
+    w: &mut Wv,
+    g: &Gen,
+    ra: &Ring<PayA, Published, N, D>,
+    rw: &Ring<PayW, Published, N, D>,
+) -> Result<(), String> {
+    if sparse_x64("sparse fragments", g)? {
+        fragments_s24x64(w, g, ra, rw)
+    } else {
+        fragments(w, g, ra, rw)
+    }
+}
+
+/// The SWMMAC bundle of a sparse slab, in `fold::BUNDLE_ORDER`; the sparse
+/// twin of [`wmma_group`]. x32: the eight SWMMACs of 32-K sub-block `sb` (0 or
+/// 1). x64: one bundle covers the whole K64 slab, so only `sb = 0` exists.
+/// `first` seeds the accumulators with `magic8` (SWMMAC has no C operand),
+/// `fold` interleaves the fold's stage 1 between the SWMMACs. Registers only:
+/// the fragments come from [`sparse_fragments`].
+pub(crate) fn sparse_wmma(
+    b: &mut Builder,
+    g: &Gen,
+    sb: usize,
+    first: bool,
+    fold: bool,
+) -> Result<(), String> {
+    let x64 = sparse_x64("sparse wmma group", g)?;
+    let after = |b: &mut Builder, i: usize| {
+        if fold {
+            fold::unbias_after_wmma(b, g, i)
+        } else {
+            Ok(())
+        }
+    };
+    if x64 {
+        if sb != 0 {
+            return Err(format!(
+                "sparse wmma group: sub-block {sb}: the spec is {}, whose one SWMMAC bundle covers the whole K64 slab (sub-block 0 only)",
+                g.spec.mma.name()
+            ));
+        }
+        bundle_s24x64(b, g, first, after)
+    } else {
+        if sb > 1 {
+            return Err(format!("sparse wmma group: sub-block {sb} is not 0 or 1"));
+        }
+        bundle_s24x32(b, g, sb, first, after)
+    }
+}
+
+/// Phase B of a sparse block: the row-scale loads issued at the label `x0`
+/// (placed first). x64 issues all four after its one bundle; x32 issues the
+/// first two (row group 0's scale rows) between its sub-blocks and leaves the
+/// rest to [`sparse_scale_tail`].
+pub(crate) fn sparse_scale_loads<NS: State>(
+    w: &mut Wv,
+    g: &Gen,
+    x0: &str,
+    rs: &Ring<MetaS, Published, NS>,
+) -> Result<(), String> {
+    let x64 = sparse_x64("sparse scale loads", g)?;
+    let [f0, f1] = g.f;
+    w.label(x0)?;
+    let sz = g.layout.sz[rs.cur_index()];
+    if x64 {
+        for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16), (f0, 64), (f1, 80)] {
+            sc_load(w, g, rs, dst, sz + off)?;
+        }
+    } else {
+        for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16)] {
+            sc_load(w, g, rs, dst, sz + off)?;
+        }
+    }
+    Ok(())
+}
+
+/// x32 only: the two last row-scale loads (row group 1), issued at the
+/// sub-block-1 label `x1` (placed first), after sub-block 1's SWMMACs have
+/// read the registers they land in. The x64 block has no sub-block 1: it is
+/// refused.
+pub(crate) fn sparse_scale_tail<NS: State>(
+    w: &mut Wv,
+    g: &Gen,
+    x1: &str,
+    rs: &Ring<MetaS, Published, NS>,
+) -> Result<(), String> {
+    if sparse_x64("sparse scale tail", g)? {
+        return Err(format!(
+            "sparse scale tail: the spec is {}: its four scale loads are all issued by `sparse_scale_loads` (no sub-block 1)",
+            g.spec.mma.name()
+        ));
+    }
+    let [f0, f1] = g.f;
+    w.label(x1)?;
+    let sz = g.layout.sz[rs.cur_index()];
+    for (dst, off) in [(f0, 64), (f1, 80)] {
+        sc_load(w, g, rs, dst, sz + off)?;
+    }
+    Ok(())
+}
+
+/// One K128 block of the sparse K-loop on plane `h`; the sparse twin of
+/// [`block_with`] (same arguments, same ring transitions, same publication,
+/// next-block fetches and fold; only the fragment loads and the MMA differ),
+/// and like it a composition of fine steps (`blocks` exposes them; the `.rip`
+/// natives `iu4::sparse_block_begin`, `sparse_fragments`, `sparse_wmma`,
+/// `sparse_scale_loads`, `sparse_scale_tail` call the same functions): the
+/// sparse steps [`sparse_block_begin`], [`sparse_fragments`], [`sparse_wmma`],
+/// [`sparse_scale_loads`], [`sparse_scale_tail`] and the MMA-independent ones
+/// the dense block shares ([`publish::publish_slab`] / [`publish::publish_meta`],
+/// the `publish::fetch_*` loads, [`d_loads`], `fold::scale`). The publishes sit
+/// after the slab's last MMA bundle (`WaitPlace::AfterMma`, the only placement
+/// a sparse spec admits).
+///
+/// - x64: per slab, W loads as dense, eight `ds_load_b64` for the activations,
+///   eight SWMMACs. Phase B issues all four scale loads after the SWMMACs, at `_s0`.
+/// - x32: dense fragment loads, per sub-block eight SWMMACs with `index_key`;
+///   scale loads (0, 16) sit between the sub-blocks at `_s0` and (64, 80) after
+///   the second at `_s1`, as in dense.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sparse_block_with(
+    wg: &mut Wg,
+    g: &Gen,
+    tag: &str,
+    h: usize,
+    fetch_next: bool,
+    end: &str,
+    entry_label: bool,
+    after_slab1_fetch: impl Fn(&mut Builder) -> Result<(), String>,
+    (ra, rw, rd, rs): Lds,
+) -> Result<Lds, String> {
+    sparse_block_begin(
+        wg,
+        g,
+        tag,
+        h,
+        end,
+        entry_label,
+        ra.cur_index(),
+        rd.cur_index(),
+    )?;
+    let x64 = sparse_x64(&format!("block {tag}"), g)?;
+    let (_, x0, x1) = sub_labels(tag);
 
     // Phase A: slab 0 from slot 0, slab 1 staged into slot 1.
-    after_slab1_fetch(b)?;
+    after_slab1_fetch(wg.isa())?;
+    sparse_fragments(wg, g, &ra, &rw)?;
     if x64 {
-        fragments_s24x64(wg, g, &ra, &rw)?;
-        bundle_s24x64(wg.isa(), g, true, |_, _| Ok(()))?;
+        sparse_wmma(wg.isa(), g, 0, true, false)?;
     } else {
-        fragments(wg, g, &ra, &rw)?;
         for sb in 0..2 {
-            bundle_s24x32(wg.isa(), g, sb, sb == 0, |_, _| Ok(()))?;
+            sparse_wmma(wg.isa(), g, sb, sb == 0, false)?;
         }
     }
     let ((ra, pa), (rw, pw)) = publish::publish_slab(wg, g, ra, rw)?;
@@ -786,49 +968,16 @@ pub(crate) fn sparse_block_with(
     if fetch_next {
         publish::fetch_next(wg.isa(), g, h)?;
     }
+    sparse_fragments(wg, g, &ra, &rw)?;
+    d_loads(wg, g, &rd)?;
     if x64 {
-        fragments_s24x64(wg, g, &ra, &rw)?;
+        sparse_wmma(wg.isa(), g, 0, false, true)?;
+        sparse_scale_loads(wg, g, &x0, &rs)?;
     } else {
-        fragments(wg, g, &ra, &rw)?;
-    }
-    let l = g.layout;
-    let dp = h as u32 * (l.ds[1] - l.ds[0]) / 4;
-    for pair in 0..2u32 {
-        wg.ds_load_cur(
-            &rd,
-            ds_load(
-                format!(
-                    "ds_load_2addr_b32 v[{}:{}], v{}{}",
-                    g.d + 2 * pair as u8,
-                    g.d + 2 * pair as u8 + 1,
-                    g.d_addr,
-                    super::ds_offsets(dp + 32 * pair, dp + 32 * pair + 16)
-                ),
-                vr(g.d + 2 * pair as u8, 2),
-                g.d_addr,
-            ),
-        )?;
-    }
-    let sz = l.sz[h];
-    if x64 {
-        bundle_s24x64(wg.isa(), g, false, |b, i| fold::unbias_after_wmma(b, g, i))?;
-        wg.label(&x0)?;
-        for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16), (f0, 64), (f1, 80)] {
-            sc_load(wg, g, &rs, dst, sz + off)?;
-        }
-    } else {
-        bundle_s24x32(wg.isa(), g, 0, false, |_, _| Ok(()))?;
-        wg.label(&x0)?;
-        for (dst, off) in [(f0 + 4, 0), (f0 + 8, 16)] {
-            sc_load(wg, g, &rs, dst, sz + off)?;
-        }
-        bundle_s24x32(wg.isa(), g, 1, false, |b, i| {
-            fold::unbias_after_wmma(b, g, i)
-        })?;
-        wg.label(&x1)?;
-        for (dst, off) in [(f0, 64), (f1, 80)] {
-            sc_load(wg, g, &rs, dst, sz + off)?;
-        }
+        sparse_wmma(wg.isa(), g, 0, false, false)?;
+        sparse_scale_loads(wg, g, &x0, &rs)?;
+        sparse_wmma(wg.isa(), g, 1, false, true)?;
+        sparse_scale_tail(wg, g, &x1, &rs)?;
     }
     if !fetch_next {
         fold::scale(wg.isa(), g)?;

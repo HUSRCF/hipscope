@@ -550,6 +550,7 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
         noise_floor,
         aa_runs,
         kld_state: None,
+        kld_token: None,
     };
     if drv.stop.is_none() {
         let screen = ClaimPolicyV1 {

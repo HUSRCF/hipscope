@@ -233,8 +233,12 @@ pub fn enumerate(case: &WorkloadCaseV1, node: usize, tokens: u64) -> Result<Doma
         .chain
         .get(node)
         .is_some_and(|n| matches!(classify(&n.symbol), Some(Node::Iu4(_))));
+    let is_mq6 = case
+        .chain
+        .get(node)
+        .is_some_and(|n| matches!(classify(&n.symbol), Some(Node::Mq6(_))));
     let rips = match std::env::var_os(RIP_DIR_VAR) {
-        Some(dir) if is_iu4 => rips_in_dir(Path::new(&dir))?,
+        Some(dir) if is_iu4 || is_mq6 => rips_in_dir(Path::new(&dir))?,
         _ => Vec::new(),
     };
     let numeric = is_iu4 && std::env::var_os(IU4_NUMERIC_VAR).is_some_and(|v| v == "1");
@@ -286,16 +290,7 @@ fn enumerate_inner(
             enumerate_moe(case, n, node, tokens, kind, incumbent_epi)
         }
         Some(Node::Iu4(k)) => enumerate_iu4(case, n, node, tokens, k, rips, iu4_numeric),
-        Some(Node::Mq6(entry)) => {
-            if !rips.is_empty() {
-                return Err(format!(
-                    "node {node} symbol {} is an {MQ6_KERNEL} entry: .rip candidates are enumerated \
-                     for {IU4_KERNEL} nodes only",
-                    n.symbol
-                ));
-            }
-            enumerate_mq6(case, n, node, tokens, entry)
-        }
+        Some(Node::Mq6(entry)) => enumerate_mq6(case, n, node, tokens, rips, entry),
         None => Err(format!(
             "node {node} symbol {:?} is not an enumerable {ARCH} entry \
              ({KERNEL} entries, {IU4_GATE_UP_SILU_B1S}, {MQ6_SYM_128}, {MQ6_SYM_WIDE})",
@@ -356,15 +351,18 @@ const IU4_TILE_TOKENS: u64 = 128;
 const IU4_RINGS: [&str; 2] = ["2", "3"];
 const IU4_WAITS: [&str; 3] = ["after", "mid", "before"];
 
-/// Why a ring depth has no generator: the refusal `iu4_gemm::Spec::validate` gives (pm-census
-/// does not link the generator, so the rule is mirrored here; `pm_loop --ring 3` surfaces the
-/// generator's own text, and an iu4 candidate this table lists as legal that the generator
-/// refuses is pruned by the offline screen with the generator's reason).
-fn iu4_ring_refusal(ring: &str) -> Option<&'static str> {
-    (ring == "3").then_some(
-        "ring depth 3 has no generator: the typed LDS core has only two-buffer rings \
-         (peacemaker-author Ring) and a 4-slab K-loop trip cannot rotate three slots \
-         through immediate LDS addresses (a 12-slab period would be needed)",
+/// Why a ring depth has no generator for `k`'s variant: the refusal
+/// `iu4_gemm::Spec::validate` gives (pm-census does not link the generator, so the rule is
+/// mirrored here, text included; `pm_loop --ring 3` surfaces the generator's own text, and an
+/// iu4 candidate this table lists as legal that the generator refuses, e.g. a budget the
+/// mirror does not model, is pruned by the offline screen with the generator's reason).
+/// Ring depth 3 is generated for the dense K-loop of every fold-128, one-accumulator
+/// variant except the fused GDN projection, whose epilogue re-lays out the K-loop's LDS.
+fn iu4_ring_refusal(ring: &str, k: Iu4Knobs) -> Option<&'static str> {
+    (ring == "3" && k.epi == "qkvzagdn").then_some(
+        "ring depth 3 is not generated for the fused GDN projection: its epilogue \
+         re-lays out the K-loop's LDS (`gdn_epilogue`, ring bytes vs the launch size) and \
+         the depth-3 map is not handled there",
     )
 }
 
@@ -377,7 +375,7 @@ fn iu4_generator_space(shape: &str, k: Iu4Knobs) -> (Vec<CandidateSpecV1>, Vec<S
             if (ring, wait) == (IU4_RINGS[0], IU4_WAITS[0]) {
                 continue;
             }
-            if let Some(why) = iu4_ring_refusal(ring) {
+            if let Some(why) = iu4_ring_refusal(ring, k) {
                 pruned.push(format!("pruned ring={ring} wait={wait}: {why}"));
                 continue;
             }
@@ -658,6 +656,42 @@ fn mq6_runtime_token_tile(m: u64, n: u64, cu_count: u64) -> u64 {
     }
 }
 
+/// Why ring depth 3 does not fit an `mq6_i8_gemm` tile: the refusal `mq6_i8_gemm::Spec::validate`
+/// gives (pm-census does not link the generator, so the rule is mirrored here; `pm_loop --ring 3`
+/// surfaces the generator's own text). Three A+W slabs and the DS/SZ planes against the 64 KiB
+/// workgroup limit (`128x128`: 3 * 16384 + 4096 = 53248 B fits; the 256-wide tiles:
+/// 3 * 24576 + 6144 = 79872 B do not), and the second raw prefetch set against the VGPR budget.
+fn mq6_ring3_refusal(tile: &str) -> Option<&'static str> {
+    match tile {
+        "128x128" => None,
+        "256x128" => Some(
+            "ring depth 3 does not fit the 256x128x16 tile: the launch needs 79872 B of LDS, \
+             the workgroup limit is 65536 B (and the second prefetch set needs 8 VGPRs on top of \
+             the 192 of the depth-2 map, over the 192 budget at 2 workgroups per WGP)",
+        ),
+        _ => Some(
+            "ring depth 3 does not fit the 128x256x16 tile: the launch needs 79872 B of LDS, \
+             the workgroup limit is 65536 B (and the second prefetch set needs 7 VGPRs on top of \
+             the 192 of the depth-2 map, over the 192 budget at 2 workgroups per WGP)",
+        ),
+    }
+}
+
+/// The A/W ring depth an `mq6_i8_gemm` script declares: its `const RING: u32 = N;` (`2` when the
+/// script has none; `pm_loop --rip` reads the same constant).
+fn mq6_rip_ring(text: &str) -> Result<&'static str, String> {
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix("const RING: u32 =") {
+            return match v.trim().trim_end_matches(';').trim() {
+                "2" => Ok("2"),
+                "3" => Ok("3"),
+                o => Err(format!("const RING = {o}: expected 2 or 3")),
+            };
+        }
+    }
+    Ok("2")
+}
+
 /// `pm_loop mq6_i8_gemm` knob set of one candidate: F32 `set` epilogue, `raster` and `tile`, and
 /// `base-shipped` = the runtime's tile, so every arm is measured against the shipped entry the
 /// runtime launches at the shape.
@@ -702,6 +736,7 @@ fn enumerate_mq6(
     n: &ChainNodeV1,
     node: usize,
     tokens: u64,
+    rips: &[PathBuf],
     entry: Mq6Entry,
 ) -> Result<DomainV1, String> {
     if case.model.family != "flash-next" {
@@ -806,7 +841,8 @@ fn enumerate_mq6(
 
     let shape = format!("M={m},N={tokens},K={k}");
     let incumbent = mq6_spec(&shape, runtime_tile, "banded", runtime_tile);
-    // Control first (the incumbent's own knobs), then tile-major, banded before linear.
+    // Control first (the incumbent's own knobs), then tile-major, banded before linear, then the
+    // legal ring-3 points (tile-major) with their non-default `--ring 3`.
     let mut candidates = vec![incumbent.clone()];
     for tile in ["128x128", "256x128", "128x256"] {
         for raster in ["banded", "linear"] {
@@ -816,19 +852,61 @@ fn enumerate_mq6(
             }
         }
     }
+    for tile in ["128x128", "256x128", "128x256"] {
+        for raster in ["banded", "linear"] {
+            match mq6_ring3_refusal(tile) {
+                Some(why) => {
+                    derivation.push(format!("pruned tile={tile} raster={raster} ring=3: {why}"))
+                }
+                None => {
+                    let mut c = mq6_spec(&shape, tile, raster, runtime_tile);
+                    c.knobs.insert("ring".to_owned(), "3".to_owned());
+                    candidates.push(c);
+                }
+            }
+        }
+    }
     derivation.push(
         "numerics: all tiles and rasters run the same exact integer dot and per-element fold \
          order; pm_loop requires identical_to_baseline for this workload, so every candidate is \
          exact (none routed to the KLD gate)"
             .to_owned(),
     );
-    let domain_hash = canonical_sha256(&json!({
+    // One candidate per `.rip` script: the script's own `const RING` is its ring depth (not a knob:
+    // `pm_loop --rip` reads it too), so a depth-3 script runs on the 128x128 tile (the only tile
+    // depth 3 fits) and a depth-2 script on the incumbent's tile, banded raster.
+    let mut rip_shas = Vec::new();
+    for path in rips {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let sha: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let p = path
+            .to_str()
+            .ok_or_else(|| format!("{}: the rip path is not valid UTF-8", path.display()))?;
+        let ring = mq6_rip_ring(&String::from_utf8_lossy(&bytes))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let tile = if ring == "3" { "128x128" } else { runtime_tile };
+        derivation.push(format!(
+            "rip candidate {p} sha256 {sha}: const RING = {ring}, tile {tile} banded"
+        ));
+        rip_shas.push(json!({"path": p, "sha256": sha}));
+        let mut c = mq6_spec(&shape, tile, "banded", runtime_tile);
+        c.knobs.insert("rip".to_owned(), p.to_owned());
+        candidates.push(c);
+    }
+    let mut hashed = json!({
         "kernel": MQ6_KERNEL,
         "arch": ARCH,
         "shape": shape,
         "incumbent": incumbent,
         "candidates": candidates,
-    }));
+    });
+    if !rip_shas.is_empty() {
+        hashed["rips"] = json!(rip_shas);
+    }
+    let domain_hash = canonical_sha256(&hashed);
     Ok(DomainV1 {
         schema: DOMAIN_SCHEMA.to_owned(),
         case_id: case.case_id.clone(),
@@ -988,26 +1066,54 @@ mod tests {
             ["k128", "128x128x8", "1", "silu", "slab"]
         );
         assert!(!k.contains_key("rip"));
-        // control, the other tile, then the legal (ring x wait) points: ring 2 with wait mid / before.
-        assert_eq!(d.candidates.len(), 4);
+        // control, the other tile, then the legal (ring x wait) points in ring-major order: ring 2 with
+        // wait mid / before, then ring 3 with every wait.
+        assert_eq!(d.candidates.len(), 7);
         assert_eq!(d.candidates[0], d.incumbent);
         assert_eq!(d.candidates[1].knobs["tile"], "256x128x16");
         assert_eq!(d.candidates[1].knobs["alayout"], "slab");
         // A generator-knob point keeps every incumbent knob and adds only its non-default knobs.
-        for (i, wait) in [(2, "mid"), (3, "before")] {
+        for (i, (ring, wait)) in [
+            (2, (None, Some("mid"))),
+            (3, (None, Some("before"))),
+            (4, (Some("3"), None)),
+            (5, (Some("3"), Some("mid"))),
+            (6, (Some("3"), Some("before"))),
+        ] {
             let mut k = d.candidates[i].knobs.clone();
-            assert_eq!(k.remove("wait").as_deref(), Some(wait));
+            assert_eq!(k.remove("ring").as_deref(), ring);
+            assert_eq!(k.remove("wait").as_deref(), wait);
             assert_eq!(k, d.incumbent.knobs);
         }
-        // 3 header lines, the knob-space summary, and the three ring=3 points pruned with the reason.
-        assert_eq!(d.derivation.len(), 7);
+        // 3 header lines and the knob-space summary: nothing of this node is pruned.
+        assert_eq!(d.derivation.len(), 4);
         assert!(
-            d.derivation[3].contains("6 points") && d.derivation[3].contains("2 further legal")
+            d.derivation[3].contains("6 points")
+                && d.derivation[3].contains("5 further legal")
+                && d.derivation[3].contains("0 pruned")
         );
-        for (line, wait) in d.derivation[4..].iter().zip(["after", "mid", "before"]) {
+    }
+
+    /// The generator refuses ring depth 3 for the fused GDN projection only: the mirror prunes exactly
+    /// those points, with the generator's reason, and keeps every other variant's.
+    #[test]
+    fn iu4_ring_3_is_pruned_only_where_the_generator_refuses() {
+        let k = |epi| Iu4Knobs {
+            fold: "k128",
+            tile: "128x128x8",
+            cacc: "1",
+            epi,
+            alayout: "token",
+        };
+        let (legal, pruned) = iu4_generator_space("M=1,N=1,K=256", k("silu"));
+        assert_eq!((legal.len(), pruned.len()), (5, 0));
+        let (legal, pruned) = iu4_generator_space("M=1,N=1,K=256", k("qkvzagdn"));
+        assert_eq!(legal.len(), 2, "ring 2 with wait mid / before");
+        assert_eq!(pruned.len(), 3);
+        for (line, wait) in pruned.iter().zip(["after", "mid", "before"]) {
             assert!(
                 line.starts_with(&format!(
-                    "pruned ring=3 wait={wait}: ring depth 3 has no generator"
+                    "pruned ring=3 wait={wait}: ring depth 3 is not generated for the fused GDN projection"
                 )),
                 "{line}"
             );
@@ -1063,6 +1169,17 @@ mod tests {
             flags(&d.candidates[3]),
             [("--wait".to_owned(), "before".to_owned())]
         );
+        assert_eq!(
+            flags(&d.candidates[4]),
+            [("--ring".to_owned(), "3".to_owned())]
+        );
+        assert_eq!(
+            flags(&d.candidates[6]),
+            [
+                ("--ring".to_owned(), "3".to_owned()),
+                ("--wait".to_owned(), "before".to_owned())
+            ]
+        );
         let ids: std::collections::BTreeSet<_> = d.candidates.iter().map(|c| c.id()).collect();
         assert_eq!(ids.len(), d.candidates.len(), "candidate ids are distinct");
         // Deterministic.
@@ -1084,16 +1201,17 @@ mod tests {
         assert!(rips[0].ends_with("a.rip") && rips[1].ends_with("b.rip"));
         assert!(rips[0].is_absolute());
         let d = enumerate_with_rips(&iu4_case(), 0, 8192, &rips).unwrap();
-        assert_eq!(d.candidates.len(), 6);
+        // control, the other tile, 5 generator points, then the scripts.
+        assert_eq!(d.candidates.len(), 9);
         let rip_of = |i: usize| d.candidates[i].knobs["rip"].clone();
-        assert_eq!(rip_of(4), rips[0].to_str().unwrap());
-        assert_eq!(rip_of(5), rips[1].to_str().unwrap());
+        assert_eq!(rip_of(7), rips[0].to_str().unwrap());
+        assert_eq!(rip_of(8), rips[1].to_str().unwrap());
         // The rip candidate keeps every incumbent knob and adds only `rip`.
-        let mut k = d.candidates[4].knobs.clone();
+        let mut k = d.candidates[7].knobs.clone();
         k.remove("rip");
         assert_eq!(k, d.incumbent.knobs);
         // `pm_loop` gets `--rip PATH` and the five knob flags.
-        let args = d.candidates[4].pm_loop_args();
+        let args = d.candidates[7].pm_loop_args();
         let at = |flag: &str| {
             let i = args.iter().position(|a| a == flag).unwrap();
             args[i + 1].clone()
@@ -1114,8 +1232,8 @@ mod tests {
             2
         );
         // Distinct ids: the resume key tells the scripts apart.
-        assert_ne!(d.candidates[4].id(), d.candidates[5].id());
-        assert_ne!(d.candidates[0].id(), d.candidates[4].id());
+        assert_ne!(d.candidates[7].id(), d.candidates[8].id());
+        assert_ne!(d.candidates[0].id(), d.candidates[7].id());
     }
 
     #[test]
@@ -1207,7 +1325,21 @@ mod tests {
     fn mq6_ids(d: &DomainV1) -> Vec<(String, String)> {
         d.candidates
             .iter()
-            .map(|c| (c.knobs["tile"].clone(), c.knobs["raster"].clone()))
+            .map(|c| {
+                let ring = c.knobs.get("ring").map_or("", String::as_str);
+                (
+                    c.knobs["tile"].clone(),
+                    format!(
+                        "{}{}",
+                        c.knobs["raster"],
+                        if ring.is_empty() {
+                            String::new()
+                        } else {
+                            format!("+r{ring}")
+                        }
+                    ),
+                )
+            })
             .collect()
     }
 
@@ -1256,6 +1388,10 @@ mod tests {
                 ("256x128", "banded"),
                 ("256x128", "linear"),
                 ("128x256", "linear"),
+                // Ring 3 fits the shipped 128x128 tile only (53248 B of LDS); the 256-wide
+                // tiles' 79872 B are pruned with the numbers.
+                ("128x128", "banded+r3"),
+                ("128x128", "linear+r3"),
             ]
             .map(|(a, b)| (a.to_owned(), b.to_owned()))
         );
@@ -1266,6 +1402,18 @@ mod tests {
         assert_eq!(baseline_symbol(&d), MQ6_SYM_WIDE);
         let text = d.derivation.join("\n");
         assert!(text.contains("gemm_mq6_i8.rs:101-116"), "{text}");
+        assert!(
+            text.contains("pruned tile=128x256 raster=banded ring=3: ring depth 3 does not fit")
+                && text.contains("79872 B"),
+            "{text}"
+        );
+        assert_eq!(
+            d.candidates
+                .iter()
+                .filter(|c| c.knobs.get("ring").is_some_and(|r| r == "3"))
+                .count(),
+            2
+        );
         assert!(
             text.contains("NOTE corpus symbol"),
             "stale-profile note: {text}"
@@ -1300,7 +1448,7 @@ mod tests {
         assert_eq!(d.incumbent.knobs["tile"], "128x128");
         assert_eq!(baseline_symbol(&d), MQ6_SYM_128);
         assert_eq!(d.candidates[0], d.incumbent);
-        assert_eq!(d.candidates.len(), 6);
+        assert_eq!(d.candidates.len(), 8);
         assert!(!d.derivation.join("\n").contains("NOTE corpus symbol"));
     }
 
@@ -1318,8 +1466,62 @@ mod tests {
         let mut a3b = mq6_case(MQ6_SYM_128, [80, 32, 1]);
         a3b.model.family = "a3b".to_owned();
         assert!(enumerate(&a3b, 0, 4096).is_err());
-        let rip = vec![PathBuf::from("/x.rip")];
+        // A missing script is an error.
+        let rip = vec![PathBuf::from("/nonexistent/x.rip")];
         assert!(enumerate_with_rips(&mq6_case(MQ6_SYM_128, [80, 32, 1]), 0, 4096, &rip).is_err());
+    }
+
+    /// A `.rip` script is an `mq6_i8_gemm` candidate: ring read from the script's `const RING`
+    /// (no `ring` knob), the 128x128 tile for depth 3, the incumbent's tile for depth 2.
+    #[test]
+    fn mq6_rips_are_candidates_with_the_ring_read_from_the_script() {
+        let dir = tmp_dir("mq6rips");
+        let rips = write_rips(
+            &dir,
+            &[
+                ("a2.rip", "const RING: u32 = 2;\nfn emit() {}"),
+                ("b3.rip", "// x\nconst RING: u32 = 3;\n"),
+            ],
+        );
+        let case = mq6_case(MQ6_SYM_128, [80, 32, 1]);
+        let base = enumerate_with_rips(&case, 0, 4096, &[]).unwrap();
+        let d = enumerate_with_rips(&case, 0, 4096, &rips).unwrap();
+        assert_eq!(d.candidates.len(), base.candidates.len() + 2);
+        assert_eq!(d.candidates[..base.candidates.len()], base.candidates[..]);
+        let (a, b) = (
+            &d.candidates[base.candidates.len()],
+            &d.candidates[base.candidates.len() + 1],
+        );
+        assert_eq!(a.knobs["rip"], rips[0].to_str().unwrap());
+        assert_eq!(a.knobs["tile"], "128x256");
+        assert_eq!(b.knobs["rip"], rips[1].to_str().unwrap());
+        assert_eq!(b.knobs["tile"], "128x128");
+        for c in [a, b] {
+            assert_eq!(c.knobs["epi"], "set");
+            assert_eq!(c.knobs["raster"], "banded");
+            assert_eq!(c.knobs["base-shipped"], "128x256");
+            assert!(!c.knobs.contains_key("ring"));
+        }
+        let args = b.pm_loop_args();
+        let at = |k: &str| args[args.iter().position(|a| a == k).unwrap() + 1].clone();
+        assert_eq!(at("--rip"), rips[1].to_str().unwrap());
+        assert_eq!(at("--tile"), "128x128");
+        let text = d.derivation.join("\n");
+        assert!(
+            text.contains("sha256") && text.contains("const RING = 3"),
+            "{text}"
+        );
+        assert_ne!(d.domain_hash, base.domain_hash);
+        assert_eq!(d, enumerate_with_rips(&case, 0, 4096, &rips).unwrap());
+        write_rips(&dir, &[("b3.rip", "const RING: u32 = 3;\n// edited")]);
+        let edited = enumerate_with_rips(&case, 0, 4096, &rips).unwrap();
+        assert_ne!(edited.domain_hash, d.domain_hash);
+        // A script with another ring depth is refused; a moe node still refuses scripts.
+        let bad = write_rips(
+            &tmp_dir("mq6rips_bad"),
+            &[("x.rip", "const RING: u32 = 4;")],
+        );
+        assert!(enumerate_with_rips(&case, 0, 4096, &bad).is_err());
     }
 
     #[test]

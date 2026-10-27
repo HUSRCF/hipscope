@@ -94,6 +94,7 @@ fn digests(tiles: &[Tile]) -> Vec<(String, String)> {
                     raster,
                     tile,
                     arch: Arch::Gfx1201,
+                    tune: Default::default(),
                 };
                 if spec.validate().is_err() {
                     continue;

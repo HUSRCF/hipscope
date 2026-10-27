@@ -35,8 +35,8 @@ use crate::value::Value;
 use peacemaker_author::runtime::{Exit, Lend, RingId};
 use peacemaker_author::{Free, Published};
 use peacemaker_isa::kernels::iu4_gemm::{
-    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, Gen, Lds, MetaD, MetaS, Mma, PayA,
-    PayW, Tile, Wg,
+    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, FreeRings3, Gen, Lds, Lds3, MetaD,
+    MetaS, Mma, PayA, PayW, RingDepth, Tile, Wg,
 };
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Emitted;
@@ -54,6 +54,10 @@ const FNS: &[&str] = &[
     "Iu4Gen::new",
     "iu4::declare_lds",
     "iu4::prologue",
+    "iu4::setup",
+    "iu4::split_trips",
+    "iu4::ring_cmp",
+    "iu4::group_end",
     "iu4::kloop",
     "iu4::block",
     "iu4::block_stepping",
@@ -81,6 +85,7 @@ pub(super) fn is_type(n: &str) -> bool {
             | "Epi"
             | "ALayout"
             | "Mma"
+            | "RingDepth"
             | "MoeKind"
             | "WeightCodec"
             | "Iu4Spec"
@@ -114,6 +119,7 @@ const ENUMS: &[(&str, &[&str])] = &[
     ),
     ("ALayout", &["Token", "Slab"]),
     ("Mma", &["Dense", "S24X64", "S24X32"]),
+    ("RingDepth", &["Two", "Three"]),
     ("MoeKind", &["GateUp", "Down"]),
     ("WeightCodec", &["Mq4Sym", "Mq3I4", "E8pI4"]),
 ];
@@ -199,6 +205,13 @@ fn mma_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Mma> {
         o => Err(unknown("Mma", o)),
     }
 }
+fn ring_depth_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<RingDepth> {
+    match variant_of(it, v, "RingDepth")?.as_str() {
+        "Two" => Ok(RingDepth::Two),
+        "Three" => Ok(RingDepth::Three),
+        o => Err(unknown("RingDepth", o)),
+    }
+}
 fn kind_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<moe::Kind> {
     match variant_of(it, v, "MoeKind")?.as_str() {
         "GateUp" => Ok(moe::Kind::GateUp),
@@ -243,6 +256,12 @@ fn no_more(fs: &Fields, name: &str) -> Res<()> {
 fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
     let mut fs = fields_of(it, v, "Iu4Spec")?;
     let n = "Iu4Spec";
+    // `ring` (the payload rings' depth, `RingDepth::Two | Three`) is the one
+    // optional field: a spec that leaves it out is the shipped depth 2.
+    let ring = match fs.iter().position(|(f, _)| &**f == "ring") {
+        Some(i) => ring_depth_of(it, &fs.remove(i).1)?,
+        None => RingDepth::Two,
+    };
     let spec = iu4::Spec {
         fold: fold_of(it, &field(&mut fs, n, "fold")?)?,
         tile: tile_of(it, &field(&mut fs, n, "tile")?)?,
@@ -251,7 +270,10 @@ fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
         act: layout_of(it, &field(&mut fs, n, "act")?)?,
         arch: arch_of(it, &field(&mut fs, n, "arch")?)?,
         mma: mma_of(it, &field(&mut fs, n, "mma")?)?,
-        tune: iu4::Tune::default(),
+        tune: iu4::Tune {
+            ring,
+            ..iu4::Tune::default()
+        },
     };
     no_more(&fs, n)?;
     Ok(spec)
@@ -273,6 +295,7 @@ fn iu4_spec_value<'a>(s: iu4::Spec) -> Value<'a> {
             f("act", enum_val("ALayout", &format!("{:?}", s.act))),
             f("arch", nat(Nat::Arch(s.arch))),
             f("mma", enum_val("Mma", &format!("{:?}", s.mma))),
+            f("ring", enum_val("RingDepth", &format!("{:?}", s.tune.ring))),
         ],
     )
 }
@@ -348,19 +371,33 @@ fn lds_val<'a>(ids: [RingId; 4]) -> Value<'a> {
 
 fn take_free(lend: &mut Lend<'_>, ids: [RingId; 4]) -> Res<FreeRings> {
     Ok((
-        lend.take::<PayA, Free, Free>(ids[0])?,
-        lend.take::<PayW, Free, Free>(ids[1])?,
-        lend.take::<MetaD, Free, Free>(ids[2])?,
-        lend.take::<MetaS, Free, Free>(ids[3])?,
+        lend.take::<PayA, Free, Free, 2>(ids[0])?,
+        lend.take::<PayW, Free, Free, 2>(ids[1])?,
+        lend.take::<MetaD, Free, Free, 2>(ids[2])?,
+        lend.take::<MetaS, Free, Free, 2>(ids[3])?,
     ))
 }
 fn take_lds(lend: &mut Lend<'_>, ids: [RingId; 4]) -> Res<Lds> {
     Ok((
-        lend.take::<PayA, Published, Free>(ids[0])?,
-        lend.take::<PayW, Published, Free>(ids[1])?,
-        lend.take::<MetaD, Published, Free>(ids[2])?,
-        lend.take::<MetaS, Published, Free>(ids[3])?,
+        lend.take::<PayA, Published, Free, 2>(ids[0])?,
+        lend.take::<PayW, Published, Free, 2>(ids[1])?,
+        lend.take::<MetaD, Published, Free, 2>(ids[2])?,
+        lend.take::<MetaS, Published, Free, 2>(ids[3])?,
     ))
+}
+fn take_free3(lend: &mut Lend<'_>, ids: [RingId; 4]) -> Res<FreeRings3> {
+    Ok((
+        lend.take::<PayA, Free, Free, 3>(ids[0])?,
+        lend.take::<PayW, Free, Free, 3>(ids[1])?,
+        lend.take::<MetaD, Free, Free, 2>(ids[2])?,
+        lend.take::<MetaS, Free, Free, 2>(ids[3])?,
+    ))
+}
+fn give_lds3(lend: &mut Lend<'_>, ids: [RingId; 4], (a, w, d, s): Lds3) -> Res<()> {
+    lend.give_back(ids[0], a)?;
+    lend.give_back(ids[1], w)?;
+    lend.give_back(ids[2], d)?;
+    lend.give_back(ids[3], s)
 }
 fn give_lds(lend: &mut Lend<'_>, ids: [RingId; 4], (a, w, d, s): Lds) -> Res<()> {
     lend.give_back(ids[0], a)?;
@@ -455,6 +492,15 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
             wg_arg(it, &a[0])?;
             let g = gen_of(it, &a[1])?;
             let ids = typed(cx, |wg, lend| {
+                if g.ring3() {
+                    let (pa, pw, pd, ps) = blocks::declare_lds3(wg, &g)?;
+                    return Ok([
+                        lend.give(pa, "iu4.A"),
+                        lend.give(pw, "iu4.W"),
+                        lend.give(pd, "iu4.DS"),
+                        lend.give(ps, "iu4.SZ"),
+                    ]);
+                }
                 let (pa, pw, pd, ps) = blocks::declare_lds(wg, &g)?;
                 Ok([
                     lend.give(pa, "iu4.A"),
@@ -471,6 +517,12 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
             let (g, exit, ids) = (gen_of(it, &a[1])?, exit_of(it, &a[2])?, lds_of(it, &a[3])?);
             let ids = typed(cx, |wg, lend| {
                 let end = lend.end(&exit)?;
+                if g.ring3() {
+                    // Depth 3: the rings are primed inside the K-loop's entry
+                    // branch (`iu4::kloop`), so the prologue leaves them Free.
+                    blocks::prologue_setup(wg, &g, &end)?;
+                    return Ok(ids);
+                }
                 let free = take_free(lend, ids)?;
                 let lds = blocks::prologue(wg, &g, &end, free)?;
                 give_lds(lend, ids, lds)?;
@@ -478,11 +530,50 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
             })?;
             Ok(done_with(ids, lds_val))
         }
+        "iu4::setup" => {
+            need(3)?;
+            wg_arg(it, &a[0])?;
+            let (g, exit) = (gen_of(it, &a[1])?, exit_of(it, &a[2])?);
+            Ok(done(typed(cx, |wg, lend| {
+                let end = lend.end(&exit)?;
+                blocks::prologue_setup(wg, &g, &end)
+            })?))
+        }
+        "iu4::split_trips" => {
+            need(2)?;
+            wg_arg(it, &a[0])?;
+            let g = gen_of(it, &a[1])?;
+            Ok(done(typed(cx, |wg, _| blocks::split_trips(wg, &g))?))
+        }
+        "iu4::ring_cmp" => {
+            need(3)?;
+            wg_arg(it, &a[0])?;
+            let g = gen_of(it, &a[1])?;
+            let v = usize_of(it, &a[2], "ring_cmp value")? as u32;
+            let c = typed(
+                cx,
+                |wg, lend| Ok(lend.wg_cond(blocks::ring_cmp(wg, &g, v)?)),
+            )?;
+            Ok(done_with(c, |c| nat(Nat::WgCond(c))))
+        }
+        "iu4::group_end" => {
+            need(3)?;
+            wg_arg(it, &a[0])?;
+            let g = gen_of(it, &a[1])?;
+            let count = bool_of(it, &a[2], "count")?;
+            Ok(done(typed(cx, |wg, _| blocks::group_end(wg, &g, count))?))
+        }
         "iu4::kloop" => {
             need(3)?;
             wg_arg(it, &a[0])?;
             let (g, ids) = (gen_of(it, &a[1])?, lds_of(it, &a[2])?);
             let ids = typed(cx, |wg, lend| {
+                if g.ring3() {
+                    let free = take_free3(lend, ids)?;
+                    let lds = blocks::kloop3(wg, &g, free)?;
+                    give_lds3(lend, ids, lds)?;
+                    return Ok(ids);
+                }
                 let lds = take_lds(lend, ids)?;
                 let lds = blocks::kloop(wg, &g, lds)?;
                 give_lds(lend, ids, lds)?;

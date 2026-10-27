@@ -90,10 +90,10 @@ impl std::str::FromStr for Mma {
 }
 
 /// Depth of the A/W payload rings (the DS/SZ planes stay per-block).
-/// `Three` would prefetch two slabs ahead; it has no generator (see
-/// [`Spec::validate`]): the typed core has only two-buffer rings and the
-/// 4-slab K-loop trip cannot rotate through three slots with immediate
-/// LDS addresses.
+/// `Three` publishes two slabs ahead: a third A/W LDS slab, a second prefetch
+/// register set and a block's next-but-one slabs in flight. The K-loop trip is
+/// three groups (12 slabs) so every LDS address stays an immediate; see
+/// [`Spec::validate`] for what it is generated for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RingDepth {
     #[default]
@@ -218,6 +218,9 @@ pub struct Spec {
 pub const VGPR_CEILING: u16 = 192;
 /// Row tiles per raster band (IU4_RASTER_BAND).
 pub const RASTER_BAND: u32 = 8;
+/// gfx1201 LDS: the most one workgroup may allocate, and the whole WGP's.
+pub const LDS_PER_WORKGROUP: u32 = 65536;
+pub const LDS_PER_WGP: u32 = 131072;
 /// Rows of the fused projection's Z fold: Z, then beta in rows 0..47 and
 /// alpha in rows 64..111 of one extra 128-row tile (zero rows elsewhere), so
 /// each beta/alpha half is one pair of wave row groups.
@@ -231,8 +234,10 @@ pub const GDN_KERNARG_BYTES: u32 = 120;
 /// (`d` and the converted `sc`): the symmetric fold reads nothing else.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
-    pub a: [u32; 2],
-    pub w: [u32; 2],
+    /// Payload slab slots (A, W). A depth-2 layout has two, a depth-3 layout three;
+    /// the unused entry is `u32::MAX` (the typed ring never names it).
+    pub a: [u32; 3],
+    pub w: [u32; 3],
     pub ds: [u32; 2],
     pub sz: [u32; 2],
     pub a_bytes: u32,
@@ -240,7 +245,12 @@ pub struct Layout {
     pub ds_bytes: u32,
     pub sz_bytes: u32,
     pub end: u32,
+    /// Dynamic LDS bytes a launch passes: the depth-2 size at every ring depth, so
+    /// the product launcher's constant stays correct for a depth-3 object.
     pub launch: u32,
+    /// Static LDS the kernel declares (`group_segment_fixed_size`): 0 at depth
+    /// 2; at depth 3 the third A/W slab, so `fixed + launch` covers `end`.
+    pub fixed: u32,
 }
 
 impl Tile {
@@ -274,34 +284,67 @@ impl Tile {
         self.threads() / 4
     }
     pub fn layout(self) -> Layout {
+        self.layout_for(RingDepth::Two)
+    }
+    /// The LDS layout of the payload rings at `ring` depth. Depth 3 appends a
+    /// third A/W slab after the depth-2 pair and moves the metadata planes
+    /// behind it; the depth-2 layout is the shipped one, unchanged.
+    pub fn layout_for(self, ring: RingDepth) -> Layout {
         let a_bytes = self.tokens() * 32;
         let w_bytes = self.rows() * 32;
-        match self {
+        let slab = a_bytes + w_bytes;
+        let (a, w, ds, sz, ds_bytes, sz_bytes, end, launch) = match self {
             // A0 W0 | A1 W1 | DS0 DS1 | SZ0 SZ1. The two DS planes are adjacent so
             // one d address reaches both with ds_load_2addr_b32 offsets.
-            Self::T128x128x8 => Layout {
-                a: [0, 8192],
-                w: [4096, 12288],
-                ds: [16384, 16896],
-                sz: [17408, 17920],
+            Self::T128x128x8 => (
+                [0, 8192, u32::MAX],
+                [4096, 12288, u32::MAX],
+                [16384, 16896],
+                [17408, 17920],
+                512,
+                512,
+                18432,
+                20480,
+            ),
+            Self::T256x128x16 => (
+                [0, 12288, u32::MAX],
+                [4096, 16384, u32::MAX],
+                [24576, 25088],
+                [25600, 26624],
+                512,
+                1024,
+                27648,
+                30720,
+            ),
+        };
+        match ring {
+            RingDepth::Two => Layout {
+                a,
+                w,
+                ds,
+                sz,
                 a_bytes,
                 w_bytes,
-                ds_bytes: 512,
-                sz_bytes: 512,
-                end: 18432,
-                launch: 20480,
+                ds_bytes,
+                sz_bytes,
+                end,
+                launch,
+                fixed: 0,
             },
-            Self::T256x128x16 => Layout {
-                a: [0, 12288],
-                w: [4096, 16384],
-                ds: [24576, 25088],
-                sz: [25600, 26624],
+            // A0 W0 | A1 W1 | A2 W2 | DS0 DS1 | SZ0 SZ1: the metadata planes
+            // keep their offsets relative to each other, one slab later.
+            RingDepth::Three => Layout {
+                a: [a[0], a[1], a[1] + slab],
+                w: [w[0], w[1], w[1] + slab],
+                ds: ds.map(|o| o + slab),
+                sz: sz.map(|o| o + slab),
                 a_bytes,
                 w_bytes,
-                ds_bytes: 512,
-                sz_bytes: 1024,
-                end: 27648,
-                launch: 30720,
+                ds_bytes,
+                sz_bytes,
+                end: end + slab,
+                launch,
+                fixed: slab,
             },
         }
     }
@@ -526,6 +569,75 @@ impl Spec {
         }
         s
     }
+    /// The LDS layout of this spec's payload rings (`Tune::ring`).
+    pub fn layout(self) -> Layout {
+        self.tile.layout_for(self.tune.ring)
+    }
+    /// Dynamic LDS bytes a launch of this spec must pass: the depth-2 size at
+    /// every ring depth (20480 for the 128x128x8 tile), so the product
+    /// launcher's constant is right for a depth-3 object too.
+    pub fn lds_launch(self) -> u32 {
+        self.layout().launch
+    }
+    /// Static LDS the kernel declares (`group_segment_fixed_size`): 0 at ring
+    /// depth 2, the third A/W slab at depth 3.
+    pub fn lds_fixed(self) -> u32 {
+        self.layout().fixed
+    }
+    /// LDS one workgroup holds: static plus dynamic.
+    pub fn lds_total(self) -> u32 {
+        let l = self.layout();
+        l.fixed + l.launch
+    }
+    /// What ring depth 3 asks of the machine for this spec, `Err` (with the
+    /// numbers) where it does not fit: the second prefetch set in the VGPRs
+    /// depth 3 frees, the VGPR occupancy ceiling, and the LDS of the third A/W
+    /// slab per workgroup and per WGP at the occupancy [`VGPR_CEILING`] keeps.
+    fn validate_ring3(self) -> Result<(), String> {
+        if self.mma.is_sparse() {
+            return Err(format!(
+                "ring depth 3 is generated for the dense K-loop block only (mma axis is {}): \
+                 the depth-3 schedule (`ring3.rs`, `const RING = 3`) composes the dense fine steps; \
+                 the sparse fine steps have no depth-3 composition yet",
+                self.mma.name()
+            ));
+        }
+        if self.epi == Epi::QkvzaGdn {
+            return Err(
+                "ring depth 3 is not generated for the fused GDN projection: its epilogue \
+                 re-lays out the K-loop's LDS (`gdn_epilogue`, ring bytes vs the launch size) and \
+                 the depth-3 map is not handled there"
+                    .into(),
+            );
+        }
+        let pf_set = 2 * (self.tile.a_rounds() + self.tile.w_rounds());
+        if pf_set > 8 {
+            return Err(format!(
+                "ring depth 3 needs a second prefetch set of {pf_set} VGPRs, but only the 8 freed \
+                 by seeding the accumulators in cacc[3][1] instead of magic8 are available"
+            ));
+        }
+        let vgprs = super::Gen::build(self).vgprs();
+        if vgprs > VGPR_CEILING {
+            return Err(format!(
+                "ring depth 3 needs {vgprs} VGPRs, the occupancy ceiling is {VGPR_CEILING}"
+            ));
+        }
+        let (end, total) = (self.layout().end, self.lds_total());
+        let per_wgp = if self.tile.waves() == 8 { 4 } else { 2 };
+        if end > total || total > LDS_PER_WORKGROUP || total * per_wgp > LDS_PER_WGP {
+            return Err(format!(
+                "ring depth 3 needs {end} B of LDS per workgroup ({total} B launched: {} B static \
+                 + {} B dynamic; {} B for the {per_wgp} workgroups per WGP the {VGPR_CEILING}-VGPR \
+                 ceiling allows); the budget is {LDS_PER_WORKGROUP} B per workgroup and \
+                 {LDS_PER_WGP} B per WGP",
+                self.lds_fixed(),
+                self.lds_launch(),
+                total * per_wgp
+            ));
+        }
+        Ok(())
+    }
     /// Reject combinations that have no generator: closed fold tracks, the
     /// dropped second accumulator set, and non-gfx12 targets.
     pub fn validate(self) -> Result<(), String> {
@@ -595,12 +707,7 @@ impl Spec {
             );
         }
         if self.tune.ring == RingDepth::Three {
-            return Err(
-                "ring depth 3 has no generator: the typed LDS core has only two-buffer rings \
-                 (peacemaker-author Ring) and a 4-slab K-loop trip cannot rotate three slots \
-                 through immediate LDS addresses (a 12-slab period would be needed)"
-                    .into(),
-            );
+            self.validate_ring3()?;
         }
         if self.tune.wait != WaitPlace::AfterMma && self.mma.is_sparse() {
             return Err(format!(
