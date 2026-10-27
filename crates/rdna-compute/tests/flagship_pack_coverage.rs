@@ -126,7 +126,16 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
             emb,
             "{route}: embedded row count differs from the measured audit"
         );
-        assert!(hip > 40, "{route}: implausibly small measured set");
+        let measured = match route {
+            "27b-ar" => (64, 9),
+            "27b-dflash-default" => (59, 7),
+            "27b-mtp" => (92, 10),
+            "fn-ar" => (68, 4),
+            "fn-mtp" => (69, 4),
+            "a3b-ar" => (37, 10),
+            _ => unreachable!(),
+        };
+        assert_eq!((hip, emb), measured, "{route}: measured set changed");
         let unique: BTreeSet<(&str, &str)> = mine
             .iter()
             .map(|r| (r.kind.as_str(), r.module.as_str()))
