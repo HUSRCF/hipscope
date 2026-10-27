@@ -223,7 +223,12 @@ fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
         (
             "gfx1151",
             FLAGSHIP_1151,
-            &[("27b-ar", 41), ("27b-dflash-default", 59), ("27b-mtp", 58)],
+            &[
+                ("27b-ar", 41),
+                ("27b-dflash-default", 59),
+                ("27b-mtp", 58),
+                ("a3b-ar-iu4off", 55),
+            ],
         ),
         (
             "gfx1100",
@@ -234,6 +239,7 @@ fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
                 ("27b-mtp", 65),
                 ("fn-ar", 30),
                 ("fn-mtp", 36),
+                ("a3b-ar-iu4off", 53),
             ],
         ),
     ];

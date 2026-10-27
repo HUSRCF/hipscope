@@ -2493,6 +2493,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_bf16_xf32_multirow_rows3",
             ]
         );
+        // A3B mq4rs on gfx1100/gfx1151 with the explicit HIPFIRE_MOE_SYM_IU4=0
+        // opt-in (qt53 F32 prefill fallback) launches the generic multirow
+        // MoE down kernel (`MoeDownKernel::Multirow`); measured as the only
+        // hipcc-compiled module of that route on both archs.
+        if matches!(arch, "gfx1100" | "gfx1151") {
+            add!(
+                "gemm_mq4g128v2_moe_grouped_top10_multirow",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC,
+                ["gemm_mq4g128v2_moe_grouped_top10_multirow"]
+            );
+        }
         add!(
             "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
             kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC,
