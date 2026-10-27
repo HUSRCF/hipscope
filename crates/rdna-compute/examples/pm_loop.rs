@@ -9,8 +9,10 @@
 //! ```text
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
 //!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
-//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
+//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
+//!         (--offline: stop after step 2 below, no device opened, record `offline: true`; the
+//!          legality screen of `pm-census tune run`; not qwen4_moe_verify)
 //!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
 //!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm; not qwen4_moe_verify)
 //! ```
