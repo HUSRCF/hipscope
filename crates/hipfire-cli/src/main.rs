@@ -9813,8 +9813,11 @@ pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
             return Some(path);
         }
     }
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    find_daemon_in(paths, &workspace, cfg!(windows))
+    find_daemon_in(paths, exe_dir.as_deref(), &workspace, cfg!(windows))
 }
 
 /// Daemon binary name candidates, most preferred first.
@@ -9833,11 +9836,21 @@ fn daemon_bin_names(windows: bool) -> &'static [&'static str] {
 }
 
 /// Candidate lookup shared by [`find_daemon`] and its platform-shaped tests:
-/// probe the install root (`~/.hipfire/bin/`) and the source-tree target dir
-/// (`release/`, then `debug/`), in that order, for each candidate name.
-fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> Option<PathBuf> {
+/// probe the directory of the running executable (`exe_dir`, so an extracted
+/// binary archive finds its own `bin/daemon` from anywhere), the install root
+/// (`~/.hipfire/bin/`) and the source-tree target dir (`release/`, then
+/// `debug/`), in that order, for each candidate name.
+fn find_daemon_in(
+    paths: &Paths,
+    exe_dir: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+    windows: bool,
+) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for name in daemon_bin_names(windows) {
+        if let Some(dir) = exe_dir {
+            candidates.push(dir.join(name));
+        }
         candidates.push(paths.root.join("bin").join(name));
         candidates.push(workspace.join("release").join(name));
         candidates.push(workspace.join("debug").join(name));
@@ -11233,7 +11246,7 @@ mod tests {
         let workspace = paths.root.join("target");
         fs::create_dir_all(&workspace).unwrap();
         assert_eq!(
-            find_daemon_in(&paths, &workspace, true),
+            find_daemon_in(&paths, None, &workspace, true),
             Some(bin.join("daemon.exe"))
         );
         fs::remove_dir_all(&paths.root).unwrap();
@@ -11249,7 +11262,7 @@ mod tests {
         let workspace = paths.root.join("target");
         fs::create_dir_all(&workspace).unwrap();
         assert_eq!(
-            find_daemon_in(&paths, &workspace, true),
+            find_daemon_in(&paths, None, &workspace, true),
             Some(bin.join("daemon"))
         );
         fs::remove_dir_all(&paths.root).unwrap();
@@ -11267,7 +11280,7 @@ mod tests {
         fs::create_dir_all(workspace.join("release")).unwrap();
         fs::write(workspace.join("release").join("daemon.exe"), b"dev").unwrap();
         assert_eq!(
-            find_daemon_in(&paths, &workspace, true),
+            find_daemon_in(&paths, None, &workspace, true),
             Some(bin.join("daemon.exe"))
         );
         fs::remove_dir_all(&paths.root).unwrap();
@@ -11282,8 +11295,45 @@ mod tests {
         fs::write(release.join("daemon"), b"").unwrap();
         let workspace = paths.root.join("target");
         assert_eq!(
-            find_daemon_in(&paths, &workspace, false),
+            find_daemon_in(&paths, None, &workspace, false),
             Some(release.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_prefers_daemon_beside_the_executable_over_hipfire_home() {
+        // A prebuilt archive (bin/hipfire + bin/daemon) works from any
+        // directory: the sibling daemon wins over ~/.hipfire/bin and the
+        // source tree, and is found under either spelling on Windows.
+        let paths = test_paths("daemon-beside-exe");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon"), b"install").unwrap();
+        let archive = paths.root.join("archive").join("bin");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("daemon"), b"beside").unwrap();
+        fs::write(archive.join("daemon.exe"), b"beside").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, Some(&archive), &workspace, false),
+            Some(archive.join("daemon"))
+        );
+        assert_eq!(
+            find_daemon_in(&paths, Some(&archive), &workspace, true),
+            Some(archive.join("daemon.exe"))
+        );
+        // No sibling daemon: falls through to the hipfire home.
+        let empty = paths.root.join("elsewhere");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, Some(&empty), &workspace, false),
+            Some(bin.join("daemon"))
+        );
+        assert_eq!(
+            find_daemon_in(&paths, None, &workspace, false),
+            Some(bin.join("daemon"))
         );
         fs::remove_dir_all(&paths.root).unwrap();
     }
