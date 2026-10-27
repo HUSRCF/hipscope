@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Release: prebuilt Linux ROCm binary archives (`hipfire-<tag>-linux-rocm-<arch>-x64.tar.gz` + `.sha256`, gfx1151 / gfx1201 / gfx1100) are attached to the release.** `scripts/build-binary-archive.sh` builds the CLI and daemon once from the tag in the release image (same toolchain as the kernel packs), strips both binaries (~100 MB unstripped each), and packs `bin/hipfire`, `bin/daemon`, `bin/kernels/compiled/<arch>/` (the pack's kernels, SHA-256 checked), `LICENSE` and `NOTICE` into a reproducible tarball. The HIP runtime is not bundled; the host needs ROCm.
+
 ## v0.4.4 — 2026-10-27
 
 - **Developer: Qwen3.5 AR hipGraph / Redline replay refuses int8, int8c and hfq4 KV caches (HIPF-192).** `attention_int8c_f16_kv` / `attention_int8_kv` / `attention_hfq4_kv` size their block and LDS (`scores[seq_len]`) from the host `seq_len`, which a replay freezes at the capture position, so per-token decode past ~256-511 positions went degenerate (one argmax every position). `ar_graph_eligible_for_kv` now refuses those tiers, which then decode eagerly. No `KvMode` builds these tiers, so production routes are unaffected; contributor-measured on gfx1151 qwen3.5-9b.mq4 int8c/int8 at 600 rows: logits bitwise equal to `HIPFIRE_GRAPH=0 HIPFIRE_AR_GRAPH=0`. (#1004, @fivetide)
