@@ -1783,10 +1783,14 @@ pub fn new_with_cand_object(
 
 /// Unmapped bytes between the exact-size buffers of an emulator-gate run (the gate demands >= 64 KiB).
 const EMU_GUARD: u64 = 0x2_0000;
-/// Tiny shapes of the emulator gate: an aligned and a ragged token count (grouped rows pad to 16 per expert).
-const EMU_GATE_SHAPES: [(&str, &str); 2] = [
+/// Shapes of the emulator gate: an aligned and a ragged token count (grouped rows pad to 16 per expert) at a tiny K
+/// (gate_up K=512 / 4 epochs, down K=128 / 1 epoch) and at the production K (H=2560, I=640: gate_up K=2560 / 20
+/// epochs, down K=640 / 5 epochs), so K-specialised paths (e.g. an epoch-count guard) are emulated too. ALL must pass.
+const EMU_GATE_SHAPES: [(&str, &str); 4] = [
     ("tiny", "E=2,TOP=2,T=20,H=512,I=128"),
     ("ragged", "E=2,TOP=2,T=37,H=512,I=128"),
+    ("prod", "E=2,TOP=2,T=20,H=2560,I=640"),
+    ("prod_ragged", "E=2,TOP=2,T=37,H=2560,I=640"),
 ];
 
 /// One emulated arm of the gate: output bytes and counters.
