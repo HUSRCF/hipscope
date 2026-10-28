@@ -2143,6 +2143,53 @@ impl HipRuntime {
         Ok(buf.with_charge(token))
     }
 
+    /// Allocate fine-grained device VRAM (`hipDeviceMallocFinegrained`, 0x1
+    /// in the installed `hip_runtime_api.h`) through the optional
+    /// `hipExtMallocWithFlags` entry. Kernels on the owning device and on
+    /// peers with access enabled see system-scope stores and loads of this
+    /// memory coherently without a kernel boundary. Allocate before enabling
+    /// peer access so the peer mapping covers it. Success alone does not
+    /// qualify the memory; callers still run a publication probe.
+    pub fn malloc_peer_finegrained(&self, size: usize) -> HipResult<DeviceBuffer> {
+        self.plan_deny("hipMalloc(finegrained)")?;
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.malloc_finegrained_raw(size);
+        };
+        let (buf, token) = crate::emu_budget::charged_alloc(
+            &budget,
+            crate::emu_budget::Class::Device,
+            size,
+            || self.malloc_finegrained_raw(size),
+        )?;
+        Ok(buf.with_charge(token))
+    }
+
+    fn malloc_finegrained_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
+        const HIP_DEVICE_MALLOC_FINEGRAINED: c_uint = 0x1;
+        let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
+            return Err(HipError::new(
+                0,
+                "hipExtMallocWithFlags unavailable; fine-grained VRAM is unsupported",
+            ));
+        };
+        let mut ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: FFI out-params are stack locals with valid writable provenance;
+        // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
+        let code = unsafe { ext_malloc(&mut ptr, size, HIP_DEVICE_MALLOC_FINEGRAINED) };
+        self.check(code, "hipExtMallocWithFlags(hipDeviceMallocFinegrained)")?;
+        crate::registry::record(
+            ptr as usize,
+            size,
+            crate::registry::AllocationKind::FineGrained,
+        );
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+            token: None,
+        })
+    }
+
     fn malloc_signal_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
         let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {

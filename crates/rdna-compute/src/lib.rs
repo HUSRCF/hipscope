@@ -127,6 +127,7 @@ pub use scratch::{
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
+pub mod tp_peer_push;
 pub mod trunk_mask;
 pub mod uma_memory;
 pub mod vae;

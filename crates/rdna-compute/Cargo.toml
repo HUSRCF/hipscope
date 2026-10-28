@@ -1171,3 +1171,14 @@ required-features = ["lab"]
 [[example]]
 name = "railgun_copy_fill_oracle"
 required-features = ["lab"]
+
+# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
+# (two gfx1201 cards); `--features lab`.
+[[example]]
+name = "tp_peer_push_probe"
+required-features = ["lab"]
+
+# TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
+[[example]]
+name = "tp_peer_pushn_probe"
+required-features = ["lab"]

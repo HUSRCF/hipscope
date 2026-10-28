@@ -1188,12 +1188,31 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp2-graph-fused-reduce",
         predicates: &[CaptureMode],
-        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp_graph_signal_reduce_gfx1100` (hipfire-runtime multi_gpu.rs)",
+        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp2_peer_push_reduce_gfx1201` on a gfx1201 pair once the load-time peer-push qualification passed (`HIPFIRE_TP_PEER_PUSH=0` and any gfx1100 pair use `tp_graph_signal_reduce_gfx1100`) (hipfire-runtime multi_gpu.rs)",
         effect: KernelSelection,
-        switches: "captured: one fused signal barrier + coherent payload exchange + residual add kernel per rank; eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
-        kernels: &["tp_graph_signal_reduce_gfx1100", "add_peer_residual_f32"],
+        switches: "captured: one fused peer exchange + residual add kernel per rank (gfx1201: tagged peer-VRAM granules; otherwise signal barrier + coherent payload exchange); eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
+        kernels: &[
+            "tp2_peer_push_reduce_gfx1201",
+            "tp_graph_signal_reduce_gfx1100",
+            "add_peer_residual_f32",
+        ],
         verdict: ByteExact,
-        evidence: "both kernels compute `x + (p0 + p1)` per element in rank order with fp32 adds only (no contraction), from the same partial bytes; the payload exchange copies bits; `tp2_cross_device_graph_reduce` (lab) checks exact results on every replay; multi-GPU TP is not a default program",
+        evidence: "all three kernels compute `x + (p0 + p1)` per element in rank order with fp32 adds only (no contraction), from the same partial bytes; the payload exchange copies bits (the peer-push kernel tags every 8-byte half with the generation and folds only granules whose tags match); `tp2_cross_device_graph_reduce` (lab) checks exact results on every replay; multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp4-graph-peer-push-reduce16",
+        predicates: &[CaptureMode],
+        condition: "peer_reduce (hipfire-runtime multi_gpu/executor.rs): decode `AllReduceAdd` on 3 or 4 gfx1201 ranks, bf16 exchange, every rank capturing (the TP3/TP4 whole-token graph: `HIPFIRE_TP_FULL_GRAPH` default on, `HIPFIRE_TP_PEER_PUSH=0` and `HIPFIRE_TP_FULL_GRAPH=0` off) with the load-time peer-push qualification passed → `tp_peer_pushn_reduce_bf16_gfx1201`",
+        effect: KernelSelection,
+        switches: "captured: one bf16 peer-push kernel per rank (tagged 16-byte granules in the peers' fine-grained VRAM, device-resident generations); eager: `tp_pack16_bf16` + peer copies + event record/wait + `tp_fold16_bf16`",
+        kernels: &[
+            "tp_peer_pushn_reduce_bf16_gfx1201",
+            "tp_pack16_bf16",
+            "tp_fold16_bf16",
+        ],
+        verdict: ByteExact,
+        evidence: "both routes compute `x + (r(p0) + r(p1) + ... + r(p_{n-1}))` per element, r = the shared round-to-nearest-even bf16 round trip of kernels/src/tp_exchange16.h applied to every rank's term (the rank's own included), left-associated in rank order with fp32 adds only; the peer-push kernel accepts a granule only when both 8-byte halves carry the current generation. The load qualifies it with 64 exchanges compared bit for bit with a host replay and greedy token IDs match the eager route on 3 prompts; multi-GPU TP is not a default program",
         reaches: &[],
     },
     Decision {
@@ -2499,6 +2518,12 @@ pub const SITES: &[Site] = &[
         function: "abort_rank_graph_captures",
         occurrences: 2,
         decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu/executor.rs",
+        function: "peer_reduce",
+        occurrences: 1,
+        decisions: &["tp4-graph-peer-push-reduce16"],
     },
     Site {
         file: "hipfire-runtime/src/multi_gpu.rs",

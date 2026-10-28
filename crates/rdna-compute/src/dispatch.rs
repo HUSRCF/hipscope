@@ -1623,6 +1623,9 @@ pub struct Gpu {
     /// device address. Read after each step by
     /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
     device_wait: Option<crate::device_wait::DeviceWaitMapping>,
+    /// Device wait timeouts read (and so cleared) since the multi-GPU step
+    /// check last collected them; see [`Gpu::take_unreported_device_wait_timeouts`].
+    device_wait_unreported: std::sync::atomic::AtomicU32,
     /// Host-mapped router non-finite fault word (`crate::router_fault`), allocated
     /// at `Gpu` init and kept for the `Gpu`'s lifetime because captured graphs bake
     /// in its device address. Folded into [`Gpu::take_device_wait_error`].
@@ -2898,6 +2901,7 @@ impl Gpu {
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
+            device_wait_unreported: std::sync::atomic::AtomicU32::new(0),
             router_fault: None,
             active_stream: None,
             last_kernel: None,
@@ -6902,9 +6906,24 @@ impl Gpu {
     /// with this.
     pub fn take_device_wait_timeout(&self) -> Option<crate::device_wait::DeviceWaitTimeout> {
         // bind_thread: skip — reads host memory only, touches no device state.
-        self.device_wait
+        let timeout = self
+            .device_wait
             .as_ref()
-            .and_then(|mapping| mapping.take(self.device_id))
+            .and_then(|mapping| mapping.take(self.device_id));
+        if timeout.is_some() {
+            self.device_wait_unreported
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        timeout
+    }
+
+    /// Timeouts this GPU's wait block reported since the last call, whoever
+    /// read them: a `download_*` reader clears the record on its own rank, so
+    /// the multi-GPU step check (`Gpus::take_device_wait_errors`) would
+    /// otherwise never learn the step failed and skip the TP state reset.
+    pub fn take_unreported_device_wait_timeouts(&self) -> u32 {
+        self.device_wait_unreported
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Fail if a bounded device spin wait on this GPU stopped on its deadline

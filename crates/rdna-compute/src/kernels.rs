@@ -10527,6 +10527,22 @@ pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip")
 );
 
+/// Exact gfx1201 TP2 graph-resident residual reduction through tagged peer-VRAM
+/// granules (fine-grained mailbox, system-scope b128 push and poll, bounded
+/// wait).
+pub const TP_PEER_PUSH_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp2_peer_push.gfx1201.hip")
+);
+
+/// Exact gfx1201 TP3/TP4 graph-resident residual reduction with a bf16 exchange
+/// through tagged peer-VRAM granules (bounded wait).
+pub const TP_PEER_PUSHN_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp_exchange16.h"),
+    include_str!("../../../kernels/src/tp_peer_pushn.gfx1201.hip")
+);
+
 /// 16-bit partial-sum exchange for the dense TP residual reduction
 /// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
 /// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit

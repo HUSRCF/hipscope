@@ -5807,6 +5807,14 @@ fn load_model_tp_qwen35_mesh(
             eprintln!(
                 "[loader] dense qwen {arch} mesh TP2 whole-token graph signal tape: {barriers} barriers"
             );
+        } else if staging
+            .gpus_mut()
+            .prepare_tp_push_whole_token_graph(config.dim * std::mem::size_of::<f32>())
+        {
+            let arch = staging.gpus_mut().devices[0].arch.clone();
+            eprintln!(
+                "[loader] dense qwen {arch} mesh TP{tp} whole-token graph peer-push mailboxes: {barriers} collectives"
+            );
         }
     }
     staging
