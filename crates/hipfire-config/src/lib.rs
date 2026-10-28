@@ -4073,6 +4073,7 @@ pub fn is_developer_key(key: &str) -> bool {
 const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_d2_default",
+    "developer.qwen4_mtp_head_d2",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
     "developer.gdn_qk_indexed",
@@ -7080,6 +7081,22 @@ mod tests {
         for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             assert_eq!(
                 typed_developer_bool_value(SYM_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_mtp_head_d2_is_a_typed_bool_developer_key_with_the_d2_default_spellings() {
+        const KEY: &str = "developer.qwen4_mtp_head_d2";
+        const ENV: &str = "HIPFIRE_QWEN4_MTP_HEAD_D2";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
                 Some(want),
                 "{raw}"
             );
@@ -10436,6 +10453,15 @@ pub mod memory {
     /// `memory.offload_exec` still wins over every value.
     pub fn qwen4_d2_default() -> Option<bool> {
         super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
+    }
+
+    /// `developer.qwen4_mtp_head_d2` (env `HIPFIRE_QWEN4_MTP_HEAD_D2`), a typed
+    /// boolean read once per load by the native MTP head attach: `Some(true)`
+    /// arms the head's routed experts with a rows=1 D2 CPU split executor when
+    /// the trunk's D2 is armed on the same load, `Some(false)` never arms it
+    /// (the kill), `None` (unset) leaves the head on the GPU route.
+    pub fn qwen4_mtp_head_d2() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
     }
 
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU

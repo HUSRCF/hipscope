@@ -3242,6 +3242,7 @@ impl Qwen4MoeLayerRuntime {
             true,
             d2_default,
             crate::expert_tier_owners::ExpertReadView::BorrowPrefill(class),
+            false,
         )
     }
 
@@ -3265,6 +3266,7 @@ impl Qwen4MoeLayerRuntime {
             true,
             d2_default,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
@@ -3275,6 +3277,7 @@ impl Qwen4MoeLayerRuntime {
         moe: &MoeWeights,
         layer_label: usize,
         config: &Qwen4Config,
+        head_split: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::build(
             gpu,
@@ -3287,6 +3290,7 @@ impl Qwen4MoeLayerRuntime {
             false,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            head_split,
         )
     }
 
@@ -3330,6 +3334,7 @@ impl Qwen4MoeLayerRuntime {
             true,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
@@ -3359,6 +3364,7 @@ impl Qwen4MoeLayerRuntime {
             true,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
@@ -3377,6 +3383,7 @@ impl Qwen4MoeLayerRuntime {
         allow_tiers: bool,
         d2_default: bool,
         read_view: crate::expert_tier_owners::ExpertReadView,
+        head_split: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -3937,13 +3944,15 @@ impl Qwen4MoeLayerRuntime {
             None => whole_layer.then_some(cpu_splice::SplitOwnerKind::WholeLayer),
         };
         let split_admission = cpu_splice::CpuSplitAdmission {
-            enabled: (if tier_layer.is_some() {
-                explicit_cpu_split || d2_default
-            } else {
-                d2_default
-            }) && allow_tiers
-                && layer_label < config.num_hidden_layers
-                && kept_ids.is_none(),
+            enabled: d2_split_enabled(
+                tier_layer.is_some(),
+                explicit_cpu_split,
+                d2_default,
+                allow_tiers,
+                layer_label < config.num_hidden_layers,
+                kept_ids.is_none(),
+                head_split,
+            ),
             kind: split_kind,
             bound_hotset: tier_layer
                 .as_ref()
@@ -4067,7 +4076,15 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        runtime.attach_cpu_split(gpu, config)
+        runtime.attach_cpu_split(
+            gpu,
+            config,
+            if head_split {
+                1
+            } else {
+                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
+            },
+        )
     }
 
     /// Create the layer's D2 split executor from its cold-expert owner's
@@ -4078,6 +4095,7 @@ impl Qwen4MoeLayerRuntime {
         mut self,
         gpu: &mut Gpu,
         config: &Qwen4Config,
+        rows: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let Some(placement) = self
             .cpu_cold_owners
@@ -4105,15 +4123,7 @@ impl Qwen4MoeLayerRuntime {
         let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
-        let built = self.new_split_executor(
-            gpu,
-            config,
-            &placement,
-            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
-            request,
-            ready,
-            join,
-        );
+        let built = self.new_split_executor(gpu, config, &placement, rows, request, ready, join);
         match built {
             Ok(executor) => {
                 self.cpu_split = Some(executor);
@@ -4517,7 +4527,7 @@ impl Qwen4MoeLayerRuntime {
         }
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
-        runtime.attach_cpu_split(gpu, config)
+        runtime.attach_cpu_split(gpu, config, hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
     }
 
     /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor
@@ -9363,6 +9373,16 @@ impl Qwen4GpuForward {
     /// storage). Tests pass `lab_armed` explicitly instead of reading it here.
     pub(crate) fn cpu_lab_override_present(gpu: &Gpu) -> bool {
         rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&gpu.arch)
+    }
+
+    /// The S1 admission verdict of every trunk MoE layer, `(label, verdict)`
+    /// in layer order: the head's runtime is never in this list.
+    pub(crate) fn s1_layer_verdicts(&self) -> Vec<(usize, Result<(), &'static str>)> {
+        self.moe
+            .iter()
+            .flatten()
+            .map(|layer| (layer.label, layer.s1_layer_check()))
+            .collect()
     }
 
     /// Minimum allocated executor capacity across armed split layers (`0`
@@ -15220,6 +15240,70 @@ mod ep_table_tests {
         };
         let text = message(entries(&layout_null, null[0]));
         assert!(text.contains("null"), "{text}");
+    }
+}
+
+/// Split-admission `enabled` decision of one layer build. Trunk layers need
+/// the load's D2 default (or the explicit `cpu` mode for tier layers) on a
+/// tier-capable build; the native MTP head (`head_split`, untiered and never
+/// D1) is armed by its own knob and is still refused when a keep mask prunes
+/// its experts.
+pub(crate) fn d2_split_enabled(
+    tier: bool,
+    explicit_cpu_split: bool,
+    d2_default: bool,
+    allow_tiers: bool,
+    label_in_trunk: bool,
+    kept_none: bool,
+    head_split: bool,
+) -> bool {
+    ((if tier {
+        explicit_cpu_split || d2_default
+    } else {
+        d2_default
+    }) && allow_tiers
+        && label_in_trunk
+        || head_split)
+        && kept_none
+}
+
+#[cfg(test)]
+mod d2_split_enabled_tests {
+    use super::d2_split_enabled;
+
+    /// The trunk formula, verbatim from before the head knob existed.
+    fn trunk(tier: bool, explicit: bool, d2: bool, allow: bool, label: bool, kept: bool) -> bool {
+        (if tier { explicit || d2 } else { d2 }) && allow && label && kept
+    }
+
+    #[test]
+    fn trunk_admission_is_unchanged_for_every_input_without_the_head_knob() {
+        for bits in 0..64u32 {
+            let b = |n: u32| bits & (1 << n) != 0;
+            assert_eq!(
+                d2_split_enabled(b(0), b(1), b(2), b(3), b(4), b(5), false),
+                trunk(b(0), b(1), b(2), b(3), b(4), b(5)),
+                "{bits:06b}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_arms_without_the_trunk_gates_and_a_pruned_head_is_refused() {
+        // Today's head: untiered, D1-free, no D2 default, not a trunk label.
+        assert!(!d2_split_enabled(
+            false, false, false, false, false, true, false
+        ));
+        assert!(d2_split_enabled(
+            false, false, false, false, false, true, true
+        ));
+        assert!(!d2_split_enabled(
+            false, false, false, false, false, false, true
+        ));
+        // The knob never un-refuses a keep-masked trunk-shaped layer either.
+        assert!(!d2_split_enabled(
+            false, true, true, true, true, false, true
+        ));
     }
 }
 

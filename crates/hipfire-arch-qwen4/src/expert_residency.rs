@@ -1317,7 +1317,7 @@ pub fn native_mtp_census_scope(
     let head_dtype = language_head_dtype(weights)
         .ok_or_else(|| "native MTP census: manifest has no language head".to_string())?;
     let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype, false)
             .ok_or_else(|| overflow("head"))?;
     let request = crate::mtp_spec::native_mtp_request_bytes(
         config,
@@ -1973,7 +1973,7 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
         let row_capture =
             crate::mtp_spec::native_mtp_capture(gpu, config, state_format.gdn, drafts);
         let (resident, build_scratch) =
-            crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(config, &census_context, head)
+            crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(config, &census_context, head, false)
                 .ok_or_else(|| "native MTP head allocation sizes overflow".to_string())?;
         let request = crate::mtp_spec::native_mtp_request_allocation_sizes(
             config,
@@ -6330,7 +6330,7 @@ mod tests {
         // its verify rows and GDN capture: the reserve holds the larger phase
         // on top of what the head keeps, not both.
         let (resident, scratch) =
-            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, &measured, DType::MQ6G256V2)
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, &measured, DType::MQ6G256V2, false)
                 .unwrap();
         let (resident, scratch) = (resident as u64, scratch as u64);
         assert_eq!(
@@ -6469,7 +6469,7 @@ mod tests {
         // Native MTP's one F32 QSA layer: the VMM head charges its first
         // chunk's pages instead of the full legacy arenas.
         let mtp = |context: &crate::Qwen4ContextCommit| {
-            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2)
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2, false)
                 .unwrap()
                 .0
         };
@@ -6489,7 +6489,7 @@ mod tests {
         let chunk = AUTO_VRAM_RESERVE_CHUNK;
         let granularity = 2 << 20;
         let mtp = |context: &Commit| {
-            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2)
+            crate::mtp_gpu::Qwen4MtpGpu::device_bytes(&config, context, DType::MQ6G256V2, false)
                 .unwrap()
                 .0
         };

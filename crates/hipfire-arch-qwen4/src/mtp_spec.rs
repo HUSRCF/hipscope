@@ -10481,7 +10481,7 @@ pub fn native_mtp_device_bytes(
         batched_fill,
     )?;
     let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype, false)?;
     u64::try_from(resident)
         .ok()?
         .checked_add(u64::try_from(scratch).ok()?.max(request))
@@ -10708,7 +10708,7 @@ mod tests {
                 fill,
             )?;
             let (mut sizes, scratch) =
-                crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head)?;
+                crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head, false)?;
             sizes.extend(
                 if scratch.iter().sum::<u64>() > request.iter().sum::<u64>() {
                     scratch
