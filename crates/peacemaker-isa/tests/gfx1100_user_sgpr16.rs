@@ -199,13 +199,16 @@ fn every_committed_gfx1100_pm_object_declares_sixteen_user_and_system_sgprs() {
                 continue;
             };
             kernels += 1;
-            if let Err(e) = Arch::Gfx1100
-                .check_user_system_sgprs(&k.symbol.0, descriptor.compute_pgm_rsrc2.0)
+            if let Err(e) =
+                Arch::Gfx1100.check_user_system_sgprs(&k.symbol.0, descriptor.compute_pgm_rsrc2.0)
             {
                 bad.push(format!("{}: {e}", path.display()));
             }
         }
     }
-    assert!(objects >= 13 && kernels >= 30, "{objects} objects {kernels} kernels");
+    assert!(
+        objects >= 13 && kernels >= 30,
+        "{objects} objects {kernels} kernels"
+    );
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

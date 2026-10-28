@@ -463,11 +463,7 @@ fn map_sgprs(text: &str, f: impl Fn(u32) -> u32) -> String {
         } else if starts && text[i..].starts_with("s[") {
             let close = i + text[i..].find(']').unwrap();
             let (lo, hi) = text[i + 2..close].split_once(':').unwrap();
-            out += &format!(
-                "s[{}:{}]",
-                f(lo.parse().unwrap()),
-                f(hi.parse().unwrap())
-            );
+            out += &format!("s[{}:{}]", f(lo.parse().unwrap()), f(hi.parse().unwrap()));
             i = close + 1;
             continue;
         }
@@ -491,9 +487,13 @@ fn arch_neutral(text: &str, arch: Arch, e8p: bool) -> String {
         .filter(|l| l.trim() != TRANS_WAIT)
         .map(|l| {
             let t = l.trim();
-            match [".amdhsa_user_sgpr_count", ".amdhsa_next_free_sgpr", ".sgpr_count:"]
-                .into_iter()
-                .find(|d| t.starts_with(d))
+            match [
+                ".amdhsa_user_sgpr_count",
+                ".amdhsa_next_free_sgpr",
+                ".sgpr_count:",
+            ]
+            .into_iter()
+            .find(|d| t.starts_with(d))
             {
                 Some(d) => format!("{d} N"),
                 None => l.to_owned(),

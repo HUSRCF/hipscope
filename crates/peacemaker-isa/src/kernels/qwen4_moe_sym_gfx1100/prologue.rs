@@ -52,8 +52,18 @@ pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(
     smem(b, ARGS3, 1, KARG, 0x38)?;
     // gfx11 native workgroup ids (after the declared user SGPRs: s2/s3, gfx1100 s14/s15).
     let (wg_in_x, wg_in_y) = (g.wg_in(), g.wg_in() + 1);
-    sop(b, format!("s_mov_b32 s{WGX}, s{wg_in_x}"), &[WGX], &[wg_in_x])?;
-    sop(b, format!("s_mov_b32 s{WGY}, s{wg_in_y}"), &[WGY], &[wg_in_y])?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WGX}, s{wg_in_x}"),
+        &[WGX],
+        &[wg_in_x],
+    )?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WGY}, s{wg_in_y}"),
+        &[WGY],
+        &[wg_in_y],
+    )?;
     // v1 = wave, v2 = lane, v3 = lr, v4 = hi.
     op(b, "v_lshrrev_b32_e32 v1, 5, v0", &[v(1)], &[v(TID)])?;
     op(b, "v_and_b32_e32 v2, 31, v0", &[v(2)], &[v(TID)])?;

@@ -95,7 +95,9 @@ impl Case {
         .symbol();
         // The emulator has no hardware-qualified gfx1100 WMMA model: gfx1151 numerics (exact for the integer WMMA chain),
         // valid for comparing arms with each other and with the exact CPU fold.
-        let emu = Emulator::new(program, &symbol).unwrap().gfx1100_as_gfx1151();
+        let emu = Emulator::new(program, &symbol)
+            .unwrap()
+            .gfx1100_as_gfx1151();
         let mut kern = Vec::new();
         let out_len = self.n * self.m * 4;
         if self.epi == Epi::Silu {

@@ -138,7 +138,10 @@ fn kernel_assembly(
         ("group_segment_fixed_size", spec.group_segment_fixed_size),
         ("private_segment_fixed_size", 0),
         ("kernarg_size", spec.kernargs.size),
-        ("user_sgpr_count", u32::from(spec.declared_user_sgprs(workgroup_id_z))),
+        (
+            "user_sgpr_count",
+            u32::from(spec.declared_user_sgprs(workgroup_id_z)),
+        ),
         ("user_sgpr_dispatch_ptr", 0),
         ("user_sgpr_queue_ptr", 0),
         ("user_sgpr_kernarg_segment_ptr", 1),

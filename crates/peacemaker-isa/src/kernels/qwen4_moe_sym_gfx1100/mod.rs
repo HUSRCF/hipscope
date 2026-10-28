@@ -558,9 +558,7 @@ struct Gen {
 impl Gen {
     /// `.amdhsa_user_sgpr_count` of this arch (`Arch::declared_user_sgprs`: gfx1100 pads user + system to 16).
     fn declared_user_sgprs(&self) -> u8 {
-        self.spec
-            .arch
-            .declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+        self.spec.arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
     }
     /// SGPR of the native workgroup id X (`+ 1`: Y): after the DECLARED user SGPRs.
     fn wg_in(&self) -> u8 {

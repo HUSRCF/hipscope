@@ -158,7 +158,12 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
     if arch.gfx12() {
         sop(&mut b, format!("s_mov_b32 s{TILE}, ttmp9"), &[TILE], &[])?;
     } else {
-        sop(&mut b, format!("s_mov_b32 s{TILE}, s{wg_x}"), &[TILE], &[wg_x])?;
+        sop(
+            &mut b,
+            format!("s_mov_b32 s{TILE}, s{wg_x}"),
+            &[TILE],
+            &[wg_x],
+        )?;
     }
     b.wait_all()?;
     // All exits here are workgroup-uniform and precede every barrier.
