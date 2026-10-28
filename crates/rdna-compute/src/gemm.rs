@@ -49544,8 +49544,8 @@ impl Gpu {
 /// header passed [`Gpu::qwen4_moe_sym_check`]: true requests it, false keeps
 /// the whole incumbent route (scatter, producers and GEMMs), and unset follows
 /// the arch descriptor's `default_requested` ([`MoeSymIu4Kernel`]): requested on
-/// gfx1151 and gfx1201 (an asymmetric artifact fails the check and stays on the
-/// incumbent), OFF on gfx1100 (`=1` opts in). `=1` on a device without a
+/// gfx1100, gfx1151 and gfx1201 (an asymmetric artifact fails the check and stays on
+/// the incumbent); `=0` is the kill switch on every arch. `=1` on a device without a
 /// descriptor, or without the exact C2 candidate set, prints one diagnostic and
 /// keeps the incumbent ([`sym_iu4_request`]). Read once.
 pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
@@ -50427,8 +50427,8 @@ pub struct MoeSymIu4Kernel {
     /// inline value, so the checker-only metadata is separate from the GEMM symbol selection
     /// that reads the other descriptor fields; call it where the checker launches.
     pub checker: fn() -> MoeSymIu4Checker,
-    /// An unset `HIPFIRE_QWEN4_MOE_SYM_IU4` requests the route: true for the qualified gfx1151 /
-    /// gfx1201 defaults, false for gfx1100 (default OFF until its Flash-Next qualification).
+    /// An unset `HIPFIRE_QWEN4_MOE_SYM_IU4` requests the route: true for the qualified gfx1100 /
+    /// gfx1151 / gfx1201 defaults (`=0` is the kill switch on every arch).
     pub default_requested: bool,
 }
 
@@ -50518,7 +50518,7 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
             k: crate::slab_moe::SLAB_DOWN_K,
         },
         checker: moe_sym_iu4_checker_gfx1100,
-        default_requested: false,
+        default_requested: true,
     },
     MoeSymIu4Kernel {
         arch: "gfx1151",
@@ -51018,12 +51018,12 @@ impl Gpu {
 /// grouping, the two A4 producers and the two grouped IU4 GEMMs. Every
 /// launcher is driven by one [`MoeSymIu4Kernel`] descriptor
 /// ([`Gpu::qwen4_moe_sym_kernel`]): gfx1151 and gfx1201 (qualified defaults)
-/// and gfx1100 (MQ4 NT1 builder entries, default OFF). A device or codec
+/// and gfx1100 (MQ4 NT1 builder entries; all three qualified defaults). A device or codec
 /// without a descriptor refuses.
 impl Gpu {
     /// The route is requested and possible on this device ([`sym_iu4_request`]):
     /// the flag (unset = the descriptor's `default_requested`: requested on
-    /// gfx1151/gfx1201, off on gfx1100), a descriptor for this arch, and the
+    /// gfx1100/gfx1151/gfx1201), a descriptor for this arch, and the
     /// frozen C2 producer candidate set (`-DIU4_A4_CANDIDATES=2`; any other
     /// value keeps the incumbent). An explicit `HIPFIRE_QWEN4_MOE_SYM_IU4=1`
     /// that cannot be served prints one diagnostic per process and keeps the
@@ -56212,7 +56212,7 @@ mod route_selector_tests {
         assert!(gfx1100.is_some());
         assert_eq!(
             sym_iu4_request(gfx1100, None, MOE_SYM_C2),
-            SymIu4Request::Off
+            SymIu4Request::Requested
         );
         assert_eq!(
             sym_iu4_request(gfx1100, Some(false), MOE_SYM_C2),
@@ -56284,7 +56284,6 @@ mod route_selector_tests {
                     let expected = match (name, flag) {
                         (_, Some(false)) => SymIu4Request::Off,
                         ("none", _) => SymIu4Request::Unsupported(SYM_IU4_NO_DESCRIPTOR),
-                        ("gfx1100", None) => SymIu4Request::Off,
                         _ if !c2 => SymIu4Request::Unsupported(SYM_IU4_NOT_C2),
                         _ => SymIu4Request::Requested,
                     };
@@ -56297,25 +56296,65 @@ mod route_selector_tests {
                 }
             }
         }
-        // Literal spot checks: unset requests gfx1151/gfx1201 (the qualified defaults) and not
-        // gfx1100; an explicit =1 opts gfx1100 in; =0 kills every arch.
+        // Literal spot checks: unset requests gfx1100/gfx1151/gfx1201 (the qualified defaults);
+        // an explicit =1 requests the same; =0 kills every arch (HIPFIRE_QWEN4_MOE_SYM_IU4=0).
         let flag_of = |arch: &str, flag| sym_iu4_request(Some(moe_sym_row(arch)), flag, MOE_SYM_C2);
         assert_eq!(flag_of("gfx1151", None), SymIu4Request::Requested);
         assert_eq!(flag_of("gfx1201", None), SymIu4Request::Requested);
-        assert_eq!(flag_of("gfx1100", None), SymIu4Request::Off);
+        assert_eq!(flag_of("gfx1100", None), SymIu4Request::Requested);
         assert_eq!(flag_of("gfx1100", Some(true)), SymIu4Request::Requested);
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert_eq!(flag_of(arch, Some(false)), SymIu4Request::Off, "{arch}");
+            assert!(moe_sym_row(arch).default_requested, "{arch}");
+            // Unset and an explicit =1 request the same route (the default is the same
+            // verdict as the opt-in), and =0 is the only way off.
             assert_eq!(
-                moe_sym_row(arch).default_requested,
-                arch != "gfx1100",
-                "{arch}"
+                flag_of(arch, None),
+                flag_of(arch, Some(true)),
+                "{arch}: unset follows =1"
             );
         }
         // The single diagnostic names the arch, the reason and the kept incumbent route.
         let notice = sym_iu4_unsupported_notice("gfx1101", SYM_IU4_NO_DESCRIPTOR);
         assert!(notice.contains("gfx1101") && notice.contains(SYM_IU4_NO_DESCRIPTOR));
         assert!(notice.contains("keeping the incumbent route"));
+    }
+
+    /// gfx1100 requests the aggregate route by default (the S1 slow-link window and the regular
+    /// prefill read this one verdict), `HIPFIRE_QWEN4_MOE_SYM_IU4=0` is the kill switch, and a
+    /// candidate set other than C2 withdraws the default without a diagnostic-worthy flag.
+    #[test]
+    fn moe_sym_iu4_gfx1100_is_requested_by_default_and_zero_kills_it() {
+        let gfx1100 = Some(moe_sym_row("gfx1100"));
+        // The product's gfx11 producers are always built with the C2 candidate set.
+        assert_eq!(
+            sym_iu4_request(gfx1100, None, MOE_SYM_C2),
+            SymIu4Request::Requested
+        );
+        assert_eq!(
+            sym_iu4_request(gfx1100, Some(true), MOE_SYM_C2),
+            SymIu4Request::Requested
+        );
+        // The kill switch is `Off` whatever the compiler flags are.
+        for extra in [MOE_SYM_C2, "", "-DIU4_A4_CANDIDATES=1", "-O3"] {
+            assert_eq!(
+                sym_iu4_request(gfx1100, Some(false), extra),
+                SymIu4Request::Off,
+                "{extra:?}"
+            );
+        }
+        // Unset with a non-C2 candidate set is withdrawn exactly like gfx1151 / gfx1201.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(
+                sym_iu4_request(Some(moe_sym_row(arch)), None, "-DIU4_A4_CANDIDATES=1"),
+                SymIu4Request::Unsupported(SYM_IU4_NOT_C2),
+                "{arch}"
+            );
+        }
+        // The route still needs 512 routed rows and never takes the agent-turn append scope.
+        assert!(!sym_iu4_rows_admit(511, false));
+        assert!(sym_iu4_rows_admit(QWEN4_MOE_SYM_IU4_MIN_ROWS, false));
+        assert!(!sym_iu4_rows_admit(QWEN4_MOE_SYM_IU4_MIN_ROWS, true));
     }
 
     /// 511 rows stay on the incumbent, 512 and above take the route, the agent-turn append
@@ -56712,7 +56751,7 @@ mod route_selector_tests {
             ([4, 8], [128, 128], [[8192, 0], [16384, 0]])
         );
         assert!(
-            gfx1151.default_requested && gfx1201.default_requested && !gfx1100.default_requested
+            gfx1100.default_requested && gfx1151.default_requested && gfx1201.default_requested
         );
     }
     /// The serving scatter binds the registered canonical gfx1100 twin (and its

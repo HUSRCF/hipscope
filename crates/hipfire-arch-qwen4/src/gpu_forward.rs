@@ -10471,8 +10471,8 @@ impl Qwen4GpuForward {
                     }
                 }
             }
-            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for gfx1151 and
-            // gfx1201, default OFF and explicit `=1` only on gfx1100, `=0` off): verify each
+            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for gfx1100, gfx1151
+            // and gfx1201, `=0` off): verify each
             // layer's final expert headers once, before any capture, and size the route's
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new
@@ -10562,8 +10562,8 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above runs there
-            // only under an explicit `HIPFIRE_QWEN4_MOE_SYM_IU4=1` (default OFF on gfx1100), yet
+            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above does not run
+            // there when `HIPFIRE_QWEN4_MOE_SYM_IU4=0` (or no layer passed the header check), yet
             // the slab K2 prefill reuses its grouping scratch, down sidecar and shared gate/up
             // scratch. Reserve them here, before any capture, through the same reserve (no
             // growth when that block already ran). gfx1201 slab loads are unchanged.

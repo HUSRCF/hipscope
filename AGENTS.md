@@ -906,11 +906,15 @@ Caveats that are part of the fixture, not trivia:
   teacher and seven primitive cases remain unchanged: a gfx1201 target is
   not a new teacher or cross-architecture greedy proof. Keep original KL
   limits (16K: 0.03948458079446915; 4K: 0.027284316982763658), not +0.010.
-  Symmetric IU4 remains requested ON by default on gfx1151/gfx1201; pending
-  qualification never justifies switching it OFF (`=0` is an isolated
+  Symmetric IU4 is requested ON by default on gfx1100, gfx1151 and gfx1201;
+  pending qualification never justifies switching it OFF (`=0` is an isolated
   control). Active execution still requires actual eligible headers,
   descriptor, row and resource admission; a request is not an active-route
-  receipt. The gfx1100 candidate remains default OFF. FP8 KV and FA2 are
+  receipt. The gfx1100 default (regular prefill and the S1 `aggregate-sym-iu4`
+  window read the same `Gpu::qwen4_moe_sym_iu4_requested`) was flipped on
+  with its numeric acceptance recorded in the CHANGELOG entry (TODO-evidence:
+  owner fills the job record: S1 context-mean KL against the limits above,
+  WT2/code24 BF16-teacher KLD deltas, pp8192/pp32768 A/B). FP8 KV and FA2 are
   independent, stackable choices; A3B H16/KV2/D256 FA2 work is not an applied
   Flash-Next H24/KV2/D256 QSA FA2 port or a Flash-Next performance gain.
   **Widened byte/state/ID and performance qualification is pending.** Before

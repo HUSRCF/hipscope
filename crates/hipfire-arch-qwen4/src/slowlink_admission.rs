@@ -509,9 +509,10 @@ pub struct SymIu4RouteFacts {
     /// The device has a symmetric IU4 MoE kernel descriptor for MQ4 experts
     /// (`Gpu::qwen4_moe_sym_kernel`).
     pub descriptor: bool,
-    /// `Gpu::qwen4_moe_sym_iu4_requested`: the typed flag requested the route (gfx1100: explicit
-    /// `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only, `=0` kills), the C2 candidate set holds and a descriptor
-    /// exists.
+    /// `Gpu::qwen4_moe_sym_iu4_requested`: the typed flag requested the route (unset follows the
+    /// arch descriptor's `default_requested`, true on gfx1100, gfx1151 and gfx1201, so the S1 window
+    /// and the regular prefill agree; `HIPFIRE_QWEN4_MOE_SYM_IU4=0` kills), the C2 candidate set
+    /// holds and a descriptor exists.
     pub requested: bool,
     /// The MoE recipe's BF16 round trip ([`QWEN4_MOE_RECIPE_BF16_ROUND_TRIP`]).
     pub recipe_bf16_round_trip: bool,
@@ -1683,7 +1684,7 @@ impl SlowlinkProfile {
 
     /// The placement log line.
     pub fn describe(&self) -> String {
-        // Only the opt-in IU4 route names itself: every other load logs byte for byte as before.
+        // Only the IU4 route names itself: every other load logs byte for byte as before.
         let route = match self.geometry.route {
             WindowRoute::AggregateSymIu4 => {
                 format!(", window route {}", WindowRoute::AggregateSymIu4.label())
@@ -3507,7 +3508,7 @@ mod tests {
         -59_717_028,
         229_640_668,
     ];
-    /// The N=10 slack of each rung on the opt-in symmetric IU4 aggregate route: the F16
+    /// The N=10 slack of each rung on the symmetric IU4 aggregate route: the F16
     /// aggregate slack less the route's own census delta (both A4 sidecars charged,
     /// 82,575,360 B at the 16K window, minus the window F16 input and slot map the IU4
     /// layout drops, 83,886,080 + 2,048 * 4 B of region: net −1,318,912 B). Every other
@@ -7272,7 +7273,7 @@ mod tests {
             "list N>T",
         );
     }
-    // ── symmetric IU4 window route (default OFF) ─────────────────────────
+    // ── symmetric IU4 window route (requested by default; HIPFIRE_QWEN4_MOE_SYM_IU4=0 kills) ──
 
     #[test]
     fn slowlink_admission_sym_iu4_route_resolution_truth_table() {
@@ -7503,7 +7504,7 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_sym_iu4_profile_log_names_only_the_opt_in_route() {
+    fn slowlink_admission_sym_iu4_profile_log_names_only_the_sym_iu4_route() {
         let purpose = AdmissionPurpose::Product;
         let f16 = admit(&j1778_inputs(
             WindowRoute::Aggregate,
@@ -7525,8 +7526,10 @@ mod tests {
 
     #[test]
     fn slowlink_admission_sym_iu4_flag_off_profile_is_the_f16_aggregate_profile() {
-        // `HIPFIRE_QWEN4_MOE_SYM_IU4` unset/0 (not requested) resolves the incumbent layout
-        // route whatever else holds, so every byte, placement and selection of the current S1
+        // A route that is not requested (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, the kill switch; the
+        // flag unset is requested on gfx1100, gfx1151 and gfx1201 because the S1 window reads the
+        // same `Gpu::qwen4_moe_sym_iu4_requested` as the regular prefill) resolves the incumbent
+        // layout route whatever else holds, so every byte, placement and selection of the F16
         // Aggregate route is unchanged.
         let off = SymIu4RouteFacts {
             descriptor: true,
