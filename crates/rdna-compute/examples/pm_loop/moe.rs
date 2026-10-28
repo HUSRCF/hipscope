@@ -1792,6 +1792,14 @@ const EMU_GATE_SHAPES: [(&str, &str); 4] = [
     ("prod", "E=2,TOP=2,T=20,H=2560,I=640"),
     ("prod_ragged", "E=2,TOP=2,T=37,H=2560,I=640"),
 ];
+/// Production-extent cases of the gate: the judge shape (Flash-Next geometry, T=16896) and T=4096 with the real
+/// kernargs and exact-size guarded buffers (hundreds of MB to ~1 GB of address space, lazily backed), emulating
+/// only sampled workgroups ([`Moe::extent_wgs`]); the sampled outputs are compared with the emulated incumbent's.
+/// Catches address-arithmetic faults that only appear at production record indices.
+const EMU_EXTENT_SHAPES: [(&str, &str); 2] = [
+    ("extent_t16896", "fn,T=16896"),
+    ("extent_t4096", "fn,T=4096"),
+];
 
 /// One emulated arm of the gate: output bytes and counters.
 struct EmuArm {
@@ -2176,7 +2184,12 @@ impl Moe {
     /// One arm of [`Moe::emu_gate_run`]: lift `object`, run its complete grid on the emulator at `p` with
     /// definedness-tracked LDS and every buffer an exact-size region of its own, `EMU_GUARD` unmapped bytes apart
     /// (no slack: any access past a buffer is an unmapped-memory error). `Err` is the verbatim refusal.
-    fn emu_gate_arm(p: &Problem, entry: Entry, object: &Object) -> Result<EmuArm> {
+    fn emu_gate_arm(
+        p: &Problem,
+        entry: Entry,
+        object: &Object,
+        wgs: Option<&[(u32, u32)]>,
+    ) -> Result<EmuArm> {
         use peacemaker_ir::emu::{Emulator, Launch as EmuLaunch, Memory};
         let program = peacemaker_lift::lift_object(
             &object.bytes,
@@ -2201,8 +2214,20 @@ impl Moe {
             .gfx1100_as_gfx1151();
         let geo = &p.geo;
         let mut mem = Memory::default();
+        // Sampled (extent) runs back only the experts the sampled tiles use; every other table entry is 0 (an access
+        // through it is an unmapped-memory error). `vec![0; n]` is calloc'd, so untouched pages cost no memory.
+        let needed: Option<std::collections::BTreeSet<i32>> = wgs.map(|w| {
+            w.iter()
+                .map(|&(_, gy)| p.tiles[gy as usize])
+                .filter(|&e| e >= 0)
+                .collect()
+        });
         let mut table = Vec::with_capacity(geo.experts * 8);
         for e in 0..geo.experts {
+            if needed.as_ref().is_some_and(|n| !n.contains(&(e as i32))) {
+                table.extend_from_slice(&0u64.to_le_bytes());
+                continue;
+            }
             let mut w = vec![0u8; p.stride];
             p.fill_weights(e % geo.distinct, &mut w);
             let base = mem.map_guarded(format!("expert{e}"), w, EMU_GUARD)?;
@@ -2237,33 +2262,101 @@ impl Moe {
         )?;
         let kernarg = mem.map_guarded("kernarg".into(), launch.kernarg.clone(), EMU_GUARD)?;
         let mut instructions = 0u64;
-        for gy in 0..launch.grid[1] {
-            for gx in 0..launch.grid[0] {
-                instructions += emu
-                    .run_workgroup_counted(
-                        &EmuLaunch {
-                            kernarg_ptr: kernarg,
-                            workgroup: [gx, gy, 0],
-                            block: launch.block,
-                            dynamic_lds: launch.lds,
-                        },
-                        &mut mem,
-                    )
-                    .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
+        let all: Vec<(u32, u32)>;
+        let run: &[(u32, u32)] = match wgs {
+            Some(w) => w,
+            None => {
+                all = (0..launch.grid[1])
+                    .flat_map(|gy| (0..launch.grid[0]).map(move |gx| (gx, gy)))
+                    .collect();
+                &all
             }
+        };
+        for &(gx, gy) in run {
+            if gx >= launch.grid[0] || gy >= launch.grid[1] {
+                return Err(format!(
+                    "workgroup ({gx},{gy}) outside the launch grid {:?}",
+                    launch.grid
+                ));
+            }
+            instructions += emu
+                .run_workgroup_counted(
+                    &EmuLaunch {
+                        kernarg_ptr: kernarg,
+                        workgroup: [gx, gy, 0],
+                        block: launch.block,
+                        dynamic_lds: launch.lds,
+                    },
+                    &mut mem,
+                )
+                .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
         }
         let region = mem
             .regions
             .iter()
             .find(|r| r.name == "y")
             .ok_or("emulator memory lost the y region")?;
+        let y = match wgs {
+            None => region.bytes.clone(),
+            Some(w) => {
+                // The output rows of every sampled tile (16 grouped rows each), ascending. A live tile that wrote
+                // nothing is a failure (an all-zero output would otherwise compare equal to an all-zero incumbent).
+                let tile_bytes = 16 * p.row_len * 2;
+                let tiles: std::collections::BTreeSet<usize> =
+                    w.iter().map(|&(_, gy)| gy as usize).collect();
+                let mut y = Vec::with_capacity(tiles.len() * tile_bytes);
+                for t in tiles {
+                    let (lo, hi) = (t * tile_bytes, (t + 1) * tile_bytes);
+                    let live = p.tiles[t] >= 0 && p.sorted[16 * t..16 * t + 16].iter().any(|&x| x >= 0);
+                    if live && !(lo..hi).any(|i| region.written.contains(i)) {
+                        return Err(format!("sampled live tile {t} wrote no output"));
+                    }
+                    y.extend_from_slice(&region.bytes[lo..hi]);
+                }
+                y
+            }
+        };
         Ok(EmuArm {
-            y: region.bytes.clone(),
+            y,
             y_bytes_written: region.written.count() as u64,
             instructions,
-            workgroups: u64::from(launch.grid[0]) * u64::from(launch.grid[1]),
+            workgroups: run.len() as u64,
             lds_static,
         })
+    }
+
+    /// Sampled workgroups of an extent run: grid corners, the first/last live, ragged (padding slots) and sentinel
+    /// (all-padding) tiles, the first tile of the last live expert, and eight seeded random (gx, tile) pairs.
+    fn extent_wgs(p: &Problem, grid: [u32; 3]) -> Vec<(u32, u32)> {
+        let nt = p.ntiles();
+        let slots = |t: usize| &p.sorted[16 * t..16 * t + 16];
+        let live = |t: usize| p.tiles[t] >= 0 && slots(t).iter().any(|&s| s >= 0);
+        let ragged = |t: usize| live(t) && slots(t).iter().any(|&s| s < 0);
+        let sentinel = |t: usize| p.tiles[t] < 0;
+        let first = |f: &dyn Fn(usize) -> bool| (0..nt).find(|&t| f(t));
+        let last = |f: &dyn Fn(usize) -> bool| (0..nt).rev().find(|&t| f(t));
+        let mut tiles: Vec<usize> = vec![0, nt - 1];
+        for f in [&live as &dyn Fn(usize) -> bool, &ragged, &sentinel] {
+            tiles.extend(first(f));
+            tiles.extend(last(f));
+        }
+        if let Some(l) = last(&live) {
+            let e = p.tiles[l];
+            tiles.extend((0..nt).find(|&t| p.tiles[t] == e));
+        }
+        let mut wgs: Vec<(u32, u32)> = tiles
+            .iter()
+            .flat_map(|&t| [0, grid[0] - 1].map(|gx| (gx, t as u32)))
+            .collect();
+        let mut rng = Rng(p.geo.seed ^ 0xE87E_0000_0000_0000 ^ nt as u64);
+        for _ in 0..8 {
+            let t = rng.below(nt as u64) as u32;
+            let gx = rng.below(u64::from(grid[0])) as u32;
+            wgs.push((gx, t));
+        }
+        wgs.sort_unstable();
+        wgs.dedup();
+        wgs
     }
 
     /// The pre-card emulator gate (`--emu`): `cand` and `base` (the incumbent) each run their complete grid on the
@@ -2279,7 +2372,11 @@ impl Moe {
         let (mut instructions, mut workgroups) = (0u64, 0u64);
         let (mut cand_hash, mut base_hash) = (Sha256::new(), Sha256::new());
         let short = |e: &str| e.split(" | ").next().unwrap_or(e).to_owned();
-        for (name, shape) in EMU_GATE_SHAPES {
+        let all_cases = EMU_GATE_SHAPES
+            .iter()
+            .map(|&(n, s)| (n, s, false))
+            .chain(EMU_EXTENT_SHAPES.iter().map(|&(n, s)| (n, s, true)));
+        for (name, shape, extent) in all_cases {
             let built = Geo::parse(&format!("{shape},seed=7"), arch)
                 .and_then(|geo| Problem::new(&geo, cand_entry.spec.kind))
                 .map(|mut p| {
@@ -2295,8 +2392,13 @@ impl Moe {
                 }
             };
             let mut case = json!({"name": name, "shape": p.shape_json()});
-            let c = Self::emu_gate_arm(&p, cand_entry, cand);
-            let b = Self::emu_gate_arm(&p, base_entry, base);
+            let wgs = extent.then(|| Self::extent_wgs(&p, p.geometry(cand_entry.spec).0));
+            if let Some(w) = &wgs {
+                case["sampled_workgroups"] = json!(w.len());
+                case["sampled"] = json!(w);
+            }
+            let c = Self::emu_gate_arm(&p, cand_entry, cand, wgs.as_deref());
+            let b = Self::emu_gate_arm(&p, base_entry, base, wgs.as_deref());
             let mut reasons: Vec<String> = Vec::new();
             match (&c, &b) {
                 (Ok(c), Ok(b)) => {
@@ -2310,7 +2412,8 @@ impl Moe {
                             first.map_or("n/a".to_owned(), |i| i.to_string())
                         ));
                     }
-                    let reference = p.reference(Sample::Full);
+                    // Extent runs have no CPU reference (it needs every row); the tiny/prod cases carry it.
+                    let reference = if extent { Vec::new() } else { p.reference(Sample::Full) };
                     let report = |y: &[u8]| match p.compare(y, &reference, Sample::Full) {
                         Ok(r) => (
                             r.pass,
@@ -2319,8 +2422,12 @@ impl Moe {
                         ),
                         Err(e) => (false, json!({"pass": false, "error": e})),
                     };
-                    let (cand_ok, cand_ref) = report(&c.y);
-                    let (base_ok, base_ref) = report(&b.y);
+                    let (cand_ok, cand_ref) = if extent {
+                        (true, json!("not computed at extent: bit-identity vs the emulated incumbent only"))
+                    } else {
+                        report(&c.y)
+                    };
+                    let (base_ok, base_ref) = if extent { (true, json!(null)) } else { report(&b.y) };
                     if !cand_ok {
                         reasons.push(format!("candidate output fails the CPU reference: {cand_ref}"));
                     }
@@ -2365,7 +2472,11 @@ impl Moe {
         json!({
             "status": status,
             "reason": if failures.is_empty() { "ok".to_owned() } else { failures.join(" | ") },
-            "shape": EMU_GATE_SHAPES.iter().map(|(n, s)| format!("{n}:{s}")).collect::<Vec<_>>(),
+            "shape": EMU_GATE_SHAPES
+                .iter()
+                .chain(EMU_EXTENT_SHAPES.iter())
+                .map(|(n, s)| format!("{n}:{s}"))
+                .collect::<Vec<_>>(),
             "instructions": instructions,
             "workgroups": workgroups,
             "cand_out_sha256": format!("{:x}", cand_hash.finalize()),
@@ -3437,7 +3548,11 @@ mod tests {
             assert_eq!(g["status"], "pass", "{epi}: {g}");
             assert!(g["instructions"].as_u64().unwrap() > 0);
             assert_eq!(g["cand_out_sha256"], g["base_out_sha256"], "{epi}");
-            assert_eq!(g["cases"].as_array().unwrap().len(), EMU_GATE_SHAPES.len());
+            let cases = g["cases"].as_array().unwrap();
+            assert_eq!(cases.len(), EMU_GATE_SHAPES.len() + EMU_EXTENT_SHAPES.len());
+            for c in &cases[EMU_GATE_SHAPES.len()..] {
+                assert!(c["sampled_workgroups"].as_u64().unwrap() >= 8, "{c}");
+            }
         }
     }
 
