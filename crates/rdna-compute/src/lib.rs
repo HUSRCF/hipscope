@@ -70,6 +70,7 @@ pub mod moe;
 mod moe_few;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
+pub mod norm_fold;
 pub mod slab_admission;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,

@@ -6918,6 +6918,16 @@ pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
 );
+/// A3B decode (exact gfx1201, hidden 2048): RMSNorm + FWHT rotate folded into
+/// the MQ4G256V2 projection GEMV that consumes it (`fused_qkvza_mq4g256v2` /
+/// `fused_qkv_mq4g256v2` / the 1281-row router + shared gate/up GEMV). Prepends
+/// the gfx12 weight-cache policy exactly as `FUSED_QKVZA_MQ4G256V2_SRC` does.
+/// Symbol `fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201`.
+pub const FUSED_RMSNORM_PROJ4_MQ4G256V2_FOLD_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_rmsnorm_proj4_mq4g256v2_fold.gfx1201.hip")
+);
 /// MQ4G256V2-Lloyd (qt=52) fused QKVZA decode: 32 LUT dwords (qkv, z, beta,
 /// alpha codebooks in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
 pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(

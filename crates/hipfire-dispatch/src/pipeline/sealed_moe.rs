@@ -8132,6 +8132,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            norm_fold: false,
         })
     }
 

@@ -934,6 +934,26 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
         ]);
     }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // A0..A3 weights, x, norm weight, signs1, signs2 (read); y0..y3 and
+        // the rotated x_rot (write). A qkv (3-source) launch passes A3/y3 as
+        // aliases of A2/y2 with m3 == 0.
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+            write(64),
+            write(72),
+            write(80),
+            write(88),
+            write(96),
+        ]);
+    }
     if matches!(
         kernel,
         "gemm_mq4g256v2_moe_grouped_wmma_k2"
@@ -1780,6 +1800,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
     ) {
         return Some(64);
+    }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // 13 ptr + m0..m3 + nw + eps = 128 explicit bytes (no hidden arguments).
+        return Some(128);
     }
     if matches!(
         kernel,
@@ -8682,6 +8706,7 @@ mod tests {
         "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
         "fused_qkv_mq4g256v2",
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_k5120_gfx1100",
         "fused_gate_up_mq4g256v2_k5120_gfx1201",

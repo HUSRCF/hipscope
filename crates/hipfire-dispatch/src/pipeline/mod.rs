@@ -33,6 +33,7 @@ pub mod slowlink_prefill;
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
+pub(crate) mod norm_fold;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub mod batched;
 #[cfg(feature = "deltanet")]

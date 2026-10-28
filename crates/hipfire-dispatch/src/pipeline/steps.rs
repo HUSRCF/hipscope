@@ -2049,7 +2049,16 @@ fn launch_fused<'a>(
     key: KernelKey,
     steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
-    // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
+    // Step 0 is always RmsnormAutomatic. The exact-gfx1201 MQ4G256V2 mixer
+    // windows fold it into the projection launch (`HIPFIRE_A3B_NORM_FOLD`).
+    if matches!(
+        key,
+        KernelKey::FusedQkvMq4G256V2 | KernelKey::FusedQkvzaMq4G256V2
+    ) && super::norm_fold::launch_mixer_window(gpu, steps)?
+    {
+        return Ok(());
+    }
+    // Run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
     let activated = rmsnorm_out(&steps[0]);
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);

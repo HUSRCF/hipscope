@@ -4012,6 +4012,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1201" {
+        // A3B decode norm fold (`HIPFIRE_A3B_NORM_FOLD`): RMSNorm + FWHT rotate
+        // inside the MQ4G256V2 projection GEMV that consumes it.
+        add!(
+            "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
+            kernels::FUSED_RMSNORM_PROJ4_MQ4G256V2_FOLD_GFX1201_SRC,
+            ["fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201"]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
@@ -10405,9 +10412,10 @@ mod tests {
         }
         // The 0.4.4 mq4rs (A3B MQ4G128V2) decode kernels: the fused qt53
         // nine-path down and the two-row shared-expert k512 GEMV.
-        const MQ4RS_DECODE_ADDED_MODULES: [&str; 2] = [
+        const MQ4RS_DECODE_ADDED_MODULES: [&str; 3] = [
             "gemv_mq4g128v2_moe_ninepath_d4",
             "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
+            "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
         ];
         for module in MQ4RS_DECODE_ADDED_MODULES {
             assert!(
