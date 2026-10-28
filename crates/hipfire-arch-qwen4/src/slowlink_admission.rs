@@ -1980,15 +1980,17 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
 /// held-back quote is the profile's placement quote, so it is internally
 /// consistent and the loader places exactly its resident count.
 ///
-/// The window takes priority over extra resident layers: the ladder is the
-/// window that covers `max_seq` (rounded UP to a tile, at most
-/// [`S1_GROWN_WINDOW_MAX_TILES`]) first, then a binary search downward to the
-/// largest whole-tile window above the floor that admits on the held-back
-/// quote. Each candidate window's resident-layer count is that window's own
-/// census verdict (`inputs.base_reserve` carries the KV of the load's
-/// `max_seq`). Nothing is decided at request time. If no window above the
-/// floor admits, the base profile is returned unchanged (growth never
-/// refuses a load).
+/// A context whose covering window (`max_seq` rounded UP to a tile) is at most
+/// [`S1_GROWN_WINDOW_MAX_TILES`] runs every request in one window, so the
+/// window takes priority over extra resident layers: the covering window is
+/// tried first, then a binary search down to the largest whole-tile window
+/// above the floor that admits on the held-back quote, each candidate with its
+/// own resident-layer verdict. A longer context runs several windows anyway:
+/// the floor admission's resident count is kept and the window grows (to at
+/// most the cap) only with the memory left at that count. The KV charge is
+/// that of the load's `max_seq` (`inputs.base_reserve`). Nothing is decided at
+/// request time. If no window above the floor admits, the base profile is
+/// returned unchanged (growth never refuses a load).
 ///
 /// Every term is the same pure census the base used, so charge ==
 /// allocation; [`S1_F32_STREAM_ROWS`], the boundary snapshot cap and the
@@ -2023,13 +2025,31 @@ pub fn admit_grown(
         },
         ..*inputs
     };
-    let fits = |tiles: usize| admit(&held(tiles)).ok();
-    // The max_seq-covering window first.
-    if let Some(profile) = fits(ceiling_tiles) {
-        return Ok(profile);
+    // A context whose covering window is within the cap runs every request in
+    // one window: the window outranks resident layers, each candidate with its
+    // own layer verdict. A longer context runs several windows anyway: the
+    // floor admission's resident count is kept and the window grows only with
+    // the memory left at that count.
+    let covering = ceiling_rows / tile;
+    let one_window = covering <= S1_GROWN_WINDOW_MAX_TILES;
+    let fits = |tiles: usize| {
+        admit(&held(tiles))
+            .ok()
+            .filter(|profile| one_window || profile.resident_layers == base.resident_layers)
+    };
+    if one_window {
+        // The max_seq-covering window first.
+        if let Some(profile) = fits(ceiling_tiles) {
+            return Ok(profile);
+        }
     }
     // Slack only falls as the window grows, so "fits" is monotone in tiles.
-    let (mut lo, mut hi, mut best) = (floor_tiles, ceiling_tiles - 1, None);
+    let top = if one_window {
+        ceiling_tiles - 1
+    } else {
+        ceiling_tiles
+    };
+    let (mut lo, mut hi, mut best) = (floor_tiles, top, None);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         match fits(mid) {
@@ -5414,14 +5434,19 @@ mod tests {
         let mid = fn_load_at(131_072);
         let short = fn_load_at(33_024);
         println!("(tiles, layers, slack): 262144 {long:?} 131072 {mid:?} 33024 {short:?}");
-        // The window outranks resident layers: memory allows growth at the cost
-        // of two layers, so the 262,144-row load takes the 64-tile cap, 4 layers.
-        assert_eq!((long.0, long.1), (S1_GROWN_WINDOW_MAX_TILES, 4));
+        // A multi-window context keeps the floor's 6 layers and grows only
+        // with the memory left at that count above the hold: one tile here.
+        assert_eq!((long.0, long.1), (S1_WINDOW_TILES + 1, 6));
+        // 131,072 keeps its floor layers (8: less KV than 262,144); nothing
+        // above the hold is left for a tile, so it is the floor admission and
+        // its slack carries no hold.
+        assert_eq!((mid.0, mid.1), (S1_WINDOW_TILES, 8));
+        // A single-window context: window priority, 43 tiles, 8 layers.
+        assert_eq!((short.0, short.1), (43, 8));
         assert!(long.2 >= S1_GROWN_FREE_HOLD_BYTES);
         assert!(short.0 >= 43, "32,780 rows in one window");
         assert!(S1_WINDOW_ROWS < 43 * tile && 43 * tile >= 32_780);
         assert!(short.2 >= S1_GROWN_FREE_HOLD_BYTES, "1 GiB held free");
-        assert!(mid.2 >= S1_GROWN_FREE_HOLD_BYTES);
     }
 
     /// Growth never refuses, never leaves less than the hold, and the window is
@@ -5462,7 +5487,7 @@ mod tests {
                         route_storage_bytes(&grown.geometry, grown.window_rows).unwrap()
                     );
                 }
-                // Maximal: one more tile does not admit on the held-back quote.
+                // Maximal on the held-back quote.
                 let next = grown.window_rows + tile;
                 if next <= S1_GROWN_WINDOW_MAX_TILES * tile {
                     let held = AdmissionInputs {
@@ -5472,7 +5497,12 @@ mod tests {
                         ),
                         ..inputs
                     };
-                    assert!(admit(&held).is_err(), "{layers} layers {slack_mib} MiB");
+                    // A multi-window context keeps the floor's layers: one more
+                    // tile must not admit at that count.
+                    assert!(
+                        admit(&held).map_or(true, |p| p.resident_layers != floor.resident_layers),
+                        "{layers} layers {slack_mib} MiB"
+                    );
                 }
             }
         }
@@ -5511,15 +5541,16 @@ mod tests {
                 mtp.window_rows,
                 mtp.resident_layers
             ),
-            (49_152, 4, 49_152, 3)
+            (17_664, 6, S1_WINDOW_ROWS, 5)
         );
-        // The window takes priority over layers: both measured loads grow to
-        // the 64-tile cap (the 262,144-row context's ceiling) and trade layers.
+        // 262,144 is a multi-window context: the floor's layers are kept and
+        // the AR load's leftover above the hold buys one tile (23); the
+        // MTP-loaded load has none and keeps the floor.
         for (rows, ar_sweeps, mtp_sweeps, floor_sweeps) in [
             (8_204usize, 1usize, 1usize, 1usize),
-            (32_780, 1, 1, 2),
-            (131_084, 3, 3, 8),
-            (250_012, 6, 6, 15),
+            (32_780, 2, 2, 2),
+            (131_084, 8, 8, 8),
+            (250_012, 15, 15, 15),
         ] {
             for cache in [false, true] {
                 for (label, profile, expect) in [
