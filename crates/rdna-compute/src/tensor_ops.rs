@@ -8874,6 +8874,28 @@ const QSA_ATTENTION_HG12_MIN_ROWS: usize = 16;
 /// (4 rows, 232 context: 55 -> 27 us per layer).
 const QSA_ATTENTION_HG4_MIN_ROWS: usize = 2;
 
+/// Whether the grouped prefill attention runs its low-LDS twin
+/// (`indexed_attention_attention_q8_batched_hg4_lite`): q8 K/V on exact gfx1100
+/// with `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE` not `0`. The kernel symbol and the
+/// dynamic-LDS size both follow from this one decision.
+fn qsa_attention_hg4_lite(flags: &crate::feature_flags::FeatureFlags, format: QsaKvFormat) -> bool {
+    format == QsaKvFormat::Q8 && flags.qwen4_qsa_hg4_q8_lite_enabled()
+}
+
+/// Dynamic LDS bytes of the grouped kernel for `shape_selected` selected rows:
+/// weights[sel][4] + (tokens[sel], except the lite twin, which recomputes the
+/// validated token) + partial maxes[4][256] + maxes[4].
+fn qsa_attention_hg4_lds_bytes_for(shape_selected: usize, lite: bool) -> Option<usize> {
+    let per_row = if lite {
+        4 * QSA_ATTENTION_HG4_HEADS
+    } else {
+        4 * QSA_ATTENTION_HG4_HEADS + 4
+    };
+    shape_selected
+        .checked_mul(per_row)?
+        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))
+}
+
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
 /// it is specialised for (gfx11+ ISA, head_dim 256, four heads per KV group,
 /// prefill-sized row counts).
@@ -8890,10 +8912,10 @@ fn qsa_attention_hg4_lds_bytes(
     {
         return None;
     }
-    // weights[sel][4] + tokens[sel] + partial maxes[4][256] + maxes[4].
-    let bytes = shape_selected
-        .checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))?;
+    let bytes = qsa_attention_hg4_lds_bytes_for(
+        shape_selected,
+        qsa_attention_hg4_lite(&gpu.flags, p.format),
+    )?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
 
@@ -9158,12 +9180,16 @@ fn indexed_attention_attention_batch_launch(
         )
     } else if let Some(bytes) = hg4_bytes {
         (
-            p.format.kernel([
-                "indexed_attention_attention_f32_batched_hg4",
-                "indexed_attention_attention_fp8_batched_hg4",
-                "indexed_attention_attention_q8_batched_hg4",
-                "indexed_attention_attention_fp8_fnuz_batched_hg4",
-            ]),
+            if qsa_attention_hg4_lite(&gpu.flags, p.format) {
+                "indexed_attention_attention_q8_batched_hg4_lite"
+            } else {
+                p.format.kernel([
+                    "indexed_attention_attention_f32_batched_hg4",
+                    "indexed_attention_attention_fp8_batched_hg4",
+                    "indexed_attention_attention_q8_batched_hg4",
+                    "indexed_attention_attention_fp8_fnuz_batched_hg4",
+                ])
+            },
             [
                 checked_u32(
                     p.n_heads / QSA_ATTENTION_HG4_HEADS,
@@ -11251,6 +11277,59 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grouped attention's dynamic LDS: 20 bytes per selected row for the
+    /// shipped kernels (weights[4] + token) and 16 for the q8 lite twin, which
+    /// keeps no token array; the 4112-byte maxes/partial-max tail is common.
+    /// The measured prefill shape (2051 selected rows) is 45132 / 36928 bytes.
+    #[test]
+    fn qsa_attention_hg4_lds_formula_drops_the_token_array_for_the_lite_twin() {
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, false), Some(45132));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, true), Some(36928));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, false), Some(4112));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, true), Some(4112));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(usize::MAX, true), None);
+        // Three lite workgroups fit a 128 KiB WGP at the measured shape; two
+        // shipped ones do, a third does not.
+        assert!(3 * 36928 <= 128 * 1024 && 3 * 45132 > 128 * 1024);
+        // The largest selected capacity under the 64 KiB dynamic limit.
+        let limit = QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES;
+        assert!(qsa_attention_hg4_lds_bytes_for(3071, false).unwrap() <= limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(3072, false).unwrap() > limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(3839, true).unwrap() <= limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(3840, true).unwrap() > limit);
+    }
+
+    /// The lite twin serves q8 K/V on exact gfx1100 unless
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE=0`; every other format and architecture
+    /// keeps the shipped kernel (and its LDS size).
+    #[test]
+    fn qsa_attention_hg4_lite_is_q8_exact_gfx1100_with_a_kill_switch() {
+        let flags = |arch: &str, switch: bool| {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.qwen4_qsa_hg4_q8_lite = switch;
+            flags
+        };
+        for format in [
+            QsaKvFormat::F32,
+            QsaKvFormat::Fp8,
+            QsaKvFormat::Q8,
+            QsaKvFormat::Fp8Fnuz,
+        ] {
+            for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+                let expect = format == QsaKvFormat::Q8 && arch == "gfx1100";
+                assert_eq!(
+                    qsa_attention_hg4_lite(&flags(arch, true), format),
+                    expect,
+                    "{arch} {format:?}"
+                );
+                assert!(
+                    !qsa_attention_hg4_lite(&flags(arch, false), format),
+                    "{arch} {format:?}: kill switch"
+                );
+            }
+        }
+    }
 
     /// The decode attention policy over the flags and architecture alone:
     /// F32 K/V keeps split-K (exact gfx1151), q8 K/V at 24 query heads over 2

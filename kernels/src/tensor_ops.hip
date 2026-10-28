@@ -5424,6 +5424,204 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
             : 0.0f;
     }
 }
+
+#if defined(QSA_HAS_Q8)
+// Q8 twin of qsa_attention_batched_hg4 with the same arithmetic in the same
+// order (bitwise-equal output), restructured for less LDS and fewer
+// instructions in the value phase:
+//  - no tokens[] array in LDS: the validated token is recomputed from the
+//    selected list where it is needed (20 -> 16 bytes per selected row, so
+//    three workgroups fit a WGP instead of two);
+//  - value loads use a wave-uniform buffer descriptor on the wave's Q8_0
+//    block of row 0 plus an SGPR row offset, with one unsigned validity
+//    compare, so no per-token 64-bit VALU address arithmetic;
+//  - every channel's denominator is the same in-order sum of the head's
+//    weights, so wave 0 computes it once (one lane per head) and publishes
+//    it through LDS instead of all eight waves adding it redundantly.
+// Requires dynamic LDS of selected_len * 16 + 4 * (4 * 256 + 4) bytes.
+template <bool B>
+struct qsa_bool {
+    static constexpr bool value = B;
+};
+
+template <int F>
+static __device__ __forceinline__ void qsa_attention_batched_hg4_lite(
+    const float* q_with_gate,
+    const unsigned char* full_keys,
+    const unsigned char* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    static_assert(F == QSA_KV_Q8, "the lite hg4 kernel is the Q8 K/V twin");
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    // token >= 0 && token < full_capacity && token < visible, as one unsigned compare.
+    const int valid_limit = max(min(visible, full_capacity), 0);
+#define QSA_TOK_OK(t) ((unsigned)(t) < (unsigned)valid_limit)
+    // Every region is a multiple of 16 bytes so float4 LDS accesses stay aligned.
+    extern __shared__ float4 lds4[];
+    float* lds = reinterpret_cast<float*>(lds4);
+    float* weights = lds;                              // [selected_len][QSA_HG]
+    float* kt = weights + QSA_HG * selected_len;       // [QSA_HG][256] partial maxes
+    float* maxes = kt + QSA_HG * 256;                  // [QSA_HG]
+    int tid = (int)threadIdx.x;
+    int head0 = (int)blockIdx.x * QSA_HG;
+    int kv_head = head0 / (n_heads / n_kv_heads);
+    const size_t row_bytes = (size_t)qsa_kv_row_bytes<F>(n_kv_heads, QSA_HD);
+    const int* row_selected = selected_indices + row * capacity;
+    int q_row = row * 2 * n_heads * QSA_HD;
+    // The query rows are block-uniform: the score loop reads them as scalar
+    // loads (an SGPR FMA operand) instead of LDS broadcasts.
+    const float* __restrict__ qg = q_with_gate + q_row + head0 * QSA_HD * 2;
+    // No token array in LDS: the validated token is recomputed from the
+    // selected list wherever it is needed.
+    auto token_at = [&](int index) -> int {
+        if (index >= selected_len) return -1;
+        const int token = row_selected[index];
+        return QSA_TOK_OK(token) ? token : -1;
+    };
+
+    // Scores: each thread owns one selected row and all four heads, reading
+    // its key straight from global memory (four independent serial d-order
+    // chains; q comes from scalar loads).  No key tile, no barriers.
+    float partial_max[QSA_HG];
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) partial_max[h] = -3.402823466e+38f;
+    for (int base = 0; base < selected_len; base += 256) {
+        const int index = base + tid;
+        const int token = token_at(index);
+        float score[QSA_HG];
+#pragma unroll
+        for (int h = 0; h < QSA_HG; ++h) score[h] = 0.0f;
+        if (token >= 0) {
+            qsa_kv_key_dots<F, QSA_HG>(qg, QSA_HD * 2, full_keys + (size_t)token * row_bytes,
+                                       n_kv_heads, QSA_HD, kv_head, score);
+        }
+        if (index < selected_len) {
+#pragma unroll
+            for (int h = 0; h < QSA_HG; ++h) {
+                const float scaled = score[h] / sqrtf((float)QSA_HD);
+                weights[index * QSA_HG + h] = scaled;
+                if (token >= 0) partial_max[h] = fmaxf(partial_max[h], scaled);
+            }
+        }
+    }
+    // fmaxf is exact and order-independent, so the tree matches the serial scan.
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) kt[h * 256 + tid] = partial_max[h];
+    __syncthreads();
+    if (tid < QSA_HG) {
+        float head_max = -3.402823466e+38f;
+        for (int i = 0; i < 256; ++i) head_max = fmaxf(head_max, kt[tid * 256 + i]);
+        maxes[tid] = head_max;
+    }
+    __syncthreads();
+    for (int index = tid; index < selected_len; index += 256) {
+        const int token = row_selected[index];
+        if (QSA_TOK_OK(token)) {
+            float4 w4 = *reinterpret_cast<const float4*>(weights + index * QSA_HG);
+            w4.x = expf(w4.x - maxes[0]);
+            w4.y = expf(w4.y - maxes[1]);
+            w4.z = expf(w4.z - maxes[2]);
+            w4.w = expf(w4.w - maxes[3]);
+            *reinterpret_cast<float4*>(weights + index * QSA_HG) = w4;
+        }
+    }
+    __syncthreads();
+
+    int channel = tid;
+    const int lane = tid & 31;
+    const int wave_id = __builtin_amdgcn_readfirstlane(tid >> 5);  // wave-uniform
+    float denominator[QSA_HG];
+    float numerator[QSA_HG];
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) {
+        denominator[h] = 0.0f;
+        numerator[h] = 0.0f;
+    }
+    // Invalid (-1) rows hold weight 0 (their score was never exponentiated)
+    // and read value 0, so they add +0.0 to sums that are never -0.0: the
+    // accumulation is branch-free and still bitwise the skipping version.
+    // Sixteen value loads are issued before their in-order accumulation.
+    // Token indices are block-uniform: read them as scalars. Q8: one Q8_0
+    // block (32 channels) per wave. The descriptor base is that block of
+    // token row 0; the token row offset is a wave-uniform SGPR offset, so the
+    // per-token address needs no 64-bit VALU arithmetic. Invalid rows read
+    // row 0 and select 0.0, exactly the value the skipped row contributed.
+    const __amdgpu_buffer_rsrc_t qrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)(full_values + (size_t)(kv_head * (QSA_HD / 32) + wave_id) * 34), 0,
+        0x7FFFFFFF, 0x31004000);
+    auto value_at = [&](int index) {
+        const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
+        const bool ok = QSA_TOK_OK(token);
+        const unsigned soff = ok ? (unsigned)token * (unsigned)row_bytes : 0u;
+        const unsigned char code = __builtin_amdgcn_raw_buffer_load_b8(qrsrc, lane + 2, soff, 0);
+        const unsigned short scale = __builtin_amdgcn_raw_buffer_load_b16(qrsrc, 0, soff, 0);
+        const float v = (float)(signed char)code * qsa_half_bits(scale);
+        return ok ? v : 0.0f;
+    };
+    float den_lane = 0.0f;  // wave 0, lane l runs head (l & 3)'s denominator chain
+    auto consume = [&](auto with_den, const float (&value)[16], int i0) {
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const float4 w4 = *reinterpret_cast<const float4*>(weights + (i0 + u) * QSA_HG);
+            if constexpr (decltype(with_den)::value) den_lane += weights[(i0 + u) * QSA_HG + (lane & 3)];
+            QSA_SUM_ACC(numerator[0], w4.x, value[u]);
+            QSA_SUM_ACC(numerator[1], w4.y, value[u]);
+            QSA_SUM_ACC(numerator[2], w4.z, value[u]);
+            QSA_SUM_ACC(numerator[3], w4.w, value[u]);
+        }
+    };
+    auto pv = [&](auto with_den) {
+        int i = 0;
+        for (; i + 16 <= selected_len; i += 16) {
+            float value[16];
+#pragma unroll
+            for (int u = 0; u < 16; ++u) value[u] = value_at(i + u);
+            consume(with_den, value, i);
+        }
+        for (; i < selected_len; ++i) {
+            const float value = value_at(i);
+            const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
+            if constexpr (decltype(with_den)::value) den_lane += weights[i * QSA_HG + (lane & 3)];
+            QSA_SUM_ACC(numerator[0], w4.x, value);
+            QSA_SUM_ACC(numerator[1], w4.y, value);
+            QSA_SUM_ACC(numerator[2], w4.z, value);
+            QSA_SUM_ACC(numerator[3], w4.w, value);
+        }
+    };
+    // Every channel's denominator is the same in-order sum of the head's
+    // weights: wave 0 computes it once (one lane per head) instead of all
+    // eight waves adding it redundantly.
+    if (wave_id == 0) pv(qsa_bool<true>{}); else pv(qsa_bool<false>{});
+    if (tid < QSA_HG) kt[tid] = den_lane;
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) denominator[h] = kt[h];
+#pragma unroll
+    for (int h = 0; h < QSA_HG; ++h) {
+        int head = head0 + h;
+        float gate = q_with_gate[q_row + head * QSA_HD * 2 + QSA_HD + channel];
+        output[row * n_heads * QSA_HD + head * QSA_HD + channel] = denominator[h] > 0.0f
+            ? numerator[h] / denominator[h] / (1.0f + expf(-gate))
+            : 0.0f;
+    }
+#undef QSA_TOK_OK
+}
+#endif
 #undef QSA_HG
 #undef QSA_HD
 
@@ -5746,6 +5944,11 @@ QSA_ATTENTION_KERNELS(fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char)
 #endif
 #if defined(QSA_HAS_Q8)
 QSA_ATTENTION_KERNELS(q8, QSA_KV_Q8, unsigned char)
+// Same arithmetic as indexed_attention_attention_q8_batched_hg4, less LDS
+// (selected_len * 16 + 4112 bytes): routed on exact gfx1100 prefill only.
+QSA_ATTENTION_BATCHED(indexed_attention_attention_q8_batched_hg4_lite,
+                      qsa_attention_batched_hg4_lite, __launch_bounds__(256), QSA_KV_Q8,
+                      unsigned char)
 #endif
 #undef QSA_ATTENTION_KERNELS
 #undef QSA_NO_BOUNDS

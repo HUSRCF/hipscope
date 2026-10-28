@@ -808,6 +808,12 @@ pub struct FeatureFlags {
     pub qwen4_qsa_extent_sync: bool,
     /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
     pub qwen4_qsa_code_check: bool,
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
+    /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
+    /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
+    /// (kill switch); acted on for exact gfx1100 only
+    /// (`qwen4_qsa_hg4_q8_lite_enabled`).
+    pub qwen4_qsa_hg4_q8_lite: bool,
 }
 
 /// Built-in default of `experimental.graph.ar` for an architecture on a host
@@ -1425,6 +1431,8 @@ impl FeatureFlags {
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
             qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref()
                 == Some("1"),
+            qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
+                != Some("0"),
         }
     }
 
@@ -1534,6 +1542,15 @@ impl FeatureFlags {
     /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// q8 grouped prefill attention low-LDS twin
+    /// (`indexed_attention_attention_q8_batched_hg4_lite`): default on, exact
+    /// gfx1100 only (the only architecture its win was measured on);
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE=0` restores
+    /// `indexed_attention_attention_q8_batched_hg4`. Bit-identical output.
+    pub fn qwen4_qsa_hg4_q8_lite_enabled(&self) -> bool {
+        self.qwen4_qsa_hg4_q8_lite && self.arch == "gfx1100"
     }
 
     /// Q8 split-KV QSA decode attention: the same
@@ -1978,6 +1995,7 @@ impl FeatureFlags {
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
+            qwen4_qsa_hg4_q8_lite: false,
         }
     }
 }
@@ -2374,6 +2392,40 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
         assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());
+    }
+
+    /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`
+    /// is the kill switch and every other value keeps it on.
+    #[test]
+    fn qwen4_qsa_hg4_q8_lite_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_QSA_HG4_Q8_LITE" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).qwen4_qsa_hg4_q8_lite, "{arch}: unset");
+            assert_eq!(flags(None).qwen4_qsa_hg4_q8_lite_enabled(), exact, "{arch}");
+            assert!(!flags(Some("0")).qwen4_qsa_hg4_q8_lite, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).qwen4_qsa_hg4_q8_lite_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).qwen4_qsa_hg4_q8_lite, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_hg4_q8_lite_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_hg4_q8_lite_enabled());
     }
 
     #[test]

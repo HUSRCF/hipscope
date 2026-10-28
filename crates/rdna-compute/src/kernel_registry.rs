@@ -2389,6 +2389,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_q8",
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_attention_q8_batched_serial",
                 "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_f32",
@@ -3050,6 +3051,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_q8",
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_attention_q8_batched_serial",
                 "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_f32",
@@ -3080,6 +3082,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_q8",
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_attention_q8_batched_serial",
                 "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_q8_batched",
@@ -3277,6 +3280,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_q8",
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_attention_q8_batched_serial",
                 "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_f32",
@@ -3309,6 +3313,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_q8",
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_attention_q8_batched_serial",
                 "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_q8_batched",
@@ -10819,6 +10824,7 @@ mod tests {
                 "QSA_SELECT_SERIAL(",
                 "QSA_SELECT_PARALLEL(",
                 "QSA_DECODE_PROLOGUE(",
+                "QSA_ATTENTION_BATCHED(",
             ] {
                 if let Some(args) = line.strip_prefix(prefix) {
                     names.insert(identifier(args));
@@ -10923,7 +10929,9 @@ mod tests {
         include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
 
     /// Preserve the measured sealed gfx1100 object's historical export/index
-    /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports.
+    /// gap; the later gfx1201-only x8 addition does not alter gfx11 exports. The
+    /// current source adds two gfx11 exports the sealed object predates: the
+    /// rope table and the q8 hg4 low-LDS twin (`..._hg4_lite`).
     #[test]
     fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
         use std::collections::BTreeSet;
@@ -10943,7 +10951,10 @@ mod tests {
         let current: BTreeSet<String> = elf
             .iter()
             .cloned()
-            .chain(["indexed_attention_rope_table_f32".to_owned()])
+            .chain([
+                "indexed_attention_attention_q8_batched_hg4_lite".to_owned(),
+                "indexed_attention_rope_table_f32".to_owned(),
+            ])
             .collect();
         assert_eq!(tensor_ops_source_exports("gfx1100"), current);
         let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();
@@ -12090,6 +12101,7 @@ mod tests {
             for symbol in [
                 "indexed_attention_attention_q8_batched",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4_lite",
                 "indexed_attention_cache_append_q8_batched",
                 "indexed_attention_decode_prologue_q8",
             ] {
