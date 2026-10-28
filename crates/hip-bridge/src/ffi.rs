@@ -5124,6 +5124,18 @@ impl MappedHostBuffer {
         &self.device_view
     }
 
+    /// The whole host mapping as bytes.
+    ///
+    /// # Safety
+    /// The caller guarantees every GPU write to this buffer completed (the
+    /// writing stream was synchronized) and no GPU write is in flight. Reading
+    /// does not change the ledger phase.
+    pub unsafe fn host_bytes(&self) -> &[u8] {
+        // SAFETY: `host` maps `size` bytes until Drop; the caller upholds the
+        // no-concurrent-GPU-write contract above.
+        unsafe { std::slice::from_raw_parts(self.host.cast::<u8>(), self.size) }
+    }
+
     /// Start a host write. Only legal from `Retired`.
     pub fn begin_write(&mut self) -> HipResult<MappedWrite<'_>> {
         self.ledger.begin_write().map_err(mapped_err)?;

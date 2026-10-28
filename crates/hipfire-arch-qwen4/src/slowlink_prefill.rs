@@ -1328,6 +1328,11 @@ fn reserve_window_scratch(gpu: &mut Gpu, args: WindowScratchArgs) -> Result<(), 
             gpu.reserve_qwen4_moe_group_scratch(args.rows, dsp::K_TOP, args.experts)
         }
     }
+    .and_then(|()| {
+        // The count barrier's host-mapped landing zone: the per-expert counts (`experts`
+        // words) and the window's inverse route map (`rows * K_TOP` words) both go through it.
+        gpu.reserve_slowlink_count_host(args.experts.max(args.rows * dsp::K_TOP))
+    })
     .map_err(|error| {
         format!(
             "window scratch growth to {} rows failed: {error}",
@@ -2716,15 +2721,25 @@ impl Run<'_, '_> {
             .map_err(dsp_err("route storage"))?;
         let mut report = WindowReport::default();
         progress.ring_primed = true;
-        self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
+        // A device-resident band-start layer uploads each tile's token ids with a blocking
+        // pageable copy (`embed_tile`) that would queue behind the prime's page copies, so
+        // the prime is deferred until that layer's tile loop has enqueued every upload.
+        let defer_prime = !self.rt.host_layer[geo.band.start];
+        if !defer_prime {
+            self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
+        }
         for layer in geo.band.clone() {
             self.rt.ring.mark_layer_begin(&*self.gpu, layer)?;
             if self.rt.host_layer[layer] {
                 self.host_layer(w, layer, &mut routes, txn, &mut report)?;
             } else {
-                self.resident_layer(w, layer, txn)?;
+                let primed = !(defer_prime && layer == geo.band.start);
+                self.resident_layer(w, layer, txn, primed)?;
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
+            if defer_prime && layer == geo.band.start {
+                self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
+            }
             #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
             if layer == geo.band.start
                 && self
@@ -2770,8 +2785,15 @@ impl Run<'_, '_> {
         Ok(report)
     }
 
-    /// A device-resident layer: the incumbent's per-tile steps.
-    fn resident_layer(&mut self, w: &WinCtx<'_>, layer: usize, txn: &mut PromptTxn) -> R<()> {
+    /// A device-resident layer: the incumbent's per-tile steps.  `primed` is false only while
+    /// the window's ring prime is deferred past this layer: no pump before the prime.
+    fn resident_layer(
+        &mut self,
+        w: &WinCtx<'_>,
+        layer: usize,
+        txn: &mut PromptTxn,
+        primed: bool,
+    ) -> R<()> {
         let geo = self.geo;
         for (ti, tile) in w.tiles.iter().enumerate() {
             if layer == geo.band.start {
@@ -2782,7 +2804,9 @@ impl Run<'_, '_> {
             if layer == geo.last_layer {
                 self.tile_output(w, ti)?;
             }
-            self.rt.ring.pump(&*self.gpu, &mut self.rt.schedule)?;
+            if primed {
+                self.rt.ring.pump(&*self.gpu, &mut self.rt.schedule)?;
+            }
         }
         Ok(())
     }

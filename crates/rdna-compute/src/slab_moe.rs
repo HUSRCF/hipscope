@@ -2341,10 +2341,103 @@ impl Gpu {
         )
     }
 
-    /// The one S1 count barrier: a stream-ordered D2H of the first `words` i32 of `tensor` on
-    /// the ACTIVE compute stream, then one wait on that stream alone (never the transport
-    /// owner's copy stream, never the legacy/null stream, never a device-wide sync).  Needs an
-    /// active stream.
+    /// Allocate (load time, never shrinking) the host-mapped coherent buffer the S1 count
+    /// barrier's copy kernel writes: two arrays of `words` i32.
+    pub fn reserve_slowlink_count_host(&mut self, words: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let bytes = words.checked_mul(8).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_slowlink_count_host: size overflows")
+        })?;
+        if self
+            .slowlink_count_host
+            .as_ref()
+            .is_some_and(|buf| buf.size() >= bytes)
+        {
+            return Ok(());
+        }
+        self.slowlink_count_host = Some(self.hip.mapped_host_buffer(bytes)?);
+        Ok(())
+    }
+
+    /// Shared body of the S1 count barrier: ONE `copy_regions_u32` kernel launch on the active
+    /// stream copying the first `words` i32 of each source into the host-mapped coherent count
+    /// buffer, one wait on that stream, then the words read out of the mapping.
+    fn slowlink_count_barrier(
+        &mut self,
+        name: &str,
+        sources: &[&GpuTensor],
+        words: usize,
+    ) -> HipResult<Vec<Vec<i32>>> {
+        if self.active_stream.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: the S1 count barrier needs the active compute stream"),
+            ));
+        }
+        let Some(mapped) = self.slowlink_count_host.take() else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: count buffer not reserved at load (reserve_slowlink_count_host)"),
+            ));
+        };
+        let result = self.slowlink_count_barrier_with(name, &mapped, sources, words);
+        self.slowlink_count_host = Some(mapped);
+        result
+    }
+
+    fn slowlink_count_barrier_with(
+        &mut self,
+        name: &str,
+        mapped: &hip_bridge::MappedHostBuffer,
+        sources: &[&GpuTensor],
+        words: usize,
+    ) -> HipResult<Vec<Vec<i32>>> {
+        let bytes = words * 4;
+        if mapped.size() < sources.len() * bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: count buffer not reserved at load (reserve_slowlink_count_host)"),
+            ));
+        }
+        if words == 0 {
+            return Ok(vec![Vec::new(); sources.len()]);
+        }
+        let words32 = u32::try_from(words)
+            .map_err(|_| hip_bridge::HipError::new(0, &format!("{name}: too many words")))?;
+        let base = mapped.device_buffer().as_ptr() as u64;
+        let mut table = [(0u64, 0u64, 0u32); 2];
+        for (index, source) in sources.iter().enumerate() {
+            let dst = base + (index * bytes) as u64;
+            let src = source.buf.as_ptr() as u64;
+            assert!(
+                (dst | src | bytes as u64) % 4 == 0,
+                "{name}: count copy is not 4-byte aligned"
+            );
+            table[index] = (dst, src, words32);
+        }
+        crate::tensor_ops::launch_copy_regions(self, &table[..sources.len()])?;
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()?;
+        // SAFETY: the active stream that ran the copy kernel was just synchronized and no
+        // other GPU write targets this Gpu-owned buffer.
+        let host = unsafe { mapped.host_bytes() };
+        Ok((0..sources.len())
+            .map(|index| {
+                host[index * bytes..(index + 1) * bytes]
+                    .chunks_exact(4)
+                    .map(|word| i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// The one S1 count barrier: a kernel copy of the first `words` i32 of `tensor` into
+    /// host-mapped coherent memory on the ACTIVE compute stream (so it never queues behind
+    /// the transport's SDMA page copies), then one wait on that stream alone (never the
+    /// transport owner's copy stream, never the legacy/null stream, never a device-wide
+    /// sync).  Needs an active stream and the load-time `reserve_slowlink_count_host`.
     pub fn slowlink_sync_download_i32(
         &mut self,
         tensor: &GpuTensor,
@@ -2360,35 +2453,13 @@ impl Gpu {
                 "slowlink_sync_download_i32: the span exceeds the tensor",
             ));
         }
-        let Some(stream) = self.active_stream.as_ref() else {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "slowlink_sync_download_i32: the S1 count barrier needs the active compute stream",
-            ));
-        };
-        let hip = &self.hip;
-        let host = guarded_async_download(
-            vec![0i32; words],
-            |host, enqueued| {
-                // SAFETY: `host` owns `words * 4` initialized bytes, i32 has no padding, and
-                // the slice is used only for this copy, which the guard joins before `host`
-                // can be dropped (or leaks `host` when the join is unconfirmed).
-                let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, words * 4)
-                };
-                hip.memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
-                *enqueued = true;
-                Ok(())
-            },
-            || hip.stream_synchronize(stream),
-        )?;
-        self.take_device_wait_error()?;
-        Ok(host)
+        let mut out = self.slowlink_count_barrier("slowlink_sync_download_i32", &[tensor], words)?;
+        Ok(out.remove(0))
     }
 
     /// [`Gpu::slowlink_sync_download_i32`] of the first `words` i32 of TWO tensors at the same
-    /// barrier: two stream-ordered D2H copies on the active compute stream, then one wait on
-    /// that stream alone.  Needs an active stream.
+    /// barrier: one kernel launch copying both into host-mapped coherent memory on the active
+    /// compute stream, then one wait on that stream alone.  Needs an active stream.
     pub fn slowlink_sync_download_i32_pair(
         &mut self,
         first: &GpuTensor,
@@ -2403,34 +2474,13 @@ impl Gpu {
                 "slowlink_sync_download_i32_pair: the span exceeds a tensor",
             ));
         }
-        let Some(stream) = self.active_stream.as_ref() else {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "slowlink_sync_download_i32_pair: the S1 count barrier needs the active compute stream",
-            ));
-        };
-        let hip = &self.hip;
-        let (a, b) = guarded_async_download(
-            (vec![0i32; words], vec![0i32; words]),
-            |host, enqueued| {
-                // SAFETY: each `Vec` owns `words * 4` initialized bytes, i32 has no padding,
-                // and each slice is used only for its own copy; the guard joins the stream
-                // (both copies, or the one that was accepted) before either `Vec` can be
-                // dropped, and leaks both when the join is unconfirmed.
-                let (ab, bb) = unsafe {
-                    (
-                        std::slice::from_raw_parts_mut(host.0.as_mut_ptr() as *mut u8, words * 4),
-                        std::slice::from_raw_parts_mut(host.1.as_mut_ptr() as *mut u8, words * 4),
-                    )
-                };
-                hip.memcpy_dtoh_async(ab, &first.buf, Some(stream))?;
-                *enqueued = true;
-                hip.memcpy_dtoh_async(bb, &second.buf, Some(stream))?;
-                Ok(())
-            },
-            || hip.stream_synchronize(stream),
+        let mut out = self.slowlink_count_barrier(
+            "slowlink_sync_download_i32_pair",
+            &[first, second],
+            words,
         )?;
-        self.take_device_wait_error()?;
+        let b = out.remove(1);
+        let a = out.remove(0);
         Ok((a, b))
     }
 }
@@ -2449,6 +2499,7 @@ impl Gpu {
 ///   there is one, else the join error).
 ///
 /// No retry and no suppression: a failure is reported as it occurred.
+#[cfg(test)]
 fn guarded_async_download<B>(
     mut host: B,
     enqueue: impl FnOnce(&mut B, &mut bool) -> HipResult<()>,

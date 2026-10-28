@@ -8507,7 +8507,7 @@ fn qsa_copy_region_extent_post(
     );
 }
 
-fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
+pub(crate) fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
     const NAME: &str = "copy_regions_u32";
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, NAME)?;
     let mut args = KernargBlob::new();

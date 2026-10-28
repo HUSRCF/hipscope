@@ -1632,6 +1632,9 @@ pub struct Gpu {
     router_fault: Option<crate::router_fault::RouterFaultMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Host-mapped coherent buffer the S1 count barrier's copy kernel writes (two arrays),
+    /// reserved at load by `reserve_slowlink_count_host`.
+    pub slowlink_count_host: Option<hip_bridge::MappedHostBuffer>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
     /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
     /// every successful launch so `sync_with_deadline` can name the suspect
@@ -2904,6 +2907,7 @@ impl Gpu {
             device_wait_unreported: std::sync::atomic::AtomicU32::new(0),
             router_fault: None,
             active_stream: None,
+            slowlink_count_host: None,
             last_kernel: None,
             #[cfg(feature = "lab")]
             lab_kernel_fault: LabKernelFaultCountdown::default(),
