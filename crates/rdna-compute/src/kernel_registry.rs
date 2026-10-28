@@ -1137,8 +1137,46 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 .map_err(recipe_err)?,
                 ["attention_flash_reduce_dsplit_gfx1201_vmm"]
             );
+            // A3B (H16/KV2) lane-batched FullAttention on the exact route
+            // (attention.rs `attention_flash_decode_vmm{,_gated_mq_rotate}`,
+            // rows_batched.rs `qwen35_a3b_fa_prep_rows`): the group-8 tile
+            // twin, the fused reduce + gate + rotate epilogue twin and the
+            // 16Q/2K FA prep rows twin.
+            add!(
+                "attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm",
+                crate::attention::vmm_rows_source_from(
+                    crate::attention::ATTENTION_FLASH_DECODE_VMM_ROWS_A3B_SRC,
+                    kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                    "attention_flash_fp8_e4m3_tile_gqa8_gfx1201",
+                    "VMM_ROWS_FP8_GQA8_TILE"
+                )
+                .map_err(recipe_err)?,
+                ["attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm"]
+            );
+            add!(
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm",
+                crate::attention::vmm_rows_source_from(
+                    crate::attention::ATTENTION_FLASH_DECODE_VMM_ROWS_A3B_SRC,
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
+                    "HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL",
+                    "VMM_ROWS_ATTN_REDUCE_GATED_MQ"
+                )
+                .map_err(recipe_err)?,
+                ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm"]
+            );
+            add!(
+                "qwen35_fa_prep_gfx1201_rows",
+                crate::attention::rows_batched::rows_twin_module_source(
+                    crate::attention::rows_batched::QWEN35_A3B_FA_PREP_ROWS
+                )
+                .map_err(recipe_err)?,
+                ["qwen35_fa_prep_gfx1201_rows"]
+            );
             // rows_batched.rs twins (`rows_twin_module_source`).
-            for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP {
+            for &(module, symbols) in QWEN36_27B_GFX1201_ROWS_TWINS_HIP
+                .iter()
+                .chain(A3B_GFX1201_DN_ROWS_TWINS_HIP)
+            {
                 entries.push(entry(
                     arch,
                     module,
@@ -4026,6 +4064,64 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::FUSED_RMSNORM_PROJ4_MQ4G256V2_FOLD_GFX1201_SRC,
             ["fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201"]
         );
+        // A3B VMM exact batch route: lane-batched multi-weight projection GEMV
+        // (`lane_proj.rs`, `HIPFIRE_A3B_LANE_PROJ`).
+        add!(
+            "gemv_mq4g256v2_lane_proj_k2048_gfx1201",
+            kernels::GEMV_MQ4G256V2_LANE_PROJ_K2048_GFX1201_SRC,
+            [
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n1",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n2",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n3",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n4",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n5",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n6",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n7",
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n8",
+            ]
+        );
+        // A3B VMM exact batch route: lane-batched twins of the MoE block's
+        // router top-k, shared down, routed gate/up and routed down/combine
+        // (`moe_decode_lanes.rs`; the shared silu launch reuses
+        // `fused_silu_mul_mq_rotate`).
+        for &(module, symbols) in A3B_GFX1201_MOE_LANES_HIP {
+            entries.push(entry(
+                arch,
+                module,
+                symbols,
+                crate::moe_decode_lanes::moe_lane_module_source(module)
+                    .map_err(|e| {
+                        RegistryError::ConflictingPlan(format!("moe lane twin source: {e}"))
+                    })?
+                    .into(),
+                extra_flags,
+            ));
+        }
+        // A3B VMM exact batch route lm_head: the one-weight-read lane-batched
+        // twin of `gemv_mq4g256v2_multirow_r2` (`head_lanes.rs`).
+        entries.push(entry(
+            arch,
+            crate::head_lanes::HEAD_LANES_MODULE,
+            &crate::head_lanes::HEAD_LANES_SYMBOLS,
+            crate::head_lanes::HEAD_LANES_SRC.into(),
+            extra_flags,
+        ));
+        // A3B VMM exact batch route: lane-batched residual GEMV of the wo
+        // projection (`residual_lanes.rs`).
+        add!(
+            "gemv_mq4g256v2_residual_lanes_gfx1201",
+            kernels::GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC,
+            ["gemv_mq4g256v2_residual_lanes_gfx1201"]
+        );
+        // A3B VMM exact batch route expert-deduplicating routed gate/up and
+        // down + combine (`moe_decode_lanes.rs`).
+        entries.push(entry(
+            arch,
+            crate::moe_decode_lanes::MOE_DEDUP_MODULE,
+            &crate::moe_decode_lanes::MOE_DEDUP_SYMBOLS,
+            crate::moe_decode_lanes::MOE_DEDUP_SRC.into(),
+            extra_flags,
+        ));
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
@@ -6325,6 +6421,29 @@ pub struct RouteKernelPlan {
 /// source is the registry's launcher-identical expression for that module.
 type RouteHip = (&'static str, &'static [&'static str]);
 
+/// A3B (`qwen3_5_moe` mq4rs) lane-batched MoE block twins of the VMM exact
+/// batch route (`moe_decode_lanes`; module name = entry name, gfx1201 only).
+/// The route also launches the batched `fused_silu_mul_mq_rotate`, which the
+/// A3B AR route already loads.
+const A3B_GFX1201_MOE_LANES_HIP: &[RouteHip] = &[
+    (
+        "moe_router_softmax_topk_k8_wave64_rows",
+        &["moe_router_softmax_topk_k8_wave64_rows"],
+    ),
+    (
+        "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2_rows",
+        &["gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2_rows"],
+    ),
+    (
+        "gemv_mq4g256v2_moe_gate_up_k8_indexed_rows",
+        &["gemv_mq4g256v2_moe_gate_up_k8_indexed_rows"],
+    ),
+    (
+        "gemv_mq4g128v2_moe_ninepath_d4_rows",
+        &["gemv_mq4g128v2_moe_ninepath_d4_rows"],
+    ),
+];
+
 /// Qwen3.6-27B dense MQ4G256V2 XTS on exact gfx1201, AR route: native fp8
 /// K/V, Q8 DeltaNet state, widened 8192-row prefill and its 512-row legacy
 /// fallback, lowered single-token decode (direct and retained replay), and
@@ -6676,6 +6795,19 @@ const QWEN36_27B_GFX1201_ROWS_TWINS_HIP: &[RouteHip] = &[
     ),
 ];
 
+/// Exact-A3B CbVmm DeltaNet rows twins (`rows_batched.rs`; module name =
+/// entry name). The conv twin is the shared 27B module.
+const A3B_GFX1201_DN_ROWS_TWINS_HIP: &[RouteHip] = &[
+    (
+        "gated_delta_net_q8_compact2_b2_rows",
+        &["gated_delta_net_q8_compact2_b2_rows"],
+    ),
+    (
+        "gated_norm_mq_rotate_gfx1201_rows",
+        &["gated_norm_mq_rotate_gfx1201_rows"],
+    ),
+];
+
 /// VMM continuous-batching exact route additions to
 /// [`QWEN36_27B_GFX1201_AR_HIP`] (`forward_slots/vmm/exact.rs`): batched
 /// VMM KV write, row-batched flash decode, and the rows twins.
@@ -6732,6 +6864,10 @@ fn gfx1201_twin_exports(
     match module {
         "gated_delta_net_q8_compact3_b2_rows" => &[
             "gated_delta_net_q8_compact3_b2_rows",
+            "gated_delta_net_q8_fast_independent_masked",
+        ],
+        "gated_delta_net_q8_compact2_b2_rows" => &[
+            "gated_delta_net_q8_compact2_b2_rows",
             "gated_delta_net_q8_fast_independent_masked",
         ],
         "attention_fp8_e4m3_kv_batched_segs" => &[
@@ -10426,16 +10562,49 @@ mod tests {
             );
         }
         // The 0.4.4 mq4rs (A3B MQ4G128V2) decode kernels: the fused qt53
-        // nine-path down and the two-row shared-expert k512 GEMV.
-        const MQ4RS_DECODE_ADDED_MODULES: [&str; 3] = [
+        // nine-path down and the two-row shared-expert k512 GEMV, the norm
+        // fold, and the lane-batched MoE block twins of the VMM exact route.
+        const MQ4RS_DECODE_ADDED_MODULES: [&str; 7] = [
             "gemv_mq4g128v2_moe_ninepath_d4",
             "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
             "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
+            "moe_router_softmax_topk_k8_wave64_rows",
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2_rows",
+            "gemv_mq4g256v2_moe_gate_up_k8_indexed_rows",
+            "gemv_mq4g128v2_moe_ninepath_d4_rows",
         ];
         for module in MQ4RS_DECODE_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
                 "missing mq4rs decode module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // The A3B lane-batched lm_head of the exact CbVmm route (gfx1201).
+        const A3B_HEAD_LANES_ADDED_MODULES: [&str; 1] = ["gemv_mq4g256v2_head_lanes_gfx1201"];
+        for module in A3B_HEAD_LANES_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B head lanes module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // The A3B expert-deduplicating routed MoE kernels (gfx1201).
+        const A3B_MOE_DEDUP_ADDED_MODULES: [&str; 1] = ["moe_dedup_mq4rs_gfx1201"];
+        for module in A3B_MOE_DEDUP_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B moe dedup module {module}"
             );
             assert!(
                 !expected
@@ -10532,6 +10701,70 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Exact-A3B CbVmm DeltaNet rows twins (gfx1201 only; the conv twin is
+        // the shared 27B module above).
+        const A3B_DN_ROWS_ADDED_MODULES: [&str; 2] = [
+            "gated_delta_net_q8_compact2_b2_rows",
+            "gated_norm_mq_rotate_gfx1201_rows",
+        ];
+        for module in A3B_DN_ROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B DN rows module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // A3B lane-batched FullAttention on the exact CbVmm route (gfx1201).
+        const A3B_FA_LANES_ADDED_MODULES: [&str; 3] = [
+            "attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm",
+            "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm",
+            "qwen35_fa_prep_gfx1201_rows",
+        ];
+        for module in A3B_FA_LANES_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B FA lanes module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // A3B VMM exact batch route: lane-batched multi-weight projection GEMV (gfx1201 only).
+        const A3B_LANE_PROJ_ADDED_MODULES: [&str; 1] = ["gemv_mq4g256v2_lane_proj_k2048_gfx1201"];
+        for module in A3B_LANE_PROJ_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B lane proj module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // A3B VMM exact batch route: lane-batched wo residual GEMV (gfx1201 only).
+        const A3B_LANE_WO_ADDED_MODULES: [&str; 1] = ["gemv_mq4g256v2_residual_lanes_gfx1201"];
+        for module in A3B_LANE_WO_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing A3B lane wo module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10550,7 +10783,13 @@ mod tests {
                 + FP8_SPLIT_LSE_ADDED_MODULES.len()
                 + SHARED_LAUNCHER_ADDED_MODULES.len()
                 + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len()
-                + ZBA_FOLD_SPLIT_ADDED_MODULES.len(),
+                + ZBA_FOLD_SPLIT_ADDED_MODULES.len()
+                + A3B_DN_ROWS_ADDED_MODULES.len()
+                + A3B_FA_LANES_ADDED_MODULES.len()
+                + A3B_HEAD_LANES_ADDED_MODULES.len()
+                + A3B_LANE_WO_ADDED_MODULES.len()
+                + A3B_MOE_DEDUP_ADDED_MODULES.len()
+                + A3B_LANE_PROJ_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

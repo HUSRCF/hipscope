@@ -140,7 +140,7 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
             "27b-mtp" => (93, 10),
             "fn-ar" => (68, 4),
             "fn-mtp" => (69, 4),
-            "a3b-ar" => (38, 10),
+            "a3b-ar" => (53, 10),
             _ => unreachable!(),
         };
         assert_eq!((hip, emb), measured, "{route}: measured set changed");
@@ -208,8 +208,35 @@ fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
 /// `hipfire-kernel-pack` compiles) AND listed in the `a3b-ar` route of the
 /// fixture with its exact source SHA-256 (the registry test above then pins
 /// symbol, flags and source). A module missing from either fails here.
-const A3B_AR_POST_MEASUREMENT_HIP_MODULES: [&str; 1] =
-    ["fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201"];
+const A3B_AR_POST_MEASUREMENT_HIP_MODULES: [&str; 16] = [
+    "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
+    // Lane-batched FullAttention of the exact CbVmm route: the batched VMM fp8
+    // KV write, the group-8 flash tile twin, the fused reduce + gate + rotate
+    // epilogue twin and the 16Q/2K FA prep rows twin.
+    "kv_cache_write_fp8_e4m3_batched_vmm",
+    "attention_flash_fp8_e4m3_tile_gqa8_gfx1201_vmm",
+    "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201_vmm",
+    "qwen35_fa_prep_gfx1201_rows",
+    // Lane-batched lm_head of the exact CbVmm route (`head_lanes.rs`).
+    "gemv_mq4g256v2_head_lanes_gfx1201",
+    // Lane-batched multi-weight projection GEMV of the exact VMM batch route
+    // (DeltaNet QKVZA, FullAttention QKV, MoE router/selector/shared quartet).
+    "gemv_mq4g256v2_lane_proj_k2048_gfx1201",
+    // Expert-deduplicating routed gate/up and down + combine of the exact
+    // CbVmm route (`moe_decode_lanes.rs`).
+    "moe_dedup_mq4rs_gfx1201",
+    // Lane-batched twins the exact CbVmm route launches for the A3B DeltaNet
+    // mixer, the MoE block (also the fallback of the dedup kernels and the
+    // one-lane path) and the `wo` residual.
+    "conv1d_silu_split_qknorm_b256_rows",
+    "gated_delta_net_q8_compact2_b2_rows",
+    "gated_norm_mq_rotate_gfx1201_rows",
+    "gemv_mq4g128v2_moe_ninepath_d4_rows",
+    "gemv_mq4g256v2_moe_gate_up_k8_indexed_rows",
+    "gemv_mq4g256v2_residual_lanes_gfx1201",
+    "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2_rows",
+    "moe_router_softmax_topk_k8_wave64_rows",
+];
 
 #[test]
 fn a3b_ar_post_measurement_decode_modules_ship_in_the_gfx1201_pack() {

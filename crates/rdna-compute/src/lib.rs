@@ -55,6 +55,7 @@ mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;
+pub mod head_lanes;
 pub mod iu4_c8_pm;
 mod kernel_abi;
 pub mod kernel_pack;
@@ -63,14 +64,17 @@ pub mod kernels;
 pub mod kv_slots;
 pub mod lane_fa;
 pub mod lane_gdn;
+pub mod lane_proj;
 pub mod lane_rows_pm;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
+pub mod moe_decode_lanes;
 mod moe_few;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
 pub mod norm_fold;
+pub mod residual_lanes;
 pub mod slab_admission;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,

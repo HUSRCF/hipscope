@@ -6940,6 +6940,26 @@ pub const FUSED_RMSNORM_PROJ4_MQ4G256V2_FOLD_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_rmsnorm_proj4_mq4g256v2_fold.gfx1201.hip")
 );
+/// A3B exact VMM batch route (exact gfx1201, K = 2048): lane-batched
+/// multi-weight MQ4G256V2 projection GEMV (`lane_proj.rs`), compiled wave64.
+pub const GEMV_MQ4G256V2_LANE_PROJ_K2048_GFX1201_SRC: &str = concat!(
+    "// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_lane_proj_k2048.gfx1201.hip")
+);
+/// Lane wrappers of the A3B decode MoE block twins (exact gfx1201): appended to
+/// each singleton body by `moe_decode_lanes::moe_lane_module_source`, which
+/// selects the wrapper with `HIPFIRE_MOE_LANES_*`.
+pub const MOE_DECODE_LANES_MQ4RS_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/moe_decode_lanes_mq4rs.gfx1201.hip");
+/// Lane-batched MQ4G256V2 residual GEMV (`y[b] += W . x[b]`, B <= 8, K % 1024
+/// == 0) of the A3B exact VMM batch route (exact gfx1201), per lane the bytes
+/// of the singleton `gemv_mq4g256v2_residual`. See `residual_lanes.rs`.
+/// Symbol `gemv_mq4g256v2_residual_lanes_gfx1201`.
+pub const GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual_lanes.gfx1201.hip")
+);
 /// MQ4G256V2-Lloyd (qt=52) fused QKVZA decode: 32 LUT dwords (qkv, z, beta,
 /// alpha codebooks in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
 pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(
@@ -9244,7 +9264,6 @@ pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
 /// half-split RoPE per head) compiles unchanged on RDNA4; the distinct
 /// module/entry symbol keeps HSACO caches from aliasing the gfx1100/gfx1151
 /// builds.
-#[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
