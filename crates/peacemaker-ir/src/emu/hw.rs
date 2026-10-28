@@ -107,10 +107,30 @@ pub(super) struct StepHw {
 pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) -> StepHw {
     let inst = step.inst;
     let eff = &inst.effects;
+    // A MUBUF access with neither OFFEN nor IDXEN (`off`) ignores VADDR, but the decoder still yields the encoded
+    // VADDR field as a register (`v[0:1]`): it is not read. (IDXEN is unrepresentable; `memory.rs::buffer_shape`
+    // refuses it.)
+    let skip: Option<usize> = (matches!(
+        inst.form,
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer)
+    ) && !inst
+        .operands
+        .iter()
+        .any(|o| matches!(o, crate::operand::Operand::Vmem(crate::operand::VmemToken::Offen)))
+        && matches!(inst.operands.get(1), Some(crate::operand::Operand::Reg(r)) if r.kind == Kind::V))
+    .then_some(1);
+    let operand_reg = |idx: usize| {
+        if Some(idx) == skip {
+            None
+        } else {
+            operand_register(arch, Wave::Wave32, inst, idx)
+        }
+    };
+    let skipped: Option<RegRef> = skip.and_then(|i| operand_register(arch, Wave::Wave32, inst, i));
     let mut masks: Vec<(Kind, u16, u32)> = Vec::new();
     let mut explicit: Vec<(Kind, u16)> = Vec::new();
     for idx in 0..inst.operands.len() {
-        let Some(reg) = operand_register(arch, Wave::Wave32, inst, idx) else {
+        let Some(reg) = operand_reg(idx) else {
             continue;
         };
         let mask = operand_mask(inst, arch, idx);
@@ -130,10 +150,21 @@ pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) ->
             .map_or(u32::MAX, |m| m.2)
     };
     let mut touch: Vec<Touch> = Vec::new();
-    let named: Vec<(Kind, u16)> = eff
-        .defs
+    // The tables reserve 64-bit lane-mask slots even in wave32 (`operand_register`): an effect register that starts at
+    // an explicit operand takes that operand's real width, or `v_add_co_u32 v, s1, ...` would "write" s2 as well.
+    let exact: Vec<RegRef> = (0..inst.operands.len()).filter_map(operand_reg).collect();
+    let fit = |r: &RegRef| -> RegRef {
+        match exact.iter().find(|e| e.kind == r.kind && e.base == r.base && e.len < r.len) {
+            Some(e) => *e,
+            None => *r,
+        }
+    };
+    let covered = |r: &RegRef| skipped.as_ref() != Some(r);
+    let defs: Vec<RegRef> = eff.defs.iter().filter(|r| covered(r)).map(&fit).collect();
+    let uses: Vec<RegRef> = eff.uses.iter().filter(|r| covered(r)).map(&fit).collect();
+    let named: Vec<(Kind, u16)> = defs
         .iter()
-        .chain(eff.uses.iter())
+        .chain(uses.iter())
         .flat_map(|r| (0..u16::from(r.len)).map(move |w| (r.kind, r.base + w)))
         .collect();
     let mut add = |key: (Kind, u16), read: bool, write: bool| {
@@ -151,12 +182,12 @@ pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) ->
             }),
         }
     };
-    for reg in &eff.defs {
+    for reg in &defs {
         for w in 0..u16::from(reg.len) {
             add((reg.kind, reg.base + w), false, true);
         }
     }
-    for reg in &eff.uses {
+    for reg in &uses {
         for w in 0..u16::from(reg.len) {
             add((reg.kind, reg.base + w), true, false);
         }
@@ -721,7 +752,7 @@ impl<'a> Emulator<'a> {
                             .is_some_and(|m| m.load && m.order.is_some() && m.order == p.order);
                     if !tolerated {
                         return Err(format!(
-                            "[in-flight] inst {} {} {} while the load at inst {} ({}) into it has not retired (no {} wait since it was issued)",
+                            "[in-flight] inst {} {} {} while the load at inst {} ({}) into it has not retired (no {} wait since it was issued) [touches: {}]",
                             pc,
                             if t.write && t.read {
                                 "reads and writes"
@@ -734,6 +765,11 @@ impl<'a> Emulator<'a> {
                             p.pc,
                             self.step_name(p.pc),
                             pending_counter(p),
+                            shw.touch
+                                .iter()
+                                .map(|x| format!("{}{}", reg_name(x.kind, x.dword), if x.write { "w" } else { "r" }))
+                                .collect::<Vec<_>>()
+                                .join(","),
                         ));
                     }
                 }
