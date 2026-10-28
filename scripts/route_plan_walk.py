@@ -12,19 +12,40 @@ route plan (crates/rdna-compute/src/route_plans/). Never used by product loading
 
 usage: route_plan_walk.py --run DIR --daemon BIN --model M --route ar|mtp
                           [--prompt-dir DIR] [--max-seq N] [--env K=V ...]
+                          [--profile full|xtx-fn-bounded] [--load-param K=JSON ...]
 The environment (device selection, HIPFIRE_PLE_FORMAT, ...) is inherited; the
-run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache. Walks of Qwen3.5
+run gets its own HOME/HIPFIRE_HOME, lock dir and an empty kernel cache (`--env
+HIPFIRE_KERNEL_CACHE=DIR` points it at a warm one). Walks of Qwen3.5
 (27B, A3B) need a daemon whose loader logs `route plan axes:` (HIPFIRE_MODULE_LOAD_AUDIT=1);
 Flash-Next walks only need the older `qwen4 state:` line.
 `--sealed` replays the checked-in plan sealed (HIPFIRE_ROUTE_PLAN_SEAL=1) for the builder.
+`--profile xtx-fn-bounded` is the gfx1100 Flash-Next walk: one fabric job's worth of requests
+(every generate decodes at most 8 tokens; prompts from short rows to the 8K / 16.9K / 32K depth
+prompts in `--prompt-dir`), instead of the full walk's ~640 requests and 128K prompt.
+`--load-param K=JSON` adds a key to the `load` request's params (e.g. kv_mode='"q8"').
+The daemon runs in its own process group and is killed when `--timeout` expires or the walk exits
+abnormally, so a hung or aborted walk never leaves a daemon holding the card.
 """
+import atexit
 import argparse
 import hashlib
 import json
 import os
 import pathlib
+import signal
 import subprocess
+import threading
 import time
+
+BOUNDED_MAX_TOKENS = 8
+# Prompt-length sweep of the bounded profile, in FILLER words (the chat template adds ~12 rows): every
+# row count to 8, a coarse stride through the row classes below one 768-row S1 tile, the tile edge,
+# and multi-tile prompts of ~1K..4K words.
+BOUNDED_WORDS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 768,
+                 1100, 1600, 2400, 4100)
+# Depth prompts of the XtxGap PF screens (8,204 / 16,896 / 32,780 framed rows): one partial S1 window, exactly
+# one 16,896-row window, one full window plus a 15,884-row second window and tail.
+BOUNDED_DEPTH_PROMPTS = ("depth_8192.txt", "depth_16884.txt", "depth_32768.txt")
 
 SAMPLING = [
     {"temperature": 0},
@@ -63,6 +84,46 @@ def prefill_rows():
     rows.update([2047, 2048, 2049, 3000, 5000, 6143, 6144, 6145, 8191, 8192, 8193, 8200, 12289, 16385, 33000,
                  125000, 131000])
     return sorted(r for r in rows if r >= 1)
+
+
+def filler_words(n):
+    words = FILLER.split()
+    return " ".join((words * (n // len(words) + 1))[:n])
+
+
+def bounded_plan(prompt_dir):
+    """The gfx1100 Flash-Next walk (`--profile xtx-fn-bounded`): the same plan for the AR and the MTP route,
+    every generate decoding at most BOUNDED_MAX_TOKENS tokens. Greedy and sampled generates on a short
+    prompt (sampler + MTP verify/accept kernels), a prompt-length sweep (short prefill row classes, the
+    768-row S1 tile and its tails), a session resume, thinking-on generates, then the 8K / 16.9K / 32K depth
+    prompts (S1 windows, the window tail, deep decode context) last, so a card fault there leaves every
+    cheaper request recorded."""
+    cap = BOUNDED_MAX_TOKENS
+    plan = [{"type": "generate", "prompt": "Hi", "max_tokens": cap, "temperature": 0}]
+    short = "Name three rivers in Europe."
+    for s in SAMPLING:
+        plan.append(dict({"type": "generate", "prompt": short, "max_tokens": cap}, **s))
+    for n in BOUNDED_WORDS:
+        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0,
+                     "_words": n})
+    for n in (40, 300):
+        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0.8,
+                     "top_k": 40, "seed": n, "_words": n})
+    # Session resumes (append prefill onto a cached prefix), greedy then sampled.
+    plan.append({"type": "generate", "prompt": short, "max_tokens": cap, "temperature": 0})
+    plan.append({"type": "generate", "chain_user": "Now name two more.", "max_tokens": cap, "temperature": 0})
+    plan.append({"type": "generate", "chain_user": "Which is longest?", "max_tokens": cap, "temperature": 0.7,
+                 "top_p": 0.9})
+    # Thinking-on generates (the typed flag the daemon treats as authoritative), tiny think budget.
+    for s in ({"temperature": 0}, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}):
+        plan.append(dict({"type": "generate", "prompt": "Is 391 prime? Reason step by step, then answer.",
+                          "max_tokens": cap, "thinking_enabled": True, "max_think_tokens": 4,
+                          "_name": "think-short"}, **s))
+    for name in BOUNDED_DEPTH_PROMPTS:
+        plan.append({"type": "generate", "prompt": (prompt_dir / name).read_text(), "max_tokens": cap,
+                     "temperature": 0, "_name": name})
+    assert all(m["max_tokens"] <= cap for m in plan if m["type"] == "generate")
+    return plan
 
 
 def walk_plan(route, prompt_dir, max_seq):
@@ -147,6 +208,11 @@ def main():
                                                 / "benchmarks" / "prompts"))
     ap.add_argument("--max-seq", type=int, default=40960)
     ap.add_argument("--env", action="append", default=[])
+    ap.add_argument("--profile", choices=["full", "xtx-fn-bounded"], default="full",
+                    help="full: the ~640-request walk of the gfx1201 plans; xtx-fn-bounded: the gfx1100 "
+                         "Flash-Next walk (at most 8 decoded tokens per request, depth prompts from --prompt-dir)")
+    ap.add_argument("--load-param", action="append", default=[], metavar="K=JSON",
+                    help="extra key of the load request's params, value as JSON (e.g. kv_mode='\"q8\"')")
     ap.add_argument("--timeout", type=float, default=3000)
     ap.add_argument("--sealed", action="store_true",
                     help="validate a checked-in plan: keep route plans on, so any kernel the sealed "
@@ -157,7 +223,8 @@ def main():
     run.mkdir(parents=True, exist_ok=False)
     for name in ("home/.hipfire", "lockdir", "kcache"):
         (run / name).mkdir(parents=True)
-    plan = walk_plan(a.route, pathlib.Path(a.prompt_dir), a.max_seq)
+    plan = (bounded_plan(pathlib.Path(a.prompt_dir)) if a.profile == "xtx-fn-bounded"
+            else walk_plan(a.route, pathlib.Path(a.prompt_dir), a.max_seq))
     env = os.environ.copy()
     env.update(HOME=str(run / "home"), HIPFIRE_HOME=str(run / "home" / ".hipfire"),
                HIPFIRE_LOCK_DIR=str(run / "lockdir"), HIPFIRE_KERNEL_CACHE=str(run / "kcache"),
@@ -177,6 +244,9 @@ def main():
         env[k] = v
     load = {"type": "load", "model": a.model,
             "params": {"max_seq": a.max_seq, "mtp_mode": "on" if a.route == "mtp" else "off"}}
+    for kv in a.load_param:
+        k, v = kv.split("=", 1)
+        load["params"][k] = json.loads(v)
     daemon = pathlib.Path(a.daemon)
     (run / "command.json").write_text(json.dumps({
         "daemon": str(daemon), "daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest(),
@@ -187,7 +257,19 @@ def main():
     err = (run / "stderr.log").open("w")
     out = (run / "stdout.log").open("w")
     proc = subprocess.Popen([str(daemon)], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=err, text=True, bufsize=1)
+                            stderr=err, text=True, bufsize=1, start_new_session=True)
+
+    def kill_daemon():
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    atexit.register(kill_daemon)
+    watchdog = threading.Timer(a.timeout, kill_daemon)
+    watchdog.daemon = True
+    watchdog.start()
     deadline = time.monotonic() + a.timeout
     last_text = ""
 
