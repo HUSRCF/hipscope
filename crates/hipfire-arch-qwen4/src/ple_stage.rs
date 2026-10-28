@@ -221,11 +221,9 @@ struct GpuStageOps<'a> {
 impl StageOps for GpuStageOps<'_> {
     fn copy(&mut self, len: usize) -> HipResult<()> {
         let dst = self.dst.expect("copy needs a destination");
-        self.gpu.hip.memcpy_htod_async_on(
-            dst,
-            &self.src[..len],
-            self.gpu.active_stream.as_ref(),
-        )
+        self.gpu
+            .hip
+            .memcpy_htod_async_on(dst, &self.src[..len], self.gpu.active_stream.as_ref())
     }
     fn record_fence(&mut self) -> HipResult<()> {
         let fence = self.fence.expect("fence created before the copy");
@@ -320,7 +318,9 @@ impl PleHostStage {
                 .active_stream
                 .as_ref()
                 .expect("capture mode requires an active stream");
-            return gpu.hip.memcpy_htod_async(dst, pinned_slice(&self.bytes, len), stream);
+            return gpu
+                .hip
+                .memcpy_htod_async(dst, pinned_slice(&self.bytes, len), stream);
         }
         self.upload_async(gpu, dst, len)?;
         self.drain(gpu)
@@ -560,10 +560,7 @@ mod tests {
         assert_eq!(dev.consumed, vec![b"token-1".to_vec()], "copy saw token-1");
         seq.upload(&mut dev, 7, true).unwrap();
         host_write(&mut seq, &mut dev, b"token-3");
-        assert_eq!(
-            dev.consumed,
-            vec![b"token-1".to_vec(), b"token-2".to_vec()]
-        );
+        assert_eq!(dev.consumed, vec![b"token-1".to_vec(), b"token-2".to_vec()]);
         assert_eq!(dev.waits, vec!["fence", "fence"]);
     }
 
