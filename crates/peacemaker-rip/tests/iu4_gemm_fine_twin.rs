@@ -8,7 +8,8 @@
 //! cookbook 17). `kernels/iu4_gemm_fine.rip` writes the dense and the 2:4-sparse
 //! K128 blocks with only them; with `WAIT = "after"` it re-emits the shipped
 //! kernel's bytes for every dense and sparse variant, and the other two
-//! placements re-emit the generator's `Tune { wait: Mid | Before }` (dense);
+//! placements re-emit the generator's `Tune { wait: Mid | Before }` (dense), and `WAIT = "window"` its
+//! `Tune { wait: Window }` (the 128x128x8 tile: the schedule the shipped 27B gate/up `_b1s` export runs);
 //! `RING = 3` writes the depth-3 K-loop (third LDS slab, second prefetch set,
 //! entry branch, three-group loop body, peeled tail) and re-emits the
 //! generator's `Tune { ring: Three }` bytes for every wait placement.
@@ -112,19 +113,33 @@ fn the_fine_composition_emits_the_shipped_bytes() {
 /// groups) compiles and equals the generator's `Tune { wait }` bytes.
 #[test]
 fn a_wait_moved_script_equals_the_generators_tune() {
-    for (place, tune) in [("mid", WaitPlace::MidMma), ("before", WaitPlace::BeforeMma)] {
+    let mut windowed = 0;
+    for (place, tune) in [
+        ("mid", WaitPlace::MidMma),
+        ("before", WaitPlace::BeforeMma),
+        ("window", WaitPlace::Window),
+    ] {
         let src = with_wait(place);
         for spec in dense_specs() {
             let name = spec.variant_name();
             let shipped = iu4_gemm::emit(spec).unwrap();
-            let want = iu4_gemm::emit(Spec {
+            let tuned = Spec {
                 tune: Tune {
                     wait: tune,
                     ..Tune::default()
                 },
                 ..spec
-            })
-            .unwrap_or_else(|e| panic!("{name} {place}: {e}"));
+            };
+            if tune == WaitPlace::Window {
+                // The window placement is the 128x128x8 tile's (its raw sub-block-1 WMMA group names that
+                // tile's registers): the generator refuses the 16-wave tile.
+                if tuned.validate().is_err() {
+                    assert_eq!(spec.tile, Tile::T256x128x16, "{name}");
+                    continue;
+                }
+                windowed += 1;
+            }
+            let want = iu4_gemm::emit(tuned).unwrap_or_else(|e| panic!("{name} {place}: {e}"));
             let got = build(&src, &name).unwrap_or_else(|e| panic!("{name} {place}: {e}"));
             assert_same(&format!("{name} wait={place}"), &want, &got);
             assert!(
@@ -133,6 +148,38 @@ fn a_wait_moved_script_equals_the_generators_tune() {
             );
         }
     }
+    assert_eq!(
+        windowed, 11,
+        "the 128x128x8 dense variants take the window placement"
+    );
+}
+
+/// The shipped `_b1s` module's 27B gate/up export (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`) is the `WAIT = "window"`
+/// twin: the module emission's symbol equals the script's bytes, and every other symbol of that module equals the
+/// `WAIT = "after"` script's.
+#[test]
+fn the_shipped_gate_up_export_is_the_window_twin() {
+    let (emitted, _, _) = iu4_gemm::emit_module(
+        Fold::K128,
+        Tile::T128x128x8,
+        Cacc::One,
+        ALayout::Slab,
+        Arch::Gfx1201,
+    )
+    .unwrap();
+    let window = with_wait("window");
+    let mut windowed = 0;
+    for e in &emitted {
+        let (src, name) = if e.proof.variant == "k128-128x128x8-cacc1-slab-silu-wwindow" {
+            windowed += 1;
+            (&window, "k128-128x128x8-cacc1-slab-silu")
+        } else {
+            (&FINE.to_owned(), e.proof.variant.as_str())
+        };
+        let rip = build(src, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_same(&e.proof.variant, e, &rip);
+    }
+    assert_eq!(windowed, 1, "exactly the gate/up slab export is windowed");
 }
 
 fn with_ring(src: &str) -> String {

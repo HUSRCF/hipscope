@@ -135,6 +135,13 @@ pub enum WaitPlace {
     MidMma,
     /// After the slab's fragment loads, before its first WMMA bundle.
     BeforeMma,
+    /// The B1 rendezvous window (dense, ring depth 2, 128x128x8 tile only): the token-scale
+    /// (`d`) loads move from phase B to right after phase A's fragment loads; the slab-1
+    /// publish follows slab 0's WMMA group; the rendezvous is split (`s_barrier_signal`
+    /// after the stores drain) and sub-block 1's WMMA group (registers only) runs inside
+    /// its window. The shipped placement of the 27B gate/up `_b1s` export
+    /// ([`Tune::shipped_gate_up_slab`]); phase B keeps the shipped order.
+    Window,
 }
 impl WaitPlace {
     pub fn name(self) -> &'static str {
@@ -142,6 +149,7 @@ impl WaitPlace {
             Self::AfterMma => "after",
             Self::MidMma => "mid",
             Self::BeforeMma => "before",
+            Self::Window => "window",
         }
     }
 }
@@ -152,7 +160,10 @@ impl std::str::FromStr for WaitPlace {
             "after" => Ok(Self::AfterMma),
             "mid" => Ok(Self::MidMma),
             "before" => Ok(Self::BeforeMma),
-            _ => Err(format!("unknown wait placement {s} (after|mid|before)")),
+            "window" => Ok(Self::Window),
+            _ => Err(format!(
+                "unknown wait placement {s} (after|mid|before|window)"
+            )),
         }
     }
 }
@@ -198,6 +209,17 @@ pub struct Tune {
 impl Tune {
     pub fn is_default(self) -> bool {
         self == Self::default()
+    }
+    /// The tune the shipped `_b1s` module emits for its 27B gate/up export
+    /// `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s` (`Epi::GateUpSilu`, slab layout,
+    /// 128x128x8 tile): the B1 rendezvous window ([`WaitPlace::Window`], GPU-timed
+    /// R2GateStack-05, 0.9966 of the previous schedule); ring depth 2 and every other
+    /// knob are the default. Every other symbol of every module keeps `Tune::default()`.
+    pub fn shipped_gate_up_slab() -> Self {
+        Self {
+            wait: WaitPlace::Window,
+            ..Self::default()
+        }
     }
 }
 
@@ -715,6 +737,17 @@ impl Spec {
                 self.tune.wait.name(),
                 self.mma.name()
             ));
+        }
+        if self.tune.wait == WaitPlace::Window {
+            if self.tune.ring != RingDepth::Two {
+                return Err("wait placement window is generated at ring depth 2 only".into());
+            }
+            if self.tile != Tile::T128x128x8 {
+                return Err(format!(
+                    "wait placement window is generated for Tile::T128x128x8 only (tile axis is {:?})",
+                    self.tile
+                ));
+            }
         }
         Ok(())
     }

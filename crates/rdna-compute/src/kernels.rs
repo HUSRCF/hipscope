@@ -5485,11 +5485,21 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7
-/// (cc0288f8 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// SHA-256 473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889
+/// (previously 7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7 with the 27B gate/up
+/// export `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s` on the earlier schedule, code sha256 080eb282…
+/// -> c9f1efc5…: its phase-A rendezvous is split and sub-block 1's WMMA group runs inside the
+/// window, the slab-1 publish follows slab 0's group, and the token-scale loads move ahead into
+/// phase A (`iu4_gemm::Tune::shipped_gate_up_slab`, `WaitPlace::Window`; bit-identical, GPU-timed
+/// 0.9966); every other symbol's code is unchanged; the export is 32 B shorter, the `.text` 256 B;
+/// cc0288f8 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
 /// 4ffe3580 with VCC counted in gfx12 `.sgpr_count`; `.text` identical)
 /// (d5190d97 with the `_b1` QKVZAGDN guard change; 5114752c with the emitter's
 /// code-end tail fill appended to `.text`).
+/// Regenerate: `peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8 --cacc 1
+/// --epi all --alayout slab --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co
+/// --bundle kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco
+/// --host-target host-x86_64-unknown-linux-gnu-`.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.

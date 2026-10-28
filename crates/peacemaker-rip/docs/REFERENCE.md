@@ -516,7 +516,7 @@ The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.ri
 
 ### `iu4_gemm` fine K-loop natives
 
-`iu4::block` and `iu4::sparse_block` are themselves compositions of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block (`fine_block`) and the 2:4-sparse blocks (`fine_sparse_block`) this way and emits the shipped bytes for every variant). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` / `kloop::sparse_block_with` are composed of; each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
+`iu4::block` and `iu4::sparse_block` are themselves compositions of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block (`fine_block`) and the 2:4-sparse blocks (`fine_sparse_block`) this way and emits the default-tune bytes for every variant; `WAIT = "window"` writes the 128x128x8 tile's rendezvous-window block the shipped 27B gate/up `_b1s` export runs). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` / `kloop::sparse_block_with` are composed of; each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
 
 | call | rings in -> out (A W DS SZ) | meaning |
 |---|---|---|

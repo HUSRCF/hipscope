@@ -239,6 +239,12 @@ pub(crate) fn block_with(
     // of the current one.
     after_slab1_fetch(wg.isa())?;
     fragments(wg, g, &ra, &rw)?;
+    let window = place == WaitPlace::Window;
+    if window {
+        // The token-scale loads issue here, ahead of the rendezvous, so phase B's
+        // post-rendezvous LDS burst carries two fewer loads.
+        d_loads(wg, g, &rd)?;
+    }
     let ((ra, pa), (rw, pw)) = match place {
         WaitPlace::AfterMma => {
             for sb in 0..2 {
@@ -259,6 +265,12 @@ pub(crate) fn block_with(
             }
             staged
         }
+        // Slab 0's group, then the slab-1 publish; sub-block 1's group runs inside
+        // the B1 rendezvous window below.
+        WaitPlace::Window => {
+            wmma_group(wg.isa(), g, 0, true, false)?;
+            publish::publish_slab(wg, g, ra, rw)?
+        }
     };
     // The next block's scale/header registers are independent of the
     // published slab; overlap their VMEM with the B1 wave rendezvous.
@@ -266,7 +278,15 @@ pub(crate) fn block_with(
         publish::fetch_next_meta(wg.isa(), g, h)?;
     }
     let (da, dw) = wg.wait_all((pa, pw))?;
-    let (ra, rw) = wg.barrier((rotate(ra, da), rotate(rw, dw)))?;
+    let (ra, rw) = if window {
+        // Split B1: arrive once the stores drained, run sub-block 1's WMMAs (registers
+        // only) while the slowest wave catches up, then wait.
+        let b1 = wg.signal((rotate(ra, da), rotate(rw, dw)))?;
+        wmma_group(wg.isa(), g, 1, false, false)?;
+        wg.wait_arrived(b1)?
+    } else {
+        wg.barrier((rotate(ra, da), rotate(rw, dw)))?
+    };
 
     // Phase B: slab 1 from slot 1, the fold, next block staged into slot 0.
     if fetch_next {
@@ -274,7 +294,9 @@ pub(crate) fn block_with(
     }
     if !fetch_next {
         fragments(wg, g, &ra, &rw)?;
-        d_loads(wg, g, &rd)?;
+        if !window {
+            d_loads(wg, g, &rd)?;
+        }
         wmma_group(wg.isa(), g, 0, false, false)?;
         scale_loads(wg, g, &x0, &rs)?;
         wmma_group(wg.isa(), g, 1, false, true)?;
@@ -285,9 +307,11 @@ pub(crate) fn block_with(
     // Next block's slab 0 and metadata publish (`WaitPlace`): the stores go to
     // the free next buffers; the B2 signal needs them drained after the last read.
     fragments(wg, g, &ra, &rw)?;
-    d_loads(wg, g, &rd)?;
+    if !window {
+        d_loads(wg, g, &rd)?;
+    }
     let ((ra, pa), (rw, pw), (rd, pd), (rs, ps)) = match place {
-        WaitPlace::AfterMma => {
+        WaitPlace::AfterMma | WaitPlace::Window => {
             wmma_group(wg.isa(), g, 0, false, false)?;
             scale_loads(wg, g, &x0, &rs)?;
             wmma_group(wg.isa(), g, 1, false, true)?;

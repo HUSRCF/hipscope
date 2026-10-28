@@ -273,3 +273,76 @@ fn muladd_matches_the_non_fused_cpu_fold_bitwise() {
         );
     }
 }
+
+/// `WaitPlace::Window` (the shipped 27B gate/up `_b1s` export, `Tune::shipped_gate_up_slab`): a distinct schedule that
+/// emits and assembles, keeps the symbol, names itself `-wwindow`, round-trips its knob string, and is refused where
+/// it has no generator (ring depth 3, the 16-wave tile, the sparse K-loop).
+#[test]
+fn window_placement_emits_and_is_refused_where_it_has_no_generator() {
+    let spec = Spec {
+        act: ALayout::Slab,
+        ..Spec::control(Epi::GateUpSilu)
+    };
+    let window = with(spec, Tune::shipped_gate_up_slab());
+    assert_eq!(window.tune.wait, WaitPlace::Window);
+    window.validate().unwrap();
+    assert_eq!(window.symbol(), spec.symbol());
+    assert_eq!(
+        window.variant_name(),
+        "k128-128x128x8-cacc1-slab-silu-wwindow"
+    );
+    let e = emit(window).unwrap();
+    peacemaker_isa::native::assemble(&e.s_text, window.arch).unwrap();
+    assert_eq!(emit(window).unwrap().s_text, e.s_text, "not deterministic");
+    for wait in WAITS {
+        let other = emit(with(
+            spec,
+            Tune {
+                wait,
+                ..Tune::default()
+            },
+        ))
+        .unwrap();
+        assert_ne!(other.s_text, e.s_text, "{} equals window", wait.name());
+    }
+    // B1 stays one signal/wait pair (split around the WMMA group); no barrier is added or dropped.
+    let count = |t: &str, m: &str| t.lines().filter(|l| l.trim_start().starts_with(m)).count();
+    assert_eq!(
+        count(&e.s_text, "s_barrier_signal"),
+        count(&emit(spec).unwrap().s_text, "s_barrier_signal")
+    );
+    assert_eq!("window".parse::<WaitPlace>().unwrap(), WaitPlace::Window);
+    assert_eq!(WaitPlace::Window.name(), "window");
+    // The window placement is generated for the dense K-loop at ring depth 2 on the 128x128x8 tile only.
+    let ring3 = with(
+        spec,
+        Tune {
+            ring: RingDepth::Three,
+            wait: WaitPlace::Window,
+            ..Tune::default()
+        },
+    );
+    let msg = ring3.validate().unwrap_err();
+    assert!(
+        msg.contains("window") && msg.contains("ring depth 2"),
+        "{msg}"
+    );
+    assert!(emit(ring3).is_err());
+    let t256 = Spec {
+        tile: Tile::T256x128x16,
+        tune: Tune::shipped_gate_up_slab(),
+        ..Spec::control(Epi::GateUpSilu)
+    };
+    let msg = t256.validate().unwrap_err();
+    assert!(
+        msg.contains("window") && msg.contains("T128x128x8"),
+        "{msg}"
+    );
+    let sparse = Spec {
+        mma: Mma::S24X64,
+        tune: Tune::shipped_gate_up_slab(),
+        ..Spec::control(Epi::Set)
+    };
+    let msg = sparse.validate().unwrap_err();
+    assert!(msg.contains("wait placement window"), "{msg}");
+}

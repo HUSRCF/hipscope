@@ -790,6 +790,18 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
     Ok((text, proof))
 }
 
+/// The tune the shipped module [`emit_module`] emits symbol `epi` with: the 27B gate/up
+/// export of the `_b1s` module (128x128x8 tile, slab layout, `Epi::GateUpSilu`,
+/// `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`) carries [`Tune::shipped_gate_up_slab`]; every
+/// other symbol of every module is the default schedule.
+pub fn module_tune(tile: Tile, act: ALayout, epi: Epi) -> Tune {
+    if tile == Tile::T128x128x8 && act == ALayout::Slab && epi == Epi::GateUpSilu {
+        Tune::shipped_gate_up_slab()
+    } else {
+        Tune::default()
+    }
+}
+
 /// All original epilogue symbols plus packed bf16 h and the fused GDN input
 /// projection for the production tile.
 pub fn emit_module(
@@ -819,7 +831,7 @@ pub fn emit_module(
                 act,
                 arch,
                 mma: Mma::Dense,
-                tune: Tune::default(),
+                tune: module_tune(tile, act, epi),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

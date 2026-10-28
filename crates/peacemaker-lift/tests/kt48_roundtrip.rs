@@ -288,9 +288,9 @@ fn builder_bundles_round_trip() {
         ),
         (
             "../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-            "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
+            "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
             5,
-            83_840,
+            83_584,
         ),
     ] {
         let input = load(relative, sha);

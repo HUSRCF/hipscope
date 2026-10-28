@@ -44,6 +44,9 @@ use crate::insn::Instruction;
 use crate::kernels::common::{op, s};
 use peacemaker_author::{advance, rotate, Free, Published, Ring, Scc, WgUniform};
 
+/// `Spec::validate` refuses the combination; the match arms of the wait placements name it.
+const WINDOW_RING3: &str = "wait placement window is generated at ring depth 2 only";
+
 /// What a block does besides its own slabs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind3 {
@@ -140,6 +143,7 @@ pub(crate) fn block3(
                 }
                 staged
             }
+            WaitPlace::Window => return Err(WINDOW_RING3.into()),
         };
         publish::fetch_next_meta(wg.isa(), g, h)?;
         let (da, dw) = wg.wait_all((pa, pw))?;
@@ -186,6 +190,7 @@ pub(crate) fn block3(
             scale_tail(wg, g, &x1, &ss.0)?;
             (sa, sw, sd, ss)
         }
+        WaitPlace::Window => return Err(WINDOW_RING3.into()),
     };
     let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
     let b2 = wg.signal((
