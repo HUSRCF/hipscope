@@ -12345,12 +12345,19 @@ extern "C" __global__ void NAMED(int* p) {}
             .find(|e| e.module == "tensor_ops")
             .expect("tensor_ops is a gfx1100 pack module");
         assert!(tensor_ops.symbols.contains(&LITE));
-        assert!(tensor_ops.symbols.contains(&"indexed_attention_attention_q8_batched_hg4"));
-        assert!(tensor_ops.source().contains(LITE), "pack source lacks the lite kernel");
+        assert!(tensor_ops
+            .symbols
+            .contains(&"indexed_attention_attention_q8_batched_hg4"));
+        assert!(
+            tensor_ops.source().contains(LITE),
+            "pack source lacks the lite kernel"
+        );
         let predicted = predict("gfx1100", Some(16), false, &no_plan());
         assert!(
-            predicted.modules.iter().any(|m| m.entry.module == "tensor_ops"
-                && m.entry.symbols.contains(&LITE)),
+            predicted
+                .modules
+                .iter()
+                .any(|m| m.entry.module == "tensor_ops" && m.entry.symbols.contains(&LITE)),
             "the Flash-Next gfx1100 predicted set must compile tensor_ops with the lite symbol"
         );
         // The PM image is embedded: nothing to compile, so it is in no HIP module list.
@@ -12358,7 +12365,10 @@ extern "C" __global__ void NAMED(int* p) {}
         assert!(!inventory.iter().any(|e| e.module == PM_MODULE));
         let image = kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100;
         let sha = format!("{:x}", Sha256::digest(image));
-        assert_eq!(sha, kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256.trim());
+        assert_eq!(
+            sha,
+            kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256.trim()
+        );
         assert_eq!(walked_arch_image("gfx1100", &sha), Some(image));
         for other in ["gfx1151", "gfx1201"] {
             assert!(walked_arch_image(other, &sha).is_none(), "{other}");
