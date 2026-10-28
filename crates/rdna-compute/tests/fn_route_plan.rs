@@ -5,7 +5,9 @@
 // and `route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1201.tsv` (the split header:
 // the canonical header minus the 128 PLE ngram_embedding shard tensors) are
 // generated from module-load
-// audits of the real dispatch (`scripts/route_plan_walk.py`). These tests check
+// audits of the real dispatch (`scripts/route_plan_walk.py`);
+// `route_plans/qwen3.8-flash-next.gfx1100.tsv` is the canonical header walked on the XTX
+// (`route_plan_walk.py --profile xtx-fn-bounded`, open: never sealed). These tests check
 // that every walked kernel is planned (walk ⊆ plan), that every planned HIP
 // module is the release pack's object with the walked source (plan ⊆ pack),
 // and that every load the walks did not cover refuses (lazy loading) instead
@@ -135,24 +137,44 @@ fn split_header(canonical: &[(String, DType, Vec<usize>)]) -> Vec<(String, DType
     split
 }
 
-/// One header layout a walked Flash-Next plan covers.
+/// One header layout a walked Flash-Next plan covers, on one exact arch.
 struct Layout {
     name: &'static str,
+    arch: &'static str,
     header: Vec<(String, DType, Vec<usize>)>,
     sha: String,
 }
 
-/// Both walked layouts: the canonical monolithic header and the split header.
+fn layout(
+    name: &'static str,
+    arch: &'static str,
+    header: Vec<(String, DType, Vec<usize>)>,
+) -> Layout {
+    let sha = route_layout_sha256(&metas(&header));
+    Layout {
+        name,
+        arch,
+        header,
+        sha,
+    }
+}
+
+/// The gfx1201 walked layouts: the canonical monolithic header and the split header.
 fn layouts() -> Vec<Layout> {
     let canonical = flash_next_header();
     let split = split_header(&canonical);
     [("canonical", canonical), ("split", split)]
         .into_iter()
-        .map(|(name, header)| {
-            let sha = route_layout_sha256(&metas(&header));
-            Layout { name, header, sha }
-        })
+        .map(|(name, header)| layout(name, "gfx1201", header))
         .collect()
+}
+
+/// Every (arch, layout) with a walked plan: the gfx1201 layouts, and the canonical
+/// header on gfx1100 (the XTX route walk, `route_plans/qwen3.8-flash-next.gfx1100.tsv`).
+fn cases() -> Vec<Layout> {
+    let mut out = layouts();
+    out.push(layout("canonical", "gfx1100", flash_next_header()));
+    out
 }
 
 /// The walked axes, each at its first walked value (what the loader resolves
@@ -216,14 +238,15 @@ fn bindings(plan: &RouteKernelPlan) -> BTreeMap<&'static str, (&'static str, boo
     out
 }
 
-/// AR and native-MTP plans of one layout at `max_seq` 16,384.
-fn gfx1201_plans(layout: &Layout) -> (RouteKernelPlan, RouteKernelPlan) {
+/// AR and native-MTP plans of one layout (on its own arch) at `max_seq` 16,384.
+fn route_plans(layout: &Layout) -> (RouteKernelPlan, RouteKernelPlan) {
+    let arch = layout.arch;
     let tensors = metas(&layout.header);
-    let walked = walked("gfx1201", &layout.sha);
-    let flags = builtin_flags("gfx1201");
+    let walked = walked(arch, &layout.sha);
+    let flags = builtin_flags(arch);
     let axes = walked_axes(walked);
     let load = |spec| Load {
-        arch: "gfx1201",
+        arch,
         tensors: &tensors,
         max_seq: 16_384,
         spec,
@@ -231,9 +254,9 @@ fn gfx1201_plans(layout: &Layout) -> (RouteKernelPlan, RouteKernelPlan) {
         axes: &axes,
     };
     let ar = plan(&load(KernelSpecRoute::Ar))
-        .unwrap_or_else(|e| panic!("{} AR route plan: {e:?}", layout.name));
+        .unwrap_or_else(|e| panic!("{arch} {} AR route plan: {e:?}", layout.name));
     let mtp = plan(&load(KernelSpecRoute::NativeMtp))
-        .unwrap_or_else(|e| panic!("{} native-MTP route plan: {e:?}", layout.name));
+        .unwrap_or_else(|e| panic!("{arch} {} native-MTP route plan: {e:?}", layout.name));
     (ar, mtp)
 }
 
@@ -276,10 +299,10 @@ fn walked_layouts_are_the_canonical_and_split_flash_next_headers() {
 /// generator, not a hash alias or a partial plan.
 #[test]
 fn every_walked_kernel_is_planned() {
-    for layout in &layouts() {
-        let (ar, mtp) = gfx1201_plans(layout);
-        let walked = walked("gfx1201", &layout.sha);
-        let inventory = entries("gfx1201", &builtin_flags("gfx1201").hipcc_extra_flags).unwrap();
+    for layout in &cases() {
+        let (ar, mtp) = route_plans(layout);
+        let walked = walked(layout.arch, &layout.sha);
+        let inventory = entries(layout.arch, &builtin_flags(layout.arch).hipcc_extra_flags).unwrap();
         for (plan, native_mtp) in [(&ar, false), (&mtp, true)] {
             let rows: Vec<_> = walked
                 .rows
@@ -289,7 +312,8 @@ fn every_walked_kernel_is_planned() {
             assert_eq!(
                 plan.entries.len(),
                 rows.len(),
-                "{} native_mtp={native_mtp}",
+                "{} {} native_mtp={native_mtp}",
+                layout.arch,
                 layout.name
             );
             for row in rows {
@@ -365,13 +389,13 @@ fn every_walked_kernel_is_planned() {
 /// plan ⊆ pack: every planned HIP module is an installer-inventory entry (what
 /// `scripts/build-kernel-pack.sh` ships) with the planned source, recipe and
 /// every planned symbol in its index, so an installed pack satisfies the whole
-/// plan with zero compiles. Both layouts' plans.
+/// plan with zero compiles. Every walked arch's and layout's plans.
 #[test]
 fn every_planned_hip_module_is_in_the_release_pack() {
-    let flags = builtin_flags("gfx1201");
-    let pack = entries("gfx1201", &flags.hipcc_extra_flags).unwrap();
-    for layout in &layouts() {
-        let (ar, mtp) = gfx1201_plans(layout);
+    for layout in &cases() {
+        let flags = builtin_flags(layout.arch);
+        let pack = entries(layout.arch, &flags.hipcc_extra_flags).unwrap();
+        let (ar, mtp) = route_plans(layout);
         let mut hip = 0;
         for entry in ar.entries.iter().chain(&mtp.entries) {
             let PlannedKernel::Hip(planned) = entry else {
@@ -382,38 +406,40 @@ fn every_planned_hip_module_is_in_the_release_pack() {
                 .find(|e| e.module == planned.module)
                 .unwrap_or_else(|| {
                     panic!(
-                        "{}: planned {} is not in the gfx1201 pack",
-                        layout.name, planned.module
+                        "{} {}: planned {} is not in the {} pack",
+                        layout.arch, layout.name, planned.module, layout.arch
                     )
                 });
             assert_eq!(
                 packed.source(),
                 planned.source(),
-                "{} {}",
+                "{} {} {}",
+                layout.arch,
                 layout.name,
                 planned.module
             );
             assert_eq!(
                 packed.flags, planned.flags,
-                "{} {}",
-                layout.name, planned.module
+                "{} {} {}",
+                layout.arch, layout.name, planned.module
             );
             assert_eq!(
                 packed.scheduler_profile, planned.scheduler_profile,
-                "{} {}",
-                layout.name, planned.module
+                "{} {} {}",
+                layout.arch, layout.name, planned.module
             );
             for symbol in planned.symbols {
                 assert!(
                     packed.symbols.contains(symbol),
-                    "{}: pack index of {} lacks {symbol}",
+                    "{} {}: pack index of {} lacks {symbol}",
+                    layout.arch,
                     layout.name,
                     planned.module
                 );
             }
             hip += 1;
         }
-        assert!(hip > 0, "{}", layout.name);
+        assert!(hip > 0, "{} {}", layout.arch, layout.name);
     }
 }
 
@@ -422,13 +448,13 @@ fn every_planned_hip_module_is_in_the_release_pack() {
 /// (`scratch::route_load_tests`). Checked against each layout's own plan.
 #[test]
 fn unwalked_flash_next_policies_keep_lazy_loading() {
-    let flags = builtin_flags("gfx1201");
-    for layout in &layouts() {
+    for layout in &cases() {
+        let flags = builtin_flags(layout.arch);
         let tensors = metas(&layout.header);
-        let walked = walked("gfx1201", &layout.sha);
+        let walked = walked(layout.arch, &layout.sha);
         let axes = walked_axes(walked);
         let base = Load {
-            arch: "gfx1201",
+            arch: layout.arch,
             tensors: &tensors,
             max_seq: walked.max_seq,
             spec: KernelSpecRoute::NativeMtp,
@@ -437,7 +463,7 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
         };
         let refused =
             |load: &Load<'_>| matches!(plan(load), Err(RegistryError::UnsupportedRoute(_)));
-        let name = layout.name;
+        let name = format!("{} {}", layout.arch, layout.name);
         assert!(
             plan(&base).is_ok(),
             "{name}: the walked ceiling itself is admitted"
@@ -456,10 +482,22 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
         ] {
             assert!(refused(&Load { spec, ..base }), "{name} {spec:?}");
         }
-        // A policy axis outside the walks, a missing axis, an unknown axis.
-        let mut q8 = axes.clone();
-        q8.iter_mut().find(|(axis, _)| *axis == "qsa").unwrap().1 = "q8".into();
-        assert!(refused(&Load { axes: &q8, ..base }), "{name}");
+        // A policy axis outside the walks (the other QSA format than the walked one),
+        // a missing axis, an unknown axis.
+        let mut other_qsa = axes.clone();
+        let qsa = &mut other_qsa
+            .iter_mut()
+            .find(|(axis, _)| *axis == "qsa")
+            .unwrap()
+            .1;
+        *qsa = if qsa == "q8" { "fp8" } else { "q8" }.into();
+        assert!(
+            refused(&Load {
+                axes: &other_qsa,
+                ..base
+            }),
+            "{name}"
+        );
         assert!(
             refused(&Load {
                 axes: &axes[1..],
@@ -489,8 +527,12 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
         let mut pm = flags.clone();
         pm.pm_decode = !pm.pm_decode;
         assert!(refused(&Load { flags: &pm, ..base }), "{name}");
-        // Archs without a walked plan have no closed route.
-        for arch in ["gfx1100", "gfx906"] {
+        // Archs without a walked plan have no closed route, and another arch's loads never
+        // borrow this arch's plan (the axes passed are this arch's walked ones).
+        for arch in ["gfx1100", "gfx1151", "gfx906", "gfx1201"] {
+            if arch == layout.arch {
+                continue;
+            }
             let arch_flags = builtin_flags(arch);
             assert!(
                 refused(&Load {
@@ -506,10 +548,9 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
 
 /// A header that is neither walked layout (a re-quantized artifact, a partial
 /// ngram shard family, an extra tensor) has no walked route, whichever walked
-/// layout it was derived from.
+/// layout it was derived from, on each walked arch.
 #[test]
 fn unknown_header_layout_has_no_walked_route() {
-    let flags = builtin_flags("gfx1201");
     let canonical = flash_next_header();
     let shard_0 = canonical
         .iter()
@@ -517,12 +558,13 @@ fn unknown_header_layout_has_no_walked_route() {
         .unwrap()
         .clone();
     let last_shard = ngram_shard_name(NGRAM_SHARDS - 1);
-    let walked_layouts: Vec<String> = walked_plans("gfx1201")
-        .iter()
-        .map(|plan| plan.layout.to_owned())
-        .collect();
-    for layout in layouts() {
-        let axes = walked_axes(walked("gfx1201", &layout.sha));
+    for layout in cases() {
+        let flags = builtin_flags(layout.arch);
+        let walked_layouts: Vec<String> = walked_plans(layout.arch)
+            .iter()
+            .map(|plan| plan.layout.to_owned())
+            .collect();
+        let axes = walked_axes(walked(layout.arch, &layout.sha));
         let mut unknown = Vec::new();
         let mut dropped = layout.header.clone();
         dropped.pop();
@@ -542,12 +584,13 @@ fn unknown_header_layout_has_no_walked_route() {
             let sha = route_layout_sha256(&tensors);
             assert!(
                 !walked_layouts.contains(&sha),
-                "{} {what} must not hash to a walked layout",
+                "{} {} {what} must not hash to a walked layout",
+                layout.arch,
                 layout.name
             );
             for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
                 let load = Load {
-                    arch: "gfx1201",
+                    arch: layout.arch,
                     tensors: &tensors,
                     max_seq: 16_384,
                     spec,
@@ -558,17 +601,106 @@ fn unknown_header_layout_has_no_walked_route() {
                     Err(RegistryError::UnsupportedRoute(why)) => {
                         assert!(
                             why.contains("has no walked route"),
-                            "{} {what} {spec:?}: {why}",
+                            "{} {} {what} {spec:?}: {why}",
+                            layout.arch,
                             layout.name
                         )
                     }
                     other => panic!(
-                        "{} {what} {spec:?}: expected UnsupportedRoute, got {:?}",
+                        "{} {} {what} {spec:?}: expected UnsupportedRoute, got {:?}",
+                        layout.arch,
                         layout.name,
                         other.map(|p| p.entries.len())
                     ),
                 }
             }
         }
+    }
+}
+
+/// The gfx1100 plan: the canonical header walked once on the XTX (q8 QSA and GDN
+/// state, legacy KV backend, `max_seq` 262,144), left open (a bounded walk never
+/// seals a route), and no other header has a gfx1100 route.
+#[test]
+fn gfx1100_plan_is_the_canonical_header_walked_open_at_q8_legacy() {
+    let canonical = layout("canonical", "gfx1100", flash_next_header());
+    assert_eq!(walked_plans("gfx1100").len(), 1);
+    let plan = walked("gfx1100", &canonical.sha);
+    assert_eq!(plan.max_seq, 262_144);
+    assert!(plan.sealed.is_empty(), "a bounded walk never seals");
+    assert!(plan.heads.is_none());
+    assert_eq!(
+        plan.axes,
+        vec![
+            ("gdn", vec!["q8"]),
+            ("kv_backend", vec!["legacy"]),
+            ("qsa", vec!["q8"]),
+            ("qsa_f16_arena", vec!["off"]),
+            ("qsa_pooled_bf16", vec!["off"]),
+        ]
+    );
+    // The split header was walked on gfx1201 only.
+    let split = layouts().remove(1);
+    let flags = builtin_flags("gfx1100");
+    let tensors = metas(&split.header);
+    let axes = walked_axes(plan);
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        match self::plan(&Load {
+            arch: "gfx1100",
+            tensors: &tensors,
+            max_seq: 16_384,
+            spec,
+            flags: &flags,
+            axes: &axes,
+        }) {
+            Err(RegistryError::UnsupportedRoute(why)) => {
+                assert!(why.contains("has no walked route"), "{spec:?}: {why}")
+            }
+            other => panic!("split on gfx1100 {spec:?}: {:?}", other.map(|p| p.entries.len())),
+        }
+    }
+}
+
+/// The gfx1100 route includes the kernels the XTX default route binds since the
+/// landed Peacemaker/lite work: the embedded MQ6 residual PM twin (`_w4`, `_w8`;
+/// the committed image) and the lite hg4 batched Q8 attention, on both spec routes.
+#[test]
+fn gfx1100_plan_carries_the_landed_kernels_on_both_routes() {
+    let canonical = layout("canonical", "gfx1100", flash_next_header());
+    let (ar, mtp) = route_plans(&canonical);
+    for (route, plan) in [("ar", &ar), ("native_mtp", &mtp)] {
+        let bound = bindings(plan);
+        for symbol in [
+            "gemm_mq6g256v2_residual_pm_gfx1100_w4",
+            "gemm_mq6g256v2_residual_pm_gfx1100_w8",
+        ] {
+            assert_eq!(
+                bound.get(symbol),
+                Some(&("gemm_mq6g256v2_residual_pm_gfx1100", true)),
+                "{route} {symbol}"
+            );
+        }
+        assert_eq!(
+            bound.get("indexed_attention_attention_q8_batched_hg4_lite"),
+            Some(&("tensor_ops", false)),
+            "{route}"
+        );
+        let image = plan
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                PlannedKernel::Embedded {
+                    module: "gemm_mq6g256v2_residual_pm_gfx1100",
+                    image,
+                    ..
+                } => Some(*image),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{route}: no embedded MQ6 residual PM entry"));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(image)),
+            rdna_compute::kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256.trim(),
+            "{route}"
+        );
     }
 }

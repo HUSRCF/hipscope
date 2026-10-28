@@ -7610,6 +7610,7 @@ const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
     include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1201.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq2-xts.gfx1201.tsv"),
+    include_str!("route_plans/qwen3.8-flash-next.gfx1100.tsv"),
 ];
 
 /// One parsed `route_plans/*.tsv`.
@@ -12183,6 +12184,7 @@ extern "C" __global__ void NAMED(int* p) {}
     #[test]
     fn exact_open_plan_compiles_whole_inventory_and_binds_only_proven() {
         for (arch, model_arch, fixture) in [
+            ("gfx1100", 16, FN_TRACE),
             ("gfx1151", 16, FN_TRACE),
             ("gfx1201", 16, FN_TRACE),
             ("gfx1100", 5, Q35_TRACE),
@@ -12389,20 +12391,20 @@ extern "C" __global__ void NAMED(int* p) {}
     #[test]
     fn traced_family_without_arch_rows_compiles_whole_inventory_without_borrowing() {
         assert!(
-            traced_symbols(FN_TRACE, "gfx1100").is_empty(),
-            "fixture grew gfx1100 rows"
+            traced_symbols(FN_TRACE, "gfx906").is_empty(),
+            "fixture grew gfx906 rows"
         );
-        let predicted = predict("gfx1100", Some(16), false, &no_plan());
+        let predicted = predict("gfx906", Some(16), false, &no_plan());
         assert_eq!(predicted.basis, PredictionBasis::ArchInventoryCompileOnly);
         assert_eq!(predicted.family, "qwen3.8-flash-next");
         assert_eq!(predicted.bound_symbols(), 0);
-        let inventory = entries("gfx1100", "").unwrap();
+        let inventory = entries("gfx906", "").unwrap();
         for module in &predicted.modules {
             let registry = inventory
                 .iter()
                 .find(|e| e.module == module.entry.module)
-                .unwrap_or_else(|| panic!("{} is not a gfx1100 module", module.entry.module));
-            assert_eq!(module.entry.arch, "gfx1100");
+                .unwrap_or_else(|| panic!("{} is not a gfx906 module", module.entry.module));
+            assert_eq!(module.entry.arch, "gfx906");
             assert_eq!(module.entry.source, registry.source);
         }
     }

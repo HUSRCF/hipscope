@@ -213,7 +213,7 @@ Existing trace fixtures (`assert_trace_packaged`, crates/rdna-compute/src/kernel
 | kernel-trace-qwen35.tsv | gfx1100 | 111 | 124 | ornith-1.5-35b-a3b.mq4 (MoE), qwen3.8-27b.mq4-xts (dense, load + AR) |
 | kernel-trace-qwen35.tsv | gfx1151 | 99 | 111 | same |
 | kernel-trace-qwen35.tsv | gfx1201 | 115 | 120 | same, plus 27B DFlash cold additions |
-| kernel-trace-qwen4-flash-next.tsv | gfx1100 | 0 | 0 | none (no gfx1100 Flash-Next trace exists) |
+| kernel-trace-qwen4-flash-next.tsv | gfx1100 | 50 | 119 | XTX route walk of the canonical mq4-xts header (`route_plan_walk.py --profile xtx-fn-bounded`, AR + native MTP), not a cold-cache trace |
 | kernel-trace-qwen4-flash-next.tsv | gfx1151 | 55 | 132 | flash-next-gptq3.mq4, then-shipped flash-next.mq4, cold-cache pack runs |
 | kernel-trace-qwen4-flash-next.tsv | gfx1201 | 52 | 113 | gptq3 (host-mapped experts), flash-next.mq4, cold pack runs |
 
