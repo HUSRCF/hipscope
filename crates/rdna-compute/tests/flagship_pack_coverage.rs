@@ -15,7 +15,7 @@
 //! gfx1100 and gfx1151 as well) that must be registered on every release arch.
 //! gfx1201-only modules are asserted for gfx1201 only.
 
-use rdna_compute::kernel_registry::{entries, SUPPORTED_ARCHES};
+use rdna_compute::kernel_registry::{entries, walked_route_plans, SUPPORTED_ARCHES};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -432,6 +432,100 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
     assert!(
         failures.is_empty(),
         "portable coverage regressions:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The exact BF16 split QSA selector is the exact-gfx1100 Flash-Next default
+/// (`HIPFIRE_QWEN4_QSA_SPLIT_GFX1100`, on unless `0`), so the gfx1100 AR and
+/// native-MTP route module sets must carry its two modules. The v0.4.4
+/// `flagship-pack-gfx1100.tsv` predates the default and is never regenerated;
+/// the required set is therefore its measured fn-ar / fn-mtp modules plus the
+/// walked gfx1100 plan's hip modules (which include the split modules) plus
+/// these two, each of which must be a registry entry (what `hipfire-kernel-pack`
+/// compiles) with the symbols the split launchers bind, the gfx1100 recipe, and
+/// the exact kernel source the gfx1201 measured rows pin. A module missing from
+/// the pack, from either walked route, or with a different source fails here.
+#[test]
+fn gfx1100_flash_next_pack_carries_the_bf16_split_qsa_modules() {
+    const SPLIT: [(&str, &[&str]); 2] = [
+        (
+            "qsa_bf16_scores",
+            &[
+                "indexed_attention_select_scores_rows16_bf16",
+                "indexed_attention_select_scores_rows8_bf16",
+            ],
+        ),
+        (
+            "qsa_filter_select",
+            &[
+                "qsa_filter_compact",
+                "qsa_filter_finish",
+                "qsa_filter_threshold",
+            ],
+        ),
+    ];
+    let pack = entries("gfx1100", EXTRA_FLAGS).unwrap();
+    let plan = walked_route_plans()
+        .unwrap()
+        .iter()
+        .find(|plan| plan.model_arch == 16 && plan.arch == "gfx1100")
+        .expect("walked gfx1100 Flash-Next plan");
+    let measured_1201 = rows();
+    let measured_1100 = rows_of(FLAGSHIP_1100);
+    let mut failures = Vec::new();
+    for (route, native_mtp, fixture_route) in
+        [("ar", false, "fn-ar"), ("native_mtp", true, "fn-mtp")]
+    {
+        let mut required: BTreeSet<&str> = measured_1100
+            .iter()
+            .filter(|r| r.route == fixture_route && r.kind == "hip")
+            .map(|r| r.module.as_str())
+            .collect();
+        let walked: BTreeSet<&str> = plan
+            .rows
+            .iter()
+            .filter(|row| row.native_mtp == native_mtp && !row.embedded)
+            .map(|row| row.module)
+            .collect();
+        required.extend(&walked);
+        required.extend(SPLIT.iter().map(|(module, _)| *module));
+        for module in &required {
+            if !pack.iter().any(|e| e.module == *module) {
+                failures.push(format!("gfx1100 {route}: {module} not in the pack"));
+            }
+        }
+        for (module, symbols) in SPLIT {
+            if !walked.contains(module) {
+                failures.push(format!("gfx1100 {route}: {module} not in the walked plan"));
+            }
+            let Some(e) = pack.iter().find(|e| e.module == module) else {
+                continue;
+            };
+            for symbol in symbols {
+                if !e.symbols.contains(symbol) {
+                    failures.push(format!("gfx1100 {route}: {module} lacks {symbol}"));
+                }
+            }
+            if !e.flags.iter().any(|f| f == "--offload-arch=gfx1100") {
+                failures.push(format!("gfx1100 {route}: {module} targets another arch"));
+            }
+            let pinned = measured_1201
+                .iter()
+                .find(|r| r.route == fixture_route && r.kind == "hip" && r.module == module)
+                .unwrap_or_else(|| panic!("{module}: no measured gfx1201 {fixture_route} row"));
+            if sha(e.source()) != pinned.sha256 {
+                failures.push(format!(
+                    "gfx1100 {route}: {module} source sha256 {} != pinned {}",
+                    sha(e.source()),
+                    pinned.sha256
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "gfx1100 Flash-Next split QSA pack regressions:\n{}",
         failures.join("\n")
     );
 }

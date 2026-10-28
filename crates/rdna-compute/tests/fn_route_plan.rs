@@ -708,3 +708,133 @@ fn gfx1100_plan_carries_the_landed_kernels_on_both_routes() {
         );
     }
 }
+
+fn sha_hex(source: &str) -> String {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+}
+
+/// The exact BF16 split QSA selector is the gfx1100 default
+/// (`HIPFIRE_QWEN4_QSA_SPLIT_GFX1100` on unless `0`), so its two modules are in
+/// the gfx1100 plan of BOTH spec routes with exactly the symbols the split
+/// launchers bind (`tensor_ops::qsa_bf16_split_select`: rows8/rows16 scores and
+/// the filter trio); a post-ready first split load no longer binds lazily.
+#[test]
+fn gfx1100_plan_carries_the_bf16_split_qsa_modules_on_both_routes() {
+    const SPLIT: [(&str, &[&str]); 2] = [
+        (
+            "qsa_bf16_scores",
+            &[
+                "indexed_attention_select_scores_rows16_bf16",
+                "indexed_attention_select_scores_rows8_bf16",
+            ],
+        ),
+        (
+            "qsa_filter_select",
+            &[
+                "qsa_filter_compact",
+                "qsa_filter_finish",
+                "qsa_filter_threshold",
+            ],
+        ),
+    ];
+    let canonical = layout("canonical", "gfx1100", flash_next_header());
+    let walked = walked("gfx1100", &canonical.sha);
+    let (ar, mtp) = route_plans(&canonical);
+    for (route, plan, native_mtp) in [("ar", &ar, false), ("native_mtp", &mtp, true)] {
+        let bound = bindings(plan);
+        for (module, symbols) in SPLIT {
+            let row = walked
+                .rows
+                .iter()
+                .find(|row| row.native_mtp == native_mtp && row.module == module)
+                .unwrap_or_else(|| panic!("{route}: no walked row for {module}"));
+            assert!(!row.embedded, "{route} {module}");
+            assert_eq!(row.symbols, symbols, "{route} {module} walked symbols");
+            for &symbol in symbols {
+                assert_eq!(
+                    bound.get(symbol),
+                    Some(&(module, false)),
+                    "{route} {symbol}"
+                );
+            }
+        }
+    }
+}
+
+/// The sha256 column of every gfx1100 HIP row is the EFFECTIVE source the loader
+/// hands to the module load (`scratch::module_load_or_recompile` hashes its
+/// `source` argument for `HIPFIRE_MODULE_LOAD_AUDIT`). The route preload passes
+/// `PlannedKernel::Hip(entry).source()` (`scratch::prepare_route_modules`), the
+/// lazy launchers pass the `kernels::*_SRC` constant they share with the
+/// registry entry; no arch define or include is prepended on either path. Both
+/// are checked against the row for every route, so a plan row can neither name
+/// a stale digest nor a source the loader would not load.
+#[test]
+fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
+    let canonical = layout("canonical", "gfx1100", flash_next_header());
+    let walked = walked("gfx1100", &canonical.sha);
+    let (ar, mtp) = route_plans(&canonical);
+    let inventory = entries("gfx1100", &builtin_flags("gfx1100").hipcc_extra_flags).unwrap();
+    let mut checked = 0;
+    for (route, plan, native_mtp) in [("ar", &ar, false), ("native_mtp", &mtp, true)] {
+        for row in walked
+            .rows
+            .iter()
+            .filter(|row| row.native_mtp == native_mtp && !row.embedded)
+        {
+            let Some(PlannedKernel::Hip(planned)) = plan
+                .entries
+                .iter()
+                .find(|entry| entry.module() == row.module)
+            else {
+                panic!("{route}: {} is not a planned HIP entry", row.module);
+            };
+            assert_eq!(
+                sha_hex(planned.source()),
+                row.sha256,
+                "{route} {}: row sha256 is not the planned effective source",
+                row.module
+            );
+            let live = inventory
+                .iter()
+                .find(|e| e.module == row.module)
+                .unwrap_or_else(|| panic!("{route}: pack lacks {}", row.module));
+            assert_eq!(
+                sha_hex(live.source()),
+                row.sha256,
+                "{route} {}: row sha256 is not the registry source",
+                row.module
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 80, "only {checked} gfx1100 hip rows checked");
+    // Lazy launcher inputs of the split route: the constants themselves.
+    for (module, source) in [
+        (
+            "qsa_bf16_scores",
+            rdna_compute::kernels::QSA_BF16_SCORES_SRC,
+        ),
+        (
+            "qsa_filter_select",
+            rdna_compute::kernels::QSA_FILTER_SELECT_SRC,
+        ),
+    ] {
+        let live = inventory.iter().find(|e| e.module == module).unwrap();
+        assert_eq!(
+            live.source(),
+            source,
+            "{module}: registry != launcher source"
+        );
+        for plan in [&ar, &mtp] {
+            let row_sha = walked
+                .rows
+                .iter()
+                .find(|row| row.module == module)
+                .map(|row| row.sha256)
+                .unwrap();
+            assert_eq!(sha_hex(source), row_sha, "{module}");
+            assert!(plan.entries.iter().any(|e| e.module() == module));
+        }
+    }
+}
