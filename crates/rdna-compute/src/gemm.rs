@@ -516,6 +516,19 @@ pub(crate) fn hc_down_tile_selected(
         }
 }
 
+/// gfx1100 HC `input_mix_down` fill tile (`HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100`, default on):
+/// exact gfx1100, M == 320 (four full 80-row tiles: no ragged M tile) and K % 64 == 0.
+/// Bit-identical to the 64 x 64 / k64 pipelined tile it replaces (same ascending-K WMMA chain
+/// per output element); any other shape keeps the generic M < 512 tile.
+pub(crate) fn hc_mix_fill80_gfx1100_selected(
+    arch: &str,
+    enabled: bool,
+    m: usize,
+    k: usize,
+) -> bool {
+    enabled && arch == "gfx1100" && m == 320 && k % 64 == 0
+}
+
 /// Smallest route-row count the gfx1201 fused HC-down + activation kernel takes; below it the
 /// three-launch chain wins.
 pub const HC_DOWN_FUSED_MIN_ROWS: usize = 1536;
@@ -656,6 +669,12 @@ impl LdsTile {
     pub const fn pipelined(self) -> Self {
         Self { pipe: true, ..self }
     }
+
+    /// gfx1100 HC input_mix_down (M = 320; [`hc_mix_fill80_gfx1100_selected`]): an 80 x 32
+    /// workgroup of two 80 x 16 waves, grid 4 x ceil(N / 32) (192 waves at N = 768 instead of
+    /// the 64 x 64 tile's 120), pinned fragment schedule. Not in [`Gpu::LDS_TILE_VARIANTS`]:
+    /// it has no plain twin and no fused-epilogue entries, and no tile chain can reach it.
+    pub const HC_MIX_FILL80_GFX1100: Self = Self::new(80, 32, 80, 16, 64, false).pipelined();
 
     /// The same tile with the plain load → barrier → WMMA → barrier main loop.
     /// This is what `HIPFIRE_FLUX_GEMM_PIPE=0` selects.
@@ -1811,7 +1830,9 @@ pub(crate) fn lds256_tile_source_selected(
 ) -> (&'static str, &'static str) {
     let qwen4_tile = matches!(
         entry,
-        "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
+        "gemm_wmma_lds_64_64_32_64_k64"
+            | "gemm_wmma_lds_64_64_32_64_k64_p"
+            | "gemm_wmma_lds_80_32_80_16_k64_p"
     );
     if qwen4_tile && !is_gfx1151 {
         (
@@ -30877,6 +30898,25 @@ impl Gpu {
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
         // K 2560): 128 x 128 over 128 x 256, 175 vs 213 us at 640 x 2560 x 1131;
         // every tile keeps each output's K order.
+        if hc_mix_fill80_gfx1100_selected(
+            self.arch.as_str(),
+            self.flags.qwen4_hc_mix_fill80_gfx1100_enabled(),
+            m,
+            k,
+        ) {
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                &w_view,
+                x_f16,
+                y,
+                None,
+                m,
+                k,
+                batch_size,
+                LdsTile::HC_MIX_FILL80_GFX1100,
+                k,
+                k,
+            );
+        }
         let tile = match m {
             0..512 => LdsTile::new(64, 64, 32, 64, 64, false),
             512..1024 => LdsTile::new(128, 128, 32, 64, 64, false),
@@ -32616,7 +32656,7 @@ impl Gpu {
             pipe: _,
         } = tile;
         assert!(
-            Self::LDS_TILE_VARIANTS.contains(&tile),
+            Self::LDS_TILE_VARIANTS.contains(&tile) || tile == LdsTile::HC_MIX_FILL80_GFX1100,
             "gemm_f16_x_f16_wmma_lds_tiled: no kernel for {}",
             tile.entry()
         );
@@ -56514,9 +56554,11 @@ mod route_selector_tests {
             for entry in [
                 "gemm_wmma_lds_64_64_32_64_k64",
                 "gemm_wmma_lds_64_64_32_64_k64_p",
+                "gemm_wmma_lds_80_32_80_16_k64_p",
                 "gemm_wmma_lds_128_128_32_64_k64_p",
             ] {
-                let special = entry.starts_with("gemm_wmma_lds_64_64");
+                let special = entry.starts_with("gemm_wmma_lds_64_64")
+                    || entry == "gemm_wmma_lds_80_32_80_16_k64_p";
                 let previous = if special && !halo {
                     (
                         "qwen4_gemm_wmma_lds256",
@@ -56531,6 +56573,40 @@ mod route_selector_tests {
                 assert_eq!(lds256_tile_source_selected(halo, entry), previous);
             }
         }
+    }
+
+    /// The gfx1100 HC `input_mix_down` fill tile: exact gfx1100, M == 320,
+    /// K % 64 == 0, kill switch off the route; its entry is the
+    /// `LdsTile::entry()` of the 80 x 32 / 80 x 16 k64 pipelined tile, two
+    /// waves, 4 x 24 workgroups at N = 768 (192 waves, five chains per wave).
+    #[test]
+    fn hc_mix_fill80_gfx1100_predicate_and_geometry() {
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+            for enabled in [false, true] {
+                for m in [1, 80, 319, 320, 321, 400, 640] {
+                    for k in [64, 2560, 10240, 10241, 10304] {
+                        assert_eq!(
+                            hc_mix_fill80_gfx1100_selected(arch, enabled, m, k),
+                            enabled && arch == "gfx1100" && m == 320 && k % 64 == 0,
+                            "{arch} enabled={enabled} m={m} k={k}"
+                        );
+                    }
+                }
+            }
+        }
+        let tile = LdsTile::HC_MIX_FILL80_GFX1100;
+        assert_eq!(tile.entry(), "gemm_wmma_lds_80_32_80_16_k64_p");
+        assert!(tile.pipe && !tile.swap);
+        assert_eq!(
+            (tile.bm / tile.wm) * (tile.bn / tile.wn),
+            2,
+            "two waves per workgroup"
+        );
+        assert_eq!(320usize.div_ceil(tile.bm), 4);
+        assert_eq!(768usize.div_ceil(tile.bn), 24);
+        assert_eq!(320 % tile.bm, 0, "no ragged M tile at the selected M");
+        // It is deliberately not a tile-chain variant (no plain twin, no epilogue set).
+        assert!(!Gpu::LDS_TILE_VARIANTS.contains(&tile));
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

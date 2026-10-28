@@ -8919,18 +8919,21 @@ fn qsa_attention_hg4_lite(flags: &crate::feature_flags::FeatureFlags, format: Qs
     format == QsaKvFormat::Q8 && flags.qwen4_qsa_hg4_q8_lite_enabled()
 }
 
-/// Dynamic LDS bytes of the grouped kernel for `shape_selected` selected rows:
-/// weights[sel][4] + (tokens[sel], except the lite twin, which recomputes the
-/// validated token) + partial maxes[4][256] + maxes[4].
+/// Dynamic LDS bytes of the grouped kernel for `shape_selected` selected rows.
+/// Shipped kernels: weights[sel][4] + tokens[sel] + partial maxes[4][256] +
+/// maxes[4]. The lite twin recomputes the validated token and reduces the
+/// maxes with wave shuffles: weights[sel][4] + 8 waves x 4 partial maxes
+/// (reused for the four denominators) = `selected * 16 + 128`.
 fn qsa_attention_hg4_lds_bytes_for(shape_selected: usize, lite: bool) -> Option<usize> {
-    let per_row = if lite {
-        4 * QSA_ATTENTION_HG4_HEADS
+    let (per_row, fixed) = if lite {
+        (4 * QSA_ATTENTION_HG4_HEADS, 4 * 8 * QSA_ATTENTION_HG4_HEADS)
     } else {
-        4 * QSA_ATTENTION_HG4_HEADS + 4
+        (
+            4 * QSA_ATTENTION_HG4_HEADS + 4,
+            4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS),
+        )
     };
-    shape_selected
-        .checked_mul(per_row)?
-        .checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))
+    shape_selected.checked_mul(per_row)?.checked_add(fixed)
 }
 
 /// Dynamic LDS for the grouped kernel, or `None` when the shape is not the one
@@ -11335,25 +11338,27 @@ mod tests {
     }
 
     /// The grouped attention's dynamic LDS: 20 bytes per selected row for the
-    /// shipped kernels (weights[4] + token) and 16 for the q8 lite twin, which
-    /// keeps no token array; the 4112-byte maxes/partial-max tail is common.
-    /// The measured prefill shape (2051 selected rows) is 45132 / 36928 bytes.
+    /// shipped kernels (weights[4] + token) plus a 4112-byte maxes/partial-max
+    /// tail; the q8 lite twin keeps no token array and reduces maxes with wave
+    /// shuffles: 16 bytes per selected row plus 128 bytes. The measured
+    /// prefill shape (2051 selected rows) is 45132 / 32944 bytes.
     #[test]
     fn qsa_attention_hg4_lds_formula_drops_the_token_array_for_the_lite_twin() {
         assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, false), Some(45132));
-        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, true), Some(36928));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(2051, true), Some(32944));
         assert_eq!(qsa_attention_hg4_lds_bytes_for(0, false), Some(4112));
-        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, true), Some(4112));
+        assert_eq!(qsa_attention_hg4_lds_bytes_for(0, true), Some(128));
         assert_eq!(qsa_attention_hg4_lds_bytes_for(usize::MAX, true), None);
         // Three lite workgroups fit a 128 KiB WGP at the measured shape; two
-        // shipped ones do, a third does not.
-        assert!(3 * 36928 <= 128 * 1024 && 3 * 45132 > 128 * 1024);
+        // shipped ones do, a third does not. Four lite ones do not (the
+        // weights alone are 32816 bytes at 2051 rows).
+        assert!(3 * 32944 <= 128 * 1024 && 4 * 32944 > 128 * 1024 && 3 * 45132 > 128 * 1024);
         // The largest selected capacity under the 64 KiB dynamic limit.
         let limit = QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES;
         assert!(qsa_attention_hg4_lds_bytes_for(3071, false).unwrap() <= limit);
         assert!(qsa_attention_hg4_lds_bytes_for(3072, false).unwrap() > limit);
-        assert!(qsa_attention_hg4_lds_bytes_for(3839, true).unwrap() <= limit);
-        assert!(qsa_attention_hg4_lds_bytes_for(3840, true).unwrap() > limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(4088, true).unwrap() <= limit);
+        assert!(qsa_attention_hg4_lds_bytes_for(4089, true).unwrap() > limit);
     }
 
     /// The lite twin serves q8 K/V on exact gfx1100 unless

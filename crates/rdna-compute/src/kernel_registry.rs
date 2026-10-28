@@ -3714,6 +3714,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_wmma_lds_64_512_64_64_k32",
                 "gemm_wmma_lds_64_64_32_64_k64",
                 "gemm_wmma_lds_64_64_32_64_k64_p",
+                "gemm_wmma_lds_80_32_80_16_k64_p",
             ]
         );
     }
@@ -12759,6 +12760,49 @@ extern "C" __global__ void NAMED(int* p) {}
                         |e| e.module == MODULE || e.symbols.iter().any(|s| SYMBOLS.contains(s))
                     ),
                     "{other} must not carry the gfx1100 port"
+                );
+            }
+        }
+    }
+
+    /// The gfx1100 HC `input_mix_down` fill tile (`gemm_wmma_lds_80_32_80_16_k64_p`) is an export of
+    /// the `qwen4_gemm_wmma_lds256` module of the exact-gfx1100 pack, next to its incumbent
+    /// (`gemm_wmma_lds_64_64_32_64_k64_p`, the kill-switch fallback), compiled from the module
+    /// source under a `__gfx1100__` guard so the gfx1151 object (same source) is unchanged; no
+    /// other arch's inventory lists it.
+    #[test]
+    fn gfx1100_pack_ships_hc_mix_fill80() {
+        const MODULE: &str = "qwen4_gemm_wmma_lds256";
+        const FILL: &str = "gemm_wmma_lds_80_32_80_16_k64_p";
+        const INCUMBENT: &str = "gemm_wmma_lds_64_64_32_64_k64_p";
+        let inventory = entries("gfx1100", "").unwrap();
+        let lds = inventory
+            .iter()
+            .find(|e| e.module == MODULE)
+            .expect("qwen4_gemm_wmma_lds256 is a gfx1100 pack module");
+        assert!(lds.symbols.contains(&FILL));
+        assert!(lds.symbols.contains(&INCUMBENT));
+        assert!(
+            lds.source().contains(&format!("WLDS_KERNEL({FILL},")),
+            "pack source lacks the fill kernel instantiation"
+        );
+        assert!(
+            lds.source().contains("#if defined(__gfx1100__)"),
+            "the fill kernel must stay gfx1100-only"
+        );
+        let predicted = predict("gfx1100", Some(16), false, &no_plan());
+        assert!(
+            predicted
+                .modules
+                .iter()
+                .any(|m| m.entry.module == MODULE && m.entry.symbols.contains(&FILL)),
+            "the Flash-Next gfx1100 predicted set must compile the module with the fill symbol"
+        );
+        for other in ["gfx1151", "gfx1201", "gfx1101", "gfx942"] {
+            if let Ok(other_entries) = entries(other, "") {
+                assert!(
+                    !other_entries.iter().any(|e| e.symbols.contains(&FILL)),
+                    "{other} must not list the gfx1100 fill tile"
                 );
             }
         }
