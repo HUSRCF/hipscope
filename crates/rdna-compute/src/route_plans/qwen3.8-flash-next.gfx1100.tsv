@@ -12,7 +12,11 @@
 #! axis qsa_f16_arena off
 #! axis qsa_pooled_bf16 off
 # walk ar ar daemon_sha256=c31d7877b7893b0c model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=38 env={"HIPFIRE_KV_MODE": "q8", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
+# walk ar 1-words_600 daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
+# walk ar 2-depth_8192 daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
+# walk ar 3-depth_32768 daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
 # walk native_mtp mtp daemon_sha256=c31d7877b7893b0c model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=38 env={"HIPFIRE_KV_MODE": "q8", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
+# walk native_mtp 4-depth_8192-mtp daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
 ar	hip	add	add_f32	b0561ebf265bfbf523e63f43f4d1544d1ceaf593f476438009635f15662121dd
 ar	hip	convert_f32_to_f16	convert_f32_to_f16	630c799ead88296f06798f9c12b2170eef37b92d1eb9fdf39a6837cf0bca94f4
 ar	hip	copy_f32_buffer	copy_f32_buffer	37f48e35951c52ae23d574eebf97a714594e27995099b4837ad30489d563c57d
@@ -45,6 +49,7 @@ ar	hip	moe_router_softmax_top10_f32	moe_router_softmax_top10_f32	2912b3edb092b05
 ar	hip	moe_scatter_fused_top10	moe_scatter_fused_top10	47a0d58e48944ce33c5d2be507eb45008ac948a240dbdad08ebbdc02da5b2dd2
 ar	hip	mq_rotate_x	mq_rotate_x	0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b
 ar	hip	mq_rotate_x_128_v2	mq_rotate_x_128_v2_silu_bf16	59ea18d4b80625ad95dd94dc2707275cb356e04ceacea6d4d3852bc56c6b1888
+ar	hip	mq_rotate_x_i4	mq_rotate_x_i4	d4426c94c6c27e30abba642235a730b49c623f1b34f6164608ce8bd4a2be11cd
 ar	hip	qsa_bf16_scores	indexed_attention_select_scores_rows16_bf16,indexed_attention_select_scores_rows8_bf16	1226e777abfe7eb2db2fb5ddfc2d5a87bc806d154775250d35acba40bd5a1d44
 ar	hip	qsa_decode_splitkv_q8	qsa_decode_splitkv_merge_f32,qsa_decode_splitkv_partial_q8	ac685f6ff67ae88605e059a8616544d85837c71780bc494d0baa4bc8204a5054
 ar	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
@@ -55,11 +60,14 @@ ar	hip	qwen4_gemv_mq4g256	hyper_read_projected_rotate_f32,mq_rotate_x_f16	1fbb17
 ar	hip	qwen4_gemv_mq6g256v2	gemv_mq6g256v2_x4	7f1d4a49e921e57b21d3d669d517742c039e18c5fbdcaa771834ec9a1def28bc
 ar	hip	qwen4_hc_streams_init_from_embed_batched	hc_streams_init_from_embed_batched_bf16	787acbd1a749e1fc28687fbcf31633eeb55da3b85c442e74f139199971744f39
 ar	hip	qwen4_moe_scatter_stable_top10_gfx1100	qwen4_moe_group_prefix,qwen4_moe_group_ranks,qwen4_moe_group_scatter	5132e7e8c2dd115db6073fc86c30448317e7ff49f9f3b975f233a4c5bcd85773
+ar	hip	qwen4_moe_sym_check_gfx1100	qwen4_moe_sym_check_gfx1100	0f7072a59c73670066862af6740b0b485ee3c65f87905a1693bdc0d369a7169d
 ar	hip	qwen4_silu_mul	shared_expert_activation_bf16_f32	e1b664949b353cd477df298475be66bdeed881e075986486312e45821f598f51
 ar	hip	slowlink_prefill	slowlink_combine_pad,slowlink_combine_panel,slowlink_fold_k1_counts,slowlink_mask_ids,slowlink_remap_sorted	bfe90a839327e041a7c07e042ab20104b43c5f5f5ff87f67306140e777c99594
 ar	hip	tensor_ops	argmax_f32,bf16_scaled_add_batched_f32,copy_regions_u32,gated_delta_conv_bf16_f32_batched_k4,gated_delta_conv_params_bf16_f32,gated_delta_gate_rotate_bf16_f32_batched,gated_delta_qk_norm_bf16_batched,gated_delta_step_gate_norm128_q8,gated_delta_step_halves_state128_persistent256_q8,gdn_state_f32_to_q8,gdn_state_q8_to_f32,hc_activation_fused_f32,hc_state_bf16_add_f32,hc_state_bf16_to_f32,hyper_norm_f32,hyper_norm_gate_f32,hyper_read_projected_f32,hyper_read_up_fused_f32,hyper_write_bf16x2,hyper_write_f32,indexed_attention_attention_q8_batched_hg4_lite,indexed_attention_cache_append_q8_batched,indexed_attention_decode_prologue_q8,indexed_attention_index_key_append_bf16_batched,indexed_attention_norm_rope_f32_batched,indexed_attention_pool_rope_bf16,indexed_attention_select_bf16_batched	69d7df17c2f488d3e6f9a954cff08c86f4880b49736e40927cb7a9229327b8f8
 ar	hip	zero_f32	zero_f32	4baff33a459998d1a2dfd25a04818bd87e70c6496a5f4b20762ea2046e827b32
 ar	embedded	gemm_mq6g256v2_residual_pm_gfx1100	gemm_mq6g256v2_residual_pm_gfx1100_w4,gemm_mq6g256v2_residual_pm_gfx1100_w8	06077af31a16b27b15e98deef22e193960e2cfe09d1a85f8887470c34aab80f5
+ar	embedded	mq_i4_a4_pm_gfx1100	mq_i4_a4_r128_k640_gfx1100	c9151319569a910c6e6a62ef3f5cbd404f3c4af02bf8ae999bf84f9cebeec71d
+ar	embedded	qwen4_moe_iu4_sym_pm_gfx1100	qwen4_moe_down_iu4_sym_pm_gfx1100,qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100	831db6f9f1b45e22cc4e3b99d1f67d510b305230eb32ef0a09e0c91088f24bad
 native_mtp	hip	add	add_f32	b0561ebf265bfbf523e63f43f4d1544d1ceaf593f476438009635f15662121dd
 native_mtp	hip	convert_f32_to_f16	convert_f32_to_f16	630c799ead88296f06798f9c12b2170eef37b92d1eb9fdf39a6837cf0bca94f4
 native_mtp	hip	copy_f32_buffer	copy_f32_buffer	37f48e35951c52ae23d574eebf97a714594e27995099b4837ad30489d563c57d
@@ -95,6 +103,7 @@ native_mtp	hip	moe_router_softmax_top10_f32	moe_router_softmax_top10_f32	2912b3e
 native_mtp	hip	moe_scatter_fused_top10	moe_scatter_fused_top10	47a0d58e48944ce33c5d2be507eb45008ac948a240dbdad08ebbdc02da5b2dd2
 native_mtp	hip	mq_rotate_x	mq_rotate_x	0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b
 native_mtp	hip	mq_rotate_x_128_v2	mq_rotate_x_128_v2_silu_bf16	59ea18d4b80625ad95dd94dc2707275cb356e04ceacea6d4d3852bc56c6b1888
+native_mtp	hip	mq_rotate_x_i4	mq_rotate_x_i4	d4426c94c6c27e30abba642235a730b49c623f1b34f6164608ce8bd4a2be11cd
 native_mtp	hip	qsa_bf16_scores	indexed_attention_select_scores_rows16_bf16,indexed_attention_select_scores_rows8_bf16	1226e777abfe7eb2db2fb5ddfc2d5a87bc806d154775250d35acba40bd5a1d44
 native_mtp	hip	qsa_decode_splitkv_q8	qsa_decode_splitkv_merge_f32,qsa_decode_splitkv_partial_q8	ac685f6ff67ae88605e059a8616544d85837c71780bc494d0baa4bc8204a5054
 native_mtp	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
@@ -106,6 +115,7 @@ native_mtp	hip	qwen4_gemv_mq6g256v2	gemv_mq6g256v2_x4	7f1d4a49e921e57b21d3d669d5
 native_mtp	hip	qwen4_gemv_q8_0	topk8_partial_f32	049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2
 native_mtp	hip	qwen4_hc_streams_init_from_embed_batched	hc_streams_init_from_embed_batched_bf16	787acbd1a749e1fc28687fbcf31633eeb55da3b85c442e74f139199971744f39
 native_mtp	hip	qwen4_moe_scatter_stable_top10_gfx1100	qwen4_moe_group_prefix,qwen4_moe_group_ranks,qwen4_moe_group_scatter	5132e7e8c2dd115db6073fc86c30448317e7ff49f9f3b975f233a4c5bcd85773
+native_mtp	hip	qwen4_moe_sym_check_gfx1100	qwen4_moe_sym_check_gfx1100	0f7072a59c73670066862af6740b0b485ee3c65f87905a1693bdc0d369a7169d
 native_mtp	hip	qwen4_silu_mul	shared_expert_activation_bf16_f32	e1b664949b353cd477df298475be66bdeed881e075986486312e45821f598f51
 native_mtp	hip	requant_g256	requant_mqg256v2_to_f32,requant_pack_mqg256v2	630ea330756b91863c05c2c9930c921844a698e21af2ef69b9feb63d362c4854
 native_mtp	hip	slowlink_prefill	slowlink_combine_pad,slowlink_combine_panel,slowlink_fold_k1_counts,slowlink_mask_ids,slowlink_remap_sorted	bfe90a839327e041a7c07e042ab20104b43c5f5f5ff87f67306140e777c99594
@@ -113,3 +123,5 @@ native_mtp	hip	tensor_ops	argmax_f32,bf16_scaled_add_batched_f32,copy_regions_u3
 native_mtp	hip	topk8_rescore_mq6g256v2	topk8_rescore_mq6g256v2_k2560	beefb0caa84e8afda5ad01a1cacaf7128a356dcfa8d795e3d9358cc7e4ab798d
 native_mtp	hip	zero_f32	zero_f32	4baff33a459998d1a2dfd25a04818bd87e70c6496a5f4b20762ea2046e827b32
 native_mtp	embedded	gemm_mq6g256v2_residual_pm_gfx1100	gemm_mq6g256v2_residual_pm_gfx1100_w4,gemm_mq6g256v2_residual_pm_gfx1100_w8	06077af31a16b27b15e98deef22e193960e2cfe09d1a85f8887470c34aab80f5
+native_mtp	embedded	mq_i4_a4_pm_gfx1100	mq_i4_a4_r128_k640_gfx1100	c9151319569a910c6e6a62ef3f5cbd404f3c4af02bf8ae999bf84f9cebeec71d
+native_mtp	embedded	qwen4_moe_iu4_sym_pm_gfx1100	qwen4_moe_down_iu4_sym_pm_gfx1100,qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100	831db6f9f1b45e22cc4e3b99d1f67d510b305230eb32ef0a09e0c91088f24bad
