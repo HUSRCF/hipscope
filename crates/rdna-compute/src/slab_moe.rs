@@ -2453,7 +2453,8 @@ impl Gpu {
                 "slowlink_sync_download_i32: the span exceeds the tensor",
             ));
         }
-        let mut out = self.slowlink_count_barrier("slowlink_sync_download_i32", &[tensor], words)?;
+        let mut out =
+            self.slowlink_count_barrier("slowlink_sync_download_i32", &[tensor], words)?;
         Ok(out.remove(0))
     }
 

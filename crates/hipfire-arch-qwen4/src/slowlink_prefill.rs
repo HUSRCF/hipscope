@@ -2721,11 +2721,20 @@ impl Run<'_, '_> {
             .map_err(dsp_err("route storage"))?;
         let mut report = WindowReport::default();
         progress.ring_primed = true;
-        // A device-resident band-start layer uploads each tile's token ids with a blocking
-        // pageable copy (`embed_tile`) that would queue behind the prime's page copies, so
-        // the prime is deferred until that layer's tile loop has enqueued every upload.
-        let defer_prime = !self.rt.host_layer[geo.band.start];
-        if !defer_prime {
+        // The band's leading device-resident layers that upload per-tile host data (the
+        // band-start layer's token ids in `embed_tile`, the PLE layer's staged rows) would queue
+        // those small uploads behind the prime's page copies on the shared copy engine, so the
+        // prime waits until the last of them has enqueued its tiles; the remaining resident
+        // layers still cover the prime's copies. A band that starts on a host layer (or has
+        // none) primes first, as before.
+        let first_host = geo.band.clone().find(|&layer| self.rt.host_layer[layer]);
+        let prime_after = first_host
+            .filter(|&host| host > geo.band.start)
+            .map(|host| match geo.ple_layer {
+                Some(ple) if ple > geo.band.start && ple < host => ple,
+                _ => geo.band.start,
+            });
+        if prime_after.is_none() {
             self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
         }
         for layer in geo.band.clone() {
@@ -2733,11 +2742,11 @@ impl Run<'_, '_> {
             if self.rt.host_layer[layer] {
                 self.host_layer(w, layer, &mut routes, txn, &mut report)?;
             } else {
-                let primed = !(defer_prime && layer == geo.band.start);
+                let primed = prime_after.is_none_or(|after| layer > after);
                 self.resident_layer(w, layer, txn, primed)?;
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
-            if defer_prime && layer == geo.band.start {
+            if prime_after == Some(layer) {
                 self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
             }
             #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
