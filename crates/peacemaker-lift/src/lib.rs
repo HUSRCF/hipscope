@@ -15,6 +15,7 @@
 //! lifter never spawns tools; the process drivers live in `peacemaker-front`.
 pub mod bundle;
 pub mod elf;
+pub mod hazards_gfx11;
 pub mod kd;
 pub mod layout;
 pub mod metadata;
