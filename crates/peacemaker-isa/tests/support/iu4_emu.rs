@@ -265,13 +265,22 @@ fn put_ptr(b: &mut Vec<u8>, p: u64) {
 /// `Y[col * M + row]` read back from the output buffer. Every buffer is followed by a zeroed 4 KiB tail region,
 /// so a kernel store or load past the end of a buffer is caught as a changed tail.
 pub fn run_gemm(spec: Spec, p: &Problem) -> Result<Vec<f32>, String> {
+    run_emitted(spec, &iu4_gemm::emit(spec)?, p)
+}
+
+/// [`run_gemm`] for an already-emitted kernel (for example one lowered from a `.rip` body): `emitted.s_text` is
+/// assembled, lifted and run under `spec`'s launch contract.
+pub fn run_emitted(
+    spec: Spec,
+    emitted: &peacemaker_isa::Emitted,
+    p: &Problem,
+) -> Result<Vec<f32>, String> {
     assert_eq!(spec.arch, Arch::Gfx1201);
     let add = match spec.epi {
         Epi::Set => false,
         Epi::Add => true,
         e => return Err(format!("run_gemm drives only set/add, not {}", e.name())),
     };
-    let emitted = iu4_gemm::emit(spec)?;
     let elf = peacemaker_isa::native::assemble(&emitted.s_text, spec.arch)?;
     let lifted = peacemaker_lift::lift_object(
         &elf,

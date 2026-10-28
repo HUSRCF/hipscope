@@ -249,7 +249,7 @@ fn raw_wmma_sb1<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lo: usize, hi: usize) -> 
 //   publish_*   next buffer Free -> Writing (a Pending token)
 //   wait        Pending -> Drained (names the ring set)
 //   barrier     rotate: cur retired, the Drained next one published
-//   fragments / scale_loads / wmma   read the Published current buffer
+//   rip_fragments / scale_loads / wmma   read the Published current buffer
 fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
         end_label: &str, entry_label: bool, step: Option<usize>, lds: Lds) -> Result<Lds, String> {
     let lds = iu4::block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
@@ -258,7 +258,7 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     }
     // Phase A: slab 0 from slot 0; slab 1 (fetched by the preceding block) is
     // published into slot 1.
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     let lds = if WAIT == "window" { iu4::d_loads(wg, g, lds)? } else { lds };
     let lds = if WAIT == "after" {
         let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
@@ -291,7 +291,7 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     if fetch_next {
         iu4::fetch_next(wg, g, h)?;
     }
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     let lds = if WAIT == "window" { lds } else { iu4::d_loads(wg, g, lds)? };
     if !fetch_next {
         // The peeled group's last block: nothing to publish.
@@ -337,6 +337,50 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     iu4::fold_scale(wg, g)?;
     wg.wait_arrived(b2)?;
     Ok(lds)
+}
+
+// The fragment loads of a dense block, written here: per 32-K sub-block one
+// W load (both row groups) and two A loads (column blocks 0-1, 2-3), from the
+// payload rings' current slot. The script builds the six instructions;
+// `iu4::fragments_body` lends the A and W rings in their state (Published
+// current buffer, Free or Writing next, depth 2 or 3), replays each load on
+// the ring its `PayloadRole` names through the typed core, and gives them
+// back. Only LDS loads are accepted. Edit the body here: no rebuild.
+fn rip_fragments<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    // DS offset fields count 512-byte strides (`stride64` of b64).
+    let slot = lds[0].cur_index();
+    let a = g.payload_base(PayloadRole::A, slot)? / 512;
+    let w = g.payload_base(PayloadRole::W, slot)? / 512;
+    let mut loads = Vec::new();
+    for sb in 0..2 {
+        let f = g.reg(&format!("f{sb}")).ok_or("no fragment register")?;
+        let fr_w = g.reg(&format!("fr_w{sb}")).ok_or("no W address register")?;
+        let fr_a = g.reg(&format!("fr_a{sb}")).ok_or("no A address register")?;
+        loads.push(NativeLoad { role: PayloadRole::W, insn: frag_load(f, fr_w, w) });
+        for half in 0..2 {
+            loads.push(NativeLoad { role: PayloadRole::A, insn: frag_load(f + 4 + 4 * half, fr_a, a + 2 * half) });
+        }
+    }
+    iu4::fragments_body(wg, g, lds, loads)
+}
+
+// `ds_load_2addr_stride64_b64` of four VGPRs at `dst` from `v{addr}`, the two
+// halves `o` and `o + 1` strides apart.
+fn frag_load(dst: u8, addr: u8, o: u32) -> Instruction {
+    let text = format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", dst, dst + 3, addr, ds_offsets(o, o + 1));
+    Instruction::new(text, vec![vr(dst, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad)
+}
+
+// DS offset fields as objdump prints them: a zero field is omitted.
+fn ds_offsets(o0: u32, o1: u32) -> String {
+    let mut t = String::new();
+    if o0 != 0 {
+        t.push_str(&format!(" offset0:{o0}"));
+    }
+    if o1 != 0 {
+        t.push_str(&format!(" offset1:{o1}"));
+    }
+    t
 }
 
 // ---- ring depth 3 (`RING = 3`) -------------------------------------------------
@@ -461,7 +505,7 @@ fn fine_block3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, kind:
     if let Some(s) = step {
         iu4::step_descriptor(wg, g, s)?;
     }
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     if kind == "t1" {
         let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
         let lds = iu4::wmma(wg, g, 1, false, false, lds)?;
@@ -487,7 +531,7 @@ fn fine_block3<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, kind:
     if kind == "full" {
         iu4::fetch_ahead(wg, g, h, 0)?;
     }
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     let lds = iu4::d_loads(wg, g, lds)?;
     if kind == "t1" {
         let lds = iu4::wmma(wg, g, 0, false, false, lds)?;

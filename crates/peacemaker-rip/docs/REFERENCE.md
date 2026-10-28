@@ -481,6 +481,7 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 | call | meaning |
 |---|---|
 | `gen.plan()?` | the kernel's `RegPlan` (a script may add ranges) |
+| `gen.payload_base(role, slot)?` | `u32`, the LDS byte offset of payload slab `slot` of the ring `role` (`PayloadRole::A` or `W`) names; refuses a slot the ring depth lacks (`payload_base(A, 2): the payload rings are 2 deep (slots 0..2)`, R0000) |
 | `gen.kernel_spec()` | the kernel's `KernelSpec` (symbol, kernargs, workgroup size) |
 | `gen.spec()` | the `Iu4Spec` |
 | `gen.reg("name")` | `Option<u8>`, the base of a physical register by name: `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i> st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips rs bs wave gpr136 mm1 hs tmp epi_s a_slab1`, kernel arguments `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`; `None` for an unknown name or an absent optional register |
@@ -516,7 +517,7 @@ The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.ri
 
 ### `iu4_gemm` fine K-loop natives
 
-`iu4::block` and `iu4::sparse_block` are themselves compositions of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block (`fine_block`) and the 2:4-sparse blocks (`fine_sparse_block`) this way and emits the default-tune bytes for every variant; `WAIT = "window"` writes the 128x128x8 tile's rendezvous-window block the shipped 27B gate/up `_b1s` export runs). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` / `kloop::sparse_block_with` are composed of; each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
+`iu4::block` and `iu4::sparse_block` are themselves compositions of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block (`fine_block`) and the 2:4-sparse blocks (`fine_sparse_block`) this way, the dense fragment loads as the script body `rip_fragments` over `iu4::fragments_body`, and emits the default-tune bytes for every variant; `WAIT = "window"` writes the 128x128x8 tile's rendezvous-window block the shipped 27B gate/up `_b1s` export runs). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` / `kloop::sparse_block_with` are composed of (`iu4::fragments_body` is the exception: it replays a script-built body); each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
 
 | call | rings in -> out (A W DS SZ) | meaning |
 |---|---|---|
@@ -528,7 +529,7 @@ The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.ri
 | `iu4::publish_slab(wg, gen, lds)?` | A, W: `Published`/`Free` -> `Published`/`Writing`, pending | the weight sign flip and the LDS stores of the staged slab into the next buffers |
 | `iu4::publish_meta(wg, gen, lds)?` | DS, SZ: `Published`/`Free` -> `Published`/`Writing`, pending | the next block's token scale and converted row scale |
 | `iu4::wait(wg, lds, set)?` | `Writing`, pending -> `Writing`, drained | the counter wait for `"slab"` (A, W), `"meta"` (DS, SZ) or `"all"`; returns the tuple of `Drained` tokens in ring order |
-| `iu4::fragments(wg, gen, lds)?` | A, W current `Published` (next `Free` or `Writing`), unchanged | the fragment loads of both 32-K sub-blocks (dense spec) |
+| `iu4::fragments_body(wg, gen, lds, loads)?` | A, W current `Published` (next both `Free` or both `Writing`, token preserved; depth 2 or 3), unchanged | replays the script's `loads` (a `Vec<NativeLoad>`) in order, each through the typed `ds_load_cur` of the ring its role names (dense spec; a sparse spec is refused) |
 | `iu4::d_loads(wg, gen, lds)?` | DS current `Published`, unchanged | phase B's token-scale loads |
 | `iu4::scale_loads(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s0`, then the first three row-scale loads (dense spec) |
 | `iu4::scale_tail(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s1`, then the last row-scale load (dense spec) |
@@ -546,7 +547,9 @@ The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.ri
 | `iu4::sparse_scale_loads(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s0`, then the row-scale loads: `s24x64` all four (after its one bundle), `s24x32` the first two (between its sub-blocks) |
 | `iu4::sparse_scale_tail(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | `s24x32` only: places `.Liu4_<tag>_s1`, then the last two row-scale loads; `s24x64` has no `_s1` and is refused |
 
-`iu4::step_descriptor(wg, gen, which)?` (above) is the descriptor step. The publishes, waits, fetches, `d_loads` and `fold_scale` do not depend on the matrix instruction and serve both K-loops; the `fragments` / `wmma` / `scale_*` / `block_begin` steps are paired with their `iu4::sparse_*` twins, and a dense step on a sparse spec (or the reverse) is refused before anything is emitted. The rendezvous is the generic driver's: `wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?` rotates the drained slab (retires the current buffer, publishes the next one), `wg.signal((rotate(..), ..))?` / `wg.wait_arrived(arrived)?` split it. `fetch_*`, `fold_scale`, `wmma`, `sparse_wmma` and `step_descriptor` emit through the builder, so they may sit between `signal` and `wait_arrived`, where a `typed` call is refused.
+`iu4::step_descriptor(wg, gen, which)?` (above) is the descriptor step. The publishes, waits, fetches, `d_loads` and `fold_scale` do not depend on the matrix instruction and serve both K-loops; the `fragments_body` / `wmma` / `scale_*` / `block_begin` steps are paired with their `iu4::sparse_*` twins, and a dense step on a sparse spec (or the reverse) is refused before anything is emitted. The rendezvous is the generic driver's: `wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?` rotates the drained slab (retires the current buffer, publishes the next one), `wg.signal((rotate(..), ..))?` / `wg.wait_arrived(arrived)?` split it. `fetch_*`, `fold_scale`, `wmma`, `sparse_wmma` and `step_descriptor` emit through the builder, so they may sit between `signal` and `wait_arrived`, where a `typed` call is refused.
+
+`PayloadRole::{A, W}` and `NativeLoad { role, insn }` are built-in (no declaration). `fragments_body` lends the A and W rings in their state, replays each load through the ring its role names (the role maps to the sealed `PayA` / `PayW` tag; a script cannot make a tagged ring) and gives them back. Its capability is a read of the payload rings: every `insn` must be an LDS load (a `ds_load*` mnemonic with `MemoryClass::DsLoad`) whose declared defs and uses cover the decoded operands (R0603), and every destination register needs a unique live owner in the plan (R0401). All refusals come before anything is emitted. The committed twin's `rip_fragments` is the dense body (six loads per block, built from `gen.payload_base`, `gen.reg("f0")` etc.): edit it, no rebuild.
 
 What the driver refuses, each a build error with a stable code ([ERRORS.md](ERRORS.md)):
 
@@ -555,13 +558,17 @@ What the driver refuses, each a build error with a stable code ([ERRORS.md](ERRO
 | publish into a buffer that is not `Free` | `iu4::publish_slab: ring .. next buffer is Writing ..` | R0399 | `publish_into_a_non_free_buffer_is_refused` |
 | rotate before the wait | `barrier would publish .. with an undrained LDS store` | R0301 | `rotating_before_the_wait_is_refused` |
 | wait with no store in flight | `wait on ring ..: no store of this wave is in flight` | R0399 | `waiting_without_a_publish_is_refused` |
-| read or WMMA of an unpublished slot | `iu4::fragments: ring .. current buffer is Free, not published` | R0303 | `reading_or_wmma_of_an_unpublished_slot_is_refused` |
+| read or WMMA of an unpublished slot | `iu4::fragments_body: ring .. current buffer is Free, not published` (via `rip_fragments`) | R0303 | `reading_or_wmma_of_an_unpublished_slot_is_refused` |
 | a ring of the wrong kind / one the script made | the typed lend's tag check | R0399 | `a_ring_of_the_wrong_kind_is_refused_by_the_fine_natives`, `a_ring_the_script_made_cannot_enter_the_fine_natives` |
 | a fine step under wave-uniform control | `.. is workgroup scope` | R0304 | `a_fine_step_under_wave_uniform_control_is_refused` |
 | a loop trip that leaves a publish in flight | the driver's loop rule | R0399 | `a_trip_that_leaves_a_publish_in_flight_is_refused` |
-| a dense step on a sparse spec, a sparse step on a dense one | `iu4::fragments: the spec is s24x64: a dense step cannot run in the sparse K-loop ..` / `iu4::sparse_fragments: the spec is dense ..` | R0000 | `a_fine_step_of_the_other_mma_family_is_refused` |
+| a dense step on a sparse spec, a sparse step on a dense one | `iu4::fragments_body: the spec is s24x64: a dense step cannot run in the sparse K-loop ..` / `iu4::sparse_fragments: the spec is dense ..` | R0000 | `a_fine_step_of_the_other_mma_family_is_refused` |
 | a second sub-block (or `_s1` scale tail) of an `s24x64` block | `sparse wmma group: sub-block 1: .. covers the whole K64 slab` | R0000 | `an_x64_block_has_no_second_sub_block` |
 | a sparse read or SWMMAC group of an unpublished slot | `iu4::sparse_fragments: ring .. not published` | R0303 | `a_sparse_read_or_wmma_of_an_unpublished_slot_is_refused` |
+| payload rings in different states | `iu4::fragments_body: .. different states ..` | R0000 | `the_script_fragments_body_keeps_the_typed_refusals` |
+| a non-load in a body | `iu4::fragments_body: load i .. is not an LDS load: a fragments body only reads the payload rings` | R0399 | `a_fragments_body_outside_its_capability_is_refused` |
+| a load whose defs/uses miss a decoded operand | `iu4::fragments_body: load i: op declares defs ..` | R0603 | `a_fragments_body_outside_its_capability_is_refused` |
+| a destination register with no unique live owner | `v[240:243] at .Liu4_m0 has no unique live owner` | R0401 | `a_fragments_body_outside_its_capability_is_refused` |
 
 (The tests are in `tests/iu4_gemm_fine_twin.rs`; `the_fine_sparse_composition_emits_the_shipped_bytes` requires `fine_sparse_block` to emit the bytes and proof of `iu4_gemm::emit` for every sparse variant, and `the_fine_composition_emits_the_shipped_bytes` the dense ones.) The opaque `iu4::sparse_block` / `iu4::sparse_block_stepping` remain and call the same composition. A sparse spec admits the shipped wait placement only (`WaitPlace::AfterMma`) and ring depth 2 only. The payload rings are two deep by default; `const RING = 3` in the twin builds the dense depth-3 K-loop from these natives plus the typed ring's `starting_at`, `advance` and `wg.wg_if_else` ([cookbook 17](cookbook/17-iu4-kloop-natives.md#ring-depth-3)).
 

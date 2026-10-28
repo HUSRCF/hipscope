@@ -15,8 +15,11 @@
 //! cannot read a `Free` buffer. A dense [`block`] is a composition of the fine
 //! steps below ([`block_begin`], [`fragments`], [`wmma_group`],
 //! [`publish_slab`], the `fetch_*` loads, ...): the generator and the `.rip`
-//! natives (`iu4::fragments`, `iu4::wmma`, `iu4::publish_slab`, ..., cookbook
-//! 17) call the same functions, so a script can place them itself. A sparse
+//! natives (`iu4::wmma`, `iu4::publish_slab`, ..., cookbook 17) call the same
+//! functions, so a script can place them itself; the exception is the dense
+//! fragment loads, which reach scripts as a script body over
+//! `iu4::fragments_body` ([`fragments`] stays the generator's step and the
+//! twin's independent reference). A sparse
 //! [`sparse_block`] is split the same way: [`sparse_block_begin`],
 //! [`sparse_fragments`], [`sparse_wmma_group`], [`sparse_scale_loads`] and
 //! [`sparse_scale_tail`] are the steps that differ from dense's (the publishes,
@@ -408,6 +411,9 @@ pub fn step_descriptor(b: &mut Builder, g: &Gen, which: usize) -> Result<(), Str
 // their typing: the publishes want a `Free` next buffer and leave it `Writing`
 // with a `Pending` token (`Staged`), the fragment and scale loads read a
 // `Published` current buffer, and only a drained `Writing` buffer rotates.
+// The dense fragment loads are the exception for scripts: the twin writes them
+// as a script body over `iu4::fragments_body`, and [`fragments`] below stays
+// the generator's own step and the twin's independent reference.
 
 /// The head of a dense block on plane `h`: its own label (`entry_label`) and
 /// the lifetimes of the registers its phases alias; see [`block`] for `tag` and

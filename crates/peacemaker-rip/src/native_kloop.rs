@@ -22,15 +22,19 @@
 //! The natives that run inside a split barrier's window (the fetches, the
 //! fold, the WMMA groups, the descriptor step) touch no ring through `typed`
 //! (which the driver refuses there): they emit through the builder, and the
-//! WMMA group is gated on the payload rings' phases.
+//! WMMA group is gated on the payload rings' phases. `iu4::fragments_body` is
+//! the exception: it replays a script-built body of DS loads through the same
+//! lend/give protocol instead of calling a Rust step.
 
 use super::{bool_of, gen_of, lds_of, lds_val, typed, wg_arg, Res};
 use super::{check_args, done, done_with, driver, nat, str_of, usize_of, Nat};
+use super::{field, insn_of, no_more, payload_role_of};
 use crate::interp::{Cx, Interp, R};
 use crate::value::Value;
 use peacemaker_author::runtime::{Lend, Phase, Place, RingId, RingView};
 use peacemaker_author::{Free, Gfx12Waits, Lendable, Published, Ring, State, Writing};
-use peacemaker_isa::kernels::iu4_gemm::{blocks, Gen, MetaD, MetaS, PayA, PayW, Wg};
+use peacemaker_isa::insn::{Instruction, MemoryClass};
+use peacemaker_isa::kernels::iu4_gemm::{blocks, Gen, MetaD, MetaS, PayA, PayW, PayloadRole, Wg};
 
 pub(super) const FNS: &[&str] = &[
     "iu4::block_begin",
@@ -44,7 +48,7 @@ pub(super) const FNS: &[&str] = &[
     "iu4::publish_slab",
     "iu4::publish_meta",
     "iu4::wait",
-    "iu4::fragments",
+    "iu4::fragments_body",
     "iu4::d_loads",
     "iu4::scale_loads",
     "iu4::scale_tail",
@@ -63,22 +67,29 @@ pub(super) fn is_fn(name: &str) -> bool {
 
 // ---- dense and sparse steps -----------------------------------------------------
 
-/// The dense steps (`iu4::block_begin`, `fragments`, `wmma`, `scale_loads`,
+/// The dense steps (`iu4::block_begin`, `fragments_body`, `wmma`, `scale_loads`,
 /// `scale_tail`) are for a dense spec and their `iu4::sparse_*` twins for a
 /// sparse one: the other pairing is refused before anything is emitted, so a
 /// WMMA never lands in a SWMMAC kernel and the register layouts of the two
 /// K-loops (and their scale-load placement) are never mixed.
 fn step_spec(what: &str, g: &Gen, sparse: bool) -> Res<()> {
     let mma = g.spec().mma;
+    // The dense fragment loads are a script body over `iu4::fragments_body`.
+    let twin = |w: &str| match w {
+        "iu4::sparse_fragments" => "iu4::fragments_body".to_string(),
+        "iu4::fragments_body" => "iu4::sparse_fragments".to_string(),
+        _ if sparse => w.replace("sparse_", ""),
+        _ => w.replace("iu4::", "iu4::sparse_"),
+    };
     match (sparse, mma.is_sparse()) {
         (true, false) => Err(format!(
             "{what}: the spec is dense: a sparse step needs an `s24x64` / `s24x32` spec (the dense step is `{}`)",
-            what.replace("sparse_", "")
+            twin(what)
         )),
         (false, true) => Err(format!(
             "{what}: the spec is {}: a dense step cannot run in the sparse K-loop (use `{}`)",
             mma.name(),
-            what.replace("iu4::", "iu4::sparse_")
+            twin(what)
         )),
         _ => Ok(()),
     }
@@ -219,15 +230,119 @@ fn publish_meta_pair<C: Lendable>(
     Ok(())
 }
 
+/// A read of the payload pair's current buffers, generic over the pair's
+/// next-buffer state `N` and depth `D` (the lent rings' types).
+trait PayRead {
+    fn read<N: State, const D: usize>(
+        self,
+        wg: &mut Wg<'_>,
+        ra: &Ring<PayA, Published, N, D>,
+        rw: &Ring<PayW, Published, N, D>,
+    ) -> Res<()>;
+}
+
+/// `iu4::sparse_fragments`: the Rust step.
+struct SparseFragments<'g>(&'g Gen);
+
+impl PayRead for SparseFragments<'_> {
+    fn read<N: State, const D: usize>(
+        self,
+        wg: &mut Wg<'_>,
+        ra: &Ring<PayA, Published, N, D>,
+        rw: &Ring<PayW, Published, N, D>,
+    ) -> Res<()> {
+        blocks::sparse_fragments(wg, self.0, ra, rw)
+    }
+}
+
+/// One load of a script-native body (`NativeLoad { role, insn }`): the
+/// payload ring it reads, named by role (the native maps the role to the
+/// sealed `PayA` / `PayW` tag), and the instruction the script built.
+struct NativeLoad {
+    role: PayloadRole,
+    insn: Instruction,
+}
+
+/// `iu4::fragments_body`: the script's loads, in its order, each through the
+/// typed `ds_load_cur` of the lent ring its role names.
+struct BodyLoads(Vec<NativeLoad>);
+
+impl PayRead for BodyLoads {
+    fn read<N: State, const D: usize>(
+        self,
+        wg: &mut Wg<'_>,
+        ra: &Ring<PayA, Published, N, D>,
+        rw: &Ring<PayW, Published, N, D>,
+    ) -> Res<()> {
+        for l in self.0 {
+            match l.role {
+                PayloadRole::A => wg.ds_load_cur(ra, l.insn)?,
+                PayloadRole::W => wg.ds_load_cur(rw, l.insn)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The loads a body passes to `iu4::fragments_body`: a `Vec` of
+/// `NativeLoad { role: PayloadRole::A | PayloadRole::W, insn }`. The body's
+/// capability is a read of the payload rings, so every instruction must be an
+/// LDS load (`MemoryClass::DsLoad`, a `ds_load*` mnemonic) whose declared defs
+/// and uses cover its decoded operands (R0603, as for every instruction a
+/// script hands the driver); anything else is refused before the rings are
+/// lent or anything is emitted.
+fn native_loads<'a>(
+    it: &Interp<'a>,
+    what: &str,
+    arch: peacemaker_isa::Arch,
+    v: &Value<'a>,
+) -> Res<Vec<NativeLoad>> {
+    let Value::Array(xs) = it.deref(v.clone()) else {
+        return Err(format!(
+            "{what}: expected the body's loads, a `Vec<NativeLoad>` (`NativeLoad {{ role, insn }}`)"
+        ));
+    };
+    xs.iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let n = "NativeLoad";
+            let mut fs = match it.deref(x.clone()) {
+                Value::Struct(s, fs) if &*s == n => fs,
+                o => {
+                    return Err(format!(
+                        "{what}: load {i}: expected a `NativeLoad {{ role, insn }}`, found {}",
+                        o.type_name()
+                    ))
+                }
+            };
+            let role = payload_role_of(it, &field(&mut fs, n, "role")?)
+                .map_err(|e| format!("{what}: load {i}: {e}"))?;
+            let insn = insn_of(it, &field(&mut fs, n, "insn")?)
+                .map_err(|e| format!("{what}: load {i}: {e}"))?;
+            no_more(&fs, n)?;
+            if insn.memory != Some(MemoryClass::DsLoad) || !insn.mnemonic().starts_with("ds_load") {
+                return Err(format!(
+                    "{what}: load {i} `{}` is not an LDS load: a fragments body only reads the payload rings (`ds_load*` with `MemoryClass::DsLoad`)",
+                    insn.text
+                ));
+            }
+            crate::validate::instruction(arch, &insn.text, &insn.defs, &insn.uses)
+                .map_err(|e| format!("{what}: load {i}: {e}"))?;
+            Ok(NativeLoad { role, insn })
+        })
+        .collect()
+}
+
 /// The fragment loads over the payload pair (A, W), which must be published
-/// and in the same state (`Free` or `Writing` next buffers).
+/// and in the same state (`Free` or `Writing` next buffers): both rings are
+/// lent in that state, `body` reads them, and both are given back as they
+/// were, token and all.
 fn fragments_pay(
     lend: &mut Lend<'_>,
     wg: &mut Wg<'_>,
-    g: &Gen,
     what: &str,
     ids: [RingId; 4],
-    sparse: bool,
+    body: impl PayRead,
 ) -> Res<()> {
     let (va, vw) = (
         lend.view::<PayA>(ids[0])
@@ -244,11 +359,7 @@ fn fragments_pay(
                 .map_err(|e| format!("{what}: {e}"))?;
             let rw = lend.take::<PayW, Published, Free, D>(ids[1])
                 .map_err(|e| format!("{what}: {e}"))?;
-            let out = if sparse {
-                blocks::sparse_fragments(wg, g, &ra, &rw)
-            } else {
-                blocks::fragments(wg, g, &ra, &rw)
-            };
+            let out = body.read(wg, &ra, &rw);
             lend.give_back(ids[0], ra)?;
             lend.give_back(ids[1], rw)?;
             out
@@ -258,11 +369,7 @@ fn fragments_pay(
                 .map_err(|e| format!("{what}: {e}"))?;
             let w = lend.take_writing::<PayW, Gfx12Waits, Published, D>(ids[1])
                 .map_err(|e| format!("{what}: {e}"))?;
-            let out = if sparse {
-                blocks::sparse_fragments(wg, g, &a.0, &w.0)
-            } else {
-                blocks::fragments(wg, g, &a.0, &w.0)
-            };
+            let out = body.read(wg, &a.0, &w.0);
             lend.give_writing(ids[0], a)?;
             lend.give_writing(ids[1], w)?;
             out
@@ -475,17 +582,36 @@ pub(super) fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx
                 |()| Value::Tuple(places.iter().map(|p| nat(Nat::Drained(*p))).collect()),
             ))
         }
-        "iu4::fragments" | "iu4::sparse_fragments" => {
+        "iu4::sparse_fragments" => {
             need(3)?;
             wg_arg(it, &a[0])?;
             let g = gen_of(it, &a[1])?;
-            let sparse = name == "iu4::sparse_fragments";
-            if let Err(e) = step_spec(what, &g, sparse) {
+            if let Err(e) = step_spec(what, &g, true) {
                 return Ok(done(Err(e)));
             }
             let ids = lds_of(it, &a[2])?;
             let ids = typed(cx, |wg, lend| {
-                fragments_pay(lend, wg, &g, what, ids, sparse)?;
+                fragments_pay(lend, wg, what, ids, SparseFragments(&g))?;
+                Ok(ids)
+            })?;
+            Ok(done_with(ids, lds_val))
+        }
+        "iu4::fragments_body" => {
+            need(4)?;
+            wg_arg(it, &a[0])?;
+            let g = gen_of(it, &a[1])?;
+            if let Err(e) = step_spec(what, &g, false) {
+                return Ok(done(Err(e)));
+            }
+            let ids = lds_of(it, &a[2])?;
+            // The loads are values the script built before this call: no
+            // evaluation runs while the rings are lent.
+            let loads = match native_loads(it, what, g.spec().arch, &a[3]) {
+                Ok(l) => l,
+                Err(e) => return Ok(done(Err(e))),
+            };
+            let ids = typed(cx, |wg, lend| {
+                fragments_pay(lend, wg, what, ids, BodyLoads(loads))?;
                 Ok(ids)
             })?;
             Ok(done_with(ids, lds_val))

@@ -12,7 +12,7 @@ A K128 block on plane `h` is two 64-K slabs. Slab 0 sits in LDS slot 0 of the pa
 block_begin                    label, register lifetimes
 [step_descriptor]              block_stepping's descriptor advance
 -- phase A (slab 0, slot 0) --
-fragments                      LDS -> registers, both 32-K sub-blocks
+rip_fragments                   LDS -> registers, both 32-K sub-blocks
 wmma sb0 (seed)    wmma sb1    the two WMMA groups
 publish_slab                   slab 1 -> slot 1: Free -> Writing      } WAIT places it
 fetch_next_meta                next token scale / row header
@@ -20,7 +20,7 @@ wait "slab"                    Writing pending -> drained
 barrier rotate(A), rotate(W)   slot 0 retired, slot 1 published
 -- phase B (slab 1, slot 1) --
 fetch_next                     next block's slab 0 -> prefetch registers
-fragments  d_loads             slot 1; token scales
+rip_fragments  d_loads             slot 1; token scales
 wmma sb0           scale_loads           (label _s0)
 wmma sb1 (fold)    scale_tail            (label _s1)
 publish_slab  publish_meta     next block -> slot 0 and the next metadata plane
@@ -41,7 +41,8 @@ The peeled last block of the K-loop (`fetch_next = false`) has no next block: no
 | `iu4::fetch_slab1(wg, g, h)?`, `iu4::fetch_slab1_next_group(wg, g)?`, `iu4::fetch_next(wg, g, h)?`, `iu4::fetch_next_meta(wg, g, h)?` | the global loads into the prefetch registers (slab 1 of block `h`; the odd block's form for the next group; the next block's slab 0; its token scale and row header) |
 | `iu4::publish_slab(wg, g, lds)?`, `iu4::publish_meta(wg, g, lds)?` | the LDS stores of the staged slab, or of the next metadata plane, into the ring's `Free` next buffer |
 | `iu4::wait(wg, lds, set)?` | the counter wait for `"slab"`, `"meta"` or `"all"` rings; returns the `Drained` tokens |
-| `iu4::fragments(wg, g, lds)?`, `iu4::d_loads(wg, g, lds)?`, `iu4::scale_loads(wg, g, tag, lds)?`, `iu4::scale_tail(wg, g, tag, lds)?` | LDS reads of the `Published` current buffers |
+| `iu4::fragments_body(wg, g, lds, loads)?` | the dense fragment loads as a script body: replays the script's `Vec<NativeLoad>` (DS loads only) on the A and W rings ([below](#the-fragment-loads-as-a-script-body)) |
+| `iu4::d_loads(wg, g, lds)?`, `iu4::scale_loads(wg, g, tag, lds)?`, `iu4::scale_tail(wg, g, tag, lds)?` | LDS reads of the `Published` current buffers |
 | `iu4::wmma(wg, g, sb, first, fold, lds)?` | the eight WMMAs of 32-K sub-block `sb`; `first` seeds the accumulators; `fold` interleaves the fold's stage 1 |
 | `iu4::publish_slab_set(wg, g, set, lds)?`, `iu4::fetch_ahead(wg, g, h, slab)?`, `iu4::fetch_slab(wg, g, set, slab, desc, woff)?` | ring depth 3: publish prefetch set `set`; fetch a block one group on into set `slab`; fetch any block's slab into a set |
 | `iu4::setup`, `iu4::split_trips`, `iu4::ring_cmp`, `iu4::group_end` | ring depth 3: the prologue without its ring part, the `q`/`r` split of the trip count, the entry branch's condition, a group's trip end |
@@ -66,10 +67,38 @@ A ring crosses between a native and the driver in the state the Rust step is typ
 | a loop trip that ends with a publish in flight | R0399 | `a_trip_that_leaves_a_publish_in_flight_is_refused` |
 | a dense step on a sparse spec, or a sparse step on a dense one | R0000 | `a_fine_step_of_the_other_mma_family_is_refused` |
 | an `s24x64` second sub-block or `_s1` scale tail | R0000 | `an_x64_block_has_no_second_sub_block` |
+| payload rings in different states, a split barrier, a re-laid-out ring, a bad slot | R0000 / R0399 | `the_script_fragments_body_keeps_the_typed_refusals` |
+| a non-load in a body (R0399), a load whose defs/uses miss an operand (R0603), an unowned destination register (R0401) | R0399 / R0603 / R0401 | `a_fragments_body_outside_its_capability_is_refused` |
 
 Each has a test in `tests/iu4_gemm_fine_twin.rs`, and the four below a whole failing script ([ERRORS.md](../ERRORS.md) points here from R0301, R0303 and R0399). The ring tags (`PayA`, `PayW`, `MetaD`, `MetaS`) are the typed lend's, so `iu4::publish_slab` with the W ring where the A ring belongs is refused. The loop rule is the driver's: `loop_carried` demands every ring leave the trip in the state it entered, which is why a block that publishes also waits and rotates inside the trip.
 
 `fetch_*`, `fold_scale`, `wmma`, `sparse_wmma` and `step_descriptor` emit through the builder rather than `Driver::typed` (which the driver refuses while a split barrier is in flight), so they may sit between `signal` and `wait_arrived`; `wmma` and `sparse_wmma` are gated on the payload rings' phases instead (the current buffer must be `Published`).
+
+## The fragment loads as a script body
+
+The dense block's fragment loads are not a native call but a script function, `rip_fragments` in the twin: it builds the six `ds_load_2addr_stride64_b64` instructions (per 32-K sub-block one W load and two A loads) as `NativeLoad { role, insn }` values, with the slab offsets from `g.payload_base(role, slot)?`, and hands them to `iu4::fragments_body(wg, g, lds, loads)?`. The native lends the A and W rings in their state, replays each load through the typed `ds_load_cur` of the ring its role (`PayloadRole::A` or `W`) names, and gives the rings back. Its capability is a read of the payload rings: every instruction must be an LDS load whose declared defs and uses cover its operands, and its destinations must be registers the plan owns; anything else is refused before anything is emitted.
+
+```text
+fn rip_fragments<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    // DS offset fields count 512-byte strides (`stride64` of b64).
+    let slot = lds[0].cur_index();
+    let a = g.payload_base(PayloadRole::A, slot)? / 512;
+    let w = g.payload_base(PayloadRole::W, slot)? / 512;
+    let mut loads = Vec::new();
+    for sb in 0..2 {
+        let f = g.reg(&format!("f{sb}")).ok_or("no fragment register")?;
+        let fr_w = g.reg(&format!("fr_w{sb}")).ok_or("no W address register")?;
+        let fr_a = g.reg(&format!("fr_a{sb}")).ok_or("no A address register")?;
+        loads.push(NativeLoad { role: PayloadRole::W, insn: frag_load(f, fr_w, w) });
+        for half in 0..2 {
+            loads.push(NativeLoad { role: PayloadRole::A, insn: frag_load(f + 4 + 4 * half, fr_a, a + 2 * half) });
+        }
+    }
+    iu4::fragments_body(wg, g, lds, loads)
+}
+```
+
+`frag_load` and `ds_offsets` (in the full program below) format one load. The Rust `blocks::fragments` stays the generator's own step and the twin's independent reference: `the_script_fragments_body_emits_the_rust_loads_for_the_set_control` requires the script's loads to equal it, and `the_script_candidate_matches_the_cpu_fold_bitwise` runs the script's kernel on the CPU emulator against the exact CPU fold. Edit the offsets here and rebuild nothing; a legal but wrong offset is caught by the twin and the numerics (`a_legal_but_wrong_fragment_offset_is_caught_by_twin_and_numerics`).
 
 ## What the driver refuses
 
@@ -179,7 +208,7 @@ fn author<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen) -> Result<(), String> {
 }
 ```
 
-Fix: run the prologue first (it stages and publishes block 0), then `iu4::fragments(wg, g, lds)?` and the WMMA groups, as `fine_block` does.
+Fix: run the prologue first (it stages and publishes block 0), then `rip_fragments(wg, g, lds)?` and the WMMA groups, as `fine_block` does.
 
 ## The twin composition
 
@@ -187,13 +216,13 @@ Fix: run the prologue first (it stages and publishes block 0), then `iu4::fragme
 
 ## The sparse K-loop
 
-The 2:4-sparse blocks (`Mma::S24X64`, `Mma::S24X32`) are the same block with SWMMAC in place of WMMA: the same rings, publishes, next-block fetches, `d_loads` and fold, so those natives serve both. What differs is split into five steps, each the `iu4::sparse_*` twin of a dense one, and each refuses a dense spec; the dense `block_begin`, `fragments`, `wmma`, `scale_loads` and `scale_tail` refuse a sparse spec in turn (`a_fine_step_of_the_other_mma_family_is_refused`), so a WMMA never lands in a SWMMAC kernel:
+The 2:4-sparse blocks (`Mma::S24X64`, `Mma::S24X32`) are the same block with SWMMAC in place of WMMA: the same rings, publishes, next-block fetches, `d_loads` and fold, so those natives serve both. What differs is split into five steps, each the `iu4::sparse_*` twin of a dense one, and each refuses a dense spec; the dense `block_begin`, `iu4::fragments_body` (behind `rip_fragments`), `wmma`, `scale_loads` and `scale_tail` refuse a sparse spec in turn (`a_fine_step_of_the_other_mma_family_is_refused`), so a WMMA never lands in a SWMMAC kernel:
 
 ```text
                 dense                   s24x64                       s24x32
 head            block_begin             sparse_block_begin           sparse_block_begin
                                         (fragments end at _s0)       (W/index regs end at _s1)
-fragments       fragments               sparse_fragments             sparse_fragments
+fragments       rip_fragments           sparse_fragments             sparse_fragments
                 (W + 2 A loads/sb)      (W + 8 ds_load_b64 B)        (= dense loads)
 MMA groups      wmma sb0, wmma sb1      sparse_wmma sb0 (one K64     sparse_wmma sb0, sb1
                                         bundle; sb1 refused)         (index_key = sb)
@@ -243,7 +272,7 @@ fn author<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen) -> Result<(), String> {
 //   publish_*   next buffer Free -> Writing (a Pending token)
 //   wait        Pending -> Drained (names the ring set)
 //   barrier     rotate: cur retired, the Drained next one published
-//   fragments / scale_loads / wmma   read the Published current buffer
+//   rip_fragments / scale_loads / wmma   read the Published current buffer
 fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
         end_label: &str, entry_label: bool, step: Option<usize>, lds: Lds) -> Result<Lds, String> {
     let lds = iu4::block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
@@ -252,7 +281,7 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     }
     // Phase A: slab 0 from slot 0; slab 1 (fetched by the preceding block) is
     // published into slot 1.
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     let lds = if WAIT == "after" {
         let lds = iu4::wmma(wg, g, 0, true, false, lds)?;
         let lds = iu4::wmma(wg, g, 1, false, false, lds)?;
@@ -275,7 +304,7 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     if fetch_next {
         iu4::fetch_next(wg, g, h)?;
     }
-    let lds = iu4::fragments(wg, g, lds)?;
+    let lds = rip_fragments(wg, g, lds)?;
     let lds = iu4::d_loads(wg, g, lds)?;
     if !fetch_next {
         // The peeled group's last block: nothing to publish.
@@ -322,6 +351,50 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     wg.wait_arrived(b2)?;
     Ok(lds)
 }
+
+// The fragment loads of a dense block, written here: per 32-K sub-block one
+// W load (both row groups) and two A loads (column blocks 0-1, 2-3), from the
+// payload rings' current slot. The script builds the six instructions;
+// `iu4::fragments_body` lends the A and W rings in their state (Published
+// current buffer, Free or Writing next, depth 2 or 3), replays each load on
+// the ring its `PayloadRole` names through the typed core, and gives them
+// back. Only LDS loads are accepted. Edit the body here: no rebuild.
+fn rip_fragments<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    // DS offset fields count 512-byte strides (`stride64` of b64).
+    let slot = lds[0].cur_index();
+    let a = g.payload_base(PayloadRole::A, slot)? / 512;
+    let w = g.payload_base(PayloadRole::W, slot)? / 512;
+    let mut loads = Vec::new();
+    for sb in 0..2 {
+        let f = g.reg(&format!("f{sb}")).ok_or("no fragment register")?;
+        let fr_w = g.reg(&format!("fr_w{sb}")).ok_or("no W address register")?;
+        let fr_a = g.reg(&format!("fr_a{sb}")).ok_or("no A address register")?;
+        loads.push(NativeLoad { role: PayloadRole::W, insn: frag_load(f, fr_w, w) });
+        for half in 0..2 {
+            loads.push(NativeLoad { role: PayloadRole::A, insn: frag_load(f + 4 + 4 * half, fr_a, a + 2 * half) });
+        }
+    }
+    iu4::fragments_body(wg, g, lds, loads)
+}
+
+// `ds_load_2addr_stride64_b64` of four VGPRs at `dst` from `v{addr}`, the two
+// halves `o` and `o + 1` strides apart.
+fn frag_load(dst: u8, addr: u8, o: u32) -> Instruction {
+    let text = format!("ds_load_2addr_stride64_b64 v[{}:{}], v{}{}", dst, dst + 3, addr, ds_offsets(o, o + 1));
+    Instruction::new(text, vec![vr(dst, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad)
+}
+
+// DS offset fields as objdump prints them: a zero field is omitted.
+fn ds_offsets(o0: u32, o1: u32) -> String {
+    let mut t = String::new();
+    if o0 != 0 {
+        t.push_str(&format!(" offset0:{o0}"));
+    }
+    if o1 != 0 {
+        t.push_str(&format!(" offset1:{o1}"));
+    }
+    t
+}
 ```
 
 Move any step the same way: put `iu4::fetch_next_meta` before the first WMMA group, split the publish across the groups, delay `iu4::fold_scale` past the `wait_arrived`. A move that breaks the ring discipline fails at the offending native; a move that is legal builds, is certified like any script, and its result bits are the shipped ones (a reorder of independent steps changes only the schedule; the loads read the same published slots).
@@ -336,7 +409,7 @@ pm_loop --kernel iu4_gemm --arch gfx1201 --shape M=17408,N=8192,K=5120 \
         --rip crates/peacemaker-isa/src/kernels/iu4_gemm_fine.rip
 ```
 
-(`pm_loop` refuses, exit 3 stage `rip`, a file whose symbol, kernarg layout, workgroup size or LDS differs from the generator's; the fine twin keeps all of them.) Change `WAIT` or the body of `fine_block` and rerun: no rebuild.
+(`pm_loop` refuses, exit 3 stage `rip`, a file whose symbol, kernarg layout, workgroup size or LDS differs from the generator's; the fine twin keeps all of them.) Change `WAIT`, the body of `fine_block` or `rip_fragments` and rerun: no rebuild.
 
 ## Ring depth 3
 

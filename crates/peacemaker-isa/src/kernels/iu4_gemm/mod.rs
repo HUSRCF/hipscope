@@ -289,6 +289,25 @@ impl Gen {
             }
         })
     }
+    /// The LDS byte offset of payload slab `slot` of ring `role` (read-only
+    /// geometry: the layout a typed `PayA` / `PayW` ring's buffer `slot` sits
+    /// at). Refuses a slot the spec's ring depth does not have.
+    pub fn payload_base(&self, role: PayloadRole, slot: usize) -> Result<u32, String> {
+        let depth = match self.spec.tune.ring {
+            RingDepth::Two => 2,
+            RingDepth::Three => 3,
+        };
+        let slots = match role {
+            PayloadRole::A => &self.layout.a,
+            PayloadRole::W => &self.layout.w,
+        };
+        match slots.get(slot) {
+            Some(&base) if slot < depth => Ok(base),
+            _ => Err(format!(
+                "payload_base({role:?}, {slot}): the payload rings are {depth} deep (slots 0..{depth})"
+            )),
+        }
+    }
     fn build(spec: Spec) -> Self {
         let tile = spec.tile;
         let args = if spec.epi.is_silu() {
@@ -643,6 +662,14 @@ pub enum PayA {}
 pub enum PayW {}
 pub enum MetaD {}
 pub enum MetaS {}
+/// The role of a payload ring (`PayA` or `PayW`) a script-native body names
+/// for one of its loads; the native maps it to the sealed tag, so a script
+/// cannot make a ring of either kind by naming it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadRole {
+    A,
+    W,
+}
 /// The kernel's workgroup scope on gfx1201.
 pub type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
 pub(crate) type Wv<'b> = Wave<'b, Gfx1201, Builder>;

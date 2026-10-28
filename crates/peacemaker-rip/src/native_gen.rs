@@ -19,16 +19,18 @@
 //!   and branch rule covers script loops around blocks. `Lds` is the array of
 //!   the four `RingId`s; blocks return it for single-assignment style.
 //! - Fine steps (`native_kloop.rs`): the dense block split into
-//!   `iu4::block_begin`, `fragments`, `wmma`, `publish_slab` / `publish_meta`,
+//!   `iu4::block_begin`, `wmma`, `publish_slab` / `publish_meta`,
 //!   `wait`, `fetch_*`, ... with the rings lent in `Free`, `Published` or
 //!   `Writing` (token pending) state, so a script places the waits itself.
+//!   `iu4::fragments_body` is the exception: it replays a script-built body of
+//!   DS loads through the same lend/give protocol instead of calling a Rust step.
 
 #[path = "native_kloop.rs"]
 mod kloop;
 
 use super::{
-    arch_of, check_args, done, done_with, driver, nat, nat_of, ring_of, spec_value, str_of, u8_of,
-    usize_of, Nat,
+    arch_of, check_args, done, done_with, driver, insn_of, nat, nat_of, ring_of, spec_value,
+    str_of, u8_of, usize_of, Nat,
 };
 use crate::interp::{Cx, Interp, R};
 use crate::value::Value;
@@ -36,7 +38,7 @@ use peacemaker_author::runtime::{Exit, Lend, RingId};
 use peacemaker_author::{Free, Published};
 use peacemaker_isa::kernels::iu4_gemm::{
     self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, FreeRings3, Gen, Lds, Lds3, MetaD,
-    MetaS, Mma, PayA, PayW, RingDepth, Tile, Wg,
+    MetaS, Mma, PayA, PayW, PayloadRole, RingDepth, Tile, Wg,
 };
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Emitted;
@@ -93,11 +95,13 @@ pub(super) fn is_type(n: &str) -> bool {
             | "Iu4Gemm"
             | "MoeSym"
             | "Iu4Gen"
+            | "PayloadRole"
+            | "NativeLoad"
     )
 }
 
 pub(super) fn is_struct(n: &str) -> bool {
-    matches!(n, "Iu4Spec" | "MoeSymSpec")
+    matches!(n, "Iu4Spec" | "MoeSymSpec" | "NativeLoad")
 }
 
 /// Enum values: `Value::Enum(type, variant, [])`, exactly like a script's own
@@ -122,6 +126,7 @@ const ENUMS: &[(&str, &[&str])] = &[
     ("RingDepth", &["Two", "Three"]),
     ("MoeKind", &["GateUp", "Down"]),
     ("WeightCodec", &["Mq4Sym", "Mq3I4", "E8pI4"]),
+    ("PayloadRole", &["A", "W"]),
 ];
 
 pub(super) fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
@@ -225,6 +230,13 @@ fn codec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<moe::WeightCodec> {
         "Mq3I4" => Ok(moe::WeightCodec::Mq3I4),
         "E8pI4" => Ok(moe::WeightCodec::E8pI4),
         o => Err(unknown("WeightCodec", o)),
+    }
+}
+fn payload_role_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<PayloadRole> {
+    match variant_of(it, v, "PayloadRole")?.as_str() {
+        "A" => Ok(PayloadRole::A),
+        "W" => Ok(PayloadRole::W),
+        o => Err(unknown("PayloadRole", o)),
     }
 }
 
@@ -670,7 +682,8 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
     }
 }
 
-/// Methods of an `Iu4Gen`: `plan()`, `kernel_spec()`, `spec()`, `reg(name)`.
+/// Methods of an `Iu4Gen`: `plan()`, `kernel_spec()`, `spec()`, `reg(name)`,
+/// `payload_base(role, slot)`.
 pub(super) fn method<'a>(
     it: &Interp<'a>,
     g: &Rc<Gen>,
@@ -698,6 +711,12 @@ pub(super) fn method<'a>(
             Some(Value::option(
                 g.reg(&str_of(it, &a[0], "reg")?).map(Value::u8),
             ))
+        }
+        "payload_base" => {
+            need(2)?;
+            let role = payload_role_of(it, &a[0])?;
+            let slot = usize_of(it, &a[1], "payload_base slot")?;
+            Some(done_with(g.payload_base(role, slot), Value::u32))
         }
         _ => None,
     })

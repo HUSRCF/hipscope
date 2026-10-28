@@ -2,21 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The fine K-loop natives (`iu4::block_begin`, `fragments`, `wmma`,
+//! The fine K-loop natives (`iu4::block_begin`, `fragments_body`, `wmma`,
 //! `publish_slab`, `wait`, ..., and the sparse `iu4::sparse_block_begin`,
 //! `sparse_fragments`, `sparse_wmma`, `sparse_scale_loads`, `sparse_scale_tail`;
 //! cookbook 17). `kernels/iu4_gemm_fine.rip` writes the dense and the 2:4-sparse
-//! K128 blocks with only them; with `WAIT = "after"` it re-emits the shipped
-//! kernel's bytes for every dense and sparse variant, and the other two
-//! placements re-emit the generator's `Tune { wait: Mid | Before }` (dense), and `WAIT = "window"` its
-//! `Tune { wait: Window }` (the 128x128x8 tile: the schedule the shipped 27B gate/up `_b1s` export runs);
-//! `RING = 3` writes the depth-3 K-loop (third LDS slab, second prefetch set,
-//! entry branch, three-group loop body, peeled tail) and re-emits the
-//! generator's `Tune { ring: Three }` bytes for every wait placement.
+//! K128 blocks with only them, the dense fragment loads as the script body
+//! `rip_fragments` over `iu4::fragments_body`; with `WAIT = "after"` it
+//! re-emits the shipped kernel's bytes (assembly, proof and linked object) for
+//! every dense and sparse variant, and the other two placements re-emit the
+//! generator's `Tune { wait: Mid | Before }` (dense), and `WAIT = "window"` its
+//! `Tune { wait: Window }` (the 128x128x8 tile: the schedule the shipped 27B
+//! gate/up `_b1s` export runs); `RING = 3` writes the depth-3 K-loop (third LDS
+//! slab, second prefetch set, entry branch, three-group loop body, peeled tail)
+//! and re-emits the generator's `Tune { ring: Three }` bytes for every wait
+//! placement.
 //! Every typing rule of the split (publish into a non-`Free` buffer, rotate
 //! before the wait, read or WMMA of an unpublished slot, a ring of the wrong
 //! kind, a dense step on a sparse spec and the reverse) is a refusal at build
-//! time.
+//! time, and so is a script fragments body that leaves its capability (a
+//! non-load, undeclared effects, an unowned register).
 
 use peacemaker_isa::kernels::iu4_gemm::{
     self, ALayout, Cacc, Epi, Fold, Mma, RingDepth, Spec, Tile, Tune, WaitPlace,
@@ -93,6 +97,12 @@ fn assert_same(what: &str, rust: &peacemaker_isa::Emitted, rip: &peacemaker_isa:
     want["variant"] = got["variant"].clone();
     got["variant"] = want["variant"].clone();
     assert_eq!(want, got, "{what}: proof");
+    // The linked code objects, each assembled from its own text.
+    let link = |e: &peacemaker_isa::Emitted| {
+        peacemaker_isa::native::assemble(&e.s_text, Arch::Gfx1201)
+            .unwrap_or_else(|err| panic!("{what}: assemble: {err}"))
+    };
+    assert!(link(rust) == link(rip), "{what}: linked object");
 }
 
 /// The K-loop block written with only the fine natives emits the shipped bytes
@@ -388,7 +398,7 @@ fn reading_or_wmma_of_an_unpublished_slot_is_refused() {
         )
     };
     for (call, native) in [
-        ("iu4::fragments(wg, g, lds)", "iu4::fragments"),
+        ("rip_fragments(wg, g, lds)", "iu4::fragments_body"),
         ("iu4::d_loads(wg, g, lds)", "iu4::d_loads"),
         ("iu4::scale_loads(wg, g, \"m0\", lds)", "iu4::scale_loads"),
         ("iu4::scale_tail(wg, g, \"m0\", lds)", "iu4::scale_tail"),
@@ -432,7 +442,7 @@ fn a_ring_the_script_made_cannot_enter_the_fine_natives() {
 #[test]
 fn a_fine_step_under_wave_uniform_control_is_refused() {
     let src = script(
-        "let c = wg.scmp(Instruction::new(\"s_cmp_eq_u32 s0, 0\", vec![], vec![s(0)]))?; wg.skip_if(c, \".Lskip\", lds, |wg, lds| { iu4::fragments(wg, g, lds) })?",
+        "let c = wg.scmp(Instruction::new(\"s_cmp_eq_u32 s0, 0\", vec![], vec![s(0)]))?; wg.skip_if(c, \".Lskip\", lds, |wg, lds| { rip_fragments(wg, g, lds) })?",
     );
     let e = refused(&src);
     assert!(
@@ -489,7 +499,7 @@ fn a_fine_step_of_the_other_mma_family_is_refused() {
             &[X64, X32][..],
         ),
         (
-            "iu4::fragments(wg, g, lds)",
+            "rip_fragments(wg, g, lds)",
             "iu4::sparse_fragments(wg, g, lds)",
             &[X64, X32][..],
         ),
@@ -521,7 +531,11 @@ fn a_fine_step_of_the_other_mma_family_is_refused() {
         for &variant in variants {
             let src = edit(FINE, sparse, dense);
             let e = refused_for(&src, variant);
-            let native = dense.split('(').next().unwrap();
+            // The dense fragment loads are the script body over the native.
+            let native = match dense.split('(').next().unwrap() {
+                "rip_fragments" => "iu4::fragments_body",
+                n => n,
+            };
             assert!(
                 e.contains(native) && e.contains("cannot run in the sparse K-loop"),
                 "{native} on {variant}: {e}"
@@ -606,4 +620,154 @@ fn a_sparse_script_that_rotates_before_the_wait_is_refused() {
         assert!(e.contains("undrained LDS store"), "{variant}: {e}");
         assert_eq!(code_for(&src, variant), "R0301", "{variant}");
     }
+}
+
+// ---- the script fragments body (`rip_fragments` / `iu4::fragments_body`) ----
+
+/// The first control: the dense SET kernel's fragment loads come from the
+/// script body, six per block, the same instructions in the same order as the
+/// Rust `blocks::fragments`, and the whole linked object is the shipped one.
+#[test]
+fn the_script_fragments_body_emits_the_rust_loads_for_the_set_control() {
+    assert!(
+        !FINE.contains("iu4::fragments("),
+        "the fine twin still calls the Rust fragments native"
+    );
+    let spec = Spec::control(Epi::Set);
+    let name = spec.variant_name();
+    assert_eq!(name, SET);
+    let rust = iu4_gemm::emit(spec).unwrap();
+    let rip = build(FINE, SET).unwrap();
+    let loads = |e: &peacemaker_isa::Emitted| -> Vec<String> {
+        e.s_text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ds_load_2addr_stride64_b64"))
+            .map(str::to_string)
+            .collect()
+    };
+    let (want, got) = (loads(&rust), loads(&rip));
+    // Two blocks per rolled trip and two in the peeled group, two slabs each.
+    assert_eq!(got.len(), 6 * 2 * 4, "{got:?}");
+    assert_eq!(want, got);
+    assert_same(SET, &rust, &rip);
+}
+
+/// The `rip_fragments` wrapper and the `iu4::fragments_body` native keep every
+/// refusal of the typed core: the wrong ring kind, a ring the script made, an
+/// unpublished slot (`reading_or_wmma_of_an_unpublished_slot_is_refused`),
+/// payload rings in different states, a split barrier holding the rings, wave
+/// control (`a_fine_step_under_wave_uniform_control_is_refused`), a ring that
+/// was re-laid out, and a slot the ring depth does not have.
+#[test]
+fn the_script_fragments_body_keeps_the_typed_refusals() {
+    let cases: Vec<(String, &str, &[&str], &str)> = vec![
+        (
+            script("let lds = [lds[1], lds[0], lds[2], lds[3]]; rip_fragments(wg, g, lds)?"),
+            SET,
+            &["iu4::fragments_body", "different tag"],
+            "R0399",
+        ),
+        (
+            script("let a = wg.lds(\"x\", 61440, 64)?; let b = wg.lds(\"y\", 61504, 64)?; let r = Ring::new(a, b); rip_fragments(wg, g, [r, r, lds[2], lds[3]])?"),
+            SET,
+            &["iu4::fragments_body", "not given by a typed body"],
+            "R0399",
+        ),
+        (
+            script("let lds = rip_fragments(wg, g, lds)?; let lds = iu4::publish_slab(wg, g, lds)?; let (da, dw) = iu4::wait(wg, lds, \"slab\")?; wg.barrier((rotate(lds[0], da),))?; rip_fragments(wg, g, lds)?"),
+            SET,
+            &["iu4::fragments_body", "different states", "next Free and Writing"],
+            "R0000",
+        ),
+        (
+            script("let lds = rip_fragments(wg, g, lds)?; let lds = iu4::publish_slab(wg, g, lds)?; let (da, dw) = iu4::wait(wg, lds, \"slab\")?; let arrived = wg.signal((rotate(lds[0], da), rotate(lds[1], dw)))?; let lds = iu4::fragments_body(wg, g, lds, vec![])?; wg.wait_arrived(arrived)?; lds"),
+            SET,
+            &["typed body while a split barrier is in flight"],
+            "R0399",
+        ),
+        (
+            script("let lds = rip_fragments(wg, g, lds)?; let lds = iu4::publish_slab(wg, g, lds)?; let (da, dw) = iu4::wait(wg, lds, \"slab\")?; let arrived = wg.signal((rotate(lds[0], da), rotate(lds[1], dw)))?; let lds = rip_fragments(wg, g, lds)?; wg.wait_arrived(arrived)?; lds"),
+            SET,
+            &["held by a split barrier"],
+            "R0399",
+        ),
+        (
+            edit(
+                FINE,
+                "        iu4::gdn_epilogue(wg, g, lds)?;\n",
+                "        iu4::gdn_epilogue(wg, g, lds)?;\n        rip_fragments(wg, g, lds)?;\n",
+            ),
+            "k128-128x128x8-cacc1-qkvzagdn",
+            &["re-laid out"],
+            "R0399",
+        ),
+        (
+            edit(
+                FINE,
+                "g.payload_base(PayloadRole::A, slot)?",
+                "g.payload_base(PayloadRole::A, 2)?",
+            ),
+            SET,
+            &["payload_base(A, 2)", "2 deep"],
+            "R0000",
+        ),
+    ];
+    for (src, variant, wants, want_code) in cases {
+        let e = refused_for(&src, variant);
+        for w in wants {
+            assert!(e.contains(w), "want `{w}`: {e}");
+        }
+        assert_eq!(code_for(&src, variant), want_code, "{e}");
+    }
+}
+
+/// The body's capability is a read of the payload rings: an instruction that
+/// is not an LDS load, a load whose declared defs or uses miss a decoded
+/// operand (no wait could protect it), and a destination no live plan
+/// allocation owns are refused before anything reaches a card.
+#[test]
+fn a_fragments_body_outside_its_capability_is_refused() {
+    let insn =
+        "Instruction::new(text, vec![vr(dst, 4)], vec![v(addr)]).memory(MemoryClass::DsLoad)";
+    for (to, wants, want_code) in [
+        (
+            "Instruction::new(text, vec![vr(dst, 4)], vec![v(addr)]).memory(MemoryClass::DsStore)",
+            &["iu4::fragments_body: load 0", "is not an LDS load"][..],
+            "R0399",
+        ),
+        (
+            "Instruction::new(\"v_mov_b32_e32 v0, 0\", vec![v(0)], vec![]).memory(MemoryClass::DsLoad)",
+            &["is not an LDS load"][..],
+            "R0399",
+        ),
+        (
+            "Instruction::new(text, vec![], vec![v(addr)]).memory(MemoryClass::DsLoad)",
+            &["iu4::fragments_body: load 0", "also writes"][..],
+            "R0603",
+        ),
+        (
+            "Instruction::new(text, vec![vr(dst, 4)], vec![v(addr + 1)]).memory(MemoryClass::DsLoad)",
+            &["iu4::fragments_body: load 0", "also reads"][..],
+            "R0603",
+        ),
+    ] {
+        let src = edit(FINE, insn, to);
+        let e = refused(&src);
+        for w in wants {
+            assert!(e.contains(w), "want `{w}`: {e}");
+        }
+        assert_eq!(code(&src), want_code, "{e}");
+    }
+    // A destination outside every live allocation of the plan.
+    let src = edit(
+        FINE,
+        "insn: frag_load(f, fr_w, w)",
+        "insn: frag_load(240, fr_w, w)",
+    );
+    let e = refused(&src);
+    assert!(
+        e.contains("v[240:243]") && e.contains("no unique live owner"),
+        "{e}"
+    );
+    assert_eq!(code(&src), "R0401");
 }
