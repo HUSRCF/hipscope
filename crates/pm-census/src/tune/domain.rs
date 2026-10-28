@@ -9,10 +9,12 @@
 //! * kernel `qwen4_moe_sym` (the shipped entries have NT1/NT4/NT8 gate/up and down
 //!   siblings plus the grouped-position `down_gp` twins). The node's launch symbol
 //!   selects the *kind* (`gate_up` or `down`) and the incumbent `--epi`; the
-//!   candidates are every `--epi` entry of that kind that `pm_loop` knows. The model
-//!   family selects the expert-geometry preset, and the node's `M` / `m_total`
-//!   params are checked against that preset so a corpus node can never be tuned at a
-//!   shape it did not run.
+//!   candidates are every `--epi` entry of that kind that `pm_loop` knows, then one
+//!   candidate per `.rip` script (knobs `epi` = the incumbent's, `rip` = the path; the
+//!   scripts' sha256 enter the derivation and, only when there are any, the domain
+//!   hash). The model family selects the expert-geometry preset, and the node's `M` /
+//!   `m_total` params are checked against that preset so a corpus node can never be
+//!   tuned at a shape it did not run.
 //! * kernel `iu4_gemm`, the dense 27B prefill `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`
 //!   (the slab-activation silu gate/up GEMM; knobs `fold`/`tile`/`cacc`/`epi`/`alayout`
 //!   as `pm_loop` names them). The rocprof-derived corpus node carries no params, only
@@ -51,7 +53,7 @@ const MQ6_KERNEL: &str = "mq6_i8_gemm";
 const ARCH: &str = "gfx1201";
 
 /// Environment variable naming a directory whose `*.rip` files [`enumerate`]
-/// lists as the `rip` candidates of an `iu4_gemm` node.
+/// lists as the `rip` candidates of a node (every enumerable kernel).
 pub const RIP_DIR_VAR: &str = "PM_CENSUS_RIP_DIR";
 
 /// Environment variable that, set to `1`, adds the deliberately NUMERIC
@@ -59,6 +61,12 @@ pub const RIP_DIR_VAR: &str = "PM_CENSUS_RIP_DIR";
 /// `numeric_contract.relation = "numeric"`) to an `iu4_gemm` node's domain. It
 /// exists to exercise the KLD/state gate; it is never part of the default space.
 pub const IU4_NUMERIC_VAR: &str = "PM_CENSUS_IU4_NUMERIC";
+
+/// Environment variable that, set to `1`, restricts [`enumerate`]'s domain to the
+/// code-identical control (the incumbent's own knob set) and the `.rip` candidates:
+/// the generator / entry knob points, already measured by earlier runs, are dropped
+/// (listed in the derivation) so a batch of scripts spends no device time on them.
+pub const RIP_ONLY_VAR: &str = "PM_CENSUS_RIP_ONLY";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -225,28 +233,47 @@ pub fn rips_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The ordered domain of `case.chain[node]` at `tokens` rows. No GPU probing and
-/// no legality decision (see the module docs). An `iu4_gemm` node takes its `rip`
+/// no legality decision (see the module docs). An enumerable node takes its `rip`
 /// candidates from the `*.rip` files of the directory named by [`RIP_DIR_VAR`]
-/// (none when unset); every other node ignores that variable.
+/// (none when unset).
 pub fn enumerate(case: &WorkloadCaseV1, node: usize, tokens: u64) -> Result<DomainV1, String> {
-    let is_iu4 = case
-        .chain
-        .get(node)
-        .is_some_and(|n| matches!(classify(&n.symbol), Some(Node::Iu4(_))));
-    let is_mq6 = case
-        .chain
-        .get(node)
-        .is_some_and(|n| matches!(classify(&n.symbol), Some(Node::Mq6(_))));
+    let class = case.chain.get(node).and_then(|n| classify(&n.symbol));
+    let is_iu4 = matches!(class, Some(Node::Iu4(_)));
     let rips = match std::env::var_os(RIP_DIR_VAR) {
-        Some(dir) if is_iu4 || is_mq6 => rips_in_dir(Path::new(&dir))?,
+        Some(dir) if class.is_some() => rips_in_dir(Path::new(&dir))?,
         _ => Vec::new(),
     };
     let numeric = is_iu4 && std::env::var_os(IU4_NUMERIC_VAR).is_some_and(|v| v == "1");
-    enumerate_inner(case, node, tokens, &rips, numeric)
+    let d = enumerate_inner(case, node, tokens, &rips, numeric)?;
+    if std::env::var_os(RIP_ONLY_VAR).is_some_and(|v| v == "1") {
+        return Ok(rip_only(d));
+    }
+    Ok(d)
 }
 
-/// [`enumerate`] with explicit `.rip` candidate scripts (`iu4_gemm` nodes only; a
-/// node of another kernel refuses a non-empty list). The deliberately numeric
+/// `d` restricted to the control and the `rip` candidates ([`RIP_ONLY_VAR`]); the dropped
+/// points are listed in the derivation and the domain hash covers the restriction.
+fn rip_only(mut d: DomainV1) -> DomainV1 {
+    let (keep, dropped): (Vec<_>, Vec<_>) = d
+        .candidates
+        .into_iter()
+        .partition(|c| *c == d.incumbent || c.knobs.contains_key("rip"));
+    d.derivation.push(format!(
+        "{RIP_ONLY_VAR}=1: kept the control and {} rip candidates, dropped {} knob points: {}",
+        keep.len().saturating_sub(1),
+        dropped.len(),
+        serde_json::to_string(&dropped).unwrap_or_default()
+    ));
+    d.candidates = keep;
+    d.domain_hash = canonical_sha256(&json!({
+        "restricted_from": d.domain_hash,
+        "rip_only": true,
+        "candidates": d.candidates,
+    }));
+    d
+}
+
+/// [`enumerate`] with explicit `.rip` candidate scripts. The deliberately numeric
 /// `iu4_gemm` candidate ([`IU4_NUMERIC_VAR`]) is not enumerated.
 pub fn enumerate_with_rips(
     case: &WorkloadCaseV1,
@@ -280,14 +307,7 @@ fn enumerate_inner(
     })?;
     match classify(&n.symbol) {
         Some(Node::Moe(kind, incumbent_epi)) => {
-            if !rips.is_empty() {
-                return Err(format!(
-                    "node {node} symbol {} is a {KERNEL} entry: .rip candidates are enumerated \
-                     for {IU4_KERNEL} nodes only",
-                    n.symbol
-                ));
-            }
-            enumerate_moe(case, n, node, tokens, kind, incumbent_epi)
+            enumerate_moe(case, n, node, tokens, kind, incumbent_epi, rips)
         }
         Some(Node::Iu4(k)) => enumerate_iu4(case, n, node, tokens, k, rips, iu4_numeric),
         Some(Node::Mq6(entry)) => enumerate_mq6(case, n, node, tokens, rips, entry),
@@ -514,6 +534,26 @@ fn enumerate_iu4(
     })
 }
 
+/// `(derivation line, {path, sha256})` of one `.rip` candidate script.
+fn rip_entry(path: &Path) -> Result<(String, String, serde_json::Value), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let sha: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let p = path
+        .to_str()
+        .ok_or_else(|| format!("{}: the rip path is not valid UTF-8", path.display()))?;
+    Ok((
+        p.to_owned(),
+        format!("rip candidate {p} sha256 {sha}"),
+        json!({"path": p, "sha256": sha}),
+    ))
+}
+
+/// A `qwen4_moe_sym` node: every `--epi` entry of its kind, then one candidate per `.rip`
+/// script (`pm_loop --rip`, compiled for the incumbent `--epi` variant). Without scripts the
+/// domain and its hash are unchanged.
 fn enumerate_moe(
     case: &WorkloadCaseV1,
     n: &ChainNodeV1,
@@ -521,6 +561,7 @@ fn enumerate_moe(
     tokens: u64,
     kind: Kind,
     incumbent_epi: &'static str,
+    rips: &[PathBuf],
 ) -> Result<DomainV1, String> {
     let p = preset(&case.model.family)?;
     let mut derivation = vec![format!(
@@ -579,17 +620,30 @@ fn enumerate_moe(
 
     let shape = format!("{},T={tokens}", p.name);
     let incumbent = spec(&shape, incumbent_epi);
-    let candidates: Vec<CandidateSpecV1> = candidate_epis(kind)
+    let mut candidates: Vec<CandidateSpecV1> = candidate_epis(kind)
         .iter()
         .map(|e| spec(&shape, e))
         .collect();
-    let domain_hash = canonical_sha256(&json!({
+    let mut rip_shas = Vec::new();
+    for path in rips {
+        let (p, line, entry) = rip_entry(path)?;
+        derivation.push(line);
+        rip_shas.push(entry);
+        let mut c = spec(&shape, incumbent_epi);
+        c.knobs.insert("rip".to_owned(), p);
+        candidates.push(c);
+    }
+    let mut hashed = json!({
         "kernel": KERNEL,
         "arch": ARCH,
         "shape": shape,
         "incumbent": incumbent,
         "candidates": candidates,
-    }));
+    });
+    if !rip_shas.is_empty() {
+        hashed["rips"] = json!(rip_shas);
+    }
+    let domain_hash = canonical_sha256(&hashed);
     Ok(DomainV1 {
         schema: DOMAIN_SCHEMA.to_owned(),
         case_id: case.case_id.clone(),
@@ -1305,12 +1359,42 @@ mod tests {
     }
 
     #[test]
-    fn rips_are_refused_for_moe_nodes() {
+    fn rips_are_listed_for_moe_nodes() {
         let case = test_case("a3b", GU_NT8, &[("M", 1024), ("m_total", 69376)]);
-        let e = enumerate_with_rips(&case, 0, 8192, &[PathBuf::from("/x/a.rip")]).unwrap_err();
-        assert!(e.contains(".rip") && e.contains("iu4_gemm"), "{e}");
-        // Without scripts the MoE path is unchanged.
-        assert!(enumerate_with_rips(&case, 0, 8192, &[]).is_ok());
+        let e = enumerate_with_rips(&case, 0, 8192, &[PathBuf::from("/nonexistent/a.rip")])
+            .unwrap_err();
+        assert!(e.contains("/nonexistent/a.rip"), "{e}");
+        let plain = enumerate_with_rips(&case, 0, 8192, &[]).unwrap();
+        let dir = std::env::temp_dir().join(format!("pm-census-moe-rip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rip = dir.join("a.rip");
+        std::fs::write(&rip, b"// candidate").unwrap();
+        let with = enumerate_with_rips(&case, 0, 8192, std::slice::from_ref(&rip)).unwrap();
+        assert_eq!(with.candidates.len(), plain.candidates.len() + 1);
+        let last = with.candidates.last().unwrap();
+        assert_eq!(last.knobs["epi"], "gate_up_nt8");
+        assert_eq!(last.knobs["rip"], rip.to_str().unwrap());
+        assert_ne!(with.domain_hash, plain.domain_hash);
+        // Without scripts the MoE domain (and its hash) is unchanged.
+        assert_eq!(plain, enumerate_with_rips(&case, 0, 8192, &[]).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rip_only_keeps_the_control_and_the_scripts() {
+        let case = test_case("a3b", GU_NT8, &[("M", 1024), ("m_total", 69376)]);
+        let dir = std::env::temp_dir().join(format!("pm-census-rip-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rip = dir.join("b.rip");
+        std::fs::write(&rip, b"// candidate").unwrap();
+        let full = enumerate_with_rips(&case, 0, 8192, std::slice::from_ref(&rip)).unwrap();
+        let only = rip_only(full.clone());
+        assert_eq!(only.candidates.len(), 2);
+        assert_eq!(only.candidates[0], only.incumbent);
+        assert!(only.candidates[1].knobs.contains_key("rip"));
+        assert_ne!(only.domain_hash, full.domain_hash);
+        assert!(only.derivation.last().unwrap().contains("dropped 2 knob points"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
