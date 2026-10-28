@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Static hardware-hazard check of lifted code objects (gfx1100 rule set; see
-//! `peacemaker_lift::hazards_gfx11` for the rules and their LLVM citations).
+//! Static hardware-hazard check of lifted code objects (gfx1100 / gfx1151 / gfx1201, wave32 and
+//! wave64; see `peacemaker_lift::hazards_gfx11` for the rules and their LLVM citations).
 //!
 //! Usage: `hazard_check [--no-advisory] [--summary] [--rules] OBJECT[:SYMBOL] ...`
 //!
@@ -105,7 +105,10 @@ fn check_object(path: &str, symbol: Option<&str>, advisory: bool, summary: bool)
                 k["pm_ir_hazard_replay"] = json!({"count": v.len(), "obligations": if summary { Value::Null } else { Value::Array(v.clone()) }});
                 failed |= !v.is_empty();
             }
-            Err(e) => k["pm_ir_hazard_replay"] = json!({"error": e}),
+            Err(e) => {
+                k["pm_ir_hazard_replay"] = json!({"error": e});
+                failed = true;
+            }
         }
         if !summary {
             k["findings"] = Value::Array(findings.iter().map(|f| f.to_json()).collect());

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Static hardware-hazard checker over lifted gfx1100 (and, where the rule exists, gfx1151 /
-//! gfx1201) kernels.
+//! gfx1201, wave32 and wave64) kernels.
 //!
 //! The emulator executes instructions atomically and in order, so it cannot see the hazards
 //! the real pipeline has. LLVM's `GCNHazardRecognizer` only protects code the compiler
@@ -15,9 +15,11 @@
 //! predecessor paths (a hazard on any path is a finding), expiring on the rule's own
 //! mitigation set.
 //!
-//! gfx1201's SGPR rule (`gfx12-valu-read-sgpr`) is not re-implemented here: the `hazard_check`
-//! example reports `peacemaker_ir::passes::hazards::analyze` (PM's port of
-//! `AMDGPUWaitSGPRHazards`) next to these findings.
+//! gfx1201's SGPR rule (`gfx12-valu-read-sgpr`) is evaluated by `rule_gfx12_sgpr`, which runs
+//! `peacemaker_ir::passes::hazards::analyze_with(.., SgprModel::LlvmExact)` (PM's port of
+//! `AMDGPUWaitSGPRHazards`) over every gfx1201 kernel and turns each demanded-but-absent
+//! `s_wait_alu` into a Required finding; the `hazard_check` example additionally prints the
+//! pipeline-default `analyze` replay for cross-checking.
 //!
 //! Source of truth: ROCm LLVM `d6f6cb691863e9258034ab48c1dfce21689d5606`
 //! (`llvm/lib/Target/AMDGPU/{GCNHazardRecognizer.cpp, GCNSubtarget.h, AMDGPU.td,
@@ -26,6 +28,38 @@
 //! rule table: which rules apply to which target, the LLVM function that defines each, the
 //! mitigation it needs, and the rules that exist in LLVM but are *not* enabled for gfx1100
 //! (with the `AMDGPU.td` feature line that excludes them).
+//!
+//! ## Rules applied to gfx1201 (wave32 and wave64)
+//!
+//! Derived from the same commit's `AMDGPU.td` `FeatureISAVersion12` / `FeatureGFX12` sets and
+//! `GCNHazardRecognizer::fixHazards` / `PreEmitNoopsCommon` (local copy of the cited sources:
+//! `pm-krsi-1100/scratch/HazardGate/src/`). Enabled, and implemented here:
+//! * `gfx12-valu-read-sgpr`: `AMDGPUWaitSGPRHazards` (`hasVALUReadSGPRHazard()`), the only
+//!   gfx12 SGPR/VCC hazard. It tracks 64-bit SGPR pairs ever read by a VALU; a SALU write
+//!   later read (SALU or VALU) needs `s_wait_alu sa_sdst(0)`, a VALU write read by a VALU
+//!   needs `va_sdst(0)` (`va_vcc(0)` for VCC), a VALU write read by a SALU needs nothing.
+//!   VCC is the pair `vcc_lo/vcc_hi` (explicit operand or implicit by descriptor), EXEC is
+//!   never tracked, wave64 lane masks are SGPR pairs. SMRD and non-FLAT VMEM retire all
+//!   pending writes; FLAT/global/scratch do not; `s_setpc_b64`/`s_swappc_b64` flush. The
+//!   checker *verifies* the `s_wait_alu` the incumbent objects carry (the
+//!   `gfx1201_incumbents_*` tests neutralise them and watch the findings appear).
+//! * `gfx11-vcmpx-permlane` (`FeatureVcmpxPermlaneHazard` is in `FeatureISAVersion12`):
+//!   `v_cmpx` writing EXEC then `v_permlane*` needs a non-nop VALU between.
+//! * `gfx11-wmma-chain` (`fixWMMAHazards`, ungated; gfx12 also checks the SWMMAC index).
+//!
+//! Not enabled for gfx12, so deliberately not checked (see [`RULES`] for the gate of each):
+//! `FeatureGFX12` carries `NoDataDepHazard`, so `PreEmitNoopsCommon` returns before the VMEM /
+//! VALU / DPP / v_div_fmas / readlane-writelane / s_getreg-s_setreg / RFE / M0 / MAI checks:
+//! DPP reads of VALU-written VGPRs, `v_readlane`/`v_s_*` SGPR writers feeding VMEM, `s_getreg`,
+//! `ds_swizzle`/`ds_bpermute`, `global_inv`, `s_barrier_signal`/`s_barrier_wait` have no
+//! recognizer rule. `fixVALUTransUseHazard` is gfx1100-only (TRANS->VALU use is
+//! hardware-interlocked on gfx12; `s_delay_alu` TRANS32_DEP is a performance hint),
+//! `fixVALUPartialForwardingHazard` / `fixVALUMaskWriteHazard` are `generation == GFX11`
+//! (gfx12 wave64 uses AMDGPUWaitSGPRHazards instead), `fixVcmpxExecWARHazard`,
+//! `fixLdsBranchVmemWARHazard`, `fixVMEMtoScalarWriteHazards`, `fixSMEMtoVectorWriteHazards`,
+//! `checkNSAtoVMEMHazard` are gfx10.1 features. LDSDIR hazards cannot occur (not in the ISA
+//! table). Counter waits (`s_wait_loadcnt`/`dscnt`/`kmcnt`) are `SIInsertWaitcnts`, not
+//! hazards, and are verified by `peacemaker_ir::passes::waits`.
 //!
 //! Severity:
 //! * [`Severity::Required`]: LLVM enables the rule for this target; a hit is a real hardware
@@ -43,6 +77,7 @@ use peacemaker_ir::cfg::{Block, Body};
 use peacemaker_ir::effects::MemClass;
 use peacemaker_ir::inst::{Abi, Arch, Form, Inst, Kernel, Program, Wave};
 use peacemaker_ir::operand::{ImmField, Operand, Special};
+use peacemaker_ir::passes::hazards as pm_hazards;
 use peacemaker_ir::reg::{Kind, RegRef};
 use serde_json::{json, Value};
 
@@ -82,10 +117,10 @@ pub struct RuleInfo {
 pub const RULES: &[RuleInfo] = &[
     RuleInfo {
         id: "gfx11-vcmpx-permlane",
-        applies: "gfx1100 gfx1151 (gfx12 too)",
+        applies: "gfx1100 gfx1151 gfx1201 (every FeatureISAVersion11_* and FeatureISAVersion12 set)",
         severity: Severity::Required,
         llvm: "GCNHazardRecognizer::fixVcmpxPermlaneHazards",
-        gate: "FeatureVcmpxPermlaneHazard in FeatureISAVersion11_Common (AMDGPU.td)",
+        gate: "FeatureVcmpxPermlaneHazard in FeatureISAVersion11_Common (AMDGPU.td:2129) and FeatureISAVersion12 (AMDGPU.td:2260)",
         mitigation: "a non-v_nop VALU between the v_cmpx that writes EXEC and v_permlane*/v_permlane64 (LLVM inserts v_mov_b32 vX, vX; v_nop is discarded by SQ and does not count)",
         implemented: true,
     },
@@ -127,12 +162,12 @@ pub const RULES: &[RuleInfo] = &[
     },
     RuleInfo {
         id: "gfx12-valu-read-sgpr",
-        applies: "gfx1201 only (HasGFX12Insts && !HasGFX1250Insts)",
+        applies: "gfx1201 only (HasGFX12Insts && !HasGFX1250Insts), wave32 and wave64",
         severity: Severity::Required,
-        llvm: "AMDGPUWaitSGPRHazards.cpp (s_wait_alu insertion)",
-        gate: "GCNSubtarget::hasVALUReadSGPRHazard(); wave32 gfx11 returns early (hasVALUMaskWriteHazard path)",
-        mitigation: "s_wait_alu sa_sdst / va_sdst / va_vcc fields per the pass",
-        implemented: false,
+        llvm: "AMDGPUWaitSGPRHazards.cpp (AMDGPUWaitSGPRHazards::runOnMachineBasicBlock / run: s_wait_alu insertion), replayed by peacemaker_ir::passes::hazards::analyze_with(SgprModel::LlvmExact)",
+        gate: "GCNSubtarget::hasVALUReadSGPRHazard() = HasGFX12Insts && !HasGFX1250Insts (GCNSubtarget.h:625). Wave64 differs from wave32 only in 64-bit lane-mask / VCC SGPR pairs and DsNopCount (8 vs 4; ds_nop culls are off by default and absent from the ISA table)",
+        mitigation: "s_wait_alu depctr_sa_sdst(0) when a tracked pair written by a SALU (or VCC written by a SALU) is read; depctr_va_sdst(0) when a pair written by a VALU is read by a VALU; depctr_va_vcc(0) when VCC written by a VALU is read by a VALU; a VALU write read by a SALU needs nothing; buffer_*/image_* and SMRD retire all pending writes, global_*/scratch_*/flat_* do not",
+        implemented: true,
     },
     RuleInfo {
         id: "gfx11-wave64-valu-partial-forwarding",
@@ -150,6 +185,24 @@ pub const RULES: &[RuleInfo] = &[
         llvm: "GCNHazardRecognizer::fixVALUMaskWriteHazard (early-outs `!ST.isWave64()`); AMDGPUWaitSGPRHazards::run returns false for wave32 gfx11",
         gate: "GCNSubtarget::hasVALUMaskWriteHazard() = (generation == GFX11)",
         mitigation: "s_waitcnt_depctr sa_sdst(0) / va_sdst(0) around SGPR mask writes",
+        implemented: false,
+    },
+    RuleInfo {
+        id: "n/a-gfx12-no-data-dep-hazard",
+        applies: "gfx1201 (NoDataDepHazard in FeatureGFX12, AMDGPU.td:1729): none of the rules below exist",
+        severity: Severity::Advisory,
+        llvm: "GCNHazardRecognizer::PreEmitNoopsCommon returns before checkVMEMHazards (VALU-written SGPR -> VMEM), checkVALUHazards, checkDPPHazards (VALU VGPR write -> DPP read), checkDivFMasHazards (VCC write -> v_div_fmas), checkRWLaneHazards (v_readlane/v_writelane lane-select SGPR), checkGetRegHazards / checkSetRegHazards (s_getreg/s_setreg), checkRFEHazards, checkReadM0*Hazards, checkMAI*Hazards; checkSMRDHazards runs first but only acts with XNACK (not supported on gfx12) or on SI",
+        gate: "GCNSubtarget::hasNoDataDepHazard() (FeatureNoDataDepHazard is in FeatureGFX11 and FeatureGFX12). global_inv, ds_swizzle_b32, ds_bpermute_b32, s_barrier_signal / s_barrier_wait, s_sendmsg, v_s_*_f32 (SALU-float pseudo-scalar VALU, a VALU SGPR writer covered by gfx12-valu-read-sgpr) and the SALU-float s_*_f32 have no GCNHazardRecognizer rule; their ordering is SIInsertWaitcnts (passes::waits) territory",
+        mitigation: "not applicable: the hardware interlocks these dependencies on gfx12",
+        implemented: false,
+    },
+    RuleInfo {
+        id: "n/a-gfx12-trans-use",
+        applies: "gfx1100 only (not gfx1151, not gfx12)",
+        severity: Severity::Advisory,
+        llvm: "GCNHazardRecognizer::fixVALUTransUseHazard / fixVALUTransCoexecutionHazards",
+        gate: "FeatureVALUTransUseHazard only in FeatureISAVersion11_0_Common / 11_Generic (AMDGPU.td:2144,2157); FeatureTransCoexecutionHazard only in gfx1250 sets (AMDGPU.td:2401+); absent from FeatureISAVersion12",
+        mitigation: "none on gfx12: a TRANS result is hardware-interlocked. s_delay_alu instid TRANS32_DEP (AMDGPUInsertDelayAlu) is a pure performance hint, not a correctness requirement, and is validated by peacemaker's own s_delay_alu window checks, not here",
         implemented: false,
     },
     RuleInfo {
@@ -226,10 +279,10 @@ pub const RULES: &[RuleInfo] = &[
     },
     RuleInfo {
         id: "n/a-others",
-        applies: "no gfx1100",
+        applies: "no gfx1100 / gfx1201",
         severity: Severity::Advisory,
-        llvm: "hasShift64HighRegBug (HasGFX90AInsts), hasDstSelForwardingHazard / hasVDecCoExecHazard / hasTransForwardingHazard (HasGFX940Insts), hasLdsWaitVMSRC (>= GFX12), hasVALUReadSGPRHazard (HasGFX12Insts && !GFX1250: AMDGPUWaitSGPRHazards, gfx1201 only), hasFPAtomicToDenormModeHazard (== GFX10), hasReadM0*Hazard (GFX9), checkSoftClauseHazards (needs XNACK), hasDOTOpSelHazard (HasGFX940Insts||HasGFX11Insts: SIInstrInfo/codegen only, no recognizer rule), checkWMMACoexecutionHazards / fixVALUTransCoexecutionHazards (gfx1250), fixRequiredExportPriority (gfx11.5/generic: exports only), hasFlatScratchSVSSwizzleBug (gfx11 scratch SVS: not a recognizer rule)",
-        gate: "NoDataDepHazard (FeatureGFX11) makes GCNHazardRecognizer::PreEmitNoopsCommon return before the VMEM/VALU/DPP/DivFMas/RWLane/SetReg/GetReg/RFE/ReadM0/MAI checks",
+        llvm: "hasShift64HighRegBug (HasGFX90AInsts), hasDstSelForwardingHazard / hasVDecCoExecHazard / hasTransForwardingHazard (HasGFX940Insts), hasLdsWaitVMSRC (>= GFX12; only used by fixLdsDirectVMEMHazard, LDSDIR absent), hasFPAtomicToDenormModeHazard (== GFX10), hasReadM0*Hazard (GFX9), checkSoftClauseHazards (needs XNACK), hasDOTOpSelHazard (HasGFX940Insts||HasGFX11Insts: SIInstrInfo/codegen only, no recognizer rule), checkWMMACoexecutionHazards / fixVALUTransCoexecutionHazards / fixGetRegWaitIdle / fixSetRegMode / fixTDM / fixDsAtomicAsyncBarrierArriveB64 / fixScratchBaseForwardingHazard (gfx1250), fixRequiredExportPriority (gfx11.5/generic: exports only), hasFlatScratchSVSSwizzleBug (gfx11 scratch SVS: not a recognizer rule), fixVALUPartialForwardingHazard / fixVALUMaskWriteHazard (generation == GFX11 only; on gfx12 AMDGPUWaitSGPRHazards replaces them)",
+        gate: "NoDataDepHazard (FeatureGFX11, FeatureGFX12) makes GCNHazardRecognizer::PreEmitNoopsCommon return before the VMEM/VALU/DPP/DivFMas/RWLane/SetReg/GetReg/RFE/ReadM0/MAI checks",
         mitigation: "not applicable",
         implemented: false,
     },
@@ -1228,6 +1281,44 @@ fn rule_wave64(symbol: &str, arch: Arch, wave: Wave, out: &mut Vec<Finding>) {
     }
 }
 
+/// gfx1201 `AMDGPUWaitSGPRHazards`: every demanded `s_wait_alu` that no reaching path
+/// carries is a Required finding. The replay is PM's port in its LLVM-exact model (VCC as a
+/// tracked pair, 64-bit lane-mask pairs in wave64, FLAT does not retire writes, `IsSetPC`
+/// flushes), applied to wave32 too, so the checker never inherits the pipeline's historic
+/// wave32 builder-parity boundary. A replay that cannot run (no CFG, no fixpoint, arch
+/// outside the tables) is Unchecked: the checker fails closed.
+fn rule_gfx12_sgpr(s: &Stream, body: &Body, arch: Arch, wave: Wave, out: &mut Vec<Finding>) {
+    match pm_hazards::analyze_with(body, arch, wave, pm_hazards::SgprModel::LlvmExact) {
+        Err(e) => out.push(Finding {
+            rule: "gfx12-valu-read-sgpr",
+            severity: Severity::Unchecked,
+            kernel: s.symbol.to_owned(),
+            pc: 0,
+            insts: Vec::new(),
+            required: "AMDGPUWaitSGPRHazards replay over the kernel CFG".into(),
+            present: format!("replay failed: {e}"),
+            detail: "the SGPR rule applies to every gfx1201 kernel; failing closed".into(),
+            context: Vec::new(),
+        }),
+        Ok(found) => {
+            for missing in &found.missing {
+                let Some(i) = body.layout.iter().position(|id| *id == missing.inst) else {
+                    continue;
+                };
+                out.push(s.finding(
+                    "gfx12-valu-read-sgpr",
+                    Severity::Required,
+                    i,
+                    None,
+                    format!("s_wait_alu {} before this instruction", missing.wait),
+                    "no s_wait_alu on some reaching path retires the pending SGPR/VCC write".into(),
+                    "AMDGPUWaitSGPRHazards::runOnMachineBasicBlock (WA_SALU sa_sdst / WA_VALU va_sdst / WA_VCC va_vcc)".into(),
+                ));
+            }
+        }
+    }
+}
+
 /// Check one instruction body. `rsrc2` is the kernel descriptor's `COMPUTE_PGM_RSRC2` when
 /// known. `advisory` enables the non-required rules.
 pub fn check_body(
@@ -1242,6 +1333,9 @@ pub fn check_body(
     let stream = Stream::new(symbol, body, arch);
     rule_user_sgpr(symbol, arch, wave, rsrc2, &mut out);
     rule_wave64(symbol, arch, wave, &mut out);
+    if arch == Arch::Gfx1201 {
+        rule_gfx12_sgpr(&stream, body, arch, wave, &mut out);
+    }
     rule_vcmpx_permlane(&stream, &mut out);
     rule_wmma_chain(&stream, &mut out);
     if arch == Arch::Gfx1100 {
@@ -1568,5 +1662,141 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), RULES.len());
+    }
+
+    // gfx1201 encodings (llvm-mc -mcpu=gfx1201 -mattr=+wavefrontsize64 / +wavefrontsize32).
+    const G_CNDMASK_VCC: &[u32] = &[0x0204_0903]; // v_cndmask_b32_e32 v2, v3, v4, vcc
+    const G_CMP_VCC: &[u32] = &[0x7c82_0300]; // v_cmp_lt_i32_e32 vcc, v0, v1
+    const G_CBR_VCCZ_1: &[u32] = &[0xbfa3_0001]; // s_cbranch_vccz +1
+    const G_SAVEEXEC_VCC: &[u32] = &[0xbe82_216a]; // s_and_saveexec_b64 s[2:3], vcc
+    const G_CNDMASK_S23_A: &[u32] = &[0xd501_0000, 0x000a_0501]; // v_cndmask_b32_e64 v0, v1, v2, s[2:3]
+    const G_CMP64_S23: &[u32] = &[0xd441_0002, 0x0202_0300]; // v_cmp_lt_i32_e64 s[2:3], v0, v1
+    const G_CNDMASK_S23_B: &[u32] = &[0xd501_0003, 0x000a_0501]; // v_cndmask_b32_e64 v3, v1, v2, s[2:3]
+    const G_WAIT_VA_SDST0: &[u32] = &[0xbf88_f19f]; // s_wait_alu depctr_va_sdst(0)
+    const G_AND_VCC_EXEC_S45: &[u32] = &[0x8bea_047e]; // s_and_b64 vcc, exec, s[4:5]
+    const G_AND_VCCLO_EXECLO_S4: &[u32] = &[0x8b6a_047e]; // s_and_b32 vcc_lo, exec_lo, s4
+    const G_WAIT_SA_SDST0: &[u32] = &[0xbf88_ff9e]; // s_wait_alu depctr_sa_sdst(0)
+
+    fn gfx12_body(seq: &[&[u32]]) -> Body {
+        let mut body = Body::default();
+        let mut pc = 0u32;
+        for words in seq.iter().chain(std::iter::once(&ENDPGM)) {
+            let (mut inst, n) =
+                peacemaker_ir::codec::gfx12::decode_for(Arch::Gfx1201, words).expect("decode");
+            assert_eq!(n, words.len());
+            inst.prov = Provenance {
+                pc: Some(pc),
+                ..Provenance::default()
+            };
+            pc += 4 * n as u32;
+            let id = body.insts.insert(inst);
+            body.layout.push(id);
+        }
+        build_blocks(&mut body, Arch::Gfx1201).expect("cfg");
+        body
+    }
+
+    fn gfx12_findings(wave: Wave, seq: &[&[u32]]) -> Vec<Finding> {
+        check_body("k", &gfx12_body(seq), Arch::Gfx1201, wave, None, true)
+    }
+
+    /// A wave64 gfx1201 kernel with VCC pair / saveexec / lane-mask traffic that carries every
+    /// guard LLVM demands is clean: no Required, Unchecked or Advisory finding at all.
+    #[test]
+    fn gfx1201_wave64_guarded_kernel_is_clean() {
+        let seq: &[&[u32]] = &[
+            G_CNDMASK_VCC,
+            G_CMP_VCC,
+            G_CBR_VCCZ_1,
+            G_SAVEEXEC_VCC,
+            G_CNDMASK_S23_A,
+            G_CMP64_S23,
+            G_WAIT_VA_SDST0,
+            G_CNDMASK_S23_B,
+        ];
+        let f = gfx12_findings(Wave::Wave64, seq);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// The synthetic wave64 violation: a VALU-written lane-mask pair read by a VALU with no
+    /// `s_wait_alu depctr_va_sdst(0)` is a Required `gfx12-valu-read-sgpr` finding at the reader.
+    #[test]
+    fn gfx1201_wave64_missing_va_sdst_is_required() {
+        let f = gfx12_findings(
+            Wave::Wave64,
+            &[G_CNDMASK_S23_A, G_CMP64_S23, G_CNDMASK_S23_B],
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "gfx12-valu-read-sgpr");
+        assert_eq!(f[0].severity, Severity::Required);
+        assert_eq!(f[0].pc, 16, "third instruction: 8 + 8 bytes in");
+        assert!(f[0].required.contains("depctr_va_sdst(0)"), "{:?}", f[0]);
+        assert!(f[0].insts.iter().any(|i| i.text.contains("s[2:3]")));
+        // The guard on the path removes it, a guard of the wrong kind does not.
+        assert!(gfx12_findings(
+            Wave::Wave64,
+            &[
+                G_CNDMASK_S23_A,
+                G_CMP64_S23,
+                G_WAIT_VA_SDST0,
+                G_CNDMASK_S23_B
+            ],
+        )
+        .is_empty());
+        assert_eq!(
+            gfx12_findings(
+                Wave::Wave64,
+                &[
+                    G_CNDMASK_S23_A,
+                    G_CMP64_S23,
+                    G_WAIT_SA_SDST0,
+                    G_CNDMASK_S23_B
+                ],
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The checker runs the LLVM-exact VCC model in wave32 too, which the pipeline-default
+    /// `analyze` (builder parity) does not: a SALU `vcc_lo` write reread by a VALU needs
+    /// `sa_sdst(0)`.
+    #[test]
+    fn gfx1201_wave32_checker_tracks_vcc_like_llvm() {
+        let seq: &[&[u32]] = &[G_CNDMASK_VCC, G_AND_VCCLO_EXECLO_S4, G_CNDMASK_VCC];
+        let f = gfx12_findings(Wave::Wave32, seq);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].required.contains("depctr_sa_sdst(0)"));
+        let body = gfx12_body(seq);
+        let default =
+            peacemaker_ir::passes::hazards::analyze(&body, Arch::Gfx1201, Wave::Wave32).unwrap();
+        assert!(default.missing.is_empty(), "{default:?}");
+        assert!(gfx12_findings(
+            Wave::Wave32,
+            &[
+                G_CNDMASK_VCC,
+                G_AND_VCCLO_EXECLO_S4,
+                G_WAIT_SA_SDST0,
+                G_CNDMASK_VCC
+            ],
+        )
+        .is_empty());
+        // wave64 spelling of the same hazard.
+        let f = gfx12_findings(
+            Wave::Wave64,
+            &[G_CNDMASK_VCC, G_AND_VCC_EXEC_S45, G_CNDMASK_VCC],
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+    }
+
+    #[test]
+    fn gfx12_sgpr_rule_is_implemented_and_documented() {
+        let r = RULES
+            .iter()
+            .find(|r| r.id == "gfx12-valu-read-sgpr")
+            .unwrap();
+        assert!(r.implemented && r.severity == Severity::Required);
+        assert!(RULES.iter().any(|r| r.id == "n/a-gfx12-no-data-dep-hazard"));
+        assert!(RULES.iter().any(|r| r.id == "n/a-gfx12-trans-use"));
     }
 }
