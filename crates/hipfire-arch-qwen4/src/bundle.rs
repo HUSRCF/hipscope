@@ -3954,7 +3954,10 @@ impl Qwen4Bundle {
             });
         match mapped {
             Ok(()) => eprintln!(
-                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
+                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens}); gather workspace {} KiB reserved / {} KiB mapped, {} VMM owners",
+                gpu.qsa_gather_reserved_bytes() >> 10,
+                gpu.qsa_gather_scratch_bytes() >> 10,
+                gpu.vmm_allocation_count()
             ),
             Err(error) => eprintln!(
                 "  qwen4 QSA map-ahead through {target} tokens failed ({error}); growing on demand"
