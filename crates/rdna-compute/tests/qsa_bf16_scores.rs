@@ -1962,9 +1962,9 @@ fn split_switch() -> bool {
 #[test]
 fn qsa_bf16_split_production_route_matches_fused() {
     let mut gpu = gpu_for_gate();
-    // gfx1100 is admitted only under the lab knob HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1
-    // (set it in the process env; the knob is read once by the library).
-    let gfx1100_knob = std::env::var("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100").as_deref() == Ok("1");
+    // gfx1100 is admitted unless the kill switch HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0
+    // is set in the process env (the knob is read once by the library).
+    let gfx1100_knob = std::env::var("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100").as_deref() != Ok("0");
     let arch_admitted = gpu.arch_caps.is_gfx1201() || (gpu.arch_caps.is_gfx1100() && gfx1100_knob);
     assert!(
         gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1100(),

@@ -6663,9 +6663,9 @@ fn indexed_attention_select_rows8_core(
 /// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
 /// blocks. Selected indices and the mirror are byte-identical to the fused
 /// `indexed_attention_select_bf16_batched` incumbent. Default on, and only on
-/// exact gfx1201 ([`qsa_bf16_split_arch`], plus gfx1100 under the lab knob
-/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1`; the other architectures keep the
-/// incumbent whatever the switch says); `0` is the kill switch and always
+/// exact gfx1201 and exact gfx1100 ([`qsa_bf16_split_arch`]; gfx1100 has the
+/// kill switch `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; the other architectures
+/// keep the incumbent whatever the switch says); `0` is the kill switch and always
 /// keeps the incumbent, as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
 /// select-from-scores arm never beats the filter on gfx1201). Read once.
 static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -6679,7 +6679,14 @@ static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::ne
 /// 1024 blocks at 1 and 8 rows and from 2048 blocks at 16 rows (1 / 8 / 16 rows
 /// at 2048 blocks: fused 64.6 / 64.3 / 67.6 us, filter 40.1 / 43.6 / 65.8 us;
 /// at 65536 blocks fused 552 / 546 / 545 us, filter 313 / 263 / 211 us), and
-/// from 1024 blocks at 64 and 256 rows.
+/// from 1024 blocks at 64 and 256 rows. Re-measured on gfx1100 (7900 XTX,
+/// `qsa_bf16_split_crossover_table`, one launch per call, us per call fused vs
+/// filter for 1 / 8 / 16 rows): at 1024 blocks 48.2 / 57.1 / 57.9 vs 38.3 /
+/// 40.9 / 55.7; at 2048 blocks 61.8 / 61.8 / 64.6 vs 42.1 / 44.5 / 59.3; at
+/// 8192 blocks 106.6 / 106.2 / 106.5 vs 50.6 / 53.5 / 69.7; at 32768 blocks
+/// 326.0 / 330.1 / 345.3 vs 77.5 / 83.8 / 126.2; at 65536 blocks 616.3 / 644.3
+/// / 657.8 vs 112.8 / 119.9 / 199.4, so the 2048 crossover holds on gfx1100
+/// for up to 16 rows.
 const QSA_BF16_SPLIT_MIN_BLOCKS: usize = 2048;
 /// Rows above which a call counts as prefill for the crossover.
 const QSA_BF16_SPLIT_MANY_ROWS: usize = 256;
@@ -6687,6 +6694,7 @@ const QSA_BF16_SPLIT_MANY_ROWS: usize = 256;
 /// is 0.5% (1024 rows) to 7% (2048 rows) behind the fused selector at 2048
 /// blocks and 2.5% to 14% behind at 4096, ahead from 8192 blocks (1024 / 2048
 /// rows at 8192 blocks: fused 1838 / 3452 us, filter 1670 / 3309 us).
+/// Measured on gfx1201 and reused unchanged on gfx1100.
 const QSA_BF16_SPLIT_MIN_BLOCKS_MANY_ROWS: usize = 8192;
 /// Rows per score / select group: with the 64 MiB score budget this bounds the
 /// scratch at a constant ([`reserve_qsa_bf16_split_scratch`] reserves it), so
@@ -6699,13 +6707,15 @@ struct QsaBf16SplitRoute {
     bounded: bool,
 }
 
-/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1` (default off) additionally admits exact
-/// gfx1100 to the BF16 split route, as a lab arm for A/B against the fused
-/// selector. The crossovers ([`QSA_BF16_SPLIT_MIN_BLOCKS`] and friends) were
-/// measured on gfx1201 only; gfx1100 crossovers are unmeasured and reuse them
-/// unchanged. Read once.
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100` (on unless `0`) is the kill switch for
+/// exact gfx1100 (7900 XTX) on the BF16 split route: unset/1 admits it under
+/// exactly the gfx1201 conditions and crossovers (measured on gfx1100, see
+/// [`QSA_BF16_SPLIT_MIN_BLOCKS`]); `0` restores the fused selector there.
+/// Byte identity on gfx1100 is proven by the route tests (knob on/off) and the
+/// exhaustive score gate (255 / 257 / 2048 / 8192 / 32768 / 65536 blocks,
+/// 27,648 launches bit-exact over 4.3e9 cells). Read once.
 static QWEN4_QSA_SPLIT_GFX1100: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100", true)
 });
 
 /// Pure admission predicate behind [`qsa_bf16_split_arch`].
@@ -6719,8 +6729,8 @@ fn qsa_bf16_split_arch_admits(
     (is_gfx1201 || (is_gfx1100 && gfx1100_knob)) && parallel_qsa_gdn && !forced_serial
 }
 
-/// Exact gfx1201 (crossovers measured there), or exact gfx1100 behind
-/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1`; gfx1151 keeps its PM routes and every
+/// Exact gfx1201, or exact gfx1100 unless
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; gfx1151 keeps its PM routes and every
 /// other arch keeps the fused selector. The route, the scratch reserve and the
 /// expert-residency census all call this one fn, so they agree in a process.
 fn qsa_bf16_split_arch(gpu: &Gpu) -> bool {
@@ -11306,16 +11316,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_knobbed_gfx1100() {
+    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_gfx1100_unless_killed() {
         let f = qsa_bf16_split_arch_admits;
-        // knob unset: exactly the gfx1201 predicate.
+        // gfx1201: admitted whatever the gfx1100 knob says.
         assert!(f(true, false, false, true, false));
-        assert!(!f(false, true, false, true, false));
-        assert!(!f(false, false, false, true, false));
-        // knob set admits gfx1100 only.
-        assert!(f(false, true, true, true, false));
-        assert!(!f(false, false, true, true, false));
         assert!(f(true, false, true, true, false));
+        // gfx1100: admitted with the knob (default), not with the kill switch.
+        assert!(f(false, true, true, true, false));
+        assert!(!f(false, true, false, true, false));
+        // other arch: never.
+        assert!(!f(false, false, true, true, false));
+        assert!(!f(false, false, false, true, false));
         // conjunction terms still gate both archs.
         for (a, b) in [(true, false), (false, true)] {
             assert!(!f(a, b, true, false, false));

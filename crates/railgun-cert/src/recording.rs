@@ -1346,7 +1346,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-qsa-bf16-split-bound",
         predicates: &[IsRecording, CaptureMode],
-        condition: "qsa_bf16_split_route (tensor_ops.rs): HIPFIRE_QWEN4_QSA_BF16_SPLIT (default on, `=0` kill switch) on exact gfx1201 with BF16 pooled keys; `bounded = is_recording()` makes the fused-vs-split crossover (2048 blocks up to 256 rows, 8192 above) read `shape_blocks` instead of the live block count, and `capture_mode` (hipGraph, which cannot patch kernargs) keeps the fused selector. indexed_attention_select_bf16_split(bounded): score stride, score grid ceil(shape_blocks/256) and filter compact grid ceil(shape_blocks/4096) come from `shape_blocks`; block_count (PositionDivU32 {rows, compress}) and position_start (PositionPlusU32 {group row offset}) of every score/threshold/compact/finish launch are declared to the recorder; scratch is the dedicated qsa_select_scores slot reserved before capture (bundle.rs)",
+        condition: "qsa_bf16_split_route (tensor_ops.rs): HIPFIRE_QWEN4_QSA_BF16_SPLIT (default on, `=0` kill switch) on exact gfx1201 and exact gfx1100 (gfx1100 also killed by HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0) with BF16 pooled keys; `bounded = is_recording()` makes the fused-vs-split crossover (2048 blocks up to 256 rows, 8192 above) read `shape_blocks` instead of the live block count, and `capture_mode` (hipGraph, which cannot patch kernargs) keeps the fused selector. indexed_attention_select_bf16_split(bounded): score stride, score grid ceil(shape_blocks/256) and filter compact grid ceil(shape_blocks/4096) come from `shape_blocks`; block_count (PositionDivU32 {rows, compress}) and position_start (PositionPlusU32 {group row offset}) of every score/threshold/compact/finish launch are declared to the recorder; scratch is the dedicated qsa_select_scores slot reserved before capture (bundle.rs)",
         effect: LaunchShape,
         switches: "recorded: hipcc BF16 rows8/rows16 scores + exact filter trio at the shape bound; eager: the same kernels at live-count grids above the crossover, fused indexed_attention_select_bf16_batched below it; captured (hipGraph): fused",
         kernels: &[
@@ -1357,7 +1357,7 @@ pub const DECISIONS: &[Decision] = &[
             "qsa_filter_finish",
         ],
         verdict: ByteExact,
-        evidence: "rdna-compute tests/qsa_bf16_scores.rs on gfx1201 (HIPFIRE_QWEN4_QSA_BF16_SPLIT on, the default): split arms eager and at the shape bound vs the fused BF16 incumbent over 2048..65536 blocks, rows 1/8/17, dense and tied keys, partial blocks, forced filter repair (selection, mirror, persisted flag and canaries identical); recorded tapes at three capture positions replayed through the recorded-HIP oracle at positions 0..capacity vs the fused incumbent run eagerly at that position",
+        evidence: "rdna-compute tests/qsa_bf16_scores.rs on gfx1201 (HIPFIRE_QWEN4_QSA_BF16_SPLIT on, the default) and on gfx1100 (7900 XTX; production route, recorded replay and arms end-to-end tests, plus the exhaustive score bit-for-bit gate at 255/257/2048/8192/32768/65536 blocks): split arms eager and at the shape bound vs the fused BF16 incumbent over 2048..65536 blocks, rows 1/8/17, dense and tied keys, partial blocks, forced filter repair (selection, mirror, persisted flag and canaries identical); recorded tapes at three capture positions replayed through the recorded-HIP oracle at positions 0..capacity vs the fused incumbent run eagerly at that position",
         reaches: &[],
     },
     Decision {
