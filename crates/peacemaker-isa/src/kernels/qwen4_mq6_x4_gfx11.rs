@@ -50,6 +50,21 @@
 //! x = sum of the regions' row blocks), static LDS 40960 bytes. K is a
 //! multiple of 256 (a ragged K tail is ignored, as in hipcc).
 //!
+//! gfx1100 residual twin (`Kind::Resid`, `Cfg::RESID` wr 4 / 8): an exact twin of hipcc's
+//! `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (`gemm_mqv2_wmma_gfx11_mw_lds.hip`,
+//! `Y[out_col * M + out_row] += acc[j]`, F32). The A operand, the B operand and the WMMA chain are
+//! the ones above (hipcc's mw kernel decodes with the same contracted `v_fma_f16` of
+//! `sc_h * (f16)q + zp_h`, one rounding; both run the ascending-K chain from +0.0), so only the
+//! epilogue differs: after the cross-half swap, Y is loaded (two b128 per tile under the
+//! token < N, row < M mask), `v_add_f32 acc, acc, y` (hipcc: `v_add_f32_e32 v1, v1, v14`, acc is
+//! src0) and stored; no `0 + acc`. Tails: rows >= M and tokens >= N are neither loaded nor
+//! stored; `M % 8 != 0` takes a per-element path. Launch: block `32*wr`, grid
+//! `[ceil(M/(16*wr)), ceil(N/256), 1]`, static LDS 40960; the symbol is the incumbent's
+//! (`Cfg::symbol`), one kernel per object, kernargs `A X Y M K N` (36 bytes). Residual entries
+//! assemble for gfx1100 (the product) and gfx1151 (the emulator differential: the instruction
+//! streams are identical); every other arch refuses. A K < 256 call adds an all-zero
+//! accumulator to Y exactly as hipcc does; K <= 0 exits without touching Y.
+//!
 //! MQ4 (`Fmt::Mq4`, `qwen4_mq4_x4_gfx11`): the MQ4G256V2 entries are exact
 //! twins of the current hipcc MQ4 route (`gemm_mq4g256v2_residual_wmma_gfx11_bt4`,
 //! contract C reference): the same A operands (`v_cvt_f32_ubyte0`,
@@ -78,6 +93,8 @@ pub enum Kind {
     Bf16,
     Regions,
     Hcw,
+    /// gfx1100 residual: `Y += acc` in F32 (the `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` twin).
+    Resid,
 }
 
 /// Weight format of the A operand.
@@ -162,15 +179,23 @@ impl Cfg {
         (8, Kind::Regions),
         (8, Kind::Hcw),
     ];
+    /// Waves per workgroup of the gfx1100 residual twin entries.
+    pub const RESID: [u8; 2] = [4, 8];
     fn suffix(&self) -> &'static str {
         match self.kind {
             Kind::Plain => "",
             Kind::Bf16 => "_bf16out",
             Kind::Regions => "_regions",
             Kind::Hcw => "_hcw",
+            Kind::Resid => "_resid",
         }
     }
+    /// Exported symbol. The residual twin exports hipcc's incumbent symbol so its object is a
+    /// drop-in for `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (one kernel per object).
     pub fn symbol(&self) -> String {
+        if self.kind == Kind::Resid {
+            return "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds".into();
+        }
         format!(
             "qwen4_{}_x4_pm_{}_w{}{}",
             self.fmt.tag(),
@@ -183,6 +208,22 @@ impl Cfg {
         format!("qwen4_{}_x4_pm_{}", fmt.tag(), arch.name())
     }
     pub fn validate(&self) -> R {
+        if self.kind == Kind::Resid {
+            if !matches!(self.arch, Arch::Gfx1100 | Arch::Gfx1151) || self.fmt != Fmt::Mq6 {
+                return Err(format!(
+                    "{} residual (Y += acc) entry is MQ6 gfx1100 / gfx1151 only",
+                    self.fmt.builder()
+                ));
+            }
+            if !Self::RESID.contains(&self.wr) {
+                return Err(format!(
+                    "{}: no residual entry w{}",
+                    self.fmt.builder(),
+                    self.wr
+                ));
+            }
+            return Ok(());
+        }
         if self.arch != Arch::Gfx1151 {
             return Err(format!(
                 "{} builder is exact-gfx1151 only",
@@ -337,6 +378,7 @@ fn lbl(spec: &Cfg, name: &str) -> String {
         Kind::Bf16 => "b",
         Kind::Regions => "r",
         Kind::Hcw => "h",
+        Kind::Resid => "y",
     };
     format!(".L{}g11w{}{k}_{name}", spec.fmt.tag(), spec.wr)
 }
@@ -434,6 +476,8 @@ struct Ep {
     vla: u8,
     vlb: u8,
     vc: u8,
+    /// Residual epilogue: Y-load registers (`YG` tiles x 8), after the 16 tile offsets.
+    yb: u8,
 }
 fn ep(spec: &Cfg) -> Ep {
     let e = spec.ringb();
@@ -451,6 +495,7 @@ fn ep(spec: &Cfg) -> Ep {
         vla: e + 82,
         vlb: e + 83,
         vc: e + 84,
+        yb: e + 22,
     }
 }
 
@@ -537,6 +582,11 @@ fn plan(spec: &Cfg) -> Result<RegPlan, String> {
     } else {
         for n in 0..16 {
             p.v::<1>("epi_offset", e.offs + n, epi())?;
+        }
+        if spec.kind == Kind::Resid {
+            for n in 0..YG {
+                p.v::<8>("y_load", e.yb + 8 * n, epi())?;
+            }
         }
     }
     p.s::<2>("kernarg_ptr", KARG, w())?;
@@ -2220,16 +2270,151 @@ fn hcw_epilogue(b: &mut Builder, spec: &Cfg) -> R {
     Ok(())
 }
 
+/// Tiles per Y-load batch of the residual epilogue (8 VGPRs per tile).
+const YG: u8 = 8;
+
+/// Residual epilogue (`Y += acc`, F32), hipcc's `Y[(long long)out_col * M + out_row] += acc[j]`
+/// for `out_col < N`, `out_row < M`: after the cross-half swap each lane owns rows
+/// `8*lh .. 8*lh+7` of its token's tile column, so the stores are two b128 runs; the value
+/// stored is `v_add_f32 acc, acc, y` (hipcc's `v_add_f32_e32 v1, v1, v14`: acc is src0, the
+/// loaded Y src1; no `0 + acc` canonicalisation, the accumulator is added to Y as is). Y is
+/// loaded and stored under the same exec mask (token < N, row < M), so nothing outside the
+/// output is read. Ragged M (`M % 8 != 0`) loads, adds and stores element by element.
+fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
+    let e = ep(spec);
+    for t in 0..BT {
+        swap_tile(b, spec, &e, t)?;
+    }
+    sop(b, format!("s_lshl_b32 s{YSTEP}, s{SM}, 6"), &[YSTEP], &[SM])?;
+    sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
+    tile_offsets(b, e.offs, BT, VYOFF, YSTEP)?;
+    sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
+    sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
+    op(
+        b,
+        format!("s_cbranch_scc1 {}", lbl(spec, "scalar")),
+        &[],
+        &[],
+    )?;
+    // M % 8 == 0: whole 8-row runs (row0 < M implies row0 + 8 <= M).
+    op(
+        b,
+        format!("v_cmp_gt_i32_e64 s{MASK1}, s{SM}, v{VROW0}"),
+        &[s(MASK1)],
+        &[s(SM), v(VROW0)],
+    )?;
+    // The token mask of tile `t` is recomputed under full exec each time: exec is
+    // restored to all ones after every tile, since a VOPC under a partial exec clears
+    // the result bits of the inactive lanes.
+    let tile_exec = |b: &mut Builder, t: u8| -> R {
+        sop(
+            b,
+            format!("s_sub_i32 s{SNB}, s{SN}, {}", lit(16 * u32::from(t))),
+            &[SNB],
+            &[SN],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"),
+            &[s(MASK0)],
+            &[s(SNB), v(VTOK)],
+        )?;
+        op(
+            b,
+            format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"),
+            &[],
+            &[s(MASK0), s(MASK1)],
+        )
+    };
+    for g in 0..BT / YG {
+        for k in 0..YG {
+            let t = g * YG + k;
+            tile_exec(b, t)?;
+            bload(b, 4, e.yb + 8 * k, e.offs + t, SRD_Y, SZERO, 0)?;
+            bload(b, 4, e.yb + 8 * k + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        }
+        for k in 0..YG {
+            let t = g * YG + k;
+            let a = spec.acc() + 8 * t;
+            tile_exec(b, t)?;
+            for i in 0..8u8 {
+                op(
+                    b,
+                    format!("v_add_f32_e32 v{0}, v{0}, v{1}", a + i, e.yb + 8 * k + i),
+                    &[v(a + i)],
+                    &[v(a + i), v(e.yb + 8 * k + i)],
+                )?;
+            }
+            bstore(b, 4, a, e.offs + t, SRD_Y, SZERO, 0)?;
+            bstore(b, 4, a + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        }
+    }
+    b.wait_all()?;
+    op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
+    // Ragged M: per element, row0 + n < M.
+    b.label(&lbl(spec, "scalar"))?;
+    for t in 0..BT {
+        let a = spec.acc() + 8 * t;
+        sop(
+            b,
+            format!("s_sub_i32 s{SNB}, s{SN}, {}", lit(16 * u32::from(t))),
+            &[SNB],
+            &[SN],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"),
+            &[s(MASK0)],
+            &[s(SNB), v(VTOK)],
+        )?;
+        for phase in 0..2u8 {
+            sop(b, format!("s_mov_b32 s{SMJ}, s{SM}"), &[SMJ], &[SM])?;
+            for n in 0..8u8 {
+                op(
+                    b,
+                    format!("v_cmp_gt_i32_e64 s{MASK1}, s{SMJ}, v{VROW0}"),
+                    &[s(MASK1)],
+                    &[s(SMJ), v(VROW0)],
+                )?;
+                op(
+                    b,
+                    format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"),
+                    &[],
+                    &[s(MASK0), s(MASK1)],
+                )?;
+                if phase == 0 {
+                    bload(b, 1, e.yb + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                } else {
+                    op(
+                        b,
+                        format!("v_add_f32_e32 v{0}, v{0}, v{1}", a + n, e.yb + n),
+                        &[v(a + n)],
+                        &[v(a + n), v(e.yb + n)],
+                    )?;
+                    bstore(b, 1, a + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                }
+                op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+                sop(b, format!("s_add_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn epilogue(b: &mut Builder, spec: &Cfg) -> R {
     b.wait_all()?;
     b.label(&lbl(spec, "epi"))?;
     if spec.hcw() {
         hcw_epilogue(b, spec)?;
+    } else if spec.kind == Kind::Resid {
+        resid_epilogue(b, spec)?;
     } else {
         plain_epilogue(b, spec)?;
     }
     b.label(&lbl(spec, "end"))?;
-    b.control(Sop::End.encode(Arch::Gfx1151)?)
+    b.control(Sop::End.encode(spec.arch)?)
 }
 
 /// One MQ6 entry (`Cfg` with `Fmt::Mq6`).
@@ -2246,7 +2431,7 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
             .fold(k, |k, (n, o)| k.hidden(n, *o, 4, "by_value"))
     };
     let kernargs = match spec.kind {
-        Kind::Plain | Kind::Bf16 => by_value(
+        Kind::Plain | Kind::Bf16 | Kind::Resid => by_value(
             KernargLayout::new(36)
                 .pointer("A", 0)
                 .pointer("X", 8)

@@ -57,6 +57,7 @@ s_barrier	control
 s_barrier_signal	control
 s_barrier_wait	control
 s_bfe_u32	alu
+s_brev_b32	alu
 s_bitcmp1_b32	alu
 s_branch	control
 s_cbranch_execnz	control
@@ -208,6 +209,8 @@ v_max3_num_f32	alu
 v_max_f32_e32	alu
 v_max_i32_e32	alu
 v_max_num_f32_e32	alu
+v_min_i32_e32	alu
+v_min_i32_e64	alu
 v_min_u32_e32	alu
 v_min_u32_e64	alu
 v_mov_b32_e32	alu
@@ -219,6 +222,8 @@ v_mul_u32_u24_e32	alu
 v_or_b32_e32	alu
 v_perm_b32	alu
 v_permlanex16_b32	alu
+v_pk_add_f16	alu
+v_pk_fma_f16	alu
 v_rcp_f32_e32	alu
 v_rcp_iflag_f32_e32	alu
 v_s_rcp_f32	alu

@@ -1113,6 +1113,40 @@ fn vector(
                 )
             }
         }
+        // Packed f16 (VOP3P): result half `h` takes each source's half chosen by `op_sel` (low result)
+        // or `op_sel_hi` (high result); `v_pk_add_f16` is the fused `a * 1 + b`, so both are one
+        // correctly rounded (nearest even, denormals kept) operation. Finite operands only.
+        "v_pk_fma_f16" | "v_pk_add_f16" => {
+            if m.neg_lo != 0
+                || m.neg_hi != 0
+                || m.neg != 0
+                || m.abs != 0
+                || m.clamp
+                || m.omod != Omod::None
+            {
+                return Err(format!("{name}: neg/abs/clamp/omod are not modeled"));
+            }
+            let fma = stem(name) == "v_pk_fma_f16";
+            let mut half = [0u16; 2];
+            for (h, slot) in half.iter_mut().enumerate() {
+                let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
+                let mut w = [0u32; 3];
+                for (n, wn) in w.iter_mut().enumerate().take(if fma { 3 } else { 2 }) {
+                    let word = raw(n)?;
+                    let hv = (if sel >> n & 1 != 0 { word >> 16 } else { word }) as u16;
+                    if hv & 0x7c00 == 0x7c00 {
+                        return Err(format!("{name}: non-finite f16 operand is not modeled"));
+                    }
+                    *wn = convert::f16_to_f32(hv);
+                }
+                *slot = if fma {
+                    fma_f16(w[0], w[1], w[2])
+                } else {
+                    fma_f16(w[0], 0x3f80_0000, w[1])
+                };
+            }
+            (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
+        }
         "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
             let byte = u32::from(stem(name).as_bytes()[stem(name).len() - 1] - b'0');
             (
@@ -2116,6 +2150,7 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_andn2_b32" => nonzero(a & !b),
         "s_orn2_b32" => nonzero(a | !b),
         "s_not_b32" => nonzero(!a),
+        "s_brev_b32" => (a.reverse_bits(), None),
         "s_lshl_b32" => nonzero(a << (b & 31)),
         "s_lshr_b32" => nonzero(a >> (b & 31)),
         "s_ashr_i32" => nonzero(((a as i32) >> (b & 31)) as u32),
@@ -3278,6 +3313,79 @@ mod tests {
         i.mods.clamp = true;
         run("v_fma_mixlo_f16", &i, &mut st).unwrap();
         assert_eq!(st.v[0][0], 0xdead_0000, "clamp of a negative result is +0");
+    }
+
+    // VOP3P: op_sel picks each source's half for the low result, op_sel_hi for the high result.
+    #[test]
+    fn v_pk_fma_f16_selects_halves_and_rounds_once() {
+        let mut i = insn("v_pk_fma_f16", vec![v(0), v(1), v(2), v(3)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0xdead_4000; // a: low 2.0
+        st.v[2][0] = 0x4500_4200; // b: low 3.0, high 5.0
+        st.v[3][0] = 0x3c00_beef; // c: high 1.0
+        i.mods.op_sel = 0b100; // c from its high half in the low result
+        i.mods.op_sel_hi = 0b110; // a low, b high, c high in the high result
+        run("v_pk_fma_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4980_4700, "lo 2*3+1 = 7, hi 2*5+1 = 11");
+        // One rounding: (1 + 2^-10)^2 - (1 + 2^-9) = 2^-20, a subnormal f16; a rounded product gives 0.
+        i.mods.op_sel = 0;
+        i.mods.op_sel_hi = 0b111;
+        st.v[1][0] = 0x3c01_3c01;
+        st.v[2][0] = 0x3c01_3c01;
+        st.v[3][0] = 0xbc02_bc02;
+        run("v_pk_fma_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x0010_0010);
+        // Non-finite operands and modifiers are refused, not approximated.
+        st.v[1][0] = 0x7c00_3c00;
+        assert!(run("v_pk_fma_f16", &i, &mut st).is_err());
+        st.v[1][0] = 0x3c00_3c00;
+        i.mods.neg_lo = 1;
+        assert!(run("v_pk_fma_f16", &i, &mut st).is_err());
+    }
+
+    #[test]
+    fn v_pk_add_f16_adds_the_selected_halves() {
+        let mut i = insn("v_pk_add_f16", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0x3c00_4000; // 1.0 high, 2.0 low
+        st.v[2][0] = 0x4500_4200; // 5.0 high, 3.0 low
+        i.mods.op_sel_hi = 0b011;
+        run("v_pk_add_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4600_4500, "lo 2+3 = 5, hi 1+5 = 6");
+        // A constant from one half for both results, as the MQ6 dequant bias add does.
+        i.mods.op_sel = 0b10;
+        i.mods.op_sel_hi = 0b10;
+        run("v_pk_add_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4700_4700, "a low (2.0) + b high (5.0) in both results");
+    }
+
+    #[test]
+    fn v_min_i32_is_signed() {
+        let i = insn("v_min_i32_e32", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 0b11;
+        st.v[1][0] = (-5i32) as u32;
+        st.v[2][0] = 3;
+        st.v[1][1] = 7;
+        st.v[2][1] = (-9i32) as u32;
+        run("v_min_i32_e32", &i, &mut st).unwrap();
+        assert_eq!((st.v[0][0], st.v[0][1]), ((-5i32) as u32, (-9i32) as u32));
+    }
+
+    #[test]
+    fn s_brev_b32_reverses_bits_and_keeps_scc() {
+        let i = insn("s_brev_b32", vec![sreg(0), sreg(1)]);
+        let mut st = state();
+        st.scc = true;
+        st.s[1] = 0xf0;
+        run("s_brev_b32", &i, &mut st).unwrap();
+        assert_eq!(st.s[0], 0x0f00_0000);
+        assert!(st.scc);
+        st.s[1] = u32::MAX - 1; // -2: the unbounded buffer-descriptor size 0x7fffffff
+        run("s_brev_b32", &i, &mut st).unwrap();
+        assert_eq!(st.s[0], 0x7fff_ffff);
     }
 
     #[test]
