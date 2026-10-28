@@ -526,3 +526,7 @@ v_cmpx_lt_i64_e32	vopc	0xd1	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_eq_u64_e32	vopc	0xda	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u64_e32 0, v[7:8]	7DB40E80	-
 v_cmpx_le_u64_e32	vopc	0xdb	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u64_e32 s[22:23], v[2:3]	7DB60416	-
 v_cmpx_gt_u64_e32	vopc	0xdc	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u64_e32 s[2:3], v[3:4]	7DB80602	-
+s_and_not1_b64	sop2	0x23	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_and_not1_b64 exec, exec, s[2:3]	91FE027E	-
+s_and_not1_saveexec_b64	sop1	0x31	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_not1_saveexec_b64 s[0:1], s[24:25]	BE803118	-
+s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b64 s[0:1], s[0:1]	BE802300	-
+s_code_end	sopp	0x1f	-	-	-	-	-	s_code_end	BF9F0000	-
