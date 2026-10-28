@@ -21,9 +21,9 @@
 //! `a3b_lane_wo_timing_hw`: warmup + 200 timed samples (hipEvents) of OLD
 //! (PM x-batch residual) vs NEW at the production shape with the weights
 //! cycled over 40 distinct copies (180 MB, beyond the last-level cache) as the
-//! 40 layers of the model do. `LANE_WO_SWEEP=8x2,4x2,...` also times other
-//! workgroup geometries (waves x rows per wave), checking each is byte-identical
-//! first.
+//! 40 layers of the model do. `LANE_WO_SWEEP=4x4,2x4,...` also times other
+//! workgroup geometries (waves = `KS_NSPL` chain splits x rows per workgroup =
+//! `KS_R`), checking each is byte-identical first.
 //!
 //! `#[ignore]`d: needs an exact gfx1201 device, no model files.
 //!
@@ -531,14 +531,14 @@ fn variant_source(entry: &str, w: usize, r: usize) -> String {
             .expect("policy inc");
             let body = std::fs::read_to_string(&path).expect("LANE_WO_SRC file");
             format!(
-                "#define HIPFIRE_RESIDUAL_LANES_KERNEL {entry}\n#define HIPFIRE_RES_LANES_W {w}\n#define HIPFIRE_RES_LANES_R {r}\n#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n{inc}{body}"
+                "#define HIPFIRE_RESIDUAL_LANES_KERNEL {entry}\n#define KS_NSPL {w}\n#define KS_R {r}\n#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n{inc}{body}"
             )
         }
         Err(_) => residual_lanes_source_with(entry, w, r),
     }
 }
 
-/// `LANE_WO_SWEEP=8x2,4x2,...`: compiled sweep variants (name, waves, rows).
+/// `LANE_WO_SWEEP=4x4,2x4,...`: compiled sweep variants (name, waves, rows per WG).
 fn load_variants(gpu: &mut Gpu) -> Vec<(String, usize, usize)> {
     let mut variants = vec![];
     if let Ok(spec) = std::env::var("LANE_WO_SWEEP") {

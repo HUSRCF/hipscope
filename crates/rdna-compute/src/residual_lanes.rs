@@ -7,9 +7,13 @@
 //! byte-identical to the singleton `gemv_mq4g256v2_residual` run on
 //! `(x[b], y[b])`.
 //!
-//! One wave32 owns two output rows; each weight row is streamed once into
-//! registers and decoded once per group while the lane columns repeat only the
-//! singleton's per-lane FMA chains. See
+//! One workgroup of four wave32s owns four output rows and splits their K range
+//! over the waves: wave `w` runs accumulator chain `w` (four of the sixteen
+//! groups) of all four rows, so a wave holds one chain of 4 x lanes
+//! accumulators; the finished chains are exchanged exactly (raw f32) through
+//! LDS and combined as the singleton does. Each weight row is streamed once
+//! into registers and decoded once per group while the lane columns repeat only
+//! the singleton's per-lane FMA chains. See
 //! `kernels/src/gemv_mq4g256v2_residual_lanes.gfx1201.hip`. Replaces the PM
 //! x-batch residual (`pm_xbatch::residual`) for the A3B `wo` projection
 //! (m = 2048, K = 4096) behind `HIPFIRE_A3B_LANE_WO`; every other shape, and
@@ -18,10 +22,12 @@
 //! Support is a pure function of the shapes: exact gfx1201, 1..=8 lanes,
 //! `K == 4096` and 32-bit weight byte offsets. The route admits it for
 //! [`RESIDUAL_LANES_MIN_ROUTED`]..=8 lanes: with the weights and instruction
-//! caches cold, as between the two `wo` launches of a decode step, the PM
-//! x-batch launch is faster up to 4 lanes (15.0 us vs 19.3 us at 4) and this
-//! kernel from 5 (22.4 vs 20.4 us) to 8 lanes (26.8 vs 23.5 us); see the lab
-//! gate `tests/a3b_lane_wo.rs` (`LANE_WO_FLUSH=1`).
+//! caches cold, as between the two `wo` launches of a decode step
+//! (`LANE_WO_FLUSH=1`, flush copy inside the timed interval), this kernel is
+//! 6.3..8.7 us per launch faster than the PM x-batch launch from 5 to 8 lanes
+//! and within the +-0.4 us noise of it at 1, 2 and 4 lanes (warm, the PM
+//! x-batch launch is faster at every lane count); see the lab gate
+//! `tests/a3b_lane_wo.rs`.
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
@@ -34,19 +40,20 @@ pub const RESIDUAL_LANES_MAX: usize = 8;
 pub const RESIDUAL_LANES_MIN_ROUTED: usize = 5;
 /// Module (and entry) name of the lane-batched residual GEMV.
 pub const RESIDUAL_LANES_MODULE: &str = "gemv_mq4g256v2_residual_lanes_gfx1201";
-/// Waves per workgroup and rows per wave of the shipped module (the kernel's
-/// `HIPFIRE_RES_LANES_W` / `HIPFIRE_RES_LANES_R` defaults).
+/// Waves per workgroup (each runs one of the four accumulator chains) and
+/// rows per workgroup of the shipped module (the kernel's `KS_NSPL` / `KS_R`
+/// defaults).
 pub const RESIDUAL_LANES_WAVES: usize = 4;
-pub const RESIDUAL_LANES_ROWS_PER_WAVE: usize = 2;
+pub const RESIDUAL_LANES_ROWS_PER_WG: usize = 4;
 /// The input width the kernel is compiled for (the A3B `wo`: 32 heads x 128).
 pub const RESIDUAL_LANES_K: usize = 4096;
 
 /// Module source with a non-default workgroup geometry and entry name (lab
-/// tuning sweeps); the shipped module is
-/// [`kernels::GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC`].
-pub fn residual_lanes_source_with(entry: &str, waves: usize, rows_per_wave: usize) -> String {
+/// tuning sweeps: `waves` = `KS_NSPL`, `rows_per_wg` = `KS_R`); the shipped
+/// module is [`kernels::GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC`].
+pub fn residual_lanes_source_with(entry: &str, waves: usize, rows_per_wg: usize) -> String {
     format!(
-        "#define HIPFIRE_RESIDUAL_LANES_KERNEL {entry}\n#define HIPFIRE_RES_LANES_W {waves}\n#define HIPFIRE_RES_LANES_R {rows_per_wave}\n{}",
+        "#define HIPFIRE_RESIDUAL_LANES_KERNEL {entry}\n#define KS_NSPL {waves}\n#define KS_R {rows_per_wg}\n{}",
         kernels::GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC
     )
 }
@@ -112,7 +119,7 @@ impl Gpu {
         self.launch_residual_lanes(
             RESIDUAL_LANES_MODULE,
             RESIDUAL_LANES_WAVES,
-            RESIDUAL_LANES_ROWS_PER_WAVE,
+            RESIDUAL_LANES_ROWS_PER_WG,
             a_raw,
             x,
             y,
@@ -122,14 +129,15 @@ impl Gpu {
         )
     }
 
-    /// Launch an already loaded residual-lanes module built for `waves` x
-    /// `rows_per_wave` geometry (lab sweeps; no admission checks).
+    /// Launch an already loaded residual-lanes module built for `waves`
+    /// (`KS_NSPL`) x `rows_per_wg` (`KS_R`) geometry (lab sweeps; no admission
+    /// checks).
     #[allow(clippy::too_many_arguments)]
     pub fn launch_residual_lanes(
         &mut self,
         module: &str,
         waves: usize,
-        rows_per_wave: usize,
+        rows_per_wg: usize,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
@@ -149,7 +157,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        let grid = m.div_ceil(waves * rows_per_wave) as u32;
+        let grid = m.div_ceil(rows_per_wg) as u32;
         self.launch_maybe_blob(
             module,
             [grid, 1, 1],
@@ -178,6 +186,6 @@ mod tests {
         let src = kernels::GEMV_MQ4G256V2_RESIDUAL_LANES_GFX1201_SRC;
         assert!(src.contains("HIPFIRE_WEIGHT_LOAD_SPLIT_U32"));
         assert!(src.contains("void HIPFIRE_RESIDUAL_LANES_KERNEL("));
-        assert!(residual_lanes_source_with("e", 4, 4).contains("#define HIPFIRE_RES_LANES_W 4\n"));
+        assert!(residual_lanes_source_with("e", 4, 4).contains("#define KS_NSPL 4\n"));
     }
 }

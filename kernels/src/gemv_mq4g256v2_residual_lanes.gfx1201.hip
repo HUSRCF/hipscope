@@ -25,47 +25,62 @@
 // accumulation order (four group-interleaved accumulators, accumulator j
 // holding groups j, j+4, j+8, j+12 in order, each group an 8-term product sum
 // added whole), the same `(acc0 + acc1) + (acc2 + acc3)` combine, the same
-// wave32 shfl_down tree and the same `y + acc` residual add. The weight row is
-// streamed ONCE into registers (the singleton's buffer-load path and cache
-// policy, a group ahead) and decoded once per group; only the per-column FMA
-// chains repeat, on the lane's x elements read straight from global memory
-// (L0/L2 hits: every wave of a workgroup reads the same activations).
+// 32-lane lower-lane-left reduction tree and the same `y + acc` residual add.
+// The weight row is streamed ONCE into registers (the singleton's buffer-load
+// path and cache policy, KS_PFW groups ahead) and decoded once per group; only
+// the per-column FMA chains repeat, on the lane's x elements read straight from
+// global memory.
 //
-// The four accumulators are independent until the combine, so the kernel walks
-// one accumulator ("chain") at a time and folds the finished chain into the
-// combine as it completes: only one accumulator set (R rows x 8 lanes) plus the
-// partial sums are live.
+// K-split: the four accumulator chains are independent until the combine, so a
+// workgroup of KS_NSPL = 4 waves owns KS_R = 4 rows and wave w runs chain w
+// (its four groups) of all four rows: a wave holds one chain of R x NB
+// accumulators, never more. The finished chains are exchanged as raw f32 through
+// LDS (one barrier, exact); wave w then owns the (row, b) pairs p = w (mod 4),
+// forms (c0 + c1) + (c2 + c3), runs the 32-lane tree and adds the residual.
 //
 // ABI: A, x, y, M, B. x is [B][4096] f32 row-major, y is [B][M] f32
-// row-major, 1 <= B <= 8, M arbitrary. Grid = ceil(M / (W * R)) workgroups of
-// W waves (block W * 32), no LDS and no barriers; wave w of workgroup g owns the
-// R consecutive rows (g * W + w) * R ... + R - 1 (R even: row parity selects
-// the contraction form below).
+// row-major, 1 <= B <= 8, M arbitrary. Grid = ceil(M / KS_R) workgroups of
+// KS_NSPL waves (block KS_NSPL * 32, static LDS KS_NSPL * KS_R * 8 * 32 f32);
+// workgroup g owns rows g * KS_R ... + KS_R - 1 (KS_R even: absolute row parity
+// selects the contraction form below). B <= KS_SMALL_NB runs a NB = KS_SMALL_NB
+// body, otherwise a NB = 8 body (two bodies keep .text small).
+//
+// The KS_* geometry/tuning macros are overridable (lab sweeps: see
+// `residual_lanes_source_with`); the defaults are the shipped configuration.
 
-#ifndef HIPFIRE_RES_LANES_W
-#define HIPFIRE_RES_LANES_W 4
+#ifndef KS_NSPL
+#define KS_NSPL 4
 #endif
-#ifndef HIPFIRE_RES_LANES_R
-#define HIPFIRE_RES_LANES_R 2
+#ifndef KS_R
+#define KS_R 4
 #endif
-#define RL_W HIPFIRE_RES_LANES_W
-#define RL_R HIPFIRE_RES_LANES_R
-#define RL_NT (RL_W * 32)
-#define RL_B 8
-#define RL_K 4096
-#define RL_NQ 4                       // groups per chain = RL_K / 1024
-static_assert((RL_R & 1) == 0, "rows per wave must be even: row parity selects the singleton's contraction form");
+#ifndef KS_XD
+#define KS_XD 4
+#endif
+#ifndef KS_PFW
+#define KS_PFW 2
+#endif
+#ifndef KS_SMALL_NB
+#define KS_SMALL_NB 5
+#endif
 
-// One 8-term group dot, the singleton's DOG_X8 sum `w0*x0 + w1*x1 + ... +
-// w7*x7` added whole into the accumulator. The singleton leaves the contraction
-// of the first two products to the compiler, which fuses them differently for
-// the two rows its dual-row workgroup owns (measured per group of the quad and
-// per row parity on the hardware, forms below): the even row (`acc*`) computes
-// F0 = fma(w1, x1, w0*x0), the odd row (`bcc*`) F1 = fma(w0, x0, w1*x1), for
-// all four groups; both then fuse w2*x2 .. w7*x7 in index order. The explicit
-// fused chains pin those forms, independent of this kernel's own instruction
-// order, so rows keep the singleton's parity (this kernel's rows per wave is
-// even and its first row even).
+#define KS_NCH (4 / KS_NSPL)          // chains per wave
+#define KS_NG (KS_NCH * 4)            // groups per wave
+#define KS_NT (KS_NSPL * 32)
+#define KS_K 4096
+#ifndef KS_W64
+#define KS_W64 0     // 1: wave64, the two 32-lane halves of a wave run different chains (KS_NSPL = 4 only)
+#endif
+#ifndef KS_WPE
+#define KS_WPE 8
+#endif
+static_assert((KS_R & 1) == 0, "rows per workgroup must be even: absolute row parity selects the contraction form");
+static_assert(KS_NSPL == 2 || KS_NSPL == 4, "KS_NSPL");
+
+// program-order pins: the FMAs of a column step complete before later x/weight loads issue
+#define KS_PIN(a0, a1) asm volatile("" : "+v"(a0), "+v"(a1) :: "memory")
+#define KS_PIN_X(xa, xb) asm volatile("" : "+v"(xa.x), "+v"(xa.y), "+v"(xa.z), "+v"(xa.w), "+v"(xb.x), "+v"(xb.y), "+v"(xb.z), "+v"(xb.w) :: "memory")
+
 #define DOG_F0(a, wv, xlo, xhi) do { \
     float t_ = (wv[0]) * (xlo.x); \
     t_ = __builtin_fmaf((wv[1]), (xlo.y), t_); \
@@ -89,126 +104,200 @@ static_assert((RL_R & 1) == 0, "rows per wave must be even: row parity selects t
     (a) += t_; \
 } while (0)
 
-__launch_bounds__(RL_NT, 1)
+// lane l < 16: s_l + s_{l+16}; then inside the 16-lane row s_l + s_{l+8}, +4, +2, +1 (own operand first = lower lane left).
+template <int N>
+__device__ __forceinline__ void ks_tree32(float (&s)[N]) {
+    #pragma unroll
+    for (int i = 0; i < N; i++) {
+#if KS_W64
+        float t = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(s[i]), 0x401f));   // lane ^ 16 inside each 32-lane half
+#else
+        float t = __int_as_float((int)__builtin_amdgcn_permlanex16(
+            0u, (unsigned int)__float_as_int(s[i]), 0x76543210u, 0xFEDCBA98u, false, false));
+#endif
+        asm volatile("" : "+v"(t));
+        s[i] = s[i] + t;
+    }
+#define KS_DPP_STEP(CTRL) \
+    _Pragma("unroll") \
+    for (int i = 0; i < N; i++) { \
+        float t = __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(s[i]), __float_as_int(s[i]), CTRL, 0xF, 0xF, false)); \
+        asm volatile("" : "+v"(t)); \
+        s[i] = s[i] + t; }
+    KS_DPP_STEP(0x108)
+    KS_DPP_STEP(0x104)
+    KS_DPP_STEP(0x102)
+    KS_DPP_STEP(0x101)
+#undef KS_DPP_STEP
+}
+
+template <int NB, typename RS>
+__device__ __forceinline__ void ks_run(const char* __restrict__ A, const float* __restrict__ x,
+                                       float* __restrict__ y, float* __restrict__ lds,
+                                       int M, int Bn, int tid, int wave, int row_base) {
+    constexpr int R = KS_R, NG = KS_NG, D = KS_XD, PFW = KS_PFW, NS = NG * NB, NP = R * NB;
+    constexpr int NSPL = KS_NSPL, NCH = KS_NCH;
+    const long long row_stride = (long long)(KS_K / 256) * 136;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const RS rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#else
+    const RS rsrc = 0;
+#endif
+    const int wch = wave * NCH;       // first chain of this wave (wave-uniform)
+    unsigned int woff[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        const int row = (row_base + r < M) ? (row_base + r) : (M - 1);
+#if KS_W64
+        woff[r] = (unsigned int)((long long)row * row_stride);      // scalar part; the lane's chain goes into the vector offsets
+#else
+        woff[r] = (unsigned int)((long long)row * row_stride) + (unsigned int)(wch * 136);
+#endif
+    }
+#if KS_W64
+    const unsigned int hoff = ((tid < 16) ? 0u : 4u) + (unsigned int)(wch * 136);
+    const unsigned int poff = 8u + (unsigned int)tid * 4u + (unsigned int)(wch * 136);
+#else
+    const unsigned int hoff = (tid < 16) ? 0u : 4u;
+    const unsigned int poff = 8u + (unsigned int)tid * 4u;
+#endif
+    const float* xl = x + tid * 8 + wch * 256;
+
+    unsigned int hs[NG][R], pk[NG][R];
+    float4 xr[D][2];
+
+#define KS_GS(ig) (((ig) / 4) + 4 * ((ig) % 4))     // group offset (relative to the wave's first chain)
+#define KS_LOADW(ig) do { \
+        _Pragma("unroll") \
+        for (int r = 0; r < R; r++) { \
+            const unsigned int g_off = woff[r] + (unsigned int)(KS_GS(ig) * 136); \
+            hs[ig][r] = HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, A + (long long)g_off + hoff, hoff, g_off); \
+            pk[ig][r] = HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, A + (long long)g_off + poff, poff, g_off); \
+        } \
+    } while (0)
+#define KS_LOADX(s) do { \
+        const int bc_ = ((s) % NB < Bn) ? ((s) % NB) : (Bn - 1); \
+        const float* xp_ = xl + (long long)bc_ * KS_K + KS_GS((s) / NB) * 256; \
+        xr[(s) % D][0] = *reinterpret_cast<const float4*>(xp_); \
+        xr[(s) % D][1] = *reinterpret_cast<const float4*>(xp_ + 4); \
+    } while (0)
+
+    // prologue
+    #pragma unroll
+    for (int ig = 0; ig < PFW; ig++) KS_LOADW(ig);
+    #pragma unroll
+    for (int s = 0; s < D - 1; s++) { if (s < NS) KS_LOADX(s); }
+
+    float acc[NCH][R][NB];
+    #pragma unroll
+    for (int ig = 0; ig < NG; ig++) {
+        const int c = ig / 4;
+        if ((ig % 4) == 0) {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+                #pragma unroll
+                for (int b = 0; b < NB; b++) acc[c][r][b] = 0.0f;
+        }
+        if (ig + PFW < NG) KS_LOADW(ig + PFW);
+        float w[R][8];
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const unsigned int h = hs[ig][r];
+            const float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
+            const float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
+            const unsigned int p = pk[ig][r];
+            const unsigned int lo = p & 0x0F0F0F0Fu;
+            const unsigned int hi = (p >> 4) & 0x0F0F0F0Fu;
+            w[r][0] = __builtin_fmaf(sc, (float)(lo & 0xFFu), zp);
+            w[r][1] = __builtin_fmaf(sc, (float)(hi & 0xFFu), zp);
+            w[r][2] = __builtin_fmaf(sc, (float)((lo >> 8) & 0xFFu), zp);
+            w[r][3] = __builtin_fmaf(sc, (float)((hi >> 8) & 0xFFu), zp);
+            w[r][4] = __builtin_fmaf(sc, (float)((lo >> 16) & 0xFFu), zp);
+            w[r][5] = __builtin_fmaf(sc, (float)((hi >> 16) & 0xFFu), zp);
+            w[r][6] = __builtin_fmaf(sc, (float)((lo >> 24) & 0xFFu), zp);
+            w[r][7] = __builtin_fmaf(sc, (float)((hi >> 24) & 0xFFu), zp);
+        }
+        #pragma unroll
+        for (int b = 0; b < NB; b++) {
+            const int s = ig * NB + b;
+            if (s + D - 1 < NS) KS_LOADX(s + D - 1);
+            float4 xa = xr[s % D][0];
+            float4 xb = xr[s % D][1];
+            KS_PIN_X(xa, xb);
+            #pragma unroll
+            for (int r = 0; r < R; r += 2) {
+                DOG_F0(acc[c][r][b], w[r], xa, xb);
+                DOG_F1(acc[c][r + 1][b], w[r + 1], xa, xb);
+                KS_PIN(acc[c][r][b], acc[c][r + 1][b]);
+            }
+        }
+    }
+
+    // ---- per-chain (pair) values -> LDS, exact combine by the owner wave of each (row, b) pair ----
+    constexpr int CPW = (NP + NSPL - 1) / NSPL;
+    float yv[CPW];
+    #pragma unroll
+    for (int i = 0; i < CPW; i++) {
+        const int p = (i * NSPL + wave < NP) ? (i * NSPL + wave) : (NP - 1);
+        const int r = p / NB, b0 = p % NB;
+        const int b = (b0 < Bn) ? b0 : (Bn - 1);
+        const int row = (row_base + r < M) ? (row_base + r) : (M - 1);
+        yv[i] = y[(long long)b * M + row];
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int b = 0; b < NB; b++) {
+            float e = acc[0][r][b];
+            if (NCH == 2) e = e + acc[1][r][b];           // acc(2w) + acc(2w+1)
+            lds[(wave * NP + r * NB + b) * 32 + tid] = e;
+        }
+    __syncthreads();
+    float a[CPW];
+    #pragma unroll
+    for (int i = 0; i < CPW; i++) {
+        const int p = (i * NSPL + wave < NP) ? (i * NSPL + wave) : (NP - 1);
+        float c[NSPL];
+        #pragma unroll
+        for (int j = 0; j < NSPL; j++) c[j] = lds[(j * NP + p) * 32 + tid];
+        if (NSPL == 4) a[i] = (c[0] + c[1]) + (c[2] + c[3]);
+        else a[i] = c[0] + c[1];
+    }
+    ks_tree32<CPW>(a);
+    if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < CPW; i++) {
+            const int pi = i * NSPL + wave;
+            const int p = (pi < NP) ? pi : (NP - 1);
+            const int r = p / NB, b = p % NB;
+            if (pi < NP && b < Bn && row_base + r < M) y[(long long)b * M + row_base + r] = yv[i] + a[i];
+        }
+    }
+}
+
+__launch_bounds__(KS_NT) __attribute__((amdgpu_waves_per_eu(KS_WPE)))
 extern "C" __global__ void HIPFIRE_RESIDUAL_LANES_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,   // [B][4096]
     float* __restrict__ y,         // [B][M]
     int M, int B
 ) {
+    __shared__ __attribute__((aligned(16))) float ks_lds[KS_NSPL * KS_R * 8 * 32];
     const int tid = threadIdx.x & 31;
-    const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
-    const long long row_stride = (long long)(RL_K / 256) * 136;
-
-    const int row_base = ((int)blockIdx.x * RL_W + wave) * RL_R;
-    unsigned int woff[RL_R];
-    #pragma unroll
-    for (int r = 0; r < RL_R; r++) {
-        const int row = (row_base + r < M) ? (row_base + r) : (M - 1);
-        woff[r] = (unsigned int)((long long)row * row_stride);
-    }
-#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
-    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#if KS_W64
+    const int wave = (int)(threadIdx.x >> 5);                  // owner/chain index, lane-uniform per 32-lane half
 #else
-    const int weight_rsrc = 0;
+    const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
 #endif
-    // Per-lane byte offsets inside a group record: header dword (first half of
-    // the group for lanes < 16, second half otherwise) and this lane's packed
-    // dword.
-    const unsigned int hoff = (tid < 16) ? 0u : 4u;
-    const unsigned int poff = 8u + (unsigned int)tid * 4u;
-    const float* xl = x + tid * 8;
-
-    // raw weights of group g of every owned row, into slot `buf`
-    unsigned int hs[2][RL_R], pk[2][RL_R];
-#define RL_LOAD_W(buf, g) do { \
-        _Pragma("unroll") \
-        for (int r = 0; r < RL_R; r++) { \
-            const unsigned int g_off = woff[r] + (unsigned int)((g) * 136); \
-            hs[buf][r] = HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(weight_rsrc, A + (long long)g_off + hoff, hoff, g_off); \
-            pk[buf][r] = HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(weight_rsrc, A + (long long)g_off + poff, poff, g_off); \
-        } \
-    } while (0)
-
-    float part[RL_R][RL_B];   // (acc0 + acc1), then (acc0 + acc1) + (acc2 + acc3)
-    float part2[RL_R][RL_B];  // acc2
-    #pragma unroll
-    for (int r = 0; r < RL_R; r++)
-        #pragma unroll
-        for (int b = 0; b < RL_B; b++) { part[r][b] = 0.0f; part2[r][b] = 0.0f; }
-
-    RL_LOAD_W(0, 0);
-
-    #pragma unroll 1
-    for (int j = 0; j < 4; j++) {
-        float acc[RL_R][RL_B];
-        #pragma unroll
-        for (int r = 0; r < RL_R; r++)
-            #pragma unroll
-            for (int b = 0; b < RL_B; b++) acc[r][b] = 0.0f;
-
-        #pragma unroll
-        for (int q = 0; q < RL_NQ; q++) {
-            const int buf = q & 1;
-            const int g = j + 4 * q;
-            // next step's raw weights: group j + 4 (q + 1) of this chain, or
-            // group j + 1 of the next
-            if (q + 1 < RL_NQ) { RL_LOAD_W(buf ^ 1, g + 4); }
-            else if (j + 1 < 4) { RL_LOAD_W(buf ^ 1, j + 1); }
-            float w[RL_R][8];
-            #pragma unroll
-            for (int r = 0; r < RL_R; r++) {
-                const unsigned int h = hs[buf][r];
-                const float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
-                const float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
-                const unsigned int p = pk[buf][r];
-                const unsigned int lo = p & 0x0F0F0F0Fu;
-                const unsigned int hi = (p >> 4) & 0x0F0F0F0Fu;
-                w[r][0] = sc * (float)(lo & 0xFFu) + zp;
-                w[r][1] = sc * (float)(hi & 0xFFu) + zp;
-                w[r][2] = sc * (float)((lo >> 8) & 0xFFu) + zp;
-                w[r][3] = sc * (float)((hi >> 8) & 0xFFu) + zp;
-                w[r][4] = sc * (float)((lo >> 16) & 0xFFu) + zp;
-                w[r][5] = sc * (float)((hi >> 16) & 0xFFu) + zp;
-                w[r][6] = sc * (float)((lo >> 24) & 0xFFu) + zp;
-                w[r][7] = sc * (float)((hi >> 24) & 0xFFu) + zp;
-            }
-            #pragma unroll
-            for (int b = 0; b < RL_B; b++) {
-                if (b >= B) break;
-                const float* xp = xl + (long long)b * RL_K + g * 256;
-                const float4 xa = *reinterpret_cast<const float4*>(xp);
-                const float4 xb = *reinterpret_cast<const float4*>(xp + 4);
-                #pragma unroll
-                for (int r = 0; r < RL_R; r++) {
-                    if (r & 1) DOG_F1(acc[r][b], w[r], xa, xb);
-                    else DOG_F0(acc[r][b], w[r], xa, xb);
-                }
-            }
-        }
-
-        // fold the finished chain into (acc0 + acc1) + (acc2 + acc3)
-        #pragma unroll
-        for (int r = 0; r < RL_R; r++) {
-            #pragma unroll
-            for (int b = 0; b < RL_B; b++) {
-                if (j == 0) part[r][b] = acc[r][b];
-                else if (j == 1) part[r][b] = part[r][b] + acc[r][b];
-                else if (j == 2) part2[r][b] = acc[r][b];
-                else part[r][b] = part[r][b] + (part2[r][b] + acc[r][b]);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (int r = 0; r < RL_R; r++) {
-        #pragma unroll
-        for (int b = 0; b < RL_B; b++) {
-            if (b >= B) break;
-            float s = part[r][b];
-            for (int offset = 16; offset > 0; offset >>= 1)
-                s += __shfl_down(s, offset);
-            if (tid == 0 && row_base + r < M) y[(long long)b * M + row_base + r] += s;
-        }
-    }
+    const int row_base = (int)blockIdx.x * KS_R;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    typedef __amdgpu_buffer_rsrc_t RsT;
+#else
+    typedef int RsT;
+#endif
+    if (B <= 0) return;
+    // B <= KS_SMALL_NB: the NB = KS_SMALL_NB body (columns >= B re-read column B-1, results never stored);
+    // otherwise the NB = 8 body (same clamp for B = 6, 7). Two bodies keep .text near the incumbent's.
+    if (B <= KS_SMALL_NB) ks_run<KS_SMALL_NB, RsT>(A, x, y, ks_lds, M, B, tid, wave, row_base);
+    else ks_run<8, RsT>(A, x, y, ks_lds, M, (B < 8 ? B : 8), tid, wave, row_base);
 }
