@@ -2765,7 +2765,6 @@ mod tests {
     /// `slowlink_admission_window_charge_delta_is_pinned`.
     const REFERENCE_WINDOW_ROWS: usize = 16_384;
 
-
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     // Flash-Next MQ4 packed: 512 experts of 1,740,800 gate/up and 870,400 down bytes.
@@ -5192,7 +5191,10 @@ mod tests {
         let new = admit(&product_window_inputs(free)).unwrap();
         let delta = new.reserve_bytes().unwrap() - old.reserve_bytes().unwrap();
         assert_eq!(new.census.arena - old.census.arena, 10_485_760);
-        assert_eq!(new.census.route_storage - old.census.route_storage, 11_902_208);
+        assert_eq!(
+            new.census.route_storage - old.census.route_storage,
+            11_902_208
+        );
         assert_eq!(new.census.a4_sidecars - old.census.a4_sidecars, 2_580_480);
         assert_eq!(new.census.group_scatter - old.census.group_scatter, 102_400);
         assert_eq!(delta, 25_070_848, "23.9 MiB");

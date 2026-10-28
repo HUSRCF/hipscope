@@ -5658,7 +5658,10 @@ mod slowlink_prompt {
             let profile = product_profile_on(route);
             assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
             assert_eq!(profile.tile_rows, 768);
-            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "the full 22-tile window");
+            assert_eq!(
+                profile.window_rows, S1_WINDOW_ROWS,
+                "the full 22-tile window"
+            );
             let plan = plan_for_profile(&profile, 0, 16384, &[], &gfx1100_routing, 8)
                 .unwrap()
                 .expect("the product tile plans a full window");
