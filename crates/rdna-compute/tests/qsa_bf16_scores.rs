@@ -1942,12 +1942,16 @@ fn split_switch() -> bool {
 
 #[test]
 fn qsa_bf16_split_production_route_matches_fused() {
-    let split_on = split_switch();
     let mut gpu = gpu_for_gate();
+    // gfx1100 is admitted only under the lab knob HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1
+    // (set it in the process env; the knob is read once by the library).
+    let gfx1100_knob = std::env::var("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100").as_deref() == Ok("1");
+    let arch_admitted = gpu.arch_caps.is_gfx1201() || (gpu.arch_caps.is_gfx1100() && gfx1100_knob);
     assert!(
-        gpu.arch_caps.is_gfx1201(),
-        "this production split-route gate requires exact gfx1201"
+        gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1100(),
+        "this production split-route gate requires gfx1201 or gfx1100"
     );
+    let split_on = split_switch() && arch_admitted;
     let fx = Fixture::new(&mut gpu, PRODUCTION);
     let reserved =
         reserve_qsa_bf16_split_scratch(&mut gpu, DType::BF16).expect("reserve split scratch");

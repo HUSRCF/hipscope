@@ -6663,7 +6663,8 @@ fn indexed_attention_select_rows8_core(
 /// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
 /// blocks. Selected indices and the mirror are byte-identical to the fused
 /// `indexed_attention_select_bf16_batched` incumbent. Default on, and only on
-/// exact gfx1201 ([`qsa_bf16_split_arch`]; the other architectures keep the
+/// exact gfx1201 ([`qsa_bf16_split_arch`], plus gfx1100 under the lab knob
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1`; the other architectures keep the
 /// incumbent whatever the switch says); `0` is the kill switch and always
 /// keeps the incumbent, as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
 /// select-from-scores arm never beats the filter on gfx1201). Read once.
@@ -6698,12 +6699,38 @@ struct QsaBf16SplitRoute {
     bounded: bool,
 }
 
-/// Exact gfx1201 only: the crossovers were measured there; gfx1151 keeps its
-/// PM routes and every other arch keeps the fused selector.
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1` (default off) additionally admits exact
+/// gfx1100 to the BF16 split route, as a lab arm for A/B against the fused
+/// selector. The crossovers ([`QSA_BF16_SPLIT_MIN_BLOCKS`] and friends) were
+/// measured on gfx1201 only; gfx1100 crossovers are unmeasured and reuse them
+/// unchanged. Read once.
+static QWEN4_QSA_SPLIT_GFX1100: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100", false)
+});
+
+/// Pure admission predicate behind [`qsa_bf16_split_arch`].
+fn qsa_bf16_split_arch_admits(
+    is_gfx1201: bool,
+    is_gfx1100: bool,
+    gfx1100_knob: bool,
+    parallel_qsa_gdn: bool,
+    forced_serial: bool,
+) -> bool {
+    (is_gfx1201 || (is_gfx1100 && gfx1100_knob)) && parallel_qsa_gdn && !forced_serial
+}
+
+/// Exact gfx1201 (crossovers measured there), or exact gfx1100 behind
+/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=1`; gfx1151 keeps its PM routes and every
+/// other arch keeps the fused selector. The route, the scratch reserve and the
+/// expert-residency census all call this one fn, so they agree in a process.
 fn qsa_bf16_split_arch(gpu: &Gpu) -> bool {
-    gpu.arch_caps.is_gfx1201()
-        && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
-        && !select_forced_serial()
+    qsa_bf16_split_arch_admits(
+        gpu.arch_caps.is_gfx1201(),
+        gpu.arch_caps.is_gfx1100(),
+        *QWEN4_QSA_SPLIT_GFX1100,
+        gpu.arch_caps.has_qwen4_parallel_qsa_gdn(),
+        select_forced_serial(),
+    )
 }
 
 /// Geometry the BF16 score kernels cover: four heads, `index_dim % 4 == 0`
@@ -11277,6 +11304,24 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_knobbed_gfx1100() {
+        let f = qsa_bf16_split_arch_admits;
+        // knob unset: exactly the gfx1201 predicate.
+        assert!(f(true, false, false, true, false));
+        assert!(!f(false, true, false, true, false));
+        assert!(!f(false, false, false, true, false));
+        // knob set admits gfx1100 only.
+        assert!(f(false, true, true, true, false));
+        assert!(!f(false, false, true, true, false));
+        assert!(f(true, false, true, true, false));
+        // conjunction terms still gate both archs.
+        for (a, b) in [(true, false), (false, true)] {
+            assert!(!f(a, b, true, false, false));
+            assert!(!f(a, b, true, true, true));
+        }
+    }
 
     /// The grouped attention's dynamic LDS: 20 bytes per selected row for the
     /// shipped kernels (weights[4] + token) and 16 for the q8 lite twin, which
