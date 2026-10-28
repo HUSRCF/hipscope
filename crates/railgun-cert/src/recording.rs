@@ -2219,6 +2219,12 @@ pub const SITES: &[Site] = &[
         decisions: &["eager-only-refusals"],
     },
     Site {
+        file: "hipfire-arch-qwen4/src/state_parity.rs",
+        function: "run_mtp_head_d2_probe",
+        occurrences: 2,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
         file: "hipfire-daemon/src/bench.rs",
         function: "handle_bench_decode",
         occurrences: 1,

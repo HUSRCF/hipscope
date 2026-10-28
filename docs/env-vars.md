@@ -899,7 +899,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1782
+**Count:** 1786
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1050,7 +1050,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CPU_EXEC_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-cpu/src/splice_pool.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
 | `HIPFIRE_CPU_EXPERT_THREADS` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
-| `HIPFIRE_CPU_SPLIT_TRACE` | crates/hipfire-dispatch/src/cpu_exec.rs, crates/hipfire-dispatch/src/cpu_split.rs | developer |
+| `HIPFIRE_CPU_SPLIT_TRACE` | crates/hipfire-arch-qwen4/tests/mtp_head_d2_hw.rs, crates/hipfire-dispatch/src/cpu_exec.rs | developer |
 | `HIPFIRE_CQN_BLOCK` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_SCALAR_PREP` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2000,6 +2000,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | developer |
 | `HIPFIRE_MTP_FLOOR_TRACE` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | developer |
 | `HIPFIRE_MTP_GPU_ACCEPT` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_HEAD_D2_DUMP` | crates/hipfire-arch-qwen4/src/state_parity.rs, crates/hipfire-arch-qwen4/tests/mtp_head_d2_hw.rs | developer |
+| `HIPFIRE_MTP_HEAD_D2_MODEL` | crates/hipfire-arch-qwen4/tests/mtp_head_d2_hw.rs | harness |
+| `HIPFIRE_MTP_HEAD_D2_OUT` | crates/hipfire-arch-qwen4/tests/mtp_head_d2_hw.rs | harness |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs | developer |
 | `HIPFIRE_MTP_IDENTITY_ARM` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-arch-qwen4/tests/q8_ef_product_routes_hw.rs | harness |
 | `HIPFIRE_MTP_IDENTITY_CASE` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-arch-qwen4/tests/q8_ef_product_routes_hw.rs | harness |
@@ -2181,7 +2184,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_COMPACT_SCRATCH` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/host_link.rs | developer |
 | `HIPFIRE_QWEN4_CUT_LAYERS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-loader/examples/fn_ep_oracle.rs | developer |
 | `HIPFIRE_QWEN4_D2_DEFAULT` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | developer |
-| `HIPFIRE_QWEN4_MTP_HEAD_D2` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/tests/mtp_head_d2_hw.rs | developer |
 | `HIPFIRE_QWEN4_D2_JOIN` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_D2_READY` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_D2_RETURN` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
@@ -2244,6 +2246,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | crates/hipfire-arch-qwen4/examples/qwen4_mtp_fill.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_DERIVED_K` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | developer |
 | `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT` | crates/hipfire-arch-qwen4/src/lab_window.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_QWEN4_MTP_HEAD_D2` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
