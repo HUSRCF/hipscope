@@ -5,6 +5,9 @@
 //! emulator gate (`Emulator::hw_model`: in-flight loads honouring `s_waitcnt`, LDS happens-before race
 //! detection, adversarial wave schedules, strict LDS/workspace reads) at the spec's real grid, block,
 //! dynamic LDS, kernarg values and exact-size guarded buffers. No device. PM-KRSI-1100 DecodeAudit.
+//! Wave32 and wave64 objects (gfx1100/gfx1151/gfx1201): the wavefront size comes from the lifted kernel (KD
+//! ENABLE_WAVEFRONT_SIZE32), `block` threads are split into waves of that size, EXEC/VCC are 64-bit in wave64 and the
+//! gate model (in-flight loads, LDS races, schedules) runs per wave of either size.
 //!
 //! Usage: emu_race_gate SPEC.json [--wg x,y,z]... [--order forward|reverse|random:SEED] [--json OUT.json] [--max-findings N]
 //!   no --wg: every workgroup of `grid_wg`. `--order` permutes the order the workgroups run in (inter-workgroup
@@ -13,7 +16,10 @@
 //!   not be run (lift refused, an opcode has no emulator semantics, bad spec): that is NOT a clean verdict.
 //!
 //! Spec (spec_version 1): `{name, object (path relative to the spec dir), object_sha256, arch, symbol,
-//!   grid_wg[3], block[3], dynamic_lds, args[], buffers[], notes}`.
+//!   grid_wg[3], block[3], dynamic_lds, args[], buffers[], notes, nan_policy?}`. `nan_policy` = `strict` (default: an
+//!   unmeasured NaN layout of a qualified opcode is a finding) | `meets_nan` (`Emulator::nan_meets_nan`: the lab
+//!   exactness contract, a NaN operand propagates a NaN, payload not claimed; needed for hipcc lane kernels fed Wild
+//!   headers).
 //!   args (the kernel's explicit arguments, in declaration order; count and byte size are checked against the object's
 //!   kernarg metadata, hidden arguments are filled from the launch geometry as the HIP runtime does):
 //!     `{name, buf, off?}` pointer to a buffer (+ byte offset), `{name, i32|u32|f32}`, `{name, null:true}`,
@@ -279,7 +285,14 @@ fn run() -> Res<i32> {
     let kva = mem.map_guarded("kernarg".to_owned(), kern, GUARD_BYTES).map_err(|e| format!("map kernarg: {e}"))?;
 
     // ---- run ----
-    let emu = Emulator::new(&program, &symbol).map_err(|e| format!("emulator: {e}"))?.hw_model().gfx1100_as_gfx1151();
+    let mut emu = Emulator::new(&program, &symbol).map_err(|e| format!("emulator: {e}"))?.hw_model().gfx1100_as_gfx1151();
+    let nan_policy = spec["nan_policy"].as_str().unwrap_or("strict").to_owned();
+    match nan_policy.as_str() {
+        "strict" => {}
+        "meets_nan" => emu = emu.nan_meets_nan(),
+        other => return Err(format!("nan_policy {other}: expected strict|meets_nan")),
+    }
+    let wave = kernel.wave.lanes();
     let wgs: Vec<[u32; 3]> = if selected.is_empty() {
         let mut v = Vec::new();
         for z in 0..grid[2] {
@@ -374,9 +387,9 @@ fn run() -> Res<i32> {
         "workgroups_total": wgs.len(), "workgroups_clean": ran, "instructions_sched0": instructions,
         "schedules": schedules, "findings_total": nfind, "findings_by_class": by_class, "findings": findings,
         "output_buffers": outputs, "elapsed_ms": started.elapsed().as_millis() as u64,
-        "private_segment_fixed_size": descriptor.private_segment_fixed_size,
+        "private_segment_fixed_size": descriptor.private_segment_fixed_size, "wave": wave, "nan_policy": nan_policy,
         "group_segment_fixed_size": descriptor.group_segment_fixed_size,
-        "model": "Emulator::hw_model().gfx1100_as_gfx1151() (decode tables gfx1100)",
+        "model": format!("Emulator::hw_model(){}.gfx1100_as_gfx1151() (arch {:?}, wave{wave})", if nan_policy == "meets_nan" { ".nan_meets_nan()" } else { "" }, program.target.arch),
         "inter_workgroup_races": "not modelled: workgroups run one after another on shared memory",
     });
     println!("{} {} wg {}/{} clean, {} finding(s) {:?}  [{} ms]", verdict, name, ran, wgs.len(), nfind, by_class, started.elapsed().as_millis());

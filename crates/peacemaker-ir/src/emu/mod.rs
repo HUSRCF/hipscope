@@ -20,6 +20,8 @@ mod gate_ops_tests;
 mod swmmac_fixtures;
 pub mod trans;
 mod wide;
+#[cfg(test)]
+mod wave64_tests;
 mod wmma;
 use crate::{
     inst::{Abi, Wave},
@@ -266,6 +268,9 @@ struct State {
     lanes: usize,
     exec: u64,
     vcc: u64,
+    /// Lab NaN policy (`Emulator::nan_meets_nan`): unmeasured NaN operand layouts of otherwise-qualified f32 opcodes
+    /// widen and propagate a NaN instead of failing closed; no payload claim.
+    nan_loose: bool,
     scc: bool,
     m0: u32,
     pc: usize,
@@ -304,6 +309,7 @@ impl State {
             t: [0; 16],
             v: Box::new([[0; 64]; 256]),
             lanes,
+            nan_loose: false,
             exec: 0,
             vcc: 0,
             scc: false,
@@ -447,8 +453,8 @@ impl State {
             }
             Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
             Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
-            Operand::Special(Special::Vcc) => self.vcc & self.lane_mask(),
-            Operand::Special(Special::Exec) => self.exec & self.lane_mask(),
+            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Exec | Special::ExecLo) => self.exec & self.lane_mask(),
             Operand::Special(Special::Null) => 0,
             Operand::Inline(InlineConst::Integer(n)) => i64::from(*n) as u64,
             Operand::Inline(InlineConst::FloatBits(b)) if kind == Wide::Float => {
@@ -469,11 +475,11 @@ impl State {
                 self.put(op, lane, 0, value as u32)?;
                 self.put(op, lane, 1, (value >> 32) as u32)
             }
-            Operand::Special(Special::Exec) => {
+            Operand::Special(Special::Exec | Special::ExecLo) => {
                 self.exec = value & self.lane_mask();
                 Ok(())
             }
-            Operand::Special(Special::Vcc) => {
+            Operand::Special(Special::Vcc | Special::VccLo) => {
                 self.vcc = value & self.lane_mask();
                 Ok(())
             }
@@ -609,6 +615,7 @@ pub struct Emulator<'a> {
     kernel: &'a Kernel,
     arch: Arch,
     steps: Vec<Step<'a>>,
+    nan_loose: bool,
     strict_lds: bool,
     /// The program's own target: instruction tables are looked up with this even when numerics run as gfx1151.
     decode_arch: Arch,
@@ -648,6 +655,7 @@ impl<'a> Emulator<'a> {
             kernel,
             arch: program.target.arch,
             steps,
+            nan_loose: false,
             strict_lds: false,
             decode_arch: program.target.arch,
             hw: None,
@@ -658,6 +666,14 @@ impl<'a> Emulator<'a> {
     /// error. Off by default so existing differential tests keep their (zero-initialised LDS) behaviour.
     pub fn strict_lds(mut self) -> Self {
         self.strict_lds = true;
+        self
+    }
+    /// The lab's exactness contract for the lane kernels: non-NaN words bit-equal, a NaN must meet a NaN (payload and
+    /// sign are tallied, not claimed). With it, a NaN operand of `v_fma_mix_f32` in a layout the hardware sweeps do not
+    /// cover (op_sel / half A or C source) widens exactly and takes the measured f32 fma NaN rule instead of failing
+    /// closed. Whether a result is a NaN is exact under IEEE; which payload it carries is NOT claimed. Off by default.
+    pub fn nan_meets_nan(mut self) -> Self {
+        self.nan_loose = true;
         self
     }
     /// Execute a gfx1100 program with gfx1151's (RDNA3.5) numerics and WMMA model. The emulator has no hardware-
@@ -701,7 +717,7 @@ impl<'a> Emulator<'a> {
             return Err("workgroup must contain 1..1024 threads".into());
         }
         let mut states = (0..n.div_ceil(kernel.wave.lanes()))
-            .map(|w| State::new(self.arch, kernel, launch, w))
+            .map(|w| State::new(self.arch, kernel, launch, w).map(|mut s| { s.nan_loose = self.nan_loose; s }))
             .collect::<Result<Vec<_>>>()?;
         let mut lds = vec![
             0u8;
@@ -908,6 +924,7 @@ mod tests {
             t: [0; 16],
             v: Box::new([[0; 64]; 256]),
             lanes: 32,
+            nan_loose: false,
             exec: 0xffff_ffff,
             vcc: 0,
             scc: false,

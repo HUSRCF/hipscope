@@ -639,6 +639,7 @@ mod tests {
             t: [0; 16],
             v: Box::new([[0; 64]; 256]),
             lanes: 32,
+            nan_loose: false,
             exec: 1,
             vcc: 0,
             scc: false,

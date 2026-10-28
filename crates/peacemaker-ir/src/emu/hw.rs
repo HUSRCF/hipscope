@@ -631,7 +631,7 @@ impl<'a> Emulator<'a> {
         }
         let nw = n.div_ceil(kernel.wave.lanes());
         let states = (0..nw)
-            .map(|w| State::new(self.arch, kernel, launch, w))
+            .map(|w| State::new(self.arch, kernel, launch, w).map(|mut s| { s.nan_loose = self.nan_loose; s }))
             .collect::<Result<Vec<_>>>()?;
         let lds_len = d
             .group_segment_fixed_size

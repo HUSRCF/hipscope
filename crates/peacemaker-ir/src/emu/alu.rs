@@ -714,7 +714,7 @@ fn mix_in(arch: Arch, s: &State, o: &[Operand], i: &Inst, lane: usize) -> Result
             if abs || neg {
                 return Err(NAN_MOD.into());
             }
-            if m.op_sel != 0 || m.op_sel_hi & 0b101 != 0 {
+            if !s.nan_loose && (m.op_sel != 0 || m.op_sel_hi & 0b101 != 0) {
                 return Err("NaN operand of v_fma_mix with op_sel or a half A/C source: only op_sel:[0,0,0] with B as the half source is measured".into());
             }
         }
@@ -2580,6 +2580,7 @@ mod tests {
             t: [0; 16],
             v: Box::new([[0; 64]; 256]),
             lanes: 32,
+            nan_loose: false,
             exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
